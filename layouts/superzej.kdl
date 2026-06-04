@@ -35,7 +35,7 @@ layout {
                     }
                 }
                 // Panel width: edit this value or set $SUPERZEJ_PANEL_WIDTH.
-                pane size="50" borderless=true {
+                pane size="44" borderless=true {
                     plugin location="file:~/.local/share/superzej/panel.wasm"
                 }
             }
