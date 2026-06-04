@@ -63,8 +63,8 @@ fn dispatch(cfg: &Config, key: &str) -> Result<()> {
     match key {
         "new-workspace" => commands::new_workspace::run(cfg, None, None, true),
         "new-worktree" => commands::new_worktree::run(cfg, None, None, false, None),
-        "new-panel" => commands::new_panel::run(cfg, "right"),
-        "new-tab" => commands::new_tab::run(),
+        "new-panel" => commands::new_panel::run(cfg, "right", false),
+        "new-tab" => commands::new_tab::run(None),
         "switch-repo" => commands::launch::run(cfg),
         "dashboard" => commands::dashboard::run(cfg, false, false),
         "toggle-sidebar" => commands::panels::sidebar(true),

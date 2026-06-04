@@ -106,7 +106,10 @@ if not (os.path.exists(SZ) and shutil.which("zellij")):
 
 tmphome = tempfile.mkdtemp()
 state = os.path.join(tmphome, "state")
-repo = os.path.join(tmphome, "navux-repo")
+# Unique repo name per run: the worktree DEST dir (~/.superzej/worktrees/{slug})
+# is keyed by repo basename, so a reused name collides with stale worktrees
+# from previous runs (the random branch-name pool is small).
+repo = os.path.join(tmphome, f"navux-{os.getpid()}")
 os.makedirs(repo)
 subprocess.run(["git", "-C", repo, "init", "-q"], check=True)
 subprocess.run(["git", "-C", repo, "-c", "user.email=t@e", "-c",
@@ -145,6 +148,9 @@ def cleanup():
     except ProcessLookupError:
         pass
     shutil.rmtree(tmphome, ignore_errors=True)
+    shutil.rmtree(
+        os.path.expanduser(f"~/.superzej/worktrees/{os.path.basename(repo)}"),
+        ignore_errors=True)
 
 
 try:
@@ -257,6 +263,25 @@ try:
     restored = focused_tab_block()
     check("sidebar.wasm" in restored and len(chrome_plugins(restored)) == 4,
           "sidebar restored to template with 1 center terminal")
+
+    # ── 8. Alt+N: one in-place panel, no dead command pane ───────────────
+    print("== Alt+N scoped panel ==")
+
+    def pane_count(block):
+        # leaf panes only — `split_direction` lines are layout containers,
+        # and a split wraps siblings in a fresh container node
+        return sum(1 for line in block.splitlines()
+                   if line.lstrip().startswith("pane")
+                   and "split_direction" not in line)
+
+    before_panes = pane_count(focused_tab_block())
+    key(b"\x1bN", wait=3)
+    block = focused_tab_block()
+    check('name="panel"' in block, "panel pane created (renamed in place)")
+    check("new-panel" not in block,
+          "no leftover exited 'superzej new-panel' pane")
+    check(pane_count(block) == before_panes + 1,
+          f"exactly one pane added ({before_panes} -> {pane_count(block)})")
 finally:
     cleanup()
 

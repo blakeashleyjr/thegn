@@ -30,11 +30,12 @@ keybinds {
         // Alt+t opens a SECOND full-chrome tab on the current worktree
         // (named "{slug}/{branch} ·2") — a fresh page of terminals, not a new
         // worktree. zellij tab-mode `n` is repointed to this too (below), so a
-        // bare chrome-less tab can't be created by habit.
+        // bare chrome-less tab can't be created by habit. MessagePlugin (not
+        // Run) so no command pane flashes: the focused tab's tabbar instance
+        // runs `superzej new-tab` in the background.
         bind "Alt t" {
-            Run "superzej" "new-tab" {
-                floating true
-                close_on_exit true
+            MessagePlugin "file:~/.local/share/superzej/tabbar.wasm" {
+                name "superzej_new_tab"
             }
         }
         // ── workspace (= repo session) ──────────────────────────────────
@@ -56,7 +57,13 @@ keybinds {
         }
         // ── panels (= plain panes): native split + scoped split ─────────
         bind "Alt n" { NewPane "Down"; }
-        bind "Alt N" { Run "superzej" "new-panel" "--dir" "right"; }
+        // The Run pane itself becomes the panel (--in-place execs a shell at
+        // the worktree root) — one pane per press, no dead command pane.
+        bind "Alt N" {
+            Run "superzej" "new-panel" "--in-place" {
+                direction "Right"
+            }
+        }
         // switch repo-session (floating picker) + cross-session worktree dash.
         // Floating + close_on_exit so declining (Exit) just closes the overlay
         // and drops you back exactly where you were.
@@ -121,9 +128,8 @@ keybinds {
     // repoint it at `superzej new-tab` so every tab keeps the wrapper.
     tab {
         bind "n" {
-            Run "superzej" "new-tab" {
-                floating true
-                close_on_exit true
+            MessagePlugin "file:~/.local/share/superzej/tabbar.wasm" {
+                name "superzej_new_tab"
             }
             SwitchToMode "Normal"
         }
