@@ -1,0 +1,291 @@
+// superzej-managed zellij config.
+//
+// On first launch superzej copies this to ~/.superzej/zellij.kdl and starts
+// zellij with `--config ~/.superzej/zellij.kdl` for full control. Edit that copy
+// to customize — superzej never overwrites it once it exists. Anything you don't
+// set falls back to zellij's built-in defaults.
+//
+// Model:  workspace = repo = session    worktree = tab    panel = plain pane
+//
+// This default is tuned to feel like a native IDE: a bespoke theme, rounded
+// frames, no session-name chrome, no startup/release-note popups, and a layout
+// (layouts/superzej.kdl) that drops zellij's two-line hint/tip status bar
+// entirely. The only persistent chrome is the top worktree-tab strip.
+
+keybinds {
+    shared_except "locked" {
+        // ── worktree (= tab) lifecycle ──────────────────────────────────
+        bind "Alt w" {
+            Run "superzej" "new-worktree" {
+                floating true
+                close_on_exit true
+            }
+        }
+        bind "Alt X" {
+            Run "superzej" "close-worktree" {
+                floating true
+                close_on_exit true
+            }
+        }
+        // Alt+t opens a SECOND full-chrome tab on the current worktree
+        // (named "{slug}/{branch} ·2") — a fresh page of terminals, not a new
+        // worktree. zellij tab-mode `n` is repointed to this too (below), so a
+        // bare chrome-less tab can't be created by habit.
+        bind "Alt t" {
+            Run "superzej" "new-tab" {
+                floating true
+                close_on_exit true
+            }
+        }
+        // ── workspace (= repo session) ──────────────────────────────────
+        bind "Alt W" {
+            Run "superzej" "new-workspace" {
+                floating true
+                close_on_exit true
+            }
+        }
+        // ── Cmd+K command palette ───────────────────────────────────────
+        // Super(=Cmd/Mod)+K opens a fuzzy menu of every superzej action. Needs
+        // the kitty protocol + a terminal/WM that forwards Super (same caveat as
+        // the Super+Alt nav binds); rebind to e.g. "Alt k" if your WM grabs it.
+        bind "Super k" {
+            Run "superzej" "menu" {
+                floating true
+                close_on_exit true
+            }
+        }
+        // ── panels (= plain panes): native split + scoped split ─────────
+        bind "Alt n" { NewPane "Down"; }
+        bind "Alt N" { Run "superzej" "new-panel" "--dir" "right"; }
+        // switch repo-session (floating picker) + cross-session worktree dash.
+        // Floating + close_on_exit so declining (Exit) just closes the overlay
+        // and drops you back exactly where you were.
+        bind "Alt o" {
+            Run "superzej" "launch" {
+                floating true
+                close_on_exit true
+            }
+        }
+        bind "Alt d" { Run "superzej" "dashboard"; }
+        // ── show / hide the two plugin surfaces ─────────────────────────
+        // MessagePlugin pipes straight to the running plugin instances (one
+        // per tab) — each suppresses/restores its own pane in place. No
+        // spawned command pane, no flash; the center column reflows instantly.
+        bind "Ctrl Alt s" {
+            MessagePlugin "file:~/.local/share/superzej/sidebar.wasm" {
+                name "superzej_toggle"
+            }
+        }
+        bind "Ctrl Alt p" {
+            MessagePlugin "file:~/.local/share/superzej/panel.wasm" {
+                name "superzej_toggle"
+            }
+        }
+        // ── per-worktree tools (open as floating panes) ─────────────────
+        bind "Alt g" { Run "superzej" "tool" "lazygit"; }
+        bind "Alt y" { Run "superzej" "tool" "yazi"; }
+        bind "Alt e" { Run "superzej" "tool" "editor"; }
+        bind "Alt /" { Run "superzej" "tool" "diff"; }
+        // ── switch tabs ─────────────────────────────────────────────────
+        // Alt+←/→ cycles tabs (vanilla tab switching). The left tree is the
+        // richer navigator; this is the quick keyboard path. Up/Down are left
+        // to their defaults (MoveFocusOrTab) for in-tab pane focus.
+        bind "Alt Left"  { GoToPreviousTab; }
+        bind "Alt Right" { GoToNextTab; }
+        // ── move focus across the columns ───────────────────────────────
+        // sidebar ←→ terminal(s) ←→ diff/PR panel, and between stacked
+        // terminal panes. MoveFocus (not MoveFocusOrTab) so the edges of a
+        // worktree never spill over into switching tabs.
+        //
+        // Alt+h/j/k/l are the PRIMARY focus keys (rebound from zellij's
+        // default MoveFocusOrTab to kill the edge spill-over): arrows = tabs,
+        // letters = panes. They work in any terminal/WM.
+        bind "Alt h" { MoveFocus "Left"; }
+        bind "Alt j" { MoveFocus "Down"; }
+        bind "Alt k" { MoveFocus "Up"; }
+        bind "Alt l" { MoveFocus "Right"; }
+        // Super(=Mod)+Alt variants. Need the kitty keyboard protocol (set
+        // above) AND a terminal that forwards Super to the app — and your
+        // window manager must not already grab Super+Alt+<key>. If these don't
+        // fire, that's the WM eating them; use the Alt+h/j/k/l binds above.
+        bind "Super Alt Left"  { MoveFocus "Left"; }
+        bind "Super Alt Right" { MoveFocus "Right"; }
+        bind "Super Alt Up"    { MoveFocus "Up"; }
+        bind "Super Alt Down"  { MoveFocus "Down"; }
+        bind "Super Alt h"     { MoveFocus "Left"; }
+        bind "Super Alt j"     { MoveFocus "Down"; }
+        bind "Super Alt k"     { MoveFocus "Up"; }
+        bind "Super Alt l"     { MoveFocus "Right"; }
+    }
+    // zellij tab-mode `n` (Ctrl+t → n) would create a bare chrome-less tab —
+    // repoint it at `superzej new-tab` so every tab keeps the wrapper.
+    tab {
+        bind "n" {
+            Run "superzej" "new-tab" {
+                floating true
+                close_on_exit true
+            }
+            SwitchToMode "Normal"
+        }
+    }
+    // NOTE: zellij's default keybinds are intentionally kept (we don't
+    // `clear-defaults`), so the center column behaves like vanilla zellij —
+    // split / stack / move / resize panes, pane & tab modes, Alt+[ / Alt+]
+    // swap layouts (cycling the center-terminal arrangements defined in the
+    // tab layouts), etc. The binds above only add superzej shortcuts,
+    // repoint Alt+←/→ at tab switching and Alt+h/j/k/l at pane focus.
+}
+
+// ── Options ─────────────────────────────────────────────────────────────
+theme "superzej"
+default_layout "superzej"
+
+pane_frames true
+mouse_mode true
+
+// Kill every bit of extraneous chrome zellij shows by default.
+show_release_notes false                   // no "what's new" popup on upgrade
+support_kitty_keyboard_protocol true        // reliable Super-Alt-arrow delivery
+
+// superzej OWNS the session structure: the managed layout pins the sidebar,
+// diff/PR panel and home tab, and worktree tabs are reconstructable from git +
+// the superzej DB. zellij's own session serialization is therefore redundant —
+// and worse, resurrecting a serialized session restores its OLD layout and
+// ignores `--layout`, so edits to this config/layout would silently never take
+// effect on restart. Turning it off makes the managed layout authoritative on
+// every (re)start. (This is also why a stale serialized session can show the
+// pre-edit theme/status-bar: `zellij delete-session <name>` clears it.)
+session_serialization false
+
+ui {
+    pane_frames {
+        rounded_corners true                // soft IDE-like pane borders
+        hide_session_name true              // drop the session name from frames
+    }
+}
+
+// ── Theme ───────────────────────────────────────────────────────────────
+// A bespoke dark palette (storm-blue base, cyan focus, warm accents). Uses
+// zellij's component theme spec so every UI surface — tabs, frames, lists,
+// tables, exit codes — is styled to match, not just the 16 ANSI slots.
+//
+//   bg0  20 22 31    deepest background
+//   bg1  26 29 41    surface
+//   bg2  40 44 62    selection / overlay
+//   fg  192 197 211  base text        fg+ 224 228 240  bright text
+//   cyan 94 218 207  focus accent     blue 122 162 247
+//   mag 187 154 247  green 158 206 106 yellow 224 175 104
+//   orange 255 158 100  red 247 118 142
+themes {
+    superzej {
+        text_unselected {
+            base 192 197 211
+            background 20 22 31
+            emphasis_0 94 218 207
+            emphasis_1 122 162 247
+            emphasis_2 187 154 247
+            emphasis_3 224 175 104
+        }
+        text_selected {
+            base 224 228 240
+            background 40 44 62
+            emphasis_0 94 218 207
+            emphasis_1 122 162 247
+            emphasis_2 187 154 247
+            emphasis_3 224 175 104
+        }
+        // tabs / ribbons: active worktree tab is a filled cyan chip
+        ribbon_selected {
+            base 20 22 31
+            background 94 218 207
+            emphasis_0 255 158 100
+            emphasis_1 20 22 31
+            emphasis_2 247 118 142
+            emphasis_3 122 162 247
+        }
+        ribbon_unselected {
+            base 192 197 211
+            background 26 29 41
+            emphasis_0 94 218 207
+            emphasis_1 224 228 240
+            emphasis_2 187 154 247
+            emphasis_3 224 175 104
+        }
+        // tables (used by some plugins / built-ins)
+        table_title {
+            base 94 218 207
+            background 20 22 31
+            emphasis_0 122 162 247
+            emphasis_1 187 154 247
+            emphasis_2 158 206 106
+            emphasis_3 224 175 104
+        }
+        table_cell_selected {
+            base 224 228 240
+            background 40 44 62
+            emphasis_0 94 218 207
+            emphasis_1 122 162 247
+            emphasis_2 187 154 247
+            emphasis_3 224 175 104
+        }
+        table_cell_unselected {
+            base 192 197 211
+            background 20 22 31
+            emphasis_0 94 218 207
+            emphasis_1 122 162 247
+            emphasis_2 187 154 247
+            emphasis_3 224 175 104
+        }
+        // lists (pickers, plugin menus)
+        list_selected {
+            base 224 228 240
+            background 40 44 62
+            emphasis_0 94 218 207
+            emphasis_1 122 162 247
+            emphasis_2 187 154 247
+            emphasis_3 224 175 104
+        }
+        list_unselected {
+            base 192 197 211
+            background 20 22 31
+            emphasis_0 94 218 207
+            emphasis_1 122 162 247
+            emphasis_2 187 154 247
+            emphasis_3 224 175 104
+        }
+        // pane frames: the focused pane gets a cyan border
+        frame_selected {
+            base 94 218 207
+            background 20 22 31
+            emphasis_0 122 162 247
+            emphasis_1 187 154 247
+            emphasis_2 224 175 104
+            emphasis_3 247 118 142
+        }
+        frame_highlight {
+            base 255 158 100
+            background 20 22 31
+            emphasis_0 224 175 104
+            emphasis_1 187 154 247
+            emphasis_2 122 162 247
+            emphasis_3 94 218 207
+        }
+        // command-pane exit status
+        exit_code_success {
+            base 158 206 106
+            background 20 22 31
+            emphasis_0 94 218 207
+            emphasis_1 122 162 247
+            emphasis_2 187 154 247
+            emphasis_3 224 175 104
+        }
+        exit_code_error {
+            base 247 118 142
+            background 20 22 31
+            emphasis_0 255 158 100
+            emphasis_1 224 175 104
+            emphasis_2 187 154 247
+            emphasis_3 122 162 247
+        }
+    }
+}

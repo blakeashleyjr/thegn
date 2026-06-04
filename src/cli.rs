@@ -60,6 +60,8 @@ pub enum Command {
         #[arg(long, default_value = "right")]
         dir: String,
     },
+    /// Open a second full-chrome tab on the current worktree ("{tab} ·N").
+    NewTab,
     /// (internal) TSV of registered workspaces for the sidebar plugin —
     /// `session_name<TAB>name<TAB>repo_path` per line, including stopped ones.
     Workspaces,

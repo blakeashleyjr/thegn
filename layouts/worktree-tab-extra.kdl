@@ -1,15 +1,15 @@
-// layouts/worktree-tab.kdl — a worktree tab, opened by `superzej new-worktree`
-// (`new-tab --cwd <worktree> --layout worktree-tab`).
+// layouts/worktree-tab-extra.kdl — a SECOND tab on an existing worktree,
+// opened by `superzej new-tab` (Alt+t / tab-mode `n`):
+// `new-tab --name "{base} ·N" --cwd <worktree> --layout worktree-tab-extra`.
 //
 // SELF-CONTAINED wrapper (sidebar | tabbar/terminal | panel) — must mirror the
-// tab structure in superzej.kdl / home-tab.kdl, because a `new-tab --layout` tab
-// does not reliably inherit the session's default_tab_template
-// (zellij-org/zellij#4646). Keep these in sync.
+// tab structure in superzej.kdl / home-tab.kdl / worktree-tab.kdl, because a
+// `new-tab --layout` tab does not reliably inherit the session's
+// default_tab_template (zellij-org/zellij#4646). Keep these in sync.
 //
-// The tab's cwd (the worktree dir) is injected via `--cwd`, so the center pane
-// inherits it and runs the agent picker in place (`--in-place` => no leftover
-// exited pane); pick-agent derives the branch from git and names the tab
-// `{slug}/{branch}`.
+// Unlike worktree-tab.kdl the center pane is a PLAIN SHELL: the tab is just a
+// fresh page of terminals on the same worktree, and the agent picker would
+// rename the tab and clobber the " ·N" page name.
 layout {
     pane split_direction="horizontal" {
         pane split_direction="vertical" {
@@ -23,10 +23,7 @@ layout {
                 pane size=1 borderless=true {
                     plugin location="file:~/.local/share/superzej/tabbar.wasm"
                 }
-                pane focus=true {
-                    command "superzej"
-                    args "pick-agent" "--in-place"
-                }
+                pane focus=true
             }
             // 27% ~= 44 cols on a 166-col terminal; the plugin snaps itself to exact width on load.
             pane size="27%" borderless=true {
