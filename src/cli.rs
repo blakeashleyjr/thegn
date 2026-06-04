@@ -59,9 +59,18 @@ pub enum Command {
     NewPanel {
         #[arg(long, default_value = "right")]
         dir: String,
+        /// Become the panel: drop to a shell at the worktree root in THIS
+        /// pane (the Alt+N keybind opens the Run pane with a direction).
+        #[arg(long = "in-place")]
+        in_place: bool,
     },
     /// Open a second full-chrome tab on the current worktree ("{tab} ·N").
-    NewTab,
+    NewTab {
+        /// Session name (passed by the tabbar plugin pipe; plugin-spawned
+        /// commands can't rely on env/cwd).
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// (internal) TSV of registered workspaces for the sidebar plugin —
     /// `session_name<TAB>name<TAB>repo_path` per line, including stopped ones.
     Workspaces,
