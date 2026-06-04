@@ -1,0 +1,21 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Flake checks (build, formatting, clippy)
+        run: nix flake check -L
+      - name: Lint (clippy, shellcheck, yamllint, taplo)
+        run: nix develop -c just lint
+      - name: Smoke test
+        run: nix develop -c just smoke

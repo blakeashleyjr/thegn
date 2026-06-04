@@ -1,0 +1,59 @@
+# superzej config — copy to ~/.config/superzej/config.toml and edit.
+# All keys are optional (sane defaults apply). Home-manager users get this
+# generated automatically from programs.superzej.
+
+# Where worktrees live (grouped per repo) and where remote URLs are cloned.
+worktrees_dir = "~/worktrees"
+workspaces_dir = "~/code"
+
+# Roots scanned by the workspace repo picker (new-workspace / bare `sj`).
+# Defaults to [workspaces_dir] if omitted.
+repo_roots = ["~/code", "~/src"]
+repo_scan_depth = 5
+
+# Base ref for new worktrees: "auto" = current branch, else the repo default.
+base_branch = "auto"
+branch_prefix = "sz/"
+
+# Picker UI: "auto" | "gum" | "fzf" | "select"
+picker = "auto"
+
+# Worktree location: "global" | "in_repo" (<repo>/.worktrees)
+worktree_mode = "global"
+
+# Auto branch naming: "words" (sz/brisk-otter) | "numbered" (sz/pane-1)
+name_scheme = "words"
+
+# Remove the worktree automatically when its pane closes.
+auto_remove_worktree = false
+
+# Coding agents offered in the new-pane picker.
+# Use "__shell__" for a plain login shell.
+[[agents]]
+name = "claude"
+command = "claude"
+
+[[agents]]
+name = "aider"
+command = "aider --model sonnet"
+
+[[agents]]
+name = "shell"
+command = "__shell__"
+
+# Per-worktree tools (also bound to Alt-g/y/e//).
+[[tools]]
+name = "lazygit"
+command = "lazygit"
+
+[[tools]]
+name = "yazi"
+command = "yazi"
+
+[[tools]]
+name = "editor"
+command = "${EDITOR:-vi} ."
+
+[[tools]]
+name = "diff"
+command = "git diff"

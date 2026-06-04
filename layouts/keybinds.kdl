@@ -1,0 +1,32 @@
+// superzej keybinds. These live at zellij config top-level (zellij does NOT
+// allow a `keybinds` node inside a layout). At launch, `superzej attach` writes
+// a merged config = your existing config.kdl + this block, and starts zellij
+// with `--config <merged>` — so your read-only config.kdl is never edited and
+// your theme/options/keybinds are preserved (zellij merges keybinds blocks).
+keybinds {
+    shared_except "locked" {
+        // workspace / worktree lifecycle
+        bind "Alt w" { Run "superzej" "new-pane"; }
+        bind "Alt W" {
+            Run "superzej" "new-workspace" {
+                floating true
+                close_on_exit true
+            }
+        }
+        bind "Alt X" {
+            Run "superzej" "close-pane" "--remove-worktree" {
+                floating true
+                close_on_exit true
+            }
+        }
+        // dashboard (floating quick-switcher)
+        bind "Alt d" { Run "superzej" "dashboard"; }
+        // per-worktree tools (open as floating panes)
+        bind "Alt g" { Run "superzej" "tool" "lazygit"; }
+        bind "Alt y" { Run "superzej" "tool" "yazi"; }
+        bind "Alt e" { Run "superzej" "tool" "editor"; }
+        bind "Alt /" { Run "superzej" "tool" "diff"; }
+        // Phase 2 (WASM sidebar):
+        // bind "Alt s" { LaunchOrFocusPlugin "file:~/.local/share/superzej/sidebar.wasm"; }
+    }
+}

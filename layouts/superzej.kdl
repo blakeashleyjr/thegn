@@ -1,0 +1,26 @@
+// layouts/superzej.kdl — the superzej session layout.
+//
+// Launch with:  zellij --layout superzej   (superzej attach does this for you,
+// plus a merged --config carrying the keybinds; see layouts/keybinds.kdl).
+//
+// NOTE: zellij does not allow a `keybinds` node inside a layout — keybinds live
+// in the config (layouts/keybinds.kdl), merged at launch by `superzej attach`.
+layout {
+    default_tab_template {
+        pane size=1 borderless=true {
+            plugin location="zellij:tab-bar"
+        }
+        children
+        pane size=2 borderless=true {
+            plugin location="zellij:status-bar"
+        }
+    }
+
+    // Home tab: the repo launcher (recents + add new).
+    tab name="superzej" focus=true {
+        pane {
+            command "superzej"
+            args "launch"
+        }
+    }
+}
