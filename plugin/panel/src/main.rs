@@ -789,23 +789,6 @@ fn push(out: &mut String, text: &str, cols: usize) {
     out.push_str("\u{1b}[0m\r\n");
 }
 
-/// Header line with a truecolor foreground, bold. No background fill.
-fn header_fg(out: &mut String, text: &str, cols: usize, rgb: &str) {
-    let body: String = text.chars().take(cols).collect();
-    out.push_str(&format!("\u{1b}[1m\u{1b}[38;2;{rgb}m{body}\u{1b}[0m\r\n"));
-}
-
-/// Header line with a truecolor fg + bg fill, padded to `cols`.
-fn header_bg(out: &mut String, text: &str, cols: usize, fg: &str, bg: &str) {
-    let body: String = text.chars().take(cols).collect();
-    let pad = cols.saturating_sub(body.chars().count());
-    out.push_str(&format!(
-        "\u{1b}[1m\u{1b}[38;2;{fg}m\u{1b}[48;2;{bg}m{body}"
-    ));
-    out.push_str(&" ".repeat(pad));
-    out.push_str("\u{1b}[0m\r\n");
-}
-
 fn short(path: &str) -> String {
     let parts: Vec<&str> = path.rsplitn(3, '/').collect();
     match parts.as_slice() {
