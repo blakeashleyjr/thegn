@@ -210,7 +210,37 @@ try:
     check(f"{wt_tab} ·4" in t and not any(x.startswith("Tab #") for x in t),
           f"tab-mode n -> ·4, no bare 'Tab #N' ({t})")
 
-    # ── 5. resolve-worktree strips the page suffix ───────────────────────
+    # ── 5. sidebar tree: repo -> worktree -> tabs ────────────────────────
+    print("== sidebar tree navigation ==")
+    home_tab = tabs()[0]
+
+    def focused_tab_name():
+        b = focused_tab_block()
+        first = b.splitlines()[0].lstrip() if b else ""
+        parts = first.split('name="', 1)
+        return parts[1].split('"', 1)[0] if len(parts) == 2 else ""
+
+    # rows: 0 repo · 1 home · 2 worktree · 3-6 pages ·1-·4 · 7 +worktree
+    key(b"\x1bh")
+    check("sidebar.wasm" in focused_pane(), "sidebar focused for tree nav")
+    key(b"j")
+    key(b"\r", wait=1.5)  # row 1: the home worktree row
+    check(focused_tab_name() == home_tab,
+          f"home row -> home tab ({focused_tab_name()!r})")
+    key(b"\x1bh")
+    key(b"j")
+    key(b"j")
+    key(b"\r", wait=1.5)  # row 2: the worktree row -> its base tab
+    check(focused_tab_name() == wt_tab,
+          f"worktree row -> base tab ({focused_tab_name()!r})")
+    key(b"\x1bh")
+    for _ in range(4):
+        key(b"j")
+    key(b"\r", wait=1.5)  # row 4: page ·2
+    check(focused_tab_name() == f"{wt_tab} ·2",
+          f"page ·2 row -> its tab ({focused_tab_name()!r})")
+
+    # ── 6. resolve-worktree strips the page suffix ───────────────────────
     print("== resolve-worktree ==")
     env = dict(os.environ, XDG_STATE_HOME=state)
     r = subprocess.run(
