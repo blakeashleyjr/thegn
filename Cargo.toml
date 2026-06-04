@@ -1,0 +1,24 @@
+[package]
+name = "superzej"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal-native git-worktree IDE on top of zellij"
+license = "MIT"
+default-run = "superzej"
+
+[[bin]]
+name = "superzej"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive", "env"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+walkdir = "2.5"
+anyhow = "1"
+
+[profile.release]
+strip = true
+lto = "thin"
