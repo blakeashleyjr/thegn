@@ -11,9 +11,10 @@
   lazygit,
   yazi,
   delta,
+  gh,
   coreutils,
 }: let
-  runtimeDeps = [git zellij fzf gum lazygit yazi delta coreutils];
+  runtimeDeps = [git zellij fzf gum lazygit yazi delta gh coreutils];
 in
   rustPlatform.buildRustPackage {
     pname = "superzej";
@@ -45,10 +46,10 @@ in
       wrapProgram $out/bin/superzej \
         --prefix PATH : ${lib.makeBinPath runtimeDeps}
 
-      # Ship the layouts (not keybinds.kdl — that's embedded in the binary and
-      # merged into the config at launch, it is not a zellij layout).
+      # Ship the layouts. The zellij config (config/zellij.kdl) is embedded in
+      # the binary and seeded to ~/.superzej/zellij.kdl at launch, not shipped here.
       mkdir -p $out/share/zellij/layouts
-      cp layouts/superzej.kdl layouts/workspace-tab.kdl $out/share/zellij/layouts/
+      cp layouts/superzej.kdl layouts/worktree-tab.kdl layouts/worktree-tab-extra.kdl layouts/home-tab.kdl $out/share/zellij/layouts/
     '';
 
     meta = {

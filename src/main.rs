@@ -2,6 +2,7 @@ mod cli;
 mod commands;
 mod config;
 mod db;
+mod diff_highlight;
 mod github;
 mod models;
 mod msg;
@@ -41,6 +42,7 @@ fn main() {
             in_place,
         } => commands::new_worktree::run(&cfg, name, base, in_place, None),
         Command::NewPanel { dir } => commands::new_panel::run(&cfg, &dir),
+        Command::NewTab => commands::new_tab::run(),
         Command::Workspaces => commands::workspaces::run(),
         Command::Menu => commands::menu::run(&cfg),
         Command::GrantPlugins => commands::grant_plugins::run(),

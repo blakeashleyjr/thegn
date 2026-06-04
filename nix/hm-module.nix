@@ -53,7 +53,7 @@ in {
 
     worktreesDir = lib.mkOption {
       type = lib.types.str;
-      default = "${config.home.homeDirectory}/worktrees";
+      default = "${config.home.homeDirectory}/.superzej/worktrees";
       description = "Base directory for git worktrees (grouped per repo).";
     };
 
@@ -132,7 +132,7 @@ in {
           { name = "shell";  command = "__shell__"; }
         ]
       '';
-      description = "Coding agents offered in the new-pane picker.";
+      description = "Coding agents offered in the new-worktree picker.";
     };
 
     tools = lib.mkOption {
@@ -168,6 +168,22 @@ in {
     # Ship layouts into the *writable* zellij layouts dir — never touches the
     # user's read-only config.kdl. zellij resolves these by name.
     xdg.configFile."zellij/layouts/superzej.kdl".source = "${cfg.package}/share/zellij/layouts/superzej.kdl";
-    xdg.configFile."zellij/layouts/workspace-tab.kdl".source = "${cfg.package}/share/zellij/layouts/workspace-tab.kdl";
+    xdg.configFile."zellij/layouts/worktree-tab.kdl".source = "${cfg.package}/share/zellij/layouts/worktree-tab.kdl";
+    xdg.configFile."zellij/layouts/home-tab.kdl".source = "${cfg.package}/share/zellij/layouts/home-tab.kdl";
+    xdg.configFile."zellij/layouts/worktree-tab-extra.kdl".source = "${cfg.package}/share/zellij/layouts/worktree-tab-extra.kdl";
+
+    # Deploy the WASM plugins to the literal paths the session layout references
+    # (file:~/.local/share/superzej/{sidebar,panel,tabbar,statusbar}.wasm). home.file
+    # is relative to $HOME, so this matches regardless of $XDG_DATA_HOME.
+    home.file.".local/share/superzej/sidebar.wasm".source = "${self.packages.${pkgs.system}.superzej-sidebar}/share/superzej/sidebar.wasm";
+    home.file.".local/share/superzej/panel.wasm".source = "${self.packages.${pkgs.system}.superzej-panel}/share/superzej/panel.wasm";
+    home.file.".local/share/superzej/tabbar.wasm".source = "${self.packages.${pkgs.system}.superzej-tabbar}/share/superzej/tabbar.wasm";
+    home.file.".local/share/superzej/statusbar.wasm".source = "${self.packages.${pkgs.system}.superzej-statusbar}/share/superzej/statusbar.wasm";
+
+    # Pre-grant the plugins' zellij permissions so the first session never shows
+    # the "Allow? (y/n)" prompt. Idempotent; merges into permissions.kdl.
+    home.activation.superzejGrantPlugins = lib.hm.dag.entryAfter ["writeBoundary"] ''
+      $DRY_RUN_CMD ${cfg.package}/bin/superzej grant-plugins
+    '';
   };
 }

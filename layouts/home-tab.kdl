@@ -13,7 +13,10 @@
 layout {
     pane split_direction="horizontal" {
         pane split_direction="vertical" {
-            pane size=20 borderless=true {
+            // 12% ~= 20 cols on a 166-col terminal; the plugin snaps itself to
+            // exactly 20 on load. Percent (not fixed) so hide/show and
+            // user resizes work — zellij refuses to resize fixed panes.
+            pane size="12%" borderless=true {
                 plugin location="file:~/.local/share/superzej/sidebar.wasm"
             }
             pane {
@@ -25,13 +28,65 @@ layout {
                     args "status"
                 }
             }
-            // Panel width: edit this value or set $SUPERZEJ_PANEL_WIDTH.
-            pane size="44" borderless=true {
+            // 27% ~= 44 cols on a 166-col terminal; the plugin snaps itself to exact width on load.
+            pane size="27%" borderless=true {
                 plugin location="file:~/.local/share/superzej/panel.wasm"
             }
         }
         pane size=1 borderless=true {
             plugin location="file:~/.local/share/superzej/statusbar.wasm"
+        }
+    }
+
+    // ── Alt+[ / Alt+] arrangements for the center terminals ────────────────
+    // The chrome template pins the four plugin surfaces; `children` is the
+    // center column under the tabbar. All variants need ≥2 center terminals
+    // (min_panes counts every pane: 4 plugins + 2 terminals = 6) so that with
+    // a single terminal NO variant matches and the sidebar/panel toggles'
+    // next_swap_layout() restore keeps snapping to the base template.
+    // "vertical" mirrors the base arrangement — keep it FIRST so any swap
+    // entry lands on the familiar look. Keep this block in sync across
+    // superzej.kdl / home-tab.kdl / worktree-tab.kdl / worktree-tab-extra.kdl.
+    tab_template name="chrome" {
+        pane split_direction="horizontal" {
+            pane split_direction="vertical" {
+                pane size="12%" borderless=true {
+                    plugin location="file:~/.local/share/superzej/sidebar.wasm"
+                }
+                pane {
+                    pane size=1 borderless=true {
+                        plugin location="file:~/.local/share/superzej/tabbar.wasm"
+                    }
+                    children
+                }
+                pane size="27%" borderless=true {
+                    plugin location="file:~/.local/share/superzej/panel.wasm"
+                }
+            }
+            pane size=1 borderless=true {
+                plugin location="file:~/.local/share/superzej/statusbar.wasm"
+            }
+        }
+    }
+    swap_tiled_layout name="vertical" {
+        chrome min_panes=6 {
+            pane split_direction="horizontal" {
+                children
+            }
+        }
+    }
+    swap_tiled_layout name="horizontal" {
+        chrome min_panes=6 {
+            pane split_direction="vertical" {
+                children
+            }
+        }
+    }
+    swap_tiled_layout name="stacked" {
+        chrome min_panes=6 {
+            pane stacked=true {
+                children
+            }
         }
     }
 }

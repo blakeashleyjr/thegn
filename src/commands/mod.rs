@@ -1,18 +1,38 @@
 pub mod attach;
-pub mod close_pane;
+pub mod close_worktree;
 pub mod dashboard;
+pub mod diff;
+pub mod grant_plugins;
 pub mod launch;
 pub mod list;
-pub mod new_pane;
+pub mod menu;
+pub mod new_panel;
+pub mod new_tab;
 pub mod new_workspace;
+pub mod new_worktree;
+pub mod panels;
 pub mod pick_agent;
+pub mod pr;
 pub mod recent;
 pub mod repos;
+pub mod resolve;
 pub mod status;
 pub mod tool;
+pub mod workspaces;
 
-use crate::util;
+use crate::{repo, util};
+use std::path::PathBuf;
 use std::process::Command;
+
+/// Resolve the worktree a command targets: explicit arg, else $SUPERZEJ_WORKTREE,
+/// else the git toplevel of the cwd, else the cwd. Mirrors `tool.rs`.
+pub fn resolve_worktree(arg: Option<String>) -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    arg.map(PathBuf::from)
+        .or_else(|| std::env::var("SUPERZEJ_WORKTREE").ok().map(PathBuf::from))
+        .or_else(|| repo::toplevel(&cwd))
+        .unwrap_or(cwd)
+}
 
 /// Yes/no confirmation (gum if present, else a y/N stdin prompt).
 pub fn confirm(message: &str) -> bool {
