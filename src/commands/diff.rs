@@ -9,6 +9,7 @@
 use crate::commands::resolve_worktree;
 use crate::{repo, util, worktree};
 use anyhow::Result;
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
@@ -33,10 +34,30 @@ pub fn run(
     let target =
         util::git_out(&wt, &["merge-base", &base, "HEAD"]).unwrap_or_else(|| "HEAD".to_string());
 
-    // --files: TSV of modified files (status\tpath per line).
+    // --files: TSV with status, path, added, deleted columns.
     if files {
-        let output = util::git_out(&wt, &["diff", "--name-status", &target]).unwrap_or_default();
-        println!("{output}");
+        let names = util::git_out(&wt, &["diff", "--name-status", &target]).unwrap_or_default();
+        let nums = util::git_out(&wt, &["diff", "--numstat", &target]).unwrap_or_default();
+
+        let mut num_map: HashMap<&str, (u32, u32)> = HashMap::new();
+        for line in nums.lines() {
+            let parts: Vec<&str> = line.splitn(3, '\t').collect();
+            if parts.len() < 3 {
+                continue;
+            }
+            let adds: u32 = parts[0].parse().unwrap_or(0);
+            let dels: u32 = parts[1].parse().unwrap_or(0);
+            num_map.insert(parts[2].trim(), (adds, dels));
+        }
+
+        for line in names.lines() {
+            let (status, path) = match line.split_once('\t') {
+                Some((s, p)) => (s, p.trim()),
+                None => continue,
+            };
+            let (adds, dels) = num_map.get(path).copied().unwrap_or((0, 0));
+            println!("{status}\t{path}\t{adds}\t{dels}");
+        }
         return Ok(());
     }
 

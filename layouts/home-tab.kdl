@@ -1,0 +1,37 @@
+// layouts/home-tab.kdl — a repo's "home" tab, opened by `superzej new-workspace`
+// (`new-tab --cwd <repo> --layout home-tab`).
+//
+// SELF-CONTAINED wrapper (sidebar | tabbar/terminal | panel) — must mirror the
+// tab structure in superzej.kdl, because a `new-tab --layout` tab does not
+// reliably inherit the session's default_tab_template (zellij-org/zellij#4646).
+// Keep these in sync.
+//
+// The tab's cwd (the repo root) is injected via `--cwd`, so the center pane
+// inherits it and runs `superzej status` in place: it self-registers the repo,
+// renames the tab to `{slug}/home`, prints the inventory + hints, then drops to
+// a shell.
+layout {
+    pane split_direction="horizontal" {
+        pane split_direction="vertical" {
+            pane size=20 borderless=true {
+                plugin location="file:~/.local/share/superzej/sidebar.wasm"
+            }
+            pane {
+                pane size=1 borderless=true {
+                    plugin location="file:~/.local/share/superzej/tabbar.wasm"
+                }
+                pane focus=true {
+                    command "superzej"
+                    args "status"
+                }
+            }
+            // Panel width: override with $SUPERZEJ_PANEL_WIDTH env var.
+            pane size="${SUPERZEJ_PANEL_WIDTH:-50}" borderless=true {
+                plugin location="file:~/.local/share/superzej/panel.wasm"
+            }
+        }
+        pane size=1 borderless=true {
+            plugin location="file:~/.local/share/superzej/statusbar.wasm"
+        }
+    }
+}

@@ -38,6 +38,8 @@ enum DiffView {
 struct FileEntry {
     status: char,
     path: String,
+    added: u32,
+    deleted: u32,
 }
 
 impl Default for Tab {
@@ -279,10 +281,15 @@ impl State {
                 self.files = text
                     .lines()
                     .filter_map(|l| {
-                        let (status, path) = l.split_once('\t')?;
+                        let parts: Vec<&str> = l.splitn(4, '\t').collect();
+                        if parts.len() < 2 {
+                            return None;
+                        }
                         Some(FileEntry {
-                            status: status.chars().next().unwrap_or('?'),
-                            path: path.to_string(),
+                            status: parts[0].chars().next().unwrap_or('?'),
+                            path: parts[1].to_string(),
+                            added: parts.get(2).and_then(|v| v.parse().ok()).unwrap_or(0),
+                            deleted: parts.get(3).and_then(|v| v.parse().ok()).unwrap_or(0),
                         })
                     })
                     .collect();
@@ -435,7 +442,19 @@ impl State {
                 'C' => "35",
                 _ => "0",
             };
-            let line = format!("  \u{1b}[{status_color}m{}\u{1b}[0m {}", f.status, f.path);
+            // Line counts: green +N, red -M
+            let counts = if f.added > 0 || f.deleted > 0 {
+                format!(
+                    " \u{1b}[32m+{}\u{1b}[0m\u{1b}[31m-{}\u{1b}[0m",
+                    f.added, f.deleted
+                )
+            } else {
+                String::new()
+            };
+            let line = format!(
+                "  \u{1b}[{status_color}m{}\u{1b}[0m {}{}",
+                f.status, f.path, counts
+            );
             if is_cursor {
                 let full = format!("\u{1b}[48;2;40;44;62m{line}\u{1b}[0m");
                 push(out, &full, cols);

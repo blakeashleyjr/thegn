@@ -1,26 +1,47 @@
-// layouts/superzej.kdl — the superzej session layout.
+// layouts/superzej.kdl — the base layout for the single superzej session.
 //
-// Launch with:  zellij --layout superzej   (superzej attach does this for you,
-// plus a merged --config carrying the keybinds; see layouts/keybinds.kdl).
+// Applied on session cold-start (`zellij --layout superzej attach --create`).
+// The session is rooted at the first repo, so the home tab's pane resolves it.
+//
+// Every tab is SELF-CONTAINED: it explicitly wraps its terminal with the left
+// sidebar, the centered branch tab-strip, and the right diff/PR panel (all WASM
+// plugins). We deliberately do NOT use a `default_tab_template`: a tab spawned
+// via `new-tab --layout home-tab|worktree-tab` does not reliably inherit the
+// session template (zellij-org/zellij#4646), which left opened repos as a bare
+// full-screen terminal. So `home-tab.kdl` / `worktree-tab.kdl` repeat this same
+// wrapper — keep the three in sync.
+//
+// Chrome is deliberately minimal: no bottom status/hint bar (superzej is a fixed
+// Alt-leader scheme), and the tab strip is a custom plugin nested inside the
+// middle column so it sits indented over the terminal.
 //
 // NOTE: zellij does not allow a `keybinds` node inside a layout — keybinds live
-// in the config (layouts/keybinds.kdl), merged at launch by `superzej attach`.
+// in the managed config (config/zellij.kdl -> ~/.superzej/zellij.kdl), which
+// `superzej` starts zellij with via `--config`.
 layout {
-    default_tab_template {
-        pane size=1 borderless=true {
-            plugin location="zellij:tab-bar"
-        }
-        children
-        pane size=2 borderless=true {
-            plugin location="zellij:status-bar"
-        }
-    }
-
-    // Home tab: the repo launcher (recents + add new).
-    tab name="superzej" focus=true {
-        pane {
-            command "superzej"
-            args "launch"
+    tab name="home" focus=true {
+        pane split_direction="horizontal" {
+            pane split_direction="vertical" {
+                pane size=20 borderless=true {
+                    plugin location="file:~/.local/share/superzej/sidebar.wasm"
+                }
+                pane {
+                    pane size=1 borderless=true {
+                        plugin location="file:~/.local/share/superzej/tabbar.wasm"
+                    }
+                    pane focus=true {
+                        command "superzej"
+                        args "status"
+                    }
+                }
+                // Panel width: override with $SUPERZEJ_PANEL_WIDTH env var.
+                pane size="${SUPERZEJ_PANEL_WIDTH:-50}" borderless=true {
+                    plugin location="file:~/.local/share/superzej/panel.wasm"
+                }
+            }
+            pane size=1 borderless=true {
+                plugin location="file:~/.local/share/superzej/statusbar.wasm"
+            }
         }
     }
 }
