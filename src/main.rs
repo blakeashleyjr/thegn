@@ -2,6 +2,7 @@ mod cli;
 mod commands;
 mod config;
 mod db;
+mod github;
 mod models;
 mod msg;
 mod picker;
@@ -20,26 +21,65 @@ fn main() {
 
     let result = match args.command.unwrap_or(Command::Launch) {
         Command::Launch => commands::launch::run(&cfg),
-        Command::Attach { session } => commands::attach::run(session),
-        Command::NewWorkspace { target, name } => commands::new_workspace::run(&cfg, target, name),
+        Command::Attach { session } => commands::attach::run(&cfg, session),
+        Command::NewWorkspace {
+            target,
+            name,
+            from_home,
+        } => commands::new_workspace::run(&cfg, target, name, from_home),
+        Command::NewWorktree {
+            name,
+            base,
+            in_place,
+            repo,
+        } => commands::new_worktree::run(&cfg, name, base, in_place, repo),
+        // Deprecated alias: `new-pane` -> `new-worktree`.
         Command::NewPane {
             name,
             base,
-            dir,
+            dir: _,
             in_place,
-        } => commands::new_pane::run(&cfg, name, base, &dir, in_place),
+        } => commands::new_worktree::run(&cfg, name, base, in_place, None),
+        Command::NewPanel { dir } => commands::new_panel::run(&cfg, &dir),
+        Command::Workspaces => commands::workspaces::run(),
+        Command::Menu => commands::menu::run(&cfg),
+        Command::GrantPlugins => commands::grant_plugins::run(),
+        Command::ResolveWorktree { session, tab } => commands::resolve::run(session, tab),
         Command::PickAgent {
             worktree,
             branch,
             agent,
+            in_place: _, // no-op; accepted for worktree-tab layout compatibility
         } => commands::pick_agent::run(&cfg, worktree, branch, agent),
         Command::Tool { name, worktree } => commands::tool::run(&cfg, &name, worktree),
         Command::Dashboard { watch, inner } => commands::dashboard::run(&cfg, watch, inner),
+        Command::CloseWorktree {
+            delete_branch,
+            force,
+        } => commands::close_worktree::run(delete_branch, force),
+        Command::ClosePanel => commands::close_worktree::close_panel(),
+        // Deprecated alias.
         Command::ClosePane {
             remove_worktree,
             delete_branch,
             force,
-        } => commands::close_pane::run(&cfg, remove_worktree, delete_branch, force),
+        } => {
+            if remove_worktree {
+                commands::close_worktree::run(delete_branch, force)
+            } else {
+                commands::close_worktree::close_panel()
+            }
+        }
+        Command::Sidebar { toggle } => commands::panels::sidebar(toggle),
+        Command::Panel { toggle } => commands::panels::panel(toggle),
+        Command::Pr { action } => commands::pr::run(action),
+        Command::Diff {
+            worktree,
+            base,
+            stat,
+            files,
+            file,
+        } => commands::diff::run(worktree, base, stat, files, file),
         Command::List { json } => commands::list::run(&cfg, json),
         Command::Repos => commands::repos::run(&cfg),
         Command::Recent { count } => commands::recent::run(count),
