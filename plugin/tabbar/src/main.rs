@@ -1,9 +1,11 @@
-//! superzej tabbar — a thin, centered strip of the **active repo's** branch
-//! tabs. Tabs are named `{repo_slug}/{branch}` (all repos share one session);
-//! this strip shows only the tabs whose prefix matches the focused tab's repo,
-//! rendering just the branch suffix. It replaces zellij's built-in `tab-bar` so
-//! there is no "Zellij (session)" wordmark and no swap-layout ("BASE")
-//! indicator. The active tab is a filled cyan chip; clicking/hovering targets it.
+//! superzej tabbar — a thin, centered strip of the **focused worktree's**
+//! tabs (its `·N` pages from `superzej new-tab`). Tabs are named
+//! `{repo_slug}/{branch}[ ·N]` (all repos share one session); this strip
+//! shows one chip per page of the focused tab's worktree (`1`, `·2`, `·3`,
+//! …) — switching worktrees/repos is the sidebar's job. It replaces zellij's
+//! built-in `tab-bar` so there is no "Zellij (session)" wordmark and no
+//! swap-layout ("BASE") indicator. The active page is a filled cyan chip;
+//! clicking/hovering targets it.
 //!
 //! It lives in the middle column of the session layout (above the terminals,
 //! between the sidebar and the diff/PR panel), so the strip sits indented over
@@ -23,7 +25,8 @@ const RESET: &str = "\u{1b}[0m";
 #[derive(Default)]
 struct State {
     tabs: Vec<Tab>,
-    active_repo: Option<String>, // prefix of the focused tab; we show only its tabs
+    // The focused tab's (repo, worktree base): only its pages are shown.
+    active_wt: Option<(String, String)>,
     hidden: bool,
     hover: Option<usize>,
     // Clickable column spans for each tab, cached from the last render:
@@ -40,8 +43,9 @@ struct State {
 }
 
 struct Tab {
-    repo: String,   // `{slug}` prefix (the repo this tab belongs to)
-    branch: String, // display label (the `{branch}` suffix)
+    repo: String, // `{slug}` prefix (the repo this tab belongs to)
+    base: String, // worktree base (branch with any ` ·N` page suffix stripped)
+    page: u32,    // page number (1 = the base tab)
     position: usize,
     active: bool,
 }
@@ -53,6 +57,20 @@ fn split_tab(name: &str) -> (String, String) {
         Some((r, b)) => (r.to_string(), b.to_string()),
         None => (String::new(), name.to_string()),
     }
+}
+
+/// Split a branch part into (worktree base, page): `"x ·2"` → `("x", 2)`,
+/// `"x"` → `("x", 1)`. Mirrors the binary's `strip_page_suffix` (the suffix
+/// counts only when all digits).
+fn split_page(branch: &str) -> (String, u32) {
+    if let Some((base, suffix)) = branch.rsplit_once(" \u{b7}") {
+        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(n) = suffix.parse() {
+                return (base.to_string(), n);
+            }
+        }
+    }
+    (branch.to_string(), 1)
 }
 
 register_plugin!(State);
@@ -76,7 +94,10 @@ impl ZellijPlugin for State {
     fn update(&mut self, event: Event) -> bool {
         match event {
             Event::TabUpdate(tabs) => {
-                self.active_repo = tabs.iter().find(|t| t.active).map(|t| split_tab(&t.name).0);
+                self.active_wt = tabs.iter().find(|t| t.active).map(|t| {
+                    let (repo, branch) = split_tab(&t.name);
+                    (repo, split_page(&branch).0)
+                });
                 self.tabs = tabs
                     .into_iter()
                     .map(|t| {
@@ -86,15 +107,19 @@ impl ZellijPlugin for State {
                             t.name
                         };
                         let (repo, branch) = split_tab(&raw);
+                        let (base, page) = split_page(&branch);
                         Tab {
                             repo,
-                            branch,
+                            base,
+                            page,
                             position: t.position,
                             active: t.active,
                         }
                     })
                     .collect();
-                self.tabs.sort_by_key(|t| t.position);
+                // Page order within the strip (positions can interleave when
+                // pages were opened from different tabs).
+                self.tabs.sort_by_key(|t| t.page);
                 true
             }
             Event::SessionUpdate(infos, _resurrectable) => {
@@ -167,18 +192,30 @@ impl ZellijPlugin for State {
         let brand_w = (WORDMARK.chars().count() + 1).min(cols); // +1 trailing space
         let avail = cols.saturating_sub(brand_w);
 
-        // Only the active repo's tabs are shown; render their branch suffixes.
+        // Only the focused worktree's pages are shown.
         let visible: Vec<usize> = self
             .tabs
             .iter()
             .enumerate()
-            .filter(|(_, t)| self.active_repo.as_deref().is_none_or(|r| t.repo == r))
+            .filter(|(_, t)| {
+                self.active_wt
+                    .as_ref()
+                    .is_none_or(|(r, b)| t.repo == *r && t.base == *b)
+            })
             .map(|(i, _)| i)
             .collect();
-        // Build each tab's visible label and total width first, so we can center.
+        // Build each page's visible chip label and total width first, so we
+        // can center: ` 1 ` for the base tab, ` ·N ` for the extra pages.
         let labels: Vec<String> = visible
             .iter()
-            .map(|&i| format!(" {} ", self.tabs[i].branch))
+            .map(|&i| {
+                let t = &self.tabs[i];
+                if t.page == 1 {
+                    " 1 ".to_string()
+                } else {
+                    format!(" \u{b7}{} ", t.page)
+                }
+            })
             .collect();
         let sep = 1usize; // one blank cell between chips
         let total: usize = labels.iter().map(|l| l.chars().count()).sum::<usize>()
@@ -236,5 +273,19 @@ impl State {
             .iter()
             .find(|(s, e, _)| col >= *s && col < *e)
             .map(|(_, _, pos)| *pos)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_page;
+
+    #[test]
+    fn splits_page_suffixes() {
+        assert_eq!(split_page("x \u{b7}2"), ("x".to_string(), 2));
+        assert_eq!(split_page("x \u{b7}12"), ("x".to_string(), 12));
+        assert_eq!(split_page("x"), ("x".to_string(), 1));
+        assert_eq!(split_page("x \u{b7}y"), ("x \u{b7}y".to_string(), 1));
+        assert_eq!(split_page("home"), ("home".to_string(), 1));
     }
 }

@@ -23,7 +23,7 @@ repos/worktrees is a tab switch — never a session change (no teleport).
 | **Workspace** | a repo's `{slug}/home` **tab** | `Alt-W` — pick/clone a repo (opens its home tab)                          |
 | **Worktree**  | a `{slug}/{branch}` **tab**    | `Alt-w` — new worktree off the base branch, then a picker for what to run |
 | **Panel**     | a plain zellij **pane**        | `Alt-n` split — behaves like any zellij pane                              |
-| **Sidebar**   | left WASM plugin               | lists all repos → branches; click to switch tabs (`Alt-s` hides)          |
+| **Sidebar**   | left WASM plugin               | repo → worktree → tabs tree; click to switch (`Alt-s` hides)              |
 | **Diff / PR** | right WASM plugin              | tracks the focused tab's worktree (`Alt-p` hides)                         |
 
 - **Worktree = tab.** `Alt-w` creates a new git worktree off the base branch and opens
