@@ -322,6 +322,11 @@ impl State {
                 _ => return false,
             }
         }
+        // Map Enter → '\r' so the file-list handler picks it up (Enter is
+        // not a BareKey::Char — it would be silently swallowed by the guard).
+        if key.bare_key == BareKey::Enter {
+            return self.dispatch_char('\r');
+        }
         let BareKey::Char(c) = key.bare_key else {
             return false;
         };
@@ -351,6 +356,11 @@ impl State {
             }
             _ => {}
         }
+        self.dispatch_char(c)
+    }
+
+    /// Dispatch a character to the active tab's per-tab key handler.
+    fn dispatch_char(&mut self, c: char) -> bool {
         match self.current_tab {
             Tab::Diff => self.on_diff_key(c),
             Tab::Pr => self.on_pr_key(c),
