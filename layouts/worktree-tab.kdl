@@ -25,8 +25,8 @@ layout {
                     args "pick-agent" "--in-place"
                 }
             }
-            // Panel width: override with $SUPERZEJ_PANEL_WIDTH env var.
-            pane size="${SUPERZEJ_PANEL_WIDTH:-50}" borderless=true {
+            // Panel width: edit this value or set $SUPERZEJ_PANEL_WIDTH.
+            pane size="50" borderless=true {
                 plugin location="file:~/.local/share/superzej/panel.wasm"
             }
         }
