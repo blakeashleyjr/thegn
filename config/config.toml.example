@@ -3,7 +3,7 @@
 # generated automatically from programs.superzej.
 
 # Where worktrees live (grouped per repo) and where remote URLs are cloned.
-worktrees_dir = "~/worktrees"
+worktrees_dir = "~/.superzej/worktrees"
 workspaces_dir = "~/code"
 
 # Roots scanned by the workspace repo picker (new-workspace / bare `sj`).
@@ -27,7 +27,12 @@ name_scheme = "words"
 # Remove the worktree automatically when its pane closes.
 auto_remove_worktree = false
 
-# Coding agents offered in the new-pane picker.
+# Visual tuning. The focus accent recolors every superzej surface (plugins,
+# pickers, dashboard); the rest of the storm-blue palette is fixed.
+[theme]
+accent = "#76eede"
+
+# Coding agents offered in the new-worktree picker.
 # Use "__shell__" for a plain login shell.
 [[agents]]
 name = "claude"
@@ -50,6 +55,10 @@ command = "lazygit"
 name = "yazi"
 command = "yazi"
 
+# "editor" is special: with the default below, superzej resolves your editor
+# from $VISUAL/$EDITOR (falling back to vi). Graphical editors are detected by
+# name (code, cursor, zed, subl, gvim, …) and launched detached. Set an explicit
+# command here to override, e.g. command = "code ." or command = "hx .".
 [[tools]]
 name = "editor"
 command = "${EDITOR:-vi} ."

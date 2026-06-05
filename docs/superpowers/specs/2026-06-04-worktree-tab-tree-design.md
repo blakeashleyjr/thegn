@@ -60,7 +60,7 @@ base; `page` = N, or 1 when no suffix. Mirrors the binary's
   first, then branch worktrees ordered by their lowest tab position
   (stable); pages sorted by page number.
 - `Row` becomes `Repo(vi) | Worktree(vi, wi) | Page(vi, wi, pi) |
-  AddWorktree(vi) | AddNew`. Page rows are emitted only when
+AddWorktree(vi) | AddNew`. Page rows are emitted only when
   `pages.len() > 1`.
 - Selection: `Worktree` → its page-1 tab (lowest page if ·1 was closed);
   `Page` → that tab; `Repo` → home shortcut / open closed repo (unchanged).

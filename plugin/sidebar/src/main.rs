@@ -33,6 +33,7 @@ const MUTED: &str = "108;112;134";
 const RESET: &str = "\u{1b}[0m";
 
 // Rendered layout: row 0 = WORKSPACES header, row 1 = rule, rows 2.. = `self.rows`.
+// (The superzej title moved to the top bar; the box frame is the top border.)
 const BODY_START: usize = 2;
 
 #[derive(Default)]
@@ -46,11 +47,9 @@ struct State {
     hover: Option<usize>,
     cursor: Option<usize>,
     my_id: Option<u32>,
-    hidden: bool, // suppressed via hide_pane_with_id (superzej_toggle pipe)
-    // The panel plugin pane in our tab: (pane id, is_suppressed). The base
-    // swap layout only matches with all surfaces present, so re-showing while
-    // the sibling is hidden flashes it in for the relayout (see set_hidden).
-    sibling: Option<(u32, bool)>,
+    // Visibility is owned by the statusbar controller (the only chrome surface
+    // that is never hidden and can re-tile the others). The sidebar just renders
+    // and switches tabs; it no longer hides/shows itself.
 }
 
 /// A managed repo as reported by `superzej workspaces` (slug, name, path).
@@ -143,18 +142,16 @@ impl ZellijPlugin for State {
             EventType::PermissionRequestResult, // re-run loads once granted
         ]);
         set_selectable(true);
-        // These may be denied if the (cached) permission grant hasn't landed
-        // yet — PermissionRequestResult below retries them.
-        self.pull_visibility();
+        // May be denied if the (cached) permission grant hasn't landed yet —
+        // PermissionRequestResult below retries it.
         self.pull_repos();
     }
 
     fn update(&mut self, event: Event) -> bool {
         match event {
             Event::PermissionRequestResult(_) => {
-                // The load()-time run_commands race the permission grant and
-                // may have been denied — re-issue them now.
-                self.pull_visibility();
+                // The load()-time run_command races the permission grant and
+                // may have been denied — re-issue it now.
                 self.pull_repos();
                 false
             }
@@ -183,12 +180,6 @@ impl ZellijPlugin for State {
                 true
             }
             Event::RunCommandResult(_code, stdout, _stderr, ctx) => {
-                if ctx.get("cmd").map(String::as_str) == Some("visstate") {
-                    if String::from_utf8_lossy(&stdout).trim() == "false" {
-                        self.set_hidden(true);
-                    }
-                    return false;
-                }
                 if ctx.get("cmd").map(String::as_str) == Some("repos") {
                     let text = String::from_utf8_lossy(&stdout);
                     self.repos = text
@@ -245,20 +236,6 @@ impl ZellijPlugin for State {
                 self.pull_repos();
                 false
             }
-            // Hide/show in place: the pane is suppressed (not closed) and the
-            // tiled layout reflows; re-showing reapplies the base swap layout
-            // so every pane snaps back to its template slot. Broadcast reaches
-            // every per-tab instance, keeping tabs in sync.
-            "superzej_toggle" => {
-                self.set_hidden(!self.hidden);
-                false
-            }
-            "superzej_show" => {
-                if self.hidden {
-                    self.set_hidden(false);
-                }
-                false
-            }
             _ => false,
         }
     }
@@ -266,11 +243,14 @@ impl ZellijPlugin for State {
     fn render(&mut self, rows: usize, cols: usize) {
         let mut out = String::new();
 
+        // Section header (the superzej title lives in the top bar now). The
+        // surrounding box frame supplies the top border.
         if self.focused {
             line_bg(&mut out, " WORKSPACES", cols, DARK, CYAN, true);
         } else {
             line_fg(&mut out, " WORKSPACES", cols, BRIGHT, true);
         }
+        // Rule under header.
         let rule: String = "─".repeat(cols);
         line_fg(
             &mut out,
@@ -297,60 +277,6 @@ impl ZellijPlugin for State {
 }
 
 impl State {
-    /// Suppress or restore our own pane and persist the visibility so
-    /// instances in new tabs start consistent. `show_pane_with_id` with
-    /// `should_focus_pane=false` restores the pane without stealing focus or
-    /// switching tabs (unlike `show_self`) — but zellij re-embeds it wherever
-    /// it finds room, so we reapply the base swap layout right after, which
-    /// snaps every pane back to its template slot (sidebar left, panel right).
-    fn set_hidden(&mut self, hidden: bool) {
-        let Some(id) = self.my_id else { return };
-        if hidden == self.hidden {
-            return;
-        }
-        if hidden {
-            hide_pane_with_id(PaneId::Plugin(id));
-        } else {
-            show_pane_with_id(PaneId::Plugin(id), false, false);
-            if let Some((sid, _)) = self.sibling {
-                // Flash the sibling in (no-op if already visible) so the
-                // 5-pane base template matches for the relayout. If it is
-                // supposed to be hidden, its own instance notices the
-                // mismatch on the next PaneUpdate and re-hides itself (see
-                // refresh_focus) — our suppressed instance can't know its
-                // sibling's current state, so we never re-hide it ourselves.
-                show_pane_with_id(PaneId::Plugin(sid), false, false);
-            }
-            next_swap_layout();
-        }
-        self.hidden = hidden;
-        run_command(
-            &[
-                "sh",
-                "-c",
-                &format!(
-                    "mkdir -p ~/.superzej && echo {} > ~/.superzej/.sidebar_state",
-                    !hidden
-                ),
-            ],
-            BTreeMap::new(),
-        );
-    }
-
-    /// Re-apply persisted visibility: a toggle may have hidden the sidebar
-    /// before this instance loaded (each tab embeds its own instance). The
-    /// reply arrives as a `RunCommandResult` tagged `cmd=visstate`.
-    fn pull_visibility(&self) {
-        run_command(
-            &[
-                "sh",
-                "-c",
-                "cat ~/.superzej/.sidebar_state 2>/dev/null || true",
-            ],
-            BTreeMap::from([("cmd".to_string(), "visstate".to_string())]),
-        );
-    }
-
     /// Ask the host for the managed-repo inventory; the reply arrives as a
     /// `RunCommandResult` tagged `cmd=repos`.
     fn pull_repos(&self) {
@@ -409,7 +335,11 @@ impl State {
                 worktrees.sort_by_key(|w| {
                     (
                         w.label != "home",
-                        w.pages.iter().map(|p| p.position).min().unwrap_or(usize::MAX),
+                        w.pages
+                            .iter()
+                            .map(|p| p.position)
+                            .min()
+                            .unwrap_or(usize::MAX),
                     )
                 });
                 RepoView {
@@ -476,8 +406,16 @@ impl State {
                 let p = &w.pages[pi];
                 // Continue the parent's trunk line unless it was the last
                 // worktree; pages get their own ├/└ connectors.
-                let trunk = if wi + 1 == v.worktrees.len() { " " } else { "│" };
-                let glyph = if pi + 1 == w.pages.len() { "└" } else { "├" };
+                let trunk = if wi + 1 == v.worktrees.len() {
+                    " "
+                } else {
+                    "│"
+                };
+                let glyph = if pi + 1 == w.pages.len() {
+                    "└"
+                } else {
+                    "├"
+                };
                 let color = if p.active { CYAN } else { MUTED };
                 (format!("  {trunk}   {glyph} ·{}", p.n), color)
             }
@@ -527,7 +465,12 @@ impl State {
                 // The worktree row stands for its base tab; fall back to the
                 // lowest page if ·1 was closed.
                 let w = &self.views[vi].worktrees[wi];
-                if let Some(p) = w.pages.iter().find(|p| p.n == 1).or_else(|| w.pages.first()) {
+                if let Some(p) = w
+                    .pages
+                    .iter()
+                    .find(|p| p.n == 1)
+                    .or_else(|| w.pages.first())
+                {
                     switch_tab_to(p.position as u32 + 1);
                 }
             }
@@ -555,15 +498,6 @@ impl State {
             for p in panes {
                 if p.is_plugin && p.id == id {
                     focused = p.is_focused;
-                    // Self-enforce: a sibling's show flashes us in for its
-                    // relayout — if we're supposed to be hidden, re-hide.
-                    if self.hidden && !p.is_suppressed {
-                        hide_pane_with_id(PaneId::Plugin(id));
-                    }
-                }
-                // Track our tab's panel pane (default title = its plugin url).
-                if p.is_plugin && p.title.contains("panel.wasm") {
-                    self.sibling = Some((p.id, p.is_suppressed));
                 }
             }
         }

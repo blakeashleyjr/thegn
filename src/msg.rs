@@ -1,25 +1,30 @@
 //! Minimal stderr logging (coloured when stderr is a tty).
 
+use crate::theme;
 use std::io::IsTerminal;
 
-fn color(code: &str) -> &str {
+/// A "✦ superzej" prefix in the given hue (faint star + faint name), tty-gated.
+fn tag(hue: &str) -> String {
     if std::io::stderr().is_terminal() {
-        code
+        format!(
+            "\x1b[38;2;{}m\u{2726}\x1b[0m \x1b[38;2;{hue}msuperzej\x1b[0m",
+            theme::MAGENTA
+        )
     } else {
-        ""
+        "superzej:".into()
     }
 }
 
 pub fn info(s: &str) {
-    eprintln!("{}superzej:{} {s}", color("\x1b[2m"), color("\x1b[0m"));
+    eprintln!("{} {s}", tag(theme::DIM));
 }
 
 pub fn warn(s: &str) {
-    eprintln!("{}superzej:{} {s}", color("\x1b[33m"), color("\x1b[0m"));
+    eprintln!("{} {s}", tag(theme::AMBER));
 }
 
 pub fn error(s: &str) {
-    eprintln!("{}superzej:{} {s}", color("\x1b[31m"), color("\x1b[0m"));
+    eprintln!("{} {s}", tag(theme::RED));
 }
 
 /// Print an error and exit non-zero.

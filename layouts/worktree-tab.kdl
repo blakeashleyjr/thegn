@@ -11,25 +11,26 @@
 // exited pane); pick-agent derives the branch from git and names the tab
 // `{slug}/{branch}`.
 layout {
+    // Full-height vertical stack: tabbar (top) · body row · statusbar (bottom).
+    // The body row holds the three FRAMED boxes (sidebar | center | panel) so
+    // every box's top border lands on the same row, right under the tabbar.
     pane split_direction="horizontal" {
+        pane size=1 borderless=true {
+            plugin location="file:~/.local/share/superzej/tabbar.wasm"
+        }
         pane split_direction="vertical" {
             // 12% ~= 20 cols on a 166-col terminal; the plugin snaps itself to
             // exactly 20 on load. Percent (not fixed) so hide/show and
             // user resizes work — zellij refuses to resize fixed panes.
-            pane size="12%" borderless=true {
+            pane size="12%" name="" {
                 plugin location="file:~/.local/share/superzej/sidebar.wasm"
             }
-            pane {
-                pane size=1 borderless=true {
-                    plugin location="file:~/.local/share/superzej/tabbar.wasm"
-                }
-                pane focus=true {
-                    command "superzej"
-                    args "pick-agent" "--in-place"
-                }
+            pane focus=true {
+                command "superzej"
+                args "pick-agent" "--in-place"
             }
             // 27% ~= 44 cols on a 166-col terminal; the plugin snaps itself to exact width on load.
-            pane size="27%" borderless=true {
+            pane size="27%" name="" {
                 plugin location="file:~/.local/share/superzej/panel.wasm"
             }
         }
@@ -49,17 +50,15 @@ layout {
     // superzej.kdl / home-tab.kdl / worktree-tab.kdl / worktree-tab-extra.kdl.
     tab_template name="chrome" {
         pane split_direction="horizontal" {
+            pane size=1 borderless=true {
+                plugin location="file:~/.local/share/superzej/tabbar.wasm"
+            }
             pane split_direction="vertical" {
-                pane size="12%" borderless=true {
+                pane size="12%" name="" {
                     plugin location="file:~/.local/share/superzej/sidebar.wasm"
                 }
-                pane {
-                    pane size=1 borderless=true {
-                        plugin location="file:~/.local/share/superzej/tabbar.wasm"
-                    }
-                    children
-                }
-                pane size="27%" borderless=true {
+                children
+                pane size="27%" name="" {
                     plugin location="file:~/.local/share/superzej/panel.wasm"
                 }
             }

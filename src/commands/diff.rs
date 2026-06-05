@@ -1,15 +1,17 @@
-//! `superzej diff` — emit a colorized, non-paged diff of a worktree against its
-//! branch point, for the right panel (and as a quick CLI view).
+//! `superzej diff` — emit a syntax-highlighted diff of a worktree against
+//! its branch point, using `syntect` (pure Rust, no external binary).
+//! Compatible with both the right-panel plugin (`run_command` capture) and
+//! the interactive CLI.
 //!
 //! Range: everything since the merge-base with the resolved base branch, so it
 //! shows "what this branch changes" — including uncommitted work (`git diff
-//! <merge-base>` diffs the working tree against that commit). Colors are forced
-//! on (output is captured by the panel, not a tty) and any pager is disabled.
+//! <merge-base>` diffs the working tree against that commit).
 
 use crate::commands::resolve_worktree;
-use crate::{repo, util, worktree};
+use crate::{diff_highlight, repo, util, worktree};
 use anyhow::Result;
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
@@ -34,7 +36,7 @@ pub fn run(
     let target =
         util::git_out(&wt, &["merge-base", &base, "HEAD"]).unwrap_or_else(|| "HEAD".to_string());
 
-    // --files: TSV with status, path, added, deleted columns.
+    // --files: TSV with status, path, added, deleted columns (no diff, no delta).
     if files {
         let names = util::git_out(&wt, &["diff", "--name-status", &target]).unwrap_or_default();
         let nums = util::git_out(&wt, &["diff", "--numstat", &target]).unwrap_or_default();
@@ -61,50 +63,37 @@ pub fn run(
         return Ok(());
     }
 
+    // Capture a git diff (without colour) and emit a syntax-highlighted
+    // version to stdout using syntect.
+    let emit_highlighted = |git_args: &[&str], file_path: Option<&str>| {
+        if let Ok(output) = Command::new("git")
+            .arg("-C")
+            .arg(&wt)
+            .args(git_args)
+            .output()
+        {
+            let raw = String::from_utf8_lossy(&output.stdout);
+            let highlighted = diff_highlight::highlight_diff(&raw, file_path.unwrap_or(""));
+            let _ = std::io::stdout().write_all(highlighted.as_bytes());
+        }
+    };
+
     // --file <path>: full diff of a single file.
     if let Some(fp) = file_path {
-        if util::have("delta") {
-            let cmd = format!(
-                "git -c color.ui=always diff {} -- {} | delta --paging=never --color-only",
-                target,
-                shell_quote(&fp),
-            );
-            let _ = Command::new("sh")
-                .arg("-c")
-                .arg(&cmd)
-                .current_dir(&wt)
-                .status();
-        } else {
-            let args = vec!["-c", "color.ui=always", "diff", &target, "--", &fp];
-            run_git(&wt, &args);
-        }
+        emit_highlighted(&["diff", "--no-color", &target, "--", &fp], Some(&fp));
         return Ok(());
     }
 
-    if !stat && util::have("delta") {
-        // Pipe through delta with paging disabled (never blocks the panel).
-        let cmd =
-            format!("git -c color.ui=always diff {target} | delta --paging=never --color-only");
-        let _ = Command::new("sh")
-            .arg("-c")
-            .arg(&cmd)
-            .current_dir(&wt)
-            .status();
+    if !stat {
+        emit_highlighted(&["diff", "--no-color", &target], None);
         return Ok(());
     }
 
     let mut args = vec!["-c", "color.ui=always", "diff"];
-    if stat {
-        args.push("--stat");
-    }
+    args.push("--stat");
     args.push(&target);
     run_git(&wt, &args);
     Ok(())
-}
-
-/// Simple shell-quoting: wrap in single quotes, escaping internal single quotes.
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Run `git -C <dir> <args>` inheriting stdout (streams colors / large diffs).

@@ -42,8 +42,15 @@ in
       # Short alias.
       ln -s superzej $out/bin/sj
 
-      # Inject runtime tools onto PATH without polluting the user's shell.
+      # Expose the pinned zellij under a superzej-private name, and point the
+      # binary at it. superzej drives THIS zellij (its own version, socket and
+      # cache namespace) — never the user's system `zellij`.
+      ln -s ${zellij}/bin/zellij $out/bin/superzej-zellij
+
+      # Inject runtime tools onto PATH (so the plugins' `zellij run` resolves to
+      # the pinned build too) and pin the binary superzej drives.
       wrapProgram $out/bin/superzej \
+        --set SUPERZEJ_ZELLIJ_BIN ${zellij}/bin/zellij \
         --prefix PATH : ${lib.makeBinPath runtimeDeps}
 
       # Ship the layouts. The zellij config (config/zellij.kdl) is embedded in

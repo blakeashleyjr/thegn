@@ -7,7 +7,7 @@ use crate::commands::list;
 use crate::config::Config;
 use crate::db::Db;
 use crate::models::WorktreeView;
-use crate::{util, worktree, zellij};
+use crate::{repo, util, worktree, zellij};
 use anyhow::Result;
 use std::io::Write;
 use std::path::Path;
@@ -37,7 +37,14 @@ fn watch_loop(cfg: &Config) -> Result<()> {
         .unwrap_or(4);
     loop {
         print!("\x1b[2J\x1b[H"); // clear + home
-        println!("\x1b[1msuperzej worktrees\x1b[0m   (refresh {interval}s)\n");
+                                 // "✦ superzej" wordmark (magenta star, accent name) + dim subtitle.
+        println!(
+            "\x1b[38;2;{}m\u{2726}\x1b[0m \x1b[1m\x1b[38;2;{}msuperzej\x1b[0m \
+\x1b[38;2;{}mworktrees · refresh {interval}s\x1b[0m\n",
+            crate::theme::MAGENTA,
+            cfg.accent_rgb(),
+            crate::theme::FAINT,
+        );
         list::run(cfg, false)?;
         std::io::stdout().flush().ok();
         std::thread::sleep(std::time::Duration::from_secs(interval));
@@ -71,9 +78,12 @@ fn inner_ui(cfg: &Config) -> Result<()> {
             "--height=100%",
             "--delimiter=\t",
             "--with-nth=1",
+            "--pointer=▌",
+            "--prompt=worktrees ❯ ",
             "--header=enter=go to tab  ^e=editor  ^g=lazygit  ^x=remove worktree",
             "--expect=enter,ctrl-e,ctrl-g,ctrl-x",
             "--preview=git -C {2} diff --stat 2>/dev/null | head -40",
+            &crate::picker::fzf_color(),
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -98,19 +108,18 @@ fn inner_ui(cfg: &Config) -> Result<()> {
         None => return Ok(()),
     };
 
-    act(key, row);
+    act(cfg, key, row);
     Ok(())
 }
 
-fn act(key: &str, row: &WorktreeView) {
+fn act(cfg: &Config, key: &str, row: &WorktreeView) {
     if !zellij::in_zellij() {
         return;
     }
     let wt = Path::new(&row.path);
     match key {
         "ctrl-e" => {
-            let sh = util::shell();
-            zellij::new_float(wt, "editor", &[&sh, "-lc", "${EDITOR:-vi} ."]);
+            crate::commands::tool::open_editor(cfg, wt, None);
         }
         "ctrl-g" => {
             zellij::new_float(wt, "lazygit", &["lazygit"]);
@@ -122,7 +131,10 @@ fn act(key: &str, row: &WorktreeView) {
             }
         }
         _ => {
-            zellij::go_to_tab_name(&row.workspace);
+            // Everything is one session now — just jump to the worktree's tab
+            // (named `{repo_slug}/{branch}`). No session switch, no teleport.
+            let slug = repo::repo_slug(Path::new(&row.repo));
+            zellij::go_to_tab_name(&repo::branch_tab(&slug, &row.branch));
         }
     }
 }

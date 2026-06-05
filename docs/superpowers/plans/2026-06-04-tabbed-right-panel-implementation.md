@@ -13,6 +13,7 @@
 ### Task 1: Foundation — Tab Bar, Tab Switching, Restructured State
 
 **Files:**
+
 - Modify: `plugin/panel/src/main.rs` (full restructure)
 
 Replace the single-view panel with a tabbed interface. Add `Tab`, `DiffView`, and `FileEntry` types. Restructure `render()` to branch on `current_tab`. PR and Checks tabs render stubs for now.
@@ -257,6 +258,7 @@ git commit -m "feat(panel): tab bar with Diff/PR/Checks tabs and tab switching"
 ### Task 2: Diff CLI — `--files` and `--file` flags
 
 **Files:**
+
 - Modify: `src/cli.rs` (add flags)
 - Modify: `src/commands/diff.rs` (handle flags)
 - Modify: `src/main.rs` (pass flags)
@@ -396,6 +398,7 @@ git commit -m "feat(diff): add --files and --file flags for panel data"
 ### Task 3: FileList View in the Panel
 
 **Files:**
+
 - Modify: `plugin/panel/src/main.rs`
 
 Add modified-files fetching, parsing, and render with cursor navigation.
@@ -622,6 +625,7 @@ git commit -m "feat(panel): file list view with cursor navigation and drill-in"
 ### Task 4: FileDiff View with Scrolling
 
 **Files:**
+
 - Modify: `plugin/panel/src/main.rs`
 
 Add the FileDiff render with half-page scrolling, Esc back, and scroll indicator.
@@ -758,6 +762,7 @@ git commit -m "feat(panel): file diff view with half-page scroll and Esc back"
 ### Task 5: PR Tab — Port Existing Render
 
 **Files:**
+
 - Modify: `plugin/panel/src/main.rs`
 
 Port the existing PR rendering and action keybindings from the old single-view layout into the dedicated PR tab. The `render_pr` method needs minimal changes — it gets called from `render_pr_tab` instead of `render`.
@@ -783,14 +788,14 @@ The existing `render_pr` method is already correct for the PR data format. No ch
 
 The `on_pr_key` method was set up in Task 1 with `o`/`c`/`m`/`a`/`r`/`f` bindings. Verify it matches the old panel's action keys:
 
-| Key | Old action | New action |
-|-----|-----------|------------|
-| `o` | `["pr", "open"]` | `["pr", "open"]` ✓ |
-| `c` | floating `["pr", "create"]` | floating `["pr", "create"]` ✓ |
-| `m` | floating `["pr", "merge", "--delete-branch"]` | same ✓ |
-| `a` | floating `["pr", "approve"]` | same ✓ |
-| `r` | `["pr", "rerun-checks"]` | same ✓ |
-| `f` | force refresh | same ✓ |
+| Key | Old action                                    | New action                    |
+| --- | --------------------------------------------- | ----------------------------- |
+| `o` | `["pr", "open"]`                              | `["pr", "open"]` ✓            |
+| `c` | floating `["pr", "create"]`                   | floating `["pr", "create"]` ✓ |
+| `m` | floating `["pr", "merge", "--delete-branch"]` | same ✓                        |
+| `a` | floating `["pr", "approve"]`                  | same ✓                        |
+| `r` | `["pr", "rerun-checks"]`                      | same ✓                        |
+| `f` | force refresh                                 | same ✓                        |
 
 The `action_inline` and `action_floating` methods already exist from the old panel — no changes needed.
 
@@ -806,6 +811,7 @@ git commit -m "feat(panel): PR tab with actions ported from old panel"
 ### Task 6: Checks Tab — Detailed Check List
 
 **Files:**
+
 - Modify: `plugin/panel/src/main.rs`
 
 Render individual check runs from `statusCheckRollup` in the cached PR data.
@@ -894,6 +900,7 @@ git commit -m "feat(panel): checks tab with individual check run status"
 ### Task 7: Timer Refresh for All Data Sources
 
 **Files:**
+
 - Modify: `plugin/panel/src/main.rs`
 
 The timer event (every 15 seconds) should refresh files and PR data without resetting the user's current view.
@@ -915,6 +922,7 @@ Event::Timer(_) => {
 ```
 
 This already works correctly because:
+
 - `RunCommandResult` updates specific fields (`self.files`, `self.pr`, `self.diff`) without touching navigation state
 - `DiffView::FileDiff` is reset to `FileList` in the `"files"` handler only when files change (which is acceptable — file list changes mean positions may shift)
 - `diff_scroll` is preserved across refreshes

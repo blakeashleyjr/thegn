@@ -75,17 +75,19 @@ keybinds {
         }
         bind "Alt d" { Run "superzej" "dashboard"; }
         // ── show / hide the two plugin surfaces ─────────────────────────
-        // MessagePlugin pipes straight to the running plugin instances (one
-        // per tab) — each suppresses/restores its own pane in place. No
-        // spawned command pane, no flash; the center column reflows instantly.
+        // The statusbar (always visible, full-width) owns chrome visibility: a
+        // suppressed plugin can't reliably re-show itself, but the statusbar can
+        // hide/show another pane and reapply the layout. MessagePlugin pipes the
+        // toggle to it (one instance per tab) — no spawned command pane, no
+        // flash; the center column reflows instantly.
         bind "Ctrl Alt s" {
-            MessagePlugin "file:~/.local/share/superzej/sidebar.wasm" {
-                name "superzej_toggle"
+            MessagePlugin "file:~/.local/share/superzej/statusbar.wasm" {
+                name "superzej_toggle_sidebar"
             }
         }
         bind "Ctrl Alt p" {
-            MessagePlugin "file:~/.local/share/superzej/panel.wasm" {
-                name "superzej_toggle"
+            MessagePlugin "file:~/.local/share/superzej/statusbar.wasm" {
+                name "superzej_toggle_panel"
             }
         }
         // ── per-worktree tools (open as floating panes) ─────────────────
@@ -171,127 +173,136 @@ ui {
 }
 
 // ── Theme ───────────────────────────────────────────────────────────────
-// A bespoke dark palette (storm-blue base, cyan focus, warm accents). Uses
+// A bespoke dark palette (storm-blue base, teal focus, warm accents). Uses
 // zellij's component theme spec so every UI surface — tabs, frames, lists,
 // tables, exit codes — is styled to match, not just the 16 ANSI slots.
+//
+// This is the default accent; superzej recolors its own plugin surfaces from
+// `[theme] accent` in config.toml, but zellij's own chrome (frames, ribbons)
+// is themed here — if you change `accent`, update emphasis_0 below to match.
+//
+// SEEDED ONCE: this file is copied to ~/.superzej/zellij.kdl on first launch
+// and never overwritten. To adopt theme changes on an existing install,
+// delete that copy (and `zellij delete-session superzej` if a stale
+// serialized session lingers).
 //
 //   bg0  20 22 31    deepest background
 //   bg1  26 29 41    surface
 //   bg2  40 44 62    selection / overlay
 //   fg  192 197 211  base text        fg+ 224 228 240  bright text
-//   cyan 94 218 207  focus accent     blue 122 162 247
-//   mag 187 154 247  green 158 206 106 yellow 224 175 104
-//   orange 255 158 100  red 247 118 142
+//   teal 118 238 222 focus accent     blue 120 170 245
+//   purple 178 148 250  green 121 227 165  amber 240 198 116
+//   coral 240 145 125  red 247 118 142
 themes {
     superzej {
         text_unselected {
             base 192 197 211
             background 20 22 31
-            emphasis_0 94 218 207
-            emphasis_1 122 162 247
-            emphasis_2 187 154 247
-            emphasis_3 224 175 104
+            emphasis_0 118 238 222
+            emphasis_1 120 170 245
+            emphasis_2 178 148 250
+            emphasis_3 240 198 116
         }
         text_selected {
             base 224 228 240
             background 40 44 62
-            emphasis_0 94 218 207
-            emphasis_1 122 162 247
-            emphasis_2 187 154 247
-            emphasis_3 224 175 104
+            emphasis_0 118 238 222
+            emphasis_1 120 170 245
+            emphasis_2 178 148 250
+            emphasis_3 240 198 116
         }
-        // tabs / ribbons: active worktree tab is a filled cyan chip
+        // tabs / ribbons: active worktree tab is a filled teal chip
         ribbon_selected {
             base 20 22 31
-            background 94 218 207
-            emphasis_0 255 158 100
+            background 118 238 222
+            emphasis_0 240 145 125
             emphasis_1 20 22 31
             emphasis_2 247 118 142
-            emphasis_3 122 162 247
+            emphasis_3 120 170 245
         }
         ribbon_unselected {
             base 192 197 211
             background 26 29 41
-            emphasis_0 94 218 207
+            emphasis_0 118 238 222
             emphasis_1 224 228 240
-            emphasis_2 187 154 247
-            emphasis_3 224 175 104
+            emphasis_2 178 148 250
+            emphasis_3 240 198 116
         }
         // tables (used by some plugins / built-ins)
         table_title {
-            base 94 218 207
+            base 118 238 222
             background 20 22 31
-            emphasis_0 122 162 247
-            emphasis_1 187 154 247
-            emphasis_2 158 206 106
-            emphasis_3 224 175 104
+            emphasis_0 120 170 245
+            emphasis_1 178 148 250
+            emphasis_2 121 227 165
+            emphasis_3 240 198 116
         }
         table_cell_selected {
             base 224 228 240
             background 40 44 62
-            emphasis_0 94 218 207
-            emphasis_1 122 162 247
-            emphasis_2 187 154 247
-            emphasis_3 224 175 104
+            emphasis_0 118 238 222
+            emphasis_1 120 170 245
+            emphasis_2 178 148 250
+            emphasis_3 240 198 116
         }
         table_cell_unselected {
             base 192 197 211
             background 20 22 31
-            emphasis_0 94 218 207
-            emphasis_1 122 162 247
-            emphasis_2 187 154 247
-            emphasis_3 224 175 104
+            emphasis_0 118 238 222
+            emphasis_1 120 170 245
+            emphasis_2 178 148 250
+            emphasis_3 240 198 116
         }
         // lists (pickers, plugin menus)
         list_selected {
             base 224 228 240
             background 40 44 62
-            emphasis_0 94 218 207
-            emphasis_1 122 162 247
-            emphasis_2 187 154 247
-            emphasis_3 224 175 104
+            emphasis_0 118 238 222
+            emphasis_1 120 170 245
+            emphasis_2 178 148 250
+            emphasis_3 240 198 116
         }
         list_unselected {
             base 192 197 211
             background 20 22 31
-            emphasis_0 94 218 207
-            emphasis_1 122 162 247
-            emphasis_2 187 154 247
-            emphasis_3 224 175 104
+            emphasis_0 118 238 222
+            emphasis_1 120 170 245
+            emphasis_2 178 148 250
+            emphasis_3 240 198 116
         }
-        // pane frames: the focused pane gets a cyan border
+        // pane frames: the focused pane gets a teal border
         frame_selected {
-            base 94 218 207
+            base 118 238 222
             background 20 22 31
-            emphasis_0 122 162 247
-            emphasis_1 187 154 247
-            emphasis_2 224 175 104
+            emphasis_0 120 170 245
+            emphasis_1 178 148 250
+            emphasis_2 240 198 116
             emphasis_3 247 118 142
         }
         frame_highlight {
-            base 255 158 100
+            base 240 145 125
             background 20 22 31
-            emphasis_0 224 175 104
-            emphasis_1 187 154 247
-            emphasis_2 122 162 247
-            emphasis_3 94 218 207
+            emphasis_0 240 198 116
+            emphasis_1 178 148 250
+            emphasis_2 120 170 245
+            emphasis_3 118 238 222
         }
         // command-pane exit status
         exit_code_success {
-            base 158 206 106
+            base 121 227 165
             background 20 22 31
-            emphasis_0 94 218 207
-            emphasis_1 122 162 247
-            emphasis_2 187 154 247
-            emphasis_3 224 175 104
+            emphasis_0 118 238 222
+            emphasis_1 120 170 245
+            emphasis_2 178 148 250
+            emphasis_3 240 198 116
         }
         exit_code_error {
             base 247 118 142
             background 20 22 31
-            emphasis_0 255 158 100
-            emphasis_1 224 175 104
-            emphasis_2 187 154 247
-            emphasis_3 122 162 247
+            emphasis_0 240 145 125
+            emphasis_1 240 198 116
+            emphasis_2 178 148 250
+            emphasis_3 120 170 245
         }
     }
 }

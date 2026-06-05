@@ -28,7 +28,7 @@ and editor integration.
 Two views in a stack:
 
 - **FileList** (default): scrollable cursor-navigated list of `git diff
-  --name-status` entries. Cursor highlight via selection bg. `Enter` drills
+--name-status` entries. Cursor highlight via selection bg. `Enter` drills
   into a single-file full diff. `o` opens the file in `$EDITOR` floating pane.
 - **FileDiff**: full colorized diff of the selected file, half-page scrollable.
   `Esc` returns to FileList. `o` opens in editor.
@@ -68,20 +68,20 @@ struct FileEntry {
 
 ## Key Bindings
 
-| Key | Diff:FileList | Diff:FileDiff | PR | Checks |
-|-----|--------------|--------------|-----|--------|
-| `1`/`2`/`3` | Switch tab | Switch tab | Switch tab | Switch tab |
-| `Tab` | Cycle tab | Cycle tab | Cycle tab | Cycle tab |
-| `j`/`↓` | Cursor down | Scroll ½-page | — | — |
-| `k`/`↑` | Cursor up | Scroll ½-page | — | — |
-| `Enter` | Drill to diff | — | — | — |
-| `Esc` | — | Back to list | — | — |
-| `o` | Edit file | Edit file | Open PR browser | — |
-| `c` | — | — | Create PR | — |
-| `m` | — | — | Merge PR | — |
-| `a` | — | — | Approve PR | — |
-| `r` | — | — | Rerun checks | Rerun checks |
-| `f` | Refresh | Refresh | Refresh | Refresh |
+| Key         | Diff:FileList | Diff:FileDiff | PR              | Checks       |
+| ----------- | ------------- | ------------- | --------------- | ------------ |
+| `1`/`2`/`3` | Switch tab    | Switch tab    | Switch tab      | Switch tab   |
+| `Tab`       | Cycle tab     | Cycle tab     | Cycle tab       | Cycle tab    |
+| `j`/`↓`     | Cursor down   | Scroll ½-page | —               | —            |
+| `k`/`↑`     | Cursor up     | Scroll ½-page | —               | —            |
+| `Enter`     | Drill to diff | —             | —               | —            |
+| `Esc`       | —             | Back to list  | —               | —            |
+| `o`         | Edit file     | Edit file     | Open PR browser | —            |
+| `c`         | —             | —             | Create PR       | —            |
+| `m`         | —             | —             | Merge PR        | —            |
+| `a`         | —             | —             | Approve PR      | —            |
+| `r`         | —             | —             | Rerun checks    | Rerun checks |
+| `f`         | Refresh       | Refresh       | Refresh         | Refresh      |
 
 ## New CLI Commands
 
@@ -115,7 +115,7 @@ Enter on FileList → diff --file <path>  ──→  file_diff (String)
 
 ## Render Layout
 
-**Tab bar (row 0):** Three segments — ` DIFF ` / ` PR ` / ` CHECKS `. Active tab
+**Tab bar (row 0):** Three segments — `DIFF` / `PR` / `CHECKS`. Active tab
 gets cyan-bg + dark-fg (focused) or bright-fg (unfocused). Inactive = muted.
 
 **Body (rows 2..N-2):** context-dependent.
@@ -124,15 +124,15 @@ gets cyan-bg + dark-fg (focused) or bright-fg (unfocused). Inactive = muted.
 
 ## Implementation Phases
 
-| Phase | Scope | Est. Δ |
-|-------|-------|--------|
-| **P1** | Tab enum, tab bar render, `1`/`2`/`3` + Tab switching, PR/Checks stubs | ~80 |
-| **P2** | `--files` and `--file` in `diff.rs` + `cli.rs` | ~40 |
-| **P3** | FileList render + cursor nav + Enter drill-in | ~100 |
-| **P4** | FileDiff half-page scroll + Esc back + o edits | ~70 |
-| **P5** | Port PR render into PR tab | ~60 |
-| **P6** | Checks list from statusCheckRollup | ~50 |
-| **P7** | Timer refresh for files + pr (no file_diff re-fetch) | ~30 |
+| Phase  | Scope                                                                  | Est. Δ |
+| ------ | ---------------------------------------------------------------------- | ------ |
+| **P1** | Tab enum, tab bar render, `1`/`2`/`3` + Tab switching, PR/Checks stubs | ~80    |
+| **P2** | `--files` and `--file` in `diff.rs` + `cli.rs`                         | ~40    |
+| **P3** | FileList render + cursor nav + Enter drill-in                          | ~100   |
+| **P4** | FileDiff half-page scroll + Esc back + o edits                         | ~70    |
+| **P5** | Port PR render into PR tab                                             | ~60    |
+| **P6** | Checks list from statusCheckRollup                                     | ~50    |
+| **P7** | Timer refresh for files + pr (no file_diff re-fetch)                   | ~30    |
 
 ## Edge Cases
 

@@ -7,27 +7,30 @@
 //! swap-layout ("BASE") indicator. The active page is a filled cyan chip;
 //! clicking/hovering targets it.
 //!
-//! It lives in the middle column of the session layout (above the terminals,
-//! between the sidebar and the diff/PR panel), so the strip sits indented over
-//! the terminal rather than spanning the full width.
+//! It's a borderless 1-row strip spanning the **full width** along the very top
+//! of the session layout, above the three framed boxes (sidebar | center |
+//! panel). It carries the `✦ superzej` title at the far left and centers the
+//! page chips over the **center column** (read from the pane manifest, so they
+//! stay centered even when the sidebar/panel fold on a narrow terminal).
 
 use std::collections::BTreeMap;
 use zellij_tile::prelude::*;
 
-// superzej theme palette (truecolor), kept in sync with config/zellij.kdl.
-const CYAN: &str = "94;218;207"; // active chip bg
-const DARK: &str = "20;22;31"; // text on cyan
-const SEL: &str = "40;44;62"; // hover bg
-const TEXT: &str = "192;197;211";
-const MUTED: &str = "108;112;134";
-const RESET: &str = "\u{1b}[0m";
+mod theme;
+use theme::{BG0, DIM, FAINT, MAGENTA, PANEL, PANEL2, RESET, TEAL, TEXT};
 
 #[derive(Default)]
 struct State {
     tabs: Vec<Tab>,
+    accent: String, // "R;G;B" from `superzej theme` (TEAL until it lands)
     // The focused tab's (repo, worktree base): only its pages are shown.
     active_wt: Option<(String, String)>,
-    hidden: bool,
+    my_id: Option<u32>,
+    // The center column's horizontal span (absolute cols), from the manifest —
+    // the tab chips are centered over it (not the full-width bar). 0 width =
+    // unknown yet, fall back to centering across the whole bar.
+    center_x: usize,
+    center_w: usize,
     hover: Option<usize>,
     // Clickable column spans for each tab, cached from the last render:
     // (start_col, end_col_exclusive, tab_position).
@@ -77,22 +80,47 @@ register_plugin!(State);
 
 impl ZellijPlugin for State {
     fn load(&mut self, _config: BTreeMap<String, String>) {
+        self.accent = TEAL.into();
         request_permission(&[
             PermissionType::ReadApplicationState,   // Tab/Session updates
             PermissionType::ChangeApplicationState, // switch tabs
-            PermissionType::RunCommands,            // `superzej new-tab` pipe
+            PermissionType::RunCommands,            // `superzej new-tab` pipe + theme
             PermissionType::ReadCliPipes,           // unblock CLI pipes
         ]);
+        self.my_id = Some(get_plugin_ids().plugin_id);
         subscribe(&[
             EventType::TabUpdate,
             EventType::SessionUpdate,
+            EventType::PaneUpdate,
             EventType::Mouse,
+            EventType::RunCommandResult,
+            EventType::PermissionRequestResult,
         ]);
         set_selectable(true);
+        fetch_theme();
     }
 
     fn update(&mut self, event: Event) -> bool {
         match event {
+            // The load()-time fetch races the permission grant; re-pull once
+            // permissions actually land.
+            Event::PermissionRequestResult(_) => {
+                fetch_theme();
+                false
+            }
+            Event::RunCommandResult(code, stdout, _, ctx)
+                if ctx.get("cmd").map(|s| s.as_str()) == Some("theme") =>
+            {
+                if code == Some(0) {
+                    if let Some(rgb) = parse_rgb_line(&stdout) {
+                        if self.accent != rgb {
+                            self.accent = rgb;
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
             Event::TabUpdate(tabs) => {
                 self.active_wt = tabs.iter().find(|t| t.active).map(|t| {
                     let (repo, branch) = split_tab(&t.name);
@@ -129,6 +157,36 @@ impl ZellijPlugin for State {
                     .map(|s| s.name.clone());
                 false
             }
+            // Track the center column's span so the tab chips center over the
+            // terminals, not the full-width bar. The center is the tiled,
+            // non-plugin pane(s) in our tab; their bounding x-range works
+            // whether or not the sidebar/panel are folded.
+            Event::PaneUpdate(manifest) => {
+                let Some(me) = self.my_id else { return false };
+                let Some(panes) = manifest
+                    .panes
+                    .values()
+                    .find(|ps| ps.iter().any(|p| p.is_plugin && p.id == me))
+                else {
+                    return false;
+                };
+                let centers: Vec<&PaneInfo> = panes
+                    .iter()
+                    .filter(|p| !p.is_plugin && !p.is_floating && !p.is_suppressed)
+                    .collect();
+                if let (Some(left), Some(right)) = (
+                    centers.iter().map(|p| p.pane_x).min(),
+                    centers.iter().map(|p| p.pane_x + p.pane_columns).max(),
+                ) {
+                    let (x, w) = (left, right - left);
+                    if (x, w) != (self.center_x, self.center_w) {
+                        self.center_x = x;
+                        self.center_w = w;
+                        return true;
+                    }
+                }
+                false
+            }
             Event::Mouse(Mouse::Hover(_line, col)) => {
                 let idx = self.col_to_index(col);
                 if self.hover != idx {
@@ -138,9 +196,16 @@ impl ZellijPlugin for State {
                 false
             }
             Event::Mouse(Mouse::LeftClick(_line, col)) => {
-                if let Some(pos) = self.col_to_index(col) {
+                match self.col_to_index(col) {
+                    // The trailing `+` chip: a new page on this worktree.
+                    Some(NEW_PAGE) => {
+                        if let Some(s) = self.session.clone() {
+                            run_command(&["superzej", "new-tab", "--session", &s], BTreeMap::new());
+                        }
+                    }
                     // switch_tab_to is 1-indexed.
-                    switch_tab_to(pos as u32 + 1);
+                    Some(pos) => switch_tab_to(pos as u32 + 1),
+                    None => {}
                 }
                 false
             }
@@ -158,41 +223,48 @@ impl ZellijPlugin for State {
                 return false;
             }
         }
-        match pipe.name.as_str() {
-            "superzej_toggle" => {
-                if self.hidden {
-                    show_self(true);
-                } else {
-                    hide_self();
-                }
-                self.hidden = !self.hidden;
+        // Alt+t / tab-mode `n`: open a second full-chrome tab on the focused
+        // worktree. Run via the plugin (no spawned command pane, no floating
+        // flash). Every per-tab instance fires; the binary resolves the focused
+        // tab from dump-layout (always fresh) and a lockfile collapses the
+        // concurrent invocations to one tab.
+        if pipe.name == "superzej_new_tab" {
+            if let Some(s) = self.session.clone() {
+                run_command(&["superzej", "new-tab", "--session", &s], BTreeMap::new());
             }
-            // Alt+t / tab-mode `n`: open a second full-chrome tab on the
-            // focused worktree. Run via the plugin (no spawned command pane,
-            // no floating flash). Every per-tab instance fires; the binary
-            // resolves the focused tab from dump-layout (always fresh) and a
-            // lockfile collapses the concurrent invocations to one tab.
-            "superzej_new_tab" => {
-                if let Some(s) = self.session.clone() {
-                    run_command(
-                        &["superzej", "new-tab", "--session", &s],
-                        BTreeMap::new(),
-                    );
-                }
-            }
-            _ => {}
         }
         false
     }
 
     fn render(&mut self, _rows: usize, cols: usize) {
-        const WORDMARK: &str = "superzej";
-        // Reserve a left wordmark (replaces zellij's old top-left "Zellij" label),
-        // then center the tabs within the remaining width.
-        let brand_w = (WORDMARK.chars().count() + 1).min(cols); // +1 trailing space
-        let avail = cols.saturating_sub(brand_w);
+        const STAR: &str = "\u{2726}"; // ✦
+        let version = concat!("v", env!("CARGO_PKG_VERSION"));
+        let accent = self.accent.clone();
+        let bar = PANEL; // the grey top-bar fill — clearly lighter than the base bg
+                       // Re-applied after every RESET so spaces/chips keep the bar background.
+        let set_bar = format!("\u{1b}[48;2;{bar}m");
 
-        // Only the focused worktree's pages are shown.
+        let mut out = String::new();
+        let mut col = 0usize;
+        self.spans.clear();
+        out.push_str(&set_bar);
+
+        // ── Title at the far left (moved here from the sidebar) ──────────────
+        // " ✦ superzej v0.1.0", magenta star + accent name. Dropped only if the
+        // bar is too narrow to hold it.
+        let title = format!("superzej {version}");
+        let title_w = 1 + 1 + 1 + title.chars().count(); // space + star + space + text
+        if title_w + 4 <= cols {
+            out.push(' ');
+            out.push_str(&format!(
+                "\u{1b}[1m\u{1b}[38;2;{MAGENTA}m{STAR}\u{1b}[0m{set_bar} \u{1b}[1m\u{1b}[38;2;{accent}m{title}\u{1b}[0m{set_bar}"
+            ));
+            col += title_w;
+        }
+        let title_end = col;
+
+        // ── Tab chips, centered over the CENTER column ──────────────────────
+        // Only the focused worktree's pages are shown: ` 1 ` / ` ·N ` + ` + `.
         let visible: Vec<usize> = self
             .tabs
             .iter()
@@ -204,8 +276,6 @@ impl ZellijPlugin for State {
             })
             .map(|(i, _)| i)
             .collect();
-        // Build each page's visible chip label and total width first, so we
-        // can center: ` 1 ` for the base tab, ` ·N ` for the extra pages.
         let labels: Vec<String> = visible
             .iter()
             .map(|&i| {
@@ -218,52 +288,98 @@ impl ZellijPlugin for State {
             })
             .collect();
         let sep = 1usize; // one blank cell between chips
+        let plus_w = 3usize + sep; // trailing ` + ` new-page chip
         let total: usize = labels.iter().map(|l| l.chars().count()).sum::<usize>()
-            + sep * labels.len().saturating_sub(1);
-        let left_pad = if total < avail {
-            (avail - total) / 2
+            + sep * labels.len().saturating_sub(1)
+            + plus_w;
+
+        // Center within the center column's span (fallback: the whole bar).
+        let (cx, cw) = if self.center_w > 0 {
+            (self.center_x, self.center_w)
         } else {
-            0
+            (0, cols)
         };
-
-        let mut out = String::new();
-        let mut col = 0usize;
-        self.spans.clear();
-
-        // Wordmark (dim cyan, bold), pinned left.
-        out.push_str(&format!("\u{1b}[1m\u{1b}[38;2;{CYAN}m{WORDMARK}{RESET}"));
-        col += WORDMARK.chars().count();
-        out.push(' ');
-        col += 1;
-
-        // Centering pad within the remaining width.
-        out.push_str(&" ".repeat(left_pad));
-        col += left_pad;
+        let mut start = cx + cw.saturating_sub(total) / 2;
+        if start < title_end + 1 {
+            start = title_end + 1; // never overlap the title
+        }
+        while col < start && col < cols {
+            out.push(' ');
+            col += 1;
+        }
 
         for (j, label) in labels.iter().enumerate() {
+            if col >= cols {
+                break;
+            }
             let i = visible[j];
             let w = label.chars().count();
-            let start = col;
+            let chip_start = col;
             let active = self.tabs[i].active;
             let hovered = self.hover == Some(self.tabs[i].position);
             if active {
-                out.push_str(&format!("\u{1b}[1m\u{1b}[38;2;{DARK}m\u{1b}[48;2;{CYAN}m"));
+                out.push_str(&format!("\u{1b}[1m\u{1b}[38;2;{BG0}m\u{1b}[48;2;{accent}m"));
             } else if hovered {
-                out.push_str(&format!("\u{1b}[1m\u{1b}[38;2;{TEXT}m\u{1b}[48;2;{SEL}m"));
+                out.push_str(&format!(
+                    "\u{1b}[1m\u{1b}[38;2;{TEXT}m\u{1b}[48;2;{PANEL2}m"
+                ));
             } else {
-                out.push_str(&format!("\u{1b}[38;2;{MUTED}m"));
+                out.push_str(&format!("\u{1b}[38;2;{DIM}m"));
             }
             out.push_str(label);
             out.push_str(RESET);
-            self.spans.push((start, start + w, self.tabs[i].position));
+            out.push_str(&set_bar);
+            self.spans
+                .push((chip_start, chip_start + w, self.tabs[i].position));
             col += w;
             if j + 1 < labels.len() {
                 out.push(' ');
                 col += 1;
             }
         }
+
+        // Trailing ` + ` chip: a new page on this worktree (same as Alt+t).
+        if col + plus_w <= cols {
+            out.push(' ');
+            col += 1;
+            let chip_start = col;
+            if self.hover == Some(NEW_PAGE) {
+                out.push_str(&format!(
+                    "\u{1b}[1m\u{1b}[38;2;{accent}m + \u{1b}[0m{set_bar}"
+                ));
+            } else {
+                out.push_str(&format!("\u{1b}[38;2;{FAINT}m + \u{1b}[0m{set_bar}"));
+            }
+            self.spans.push((chip_start, chip_start + 3, NEW_PAGE));
+            col += 3;
+        }
+
+        // Fill the rest of the bar with the grey background.
+        while col < cols {
+            out.push(' ');
+            col += 1;
+        }
+        out.push_str(RESET);
         print!("{out}");
     }
+}
+
+/// Sentinel "tab position" for the trailing `+` (new page) chip.
+const NEW_PAGE: usize = usize::MAX;
+
+/// Kick off `superzej theme`; the accent lands via RunCommandResult.
+fn fetch_theme() {
+    let mut ctx = BTreeMap::new();
+    ctx.insert("cmd".to_string(), "theme".to_string());
+    run_command(&["superzej", "theme"], ctx);
+}
+
+/// First line of stdout as a validated "R;G;B" triple.
+fn parse_rgb_line(stdout: &[u8]) -> Option<String> {
+    let s = String::from_utf8_lossy(stdout);
+    let line = s.lines().next()?.trim();
+    let ok = line.split(';').filter(|p| p.parse::<u8>().is_ok()).count() == 3;
+    ok.then(|| line.to_string())
 }
 
 impl State {

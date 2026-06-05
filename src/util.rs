@@ -25,6 +25,24 @@ pub fn xdg_state_home() -> PathBuf {
         .unwrap_or_else(|| home().join(".local/state"))
 }
 
+/// superzej's own home — config, worktrees, zellij socket/cache, activity all
+/// live under here (`~/.superzej`). `SUPERZEJ_DIR` relocates it so a dev/test
+/// instance can run on a fully separate root (its own session namespace, cache,
+/// config and worktrees) without touching your daily-driver superzej. Pair it
+/// with `XDG_STATE_HOME` to also isolate the DB (see `just start-term`).
+pub fn superzej_dir() -> PathBuf {
+    std::env::var_os("SUPERZEJ_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".superzej"))
+}
+
+/// Where superzej's WASM plugins are deployed. Kept as a literal `~/.local/share`
+/// path (not `$XDG_DATA_HOME`) so it always matches the `file:~/.local/share/...`
+/// references in the session layout — and thus the zellij permission-cache keys.
+pub fn plugin_dir() -> PathBuf {
+    home().join(".local/share/superzej")
+}
+
 /// Expand a leading `~` to `$HOME` (config values may contain it literally).
 pub fn expand_tilde(p: &str) -> String {
     if p == "~" {
@@ -99,7 +117,11 @@ pub fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 /// The last path component of a string (no trailing-slash handling needed here).
@@ -109,6 +131,74 @@ pub fn basename(s: &str) -> &str {
 
 pub fn shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
+}
+
+/// The user's preferred editor command (program plus any args), honoring
+/// `$VISUAL` then `$EDITOR`, falling back to `vi`. Blank/whitespace values are
+/// skipped so an exported-but-empty var doesn't shadow the next choice.
+pub fn editor() -> String {
+    ["VISUAL", "EDITOR"]
+        .into_iter()
+        .find_map(|k| {
+            std::env::var(k)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "vi".to_string())
+}
+
+/// Whether an editor command launches a graphical (windowed) editor that should
+/// be spawned detached rather than run inside a terminal pane. Matches on the
+/// program's basename (first whitespace-delimited word), so `code --wait` and
+/// `/usr/bin/code` both resolve to `code`.
+pub fn is_gui_editor(cmd: &str) -> bool {
+    let prog = cmd.split_whitespace().next().unwrap_or(cmd);
+    let base = basename(prog);
+    let base = base.strip_suffix(".exe").unwrap_or(base);
+    matches!(
+        base,
+        "code"
+            | "code-insiders"
+            | "codium"
+            | "vscodium"
+            | "cursor"
+            | "windsurf"
+            | "subl"
+            | "sublime_text"
+            | "zed"
+            | "zeditor"
+            | "gvim"
+            | "mvim"
+            | "gedit"
+            | "kate"
+            | "idea"
+            | "pycharm"
+            | "webstorm"
+            | "rider"
+    )
+}
+
+/// Spawn `cmd` via the login shell, fully detached (no controlling pane, output
+/// discarded). For GUI apps launched from a pane that is about to close.
+pub fn spawn_detached(cmd: &str, cwd: &Path) {
+    use std::process::Stdio;
+    let _ = Command::new(shell())
+        .args(["-lc", cmd])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+/// Set the terminal (pane) window title via OSC. zellij shows it as the pane's
+/// frame title; any program run afterwards (vim, lazygit, …) overrides it as
+/// usual, so this just seeds a sensible default (the branch/worktree name).
+pub fn set_terminal_title(title: &str) {
+    use std::io::Write;
+    print!("\u{1b}]0;{title}\u{07}");
+    let _ = std::io::stdout().flush();
 }
 
 /// Replace this process with an interactive login shell.

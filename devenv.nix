@@ -19,7 +19,12 @@
     lazygit
     yazi
     delta
+    gh
   ];
+
+  # The WASM plugins (plugin/sidebar, plugin/panel) build via the flake
+  # (`just nix-build-plugins`) or install.sh, which provide the wasm32-wasip1
+  # toolchain — kept out of this nixpkgs dev shell to avoid formatter skew.
 
   # Use the nixpkgs toolchain (no channel/rust-overlay) so rustfmt/clippy match
   # the flake's treefmt + checks exactly — avoids formatter version skew.

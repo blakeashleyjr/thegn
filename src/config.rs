@@ -12,6 +12,23 @@ pub struct NamedCommand {
     pub command: String,
 }
 
+/// `[theme]` — visual tuning. Only the accent for now; the rest of the
+/// palette is fixed (src/theme.rs).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ThemeConfig {
+    /// Focus accent as "#rrggbb" (default the signature teal).
+    pub accent: String,
+}
+
+impl Default for ThemeConfig {
+    fn default() -> Self {
+        ThemeConfig {
+            accent: "#76eede".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -27,13 +44,19 @@ pub struct Config {
     pub repo_scan_depth: usize,
     pub agents: Vec<NamedCommand>,
     pub tools: Vec<NamedCommand>,
+    pub theme: ThemeConfig,
 }
 
 impl Default for Config {
     fn default() -> Self {
         let home = util::home();
         Config {
-            worktrees_dir: home.join("worktrees").to_string_lossy().into_owned(),
+            // Under superzej's root (honors SUPERZEJ_DIR) so a dev/test instance
+            // gets its own worktrees, isolated from the daily-driver instance.
+            worktrees_dir: util::superzej_dir()
+                .join("worktrees")
+                .to_string_lossy()
+                .into_owned(),
             workspaces_dir: home.join("code").to_string_lossy().into_owned(),
             base_branch: "auto".into(),
             branch_prefix: "sz/".into(),
@@ -45,6 +68,7 @@ impl Default for Config {
             repo_scan_depth: 5,
             agents: Vec::new(),
             tools: Vec::new(),
+            theme: ThemeConfig::default(),
         }
     }
 }
@@ -124,4 +148,35 @@ impl Config {
             .find(|t| t.name == name)
             .map(|t| t.command.as_str())
     }
+
+    /// The accent as a truecolor "R;G;B" fragment; invalid hex falls back to
+    /// the default teal.
+    pub fn accent_rgb(&self) -> String {
+        parse_hex_rgb(&self.theme.accent).unwrap_or_else(|| crate::theme::TEAL.to_string())
+    }
+
+    /// The accent as "#rrggbb" (validated; falls back to the default teal).
+    pub fn accent_hex(&self) -> String {
+        match parse_hex_rgb(&self.theme.accent) {
+            Some(_) => self.theme.accent.to_ascii_lowercase(),
+            None => "#76eede".into(),
+        }
+    }
+}
+
+/// "#rrggbb" / "#rgb" -> "R;G;B".
+fn parse_hex_rgb(hex: &str) -> Option<String> {
+    let h = hex.trim().strip_prefix('#')?;
+    let h = match h.len() {
+        3 => h.chars().flat_map(|c| [c, c]).collect::<String>(),
+        6 => h.to_string(),
+        _ => return None,
+    };
+    let n = u32::from_str_radix(&h, 16).ok()?;
+    Some(format!(
+        "{};{};{}",
+        (n >> 16) & 255,
+        (n >> 8) & 255,
+        n & 255
+    ))
 }
