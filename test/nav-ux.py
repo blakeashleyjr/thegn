@@ -49,7 +49,10 @@ def check(cond, msg):
 
 
 def act(*args, timeout=10):
-    env = dict(os.environ, ZELLIJ_SESSION_NAME=SESSION)
+    # ZELLIJ_SOCKET_DIR pins this to the sandbox session namespace — it can
+    # never reach a real (system or live-superzej) session.
+    env = dict(os.environ, ZELLIJ_SESSION_NAME=SESSION,
+               ZELLIJ_SOCKET_DIR=SANDBOX_RUN)
     r = subprocess.run(["zellij", "action", *args], env=env,
                        capture_output=True, text=True, timeout=timeout)
     return r.stdout
@@ -106,6 +109,18 @@ if not (os.path.exists(SZ) and shutil.which("zellij")):
 
 tmphome = tempfile.mkdtemp()
 state = os.path.join(tmphome, "state")
+# Fully isolated zellij: a private socket dir (session namespace) and cache,
+# both under the throwaway tmp tree — this harness can NEVER see or disturb a
+# real (system or live-superzej) session.
+SANDBOX_RUN = os.path.join(tmphome, "run")
+SANDBOX_CACHE = os.path.join(tmphome, "cache")
+os.makedirs(os.path.join(SANDBOX_CACHE, "zellij"))
+os.makedirs(SANDBOX_RUN)
+for _src in (os.path.expanduser("~/.superzej/cache/zellij/permissions.kdl"),
+             os.path.expanduser("~/.cache/zellij/permissions.kdl")):
+    if os.path.exists(_src):
+        shutil.copy(_src, os.path.join(SANDBOX_CACHE, "zellij", "permissions.kdl"))
+        break
 # Unique repo name per run: the worktree DEST dir (~/.superzej/worktrees/{slug})
 # is keyed by repo basename, so a reused name collides with stale worktrees
 # from previous runs (the random branch-name pool is small).
@@ -120,6 +135,8 @@ pid, fd = pty.fork()
 if pid == 0:
     os.chdir(repo)
     os.environ["XDG_STATE_HOME"] = state
+    os.environ["ZELLIJ_SOCKET_DIR"] = SANDBOX_RUN
+    os.environ["XDG_CACHE_HOME"] = SANDBOX_CACHE
     os.execvp("zellij", ["zellij", "--config", CONFIG, "--session", SESSION])
 fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 45, 170, 0, 0))
 os.set_blocking(fd, False)
@@ -142,7 +159,8 @@ def key(seq, wait=1.0):
 
 def cleanup():
     subprocess.run(["zellij", "delete-session", SESSION, "--force"],
-                   capture_output=True)
+                   capture_output=True,
+                   env=dict(os.environ, ZELLIJ_SOCKET_DIR=SANDBOX_RUN))
     try:
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
@@ -242,7 +260,8 @@ try:
 
     # ── 6. resolve-worktree strips the page suffix ───────────────────────
     print("== resolve-worktree ==")
-    env = dict(os.environ, XDG_STATE_HOME=state)
+    # ZELLIJ_SOCKET_DIR so the binary's own zellij query hits the sandbox session.
+    env = dict(os.environ, XDG_STATE_HOME=state, ZELLIJ_SOCKET_DIR=SANDBOX_RUN)
     r = subprocess.run(
         [SZ, "resolve-worktree", "--session", SESSION, "--tab",
          f"{wt_tab} ·2"],

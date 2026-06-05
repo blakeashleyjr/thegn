@@ -45,6 +45,40 @@ pub fn repo_name(root: &Path) -> String {
         .unwrap_or(base)
 }
 
+/// A stable, globally-unique slug for a repo — the prefix of every tab that
+/// belongs to it (`"{slug}/…"`). All repos live in one zellij session now, so
+/// tabs are scoped by this prefix rather than by a per-repo session.
+///
+/// The slug is assigned once and persisted (DB), with `-2`/`-3` suffixing when
+/// two repos share a basename (e.g. two different `WASHU` checkouts), so their
+/// tabs never collide. Same repo path always yields the same slug, so every call
+/// site (tab creation, rename, resolve, sidebar grouping) stays consistent.
+pub fn repo_slug(root: &Path) -> String {
+    let base = {
+        let s = util::slugify(&repo_name(root));
+        if s.is_empty() {
+            "repo".to_string()
+        } else {
+            s
+        }
+    };
+    crate::db::Db::open()
+        .ok()
+        .and_then(|db| db.slug_for_repo(&root.to_string_lossy(), &base).ok())
+        .unwrap_or(base)
+}
+
+/// Tab name for a repo's main checkout (its "home" tab).
+pub fn home_tab(slug: &str) -> String {
+    format!("{slug}/home")
+}
+
+/// Tab name for a worktree of `slug` on `branch` (`"{slug}/{branch-slug}"`).
+/// Globally unique, so it doubles as the key the panel/`resolve-worktree` use.
+pub fn branch_tab(slug: &str, branch: &str) -> String {
+    format!("{slug}/{}", util::slugify(branch))
+}
+
 /// Discover git repos under the configured roots (parent dirs of a `.git`
 /// directory). Skips worktrees (whose `.git` is a file). Sorted + deduped.
 pub fn discover_repos(cfg: &Config) -> Vec<String> {
@@ -64,6 +98,38 @@ pub fn discover_repos(cfg: &Config) -> Vec<String> {
                     found.push(parent.to_string_lossy().into_owned());
                 }
             }
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// Discover git repos under a single `root` (e.g. `$HOME`), depth-limited and
+/// pruning hidden + heavy dirs so a deep home directory stays fast. A repo is a
+/// dir containing a `.git` (dir or file); we don't descend into `.git`. Used by
+/// the sidebar's "+ new workspace" fzf picker. Sorted + deduped.
+pub fn discover_repos_in(root: &Path, max_depth: usize) -> Vec<String> {
+    fn prune(e: &walkdir::DirEntry) -> bool {
+        if e.depth() == 0 {
+            return false;
+        }
+        let n = e.file_name().to_string_lossy();
+        // Don't descend into .git, hidden dirs, or notorious build/cache dirs.
+        n == ".git" || n.starts_with('.') || matches!(n.as_ref(), "node_modules" | "target")
+    }
+    let mut found: Vec<String> = Vec::new();
+    if !root.is_dir() {
+        return found;
+    }
+    for entry in WalkDir::new(root)
+        .max_depth(max_depth)
+        .into_iter()
+        .filter_entry(|e| !prune(e))
+        .filter_map(|e| e.ok())
+    {
+        if entry.file_type().is_dir() && entry.path().join(".git").exists() {
+            found.push(entry.path().to_string_lossy().into_owned());
         }
     }
     found.sort();

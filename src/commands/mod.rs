@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod attach;
 pub mod close_worktree;
 pub mod dashboard;
@@ -10,6 +11,7 @@ pub mod new_panel;
 pub mod new_tab;
 pub mod new_workspace;
 pub mod new_worktree;
+pub mod open_worktree;
 pub mod panels;
 pub mod pick_agent;
 pub mod pr;
@@ -17,8 +19,10 @@ pub mod recent;
 pub mod repos;
 pub mod resolve;
 pub mod status;
+pub mod theme;
 pub mod tool;
 pub mod workspaces;
+pub mod worktrees;
 
 use crate::{repo, util};
 use std::path::PathBuf;

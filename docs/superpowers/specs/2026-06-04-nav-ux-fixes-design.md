@@ -32,7 +32,7 @@ Status: approved (user picked the recommended option for each issue)
 
 ### 1. Focus keybinds (config/zellij.kdl)
 
-- `Alt h/j/k/l` → `MoveFocus Left/Down/Up/Right`. This *rebinds* zellij's
+- `Alt h/j/k/l` → `MoveFocus Left/Down/Up/Right`. This _rebinds_ zellij's
   default `MoveFocusOrTab` so worktree edges never spill into tab switching
   (same reasoning as the existing Super+Alt binds). Alt+arrows stay tab
   cycling: **arrows = tabs, letters = panes**.
@@ -51,7 +51,7 @@ Status: approved (user picked the recommended option for each issue)
   2. Scan `zellij::tab_names()` for `base` / `base ·N`; pick the lowest free
      N ≥ 2.
   3. `zellij new-tab --name "{base} ·N" --cwd <worktree> --layout
-     worktree-tab-extra` (fallback: no layout, as new-worktree does).
+worktree-tab-extra` (fallback: no layout, as new-worktree does).
 - **Keybinds**: `Alt t` → `Run superzej new-tab` (floating, close_on_exit,
   like Alt+w); `keybinds.tab` `n` → same Run + `SwitchToMode "Normal"`.
 - **Resolution**: `resolve-worktree` (panel feed) tries the exact tab name,

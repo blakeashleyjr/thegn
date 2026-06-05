@@ -1,4 +1,5 @@
 /target
+plugin/*/target
 result
 result-*
 .direnv/
@@ -6,3 +7,5 @@ result-*
 .devenv.flake.nix
 devenv.local.nix
 .pre-commit-config.yaml
+__pycache__/
+.opencode/

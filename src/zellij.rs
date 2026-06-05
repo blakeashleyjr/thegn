@@ -1,7 +1,69 @@
 //! Thin wrappers around `zellij action ...`. No-op gracefully outside a session.
+//!
+//! superzej drives its OWN pinned zellij, fully isolated from any system
+//! `zellij`: a private binary (`SUPERZEJ_ZELLIJ_BIN`, wired by Nix to the
+//! version-pinned `superzej-zellij`), a private socket/session namespace
+//! (`ZELLIJ_SOCKET_DIR` = `~/.superzej/run`), and a private cache
+//! (`XDG_CACHE_HOME` = `~/.superzej/cache`: plugin artifacts + permissions).
+//! So superzej sessions never appear in a system `zellij list-sessions`, and
+//! wiping its cache can't disturb a system zellij (and vice-versa). Every zellij
+//! invocation goes through `command()` (one-shot) or `export_private_env()`
+//! before exec (cold-start, so the whole session inherits it).
 
-use std::path::Path;
+use crate::util;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// The zellij binary superzej drives — a private, version-pinned build, NOT the
+/// system `zellij`. `SUPERZEJ_ZELLIJ_BIN` overrides it (dev: the dev-shell
+/// zellij; the Nix package wires it to the pinned `superzej-zellij`).
+pub fn bin() -> String {
+    std::env::var("SUPERZEJ_ZELLIJ_BIN").unwrap_or_else(|_| "zellij".into())
+}
+
+/// Private IPC/socket dir — superzej sessions live in their own namespace,
+/// invisible to (and unable to clobber) any system `zellij`. An already-set
+/// `ZELLIJ_SOCKET_DIR` wins (so an in-session `superzej` inherits the running
+/// server's namespace, and test harnesses can point at a throwaway sandbox).
+pub fn socket_dir() -> PathBuf {
+    std::env::var_os("ZELLIJ_SOCKET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| util::superzej_dir().join("run"))
+}
+
+/// Private cache dir (zellij plugin artifacts, `permissions.kdl`, session info),
+/// keeping superzej's zellij fully separate from `~/.cache/zellij`.
+pub fn cache_dir() -> PathBuf {
+    util::superzej_dir().join("cache")
+}
+
+/// Apply superzej's private zellij environment to `cmd` (socket + cache dirs),
+/// creating the dirs first.
+fn private_env(cmd: &mut Command) {
+    let (sock, cache) = (socket_dir(), cache_dir());
+    let _ = std::fs::create_dir_all(&sock);
+    let _ = std::fs::create_dir_all(&cache);
+    cmd.env("ZELLIJ_SOCKET_DIR", &sock);
+    cmd.env("XDG_CACHE_HOME", &cache);
+}
+
+/// A `Command` for the private zellij with the isolation env applied.
+pub fn command() -> Command {
+    let mut c = Command::new(bin());
+    private_env(&mut c);
+    c
+}
+
+/// Export the private zellij env into THIS process, so an exec'd zellij — and
+/// the whole session it spawns (panes, plugin `run_command`, in-session
+/// `superzej` calls) — inherits the private socket + cache. Cold-start/attach.
+pub fn export_private_env() {
+    let (sock, cache) = (socket_dir(), cache_dir());
+    let _ = std::fs::create_dir_all(&sock);
+    let _ = std::fs::create_dir_all(&cache);
+    std::env::set_var("ZELLIJ_SOCKET_DIR", &sock);
+    std::env::set_var("XDG_CACHE_HOME", &cache);
+}
 
 pub fn in_zellij() -> bool {
     std::env::var_os("ZELLIJ").is_some() || std::env::var_os("ZELLIJ_SESSION_NAME").is_some()
@@ -18,7 +80,7 @@ pub fn in_superzej_session() -> bool {
 }
 
 fn action(args: &[&str]) -> bool {
-    Command::new("zellij")
+    command()
         .arg("action")
         .args(args)
         .status()
@@ -82,7 +144,7 @@ pub fn go_to_tab_name(name: &str) -> bool {
 
 /// Names of all tabs in the current session.
 pub fn tab_names() -> Vec<String> {
-    Command::new("zellij")
+    command()
         .args(["action", "query-tab-names"])
         .output()
         .ok()
@@ -111,7 +173,7 @@ pub fn rename_pane(name: &str) -> bool {
 /// reports focus; `query-tab-names` doesn't). Fresh from the server, so it's
 /// trustworthy even from plugin-spawned processes with stale-plugin parents.
 pub fn focused_tab_name() -> Option<String> {
-    let out = Command::new("zellij")
+    let out = command()
         .args(["action", "dump-layout"])
         .output()
         .ok()
@@ -128,7 +190,7 @@ pub fn focused_tab_name() -> Option<String> {
 
 /// Send a `zellij pipe` message to a plugin.
 pub fn pipe_plugin(url: &str, name: &str, payload: &str) -> bool {
-    Command::new("zellij")
+    command()
         .args(["pipe", "--plugin", url, "--name", name, "--", payload])
         .status()
         .map(|s| s.success())

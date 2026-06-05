@@ -62,7 +62,9 @@ struct State {
     pr: Option<serde_json::Value>,
     diff: String,
     status_line: String,
-    hidden: bool,
+    // Visibility is owned by the statusbar controller (it is the only chrome
+    // surface that is never hidden and can re-tile the others). The panel just
+    // renders; it no longer hides/shows itself.
     focused: bool,
     my_id: Option<u32>,
     // new tab/diff fields:
@@ -126,15 +128,6 @@ impl ZellijPlugin for State {
 
     fn pipe(&mut self, pipe: PipeMessage) -> bool {
         match pipe.name.as_str() {
-            "superzej_toggle" => {
-                if self.hidden {
-                    show_self(true);
-                } else {
-                    hide_self();
-                }
-                self.hidden = !self.hidden;
-                false
-            }
             "superzej_pr" => {
                 if let Some(payload) = pipe.payload {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
@@ -171,10 +164,15 @@ impl ZellijPlugin for State {
             }
         }
 
+        // Body height = pane rows minus what render() prints around the tab:
+        // tab bar + rule (2) above, the status line (when shown) below, and one
+        // row of slack so the final line's trailing newline doesn't push the
+        // cursor past the pane and scroll the tab bar off the top.
+        let body = rows.saturating_sub(3 + usize::from(!self.status_line.is_empty()));
         match self.current_tab {
-            Tab::Diff => self.render_diff_tab(&mut out, rows, cols),
-            Tab::Pr => self.render_pr_tab(&mut out, rows, cols),
-            Tab::Checks => self.render_checks_tab(&mut out, rows, cols),
+            Tab::Diff => self.render_diff_tab(&mut out, body, cols),
+            Tab::Pr => self.render_pr_tab(&mut out, body, cols),
+            Tab::Checks => self.render_checks_tab(&mut out, body, cols),
         }
 
         if !self.status_line.is_empty() {

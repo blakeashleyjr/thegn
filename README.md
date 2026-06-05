@@ -46,26 +46,26 @@ panes, pane & tab modes. `Alt-[` / `Alt-]` cycle the center terminals through
 vertical / side-by-side / stacked arrangements (needs ≥2 center panes; the
 sidebar, tabbar and panel stay pinned).
 
-| Key             | Action                                                  |
-| --------------- | ------------------------------------------------------- |
-| Cmd-K (Super-K) | command palette (fuzzy menu of all actions)             |
-| Alt-←/→         | switch tabs                                             |
-| Alt-h/j/k/l     | move pane focus (sidebar ↔ terminals ↔ panel)           |
-| Super-Alt-←/→/h/l | same, across columns (needs a WM that forwards Super) |
-| Super-Alt-↑/↓/j/k | same, between stacked terminal panes                  |
-| Alt-W           | new workspace (open a repo as its home tab)             |
-| Alt-w           | new worktree (a tab + "what to run" picker)             |
-| Alt-t           | new tab on the *same* worktree (`{tab} ·2`, full chrome) |
-| Alt-n           | new panel (plain split pane)                            |
-| Alt-o           | switch workspace (floating repo picker)                 |
-| Alt-d           | worktree dashboard (jump to any worktree tab)           |
-| Alt-s           | hide / show the left sidebar                            |
-| Alt-p           | hide / show the right diff/PR panel                     |
-| Alt-g           | lazygit (floating, scoped to worktree)                  |
-| Alt-y           | yazi                                                    |
-| Alt-e           | `$EDITOR`                                               |
-| Alt-/           | git diff                                                |
-| Alt-X           | remove worktree + close tab                             |
+| Key               | Action                                                   |
+| ----------------- | -------------------------------------------------------- |
+| Cmd-K (Super-K)   | command palette (fuzzy menu of all actions)              |
+| Alt-←/→           | switch tabs                                              |
+| Alt-h/j/k/l       | move pane focus (sidebar ↔ terminals ↔ panel)            |
+| Super-Alt-←/→/h/l | same, across columns (needs a WM that forwards Super)    |
+| Super-Alt-↑/↓/j/k | same, between stacked terminal panes                     |
+| Alt-W             | new workspace (open a repo as its home tab)              |
+| Alt-w             | new worktree (a tab + "what to run" picker)              |
+| Alt-t             | new tab on the _same_ worktree (`{tab} ·2`, full chrome) |
+| Alt-n             | new panel (plain split pane)                             |
+| Alt-o             | switch workspace (floating repo picker)                  |
+| Alt-d             | worktree dashboard (jump to any worktree tab)            |
+| Alt-s             | hide / show the left sidebar                             |
+| Alt-p             | hide / show the right diff/PR panel                      |
+| Alt-g             | lazygit (floating, scoped to worktree)                   |
+| Alt-y             | yazi                                                     |
+| Alt-e             | `$EDITOR`                                                |
+| Alt-/             | git diff                                                 |
+| Alt-X             | remove worktree + close tab                              |
 
 ## Install
 
@@ -156,9 +156,15 @@ plugins via `nix build .#superzej-sidebar .#superzej-panel .#superzej-tabbar`. s
 - **superzej behavior** — see [`config/config.toml.example`](config/config.toml.example).
   Home-manager users configure via `programs.superzej.*`; standalone users edit
   `~/.config/superzej/config.toml`.
+- **accent color** — `[theme] accent = "#76eede"` in `config.toml` (or
+  `programs.superzej.themeAccent`) recolors every superzej surface: the plugin
+  chrome, pickers, dashboard, and `list`. The rest of the storm-blue palette is
+  fixed.
 - **zellij behavior** (keybinds, options, theme) — edit the managed config at
   `~/.superzej/zellij.kdl` (seeded from [`config/zellij.kdl`](config/zellij.kdl); never
-  overwritten once it exists).
+  overwritten once it exists). To adopt a new shipped theme on an existing
+  install, delete that copy so it re-seeds (and `zellij delete-session superzej`
+  if a stale serialized session lingers).
 
 ## Development
 

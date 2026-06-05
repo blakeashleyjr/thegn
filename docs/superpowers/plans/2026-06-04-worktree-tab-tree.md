@@ -11,14 +11,14 @@ Status: implemented + verified 2026-06-04
    rule is also covered by the binary's `strip_page_suffix` tests).
 2. **Sidebar** (`plugin/sidebar`) — DONE: `RepoView.worktrees` →
    `WorktreeView { label, pages, active }` / `PageView { n, position,
-   active }`; home first, then worktrees by lowest tab position; pages by
+active }`; home first, then worktrees by lowest tab position; pages by
    number. Rows: `Repo | Worktree | Page | AddWorktree | AddNew`; page rows
    only when `pages.len() > 1`. Worktree row → page-1 tab (lowest if ·1
    closed); page row → its tab; repo row unchanged. Tree connectors:
    `├/└` worktrees, `│   ├/└ ·N` pages (trunk blank under last worktree).
 3. **Tabbar** (`plugin/tabbar`) — DONE: strip shows only the focused
    worktree's pages (`active_wt = (repo, base)` from the active tab); chips
-   ` 1 `, ` ·2 `, … sorted by page, same span/click/hover mechanics.
+   `1`, `·2`, … sorted by page, same span/click/hover mechanics.
 4. **Tests** — DONE: `test/nav-ux.py` "sidebar tree navigation" section
    drives the sidebar by keys (Alt+h, j…, Enter) and asserts: home row →
    home tab, worktree row → base tab, page ·2 row → its tab.

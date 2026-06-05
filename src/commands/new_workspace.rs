@@ -1,6 +1,12 @@
-//! `superzej new-workspace [path|url]` — open a repo as a tab. Directory-agnostic:
-//! prompts to pick a repo (from repo_roots) or clone a URL when no target given.
+//! `superzej new-workspace [path|url]` — open a repo as a workspace: its **home
+//! tab** in the single superzej session. Directory-agnostic: prompts to pick a
+//! repo (from repo_roots) or clone a URL when no target given.
+//!
+//! Inside our session we open-or-focus the repo's `{slug}/home` tab (a tab
+//! switch — never a session teleport). From a plain terminal we cold-start the
+//! one session, rooted at the repo (its first tab becomes that repo's home).
 
+use crate::commands::attach;
 use crate::config::Config;
 use crate::db::Db;
 use crate::{msg, picker, repo, util, zellij};
@@ -12,16 +18,28 @@ fn is_url(s: &str) -> bool {
     s.contains("://") || (s.starts_with("git@") && s.contains(':'))
 }
 
-pub fn run(cfg: &Config, target: Option<String>, name: Option<String>) -> Result<()> {
+pub fn run(
+    cfg: &Config,
+    target: Option<String>,
+    name: Option<String>,
+    from_home: bool,
+) -> Result<()> {
     let target = match target {
         Some(t) => t,
-        None => match picker::pick_repo(cfg) {
-            Some(t) => t,
-            None => {
-                msg::info("no repo selected");
-                return Ok(());
+        None => {
+            let picked = if from_home {
+                picker::pick_dir_home(cfg)
+            } else {
+                picker::pick_repo(cfg)
+            };
+            match picked {
+                Some(t) => t,
+                None => {
+                    msg::info("no repo selected");
+                    return Ok(());
+                }
             }
-        },
+        }
     };
 
     let root: PathBuf = if is_url(&target) {
@@ -54,16 +72,31 @@ pub fn run(cfg: &Config, target: Option<String>, name: Option<String>) -> Result
 
     let db = Db::open()?;
     db.touch_repo(&root_s, &name)?; // record in history (launcher recents)
-    db.put_tab(&name, &root_s)?;
+    db.put_workspace(&root_s, &name)?; // register the repo (shows in the sidebar)
 
-    if zellij::in_zellij() {
-        if !zellij::new_tab(&name, &root, Some("workspace-tab")) {
-            zellij::new_tab(&name, &root, None);
+    let slug = repo::repo_slug(&root);
+    let home = repo::home_tab(&slug);
+
+    if zellij::in_superzej_session() {
+        // Already in our world: open-or-focus the repo's home TAB in the one
+        // session. A tab switch — the sidebar/panel stay put, no teleport. The
+        // home tab's `superzej status` pane registers the repo + names the tab.
+        if zellij::tab_names().iter().any(|t| t == &home) {
+            zellij::go_to_tab_name(&home);
+        } else {
+            zellij::new_tab(&home, &root, Some("home-tab"));
         }
+        // Nudge the sidebar to re-pull (the repo may be newly registered).
+        let url = crate::commands::panels::plugin_url("sidebar.wasm");
+        zellij::pipe_plugin(&url, "superzej_refresh", "");
+        Ok(())
+    } else if std::env::var_os("SUPERZEJ_NO_EXEC").is_some() {
+        // Scripting / tests: register without launching/affecting any session.
+        msg::info(&format!("workspace '{name}' registered ({root_s})"));
+        Ok(())
     } else {
-        msg::info(&format!(
-            "(not in zellij) workspace '{name}' registered at {root_s}"
-        ));
+        // From a plain (or foreign/leaked) terminal: cold-start the one superzej
+        // session, rooted at this repo (its first tab becomes the repo's home).
+        attach::cold_start(&zellij::ui_session(), &root);
     }
-    Ok(())
 }

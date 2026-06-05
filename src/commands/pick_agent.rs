@@ -4,7 +4,7 @@
 
 use crate::config::Config;
 use crate::db::Db;
-use crate::{msg, picker, util};
+use crate::{msg, picker, repo, theme, util, zellij};
 use anyhow::Result;
 use std::path::Path;
 
@@ -23,6 +23,23 @@ pub fn run(
         msg::die(&format!("pick-agent: worktree '{worktree}' does not exist"));
     }
 
+    // Branch may be omitted (worktree-tab layout runs us with cwd only); derive
+    // it from git, and name the tab after it so resurrected tabs read correctly.
+    let branch = branch.or_else(|| {
+        util::git_out(
+            Path::new(&worktree),
+            &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        )
+    });
+    // Name the tab `{repo_slug}/{branch}` — the globally-unique scheme that lets
+    // the panel/resolve key on tab name in the single session.
+    if let (true, Some(b)) = (zellij::in_zellij(), branch.as_deref()) {
+        let slug = repo::main_worktree(Path::new(&worktree))
+            .map(|r| repo::repo_slug(&r))
+            .unwrap_or_else(|| "repo".to_string());
+        zellij::rename_tab(&repo::branch_tab(&slug, b));
+    }
+
     // Choices: agents + tools + a literal shell.
     let mut labels: Vec<String> = cfg.agents.iter().map(|a| a.name.clone()).collect();
     labels.extend(cfg.tools.iter().map(|t| t.name.clone()));
@@ -32,10 +49,23 @@ pub fn run(
 
     let choice = preset.unwrap_or_else(|| {
         let prompt = format!("Run in {}", util::basename(&worktree));
-        picker::pick(&prompt, &labels, &cfg.picker).unwrap_or_else(|| {
-            msg::warn("no selection; dropping to shell");
-            "shell".into()
-        })
+        // Show each choice with its identity glyph; map the display label back
+        // to the bare name on selection.
+        let display: Vec<String> = labels
+            .iter()
+            .map(|n| format!("{} {n}", theme::agent_glyph(n)))
+            .collect();
+        match picker::pick(&prompt, &display, &cfg.picker) {
+            Some(sel) => display
+                .iter()
+                .position(|d| *d == sel)
+                .map(|i| labels[i].clone())
+                .unwrap_or(sel),
+            None => {
+                msg::warn("no selection; dropping to shell");
+                "shell".into()
+            }
+        }
     });
 
     // Resolve the chosen label to a command string.
@@ -55,8 +85,24 @@ pub fn run(
         let _ = db.set_worktree_agent(&worktree, &choice);
     }
 
+    // Tag the pane title with the agent's identity glyph (a bare char — pane
+    // titles can't carry ANSI), so the session shows "C feat/foo" etc.
+    if zellij::in_zellij() {
+        let label = branch
+            .as_deref()
+            .unwrap_or_else(|| util::basename(&worktree));
+        zellij::rename_pane(&format!("{} {label}", theme::agent_glyph(&choice)));
+    }
+
     std::env::set_current_dir(&worktree)?;
     std::env::set_var("SUPERZEJ_WORKTREE", &worktree);
+    // Seed the pane's window title with the branch (the worktree); the chosen
+    // program overrides it as usual.
+    util::set_terminal_title(
+        branch
+            .as_deref()
+            .unwrap_or_else(|| util::basename(&worktree)),
+    );
     std::env::set_var("SUPERZEJ_BRANCH", branch.unwrap_or_default());
 
     if cmd == "__shell__" {

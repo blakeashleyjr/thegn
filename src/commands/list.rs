@@ -26,6 +26,13 @@ pub fn collect(cfg: &Config) -> Result<Vec<WorktreeView>> {
         .map(|w| (w.worktree, (w.created_at, w.agent)))
         .collect();
 
+    // repo path -> display name (the workspace), for the WORKSPACE column.
+    let sessions: HashMap<String, String> = db
+        .workspaces()?
+        .into_iter()
+        .map(|w| (w.repo_path, w.name))
+        .collect();
+
     let mut repos = db.known_repos()?;
     repos.sort();
     repos.dedup();
@@ -36,7 +43,10 @@ pub fn collect(cfg: &Config) -> Result<Vec<WorktreeView>> {
         if !repo_dir.is_dir() {
             continue;
         }
-        let name = repo::repo_name(repo_dir);
+        let name = sessions
+            .get(&repo_path)
+            .cloned()
+            .unwrap_or_else(|| repo::repo_name(repo_dir));
         let base = worktree::default_branch(repo_dir);
 
         let porcelain = match util::git_out(repo_dir, &["worktree", "list", "--porcelain"]) {
@@ -111,6 +121,9 @@ fn view(
 }
 
 pub fn run(cfg: &Config, json: bool) -> Result<()> {
+    use crate::theme;
+    use std::io::IsTerminal;
+
     let rows = collect(cfg)?;
     if json {
         println!("{}", serde_json::to_string(&rows)?);
@@ -120,20 +133,66 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
         println!("No worktrees yet. Press Alt-W to open a workspace, Alt-w for a worktree.");
         return Ok(());
     }
+
+    // Color only when writing to a terminal (piped output stays clean).
+    let tty = std::io::stdout().is_terminal();
+    let accent = cfg.accent_rgb();
+    let c = |on: &str, s: &str| -> String {
+        if tty {
+            format!("\x1b[38;2;{on}m{s}\x1b[0m")
+        } else {
+            s.to_string()
+        }
+    };
+
     println!(
-        "{:<16} {:<26} {:>5} {:>4} {:>4} {:>6}  AGENT",
-        "WORKSPACE", "BRANCH", "AGE", "+", "-", "FILES"
+        "{}",
+        c(
+            theme::FAINT,
+            &format!(
+                "{:<16} {:<26} {:>5} {:>4} {:>4} {:>6}  AGENT",
+                "WORKSPACE", "BRANCH", "AGE", "+", "-", "FILES"
+            )
+        )
     );
     for r in rows {
+        let ahead = if r.ahead > 0 {
+            c(theme::GREEN, &format!("{:>4}", r.ahead))
+        } else {
+            c(theme::GHOST, &format!("{:>4}", r.ahead))
+        };
+        let behind = if r.behind > 0 {
+            c(theme::RED, &format!("{:>4}", r.behind))
+        } else {
+            c(theme::GHOST, &format!("{:>4}", r.behind))
+        };
+        let files = if r.dirty > 0 {
+            c(theme::AMBER, &format!("{:>6}", r.dirty))
+        } else {
+            c(theme::GHOST, &format!("{:>6}", r.dirty))
+        };
+        // AGENT column: identity glyph chip + name in the agent's hue.
+        let agent = if r.agent.is_empty() {
+            String::new()
+        } else if tty {
+            let hue = theme::agent_hue(&r.agent);
+            format!(
+                "{} {}",
+                theme::glyph_square(&theme::agent_glyph(&r.agent), hue),
+                c(hue, &r.agent)
+            )
+        } else {
+            r.agent.clone()
+        };
         println!(
-            "{:<16.16} {:<26.26} {:>5} {:>4} {:>4} {:>6}  {}",
-            r.workspace,
-            r.branch,
-            util::age(r.created_at),
-            r.ahead,
-            r.behind,
-            r.dirty,
-            r.agent
+            "{} {} {} {} {} {}  {}",
+            c(theme::TEXT, &format!("{:<16.16}", r.workspace)),
+            c(&accent, &format!("{:<26.26}", r.branch)),
+            c(theme::DIM, &format!("{:>5}", util::age(r.created_at))),
+            ahead,
+            behind,
+            files,
+            agent
         );
     }
     Ok(())

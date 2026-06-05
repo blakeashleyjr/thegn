@@ -74,6 +74,14 @@ pub enum Command {
     /// (internal) TSV of registered workspaces for the sidebar plugin —
     /// `session_name<TAB>name<TAB>repo_path` per line, including stopped ones.
     Workspaces,
+    /// (internal) TSV of managed on-disk worktrees for the sidebar plugin —
+    /// `repo_slug<TAB>branch_label<TAB>worktree_path` per line.
+    Worktrees,
+    /// (internal) Open an existing managed worktree as a tab (sidebar select).
+    OpenWorktree {
+        #[arg(long)]
+        path: String,
+    },
     /// The Cmd+K command palette: a fuzzy menu of superzej actions.
     Menu,
     /// Pre-grant zellij plugin permissions for the sidebar + panel (setup).
@@ -103,6 +111,9 @@ pub enum Command {
         name: String,
         #[arg(long)]
         worktree: Option<String>,
+        /// For `editor`: open this file instead of the worktree directory.
+        #[arg(long)]
+        file: Option<String>,
     },
     /// Worktree dashboard (floating switcher, or pinnable --watch pane).
     Dashboard {
@@ -173,6 +184,15 @@ pub enum Command {
     Recent { count: Option<i64> },
     /// Worktree inventory + key hints.
     Status,
+    /// (internal) Theme values for the plugins — one line, the accent "R;G;B".
+    Theme,
+    /// (internal) Terminal-activity state per worktree for the sidebar dots —
+    /// `tab<TAB>state<TAB>quiet_secs` per line (state: none|active|quiet|acked).
+    Activity {
+        /// Acknowledge a quiet worktree (its tab was focused): clears the dot.
+        #[arg(long)]
+        ack: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]

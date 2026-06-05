@@ -123,8 +123,9 @@ pub fn worktree_path(root: &Path, branch: &str, cfg: &Config) -> PathBuf {
     }
 }
 
-/// Create a worktree (dies on hard failure).
-pub fn add(root: &Path, branch: &str, base: &str, path: &Path, cfg: &Config) {
+/// Create a worktree. Returns false on failure (caller decides how to recover)
+/// rather than killing the pane.
+pub fn add(root: &Path, branch: &str, base: &str, path: &Path, cfg: &Config) -> bool {
     if cfg.worktree_mode == "in_repo" {
         // Keep .worktrees out of git locally without touching tracked .gitignore.
         let excl = root.join(".git/info/exclude");
@@ -140,20 +141,27 @@ pub fn add(root: &Path, branch: &str, base: &str, path: &Path, cfg: &Config) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let ok = Command::new("git")
+    let out = Command::new("git")
         .arg("-C")
         .arg(root)
         .args(["worktree", "add", "-b", branch])
         .arg(path)
         .arg(base)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !ok {
-        msg::die(&format!(
-            "git worktree add failed (branch={branch} base={base} path={})",
-            path.display()
-        ));
+        .output();
+    match out {
+        Ok(o) if o.status.success() => true,
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            msg::warn(&format!(
+                "git worktree add failed (branch={branch} base={base}): {}",
+                stderr.trim()
+            ));
+            false
+        }
+        Err(e) => {
+            msg::warn(&format!("could not run git worktree add: {e}"));
+            false
+        }
     }
 }
 

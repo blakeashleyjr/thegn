@@ -39,6 +39,7 @@ self: {
     auto_remove_worktree = cfg.autoRemoveWorktree;
     agents = map (a: {inherit (a) name command;}) cfg.agents;
     tools = map (t: {inherit (t) name command;}) cfg.tools;
+    theme.accent = cfg.themeAccent;
   };
 in {
   options.programs.superzej = {
@@ -111,6 +112,13 @@ in {
       type = lib.types.bool;
       default = false;
       description = "Remove the worktree automatically when its pane is closed.";
+    };
+
+    themeAccent = lib.mkOption {
+      type = lib.types.str;
+      default = "#76eede";
+      example = "#f083ba";
+      description = "Focus accent color (#rrggbb) for every superzej surface.";
     };
 
     agents = lib.mkOption {

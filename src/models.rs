@@ -2,8 +2,20 @@
 
 use serde::Serialize;
 
-/// A superzej-managed worktree as recorded in the DB. Some fields are carried
-/// for future use (e.g. the Phase-2 sidebar) even if `list` doesn't read them.
+/// A registered repo (a "workspace"), as recorded in the DB. All repos share the
+/// one zellij session now — a workspace is identified by its repo path, not a
+/// per-repo session.
+#[derive(Debug, Clone, Serialize)]
+#[allow(dead_code)]
+pub struct WorkspaceRow {
+    pub repo_path: String,
+    pub name: String,
+    pub created_at: i64,
+    pub last_active: i64,
+}
+
+/// A superzej-managed worktree (= a zellij tab) as recorded in the DB. Some
+/// fields are carried for the sidebar/panel plugins even if `list` ignores them.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct WorktreeRow {
@@ -13,9 +25,11 @@ pub struct WorktreeRow {
     pub created_at: i64,
     pub repo_root: String,
     pub tab_name: String,
+    pub session_name: String,
 }
 
 /// A worktree enriched with live git status, for `list` / `dashboard` output.
+/// `workspace` holds the owning session name (the workspace) in the v2 model.
 #[derive(Debug, Clone, Serialize)]
 pub struct WorktreeView {
     pub workspace: String,

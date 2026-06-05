@@ -8,6 +8,7 @@ mod models;
 mod msg;
 mod picker;
 mod repo;
+mod theme;
 mod util;
 mod worktree;
 mod zellij;
@@ -19,6 +20,7 @@ use config::Config;
 fn main() {
     let args = Cli::parse();
     let cfg = Config::load();
+    picker::set_accent(&cfg.accent_hex());
 
     let result = match args.command.unwrap_or(Command::Launch) {
         Command::Launch => commands::launch::run(&cfg),
@@ -44,6 +46,8 @@ fn main() {
         Command::NewPanel { dir, in_place } => commands::new_panel::run(&cfg, &dir, in_place),
         Command::NewTab { session } => commands::new_tab::run(session),
         Command::Workspaces => commands::workspaces::run(),
+        Command::Worktrees => commands::worktrees::run(&cfg),
+        Command::OpenWorktree { path } => commands::open_worktree::run(path),
         Command::Menu => commands::menu::run(&cfg),
         Command::GrantPlugins => commands::grant_plugins::run(),
         Command::ResolveWorktree { session, tab } => commands::resolve::run(session, tab),
@@ -53,7 +57,11 @@ fn main() {
             agent,
             in_place: _, // no-op; accepted for worktree-tab layout compatibility
         } => commands::pick_agent::run(&cfg, worktree, branch, agent),
-        Command::Tool { name, worktree } => commands::tool::run(&cfg, &name, worktree),
+        Command::Tool {
+            name,
+            worktree,
+            file,
+        } => commands::tool::run(&cfg, &name, worktree, file),
         Command::Dashboard { watch, inner } => commands::dashboard::run(&cfg, watch, inner),
         Command::CloseWorktree {
             delete_branch,
@@ -86,6 +94,8 @@ fn main() {
         Command::Repos => commands::repos::run(&cfg),
         Command::Recent { count } => commands::recent::run(count),
         Command::Status => commands::status::run(&cfg),
+        Command::Theme => commands::theme::run(&cfg),
+        Command::Activity { ack } => commands::activity::run(ack),
     };
 
     if let Err(e) = result {
