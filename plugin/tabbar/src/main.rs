@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use zellij_tile::prelude::*;
 
 mod theme;
-use theme::{BG0, DIM, FAINT, MAGENTA, PANEL, PANEL2, RESET, TEAL, TEXT};
+use theme::{BG0, DIM, FAINT, GHOST, MAGENTA, PANEL, PANEL2, RESET, TEAL, TEXT, fg};
 
 #[derive(Default)]
 struct State {
@@ -43,6 +43,13 @@ struct State {
     // instance fires; `superzej new-tab` resolves the focused tab itself via
     // dump-layout and dedupes concurrent invocations with a lockfile.)
     session: Option<String>,
+    // System stats for the far-right widget, polled from `superzej stats` on a
+    // timer. Each field is independent; a `None`/empty value drops it from the
+    // strip (e.g. `gpu` on a box with no readable GPU counter).
+    cpu: Option<u8>,
+    mem: Option<u8>,
+    gpu: Option<u8>,
+    time: String,
 }
 
 struct Tab {
@@ -95,9 +102,12 @@ impl ZellijPlugin for State {
             EventType::Mouse,
             EventType::RunCommandResult,
             EventType::PermissionRequestResult,
+            EventType::Timer,
         ]);
         set_selectable(true);
         fetch_theme();
+        fetch_stats();
+        set_timeout(STATS_SECS);
     }
 
     fn update(&mut self, event: Event) -> bool {
@@ -106,6 +116,7 @@ impl ZellijPlugin for State {
             // permissions actually land.
             Event::PermissionRequestResult(_) => {
                 fetch_theme();
+                fetch_stats();
                 false
             }
             Event::RunCommandResult(code, stdout, _, ctx)
@@ -119,6 +130,19 @@ impl ZellijPlugin for State {
                         }
                     }
                 }
+                false
+            }
+            Event::RunCommandResult(code, stdout, _, ctx)
+                if ctx.get("cmd").map(|s| s.as_str()) == Some("stats") =>
+            {
+                // Repaint only when a value actually changed (the timer fires
+                // every few seconds regardless).
+                code == Some(0) && self.update_stats(&stdout)
+            }
+            // Re-poll stats and re-arm the timer.
+            Event::Timer(_) => {
+                fetch_stats();
+                set_timeout(STATS_SECS);
                 false
             }
             Event::TabUpdate(tabs) => {
@@ -354,10 +378,25 @@ impl ZellijPlugin for State {
             col += 3;
         }
 
-        // Fill the rest of the bar with the grey background.
-        while col < cols {
-            out.push(' ');
-            col += 1;
+        // ── System-stats widget, pinned to the far right ───────────────────
+        // The chips center over the (left-of-panel) center column, so the
+        // widget's right-edge slot doesn't collide with them at normal widths.
+        // On a terminal too narrow to fit both, the chips win and the widget is
+        // dropped rather than overlapped.
+        let (widget, ww) = self.stats_widget();
+        let right_start = cols.saturating_sub(ww);
+        if ww > 0 && col <= right_start {
+            while col < right_start {
+                out.push(' ');
+                col += 1;
+            }
+            out.push_str(&set_bar); // keep the bar background under the widget
+            out.push_str(&widget);
+        } else {
+            while col < cols {
+                out.push(' ');
+                col += 1;
+            }
         }
         out.push_str(RESET);
         print!("{out}");
@@ -367,11 +406,21 @@ impl ZellijPlugin for State {
 /// Sentinel "tab position" for the trailing `+` (new page) chip.
 const NEW_PAGE: usize = usize::MAX;
 
+/// How often to re-poll `superzej stats` for the right-hand widget.
+const STATS_SECS: f64 = 2.0;
+
 /// Kick off `superzej theme`; the accent lands via RunCommandResult.
 fn fetch_theme() {
     let mut ctx = BTreeMap::new();
     ctx.insert("cmd".to_string(), "theme".to_string());
     run_command(&["superzej", "theme"], ctx);
+}
+
+/// Kick off `superzej stats`; the values land via RunCommandResult.
+fn fetch_stats() {
+    let mut ctx = BTreeMap::new();
+    ctx.insert("cmd".to_string(), "stats".to_string());
+    run_command(&["superzej", "stats"], ctx);
 }
 
 /// First line of stdout as a validated "R;G;B" triple.
@@ -389,6 +438,75 @@ impl State {
             .iter()
             .find(|(s, e, _)| col >= *s && col < *e)
             .map(|(_, _, pos)| *pos)
+    }
+
+    /// Parse a `cpu=NN mem=NN gpu=NN time=HH:MM` line from `superzej stats`
+    /// into the widget fields. Returns whether any value changed (so the caller
+    /// can skip a no-op repaint on an unchanged tick).
+    fn update_stats(&mut self, stdout: &[u8]) -> bool {
+        let s = String::from_utf8_lossy(stdout);
+        let line = s.lines().next().unwrap_or("");
+        let (mut cpu, mut mem, mut gpu, mut time) = (None, None, None, String::new());
+        for tok in line.split_whitespace() {
+            let Some((k, v)) = tok.split_once('=') else {
+                continue;
+            };
+            match k {
+                "cpu" => cpu = v.parse().ok(),
+                "mem" => mem = v.parse().ok(),
+                "gpu" => gpu = v.parse().ok(),
+                "time" => time = v.to_string(),
+                _ => {}
+            }
+        }
+        let changed = (cpu, mem, gpu) != (self.cpu, self.mem, self.gpu) || time != self.time;
+        self.cpu = cpu;
+        self.mem = mem;
+        self.gpu = gpu;
+        self.time = time;
+        changed
+    }
+
+    /// The far-right stats strip and its display width (0 when no data has
+    /// arrived yet). Labels are FAINT, values TEXT, the clock the accent, joined
+    /// by a GHOST "·"; one cell of padding on each end.
+    fn stats_widget(&self) -> (String, usize) {
+        let metric = |label: &str, v: u8| -> (String, usize) {
+            let val = format!("{v}%");
+            let width = label.chars().count() + 1 + val.chars().count();
+            (format!("{}{label} {}{val}", fg(FAINT), fg(TEXT)), width)
+        };
+        let mut parts: Vec<(String, usize)> = Vec::new();
+        if let Some(c) = self.cpu {
+            parts.push(metric("CPU", c));
+        }
+        if let Some(m) = self.mem {
+            parts.push(metric("MEM", m));
+        }
+        if let Some(g) = self.gpu {
+            parts.push(metric("GPU", g));
+        }
+        if !self.time.is_empty() {
+            let w = self.time.chars().count();
+            parts.push((format!("{}{}", fg(&self.accent), self.time), w));
+        }
+        if parts.is_empty() {
+            return (String::new(), 0);
+        }
+        let sep = format!(" {}\u{b7} ", fg(GHOST)); // " · ", 3 cells
+        let mut out = String::from(" "); // leading pad
+        let mut width = 1usize;
+        for (i, (rendered, w)) in parts.iter().enumerate() {
+            if i > 0 {
+                out.push_str(&sep);
+                width += 3;
+            }
+            out.push_str(rendered);
+            width += w;
+        }
+        out.push(' '); // trailing pad
+        width += 1;
+        (out, width)
     }
 }
 

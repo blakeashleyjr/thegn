@@ -18,6 +18,7 @@ pub mod pr;
 pub mod recent;
 pub mod repos;
 pub mod resolve;
+pub mod stats;
 pub mod status;
 pub mod theme;
 pub mod tool;
