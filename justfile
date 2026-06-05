@@ -141,9 +141,28 @@ start-term name="dev": build build-plugins
       "SUPERZEJ_FRESH=1" \
       "$PWD/target/debug/superzej"
 
-# Enter the dev shell.
-dev:
-    nix develop
+# Install/update the latest superzej onto your PATH (standalone, non-Nix):
+# builds a release binary + WASM plugins and symlinks `superzej`/`sj`, the
+# layouts and plugins into place (via install.sh). Because it symlinks the
+# release artifacts, re-running just rebuilds — picking up your latest changes.
+# Pass a bindir to override the default (~/.local/bin), e.g. `just install ~/bin`.
+install *bindir:
+    ./install.sh {{bindir}}
+
+# Enter the dev shell (default), or `just dev tui` for the auto-refreshing
+# sandboxed TUI (see `dev-tui`).
+dev what="shell":
+    {{ if what == "tui" { "just dev-tui" } else { "nix develop" } }}
+
+# Auto-refreshing sandboxed TUI (also reachable as `just dev tui`). Watches the
+# sources and, on every save, rebuilds the binary + WASM plugins and
+# force-relaunches the FULLY ISOLATED `~/.superzej-{{name}}` session (via
+# `start-term`, SUPERZEJ_FRESH=1) so the running TUI always reflects the latest
+# build. Runs once immediately; Ctrl-C stops the watcher. Never touches your
+# daily-driver superzej. Run from a NON-zellij terminal (zellij can't nest).
+# The watch set is scoped to source dirs, so build outputs don't retrigger it.
+dev-tui name="dev":
+    cargo watch -w src -w plugin -w layouts -w config -s "just start-term {{name}}"
 
 # Remove build artifacts.
 clean:

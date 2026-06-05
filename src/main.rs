@@ -95,6 +95,7 @@ fn main() {
         Command::Recent { count } => commands::recent::run(count),
         Command::Status => commands::status::run(&cfg),
         Command::Theme => commands::theme::run(&cfg),
+        Command::Stats => commands::stats::run(),
         Command::Activity { ack } => commands::activity::run(ack),
     };
 

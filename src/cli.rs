@@ -186,6 +186,9 @@ pub enum Command {
     Status,
     /// (internal) Theme values for the plugins — one line, the accent "R;G;B".
     Theme,
+    /// (internal) System stats for the tabbar widget — one line of
+    /// `cpu=NN mem=NN gpu=NN time=HH:MM` (percents; gpu dropped if unreadable).
+    Stats,
     /// (internal) Terminal-activity state per worktree for the sidebar dots —
     /// `tab<TAB>state<TAB>quiet_secs` per line (state: none|active|quiet|acked).
     Activity {

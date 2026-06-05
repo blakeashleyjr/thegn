@@ -23,6 +23,15 @@ syntect = { version = "5", default-features = false, features = [
   "default-themes",
   "regex-fancy",
 ] }
+# Cross-platform CPU/memory sampling (Linux/macOS/Windows/BSD); only the
+# `system` component is needed — disk/network/etc. are off.
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+# Timezone-correct local wall-clock for the tabbar widget.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# NVIDIA GPU utilization. Loads libnvidia-ml at runtime (dlopen), so it's safe
+# to depend on unconditionally — `Nvml::init()` simply errors on machines
+# without it, and we fall back to the OS-native GPU counter (see stats.rs).
+nvml-wrapper = "0.12"
 
 [profile.release]
 strip = true
