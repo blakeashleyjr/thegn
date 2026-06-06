@@ -66,3 +66,44 @@ command = "${EDITOR:-vi} ."
 [[tools]]
 name = "diff"
 command = "git diff"
+
+# ── Sandbox / containers ──────────────────────────────────────────────────────
+# Run each worktree's interactive process (agent/shell/tools) inside a
+# container/sandbox. The git worktree stays on the host and is bind-mounted in at
+# its real path, so the sidebar/panel/PR (which read git host-side) keep working.
+# Per-repo overrides go in a repo-root `.superzej.{toml,yaml,yml,json}` under a
+# `[sandbox]` table (only the keys you set override these).
+[sandbox]
+enabled = true
+# auto | podman | docker | bwrap | systemd | apple | wsl | none
+backend = "auto"
+# Detection order for "auto"; "none" = run on the host (always works).
+backend_chain = ["podman", "docker", "bwrap", "none"]
+# Empty => host-toolchain mode (bwrap/systemd reuse your installed tools).
+# Set an OCI image to get a reproducible env via podman/docker.
+image = ""
+# nat (egress, no inbound) | host | none. Coding agents need egress, so "none"
+# will break API-backed agents.
+network = "nat"
+# Host env vars forwarded into the sandbox (agent/git auth lives here).
+env_passthrough = ["SSH_AUTH_SOCK", "GH_TOKEN", "GITHUB_TOKEN", "ANTHROPIC_API_KEY", "TERM", "COLORTERM"]
+# Extra bind mounts: "host", "host:ro", "host:dest", or "host:dest:ro".
+mounts = ["~/.gitconfig:ro"]
+# Shell run inside before the agent/shell (e.g. tool setup).
+init_script = ""
+# Wrap the inner command in `devenv shell --` (auto-on if devenv.nix is present
+# and `devenv` is installed).
+devenv = false
+# warn | prompt | fail when no backend is available.
+on_missing = "warn"
+
+# Run worktrees on a remote machine. Leave host empty for local (default).
+# Control plane (git reads, container lifecycle) uses ssh; the interactive pane
+# uses mosh when transport = "mosh".
+[sandbox.remote]
+host = ""              # e.g. "user@devbox"
+port = 22
+transport = "mosh"    # mosh | ssh
+mode = "remote"       # remote | local_exec | sshfs
+remote_dir = "~/superzej-worktrees"
+forward_agent = true

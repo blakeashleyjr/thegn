@@ -8,12 +8,11 @@
 //! <merge-base>` diffs the working tree against that commit).
 
 use crate::commands::resolve_worktree;
-use crate::{diff_highlight, repo, util, worktree};
+use crate::diff_highlight;
+use crate::remote::GitLoc;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::Path;
-use std::process::Command;
 
 pub fn run(
     worktree: Option<String>,
@@ -23,23 +22,28 @@ pub fn run(
     file_path: Option<String>,
 ) -> Result<()> {
     let wt = resolve_worktree(worktree);
+    // Route git through the worktree's location — local, or over ssh for a remote
+    // worktree (so the panel reads remote state exactly like a local one).
+    let loc = GitLoc::for_worktree(&wt);
 
     // Base = explicit, else the repo's default branch (main/master), not the
     // worktree's own branch.
-    let base = base.unwrap_or_else(|| {
-        let root = repo::main_worktree(&wt).unwrap_or_else(|| wt.clone());
-        worktree::default_branch(&root)
-    });
+    let base = base.unwrap_or_else(|| default_branch(&loc));
 
     // Diff against the merge-base so we capture the branch's full delta; fall
     // back to HEAD (uncommitted-only) if no merge-base exists.
-    let target =
-        util::git_out(&wt, &["merge-base", &base, "HEAD"]).unwrap_or_else(|| "HEAD".to_string());
+    let target = loc
+        .git_out(&["merge-base", &base, "HEAD"])
+        .unwrap_or_else(|| "HEAD".to_string());
 
     // --files: TSV with status, path, added, deleted columns (no diff, no delta).
     if files {
-        let names = util::git_out(&wt, &["diff", "--name-status", &target]).unwrap_or_default();
-        let nums = util::git_out(&wt, &["diff", "--numstat", &target]).unwrap_or_default();
+        let names = loc
+            .git_out(&["diff", "--name-status", &target])
+            .unwrap_or_default();
+        let nums = loc
+            .git_out(&["diff", "--numstat", &target])
+            .unwrap_or_default();
 
         let mut num_map: HashMap<&str, (u32, u32)> = HashMap::new();
         for line in nums.lines() {
@@ -66,12 +70,7 @@ pub fn run(
     // Capture a git diff (without colour) and emit a syntax-highlighted
     // version to stdout using syntect.
     let emit_highlighted = |git_args: &[&str], file_path: Option<&str>| {
-        if let Ok(output) = Command::new("git")
-            .arg("-C")
-            .arg(&wt)
-            .args(git_args)
-            .output()
-        {
+        if let Ok(output) = loc.git_command(git_args).output() {
             let raw = String::from_utf8_lossy(&output.stdout);
             let highlighted = diff_highlight::highlight_diff(&raw, file_path.unwrap_or(""));
             let _ = std::io::stdout().write_all(highlighted.as_bytes());
@@ -89,14 +88,33 @@ pub fn run(
         return Ok(());
     }
 
-    let mut args = vec!["-c", "color.ui=always", "diff"];
-    args.push("--stat");
-    args.push(&target);
-    run_git(&wt, &args);
+    // --stat: stream straight through (colors / large diffs).
+    let _ = loc
+        .git_command(&["-c", "color.ui=always", "diff", "--stat", &target])
+        .status();
     Ok(())
 }
 
-/// Run `git -C <dir> <args>` inheriting stdout (streams colors / large diffs).
-fn run_git(dir: &Path, args: &[&str]) {
-    let _ = Command::new("git").arg("-C").arg(dir).args(args).status();
+/// The repo's default branch (origin/HEAD, else main/master, else HEAD), probed
+/// through the location so it works for remote worktrees too.
+fn default_branch(loc: &GitLoc) -> String {
+    if let Some(r) = loc.git_out(&[
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "refs/remotes/origin/HEAD",
+    ]) {
+        return r.strip_prefix("origin/").unwrap_or(&r).to_string();
+    }
+    for b in ["main", "master"] {
+        if loc.git_ok(&[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{b}"),
+        ]) {
+            return b.to_string();
+        }
+    }
+    "HEAD".to_string()
 }

@@ -7,7 +7,9 @@ mod github;
 mod models;
 mod msg;
 mod picker;
+mod remote;
 mod repo;
+mod sandbox;
 mod theme;
 mod util;
 mod worktree;
@@ -66,7 +68,7 @@ fn main() {
         Command::CloseWorktree {
             delete_branch,
             force,
-        } => commands::close_worktree::run(delete_branch, force),
+        } => commands::close_worktree::run(&cfg, delete_branch, force),
         Command::ClosePanel => commands::close_worktree::close_panel(),
         // Deprecated alias.
         Command::ClosePane {
@@ -75,7 +77,7 @@ fn main() {
             force,
         } => {
             if remove_worktree {
-                commands::close_worktree::run(delete_branch, force)
+                commands::close_worktree::run(&cfg, delete_branch, force)
             } else {
                 commands::close_worktree::close_panel()
             }
