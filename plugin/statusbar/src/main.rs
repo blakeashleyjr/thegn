@@ -37,6 +37,8 @@ struct State {
     // `manual` (the Ctrl+Alt+s/p toggle) OR `auto` (narrow terminal); the pane
     // is suppressed when either holds.
     my_id: Option<u32>,
+    my_tab: Option<usize>, // tab position this instance lives on (manifest key)
+    active_tab: Option<usize>, // the currently-focused tab (from TabUpdate)
     sidebar: Surface,
     panel: Surface,
     term_cols: usize, // last width seen in render (the statusbar spans full width)
@@ -130,10 +132,14 @@ impl ZellijPlugin for State {
                 false
             }
             Event::TabUpdate(tabs) => {
+                let active = tabs.iter().find(|t| t.active);
+                self.active_tab = active.map(|t| t.position);
+                // A tab may have just become active — reconcile its chrome now
+                // (relayout is deferred while a tab is in the background, since
+                // only the active tab may call next_swap_layout). See reconcile().
+                self.reconcile();
                 // `{slug}/home` => home tab; anything else under a repo is a worktree.
-                let wt = tabs
-                    .iter()
-                    .find(|t| t.active)
+                let wt = active
                     .map(|t| {
                         t.name
                             .rsplit_once('/')
@@ -278,14 +284,16 @@ impl State {
     fn scan_panes(&mut self, manifest: &PaneManifest) {
         let Some(me) = self.my_id else { return };
         // Only the layer (tab) that holds our own pane — other tabs carry the
-        // same plugin urls under different ids.
-        let Some(panes) = manifest
+        // same plugin urls under different ids. The map key is the tab position,
+        // which tells us which tab this instance lives on (for the active-tab gate).
+        let Some((tab_pos, panes)) = manifest
             .panes
-            .values()
-            .find(|ps| ps.iter().any(|p| p.is_plugin && p.id == me))
+            .iter()
+            .find(|(_, ps)| ps.iter().any(|p| p.is_plugin && p.id == me))
         else {
             return;
         };
+        self.my_tab = Some(*tab_pos);
         for p in panes {
             if !p.is_plugin {
                 continue;
@@ -334,6 +342,17 @@ impl State {
     /// (a brief sibling flash, but every pane lands in its slot). Driven from
     /// the statusbar's always-visible context.
     fn reconcile(&mut self) {
+        // Only the ACTIVE tab's statusbar may relayout. `next_swap_layout()`
+        // (and add/hide pane) act on the FOCUSED tab, but the toggle keybind
+        // broadcasts to every tab's statusbar instance — so a background
+        // instance firing it would mutate the visible tab, cycling its swap
+        // layout once per open tab and leaving a surface jammed at a ~50% split
+        // (the bug that surfaced after a manual drag with several tabs open).
+        // Background tabs defer; each reconciles when it becomes active (the
+        // TabUpdate handler calls reconcile() on the new active tab).
+        if self.my_tab.is_none() || self.my_tab != self.active_tab {
+            return;
+        }
         let hidden = |s: &Surface| s.manual || s.auto;
         let need_show = [&self.sidebar, &self.panel]
             .iter()
@@ -367,7 +386,9 @@ impl State {
                     "sh",
                     "-c",
                     // Honor SUPERZEJ_DIR so a dev/test instance reads its own state.
-                    &format!("cat \"${{SUPERZEJ_DIR:-$HOME/.superzej}}/{file}\" 2>/dev/null || true"),
+                    &format!(
+                        "cat \"${{SUPERZEJ_DIR:-$HOME/.superzej}}/{file}\" 2>/dev/null || true"
+                    ),
                 ],
                 BTreeMap::from([("cmd".to_string(), tag.to_string())]),
             );
