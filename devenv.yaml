@@ -1,6 +1,6 @@
 inputs:
   nixpkgs:
-    url: github:cachix/devenv-nixpkgs/rolling
+    url: github:NixOS/nixpkgs/nixpkgs-unstable
   git-hooks:
     url: github:cachix/git-hooks.nix
     inputs:

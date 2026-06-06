@@ -5,12 +5,17 @@
   packages = with pkgs; [
     # task runner
     just
-    # linters / formatters used outside the language toolchain
-    shellcheck
-    shfmt
-    yamllint
-    taplo
+    # treefmt — reads treefmt.toml; versions must match the flake's nixpkgs
+    treefmt
+    # formatter binaries treefmt.toml references (rustfmt comes from languages.rust below)
     alejandra
+    shfmt
+    taplo
+    yamlfmt
+    prettier
+    # linters (not formatters — kept as separate pre-commit hooks)
+    shellcheck
+    yamllint
     # runtime tools superzej shells out to
     git
     zellij
@@ -30,20 +35,28 @@
   # the flake's treefmt + checks exactly — avoids formatter version skew.
   languages.rust.enable = true;
 
-  # Comprehensive pre-commit hooks (rust + bash + yaml + toml + nix).
+  # Pre-commit hooks: ONE formatter hook (treefmt) + linters only.
+  # treefmt reads treefmt.toml at the repo root — single source of formatter
+  # config shared with `nix fmt` (flake formatter).
   git-hooks.hooks = {
-    # rust
-    rustfmt.enable = true;
+    # formatting — delegate ALL formatters to treefmt via treefmt.toml
+    treefmt = {
+      enable = true;
+      settings.formatters = with pkgs; [
+        # rustfmt is provided by languages.rust above; list it here so the
+        # hook wrapper puts it on PATH explicitly too.
+        rustfmt
+        alejandra
+        shfmt
+        taplo
+        yamlfmt
+        prettier
+      ];
+    };
+    # linters — these are checks, not formatters; kept as separate hooks
     clippy.enable = true;
-    # bash
     shellcheck.enable = true;
-    shfmt.enable = true;
-    # yaml
     yamllint.enable = true;
-    # toml
-    taplo.enable = true;
-    # nix
-    alejandra.enable = true;
   };
 
   enterShell = ''
