@@ -56,11 +56,7 @@ pub fn repo_name(root: &Path) -> String {
 pub fn repo_slug(root: &Path) -> String {
     let base = {
         let s = util::slugify(&repo_name(root));
-        if s.is_empty() {
-            "repo".to_string()
-        } else {
-            s
-        }
+        if s.is_empty() { "repo".to_string() } else { s }
     };
     crate::db::Db::open()
         .ok()

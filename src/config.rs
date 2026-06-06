@@ -29,6 +29,37 @@ impl Default for ThemeConfig {
     }
 }
 
+/// `[drawer]` — the bottom file-manager drawer (hidden by default, toggled with
+/// Ctrl+Alt+f). Runs yazi by default, with its config kept separate from the
+/// system under a private `config_home`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct DrawerConfig {
+    /// File manager to run. Empty ⇒ the pinned yazi (`SUPERZEJ_YAZI_BIN`).
+    pub command: String,
+    /// `YAZI_CONFIG_HOME` for the drawer's yazi. Empty (default) ⇒ a private
+    /// `<superzej-dir>/yazi`, fully separate from the user's `~/.config/yazi` and
+    /// seeded with superzej's bundled config. "system" (or "none") ⇒ use the
+    /// user's own yazi config (no isolation, no seeding). Any other value is used
+    /// verbatim (tilde-expanded).
+    pub config_home: String,
+    /// Drawer height as a zellij floating size ("35%" or a row count).
+    pub height: String,
+    /// Drawer width: "full" (span the terminal) or "center" (narrower, centered).
+    pub width: String,
+}
+
+impl Default for DrawerConfig {
+    fn default() -> Self {
+        DrawerConfig {
+            command: String::new(),
+            config_home: String::new(),
+            height: "35%".into(),
+            width: "full".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -45,6 +76,7 @@ pub struct Config {
     pub agents: Vec<NamedCommand>,
     pub tools: Vec<NamedCommand>,
     pub theme: ThemeConfig,
+    pub drawer: DrawerConfig,
 }
 
 impl Default for Config {
@@ -69,6 +101,7 @@ impl Default for Config {
             agents: Vec::new(),
             tools: Vec::new(),
             theme: ThemeConfig::default(),
+            drawer: DrawerConfig::default(),
         }
     }
 }
@@ -179,4 +212,47 @@ fn parse_hex_rgb(hex: &str) -> Option<String> {
         (n >> 8) & 255,
         n & 255
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drawer_defaults() {
+        let d = DrawerConfig::default();
+        assert_eq!(d.command, "");
+        assert_eq!(d.config_home, ""); // empty = private default
+        assert_eq!(d.height, "35%");
+        assert_eq!(d.width, "full");
+    }
+
+    #[test]
+    fn config_without_drawer_section_uses_defaults() {
+        let cfg: Config = toml::from_str("base_branch = \"main\"").unwrap();
+        assert_eq!(cfg.drawer.height, "35%");
+        assert_eq!(cfg.drawer.width, "full");
+        assert_eq!(cfg.drawer.command, "");
+    }
+
+    #[test]
+    fn drawer_section_overrides_parse() {
+        let cfg: Config = toml::from_str(
+            "[drawer]\ncommand = \"ranger\"\nconfig_home = \"system\"\nheight = \"50%\"\nwidth = \"center\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.drawer.command, "ranger");
+        assert_eq!(cfg.drawer.config_home, "system");
+        assert_eq!(cfg.drawer.height, "50%");
+        assert_eq!(cfg.drawer.width, "center");
+    }
+
+    #[test]
+    fn drawer_partial_section_keeps_other_defaults() {
+        // Only height set; the rest fall back to defaults via #[serde(default)].
+        let cfg: Config = toml::from_str("[drawer]\nheight = \"20%\"\n").unwrap();
+        assert_eq!(cfg.drawer.height, "20%");
+        assert_eq!(cfg.drawer.width, "full");
+        assert_eq!(cfg.drawer.command, "");
+    }
 }
