@@ -28,7 +28,7 @@ pub fn run(cfg: &Config) -> Result<()> {
             let _ = db.put_workspace(&root_s, &name);
             // The home tab maps to the repo's main checkout (for the diff/PR panel).
             let branch = worktree::default_branch(&root);
-            let _ = db.put_worktree(&home, &root_s, &root_s, &branch);
+            let _ = db.put_worktree(&home, &root_s, &root_s, &branch, None);
         }
         if zellij::in_zellij() {
             zellij::rename_tab(&home);

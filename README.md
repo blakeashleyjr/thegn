@@ -166,6 +166,34 @@ plugins via `nix build .#superzej-sidebar .#superzej-panel .#superzej-tabbar`. s
   install, delete that copy so it re-seeds (and `zellij delete-session superzej`
   if a stale serialized session lingers).
 
+## Sandboxing worktrees
+
+By default each worktree's interactive process (agent / shell / tools) runs inside
+a container or sandbox, so a coding agent can't reach your whole machine. The git
+worktree itself stays on the host and is **bind-mounted into the sandbox at its
+real path** — so the sidebar/panel/PR (which read git host-side) keep working,
+while the agent only sees the worktree and its git metadata.
+
+- **Backends** (`[sandbox] backend`): `auto` walks `backend_chain` and picks the
+  first available — `podman` (rootless, preferred) → `docker` → `bwrap`
+  (lightweight, reuses host tools, no image) → `none` (plain host, with a
+  warning). `systemd`, `apple` (macOS `container`), and `wsl` are also selectable.
+  Setting an `image` switches `auto` to the OCI runtimes; leaving it empty uses
+  the host-toolchain sandbox (bwrap/systemd).
+- **Per-repo** — drop a `.superzej.{toml,yaml,yml,json}` at a repo root with a
+  `[sandbox]` table to override the global config (image, init script, mounts,
+  `devenv`, remote, …). A repo with `devenv.nix` auto-wraps the shell in
+  `devenv shell` when `devenv` is installed.
+- **Remote** (`[sandbox.remote] host`) — run worktrees on another machine. The
+  interactive pane goes over **mosh** (low-latency, roaming); git reads and
+  container lifecycle go over **ssh**. Composes with the container backends (mosh/
+  ssh → podman on the remote).
+- **Opt out** — `backend = "none"` (or `enabled = false`) runs on the host as
+  before. Auth/egress: agents need network and credentials, so `network` defaults
+  to `nat` and `env_passthrough` forwards `SSH_AUTH_SOCK`/tokens.
+
+See [`config/config.toml.example`](config/config.toml.example) for every key.
+
 ## Development
 
 ```sh

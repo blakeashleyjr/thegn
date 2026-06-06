@@ -26,6 +26,8 @@ pub struct WorktreeRow {
     pub repo_root: String,
     pub tab_name: String,
     pub session_name: String,
+    /// Remote-location descriptor (JSON) for a remote worktree; empty = local.
+    pub location: String,
 }
 
 /// A worktree enriched with live git status, for `list` / `dashboard` output.
