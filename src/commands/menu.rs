@@ -117,6 +117,7 @@ mod tests {
             "dashboard",
             "toggle-sidebar",
             "toggle-panel",
+            "files",
             "tool-lazygit",
             "tool-yazi",
             "tool-editor",

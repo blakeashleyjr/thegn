@@ -24,7 +24,6 @@ pub const END: &str = "// >>> end superzej:keybinds <<<";
 /// it always matches the layout's `file:~/.local/share/...` references).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Plugin {
-    Sidebar,
     Statusbar,
     Tabbar,
 }
@@ -32,7 +31,6 @@ pub enum Plugin {
 impl Plugin {
     fn wasm(self) -> &'static str {
         match self {
-            Plugin::Sidebar => "sidebar.wasm",
             Plugin::Statusbar => "statusbar.wasm",
             Plugin::Tabbar => "tabbar.wasm",
         }
@@ -233,10 +231,30 @@ pub const BUILTINS: &[Action] = &[
         chords: &["Super k"],
         menu_label: "Command palette",
         hint: "menu",
-        invocation: run_float!("menu"),
+        // Super+K routes through the statusbar so it's a real toggle: a bare
+        // `Run` only ever *spawns* a pane (a second press can't close the open
+        // palette, and rapid presses race a flurry of floating panes). The
+        // statusbar tracks the palette's id and spawns `superzej menu` itself.
+        invocation: Invocation::Pipe {
+            plugin: Plugin::Statusbar,
+            name: "superzej_toggle_palette",
+        },
         scope: Scope::Shared,
         context: Context::Always,
         menu: false,
+    },
+    Action {
+        id: "files",
+        chords: &["Ctrl Alt f"],
+        menu_label: "File drawer (yazi)",
+        hint: "drawer",
+        // Spawn/close a bottom-anchored floating yazi rooted at the focused
+        // worktree; `superzej files` self-toggles (closes via the statusbar's
+        // `superzej_close_files` pipe when already open).
+        invocation: run_float!("files"),
+        scope: Scope::Shared,
+        context: Context::Always,
+        menu: true,
     },
     Action {
         id: "new-panel-native",
@@ -424,26 +442,28 @@ pub const BUILTINS: &[Action] = &[
         menu: false,
     },
     Action {
-        id: "nav-down",
+        id: "select-bottombar",
         chords: &["Super Alt Down", "Super Alt j"],
-        menu_label: "Sidebar selection down",
+        menu_label: "Focus the bottom status bar",
         hint: "nav",
+        // The statusbar owns bottom-bar selection (highlight + key routing).
         invocation: Invocation::Pipe {
-            plugin: Plugin::Sidebar,
-            name: "superzej_nav_down",
+            plugin: Plugin::Statusbar,
+            name: "superzej_select_bottombar",
         },
         scope: Scope::Shared,
         context: Context::Always,
         menu: false,
     },
     Action {
-        id: "nav-up",
+        id: "select-topbar",
         chords: &["Super Alt Up", "Super Alt k"],
-        menu_label: "Sidebar selection up",
+        menu_label: "Focus the top stats bar",
         hint: "nav",
+        // The tabbar owns top-bar stat selection (CPU/MEM/GPU → embed monitor).
         invocation: Invocation::Pipe {
-            plugin: Plugin::Sidebar,
-            name: "superzej_nav_up",
+            plugin: Plugin::Tabbar,
+            name: "superzej_select_topbar",
         },
         scope: Scope::Shared,
         context: Context::Always,
