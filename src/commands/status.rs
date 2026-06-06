@@ -57,6 +57,11 @@ pub fn run(cfg: &Config) -> Result<()> {
          Alt-g lazygit   Alt-y yazi   Alt-e editor   Alt-/ diff\n         \
          Alt-X remove worktree + close tab\n"
     );
+    // On a cold start (this is the only tab), bring back the previous session's
+    // worktree tabs from the DB, each relaunching its recorded agent. A no-op
+    // when other tabs already exist (a reopened home view, not a fresh start).
+    let _ = crate::commands::restore::run();
+
     // Seed the pane title with the repo's current branch (the home checkout).
     let branch = std::env::current_dir()
         .ok()

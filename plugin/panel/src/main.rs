@@ -13,7 +13,9 @@
 use std::collections::BTreeMap;
 use zellij_tile::prelude::*;
 
-const REFRESH_SECS: f64 = 15.0;
+// The watch daemon pushes diff/PR updates on change, so this is just a
+// safety-net re-poll in case a push is missed (e.g. the daemon isn't running).
+const REFRESH_SECS: f64 = 30.0;
 
 // superzej theme palette (truecolor), kept in sync with config/zellij.kdl.
 const CYAN: &str = "94;218;207";
@@ -60,7 +62,6 @@ struct State {
     identity: Option<(String, String)>,
     worktree: Option<String>,
     pr: Option<serde_json::Value>,
-    diff: String,
     status_line: String,
     // Visibility is owned by the statusbar controller (it is the only chrome
     // surface that is never hidden and can re-tile the others). The panel just
@@ -137,6 +138,22 @@ impl ZellijPlugin for State {
                         if same {
                             self.pr = Some(v);
                             return true;
+                        }
+                    }
+                }
+                false
+            }
+            // Live diff push from the watch daemon (fs change in the worktree).
+            "superzej_diff" => {
+                if let Some(payload) = pipe.payload {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
+                        let same =
+                            v.get("worktree").and_then(|w| w.as_str()) == self.worktree.as_deref();
+                        if same {
+                            if let Some(files) = v.get("files").and_then(|f| f.as_str()) {
+                                self.files = parse_files(files);
+                                return true;
+                            }
                         }
                     }
                 }
@@ -219,17 +236,20 @@ impl State {
         self.identity = Some(id);
         self.worktree = None;
         self.pr = None;
-        self.diff.clear();
+        self.files.clear();
+        // Phase 1: one cheap call returns the worktree + whatever is cached
+        // (PR + diff), so we paint instantly; on_result then hydrates live.
         let mut ctx = BTreeMap::new();
-        ctx.insert("cmd".to_string(), "resolve".to_string());
+        ctx.insert("cmd".to_string(), "snapshot".to_string());
         run_command(
-            &["superzej", "resolve-worktree", "--session", &s, "--tab", &t],
+            &["superzej", "panel-snapshot", "--session", &s, "--tab", &t],
             ctx,
         );
         true
     }
 
-    /// Kick off `superzej pr status` + `superzej diff --files` + `--stat` for the worktree.
+    /// Phase 2: live hydration — `superzej pr status` + `superzej diff --files`
+    /// for the worktree (results overwrite the cached snapshot as they arrive).
     fn fetch(&mut self, refresh: bool) {
         let Some(wt) = self.worktree.clone() else {
             return;
@@ -248,10 +268,6 @@ impl State {
             &["superzej", "diff", "--files", "--worktree", &wt],
             file_ctx,
         );
-
-        let mut diff_ctx = BTreeMap::new();
-        diff_ctx.insert("cmd".to_string(), "diff".to_string());
-        run_command(&["superzej", "diff", "--stat", "--worktree", &wt], diff_ctx);
     }
 
     fn on_result(&mut self, cmd: Option<&str>, stdout: Vec<u8>) -> bool {
@@ -267,30 +283,31 @@ impl State {
                 }
                 true
             }
+            Some("snapshot") => {
+                // Phase 1: paint from cache (worktree + cached PR/diff), then
+                // start the live fetch to hydrate.
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) {
+                    self.worktree = v.get("worktree").and_then(|w| w.as_str()).map(String::from);
+                    if let Some(pr) = v.get("pr") {
+                        if !pr.is_null() {
+                            self.pr = Some(pr.clone());
+                        }
+                    }
+                    if let Some(files) = v.get("files").and_then(|f| f.as_str()) {
+                        self.files = parse_files(files);
+                    }
+                    if self.worktree.is_some() {
+                        self.fetch(false);
+                    }
+                }
+                true
+            }
             Some("pr") => {
                 self.pr = serde_json::from_str(text.trim()).ok();
                 true
             }
-            Some("diff") => {
-                self.diff = text;
-                true
-            }
             Some("files") => {
-                self.files = text
-                    .lines()
-                    .filter_map(|l| {
-                        let parts: Vec<&str> = l.splitn(4, '\t').collect();
-                        if parts.len() < 2 {
-                            return None;
-                        }
-                        Some(FileEntry {
-                            status: parts[0].chars().next().unwrap_or('?'),
-                            path: parts[1].to_string(),
-                            added: parts.get(2).and_then(|v| v.parse().ok()).unwrap_or(0),
-                            deleted: parts.get(3).and_then(|v| v.parse().ok()).unwrap_or(0),
-                        })
-                    })
-                    .collect();
+                self.files = parse_files(&text);
                 if self.diff_view == DiffView::FileDiff {
                     self.diff_view = DiffView::FileList;
                 }
@@ -814,6 +831,25 @@ fn push(out: &mut String, text: &str, cols: usize) {
         shown += 1;
     }
     out.push_str("\u{1b}[0m\r\n");
+}
+
+/// Parse the `status\tpath\tadded\tdeleted` TSV (from `diff --files`, the cached
+/// snapshot, or a watch-daemon push) into the file list.
+fn parse_files(text: &str) -> Vec<FileEntry> {
+    text.lines()
+        .filter_map(|l| {
+            let parts: Vec<&str> = l.splitn(4, '\t').collect();
+            if parts.len() < 2 {
+                return None;
+            }
+            Some(FileEntry {
+                status: parts[0].chars().next().unwrap_or('?'),
+                path: parts[1].to_string(),
+                added: parts.get(2).and_then(|v| v.parse().ok()).unwrap_or(0),
+                deleted: parts.get(3).and_then(|v| v.parse().ok()).unwrap_or(0),
+            })
+        })
+        .collect()
 }
 
 fn short(path: &str) -> String {

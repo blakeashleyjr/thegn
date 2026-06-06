@@ -96,6 +96,13 @@ impl Db {
               json       TEXT,
               fetched_at INTEGER
             );
+            -- Last computed `diff --files` TSV per worktree, so the panel can
+            -- paint instantly from cache (via `panel-snapshot`) and hydrate live.
+            CREATE TABLE IF NOT EXISTS diff_cache (
+              worktree   TEXT PRIMARY KEY,
+              files      TEXT,
+              fetched_at INTEGER
+            );
             -- A stable, globally-unique slug per repo: the prefix of every tab
             -- that repo owns (`{slug}/…`). Assigned once with collision suffixing
             -- so two repos with the same basename get distinct tabs.
@@ -133,6 +140,43 @@ impl Db {
             params![worktree, branch, json, util::now()],
         )?;
         Ok(())
+    }
+
+    // --- diff cache (per worktree; feeds panel-snapshot's instant paint) ----
+    pub fn get_diff_cache(&self, worktree: &str) -> Result<Option<(String, i64)>> {
+        let r = self
+            .conn
+            .query_row(
+                "SELECT files, fetched_at FROM diff_cache WHERE worktree=?1",
+                params![worktree],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .ok();
+        Ok(r)
+    }
+
+    pub fn put_diff_cache(&self, worktree: &str, files: &str) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO diff_cache(worktree,files,fetched_at)
+               VALUES(?1,?2,?3)
+               ON CONFLICT(worktree) DO UPDATE SET files=?2, fetched_at=?3"#,
+            params![worktree, files, util::now()],
+        )?;
+        Ok(())
+    }
+
+    /// The recorded agent for a worktree (for `pick-agent --resume` on restart).
+    pub fn worktree_agent(&self, worktree: &str) -> Result<Option<String>> {
+        let r = self
+            .conn
+            .query_row(
+                "SELECT agent FROM worktrees WHERE worktree=?1",
+                params![worktree],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+            .filter(|s: &String| !s.is_empty());
+        Ok(r)
     }
 
     // --- repo history (launcher recents) -----------------------------------

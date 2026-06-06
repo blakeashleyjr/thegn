@@ -10,19 +10,25 @@ pub fn run(session: Option<String>, tab: Option<String>) -> Result<()> {
     let Some(tab) = tab else {
         return Ok(());
     };
-    if let Ok(db) = Db::open() {
-        if let Ok(Some(path)) = db.worktree_for_tab(&session, &tab) {
-            println!("{path}");
-            return Ok(());
-        }
-        // Extra same-worktree tabs ("{base} ·N", superzej new-tab) resolve to
-        // their base tab's worktree.
-        let base = crate::commands::new_tab::strip_page_suffix(&tab);
-        if base != tab {
-            if let Ok(Some(path)) = db.worktree_for_tab(&session, base) {
-                println!("{path}");
-            }
-        }
+    if let Some(path) = resolve_tab_worktree(&session, &tab) {
+        println!("{path}");
     }
     Ok(())
+}
+
+/// The worktree path for a (session, tab) pair. Extra same-worktree tabs
+/// ("{base} ·N", from `superzej new-tab`) resolve to their base tab's worktree.
+/// Shared by `resolve-worktree` and `panel-snapshot`.
+pub fn resolve_tab_worktree(session: &str, tab: &str) -> Option<String> {
+    let db = Db::open().ok()?;
+    if let Ok(Some(path)) = db.worktree_for_tab(session, tab) {
+        return Some(path);
+    }
+    let base = crate::commands::new_tab::strip_page_suffix(tab);
+    if base != tab {
+        if let Ok(Some(path)) = db.worktree_for_tab(session, base) {
+            return Some(path);
+        }
+    }
+    None
 }

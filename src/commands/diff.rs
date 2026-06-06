@@ -8,11 +8,13 @@
 //! <merge-base>` diffs the working tree against that commit).
 
 use crate::commands::resolve_worktree;
+use crate::db::Db;
 use crate::diff_highlight;
 use crate::remote::GitLoc;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::io::Write;
+use std::path::Path;
 
 pub fn run(
     worktree: Option<String>,
@@ -38,32 +40,12 @@ pub fn run(
 
     // --files: TSV with status, path, added, deleted columns (no diff, no delta).
     if files {
-        let names = loc
-            .git_out(&["diff", "--name-status", &target])
-            .unwrap_or_default();
-        let nums = loc
-            .git_out(&["diff", "--numstat", &target])
-            .unwrap_or_default();
-
-        let mut num_map: HashMap<&str, (u32, u32)> = HashMap::new();
-        for line in nums.lines() {
-            let parts: Vec<&str> = line.splitn(3, '\t').collect();
-            if parts.len() < 3 {
-                continue;
-            }
-            let adds: u32 = parts[0].parse().unwrap_or(0);
-            let dels: u32 = parts[1].parse().unwrap_or(0);
-            num_map.insert(parts[2].trim(), (adds, dels));
+        let tsv = files_tsv(&loc, &target);
+        // Warm the diff cache so the next `panel-snapshot` paints instantly.
+        if let Ok(db) = Db::open() {
+            let _ = db.put_diff_cache(&wt.to_string_lossy(), &tsv);
         }
-
-        for line in names.lines() {
-            let (status, path) = match line.split_once('\t') {
-                Some((s, p)) => (s, p.trim()),
-                None => continue,
-            };
-            let (adds, dels) = num_map.get(path).copied().unwrap_or((0, 0));
-            println!("{status}\t{path}\t{adds}\t{dels}");
-        }
+        print!("{tsv}");
         return Ok(());
     }
 
@@ -117,4 +99,53 @@ fn default_branch(loc: &GitLoc) -> String {
         }
     }
     "HEAD".to_string()
+}
+
+/// The merge-base target a worktree diffs against (its branch's full delta vs
+/// the repo's default branch), falling back to HEAD when there's no merge-base.
+fn default_target(loc: &GitLoc) -> String {
+    let base = default_branch(loc);
+    loc.git_out(&["merge-base", &base, "HEAD"])
+        .unwrap_or_else(|| "HEAD".to_string())
+}
+
+/// Build the file-list TSV (`status\tpath\tadded\tdeleted` per line) for a diff
+/// against `target`. Shared by the `--files` CLI path and the watch daemon, and
+/// routed through `GitLoc` so it works for remote worktrees too.
+fn files_tsv(loc: &GitLoc, target: &str) -> String {
+    let names = loc
+        .git_out(&["diff", "--name-status", target])
+        .unwrap_or_default();
+    let nums = loc
+        .git_out(&["diff", "--numstat", target])
+        .unwrap_or_default();
+
+    let mut num_map: HashMap<&str, (u32, u32)> = HashMap::new();
+    for line in nums.lines() {
+        let parts: Vec<&str> = line.splitn(3, '\t').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let adds: u32 = parts[0].parse().unwrap_or(0);
+        let dels: u32 = parts[1].parse().unwrap_or(0);
+        num_map.insert(parts[2].trim(), (adds, dels));
+    }
+
+    let mut out = String::new();
+    for line in names.lines() {
+        let (status, path) = match line.split_once('\t') {
+            Some((s, p)) => (s, p.trim()),
+            None => continue,
+        };
+        let (adds, dels) = num_map.get(path).copied().unwrap_or((0, 0));
+        out.push_str(&format!("{status}\t{path}\t{adds}\t{dels}\n"));
+    }
+    out
+}
+
+/// Compute the file-list TSV for a worktree against its default-branch
+/// merge-base — used by the watch daemon to push live diffs to the panel.
+pub fn files_for(wt: &Path) -> String {
+    let loc = GitLoc::for_worktree(wt);
+    files_tsv(&loc, &default_target(&loc))
 }

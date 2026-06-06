@@ -37,6 +37,9 @@ nvml-wrapper = "0.12"
 # Already vendored transitively (via sysinfo); used only to restore the default
 # SIGPIPE disposition at startup so `superzej … | head` exits quietly.
 libc = "0.2"
+# Filesystem change notifications for the `watch` daemon (the panel's live diff
+# refresh). Pure Rust; uses the OS-native backend (inotify on Linux).
+notify = "6"
 
 [profile.release]
 strip = true
