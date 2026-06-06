@@ -37,9 +37,16 @@ struct State {
     // `manual` (the Ctrl+Alt+s/p toggle) OR `auto` (narrow terminal); the pane
     // is suppressed when either holds.
     my_id: Option<u32>,
+    my_tab: Option<usize>, // tab position this instance lives on (manifest key)
+    active_tab: Option<usize>, // the currently-focused tab (from TabUpdate)
     sidebar: Surface,
     panel: Surface,
     term_cols: usize, // last width seen in render (the statusbar spans full width)
+    // Bottom-bar selection (Super+Alt+Down focuses this pane). Highlight-only
+    // for now — Enter is reserved for a future action. Esc / moving focus away
+    // clears it. `center_id` is the terminal to hand focus back to on Esc.
+    selected: bool,
+    center_id: Option<u32>,
 }
 
 /// Tracked visibility of one controlled chrome surface.
@@ -67,9 +74,12 @@ impl ZellijPlugin for State {
             EventType::ModeUpdate,
             EventType::TabUpdate,
             EventType::PaneUpdate,
+            EventType::Key,
             EventType::RunCommandResult,
             EventType::PermissionRequestResult,
         ]);
+        // Selectable so Super+Alt+Down can focus the bottom bar and route keys.
+        set_selectable(true);
         fetch_theme();
         // Restore any persisted manual-hide (a toggle may have hidden a surface
         // before this per-tab statusbar loaded). Replies tagged vis_sidebar/vis_panel.
@@ -130,10 +140,14 @@ impl ZellijPlugin for State {
                 false
             }
             Event::TabUpdate(tabs) => {
+                let active = tabs.iter().find(|t| t.active);
+                self.active_tab = active.map(|t| t.position);
+                // A tab may have just become active — reconcile its chrome now
+                // (relayout is deferred while a tab is in the background, since
+                // only the active tab may call next_swap_layout). See reconcile().
+                self.reconcile();
                 // `{slug}/home` => home tab; anything else under a repo is a worktree.
-                let wt = tabs
-                    .iter()
-                    .find(|t| t.active)
+                let wt = active
                     .map(|t| {
                         t.name
                             .rsplit_once('/')
@@ -147,6 +161,7 @@ impl ZellijPlugin for State {
                 }
                 false
             }
+            Event::Key(key) => self.on_key(key),
             _ => false,
         }
     }
@@ -185,6 +200,18 @@ impl ZellijPlugin for State {
                     self.persist("panel", true);
                 }
             }
+            // Super+Alt+Down: select the bottom bar. Broadcast hits every per-tab
+            // instance; only the active tab's responds (else focus_plugin_pane
+            // would teleport to a background tab). Highlight-only for now.
+            "superzej_select_bottombar" => {
+                if self.my_tab.is_some() && self.my_tab == self.active_tab {
+                    self.selected = true;
+                    if let Some(id) = self.my_id {
+                        focus_plugin_pane(id, false, false);
+                    }
+                    return true;
+                }
+            }
             _ => {}
         }
         false
@@ -201,6 +228,17 @@ impl ZellijPlugin for State {
         let mut out = String::new();
         out.push_str(&format!("\u{1b}[48;2;{BG1}m")); // bar background
         let mut col = 0usize;
+
+        // Bottom-bar selected (Super+Alt+Down): a leading accent block as a cue.
+        if self.selected {
+            push_raw(
+                &mut out,
+                &mut col,
+                cols,
+                &format!("\u{1b}[1m\u{1b}[38;2;{accent}m\u{2590}\u{1b}[0m\u{1b}[48;2;{BG1}m"),
+                1,
+            );
+        }
 
         // A mode indicator chip on the left when not in Normal mode.
         if mode != InputMode::Normal {
@@ -271,6 +309,21 @@ fn parse_rgb_line(stdout: &[u8]) -> Option<String> {
 }
 
 impl State {
+    fn on_key(&mut self, key: KeyWithModifier) -> bool {
+        // Reserved: Enter has no action yet. Esc (or moving focus away) drops the
+        // selection and hands focus back to the center terminal.
+        match key.bare_key {
+            BareKey::Esc => {
+                self.selected = false;
+                if let Some(id) = self.center_id {
+                    focus_terminal_pane(id, false, false);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Discover the sidebar/panel pane ids in this tab and sync their live
     /// suppression from the manifest. The width-driven auto-hide is decided in
     /// `render` (zellij fires render on every resize but only sometimes a
@@ -278,15 +331,34 @@ impl State {
     fn scan_panes(&mut self, manifest: &PaneManifest) {
         let Some(me) = self.my_id else { return };
         // Only the layer (tab) that holds our own pane — other tabs carry the
-        // same plugin urls under different ids.
-        let Some(panes) = manifest
+        // same plugin urls under different ids. The map key is the tab position,
+        // which tells us which tab this instance lives on (for the active-tab gate).
+        let Some((tab_pos, panes)) = manifest
             .panes
-            .values()
-            .find(|ps| ps.iter().any(|p| p.is_plugin && p.id == me))
+            .iter()
+            .find(|(_, ps)| ps.iter().any(|p| p.is_plugin && p.id == me))
         else {
             return;
         };
+        self.my_tab = Some(*tab_pos);
+        // Drop the bottom-bar selection once focus leaves this pane.
+        if self.selected
+            && !panes
+                .iter()
+                .any(|p| p.is_plugin && p.id == me && p.is_focused)
+        {
+            self.selected = false;
+        }
         for p in panes {
+            // The center terminal to hand focus back to on Esc: the focused one,
+            // else the first (kept across our own focus grab).
+            if !p.is_plugin
+                && !p.is_floating
+                && !p.is_suppressed
+                && (p.is_focused || self.center_id.is_none())
+            {
+                self.center_id = Some(p.id);
+            }
             if !p.is_plugin {
                 continue;
             }
@@ -334,6 +406,17 @@ impl State {
     /// (a brief sibling flash, but every pane lands in its slot). Driven from
     /// the statusbar's always-visible context.
     fn reconcile(&mut self) {
+        // Only the ACTIVE tab's statusbar may relayout. `next_swap_layout()`
+        // (and add/hide pane) act on the FOCUSED tab, but the toggle keybind
+        // broadcasts to every tab's statusbar instance — so a background
+        // instance firing it would mutate the visible tab, cycling its swap
+        // layout once per open tab and leaving a surface jammed at a ~50% split
+        // (the bug that surfaced after a manual drag with several tabs open).
+        // Background tabs defer; each reconciles when it becomes active (the
+        // TabUpdate handler calls reconcile() on the new active tab).
+        if self.my_tab.is_none() || self.my_tab != self.active_tab {
+            return;
+        }
         let hidden = |s: &Surface| s.manual || s.auto;
         let need_show = [&self.sidebar, &self.panel]
             .iter()
@@ -367,7 +450,9 @@ impl State {
                     "sh",
                     "-c",
                     // Honor SUPERZEJ_DIR so a dev/test instance reads its own state.
-                    &format!("cat \"${{SUPERZEJ_DIR:-$HOME/.superzej}}/{file}\" 2>/dev/null || true"),
+                    &format!(
+                        "cat \"${{SUPERZEJ_DIR:-$HOME/.superzej}}/{file}\" 2>/dev/null || true"
+                    ),
                 ],
                 BTreeMap::from([("cmd".to_string(), tag.to_string())]),
             );

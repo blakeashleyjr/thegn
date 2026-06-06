@@ -236,6 +236,9 @@ impl ZellijPlugin for State {
                 self.pull_repos();
                 false
             }
+            // The tree cursor is moved with plain j/k/↑/↓ once the sidebar pane
+            // is focused (see on_key) — Super+Alt+Up/Down now select the top /
+            // bottom chrome bars, so there's no broadcast nav pipe here anymore.
             _ => false,
         }
     }
@@ -424,20 +427,28 @@ impl State {
         }
     }
 
-    fn on_key(&mut self, key: KeyWithModifier) -> bool {
+    /// Move the selection one row down (`true`) or up (`false`), clamping at the
+    /// ends. Returns whether the cursor changed (i.e. a re-render is needed).
+    fn move_cursor(&mut self, down: bool) -> bool {
         if self.rows.is_empty() {
             return false;
         }
         let last = self.rows.len() - 1;
+        self.cursor = Some(if down {
+            self.cursor.map_or(0, |c| (c + 1).min(last))
+        } else {
+            self.cursor.map_or(last, |c| c.saturating_sub(1))
+        });
+        true
+    }
+
+    fn on_key(&mut self, key: KeyWithModifier) -> bool {
+        if self.rows.is_empty() {
+            return false;
+        }
         match key.bare_key {
-            BareKey::Down | BareKey::Char('j') => {
-                self.cursor = Some(self.cursor.map_or(0, |c| (c + 1).min(last)));
-                true
-            }
-            BareKey::Up | BareKey::Char('k') => {
-                self.cursor = Some(self.cursor.map_or(last, |c| c.saturating_sub(1)));
-                true
-            }
+            BareKey::Down | BareKey::Char('j') => self.move_cursor(true),
+            BareKey::Up | BareKey::Char('k') => self.move_cursor(false),
             BareKey::Enter | BareKey::Right | BareKey::Char('l') => {
                 if let Some(c) = self.cursor {
                     self.activate(c);

@@ -32,6 +32,13 @@ auto_remove_worktree = false
 [theme]
 accent = "#76eede"
 
+# Resource managers opened from the top-bar stats widget: highlight a stat with
+# Super+Alt+Up, cycle CPU/MEM/GPU with ←/→, press Enter to embed it as a pane.
+# `system` backs the CPU and MEM segments; `gpu` backs the GPU segment.
+[monitor]
+system = "btm"   # CPU/RAM monitor (ClementTsang/bottom); e.g. "htop", "btop"
+gpu = "nvtop"    # GPU monitor
+
 # Coding agents offered in the new-worktree picker.
 # Use "__shell__" for a plain login shell.
 [[agents]]

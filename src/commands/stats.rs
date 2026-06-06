@@ -13,7 +13,7 @@
 //! combinations (e.g. Apple GPUs) simply omit the field for now.
 
 use anyhow::Result;
-use sysinfo::{System, MINIMUM_CPU_UPDATE_INTERVAL};
+use sysinfo::{MINIMUM_CPU_UPDATE_INTERVAL, System};
 
 pub fn run() -> Result<()> {
     let mut fields: Vec<String> = Vec::new();

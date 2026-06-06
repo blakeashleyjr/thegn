@@ -12,7 +12,7 @@
 use crate::models::{WorkspaceRow, WorktreeRow};
 use crate::util;
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::path::PathBuf;
 
 /// Schema version. Bumped to 2 for the workspace=session / worktree=tab remap.

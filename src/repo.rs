@@ -45,6 +45,19 @@ pub fn repo_name(root: &Path) -> String {
         .unwrap_or(base)
 }
 
+/// Short repo name derived purely from a repo *root* path — no git, no DB.
+/// Use this for bulk listings (e.g. the sidebar inventory) where the paths are
+/// already repo roots and spawning `git` per repo would be the bottleneck.
+pub fn repo_name_from_path(root: &Path) -> String {
+    let base = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    base.strip_suffix(".git")
+        .map(|s| s.to_string())
+        .unwrap_or(base)
+}
+
 /// A stable, globally-unique slug for a repo — the prefix of every tab that
 /// belongs to it (`"{slug}/…"`). All repos live in one zellij session now, so
 /// tabs are scoped by this prefix rather than by a per-repo session.
@@ -56,11 +69,7 @@ pub fn repo_name(root: &Path) -> String {
 pub fn repo_slug(root: &Path) -> String {
     let base = {
         let s = util::slugify(&repo_name(root));
-        if s.is_empty() {
-            "repo".to_string()
-        } else {
-            s
-        }
+        if s.is_empty() { "repo".to_string() } else { s }
     };
     crate::db::Db::open()
         .ok()

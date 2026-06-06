@@ -50,6 +50,20 @@ struct State {
     mem: Option<u8>,
     gpu: Option<u8>,
     time: String,
+    // Keyboard selection of a stat segment, indexing the *present* segments in
+    // CPU→MEM→GPU order (GPU drops on boxes with no counter). `Some` means the
+    // top bar is "selected": Super+Alt+Up focuses this pane and sets it, plain
+    // ←/→ (h/l) move it, Enter opens the matching monitor, Esc clears it.
+    sel: Option<u8>,
+    // Broadcast guard: the Super+Alt+Up keybind hits every per-tab instance, so
+    // only the one whose tab is active acts (mirrors the sidebar) — otherwise a
+    // background instance's focus_plugin_pane would teleport to its tab.
+    my_tab: Option<usize>,
+    active_tab: Option<usize>,
+    // The center terminal to split the monitor under (the last-focused center
+    // pane in this tab), so the embedded monitor lands at the bottom of the
+    // center column rather than under the top strip.
+    center_id: Option<u32>,
 }
 
 struct Tab {
@@ -100,6 +114,7 @@ impl ZellijPlugin for State {
             EventType::SessionUpdate,
             EventType::PaneUpdate,
             EventType::Mouse,
+            EventType::Key,
             EventType::RunCommandResult,
             EventType::PermissionRequestResult,
             EventType::Timer,
@@ -146,6 +161,7 @@ impl ZellijPlugin for State {
                 false
             }
             Event::TabUpdate(tabs) => {
+                self.active_tab = tabs.iter().find(|t| t.active).map(|t| t.position);
                 self.active_wt = tabs.iter().find(|t| t.active).map(|t| {
                     let (repo, branch) = split_tab(&t.name);
                     (repo, split_page(&branch).0)
@@ -187,17 +203,38 @@ impl ZellijPlugin for State {
             // whether or not the sidebar/panel are folded.
             Event::PaneUpdate(manifest) => {
                 let Some(me) = self.my_id else { return false };
-                let Some(panes) = manifest
+                let Some((tab_pos, panes)) = manifest
                     .panes
-                    .values()
-                    .find(|ps| ps.iter().any(|p| p.is_plugin && p.id == me))
+                    .iter()
+                    .find(|(_, ps)| ps.iter().any(|p| p.is_plugin && p.id == me))
                 else {
                     return false;
                 };
+                self.my_tab = Some(*tab_pos);
+                let mut changed = false;
+                // Drop the stat selection once focus leaves the top bar (e.g.
+                // the user moved focus away with Super+Alt+Left) so a stale
+                // highlight doesn't linger.
+                let me_focused = panes
+                    .iter()
+                    .any(|p| p.is_plugin && p.id == me && p.is_focused);
+                if !me_focused && self.sel.is_some() {
+                    self.sel = None;
+                    changed = true;
+                }
                 let centers: Vec<&PaneInfo> = panes
                     .iter()
                     .filter(|p| !p.is_plugin && !p.is_floating && !p.is_suppressed)
                     .collect();
+                // Remember the center terminal to split the monitor under: the
+                // focused center pane when there is one, else keep the last
+                // known (so grabbing top-bar focus doesn't lose it), falling
+                // back to the first center pane.
+                if let Some(f) = centers.iter().find(|p| p.is_focused) {
+                    self.center_id = Some(f.id);
+                } else if self.center_id.is_none() {
+                    self.center_id = centers.first().map(|p| p.id);
+                }
                 if let (Some(left), Some(right)) = (
                     centers.iter().map(|p| p.pane_x).min(),
                     centers.iter().map(|p| p.pane_x + p.pane_columns).max(),
@@ -206,10 +243,10 @@ impl ZellijPlugin for State {
                     if (x, w) != (self.center_x, self.center_w) {
                         self.center_x = x;
                         self.center_w = w;
-                        return true;
+                        changed = true;
                     }
                 }
-                false
+                changed
             }
             Event::Mouse(Mouse::Hover(_line, col)) => {
                 let idx = self.col_to_index(col);
@@ -233,6 +270,9 @@ impl ZellijPlugin for State {
                 }
                 false
             }
+            // Keys only arrive while this pane is focused (Super+Alt+Up focuses
+            // it via the `superzej_select_topbar` pipe). Drive the stat cursor.
+            Event::Key(key) => self.on_key(key),
             _ => false,
         }
     }
@@ -257,6 +297,21 @@ impl ZellijPlugin for State {
                 run_command(&["superzej", "new-tab", "--session", &s], BTreeMap::new());
             }
         }
+        // Super+Alt+Up: select the top bar. The broadcast hits every per-tab
+        // instance; only the active tab's responds (else focus_plugin_pane would
+        // teleport to a background tab). Focus this pane so plain ←/→/Enter/Esc
+        // land here, and seed the cursor on the first stat segment.
+        if pipe.name == "superzej_select_topbar"
+            && self.my_tab.is_some()
+            && self.my_tab == self.active_tab
+            && !self.stat_kinds().is_empty()
+        {
+            self.sel = Some(0);
+            if let Some(id) = self.my_id {
+                focus_plugin_pane(id, false, false);
+            }
+            return true;
+        }
         false
     }
 
@@ -265,7 +320,7 @@ impl ZellijPlugin for State {
         let version = concat!("v", env!("CARGO_PKG_VERSION"));
         let accent = self.accent.clone();
         let bar = PANEL; // the grey top-bar fill — clearly lighter than the base bg
-                       // Re-applied after every RESET so spaces/chips keep the bar background.
+        // Re-applied after every RESET so spaces/chips keep the bar background.
         let set_bar = format!("\u{1b}[48;2;{bar}m");
 
         let mut out = String::new();
@@ -431,6 +486,21 @@ fn parse_rgb_line(stdout: &[u8]) -> Option<String> {
     ok.then(|| line.to_string())
 }
 
+/// Next stat cursor after moving right (`true`) or left (`false`), clamped to
+/// `[0, n)`. From `None`, either direction lands on the first segment; with no
+/// segments (`n == 0`) there is nothing to select.
+fn step_sel(cur: Option<u8>, n: usize, right: bool) -> Option<u8> {
+    if n == 0 {
+        return None;
+    }
+    let last = (n - 1) as u8;
+    Some(match cur {
+        None => 0,
+        Some(s) if right => (s + 1).min(last),
+        Some(s) => s.saturating_sub(1),
+    })
+}
+
 impl State {
     /// Which tab position (if any) sits under viewport column `col`.
     fn col_to_index(&self, col: usize) -> Option<usize> {
@@ -438,6 +508,77 @@ impl State {
             .iter()
             .find(|(s, e, _)| col >= *s && col < *e)
             .map(|(_, _, pos)| *pos)
+    }
+
+    /// The stat segments actually present, in display order — `sel` indexes into
+    /// this (GPU drops on boxes with no readable counter).
+    fn stat_kinds(&self) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        if self.cpu.is_some() {
+            v.push("cpu");
+        }
+        if self.mem.is_some() {
+            v.push("mem");
+        }
+        if self.gpu.is_some() {
+            v.push("gpu");
+        }
+        v
+    }
+
+    /// Drive the stat cursor while the top bar is selected (this pane focused).
+    /// ←/h and →/l move it (clamped); Enter opens the monitor; Esc cancels.
+    fn on_key(&mut self, key: KeyWithModifier) -> bool {
+        let n = self.stat_kinds().len();
+        if n == 0 {
+            return false;
+        }
+        match key.bare_key {
+            BareKey::Left | BareKey::Char('h') => {
+                self.sel = step_sel(self.sel, n, false);
+                true
+            }
+            BareKey::Right | BareKey::Char('l') => {
+                self.sel = step_sel(self.sel, n, true);
+                true
+            }
+            BareKey::Enter => {
+                self.activate();
+                true
+            }
+            BareKey::Esc => {
+                self.sel = None;
+                self.refocus_center();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The stat kind under the cursor, if any.
+    fn selected_kind(&self) -> Option<&'static str> {
+        self.sel
+            .and_then(|i| self.stat_kinds().get(i as usize).copied())
+    }
+
+    /// Open the monitor for the selected stat, then drop the selection and hand
+    /// focus back to the center terminal (so the new pane splits *it*, landing
+    /// at the bottom of the center column).
+    fn activate(&mut self) {
+        let kind = self.selected_kind();
+        self.sel = None;
+        let Some(kind) = kind else { return };
+        self.refocus_center();
+        let mut ctx = BTreeMap::new();
+        ctx.insert("cmd".to_string(), "monitor".to_string());
+        run_command(&["superzej", "monitor", kind], ctx);
+    }
+
+    /// Return focus to the tracked center terminal, if any.
+    fn refocus_center(&self) {
+        if let Some(id) = self.center_id {
+            focus_terminal_pane(id, false, false);
+        }
     }
 
     /// Parse a `cpu=NN mem=NN gpu=NN time=HH:MM` line from `superzej stats`
@@ -471,21 +612,37 @@ impl State {
     /// arrived yet). Labels are FAINT, values TEXT, the clock the accent, joined
     /// by a GHOST "·"; one cell of padding on each end.
     fn stats_widget(&self) -> (String, usize) {
-        let metric = |label: &str, v: u8| -> (String, usize) {
+        // The selected segment is a filled accent chip (BG0 on accent, bold),
+        // then RESET back to the grey bar fill so the separator/clock keep it.
+        let set_bar = format!("\u{1b}[48;2;{PANEL}m");
+        let metric = |label: &str, v: u8, selected: bool| -> (String, usize) {
             let val = format!("{v}%");
             let width = label.chars().count() + 1 + val.chars().count();
-            (format!("{}{label} {}{val}", fg(FAINT), fg(TEXT)), width)
+            let s = if selected {
+                format!(
+                    "\u{1b}[1m\u{1b}[38;2;{BG0}m\u{1b}[48;2;{}m{label} {val}{RESET}{set_bar}",
+                    self.accent
+                )
+            } else {
+                format!("{}{label} {}{val}", fg(FAINT), fg(TEXT))
+            };
+            (s, width)
         };
         let mut parts: Vec<(String, usize)> = Vec::new();
+        let mut si: u8 = 0; // stat-segment index, for matching self.sel
         if let Some(c) = self.cpu {
-            parts.push(metric("CPU", c));
+            parts.push(metric("CPU", c, self.sel == Some(si)));
+            si += 1;
         }
         if let Some(m) = self.mem {
-            parts.push(metric("MEM", m));
+            parts.push(metric("MEM", m, self.sel == Some(si)));
+            si += 1;
         }
         if let Some(g) = self.gpu {
-            parts.push(metric("GPU", g));
+            parts.push(metric("GPU", g, self.sel == Some(si)));
+            si += 1;
         }
+        let _ = si;
         if !self.time.is_empty() {
             let w = self.time.chars().count();
             parts.push((format!("{}{}", fg(&self.accent), self.time), w));
@@ -512,7 +669,7 @@ impl State {
 
 #[cfg(test)]
 mod tests {
-    use super::split_page;
+    use super::{State, split_page, step_sel};
 
     #[test]
     fn splits_page_suffixes() {
@@ -521,5 +678,108 @@ mod tests {
         assert_eq!(split_page("x"), ("x".to_string(), 1));
         assert_eq!(split_page("x \u{b7}y"), ("x \u{b7}y".to_string(), 1));
         assert_eq!(split_page("home"), ("home".to_string(), 1));
+    }
+
+    fn st(cpu: Option<u8>, mem: Option<u8>, gpu: Option<u8>) -> State {
+        State {
+            cpu,
+            mem,
+            gpu,
+            ..State::default()
+        }
+    }
+
+    #[test]
+    fn stat_kinds_lists_present_segments_in_order() {
+        assert_eq!(
+            st(Some(1), Some(2), Some(3)).stat_kinds(),
+            ["cpu", "mem", "gpu"]
+        );
+        // GPU drops on a box with no counter.
+        assert_eq!(st(Some(1), Some(2), None).stat_kinds(), ["cpu", "mem"]);
+        // Only what's present, preserving order.
+        assert_eq!(st(None, None, Some(3)).stat_kinds(), ["gpu"]);
+        assert!(st(None, None, None).stat_kinds().is_empty());
+    }
+
+    #[test]
+    fn step_sel_clamps_at_both_ends() {
+        // From None either direction lands on the first segment.
+        assert_eq!(step_sel(None, 3, true), Some(0));
+        assert_eq!(step_sel(None, 3, false), Some(0));
+        // Right advances and clamps at the last index.
+        assert_eq!(step_sel(Some(0), 3, true), Some(1));
+        assert_eq!(step_sel(Some(2), 3, true), Some(2));
+        // Left retreats and clamps at zero.
+        assert_eq!(step_sel(Some(2), 3, false), Some(1));
+        assert_eq!(step_sel(Some(0), 3, false), Some(0));
+        // No segments: nothing selectable.
+        assert_eq!(step_sel(Some(0), 0, true), None);
+        assert_eq!(step_sel(None, 0, false), None);
+    }
+
+    #[test]
+    fn selected_kind_maps_cursor_to_present_segment() {
+        // All three present: index → kind directly.
+        let mut s = st(Some(1), Some(2), Some(3));
+        s.sel = Some(0);
+        assert_eq!(s.selected_kind(), Some("cpu"));
+        s.sel = Some(2);
+        assert_eq!(s.selected_kind(), Some("gpu"));
+        // GPU absent: index 1 is MEM (cpu/mem only), index 2 is out of range.
+        let mut s = st(Some(1), Some(2), None);
+        s.sel = Some(1);
+        assert_eq!(s.selected_kind(), Some("mem"));
+        s.sel = Some(2);
+        assert_eq!(s.selected_kind(), None);
+        // No selection.
+        let mut s = st(Some(1), None, None);
+        s.sel = None;
+        assert_eq!(s.selected_kind(), None);
+    }
+
+    #[test]
+    fn cpu_and_mem_both_map_to_the_system_monitor_kind() {
+        // The plugin emits the segment kind; `superzej monitor` maps cpu/mem →
+        // the system monitor and gpu → the gpu monitor (see config::tests).
+        let mut s = st(Some(10), Some(20), Some(30));
+        s.sel = Some(0);
+        assert_eq!(s.selected_kind(), Some("cpu"));
+        s.sel = Some(1);
+        assert_eq!(s.selected_kind(), Some("mem"));
+    }
+
+    #[test]
+    fn highlighted_segment_uses_accent_background() {
+        let mut s = st(Some(42), Some(63), Some(7));
+        s.accent = "1;2;3".into();
+        // Nothing selected: no accent-background fill in the widget.
+        let (plain, _) = s.stats_widget();
+        assert!(
+            !plain.contains("48;2;1;2;3m"),
+            "unselected widget should not fill accent bg"
+        );
+        // Selecting MEM paints it as a bold accent chip (BG0 fg on accent bg).
+        s.sel = Some(1);
+        let (sel, _) = s.stats_widget();
+        assert!(
+            sel.contains("48;2;1;2;3m"),
+            "selected segment should fill the accent bg"
+        );
+        assert!(sel.contains("\u{1b}[1m"), "selected segment should be bold");
+    }
+
+    #[test]
+    fn highlighted_segment_keeps_widget_width() {
+        // Selecting a segment must not change the reported width (only styling),
+        // or the right-edge layout in render() would shift under selection.
+        let mut s = st(Some(42), Some(63), Some(7));
+        s.time = "12:34".into();
+        let (_, w_plain) = s.stats_widget();
+        for i in 0..3 {
+            s.sel = Some(i);
+            let (_, w_sel) = s.stats_widget();
+            assert_eq!(w_sel, w_plain, "width changed when segment {i} selected");
+        }
     }
 }
