@@ -51,7 +51,7 @@ ci: fmt-check lint build build-plugins test smoke nix-build
 # Comprehensive linting: rust (clippy), bash (shellcheck), yaml (yamllint), toml (taplo).
 lint: check-theme
     cargo clippy --all-targets -- -D warnings
-    shellcheck -x install.sh test/smoke.sh
+    shellcheck -x install.sh test/smoke.sh test/gen-fixture.sh test/perf.sh test/one-session.sh test/slug-unique.sh
     yamllint .
     taplo lint
 
@@ -140,6 +140,39 @@ start-term name="dev": build build-plugins
       "SUPERZEJ_CONFIG=$PWD/config/zellij.kdl" \
       "SUPERZEJ_FRESH=1" \
       "$PWD/target/debug/superzej"
+
+# --- stress fixture -------------------------------------------------------
+
+# Generate a heavy, FULLY ISOLATED stress instance (~/.superzej-{{name}}): 20
+# repos with random histories + 3-20 worktrees each (random ahead/behind/dirty),
+# plus layout-stress.kdl pre-opening {{tabs}} worktree tabs. Idempotent; never
+# touches your daily-driver superzej. See test/gen-fixture.sh.
+stress-gen name="stress" repos="20" tabs="100": build
+    ./test/gen-fixture.sh {{name}} {{repos}} {{tabs}}
+
+# Launch the dev-tui against the stress instance in a fresh ghostty window
+# (generates it first if missing). Same isolation as `start-term`, but reads the
+# instance's own config + the generated heavy layout so the sidebar/tabbar are
+# stressed by 20 repos and many open worktree tabs at once.
+stress name="stress": build build-plugins
+    [ -d "$HOME/.superzej-{{name}}/state" ] || ./test/gen-fixture.sh {{name}}
+    -find "$HOME/.superzej-{{name}}/cache" -type d -name '*.wasm' -prune -exec rm -rf {} + 2>/dev/null
+    setsid -f ghostty -e env \
+      -u ZELLIJ -u ZELLIJ_SESSION_NAME -u ZELLIJ_PANE_ID \
+      "PATH=$PWD/target/debug:$PATH" \
+      "SUPERZEJ_ZELLIJ_BIN=$(nix build --no-link --print-out-paths .#zellij)/bin/zellij" \
+      "SUPERZEJ_DIR=$HOME/.superzej-{{name}}" \
+      "XDG_STATE_HOME=$HOME/.superzej-{{name}}/state" \
+      "XDG_CONFIG_HOME=$HOME/.superzej-{{name}}/config" \
+      "SUPERZEJ_LAYOUT=$HOME/.superzej-{{name}}/layout-stress.kdl" \
+      "SUPERZEJ_CONFIG=$PWD/config/zellij.kdl" \
+      "SUPERZEJ_FRESH=1" \
+      "$PWD/target/debug/superzej" new-workspace "$HOME/.superzej-{{name}}/fixtures/repos/east/washu"
+
+# Perf regression check against the stress instance (asserts the `workspaces`
+# sidebar feed stays fast). Run `just stress-gen` first.
+perf name="stress": release
+    ./test/perf.sh {{name}}
 
 # Install/update the latest superzej onto your PATH (standalone, non-Nix):
 # builds a release binary + WASM plugins and symlinks `superzej`/`sj`, the
