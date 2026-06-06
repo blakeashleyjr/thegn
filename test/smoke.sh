@@ -10,8 +10,8 @@ SZ="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/debug/superzej}
 # Resolve to an absolute path — the test cd's into a temp repo before running it.
 SZ="$(cd "$(dirname "$SZ")" && pwd)/$(basename "$SZ")"
 [[ -x $SZ ]] || {
-	echo "not executable: $SZ (run: cargo build)" >&2
-	exit 1
+  echo "not executable: $SZ (run: cargo build)" >&2
+  exit 1
 }
 
 TMP="$(mktemp -d)"
@@ -33,16 +33,16 @@ EOF
 fail=0
 ok() { printf '  \033[32mok\033[0m   %s\n' "$1"; }
 bad() {
-	printf '  \033[31mFAIL\033[0m %s\n' "$1"
-	fail=1
+  printf '  \033[31mFAIL\033[0m %s\n' "$1"
+  fail=1
 }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 
 # Two repos under the scan root, plus one outside it.
 mkdir -p "$TMP/code"
 for n in alpha beta; do
-	git init -q "$TMP/code/$n"
-	git -C "$TMP/code/$n" commit -q --allow-empty -m init
+  git init -q "$TMP/code/$n"
+  git -C "$TMP/code/$n" commit -q --allow-empty -m init
 done
 R="$TMP/repo" # this one is OUTSIDE SZ_REPO_ROOTS
 git init -q "$R"
@@ -55,29 +55,29 @@ echo "superzej smoke test"
 # Directory-agnostic repo discovery: finds the two repos under the scan root,
 # and not the one outside it — regardless of $PWD.
 check "repos discovers repos under SZ_REPO_ROOTS" \
-	"[[ \$('$SZ' repos | wc -l) -eq 2 ]]"
+  "[[ \$('$SZ' repos | wc -l) -eq 2 ]]"
 check "discovery is scoped to SZ_REPO_ROOTS (excludes outside repos)" \
-	"! '$SZ' repos | grep -q '/repo$'"
+  "! '$SZ' repos | grep -q '/repo$'"
 
 # Explicit path avoids the interactive picker (no tty in the test).
 "$SZ" new-workspace "$R" >/dev/null 2>&1
 check "new-workspace records repo in history (recents)" \
-	"'$SZ' recent | grep -qx '$R'"
+  "'$SZ' recent | grep -qx '$R'"
 # Open another so recents ordering is exercised; most-recent first.
 "$SZ" new-workspace "$TMP/code/alpha" >/dev/null 2>&1
 check "most-recently-opened repo is first in recents" \
-	"[[ \$('$SZ' recent | head -1) == '$TMP/code/alpha' ]]"
+  "[[ \$('$SZ' recent | head -1) == '$TMP/code/alpha' ]]"
 
 "$SZ" new-worktree --name "demo feature" >/dev/null 2>&1
 "$SZ" new-worktree >/dev/null 2>&1
 check "worktrees created on disk" \
-	"[[ \$(git -C '$R' worktree list | grep -c sz-) -eq 2 ]]"
+  "[[ \$(git -C '$R' worktree list | grep -c sz-) -eq 2 ]]"
 
 # Collision suffixing: same human name twice -> sz/demo, sz/demo-1.
 "$SZ" new-worktree --name demo >/dev/null 2>&1
 "$SZ" new-worktree --name demo >/dev/null 2>&1
 check "branch collisions are suffixed (-1)" \
-	"git -C '$R' show-ref --verify --quiet refs/heads/sz/demo-1"
+  "git -C '$R' show-ref --verify --quiet refs/heads/sz/demo-1"
 
 # Dirty / ahead counts surface in list --json.
 WT="$("$SZ" list --json | jq -r '[.[] | select(.branch=="sz/demo-feature")][0].path')"
@@ -95,36 +95,36 @@ check "dirty count is correct (1)" "[[ '$DIRTY' -eq 1 ]]"
 # tabs are named `{repo_slug}/{branch}` (repo basename is "repo" -> slug "repo").
 RESOLVED="$("$SZ" resolve-worktree --session default --tab repo/sz-demo-feature)"
 check "resolve-worktree maps (session,tab) -> path" \
-	"[[ -n '$RESOLVED' && '$RESOLVED' == \"$WT\" ]]"
+  "[[ -n '$RESOLVED' && '$RESOLVED' == \"$WT\" ]]"
 
 # The data-plane commands degrade gracefully on a repo with no remote / no gh PR
 # (must exit 0 so the panel never sees a crash).
 check "pr status degrades gracefully (exit 0)" \
-	"'$SZ' pr status --worktree '$WT' >/dev/null 2>&1"
+  "'$SZ' pr status --worktree '$WT' >/dev/null 2>&1"
 check "pr status --json emits a kind tag" \
-	"'$SZ' pr status --worktree '$WT' --json | jq -e '.kind' >/dev/null"
+  "'$SZ' pr status --worktree '$WT' --json | jq -e '.kind' >/dev/null"
 check "diff emits without error" \
-	"'$SZ' diff --worktree '$WT' --base main >/dev/null 2>&1"
+  "'$SZ' diff --worktree '$WT' --base main >/dev/null 2>&1"
 
 # Theme + activity feeds for the plugins: a valid accent triple, and a complete
 # TSV that never errors (the sidebar tolerates an empty map but not a crash).
 check "theme prints an R;G;B accent" \
-	"'$SZ' theme | grep -Eq '^[0-9]+;[0-9]+;[0-9]+$'"
+  "'$SZ' theme | grep -Eq '^[0-9]+;[0-9]+;[0-9]+$'"
 check "activity exits 0 and is well-formed" \
-	"'$SZ' activity >/dev/null 2>&1"
+  "'$SZ' activity >/dev/null 2>&1"
 
 # Removal keeps the branch, drops the worktree, reconciles state.
 SUPERZEJ_WORKTREE="$WT" "$SZ" close-worktree --force >/dev/null 2>&1
 check "worktree removed" "[[ ! -d '$WT' ]]"
 check "branch kept after removal" \
-	"git -C '$R' show-ref --verify --quiet refs/heads/sz/demo-feature"
+  "git -C '$R' show-ref --verify --quiet refs/heads/sz/demo-feature"
 check "removed worktree gone from list" \
-	"[[ \$('$SZ' list --json | jq -r '[.[] | select(.branch==\"sz/demo-feature\")] | length') -eq 0 ]]"
+  "[[ \$('$SZ' list --json | jq -r '[.[] | select(.branch==\"sz/demo-feature\")] | length') -eq 0 ]]"
 
 echo
 if [[ $fail -eq 0 ]]; then
-	printf '\033[32mall smoke checks passed\033[0m\n'
+  printf '\033[32mall smoke checks passed\033[0m\n'
 else
-	printf '\033[31msmoke test FAILED\033[0m\n'
-	exit 1
+  printf '\033[31msmoke test FAILED\033[0m\n'
+  exit 1
 fi
