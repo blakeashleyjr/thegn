@@ -18,6 +18,15 @@ use cli::{Cli, Command};
 use config::Config;
 
 fn main() {
+    // Rust installs SIG_IGN for SIGPIPE at startup, so writing to a closed pipe
+    // (e.g. `superzej worktrees | head`) surfaces as an EPIPE that `println!`
+    // unwraps into a panic. Restore the default disposition so we exit quietly
+    // like a normal Unix tool. Safe: single-threaded, before any output.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let args = Cli::parse();
     let cfg = Config::load();
     picker::set_accent(&cfg.accent_hex());

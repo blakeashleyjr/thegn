@@ -32,6 +32,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # to depend on unconditionally — `Nvml::init()` simply errors on machines
 # without it, and we fall back to the OS-native GPU counter (see stats.rs).
 nvml-wrapper = "0.12"
+# Already vendored transitively (via sysinfo); used only to restore the default
+# SIGPIPE disposition at startup so `superzej … | head` exits quietly.
+libc = "0.2"
 
 [profile.release]
 strip = true
