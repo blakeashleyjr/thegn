@@ -71,6 +71,7 @@ fn main() {
             worktree,
             file,
         } => commands::tool::run(&cfg, &name, worktree, file),
+        Command::Monitor { kind } => commands::monitor::run(&cfg, &kind),
         Command::Dashboard { watch, inner } => commands::dashboard::run(&cfg, watch, inner),
         Command::CloseWorktree {
             delete_branch,

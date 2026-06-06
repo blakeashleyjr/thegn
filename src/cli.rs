@@ -115,6 +115,9 @@ pub enum Command {
         #[arg(long)]
         file: Option<String>,
     },
+    /// (internal) Open a resource monitor for a top-bar stat, embedded as a
+    /// tiled pane. `kind` is `cpu`/`mem` (system monitor) or `gpu` (nvtop).
+    Monitor { kind: String },
     /// Worktree dashboard (floating switcher, or pinnable --watch pane).
     Dashboard {
         #[arg(long)]

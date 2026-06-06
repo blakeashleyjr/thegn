@@ -42,6 +42,11 @@ struct State {
     sidebar: Surface,
     panel: Surface,
     term_cols: usize, // last width seen in render (the statusbar spans full width)
+    // Bottom-bar selection (Super+Alt+Down focuses this pane). Highlight-only
+    // for now — Enter is reserved for a future action. Esc / moving focus away
+    // clears it. `center_id` is the terminal to hand focus back to on Esc.
+    selected: bool,
+    center_id: Option<u32>,
 }
 
 /// Tracked visibility of one controlled chrome surface.
@@ -69,9 +74,12 @@ impl ZellijPlugin for State {
             EventType::ModeUpdate,
             EventType::TabUpdate,
             EventType::PaneUpdate,
+            EventType::Key,
             EventType::RunCommandResult,
             EventType::PermissionRequestResult,
         ]);
+        // Selectable so Super+Alt+Down can focus the bottom bar and route keys.
+        set_selectable(true);
         fetch_theme();
         // Restore any persisted manual-hide (a toggle may have hidden a surface
         // before this per-tab statusbar loaded). Replies tagged vis_sidebar/vis_panel.
@@ -153,6 +161,7 @@ impl ZellijPlugin for State {
                 }
                 false
             }
+            Event::Key(key) => self.on_key(key),
             _ => false,
         }
     }
@@ -191,6 +200,18 @@ impl ZellijPlugin for State {
                     self.persist("panel", true);
                 }
             }
+            // Super+Alt+Down: select the bottom bar. Broadcast hits every per-tab
+            // instance; only the active tab's responds (else focus_plugin_pane
+            // would teleport to a background tab). Highlight-only for now.
+            "superzej_select_bottombar" => {
+                if self.my_tab.is_some() && self.my_tab == self.active_tab {
+                    self.selected = true;
+                    if let Some(id) = self.my_id {
+                        focus_plugin_pane(id, false, false);
+                    }
+                    return true;
+                }
+            }
             _ => {}
         }
         false
@@ -207,6 +228,17 @@ impl ZellijPlugin for State {
         let mut out = String::new();
         out.push_str(&format!("\u{1b}[48;2;{BG1}m")); // bar background
         let mut col = 0usize;
+
+        // Bottom-bar selected (Super+Alt+Down): a leading accent block as a cue.
+        if self.selected {
+            push_raw(
+                &mut out,
+                &mut col,
+                cols,
+                &format!("\u{1b}[1m\u{1b}[38;2;{accent}m\u{2590}\u{1b}[0m\u{1b}[48;2;{BG1}m"),
+                1,
+            );
+        }
 
         // A mode indicator chip on the left when not in Normal mode.
         if mode != InputMode::Normal {
@@ -277,6 +309,21 @@ fn parse_rgb_line(stdout: &[u8]) -> Option<String> {
 }
 
 impl State {
+    fn on_key(&mut self, key: KeyWithModifier) -> bool {
+        // Reserved: Enter has no action yet. Esc (or moving focus away) drops the
+        // selection and hands focus back to the center terminal.
+        match key.bare_key {
+            BareKey::Esc => {
+                self.selected = false;
+                if let Some(id) = self.center_id {
+                    focus_terminal_pane(id, false, false);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Discover the sidebar/panel pane ids in this tab and sync their live
     /// suppression from the manifest. The width-driven auto-hide is decided in
     /// `render` (zellij fires render on every resize but only sometimes a
@@ -294,7 +341,24 @@ impl State {
             return;
         };
         self.my_tab = Some(*tab_pos);
+        // Drop the bottom-bar selection once focus leaves this pane.
+        if self.selected
+            && !panes
+                .iter()
+                .any(|p| p.is_plugin && p.id == me && p.is_focused)
+        {
+            self.selected = false;
+        }
         for p in panes {
+            // The center terminal to hand focus back to on Esc: the focused one,
+            // else the first (kept across our own focus grab).
+            if !p.is_plugin
+                && !p.is_floating
+                && !p.is_suppressed
+                && (p.is_focused || self.center_id.is_none())
+            {
+                self.center_id = Some(p.id);
+            }
             if !p.is_plugin {
                 continue;
             }

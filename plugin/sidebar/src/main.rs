@@ -47,11 +47,9 @@ struct State {
     hover: Option<usize>,
     cursor: Option<usize>,
     my_id: Option<u32>,
-    my_tab: Option<usize>, // tab position this instance lives on (manifest key)
-    active_tab: Option<usize>, // the currently-focused tab (from TabUpdate)
-                           // Visibility is owned by the statusbar controller (the only chrome surface
-                           // that is never hidden and can re-tile the others). The sidebar just renders
-                           // and switches tabs; it no longer hides/shows itself.
+    // Visibility is owned by the statusbar controller (the only chrome surface
+    // that is never hidden and can re-tile the others). The sidebar just renders
+    // and switches tabs; it no longer hides/shows itself.
 }
 
 /// A managed repo as reported by `superzej workspaces` (slug, name, path).
@@ -159,7 +157,6 @@ impl ZellijPlugin for State {
             }
             Event::TabUpdate(tabs) => {
                 self.active_repo = tabs.iter().find(|t| t.active).map(|t| split_tab(&t.name).0);
-                self.active_tab = tabs.iter().find(|t| t.active).map(|t| t.position);
                 self.tabs = tabs
                     .into_iter()
                     .map(|t| {
@@ -239,16 +236,9 @@ impl ZellijPlugin for State {
                 self.pull_repos();
                 false
             }
-            // Super+Alt+j/k/↓/↑ move the selection in the tree (highlight only;
-            // Enter/click still opens). The keybind broadcasts to every tab's
-            // sidebar instance, so only the one on the active tab responds —
-            // otherwise off-screen instances would drift their cursors too.
-            "superzej_nav_down" | "superzej_nav_up" => {
-                if self.my_tab.is_none() || self.my_tab != self.active_tab {
-                    return false;
-                }
-                self.move_cursor(pipe.name.ends_with("down"))
-            }
+            // The tree cursor is moved with plain j/k/↑/↓ once the sidebar pane
+            // is focused (see on_key) — Super+Alt+Up/Down now select the top /
+            // bottom chrome bars, so there's no broadcast nav pipe here anymore.
             _ => false,
         }
     }
@@ -512,11 +502,10 @@ impl State {
     fn refresh_focus(&mut self, manifest: &PaneManifest) -> bool {
         let Some(id) = self.my_id else { return false };
         let mut focused = false;
-        for (tab_pos, panes) in &manifest.panes {
+        for panes in manifest.panes.values() {
             if !panes.iter().any(|p| p.is_plugin && p.id == id) {
                 continue; // another tab's panes
             }
-            self.my_tab = Some(*tab_pos); // which tab this sidebar instance is on
             for p in panes {
                 if p.is_plugin && p.id == id {
                     focused = p.is_focused;

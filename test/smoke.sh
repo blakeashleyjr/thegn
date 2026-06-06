@@ -113,6 +113,18 @@ check "theme prints an R;G;B accent" \
 check "activity exits 0 and is well-formed" \
   "'$SZ' activity >/dev/null 2>&1"
 
+# Resource-monitor command resolution (top-bar stats -> embedded monitor):
+# cpu/mem map to the system monitor, gpu to the gpu monitor. Not in a zellij
+# session here, so each reports the command it would embed instead of spawning.
+check "monitor cpu -> system monitor (default btm)" \
+  "'$SZ' monitor cpu 2>&1 | grep -q btm"
+check "monitor mem -> system monitor (default btm)" \
+  "'$SZ' monitor mem 2>&1 | grep -q btm"
+check "monitor gpu -> gpu monitor (default nvtop)" \
+  "'$SZ' monitor gpu 2>&1 | grep -q nvtop"
+check "monitor rejects an unknown stat (exit non-zero)" \
+  "! '$SZ' monitor bogus >/dev/null 2>&1"
+
 # Removal keeps the branch, drops the worktree, reconciles state.
 SUPERZEJ_WORKTREE="$WT" "$SZ" close-worktree --force >/dev/null 2>&1
 check "worktree removed" "[[ ! -d '$WT' ]]"
