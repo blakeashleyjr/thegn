@@ -6,6 +6,7 @@ mod diff_highlight;
 mod github;
 mod models;
 mod msg;
+mod palette;
 mod picker;
 mod remote;
 mod repo;

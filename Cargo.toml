@@ -41,6 +41,27 @@ libc = "0.2"
 # refresh). Pure Rust; uses the OS-native backend (inotify on Linux).
 notify = "6"
 
+# --- cmd+k command palette (`superzej menu`) ---
+# iocraft: React-like declarative TUI (flexbox via taffy, components + hooks);
+# drives the full-screen palette. smol is its async runtime (render loop +
+# `smol::Timer` poll ticks).
+iocraft = "0.8.3"
+smol = "2.0.2"
+# nucleo: helix's fuzzy matcher — lock-free streaming over a background
+# threadpool, so matching never blocks the UI thread.
+nucleo = "0.5.0"
+# ripgrep's own internals as libraries: `ignore` for the parallel,
+# .gitignore-aware file walk; grep-searcher/regex for embedded content search.
+ignore = "0.4.26"
+grep-searcher = "0.1.16"
+grep-regex = "0.1.14"
+grep-matcher = "0.1.8"
+
+[dev-dependencies]
+# Stream combinators for the palette's in-process mock-terminal e2e tests
+# (iocraft's `mock_terminal_render_loop` yields a `Stream<Canvas>`).
+futures = "0.3"
+
 [profile.release]
 strip = true
 lto = "thin"
