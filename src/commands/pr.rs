@@ -9,9 +9,9 @@ use crate::cli::PrAction;
 use crate::commands::{confirm, panels, resolve_worktree};
 use crate::db::Db;
 use crate::github::{self, CreateOpts, PanelState, PrPanel};
+use crate::remote::GitLoc;
 use crate::{msg, util, zellij};
 use anyhow::Result;
-use std::path::Path;
 
 fn ttl() -> i64 {
     std::env::var("SZ_PR_TTL")
@@ -52,8 +52,8 @@ pub fn run(action: PrAction) -> Result<()> {
 
 /// The panel JSON, served from cache when fresh (unless `refresh`); otherwise a
 /// live `gh` fetch written back to the cache.
-fn fetch_json(wt: &Path, refresh: bool) -> String {
-    let wt_s = wt.to_string_lossy().into_owned();
+fn fetch_json(loc: &GitLoc, refresh: bool) -> String {
+    let wt_s = loc.path();
     if !refresh {
         if let Ok(db) = Db::open() {
             if let Ok(Some((json, fetched_at))) = db.get_pr_cache(&wt_s) {
@@ -63,7 +63,7 @@ fn fetch_json(wt: &Path, refresh: bool) -> String {
             }
         }
     }
-    let panel = github::pr_status(wt);
+    let panel = github::pr_status(loc);
     let json = serde_json::to_string(&panel).unwrap_or_default();
     if let Ok(db) = Db::open() {
         let _ = db.put_pr_cache(&wt_s, &panel.branch, &json);
@@ -72,16 +72,16 @@ fn fetch_json(wt: &Path, refresh: bool) -> String {
 }
 
 fn status(worktree: Option<String>, json: bool, refresh: bool) -> Result<()> {
-    let wt = resolve_worktree(worktree);
+    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
     if json {
         // Cache-served fast path for the plugin.
-        println!("{}", fetch_json(&wt, refresh));
+        println!("{}", fetch_json(&loc, refresh));
     } else {
         // Always show a fresh human summary on the CLI.
-        let panel = github::pr_status(&wt);
+        let panel = github::pr_status(&loc);
         let json = serde_json::to_string(&panel).unwrap_or_default();
         if let Ok(db) = Db::open() {
-            let _ = db.put_pr_cache(&wt.to_string_lossy(), &panel.branch, &json);
+            let _ = db.put_pr_cache(&loc.path(), &panel.branch, &json);
         }
         print_summary(&panel);
     }
@@ -114,15 +114,15 @@ fn print_summary(p: &PrPanel) {
 }
 
 fn watch(worktree: Option<String>, interval: u64) -> Result<()> {
-    let wt = resolve_worktree(worktree);
+    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
     let url = panels::plugin_url("panel.wasm");
     let base = interval.max(1);
     let mut delay = base;
     loop {
-        let panel = github::pr_status(&wt);
+        let panel = github::pr_status(&loc);
         let json = serde_json::to_string(&panel).unwrap_or_default();
         if let Ok(db) = Db::open() {
-            let _ = db.put_pr_cache(&wt.to_string_lossy(), &panel.branch, &json);
+            let _ = db.put_pr_cache(&loc.path(), &panel.branch, &json);
         }
         if zellij::in_zellij() {
             zellij::pipe_plugin(&url, "superzej_pr", &json);
@@ -146,7 +146,7 @@ fn create(
     web: bool,
     fill: bool,
 ) -> Result<()> {
-    let wt = resolve_worktree(worktree);
+    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
     // Default to --fill when nothing else was specified, so the action is usable
     // from a keybind without prompting.
     let fill = fill || (title.is_none() && body.is_none() && !web);
@@ -158,7 +158,7 @@ fn create(
         web,
         fill,
     };
-    match github::create_pr(&wt, &opts) {
+    match github::create_pr(&loc, &opts) {
         Ok(out) => {
             if !out.is_empty() {
                 println!("{out}");
@@ -171,16 +171,16 @@ fn create(
 }
 
 fn open(worktree: Option<String>) -> Result<()> {
-    let wt = resolve_worktree(worktree);
-    if let Err(e) = github::open_pr(&wt) {
+    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    if let Err(e) = github::open_pr(&loc) {
         msg::die(&format!("pr open failed: {}", github::describe(&e)));
     }
     Ok(())
 }
 
 fn approve(worktree: Option<String>, body: Option<String>) -> Result<()> {
-    let wt = resolve_worktree(worktree);
-    match github::approve_pr(&wt, body.as_deref()) {
+    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    match github::approve_pr(&loc, body.as_deref()) {
         Ok(()) => msg::info("PR approved"),
         Err(e) => msg::die(&format!("pr approve failed: {}", github::describe(&e))),
     }
@@ -193,12 +193,12 @@ fn merge(
     delete_branch: bool,
     auto: bool,
 ) -> Result<()> {
-    let wt = resolve_worktree(worktree);
+    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
     if !confirm(&format!("Merge this PR ({method:?})?")) {
         msg::info("cancelled");
         return Ok(());
     }
-    match github::merge_pr(&wt, method, delete_branch, auto) {
+    match github::merge_pr(&loc, method, delete_branch, auto) {
         Ok(()) => msg::info("PR merged"),
         Err(e) => msg::die(&format!("pr merge failed: {}", github::describe(&e))),
     }
@@ -206,8 +206,8 @@ fn merge(
 }
 
 fn rerun(worktree: Option<String>) -> Result<()> {
-    let wt = resolve_worktree(worktree);
-    match github::rerun_failed_checks(&wt) {
+    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    match github::rerun_failed_checks(&loc) {
         Ok(0) => msg::info("no failed checks to re-run"),
         Ok(n) => msg::info(&format!("re-ran {n} failed workflow run(s)")),
         Err(e) => msg::die(&format!("pr rerun-checks failed: {}", github::describe(&e))),
@@ -216,8 +216,8 @@ fn rerun(worktree: Option<String>) -> Result<()> {
 }
 
 fn reviews(worktree: Option<String>) -> Result<()> {
-    let wt = resolve_worktree(worktree);
-    match github::reviews(&wt) {
+    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    match github::reviews(&loc) {
         Ok(json) => println!("{json}"),
         Err(e) => msg::die(&format!("pr reviews failed: {}", github::describe(&e))),
     }

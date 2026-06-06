@@ -73,7 +73,7 @@ fn dispatch(cfg: &Config, key: &str) -> Result<()> {
         "yazi" => commands::tool::run(cfg, "yazi", None, None),
         "editor" => commands::tool::run(cfg, "editor", None, None),
         "diff" => commands::tool::run(cfg, "diff", None, None),
-        "close-worktree" => commands::close_worktree::run(false, false),
+        "close-worktree" => commands::close_worktree::run(cfg, false, false),
         "pr-open" => commands::pr::run(PrAction::Open { worktree: None }),
         "pr-create" => commands::pr::run(PrAction::Create {
             worktree: None,

@@ -29,6 +29,186 @@ impl Default for ThemeConfig {
     }
 }
 
+/// `[sandbox.remote]` — optionally run a worktree on a remote machine. Empty
+/// `host` means local (the default); set it (e.g. `user@devbox`) to enable.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RemoteConfig {
+    pub host: String, // "" => local
+    pub port: u16,
+    pub transport: String,   // "mosh" (preferred interactive) | "ssh"
+    pub mode: String,        // "remote" | "local_exec" | "sshfs"
+    pub remote_dir: String,  // where remote worktrees live (mode=remote)
+    pub forward_agent: bool, // ssh -A so remote git push uses the host agent
+}
+
+impl Default for RemoteConfig {
+    fn default() -> Self {
+        RemoteConfig {
+            host: String::new(),
+            port: 22,
+            transport: "mosh".into(),
+            mode: "remote".into(),
+            remote_dir: "~/superzej-worktrees".into(),
+            forward_agent: true,
+        }
+    }
+}
+
+impl RemoteConfig {
+    /// Whether a remote host is configured (otherwise everything is local).
+    pub fn is_remote(&self) -> bool {
+        !self.host.trim().is_empty()
+    }
+}
+
+/// `[sandbox]` — containerize/sandbox a worktree's interactive process. On by
+/// default; `backend = "auto"` walks `backend_chain` and falls back to the host
+/// shell (with a warning) when nothing is available.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SandboxConfig {
+    pub enabled: bool,
+    pub backend: String, // auto|podman|docker|bwrap|systemd|apple|wsl|none
+    pub backend_chain: Vec<String>, // auto detection order; "none" = host fallback
+    pub image: String,   // "" => host-toolchain mode
+    pub network: String, // nat|host|none
+    pub env_passthrough: Vec<String>,
+    pub mounts: Vec<String>, // extra binds ("host:dest" or "host"); ":ro" suffix allowed
+    pub init_script: String, // runs inside before the agent/shell
+    pub devenv: bool,        // wrap inner cmd with `devenv shell --`
+    pub on_missing: String,  // warn|prompt|fail
+    pub remote: RemoteConfig,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        SandboxConfig {
+            enabled: true,
+            backend: "auto".into(),
+            backend_chain: ["podman", "docker", "bwrap", "none"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            image: String::new(),
+            network: "nat".into(),
+            env_passthrough: [
+                "SSH_AUTH_SOCK",
+                "GH_TOKEN",
+                "GITHUB_TOKEN",
+                "ANTHROPIC_API_KEY",
+                "TERM",
+                "COLORTERM",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+            mounts: vec!["~/.gitconfig:ro".into()],
+            init_script: String::new(),
+            devenv: false,
+            on_missing: "warn".into(),
+            remote: RemoteConfig::default(),
+        }
+    }
+}
+
+/// Partial overlay deserialized from a repo-root `.superzej.{toml,yaml,yml,json}`
+/// — only the keys present override the global `[sandbox]`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct SandboxOverlay {
+    pub enabled: Option<bool>,
+    pub backend: Option<String>,
+    pub backend_chain: Option<Vec<String>>,
+    pub image: Option<String>,
+    pub network: Option<String>,
+    pub env_passthrough: Option<Vec<String>>,
+    pub mounts: Option<Vec<String>>,
+    pub init_script: Option<String>,
+    pub devenv: Option<bool>,
+    pub on_missing: Option<String>,
+    pub remote: Option<RemoteOverlay>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct RemoteOverlay {
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub transport: Option<String>,
+    pub mode: Option<String>,
+    pub remote_dir: Option<String>,
+    pub forward_agent: Option<bool>,
+}
+
+impl SandboxOverlay {
+    fn apply(self, base: &mut SandboxConfig) {
+        if let Some(v) = self.enabled {
+            base.enabled = v;
+        }
+        if let Some(v) = self.backend {
+            base.backend = v;
+        }
+        if let Some(v) = self.backend_chain {
+            base.backend_chain = v;
+        }
+        if let Some(v) = self.image {
+            base.image = v;
+        }
+        if let Some(v) = self.network {
+            base.network = v;
+        }
+        if let Some(v) = self.env_passthrough {
+            base.env_passthrough = v;
+        }
+        if let Some(v) = self.mounts {
+            base.mounts = v;
+        }
+        if let Some(v) = self.init_script {
+            base.init_script = v;
+        }
+        if let Some(v) = self.devenv {
+            base.devenv = v;
+        }
+        if let Some(v) = self.on_missing {
+            base.on_missing = v;
+        }
+        if let Some(r) = self.remote {
+            r.apply(&mut base.remote);
+        }
+    }
+}
+
+impl RemoteOverlay {
+    fn apply(self, base: &mut RemoteConfig) {
+        if let Some(v) = self.host {
+            base.host = v;
+        }
+        if let Some(v) = self.port {
+            base.port = v;
+        }
+        if let Some(v) = self.transport {
+            base.transport = v;
+        }
+        if let Some(v) = self.mode {
+            base.mode = v;
+        }
+        if let Some(v) = self.remote_dir {
+            base.remote_dir = v;
+        }
+        if let Some(v) = self.forward_agent {
+            base.forward_agent = v;
+        }
+    }
+}
+
+/// The shape of a repo-root `.superzej.*` file: a `[sandbox]` table overlay.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct RepoConfigFile {
+    sandbox: SandboxOverlay,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -45,6 +225,7 @@ pub struct Config {
     pub agents: Vec<NamedCommand>,
     pub tools: Vec<NamedCommand>,
     pub theme: ThemeConfig,
+    pub sandbox: SandboxConfig,
 }
 
 impl Default for Config {
@@ -69,6 +250,7 @@ impl Default for Config {
             agents: Vec::new(),
             tools: Vec::new(),
             theme: ThemeConfig::default(),
+            sandbox: SandboxConfig::default(),
         }
     }
 }
@@ -149,6 +331,27 @@ impl Config {
             .map(|t| t.command.as_str())
     }
 
+    /// The effective sandbox config for a worktree's repo: the global `[sandbox]`
+    /// with a repo-root `.superzej.{toml,yaml,yml,json}` overlay applied on top.
+    /// Tilde-expands path-bearing fields (mounts, remote_dir).
+    pub fn repo_sandbox(&self, repo_root: &std::path::Path) -> SandboxConfig {
+        let mut sb = self.sandbox.clone();
+        if let Some(overlay) = load_repo_overlay(repo_root) {
+            overlay.sandbox.apply(&mut sb);
+        }
+        sb.mounts = sb
+            .mounts
+            .iter()
+            .map(|m| match m.split_once(':') {
+                Some((host, opt)) => format!("{}:{opt}", util::expand_tilde(host)),
+                None => util::expand_tilde(m),
+            })
+            .collect();
+        // NB: remote.remote_dir is a *remote* path — its `~` is expanded on the
+        // remote host (see new_worktree::create_remote), not against the local HOME.
+        sb
+    }
+
     /// The accent as a truecolor "R;G;B" fragment; invalid hex falls back to
     /// the default teal.
     pub fn accent_rgb(&self) -> String {
@@ -162,6 +365,36 @@ impl Config {
             None => "#76eede".into(),
         }
     }
+}
+
+/// Load and parse a repo-root `.superzej.*` overlay, if present. Tries TOML,
+/// YAML, then JSON (first existing file wins); parse errors warn and are ignored
+/// so a malformed repo file never blocks opening a worktree.
+fn load_repo_overlay(repo_root: &std::path::Path) -> Option<RepoConfigFile> {
+    for (ext, kind) in [
+        ("toml", "toml"),
+        ("yaml", "yaml"),
+        ("yml", "yaml"),
+        ("json", "json"),
+    ] {
+        let path = repo_root.join(format!(".superzej.{ext}"));
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let parsed: Result<RepoConfigFile, String> = match kind {
+            "toml" => toml::from_str(&text).map_err(|e| e.to_string()),
+            "yaml" => serde_yaml::from_str(&text).map_err(|e| e.to_string()),
+            _ => serde_json::from_str(&text).map_err(|e| e.to_string()),
+        };
+        return match parsed {
+            Ok(cfg) => Some(cfg),
+            Err(e) => {
+                crate::msg::warn(&format!("{}: parse error: {e}; ignoring", path.display()));
+                None
+            }
+        };
+    }
+    None
 }
 
 /// "#rrggbb" / "#rgb" -> "R;G;B".
@@ -179,4 +412,62 @@ fn parse_hex_rgb(hex: &str) -> Option<String> {
         (n >> 8) & 255,
         n & 255
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("sz-cfg-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    // The same overlay expressed in each format must produce identical results,
+    // and only the present keys override the global defaults.
+    #[test]
+    fn repo_overlay_all_three_formats_agree() {
+        let cfg = Config::default();
+        let cases = [
+            (
+                "toml",
+                ".superzej.toml",
+                "[sandbox]\nimage = \"img:1\"\ninit_script = \"echo hi\"\n[sandbox.remote]\nhost = \"user@box\"\n",
+            ),
+            (
+                "yaml",
+                ".superzej.yaml",
+                "sandbox:\n  image: img:1\n  init_script: echo hi\n  remote:\n    host: user@box\n",
+            ),
+            (
+                "json",
+                ".superzej.json",
+                "{\"sandbox\":{\"image\":\"img:1\",\"init_script\":\"echo hi\",\"remote\":{\"host\":\"user@box\"}}}",
+            ),
+        ];
+        for (tag, file, body) in cases {
+            let dir = tmpdir(tag);
+            std::fs::write(dir.join(file), body).unwrap();
+            let sb = cfg.repo_sandbox(&dir);
+            assert_eq!(sb.image, "img:1", "{tag}: image overridden");
+            assert_eq!(sb.init_script, "echo hi", "{tag}: init overridden");
+            assert_eq!(sb.remote.host, "user@box", "{tag}: remote host overridden");
+            // Untouched keys keep their defaults.
+            assert!(sb.enabled, "{tag}: enabled keeps default");
+            assert_eq!(sb.backend, "auto", "{tag}: backend keeps default");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn no_repo_file_yields_global() {
+        let cfg = Config::default();
+        let dir = tmpdir("none");
+        let sb = cfg.repo_sandbox(&dir);
+        assert_eq!(sb.image, ""); // global default (host-toolchain)
+        assert!(!sb.remote.is_remote());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

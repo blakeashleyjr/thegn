@@ -6,10 +6,8 @@
 //! remote (mirrors how `util::git_out` uses `-C dir`). All failure modes the
 //! panel cares about are mapped onto `PanelState` so the UI never crashes.
 
-use crate::util;
+use crate::remote::GitLoc;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
-use std::process::Command;
 
 /// Distinguishable `gh` failure modes.
 #[derive(Debug)]
@@ -39,15 +37,11 @@ impl MergeMethod {
     }
 }
 
-/// Run `gh <args>` with `cwd = dir`; trimmed stdout on success, else a
-/// classified error.
-pub fn gh_out(dir: &Path, args: &[&str]) -> Result<String, GhError> {
-    if !util::have("gh") {
-        return Err(GhError::NotInstalled);
-    }
-    let out = Command::new("gh")
-        .current_dir(dir)
-        .args(args)
+/// Run `gh <args>` with `cwd = worktree` (local, or over ssh on the remote host);
+/// trimmed stdout on success, else a classified error.
+pub fn gh_out(loc: &GitLoc, args: &[&str]) -> Result<String, GhError> {
+    let out = loc
+        .gh_command(args)
         .output()
         .map_err(|e| GhError::Other(e.to_string()))?;
     if out.status.success() {
@@ -59,13 +53,9 @@ pub fn gh_out(dir: &Path, args: &[&str]) -> Result<String, GhError> {
 }
 
 /// Run `gh <args>` for its exit code (output discarded). Errors classified.
-pub fn gh_run(dir: &Path, args: &[&str]) -> Result<(), GhError> {
-    if !util::have("gh") {
-        return Err(GhError::NotInstalled);
-    }
-    let out = Command::new("gh")
-        .current_dir(dir)
-        .args(args)
+pub fn gh_run(loc: &GitLoc, args: &[&str]) -> Result<(), GhError> {
+    let out = loc
+        .gh_command(args)
         .output()
         .map_err(|e| GhError::Other(e.to_string()))?;
     if out.status.success() {
@@ -78,7 +68,12 @@ pub fn gh_run(dir: &Path, args: &[&str]) -> Result<(), GhError> {
 }
 
 fn classify(stderr: &str) -> GhError {
-    if stderr.contains("no pull requests found")
+    if stderr.contains("command not found")
+        || stderr.contains("not found")
+        || stderr.contains("no such file")
+    {
+        GhError::NotInstalled
+    } else if stderr.contains("no pull requests found")
         || stderr.contains("no default remote repository")
         || stderr.contains("no open pull request")
         || stderr.contains("no pr ")
@@ -229,10 +224,11 @@ const PR_FIELDS: &str = "number,title,state,url,isDraft,headRefName,baseRefName,
                          mergeable,mergeStateStatus,reviewDecision,statusCheckRollup";
 
 /// Fetch the PR state for a worktree, mapping every failure mode to a PanelState.
-pub fn pr_status(worktree: &Path) -> PrPanel {
-    let branch =
-        util::git_out(worktree, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default();
-    let state = match gh_out(worktree, &["pr", "view", "--json", PR_FIELDS]) {
+pub fn pr_status(loc: &GitLoc) -> PrPanel {
+    let branch = loc
+        .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
+        .unwrap_or_default();
+    let state = match gh_out(loc, &["pr", "view", "--json", PR_FIELDS]) {
         Ok(json) => match serde_json::from_str::<PrStatus>(&json) {
             Ok(mut pr) => {
                 pr.checks = summarize(&pr.status_check_rollup);
@@ -250,9 +246,9 @@ pub fn pr_status(worktree: &Path) -> PrPanel {
     };
     PrPanel {
         state,
-        worktree: worktree.to_string_lossy().into_owned(),
+        worktree: loc.path(),
         branch,
-        fetched_at: util::now(),
+        fetched_at: crate::util::now(),
     }
 }
 
@@ -268,7 +264,7 @@ pub struct CreateOpts {
     pub fill: bool,
 }
 
-pub fn create_pr(worktree: &Path, o: &CreateOpts) -> Result<String, GhError> {
+pub fn create_pr(loc: &GitLoc, o: &CreateOpts) -> Result<String, GhError> {
     let mut args: Vec<String> = vec!["pr".into(), "create".into()];
     if o.fill {
         args.push("--fill".into());
@@ -292,24 +288,24 @@ pub fn create_pr(worktree: &Path, o: &CreateOpts) -> Result<String, GhError> {
         args.push(b.clone());
     }
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    gh_out(worktree, &refs)
+    gh_out(loc, &refs)
 }
 
-pub fn open_pr(worktree: &Path) -> Result<(), GhError> {
-    gh_run(worktree, &["pr", "view", "--web"])
+pub fn open_pr(loc: &GitLoc) -> Result<(), GhError> {
+    gh_run(loc, &["pr", "view", "--web"])
 }
 
-pub fn approve_pr(worktree: &Path, body: Option<&str>) -> Result<(), GhError> {
+pub fn approve_pr(loc: &GitLoc, body: Option<&str>) -> Result<(), GhError> {
     let mut args = vec!["pr", "review", "--approve"];
     if let Some(b) = body {
         args.push("--body");
         args.push(b);
     }
-    gh_run(worktree, &args)
+    gh_run(loc, &args)
 }
 
 pub fn merge_pr(
-    worktree: &Path,
+    loc: &GitLoc,
     method: MergeMethod,
     delete_branch: bool,
     auto: bool,
@@ -321,24 +317,25 @@ pub fn merge_pr(
     if auto {
         args.push("--auto");
     }
-    gh_run(worktree, &args)
+    gh_run(loc, &args)
 }
 
 /// Print review comments / reviews as JSON.
-pub fn reviews(worktree: &Path) -> Result<String, GhError> {
+pub fn reviews(loc: &GitLoc) -> Result<String, GhError> {
     gh_out(
-        worktree,
+        loc,
         &["pr", "view", "--json", "reviews,latestReviews,comments"],
     )
 }
 
 /// Re-run failed workflow runs for the worktree's branch. Returns the count.
-pub fn rerun_failed_checks(worktree: &Path) -> Result<u32, GhError> {
-    let branch = util::git_out(worktree, &["rev-parse", "--abbrev-ref", "HEAD"])
+pub fn rerun_failed_checks(loc: &GitLoc) -> Result<u32, GhError> {
+    let branch = loc
+        .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
         .ok_or_else(|| GhError::Other("could not resolve branch".into()))?;
     // Enumerate this branch's workflow runs and re-run any that failed.
     let json = gh_out(
-        worktree,
+        loc,
         &[
             "run",
             "list",
@@ -364,7 +361,7 @@ pub fn rerun_failed_checks(worktree: &Path) -> Result<u32, GhError> {
             Some("FAILURE") | Some("TIMED_OUT") | Some("CANCELLED") | Some("STARTUP_FAILURE")
         ) {
             let id = r.database_id.to_string();
-            if gh_run(worktree, &["run", "rerun", &id, "--failed"]).is_ok() {
+            if gh_run(loc, &["run", "rerun", &id, "--failed"]).is_ok() {
                 count += 1;
             }
         }
