@@ -11,7 +11,7 @@ pub fn run(session: Option<String>, tab: Option<String>) -> Result<()> {
         return Ok(());
     };
     if let Some(path) = resolve_tab_worktree(&session, &tab) {
-        println!("{path}");
+        crate::outln!("{path}");
     }
     Ok(())
 }

@@ -45,3 +45,51 @@ pub struct WorktreeView {
     pub created_at: i64,
     pub exists: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rows_construct_and_serialize() {
+        let ws = WorkspaceRow {
+            repo_path: "/r".into(),
+            name: "r".into(),
+            created_at: 1,
+            last_active: 2,
+        };
+        assert!(
+            serde_json::to_string(&ws)
+                .unwrap()
+                .contains("\"repo_path\":\"/r\"")
+        );
+
+        let v = WorktreeView {
+            workspace: "w".into(),
+            repo: "/r".into(),
+            path: "/wt".into(),
+            branch: "sz/x".into(),
+            agent: "claude".into(),
+            dirty: 1,
+            ahead: 2,
+            behind: 0,
+            created_at: 3,
+            exists: true,
+        };
+        let j = serde_json::to_string(&v).unwrap();
+        assert!(j.contains("\"branch\":\"sz/x\"") && j.contains("\"exists\":true"));
+
+        // WorktreeRow has no Serialize; just exercise construction + Clone/Debug.
+        let row = WorktreeRow {
+            worktree: "/wt".into(),
+            branch: "sz/x".into(),
+            agent: String::new(),
+            created_at: 0,
+            repo_root: "/r".into(),
+            tab_name: "r/x".into(),
+            session_name: "default".into(),
+            location: String::new(),
+        };
+        let _ = format!("{:?}", row.clone());
+    }
+}

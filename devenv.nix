@@ -5,6 +5,9 @@
   packages = with pkgs; [
     # task runner
     just
+    # coverage gate (`just coverage`) + visual-regression harness
+    cargo-llvm-cov
+    python3
     # treefmt — reads treefmt.toml; versions must match the flake's nixpkgs
     treefmt
     # formatter binaries treefmt.toml references (rustfmt comes from languages.rust below)
@@ -66,6 +69,42 @@
     clippy.enable = true;
     shellcheck.enable = true;
     yamllint.enable = true;
+
+    # ── Tiered gates ──────────────────────────────────────────────────────
+    # pre-commit stays fast (formatting + lint + unit tests); the heavier
+    # coverage / e2e / visual gates run on pre-push (and in CI via `just ci`).
+    cargo-test = {
+      enable = true;
+      name = "cargo test";
+      entry = "cargo test --bin superzej";
+      language = "system";
+      pass_filenames = false;
+      stages = ["pre-commit"];
+    };
+    coverage = {
+      enable = true;
+      name = "coverage 95% (core)";
+      entry = "just coverage";
+      language = "system";
+      pass_filenames = false;
+      stages = ["pre-push"];
+    };
+    e2e = {
+      enable = true;
+      name = "e2e (sandboxed zellij)";
+      entry = "just e2e";
+      language = "system";
+      pass_filenames = false;
+      stages = ["pre-push"];
+    };
+    visual-regression = {
+      enable = true;
+      name = "visual regression";
+      entry = "just visual";
+      language = "system";
+      pass_filenames = false;
+      stages = ["pre-push"];
+    };
   };
 
   enterShell = ''

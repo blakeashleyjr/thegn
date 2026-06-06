@@ -1,0 +1,32 @@
+# Visual-regression flows (see test/visual.py).
+#
+# Each flow boots superzej in a sandboxed zellij, sends `keys` (zellij chord
+# strings), captures the screen via `zellij action dump-screen`, and compares it
+# to the golden test/visual/<name>.txt at >=95% cell similarity. Aim for ~95%
+# coverage of the UI surface: every persistent state and overlay.
+#
+# Capture a baseline with `just visual-update`, review the diff, then commit the
+# generated .txt goldens alongside this manifest.
+
+[[flow]]
+name = "home-tab"
+keys = []
+
+[[flow]]
+name = "menu"
+keys = ["Super k"]
+
+[[flow]]
+name = "sidebar-hidden"
+keys = ["Ctrl Alt s"]
+
+[[flow]]
+name = "panel-hidden"
+keys = ["Ctrl Alt p"]
+
+[[flow]]
+name = "dashboard"
+keys = ["Alt d"]
+
+# Add worktree-tab, panel-diff, panel-pr, statusbar-per-mode, tabbar-stats … as
+# the fixtures to reach them are scripted.

@@ -23,28 +23,37 @@ pub fn dispatch(cfg: &Config, action: Action) -> Result<()> {
         Action::TogglePanel => commands::panels::panel(true),
         Action::Tool(name) => commands::tool::run(cfg, &name, None, None),
         Action::CloseWorktree => commands::close_worktree::run(cfg, false, false),
-        Action::PrOpen => commands::pr::run(PrAction::Open { worktree: None }),
-        Action::PrCreate => commands::pr::run(PrAction::Create {
-            worktree: None,
-            title: None,
-            body: None,
-            base: None,
-            draft: false,
-            web: true,
-            fill: false,
-        }),
+        Action::PrOpen => commands::pr::run(cfg, PrAction::Open { worktree: None }),
+        Action::PrCreate => commands::pr::run(
+            cfg,
+            PrAction::Create {
+                worktree: None,
+                title: None,
+                body: None,
+                base: None,
+                draft: false,
+                web: true,
+                fill: false,
+            },
+        ),
         Action::PrStatus => commands::panels::panel(false),
-        Action::PrApprove => commands::pr::run(PrAction::Approve {
-            worktree: None,
-            body: None,
-        }),
-        Action::PrMerge => commands::pr::run(PrAction::Merge {
-            worktree: None,
-            method: MergeMethod::Squash,
-            delete_branch: false,
-            auto: false,
-        }),
-        Action::PrRerun => commands::pr::run(PrAction::RerunChecks { worktree: None }),
+        Action::PrApprove => commands::pr::run(
+            cfg,
+            PrAction::Approve {
+                worktree: None,
+                body: None,
+            },
+        ),
+        Action::PrMerge => commands::pr::run(
+            cfg,
+            PrAction::Merge {
+                worktree: None,
+                method: MergeMethod::Squash,
+                delete_branch: false,
+                auto: false,
+            },
+        ),
+        Action::PrRerun => commands::pr::run(cfg, PrAction::RerunChecks { worktree: None }),
         Action::OpenFile(path) => {
             open_file(cfg, &path, None);
             Ok(())

@@ -1,20 +1,190 @@
-//! User configuration, loaded from `$XDG_CONFIG_HOME/superzej/config.toml`.
-//! Missing fields fall back to sensible defaults, so superzej works with no
-//! config at all. The home-manager module renders this file.
+//! User configuration — a layered, validated system.
+//!
+//! Precedence, lowest to highest:
+//!   1. built-in defaults (`Config::default`)
+//!   2. `$XDG_CONFIG_HOME/superzej/config.toml` (or `--config <path>`)
+//!   3. `SUPERZEJ_<SECTION>_<KEY>` environment overrides (see [`env_overlay`])
+//!   4. CLI flags (a [`ConfigOverlay`] built by `main`)
+//!
+//! Plus a repo-root `.superzej.{toml,yaml,yml,json}` overlay, scoped to
+//! `[sandbox]`, applied per-repo in [`Config::repo_sandbox`].
+//!
+//! Bad values never block: an unknown enum value warns and falls back to the
+//! default (the strict check lives in `superzej config validate`). The
+//! home-manager module renders the file; keys match the serde field names.
 
 use crate::util;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Deserialize)]
+/// Prefix a config diagnostic and emit it as a warning. Centralised so the
+/// validated-enum deserializers and the env/flag layers speak with one voice.
+pub fn config_warn(msg: &str) {
+    crate::msg::warn(&format!("config: {msg}"));
+}
+
+/// Declare a string-backed, validated, TOML-friendly enum.
+///
+/// Generates `Default`, `Display`, `as_str`, `from_str_validated` (strict, for
+/// `config validate`), and serde impls. Deserialization is **infallible**: an
+/// unrecognised value warns and yields the default, so a typo never blocks a
+/// launch. `Serialize` round-trips to the canonical string (for `config show`).
+macro_rules! config_enum {
+    (
+        $(#[$meta:meta])*
+        $vis:vis enum $name:ident : $kind:literal {
+            $( $variant:ident = $canon:literal $(| $alias:literal)* ),+ $(,)?
+        } default = $def:ident;
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        $vis enum $name { $( $variant ),+ }
+
+        impl $name {
+            /// Strict parse: `Err` (with the valid set) on an unknown value.
+            pub fn from_str_validated(s: &str) -> Result<Self, String> {
+                match s.trim().to_ascii_lowercase().as_str() {
+                    $( $canon $(| $alias)* => Ok($name::$variant), )+
+                    other => Err(format!(
+                        "unknown {} {:?}; expected one of: {}",
+                        $kind, other, [$( $canon ),+].join(", ")
+                    )),
+                }
+            }
+            /// The canonical string form (what serialization emits).
+            pub fn as_str(self) -> &'static str {
+                match self { $( $name::$variant => $canon ),+ }
+            }
+        }
+        impl Default for $name { fn default() -> Self { $name::$def } }
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let s = String::deserialize(d)?;
+                Ok($name::from_str_validated(&s).unwrap_or_else(|e| {
+                    config_warn(&e);
+                    $name::default()
+                }))
+            }
+        }
+        impl serde::Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.serialize_str(self.as_str())
+            }
+        }
+    };
+}
+
+config_enum! {
+    /// TUI used for the agent/tool/repo pickers.
+    pub enum Picker: "picker" {
+        Auto = "auto", Gum = "gum", Fzf = "fzf", Select = "select",
+    } default = Auto;
+}
+config_enum! {
+    /// Where worktrees live on disk.
+    pub enum WorktreeMode: "worktree_mode" {
+        Global = "global", InRepo = "in_repo",
+    } default = Global;
+}
+config_enum! {
+    /// Auto branch-name style.
+    pub enum NameScheme: "name_scheme" {
+        Words = "words", Numbered = "numbered",
+    } default = Words;
+}
+config_enum! {
+    /// Sandbox backend selector (the config-facing set; the runtime detection
+    /// enum lives in `sandbox.rs`). `Auto` walks `backend_chain`.
+    pub enum SandboxBackend: "sandbox backend" {
+        Auto = "auto",
+        Podman = "podman",
+        Docker = "docker",
+        Bwrap = "bwrap" | "bubblewrap",
+        Systemd = "systemd" | "systemd-run",
+        Apple = "apple" | "container",
+        Wsl = "wsl",
+        None = "none" | "host",
+    } default = Auto;
+}
+config_enum! {
+    /// Sandbox network mode.
+    pub enum Network: "sandbox network" {
+        Nat = "nat", Host = "host", None = "none",
+    } default = Nat;
+}
+config_enum! {
+    /// What to do when no sandbox backend is available.
+    pub enum OnMissing: "on_missing" {
+        Warn = "warn", Prompt = "prompt", Fail = "fail",
+    } default = Warn;
+}
+config_enum! {
+    /// Interactive remote transport (the control plane always uses ssh).
+    pub enum RemoteTransport: "remote transport" {
+        Mosh = "mosh", Ssh = "ssh",
+    } default = Mosh;
+}
+config_enum! {
+    /// Where a remote worktree lives.
+    pub enum RemoteMode: "remote mode" {
+        Remote = "remote", LocalExec = "local_exec", Sshfs = "sshfs",
+    } default = Remote;
+}
+config_enum! {
+    /// Default log verbosity (the `SUPERZEJ_LOG` env filter can refine it
+    /// per-module). Maps to a `tracing` level.
+    pub enum LogLevel: "log level" {
+        Error = "error", Warn = "warn", Info = "info", Debug = "debug", Trace = "trace",
+    } default = Info;
+}
+config_enum! {
+    /// Log file encoding.
+    pub enum LogFormat: "log format" {
+        Text = "text", Json = "json",
+    } default = Text;
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NamedCommand {
     pub name: String,
     pub command: String,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+/// A user-defined keybind action (`[[actions]]`): a chord bound to a shell
+/// command, optionally surfaced in the Cmd+K menu. See `src/keymap.rs`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CustomAction {
+    /// Stable id + default menu/hint label.
+    pub name: String,
+    /// Key chord (zellij syntax, e.g. "Alt D"); validated by keymap.
+    pub key: String,
+    /// Shell command line run via `sh -c`.
+    pub run: String,
+    /// Show in the command palette.
+    #[serde(default)]
+    pub menu: bool,
+    /// Short statusbar hint (defaults to `name`).
+    #[serde(default)]
+    pub hint: Option<String>,
+    #[serde(default = "default_true")]
+    pub floating: bool,
+    #[serde(default = "default_true")]
+    pub close_on_exit: bool,
+}
+
 /// `[theme]` — visual tuning. Only the accent for now; the rest of the
 /// palette is fixed (src/theme.rs).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ThemeConfig {
     /// Focus accent as "#rrggbb" (default the signature teal).
@@ -33,7 +203,7 @@ impl Default for ThemeConfig {
 /// (highlight a stat with Super+Alt+Up, then Enter). Each is a shell command
 /// run in an embedded tiled pane. `system` backs the CPU and MEM segments; `gpu`
 /// backs the GPU segment.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct MonitorConfig {
     /// CPU/RAM monitor (default `btm`, ClementTsang/bottom).
@@ -58,7 +228,7 @@ impl Default for MonitorConfig {
 /// *inside its own cgroup* instead of triggering a global OOM that takes the
 /// terminal session down. Scope teardown on tool exit also reaps orphaned
 /// children. An empty `tool_mem_max` disables containment.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LimitsConfig {
     /// `MemoryMax` for the tool scope (e.g. "6G"). Empty = no containment.
@@ -76,15 +246,101 @@ impl Default for LimitsConfig {
     }
 }
 
+/// `[pr]` — GitHub PR data feeding the right panel.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct PrConfig {
+    /// Cache TTL (seconds) before a live `gh` re-fetch.
+    pub ttl_secs: u64,
+}
+
+impl Default for PrConfig {
+    fn default() -> Self {
+        PrConfig { ttl_secs: 30 }
+    }
+}
+
+/// `[dashboard]` — the worktree switcher's live refresh.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct DashboardConfig {
+    /// Seconds between refreshes of the `--watch` dashboard pane.
+    pub interval_secs: u64,
+}
+
+impl Default for DashboardConfig {
+    fn default() -> Self {
+        DashboardConfig { interval_secs: 4 }
+    }
+}
+
+/// `[watch]` — the per-session daemon that pushes live panel updates.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct WatchConfig {
+    /// Seconds between PR refreshes (back-off applies on rate limits).
+    pub pr_interval_secs: u64,
+}
+
+impl Default for WatchConfig {
+    fn default() -> Self {
+        WatchConfig {
+            pr_interval_secs: 20,
+        }
+    }
+}
+
+/// `[log]` — diagnostics. The stderr sink is always on (level-gated); the file
+/// sink under `dir` is opt-in. `SUPERZEJ_LOG` (env) is a `tracing`-style filter
+/// that overrides `level` per-module.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LogConfig {
+    pub level: LogLevel,
+    /// Mirror diagnostics to a rotating file under `dir`.
+    pub file: bool,
+    /// Log directory ("" => `$XDG_STATE_HOME/superzej/logs`). Tilde-expanded.
+    pub dir: String,
+    /// Rotate the active log once it exceeds this many MiB.
+    pub rotation_size_mb: u64,
+    /// How many rotated files to keep.
+    pub max_files: usize,
+    pub format: LogFormat,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        LogConfig {
+            level: LogLevel::Info,
+            file: false,
+            dir: String::new(),
+            rotation_size_mb: 5,
+            max_files: 5,
+            format: LogFormat::Text,
+        }
+    }
+}
+
+impl LogConfig {
+    /// The resolved log directory (default under `$XDG_STATE_HOME/superzej`).
+    pub fn dir_path(&self) -> PathBuf {
+        if self.dir.trim().is_empty() {
+            util::xdg_state_home().join("superzej/logs")
+        } else {
+            PathBuf::from(util::expand_tilde(&self.dir))
+        }
+    }
+}
+
 /// `[sandbox.remote]` — optionally run a worktree on a remote machine. Empty
 /// `host` means local (the default); set it (e.g. `user@devbox`) to enable.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RemoteConfig {
     pub host: String, // "" => local
     pub port: u16,
-    pub transport: String,   // "mosh" (preferred interactive) | "ssh"
-    pub mode: String,        // "remote" | "local_exec" | "sshfs"
+    pub transport: RemoteTransport,
+    pub mode: RemoteMode,
     pub remote_dir: String,  // where remote worktrees live (mode=remote)
     pub forward_agent: bool, // ssh -A so remote git push uses the host agent
 }
@@ -94,8 +350,8 @@ impl Default for RemoteConfig {
         RemoteConfig {
             host: String::new(),
             port: 22,
-            transport: "mosh".into(),
-            mode: "remote".into(),
+            transport: RemoteTransport::Mosh,
+            mode: RemoteMode::Remote,
             remote_dir: "~/superzej-worktrees".into(),
             forward_agent: true,
         }
@@ -112,19 +368,19 @@ impl RemoteConfig {
 /// `[sandbox]` — containerize/sandbox a worktree's interactive process. On by
 /// default; `backend = "auto"` walks `backend_chain` and falls back to the host
 /// shell (with a warning) when nothing is available.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SandboxConfig {
     pub enabled: bool,
-    pub backend: String, // auto|podman|docker|bwrap|systemd|apple|wsl|none
+    pub backend: SandboxBackend,
     pub backend_chain: Vec<String>, // auto detection order; "none" = host fallback
-    pub image: String,   // "" => host-toolchain mode
-    pub network: String, // nat|host|none
+    pub image: String,              // "" => host-toolchain mode
+    pub network: Network,
     pub env_passthrough: Vec<String>,
     pub mounts: Vec<String>, // extra binds ("host:dest" or "host"); ":ro" suffix allowed
     pub init_script: String, // runs inside before the agent/shell
     pub devenv: bool,        // wrap inner cmd with `devenv shell --`
-    pub on_missing: String,  // warn|prompt|fail
+    pub on_missing: OnMissing,
     pub remote: RemoteConfig,
 }
 
@@ -132,13 +388,13 @@ impl Default for SandboxConfig {
     fn default() -> Self {
         SandboxConfig {
             enabled: true,
-            backend: "auto".into(),
+            backend: SandboxBackend::Auto,
             backend_chain: ["podman", "docker", "bwrap", "none"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
             image: String::new(),
-            network: "nat".into(),
+            network: Network::Nat,
             env_passthrough: [
                 "SSH_AUTH_SOCK",
                 "GH_TOKEN",
@@ -153,27 +409,28 @@ impl Default for SandboxConfig {
             mounts: vec!["~/.gitconfig:ro".into()],
             init_script: String::new(),
             devenv: false,
-            on_missing: "warn".into(),
+            on_missing: OnMissing::Warn,
             remote: RemoteConfig::default(),
         }
     }
 }
 
 /// Partial overlay deserialized from a repo-root `.superzej.{toml,yaml,yml,json}`
-/// — only the keys present override the global `[sandbox]`.
+/// — only the keys present override the global `[sandbox]`. Also reused for the
+/// `SUPERZEJ_SANDBOX_*` env layer.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct SandboxOverlay {
     pub enabled: Option<bool>,
-    pub backend: Option<String>,
+    pub backend: Option<SandboxBackend>,
     pub backend_chain: Option<Vec<String>>,
     pub image: Option<String>,
-    pub network: Option<String>,
+    pub network: Option<Network>,
     pub env_passthrough: Option<Vec<String>>,
     pub mounts: Option<Vec<String>>,
     pub init_script: Option<String>,
     pub devenv: Option<bool>,
-    pub on_missing: Option<String>,
+    pub on_missing: Option<OnMissing>,
     pub remote: Option<RemoteOverlay>,
 }
 
@@ -182,8 +439,8 @@ pub struct SandboxOverlay {
 pub struct RemoteOverlay {
     pub host: Option<String>,
     pub port: Option<u16>,
-    pub transport: Option<String>,
-    pub mode: Option<String>,
+    pub transport: Option<RemoteTransport>,
+    pub mode: Option<RemoteMode>,
     pub remote_dir: Option<String>,
     pub forward_agent: Option<bool>,
 }
@@ -224,6 +481,20 @@ impl SandboxOverlay {
             r.apply(&mut base.remote);
         }
     }
+
+    fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+            && self.backend.is_none()
+            && self.backend_chain.is_none()
+            && self.image.is_none()
+            && self.network.is_none()
+            && self.env_passthrough.is_none()
+            && self.mounts.is_none()
+            && self.init_script.is_none()
+            && self.devenv.is_none()
+            && self.on_missing.is_none()
+            && self.remote.is_none()
+    }
 }
 
 impl RemoteOverlay {
@@ -259,7 +530,7 @@ struct RepoConfigFile {
 /// `[drawer]` — the bottom file-manager drawer (hidden by default, toggled with
 /// Ctrl+Alt+f). Runs yazi by default, with its config kept separate from the
 /// system under a private `config_home`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct DrawerConfig {
     /// File manager to run. Empty ⇒ the pinned yazi (`SUPERZEJ_YAZI_BIN`).
@@ -287,26 +558,37 @@ impl Default for DrawerConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
+    // --- scalar values (must serialize before any sub-table for TOML) ---
     pub worktrees_dir: String,
     pub workspaces_dir: String,
     pub base_branch: String,
     pub branch_prefix: String,
-    pub picker: String,
-    pub worktree_mode: String, // "global" | "in_repo"
-    pub name_scheme: String,   // "words" | "numbered"
+    pub picker: Picker,
+    pub worktree_mode: WorktreeMode,
+    pub name_scheme: NameScheme,
     pub auto_remove_worktree: bool,
     pub repo_roots: Vec<String>,
     pub repo_scan_depth: usize,
+    // --- arrays of tables (must serialize before any plain sub-table) ---
     pub agents: Vec<NamedCommand>,
     pub tools: Vec<NamedCommand>,
+    pub actions: Vec<CustomAction>,
+    // --- sub-tables ---
     pub theme: ThemeConfig,
     pub monitor: MonitorConfig,
+    pub pr: PrConfig,
+    pub dashboard: DashboardConfig,
+    pub watch: WatchConfig,
+    pub log: LogConfig,
     pub sandbox: SandboxConfig,
     pub limits: LimitsConfig,
     pub drawer: DrawerConfig,
+    /// Rebind a built-in action by id, e.g. `new-worktree = "Ctrl w"` (a plain
+    /// table — kept last so it serializes after all other sub-tables).
+    pub keybinds: BTreeMap<String, String>,
 }
 
 impl Default for Config {
@@ -322,9 +604,9 @@ impl Default for Config {
             workspaces_dir: home.join("code").to_string_lossy().into_owned(),
             base_branch: "auto".into(),
             branch_prefix: "sz/".into(),
-            picker: "auto".into(),
-            worktree_mode: "global".into(),
-            name_scheme: "words".into(),
+            picker: Picker::Auto,
+            worktree_mode: WorktreeMode::Global,
+            name_scheme: NameScheme::Words,
             auto_remove_worktree: false,
             repo_roots: Vec::new(),
             repo_scan_depth: 5,
@@ -332,31 +614,245 @@ impl Default for Config {
             tools: Vec::new(),
             theme: ThemeConfig::default(),
             monitor: MonitorConfig::default(),
+            pr: PrConfig::default(),
+            dashboard: DashboardConfig::default(),
+            watch: WatchConfig::default(),
+            log: LogConfig::default(),
             sandbox: SandboxConfig::default(),
             limits: LimitsConfig::default(),
             drawer: DrawerConfig::default(),
+            keybinds: BTreeMap::new(),
+            actions: Vec::new(),
+        }
+    }
+}
+
+/// A source of environment variables — abstracted so the layering is testable
+/// without touching the real process environment.
+pub trait EnvSource {
+    fn get(&self, key: &str) -> Option<String>;
+}
+
+/// The real process environment.
+pub struct ProcessEnv;
+impl EnvSource for ProcessEnv {
+    fn get(&self, key: &str) -> Option<String> {
+        std::env::var(key).ok().filter(|s| !s.trim().is_empty())
+    }
+}
+
+/// An in-memory environment (for tests).
+#[cfg(test)]
+#[derive(Default)]
+pub struct MapEnv(pub BTreeMap<String, String>);
+#[cfg(test)]
+impl EnvSource for MapEnv {
+    fn get(&self, key: &str) -> Option<String> {
+        self.0.get(key).cloned().filter(|s| !s.trim().is_empty())
+    }
+}
+
+/// An all-`Option` mirror of [`Config`] used for the env and CLI-flag layers.
+/// `apply` writes only the set fields onto a base, so each layer overrides the
+/// one below it.
+#[derive(Debug, Default)]
+pub struct ConfigOverlay {
+    pub worktrees_dir: Option<String>,
+    pub workspaces_dir: Option<String>,
+    pub base_branch: Option<String>,
+    pub branch_prefix: Option<String>,
+    pub picker: Option<Picker>,
+    pub worktree_mode: Option<WorktreeMode>,
+    pub name_scheme: Option<NameScheme>,
+    pub auto_remove_worktree: Option<bool>,
+    pub repo_scan_depth: Option<usize>,
+    pub accent: Option<String>,
+    pub pr_ttl_secs: Option<u64>,
+    pub dashboard_interval_secs: Option<u64>,
+    pub watch_pr_interval_secs: Option<u64>,
+    pub log_level: Option<LogLevel>,
+    pub log_file: Option<bool>,
+    pub log_dir: Option<String>,
+    pub log_rotation_size_mb: Option<u64>,
+    pub log_max_files: Option<usize>,
+    pub log_format: Option<LogFormat>,
+    pub sandbox: SandboxOverlay,
+}
+
+impl ConfigOverlay {
+    fn apply(self, base: &mut Config) {
+        macro_rules! set {
+            ($field:expr, $val:expr) => {
+                if let Some(v) = $val {
+                    $field = v;
+                }
+            };
+        }
+        set!(base.worktrees_dir, self.worktrees_dir);
+        set!(base.workspaces_dir, self.workspaces_dir);
+        set!(base.base_branch, self.base_branch);
+        set!(base.branch_prefix, self.branch_prefix);
+        set!(base.picker, self.picker);
+        set!(base.worktree_mode, self.worktree_mode);
+        set!(base.name_scheme, self.name_scheme);
+        set!(base.auto_remove_worktree, self.auto_remove_worktree);
+        set!(base.repo_scan_depth, self.repo_scan_depth);
+        set!(base.theme.accent, self.accent);
+        set!(base.pr.ttl_secs, self.pr_ttl_secs);
+        set!(base.dashboard.interval_secs, self.dashboard_interval_secs);
+        set!(base.watch.pr_interval_secs, self.watch_pr_interval_secs);
+        set!(base.log.level, self.log_level);
+        set!(base.log.file, self.log_file);
+        set!(base.log.dir, self.log_dir);
+        set!(base.log.rotation_size_mb, self.log_rotation_size_mb);
+        set!(base.log.max_files, self.log_max_files);
+        set!(base.log.format, self.log_format);
+        if !self.sandbox.is_empty() {
+            self.sandbox.apply(&mut base.sandbox);
+        }
+    }
+}
+
+/// Read the `SUPERZEJ_<SECTION>_<KEY>` env layer. Each knob is one line here —
+/// this is the single place to extend when a new setting becomes env-settable.
+/// Deprecated `SZ_*` names are honored as a fallback with a one-time warning.
+pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
+    let mut o = ConfigOverlay::default();
+
+    // Helper that warns-and-skips on a malformed number (never blocks).
+    let parse_num = |raw: String, key: &str| -> Option<u64> {
+        match raw.trim().parse::<u64>() {
+            Ok(n) => Some(n),
+            Err(_) => {
+                config_warn(&format!("{key}: not a number ({raw:?}); ignoring"));
+                None
+            }
+        }
+    };
+
+    o.worktrees_dir = env.get("SUPERZEJ_WORKTREES_DIR");
+    o.workspaces_dir = env.get("SUPERZEJ_WORKSPACES_DIR");
+    o.base_branch = env.get("SUPERZEJ_BASE_BRANCH");
+    o.branch_prefix = env.get("SUPERZEJ_BRANCH_PREFIX");
+    if let Some(v) = env.get("SUPERZEJ_PICKER") {
+        o.picker = Picker::from_str_validated(v.trim()).ok();
+    }
+    if let Some(v) = env.get("SUPERZEJ_WORKTREE_MODE") {
+        o.worktree_mode = WorktreeMode::from_str_validated(v.trim()).ok();
+    }
+    if let Some(v) = env.get("SUPERZEJ_NAME_SCHEME") {
+        o.name_scheme = NameScheme::from_str_validated(v.trim()).ok();
+    }
+    if let Some(v) = env.get("SUPERZEJ_AUTO_REMOVE_WORKTREE") {
+        o.auto_remove_worktree = parse_bool(&v, "SUPERZEJ_AUTO_REMOVE_WORKTREE");
+    }
+    if let Some(v) = env.get("SUPERZEJ_REPO_SCAN_DEPTH") {
+        o.repo_scan_depth = parse_num(v, "SUPERZEJ_REPO_SCAN_DEPTH").map(|n| n as usize);
+    }
+    o.accent = env.get("SUPERZEJ_THEME_ACCENT");
+
+    // [pr] — SUPERZEJ_PR_TTL, with deprecated SZ_PR_TTL fallback.
+    if let Some(v) = env.get("SUPERZEJ_PR_TTL") {
+        o.pr_ttl_secs = parse_num(v, "SUPERZEJ_PR_TTL");
+    } else if let Some(v) = env.get("SZ_PR_TTL") {
+        config_warn("SZ_PR_TTL is deprecated; use SUPERZEJ_PR_TTL");
+        o.pr_ttl_secs = parse_num(v, "SZ_PR_TTL");
+    }
+    // [dashboard] — SUPERZEJ_DASHBOARD_INTERVAL, deprecated SZ_DASH_INTERVAL.
+    if let Some(v) = env.get("SUPERZEJ_DASHBOARD_INTERVAL") {
+        o.dashboard_interval_secs = parse_num(v, "SUPERZEJ_DASHBOARD_INTERVAL");
+    } else if let Some(v) = env.get("SZ_DASH_INTERVAL") {
+        config_warn("SZ_DASH_INTERVAL is deprecated; use SUPERZEJ_DASHBOARD_INTERVAL");
+        o.dashboard_interval_secs = parse_num(v, "SZ_DASH_INTERVAL");
+    }
+    if let Some(v) = env.get("SUPERZEJ_WATCH_PR_INTERVAL") {
+        o.watch_pr_interval_secs = parse_num(v, "SUPERZEJ_WATCH_PR_INTERVAL");
+    }
+
+    // [log]
+    if let Some(v) = env.get("SUPERZEJ_LOG_LEVEL") {
+        o.log_level = LogLevel::from_str_validated(v.trim()).ok();
+    }
+    if let Some(v) = env.get("SUPERZEJ_LOG_FILE") {
+        o.log_file = parse_bool(&v, "SUPERZEJ_LOG_FILE");
+    }
+    o.log_dir = env.get("SUPERZEJ_LOG_DIR");
+    if let Some(v) = env.get("SUPERZEJ_LOG_ROTATION_SIZE_MB") {
+        o.log_rotation_size_mb = parse_num(v, "SUPERZEJ_LOG_ROTATION_SIZE_MB");
+    }
+    if let Some(v) = env.get("SUPERZEJ_LOG_MAX_FILES") {
+        o.log_max_files = parse_num(v, "SUPERZEJ_LOG_MAX_FILES").map(|n| n as usize);
+    }
+    if let Some(v) = env.get("SUPERZEJ_LOG_FORMAT") {
+        o.log_format = LogFormat::from_str_validated(v.trim()).ok();
+    }
+
+    // [sandbox]
+    if let Some(v) = env.get("SUPERZEJ_SANDBOX_BACKEND") {
+        o.sandbox.backend = SandboxBackend::from_str_validated(v.trim()).ok();
+    }
+    if let Some(v) = env.get("SUPERZEJ_SANDBOX_NETWORK") {
+        o.sandbox.network = Network::from_str_validated(v.trim()).ok();
+    }
+    o.sandbox.image = env.get("SUPERZEJ_SANDBOX_IMAGE");
+    if let Some(v) = env.get("SUPERZEJ_SANDBOX_ON_MISSING") {
+        o.sandbox.on_missing = OnMissing::from_str_validated(v.trim()).ok();
+    }
+    if let Some(v) = env.get("SUPERZEJ_SANDBOX_ENABLED") {
+        o.sandbox.enabled = parse_bool(&v, "SUPERZEJ_SANDBOX_ENABLED");
+    }
+    if let Some(host) = env.get("SUPERZEJ_SANDBOX_REMOTE_HOST") {
+        o.sandbox.remote = Some(RemoteOverlay {
+            host: Some(host),
+            ..Default::default()
+        });
+    }
+    o
+}
+
+fn parse_bool(raw: &str, key: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        other => {
+            config_warn(&format!("{key}: not a boolean ({other:?}); ignoring"));
+            None
         }
     }
 }
 
 impl Config {
+    /// The default config path (overridable with `--config`).
     pub fn path() -> PathBuf {
         util::xdg_config_home().join("superzej/config.toml")
     }
 
-    /// Load config, applying defaults and post-processing (fallback agents/tools,
-    /// default repo_roots, tilde expansion).
-    pub fn load() -> Self {
-        let mut cfg: Config = match std::fs::read_to_string(Self::path()) {
+    /// Load with all layers: defaults < file (`path` or the default) < env < flags.
+    pub fn load_layered(
+        env: &dyn EnvSource,
+        flags: Option<ConfigOverlay>,
+        path: Option<PathBuf>,
+    ) -> Self {
+        let file = path.unwrap_or_else(Self::path);
+        let mut cfg: Config = match std::fs::read_to_string(&file) {
             Ok(s) => toml::from_str(&s).unwrap_or_else(|e| {
-                crate::msg::warn(&format!("config parse error: {e}; using defaults"));
+                config_warn(&format!("parse error: {e}; using defaults"));
                 Config::default()
             }),
             Err(_) => Config::default(),
         };
+        env_overlay(env).apply(&mut cfg);
+        if let Some(f) = flags {
+            f.apply(&mut cfg);
+        }
+        cfg.post_process();
+        cfg
+    }
 
-        if cfg.agents.is_empty() {
-            cfg.agents = vec![
+    /// Fallback agents/tools, default repo_roots, tilde expansion. Idempotent.
+    fn post_process(&mut self) {
+        if self.agents.is_empty() {
+            self.agents = vec![
                 NamedCommand {
                     name: "claude".into(),
                     command: "claude".into(),
@@ -367,8 +863,8 @@ impl Config {
                 },
             ];
         }
-        if cfg.tools.is_empty() {
-            cfg.tools = vec![
+        if self.tools.is_empty() {
+            self.tools = vec![
                 NamedCommand {
                     name: "lazygit".into(),
                     command: "lazygit".into(),
@@ -388,17 +884,16 @@ impl Config {
             ];
         }
 
-        cfg.worktrees_dir = util::expand_tilde(&cfg.worktrees_dir);
-        cfg.workspaces_dir = util::expand_tilde(&cfg.workspaces_dir);
-        if cfg.repo_roots.is_empty() {
-            cfg.repo_roots = vec![cfg.workspaces_dir.clone()];
+        self.worktrees_dir = util::expand_tilde(&self.worktrees_dir);
+        self.workspaces_dir = util::expand_tilde(&self.workspaces_dir);
+        if self.repo_roots.is_empty() {
+            self.repo_roots = vec![self.workspaces_dir.clone()];
         }
-        cfg.repo_roots = cfg
+        self.repo_roots = self
             .repo_roots
             .iter()
             .map(|r| util::expand_tilde(r))
             .collect();
-        cfg
     }
 
     pub fn agent_command(&self, name: &str) -> Option<&str> {
@@ -459,6 +954,108 @@ impl Config {
             None => "#76eede".into(),
         }
     }
+
+    /// Look up a dotted config key as a bare string (for `config get` and the
+    /// plugin feed). `None` for an unknown key.
+    pub fn get_dotted(&self, key: &str) -> Option<String> {
+        Some(match key {
+            "worktrees_dir" => self.worktrees_dir.clone(),
+            "workspaces_dir" => self.workspaces_dir.clone(),
+            "base_branch" => self.base_branch.clone(),
+            "branch_prefix" => self.branch_prefix.clone(),
+            "picker" => self.picker.to_string(),
+            "worktree_mode" => self.worktree_mode.to_string(),
+            "name_scheme" => self.name_scheme.to_string(),
+            "auto_remove_worktree" => self.auto_remove_worktree.to_string(),
+            "repo_scan_depth" => self.repo_scan_depth.to_string(),
+            "repo_roots" => self.repo_roots.join("\n"),
+            "theme.accent" => self.theme.accent.clone(),
+            "pr.ttl_secs" => self.pr.ttl_secs.to_string(),
+            "dashboard.interval_secs" => self.dashboard.interval_secs.to_string(),
+            "watch.pr_interval_secs" => self.watch.pr_interval_secs.to_string(),
+            "log.level" => self.log.level.to_string(),
+            "log.file" => self.log.file.to_string(),
+            "log.dir" => self.log.dir_path().to_string_lossy().into_owned(),
+            "log.rotation_size_mb" => self.log.rotation_size_mb.to_string(),
+            "log.max_files" => self.log.max_files.to_string(),
+            "log.format" => self.log.format.to_string(),
+            "sandbox.enabled" => self.sandbox.enabled.to_string(),
+            "sandbox.backend" => self.sandbox.backend.to_string(),
+            "sandbox.image" => self.sandbox.image.clone(),
+            "sandbox.network" => self.sandbox.network.to_string(),
+            "sandbox.on_missing" => self.sandbox.on_missing.to_string(),
+            "sandbox.remote.host" => self.sandbox.remote.host.clone(),
+            "sandbox.remote.transport" => self.sandbox.remote.transport.to_string(),
+            "sandbox.remote.mode" => self.sandbox.remote.mode.to_string(),
+            _ => return None,
+        })
+    }
+}
+
+/// Strictly validate a raw `config.toml` body, collecting human-readable errors
+/// for `config validate` (the only place a bad value is treated as an error
+/// rather than warned-and-defaulted). Returns the list of problems (empty = ok).
+pub fn validate_str(body: &str) -> Vec<String> {
+    let mut errs = Vec::new();
+    let val: toml::Value = match body.parse() {
+        Ok(v) => v,
+        Err(e) => return vec![format!("TOML syntax error: {e}")],
+    };
+    fn check(
+        errs: &mut Vec<String>,
+        path: &str,
+        opt: Option<&toml::Value>,
+        f: fn(&str) -> Result<(), String>,
+    ) {
+        if let Some(toml::Value::String(s)) = opt {
+            if let Err(e) = f(s) {
+                errs.push(format!("{path}: {e}"));
+            }
+        }
+    }
+    let Some(t) = val.as_table() else {
+        return errs;
+    };
+    check(&mut errs, "picker", t.get("picker"), |s| {
+        Picker::from_str_validated(s).map(|_| ())
+    });
+    check(&mut errs, "worktree_mode", t.get("worktree_mode"), |s| {
+        WorktreeMode::from_str_validated(s).map(|_| ())
+    });
+    check(&mut errs, "name_scheme", t.get("name_scheme"), |s| {
+        NameScheme::from_str_validated(s).map(|_| ())
+    });
+    if let Some(sb) = t.get("sandbox").and_then(|v| v.as_table()) {
+        check(&mut errs, "sandbox.backend", sb.get("backend"), |s| {
+            SandboxBackend::from_str_validated(s).map(|_| ())
+        });
+        check(&mut errs, "sandbox.network", sb.get("network"), |s| {
+            Network::from_str_validated(s).map(|_| ())
+        });
+        check(&mut errs, "sandbox.on_missing", sb.get("on_missing"), |s| {
+            OnMissing::from_str_validated(s).map(|_| ())
+        });
+        if let Some(rm) = sb.get("remote").and_then(|v| v.as_table()) {
+            check(
+                &mut errs,
+                "sandbox.remote.transport",
+                rm.get("transport"),
+                |s| RemoteTransport::from_str_validated(s).map(|_| ()),
+            );
+            check(&mut errs, "sandbox.remote.mode", rm.get("mode"), |s| {
+                RemoteMode::from_str_validated(s).map(|_| ())
+            });
+        }
+    }
+    if let Some(lg) = t.get("log").and_then(|v| v.as_table()) {
+        check(&mut errs, "log.level", lg.get("level"), |s| {
+            LogLevel::from_str_validated(s).map(|_| ())
+        });
+        check(&mut errs, "log.format", lg.get("format"), |s| {
+            LogFormat::from_str_validated(s).map(|_| ())
+        });
+    }
+    errs
 }
 
 /// Load and parse a repo-root `.superzej.*` overlay, if present. Tries TOML,
@@ -483,7 +1080,7 @@ fn load_repo_overlay(repo_root: &std::path::Path) -> Option<RepoConfigFile> {
         return match parsed {
             Ok(cfg) => Some(cfg),
             Err(e) => {
-                crate::msg::warn(&format!("{}: parse error: {e}; ignoring", path.display()));
+                config_warn(&format!("{}: parse error: {e}; ignoring", path.display()));
                 None
             }
         };
@@ -604,6 +1201,15 @@ mod tests {
         d
     }
 
+    fn map_env(pairs: &[(&str, &str)]) -> MapEnv {
+        MapEnv(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+
     // The same overlay expressed in each format must produce identical results,
     // and only the present keys override the global defaults.
     #[test]
@@ -635,7 +1241,11 @@ mod tests {
             assert_eq!(sb.remote.host, "user@box", "{tag}: remote host overridden");
             // Untouched keys keep their defaults.
             assert!(sb.enabled, "{tag}: enabled keeps default");
-            assert_eq!(sb.backend, "auto", "{tag}: backend keeps default");
+            assert_eq!(
+                sb.backend,
+                SandboxBackend::Auto,
+                "{tag}: backend keeps default"
+            );
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
@@ -686,5 +1296,377 @@ mod tests {
         assert_eq!(cfg.drawer.height, "20%");
         assert_eq!(cfg.drawer.width, "full");
         assert_eq!(cfg.drawer.command, "");
+    }
+
+    // defaults < file < env < flag, for a scalar and a validated enum.
+    #[test]
+    fn precedence_default_file_env_flag() {
+        let dir = tmpdir("prec");
+        let file = dir.join("config.toml");
+        std::fs::write(&file, "branch_prefix = \"file/\"\npicker = \"gum\"\n").unwrap();
+
+        // file only
+        let c = Config::load_layered(&MapEnv::default(), None, Some(file.clone()));
+        assert_eq!(c.branch_prefix, "file/");
+        assert_eq!(c.picker, Picker::Gum);
+
+        // env overrides file
+        let env = map_env(&[
+            ("SUPERZEJ_BRANCH_PREFIX", "env/"),
+            ("SUPERZEJ_PICKER", "fzf"),
+        ]);
+        let c = Config::load_layered(&env, None, Some(file.clone()));
+        assert_eq!(c.branch_prefix, "env/");
+        assert_eq!(c.picker, Picker::Fzf);
+
+        // flag overrides env
+        let flags = ConfigOverlay {
+            picker: Some(Picker::Select),
+            ..Default::default()
+        };
+        let c = Config::load_layered(&env, Some(flags), Some(file));
+        assert_eq!(c.picker, Picker::Select);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bad_enum_warns_and_defaults() {
+        // A junk picker in the file deserializes to the default, never errors.
+        let c: Config = toml::from_str("picker = \"nope\"\n").unwrap();
+        assert_eq!(c.picker, Picker::Auto);
+        // strict validate flags it
+        let errs = validate_str("picker = \"nope\"\n");
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("picker"));
+    }
+
+    #[test]
+    fn deprecated_sz_pr_ttl_still_read() {
+        let env = map_env(&[("SZ_PR_TTL", "7")]);
+        let o = env_overlay(&env);
+        assert_eq!(o.pr_ttl_secs, Some(7));
+        // canonical wins when both set
+        let env = map_env(&[("SZ_PR_TTL", "7"), ("SUPERZEJ_PR_TTL", "9")]);
+        assert_eq!(env_overlay(&env).pr_ttl_secs, Some(9));
+    }
+
+    #[test]
+    fn enum_roundtrip() {
+        for (s, p) in [
+            ("auto", Picker::Auto),
+            ("gum", Picker::Gum),
+            ("fzf", Picker::Fzf),
+            ("select", Picker::Select),
+        ] {
+            assert_eq!(Picker::from_str_validated(s).unwrap(), p);
+            assert_eq!(p.as_str(), s);
+        }
+        assert!(Picker::from_str_validated("bogus").is_err());
+        // aliases
+        assert_eq!(
+            SandboxBackend::from_str_validated("bubblewrap").unwrap(),
+            SandboxBackend::Bwrap
+        );
+        assert_eq!(
+            SandboxBackend::from_str_validated("host").unwrap(),
+            SandboxBackend::None
+        );
+    }
+
+    #[test]
+    fn get_dotted_reads_values() {
+        let c = Config::default();
+        assert_eq!(c.get_dotted("picker").as_deref(), Some("auto"));
+        assert_eq!(c.get_dotted("pr.ttl_secs").as_deref(), Some("30"));
+        assert_eq!(c.get_dotted("sandbox.backend").as_deref(), Some("auto"));
+        assert!(c.get_dotted("nope.nope").is_none());
+    }
+
+    #[test]
+    fn effective_config_serializes_to_toml() {
+        // `config show` round-trips the effective config back to parseable TOML.
+        let c = Config::default();
+        let s = toml::to_string_pretty(&c).expect("serialize");
+        let back: Config = toml::from_str(&s).expect("reparse");
+        assert_eq!(back.picker, c.picker);
+        assert_eq!(back.sandbox.backend, c.sandbox.backend);
+    }
+
+    // Exercise every env knob (and the canonical/deprecated/bad-value paths) so
+    // the layering is covered, not just spot-checked.
+    #[test]
+    fn env_overlay_covers_every_knob() {
+        let env = map_env(&[
+            ("SUPERZEJ_WORKTREES_DIR", "/wt"),
+            ("SUPERZEJ_WORKSPACES_DIR", "/ws"),
+            ("SUPERZEJ_BASE_BRANCH", "develop"),
+            ("SUPERZEJ_BRANCH_PREFIX", "x/"),
+            ("SUPERZEJ_PICKER", "fzf"),
+            ("SUPERZEJ_WORKTREE_MODE", "in_repo"),
+            ("SUPERZEJ_NAME_SCHEME", "numbered"),
+            ("SUPERZEJ_AUTO_REMOVE_WORKTREE", "yes"),
+            ("SUPERZEJ_REPO_SCAN_DEPTH", "9"),
+            ("SUPERZEJ_THEME_ACCENT", "#abcdef"),
+            ("SUPERZEJ_PR_TTL", "11"),
+            ("SUPERZEJ_DASHBOARD_INTERVAL", "6"),
+            ("SUPERZEJ_WATCH_PR_INTERVAL", "13"),
+            ("SUPERZEJ_LOG_LEVEL", "debug"),
+            ("SUPERZEJ_LOG_FILE", "true"),
+            ("SUPERZEJ_LOG_DIR", "/logs"),
+            ("SUPERZEJ_LOG_ROTATION_SIZE_MB", "8"),
+            ("SUPERZEJ_LOG_MAX_FILES", "4"),
+            ("SUPERZEJ_LOG_FORMAT", "json"),
+            ("SUPERZEJ_SANDBOX_BACKEND", "docker"),
+            ("SUPERZEJ_SANDBOX_NETWORK", "host"),
+            ("SUPERZEJ_SANDBOX_IMAGE", "img:9"),
+            ("SUPERZEJ_SANDBOX_ON_MISSING", "fail"),
+            ("SUPERZEJ_SANDBOX_ENABLED", "off"),
+            ("SUPERZEJ_SANDBOX_REMOTE_HOST", "user@box"),
+        ]);
+        let c = Config::load_layered(&env, None, None);
+        assert_eq!(c.worktrees_dir, "/wt");
+        assert_eq!(c.workspaces_dir, "/ws");
+        assert_eq!(c.base_branch, "develop");
+        assert_eq!(c.branch_prefix, "x/");
+        assert_eq!(c.picker, Picker::Fzf);
+        assert_eq!(c.worktree_mode, WorktreeMode::InRepo);
+        assert_eq!(c.name_scheme, NameScheme::Numbered);
+        assert!(c.auto_remove_worktree);
+        assert_eq!(c.repo_scan_depth, 9);
+        assert_eq!(c.theme.accent, "#abcdef");
+        assert_eq!(c.pr.ttl_secs, 11);
+        assert_eq!(c.dashboard.interval_secs, 6);
+        assert_eq!(c.watch.pr_interval_secs, 13);
+        assert_eq!(c.log.level, LogLevel::Debug);
+        assert!(c.log.file);
+        assert_eq!(c.log.dir, "/logs");
+        assert_eq!(c.log.rotation_size_mb, 8);
+        assert_eq!(c.log.max_files, 4);
+        assert_eq!(c.log.format, LogFormat::Json);
+        assert_eq!(c.sandbox.backend, SandboxBackend::Docker);
+        assert_eq!(c.sandbox.network, Network::Host);
+        assert_eq!(c.sandbox.image, "img:9");
+        assert_eq!(c.sandbox.on_missing, OnMissing::Fail);
+        assert!(!c.sandbox.enabled);
+        assert_eq!(c.sandbox.remote.host, "user@box");
+    }
+
+    #[test]
+    fn env_bad_values_warn_and_skip() {
+        // Malformed number / bool / enum values are ignored (defaults survive).
+        let env = map_env(&[
+            ("SUPERZEJ_PR_TTL", "lots"),
+            ("SUPERZEJ_AUTO_REMOVE_WORKTREE", "maybe"),
+            ("SUPERZEJ_PICKER", "telescope"),
+            ("SUPERZEJ_REPO_SCAN_DEPTH", "deep"),
+        ]);
+        let o = env_overlay(&env);
+        assert_eq!(o.pr_ttl_secs, None);
+        assert_eq!(o.auto_remove_worktree, None);
+        assert_eq!(o.picker, None);
+        assert_eq!(o.repo_scan_depth, None);
+        // parse_bool accepts the documented spellings.
+        assert_eq!(parse_bool("on", "k"), Some(true));
+        assert_eq!(parse_bool("0", "k"), Some(false));
+        assert_eq!(parse_bool("huh", "k"), None);
+    }
+
+    #[test]
+    fn get_dotted_covers_all_keys() {
+        let c = Config::default();
+        for key in [
+            "worktrees_dir",
+            "workspaces_dir",
+            "base_branch",
+            "branch_prefix",
+            "picker",
+            "worktree_mode",
+            "name_scheme",
+            "auto_remove_worktree",
+            "repo_scan_depth",
+            "repo_roots",
+            "theme.accent",
+            "pr.ttl_secs",
+            "dashboard.interval_secs",
+            "watch.pr_interval_secs",
+            "log.level",
+            "log.file",
+            "log.dir",
+            "log.rotation_size_mb",
+            "log.max_files",
+            "log.format",
+            "sandbox.enabled",
+            "sandbox.backend",
+            "sandbox.image",
+            "sandbox.network",
+            "sandbox.on_missing",
+            "sandbox.remote.host",
+            "sandbox.remote.transport",
+            "sandbox.remote.mode",
+        ] {
+            assert!(c.get_dotted(key).is_some(), "missing dotted key: {key}");
+        }
+    }
+
+    #[test]
+    fn validate_str_flags_every_section() {
+        assert!(
+            validate_str("not = valid = toml")
+                .iter()
+                .any(|e| e.contains("syntax"))
+        );
+        let body = "\
+picker = \"x\"
+worktree_mode = \"y\"
+name_scheme = \"z\"
+[sandbox]
+backend = \"bad\"
+network = \"bad\"
+on_missing = \"bad\"
+[sandbox.remote]
+transport = \"bad\"
+mode = \"bad\"
+[log]
+level = \"bad\"
+format = \"bad\"
+";
+        let errs = validate_str(body);
+        assert_eq!(errs.len(), 10, "{errs:?}");
+        assert!(validate_str("picker = \"auto\"\n").is_empty());
+        // a non-table top-level is tolerated (no panic).
+        assert!(validate_str("").is_empty());
+    }
+
+    #[test]
+    fn accent_and_log_dir_helpers() {
+        let mut c = Config::default();
+        assert_eq!(c.accent_hex(), "#76eede");
+        assert!(c.accent_rgb().contains(';'));
+        c.theme.accent = "#fff".into();
+        assert_eq!(c.accent_rgb(), "255;255;255"); // 3-digit hex expands
+        c.theme.accent = "garbage".into();
+        assert_eq!(c.accent_hex(), "#76eede"); // invalid falls back
+        assert!(c.accent_rgb().len() > 3);
+        // log dir: default vs explicit.
+        assert!(c.log.dir_path().ends_with("superzej/logs"));
+        c.log.dir = "~/x".into();
+        assert!(!c.log.dir_path().to_string_lossy().contains('~'));
+        assert!(!c.sandbox.remote.is_remote());
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn non_default_enums_roundtrip() {
+        // Exercises Serialize (as_str) for the non-default variants.
+        let mut c = Config::default();
+        c.picker = Picker::Select;
+        c.worktree_mode = WorktreeMode::InRepo;
+        c.name_scheme = NameScheme::Numbered;
+        c.sandbox.backend = SandboxBackend::Podman;
+        c.sandbox.network = Network::None;
+        c.sandbox.on_missing = OnMissing::Prompt;
+        c.sandbox.remote.transport = RemoteTransport::Ssh;
+        c.sandbox.remote.mode = RemoteMode::Sshfs;
+        c.log.level = LogLevel::Trace;
+        c.log.format = LogFormat::Json;
+        let s = toml::to_string_pretty(&c).unwrap();
+        let back: Config = toml::from_str(&s).unwrap();
+        assert_eq!(back.sandbox.remote.transport, RemoteTransport::Ssh);
+        assert_eq!(back.sandbox.remote.mode, RemoteMode::Sshfs);
+        assert_eq!(back.log.level, LogLevel::Trace);
+        assert_eq!(back.log.format, LogFormat::Json);
+        assert_eq!(back.sandbox.on_missing, OnMissing::Prompt);
+    }
+
+    #[test]
+    fn malformed_toml_falls_back_to_defaults() {
+        let dir = tmpdir("bad");
+        let f = dir.join("c.toml");
+        std::fs::write(&f, "this is = = not toml\n").unwrap();
+        let c = Config::load_layered(&MapEnv::default(), None, Some(f));
+        assert_eq!(c.picker, Picker::Auto);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn path_is_under_xdg_config() {
+        assert!(Config::path().ends_with("superzej/config.toml"));
+    }
+
+    #[test]
+    fn repo_sandbox_expands_mount_tildes() {
+        let cfg = Config::default();
+        let dir = tmpdir("mounts");
+        let sb = cfg.repo_sandbox(&dir);
+        // default mount "~/.gitconfig:ro" → tilde expanded, :ro preserved.
+        assert!(
+            sb.mounts
+                .iter()
+                .any(|m| m.ends_with("/.gitconfig:ro") && !m.starts_with('~'))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A repo overlay that sets *every* sandbox + remote field exercises all the
+    // overlay `apply` branches.
+    #[test]
+    fn full_repo_overlay_applies_every_field() {
+        let cfg = Config::default();
+        let dir = tmpdir("full");
+        std::fs::write(
+            dir.join(".superzej.toml"),
+            "\
+[sandbox]
+enabled = false
+backend = \"docker\"
+backend_chain = [\"docker\", \"none\"]
+image = \"img:2\"
+network = \"none\"
+env_passthrough = [\"FOO\"]
+mounts = [\"/a:/b\"]
+init_script = \"echo go\"
+devenv = true
+on_missing = \"fail\"
+[sandbox.remote]
+host = \"u@h\"
+port = 2200
+transport = \"ssh\"
+mode = \"sshfs\"
+remote_dir = \"/srv/wt\"
+forward_agent = false
+",
+        )
+        .unwrap();
+        let sb = cfg.repo_sandbox(&dir);
+        assert!(!sb.enabled);
+        assert_eq!(sb.backend, SandboxBackend::Docker);
+        assert_eq!(sb.backend_chain, vec!["docker", "none"]);
+        assert_eq!(sb.image, "img:2");
+        assert_eq!(sb.network, Network::None);
+        assert_eq!(sb.env_passthrough, vec!["FOO"]);
+        assert!(sb.devenv);
+        assert_eq!(sb.on_missing, OnMissing::Fail);
+        assert_eq!(sb.remote.host, "u@h");
+        assert_eq!(sb.remote.port, 2200);
+        assert_eq!(sb.remote.transport, RemoteTransport::Ssh);
+        assert_eq!(sb.remote.mode, RemoteMode::Sshfs);
+        assert_eq!(sb.remote.remote_dir, "/srv/wt");
+        assert!(!sb.remote.forward_agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn process_env_reads_real_vars() {
+        std::env::set_var("SUPERZEJ_TEST_PENV_xyz", "v1");
+        assert_eq!(
+            ProcessEnv.get("SUPERZEJ_TEST_PENV_xyz").as_deref(),
+            Some("v1")
+        );
+        assert!(ProcessEnv.get("SUPERZEJ_TEST_PENV_absent_qqq").is_none());
+        std::env::remove_var("SUPERZEJ_TEST_PENV_xyz");
+        // blank values are treated as unset.
+        std::env::set_var("SUPERZEJ_TEST_PENV_blank", "   ");
+        assert!(ProcessEnv.get("SUPERZEJ_TEST_PENV_blank").is_none());
+        std::env::remove_var("SUPERZEJ_TEST_PENV_blank");
     }
 }

@@ -90,7 +90,7 @@ pub fn run(ack: Option<String>) -> Result<()> {
             ("quiet", Some(t)) => (now - t).max(0.0) as u64,
             _ => 0,
         };
-        println!("{}\t{}\t{}", e.tab, e.state, quiet_secs);
+        crate::outln!("{}\t{}\t{}", e.tab, e.state, quiet_secs);
     }
     Ok(())
 }

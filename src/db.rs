@@ -38,7 +38,28 @@ impl Db {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let conn = Connection::open(&path)?;
+        Self::init(Connection::open(&path)?)
+    }
+
+    /// An isolated in-memory DB (tests): same schema/migration, no file.
+    #[cfg(test)]
+    fn open_memory() -> Result<Db> {
+        Self::init(Connection::open_in_memory()?)
+    }
+
+    /// Open at an explicit path (tests): exercises the real file-backed `open()`
+    /// path (dir creation + on-disk connection + migration) without mutating the
+    /// process-global `XDG_STATE_HOME`, which would race other parallel tests.
+    #[cfg(test)]
+    fn open_at(path: &std::path::Path) -> Result<Db> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        Self::init(Connection::open(path)?)
+    }
+
+    /// Apply pragmas, migration, and schema to a fresh connection.
+    fn init(conn: Connection) -> Result<Db> {
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
 
@@ -429,5 +450,162 @@ impl Db {
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn db() -> Db {
+        Db::open_memory().unwrap()
+    }
+
+    #[test]
+    fn repos_recents_order_by_seq() {
+        let db = db();
+        db.touch_repo("/a", "a").unwrap();
+        db.touch_repo("/b", "b").unwrap();
+        db.touch_repo("/a", "a").unwrap(); // re-open bumps seq
+        let recents = db.recent_repos(10).unwrap();
+        assert_eq!(recents, vec!["/a".to_string(), "/b".to_string()]);
+        assert!(db.recent_repos(1).unwrap().len() == 1);
+        assert!(db.is_known_repo("/a").unwrap());
+        assert!(!db.is_known_repo("/nope").unwrap());
+        assert!(db.known_repos().unwrap().contains(&"/b".to_string()));
+    }
+
+    #[test]
+    fn workspaces_roundtrip() {
+        let db = db();
+        db.put_workspace("/repo", "repo").unwrap();
+        db.put_workspace("/repo", "repo2").unwrap(); // upsert renames
+        let ws = db.workspaces().unwrap();
+        assert_eq!(ws.len(), 1);
+        assert_eq!(ws[0].repo_path, "/repo");
+        assert_eq!(ws[0].name, "repo2");
+        assert!(db.is_known_repo("/repo").unwrap());
+    }
+
+    #[test]
+    fn slug_reuse_and_collision_suffix() {
+        let db = db();
+        // First repo takes the bare base.
+        assert_eq!(db.slug_for_repo("/x/app", "app").unwrap(), "app");
+        // Same repo reuses its slug.
+        assert_eq!(db.slug_for_repo("/x/app", "app").unwrap(), "app");
+        // Different repo, same basename → suffixed.
+        assert_eq!(db.slug_for_repo("/y/app", "app").unwrap(), "app-2");
+        assert_eq!(db.slug_for_repo("/z/app", "app").unwrap(), "app-3");
+    }
+
+    #[test]
+    fn pr_and_diff_caches() {
+        let db = db();
+        assert!(db.get_pr_cache("/wt").unwrap().is_none());
+        db.put_pr_cache("/wt", "br", "{\"k\":1}").unwrap();
+        let (json, at) = db.get_pr_cache("/wt").unwrap().unwrap();
+        assert_eq!(json, "{\"k\":1}");
+        assert!(at > 0);
+        db.put_pr_cache("/wt", "br", "{\"k\":2}").unwrap(); // upsert
+        assert_eq!(db.get_pr_cache("/wt").unwrap().unwrap().0, "{\"k\":2}");
+
+        assert!(db.get_diff_cache("/wt").unwrap().is_none());
+        db.put_diff_cache("/wt", "M\tfile.rs").unwrap();
+        assert_eq!(db.get_diff_cache("/wt").unwrap().unwrap().0, "M\tfile.rs");
+    }
+
+    #[test]
+    fn worktree_crud() {
+        let db = db();
+        db.put_worktree("app/feat", "/x/app", "/wt/feat", "sz/feat", None)
+            .unwrap();
+        // metadata round-trips
+        let all = db.worktrees().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].worktree, "/wt/feat");
+        assert_eq!(all[0].branch, "sz/feat");
+        assert_eq!(all[0].repo_root, "/x/app");
+        // tab → worktree mapping uses the recorded session.
+        let sess = session();
+        assert_eq!(
+            db.worktree_for_tab(&sess, "app/feat").unwrap().as_deref(),
+            Some("/wt/feat")
+        );
+        assert_eq!(
+            db.repo_root_for("/wt/feat").unwrap().as_deref(),
+            Some("/x/app")
+        );
+        // agent: empty → None, then set → Some.
+        assert!(db.worktree_agent("/wt/feat").unwrap().is_none());
+        db.set_worktree_agent("/wt/feat", "claude").unwrap();
+        assert_eq!(
+            db.worktree_agent("/wt/feat").unwrap().as_deref(),
+            Some("claude")
+        );
+        // location: none by default; set via upsert.
+        assert!(
+            db.location_for("/wt/feat")
+                .unwrap()
+                .map(|s| s.is_empty())
+                .unwrap_or(true)
+        );
+        db.put_worktree(
+            "app/feat",
+            "/x/app",
+            "/wt/feat",
+            "sz/feat",
+            Some("{\"host\":\"box\"}"),
+        )
+        .unwrap();
+        assert_eq!(
+            db.location_for("/wt/feat").unwrap().as_deref(),
+            Some("{\"host\":\"box\"}")
+        );
+        // delete
+        db.del_worktree("/wt/feat").unwrap();
+        assert!(db.worktrees().unwrap().is_empty());
+    }
+
+    #[test]
+    fn empty_and_miss_paths() {
+        let db = db();
+        // Fresh DB: queries return empty / None rather than erroring.
+        assert!(db.recent_repos(5).unwrap().is_empty());
+        assert!(db.known_repos().unwrap().is_empty());
+        assert!(db.workspaces().unwrap().is_empty());
+        assert!(db.worktrees().unwrap().is_empty());
+        assert!(db.worktree_for_tab("s", "t").unwrap().is_none());
+        assert!(db.location_for("/missing").unwrap().is_none());
+        assert!(db.repo_root_for("/missing").unwrap().is_none());
+        assert!(db.worktree_agent("/missing").unwrap().is_none());
+        assert!(!db.is_known_repo("/missing").unwrap());
+        // session() honors the env (defaults to "default").
+        assert!(!session().is_empty());
+    }
+
+    // Cover the real file-backed open() path (db_path + dir creation + on-disk
+    // connection + migration) by pointing XDG_STATE_HOME at a temp dir.
+    #[test]
+    fn open_on_disk() {
+        let dir =
+            std::env::temp_dir().join(format!("sz-db-disk-{}-{:p}", std::process::id(), &0u8));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Open at an explicit path rather than mutating the global XDG_STATE_HOME
+        // (which other parallel tests read via Db::open()/db_path()).
+        let path = dir.join("superzej/superzej.db");
+        {
+            let db = Db::open_at(&path).unwrap();
+            db.touch_repo("/r", "r").unwrap();
+            assert_eq!(db.recent_repos(5).unwrap(), vec!["/r".to_string()]);
+        }
+        // Reopen the persisted file: migration is idempotent, data survives.
+        {
+            let db = Db::open_at(&path).unwrap();
+            assert!(db.is_known_repo("/r").unwrap());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        // db_path() still derives the default location from XDG_STATE_HOME.
+        assert!(db_path().ends_with("superzej/superzej.db"));
     }
 }

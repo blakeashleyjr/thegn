@@ -36,7 +36,11 @@ pub fn run(
     // worktree last ran (recorded in the DB); fall back to the picker if none.
     let preset = preset.or_else(|| {
         resume
-            .then(|| Db::open().ok().and_then(|db| db.worktree_agent(&worktree).ok().flatten()))
+            .then(|| {
+                Db::open()
+                    .ok()
+                    .and_then(|db| db.worktree_agent(&worktree).ok().flatten())
+            })
             .flatten()
     });
 
@@ -75,7 +79,7 @@ pub fn run(
             .iter()
             .map(|n| format!("{} {n}", theme::agent_glyph(n)))
             .collect();
-        match picker::pick(&prompt, &display, &cfg.picker) {
+        match picker::pick(&prompt, &display, cfg.picker.as_str()) {
             Some(sel) => display
                 .iter()
                 .position(|d| *d == sel)

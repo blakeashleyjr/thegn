@@ -5,7 +5,7 @@
 //! sidebar's "+ worktree"); otherwise the current tab's repo is used. All tabs
 //! live in the one session, so this is always a plain `new-tab` + tab switch.
 
-use crate::config::{Config, SandboxConfig};
+use crate::config::{Config, RemoteMode, SandboxConfig};
 use crate::db::Db;
 use crate::remote::{self, GitLoc};
 use crate::{commands, msg, repo, util, worktree, zellij};
@@ -61,7 +61,7 @@ pub fn run(
     // Remote worktrees are created on the remote over ssh; the tab's cwd then
     // stays the *local* repo root (a valid local dir) and pick-agent picks the
     // remote path back up from the DB. Everything else (local create) is as before.
-    let remote = sb.remote.is_remote() && sb.remote.mode == "remote";
+    let remote = sb.remote.is_remote() && sb.remote.mode == RemoteMode::Remote;
     let (wt_path, location, cwd): (String, Option<String>, PathBuf) = if remote {
         match create_remote(&root, &branch, &base, &sb) {
             Some((wt, loc)) => (wt, Some(loc), root.clone()),
