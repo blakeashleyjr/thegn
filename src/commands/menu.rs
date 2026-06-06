@@ -34,8 +34,9 @@ const ITEMS: &[(&str, &str)] = &[
         "Toggle diff / PR panel            Ctrl-Alt-p",
         "toggle-panel",
     ),
+    ("File drawer (yazi)                Ctrl-Alt-f", "files"),
     ("lazygit                                Alt-g", "lazygit"),
-    ("yazi — file manager                    Alt-y", "yazi"),
+    ("yazi — file manager (float)            Alt-y", "yazi"),
     ("editor                                 Alt-e", "editor"),
     ("git diff                               Alt-/", "diff"),
     (
@@ -88,6 +89,7 @@ fn dispatch(cfg: &Config, key: &str) -> Result<()> {
         "dashboard" => commands::dashboard::run(cfg, false, false),
         "toggle-sidebar" => commands::panels::sidebar(true),
         "toggle-panel" => commands::panels::panel(true),
+        "files" => commands::files::run(cfg, None, None, None, None, false, false),
         "lazygit" => commands::tool::run(cfg, "lazygit", None, None),
         "yazi" => commands::tool::run(cfg, "yazi", None, None),
         "editor" => commands::tool::run(cfg, "editor", None, None),

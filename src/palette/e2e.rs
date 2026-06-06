@@ -151,9 +151,12 @@ fn file_mode_streams_files() {
 
 #[test]
 fn content_mode_streams_ripgrep_hits() {
+    // Ticks must outlast the streaming ripgrep walk over the whole repo, which
+    // grows with the file count — give it generous headroom so content.rs's hit
+    // lands in a rendered frame before we snapshot.
     let (frames, _) = run([
         typed("/RegexMatcherBuilder"),
-        ticks(25),
+        ticks(60),
         vec![special(KeyCode::Esc)],
     ]
     .concat());

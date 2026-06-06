@@ -3,6 +3,7 @@ pub mod attach;
 pub mod close_worktree;
 pub mod dashboard;
 pub mod diff;
+pub mod files;
 pub mod grant_plugins;
 pub mod launch;
 pub mod list;

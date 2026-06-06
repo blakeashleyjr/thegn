@@ -17,5 +17,23 @@ jobs:
         run: nix flake check -L
       - name: Lint (clippy, shellcheck, yamllint, taplo)
         run: nix develop -c just lint
+      - name: Unit tests
+        run: nix develop -c just test
       - name: Smoke test
         run: nix develop -c just smoke
+  # The drawer's visual/structural regression + its 95% coverage gate spawn real
+  # sandboxed zellij+yazi sessions (CPU-heavy plugin compilation), so they run as
+  # their own job — isolated on a CI runner, never alongside an interactive shell.
+  drawer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Drawer visual regression (pty)
+        run: nix develop -c just drawer-e2e
+      - name: Drawer coverage gate (>= 95%)
+        run: nix develop -c just coverage-drawer

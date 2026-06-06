@@ -1,0 +1,29 @@
+# superzej bundled yazi config for the bottom file-manager drawer.
+#
+# Seeded ONCE into the drawer's private YAZI_CONFIG_HOME (default
+# ~/.superzej/yazi) and never overwritten — edit it freely. theme.toml living
+# beside it is REGENERATED from the superzej accent on every open, so don't hand-
+# edit that one. If yazi can't parse a file here it falls back to its presets, so
+# the drawer keeps working.
+
+[mgr]
+ratio = [1, 3, 4]
+show_hidden = true
+show_symlink = true
+sort_by = "natural"
+sort_dir_first = true
+scrolloff = 5
+
+[preview]
+max_width = 1000
+max_height = 1000
+tab_size = 2
+
+# Route "edit" (Enter/o on a text file) through superzej so it opens in
+# superzej's editor surface (honoring $VISUAL/$EDITOR and GUI editors) rather
+# than a raw editor inside the drawer. Non-blocking: superzej spawns the editor
+# pane and the drawer stays put.
+[[opener.edit]]
+run = 'superzej tool editor --file "$@"'
+block = false
+desc = "Edit (superzej)"
