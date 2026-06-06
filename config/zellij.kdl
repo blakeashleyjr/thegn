@@ -118,32 +118,35 @@ keybinds {
         // window manager must not already grab Super+Alt+<key>. If these don't
         // fire, that's the WM eating them; use the Alt+h/j/k/l binds above.
         //
-        // Left/Right + h/l move PANE focus. Up/Down + j/k instead drive the left
-        // sidebar's selection (j/↓ next, k/↑ previous worktree/branch/repo) — the
-        // bind broadcasts to every tab's sidebar, only the active tab's responds.
-        // Pane-focus up/down stays on the bare Alt+j/k binds above.
+        // Left/Right + h/l move PANE focus. Up/Down + j/k SELECT the chrome
+        // bars: Up/k focuses the top bar (the resource-monitor strip) — then
+        // plain ←/→ pick a stat (CPU/MEM/GPU) and Enter pulls up that monitor
+        // embedded at the bottom; Down/j focuses the bottom statusbar. The bind
+        // broadcasts to every tab's instance; only the active tab's responds.
+        // (The sidebar tree is navigated with plain j/k/↑/↓ once the sidebar
+        // pane itself is focused — e.g. Super+Alt+Left/Alt+h onto it.)
         bind "Super Alt Left"  { MoveFocus "Left"; }
         bind "Super Alt Right" { MoveFocus "Right"; }
         bind "Super Alt h"     { MoveFocus "Left"; }
         bind "Super Alt l"     { MoveFocus "Right"; }
-        bind "Super Alt Down" {
-            MessagePlugin "file:~/.local/share/superzej/sidebar.wasm" {
-                name "superzej_nav_down"
-            }
-        }
-        bind "Super Alt j" {
-            MessagePlugin "file:~/.local/share/superzej/sidebar.wasm" {
-                name "superzej_nav_down"
-            }
-        }
         bind "Super Alt Up" {
-            MessagePlugin "file:~/.local/share/superzej/sidebar.wasm" {
-                name "superzej_nav_up"
+            MessagePlugin "file:~/.local/share/superzej/tabbar.wasm" {
+                name "superzej_select_topbar"
             }
         }
         bind "Super Alt k" {
-            MessagePlugin "file:~/.local/share/superzej/sidebar.wasm" {
-                name "superzej_nav_up"
+            MessagePlugin "file:~/.local/share/superzej/tabbar.wasm" {
+                name "superzej_select_topbar"
+            }
+        }
+        bind "Super Alt Down" {
+            MessagePlugin "file:~/.local/share/superzej/statusbar.wasm" {
+                name "superzej_select_bottombar"
+            }
+        }
+        bind "Super Alt j" {
+            MessagePlugin "file:~/.local/share/superzej/statusbar.wasm" {
+                name "superzej_select_bottombar"
             }
         }
     }

@@ -95,6 +95,13 @@ e2e: release
     ./test/one-session.sh
     ./test/slug-unique.sh
 
+# Real-zellij-on-a-pty UI tests. Self-contained (own sandbox HOME pointed at
+# the freshly built binary + plugins) — never touches a live session. Needs a
+# real `zellij` on PATH. resource-monitor: top-bar stat select -> embedded
+# monitor. (nav-ux reads the *installed* plugins, so run it after `just install`.)
+e2e-ui: release build-plugins
+    python3 ./test/resource-monitor.py
+
 # --- run / install --------------------------------------------------------
 
 # Run a subcommand against the debug build, e.g. `just run list --json`.

@@ -29,6 +29,28 @@ impl Default for ThemeConfig {
     }
 }
 
+/// `[monitor]` — the resource managers opened from the top-bar stats widget
+/// (highlight a stat with Super+Alt+Up, then Enter). Each is a shell command
+/// run in an embedded tiled pane. `system` backs the CPU and MEM segments; `gpu`
+/// backs the GPU segment.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct MonitorConfig {
+    /// CPU/RAM monitor (default `btm`, ClementTsang/bottom).
+    pub system: String,
+    /// GPU monitor (default `nvtop`).
+    pub gpu: String,
+}
+
+impl Default for MonitorConfig {
+    fn default() -> Self {
+        MonitorConfig {
+            system: "btm".into(),
+            gpu: "nvtop".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -45,6 +67,7 @@ pub struct Config {
     pub agents: Vec<NamedCommand>,
     pub tools: Vec<NamedCommand>,
     pub theme: ThemeConfig,
+    pub monitor: MonitorConfig,
 }
 
 impl Default for Config {
@@ -69,6 +92,7 @@ impl Default for Config {
             agents: Vec::new(),
             tools: Vec::new(),
             theme: ThemeConfig::default(),
+            monitor: MonitorConfig::default(),
         }
     }
 }
@@ -149,6 +173,16 @@ impl Config {
             .map(|t| t.command.as_str())
     }
 
+    /// The resource-monitor command for a stat segment: `cpu`/`mem` → the
+    /// system monitor, `gpu` → the GPU monitor. Unknown kinds → `None`.
+    pub fn monitor_command(&self, kind: &str) -> Option<&str> {
+        match kind {
+            "cpu" | "mem" => Some(self.monitor.system.as_str()),
+            "gpu" => Some(self.monitor.gpu.as_str()),
+            _ => None,
+        }
+    }
+
     /// The accent as a truecolor "R;G;B" fragment; invalid hex falls back to
     /// the default teal.
     pub fn accent_rgb(&self) -> String {
@@ -179,4 +213,94 @@ fn parse_hex_rgb(hex: &str) -> Option<String> {
         (n >> 8) & 255,
         n & 255
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn monitor_defaults() {
+        let m = MonitorConfig::default();
+        assert_eq!(m.system, "btm");
+        assert_eq!(m.gpu, "nvtop");
+    }
+
+    #[test]
+    fn monitor_command_maps_kinds() {
+        let cfg = Config::default();
+        assert_eq!(cfg.monitor_command("cpu"), Some("btm"));
+        assert_eq!(cfg.monitor_command("mem"), Some("btm"));
+        assert_eq!(cfg.monitor_command("gpu"), Some("nvtop"));
+        assert_eq!(cfg.monitor_command("disk"), None);
+        assert_eq!(cfg.monitor_command(""), None);
+    }
+
+    #[test]
+    fn monitor_command_honors_overrides() {
+        let cfg = Config {
+            monitor: MonitorConfig {
+                system: "htop".into(),
+                gpu: "nvitop".into(),
+            },
+            ..Config::default()
+        };
+        assert_eq!(cfg.monitor_command("cpu"), Some("htop"));
+        assert_eq!(cfg.monitor_command("gpu"), Some("nvitop"));
+    }
+
+    #[test]
+    fn missing_monitor_table_uses_defaults() {
+        // A config.toml without a [monitor] table parses with serde defaults.
+        let cfg: Config = toml::from_str("base_branch = \"main\"").unwrap();
+        assert_eq!(cfg.monitor.system, "btm");
+        assert_eq!(cfg.monitor.gpu, "nvtop");
+    }
+
+    #[test]
+    fn parses_monitor_table() {
+        let cfg: Config =
+            toml::from_str("[monitor]\nsystem = \"htop\"\ngpu = \"nvtop\"\n").unwrap();
+        assert_eq!(cfg.monitor.system, "htop");
+        assert_eq!(cfg.monitor.gpu, "nvtop");
+    }
+
+    #[test]
+    fn partial_monitor_table_keeps_serde_defaults() {
+        // Only one key set — the other falls back to its default.
+        let cfg: Config = toml::from_str("[monitor]\ngpu = \"nvitop\"\n").unwrap();
+        assert_eq!(cfg.monitor.system, "btm");
+        assert_eq!(cfg.monitor.gpu, "nvitop");
+    }
+
+    #[test]
+    fn parse_hex_rgb_accepts_3_and_6_digit_and_rejects_junk() {
+        assert_eq!(parse_hex_rgb("#76eede").as_deref(), Some("118;238;222"));
+        assert_eq!(parse_hex_rgb("#fff").as_deref(), Some("255;255;255"));
+        assert_eq!(parse_hex_rgb("#000").as_deref(), Some("0;0;0"));
+        assert_eq!(parse_hex_rgb("76eede"), None); // requires a leading '#'
+        assert_eq!(parse_hex_rgb("#12g456"), None);
+        assert_eq!(parse_hex_rgb("#1234"), None);
+        assert_eq!(parse_hex_rgb(""), None);
+    }
+
+    #[test]
+    fn accent_helpers_fall_back_to_teal_on_bad_hex() {
+        let good = Config {
+            theme: ThemeConfig {
+                accent: "#FFffFF".into(),
+            },
+            ..Config::default()
+        };
+        assert_eq!(good.accent_rgb(), "255;255;255");
+        assert_eq!(good.accent_hex(), "#ffffff"); // normalized to lowercase
+        let bad = Config {
+            theme: ThemeConfig {
+                accent: "not-a-color".into(),
+            },
+            ..Config::default()
+        };
+        assert_eq!(bad.accent_hex(), "#76eede");
+        assert_eq!(bad.accent_rgb(), crate::theme::TEAL);
+    }
 }
