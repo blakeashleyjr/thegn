@@ -14,6 +14,7 @@
 use crate::commands::{diff, panels};
 use crate::db::Db;
 use crate::github::{self, PanelState};
+use crate::remote::GitLoc;
 use crate::{util, zellij};
 use anyhow::Result;
 use notify::{recommended_watcher, Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -176,7 +177,7 @@ fn push_diff(url: &str, wt: &str) {
 /// Re-fetch the PR for `wt`, cache it, push it; returns whether we were rate
 /// limited (so the caller can back off).
 fn push_pr(url: &str, wt: &str) -> bool {
-    let panel = github::pr_status(Path::new(wt));
+    let panel = github::pr_status(&GitLoc::for_worktree(Path::new(wt)));
     let rate_limited = matches!(panel.state, PanelState::RateLimited);
     let json = serde_json::to_string(&panel).unwrap_or_default();
     if let Ok(db) = Db::open() {

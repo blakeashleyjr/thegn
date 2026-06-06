@@ -23,6 +23,103 @@ self: {
     };
   };
 
+  remoteSubmodule = lib.types.submodule {
+    options = {
+      host = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        example = "user@devbox";
+        description = "Remote ssh target to run worktrees on. Empty = local.";
+      };
+      port = lib.mkOption {
+        type = lib.types.port;
+        default = 22;
+        description = "ssh port for the remote.";
+      };
+      transport = lib.mkOption {
+        type = lib.types.enum ["mosh" "ssh"];
+        default = "mosh";
+        description = "Interactive pane transport (control plane always uses ssh).";
+      };
+      mode = lib.mkOption {
+        type = lib.types.enum ["remote" "local_exec" "sshfs"];
+        default = "remote";
+        description = "Where the remote worktree lives.";
+      };
+      remoteDir = lib.mkOption {
+        type = lib.types.str;
+        default = "~/superzej-worktrees";
+        description = "Where remote worktrees live (mode = remote).";
+      };
+      forwardAgent = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "ssh -A so remote git push reuses the host ssh-agent.";
+      };
+    };
+  };
+
+  sandboxSubmodule = lib.types.submodule {
+    options = {
+      enabled = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Run each worktree's interactive process in a container/sandbox.";
+      };
+      backend = lib.mkOption {
+        type = lib.types.enum ["auto" "podman" "docker" "bwrap" "systemd" "apple" "wsl" "none"];
+        default = "auto";
+        description = "Sandbox backend; \"auto\" walks backendChain.";
+      };
+      backendChain = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = ["podman" "docker" "bwrap" "none"];
+        description = "Auto-detection order; \"none\" = run on the host.";
+      };
+      image = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        example = "ghcr.io/you/devbox:latest";
+        description = "OCI image. Empty = host-toolchain mode (bwrap/systemd).";
+      };
+      network = lib.mkOption {
+        type = lib.types.enum ["nat" "host" "none"];
+        default = "nat";
+        description = "Sandbox network mode (agents need egress).";
+      };
+      envPassthrough = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = ["SSH_AUTH_SOCK" "GH_TOKEN" "GITHUB_TOKEN" "ANTHROPIC_API_KEY" "TERM" "COLORTERM"];
+        description = "Host env vars forwarded into the sandbox.";
+      };
+      mounts = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = ["~/.gitconfig:ro"];
+        description = "Extra bind mounts (\"host\", \"host:ro\", \"host:dest\", \"host:dest:ro\").";
+      };
+      initScript = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        description = "Shell run inside the sandbox before the agent/shell.";
+      };
+      devenv = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Wrap the inner command in `devenv shell --`.";
+      };
+      onMissing = lib.mkOption {
+        type = lib.types.enum ["warn" "prompt" "fail"];
+        default = "warn";
+        description = "What to do when no backend is available.";
+      };
+      remote = lib.mkOption {
+        type = remoteSubmodule;
+        default = {};
+        description = "Run worktrees on a remote machine over mosh/ssh.";
+      };
+    };
+  };
+
   tomlFormat = pkgs.formats.toml {};
 
   # Rendered to ~/.config/superzej/config.toml; keys match the Rust serde struct.
@@ -43,6 +140,18 @@ self: {
     monitor = {
       system = cfg.monitorSystem;
       gpu = cfg.monitorGpu;
+    };
+    sandbox = {
+      inherit (cfg.sandbox) enabled backend image network mounts devenv;
+      backend_chain = cfg.sandbox.backendChain;
+      env_passthrough = cfg.sandbox.envPassthrough;
+      init_script = cfg.sandbox.initScript;
+      on_missing = cfg.sandbox.onMissing;
+      remote = {
+        inherit (cfg.sandbox.remote) host port transport mode;
+        remote_dir = cfg.sandbox.remote.remoteDir;
+        forward_agent = cfg.sandbox.remote.forwardAgent;
+      };
     };
   };
 in {
@@ -189,6 +298,19 @@ in {
         }
       ];
       description = "Per-worktree tools (also bound to Alt-g/y/e//).";
+    };
+
+    sandbox = lib.mkOption {
+      type = sandboxSubmodule;
+      default = {};
+      example = lib.literalExpression ''
+        {
+          backend = "podman";
+          image = "ghcr.io/you/devbox:latest";
+          remote = { host = "user@devbox"; transport = "mosh"; };
+        }
+      '';
+      description = "Per-worktree container/sandbox settings (see README \"Sandboxing worktrees\").";
     };
   };
 

@@ -2,7 +2,9 @@
 //! as a floating pane scoped to the focused worktree.
 
 use crate::config::Config;
-use crate::{msg, repo, util, zellij};
+use crate::db::Db;
+use crate::remote::GitLoc;
+use crate::{msg, repo, sandbox, util, zellij};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
@@ -39,8 +41,30 @@ pub fn run(cfg: &Config, name: &str, worktree: Option<String>, file: Option<Stri
     }
 
     if zellij::in_zellij() {
-        let sh = util::shell();
-        zellij::new_float(&worktree, name, &[&sh, "-lc", &cmd]);
+        // Run the tool inside the worktree's sandbox so it shares the same git
+        // env as the agent pane (no-op when the sandbox resolves to the host).
+        let wt_s = worktree.to_string_lossy().into_owned();
+        let loc = GitLoc::for_worktree(&worktree);
+        let root = Db::open()
+            .ok()
+            .and_then(|db| db.repo_root_for(&wt_s).ok().flatten())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| repo::main_worktree(&worktree))
+            .unwrap_or_else(|| worktree.clone());
+        let sb = cfg.repo_sandbox(&root);
+        let cname = sandbox::container_name(&wt_s);
+        match sandbox::resolve(&sb, &loc, &cname) {
+            Some(spec) if sandbox::ensure(&spec).is_ok() => {
+                let argv = sandbox::enter_argv(&spec, &cmd);
+                let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+                zellij::new_float(&worktree, name, &refs);
+            }
+            _ => {
+                let sh = util::shell();
+                zellij::new_float(&worktree, name, &[&sh, "-lc", &cmd]);
+            }
+        }
         // Close this launcher pane (spawned by the keybind's Run).
         zellij::close_pane();
     } else {
