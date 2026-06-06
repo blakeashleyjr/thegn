@@ -13,6 +13,7 @@ pub fn run(
     worktree: Option<String>,
     branch: Option<String>,
     preset: Option<String>,
+    resume: bool,
 ) -> Result<()> {
     let worktree = worktree.unwrap_or_else(|| {
         std::env::current_dir()
@@ -22,6 +23,14 @@ pub fn run(
     if !Path::new(&worktree).is_dir() {
         msg::die(&format!("pick-agent: worktree '{worktree}' does not exist"));
     }
+
+    // On restart (`--resume`) skip the picker and relaunch the agent this
+    // worktree last ran (recorded in the DB); fall back to the picker if none.
+    let preset = preset.or_else(|| {
+        resume
+            .then(|| Db::open().ok().and_then(|db| db.worktree_agent(&worktree).ok().flatten()))
+            .flatten()
+    });
 
     // Branch may be omitted (worktree-tab layout runs us with cwd only); derive
     // it from git, and name the tab after it so resurrected tabs read correctly.

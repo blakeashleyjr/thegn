@@ -73,7 +73,7 @@ pub fn run(
         if zellij::in_zellij() {
             zellij::rename_tab(&tab);
         }
-        return commands::pick_agent::run(cfg, Some(path_s), Some(branch), None);
+        return commands::pick_agent::run(cfg, Some(path_s), Some(branch), None, false);
     }
 
     if zellij::in_zellij() {

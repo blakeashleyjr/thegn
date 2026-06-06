@@ -188,6 +188,21 @@ pub fn spawn_detached(cmd: &str, cwd: &Path) {
         .spawn();
 }
 
+/// Spawn `prog args...` as a detached background daemon: its own process group
+/// (so a Ctrl-C / SIGINT in the launching terminal doesn't reach it) and null
+/// stdio. Used to start the `watch` daemon just before we exec into zellij — it
+/// is reparented to init when the launching client exits.
+pub fn spawn_daemon(prog: &str, args: &[&str]) {
+    use std::process::Stdio;
+    let _ = Command::new(prog)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn();
+}
+
 /// Set the terminal (pane) window title via OSC. zellij shows it as the pane's
 /// frame title; any program run afterwards (vim, lazygit, …) overrides it as
 /// usual, so this just seeds a sensible default (the branch/worktree name).
