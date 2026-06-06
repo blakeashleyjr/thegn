@@ -47,6 +47,13 @@ const ITEMS: &[(&str, &str)] = &[
 ];
 
 pub fn run(cfg: &Config) -> Result<()> {
+    crate::palette::run(cfg)
+}
+
+/// The legacy external-picker palette, kept as a fallback until the native
+/// palette covers every path. Unused while `run` delegates to the iocraft UI.
+#[allow(dead_code)]
+fn run_external(cfg: &Config) -> Result<()> {
     let labels: Vec<String> = ITEMS.iter().map(|(l, _)| (*l).to_string()).collect();
     let Some(choice) = picker::pick("superzej ❯ ", &labels, &cfg.picker) else {
         return Ok(());
@@ -59,6 +66,7 @@ pub fn run(cfg: &Config) -> Result<()> {
     dispatch(cfg, key)
 }
 
+#[allow(dead_code)]
 fn dispatch(cfg: &Config, key: &str) -> Result<()> {
     match key {
         "new-workspace" => commands::new_workspace::run(cfg, None, None, true),

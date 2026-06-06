@@ -80,9 +80,15 @@ fmt-check:
 test:
     cargo test
 
+# Line-coverage report (needs `cargo install cargo-llvm-cov`). Pass a path filter,
+# e.g. `just coverage src/palette` to scope the summary to the command palette.
+coverage *filter:
+    cargo llvm-cov --summary-only {{ if filter != "" { "2>&1 | grep -E 'Filename|" + filter + "|TOTAL|---'" } else { "" } }}
+
 # Hermetic end-to-end test against the debug binary (no zellij side effects).
 smoke: build
     ./test/smoke.sh {{bin}}
+    python3 test/palette-smoke.py {{bin}}
 
 # Same, but against the built Nix package (verifies the wrapper + injected deps).
 smoke-pkg:
