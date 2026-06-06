@@ -47,9 +47,11 @@ struct State {
     hover: Option<usize>,
     cursor: Option<usize>,
     my_id: Option<u32>,
-    // Visibility is owned by the statusbar controller (the only chrome surface
-    // that is never hidden and can re-tile the others). The sidebar just renders
-    // and switches tabs; it no longer hides/shows itself.
+    my_tab: Option<usize>, // tab position this instance lives on (manifest key)
+    active_tab: Option<usize>, // the currently-focused tab (from TabUpdate)
+                           // Visibility is owned by the statusbar controller (the only chrome surface
+                           // that is never hidden and can re-tile the others). The sidebar just renders
+                           // and switches tabs; it no longer hides/shows itself.
 }
 
 /// A managed repo as reported by `superzej workspaces` (slug, name, path).
@@ -157,6 +159,7 @@ impl ZellijPlugin for State {
             }
             Event::TabUpdate(tabs) => {
                 self.active_repo = tabs.iter().find(|t| t.active).map(|t| split_tab(&t.name).0);
+                self.active_tab = tabs.iter().find(|t| t.active).map(|t| t.position);
                 self.tabs = tabs
                     .into_iter()
                     .map(|t| {
@@ -235,6 +238,16 @@ impl ZellijPlugin for State {
             "superzej_refresh" => {
                 self.pull_repos();
                 false
+            }
+            // Super+Alt+j/k/↓/↑ move the selection in the tree (highlight only;
+            // Enter/click still opens). The keybind broadcasts to every tab's
+            // sidebar instance, so only the one on the active tab responds —
+            // otherwise off-screen instances would drift their cursors too.
+            "superzej_nav_down" | "superzej_nav_up" => {
+                if self.my_tab.is_none() || self.my_tab != self.active_tab {
+                    return false;
+                }
+                self.move_cursor(pipe.name.ends_with("down"))
             }
             _ => false,
         }
@@ -424,20 +437,28 @@ impl State {
         }
     }
 
-    fn on_key(&mut self, key: KeyWithModifier) -> bool {
+    /// Move the selection one row down (`true`) or up (`false`), clamping at the
+    /// ends. Returns whether the cursor changed (i.e. a re-render is needed).
+    fn move_cursor(&mut self, down: bool) -> bool {
         if self.rows.is_empty() {
             return false;
         }
         let last = self.rows.len() - 1;
+        self.cursor = Some(if down {
+            self.cursor.map_or(0, |c| (c + 1).min(last))
+        } else {
+            self.cursor.map_or(last, |c| c.saturating_sub(1))
+        });
+        true
+    }
+
+    fn on_key(&mut self, key: KeyWithModifier) -> bool {
+        if self.rows.is_empty() {
+            return false;
+        }
         match key.bare_key {
-            BareKey::Down | BareKey::Char('j') => {
-                self.cursor = Some(self.cursor.map_or(0, |c| (c + 1).min(last)));
-                true
-            }
-            BareKey::Up | BareKey::Char('k') => {
-                self.cursor = Some(self.cursor.map_or(last, |c| c.saturating_sub(1)));
-                true
-            }
+            BareKey::Down | BareKey::Char('j') => self.move_cursor(true),
+            BareKey::Up | BareKey::Char('k') => self.move_cursor(false),
             BareKey::Enter | BareKey::Right | BareKey::Char('l') => {
                 if let Some(c) = self.cursor {
                     self.activate(c);
@@ -491,10 +512,11 @@ impl State {
     fn refresh_focus(&mut self, manifest: &PaneManifest) -> bool {
         let Some(id) = self.my_id else { return false };
         let mut focused = false;
-        for panes in manifest.panes.values() {
+        for (tab_pos, panes) in &manifest.panes {
             if !panes.iter().any(|p| p.is_plugin && p.id == id) {
                 continue; // another tab's panes
             }
+            self.my_tab = Some(*tab_pos); // which tab this sidebar instance is on
             for p in panes {
                 if p.is_plugin && p.id == id {
                     focused = p.is_focused;
