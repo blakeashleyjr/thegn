@@ -110,6 +110,15 @@ impl Db {
               repo_path TEXT PRIMARY KEY,
               slug      TEXT NOT NULL
             );
+            -- Command-palette frecency: how often / how recently each action or
+            -- nav target was chosen, so the palette floats them up on an empty
+            -- query. `key` is the row's stable frecency key (e.g. "new-worktree",
+            -- "wt:/path", "repo:/path").
+            CREATE TABLE IF NOT EXISTS palette_usage (
+              key        TEXT PRIMARY KEY,
+              count      INTEGER DEFAULT 0,
+              last_used  INTEGER
+            );
             "#,
         )?;
         // Additive: a pre-existing v3 worktrees table predates the remote-worktree
@@ -293,6 +302,33 @@ impl Db {
                 created_at: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
                 last_active: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
             })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    // --- command-palette frecency -----------------------------------------
+    /// Record that `key` was just chosen (increment count, stamp last_used).
+    pub fn bump_palette_usage(&self, key: &str) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO palette_usage(key,count,last_used)
+               VALUES(?1,1,?2)
+               ON CONFLICT(key) DO UPDATE SET count=count+1, last_used=?2"#,
+            params![key, util::now()],
+        )?;
+        Ok(())
+    }
+
+    /// All usage rows as (key, count, last_used), for frecency ranking.
+    pub fn palette_usage(&self) -> Result<Vec<(String, i64, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key, count, last_used FROM palette_usage")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+            ))
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
