@@ -174,7 +174,7 @@ mod tests {
     fn switching_modes_repopulates() {
         testutil::sandbox();
         let db = crate::db::Db::open().unwrap();
-        db.put_worktree("r/feat-y", "/r", "/wt/feat-y", "feat/y")
+        db.put_worktree("r/feat-y", "/r", "/wt/feat-y", "feat/y", None)
             .unwrap();
 
         let mut c = Core::new(Config::default());

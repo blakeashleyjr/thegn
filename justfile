@@ -126,6 +126,7 @@ start name="dev": build build-plugins
       SUPERZEJ_DIR="$HOME/.superzej-{{name}}" \
       XDG_STATE_HOME="$HOME/.superzej-{{name}}/state" \
       SUPERZEJ_LAYOUT="$PWD/layouts/superzej.kdl" \
+      SUPERZEJ_LAYOUT_DIR="$PWD/layouts" \
       SUPERZEJ_CONFIG="$PWD/config/zellij.kdl" \
       {{bin}}
 
@@ -150,6 +151,7 @@ start-term name="dev": build build-plugins
       "SUPERZEJ_DIR=$HOME/.superzej-{{name}}" \
       "XDG_STATE_HOME=$HOME/.superzej-{{name}}/state" \
       "SUPERZEJ_LAYOUT=$PWD/layouts/superzej.kdl" \
+      "SUPERZEJ_LAYOUT_DIR=$PWD/layouts" \
       "SUPERZEJ_CONFIG=$PWD/config/zellij.kdl" \
       "SUPERZEJ_FRESH=1" \
       "$PWD/target/debug/superzej"
@@ -178,6 +180,7 @@ stress name="stress": build build-plugins
       "XDG_STATE_HOME=$HOME/.superzej-{{name}}/state" \
       "XDG_CONFIG_HOME=$HOME/.superzej-{{name}}/config" \
       "SUPERZEJ_LAYOUT=$HOME/.superzej-{{name}}/layout-stress.kdl" \
+      "SUPERZEJ_LAYOUT_DIR=$PWD/layouts" \
       "SUPERZEJ_CONFIG=$PWD/config/zellij.kdl" \
       "SUPERZEJ_FRESH=1" \
       "$PWD/target/debug/superzej" new-workspace "$HOME/.superzej-{{name}}/fixtures/repos/east/washu"

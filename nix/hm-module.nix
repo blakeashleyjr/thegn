@@ -320,12 +320,12 @@ in {
     # superzej reads this TOML config.
     xdg.configFile."superzej/config.toml".source = configFile;
 
-    # Ship layouts into the *writable* zellij layouts dir — never touches the
-    # user's read-only config.kdl. zellij resolves these by name.
-    xdg.configFile."zellij/layouts/superzej.kdl".source = "${cfg.package}/share/zellij/layouts/superzej.kdl";
-    xdg.configFile."zellij/layouts/worktree-tab.kdl".source = "${cfg.package}/share/zellij/layouts/worktree-tab.kdl";
-    xdg.configFile."zellij/layouts/home-tab.kdl".source = "${cfg.package}/share/zellij/layouts/home-tab.kdl";
-    xdg.configFile."zellij/layouts/worktree-tab-extra.kdl".source = "${cfg.package}/share/zellij/layouts/worktree-tab-extra.kdl";
+    # NOTE: layouts are NOT shipped into the user's ~/.config/zellij. superzej
+    # embeds them in the binary and seeds them into its own private layout dir
+    # (~/.superzej/layouts) at launch, resolving them via an absolute --layout
+    # path / --layout-dir. This keeps superzej fully independent of the user's
+    # zellij config — and means adding a layout can never drift between the
+    # package and this module again. See src/commands/attach.rs (seed_layouts).
 
     # Deploy the WASM plugins to the literal paths the session layout references
     # (file:~/.local/share/superzej/{sidebar,panel,tabbar,statusbar}.wasm). home.file
