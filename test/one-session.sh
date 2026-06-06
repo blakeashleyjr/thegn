@@ -26,41 +26,51 @@ TMPHOME="$(mktemp -d)"
 TMPSTATE="$TMPHOME/.local/state"
 REPOPARENT="$(mktemp -d)"
 FAIL=0
+
+# CRITICAL isolation: pin zellij to a PRIVATE socket + cache, and drop any
+# inherited zellij env. Without this, running the test from inside a live
+# superzej session leaks — every `zellij`/`superzej` call would use the live
+# socket, so the home-tab's `superzej status` pane registers the throwaway repos
+# in your REAL daily DB and opens tabs in your REAL session. The sandbox socket
+# means the test can never see or touch a live session (and vice-versa).
+export ZELLIJ_SOCKET_DIR="$TMPHOME/run"
+export XDG_CACHE_HOME="$TMPHOME/.cache"
+unset ZELLIJ ZELLIJ_SESSION_NAME ZELLIJ_PANE_ID
 ok() { echo "  ✓ $1"; }
 bad() {
-	echo "  ✗ $1"
-	FAIL=1
+  echo "  ✗ $1"
+  FAIL=1
 }
 
 cleanup() {
-	zellij delete-session "$H" --force >/dev/null 2>&1
-	rm -rf "$TMPHOME" "$REPOPARENT"
+  zellij delete-session "$H" --force >/dev/null 2>&1
+  rm -rf "$TMPHOME" "$REPOPARENT"
 }
 trap cleanup EXIT
 
 command -v zellij >/dev/null || {
-	echo "SKIP: zellij not installed"
-	exit 0
+  echo "SKIP: zellij not installed"
+  exit 0
 }
 [ -x "$SZ" ] || {
-	echo "FAIL: build first (cargo build --release)"
-	exit 1
+  echo "FAIL: build first (cargo build --release)"
+  exit 1
 }
 
 # Run the binary as if it were a pane inside session H, with an isolated DB.
 sj() { env XDG_STATE_HOME="$TMPSTATE" SUPERZEJ_CONFIG="$CONFIG" SUPERZEJ_LAYOUT="$LAYOUT" \
-	ZELLIJ=0 ZELLIJ_SESSION_NAME="$H" ZELLIJ_PANE_ID=1 SUPERZEJ_SESSION="$H" \
-	timeout 20 "$SZ" "$@"; }
+  ZELLIJ=0 ZELLIJ_SESSION_NAME="$H" ZELLIJ_PANE_ID=1 SUPERZEJ_SESSION="$H" \
+  timeout 20 "$SZ" "$@"; }
 tabs_of_H() { ZELLIJ_SESSION_NAME="$H" timeout 5 zellij action query-tab-names 2>/dev/null; }
 slug() { basename "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\+/-/g; s/^-//; s/-$//'; }
 
 echo "== setup =="
 mkA() {
-	local d="$REPOPARENT/$1"
-	mkdir -p "$d"
-	git -C "$d" init -q
-	git -C "$d" -c user.email=t@e -c user.name=t commit -q --allow-empty -m init
-	echo "$d"
+  local d="$REPOPARENT/$1"
+  mkdir -p "$d"
+  git -C "$d" init -q
+  git -C "$d" -c user.email=t@e -c user.name=t commit -q --allow-empty -m init
+  echo "$d"
 }
 REPO_A="$(mkA sz1-alpha-$$)"
 REPO_B="$(mkA sz1-bravo-$$)"
@@ -88,10 +98,10 @@ names="$(tabs_of_H)"
 
 echo "== assert =="
 [ "$before" = "$after" ] && ok "opening repos created NO new sessions (one session, no teleport)" ||
-	{
-		bad "session list changed:"
-		diff <(echo "$before") <(echo "$after") | sed 's/^/      /'
-	}
+  {
+    bad "session list changed:"
+    diff <(echo "$before") <(echo "$after") | sed 's/^/      /'
+  }
 
 echo "$names" | grep -qx "$SLUG_A/home" && ok "repo A is the tab '$SLUG_A/home'" || bad "missing tab '$SLUG_A/home' (got: $(echo "$names" | tr '\n' ' '))"
 echo "$names" | grep -qx "$SLUG_B/home" && ok "repo B is the tab '$SLUG_B/home'" || bad "missing tab '$SLUG_B/home'"
@@ -101,10 +111,10 @@ dups="$(echo "$names" | grep -cx "$SLUG_A/home")"
 
 reg="$(env XDG_STATE_HOME="$TMPSTATE" "$SZ" workspaces 2>/dev/null | cut -f3 | sort)"
 echo "$reg" | grep -qx "$REPO_A" && echo "$reg" | grep -qx "$REPO_B" &&
-	ok "both repos registered in the DB (sidebar lists them)" || bad "repos not both registered"
+  ok "both repos registered in the DB (sidebar lists them)" || bad "repos not both registered"
 
 echo
 if [ "$FAIL" = 0 ]; then echo "PASS"; else
-	echo "FAIL"
-	exit 1
+  echo "FAIL"
+  exit 1
 fi

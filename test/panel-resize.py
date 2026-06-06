@@ -92,15 +92,10 @@ if not (os.path.exists(SZ) and shutil.which("zellij")):
     print("SKIP: need target/release/superzej and zellij")
     sys.exit(0)
 
-# The manual-visibility persistence lives at $HOME/.superzej (shared across
-# sessions, and we can't redirect $HOME without breaking the `~`-rooted plugin
-# urls), so clear it for a clean start and restore nothing.
-for f in (".panel_state", ".sidebar_state"):
-    try:
-        os.remove(os.path.expanduser(f"~/.superzej/{f}"))
-    except FileNotFoundError:
-        pass
-
+# Visibility state (.panel_state/.sidebar_state) lives under
+# ${SUPERZEJ_DIR:-$HOME/.superzej}. We point SUPERZEJ_DIR at the sandbox below
+# (it doesn't affect the `~`-rooted plugin urls), so this never reads or writes
+# your real ~/.superzej.
 tmphome = tempfile.mkdtemp()
 state = os.path.join(tmphome, "state")
 # Fully isolated zellij: a private socket dir (session namespace) and cache,
@@ -133,6 +128,11 @@ if pid == 0:
     os.environ["XDG_STATE_HOME"] = state
     os.environ["ZELLIJ_SOCKET_DIR"] = SANDBOX_RUN
     os.environ["XDG_CACHE_HOME"] = SANDBOX_CACHE
+    os.environ["SUPERZEJ_DIR"] = tmphome  # state files (.panel_state, …) stay in the sandbox
+    # Drop inherited zellij env so this never nests into / leaks from a live
+    # session when the harness is run from inside one.
+    for _v in ("ZELLIJ", "ZELLIJ_SESSION_NAME", "ZELLIJ_PANE_ID"):
+        os.environ.pop(_v, None)
     os.environ["PATH"] = os.path.join(ROOT, "target", "release") + os.pathsep + os.environ["PATH"]
     os.execvp("zellij", ["zellij", "--config", CONFIG, "--session", SESSION])
 os.set_blocking(fd, False)
@@ -169,12 +169,7 @@ def cleanup():
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
-    shutil.rmtree(tmphome, ignore_errors=True)
-    for f in (".panel_state", ".sidebar_state"):
-        try:
-            os.remove(os.path.expanduser(f"~/.superzej/{f}"))
-        except FileNotFoundError:
-            pass
+    shutil.rmtree(tmphome, ignore_errors=True)  # takes the sandboxed state with it
 
 
 # Start at a normal-but-not-huge width: 120 cols. Old (buggy) code hid both
