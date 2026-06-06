@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # install.sh — standalone (non-Nix) install: build a release binary and symlink
-# it (plus the layouts) into place. The Nix/home-manager path does all of this
-# declaratively; this is for a quick local setup.
+# it into place. The Nix/home-manager path does all of this declaratively; this
+# is for a quick local setup. Layouts are NOT installed here — the binary embeds
+# them and seeds its own private ~/.superzej/layouts at launch, so superzej never
+# touches the user's ~/.config/zellij.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 bindir="${1:-$HOME/.local/bin}"
 : "${XDG_CONFIG_HOME:=$HOME/.config}"
-layoutdir="$XDG_CONFIG_HOME/zellij/layouts"
 # Literal ~/.local/share to match the `file:~/.local/share/...` plugin paths in
 # the session layout (and thus zellij's permission-cache keys).
 datadir="$HOME/.local/share/superzej"
@@ -27,15 +28,10 @@ rustup target add wasm32-wasip1 2>/dev/null || true
 (cd "$here/plugin/tabbar" && cargo build --release --target wasm32-wasip1)
 (cd "$here/plugin/statusbar" && cargo build --release --target wasm32-wasip1)
 
-mkdir -p "$bindir" "$layoutdir" "$XDG_CONFIG_HOME/superzej" "$datadir"
+mkdir -p "$bindir" "$XDG_CONFIG_HOME/superzej" "$datadir"
 
 ln -sfn "$here/target/release/superzej" "$bindir/superzej"
 ln -sfn "$here/target/release/superzej" "$bindir/sj"
-ln -sfn "$here/layouts/superzej.kdl" "$layoutdir/superzej.kdl"
-ln -sfn "$here/layouts/worktree-tab.kdl" "$layoutdir/worktree-tab.kdl"
-ln -sfn "$here/layouts/home-tab.kdl" "$layoutdir/home-tab.kdl"
-ln -sfn "$here/layouts/worktree-tab-extra.kdl" "$layoutdir/worktree-tab-extra.kdl"
-ln -sfn "$here/layouts/worktree-tab-restore.kdl" "$layoutdir/worktree-tab-restore.kdl"
 ln -sfn "$here/plugin/sidebar/target/wasm32-wasip1/release/superzej-sidebar.wasm" "$datadir/sidebar.wasm"
 ln -sfn "$here/plugin/panel/target/wasm32-wasip1/release/superzej-panel.wasm" "$datadir/panel.wasm"
 ln -sfn "$here/plugin/tabbar/target/wasm32-wasip1/release/superzej-tabbar.wasm" "$datadir/tabbar.wasm"
@@ -61,8 +57,8 @@ command -v delta >/dev/null || echo "warning: 'delta' not found — diff output 
 
 echo "installed:"
 echo "  $bindir/{superzej,sj} -> $here/target/release/superzej"
-echo "  $layoutdir/{superzej,worktree-tab}.kdl"
 echo "  $datadir/{sidebar,panel,tabbar,statusbar}.wasm"
+echo "  layouts seeded to ~/.superzej/layouts on first launch"
 echo "  $HOME/.superzej/zellij.kdl  (managed zellij config — customize here)"
 echo
 echo "Ensure $bindir is on PATH, then run:  sj"

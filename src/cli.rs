@@ -83,7 +83,15 @@ pub enum Command {
         path: String,
     },
     /// The Cmd+K command palette: a fuzzy menu of superzej actions.
-    Menu,
+    Menu {
+        /// (internal) Resolve cwd to this tab's worktree before opening. The
+        /// Super+K statusbar toggle spawns the palette from a plugin, so the new
+        /// pane's cwd is NOT the focused worktree; without this, worktree-scoped
+        /// actions (diff/pr/lazygit/…) and the file/grep sources target the
+        /// wrong tree. Omitted when run directly from a worktree shell.
+        #[arg(long)]
+        tab: Option<String>,
+    },
     /// Pre-grant zellij plugin permissions for the sidebar + panel (setup).
     GrantPlugins,
     /// (internal) Print the worktree path for a session+tab (for the panel).

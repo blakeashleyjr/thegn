@@ -46,13 +46,18 @@ keybinds {
             }
         }
         // ── Cmd+K command palette ───────────────────────────────────────
-        // Super(=Cmd/Mod)+K opens a fuzzy menu of every superzej action. Needs
-        // the kitty protocol + a terminal/WM that forwards Super (same caveat as
-        // the Super+Alt nav binds); rebind to e.g. "Alt k" if your WM grabs it.
+        // Super(=Cmd/Mod)+K toggles a fuzzy menu of every superzej action. Needs
+        // a terminal/WM that forwards Super (same caveat as the Super+Alt nav
+        // binds); rebind to e.g. "Alt k" if your WM grabs it.
+        //
+        // Routed through the statusbar (like the sidebar/panel toggles below): a
+        // bare `Run` only ever *spawns* a pane, so a second press can't close the
+        // open palette and rapid presses race a flurry of floating panes that
+        // flash open and vanish. The statusbar owns the single palette pane and
+        // makes Super+K a real toggle — open if closed, close if open.
         bind "Super k" {
-            Run "superzej" "menu" {
-                floating true
-                close_on_exit true
+            MessagePlugin "file:~/.local/share/superzej/statusbar.wasm" {
+                name "superzej_toggle_palette"
             }
         }
         // ── panels (= plain panes): native split + scoped split ─────────

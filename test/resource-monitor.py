@@ -117,6 +117,10 @@ CHILD_ENV = dict(
     XDG_STATE_HOME=STATE,
     XDG_CONFIG_HOME=os.path.join(SBX, ".config"),
     ZELLIJ_SOCKET_DIR=RUN,
+    # superzej-spawned tabs resolve named layouts via --layout-dir = this dir
+    # (no longer ~/.config/zellij/layouts). Point it at this worktree's source so
+    # `Alt+w` worktree tabs come back with the real worktree-tab layout.
+    SUPERZEJ_LAYOUT_DIR=os.path.join(ROOT, "layouts"),
     PATH=os.path.join(ROOT, "target", "release") + os.pathsep + os.environ["PATH"],
 )
 # Env for the `zellij action`/`pipe` clients — they target the session by name.

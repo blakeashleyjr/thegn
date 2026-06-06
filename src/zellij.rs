@@ -105,11 +105,16 @@ pub fn new_float(cwd: &Path, name: &str, cmd: &[&str]) -> bool {
     action(&refs)
 }
 
-/// Open a new workspace tab (with a layout if given).
+/// Open a new workspace tab (with a layout if given). Named layouts resolve
+/// against superzej's private layout dir (passed explicitly via `--layout-dir`),
+/// never the user's `~/.config/zellij/layouts`.
 pub fn new_tab(name: &str, cwd: &Path, layout: Option<&str>) -> bool {
     let cwd = cwd.to_string_lossy();
+    let ldir = crate::util::layout_dir().to_string_lossy().into_owned();
     let mut a = vec!["new-tab", "--name", name, "--cwd", &cwd];
     if let Some(l) = layout {
+        a.push("--layout-dir");
+        a.push(&ldir);
         a.push("--layout");
         a.push(l);
     }

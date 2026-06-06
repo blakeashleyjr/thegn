@@ -46,7 +46,18 @@ const ITEMS: &[(&str, &str)] = &[
     ("PR — create (web)", "pr-create"),
 ];
 
-pub fn run(cfg: &Config) -> Result<()> {
+pub fn run(cfg: &Config, tab: Option<String>) -> Result<()> {
+    // The Super+K statusbar toggle spawns the palette from a plugin, so the new
+    // pane's cwd is NOT the focused worktree (a plugin-spawned pane can't inherit
+    // it the way the old `Run` keybind did). `resolve_worktree` is cwd-based and
+    // the file/grep sources walk cwd, so chdir into the focused tab's worktree
+    // first — resolved from the DB by tab name, exactly as the panel does.
+    if let Some(tab) = tab {
+        let session = crate::db::session();
+        if let Some(path) = crate::commands::resolve::resolve_tab_worktree(&session, &tab) {
+            let _ = std::env::set_current_dir(&path);
+        }
+    }
     crate::palette::run(cfg)
 }
 
