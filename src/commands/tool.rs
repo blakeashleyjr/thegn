@@ -62,7 +62,8 @@ pub fn run(cfg: &Config, name: &str, worktree: Option<String>, file: Option<Stri
             }
             _ => {
                 let sh = util::shell();
-                zellij::new_float(&worktree, name, &[&sh, "-lc", &cmd]);
+                let inner = mem_contain(cfg, &cmd);
+                zellij::new_float(&worktree, name, &[&sh, "-lc", &inner]);
             }
         }
         // Close this launcher pane (spawned by the keybind's Run).
@@ -120,4 +121,22 @@ fn editor_program(cfg: &Config) -> String {
 /// Single-quote a shell argument so paths with spaces/specials survive `-lc`.
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Wrap a host tool command in a memory-capped transient systemd scope so a
+/// runaway child (notably yazi's `ueberzugpp` image previewer, which can leak to
+/// tens of GB and trigger a global OOM that kills the terminal) is OOM-killed
+/// inside its own cgroup instead. Scope teardown on exit also reaps orphans.
+/// Falls back to the bare command when containment is disabled (empty
+/// `tool_mem_max`) or `systemd-run` is unavailable (non-systemd hosts).
+fn mem_contain(cfg: &Config, cmd: &str) -> String {
+    let lim = &cfg.limits;
+    if lim.tool_mem_max.trim().is_empty() || !util::have("systemd-run") {
+        return cmd.to_string();
+    }
+    format!(
+        "systemd-run --user --scope --quiet \
+         -p MemoryMax={} -p MemorySwapMax={} -- {cmd}",
+        lim.tool_mem_max, lim.tool_mem_swap_max
+    )
 }

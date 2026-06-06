@@ -60,7 +60,7 @@ fn main() {
         Command::Workspaces => commands::workspaces::run(),
         Command::Worktrees => commands::worktrees::run(&cfg),
         Command::OpenWorktree { path } => commands::open_worktree::run(path),
-        Command::Menu => commands::menu::run(&cfg),
+        Command::Menu { tab } => commands::menu::run(&cfg, tab),
         Command::GrantPlugins => commands::grant_plugins::run(),
         Command::ResolveWorktree { session, tab } => commands::resolve::run(session, tab),
         Command::PanelSnapshot { session, tab } => commands::snapshot::run(session, tab),

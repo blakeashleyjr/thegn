@@ -15,6 +15,27 @@ use std::path::{Path, PathBuf};
 /// The default managed zellij config, seeded to ~/.superzej/zellij.kdl.
 const DEFAULT_CONFIG: &str = include_str!("../../config/zellij.kdl");
 
+/// The session/tab layouts, embedded in the binary and seeded into superzej's
+/// private layout dir (see `seed_layouts`). They reference superzej's own
+/// plugins/structure and must track the build, so they ship *with* the binary —
+/// never via the user's `~/.config/zellij`, which superzej must not depend on.
+const LAYOUTS: &[(&str, &str)] = &[
+    ("superzej.kdl", include_str!("../../layouts/superzej.kdl")),
+    ("home-tab.kdl", include_str!("../../layouts/home-tab.kdl")),
+    (
+        "worktree-tab.kdl",
+        include_str!("../../layouts/worktree-tab.kdl"),
+    ),
+    (
+        "worktree-tab-extra.kdl",
+        include_str!("../../layouts/worktree-tab-extra.kdl"),
+    ),
+    (
+        "worktree-tab-restore.kdl",
+        include_str!("../../layouts/worktree-tab-restore.kdl"),
+    ),
+];
+
 /// `superzej attach [session]`:
 ///   - no session  -> run the launcher (pick a repo, then open it)
 ///   - a session    -> (re)attach to it, or cold-start it if not running
@@ -55,9 +76,37 @@ fn session_exists(s: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// The layout name (or dev path via SUPERZEJ_LAYOUT) for new sessions.
+/// The session layout for new sessions: an absolute path into superzej's private
+/// layout dir (zellij's top-level `--layout` accepts a path), so resolution never
+/// depends on the user's `~/.config/zellij/layouts`. `SUPERZEJ_LAYOUT` overrides
+/// it with a path used verbatim — the dev counterpart that runs against the live
+/// `layouts/superzej.kdl` source.
 pub fn layout() -> String {
-    std::env::var("SUPERZEJ_LAYOUT").unwrap_or_else(|_| "superzej".into())
+    if let Some(l) = std::env::var_os("SUPERZEJ_LAYOUT") {
+        return l.to_string_lossy().into_owned();
+    }
+    util::layout_dir()
+        .join("superzej.kdl")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Seed the embedded layouts into superzej's private layout dir, overwriting on
+/// every launch so the installed binary's layouts stay authoritative — they pin
+/// the chrome/plugins and must track the build (unlike the once-seeded,
+/// user-customizable `zellij.kdl`). Skipped when `SUPERZEJ_LAYOUT_DIR` is set, so
+/// dev runs use the live `layouts/` source without clobbering it. Best-effort:
+/// callers proceed even if it fails (a stale dir still works).
+fn seed_layouts() -> Result<()> {
+    if std::env::var_os("SUPERZEJ_LAYOUT_DIR").is_some() {
+        return Ok(());
+    }
+    let dir = util::layout_dir();
+    std::fs::create_dir_all(&dir)?;
+    for (name, body) in LAYOUTS {
+        std::fs::write(dir.join(name), body)?;
+    }
+    Ok(())
 }
 
 /// Path to the managed config, seeding it from the default on first use.
@@ -107,6 +156,9 @@ fn exec_clean_attach(session: &str) -> ! {
     // are pre-approved on load — the prompt renders inside fixed plugin panes
     // and is effectively un-approvable. Best-effort; idempotent.
     let _ = commands::grant_plugins::seed();
+    // Refresh the private layouts so tabs opened in this session (and any
+    // worktree-tab-restore on the next cold start) resolve against this build.
+    let _ = seed_layouts();
     spawn_watch_daemon(session);
     util::exec_command(&zellij::bin(), &["--config", &config, "attach", session]);
 }
@@ -152,6 +204,9 @@ pub fn cold_start(session: &str, cwd: &Path) -> ! {
     // so RunCommands is granted from the first instant (no un-approvable prompt
     // in the fixed plugin panes). Best-effort; idempotent.
     let _ = commands::grant_plugins::seed();
+    // Seed the private layouts before zellij resolves `--layout` below, so the
+    // base session layout (and every tab layout) loads from superzej's own dir.
+    let _ = seed_layouts();
     spawn_watch_daemon(session);
     util::exec_command(
         &zellij::bin(),

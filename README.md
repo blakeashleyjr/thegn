@@ -90,12 +90,14 @@ programs.superzej = {
 };
 ```
 
-This installs the `superzej` command, ships the layouts into
-`~/.config/zellij/layouts/`, deploys the three WASM plugins to
-`~/.local/share/superzej/{sidebar,panel,tabbar}.wasm`, and seeds a **superzej-managed
-zellij config** at `~/.superzej/zellij.kdl`. superzej starts zellij with
-`--config ~/.superzej/zellij.kdl` for full control — edit that file to customize;
-it is **never overwritten** once it exists.
+This installs the `superzej` command and deploys the three WASM plugins to
+`~/.local/share/superzej/{sidebar,panel,tabbar}.wasm`. The layouts and the
+zellij config are embedded in the binary and seeded into superzej's own
+namespace — `~/.superzej/layouts/` and `~/.superzej/zellij.kdl` — at launch, so
+superzej never touches your personal `~/.config/zellij`. superzej starts zellij
+with `--config ~/.superzej/zellij.kdl` for full control — edit that file to
+customize; it is **never overwritten** once it exists. (The layouts _are_
+re-seeded each launch, so they track the installed build.)
 
 ### Standalone
 

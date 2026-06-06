@@ -51,6 +51,31 @@ impl Default for MonitorConfig {
     }
 }
 
+/// `[limits]` — resource ceilings for tools launched in floating panes
+/// (`superzej tool <name>`). When `systemd-run` is available, the tool runs in a
+/// transient `--user --scope` with these caps, so a runaway child (e.g. yazi's
+/// `ueberzugpp` image-preview backend, which can leak to tens of GB) is OOM-killed
+/// *inside its own cgroup* instead of triggering a global OOM that takes the
+/// terminal session down. Scope teardown on tool exit also reaps orphaned
+/// children. An empty `tool_mem_max` disables containment.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct LimitsConfig {
+    /// `MemoryMax` for the tool scope (e.g. "6G"). Empty = no containment.
+    pub tool_mem_max: String,
+    /// `MemorySwapMax` for the tool scope (e.g. "1G").
+    pub tool_mem_swap_max: String,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        LimitsConfig {
+            tool_mem_max: "6G".into(),
+            tool_mem_swap_max: "1G".into(),
+        }
+    }
+}
+
 /// `[sandbox.remote]` — optionally run a worktree on a remote machine. Empty
 /// `host` means local (the default); set it (e.g. `user@devbox`) to enable.
 #[derive(Debug, Clone, Deserialize)]
@@ -249,6 +274,7 @@ pub struct Config {
     pub theme: ThemeConfig,
     pub monitor: MonitorConfig,
     pub sandbox: SandboxConfig,
+    pub limits: LimitsConfig,
 }
 
 impl Default for Config {
@@ -275,6 +301,7 @@ impl Default for Config {
             theme: ThemeConfig::default(),
             monitor: MonitorConfig::default(),
             sandbox: SandboxConfig::default(),
+            limits: LimitsConfig::default(),
         }
     }
 }

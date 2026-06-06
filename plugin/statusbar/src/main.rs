@@ -24,6 +24,10 @@ use theme::{BG0, BG1, DIM, GHOST, RESET, TEAL};
 const PANEL_MIN_TOTAL_COLS: usize = 100;
 const SIDEBAR_MIN_TOTAL_COLS: usize = 76;
 
+/// Pane name (`zellij run --name`) of the command palette's floating pane. Used
+/// both to spawn it and to find it in the manifest for the toggle-close.
+const PALETTE_PANE_NAME: &str = "superzej-palette";
+
 #[derive(Default)]
 struct State {
     mode: Option<InputMode>,
@@ -47,6 +51,14 @@ struct State {
     // clears it. `center_id` is the terminal to hand focus back to on Esc.
     selected: bool,
     center_id: Option<u32>,
+    // Command palette (Super+K). The statusbar owns the toggle: a bare `Run`
+    // keybind only ever *spawns* a pane, so a second press can't close the open
+    // palette (and rapid presses race a flurry of floating panes that flash open
+    // and vanish). Routing Super+K through here makes it a real toggle — open if
+    // closed, close if open. `palette_id` is the open palette's floating pane id,
+    // tracked from the manifest (None when closed).
+    active_tab_name: Option<String>,
+    palette_id: Option<u32>,
 }
 
 /// Tracked visibility of one controlled chrome surface.
@@ -142,6 +154,9 @@ impl ZellijPlugin for State {
             Event::TabUpdate(tabs) => {
                 let active = tabs.iter().find(|t| t.active);
                 self.active_tab = active.map(|t| t.position);
+                // Needed to spawn the palette with the focused worktree's cwd
+                // (`superzej menu --tab <name>` resolves the tree from the DB).
+                self.active_tab_name = active.map(|t| t.name.clone());
                 // A tab may have just become active — reconcile its chrome now
                 // (relayout is deferred while a tab is in the background, since
                 // only the active tab may call next_swap_layout). See reconcile().
@@ -210,6 +225,15 @@ impl ZellijPlugin for State {
                         focus_plugin_pane(id, false, false);
                     }
                     return true;
+                }
+            }
+            // Super+K: toggle the command palette. Broadcast hits every per-tab
+            // instance; only the active tab's acts (the palette is a floating
+            // pane on the focused tab — a background instance would open/close it
+            // on the wrong tab).
+            "superzej_toggle_palette" => {
+                if self.my_tab.is_some() && self.my_tab == self.active_tab {
+                    self.toggle_palette();
                 }
             }
             _ => {}
@@ -309,6 +333,40 @@ fn parse_rgb_line(stdout: &[u8]) -> Option<String> {
 }
 
 impl State {
+    /// Open the command palette if closed, close it if open (the Super+K toggle).
+    /// Closed/open is read from the manifest (`palette_id`); the pane closes on
+    /// exit, so picking an action or pressing Esc clears it without a toggle.
+    fn toggle_palette(&mut self) {
+        if let Some(id) = self.palette_id.take() {
+            close_terminal_pane(id);
+            return;
+        }
+        // Spawn as a floating, close-on-exit pane named so we can find it again.
+        // `--tab` lets `superzej menu` chdir into the focused worktree (a
+        // plugin-spawned pane doesn't inherit the focused pane's cwd, which the
+        // worktree-scoped actions + file/grep sources need).
+        let mut argv = vec![
+            "zellij",
+            "run",
+            "--floating",
+            "--width",
+            "80%",
+            "--height",
+            "80%",
+            "--close-on-exit",
+            "--name",
+            PALETTE_PANE_NAME,
+            "--",
+            "superzej",
+            "menu",
+        ];
+        if let Some(tab) = self.active_tab_name.as_deref() {
+            argv.push("--tab");
+            argv.push(tab);
+        }
+        run_command(&argv, BTreeMap::new());
+    }
+
     fn on_key(&mut self, key: KeyWithModifier) -> bool {
         // Reserved: Enter has no action yet. Esc (or moving focus away) drops the
         // selection and hands focus back to the center terminal.
@@ -349,7 +407,15 @@ impl State {
         {
             self.selected = false;
         }
+        // Re-derive the open palette each scan (None once its pane is gone — the
+        // palette closes on exit, so this clears when the user picks/dismisses).
+        let mut palette = None;
         for p in panes {
+            // The open command palette: the floating pane we spawn as
+            // `--name superzej-palette` (see `toggle_palette`).
+            if !p.is_plugin && p.is_floating && p.title.contains(PALETTE_PANE_NAME) {
+                palette = Some(p.id);
+            }
             // The center terminal to hand focus back to on Esc: the focused one,
             // else the first (kept across our own focus grab).
             if !p.is_plugin
@@ -374,6 +440,7 @@ impl State {
                 _ => {}
             }
         }
+        self.palette_id = palette;
     }
 
     /// Recompute the width-driven auto-hide from the total terminal width and

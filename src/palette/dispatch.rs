@@ -22,7 +22,7 @@ pub fn dispatch(cfg: &Config, action: Action) -> Result<()> {
         Action::ToggleSidebar => commands::panels::sidebar(true),
         Action::TogglePanel => commands::panels::panel(true),
         Action::Tool(name) => commands::tool::run(cfg, &name, None, None),
-        Action::CloseWorktree => commands::close_worktree::run(false, false),
+        Action::CloseWorktree => commands::close_worktree::run(cfg, false, false),
         Action::PrOpen => commands::pr::run(PrAction::Open { worktree: None }),
         Action::PrCreate => commands::pr::run(PrAction::Create {
             worktree: None,

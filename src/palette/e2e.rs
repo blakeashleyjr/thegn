@@ -169,7 +169,7 @@ fn content_mode_streams_ripgrep_hits() {
 fn nav_mode_lists_db_worktrees() {
     testutil::sandbox();
     let db = crate::db::Db::open().unwrap();
-    db.put_worktree("r/feat-z", "/r", "/wt/feat-z", "feat/z")
+    db.put_worktree("r/feat-z", "/r", "/wt/feat-z", "feat/z", None)
         .unwrap();
     let (frames, _) = run([typed("@feat"), ticks(5), vec![special(KeyCode::Esc)]].concat());
     let text = joined(&frames);

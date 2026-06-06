@@ -38,6 +38,15 @@
   # Pre-commit hooks: ONE formatter hook (treefmt) + linters only.
   # treefmt reads treefmt.toml at the repo root — single source of formatter
   # config shared with `nix fmt` (flake formatter).
+  #
+  # Run the suite on merges too, not just plain commits. A clean auto-merge of
+  # two individually-valid branches can produce a semantically broken tree (e.g.
+  # one branch changes a fn signature while another adds a now-stale call site —
+  # different files, so no text conflict, so merge succeeds). `git merge` fires
+  # `pre-merge-commit`, NOT `pre-commit`, so without this the merge result is
+  # never linted. Listing pre-merge-commit makes the module install that hook.
+  git-hooks.default_stages = ["pre-commit" "pre-merge-commit"];
+
   git-hooks.hooks = {
     # formatting — delegate ALL formatters to treefmt via treefmt.toml
     treefmt = {
