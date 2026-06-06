@@ -117,14 +117,35 @@ keybinds {
         // above) AND a terminal that forwards Super to the app — and your
         // window manager must not already grab Super+Alt+<key>. If these don't
         // fire, that's the WM eating them; use the Alt+h/j/k/l binds above.
+        //
+        // Left/Right + h/l move PANE focus. Up/Down + j/k instead drive the left
+        // sidebar's selection (j/↓ next, k/↑ previous worktree/branch/repo) — the
+        // bind broadcasts to every tab's sidebar, only the active tab's responds.
+        // Pane-focus up/down stays on the bare Alt+j/k binds above.
         bind "Super Alt Left"  { MoveFocus "Left"; }
         bind "Super Alt Right" { MoveFocus "Right"; }
-        bind "Super Alt Up"    { MoveFocus "Up"; }
-        bind "Super Alt Down"  { MoveFocus "Down"; }
         bind "Super Alt h"     { MoveFocus "Left"; }
-        bind "Super Alt j"     { MoveFocus "Down"; }
-        bind "Super Alt k"     { MoveFocus "Up"; }
         bind "Super Alt l"     { MoveFocus "Right"; }
+        bind "Super Alt Down" {
+            MessagePlugin "file:~/.local/share/superzej/sidebar.wasm" {
+                name "superzej_nav_down"
+            }
+        }
+        bind "Super Alt j" {
+            MessagePlugin "file:~/.local/share/superzej/sidebar.wasm" {
+                name "superzej_nav_down"
+            }
+        }
+        bind "Super Alt Up" {
+            MessagePlugin "file:~/.local/share/superzej/sidebar.wasm" {
+                name "superzej_nav_up"
+            }
+        }
+        bind "Super Alt k" {
+            MessagePlugin "file:~/.local/share/superzej/sidebar.wasm" {
+                name "superzej_nav_up"
+            }
+        }
     }
     // zellij tab-mode `n` (Ctrl+t → n) would create a bare chrome-less tab —
     // repoint it at `superzej new-tab` so every tab keeps the wrapper.
