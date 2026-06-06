@@ -56,7 +56,7 @@ in
       # Ship the layouts. The zellij config (config/zellij.kdl) is embedded in
       # the binary and seeded to ~/.superzej/zellij.kdl at launch, not shipped here.
       mkdir -p $out/share/zellij/layouts
-      cp layouts/superzej.kdl layouts/worktree-tab.kdl layouts/worktree-tab-extra.kdl layouts/home-tab.kdl $out/share/zellij/layouts/
+      cp layouts/superzej.kdl layouts/worktree-tab.kdl layouts/worktree-tab-extra.kdl layouts/worktree-tab-restore.kdl layouts/home-tab.kdl $out/share/zellij/layouts/
     '';
 
     meta = {

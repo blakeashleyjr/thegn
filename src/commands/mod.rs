@@ -18,10 +18,13 @@ pub mod pr;
 pub mod recent;
 pub mod repos;
 pub mod resolve;
+pub mod restore;
+pub mod snapshot;
 pub mod stats;
 pub mod status;
 pub mod theme;
 pub mod tool;
+pub mod watch;
 pub mod workspaces;
 pub mod worktrees;
 
