@@ -10,8 +10,10 @@
 //! touching worktrees.
 
 use crate::commands::confirm;
+use crate::config::Config;
 use crate::db::Db;
-use crate::{msg, repo, util, worktree, zellij};
+use crate::remote::GitLoc;
+use crate::{msg, repo, sandbox, worktree, zellij};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
@@ -23,27 +25,45 @@ pub fn close_panel() -> Result<()> {
     Ok(())
 }
 
-pub fn run(delete_branch: bool, force: bool) -> Result<()> {
+pub fn run(cfg: &Config, delete_branch: bool, force: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let worktree_path: Option<PathBuf> = match std::env::var("SUPERZEJ_WORKTREE") {
-        Ok(w) => Some(PathBuf::from(w)),
-        Err(_) => repo::toplevel(&cwd),
-    };
+    let wt_s: Option<String> = std::env::var("SUPERZEJ_WORKTREE")
+        .ok()
+        .or_else(|| repo::toplevel(&cwd).map(|p| p.to_string_lossy().into_owned()));
 
-    let worktree_path = match worktree_path {
-        Some(p) if p.is_dir() => p,
-        _ => {
-            // Not a worktree — just close the focused pane.
+    let wt_s = match wt_s {
+        Some(s) => s,
+        None => {
             if zellij::in_zellij() {
                 zellij::close_pane();
             }
             return Ok(());
         }
     };
+    let loc = GitLoc::for_worktree(Path::new(&wt_s));
 
-    let root = repo::main_worktree(&worktree_path).unwrap_or_else(|| worktree_path.clone());
-    // A worktree's main pane is the repo root itself — refuse to "remove" it.
-    if root == worktree_path {
+    // A local worktree must exist on disk; a remote one is reachable over ssh.
+    if !loc.is_remote() && !Path::new(&wt_s).is_dir() {
+        if zellij::in_zellij() {
+            zellij::close_pane();
+        }
+        return Ok(());
+    }
+
+    // The repo root: from the DB for a remote worktree, else climbed locally.
+    let root = if loc.is_remote() {
+        Db::open()
+            .ok()
+            .and_then(|db| db.repo_root_for(&wt_s).ok().flatten())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(&wt_s))
+    } else {
+        repo::main_worktree(Path::new(&wt_s)).unwrap_or_else(|| PathBuf::from(&wt_s))
+    };
+    // A worktree's main pane is the repo root itself — refuse to "remove" it
+    // (local only; a remote worktree path is never the local root).
+    if !loc.is_remote() && root == Path::new(&wt_s) {
         msg::warn("focused pane is the repo's main worktree; not removing it");
         if zellij::in_zellij() {
             zellij::close_pane();
@@ -51,21 +71,32 @@ pub fn run(delete_branch: bool, force: bool) -> Result<()> {
         return Ok(());
     }
 
-    let branch = util::git_out(
-        &worktree_path,
-        &["symbolic-ref", "--quiet", "--short", "HEAD"],
-    )
-    .unwrap_or_default();
-    let wt_s = worktree_path.to_string_lossy().into_owned();
+    let branch = loc
+        .git_out(&["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .unwrap_or_default();
 
     if !force && !confirm(&format!("Remove worktree '{branch}' at {wt_s}?")) {
         msg::info("cancelled");
         return Ok(());
     }
-    worktree::remove(&root, Path::new(&wt_s), &branch, delete_branch);
+    if loc.is_remote() {
+        // Remove the worktree on the remote over ssh.
+        if !loc.git_ok(&["worktree", "remove", "--force", &wt_s]) {
+            msg::warn(&format!("could not remove remote worktree at {wt_s}"));
+        }
+        if delete_branch && !branch.is_empty() && !loc.git_ok(&["branch", "-D", &branch]) {
+            msg::warn(&format!("could not delete remote branch {branch}"));
+        }
+    } else {
+        worktree::remove(&root, Path::new(&wt_s), &branch, delete_branch);
+    }
     if let Ok(db) = Db::open() {
         let _ = db.del_worktree(&wt_s);
     }
+    // Reap the worktree's sandbox container (no-op for host/bwrap; over ssh for
+    // a remote worktree).
+    let cname = sandbox::container_name(&wt_s);
+    sandbox::teardown(&cfg.repo_sandbox(&root), &loc, &cname);
     msg::info(&format!("removed worktree {branch}"));
 
     if zellij::in_zellij() {

@@ -217,6 +217,28 @@ pub fn exec_command(prog: &str, args: &[&str]) -> ! {
     msg::die(&format!("exec {prog} failed: {err}"));
 }
 
+/// Single-quote a string for POSIX `sh -c` / ssh remote commands so paths with
+/// spaces or specials survive. Bare words (alnum + a few safe punctuation) pass
+/// through unquoted for readability.
+pub fn sh_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./=:@%+,".contains(c))
+    {
+        return s.to_string();
+    }
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Join an argv into a single shell-quoted command string (for `sh -lc` bodies
+/// and ssh/mosh remote commands).
+pub fn sh_join(argv: &[String]) -> String {
+    argv.iter()
+        .map(|a| sh_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Run `git -C <dir> <args...>`, returning success (stdout/stderr discarded).
 pub fn git_ok(dir: &Path, args: &[&str]) -> bool {
     Command::new("git")

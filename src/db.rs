@@ -87,7 +87,8 @@ impl Db {
               repo_path    TEXT,
               branch       TEXT,
               agent        TEXT,
-              created_at   INTEGER
+              created_at   INTEGER,
+              location     TEXT
             );
             CREATE TABLE IF NOT EXISTS pr_cache (
               worktree   TEXT PRIMARY KEY,
@@ -104,6 +105,10 @@ impl Db {
             );
             "#,
         )?;
+        // Additive: a pre-existing v3 worktrees table predates the remote-worktree
+        // `location` column. Add it in place (ignored if already present) so local
+        // worktree history survives — no full migration/reset needed.
+        let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN location TEXT", []);
         Ok(Db { conn })
     }
 
@@ -249,14 +254,52 @@ impl Db {
     }
 
     // --- worktrees (one per tab; keyed by worktree path) -------------------
-    pub fn put_worktree(&self, tab: &str, root: &str, wt: &str, branch: &str) -> Result<()> {
+    /// Record a worktree. `location` is the remote descriptor (JSON) for a remote
+    /// worktree, or `None`/empty for an ordinary on-host one.
+    pub fn put_worktree(
+        &self,
+        tab: &str,
+        root: &str,
+        wt: &str,
+        branch: &str,
+        location: Option<&str>,
+    ) -> Result<()> {
         self.conn.execute(
-            r#"INSERT INTO worktrees(worktree,session_name,tab_name,repo_path,branch,agent,created_at)
-               VALUES(?1,?2,?3,?4,?5,'',?6)
-               ON CONFLICT(worktree) DO UPDATE SET branch=?5, tab_name=?3, repo_path=?4, session_name=?2"#,
-            params![wt, session(), tab, root, branch, util::now()],
+            r#"INSERT INTO worktrees(worktree,session_name,tab_name,repo_path,branch,agent,created_at,location)
+               VALUES(?1,?2,?3,?4,?5,'',?6,?7)
+               ON CONFLICT(worktree) DO UPDATE SET branch=?5, tab_name=?3, repo_path=?4, session_name=?2, location=?7"#,
+            params![wt, session(), tab, root, branch, util::now(), location],
         )?;
         Ok(())
+    }
+
+    /// The remote-location descriptor for a worktree (None/empty = local).
+    pub fn location_for(&self, wt: &str) -> Result<Option<String>> {
+        let r = self
+            .conn
+            .query_row(
+                "SELECT location FROM worktrees WHERE worktree=?1",
+                params![wt],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten();
+        Ok(r)
+    }
+
+    /// The (local) repo root recorded for a worktree — needed for the per-repo
+    /// `.superzej` overlay when the worktree itself lives remote.
+    pub fn repo_root_for(&self, wt: &str) -> Result<Option<String>> {
+        let r = self
+            .conn
+            .query_row(
+                "SELECT repo_path FROM worktrees WHERE worktree=?1",
+                params![wt],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten();
+        Ok(r)
     }
 
     pub fn set_worktree_agent(&self, wt: &str, agent: &str) -> Result<()> {
@@ -290,7 +333,7 @@ impl Db {
     /// All recorded worktrees (metadata only; git supplies live status).
     pub fn worktrees(&self) -> Result<Vec<WorktreeRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT worktree, branch, agent, created_at, repo_path, tab_name, session_name
+            "SELECT worktree, branch, agent, created_at, repo_path, tab_name, session_name, location
              FROM worktrees",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -302,6 +345,7 @@ impl Db {
                 repo_root: r.get(4)?,
                 tab_name: r.get(5)?,
                 session_name: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                location: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
