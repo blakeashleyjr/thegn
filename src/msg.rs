@@ -1,4 +1,12 @@
-//! Minimal stderr logging (coloured when stderr is a tty).
+//! Branded diagnostics. Once [`crate::log::init`] has installed the `tracing`
+//! subscriber, `info`/`warn`/`error` route through it (level-filtered, mirrored
+//! to the log file with the same `✦ superzej` look). Before that — and always
+//! for `die` — they print straight to stderr so early config errors and fatals
+//! are never lost.
+//!
+//! Most code should keep calling these; new code wanting per-module filtering or
+//! `debug!`/`trace!` can use `tracing` macros directly.
+#![allow(clippy::disallowed_macros)] // this module is the stderr fallback
 
 use crate::theme;
 use std::io::IsTerminal;
@@ -16,19 +24,32 @@ fn tag(hue: &str) -> String {
 }
 
 pub fn info(s: &str) {
-    eprintln!("{} {s}", tag(theme::DIM));
+    if crate::log::ready() {
+        tracing::info!("{s}");
+    } else {
+        eprintln!("{} {s}", tag(theme::DIM));
+    }
 }
 
 pub fn warn(s: &str) {
-    eprintln!("{} {s}", tag(theme::AMBER));
+    if crate::log::ready() {
+        tracing::warn!("{s}");
+    } else {
+        eprintln!("{} {s}", tag(theme::AMBER));
+    }
 }
 
 pub fn error(s: &str) {
-    eprintln!("{} {s}", tag(theme::RED));
+    if crate::log::ready() {
+        tracing::error!("{s}");
+    } else {
+        eprintln!("{} {s}", tag(theme::RED));
+    }
 }
 
-/// Print an error and exit non-zero.
+/// Print an error and exit non-zero. Always goes straight to stderr (branded),
+/// regardless of the subscriber or level filter — a fatal must be seen.
 pub fn die(s: &str) -> ! {
-    error(s);
+    eprintln!("{} {s}", tag(theme::RED));
     std::process::exit(1);
 }

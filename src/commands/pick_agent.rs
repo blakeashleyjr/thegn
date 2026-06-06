@@ -79,7 +79,7 @@ pub fn run(
             .iter()
             .map(|n| format!("{} {n}", theme::agent_glyph(n)))
             .collect();
-        match picker::pick(&prompt, &display, &cfg.picker) {
+        match picker::pick(&prompt, &display, cfg.picker.as_str()) {
             Some(sel) => display
                 .iter()
                 .position(|d| *d == sel)

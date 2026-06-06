@@ -34,6 +34,6 @@ pub fn run(session: Option<String>, tab: Option<String>) -> Result<()> {
             }
         }
     }
-    println!("{}", Value::Object(obj));
+    crate::outln!("{}", Value::Object(obj));
     Ok(())
 }

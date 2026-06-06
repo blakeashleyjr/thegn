@@ -62,6 +62,8 @@
       # can also target wasm32-wasip1 — used for the dev shell and the plugins.
       rustToolchain = pkgs.rust-bin.stable.latest.default.override {
         targets = ["wasm32-wasip1"];
+        # llvm-tools-preview backs `cargo llvm-cov` (the coverage gate).
+        extensions = ["llvm-tools-preview"];
       };
       rustPlatformWasm = pkgs.makeRustPlatform {
         cargo = rustToolchain;
@@ -129,6 +131,9 @@
             # task runner + formatter (treefmt wrapper with all formatters on PATH)
             just
             treefmtWrapper
+            # coverage gate (`just coverage`) + the visual-regression harness
+            cargo-llvm-cov
+            python3
             # linters
             shellcheck
             yamllint

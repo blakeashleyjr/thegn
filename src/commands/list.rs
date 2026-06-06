@@ -126,11 +126,11 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
 
     let rows = collect(cfg)?;
     if json {
-        println!("{}", serde_json::to_string(&rows)?);
+        crate::outln!("{}", serde_json::to_string(&rows)?);
         return Ok(());
     }
     if rows.is_empty() {
-        println!("No worktrees yet. Press Alt-W to open a workspace, Alt-w for a worktree.");
+        crate::outln!("No worktrees yet. Press Alt-W to open a workspace, Alt-w for a worktree.");
         return Ok(());
     }
 
@@ -145,7 +145,7 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
         }
     };
 
-    println!(
+    crate::outln!(
         "{}",
         c(
             theme::FAINT,
@@ -184,7 +184,7 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
         } else {
             r.agent.clone()
         };
-        println!(
+        crate::outln!(
             "{} {} {} {} {} {}  {}",
             c(theme::TEXT, &format!("{:<16.16}", r.workspace)),
             c(&accent, &format!("{:<26.26}", r.branch)),

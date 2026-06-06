@@ -120,6 +120,69 @@ self: {
     };
   };
 
+  logSubmodule = lib.types.submodule {
+    options = {
+      level = lib.mkOption {
+        type = lib.types.enum ["error" "warn" "info" "debug" "trace"];
+        default = "info";
+        description = "Default log verbosity (SUPERZEJ_LOG can refine per-module).";
+      };
+      file = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Mirror diagnostics to a rotating log file under `dir`.";
+      };
+      dir = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        description = "Log directory (empty = $XDG_STATE_HOME/superzej/logs).";
+      };
+      rotationSizeMb = lib.mkOption {
+        type = lib.types.int;
+        default = 5;
+        description = "Rotate the active log once it exceeds this many MiB.";
+      };
+      maxFiles = lib.mkOption {
+        type = lib.types.int;
+        default = 5;
+        description = "How many rotated log files to keep.";
+      };
+      format = lib.mkOption {
+        type = lib.types.enum ["text" "json"];
+        default = "text";
+        description = "Log file encoding.";
+      };
+    };
+  };
+
+  actionSubmodule = lib.types.submodule {
+    options = {
+      name = lib.mkOption {
+        type = lib.types.str;
+        description = "Stable id + default menu/hint label.";
+      };
+      key = lib.mkOption {
+        type = lib.types.str;
+        example = "Alt D";
+        description = "Key chord (zellij syntax).";
+      };
+      run = lib.mkOption {
+        type = lib.types.str;
+        description = "Shell command run via `sh -c`.";
+      };
+      menu = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Surface this action in the Cmd+K palette.";
+      };
+      hint = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Short statusbar hint (defaults to name).";
+      };
+    };
+  };
+
   tomlFormat = pkgs.formats.toml {};
 
   # Rendered to ~/.config/superzej/config.toml; keys match the Rust serde struct.
@@ -136,7 +199,17 @@ self: {
     auto_remove_worktree = cfg.autoRemoveWorktree;
     agents = map (a: {inherit (a) name command;}) cfg.agents;
     tools = map (t: {inherit (t) name command;}) cfg.tools;
+    keybinds = cfg.keybinds;
+    actions = map (a: lib.filterAttrs (_: v: v != null) {inherit (a) name key run menu hint;}) cfg.actions;
     theme.accent = cfg.themeAccent;
+    pr.ttl_secs = cfg.prTtlSecs;
+    dashboard.interval_secs = cfg.dashboardIntervalSecs;
+    watch.pr_interval_secs = cfg.watchPrIntervalSecs;
+    log = {
+      inherit (cfg.log) level file dir format;
+      rotation_size_mb = cfg.log.rotationSizeMb;
+      max_files = cfg.log.maxFiles;
+    };
     sandbox = {
       inherit (cfg.sandbox) enabled backend image network mounts devenv;
       backend_chain = cfg.sandbox.backendChain;
@@ -273,6 +346,44 @@ in {
         }
       ];
       description = "Per-worktree tools (also bound to Alt-g/y/e//).";
+    };
+
+    prTtlSecs = lib.mkOption {
+      type = lib.types.int;
+      default = 30;
+      description = "PR-status cache TTL (seconds) before a live `gh` re-fetch.";
+    };
+
+    dashboardIntervalSecs = lib.mkOption {
+      type = lib.types.int;
+      default = 4;
+      description = "Refresh interval (seconds) for the --watch dashboard pane.";
+    };
+
+    watchPrIntervalSecs = lib.mkOption {
+      type = lib.types.int;
+      default = 20;
+      description = "PR refresh interval (seconds) for the per-session watch daemon.";
+    };
+
+    log = lib.mkOption {
+      type = logSubmodule;
+      default = {};
+      description = "Logging: level, optional rotating file sink, format.";
+    };
+
+    keybinds = lib.mkOption {
+      type = lib.types.attrsOf lib.types.str;
+      default = {};
+      example = lib.literalExpression ''{ new-worktree = "Ctrl w"; }'';
+      description = "Rebind built-in actions by id (see `superzej keys list`).";
+    };
+
+    actions = lib.mkOption {
+      type = lib.types.listOf actionSubmodule;
+      default = [];
+      example = lib.literalExpression ''[ { name = "deploy"; key = "Alt D"; run = "just deploy"; menu = true; } ]'';
+      description = "User-defined keybind actions (chord → shell command).";
     };
 
     sandbox = lib.mkOption {

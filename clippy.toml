@@ -1,0 +1,18 @@
+# Enforce superzej's output discipline (the `checks.clippy` flake check runs
+# `clippy --all-targets -D warnings`, so these become hard errors in CI).
+#
+#   stdout = machine data  → use `crate::out!` / `crate::outln!`
+#   stderr = diagnostics   → use `tracing::{info,warn,error,debug,trace}!`
+#                            or the `msg` helpers
+#
+# Bare print/eprint/dbg are banned so a stray diagnostic never corrupts the
+# stdout contract the WASM plugins parse. The sanctioned sinks (src/out.rs,
+# src/msg.rs, src/log.rs) and a handful of interactive prompts / terminal-control
+# writers carry a local `#[allow(clippy::disallowed_macros)]`.
+disallowed-macros = [
+  { path = "std::println", reason = "stdout data: use crate::outln!; diagnostics: use tracing/msg" },
+  { path = "std::print", reason = "stdout data: use crate::out!; diagnostics: use tracing/msg" },
+  { path = "std::eprintln", reason = "diagnostics: use tracing::{warn,error,...}! or msg" },
+  { path = "std::eprint", reason = "diagnostics: use tracing/msg (interactive prompts may #[allow])" },
+  { path = "std::dbg", reason = "remove debug dbg! before committing" },
+]

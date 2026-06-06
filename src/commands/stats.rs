@@ -16,6 +16,16 @@ use anyhow::Result;
 use sysinfo::{MINIMUM_CPU_UPDATE_INTERVAL, System};
 
 pub fn run() -> Result<()> {
+    // Determinism shim for visual-regression tests: `SZ_FAKE_STATS` replaces the
+    // whole line (e.g. "cpu=12 mem=34 gpu=0 time=09:41") so the tabbar renders
+    // identically run-to-run. Production paths are unaffected when it's unset.
+    if let Ok(fake) = std::env::var("SZ_FAKE_STATS") {
+        if !fake.trim().is_empty() {
+            crate::outln!("{}", fake.trim());
+            return Ok(());
+        }
+    }
+
     let mut fields: Vec<String> = Vec::new();
 
     let mut sys = System::new();
@@ -45,7 +55,7 @@ pub fn run() -> Result<()> {
 
     fields.push(format!("time={}", chrono::Local::now().format("%H:%M")));
 
-    println!("{}", fields.join(" "));
+    crate::outln!("{}", fields.join(" "));
     Ok(())
 }
 

@@ -4,8 +4,11 @@ mod config;
 mod db;
 mod diff_highlight;
 mod github;
+mod keymap;
+mod log;
 mod models;
 mod msg;
+mod out;
 mod picker;
 mod remote;
 mod repo;
@@ -30,7 +33,28 @@ fn main() {
     }
 
     let args = Cli::parse();
-    let cfg = Config::load();
+
+    // CLI-flag config layer (highest precedence) + the resolved file path.
+    let mut flags = config::ConfigOverlay::default();
+    if let Some(lvl) = args.log_level.as_deref() {
+        match config::LogLevel::from_str_validated(lvl) {
+            Ok(l) => flags.log_level = Some(l),
+            Err(e) => msg::warn(&format!("--log-level: {e}")),
+        }
+    }
+    let effective_path = args.config.clone().unwrap_or_else(Config::path);
+    let cfg = Config::load_layered(&config::ProcessEnv, Some(flags), args.config.clone());
+
+    // Bring up diagnostics now that we have `[log]`. The daemon (whose stdio is
+    // nulled) logs only to its file; everything else also writes branded stderr.
+    let role = match &args.command {
+        Some(Command::Watch { session, .. }) => log::Role::Watch {
+            session: session.clone().unwrap_or_else(zellij::ui_session),
+        },
+        _ => log::Role::Cli,
+    };
+    log::init(role, &cfg.log);
+
     picker::set_accent(&cfg.accent_hex());
 
     let result = match args.command.unwrap_or(Command::Launch) {
@@ -66,7 +90,7 @@ fn main() {
         Command::Watch {
             session,
             pr_interval,
-        } => commands::watch::run(session, pr_interval),
+        } => commands::watch::run(&cfg, session, pr_interval),
         Command::RestoreSession => commands::restore::run(),
         Command::PickAgent {
             worktree,
@@ -100,7 +124,7 @@ fn main() {
         }
         Command::Sidebar { toggle } => commands::panels::sidebar(toggle),
         Command::Panel { toggle } => commands::panels::panel(toggle),
-        Command::Pr { action } => commands::pr::run(action),
+        Command::Pr { action } => commands::pr::run(&cfg, action),
         Command::Diff {
             worktree,
             base,
@@ -112,6 +136,8 @@ fn main() {
         Command::Repos => commands::repos::run(&cfg),
         Command::Recent { count } => commands::recent::run(count),
         Command::Status => commands::status::run(&cfg),
+        Command::Config { action } => commands::config::run(&cfg, action, effective_path),
+        Command::Keys { action } => commands::keys::run(&cfg, action),
         Command::Theme => commands::theme::run(&cfg),
         Command::Stats => commands::stats::run(),
         Command::Activity { ack } => commands::activity::run(ack),

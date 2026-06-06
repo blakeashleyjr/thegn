@@ -208,7 +208,7 @@ pub fn spawn_daemon(prog: &str, args: &[&str]) {
 /// usual, so this just seeds a sensible default (the branch/worktree name).
 pub fn set_terminal_title(title: &str) {
     use std::io::Write;
-    print!("\u{1b}]0;{title}\u{07}");
+    crate::out!("\u{1b}]0;{title}\u{07}");
     let _ = std::io::stdout().flush();
 }
 

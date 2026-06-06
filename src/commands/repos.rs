@@ -6,7 +6,7 @@ use anyhow::Result;
 
 pub fn run(cfg: &Config) -> Result<()> {
     for path in repo::discover_repos(cfg) {
-        println!("{path}");
+        crate::outln!("{path}");
     }
     Ok(())
 }
