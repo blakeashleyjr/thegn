@@ -101,13 +101,13 @@ check "resolve-worktree maps (session,tab) -> path" \
 # worktree plus whatever is cached. After a `diff --files` warms the cache, the
 # snapshot carries the file list too.
 check "panel-snapshot resolves the worktree as JSON" \
-	"[[ \$('$SZ' panel-snapshot --session default --tab repo/sz-demo-feature | jq -r '.worktree') == \"$WT\" ]]"
+  "[[ \$('$SZ' panel-snapshot --session default --tab repo/sz-demo-feature | jq -r '.worktree') == \"$WT\" ]]"
 "$SZ" diff --files --worktree "$WT" --base main >/dev/null 2>&1
 check "panel-snapshot carries cached diff files after a diff" \
-	"'$SZ' panel-snapshot --session default --tab repo/sz-demo-feature | jq -e '.files | length > 0' >/dev/null"
+  "'$SZ' panel-snapshot --session default --tab repo/sz-demo-feature | jq -e '.files | length > 0' >/dev/null"
 # restore-session is a graceful no-op outside a live session (it needs zellij).
 check "restore-session degrades gracefully outside a session (exit 0)" \
-	"'$SZ' restore-session >/dev/null 2>&1"
+  "'$SZ' restore-session >/dev/null 2>&1"
 
 # The data-plane commands degrade gracefully on a repo with no remote / no gh PR
 # (must exit 0 so the panel never sees a crash).
@@ -144,6 +144,15 @@ check "branch kept after removal" \
   "git -C '$R' show-ref --verify --quiet refs/heads/sz/demo-feature"
 check "removed worktree gone from list" \
   "[[ \$('$SZ' list --json | jq -r '[.[] | select(.branch==\"sz/demo-feature\")] | length') -eq 0 ]]"
+
+# ── file-manager drawer (`superzej files`) — hermetic surface only ──────────
+# In-session behavior (spawn/close/restore) is covered by test/files-drawer.py;
+# here we confirm the command is wired and degrades gracefully off-session.
+check "files subcommand exists" "'$SZ' files --help >/dev/null 2>&1"
+check "files off-session exits 0 (no zellij side effects)" "'$SZ' files >/dev/null 2>&1"
+check "files off-session reports it needs a session" \
+  "'$SZ' files 2>&1 | grep -qi 'not in zellij'"
+check "files --close off-session is safe" "'$SZ' files --close >/dev/null 2>&1"
 
 echo
 if [[ $fail -eq 0 ]]; then

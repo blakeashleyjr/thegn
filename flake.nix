@@ -15,6 +15,11 @@
     # match) — a routine `nix flake update` of the main nixpkgs never moves it.
     # NOT `follows = nixpkgs` precisely so the two stay decoupled.
     nixpkgs-zellij.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    # The pinned yazi superzej drives for its bottom file-manager drawer, on its
+    # OWN nixpkgs input — same rationale as `nixpkgs-zellij`: superzej bundles a
+    # specific yazi (+ its preview tools) independent of the user's system and of
+    # the main `nixpkgs`. Bump it deliberately with `nix flake update nixpkgs-yazi`.
+    nixpkgs-yazi.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
   };
 
   outputs = {
@@ -23,6 +28,7 @@
     flake-utils,
     rust-overlay,
     nixpkgs-zellij,
+    nixpkgs-yazi,
   }:
     flake-utils.lib.eachDefaultSystem (system: let
       pkgs = import nixpkgs {
@@ -56,12 +62,38 @@
       # would force a hand-rolled from-source build; a pinned nixpkgs is the
       # binary-cached way to control the exact version.)
       zellijPinned = (import nixpkgs-zellij {inherit system;}).zellij;
-      superzej = pkgs.callPackage ./nix/package.nix {zellij = zellijPinned;};
+      # The pinned yazi + its preview/runtime tools, from `nixpkgs-yazi` so the
+      # exact versions are frozen in flake.lock independently of the main nixpkgs.
+      # superzej drives THIS yazi for the file-manager drawer (a private binary
+      # via SUPERZEJ_YAZI_BIN + a private YAZI_CONFIG_HOME), never the system one.
+      yaziPkgs = import nixpkgs-yazi {inherit system;};
+      yaziPinned = yaziPkgs.yazi;
+      # yazi's preview/runtime deps (fzf + zoxide are already in runtimeDeps).
+      # `poppler-utils` (pdftoppm/pdftotext) is selected by attrpath — its hyphen
+      # makes it unusable as a bare identifier inside `with`.
+      yaziDeps =
+        (with yaziPkgs; [
+          file
+          ffmpegthumbnailer
+          unar
+          jq
+          fd
+          ripgrep
+          imagemagick
+        ])
+        ++ [yaziPkgs.poppler-utils];
+      superzej = pkgs.callPackage ./nix/package.nix {
+        zellij = zellijPinned;
+        yazi = yaziPinned;
+        inherit yaziDeps;
+      };
 
       # One rust-overlay toolchain (clippy/rustfmt/rust-analyzer included) that
       # can also target wasm32-wasip1 — used for the dev shell and the plugins.
       rustToolchain = pkgs.rust-bin.stable.latest.default.override {
         targets = ["wasm32-wasip1"];
+        # llvm-tools for `cargo llvm-cov` (just coverage).
+        extensions = ["llvm-tools-preview"];
       };
       rustPlatformWasm = pkgs.makeRustPlatform {
         cargo = rustToolchain;
@@ -83,6 +115,8 @@
       # The pinned zellij superzej drives, exposed so dev (`just start*`) and
       # scripts can resolve its path: `nix build .#zellij`.
       packages.zellij = zellijPinned;
+      # The pinned yazi superzej drives for the file-manager drawer.
+      packages.yazi = yaziPinned;
       packages.superzej-sidebar = sidebar;
       packages.superzej-panel = panel;
       packages.superzej-tabbar = tabbar;
@@ -129,26 +163,32 @@
             # task runner + formatter (treefmt wrapper with all formatters on PATH)
             just
             treefmtWrapper
+            # line-coverage for `just coverage`
+            cargo-llvm-cov
             # linters
             shellcheck
             yamllint
             taplo
+            # pty visual-regression harnesses (test/*.py reconstruct the screen)
+            (python3.withPackages (ps: with ps; [pyte]))
             # runtime tools superzej shells out to
             git
             fzf
             gum
             lazygit
-            yazi
             delta
             gh
           ]
-          # The same pinned zellij as the package, so `just start` runs the
-          # version superzej ships — not whatever zellij is on the system.
-          ++ [zellijPinned];
+          # The same pinned zellij + yazi as the package, so `just start` runs
+          # the versions superzej ships — not whatever is on the system — and the
+          # yazi preview tools resolve on PATH inside the drawer.
+          ++ [zellijPinned yaziPinned]
+          ++ yaziDeps;
         shellHook = ''
           export PATH="$PWD/target/debug:$PATH"
-          # Point dev superzej at the pinned zellij (the package wires this too).
+          # Point dev superzej at the pinned zellij + yazi (the package wires these too).
           export SUPERZEJ_ZELLIJ_BIN="${zellijPinned}/bin/zellij"
+          export SUPERZEJ_YAZI_BIN="${yaziPinned}/bin/yazi"
           echo "superzej dev shell — 'cargo build', 'just build-plugins', 'just smoke', 'nix fmt'"
         '';
       };

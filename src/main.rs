@@ -14,6 +14,7 @@ mod sandbox;
 mod theme;
 mod util;
 mod worktree;
+mod yazi;
 mod zellij;
 
 use clap::Parser;
@@ -82,6 +83,14 @@ fn main() {
             file,
         } => commands::tool::run(&cfg, &name, worktree, file),
         Command::Monitor { kind } => commands::monitor::run(&cfg, &kind),
+        Command::Files {
+            reveal,
+            worktree,
+            tab,
+            session,
+            close,
+            restore,
+        } => commands::files::run(&cfg, reveal, worktree, tab, session, close, restore),
         Command::Dashboard { watch, inner } => commands::dashboard::run(&cfg, watch, inner),
         Command::CloseWorktree {
             delete_branch,

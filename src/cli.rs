@@ -150,6 +150,29 @@ pub enum Command {
     /// (internal) Open a resource monitor for a top-bar stat, embedded as a
     /// tiled pane. `kind` is `cpu`/`mem` (system monitor) or `gpu` (nvtop).
     Monitor { kind: String },
+    /// Toggle the bottom file-manager drawer (yazi) for the focused worktree.
+    Files {
+        /// Open the drawer focused on this file (reveal), not the worktree dir.
+        #[arg(long)]
+        reveal: Option<String>,
+        /// Target worktree path (defaults to the focused worktree).
+        #[arg(long)]
+        worktree: Option<String>,
+        /// Resolve the worktree from this tab name via the DB (restore path).
+        #[arg(long)]
+        tab: Option<String>,
+        /// Session name (the statusbar restore pipe passes it; plugin-spawned
+        /// commands can't rely on env to target `zellij action` / the DB).
+        #[arg(long)]
+        session: Option<String>,
+        /// Dismiss the drawer (records it so it won't auto-restore).
+        #[arg(long)]
+        close: bool,
+        /// Open only if it was left open for this worktree (auto-restore; never
+        /// toggles closed, and runs without a launcher pane to close).
+        #[arg(long)]
+        restore: bool,
+    },
     /// Worktree dashboard (floating switcher, or pinnable --watch pane).
     Dashboard {
         #[arg(long)]

@@ -1,0 +1,39 @@
+# superzej drawer theme — REGENERATED on every open from `[theme] accent` in
+# config.toml ({{ACCENT}} below is substituted with that #rrggbb). Do NOT edit by
+# hand; your changes are overwritten. Change the accent instead. Only the accent-
+# bearing surfaces are themed here — everything else falls back to yazi's preset.
+# (#14161f is the superzej deepest-background, used as the on-accent foreground.)
+
+[mgr.hovered]
+bg = "{{ACCENT}}"
+fg = "#14161f"
+
+[mgr.cwd]
+fg = "{{ACCENT}}"
+
+[mgr.preview_hovered]
+underline = true
+
+[mgr.find_keyword]
+fg = "{{ACCENT}}"
+bold = true
+
+[mgr.count_selected]
+bg = "{{ACCENT}}"
+fg = "#14161f"
+
+[mgr.marker_marked]
+bg = "{{ACCENT}}"
+fg = "{{ACCENT}}"
+
+[mgr.tab_active]
+bg = "{{ACCENT}}"
+fg = "#14161f"
+
+[mgr.border_style]
+fg = "{{ACCENT}}"
+
+[status.mode_normal]
+bg = "{{ACCENT}}"
+fg = "#14161f"
+bold = true

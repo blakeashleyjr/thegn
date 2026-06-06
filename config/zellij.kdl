@@ -95,6 +95,16 @@ keybinds {
                 name "superzej_toggle_panel"
             }
         }
+        // ── bottom file-manager drawer (yazi) ───────────────────────────
+        // Spawn/close a bottom-anchored floating yazi rooted at the focused
+        // worktree; pressing it again (or `q` inside yazi) dismisses it. Its
+        // open/closed state is remembered per worktree across restarts.
+        bind "Ctrl Alt f" {
+            Run "superzej" "files" {
+                floating true
+                close_on_exit true
+            }
+        }
         // ── per-worktree tools (open as floating panes) ─────────────────
         bind "Alt g" { Run "superzej" "tool" "lazygit"; }
         bind "Alt y" { Run "superzej" "tool" "yazi"; }
