@@ -1,4 +1,6 @@
 //! Interactive pickers. Prefers gum/fzf; falls back to a numbered stdin prompt.
+// Interactive stdin/stderr prompts (gum/fzf fallbacks), not diagnostics.
+#![allow(clippy::disallowed_macros)]
 
 use crate::config::Config;
 use crate::repo;
@@ -184,7 +186,7 @@ pub fn pick_repo(cfg: &Config) -> Option<String> {
     let clone_label = "+ clone a URL…".to_string();
     options.push(clone_label.clone());
 
-    let choice = pick("Select a repo", &options, &cfg.picker)?;
+    let choice = pick("Select a repo", &options, cfg.picker.as_str())?;
     if choice == clone_label {
         let url = if util::have("gum") {
             let out = Command::new("gum")

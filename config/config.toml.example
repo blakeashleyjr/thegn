@@ -27,10 +27,60 @@ name_scheme = "words"
 # Remove the worktree automatically when its pane closes.
 auto_remove_worktree = false
 
+# ── Overriding any setting at runtime ─────────────────────────────────────────
+# Precedence (low → high): built-in defaults < this file < SUPERZEJ_* env vars
+#   < CLI flags. Override any key for one run with SUPERZEJ_<SECTION>_<KEY>, e.g.
+#     SUPERZEJ_PICKER=fzf        SUPERZEJ_SANDBOX_BACKEND=docker
+#     SUPERZEJ_LOG_LEVEL=debug   SUPERZEJ_PR_TTL=10
+# `superzej config show` prints the effective merged config; `superzej config
+# get <dotted.key>` prints one value; `superzej config validate` checks it.
+
 # Visual tuning. The focus accent recolors every superzej surface (plugins,
 # pickers, dashboard); the rest of the storm-blue palette is fixed.
 [theme]
 accent = "#76eede"
+
+# GitHub PR data feeding the right panel.
+[pr]
+ttl_secs = 30          # cache TTL before a live `gh` re-fetch (SUPERZEJ_PR_TTL)
+
+# The --watch worktree dashboard.
+[dashboard]
+interval_secs = 4      # refresh cadence (SUPERZEJ_DASHBOARD_INTERVAL)
+
+# The per-session daemon that pushes live diff/PR updates to the panel.
+[watch]
+pr_interval_secs = 20  # PR refresh cadence (SUPERZEJ_WATCH_PR_INTERVAL)
+
+# Diagnostics. stderr is always on (level-gated, branded, colored on a TTY); the
+# file sink is opt-in. SUPERZEJ_LOG is a tracing-style filter that refines the
+# level per-module, e.g. SUPERZEJ_LOG=debug,superzej::db=trace
+[log]
+level = "info"            # error | warn | info | debug | trace
+file = false              # mirror to a rotating file under `dir`
+dir = ""                  # "" => $XDG_STATE_HOME/superzej/logs
+rotation_size_mb = 5
+max_files = 5
+format = "text"           # text | json
+
+# ── Keybindings ───────────────────────────────────────────────────────────────
+# superzej owns its zellij keybinds: the registry (one entry per action) is
+# rendered into a managed region of ~/.superzej/zellij.kdl on launch (your other
+# edits to that file survive). Inspect with `superzej keys list`; check with
+# `superzej keys validate`; force a regen with `superzej keys sync`.
+#
+# Rebind a built-in by its id (see `superzej keys list` for ids + defaults):
+[keybinds]
+# new-worktree = "Ctrl w"
+# toggle-sidebar = "Alt s"
+
+# Define your own actions — a chord bound to a shell command. `menu = true`
+# surfaces it in the Cmd+K palette.
+# [[actions]]
+# name = "deploy"
+# key = "Alt D"
+# run = "just deploy"
+# menu = true
 
 # Coding agents offered in the new-worktree picker.
 # Use "__shell__" for a plain login shell.

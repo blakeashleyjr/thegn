@@ -28,12 +28,16 @@ pub fn run(cfg: &Config, session: Option<String>) -> Result<()> {
         Some(s) => {
             if zellij::in_superzej_session() {
                 Ok(()) // already inside the one session — nothing to attach
-            } else if session_exists(&s) {
-                // Reattach to the running session (managed config already applied).
-                exec_clean_attach(&s);
             } else {
-                let cwd = std::env::current_dir().unwrap_or_else(|_| util::home());
-                cold_start(&s, &cwd);
+                // Keep the managed keybinds in sync with config before (re)launch.
+                let _ = sync_managed_config(cfg);
+                if session_exists(&s) {
+                    // Reattach to the running session (managed config already applied).
+                    exec_clean_attach(&s);
+                } else {
+                    let cwd = std::env::current_dir().unwrap_or_else(|_| util::home());
+                    cold_start(&s, &cwd);
+                }
             }
         }
     }
@@ -77,6 +81,27 @@ pub fn config_path() -> Result<PathBuf> {
         std::fs::write(&path, DEFAULT_CONFIG)?;
     }
     Ok(path)
+}
+
+/// Re-render the generated keybind region of the managed `zellij.kdl` from the
+/// effective registry (builtins + `[keybinds]`/`[[actions]]`), preserving every
+/// other part of the file. Writes only when the content changes. No-op (with a
+/// note) under the `SUPERZEJ_CONFIG` dev override, which is used verbatim.
+pub fn sync_managed_config(cfg: &Config) -> Result<bool> {
+    if std::env::var_os("SUPERZEJ_CONFIG").is_some() {
+        msg::info("SUPERZEJ_CONFIG set; not rewriting the dev config — edit config/zellij.kdl");
+        return Ok(false);
+    }
+    let path = config_path()?; // seeds the default on first use
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let generated = crate::keymap::render_keybinds_kdl(&crate::keymap::effective(cfg));
+    let updated = crate::keymap::splice_managed_region(&existing, &generated);
+    if updated != existing {
+        std::fs::write(&path, &updated)?;
+        tracing::debug!("rewrote managed keybinds in {}", path.display());
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// Remove any inherited zellij env so a fresh `zellij` invocation doesn't think

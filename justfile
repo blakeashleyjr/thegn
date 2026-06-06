@@ -42,9 +42,39 @@ path:
 flake-check:
     nix flake check
 
-# The full pre-commit gate.
-ci: fmt-check lint build build-plugins test smoke nix-build
+# The full gate.
+ci: fmt-check lint build build-plugins test coverage smoke nix-build
     @echo "ci: all green"
+
+# The modules EXCLUDED from the coverage gate: exec / exit / daemon / subprocess
+# seams that can't be unit-covered without real external tools (git/gh/zellij/
+# podman/ssh) or that replace/loop the process — plus the WASM plugins. These are
+# exercised by smoke + e2e instead. See docs/coverage.md for the rationale.
+# Everything NOT matched here (config, keymap, db, theme, diff_highlight, models)
+# is gated at 95% lines.
+cov_ignore := '(src/commands/|src/main\.rs|src/cli\.rs|src/zellij\.rs|src/repo\.rs|src/worktree\.rs|src/sandbox\.rs|src/remote\.rs|src/github\.rs|src/picker\.rs|src/util\.rs|src/msg\.rs|src/out\.rs|src/log\.rs)'
+
+# Coverage gate: 95% lines on the testable core. Writes lcov to target/coverage.
+coverage:
+    mkdir -p target/coverage
+    cargo llvm-cov --bin superzej --fail-under-lines 95 \
+      --ignore-filename-regex '{{cov_ignore}}' \
+      --lcov --output-path target/coverage/lcov.info
+    @echo "coverage: core ≥95% lines"
+
+# Coverage as a browsable HTML report (target/llvm-cov/html).
+coverage-html:
+    cargo llvm-cov --bin superzej --html \
+      --ignore-filename-regex '{{cov_ignore}}'
+
+# Visual-regression: cell-grid snapshots of UI states via a sandboxed zellij.
+# Compares against goldens in test/visual/ (≥95% cell similarity to pass).
+visual: release
+    python3 test/visual.py
+
+# Regenerate the visual goldens (review the diff before committing).
+visual-update: release
+    python3 test/visual.py --update
 
 # --- quality --------------------------------------------------------------
 

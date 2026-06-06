@@ -33,7 +33,7 @@ pub fn run(cfg: &Config) -> Result<()> {
             db.slug_for_repo(&v.repo, &base).unwrap_or(base)
         });
         let label = util::slugify(&v.branch);
-        println!("{slug}\t{label}\t{}", v.path);
+        crate::outln!("{slug}\t{label}\t{}", v.path);
     }
     Ok(())
 }

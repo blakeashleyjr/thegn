@@ -38,7 +38,7 @@ pub fn run(cfg: &Config) -> Result<()> {
     use crate::theme;
     use std::io::IsTerminal;
     if std::io::stdout().is_terminal() {
-        println!(
+        crate::outln!(
             "\x1b[38;2;{}m\u{2726}\x1b[0m \x1b[1m\x1b[38;2;{}msuperzej\x1b[0m \
 \x1b[38;2;{}m— terminal-native worktree IDE\x1b[0m\n",
             theme::MAGENTA,
@@ -46,10 +46,10 @@ pub fn run(cfg: &Config) -> Result<()> {
             theme::FAINT,
         );
     } else {
-        println!("superzej — terminal-native worktree IDE\n");
+        crate::outln!("superzej — terminal-native worktree IDE\n");
     }
     list::run(cfg, false)?;
-    println!(
+    crate::outln!(
         "\n  Keys:  Alt-W new workspace (repo session)   Alt-w new worktree (tab)\n         \
          Alt-t new tab (same worktree)   Alt-h/j/k/l move focus\n         \
          Alt-n new panel   Alt-o switch repo   Alt-d dashboard\n         \

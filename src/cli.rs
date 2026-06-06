@@ -2,6 +2,7 @@
 
 use crate::github::MergeMethod;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
@@ -10,6 +11,13 @@ use clap::{Parser, Subcommand};
     about = "Terminal-native git-worktree IDE on zellij (sj is a short alias)"
 )]
 pub struct Cli {
+    /// Use this config file instead of $XDG_CONFIG_HOME/superzej/config.toml.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+    /// Override the default log level for this run (error|warn|info|debug|trace).
+    /// `SUPERZEJ_LOG` (tracing-style filter) takes precedence for fine control.
+    #[arg(long, global = true, value_name = "LEVEL")]
+    pub log_level: Option<String>,
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -106,9 +114,9 @@ pub enum Command {
     Watch {
         #[arg(long)]
         session: Option<String>,
-        /// Seconds between PR refreshes (back-off applies on rate limits).
-        #[arg(long = "pr-interval", default_value = "20")]
-        pr_interval: u64,
+        /// Seconds between PR refreshes (defaults to `[watch] pr_interval_secs`).
+        #[arg(long = "pr-interval")]
+        pr_interval: Option<u64>,
     },
     /// (internal) Recreate the previous session's worktree tabs from the DB
     /// (each relaunches its recorded agent). Run once at cold start.
@@ -208,6 +216,16 @@ pub enum Command {
     Recent { count: Option<i64> },
     /// Worktree inventory + key hints.
     Status,
+    /// Inspect the effective (layered) configuration.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+    /// Inspect / regenerate superzej keybindings.
+    Keys {
+        #[command(subcommand)]
+        action: KeysAction,
+    },
     /// (internal) Theme values for the plugins — one line, the accent "R;G;B".
     Theme,
     /// (internal) System stats for the tabbar widget — one line of
@@ -238,8 +256,9 @@ pub enum PrAction {
     Watch {
         #[arg(long)]
         worktree: Option<String>,
-        #[arg(long, default_value = "20")]
-        interval: u64,
+        /// Seconds between refreshes (defaults to `[watch] pr_interval_secs`).
+        #[arg(long)]
+        interval: Option<u64>,
     },
     /// Create a PR from the worktree's branch.
     Create {
@@ -290,5 +309,55 @@ pub enum PrAction {
     Reviews {
         #[arg(long)]
         worktree: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ConfigAction {
+    /// Print the path to the config file.
+    Path,
+    /// Print the effective merged config (defaults < file < env < flags).
+    Show {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Alias for `show` (the effective config).
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a single value by dotted key (bare value; for scripts/plugins).
+    Get {
+        key: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Open the config file in $EDITOR (seeds from the example if missing).
+    Edit,
+    /// Strictly validate the config file; non-zero exit on any problem.
+    Validate,
+}
+
+#[derive(Subcommand)]
+pub enum KeysAction {
+    /// Table of every action: id, key(s), label, context.
+    List,
+    /// Print the bare chord for one action id (non-zero if unknown).
+    Get { id: String },
+    /// Full effective registry (builtins + overrides + custom).
+    Show {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Collision + reserved-key + unknown-id check; non-zero on any problem.
+    Validate,
+    /// Re-render the managed keybind region in ~/.superzej/zellij.kdl.
+    Sync,
+    /// (internal) Statusbar hint feed: `key<TAB>label` lines.
+    Hints {
+        #[arg(long, default_value = "normal")]
+        mode: String,
+        #[arg(long, default_value = "always")]
+        context: String,
     },
 }

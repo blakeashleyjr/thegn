@@ -1,6 +1,6 @@
 //! Branch-name generation, base-branch resolution, and worktree add/remove.
 
-use crate::config::Config;
+use crate::config::{Config, NameScheme, WorktreeMode};
 use crate::msg;
 use crate::repo;
 use crate::util;
@@ -44,7 +44,7 @@ pub fn branch_name(root: &Path, human: Option<&str>, cfg: &Config) -> String {
     let prefix = &cfg.branch_prefix;
     let base = if let Some(h) = human {
         format!("{prefix}{}", util::slugify(h))
-    } else if cfg.name_scheme == "numbered" {
+    } else if cfg.name_scheme == NameScheme::Numbered {
         format!("{prefix}pane")
     } else {
         let pane: u64 = std::env::var("ZELLIJ_PANE_ID")
@@ -114,7 +114,7 @@ pub fn resolve_base(root: &Path, cfg: &Config) -> String {
 /// Compute the worktree directory path for a branch.
 pub fn worktree_path(root: &Path, branch: &str, cfg: &Config) -> PathBuf {
     let slug = util::slugify(branch);
-    if cfg.worktree_mode == "in_repo" {
+    if cfg.worktree_mode == WorktreeMode::InRepo {
         root.join(".worktrees").join(slug)
     } else {
         Path::new(&cfg.worktrees_dir)
@@ -126,7 +126,7 @@ pub fn worktree_path(root: &Path, branch: &str, cfg: &Config) -> PathBuf {
 /// Create a worktree. Returns false on failure (caller decides how to recover)
 /// rather than killing the pane.
 pub fn add(root: &Path, branch: &str, base: &str, path: &Path, cfg: &Config) -> bool {
-    if cfg.worktree_mode == "in_repo" {
+    if cfg.worktree_mode == WorktreeMode::InRepo {
         // Keep .worktrees out of git locally without touching tracked .gitignore.
         let excl = root.join(".git/info/exclude");
         if let Ok(contents) = std::fs::read_to_string(&excl) {

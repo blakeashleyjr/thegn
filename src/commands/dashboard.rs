@@ -2,6 +2,8 @@
 //!   (default) floating fuzzy quick-switcher (Alt-d)
 //!   --watch   persistent auto-refreshing table (pinnable pane)
 //!   --inner   internal: the fzf UI itself (spawned floating)
+// Terminal-control writes (screen clear) + an interactive prompt; not diagnostics.
+#![allow(clippy::disallowed_macros)]
 
 use crate::commands::list;
 use crate::config::Config;
@@ -31,14 +33,11 @@ pub fn run(cfg: &Config, watch: bool, inner: bool) -> Result<()> {
 }
 
 fn watch_loop(cfg: &Config) -> Result<()> {
-    let interval: u64 = std::env::var("SZ_DASH_INTERVAL")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(4);
+    let interval = cfg.dashboard.interval_secs.max(1);
     loop {
-        print!("\x1b[2J\x1b[H"); // clear + home
+        crate::out!("\x1b[2J\x1b[H"); // clear + home
         // "✦ superzej" wordmark (magenta star, accent name) + dim subtitle.
-        println!(
+        crate::outln!(
             "\x1b[38;2;{}m\u{2726}\x1b[0m \x1b[1m\x1b[38;2;{}msuperzej\x1b[0m \
 \x1b[38;2;{}mworktrees · refresh {interval}s\x1b[0m\n",
             crate::theme::MAGENTA,
