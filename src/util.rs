@@ -36,6 +36,19 @@ pub fn superzej_dir() -> PathBuf {
         .unwrap_or_else(|| home().join(".superzej"))
 }
 
+/// Where superzej's zellij layouts live. Seeded from the binary into superzej's
+/// own namespace (under `~/.superzej`, NOT the user's `~/.config/zellij`), so a
+/// missing/foreign/personal zellij config can never break the session — superzej
+/// owns these end to end, the same way it owns `~/.superzej/zellij.kdl`.
+/// `SUPERZEJ_DIR` relocates it for dev/test isolation; `SUPERZEJ_LAYOUT_DIR`
+/// overrides it outright (dev: point at the live `layouts/` source so edits take
+/// effect without a re-seed).
+pub fn layout_dir() -> PathBuf {
+    std::env::var_os("SUPERZEJ_LAYOUT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| superzej_dir().join("layouts"))
+}
+
 /// Where superzej's WASM plugins are deployed. Kept as a literal `~/.local/share`
 /// path (not `$XDG_DATA_HOME`) so it always matches the `file:~/.local/share/...`
 /// references in the session layout — and thus the zellij permission-cache keys.

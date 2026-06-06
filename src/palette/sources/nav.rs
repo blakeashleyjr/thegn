@@ -114,6 +114,7 @@ mod tests {
             "/repos/myrepo",
             "/wt/feature-x",
             "feature/x",
+            None,
         )
         .unwrap();
         db.touch_repo("/repos/myrepo", "myrepo").unwrap();
@@ -139,7 +140,7 @@ mod tests {
     fn worktree_with_empty_branch_falls_back_to_tab_name() {
         testutil::sandbox();
         let db = crate::db::Db::open().unwrap();
-        db.put_worktree("repo/home", "/repos/r2", "/wt/home", "")
+        db.put_worktree("repo/home", "/repos/r2", "/wt/home", "", None)
             .unwrap();
         let rows = rows();
         assert!(rows
