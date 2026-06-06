@@ -4,8 +4,6 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    treefmt-nix.url = "github:numtide/treefmt-nix";
-    treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
     # Toolchain with the wasm32-wasip1 target for the plugins.
     rust-overlay.url = "github:oxalica/rust-overlay";
     rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
@@ -23,7 +21,6 @@
     self,
     nixpkgs,
     flake-utils,
-    treefmt-nix,
     rust-overlay,
     nixpkgs-zellij,
   }:
@@ -32,7 +29,27 @@
         inherit system;
         overlays = [(import rust-overlay)];
       };
-      treefmtEval = treefmt-nix.lib.evalModule pkgs ./treefmt.nix;
+      # Formatter binaries that treefmt.toml references.  Bundled together so
+      # both the `formatter` wrapper and `checks.formatting` use identical
+      # versions — no drift between `nix fmt` and the devenv pre-commit hook.
+      fmtPackages = with pkgs; [
+        # Use pkgs.rustfmt (not rustToolchain) so the formatter version tracks
+        # nixpkgs-unstable, independent of the rust-overlay pin.
+        rustfmt
+        alejandra
+        shfmt
+        taplo
+        yamlfmt
+        prettier
+      ];
+      # `nix fmt` wrapper: reads treefmt.toml from the source tree, with all
+      # formatter binaries pre-wired onto PATH.
+      treefmtWrapper = pkgs.writeShellScriptBin "treefmt" ''
+        export PATH="${pkgs.lib.makeBinPath fmtPackages}:$PATH"
+        exec ${pkgs.treefmt}/bin/treefmt \
+          --config-file="$(${pkgs.git}/bin/git rev-parse --show-toplevel)/treefmt.toml" \
+          "$@"
+      '';
       # The pinned zellij superzej drives, from its own `nixpkgs-zellij` input so
       # its version is frozen in flake.lock independently of the main nixpkgs.
       # (zellij v0.44.x ships no flake.nix, so a standalone zellij flake input
@@ -71,8 +88,8 @@
       packages.superzej-tabbar = tabbar;
       packages.superzej-statusbar = statusbar;
 
-      # `nix fmt` formats every tracked file via treefmt.
-      formatter = treefmtEval.config.build.wrapper;
+      # `nix fmt` formats every tracked file via treefmt.toml.
+      formatter = treefmtWrapper;
 
       checks = {
         # `nix flake check` gates on a clean build, formatting, clippy, and the
@@ -82,7 +99,18 @@
         plugin-panel = panel;
         plugin-tabbar = tabbar;
         plugin-statusbar = statusbar;
-        formatting = treefmtEval.config.build.check self;
+        formatting =
+          pkgs.runCommand "treefmt-check" {
+            buildInputs = fmtPackages ++ [pkgs.treefmt pkgs.git];
+          } ''
+            set -euo pipefail
+            cp -r ${self} src
+            chmod -R u+w src
+            cd src
+            treefmt --config-file=${self}/treefmt.toml \
+              --no-cache --fail-on-change --tree-root .
+            touch $out
+          '';
         clippy = superzej.overrideAttrs (old: {
           pname = "superzej-clippy";
           nativeBuildInputs = (old.nativeBuildInputs or []) ++ [pkgs.clippy];
@@ -98,9 +126,9 @@
           [
             # rust toolchain (clippy/rustfmt/rust-analyzer + wasm32-wasip1 target)
             rustToolchain
-            # task runner + formatter
+            # task runner + formatter (treefmt wrapper with all formatters on PATH)
             just
-            treefmtEval.config.build.wrapper
+            treefmtWrapper
             # linters
             shellcheck
             yamllint

@@ -720,6 +720,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "libc",
  "nvml-wrapper",
  "rusqlite",
  "serde",

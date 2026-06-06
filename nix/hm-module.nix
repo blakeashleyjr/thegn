@@ -40,6 +40,10 @@ self: {
     agents = map (a: {inherit (a) name command;}) cfg.agents;
     tools = map (t: {inherit (t) name command;}) cfg.tools;
     theme.accent = cfg.themeAccent;
+    monitor = {
+      system = cfg.monitorSystem;
+      gpu = cfg.monitorGpu;
+    };
   };
 in {
   options.programs.superzej = {
@@ -119,6 +123,27 @@ in {
       default = "#76eede";
       example = "#f083ba";
       description = "Focus accent color (#rrggbb) for every superzej surface.";
+    };
+
+    monitorSystem = lib.mkOption {
+      type = lib.types.str;
+      default = "btm";
+      example = "htop";
+      description = ''
+        CPU/RAM resource monitor opened from the top-bar stats widget
+        (highlight CPU or MEM with Super+Alt+Up, then Enter). Default is `btm`
+        (ClementTsang/bottom); run in an embedded tiled pane.
+      '';
+    };
+
+    monitorGpu = lib.mkOption {
+      type = lib.types.str;
+      default = "nvtop";
+      example = "nvtop";
+      description = ''
+        GPU resource monitor opened from the top-bar stats widget (highlight
+        GPU with Super+Alt+Up, then Enter). Run in an embedded tiled pane.
+      '';
     };
 
     agents = lib.mkOption {

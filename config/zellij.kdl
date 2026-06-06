@@ -117,14 +117,38 @@ keybinds {
         // above) AND a terminal that forwards Super to the app — and your
         // window manager must not already grab Super+Alt+<key>. If these don't
         // fire, that's the WM eating them; use the Alt+h/j/k/l binds above.
+        //
+        // Left/Right + h/l move PANE focus. Up/Down + j/k SELECT the chrome
+        // bars: Up/k focuses the top bar (the resource-monitor strip) — then
+        // plain ←/→ pick a stat (CPU/MEM/GPU) and Enter pulls up that monitor
+        // embedded at the bottom; Down/j focuses the bottom statusbar. The bind
+        // broadcasts to every tab's instance; only the active tab's responds.
+        // (The sidebar tree is navigated with plain j/k/↑/↓ once the sidebar
+        // pane itself is focused — e.g. Super+Alt+Left/Alt+h onto it.)
         bind "Super Alt Left"  { MoveFocus "Left"; }
         bind "Super Alt Right" { MoveFocus "Right"; }
-        bind "Super Alt Up"    { MoveFocus "Up"; }
-        bind "Super Alt Down"  { MoveFocus "Down"; }
         bind "Super Alt h"     { MoveFocus "Left"; }
-        bind "Super Alt j"     { MoveFocus "Down"; }
-        bind "Super Alt k"     { MoveFocus "Up"; }
         bind "Super Alt l"     { MoveFocus "Right"; }
+        bind "Super Alt Up" {
+            MessagePlugin "file:~/.local/share/superzej/tabbar.wasm" {
+                name "superzej_select_topbar"
+            }
+        }
+        bind "Super Alt k" {
+            MessagePlugin "file:~/.local/share/superzej/tabbar.wasm" {
+                name "superzej_select_topbar"
+            }
+        }
+        bind "Super Alt Down" {
+            MessagePlugin "file:~/.local/share/superzej/statusbar.wasm" {
+                name "superzej_select_bottombar"
+            }
+        }
+        bind "Super Alt j" {
+            MessagePlugin "file:~/.local/share/superzej/statusbar.wasm" {
+                name "superzej_select_bottombar"
+            }
+        }
     }
     // zellij tab-mode `n` (Ctrl+t → n) would create a bare chrome-less tab —
     // repoint it at `superzej new-tab` so every tab keeps the wrapper.
