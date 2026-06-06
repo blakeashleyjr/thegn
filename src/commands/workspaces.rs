@@ -71,7 +71,7 @@ pub fn run() -> Result<()> {
         } else {
             name.clone()
         };
-        println!("{slug}\t{disp}\t{path}");
+        crate::outln!("{slug}\t{disp}\t{path}");
     }
     Ok(())
 }

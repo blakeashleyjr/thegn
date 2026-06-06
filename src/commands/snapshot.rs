@@ -10,7 +10,7 @@
 use crate::commands::{resolve, watch};
 use crate::db::{self, Db};
 use anyhow::Result;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 pub fn run(session: Option<String>, tab: Option<String>) -> Result<()> {
     let session = session.unwrap_or_else(db::session);
@@ -34,6 +34,6 @@ pub fn run(session: Option<String>, tab: Option<String>) -> Result<()> {
             }
         }
     }
-    println!("{}", Value::Object(obj));
+    crate::outln!("{}", Value::Object(obj));
     Ok(())
 }

@@ -55,7 +55,7 @@ fn menu(cfg: &Config) -> Result<()> {
         options.push(ADD_NEW.to_string());
         options.push(SHELL_HERE.to_string());
 
-        match picker::pick("superzej — open a repo", &options, &cfg.picker) {
+        match picker::pick("superzej — open a repo", &options, cfg.picker.as_str()) {
             None => util::exec_shell(),
             Some(c) if c == SHELL_HERE => util::exec_shell(),
             Some(c) if c == ADD_NEW => {
@@ -80,7 +80,7 @@ fn wizard(cfg: &Config) -> Result<()> {
         "Add a local repo by path".to_string(),
         "Quit".to_string(),
     ];
-    match picker::pick("superzej setup", &options, &cfg.picker).as_deref() {
+    match picker::pick("superzej setup", &options, cfg.picker.as_str()).as_deref() {
         Some("Clone a repo from a URL") => {
             if let Some(url) = picker::prompt("Git URL (git@github.com:org/repo.git)") {
                 return commands::new_workspace::run(cfg, Some(url), None, false);

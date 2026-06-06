@@ -12,14 +12,15 @@
 //! lockfile makes the auto-spawn from `attach` idempotent.
 
 use crate::commands::{diff, panels};
+use crate::config::Config;
 use crate::db::Db;
 use crate::github::{self, PanelState};
 use crate::remote::GitLoc;
 use crate::{util, zellij};
 use anyhow::Result;
-use notify::{recommended_watcher, Event, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher, recommended_watcher};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
+use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::time::Duration;
 
 /// How often the loop wakes to re-check focus and the PR interval.
@@ -72,13 +73,13 @@ fn acquire_lock(session: &str) -> bool {
     std::fs::write(&p, std::process::id().to_string()).is_ok()
 }
 
-pub fn run(session: Option<String>, pr_interval: u64) -> Result<()> {
+pub fn run(cfg: &Config, session: Option<String>, pr_interval: Option<u64>) -> Result<()> {
     let session = session.unwrap_or_else(zellij::ui_session);
     if !acquire_lock(&session) {
         return Ok(()); // a live daemon already owns this session
     }
     let url = panels::plugin_url("panel.wasm");
-    let base = pr_interval.max(1) as i64;
+    let base = pr_interval.unwrap_or(cfg.watch.pr_interval_secs).max(1) as i64;
 
     let (tx, rx) = channel::<()>();
     let mut watcher: Option<RecommendedWatcher> = None;

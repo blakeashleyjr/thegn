@@ -287,10 +287,7 @@ impl State {
                 // Phase 1: paint from cache (worktree + cached PR/diff), then
                 // start the live fetch to hydrate.
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) {
-                    self.worktree = v
-                        .get("worktree")
-                        .and_then(|w| w.as_str())
-                        .map(String::from);
+                    self.worktree = v.get("worktree").and_then(|w| w.as_str()).map(String::from);
                     if let Some(pr) = v.get("pr") {
                         if !pr.is_null() {
                             self.pr = Some(pr.clone());

@@ -7,27 +7,21 @@
 
 use crate::cli::PrAction;
 use crate::commands::{confirm, panels, resolve_worktree};
+use crate::config::Config;
 use crate::db::Db;
 use crate::github::{self, CreateOpts, PanelState, PrPanel};
 use crate::remote::GitLoc;
 use crate::{msg, util, zellij};
 use anyhow::Result;
 
-fn ttl() -> i64 {
-    std::env::var("SZ_PR_TTL")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(30)
-}
-
-pub fn run(action: PrAction) -> Result<()> {
+pub fn run(cfg: &Config, action: PrAction) -> Result<()> {
     match action {
         PrAction::Status {
             worktree,
             json,
             refresh,
-        } => status(worktree, json, refresh),
-        PrAction::Watch { worktree, interval } => watch(worktree, interval),
+        } => status(cfg, worktree, json, refresh),
+        PrAction::Watch { worktree, interval } => watch(cfg, worktree, interval),
         PrAction::Create {
             worktree,
             title,
@@ -52,12 +46,12 @@ pub fn run(action: PrAction) -> Result<()> {
 
 /// The panel JSON, served from cache when fresh (unless `refresh`); otherwise a
 /// live `gh` fetch written back to the cache.
-fn fetch_json(loc: &GitLoc, refresh: bool) -> String {
+fn fetch_json(cfg: &Config, loc: &GitLoc, refresh: bool) -> String {
     let wt_s = loc.path();
     if !refresh {
         if let Ok(db) = Db::open() {
             if let Ok(Some((json, fetched_at))) = db.get_pr_cache(&wt_s) {
-                if util::now() - fetched_at < ttl() {
+                if util::now() - fetched_at < cfg.pr.ttl_secs as i64 {
                     return json; // cache hit — no network
                 }
             }
@@ -71,11 +65,11 @@ fn fetch_json(loc: &GitLoc, refresh: bool) -> String {
     json
 }
 
-fn status(worktree: Option<String>, json: bool, refresh: bool) -> Result<()> {
+fn status(cfg: &Config, worktree: Option<String>, json: bool, refresh: bool) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
     if json {
         // Cache-served fast path for the plugin.
-        println!("{}", fetch_json(&loc, refresh));
+        crate::outln!("{}", fetch_json(cfg, &loc, refresh));
     } else {
         // Always show a fresh human summary on the CLI.
         let panel = github::pr_status(&loc);
@@ -90,33 +84,33 @@ fn status(worktree: Option<String>, json: bool, refresh: bool) -> Result<()> {
 
 fn print_summary(p: &PrPanel) {
     match &p.state {
-        PanelState::NoGh => println!("gh CLI not installed"),
-        PanelState::NotAuthenticated => println!("gh not authenticated (run: gh auth login)"),
-        PanelState::NoPr => println!(
+        PanelState::NoGh => crate::outln!("gh CLI not installed"),
+        PanelState::NotAuthenticated => crate::outln!("gh not authenticated (run: gh auth login)"),
+        PanelState::NoPr => crate::outln!(
             "branch '{}': no PR yet  (create: superzej pr create)",
             p.branch
         ),
-        PanelState::RateLimited => println!("GitHub API rate limited; try again shortly"),
-        PanelState::Error { message } => println!("error: {message}"),
+        PanelState::RateLimited => crate::outln!("GitHub API rate limited; try again shortly"),
+        PanelState::Error { message } => crate::outln!("error: {message}"),
         PanelState::Pr(pr) => {
             let draft = if pr.is_draft { " (draft)" } else { "" };
-            println!("#{} {}{}  [{}]", pr.number, pr.title, draft, pr.state);
-            println!(
+            crate::outln!("#{} {}{}  [{}]", pr.number, pr.title, draft, pr.state);
+            crate::outln!(
                 "  checks: {} ok / {} failed / {} pending   review: {}",
                 pr.checks.passed,
                 pr.checks.failed,
                 pr.checks.pending,
                 pr.review_decision.as_deref().unwrap_or("—")
             );
-            println!("  {}", pr.url);
+            crate::outln!("  {}", pr.url);
         }
     }
 }
 
-fn watch(worktree: Option<String>, interval: u64) -> Result<()> {
+fn watch(cfg: &Config, worktree: Option<String>, interval: Option<u64>) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
     let url = panels::plugin_url("panel.wasm");
-    let base = interval.max(1);
+    let base = interval.unwrap_or(cfg.watch.pr_interval_secs).max(1);
     let mut delay = base;
     loop {
         let panel = github::pr_status(&loc);
@@ -161,7 +155,7 @@ fn create(
     match github::create_pr(&loc, &opts) {
         Ok(out) => {
             if !out.is_empty() {
-                println!("{out}");
+                crate::outln!("{out}");
             }
             msg::info("PR created");
         }
@@ -218,7 +212,7 @@ fn rerun(worktree: Option<String>) -> Result<()> {
 fn reviews(worktree: Option<String>) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
     match github::reviews(&loc) {
-        Ok(json) => println!("{json}"),
+        Ok(json) => crate::outln!("{json}"),
         Err(e) => msg::die(&format!("pr reviews failed: {}", github::describe(&e))),
     }
     Ok(())

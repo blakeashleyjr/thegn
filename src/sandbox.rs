@@ -16,12 +16,14 @@
 //! finally `none` (the plain host shell, with a warning). An orthogonal transport
 //! layer (mosh preferred / ssh) runs the whole thing on a remote machine.
 
-use crate::config::SandboxConfig;
+use crate::config::{Network, OnMissing, RemoteTransport, SandboxBackend, SandboxConfig};
 use crate::remote::GitLoc;
 use crate::{msg, util};
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Runtime backend (resolved from the config-facing [`SandboxBackend`]; this set
+/// has no `Auto` — auto resolution is what produces a concrete `Backend`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     Podman,
@@ -44,6 +46,21 @@ impl Backend {
             "wsl" => Backend::Wsl,
             "none" | "host" => Backend::None,
             _ => return None,
+        })
+    }
+
+    /// Map a config backend to its runtime form. `Auto` has no concrete runtime
+    /// backend (it triggers the detection chain) and yields `None`.
+    fn from_config(b: SandboxBackend) -> Option<Backend> {
+        Some(match b {
+            SandboxBackend::Auto => return None,
+            SandboxBackend::Podman => Backend::Podman,
+            SandboxBackend::Docker => Backend::Docker,
+            SandboxBackend::Bwrap => Backend::Bwrap,
+            SandboxBackend::Systemd => Backend::Systemd,
+            SandboxBackend::Apple => Backend::Apple,
+            SandboxBackend::Wsl => Backend::Wsl,
+            SandboxBackend::None => Backend::None,
         })
     }
 
@@ -71,23 +88,6 @@ impl Backend {
 
     fn is_host_toolchain(self) -> bool {
         matches!(self, Backend::Bwrap | Backend::Systemd)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Network {
-    Nat,
-    Host,
-    None,
-}
-
-impl Network {
-    fn parse(s: &str) -> Network {
-        match s {
-            "host" => Network::Host,
-            "none" => Network::None,
-            _ => Network::Nat,
-        }
     }
 }
 
@@ -203,7 +203,7 @@ pub fn resolve(cfg: &SandboxConfig, loc: &GitLoc, name: &str) -> Option<SandboxS
         worktree,
         mounts,
         env,
-        network: Network::parse(&cfg.network),
+        network: cfg.network,
         init_script: (!cfg.init_script.trim().is_empty()).then(|| cfg.init_script.clone()),
         // Explicit opt-in, or a *local* repo with devenv.nix when `devenv` is on PATH.
         devenv: cfg.devenv
@@ -227,7 +227,7 @@ fn transport_from_loc(cfg: &SandboxConfig, loc: &GitLoc) -> Transport {
     match loc.ssh() {
         None => Transport::Local,
         Some(ssh) => {
-            let kind = if cfg.remote.transport == "ssh" {
+            let kind = if cfg.remote.transport == RemoteTransport::Ssh {
                 TransportKind::Ssh
             } else {
                 TransportKind::Mosh
@@ -258,12 +258,12 @@ fn pick_backend(cfg: &SandboxConfig, transport: &Transport) -> Option<Backend> {
     };
 
     // Explicit backend: use it if suitable+available; otherwise warn and fall
-    // through to the chain.
-    if cfg.backend != "auto" {
-        match Backend::parse(&cfg.backend) {
-            Some(Backend::None) => return Some(Backend::None),
-            Some(b) if suitable(b) && available(transport, b) => return Some(b),
-            Some(b) => on_missing(
+    // through to the chain. `Auto` falls straight through to the chain.
+    if let Some(explicit) = Backend::from_config(cfg.backend) {
+        match explicit {
+            Backend::None => return Some(Backend::None),
+            b if suitable(b) && available(transport, b) => return Some(b),
+            b => on_missing(
                 cfg,
                 &format!(
                     "sandbox backend '{}' unavailable{}; trying the chain",
@@ -275,10 +275,6 @@ fn pick_backend(cfg: &SandboxConfig, transport: &Transport) -> Option<Backend> {
                     }
                 ),
             ),
-            None => msg::warn(&format!(
-                "sandbox: unknown backend '{}'; trying the chain",
-                cfg.backend
-            )),
         }
     }
 
@@ -306,8 +302,8 @@ fn pick_backend(cfg: &SandboxConfig, transport: &Transport) -> Option<Backend> {
 }
 
 fn on_missing(cfg: &SandboxConfig, what: &str) {
-    match cfg.on_missing.as_str() {
-        "fail" => msg::die(what),
+    match cfg.on_missing {
+        OnMissing::Fail => msg::die(what),
         // "prompt" is treated as "warn" here; the picker layer can offer choices.
         _ => msg::warn(what),
     }

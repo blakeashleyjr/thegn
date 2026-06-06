@@ -56,6 +56,17 @@ ignore = "0.4.26"
 grep-searcher = "0.1.16"
 grep-regex = "0.1.14"
 grep-matcher = "0.1.8"
+# Structured, level-filtered diagnostics. `tracing` is the facade; the subscriber
+# is hand-composed in src/log.rs (a custom branded formatter + a hand-rolled
+# size-capped file sink) — so default-features off and no `tracing-appender`.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+  "std",
+  "fmt",
+  "ansi",
+  "env-filter",
+  "registry",
+] }
 
 [dev-dependencies]
 # Stream combinators for the palette's in-process mock-terminal e2e tests

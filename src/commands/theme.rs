@@ -7,6 +7,6 @@ use crate::config::Config;
 use anyhow::Result;
 
 pub fn run(cfg: &Config) -> Result<()> {
-    println!("{}", cfg.accent_rgb());
+    crate::outln!("{}", cfg.accent_rgb());
     Ok(())
 }

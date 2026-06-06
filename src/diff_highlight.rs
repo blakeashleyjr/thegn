@@ -165,3 +165,94 @@ fn style_ansi(style: &Style, bg: Option<Color>) -> String {
 
     ansi
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn highlights_each_line_kind() {
+        let diff = "\
+diff --git a/x.rs b/x.rs
+--- a/x.rs
++++ b/x.rs
+@@ -1,2 +1,2 @@
+ fn main() {}
+-let removed = 1;
++let added = 2;
+
+";
+        let out = highlight_diff(diff, "x.rs");
+        // headers/hunk lines pass through verbatim.
+        assert!(out.contains("@@ -1,2 +1,2 @@"));
+        assert!(out.contains("--- a/x.rs"));
+        assert!(out.contains("+++ b/x.rs"));
+        // added/removed gutters get their diff foreground colour.
+        assert!(out.contains(FG_PREFIX_ADD));
+        assert!(out.contains(FG_PREFIX_REMOVE));
+        // added line carries the added background.
+        assert!(out.contains("\x1b[48;2;28;46;40m"));
+        // blank line preserved.
+        assert!(out.contains('\n'));
+    }
+
+    #[test]
+    fn unknown_extension_falls_back_to_plain() {
+        // Exercises the extension → whole-filename → plain-text fallback chain
+        // without panicking. (Token content can be split by ANSI codes, so we
+        // assert on the structural markers rather than exact substrings.)
+        let out = highlight_diff("+hello\n", "file.unknownext");
+        assert!(out.contains(FG_PREFIX_ADD) && out.ends_with("\x1b[0m\n"));
+        // whole-filename fallback path (Makefile has no extension).
+        let out2 = highlight_diff(" all:\n", "Makefile");
+        assert!(!out2.is_empty());
+    }
+
+    #[test]
+    fn style_ansi_covers_font_styles_and_bg() {
+        let style = Style {
+            foreground: Color {
+                r: 10,
+                g: 20,
+                b: 30,
+                a: 255,
+            },
+            background: Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            },
+            font_style: FontStyle::BOLD | FontStyle::ITALIC | FontStyle::UNDERLINE,
+        };
+        let with_bg = style_ansi(&style, Some(BG_ADDED));
+        assert!(with_bg.contains("\x1b[48;2;28;46;40m")); // bg
+        assert!(with_bg.contains("\x1b[38;2;10;20;30m")); // fg
+        assert!(
+            with_bg.contains("\x1b[1m")
+                && with_bg.contains("\x1b[3m")
+                && with_bg.contains("\x1b[4m")
+        );
+        // No-bg, no-font-style path.
+        let plain = style_ansi(
+            &Style {
+                foreground: Color {
+                    r: 1,
+                    g: 2,
+                    b: 3,
+                    a: 255,
+                },
+                background: Color {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 255,
+                },
+                font_style: FontStyle::empty(),
+            },
+            None,
+        );
+        assert!(!plain.contains("\x1b[48"));
+        assert!(plain.contains("\x1b[38;2;1;2;3m"));
+    }
+}

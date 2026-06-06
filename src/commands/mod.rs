@@ -1,10 +1,15 @@
+// `confirm` writes an interactive y/N prompt to stderr (not a diagnostic).
+#![allow(clippy::disallowed_macros)]
+
 pub mod activity;
 pub mod attach;
 pub mod close_worktree;
+pub mod config;
 pub mod dashboard;
 pub mod diff;
 pub mod files;
 pub mod grant_plugins;
+pub mod keys;
 pub mod launch;
 pub mod list;
 pub mod menu;

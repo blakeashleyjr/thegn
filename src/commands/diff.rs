@@ -45,7 +45,7 @@ pub fn run(
         if let Ok(db) = Db::open() {
             let _ = db.put_diff_cache(&wt.to_string_lossy(), &tsv);
         }
-        print!("{tsv}");
+        crate::out!("{tsv}");
         return Ok(());
     }
 

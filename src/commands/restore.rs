@@ -55,7 +55,10 @@ pub fn run() -> Result<()> {
     }
 
     // Opening tabs steals focus; return to the home tab.
-    if let Some(home) = zellij::tab_names().into_iter().find(|t| t.ends_with("/home")) {
+    if let Some(home) = zellij::tab_names()
+        .into_iter()
+        .find(|t| t.ends_with("/home"))
+    {
         zellij::go_to_tab_name(&home);
     }
     Ok(())
