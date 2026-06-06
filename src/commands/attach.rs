@@ -107,7 +107,18 @@ fn exec_clean_attach(session: &str) -> ! {
     // are pre-approved on load — the prompt renders inside fixed plugin panes
     // and is effectively un-approvable. Best-effort; idempotent.
     let _ = commands::grant_plugins::seed();
+    spawn_watch_daemon(session);
     util::exec_command(&zellij::bin(), &["--config", &config, "attach", session]);
+}
+
+/// Spawn the per-session `watch` daemon (live panel refresh) detached, before we
+/// exec into zellij. It inherits the private socket/cache env set by
+/// `prepare_env`, and its own pid lockfile makes this idempotent — so spawning
+/// from both cold-start and reattach is safe.
+fn spawn_watch_daemon(session: &str) {
+    if let Ok(exe) = std::env::current_exe() {
+        util::spawn_daemon(&exe.to_string_lossy(), &["watch", "--session", session]);
+    }
 }
 
 /// Start a fresh superzej zellij session, rooted at `cwd` (the repo root, so the
@@ -141,6 +152,7 @@ pub fn cold_start(session: &str, cwd: &Path) -> ! {
     // so RunCommands is granted from the first instant (no un-approvable prompt
     // in the fixed plugin panes). Best-effort; idempotent.
     let _ = commands::grant_plugins::seed();
+    spawn_watch_daemon(session);
     util::exec_command(
         &zellij::bin(),
         &[
