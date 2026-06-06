@@ -265,7 +265,7 @@ impl ZellijPlugin for State {
         let version = concat!("v", env!("CARGO_PKG_VERSION"));
         let accent = self.accent.clone();
         let bar = PANEL; // the grey top-bar fill — clearly lighter than the base bg
-                       // Re-applied after every RESET so spaces/chips keep the bar background.
+        // Re-applied after every RESET so spaces/chips keep the bar background.
         let set_bar = format!("\u{1b}[48;2;{bar}m");
 
         let mut out = String::new();

@@ -13,8 +13,8 @@ layoutdir="$XDG_CONFIG_HOME/zellij/layouts"
 datadir="$HOME/.local/share/superzej"
 
 command -v cargo >/dev/null || {
-	echo "cargo not found — install Rust or use 'nix profile install'." >&2
-	exit 1
+  echo "cargo not found — install Rust or use 'nix profile install'." >&2
+  exit 1
 }
 
 echo "building release binary…"
@@ -41,15 +41,15 @@ ln -sfn "$here/plugin/tabbar/target/wasm32-wasip1/release/superzej-tabbar.wasm" 
 ln -sfn "$here/plugin/statusbar/target/wasm32-wasip1/release/superzej-statusbar.wasm" "$datadir/statusbar.wasm"
 
 if [[ ! -f "$XDG_CONFIG_HOME/superzej/config.toml" ]]; then
-	cp "$here/config/config.toml.example" "$XDG_CONFIG_HOME/superzej/config.toml"
-	echo "wrote default config: $XDG_CONFIG_HOME/superzej/config.toml"
+  cp "$here/config/config.toml.example" "$XDG_CONFIG_HOME/superzej/config.toml"
+  echo "wrote default config: $XDG_CONFIG_HOME/superzej/config.toml"
 fi
 
 # Seed the superzej-managed zellij config (customize it freely; never overwritten).
 mkdir -p "$HOME/.superzej"
 if [[ ! -f "$HOME/.superzej/zellij.kdl" ]]; then
-	cp "$here/config/zellij.kdl" "$HOME/.superzej/zellij.kdl"
-	echo "wrote managed zellij config: $HOME/.superzej/zellij.kdl"
+  cp "$here/config/zellij.kdl" "$HOME/.superzej/zellij.kdl"
+  echo "wrote managed zellij config: $HOME/.superzej/zellij.kdl"
 fi
 
 # Pre-grant the plugins' zellij permissions so the first session doesn't prompt.
