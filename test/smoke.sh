@@ -97,6 +97,18 @@ RESOLVED="$("$SZ" resolve-worktree --session default --tab repo/sz-demo-feature)
 check "resolve-worktree maps (session,tab) -> path" \
 	"[[ -n '$RESOLVED' && '$RESOLVED' == \"$WT\" ]]"
 
+# panel-snapshot: the panel's fast first paint — one process returns the resolved
+# worktree plus whatever is cached. After a `diff --files` warms the cache, the
+# snapshot carries the file list too.
+check "panel-snapshot resolves the worktree as JSON" \
+	"[[ \$('$SZ' panel-snapshot --session default --tab repo/sz-demo-feature | jq -r '.worktree') == \"$WT\" ]]"
+"$SZ" diff --files --worktree "$WT" --base main >/dev/null 2>&1
+check "panel-snapshot carries cached diff files after a diff" \
+	"'$SZ' panel-snapshot --session default --tab repo/sz-demo-feature | jq -e '.files | length > 0' >/dev/null"
+# restore-session is a graceful no-op outside a live session (it needs zellij).
+check "restore-session degrades gracefully outside a session (exit 0)" \
+	"'$SZ' restore-session >/dev/null 2>&1"
+
 # The data-plane commands degrade gracefully on a repo with no remote / no gh PR
 # (must exit 0 so the panel never sees a crash).
 check "pr status degrades gracefully (exit 0)" \

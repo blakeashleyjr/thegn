@@ -51,12 +51,19 @@ fn main() {
         Command::Menu => commands::menu::run(&cfg),
         Command::GrantPlugins => commands::grant_plugins::run(),
         Command::ResolveWorktree { session, tab } => commands::resolve::run(session, tab),
+        Command::PanelSnapshot { session, tab } => commands::snapshot::run(session, tab),
+        Command::Watch {
+            session,
+            pr_interval,
+        } => commands::watch::run(session, pr_interval),
+        Command::RestoreSession => commands::restore::run(),
         Command::PickAgent {
             worktree,
             branch,
             agent,
             in_place: _, // no-op; accepted for worktree-tab layout compatibility
-        } => commands::pick_agent::run(&cfg, worktree, branch, agent),
+            resume,
+        } => commands::pick_agent::run(&cfg, worktree, branch, agent, resume),
         Command::Tool {
             name,
             worktree,

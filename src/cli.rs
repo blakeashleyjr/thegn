@@ -93,6 +93,26 @@ pub enum Command {
         #[arg(long)]
         tab: Option<String>,
     },
+    /// (internal) One-shot JSON snapshot (cached PR + diff) for the panel's fast
+    /// first paint; also records the focused worktree for the watch daemon.
+    PanelSnapshot {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        tab: Option<String>,
+    },
+    /// (internal) Per-session daemon: fs-watch the focused worktree and push
+    /// live diff/PR updates to the panel. Auto-spawned by `attach`.
+    Watch {
+        #[arg(long)]
+        session: Option<String>,
+        /// Seconds between PR refreshes (back-off applies on rate limits).
+        #[arg(long = "pr-interval", default_value = "20")]
+        pr_interval: u64,
+    },
+    /// (internal) Recreate the previous session's worktree tabs from the DB
+    /// (each relaunches its recorded agent). Run once at cold start.
+    RestoreSession,
     /// (internal) Picker run inside a new worktree tab's first pane.
     PickAgent {
         #[arg(long)]
@@ -105,6 +125,10 @@ pub enum Command {
         /// pick-agent always runs in its own pane, so this is a no-op.
         #[arg(long = "in-place")]
         in_place: bool,
+        /// On session restore: relaunch the worktree's previously-recorded agent
+        /// instead of prompting (falls back to the picker if none is recorded).
+        #[arg(long)]
+        resume: bool,
     },
     /// Open a tool (lazygit/yazi/editor/diff) floating, scoped to the worktree.
     Tool {
