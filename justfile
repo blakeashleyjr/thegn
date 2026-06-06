@@ -95,6 +95,23 @@ e2e: release
     ./test/one-session.sh
     ./test/slug-unique.sh
 
+# Visual + structural regression for the bottom file-manager drawer (needs
+# zellij + yazi; SKIPs if absent). Sandboxed — never touches a real session.
+drawer-e2e: release build-plugins
+    python3 test/files-drawer.py
+    SZ_TEST_DRAWER_WIDTH=center python3 test/files-drawer.py
+
+# Line coverage (cargo-llvm-cov). `just coverage` prints the per-file summary;
+# `just coverage html` opens a browsable report.
+coverage what="summary":
+    {{ if what == "html" { "cargo llvm-cov --open" } else { "cargo llvm-cov --summary-only" } }}
+
+# Combined unit + integration coverage with a 95% gate on the drawer code
+# (yazi.rs, commands/files.rs, and the new zellij/config helpers). Captures the
+# in-session paths (run/spawn/close/restore) the pty harness exercises.
+coverage-drawer:
+    ./test/coverage-drawer.sh
+
 # --- run / install --------------------------------------------------------
 
 # Run a subcommand against the debug build, e.g. `just run list --json`.

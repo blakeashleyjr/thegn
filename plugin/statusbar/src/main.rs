@@ -24,6 +24,10 @@ use theme::{BG0, BG1, DIM, GHOST, RESET, TEAL};
 const PANEL_MIN_TOTAL_COLS: usize = 100;
 const SIDEBAR_MIN_TOTAL_COLS: usize = 76;
 
+/// The bottom file-manager drawer's pane name (set by `superzej files` when it
+/// spawns the floating pane). Kept in sync with `commands::files::PANE_NAME`.
+const FILES_PANE: &str = "superzej-files";
+
 #[derive(Default)]
 struct State {
     mode: Option<InputMode>,
@@ -40,6 +44,16 @@ struct State {
     sidebar: Surface,
     panel: Surface,
     term_cols: usize, // last width seen in render (the statusbar spans full width)
+    // The bottom file-manager drawer. Unlike sidebar/panel it is a spawn/close
+    // command pane (not a suppressed plugin), so the statusbar only needs its id
+    // — to close it on the toggle pipe — and to re-open it (per-worktree) when
+    // its tab (re)loads. No reconcile/`next_swap_layout` involvement.
+    files_id: Option<u32>,         // drawer pane id in THIS tab (None ⇒ closed)
+    my_tab_index: Option<usize>,   // manifest key of the tab holding our own pane
+    active_tab_pos: Option<usize>, // position of the session's active tab
+    active_tab_name: String,       // its name (for the restore `--tab` arg)
+    session: Option<String>,       // current session name (restore `--session` arg)
+    restore_poked: bool,           // restore already requested for this activation
 }
 
 /// Tracked visibility of one controlled chrome surface.
@@ -67,6 +81,7 @@ impl ZellijPlugin for State {
             EventType::ModeUpdate,
             EventType::TabUpdate,
             EventType::PaneUpdate,
+            EventType::SessionUpdate, // session name for the drawer restore poke
             EventType::RunCommandResult,
             EventType::PermissionRequestResult,
         ]);
@@ -92,12 +107,23 @@ impl ZellijPlugin for State {
                 self.pull_visibility();
                 false
             }
+            // Track the session name so the drawer restore poke can target the
+            // right session from its plugin-spawned `superzej files` (which
+            // can't read it from env). Same source the tabbar uses for new-tab.
+            Event::SessionUpdate(infos, _) => {
+                self.session = infos
+                    .iter()
+                    .find(|s| s.is_current_session)
+                    .map(|s| s.name.clone());
+                false
+            }
             // The controller watches geometry: every resize/structure change
             // arrives here (the statusbar is always visible, so it never misses
             // one). Recompute auto-hide from the total width and reconcile.
             Event::PaneUpdate(manifest) => {
                 self.scan_panes(&manifest);
                 self.reconcile();
+                self.maybe_restore();
                 false
             }
             Event::RunCommandResult(code, stdout, _, ctx)
@@ -130,6 +156,12 @@ impl ZellijPlugin for State {
                 false
             }
             Event::TabUpdate(tabs) => {
+                // Track the active tab (position + name) so a worktree tab can
+                // restore its drawer when it becomes/loads as the focused tab.
+                if let Some(active) = tabs.iter().find(|t| t.active) {
+                    self.active_tab_pos = Some(active.position);
+                    self.active_tab_name = active.name.clone();
+                }
                 // `{slug}/home` => home tab; anything else under a repo is a worktree.
                 let wt = tabs
                     .iter()
@@ -141,11 +173,10 @@ impl ZellijPlugin for State {
                             .unwrap_or(false)
                     })
                     .unwrap_or(false);
-                if self.worktree_ctx != wt {
-                    self.worktree_ctx = wt;
-                    return true;
-                }
-                false
+                let changed = self.worktree_ctx != wt;
+                self.worktree_ctx = wt;
+                self.maybe_restore();
+                changed
             }
             _ => false,
         }
@@ -183,6 +214,14 @@ impl ZellijPlugin for State {
                     self.panel.manual = false;
                     self.reconcile();
                     self.persist("panel", true);
+                }
+            }
+            // Close the drawer by id (the CLI can only close the focused pane).
+            // Only the tab actually holding the drawer has its id, so a broadcast
+            // pipe closes exactly the one drawer.
+            "superzej_close_files" => {
+                if let Some(id) = self.files_id {
+                    close_pane_with_id(PaneId::Terminal(id));
                 }
             }
             _ => {}
@@ -262,6 +301,40 @@ fn fetch_theme() {
     run_command(&["superzej", "theme"], ctx);
 }
 
+/// Outcome of the per-activation drawer-restore check (see `restore_decision`).
+enum RestoreDecision {
+    /// Not our active tab — re-arm so the next focus can fire.
+    Disarm,
+    /// Conditions not met (not focused, no session yet, already open/poked).
+    Skip,
+    /// Re-open this worktree's drawer (it was left open).
+    Fire,
+}
+
+/// Pure restore gate: fire once per activation when our tab is the active
+/// worktree tab, no drawer is open, and the session name is known. Kept free of
+/// `self`/host calls so the branch table is unit-testable.
+fn restore_decision(
+    my_tab_index: Option<usize>,
+    active_tab_pos: Option<usize>,
+    worktree_ctx: bool,
+    files_open: bool,
+    restore_poked: bool,
+    has_session: bool,
+) -> RestoreDecision {
+    let (Some(mine), Some(active)) = (my_tab_index, active_tab_pos) else {
+        return RestoreDecision::Skip;
+    };
+    if mine != active {
+        return RestoreDecision::Disarm;
+    }
+    if has_session && worktree_ctx && !files_open && !restore_poked {
+        RestoreDecision::Fire
+    } else {
+        RestoreDecision::Skip
+    }
+}
+
 /// First line of stdout as a validated "R;G;B" triple.
 fn parse_rgb_line(stdout: &[u8]) -> Option<String> {
     let s = String::from_utf8_lossy(stdout);
@@ -279,27 +352,70 @@ impl State {
         let Some(me) = self.my_id else { return };
         // Only the layer (tab) that holds our own pane — other tabs carry the
         // same plugin urls under different ids.
-        let Some(panes) = manifest
+        let Some((idx, panes)) = manifest
             .panes
-            .values()
-            .find(|ps| ps.iter().any(|p| p.is_plugin && p.id == me))
+            .iter()
+            .find(|(_, ps)| ps.iter().any(|p| p.is_plugin && p.id == me))
         else {
             return;
         };
+        self.my_tab_index = Some(*idx);
+        // The drawer is a non-plugin (command) pane named FILES_PANE; track its
+        // id so the close pipe can target it, and so restore knows it's open.
+        // Absent ⇒ closed (e.g. the user quit yazi, or it was never opened).
+        let mut files_id = None;
         for p in panes {
-            if !p.is_plugin {
-                continue;
+            if p.is_plugin {
+                match p.plugin_url.as_deref() {
+                    Some(u) if u.contains("sidebar.wasm") => {
+                        self.sidebar.id = Some(p.id);
+                        self.sidebar.suppressed = p.is_suppressed;
+                    }
+                    Some(u) if u.contains("panel.wasm") => {
+                        self.panel.id = Some(p.id);
+                        self.panel.suppressed = p.is_suppressed;
+                    }
+                    _ => {}
+                }
+            } else if p.title == FILES_PANE {
+                files_id = Some(p.id);
             }
-            match p.plugin_url.as_deref() {
-                Some(u) if u.contains("sidebar.wasm") => {
-                    self.sidebar.id = Some(p.id);
-                    self.sidebar.suppressed = p.is_suppressed;
-                }
-                Some(u) if u.contains("panel.wasm") => {
-                    self.panel.id = Some(p.id);
-                    self.panel.suppressed = p.is_suppressed;
-                }
-                _ => {}
+        }
+        self.files_id = files_id;
+    }
+
+    /// Per-worktree drawer auto-restore: when our tab is the active worktree tab
+    /// and no drawer is open, ask `superzej files --restore` to re-open it iff it
+    /// was left open for this worktree. Fires once per activation; the CLI side
+    /// no-ops when the worktree was last closed or a drawer is already present.
+    fn maybe_restore(&mut self) {
+        match restore_decision(
+            self.my_tab_index,
+            self.active_tab_pos,
+            self.worktree_ctx,
+            self.files_id.is_some(),
+            self.restore_poked,
+            self.session.is_some(),
+        ) {
+            RestoreDecision::Disarm => self.restore_poked = false,
+            RestoreDecision::Skip => {}
+            RestoreDecision::Fire => {
+                self.restore_poked = true;
+                let session = self.session.clone().unwrap_or_default();
+                let mut ctx = BTreeMap::new();
+                ctx.insert("cmd".to_string(), "files_restore".to_string());
+                run_command(
+                    &[
+                        "superzej",
+                        "files",
+                        "--restore",
+                        "--tab",
+                        &self.active_tab_name,
+                        "--session",
+                        &session,
+                    ],
+                    ctx,
+                );
             }
         }
     }
@@ -367,7 +483,9 @@ impl State {
                     "sh",
                     "-c",
                     // Honor SUPERZEJ_DIR so a dev/test instance reads its own state.
-                    &format!("cat \"${{SUPERZEJ_DIR:-$HOME/.superzej}}/{file}\" 2>/dev/null || true"),
+                    &format!(
+                        "cat \"${{SUPERZEJ_DIR:-$HOME/.superzej}}/{file}\" 2>/dev/null || true"
+                    ),
                 ],
                 BTreeMap::from([("cmd".to_string(), tag.to_string())]),
             );

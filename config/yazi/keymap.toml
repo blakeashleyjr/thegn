@@ -1,0 +1,13 @@
+# superzej drawer keymap — PREPENDED to yazi's presets, so these win for their
+# keys while every default yazi binding still works. If this file fails to parse
+# yazi falls back to its presets (so the drawer still works; only these extras
+# are lost).
+
+[mgr]
+prepend_keymap = [
+  # Quit closes the superzej drawer (records the dismiss so it doesn't reopen on
+  # the next restore, then removes the pane via the statusbar controller).
+  { on = "q", run = 'shell "superzej files --close" --orphan', desc = "Close the superzej drawer" },
+  # Open the hovered file in the superzej editor surface.
+  { on = "<C-e>", run = 'shell "superzej tool editor --file $@" --orphan', desc = "Open in the superzej editor" },
+]

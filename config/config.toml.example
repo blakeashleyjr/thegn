@@ -32,6 +32,19 @@ auto_remove_worktree = false
 [theme]
 accent = "#76eede"
 
+# Bottom file-manager drawer (hidden by default; toggle with Ctrl+Alt+f). Runs a
+# pinned, bundled yazi with its own config kept separate from the system.
+[drawer]
+# File manager to run. Empty = the bundled, pinned yazi.
+command = ""
+# yazi config dir (YAZI_CONFIG_HOME). Empty = a private ~/.superzej/yazi, seeded
+# with superzej's bundled config and recolored to match [theme] accent. Use
+# "system" to point at your own ~/.config/yazi instead, or give an explicit path.
+config_home = ""
+# Drawer geometry. height: "35%" or a row count. width: "full" | "center".
+height = "35%"
+width = "full"
+
 # Coding agents offered in the new-worktree picker.
 # Use "__shell__" for a plain login shell.
 [[agents]]

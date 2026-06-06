@@ -37,7 +37,7 @@ fn watch_loop(cfg: &Config) -> Result<()> {
         .unwrap_or(4);
     loop {
         print!("\x1b[2J\x1b[H"); // clear + home
-                                 // "✦ superzej" wordmark (magenta star, accent name) + dim subtitle.
+        // "✦ superzej" wordmark (magenta star, accent name) + dim subtitle.
         println!(
             "\x1b[38;2;{}m\u{2726}\x1b[0m \x1b[1m\x1b[38;2;{}msuperzej\x1b[0m \
 \x1b[38;2;{}mworktrees · refresh {interval}s\x1b[0m\n",

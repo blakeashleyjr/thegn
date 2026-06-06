@@ -135,11 +135,7 @@ pub fn prompt(label: &str) -> Option<String> {
         std::io::stdin().lock().read_line(&mut line).ok()?;
         line.trim().to_string()
     };
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    if s.is_empty() { None } else { Some(s) }
 }
 
 /// The sidebar's "+ new workspace" picker: a slick `fzf` over every git repo
@@ -203,11 +199,7 @@ pub fn pick_repo(cfg: &Config) -> Option<String> {
             std::io::stdin().lock().read_line(&mut line).ok()?;
             line.trim().to_string()
         };
-        if url.is_empty() {
-            None
-        } else {
-            Some(url)
-        }
+        if url.is_empty() { None } else { Some(url) }
     } else {
         Some(choice)
     }

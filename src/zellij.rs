@@ -105,6 +105,105 @@ pub fn new_float(cwd: &Path, name: &str, cmd: &[&str]) -> bool {
     action(&refs)
 }
 
+/// Open the bottom file-manager drawer: a bottom-anchored, full-width (or
+/// centered) floating pane that closes when its command exits. Pinned so it
+/// stays above other floats. `height`/`width` come from `[drawer]` config.
+pub fn new_drawer(cwd: &Path, name: &str, height: &str, width: &str, cmd: &[&str]) -> bool {
+    let mut a = drawer_args(cwd, name, height, width);
+    a.extend(cmd.iter().map(|s| s.to_string()));
+    let refs: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
+    action(&refs)
+}
+
+/// The `new-pane` args (through the trailing `--`) for a bottom-anchored drawer
+/// of the given geometry — pure, so the geometry is unit-testable. `width`
+/// "full" spans the tab; "center" is a narrower bottom band. `height` is a
+/// percentage (or a row count, anchored near the bottom).
+fn drawer_args(cwd: &Path, name: &str, height: &str, width: &str) -> Vec<String> {
+    let (x, w) = match width {
+        "center" => ("10%", "80%"),
+        _ => ("0", "100%"),
+    };
+    let y = drawer_top(height);
+    vec![
+        "new-pane".into(),
+        "--floating".into(),
+        "--pinned".into(),
+        "true".into(),
+        "--close-on-exit".into(),
+        "-x".into(),
+        x.into(),
+        "-y".into(),
+        y,
+        "--width".into(),
+        w.into(),
+        "--height".into(),
+        height.to_string(),
+        "--cwd".into(),
+        cwd.to_string_lossy().into_owned(),
+        "--name".into(),
+        name.into(),
+        "--".into(),
+    ]
+}
+
+/// Top edge for a drawer of the given height: `100-H%` for a percentage height,
+/// else a best-effort bottom anchor.
+fn drawer_top(height: &str) -> String {
+    match height
+        .trim()
+        .strip_suffix('%')
+        .and_then(|s| s.trim().parse::<u32>().ok())
+    {
+        Some(h) => format!("{}%", 100u32.saturating_sub(h.min(100))),
+        None => "60%".into(),
+    }
+}
+
+/// Whether a pane named `name` exists in the FOCUSED tab (parsed from
+/// `dump-layout`). Scoped to the focused tab so a drawer open in another
+/// worktree's tab doesn't read as "present" here — each worktree's drawer is
+/// independent.
+pub fn pane_named_in_focused_tab(name: &str) -> bool {
+    let Some(out) = command()
+        .args(["action", "dump-layout"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+    else {
+        return false;
+    };
+    pane_named_in_focused_tab_in(&String::from_utf8_lossy(&out.stdout), name)
+}
+
+/// The pure parser behind `pane_named_in_focused_tab`: brace-depth tracking
+/// isolates the `tab … focus=true { … }` block and looks for `name="<name>"`
+/// inside it only.
+fn pane_named_in_focused_tab_in(dump: &str, name: &str) -> bool {
+    let needle = format!("name=\"{name}\"");
+    let mut depth: i32 = 0;
+    let mut tab_at: Option<i32> = None; // brace depth at which the focused tab opened
+    for line in dump.lines() {
+        // Inside the focused tab block, a matching pane name means present.
+        // (The tab's own `name="…"` is a slug/branch, never the pane needle, and
+        // is on the `focus=true` line which we only enter *after* this check.)
+        if tab_at.is_some() && line.contains(&needle) {
+            return true;
+        }
+        if tab_at.is_none() && line.trim_start().starts_with("tab ") && line.contains("focus=true")
+        {
+            tab_at = Some(depth);
+        }
+        depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+        if let Some(start) = tab_at {
+            if depth <= start {
+                tab_at = None; // left the focused tab block
+            }
+        }
+    }
+    false
+}
+
 /// Open a new workspace tab (with a layout if given).
 pub fn new_tab(name: &str, cwd: &Path, layout: Option<&str>) -> bool {
     let cwd = cwd.to_string_lossy();
@@ -195,4 +294,102 @@ pub fn pipe_plugin(url: &str, name: &str, payload: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drawer_top_from_percentage() {
+        assert_eq!(drawer_top("35%"), "65%");
+        assert_eq!(drawer_top("100%"), "0%");
+        assert_eq!(drawer_top("0%"), "100%");
+        assert_eq!(drawer_top(" 40% "), "60%"); // trimmed
+    }
+
+    #[test]
+    fn drawer_top_clamps_and_falls_back() {
+        assert_eq!(drawer_top("150%"), "0%"); // clamp >100 to bottom
+        assert_eq!(drawer_top("20"), "60%"); // non-percentage -> best-effort anchor
+        assert_eq!(drawer_top("auto"), "60%");
+    }
+
+    #[test]
+    fn drawer_args_full_width_geometry() {
+        let a = drawer_args(Path::new("/wt"), "superzej-files", "35%", "full");
+        // anchored bottom-left, spanning the width, closing on exit, named + pinned.
+        assert!(a.contains(&"--floating".to_string()));
+        assert!(a.contains(&"--close-on-exit".to_string()));
+        assert!(a.windows(2).any(|w| w[0] == "--pinned" && w[1] == "true"));
+        assert!(a.windows(2).any(|w| w[0] == "-x" && w[1] == "0"));
+        assert!(a.windows(2).any(|w| w[0] == "-y" && w[1] == "65%"));
+        assert!(a.windows(2).any(|w| w[0] == "--width" && w[1] == "100%"));
+        assert!(a.windows(2).any(|w| w[0] == "--height" && w[1] == "35%"));
+        assert!(a.windows(2).any(|w| w[0] == "--cwd" && w[1] == "/wt"));
+        assert!(
+            a.windows(2)
+                .any(|w| w[0] == "--name" && w[1] == "superzej-files")
+        );
+        assert_eq!(a.last().unwrap(), "--"); // command appended after this
+    }
+
+    #[test]
+    fn drawer_args_center_width_geometry() {
+        let a = drawer_args(Path::new("/wt"), "superzej-files", "50%", "center");
+        assert!(a.windows(2).any(|w| w[0] == "-x" && w[1] == "10%"));
+        assert!(a.windows(2).any(|w| w[0] == "--width" && w[1] == "80%"));
+        assert!(a.windows(2).any(|w| w[0] == "-y" && w[1] == "50%"));
+    }
+
+    // A trimmed-down but structurally faithful `dump-layout` with two tabs.
+    fn dump(focused_has_drawer: bool, other_has_drawer: bool) -> String {
+        let other = if other_has_drawer {
+            "        pane name=\"superzej-files\" command=\"yazi\"\n"
+        } else {
+            "        pane\n"
+        };
+        let focused_float = if focused_has_drawer {
+            "        floating_panes {\n            pane name=\"superzej-files\" command=\"yazi\"\n        }\n"
+        } else {
+            ""
+        };
+        format!(
+            "layout {{\n    tab name=\"repo/home\" {{\n{other}    }}\n    \
+             tab name=\"repo/feature\" focus=true {{\n        pane\n{focused_float}    }}\n}}\n"
+        )
+    }
+
+    #[test]
+    fn drawer_present_only_when_in_focused_tab() {
+        // In the focused tab -> present.
+        assert!(pane_named_in_focused_tab_in(
+            &dump(true, false),
+            "superzej-files"
+        ));
+        // Open only in another (background) worktree's tab -> NOT present here.
+        assert!(!pane_named_in_focused_tab_in(
+            &dump(false, true),
+            "superzej-files"
+        ));
+        // Open in both -> present (the focused one counts).
+        assert!(pane_named_in_focused_tab_in(
+            &dump(true, true),
+            "superzej-files"
+        ));
+        // Open in neither -> absent.
+        assert!(!pane_named_in_focused_tab_in(
+            &dump(false, false),
+            "superzej-files"
+        ));
+    }
+
+    #[test]
+    fn drawer_present_handles_no_focused_tab_or_empty() {
+        assert!(!pane_named_in_focused_tab_in("", "superzej-files"));
+        assert!(!pane_named_in_focused_tab_in(
+            "layout {\n    tab name=\"a\" {\n        pane name=\"superzej-files\"\n    }\n}",
+            "superzej-files"
+        ));
+    }
 }
