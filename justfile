@@ -18,12 +18,29 @@ release:
     cargo build --release
 
 # Build the WASM zellij plugins (sidebar + panel + tabbar + statusbar) -> plugin/*/target/wasm32-wasip1.
+# The plugins compile for wasm32-wasip1. That target lives in the FLAKE dev shell's
+# toolchain (and `just nix-build-plugins`); the devenv/nixpkgs dev shell deliberately
+# omits it (to keep rustfmt/clippy matching treefmt), and a plain shell may not have
+# it. So: build with the ambient `cargo` when it already supports the target (inside
+# `nix develop`, or a rustup toolchain with it added); otherwise build THROUGH the
+# flake, so this works from the devenv shell or a plain shell too — instead of the
+# cryptic "can't find crate for core" you get when the ambient toolchain lacks it.
 build-plugins:
-    rustup target add wasm32-wasip1 2>/dev/null || true
-    cd plugin/sidebar && cargo build --release --target wasm32-wasip1
-    cd plugin/panel && cargo build --release --target wasm32-wasip1
-    cd plugin/tabbar && cargo build --release --target wasm32-wasip1
-    cd plugin/statusbar && cargo build --release --target wasm32-wasip1
+    #!/usr/bin/env bash
+    set -euo pipefail
+    plugins=(sidebar panel tabbar statusbar)
+    build() { for p in "${plugins[@]}"; do ( cd "plugin/$p" && cargo build --release --target wasm32-wasip1 ); done; }
+    # True when the toolchain `cargo` will use already has wasm32-wasip1 std.
+    have_wasm() { local s; s="$(rustc --print sysroot 2>/dev/null)" || return 1; compgen -G "$s/lib/rustlib/wasm32-wasip1/lib/*.rlib" >/dev/null 2>&1; }
+
+    if have_wasm; then
+        build
+    elif command -v rustup >/dev/null 2>&1 && rustup target add wasm32-wasip1 >/dev/null 2>&1 && have_wasm; then
+        build
+    else
+        echo "build-plugins: ambient toolchain has no wasm32-wasip1 target — building via the flake dev shell (run 'just dev' first for a faster loop)…" >&2
+        nix develop --command bash -c 'set -euo pipefail; for p in sidebar panel tabbar statusbar; do ( cd "plugin/$p" && cargo build --release --target wasm32-wasip1 ); done'
+    fi
 
 
 # Build the Nix package; symlinks ./result.
