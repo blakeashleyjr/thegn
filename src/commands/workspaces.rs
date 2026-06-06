@@ -9,6 +9,7 @@
 
 use crate::db::Db;
 use crate::repo;
+use crate::util;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
@@ -27,17 +28,29 @@ pub fn run() -> Result<()> {
     repos.sort();
     repos.dedup();
 
-    // (slug, name, path) per repo.
+    // (slug, name, path) per repo. Reuse the one open DB connection and derive
+    // names from the path basename — no per-repo `Db::open()` or `git` spawn, so
+    // this stays instant as the repo count grows (it's pulled on every tab
+    // change). `repo::repo_slug`/`repo_name` would reopen the DB and shell out to
+    // git for each repo; the paths here are already repo roots, so we don't need
+    // either.
     let rows: Vec<(String, String, String)> = repos
         .into_iter()
         .map(|path| {
             let p = Path::new(&path);
-            let slug = repo::repo_slug(p);
+            // Slug `base` always derives from the repo dir name (matches the old
+            // `repo_slug` path) so persisted slugs stay stable; the display name
+            // may be a custom workspace name and shouldn't drive the slug.
+            let base = {
+                let s = util::slugify(&repo::repo_name_from_path(p));
+                if s.is_empty() { "repo".to_string() } else { s }
+            };
+            let slug = db.slug_for_repo(&path, &base).unwrap_or(base);
             let name = names
                 .get(&path)
                 .filter(|n| !n.is_empty())
                 .cloned()
-                .unwrap_or_else(|| repo::repo_name(p));
+                .unwrap_or_else(|| repo::repo_name_from_path(p));
             (slug, name, path)
         })
         .collect();
