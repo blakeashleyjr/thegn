@@ -1,7 +1,7 @@
 # szhost chrome stability design
 
-Date: 2026-06-06
-Status: approved (user confirmed tab labels should align to the center/workspace area)
+Date: 2026-06-07
+Status: approved (committed)
 
 ## Goal
 
