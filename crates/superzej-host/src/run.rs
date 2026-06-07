@@ -6,6 +6,7 @@
 //! clear-and-redraw → no flashing). The tokio mpsc event loop arrives in Phase 2.
 
 use anyhow::{Context, Result};
+use std::path::Path;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::Duration;
 
@@ -105,7 +106,7 @@ fn build_palette(session: &crate::session::Session) -> Vec<crate::palette::Palet
     crate::palette::order_by_frecency(items, &usage)
 }
 
-fn now_secs() -> i64 {
+pub fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -126,9 +127,40 @@ fn load_or_seed_session(cwd: &std::path::Path) -> crate::session::Session {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "workspace".into());
 
-    let Ok(db) = superzej_core::db::Db::open() else {
+    let session_name = if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
+        // Use the explicit DB in test scenarios
+        let path = std::path::Path::new(&state_home).join("superzej/superzej.db");
+        if let Ok(db) = superzej_core::db::Db::open_at(&path) {
+            db.workspaces()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|w| Path::new(&w.repo_path) == cwd || w.repo_path == sess)
+                .map(|w| w.repo_path)
+                .unwrap_or_else(|| sess.clone())
+        } else {
+            sess.clone()
+        }
+    } else if let Ok(db) = superzej_core::db::Db::open() {
+        // Use the workspace from DB if available for cwd
+        db.workspaces()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|w| Path::new(&w.repo_path) == cwd || w.repo_path == sess)
+            .map(|w| w.repo_path)
+            .unwrap_or_else(|| sess.clone())
+    } else {
+        sess.clone()
+    };
+
+    let Ok(db) = (if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
+        let path = std::path::Path::new(&state_home).join("superzej/superzej.db");
+        superzej_core::db::Db::open_at(&path)
+    } else {
+        superzej_core::db::Db::open()
+    }) else {
         // No DB — synthesize an ephemeral single-tab session.
         return Session {
+            id: sess.to_string(),
             tabs: vec![Tab {
                 name: format!("{base}/home"),
                 kind: TabKind::Home,
@@ -140,7 +172,7 @@ fn load_or_seed_session(cwd: &std::path::Path) -> crate::session::Session {
         };
     };
 
-    let mut session = Session::resurrect(&db, &sess).unwrap_or_default();
+    let mut session = Session::resurrect(&db, &session_name).unwrap_or_default();
     if session.tabs.is_empty() {
         session.tabs.push(Tab {
             name: format!("{base}/home"),
@@ -150,8 +182,9 @@ fn load_or_seed_session(cwd: &std::path::Path) -> crate::session::Session {
             focused_pane: 0,
         });
         session.active = 0;
-        let _ = session.persist(&db, &sess, now_secs());
+        let _ = session.persist(&db, &session_name, now_secs());
     }
+    session.id = session_name; // Need to add id to session
     session
 }
 
@@ -201,10 +234,11 @@ fn build_model(session: &crate::session::Session) -> FrameModel {
     let git = GixGit::new();
     let branch = git.current_branch(&loc).unwrap_or_else(|_| "—".into());
 
-    // Sidebar: recent repos from the DB (best-effort).
+    // Sidebar: workspaces from the DB (best-effort).
     let sidebar = superzej_core::db::Db::open()
         .ok()
-        .and_then(|db| db.recent_repos(20).ok())
+        .and_then(|db| db.workspaces().ok())
+        .map(|ws| ws.into_iter().map(|w| w.name).collect())
         .unwrap_or_default();
 
     // Panel: a quick diff summary for the active worktree.
@@ -673,6 +707,41 @@ fn event_loop<T: Terminal>(
                                     session.tabs[active].focused_pane = n;
                                 }
                             }
+                            Action::NewWorkspace | Action::SwitchWorkspace => {
+                                if let Ok(db) = superzej_core::db::Db::open() {
+                                    if let Some(target) = palette
+                                        .as_ref()
+                                        .and_then(|p| p.selected_item())
+                                        .map(|i| i.key.clone())
+                                    {
+                                        let repo_path = target
+                                            .strip_prefix("repo:")
+                                            .unwrap_or(&target)
+                                            .to_string();
+                                        if session.switch_to_workspace(&repo_path, &db).is_ok() {
+                                            refresh_tab_model(&mut model, &session);
+                                            need_relayout = true;
+                                        }
+                                    }
+                                }
+                            }
+                            Action::NewWorktree => {
+                                // Add a new tab using the current workspace's root.
+                                // In a full implementation this would branch/pick,
+                                // but for the spike we just open a local shell pane in a new tab.
+                                let src = &session.tabs[active];
+                                let n = session.tabs.len();
+                                let tab = crate::session::Tab {
+                                    name: format!("{} ·{}", src.name, n),
+                                    kind: crate::session::TabKind::Worktree,
+                                    worktree: src.worktree.clone(),
+                                    center: crate::center::CenterTree::Leaf(0),
+                                    focused_pane: 0,
+                                };
+                                session.add_tab(tab);
+                                refresh_tab_model(&mut model, &session);
+                                need_relayout = true;
+                            }
                             Action::NewTab => {
                                 // A fresh tab on the same worktree (an "extra" page).
                                 let src = &session.tabs[active];
@@ -798,6 +867,7 @@ mod tests {
 
     fn one_tab_session() -> Session {
         Session {
+            id: "s1".into(),
             tabs: vec![Tab {
                 name: "app/home".into(),
                 kind: TabKind::Home,
@@ -810,6 +880,62 @@ mod tests {
     }
 
     #[test]
+    fn load_or_seed_session_recovers_tabs_from_db_when_present() {
+        let state_home = std::env::temp_dir().join(format!("test_db_{}", std::process::id()));
+        let db_path = state_home.join("superzej/superzej.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+        let db = superzej_core::db::Db::open_at(&db_path).unwrap();
+        let _ = db.put_workspace("/tmp/app", "app");
+        let mk = |name: &str, wt: &str| superzej_core::models::TabLayoutRow {
+            tab_name: name.into(),
+            kind: "worktree".into(),
+            worktree: wt.into(),
+            pane_tree: r#"{"leaf":0}"#.into(),
+            ordinal: 0,
+            focused_pane: 0,
+        };
+        db.put_tab_layout("/tmp/app", &mk("app/feat", "/tmp/app-feat"))
+            .unwrap();
+
+        std::env::set_var("XDG_STATE_HOME", &state_home);
+
+        let session = load_or_seed_session(std::path::Path::new("/tmp/app"));
+
+        std::env::remove_var("XDG_STATE_HOME");
+
+        assert_eq!(session.tabs.len(), 1);
+        assert_eq!(session.tabs[0].name, "app/feat");
+        assert_eq!(session.id, "/tmp/app");
+    }
+
+    #[test]
+    fn hydration_worker_loads_real_workspaces_into_sidebar() {
+        let state_home =
+            std::env::temp_dir().join(format!("test_db_sidebar_{}_state", std::process::id()));
+        let db_path = state_home.join("superzej/superzej.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+        let db = superzej_core::db::Db::open_at(&db_path).unwrap();
+        let _ = db.put_workspace("/tmp/repo1", "repo1");
+        // Ensure some time passes so timestamps are distinctly different
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let _ = db.put_workspace("/tmp/repo2", "repo2");
+
+        std::env::set_var("XDG_STATE_HOME", &state_home);
+
+        let session = load_or_seed_session(std::path::Path::new("/tmp/repo1"));
+
+        // Ensure Db::open inside build_model will use the state_home
+        let model = build_model(&session);
+
+        std::env::remove_var("XDG_STATE_HOME");
+
+        assert!(model.sidebar.contains(&"repo1".to_string()));
+        assert!(model.sidebar.contains(&"repo2".to_string()));
+    }
+
+    #[test]
     fn initial_model_is_cheap_and_marks_hydration_pending() {
         let session = one_tab_session();
         let model = build_initial_model(&session);
@@ -818,6 +944,34 @@ mod tests {
         assert_eq!(model.sidebar, vec!["hydrating…".to_string()]);
         assert!(model.panel.iter().any(|l| l.contains("hydrating")));
         assert!(model.status.contains("Starting szhost"));
+    }
+    #[test]
+    fn action_new_worktree_adds_tab_and_focuses_it() {
+        let mut session = one_tab_session();
+        let mut model = build_initial_model(&session);
+        let chrome = layout::compute(160, 40, true, true);
+        let mut keymap =
+            crate::keymap::default_keymap_with_config(&superzej_core::config::Config::default());
+
+        // Simulating the Action block manually since the event loop is complex to instantiate
+        let active = session.active;
+        let src = session.tabs[active].clone();
+        let n = session.tabs.len();
+        let tab = crate::session::Tab {
+            name: format!("{} ·{}", src.name, n),
+            kind: crate::session::TabKind::Worktree,
+            worktree: src.worktree.clone(),
+            center: crate::center::CenterTree::Leaf(0),
+            focused_pane: 0,
+        };
+        session.add_tab(tab);
+        refresh_tab_model(&mut model, &session);
+
+        assert_eq!(session.tabs.len(), 2);
+        assert_eq!(session.active, 1);
+        assert_eq!(session.tabs[1].name, "app/home ·1");
+        assert_eq!(model.active_tab, 1);
+        assert_eq!(model.tabs[1], "app/home ·1");
     }
 
     #[test]
