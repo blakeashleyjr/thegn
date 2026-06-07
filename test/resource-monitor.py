@@ -6,8 +6,8 @@ delivery; cursor moves + Enter/Esc are real keystrokes to the focused pane.
 
   1. Super+Alt+Up focuses the top bar and renders the first stat as an
      accent-filled chip (visual); Esc cancels and refocuses the center.
-  2. Enter opens the monitor for the selected stat, EMBEDDED tiled in the
-     center column (not floating/top), focused, with no new tab.
+  2. Enter opens the monitor for the selected stat as a FLOATING pane
+     overlaying the center column (not tiled), focused, with no new tab.
   3. vim `l` -> MEM also opens the system monitor (cpu+mem share `[monitor].system`).
   4. `h` clamps at the first stat (left from cpu stays cpu).
   5. GPU segment -> `[monitor].gpu` (gated on a readable GPU counter); Right
@@ -17,7 +17,7 @@ delivery; cursor moves + Enter/Esc are real keystrokes to the focused pane.
   7. With >1 tab, selecting never teleports (the broadcast guard keeps a
      background instance from stealing focus via focus_plugin_pane).
 
-Monitors are configured to distinctive `sleep <mark>` commands so the embedded
+Monitors are configured to distinctive `sleep <mark>` commands so the monitor
 pane's dump-layout `args` unambiguously identify WHICH monitor opened — this
 also proves `[monitor]` config is honored end-to-end.
 
@@ -91,7 +91,7 @@ for lay in ("superzej", "home-tab", "worktree-tab", "worktree-tab-extra"):
 
 # Deterministic, dependency-free monitors: a long sleep keeps the pane alive so
 # we can observe it; the pane NAME (system/gpu) is what we assert.
-# Distinctive sleep durations so the embedded pane's `command`/`args` in
+# Distinctive sleep durations so the monitor pane's `command`/`args` in
 # dump-layout unambiguously identify WHICH monitor (system vs gpu) was opened.
 SYS_MARK = "4242"
 GPU_MARK = "5353"
@@ -285,14 +285,21 @@ try:
                    if l.lstrip().startswith("pane") and
                    ("command=" in l or "plugin location=" in l))
 
-    def embedded_in_center(block, mark):
-        """The monitor pane (`args "<mark>"`) is tiled in the tab block between
-        the sidebar and panel plugins — center column, not floating/top strip."""
-        lines = block.splitlines()
-        sb = next((i for i, l in enumerate(lines) if "sidebar.wasm" in l), None)
-        pn = next((i for i, l in enumerate(lines) if "panel.wasm" in l), None)
-        mk = next((i for i, l in enumerate(lines) if f'"{mark}"' in l), None)
-        return sb is not None and pn is not None and mk is not None and sb < mk < pn
+    def floating_monitor(block, mark):
+        """The monitor pane (`args "<mark>"`) is a FLOATING pane overlaying the
+        center — inside a `floating_panes {…}` block, not tiled between the
+        sidebar and panel plugins."""
+        depth = 0
+        in_float = None  # brace depth at which floating_panes opened
+        for l in block.splitlines():
+            if in_float is not None and f'"{mark}"' in l:
+                return True
+            if in_float is None and l.lstrip().startswith("floating_panes"):
+                in_float = depth
+            depth += l.count("{") - l.count("}")
+            if in_float is not None and depth <= in_float:
+                in_float = None
+        return False
 
     # ── 1. select highlights the first stat (visual) + Esc cancels ──────────
     print("== select highlights a stat (visual) + Esc cancels ==")
@@ -315,17 +322,17 @@ try:
           f"Esc leaves the top bar, back to the center ({focused_pane()})")
     check("command=\"sleep\"" not in dump(), "Esc opened no monitor pane")
 
-    # ── 2. Enter embeds the system monitor in the center column, focused ─────
-    print("== Enter opens the embedded system monitor (cpu) ==")
+    # ── 2. Enter floats the system monitor over the center column, focused ───
+    print("== Enter opens the floating system monitor (cpu) ==")
     select_top()
     check(tabs() == before_tabs, "selecting the top bar did not switch tabs")
     key(b"\r", wait=3)  # Enter -> cpu -> system monitor
     block = focused_tab_block()
-    check(f'"{SYS_MARK}"' in block, "cpu -> [monitor].system embedded")
-    check(embedded_in_center(block, SYS_MARK),
-          "system monitor is tiled in the center column (not floating/top)")
+    check(f'"{SYS_MARK}"' in block, "cpu -> [monitor].system opened")
+    check(floating_monitor(block, SYS_MARK),
+          "system monitor floats over the center column (not tiled)")
     check(SYS_MARK in focused_pane(),
-          f"the embedded monitor is focused ({focused_pane()})")
+          f"the floating monitor is focused ({focused_pane()})")
     check(len(tabs()) == len(before_tabs), "no new tab was created")
     act("close-pane")
     time.sleep(1)

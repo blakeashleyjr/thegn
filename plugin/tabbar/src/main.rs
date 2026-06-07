@@ -533,6 +533,12 @@ impl State {
         if n == 0 {
             return false;
         }
+        // The stat cursor responds to PLAIN keys only (←/→/h/l/Enter/Esc). A
+        // modifier-carrying chord that leaked here (rather than firing its own
+        // keybind) must not move the cursor — mirrors the sidebar guard.
+        if !key.key_modifiers.is_empty() {
+            return false;
+        }
         match key.bare_key {
             BareKey::Left | BareKey::Char('h') => {
                 self.sel = step_sel(self.sel, n, false);
@@ -562,8 +568,10 @@ impl State {
     }
 
     /// Open the monitor for the selected stat, then drop the selection and hand
-    /// focus back to the center terminal (so the new pane splits *it*, landing
-    /// at the bottom of the center column).
+    /// focus back to the center terminal. `superzej monitor` opens the monitor
+    /// as a FLOATING pane (it overlays the center rather than reflowing the
+    /// chrome), so refocusing the center just restores a sensible focus target
+    /// for when the float closes.
     fn activate(&mut self) {
         let kind = self.selected_kind();
         self.sel = None;
