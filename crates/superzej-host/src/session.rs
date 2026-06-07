@@ -78,6 +78,7 @@ impl Tab {
 
 #[derive(Debug, Clone, Default)]
 pub struct Session {
+    pub id: String,
     pub tabs: Vec<Tab>,
     pub active: usize,
 }
@@ -86,13 +87,51 @@ impl Session {
     /// Rebuild the session from the DB (cold-start resurrect). Tabs come back in
     /// persisted order; the active tab is restored from `session_state`.
     pub fn resurrect(db: &Db, session: &str) -> Result<Session> {
-        let rows = db.tabs_for_session(session)?;
-        let tabs: Vec<Tab> = rows.iter().map(Tab::from_row).collect();
+        let mut tabs: Vec<Tab> = db
+            .tabs_for_session(session)?
+            .iter()
+            .map(Tab::from_row)
+            .collect();
+
+        // Also fetch any worktrees recorded for this session that aren't in tab_layout yet.
+        // This handles migrating/restoring state from older sessions where tab_layout wasn't used.
+        if let Ok(wts) = db.worktrees() {
+            let slug = superzej_core::repo::repo_slug(std::path::Path::new(session));
+            for wt in wts {
+                if wt.session_name == session && !tabs.iter().any(|t| t.name == wt.tab_name) {
+                    tabs.push(Tab {
+                        name: wt.tab_name.clone(),
+                        kind: TabKind::Worktree,
+                        worktree: wt.worktree.clone(),
+                        center: CenterTree::Leaf(0),
+                        focused_pane: 0,
+                    });
+                } else if wt.session_name.is_empty()
+                    && wt.repo_root == session
+                    && wt.tab_name.starts_with(&slug)
+                    && !tabs.iter().any(|t| t.name == wt.tab_name)
+                {
+                    // Pre-v3 or missing session_name fallback
+                    tabs.push(Tab {
+                        name: wt.tab_name.clone(),
+                        kind: TabKind::Worktree,
+                        worktree: wt.worktree.clone(),
+                        center: CenterTree::Leaf(0),
+                        focused_pane: 0,
+                    });
+                }
+            }
+        }
+
         let active = db
             .active_tab(session)?
             .and_then(|name| tabs.iter().position(|t| t.name == name))
             .unwrap_or(0);
-        Ok(Session { tabs, active })
+        Ok(Session {
+            id: session.to_string(),
+            tabs,
+            active,
+        })
     }
 
     /// Persist the full tab set + active tab (debounced by the caller on layout
@@ -127,6 +166,42 @@ impl Session {
         if !self.tabs.is_empty() {
             self.active = idx.min(self.tabs.len() - 1);
         }
+    }
+
+    pub fn switch_to_workspace(
+        &mut self,
+        repo_path: &str,
+        db: &superzej_core::db::Db,
+    ) -> Result<()> {
+        let now = crate::run::now_secs();
+        self.persist(db, &self.id, now)?;
+
+        let new_session = Session::resurrect(db, repo_path)?;
+        let mut tabs = new_session.tabs;
+        let active = new_session.active;
+
+        if tabs.is_empty() {
+            let base = std::path::Path::new(repo_path)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "workspace".into());
+            tabs.push(Tab {
+                name: format!("{base}/home"),
+                kind: TabKind::Home,
+                worktree: repo_path.to_string(),
+                center: CenterTree::Leaf(0),
+                focused_pane: 0,
+            });
+            let _ = db.put_workspace(repo_path, &base);
+            let _ = db.touch_repo(repo_path, &base);
+        }
+
+        self.id = repo_path.to_string();
+        self.tabs = tabs;
+        self.active = active;
+        self.persist(db, &self.id, now)?;
+
+        Ok(())
     }
 
     /// Cycle focus to the next tab (wraps).
@@ -263,6 +338,7 @@ mod tests {
             focused_pane: pane,
         };
         let session = Session {
+            id: sess.to_string(),
             tabs: vec![
                 make("app/home", TabKind::Home, 0),
                 make("app/feat", TabKind::Worktree, 2),
