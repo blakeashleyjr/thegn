@@ -26,6 +26,21 @@ pub struct ChromeLayout {
     pub center: Rect,
 }
 
+impl ChromeLayout {
+    /// The tabbar's label/content area, aligned with the center workspace.
+    ///
+    /// The tabbar background stays full width, but labels should not occupy the
+    /// sidebar-owned columns when the sidebar is visible.
+    pub fn tabbar_content(&self) -> Rect {
+        Rect {
+            x: self.center.x,
+            y: self.tabbar.y,
+            cols: self.center.cols,
+            rows: self.tabbar.rows,
+        }
+    }
+}
+
 /// Compute the chrome cross for a `cols`x`rows` screen. `want_sidebar`/
 /// `want_panel` are the user's toggle state; each is additionally suppressed
 /// when the screen is too narrow.
@@ -120,6 +135,38 @@ mod tests {
         // The band sits between the bars.
         assert_eq!(l.center.y, 1);
         assert_eq!(l.center.rows, 38);
+    }
+
+    #[test]
+    fn tabbar_content_aligns_with_center_when_sidebar_is_visible() {
+        let l = compute(160, 40, true, true);
+        let content = l.tabbar_content();
+
+        assert_eq!(content.x, SIDEBAR_COLS);
+        assert_eq!(content.y, l.tabbar.y);
+        assert_eq!(content.cols, l.center.cols);
+        assert_eq!(content.rows, l.tabbar.rows);
+        assert_eq!(l.panel.unwrap().cols, PANEL_COLS);
+    }
+
+    #[test]
+    fn tabbar_content_starts_at_zero_when_sidebar_is_hidden() {
+        let l = compute(160, 40, false, true);
+        let content = l.tabbar_content();
+
+        assert_eq!(content.x, 0);
+        assert_eq!(content.cols, l.center.cols);
+    }
+
+    #[test]
+    fn repeated_layout_compute_preserves_panel_and_tabbar_content_geometry() {
+        let first = compute(160, 40, true, true);
+        let second = compute(160, 40, true, true);
+
+        assert_eq!(first.panel.unwrap().cols, PANEL_COLS);
+        assert_eq!(second.panel.unwrap().cols, PANEL_COLS);
+        assert_eq!(first.center, second.center);
+        assert_eq!(first.tabbar_content(), second.tabbar_content());
     }
 
     #[test]

@@ -94,22 +94,34 @@ impl FrameModel {
     }
 }
 
-pub fn draw_tabbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
+pub fn draw_tabbar(surface: &mut Surface, rect: Rect, content: Rect, model: &FrameModel) {
     if rect.rows == 0 {
         return;
     }
     fill(surface, rect, theme_color(theme::BG1));
+    if content.rows == 0 || content.cols == 0 {
+        return;
+    }
     let accent = theme_color(model.accent_or_default());
     let dim = theme_color(theme::DIM);
-    let mut x = rect.x + 1;
+    let content_end = content.x.saturating_add(content.cols);
+    let mut x = content.x.saturating_add(1);
     for (i, name) in model.tabs.iter().enumerate() {
-        if x >= rect.x + rect.cols {
+        if x >= content_end {
             break;
         }
         let label = format!(" {name} ");
         let fg = if i == model.active_tab { accent } else { dim };
-        let max = (rect.x + rect.cols).saturating_sub(x);
-        draw_text(surface, x, rect.y, &label, fg, theme_color(theme::BG1), max);
+        let max = content_end.saturating_sub(x);
+        draw_text(
+            surface,
+            x,
+            content.y,
+            &label,
+            fg,
+            theme_color(theme::BG1),
+            max,
+        );
         x += label.chars().count();
     }
 }
@@ -208,7 +220,7 @@ pub fn draw_chrome(
     if let Some(pn) = chrome.panel {
         draw_panel(surface, pn, model);
     }
-    draw_tabbar(surface, chrome.tabbar, model);
+    draw_tabbar(surface, chrome.tabbar, chrome.tabbar_content(), model);
     draw_statusbar(surface, chrome.statusbar, model);
 }
 
@@ -271,19 +283,85 @@ mod tests {
             active_tab: 1,
             ..Default::default()
         };
-        draw_tabbar(
-            &mut s,
-            Rect {
-                x: 0,
-                y: 0,
-                cols: 80,
-                rows: 1,
-            },
-            &model,
-        );
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 80,
+            rows: 1,
+        };
+        draw_tabbar(&mut s, rect, rect, &model);
         let l = lines(&s);
         assert!(l[0].contains("app/home"));
         assert!(l[0].contains("app/feat"));
+    }
+
+    #[test]
+    fn tabbar_labels_start_in_center_content_area_when_sidebar_is_visible() {
+        let chrome = layout::compute(160, 10, true, true);
+        let mut s = Surface::new(160, 10);
+        let model = FrameModel {
+            tabs: vec!["repo/home".into(), "repo/feat".into()],
+            active_tab: 0,
+            ..Default::default()
+        };
+
+        draw_chrome(&mut s, &chrome, &model);
+
+        let l = lines(&s);
+        let row = &l[0];
+        let far_left: String = row.chars().take(chrome.center.x).collect();
+        let center_band: String = row
+            .chars()
+            .skip(chrome.center.x)
+            .take(chrome.center.cols)
+            .collect();
+
+        assert!(
+            !far_left.contains("repo/home") && !far_left.contains("repo/feat"),
+            "tab labels should not draw in sidebar columns: {row:?}"
+        );
+        assert!(
+            center_band.contains("repo/home") && center_band.contains("repo/feat"),
+            "tab labels should draw in center band: {row:?}"
+        );
+    }
+
+    #[test]
+    fn full_frame_tab_label_is_center_aligned_not_far_left() {
+        let cols = 160usize;
+        let rows = 10usize;
+        let chrome = layout::compute(cols, rows, true, true);
+        let mut emu = Vt100Emulator::new(chrome.center.rows as u16, chrome.center.cols as u16, 0);
+        emu.advance(b"CENTER");
+        let model = FrameModel {
+            tabs: vec!["repo/home".into()],
+            active_tab: 0,
+            ..Default::default()
+        };
+        let center = crate::center::CenterTree::Leaf(1);
+        let mut s = Surface::new(cols, rows);
+
+        render_tab(&mut s, &chrome, &center, 1, &model, |id| {
+            (id == 1).then_some(&emu as &dyn PaneEmulator)
+        });
+
+        let l = lines(&s);
+        let row = &l[0];
+        let far_left: String = row.chars().take(chrome.center.x).collect();
+        let center_band: String = row
+            .chars()
+            .skip(chrome.center.x)
+            .take(chrome.center.cols)
+            .collect();
+
+        assert!(
+            !far_left.contains("repo/home"),
+            "tab label should not flash/draw at far-left: {row:?}"
+        );
+        assert!(
+            center_band.contains("repo/home"),
+            "tab label should appear in center band: {row:?}"
+        );
     }
 
     #[test]
