@@ -106,10 +106,35 @@ keybinds {
             }
         }
         // ── per-worktree tools (open as floating panes) ─────────────────
-        bind "Alt g" { Run "superzej" "tool" "lazygit"; }
-        bind "Alt y" { Run "superzej" "tool" "yazi"; }
-        bind "Alt e" { Run "superzej" "tool" "editor"; }
-        bind "Alt /" { Run "superzej" "tool" "diff"; }
+        // Floating + close_on_exit launcher (like the drawer/worktree binds):
+        // `superzej tool` spawns the tool in its own floating pane and the
+        // launcher self-closes when it exits. A bare `Run` (tiled, no
+        // close_on_exit) made `superzej tool` call `close-pane`, which closed
+        // the just-spawned tool float — the "flashes and vanishes" bug.
+        bind "Alt g" {
+            Run "superzej" "tool" "lazygit" {
+                floating true
+                close_on_exit true
+            }
+        }
+        bind "Alt y" {
+            Run "superzej" "tool" "yazi" {
+                floating true
+                close_on_exit true
+            }
+        }
+        bind "Alt e" {
+            Run "superzej" "tool" "editor" {
+                floating true
+                close_on_exit true
+            }
+        }
+        bind "Alt /" {
+            Run "superzej" "tool" "diff" {
+                floating true
+                close_on_exit true
+            }
+        }
         // ── switch tabs ─────────────────────────────────────────────────
         // Alt+←/→ cycles tabs (vanilla tab switching). The left tree is the
         // richer navigator; this is the quick keyboard path. Up/Down are left

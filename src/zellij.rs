@@ -220,34 +220,6 @@ pub fn new_tab(name: &str, cwd: &Path, layout: Option<&str>) -> bool {
     action(&a)
 }
 
-/// Build the `zellij action new-pane …` argv for an embedded command pane.
-/// Split out from `new_pane_cmd` so the flag wiring is unit-testable without a
-/// running zellij.
-fn new_pane_cmd_args(cwd: &Path, name: &str, direction: &str, cmd: &[&str]) -> Vec<String> {
-    let mut a: Vec<String> = vec![
-        "new-pane".into(),
-        "--direction".into(),
-        direction.into(),
-        "--close-on-exit".into(),
-        "--cwd".into(),
-        cwd.to_string_lossy().into_owned(),
-        "--name".into(),
-        name.into(),
-        "--".into(),
-    ];
-    a.extend(cmd.iter().map(|s| s.to_string()));
-    a
-}
-
-/// Open a tiled pane running `cmd`, splitting the focused pane in `direction`
-/// and closing when the command exits — an embedded panel (e.g. a resource
-/// monitor). Unlike `new_float` this stays in the tiled layout, not floating.
-pub fn new_pane_cmd(cwd: &Path, name: &str, direction: &str, cmd: &[&str]) -> bool {
-    let args = new_pane_cmd_args(cwd, name, direction, cmd);
-    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    action(&refs)
-}
-
 /// Open a plain tiled pane (default shell) at `cwd` — a "panel".
 pub fn new_pane_bare(cwd: &Path, name: &str, direction: &str) -> bool {
     action(&[
@@ -333,25 +305,6 @@ pub fn pipe_plugin(url: &str, name: &str, payload: &str) -> bool {
 mod tests {
     use super::*;
     use std::path::Path;
-
-    #[test]
-    fn new_pane_cmd_args_wires_an_embedded_tiled_command_pane() {
-        let a = new_pane_cmd_args(Path::new("/wt/x"), "system", "Down", &["sh", "-lc", "btm"]);
-        // Tiled (not floating), splits downward, closes on exit, named, with the
-        // command after the `--` terminator.
-        assert!(
-            !a.contains(&"--floating".to_string()),
-            "must be tiled, not floating"
-        );
-        assert_eq!(a[0], "new-pane");
-        let pos = |f: &str| a.iter().position(|x| x == f).expect(f);
-        assert_eq!(a[pos("--direction") + 1], "Down");
-        assert!(a.contains(&"--close-on-exit".to_string()));
-        assert_eq!(a[pos("--cwd") + 1], "/wt/x");
-        assert_eq!(a[pos("--name") + 1], "system");
-        let term = pos("--");
-        assert_eq!(&a[term + 1..], &["sh", "-lc", "btm"]);
-    }
 
     #[test]
     fn drawer_top_from_percentage() {

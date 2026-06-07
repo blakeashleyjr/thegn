@@ -1,8 +1,9 @@
-//! `superzej monitor <kind>` — open a resource monitor for a top-bar stat,
-//! embedded as a tiled pane at the bottom of the center column. Dispatched by
-//! the tabbar plugin when a stat segment is selected and Enter is pressed:
-//! `cpu`/`mem` open the system monitor (`btm` by default), `gpu` opens `nvtop`.
-//! Both commands are configurable under `[monitor]` in config.toml.
+//! `superzej monitor <kind>` — open a resource monitor for a top-bar stat as a
+//! floating pane. Dispatched by the tabbar plugin when a stat segment is
+//! selected and Enter is pressed: `cpu`/`mem` open the system monitor (`btm` by
+//! default), `gpu` opens `nvtop`. Both commands are configurable under
+//! `[monitor]` in config.toml. The pane floats (not tiled) so it overlays the
+//! center column instead of reflowing the chrome layout, and closes on exit.
 
 use crate::config::Config;
 use crate::{commands, msg, util, zellij};
@@ -27,7 +28,7 @@ pub fn run(cfg: &Config, kind: &str) -> Result<()> {
     let cwd = commands::resolve_worktree(None);
     if zellij::in_zellij() {
         let sh = util::shell();
-        zellij::new_pane_cmd(&cwd, name, "Down", &[&sh, "-lc", &cmd]);
+        zellij::new_float(&cwd, name, &[&sh, "-lc", &cmd]);
     } else {
         msg::info(&format!(
             "(not in zellij) would run: {cmd}  [cwd={}]",

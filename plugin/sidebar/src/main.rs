@@ -446,6 +446,15 @@ impl State {
         if self.rows.is_empty() {
             return false;
         }
+        // Tree nav is PLAIN keys only (j/k/↑/↓/Enter/l). Ignore anything
+        // carrying a modifier, so a chrome-bar select chord (Super+Alt+Down/j,
+        // Super+Alt+Up/k) that reaches the focused sidebar as a key event —
+        // instead of being consumed by its keybind — can't also scroll the
+        // workspace tree. (This was the "tree is also being navigated" symptom
+        // when reaching for the bottom bar.)
+        if !key.key_modifiers.is_empty() {
+            return false;
+        }
         match key.bare_key {
             BareKey::Down | BareKey::Char('j') => self.move_cursor(true),
             BareKey::Up | BareKey::Char('k') => self.move_cursor(false),

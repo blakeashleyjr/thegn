@@ -334,7 +334,7 @@ pub const BUILTINS: &[Action] = &[
         chords: &["Alt g"],
         menu_label: "lazygit",
         hint: "lazygit",
-        invocation: run!("tool", "lazygit"),
+        invocation: run_float!("tool", "lazygit"),
         scope: Scope::Shared,
         context: Context::WorktreeOnly,
         menu: true,
@@ -344,7 +344,7 @@ pub const BUILTINS: &[Action] = &[
         chords: &["Alt y"],
         menu_label: "yazi — file manager",
         hint: "files",
-        invocation: run!("tool", "yazi"),
+        invocation: run_float!("tool", "yazi"),
         scope: Scope::Shared,
         context: Context::WorktreeOnly,
         menu: true,
@@ -354,7 +354,7 @@ pub const BUILTINS: &[Action] = &[
         chords: &["Alt e"],
         menu_label: "editor",
         hint: "edit",
-        invocation: run!("tool", "editor"),
+        invocation: run_float!("tool", "editor"),
         scope: Scope::Shared,
         context: Context::WorktreeOnly,
         menu: true,
@@ -364,7 +364,7 @@ pub const BUILTINS: &[Action] = &[
         chords: &["Alt /"],
         menu_label: "git diff",
         hint: "diff",
-        invocation: run!("tool", "diff"),
+        invocation: run_float!("tool", "diff"),
         scope: Scope::Shared,
         context: Context::WorktreeOnly,
         menu: true,
@@ -614,8 +614,42 @@ pub fn detect_collisions(actions: &[Resolved]) -> Vec<Collision> {
 
 // ─── KDL generation ─────────────────────────────────────────────────────────
 
-fn render_invocation(inv: &Invocation) -> String {
+/// The `floating`/`close_on_exit`/`direction` child-node lines for a `Run`.
+fn run_opt_lines(floating: bool, close_on_exit: bool, direction: Option<&str>) -> Vec<String> {
+    let mut v = Vec::new();
+    if floating {
+        v.push("floating true".to_string());
+    }
+    if close_on_exit {
+        v.push("close_on_exit true".to_string());
+    }
+    if let Some(d) = direction {
+        v.push(format!("direction \"{d}\""));
+    }
+    v
+}
+
+/// A `Run`/`MessagePlugin` action with a child block, rendered as the body of a
+/// `bind` MULTI-LINE: zellij's KDL parser rejects a nested child block placed on
+/// the same line as the bind (`bind "X" { Run … { … } }` fails to deserialize),
+/// so the nested block must span lines. `head` is e.g. `Run "superzej" "x"`;
+/// `children` are the inner node lines. Indented to sit inside `shared_except`/
+/// `tab` (8-space `bind`, 12-space action, 16-space children).
+fn render_block_bind(chord: &str, head: &str, children: &[String]) -> String {
+    let mut s = format!("        bind \"{chord}\" {{\n            {head} {{\n");
+    for c in children {
+        s.push_str(&format!("                {c}\n"));
+    }
+    s.push_str("            }\n        }\n");
+    s
+}
+
+/// Render a single `bind "<chord>" { … }` block. Actions carrying a nested child
+/// block (`Run … { floating … }`, `MessagePlugin … { name … }`) are emitted
+/// multi-line (see [`render_block_bind`]); bare actions stay on one line.
+fn render_bind(chord: &str, inv: &Invocation) -> String {
     match inv {
+        Invocation::Native { body } => format!("        bind \"{chord}\" {{ {body} }}\n"),
         Invocation::Run {
             args,
             floating,
@@ -627,20 +661,11 @@ fn render_invocation(inv: &Invocation) -> String {
                 .map(|a| format!("\"{a}\""))
                 .collect::<Vec<_>>()
                 .join(" ");
-            let mut opts = Vec::new();
-            if *floating {
-                opts.push("floating true".to_string());
-            }
-            if *close_on_exit {
-                opts.push("close_on_exit true".to_string());
-            }
-            if let Some(d) = direction {
-                opts.push(format!("direction \"{d}\""));
-            }
+            let opts = run_opt_lines(*floating, *close_on_exit, *direction);
             if opts.is_empty() {
-                format!("Run \"superzej\" {argv};")
+                format!("        bind \"{chord}\" {{ Run \"superzej\" {argv}; }}\n")
             } else {
-                format!("Run \"superzej\" {argv} {{ {} }}", opts.join("; "))
+                render_block_bind(chord, &format!("Run \"superzej\" {argv}"), &opts)
             }
         }
         Invocation::Shell {
@@ -648,24 +673,19 @@ fn render_invocation(inv: &Invocation) -> String {
             floating,
             close_on_exit,
         } => {
-            let mut opts = Vec::new();
-            if *floating {
-                opts.push("floating true".to_string());
-            }
-            if *close_on_exit {
-                opts.push("close_on_exit true".to_string());
-            }
             let esc = run.replace('\\', "\\\\").replace('"', "\\\"");
+            let opts = run_opt_lines(*floating, *close_on_exit, None);
             if opts.is_empty() {
-                format!("Run \"sh\" \"-c\" \"{esc}\";")
+                format!("        bind \"{chord}\" {{ Run \"sh\" \"-c\" \"{esc}\"; }}\n")
             } else {
-                format!("Run \"sh\" \"-c\" \"{esc}\" {{ {} }}", opts.join("; "))
+                render_block_bind(chord, &format!("Run \"sh\" \"-c\" \"{esc}\""), &opts)
             }
         }
-        Invocation::Pipe { plugin, name } => {
-            format!("MessagePlugin \"{}\" {{ name \"{name}\"; }}", plugin.url())
-        }
-        Invocation::Native { body } => body.to_string(),
+        Invocation::Pipe { plugin, name } => render_block_bind(
+            chord,
+            &format!("MessagePlugin \"{}\"", plugin.url()),
+            &[format!("name \"{name}\"")],
+        ),
     }
 }
 
@@ -676,11 +696,7 @@ pub fn render_keybinds_kdl(actions: &[Resolved]) -> String {
     let mut tab = String::new();
     for a in actions {
         for c in &a.chords {
-            let line = format!(
-                "        bind \"{}\" {{ {} }}\n",
-                c.to_kdl(),
-                render_invocation(&a.invocation)
-            );
+            let line = render_bind(c.to_kdl(), &a.invocation);
             match a.scope {
                 Scope::Shared => shared.push_str(&line),
                 Scope::Tab => tab.push_str(&line),
@@ -688,16 +704,24 @@ pub fn render_keybinds_kdl(actions: &[Resolved]) -> String {
         }
     }
     // The tab-mode `n` override always repoints new-tab (+ returns to Normal).
-    let new_tab_pipe = actions
+    // Rendered multi-line: a `MessagePlugin … { … }` block can't share the
+    // bind's line (zellij KDL), and `SwitchToMode` follows as a sibling node.
+    let (nt_url, nt_name) = actions
         .iter()
         .find(|a| a.id == "new-tab")
-        .map(|a| match &a.invocation {
-            Invocation::Pipe { plugin, name } => {
-                format!("MessagePlugin \"{}\" {{ name \"{name}\"; }}", plugin.url())
-            }
-            _ => "MessagePlugin \"file:~/.local/share/superzej/tabbar.wasm\" { name \"superzej_new_tab\"; }".into(),
+        .and_then(|a| match &a.invocation {
+            Invocation::Pipe { plugin, name } => Some((plugin.url(), name.to_string())),
+            _ => None,
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|| {
+            (
+                "file:~/.local/share/superzej/tabbar.wasm".to_string(),
+                "superzej_new_tab".to_string(),
+            )
+        });
+    let new_tab_bind = format!(
+        "        bind \"n\" {{\n            MessagePlugin \"{nt_url}\" {{\n                name \"{nt_name}\"\n            }}\n            SwitchToMode \"Normal\"\n        }}\n"
+    );
 
     let mut out = String::new();
     out.push_str(BEGIN);
@@ -707,9 +731,7 @@ pub fn render_keybinds_kdl(actions: &[Resolved]) -> String {
     out.push_str(&shared);
     out.push_str("    }\n");
     out.push_str("    tab {\n");
-    out.push_str(&format!(
-        "        bind \"n\" {{ {new_tab_pipe} SwitchToMode \"Normal\"; }}\n"
-    ));
+    out.push_str(&new_tab_bind);
     out.push_str(&tab);
     out.push_str("    }\n");
     out.push_str("}\n");
@@ -814,12 +836,32 @@ mod tests {
         let acts = effective(&Config::default());
         let kdl = render_keybinds_kdl(&acts);
         assert!(kdl.contains(BEGIN) && kdl.contains(END));
-        assert!(kdl.contains("bind \"Alt w\" { Run \"superzej\" \"new-worktree\""));
-        assert!(kdl.contains("bind \"Ctrl Alt s\" { MessagePlugin \"file:~/.local/share/superzej/statusbar.wasm\" { name \"superzej_toggle_sidebar\"; } }"));
-        assert!(kdl.contains("bind \"Alt h\" { MoveFocus \"Left\"; }"));
+        // A floating Run is emitted MULTI-LINE (zellij KDL rejects an inline
+        // nested block); check the head line + its child options.
+        assert!(kdl.contains(
+            "        bind \"Alt w\" {\n            Run \"superzej\" \"new-worktree\" {\n"
+        ));
+        assert!(kdl.contains("                floating true\n"));
+        assert!(kdl.contains("                close_on_exit true\n"));
+        // A pipe (MessagePlugin) is multi-line with its `name` child.
+        assert!(kdl.contains("        bind \"Ctrl Alt s\" {\n            MessagePlugin \"file:~/.local/share/superzej/statusbar.wasm\" {\n                name \"superzej_toggle_sidebar\"\n            }\n        }\n"));
+        // A bare native action stays on one line.
+        assert!(kdl.contains("        bind \"Alt h\" { MoveFocus \"Left\"; }\n"));
         // tab-mode override present
-        assert!(kdl.contains("tab {"));
+        assert!(kdl.contains("    tab {\n"));
         assert!(kdl.contains("SwitchToMode \"Normal\""));
+        // Regression guard: no inline nested block (the form zellij rejects) —
+        // a single line must never carry both an action head and its child.
+        assert!(
+            !kdl.lines()
+                .any(|l| l.contains("Run \"") && l.contains("floating true")),
+            "Run options must not be inlined on the bind line"
+        );
+        assert!(
+            !kdl.lines()
+                .any(|l| l.contains("MessagePlugin") && l.contains("name \"")),
+            "MessagePlugin name must not be inlined on the bind line"
+        );
     }
 
     #[test]
@@ -888,10 +930,11 @@ mod tests {
             close_on_exit: true,
         });
         let kdl = render_keybinds_kdl(&effective(&cfg));
-        assert!(kdl.contains("bind \"Alt D\" { Run \"sh\" \"-c\""));
+        // Floating shell action -> multi-line `Run "sh" "-c" … { … }`.
+        assert!(kdl.contains("        bind \"Alt D\" {\n            Run \"sh\" \"-c\""));
         assert!(kdl.contains("echo \\\"hi\\\""), "quotes escaped: {kdl}");
-        // the scoped panel binding carries its direction option.
-        assert!(kdl.contains("\"new-panel\" \"--in-place\" { direction \"Right\" }"));
+        // the scoped panel binding carries its direction option (multi-line).
+        assert!(kdl.contains("            Run \"superzej\" \"new-panel\" \"--in-place\" {\n                direction \"Right\"\n"));
     }
 
     #[test]

@@ -21,12 +21,12 @@ pub fn run(cfg: &Config, name: &str, worktree: Option<String>, file: Option<Stri
     // `--file` opens that path instead of the worktree directory.
     if name == "editor" {
         open_editor(cfg, &worktree, file.as_deref());
-        // The keybind path (no --file) runs in its own launcher pane that must
-        // be closed. The plugin path (--file) is a host run_command with no pane
-        // of its own, so closing here would kill the user's focused pane.
-        if zellij::in_zellij() && file.is_none() {
-            zellij::close_pane();
-        }
+        // No launcher-pane cleanup: the keybind/menu invoke `tool` with
+        // `Run … { floating true; close_on_exit true }`, so the floating
+        // launcher self-closes when we exit. Calling `close-pane` here would
+        // instead close the just-spawned (focused) editor float — the trap
+        // documented in commands::files. The `--file` plugin path has no pane
+        // of its own either.
         return Ok(());
     }
 
@@ -66,8 +66,10 @@ pub fn run(cfg: &Config, name: &str, worktree: Option<String>, file: Option<Stri
                 zellij::new_float(&worktree, name, &[&sh, "-lc", &inner]);
             }
         }
-        // Close this launcher pane (spawned by the keybind's Run).
-        zellij::close_pane();
+        // No `close_pane()` here: the keybind/menu launcher is a floating,
+        // `close_on_exit` pane (like `files`), so it self-closes when this
+        // process exits. `close-pane` would close the just-spawned tool float
+        // (the focused pane) instead — the "flashes and vanishes" bug.
     } else {
         msg::info(&format!(
             "(not in zellij) would run: {cmd}  [cwd={}]",
