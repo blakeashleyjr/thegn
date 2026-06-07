@@ -24,3 +24,6 @@ portable-pty.workspace = true
 termwiz.workspace = true
 vt100.workspace = true
 nucleo-matcher.workspace = true
+
+[dev-dependencies]
+toml.workspace = true

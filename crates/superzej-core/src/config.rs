@@ -621,6 +621,45 @@ impl Default for DrawerConfig {
     }
 }
 
+/// Mode-aware keybind tables. The legacy `[keybinds]` table is stored in
+/// `normal` and remains map-like via `Deref`, while nested tables such as
+/// `[keybinds.vim_normal]` add modal layers for the native host.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct KeybindsConfig {
+    #[serde(default, flatten)]
+    pub normal: BTreeMap<String, String>,
+    #[serde(default)]
+    pub vim_normal: BTreeMap<String, String>,
+    #[serde(default)]
+    pub vim_insert: BTreeMap<String, String>,
+    #[serde(default)]
+    pub emacs: BTreeMap<String, String>,
+}
+
+impl std::ops::Deref for KeybindsConfig {
+    type Target = BTreeMap<String, String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.normal
+    }
+}
+
+impl std::ops::DerefMut for KeybindsConfig {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.normal
+    }
+}
+
+impl<'a> IntoIterator for &'a KeybindsConfig {
+    type Item = (&'a String, &'a String);
+    type IntoIter = std::collections::btree_map::Iter<'a, String, String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.normal.iter()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
@@ -640,6 +679,7 @@ pub struct Config {
     pub tools: Vec<NamedCommand>,
     pub pins: Vec<Pin>,
     pub actions: Vec<CustomAction>,
+    pub plugins: Vec<crate::plugin_api::PluginManifest>,
     // --- sub-tables ---
     pub theme: ThemeConfig,
     pub monitor: MonitorConfig,
@@ -650,9 +690,19 @@ pub struct Config {
     pub sandbox: SandboxConfig,
     pub limits: LimitsConfig,
     pub drawer: DrawerConfig,
+<<<<<<< Updated upstream
     /// Rebind a built-in action by id, e.g. `new-worktree = "Ctrl w"`. The flat
     /// table is the global/default layer; nested mode tables are native-host only.
     pub keybinds: KeybindConfig,
+||||||| Stash base
+    /// Rebind a built-in action by id, e.g. `new-worktree = "Ctrl w"` (a plain
+    /// table — kept last so it serializes after all other sub-tables).
+    pub keybinds: BTreeMap<String, String>,
+=======
+    /// Rebind a built-in action by id, e.g. `new-worktree = "Ctrl w"` (a plain
+    /// table — kept last so it serializes after all other sub-tables).
+    pub keybinds: KeybindsConfig,
+>>>>>>> Stashed changes
 }
 
 impl Default for Config {
@@ -677,6 +727,7 @@ impl Default for Config {
             agents: Vec::new(),
             tools: Vec::new(),
             pins: Vec::new(),
+            plugins: Vec::new(),
             theme: ThemeConfig::default(),
             monitor: MonitorConfig::default(),
             pr: PrConfig::default(),
@@ -686,7 +737,13 @@ impl Default for Config {
             sandbox: SandboxConfig::default(),
             limits: LimitsConfig::default(),
             drawer: DrawerConfig::default(),
+<<<<<<< Updated upstream
             keybinds: KeybindConfig::default(),
+||||||| Stash base
+            keybinds: BTreeMap::new(),
+=======
+            keybinds: KeybindsConfig::default(),
+>>>>>>> Stashed changes
             actions: Vec::new(),
         }
     }
@@ -1188,6 +1245,34 @@ fn parse_hex_rgb(hex: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_manifest_config_projection_parses() {
+        let cfg: Config = toml::from_str(
+            r#"
+[[plugins]]
+id = "todoist"
+name = "Todoist"
+version = "1.0.0"
+api = "0.1.0"
+capabilities = ["surface:statusbar"]
+
+[[plugins.contributions]]
+id = "todoist.count"
+extension_point = "StatusBarSegment"
+label = "Todoist"
+surface = "todoist.status"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.plugins.len(), 1);
+        assert_eq!(cfg.plugins[0].id.as_str(), "todoist");
+        assert_eq!(
+            cfg.plugins[0].contributions[0].extension_point,
+            crate::plugin_api::ExtensionPoint::StatusBarSegment
+        );
+    }
 
     #[test]
     fn monitor_defaults() {
@@ -1785,5 +1870,30 @@ forward_agent = false
         std::env::set_var("SUPERZEJ_TEST_PENV_blank", "   ");
         assert!(ProcessEnv.get("SUPERZEJ_TEST_PENV_blank").is_none());
         std::env::remove_var("SUPERZEJ_TEST_PENV_blank");
+    }
+
+    #[test]
+    fn config_parses_mode_specific_keybinds() {
+        let toml = r#"
+            [keybinds]
+            new-worktree = "Ctrl w"
+
+            [keybinds.vim_normal]
+            focus-down = "j"
+
+            [keybinds.vim_insert]
+            mode-vim-normal = "Esc"
+
+            [keybinds.emacs]
+            focus-left = "Ctrl b"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.keybinds.get("new-worktree").unwrap(), "Ctrl w");
+        assert_eq!(cfg.keybinds.vim_normal.get("focus-down").unwrap(), "j");
+        assert_eq!(
+            cfg.keybinds.vim_insert.get("mode-vim-normal").unwrap(),
+            "Esc"
+        );
+        assert_eq!(cfg.keybinds.emacs.get("focus-left").unwrap(), "Ctrl b");
     }
 }
