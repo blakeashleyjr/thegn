@@ -182,4 +182,39 @@ mod tests {
         assert_eq!(agent_glyph("shell"), "$");
         assert_eq!(agent_glyph("goose"), "G");
     }
+
+    #[test]
+    fn escape_helpers() {
+        assert_eq!(fg("1;2;3"), "\u{1b}[38;2;1;2;3m");
+        assert_eq!(bg("1;2;3"), "\u{1b}[48;2;1;2;3m");
+        assert_eq!(bold(), "\u{1b}[1m");
+    }
+
+    #[test]
+    fn every_agent_hue_and_glyph_arm() {
+        for (name, hue, glyph) in [
+            ("claude", CORAL, "C"),
+            ("codex", GREEN, "Cx"),
+            ("aider", AMBER, "Ai"),
+            ("gemini", PURPLE, "G"),
+            ("lazygit", GREEN, "↟"),
+            ("yazi", PURPLE, "⊞"),
+            ("editor", TEAL, "✎"),
+            ("diff", AMBER, "±"),
+        ] {
+            assert_eq!(agent_hue(name), hue, "{name} hue");
+            assert_eq!(agent_glyph(name), glyph, "{name} glyph");
+        }
+        // empty fallback glyph
+        assert_eq!(agent_glyph(""), "•");
+    }
+
+    #[test]
+    fn glyph_square_and_kbd_render() {
+        let sq = glyph_square("C", CORAL);
+        assert!(sq.contains("C") && sq.contains(RESET));
+        let strip = kbd(&[("d", "diff"), ("c", "PR")], TEAL);
+        // both labels + the "·" separator between pairs.
+        assert!(strip.contains("diff") && strip.contains("PR") && strip.contains('·'));
+    }
 }
