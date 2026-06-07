@@ -217,8 +217,8 @@ pub enum Command {
         #[arg(long)]
         toggle: bool,
     },
-    /// Pinned programs (Alt-1..9 / tabbar chips): each lives as its own
-    /// `pin:<name>` session tab.
+    /// Pinned programs (Alt-1..9 / tabbar chips): open as either dedicated
+    /// `pin:<name>` tabs or tiled panes in the active layout, per config.
     Pin {
         #[command(subcommand)]
         action: PinAction,
@@ -282,9 +282,15 @@ pub enum Command {
 
 #[derive(Subcommand)]
 pub enum PinAction {
-    /// Launch-or-focus a pin by name or 1-based index: focus its `pin:<name>`
-    /// tab if it exists, else open it. The keybind / chip entry point.
-    Open { target: String },
+    /// Launch-or-focus a pin by name or 1-based index. Tab pins focus/open their
+    /// `pin:<name>` tab; layout pins add a tiled pane to the active layout.
+    Open {
+        target: String,
+        /// Session name (passed by the tabbar plugin; plugin-spawned commands
+        /// cannot rely on env/cwd to target the right zellij session).
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// (internal) Run the focused pin tab's command in place — the `pin-tab`
     /// layout's center pane invokes this; it resolves the pin from the tab name.
     Exec {

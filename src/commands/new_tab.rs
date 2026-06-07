@@ -19,7 +19,7 @@
 //! floating pane WITH env/cwd) the worktree is derived from the cwd if the
 //! focused tab can't be resolved.
 
-use crate::db::{self, Db};
+use crate::db;
 use crate::{msg, repo, util, zellij};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -45,7 +45,12 @@ pub fn run(session: Option<String>) -> Result<()> {
     let (base, dir) = match zellij::focused_tab_name() {
         Some(t) => {
             let base = strip_page_suffix(&t).to_string();
-            match tab_dir(&base, session.as_deref()) {
+            let session_name = session
+                .as_deref()
+                .map(str::to_string)
+                .unwrap_or_else(db::session);
+            match crate::commands::resolve::resolve_tab_dir(&session_name, &base).map(PathBuf::from)
+            {
                 Some(dir) => (base, dir),
                 None => cwd_base()?, // ad-hoc tab with no DB row
             }
@@ -117,22 +122,6 @@ fn cwd_base() -> Result<(String, PathBuf)> {
         repo::branch_tab(&slug, &branch)
     };
     Ok((base, top))
-}
-
-/// Directory for a base tab name: a worktree row, or — for `{slug}/home` —
-/// the workspace whose repo path slugs to `{slug}`.
-fn tab_dir(base: &str, session: Option<&str>) -> Option<PathBuf> {
-    let db = Db::open().ok()?;
-    let session = session.map(str::to_string).unwrap_or_else(db::session);
-    if let Ok(Some(p)) = db.worktree_for_tab(&session, base) {
-        return Some(PathBuf::from(p));
-    }
-    let slug = base.strip_suffix("/home")?;
-    db.workspaces()
-        .ok()?
-        .into_iter()
-        .find(|w| repo::repo_slug(Path::new(&w.repo_path)) == slug)
-        .map(|w| PathBuf::from(w.repo_path))
 }
 
 /// Lowest free `"{base} ·N"` (N ≥ 2) among the existing tab names.

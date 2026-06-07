@@ -259,7 +259,7 @@ entity, not a float — overrides the float reading below), summoned by `Alt-1..
 `layouts/pin-tab.kdl`, the tabbar chip strip, and `[[pins]]` config.
 
 - [x] 57. Pin to top strip _(tabbar pin chips; the pin itself is its own tab)_
-- [ ] 58. Add anywhere (into active layout)
+- [~] 58. Add anywhere (into active layout) _(docs/e2e done, pending PR)_
 - [ ] 59. Floating/scratch pin _(tools/drawer/monitors are floats, but not a pin system)_
 - [x] 60. Global pins (everywhere) _(every pin is a session-level tab)_
 - [ ] 61. Workspace-scoped pins

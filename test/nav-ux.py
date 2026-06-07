@@ -209,7 +209,18 @@ for lay in ("superzej", "home-tab", "worktree-tab", "worktree-tab-extra",
 with open(os.path.join(CFGDIR, "config.toml"), "w") as f:
     f.write(f'worktrees_dir = "{SBX}/wt"\n'
             'picker = "select"\n')
+# Append pins configuration for E2E tests
+with open(os.path.join(CFGDIR, "config.toml"), "a") as f:
+    f.write('\n[[pins]]\n'
+            'name = "tab-pin"\n'
+            'command = "echo tab-pin-ready; exec sh"\n'
+            'location = "tab"\n\n'
+            '[[pins]]\n'
+            'name = "layout-pin"\n'
+            'command = "echo layout-pin-ready; exec sh"\n'
+            'location = "layout"\n')
 
+# This harness may itself run inside a live zellij/superzej — strip the inherited
 # This harness may itself run inside a live zellij/superzej — strip the inherited
 # ZELLIJ_* vars so the sandbox session never nests into or leaks to it.
 _base = {k: v for k, v in os.environ.items()
@@ -605,6 +616,48 @@ try:
           "no leftover exited 'superzej new-panel' pane")
     check(pane_count(block) == before_panes + 1,
           f"exactly one pane added ({before_panes} -> {pane_count(block)})")
+
+    # ── 9. Layout pins vs Tab pins ───────────────────────────────────────
+    print("== 9. Layout pins vs Tab pins ==")
+    
+    # A. Tab-Pin
+    # Tab pins are bound to Alt-1 for the first pin (tab-pin)
+    goto_tab(wt_tab)
+    key(b"\x1b1", wait=4)
+    
+    check(settle(lambda: "pin:tab-pin" in tabs(), timeout=10.0),
+          f"tab-pin opens as a new tab named pin:tab-pin ({tabs()})")
+    check(settle(lambda: focused_tab_name() == "pin:tab-pin", timeout=5.0),
+          "tab-pin tab becomes active")
+    
+    # B. Layout-Pin
+    # Second pin is bound to Alt-2 (layout-pin)
+    goto_tab(wt_tab)
+    focus_center_terminal()
+    before_tabs = tabs()
+    
+    # We use CLI instead of Alt-2 because Alt-keybinds might be hijacked or dropped under load
+    r = subprocess.run([SZ, "pin", "open", "2", "--session", SESSION], env=ENV, capture_output=True)
+    
+    check(settle(lambda: 'name="📌 layout-pin"' in chrome_settled(), timeout=10.0),
+          "layout-pin pane is injected into active tab")
+    check(focused_tab_name() == wt_tab,
+          "active tab does not change after opening layout-pin")
+    check(tabs() == before_tabs,
+          "no pin:layout-pin tab was created")
+          
+    # Check that layout pane does not float
+    block = chrome_settled()
+    pin_pane_line = next((l for l in block.splitlines() if 'name="📌 layout-pin"' in l), "")
+    check('floating=true' not in pin_pane_line,
+          "layout pin is a standard tiled pane (not floating)")
+          
+    # C. Duplicate Panes
+    r = subprocess.run([SZ, "pin", "open", "2", "--session", SESSION], env=ENV, capture_output=True)
+    settle(lambda: sum(1 for l in chrome_settled().splitlines() if 'name="📌 layout-pin"' in l) == 2, timeout=10.0)
+    check(sum(1 for l in chrome_settled().splitlines() if 'name="📌 layout-pin"' in l) == 2,
+          "opening same layout-pin again spawns a duplicate pane")
+
 finally:
     cleanup()
 

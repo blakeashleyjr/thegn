@@ -1,6 +1,7 @@
-// layouts/pin-tab.kdl — a pinned-program tab, opened by `superzej pin open`
-// (`new-tab --cwd <cwd> --layout pin-tab`). A pin is its own session tab
-// (`pin:<name>`); summon it with Alt-1..9 or the tabbar's pin chips.
+// layouts/pin-tab.kdl — the tab-placement pin layout, opened by
+// `superzej pin open` for pins with `location = "tab"` (`new-tab --cwd <cwd>
+// --layout pin-tab`). Layout-placement pins (`location = "layout"`) do not use
+// this file; they create a tiled pane in the focused tab.
 //
 // Minimal chrome — tabbar (top) · program · statusbar (bottom). No sidebar/panel
 // (a pin has no worktree, so the diff/PR panel has nothing to resolve).
