@@ -12,11 +12,13 @@
 use crate::models::{WorkspaceRow, WorktreeRow};
 use crate::util;
 use anyhow::Result;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::path::PathBuf;
 
-/// Schema version. Bumped to 2 for the workspace=session / worktree=tab remap.
-const SCHEMA_VERSION: i64 = 3;
+/// Schema version. v3: workspace=session / worktree=tab remap. v4 (native host):
+/// adds `tab_layout` + `session_state` for DB-driven session resurrect (the
+/// native compositor owns layout, which zellij owned before) — purely additive.
+const SCHEMA_VERSION: i64 = 4;
 
 pub struct Db {
     conn: Connection,
@@ -47,11 +49,11 @@ impl Db {
         Self::init(Connection::open_in_memory()?)
     }
 
-    /// Open at an explicit path (tests): exercises the real file-backed `open()`
-    /// path (dir creation + on-disk connection + migration) without mutating the
-    /// process-global `XDG_STATE_HOME`, which would race other parallel tests.
-    #[cfg(test)]
-    fn open_at(path: &std::path::Path) -> Result<Db> {
+    /// Open at an explicit path: exercises the real file-backed `open()` path
+    /// (dir creation + on-disk connection + migration) without mutating the
+    /// process-global `XDG_STATE_HOME`. Used by tests and by host integration
+    /// tests across the workspace, hence `pub`.
+    pub fn open_at(path: &std::path::Path) -> Result<Db> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -72,7 +74,10 @@ impl Db {
         let ver: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap_or(0);
-        if ver < SCHEMA_VERSION {
+        // The v2→v3 remap has no faithful transform — drop & recreate. Guard it
+        // to `ver < 3` so later, purely-additive bumps (v3→v4: new `tab_layout`
+        // /`session_state` tables, created below) don't wipe a v3 user's data.
+        if ver < 3 {
             conn.execute_batch(
                 "DROP TABLE IF EXISTS tabs;
                  DROP TABLE IF EXISTS worktrees;
@@ -81,6 +86,8 @@ impl Db {
             // Add the session_name column to a pre-existing repos table (no-op /
             // ignored error on a fresh DB, where the CREATE below adds it).
             let _ = conn.execute("ALTER TABLE repos ADD COLUMN session_name TEXT", []);
+        }
+        if ver < SCHEMA_VERSION {
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
 
@@ -140,6 +147,29 @@ impl Db {
               count      INTEGER DEFAULT 0,
               last_used  INTEGER
             );
+            -- v4: the native host owns the layout zellij used to own. One row per
+            -- tab: its kind, the worktree it belongs to (NULL for home/pinned),
+            -- the serialized pane tree (CenterTree JSON), order, and which leaf
+            -- had focus — enough to rebuild every tab on resurrect.
+            CREATE TABLE IF NOT EXISTS tab_layout (
+              session_name TEXT,
+              tab_name     TEXT,
+              kind         TEXT,
+              worktree     TEXT,
+              pane_tree    TEXT,
+              ordinal      INTEGER,
+              focused_pane INTEGER,
+              PRIMARY KEY (session_name, tab_name)
+            );
+            -- v4: which tab was active at exit, per session.
+            CREATE TABLE IF NOT EXISTS session_state (
+              session_name TEXT PRIMARY KEY,
+              active_tab   TEXT,
+              updated_at   INTEGER
+            );
+            -- Switch/panel-resolve hot path: worktree lookup keyed by the tab.
+            CREATE INDEX IF NOT EXISTS idx_worktrees_session_tab
+              ON worktrees (session_name, tab_name);
             "#,
         )?;
         // Additive: a pre-existing v3 worktrees table predates the remote-worktree
@@ -451,6 +481,81 @@ impl Db {
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
+
+    // --- v4 session/layout persistence (native-host resurrect) -------------
+
+    /// Insert or replace a tab's persisted layout.
+    pub fn put_tab_layout(&self, session: &str, row: &crate::models::TabLayoutRow) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO tab_layout
+               (session_name, tab_name, kind, worktree, pane_tree, ordinal, focused_pane)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(session_name, tab_name) DO UPDATE SET
+               kind=?3, worktree=?4, pane_tree=?5, ordinal=?6, focused_pane=?7",
+            params![
+                session,
+                row.tab_name,
+                row.kind,
+                row.worktree,
+                row.pane_tree,
+                row.ordinal,
+                row.focused_pane,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// All persisted tabs for a session, in display order (for resurrect).
+    pub fn tabs_for_session(&self, session: &str) -> Result<Vec<crate::models::TabLayoutRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tab_name, kind, worktree, pane_tree, ordinal, focused_pane
+               FROM tab_layout WHERE session_name=?1 ORDER BY ordinal",
+        )?;
+        let rows = stmt.query_map(params![session], |r| {
+            Ok(crate::models::TabLayoutRow {
+                tab_name: r.get(0)?,
+                kind: r.get(1)?,
+                worktree: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                pane_tree: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                ordinal: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                focused_pane: r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Forget a tab's persisted layout (on close).
+    pub fn delete_tab_layout(&self, session: &str, tab: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM tab_layout WHERE session_name=?1 AND tab_name=?2",
+            params![session, tab],
+        )?;
+        Ok(())
+    }
+
+    /// Record which tab is active (for restoring focus on resurrect).
+    pub fn set_active_tab(&self, session: &str, tab: &str, now: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO session_state (session_name, active_tab, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(session_name) DO UPDATE SET active_tab=?2, updated_at=?3",
+            params![session, tab, now],
+        )?;
+        Ok(())
+    }
+
+    /// The tab that was active at exit, if recorded.
+    pub fn active_tab(&self, session: &str) -> Result<Option<String>> {
+        let r = self
+            .conn
+            .query_row(
+                "SELECT active_tab FROM session_state WHERE session_name=?1",
+                params![session],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(r.flatten())
+    }
 }
 
 #[cfg(test)]
@@ -459,6 +564,80 @@ mod tests {
 
     fn db() -> Db {
         Db::open_memory().unwrap()
+    }
+
+    #[test]
+    fn tab_layout_roundtrip_ordered_by_ordinal() {
+        use crate::models::TabLayoutRow;
+        let db = db();
+        let sess = "s1";
+        let mk = |name: &str, ord: i64| TabLayoutRow {
+            tab_name: name.into(),
+            kind: "worktree".into(),
+            worktree: format!("/wt/{name}"),
+            pane_tree: r#"{"leaf":0}"#.into(),
+            ordinal: ord,
+            focused_pane: 0,
+        };
+        // Insert out of order; expect ordinal ordering back.
+        db.put_tab_layout(sess, &mk("app/feat", 1)).unwrap();
+        db.put_tab_layout(sess, &mk("app/home", 0)).unwrap();
+        let rows = db.tabs_for_session(sess).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].tab_name, "app/home");
+        assert_eq!(rows[1].tab_name, "app/feat");
+
+        // Upsert replaces in place (no duplicate row).
+        db.put_tab_layout(sess, &mk("app/feat", 5)).unwrap();
+        let rows = db.tabs_for_session(sess).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.tab_name == "app/feat")
+                .unwrap()
+                .ordinal,
+            5
+        );
+
+        // Delete removes just that tab; other session is untouched.
+        db.put_tab_layout("other", &mk("x/home", 0)).unwrap();
+        db.delete_tab_layout(sess, "app/feat").unwrap();
+        assert_eq!(db.tabs_for_session(sess).unwrap().len(), 1);
+        assert_eq!(db.tabs_for_session("other").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn active_tab_persists_per_session() {
+        let db = db();
+        assert_eq!(db.active_tab("s").unwrap(), None);
+        db.set_active_tab("s", "app/feat", 100).unwrap();
+        assert_eq!(db.active_tab("s").unwrap().as_deref(), Some("app/feat"));
+        // Upsert moves it.
+        db.set_active_tab("s", "app/home", 200).unwrap();
+        assert_eq!(db.active_tab("s").unwrap().as_deref(), Some("app/home"));
+    }
+
+    #[test]
+    fn palette_usage_accumulates_and_reports() {
+        let db = db();
+        assert!(db.palette_usage().unwrap().is_empty());
+        // First bump inserts; subsequent bumps increment the count in place.
+        db.bump_palette_usage("new-worktree").unwrap();
+        db.bump_palette_usage("new-worktree").unwrap();
+        db.bump_palette_usage("diff").unwrap();
+        let usage = db.palette_usage().unwrap();
+        assert_eq!(usage.len(), 2, "one row per distinct key");
+        let by_key: std::collections::HashMap<_, _> = usage
+            .iter()
+            .map(|(k, c, l)| (k.as_str(), (*c, *l)))
+            .collect();
+        assert_eq!(
+            by_key["new-worktree"].0, 2,
+            "repeated bump increments count"
+        );
+        assert_eq!(by_key["diff"].0, 1);
+        // last_used is stamped (non-zero) on every key.
+        assert!(by_key["new-worktree"].1 > 0 && by_key["diff"].1 > 0);
     }
 
     #[test]
