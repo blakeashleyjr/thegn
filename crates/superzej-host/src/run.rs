@@ -80,7 +80,10 @@ fn key_bytes(key: &KeyCode, mods: Modifiers) -> Option<Vec<u8>> {
 /// Build the palette's item list: the command actions + a nav row per open tab
 /// (`tab:<name>`), ordered by frecency for the empty-query view (the host port
 /// of the old engine's command + nav + frecency sources).
-fn build_palette(session: &crate::session::Session) -> Vec<crate::palette::PaletteItem> {
+fn build_palette(
+    session: &crate::session::Session,
+    db: &superzej_core::db::Db,
+) -> Vec<crate::palette::PaletteItem> {
     use crate::palette::PaletteItem;
     let mut items = vec![
         PaletteItem::new("new-worktree", "New worktree"),
@@ -93,16 +96,30 @@ fn build_palette(session: &crate::session::Session) -> Vec<crate::palette::Palet
         PaletteItem::new("lazygit", "Open lazygit"),
         PaletteItem::new("quit", "Quit superzej"),
     ];
+
+    // Add active session's tabs
     for t in &session.tabs {
         items.push(PaletteItem::new(
             format!("tab:{}", t.name),
             format!("→ {}", t.name),
         ));
     }
-    let usage = superzej_core::db::Db::open()
-        .ok()
-        .and_then(|db| db.palette_usage().ok())
-        .unwrap_or_default();
+
+    // Add workspaces (repos) for switching
+    if let Ok(workspaces) = db.workspaces() {
+        for w in workspaces {
+            // Don't add the current workspace as a switch target
+            if w.repo_path != session.id {
+                let name = w.name;
+                items.push(PaletteItem::new(
+                    format!("repo:{}", w.repo_path),
+                    format!("✦ {}", name),
+                ));
+            }
+        }
+    }
+
+    let usage = db.palette_usage().unwrap_or_default();
     crate::palette::order_by_frecency(items, &usage)
 }
 
@@ -225,7 +242,7 @@ fn build_initial_model(session: &crate::session::Session) -> FrameModel {
 /// is the in-process data flow the chrome relies on: read core + svc directly,
 /// no IPC. This can be slow on large repos, so launch calls it on a background
 /// worker after the first frame is already possible.
-fn build_model(session: &crate::session::Session) -> FrameModel {
+fn build_model(session: &crate::session::Session, db: &superzej_core::db::Db) -> FrameModel {
     use superzej_core::remote::GitLoc;
     use superzej_svc::git::{GitBackend, GixGit};
 
@@ -235,14 +252,25 @@ fn build_model(session: &crate::session::Session) -> FrameModel {
     let branch = git.current_branch(&loc).unwrap_or_else(|_| "—".into());
 
     // Sidebar: workspaces from the DB (best-effort).
-    let sidebar = superzej_core::db::Db::open()
-        .ok()
-        .and_then(|db| db.workspaces().ok())
+    let sidebar = db
+        .workspaces()
         .map(|ws| ws.into_iter().map(|w| w.name).collect())
         .unwrap_or_default();
 
     // Panel: a quick diff summary for the active worktree.
     let mut panel = vec![branch.clone(), String::new()];
+
+    // Add PR info if cached (native-host replacement for the zellij PR widget).
+    if let Ok(Some((json, _))) = db.get_pr_cache(&loc.path()) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+            if let Some(state) = v.get("state").and_then(|s| s.as_str()) {
+                if let Some(num) = v.get("number").and_then(|n| n.as_i64()) {
+                    panel.push(format!("#{} {}", num, state));
+                }
+            }
+        }
+    }
+
     if let Ok(files) = git.diff_files(&loc, "HEAD") {
         let (add, del): (u32, u32) = files
             .iter()
@@ -271,7 +299,9 @@ fn apply_mode_status(model: &mut FrameModel, mode: crate::keymap::Mode) {
 fn spawn_model_hydration(session: crate::session::Session) -> Receiver<FrameModel> {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
-        let _ = tx.send(build_model(&session));
+        if let Ok(db) = superzej_core::db::Db::open() {
+            let _ = tx.send(build_model(&session, &db));
+        }
     });
     rx
 }
@@ -652,8 +682,11 @@ fn event_loop<T: Terminal>(
                             }
                             Action::Quit => return Ok(()),
                             Action::OpenPalette => {
-                                palette =
-                                    Some(crate::palette::Palette::new(build_palette(&session)));
+                                if let Ok(db) = superzej_core::db::Db::open() {
+                                    palette = Some(crate::palette::Palette::new(build_palette(
+                                        &session, &db,
+                                    )));
+                                }
                             }
                             Action::ToggleSidebar => {
                                 want_sidebar = !want_sidebar;
@@ -925,14 +958,20 @@ mod tests {
         std::env::set_var("XDG_STATE_HOME", &state_home);
 
         let session = load_or_seed_session(std::path::Path::new("/tmp/repo1"));
-
-        // Ensure Db::open inside build_model will use the state_home
-        let model = build_model(&session);
+        let model = build_model(&session, &db);
 
         std::env::remove_var("XDG_STATE_HOME");
 
-        assert!(model.sidebar.contains(&"repo1".to_string()));
-        assert!(model.sidebar.contains(&"repo2".to_string()));
+        assert!(
+            model.sidebar.contains(&"repo1".to_string()),
+            "Sidebar should contain repo1, got: {:?}",
+            model.sidebar
+        );
+        assert!(
+            model.sidebar.contains(&"repo2".to_string()),
+            "Sidebar should contain repo2, got: {:?}",
+            model.sidebar
+        );
     }
 
     #[test]
