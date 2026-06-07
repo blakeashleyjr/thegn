@@ -64,6 +64,19 @@ struct State {
     // pane in this tab), so the embedded monitor lands at the bottom of the
     // center column rather than under the top strip.
     center_id: Option<u32>,
+    // Pinned programs (config `[[pins]]`), polled from `superzej pin list`. Each
+    // is rendered as a chip right after the title; "running" = a `pin:<name>`
+    // tab exists (derived from `self.tabs`, so it tracks `TabUpdate` for free).
+    pins: Vec<PinChip>,
+    // Clickable column spans for the pin chips, cached from the last render:
+    // (start_col, end_col_exclusive, pin_index).
+    pin_spans: Vec<(usize, usize, usize)>,
+}
+
+/// A pinned program in the strip: its 1-based `Alt-N` index + display name.
+struct PinChip {
+    index: usize,
+    name: String,
 }
 
 struct Tab {
@@ -122,6 +135,7 @@ impl ZellijPlugin for State {
         set_selectable(true);
         fetch_theme();
         fetch_stats();
+        fetch_pins();
         set_timeout(STATS_SECS);
     }
 
@@ -132,6 +146,7 @@ impl ZellijPlugin for State {
             Event::PermissionRequestResult(_) => {
                 fetch_theme();
                 fetch_stats();
+                fetch_pins();
                 false
             }
             Event::RunCommandResult(code, stdout, _, ctx)
@@ -153,6 +168,11 @@ impl ZellijPlugin for State {
                 // Repaint only when a value actually changed (the timer fires
                 // every few seconds regardless).
                 code == Some(0) && self.update_stats(&stdout)
+            }
+            Event::RunCommandResult(code, stdout, _, ctx)
+                if ctx.get("cmd").map(|s| s.as_str()) == Some("pins") =>
+            {
+                code == Some(0) && self.update_pins(&stdout)
             }
             // Re-poll stats and re-arm the timer.
             Event::Timer(_) => {
@@ -257,6 +277,15 @@ impl ZellijPlugin for State {
                 false
             }
             Event::Mouse(Mouse::LeftClick(_line, col)) => {
+                // Pin chips launch-or-focus their `pin:<name>` tab (only the
+                // focused tab gets the click, so no broadcast race).
+                if let Some(idx) = self.pin_at(col) {
+                    run_command(
+                        &["superzej", "pin", "open", &idx.to_string()],
+                        BTreeMap::new(),
+                    );
+                    return false;
+                }
                 match self.col_to_index(col) {
                     // The trailing `+` chip: a new page on this worktree.
                     Some(NEW_PAGE) => {
@@ -296,6 +325,23 @@ impl ZellijPlugin for State {
             if let Some(s) = self.session.clone() {
                 run_command(&["superzej", "new-tab", "--session", &s], BTreeMap::new());
             }
+        }
+        // Alt-1..9: launch-or-focus the Nth pinned program. The broadcast hits
+        // every per-tab instance, so — like select_topbar — only the focused
+        // tab's instance acts (else two instances would race `pin open` and
+        // could create duplicate `pin:<name>` tabs). The binary then resolves
+        // the index against config and `go-to-tab`/`new-tab`s as needed.
+        if let Some(idx) = pin_pipe_index(&pipe.name) {
+            if self.my_tab.is_some()
+                && self.my_tab == self.active_tab
+                && self.pins.iter().any(|p| p.index == idx)
+            {
+                run_command(
+                    &["superzej", "pin", "open", &idx.to_string()],
+                    BTreeMap::new(),
+                );
+            }
+            return false;
         }
         // Super+Alt+Up: select the top bar. The broadcast hits every per-tab
         // instance; only the active tab's responds (else focus_plugin_pane would
@@ -340,6 +386,36 @@ impl ZellijPlugin for State {
             ));
             col += title_w;
         }
+
+        // ── Pin chips, right after the title ────────────────────────────────
+        // ` N name● ` per pinned program (config `[[pins]]`): a filled accent
+        // chip when its `pin:<name>` tab is the focused tab, TEXT when running,
+        // DIM when stopped. `●` running / `◌` stopped.
+        self.pin_spans.clear();
+        for p in &self.pins {
+            let running = self.pin_running(&p.name);
+            let glyph = if running { '\u{25cf}' } else { '\u{25cc}' }; // ● ◌
+            let label = format!(" {} {}{} ", p.index, p.name, glyph);
+            let w = label.chars().count();
+            if col + w + 1 > cols {
+                break; // out of room — drop the rest (page chips/stats win)
+            }
+            out.push(' ');
+            col += 1;
+            let chip_start = col;
+            if self.pin_active(&p.name) {
+                out.push_str(&format!("\u{1b}[1m\u{1b}[38;2;{BG0}m\u{1b}[48;2;{accent}m"));
+            } else if running {
+                out.push_str(&fg(TEXT));
+            } else {
+                out.push_str(&fg(DIM));
+            }
+            out.push_str(&label);
+            out.push_str(RESET);
+            out.push_str(&set_bar);
+            self.pin_spans.push((chip_start, chip_start + w, p.index));
+            col += w;
+        }
         let title_end = col;
 
         // ── Tab chips, centered over the CENTER column ──────────────────────
@@ -348,6 +424,9 @@ impl ZellijPlugin for State {
             .tabs
             .iter()
             .enumerate()
+            // Pin tabs (`pin:<name>`) are their own thing — shown as pin chips,
+            // never as worktree pages.
+            .filter(|(_, t)| !is_pin_tab(t))
             .filter(|(_, t)| {
                 self.active_wt
                     .as_ref()
@@ -478,6 +557,23 @@ fn fetch_stats() {
     run_command(&["superzej", "stats"], ctx);
 }
 
+/// Kick off `superzej pin list`; the pin chips land via RunCommandResult.
+fn fetch_pins() {
+    let mut ctx = BTreeMap::new();
+    ctx.insert("cmd".to_string(), "pins".to_string());
+    run_command(&["superzej", "pin", "list"], ctx);
+}
+
+/// The `Alt-N` index of a `superzej_pin_<N>` pipe message (`None` otherwise).
+fn pin_pipe_index(name: &str) -> Option<usize> {
+    name.strip_prefix("superzej_pin_")?.parse().ok()
+}
+
+/// Whether a tab is a pinned-program tab (`pin:<name>` → repo "" / base `pin:…`).
+fn is_pin_tab(t: &Tab) -> bool {
+    t.repo.is_empty() && t.base.starts_with("pin:")
+}
+
 /// First line of stdout as a validated "R;G;B" triple.
 fn parse_rgb_line(stdout: &[u8]) -> Option<String> {
     let s = String::from_utf8_lossy(stdout);
@@ -508,6 +604,58 @@ impl State {
             .iter()
             .find(|(s, e, _)| col >= *s && col < *e)
             .map(|(_, _, pos)| *pos)
+    }
+
+    /// The pin index (if any) whose chip sits under viewport column `col`.
+    fn pin_at(&self, col: usize) -> Option<usize> {
+        self.pin_spans
+            .iter()
+            .find(|(s, e, _)| col >= *s && col < *e)
+            .map(|(_, _, idx)| *idx)
+    }
+
+    /// The pin tab name for a pin (`pin:<name>`).
+    fn pin_tab(name: &str) -> String {
+        format!("pin:{name}")
+    }
+
+    /// Whether the pin's `pin:<name>` tab currently exists (= "running").
+    fn pin_running(&self, name: &str) -> bool {
+        let tab = Self::pin_tab(name);
+        self.tabs.iter().any(|t| t.repo.is_empty() && t.base == tab)
+    }
+
+    /// Whether the pin's tab is the focused tab.
+    fn pin_active(&self, name: &str) -> bool {
+        let tab = Self::pin_tab(name);
+        self.active_wt
+            .as_ref()
+            .is_some_and(|(r, b)| r.is_empty() && *b == tab)
+    }
+
+    /// Parse `superzej pin list`'s TSV (`index\tname\tcommand`) into the pin
+    /// chips. Returns whether the set changed (so the caller skips no-op
+    /// repaints — pins rarely change within a session).
+    fn update_pins(&mut self, stdout: &[u8]) -> bool {
+        let s = String::from_utf8_lossy(stdout);
+        let pins: Vec<PinChip> = s
+            .lines()
+            .filter_map(|line| {
+                let mut it = line.split('\t');
+                let index: usize = it.next()?.trim().parse().ok()?;
+                let name = it.next()?.to_string();
+                Some(PinChip { index, name })
+            })
+            .collect();
+        let changed = pins.len() != self.pins.len()
+            || pins
+                .iter()
+                .zip(&self.pins)
+                .any(|(a, b)| a.index != b.index || a.name != b.name);
+        if changed {
+            self.pins = pins;
+        }
+        changed
     }
 
     /// The stat segments actually present, in display order — `sel` indexes into
@@ -677,7 +825,49 @@ impl State {
 
 #[cfg(test)]
 mod tests {
-    use super::{State, split_page, step_sel};
+    use super::{State, Tab, pin_pipe_index, split_page, step_sel};
+
+    #[test]
+    fn pin_pipe_index_parses_alt_n() {
+        assert_eq!(pin_pipe_index("superzej_pin_1"), Some(1));
+        assert_eq!(pin_pipe_index("superzej_pin_9"), Some(9));
+        assert_eq!(pin_pipe_index("superzej_new_tab"), None);
+        assert_eq!(pin_pipe_index("superzej_pin_x"), None);
+    }
+
+    #[test]
+    fn update_pins_parses_tsv() {
+        let mut s = State::default();
+        assert!(s.update_pins(b"1\taerc\taerc\n2\tlogs\tjournalctl -f\n"));
+        assert_eq!(s.pins.len(), 2);
+        assert_eq!(s.pins[0].index, 1);
+        assert_eq!(s.pins[0].name, "aerc");
+        assert_eq!(s.pins[1].name, "logs");
+        // Re-parsing the same TSV is a no-op (no needless repaint).
+        assert!(!s.update_pins(b"1\taerc\taerc\n2\tlogs\tjournalctl -f\n"));
+        // Empty input clears.
+        assert!(s.update_pins(b""));
+        assert!(s.pins.is_empty());
+    }
+
+    #[test]
+    fn pin_running_and_active_track_tabs() {
+        let mut s = State::default();
+        s.update_pins(b"1\taerc\taerc\n");
+        assert!(!s.pin_running("aerc"));
+        // A `pin:aerc` tab marks it running.
+        s.tabs = vec![Tab {
+            repo: String::new(),
+            base: "pin:aerc".into(),
+            page: 1,
+            position: 0,
+            active: true,
+        }];
+        assert!(s.pin_running("aerc"));
+        assert!(!s.pin_active("aerc")); // active_wt not set
+        s.active_wt = Some((String::new(), "pin:aerc".into()));
+        assert!(s.pin_active("aerc"));
+    }
 
     #[test]
     fn splits_page_suffixes() {

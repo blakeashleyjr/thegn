@@ -156,6 +156,19 @@ pub struct NamedCommand {
     pub command: String,
 }
 
+/// A `[[pins]]` entry — a named program that lives as its own session tab
+/// (`pin:<name>`), summoned via `Alt-1..9` / the tabbar's pin chips. Pins are
+/// global (reachable from anywhere) and run on the host (no sandbox wrap). See
+/// `src/commands/pin.rs`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Pin {
+    pub name: String,
+    pub command: String,
+    /// Working directory for the pin's pane (defaults to `$HOME`).
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -575,6 +588,7 @@ pub struct Config {
     // --- arrays of tables (must serialize before any plain sub-table) ---
     pub agents: Vec<NamedCommand>,
     pub tools: Vec<NamedCommand>,
+    pub pins: Vec<Pin>,
     pub actions: Vec<CustomAction>,
     // --- sub-tables ---
     pub theme: ThemeConfig,
@@ -612,6 +626,7 @@ impl Default for Config {
             repo_scan_depth: 5,
             agents: Vec::new(),
             tools: Vec::new(),
+            pins: Vec::new(),
             theme: ThemeConfig::default(),
             monitor: MonitorConfig::default(),
             pr: PrConfig::default(),
@@ -884,6 +899,11 @@ impl Config {
             ];
         }
 
+        for p in &mut self.pins {
+            if let Some(cwd) = &p.cwd {
+                p.cwd = Some(util::expand_tilde(cwd));
+            }
+        }
         self.worktrees_dir = util::expand_tilde(&self.worktrees_dir);
         self.workspaces_dir = util::expand_tilde(&self.workspaces_dir);
         if self.repo_roots.is_empty() {
@@ -908,6 +928,16 @@ impl Config {
             .iter()
             .find(|t| t.name == name)
             .map(|t| t.command.as_str())
+    }
+
+    /// The pin with the given name.
+    pub fn pin(&self, name: &str) -> Option<&Pin> {
+        self.pins.iter().find(|p| p.name == name)
+    }
+
+    /// The pin at 1-based position `idx` (the `Alt-1..9` mapping).
+    pub fn pin_by_index(&self, idx: usize) -> Option<&Pin> {
+        idx.checked_sub(1).and_then(|i| self.pins.get(i))
     }
 
     /// The resource-monitor command for a stat segment: `cpu`/`mem` → the

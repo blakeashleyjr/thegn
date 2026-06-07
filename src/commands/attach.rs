@@ -34,6 +34,7 @@ const LAYOUTS: &[(&str, &str)] = &[
         "worktree-tab-restore.kdl",
         include_str!("../../layouts/worktree-tab-restore.kdl"),
     ),
+    ("pin-tab.kdl", include_str!("../../layouts/pin-tab.kdl")),
 ];
 
 /// `superzej attach [session]`:

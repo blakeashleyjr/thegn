@@ -135,6 +135,7 @@ fn main() {
         }
         Command::Sidebar { toggle } => commands::panels::sidebar(toggle),
         Command::Panel { toggle } => commands::panels::panel(toggle),
+        Command::Pin { action } => commands::pin::run(&cfg, action),
         Command::Pr { action } => commands::pr::run(&cfg, action),
         Command::Diff {
             worktree,

@@ -21,6 +21,7 @@ pub mod new_worktree;
 pub mod open_worktree;
 pub mod panels;
 pub mod pick_agent;
+pub mod pin;
 pub mod pr;
 pub mod recent;
 pub mod repos;
