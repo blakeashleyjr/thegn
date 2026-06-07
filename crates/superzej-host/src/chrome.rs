@@ -48,6 +48,13 @@ pub fn draw_text(
     surface.add_change(Change::Text(clipped));
 }
 
+/// Clear the logical back-buffer before composing a new frame. This is not a
+/// physical terminal clear: `BufferedTerminal` still diffs this logical state
+/// against its prior frame and emits only changed cells.
+pub fn clear_frame(surface: &mut Surface) {
+    surface.add_change(Change::ClearScreen(theme_color(theme::BG0)));
+}
+
 /// Fill `rect` with spaces on `bg` (a solid background block).
 pub fn fill(surface: &mut Surface, rect: Rect, bg: ColorAttribute) {
     let row = " ".repeat(rect.cols);
@@ -238,6 +245,24 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn clear_frame_removes_stale_cells_from_logical_surface() {
+        let mut s = Surface::new(20, 3);
+        draw_text(
+            &mut s,
+            0,
+            0,
+            "STALE",
+            theme_color(theme::TEXT),
+            theme_color(theme::BG1),
+            20,
+        );
+        assert!(s.screen_chars_to_string().contains("STALE"));
+
+        clear_frame(&mut s);
+        let text = s.screen_chars_to_string();
+        assert!(!text.contains("STALE"), "logical clear removes old cells");
+    }
     #[test]
     fn tabbar_shows_tab_names() {
         let mut s = Surface::new(80, 1);

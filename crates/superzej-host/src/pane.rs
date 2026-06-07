@@ -19,6 +19,15 @@ pub enum PaneEvent {
     Exit(u32),
 }
 
+impl PaneEvent {
+    pub fn byte_len(&self) -> usize {
+        match self {
+            PaneEvent::Output(_, b) => b.len(),
+            PaneEvent::Exit(_) => 0,
+        }
+    }
+}
+
 pub struct PtyPane {
     master: Box<dyn MasterPty + Send>,
     #[allow(dead_code)]
