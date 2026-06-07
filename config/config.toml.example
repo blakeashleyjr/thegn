@@ -84,15 +84,29 @@ max_files = 5
 format = "text"           # text | json
 
 # ── Keybindings ───────────────────────────────────────────────────────────────
-# superzej owns its zellij keybinds: the registry (one entry per action) is
-# rendered into a managed region of ~/.superzej/zellij.kdl on launch (your other
-# edits to that file survive). Inspect with `superzej keys list`; check with
-# `superzej keys validate`; force a regen with `superzej keys sync`.
+# superzej owns its keybinds. Inspect with `superzej keys list`; check with
+# `superzej keys validate`.
 #
-# Rebind a built-in by its id (see `superzej keys list` for ids + defaults):
+# By default, szhost has four modes: Normal, VimNormal, VimInsert, and Emacs.
+# - Normal: The classic `Ctrl` and `Alt` chorded UI.
+# - VimNormal: `h j k l` focus moves, `g g`/`G` scrolling, `i` to insert.
+#   Also features a `Space` leader layer (e.g. `Space p` for panel).
+# - VimInsert: Typing goes to pane. `Esc` back to VimNormal.
+# - Emacs: `Ctrl x` / `Ctrl g` layer.
+# Switch modes: `Ctrl Alt n` (Normal), `Ctrl Alt v` (VimNormal), `Ctrl Alt e` (Emacs).
+#
+# Rebind a built-in by its id (see `superzej keys list` for ids).
+# Flat entries override chords globally.
 [keybinds]
 # new-worktree = "Ctrl w"
 # toggle-sidebar = "Alt s"
+
+# You can also scope rebinds to a specific mode:
+[keybinds.vim_normal]
+# focus-down = "J"
+
+[keybinds.emacs]
+# quit = "Ctrl x q"
 
 # Define your own actions — a chord bound to a shell command. `menu = true`
 # surfaces it in the Cmd+K palette.
@@ -153,7 +167,8 @@ command = "git diff"
 # ── Sandbox / containers ──────────────────────────────────────────────────────
 # Run each worktree's interactive process (agent/shell/tools) inside a
 # container/sandbox. The git worktree stays on the host and is bind-mounted in at
-# its real path, so the sidebar/panel/PR (which read git host-side) keep working.
+# its real path, so the sidebar/panel/PR (which read git host-side) keep working,
+# while the agent only sees the worktree and its git metadata.
 # Per-repo overrides go in a repo-root `.superzej.{toml,yaml,yml,json}` under a
 # `[sandbox]` table (only the keys you set override these).
 [sandbox]

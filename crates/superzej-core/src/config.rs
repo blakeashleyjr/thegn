@@ -195,6 +195,56 @@ pub struct CustomAction {
     pub close_on_exit: bool,
 }
 
+/// Host/zellij keybinding overrides. The flat `[keybinds]` table remains the
+/// default/global layer for backwards compatibility; nested tables such as
+/// `[keybinds.vim_normal]` override only the native host's named modes.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct KeybindConfig {
+    /// Backwards-compatible flat `[keybinds] action-id = "Chord"` entries.
+    #[serde(flatten)]
+    pub normal: BTreeMap<String, String>,
+    /// Native host vim-normal-mode overrides.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub vim_normal: BTreeMap<String, String>,
+    /// Native host vim-insert-mode overrides.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub vim_insert: BTreeMap<String, String>,
+    /// Native host emacs-mode overrides.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub emacs: BTreeMap<String, String>,
+}
+
+impl KeybindConfig {
+    pub fn insert(&mut self, key: String, value: String) -> Option<String> {
+        self.normal.insert(key, value)
+    }
+
+    pub fn get(&self, key: &str) -> Option<&String> {
+        self.normal.get(key)
+    }
+
+    pub fn iter(&self) -> std::collections::btree_map::Iter<'_, String, String> {
+        self.normal.iter()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.normal.is_empty()
+            && self.vim_normal.is_empty()
+            && self.vim_insert.is_empty()
+            && self.emacs.is_empty()
+    }
+}
+
+impl<'a> IntoIterator for &'a KeybindConfig {
+    type Item = (&'a String, &'a String);
+    type IntoIter = std::collections::btree_map::Iter<'a, String, String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.normal.iter()
+    }
+}
+
 /// `[theme]` — visual tuning. Only the accent for now; the rest of the
 /// palette is fixed (src/theme.rs).
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -600,9 +650,9 @@ pub struct Config {
     pub sandbox: SandboxConfig,
     pub limits: LimitsConfig,
     pub drawer: DrawerConfig,
-    /// Rebind a built-in action by id, e.g. `new-worktree = "Ctrl w"` (a plain
-    /// table — kept last so it serializes after all other sub-tables).
-    pub keybinds: BTreeMap<String, String>,
+    /// Rebind a built-in action by id, e.g. `new-worktree = "Ctrl w"`. The flat
+    /// table is the global/default layer; nested mode tables are native-host only.
+    pub keybinds: KeybindConfig,
 }
 
 impl Default for Config {
@@ -636,7 +686,7 @@ impl Default for Config {
             sandbox: SandboxConfig::default(),
             limits: LimitsConfig::default(),
             drawer: DrawerConfig::default(),
-            keybinds: BTreeMap::new(),
+            keybinds: KeybindConfig::default(),
             actions: Vec::new(),
         }
     }
@@ -1326,6 +1376,43 @@ mod tests {
         assert_eq!(cfg.drawer.height, "20%");
         assert_eq!(cfg.drawer.width, "full");
         assert_eq!(cfg.drawer.command, "");
+    }
+
+    #[test]
+    fn config_parses_mode_specific_keybinds() {
+        let cfg: Config = toml::from_str(
+            "[keybinds]\nnew-worktree = \"Alt w\"\n[keybinds.vim_normal]\nfocus-down = \"j\"\n[keybinds.emacs]\nquit = \"Ctrl x Ctrl c\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.keybinds.get("new-worktree").map(String::as_str),
+            Some("Alt w")
+        );
+        assert_eq!(
+            cfg.keybinds
+                .vim_normal
+                .get("focus-down")
+                .map(String::as_str),
+            Some("j")
+        );
+        assert_eq!(
+            cfg.keybinds.emacs.get("quit").map(String::as_str),
+            Some("Ctrl x Ctrl c")
+        );
+    }
+
+    #[test]
+    fn keybind_config_serializes_nested_mode_tables() {
+        let mut cfg = Config::default();
+        cfg.keybinds.insert("new-worktree".into(), "Ctrl w".into());
+        cfg.keybinds
+            .vim_normal
+            .insert("focus-down".into(), "j".into());
+        let s = toml::to_string_pretty(&cfg).unwrap();
+        assert!(s.contains("[keybinds]"));
+        assert!(s.contains("new-worktree = \"Ctrl w\""));
+        assert!(s.contains("[keybinds.vim_normal]"));
+        assert!(s.contains("focus-down = \"j\""));
     }
 
     // defaults < file < env < flag, for a scalar and a validated enum.

@@ -14,6 +14,7 @@ mod layout;
 mod palette;
 mod pane;
 mod run;
+mod sequence;
 mod session;
 
 fn main() -> anyhow::Result<()> {

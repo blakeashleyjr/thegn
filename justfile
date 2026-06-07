@@ -109,7 +109,7 @@ visual-update: release
 # Comprehensive linting: rust (clippy), bash (shellcheck), yaml (yamllint), toml (taplo).
 lint: check-theme
     cargo clippy --workspace --all-targets -- -D warnings
-    shellcheck -x install.sh test/smoke.sh test/gen-fixture.sh test/perf.sh test/one-session.sh test/slug-unique.sh
+    shellcheck -x install.sh test/smoke.sh test/install-plan.sh test/dev-tui-plan.sh test/gen-fixture.sh test/perf.sh test/one-session.sh test/slug-unique.sh
     yamllint .
     taplo lint
 
@@ -140,6 +140,8 @@ test:
 
 # Hermetic end-to-end test against the debug binary (no zellij side effects).
 smoke: build
+    ./test/install-plan.sh
+    ./test/dev-tui-plan.sh
     ./test/smoke.sh {{bin}}
     python3 test/palette-smoke.py {{bin}}
 
@@ -179,12 +181,29 @@ coverage-drawer:
 run *args: build
     {{bin}} {{args}}
 
-# Build and run superzej locally in a FULLY ISOLATED instance — its own data
-# root `~/.superzej-{{name}}` (config, worktrees, zellij socket/cache) and DB
-# (XDG_STATE_HOME under it), and the pinned zellij. So it never touches your
-# daily-driver superzej. `just start work2` is a second, independent instance.
-# Run from a NON-zellij terminal (zellij can't nest). Rebuilds binary + plugins.
-start name="dev": build build-plugins
+# Build and run the native host locally in an isolated state root. The native
+# compositor is `szhost`; this path deliberately avoids the legacy zellij/WASM
+# launcher and all installed/PATH-resolved superzej binaries.
+start name="dev": build
+    mkdir -p "$HOME/.superzej-{{name}}/state"
+    XDG_STATE_HOME="$HOME/.superzej-{{name}}/state" \
+      {{host_bin}}
+
+# Alias for `start`.
+attach: start
+
+# Build and open the native host in a fresh ghostty window. `ghostty -e` runs the
+# repo-local `target/debug/szhost` directly (no fish autostart and no legacy
+# zellij/WASM wrapper), with only the instance's isolated XDG state injected.
+start-term name="dev": build
+    mkdir -p "$HOME/.superzej-{{name}}/state"
+    setsid -f ghostty -e env \
+      -u ZELLIJ -u ZELLIJ_SESSION_NAME -u ZELLIJ_PANE_ID \
+      "XDG_STATE_HOME=$HOME/.superzej-{{name}}/state" \
+      "$PWD/{{host_bin}}"
+
+# Legacy zellij/WASM development path, kept explicit for plugin/layout debugging.
+start-zellij name="dev": build build-plugins
     mkdir -p "$HOME/.superzej-{{name}}/state"
     PATH="$PWD/target/debug:$PATH" \
       SUPERZEJ_ZELLIJ_BIN="$(nix build --no-link --print-out-paths .#zellij)/bin/zellij" \
@@ -195,18 +214,8 @@ start name="dev": build build-plugins
       SUPERZEJ_CONFIG="$PWD/config/zellij.kdl" \
       {{bin}}
 
-# Alias for `start`.
-attach: start
-
-# Build and open a FULLY ISOLATED superzej in a fresh ghostty window. Same
-# isolation as `start` (own `~/.superzej-{{name}}` root + DB + pinned zellij),
-# so you can develop here without touching your daily-driver superzej; pass a
-# name for independent parallel instances (`just start-term work2`).
-# `ghostty -e` runs the binary DIRECTLY (no fish autostart, so no nesting).
-# SUPERZEJ_FRESH force-kills this instance's same-named session first, so every
-# launch is a clean session on the latest layout/config/theme. The cache wipe
-# targets this instance's OWN cache only — never the system ~/.cache/zellij.
-start-term name="dev": build build-plugins
+# Legacy zellij/WASM dev window, kept explicit for plugin/layout debugging.
+start-zellij-term name="dev": build build-plugins
     mkdir -p "$HOME/.superzej-{{name}}/state"
     -find "$HOME/.superzej-{{name}}/cache" -type d -name '*.wasm' -prune -exec rm -rf {} + 2>/dev/null
     setsid -f ghostty -e env \
@@ -255,28 +264,37 @@ stress name="stress": build build-plugins
 perf name="stress": release
     ./test/perf.sh {{name}}
 
-# Install/update the latest superzej onto your PATH (standalone, non-Nix):
-# builds a release binary + WASM plugins and symlinks `superzej`/`sj`, the
-# layouts and plugins into place (via install.sh). Because it symlinks the
-# release artifacts, re-running just rebuilds — picking up your latest changes.
-# Pass a bindir to override the default (~/.local/bin), e.g. `just install ~/bin`.
+# Install/update the latest native superzej host onto your PATH (standalone,
+# non-Nix): builds release artifacts and symlinks `superzej`/`sj`/`szhost` to
+# target/release/szhost. This deliberately does NOT install the legacy zellij/WASM
+# launcher by default, so repo-local native-host testing never resolves to stale
+# host-level wrappers. Pass a bindir to override the default (~/.local/bin), e.g.
+# `just install ~/bin`.
 install *bindir:
-    ./install.sh {{bindir}}
+    ./install.sh --native {{bindir}}
+
+# Install/update the transitional zellij/WASM launcher instead. This is the old
+# behavior of `just install`, kept explicit for legacy/plugin debugging.
+install-zellij *bindir:
+    ./install.sh --zellij {{bindir}}
 
 # Enter the dev shell (default), or `just dev tui` for the auto-refreshing
 # sandboxed TUI (see `dev-tui`).
 dev what="shell":
     {{ if what == "tui" { "just dev-tui" } else { "nix develop" } }}
 
-# Auto-refreshing sandboxed TUI (also reachable as `just dev tui`). Watches the
-# sources and, on every save, rebuilds the binary + WASM plugins and
-# force-relaunches the FULLY ISOLATED `~/.superzej-{{name}}` session (via
-# `start-term`, SUPERZEJ_FRESH=1) so the running TUI always reflects the latest
-# build. Runs once immediately; Ctrl-C stops the watcher. Never touches your
-# daily-driver superzej. Run from a NON-zellij terminal (zellij can't nest).
+# Auto-refreshing native host TUI (also reachable as `just dev tui`). Watches
+# Rust crates and, on every save, rebuilds/relaunches a fresh ghostty running the
+# repo-local `target/debug/szhost`. It does not build plugins, read layouts, or
+# invoke the legacy zellij/WASM launcher. Runs once immediately; Ctrl-C stops the
+# watcher. Run from a NON-zellij terminal.
 # The watch set is scoped to source dirs, so build outputs don't retrigger it.
 dev-tui name="dev":
-    cargo watch -w crates -w plugin -w layouts -w config -s "just start-term {{name}}"
+    cargo watch -w crates -s "just start-term {{name}}"
+
+# Auto-refreshing legacy zellij/WASM development loop for plugin/layout work.
+dev-zellij-tui name="dev":
+    cargo watch -w crates -w plugin -w layouts -w config -s "just start-zellij-term {{name}}"
 
 # Remove build artifacts.
 clean:
