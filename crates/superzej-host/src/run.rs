@@ -798,4 +798,33 @@ mod tests {
         assert_eq!(stats.chunks, 1);
         assert!(stats.disconnected);
     }
+
+    #[test]
+    fn tab_switch_refreshes_model_without_changing_chrome_layout() {
+        let mut session = one_tab_session();
+        session.add_tab(Tab {
+            name: "app/feat".into(),
+            kind: TabKind::Worktree,
+            worktree: "/tmp/app-feat".into(),
+            center: CenterTree::Leaf(0),
+            focused_pane: 0,
+        });
+        let mut model = build_initial_model(&session);
+        let chrome = layout::compute(160, 40, true, true);
+        let before = chrome.clone();
+
+        session.switch_to(1);
+        refresh_tab_model(&mut model, &session);
+
+        assert_eq!(model.active_tab, 1);
+        assert_eq!(
+            model.tabs,
+            vec!["app/home".to_string(), "app/feat".to_string()]
+        );
+        assert_eq!(
+            chrome, before,
+            "tab switches must reuse the chrome snapshot"
+        );
+        assert_eq!(chrome.panel.unwrap().cols, layout::PANEL_COLS);
+    }
 }
