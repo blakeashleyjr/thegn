@@ -28,6 +28,14 @@ cat >"$XDG_CONFIG_HOME/superzej/config.toml" <<EOF
 worktrees_dir = "$TMP/wt"
 name_scheme = "numbered"
 repo_roots = ["$TMP/code"]
+
+[[pins]]
+name = "aerc"
+command = "echo aerc"
+
+[[pins]]
+name = "logs"
+command = "echo logs"
 EOF
 
 fail=0
@@ -153,6 +161,22 @@ check "files off-session exits 0 (no zellij side effects)" "'$SZ' files >/dev/nu
 check "files off-session reports it needs a session" \
   "'$SZ' files 2>&1 | grep -qi 'not in zellij'"
 check "files --close off-session is safe" "'$SZ' files --close >/dev/null 2>&1"
+
+# ── pinned programs (`superzej pin`) — hermetic surface only ────────────────
+# Launch-or-focus / tab lifecycle is covered in-session by the e2e suite; here
+# we confirm config wiring (list) and graceful off-session degradation.
+check "pin list emits configured pins (TSV)" \
+  "'$SZ' pin list | grep -qE '^1'$'\t''aerc'"
+check "pin list --json is an indexed array" \
+  "'$SZ' pin list --json | grep -q '\"index\":1,\"name\":\"aerc\"'"
+check "pin open off-session exits 0 (no zellij side effects)" \
+  "'$SZ' pin open aerc >/dev/null 2>&1"
+check "pin open off-session reports it needs a session" \
+  "'$SZ' pin open aerc 2>&1 | grep -qi 'not in zellij'"
+check "pin open resolves by 1-based index" \
+  "'$SZ' pin open 2 2>&1 | grep -q logs"
+check "pin open rejects an unknown pin (exit non-zero)" \
+  "! '$SZ' pin open nope >/dev/null 2>&1"
 
 echo
 if [[ $fail -eq 0 ]]; then

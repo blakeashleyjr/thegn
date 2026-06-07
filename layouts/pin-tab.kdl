@@ -1,0 +1,26 @@
+// layouts/pin-tab.kdl — a pinned-program tab, opened by `superzej pin open`
+// (`new-tab --cwd <cwd> --layout pin-tab`). A pin is its own session tab
+// (`pin:<name>`); summon it with Alt-1..9 or the tabbar's pin chips.
+//
+// Minimal chrome — tabbar (top) · program · statusbar (bottom). No sidebar/panel
+// (a pin has no worktree, so the diff/PR panel has nothing to resolve).
+// SELF-CONTAINED (does not reliably inherit the session's default_tab_template,
+// zellij-org/zellij#4646 — see worktree-tab.kdl).
+//
+// The center pane runs `superzej pin exec --in-place`, which resolves the pin
+// from the focused tab name (`pin:<name>`) and execs its command in place
+// (`--in-place` => no leftover exited pane).
+layout {
+    pane split_direction="horizontal" {
+        pane size=1 borderless=true {
+            plugin location="file:~/.local/share/superzej/tabbar.wasm"
+        }
+        pane focus=true {
+            command "superzej"
+            args "pin" "exec" "--in-place"
+        }
+        pane size=1 borderless=true {
+            plugin location="file:~/.local/share/superzej/statusbar.wasm"
+        }
+    }
+}

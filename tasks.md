@@ -253,24 +253,29 @@ Tor (444) and GPU passthrough (393) as niche opt-ins.
 
 ### E. Pinned programs / tiles ◀ **NEXT FEATURE TARGET** (see ▶ below)
 
-- [ ] 57. Pin to top strip
+**Slice 1 (shipped):** pins are their own `pin:<name>` session tabs (a workspace-like
+entity, not a float — overrides the float reading below), summoned by `Alt-1..9`
+/ tabbar pin chips. Global + lazy only. See `src/commands/pin.rs`,
+`layouts/pin-tab.kdl`, the tabbar chip strip, and `[[pins]]` config.
+
+- [x] 57. Pin to top strip _(tabbar pin chips; the pin itself is its own tab)_
 - [ ] 58. Add anywhere (into active layout)
 - [ ] 59. Floating/scratch pin _(tools/drawer/monitors are floats, but not a pin system)_
-- [ ] 60. Global pins (everywhere)
+- [x] 60. Global pins (everywhere) _(every pin is a session-level tab)_
 - [ ] 61. Workspace-scoped pins
-- [ ] 62. Pin definition in config — cmd/args/cwd/location/scope _(adjacent: `[[tools]]`/`[[agents]]` config)_
-- [ ] 63. Eager vs lazy start
+- [x] 62. Pin definition in config — `[[pins]]` name/command/cwd _(args/location/scope deferred)_
+- [~] 63. Eager vs lazy start _(lazy implemented; eager deferred)_
 - [ ] 64. Restart-on-exit policy
 - [ ] 65. Singleton vs multi-instance
-- [ ] 66. Persist daemons across workspace switches
+- [x] 66. Persist daemons across workspace switches _(free: a pin tab stays in the session)_
 - [ ] 67. Promote running pane to pinned
 - [ ] 68. Unpin at runtime
 - [ ] 69. Top-strip sizing/ratio
-- [ ] 70. Program labels + status glyph
+- [x] 70. Program labels + status glyph _(chip label + ●/◌ running/stopped)_
 - [ ] 71. Per-program env injection
 - [ ] 72. Health monitoring/auto-restart
-- [~] 73. Program adapter — launch/notify/restart spec _(launch spec exists via `[[tools]]`/`[[agents]]`)_
-- [ ] 74. Quick-toggle visibility
+- [x] 73. Program adapter — launch/notify/restart spec _(launch-or-focus via `superzej pin open`)_
+- [x] 74. Quick-toggle visibility _(`Alt-1..9` launch-or-focus; chip click)_
 
 ### F. Keybindings
 

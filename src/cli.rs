@@ -217,6 +217,12 @@ pub enum Command {
         #[arg(long)]
         toggle: bool,
     },
+    /// Pinned programs (Alt-1..9 / tabbar chips): each lives as its own
+    /// `pin:<name>` session tab.
+    Pin {
+        #[command(subcommand)]
+        action: PinAction,
+    },
     /// GitHub PR data + actions for a worktree (feeds the right panel).
     Pr {
         #[command(subcommand)]
@@ -271,6 +277,25 @@ pub enum Command {
         /// Acknowledge a quiet worktree (its tab was focused): clears the dot.
         #[arg(long)]
         ack: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum PinAction {
+    /// Launch-or-focus a pin by name or 1-based index: focus its `pin:<name>`
+    /// tab if it exists, else open it. The keybind / chip entry point.
+    Open { target: String },
+    /// (internal) Run the focused pin tab's command in place — the `pin-tab`
+    /// layout's center pane invokes this; it resolves the pin from the tab name.
+    Exec {
+        /// Accepted for layout compatibility (the pin-tab pane passes it).
+        #[arg(long = "in-place")]
+        in_place: bool,
+    },
+    /// List configured pins as JSON (the tabbar's pin-chip feed).
+    List {
+        #[arg(long)]
+        json: bool,
     },
 }
 

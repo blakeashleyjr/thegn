@@ -490,7 +490,42 @@ pub const BUILTINS: &[Action] = &[
         context: Context::WorktreeOnly,
         menu: true,
     },
+    // ── Pinned programs — Alt-1..9 launch-or-focus (config `[[pins]]`) ─────────
+    // Pipe to the tabbar (no command-pane flash, like `new-tab`): it maps the
+    // index to the configured pin name and runs `superzej pin open <name>`.
+    pin_action("pin-1", &["Alt 1"], "superzej_pin_1"),
+    pin_action("pin-2", &["Alt 2"], "superzej_pin_2"),
+    pin_action("pin-3", &["Alt 3"], "superzej_pin_3"),
+    pin_action("pin-4", &["Alt 4"], "superzej_pin_4"),
+    pin_action("pin-5", &["Alt 5"], "superzej_pin_5"),
+    pin_action("pin-6", &["Alt 6"], "superzej_pin_6"),
+    pin_action("pin-7", &["Alt 7"], "superzej_pin_7"),
+    pin_action("pin-8", &["Alt 8"], "superzej_pin_8"),
+    pin_action("pin-9", &["Alt 9"], "superzej_pin_9"),
 ];
+
+/// A pinned-program builtin: `Alt-N` pipes `superzej_pin_N` to the tabbar, which
+/// resolves the index to a pin and launch-or-focuses it. `const fn` so the
+/// entries stay in the `BUILTINS` const slice.
+const fn pin_action(
+    id: &'static str,
+    chords: &'static [&'static str],
+    pipe: &'static str,
+) -> Action {
+    Action {
+        id,
+        chords,
+        menu_label: "Pinned program",
+        hint: "pin",
+        invocation: Invocation::Pipe {
+            plugin: Plugin::Tabbar,
+            name: pipe,
+        },
+        scope: Scope::Shared,
+        context: Context::Always,
+        menu: false,
+    }
+}
 
 /// Vanilla-zellij chords superzej deliberately keeps; a user override landing on
 /// one is flagged by `keys validate`.
