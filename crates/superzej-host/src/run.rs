@@ -57,6 +57,7 @@ fn pane_shell_argv() -> Vec<String> {
     shell_argv_from(&shell, login)
 }
 
+<<<<<<< Updated upstream
 fn tool_drawer_argv(command: &str) -> Vec<String> {
     vec![
         superzej_core::util::shell(),
@@ -65,6 +66,13 @@ fn tool_drawer_argv(command: &str) -> Vec<String> {
     ]
 }
 
+||||||| Stash base
+=======
+fn shell_command_argv(run: &str) -> Vec<String> {
+    vec!["/bin/sh".into(), "-c".into(), run.into()]
+}
+
+>>>>>>> Stashed changes
 /// Translate a termwiz key event into the bytes a terminal app expects on stdin.
 fn key_bytes(key: &KeyCode, mods: Modifiers) -> Option<Vec<u8>> {
     match key {
@@ -545,6 +553,7 @@ impl Panes {
         }
     }
 
+<<<<<<< Updated upstream
     /// Spawn one shell pane in `cwd`, sized to `center`; returns its id.
     fn spawn(&mut self, cwd: Option<&std::path::Path>, center: Rect) -> Result<u32> {
         let argv = pane_shell_argv();
@@ -558,6 +567,18 @@ impl Panes {
         cwd: Option<&std::path::Path>,
         center: Rect,
     ) -> Result<u32> {
+||||||| Stash base
+    /// Spawn one shell pane in `cwd`, sized to `center`; returns its id.
+    fn spawn(&mut self, cwd: Option<&std::path::Path>, center: Rect) -> Result<u32> {
+=======
+    /// Spawn `argv` in `cwd`, sized to `center`; returns its id.
+    fn spawn_argv(
+        &mut self,
+        argv: &[String],
+        cwd: Option<&std::path::Path>,
+        center: Rect,
+    ) -> Result<u32> {
+>>>>>>> Stashed changes
         let id = self.next_id;
         self.next_id += 1;
         let pane = PtyPane::spawn(
@@ -570,6 +591,12 @@ impl Panes {
         )?;
         self.table.insert(id, pane);
         Ok(id)
+    }
+
+    /// Spawn one shell pane in `cwd`, sized to `center`; returns its id.
+    fn spawn(&mut self, cwd: Option<&std::path::Path>, center: Rect) -> Result<u32> {
+        let argv = pane_shell_argv();
+        self.spawn_argv(&argv, cwd, center)
     }
 
     /// Ensure every leaf in `tab.center` is backed by a live pane. On first focus
@@ -735,6 +762,13 @@ fn event_loop<T: Terminal>(
     let mut chrome = layout::compute(cols, rows, want_sidebar, want_panel);
     let mut dirty = true;
     let mut palette: Option<crate::palette::Palette> = None;
+    let cfg = superzej_core::config::Config::load_layered(
+        &superzej_core::config::ProcessEnv,
+        None,
+        None,
+    );
+    let mut keymap = crate::keymap::KeyMap::from_config(&cfg);
+    let mut mode = crate::keymap::Mode::Normal;
 
     let (tx, rx) = channel::<PaneEvent>();
     let mut panes = Panes::new(tx);
@@ -969,6 +1003,7 @@ fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+<<<<<<< Updated upstream
                 // Global/mode chords are intercepted by the keymap; everything
                 // else is forwarded to the focused pane.
                 let input_key = crate::sequence::Key::modified(k.key, k.modifiers);
@@ -980,7 +1015,75 @@ fn event_loop<T: Terminal>(
                                 mode = next;
                                 keymap.reset();
                                 apply_mode_status(&mut model, mode);
+||||||| Stash base
+                // Global chords are intercepted by the keymap; everything else is
+                // forwarded to the focused pane.
+                if let Some(action) = crate::keymap::map_key(&k.key, k.modifiers) {
+                    use crate::keymap::Action;
+                    match action {
+                        Action::Quit => return Ok(()),
+                        Action::OpenPalette => {
+                            palette = Some(crate::palette::Palette::new(build_palette(&session)));
+                        }
+                        Action::ToggleSidebar => {
+                            want_sidebar = !want_sidebar;
+                            chrome = layout::compute(cols, rows, want_sidebar, want_panel);
+                            need_relayout = true;
+                        }
+                        Action::TogglePanel => {
+                            want_panel = !want_panel;
+                            chrome = layout::compute(cols, rows, want_sidebar, want_panel);
+                            need_relayout = true;
+                        }
+                        Action::NextTab => {
+                            session.next_tab();
+                            refresh_tab_model(&mut model, &session);
+                            need_relayout = true;
+                        }
+                        Action::PrevTab => {
+                            session.prev_tab();
+                            refresh_tab_model(&mut model, &session);
+                            need_relayout = true;
+                        }
+                        Action::SplitDown | Action::SplitRight => {
+                            let dir = if action == Action::SplitDown {
+                                crate::center::Dir::Col
+                            } else {
+                                crate::center::Dir::Row
+                            };
+                            let cwd = tab_cwd(&session.tabs[active]);
+                            let new = panes.spawn(cwd.as_deref(), chrome.center)?;
+                            if session.tabs[active].center.split(focused, dir, new) {
+                                session.tabs[active].focused_pane = new;
+                                need_relayout = true;
+                            } else {
+                                // target not found (shouldn't happen); reap the pane
+                                panes.table.remove(&new);
+=======
+                // Global/modal chords are intercepted by the keymap; everything
+                // else is forwarded to the focused pane.
+                let key = crate::sequence::Key::new(k.key.clone(), k.modifiers);
+                match keymap.dispatch(mode, key) {
+                    crate::sequence::MatchResult::Pending => continue,
+                    crate::sequence::MatchResult::None => {}
+                    crate::sequence::MatchResult::Matched(action) => {
+                        use crate::keymap::Action;
+                        match action {
+                            Action::SwitchMode(new_mode) => {
+                                mode = new_mode;
                             }
+                            Action::Quit => return Ok(()),
+                            Action::OpenPalette => {
+                                palette =
+                                    Some(crate::palette::Palette::new(build_palette(&session)));
+                            }
+                            Action::ToggleSidebar => {
+                                want_sidebar = !want_sidebar;
+                                chrome = layout::compute(cols, rows, want_sidebar, want_panel);
+                                need_relayout = true;
+>>>>>>> Stashed changes
+                            }
+<<<<<<< Updated upstream
                             Action::Custom(idx) => {
                                 if let Some(ca) = keymap.custom_actions().get(idx as usize) {
                                     let mut cmd =
@@ -998,8 +1101,179 @@ fn event_loop<T: Terminal>(
                                         // or spawn a new pane. For now, spawn floating.
                                         let _ = cmd.spawn();
                                     }
+||||||| Stash base
+                        }
+                        Action::FocusLeft
+                        | Action::FocusRight
+                        | Action::FocusUp
+                        | Action::FocusDown => {
+                            use crate::center::Move;
+                            let mv = match action {
+                                Action::FocusLeft => Move::Left,
+                                Action::FocusRight => Move::Right,
+                                Action::FocusUp => Move::Up,
+                                _ => Move::Down,
+                            };
+                            let layout = session.tabs[active].center.layout(chrome.center);
+                            if let Some(n) = crate::center::neighbor(&layout, focused, mv) {
+                                session.tabs[active].focused_pane = n;
+                            }
+                        }
+                        Action::NewTab => {
+                            // A fresh tab on the same worktree (an "extra" page).
+                            let src = &session.tabs[active];
+                            let n = session.tabs.len();
+                            let tab = crate::session::Tab {
+                                name: format!("{} ·{}", src.name, n),
+                                kind: crate::session::TabKind::Extra,
+                                worktree: src.worktree.clone(),
+                                center: crate::center::CenterTree::Leaf(0),
+                                focused_pane: 0,
+                            };
+                            session.add_tab(tab);
+                            refresh_tab_model(&mut model, &session);
+                            need_relayout = true;
+                        }
+                        Action::CloseWorktree => {
+                            // Close the active tab; reap its panes' processes.
+                            for id in session.tabs[active].center.pane_ids() {
+                                panes.table.remove(&id);
+                            }
+                            session.close_active();
+                            refresh_tab_model(&mut model, &session);
+                            need_relayout = true;
+                        }
+                        Action::ScrollUp | Action::ScrollDown => {
+                            let half = (chrome.center.rows / 2).max(1);
+                            if let Some(p) = panes.table.get_mut(&focused) {
+                                if action == Action::ScrollUp {
+                                    p.scroll_up(half);
+                                } else {
+                                    p.scroll_down(half);
+=======
+                            Action::TogglePanel => {
+                                want_panel = !want_panel;
+                                chrome = layout::compute(cols, rows, want_sidebar, want_panel);
+                                need_relayout = true;
+                            }
+                            Action::NextTab => {
+                                session.next_tab();
+                                refresh_tab_model(&mut model, &session);
+                                need_relayout = true;
+                            }
+                            Action::PrevTab => {
+                                session.prev_tab();
+                                refresh_tab_model(&mut model, &session);
+                                need_relayout = true;
+                            }
+                            Action::SplitDown => {
+                                let cwd = tab_cwd(&session.tabs[active]);
+                                let new = panes.spawn(cwd.as_deref(), chrome.center)?;
+                                if session.tabs[active].center.split(
+                                    focused,
+                                    crate::center::Dir::Col,
+                                    new,
+                                ) {
+                                    session.tabs[active].focused_pane = new;
+                                    need_relayout = true;
+                                } else {
+                                    // target not found (shouldn't happen); reap the pane
+                                    panes.table.remove(&new);
                                 }
                             }
+                            Action::SplitRight => {
+                                let cwd = tab_cwd(&session.tabs[active]);
+                                let new = panes.spawn(cwd.as_deref(), chrome.center)?;
+                                if session.tabs[active].center.split(
+                                    focused,
+                                    crate::center::Dir::Row,
+                                    new,
+                                ) {
+                                    session.tabs[active].focused_pane = new;
+                                    need_relayout = true;
+                                } else {
+                                    // target not found (shouldn't happen); reap the pane
+                                    panes.table.remove(&new);
+                                }
+                            }
+                            Action::FocusLeft => {
+                                let layout = session.tabs[active].center.layout(chrome.center);
+                                if let Some(n) = crate::center::neighbor(
+                                    &layout,
+                                    focused,
+                                    crate::center::Move::Left,
+                                ) {
+                                    session.tabs[active].focused_pane = n;
+                                }
+                            }
+                            Action::FocusRight => {
+                                let layout = session.tabs[active].center.layout(chrome.center);
+                                if let Some(n) = crate::center::neighbor(
+                                    &layout,
+                                    focused,
+                                    crate::center::Move::Right,
+                                ) {
+                                    session.tabs[active].focused_pane = n;
+                                }
+                            }
+                            Action::FocusUp => {
+                                let layout = session.tabs[active].center.layout(chrome.center);
+                                if let Some(n) = crate::center::neighbor(
+                                    &layout,
+                                    focused,
+                                    crate::center::Move::Up,
+                                ) {
+                                    session.tabs[active].focused_pane = n;
+                                }
+                            }
+                            Action::FocusDown => {
+                                let layout = session.tabs[active].center.layout(chrome.center);
+                                if let Some(n) = crate::center::neighbor(
+                                    &layout,
+                                    focused,
+                                    crate::center::Move::Down,
+                                ) {
+                                    session.tabs[active].focused_pane = n;
+                                }
+                            }
+                            Action::NewTab => {
+                                // A fresh tab on the same worktree (an "extra" page).
+                                let src = &session.tabs[active];
+                                let n = session.tabs.len();
+                                let tab = crate::session::Tab {
+                                    name: format!("{} ·{}", src.name, n),
+                                    kind: crate::session::TabKind::Extra,
+                                    worktree: src.worktree.clone(),
+                                    center: crate::center::CenterTree::Leaf(0),
+                                    focused_pane: 0,
+                                };
+                                session.add_tab(tab);
+                                refresh_tab_model(&mut model, &session);
+                                need_relayout = true;
+                            }
+                            Action::CloseWorktree => {
+                                // Close the active tab; reap its panes' processes.
+                                for id in session.tabs[active].center.pane_ids() {
+                                    panes.table.remove(&id);
+                                }
+                                session.close_active();
+                                refresh_tab_model(&mut model, &session);
+                                need_relayout = true;
+                            }
+                            Action::ScrollUp => {
+                                let half = (chrome.center.rows / 2).max(1);
+                                if let Some(p) = panes.table.get_mut(&focused) {
+                                    p.scroll_up(half);
+                                }
+                            }
+                            Action::ScrollDown => {
+                                let half = (chrome.center.rows / 2).max(1);
+                                if let Some(p) = panes.table.get_mut(&focused) {
+                                    p.scroll_down(half);
+>>>>>>> Stashed changes
+                                }
+                            }
+<<<<<<< Updated upstream
                             Action::Quit => return Ok(()),
                             Action::OpenPalette => {
                                 if let Ok(db) = superzej_core::db::Db::open() {
@@ -1007,7 +1281,35 @@ fn event_loop<T: Terminal>(
                                         &session, &db,
                                     )));
                                 }
+||||||| Stash base
+                        }
+                        Action::CopyPane => {
+                            // Copy the focused pane's visible text to the system
+                            // clipboard via OSC 52 (out-of-band to the outer term).
+                            if let Some(p) = panes.table.get(&focused) {
+                                let emu = p.emulator();
+                                let sel = crate::copymode::whole(emu);
+                                let text = crate::copymode::extract(emu, &sel);
+                                use std::io::Write;
+                                let mut out = std::io::stdout();
+                                let _ = out.write_all(&crate::copymode::osc52(&text));
+                                let _ = out.flush();
+=======
+                            Action::CopyPane => {
+                                // Copy the focused pane's visible text to the system
+                                // clipboard via OSC 52 (out-of-band to the outer term).
+                                if let Some(p) = panes.table.get(&focused) {
+                                    let emu = p.emulator();
+                                    let sel = crate::copymode::whole(emu);
+                                    let text = crate::copymode::extract(emu, &sel);
+                                    use std::io::Write;
+                                    let mut out = std::io::stdout();
+                                    let _ = out.write_all(&crate::copymode::osc52(&text));
+                                    let _ = out.flush();
+                                }
+>>>>>>> Stashed changes
                             }
+<<<<<<< Updated upstream
                             Action::ToggleDrawer => {
                                 if drawer.is_some() {
                                     // Reap the drawer pane
@@ -1253,16 +1555,44 @@ fn event_loop<T: Terminal>(
                             // and consumed; they land with the sandbox::enter_argv spawn
                             // + branch/repo picker wiring.
                             _ => {}
+||||||| Stash base
+=======
+                            Action::ShellCommand { run, .. } => {
+                                let cwd = tab_cwd(&session.tabs[active]);
+                                let argv = shell_command_argv(&run);
+                                let new = panes.spawn_argv(&argv, cwd.as_deref(), chrome.center)?;
+                                if session.tabs[active].center.split(
+                                    focused,
+                                    crate::center::Dir::Col,
+                                    new,
+                                ) {
+                                    session.tabs[active].focused_pane = new;
+                                    need_relayout = true;
+                                } else {
+                                    panes.table.remove(&new);
+                                }
+                            }
+                            // New/switch worktree+workspace and tool floats: recognized
+                            // and consumed; they land with the sandbox::enter_argv spawn
+                            // + branch/repo picker wiring.
+                            _ => {}
+>>>>>>> Stashed changes
                         }
                         dirty = true;
                         continue;
                     }
+<<<<<<< Updated upstream
                     crate::sequence::MatchResult::Pending => {
                         model.status = format!("{} mode   awaiting next key…", mode.as_str());
                         dirty = true;
                         continue;
                     }
                     crate::sequence::MatchResult::None => {}
+||||||| Stash base
+                    dirty = true;
+                    continue;
+=======
+>>>>>>> Stashed changes
                 }
                 if let Some(bytes) = key_bytes(&k.key, k.modifiers) {
                     let target_pane = drawer.unwrap_or(focused);

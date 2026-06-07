@@ -4373,6 +4373,7 @@ dependencies = [
  "superzej-svc",
  "termwiz",
  "tokio",
+ "toml",
  "tracing",
  "vt100",
 ]

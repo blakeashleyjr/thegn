@@ -7,7 +7,7 @@ use termwiz::cell::AttributeChange;
 use termwiz::color::{ColorAttribute, SrgbaTuple};
 use termwiz::surface::{Change, Position, Surface};
 
-use crate::compositor::{Rect, compose_pane};
+use crate::compositor::{compose_pane, Rect};
 use crate::emulator::PaneEmulator;
 use superzej_core::theme;
 
@@ -46,6 +46,47 @@ pub fn draw_text(
     surface.add_change(Change::Attribute(AttributeChange::Background(bg)));
     let clipped: String = text.chars().take(max_cols).collect();
     surface.add_change(Change::Text(clipped));
+}
+
+/// Draw a transport-neutral plugin [`View`] into a host-owned surface rect.
+/// Plugins supply semantic roles only; this function resolves them against the
+/// current superzej theme/accent and clips to the host-owned slot.
+pub fn draw_plugin_view(
+    surface: &mut Surface,
+    rect: Rect,
+    view: &superzej_core::plugin_api::View,
+    accent_rgb: &str,
+) {
+    if rect.rows == 0 || rect.cols == 0 {
+        return;
+    }
+    fill(surface, rect, theme_color(theme::BG1));
+    let mut x = rect.x;
+    let max_x = rect.x + rect.cols;
+    for span in &view.spans {
+        if x >= max_x {
+            break;
+        }
+        let fg = plugin_role_color(span.role, accent_rgb);
+        let bg = theme_color(theme::BG1);
+        let max_cols = max_x.saturating_sub(x);
+        draw_text(surface, x, rect.y, &span.text, fg, bg, max_cols);
+        x += span.text.chars().take(max_cols).count();
+    }
+}
+
+fn plugin_role_color(
+    role: superzej_core::plugin_api::StyleRole,
+    accent_rgb: &str,
+) -> ColorAttribute {
+    use superzej_core::plugin_api::StyleRole;
+    match role {
+        StyleRole::Default => theme_color(theme::TEXT),
+        StyleRole::Accent => theme_color(accent_rgb),
+        StyleRole::Warning => theme_color(theme::AMBER),
+        StyleRole::Error => theme_color(theme::RED),
+        StyleRole::Faint => theme_color(theme::FAINT),
+    }
 }
 
 /// Clear the logical back-buffer before composing a new frame. This is not a
@@ -275,6 +316,31 @@ mod tests {
         let text = s.screen_chars_to_string();
         assert!(!text.contains("STALE"), "logical clear removes old cells");
     }
+    #[test]
+    fn plugin_view_is_host_rendered_with_semantic_roles() {
+        use superzej_core::plugin_api::{Span, StyleRole, View};
+
+        let mut s = Surface::new(20, 1);
+        let view = View::line([
+            Span::styled("ok", StyleRole::Accent),
+            Span::styled(" warn", StyleRole::Warning),
+        ]);
+        draw_plugin_view(
+            &mut s,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 20,
+                rows: 1,
+            },
+            &view,
+            theme::TEAL,
+        );
+
+        let text = s.screen_chars_to_string();
+        assert!(text.contains("ok warn"), "{text:?}");
+    }
+
     #[test]
     fn tabbar_shows_tab_names() {
         let mut s = Surface::new(80, 1);

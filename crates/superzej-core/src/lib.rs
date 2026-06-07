@@ -17,6 +17,7 @@ pub mod models;
 pub mod msg;
 pub mod out;
 pub mod picker;
+pub mod plugin_api;
 pub mod remote;
 pub mod repo;
 pub mod sandbox;
