@@ -114,14 +114,24 @@ pub struct HostCustomAction {
 pub struct KeyMap {
     modes: std::collections::HashMap<Mode, SequenceMatcher>,
     custom_actions: Vec<HostCustomAction>,
+    config: superzej_core::config::Config,
 }
 
 impl KeyMap {
     pub fn new() -> Self {
+        Self::with_config(superzej_core::config::Config::default())
+    }
+
+    pub fn with_config(config: superzej_core::config::Config) -> Self {
         Self {
             modes: std::collections::HashMap::new(),
             custom_actions: Vec::new(),
+            config,
         }
+    }
+
+    pub fn config(&self) -> &superzej_core::config::Config {
+        &self.config
     }
 
     pub fn insert(&mut self, mode: Mode, chord: &str, action: Action) -> Result<(), String> {
@@ -234,7 +244,6 @@ fn parse_chord(s: &str) -> Result<Vec<Key>, String> {
 
 pub fn default_keymap() -> KeyMap {
     let mut map = KeyMap::new();
-
     // Global defaults: work in every host mode, so Vim/Emacs modes never trap
     // users away from workspace/pane management.
     map.insert_all("Ctrl q", Action::Quit).unwrap();
@@ -345,6 +354,7 @@ pub fn default_keymap() -> KeyMap {
 
 pub fn default_keymap_with_config(cfg: &superzej_core::config::Config) -> KeyMap {
     let mut map = default_keymap();
+    map.config = cfg.clone();
 
     for action in &cfg.actions {
         let ca = HostCustomAction {
