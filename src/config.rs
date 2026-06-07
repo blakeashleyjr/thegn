@@ -149,6 +149,13 @@ config_enum! {
         Text = "text", Json = "json",
     } default = Text;
 }
+config_enum! {
+    /// Where a configured pin appears when opened.
+    pub enum PinLocation: "pin location" {
+        Tab = "tab",
+        Layout = "layout" | "pane" | "active_layout" | "active-layout",
+    } default = Tab;
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NamedCommand {
@@ -156,17 +163,22 @@ pub struct NamedCommand {
     pub command: String,
 }
 
-/// A `[[pins]]` entry — a named program that lives as its own session tab
-/// (`pin:<name>`), summoned via `Alt-1..9` / the tabbar's pin chips. Pins are
-/// global (reachable from anywhere) and run on the host (no sandbox wrap). See
-/// `src/commands/pin.rs`.
+/// A `[[pins]]` entry — a named program that opens either as its own session
+/// tab (`location = "tab"`, the default) or as a tiled pane in the active
+/// layout (`location = "layout"`). Pins are summoned via `Alt-1..9` / the
+/// tabbar's pin chips, are global (reachable from anywhere), and run on the
+/// host (no sandbox wrap). See `src/commands/pin.rs`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Pin {
     pub name: String,
     pub command: String,
-    /// Working directory for the pin's pane (defaults to `$HOME`).
+    /// Working directory for the pin's pane. Tab pins default to `$HOME`; layout
+    /// pins default to the focused repo/worktree when it can be resolved.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Where the pin appears when opened.
+    #[serde(default)]
+    pub location: PinLocation,
 }
 
 fn default_true() -> bool {
@@ -1085,6 +1097,18 @@ pub fn validate_str(body: &str) -> Vec<String> {
             LogFormat::from_str_validated(s).map(|_| ())
         });
     }
+    if let Some(pins) = t.get("pins").and_then(|v| v.as_array()) {
+        for (i, pin) in pins.iter().enumerate() {
+            if let Some(pin) = pin.as_table() {
+                check(
+                    &mut errs,
+                    &format!("pins[{i}].location"),
+                    pin.get("location"),
+                    |s| PinLocation::from_str_validated(s).map(|_| ()),
+                );
+            }
+        }
+    }
     errs
 }
 
@@ -1368,6 +1392,31 @@ mod tests {
         let errs = validate_str("picker = \"nope\"\n");
         assert_eq!(errs.len(), 1, "{errs:?}");
         assert!(errs[0].contains("picker"));
+    }
+
+    #[test]
+    fn pin_location_defaults_to_tab() {
+        let cfg: Config = toml::from_str("[[pins]]\nname = 'x'\ncommand = 'echo x'\n").unwrap();
+        assert_eq!(cfg.pins[0].location, PinLocation::Tab);
+    }
+
+    #[test]
+    fn pin_location_parses_layout() {
+        let cfg: Config =
+            toml::from_str("[[pins]]\nname = 'x'\ncommand = 'echo x'\nlocation = 'layout'\n")
+                .unwrap();
+        assert_eq!(cfg.pins[0].location, PinLocation::Layout);
+        assert_eq!(PinLocation::Layout.as_str(), "layout");
+    }
+
+    #[test]
+    fn pin_location_bad_value_defaults_but_validate_flags_it() {
+        let body = "[[pins]]\nname = 'x'\ncommand = 'echo x'\nlocation = 'bogus'\n";
+        let cfg: Config = toml::from_str(body).unwrap();
+        assert_eq!(cfg.pins[0].location, PinLocation::Tab);
+        let errs = validate_str(body);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("pins[0].location"), "{errs:?}");
     }
 
     #[test]
