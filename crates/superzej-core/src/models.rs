@@ -30,6 +30,21 @@ pub struct WorktreeRow {
     pub location: String,
 }
 
+/// A persisted tab's layout (native host, schema v4). The `pane_tree` is the
+/// serialized `CenterTree` (host-owned); core treats it as an opaque blob so the
+/// layout model can evolve without touching the schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabLayoutRow {
+    pub tab_name: String,
+    pub kind: String,
+    /// Owning worktree path (empty for home/pinned tabs).
+    pub worktree: String,
+    /// Serialized pane tree (opaque JSON to core).
+    pub pane_tree: String,
+    pub ordinal: i64,
+    pub focused_pane: i64,
+}
+
 /// A worktree enriched with live git status, for `list` / `dashboard` output.
 /// `workspace` holds the owning session name (the workspace) in the v2 model.
 #[derive(Debug, Clone, Serialize)]

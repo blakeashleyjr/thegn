@@ -1,0 +1,17 @@
+[package]
+name = "superzej-svc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "superzej native service layer: git/GitHub/ssh behind traits with CLI fallbacks"
+
+[dependencies]
+superzej-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+# git reads go native via gix (Phase 2); GitHub via octocrab GraphQL (Phase 4).
+gix.workspace = true
+octocrab.workspace = true
+tokio.workspace = true

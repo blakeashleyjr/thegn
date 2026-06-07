@@ -1,0 +1,222 @@
+//! The pane terminal-emulator seam.
+//!
+//! A `PaneEmulator` turns a PTY byte stream into a readable grid of styled
+//! cells. The compositor reads that grid to paint the focused pane; background
+//! panes still `advance()` (drain-without-render) so a backgrounded agent keeps
+//! progressing.
+//!
+//! The spike impl is [`Vt100Emulator`] (the `vt100` crate — a full, simple
+//! emulator). It is intentionally behind a trait: high-fidelity + image-protocol
+//! support (sixel/kitty) swaps in a different impl (`alacritty_terminal` + an
+//! escape-interception passthrough layer, or a `wezterm-term` git dep — the
+//! latter is unpublished on crates.io) without touching the compositor.
+
+/// One styled cell, renderer-agnostic.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GridCell {
+    /// Cell contents (usually one grapheme; empty == blank).
+    pub text: String,
+    pub fg: CellColor,
+    pub bg: CellColor,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub inverse: bool,
+}
+
+/// A color in terminal terms, normalized away from any one library's enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CellColor {
+    #[default]
+    Default,
+    /// One of the 256 indexed colors.
+    Indexed(u8),
+    /// A 24-bit truecolor value.
+    Rgb(u8, u8, u8),
+}
+
+/// A terminal emulator for a single pane.
+pub trait PaneEmulator: Send {
+    /// Feed PTY output bytes (advances the screen; never renders).
+    fn advance(&mut self, bytes: &[u8]);
+    /// Resize the screen to `rows` x `cols`.
+    fn resize(&mut self, rows: u16, cols: u16);
+    /// Current grid size as `(rows, cols)`.
+    fn size(&self) -> (u16, u16);
+    /// Cell at `(row, col)`, or `None` if out of range.
+    fn cell(&self, row: u16, col: u16) -> Option<GridCell>;
+    /// Cursor position as `(row, col)`.
+    fn cursor(&self) -> (u16, u16);
+    /// Whether the cursor should be drawn (hidden in some modes).
+    #[allow(dead_code)]
+    fn cursor_visible(&self) -> bool;
+    /// Scroll the viewport up into history by `n` rows (copy-mode / scrollback).
+    fn scroll_up(&mut self, _n: usize) {}
+    /// Scroll the viewport back down toward the live tail by `n` rows.
+    fn scroll_down(&mut self, _n: usize) {}
+    /// Jump back to the live tail (offset 0).
+    fn scroll_reset(&mut self) {}
+    /// Current scrollback offset in rows (0 == live tail).
+    fn scrollback(&self) -> usize {
+        0
+    }
+    /// Convenience: the visible text of a row, trailing blanks trimmed.
+    #[allow(dead_code)]
+    fn row_text(&self, row: u16) -> String {
+        let (_, cols) = self.size();
+        let mut s = String::new();
+        for col in 0..cols {
+            match self.cell(row, col) {
+                Some(c) if !c.text.is_empty() => s.push_str(&c.text),
+                _ => s.push(' '),
+            }
+        }
+        s.trim_end().to_string()
+    }
+}
+
+/// The `vt100`-backed spike emulator.
+pub struct Vt100Emulator {
+    parser: vt100::Parser,
+}
+
+impl Vt100Emulator {
+    pub fn new(rows: u16, cols: u16, scrollback: usize) -> Self {
+        Self {
+            parser: vt100::Parser::new(rows, cols, scrollback),
+        }
+    }
+}
+
+fn conv_color(c: vt100::Color) -> CellColor {
+    match c {
+        vt100::Color::Default => CellColor::Default,
+        vt100::Color::Idx(i) => CellColor::Indexed(i),
+        vt100::Color::Rgb(r, g, b) => CellColor::Rgb(r, g, b),
+    }
+}
+
+impl PaneEmulator for Vt100Emulator {
+    fn advance(&mut self, bytes: &[u8]) {
+        self.parser.process(bytes);
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) {
+        self.parser.screen_mut().set_size(rows, cols);
+    }
+
+    fn size(&self) -> (u16, u16) {
+        self.parser.screen().size()
+    }
+
+    fn cell(&self, row: u16, col: u16) -> Option<GridCell> {
+        let cell = self.parser.screen().cell(row, col)?;
+        Some(GridCell {
+            text: cell.contents().to_string(),
+            fg: conv_color(cell.fgcolor()),
+            bg: conv_color(cell.bgcolor()),
+            bold: cell.bold(),
+            italic: cell.italic(),
+            underline: cell.underline(),
+            inverse: cell.inverse(),
+        })
+    }
+
+    fn cursor(&self) -> (u16, u16) {
+        self.parser.screen().cursor_position()
+    }
+
+    fn cursor_visible(&self) -> bool {
+        !self.parser.screen().hide_cursor()
+    }
+
+    fn scroll_up(&mut self, n: usize) {
+        let cur = self.parser.screen().scrollback();
+        self.parser.screen_mut().set_scrollback(cur + n);
+    }
+
+    fn scroll_down(&mut self, n: usize) {
+        let cur = self.parser.screen().scrollback();
+        self.parser
+            .screen_mut()
+            .set_scrollback(cur.saturating_sub(n));
+    }
+
+    fn scroll_reset(&mut self) {
+        self.parser.screen_mut().set_scrollback(0);
+    }
+
+    fn scrollback(&self) -> usize {
+        self.parser.screen().scrollback()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_text_lands_in_the_grid() {
+        let mut e = Vt100Emulator::new(24, 80, 0);
+        e.advance(b"hello world");
+        assert_eq!(e.row_text(0), "hello world");
+        assert_eq!(e.cursor(), (0, 11));
+    }
+
+    #[test]
+    fn newline_advances_row() {
+        let mut e = Vt100Emulator::new(24, 80, 0);
+        e.advance(b"line1\r\nline2");
+        assert_eq!(e.row_text(0), "line1");
+        assert_eq!(e.row_text(1), "line2");
+    }
+
+    #[test]
+    fn sgr_bold_and_color_are_captured() {
+        let mut e = Vt100Emulator::new(24, 80, 0);
+        // bold + red foreground, one char, then reset.
+        e.advance(b"\x1b[1;31mX\x1b[0m");
+        let c = e.cell(0, 0).unwrap();
+        assert_eq!(c.text, "X");
+        assert!(c.bold);
+        assert_eq!(c.fg, CellColor::Indexed(1));
+    }
+
+    #[test]
+    fn scrollback_view_reveals_history() {
+        // A 3-row screen with scrollback; print 6 lines so 3 scroll off-screen.
+        let mut e = Vt100Emulator::new(3, 20, 100);
+        for i in 1..=6 {
+            e.advance(format!("line{i}\r\n").as_bytes());
+        }
+        // Live tail: the last lines are visible, line1 is gone.
+        assert_eq!(e.scrollback(), 0);
+        let tail: Vec<String> = (0..3).map(|r| e.row_text(r)).collect();
+        assert!(
+            tail.iter().any(|l| l == "line5"),
+            "tail shows recent: {tail:?}"
+        );
+        assert!(!tail.iter().any(|l| l == "line1"));
+
+        // Scroll all the way up into history — the oldest line comes into view
+        // (vt100 clamps the offset to the available scrollback).
+        e.scroll_up(100);
+        assert!(e.scrollback() > 0, "offset advanced into history");
+        let hist: Vec<String> = (0..3).map(|r| e.row_text(r)).collect();
+        assert!(
+            hist.iter().any(|l| l == "line1"),
+            "history shows line1: {hist:?}"
+        );
+
+        // Reset returns to the live tail.
+        e.scroll_reset();
+        assert_eq!(e.scrollback(), 0);
+    }
+
+    #[test]
+    fn resize_changes_reported_size() {
+        let mut e = Vt100Emulator::new(24, 80, 0);
+        e.resize(40, 100);
+        assert_eq!(e.size(), (40, 100));
+    }
+}

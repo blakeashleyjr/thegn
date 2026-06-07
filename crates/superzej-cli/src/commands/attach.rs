@@ -13,28 +13,37 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 /// The default managed zellij config, seeded to ~/.superzej/zellij.kdl.
-const DEFAULT_CONFIG: &str = include_str!("../../config/zellij.kdl");
+const DEFAULT_CONFIG: &str = include_str!("../../../../config/zellij.kdl");
 
 /// The session/tab layouts, embedded in the binary and seeded into superzej's
 /// private layout dir (see `seed_layouts`). They reference superzej's own
 /// plugins/structure and must track the build, so they ship *with* the binary —
 /// never via the user's `~/.config/zellij`, which superzej must not depend on.
 const LAYOUTS: &[(&str, &str)] = &[
-    ("superzej.kdl", include_str!("../../layouts/superzej.kdl")),
-    ("home-tab.kdl", include_str!("../../layouts/home-tab.kdl")),
+    (
+        "superzej.kdl",
+        include_str!("../../../../layouts/superzej.kdl"),
+    ),
+    (
+        "home-tab.kdl",
+        include_str!("../../../../layouts/home-tab.kdl"),
+    ),
     (
         "worktree-tab.kdl",
-        include_str!("../../layouts/worktree-tab.kdl"),
+        include_str!("../../../../layouts/worktree-tab.kdl"),
     ),
     (
         "worktree-tab-extra.kdl",
-        include_str!("../../layouts/worktree-tab-extra.kdl"),
+        include_str!("../../../../layouts/worktree-tab-extra.kdl"),
     ),
     (
         "worktree-tab-restore.kdl",
-        include_str!("../../layouts/worktree-tab-restore.kdl"),
+        include_str!("../../../../layouts/worktree-tab-restore.kdl"),
     ),
-    ("pin-tab.kdl", include_str!("../../layouts/pin-tab.kdl")),
+    (
+        "pin-tab.kdl",
+        include_str!("../../../../layouts/pin-tab.kdl"),
+    ),
 ];
 
 /// `superzej attach [session]`:

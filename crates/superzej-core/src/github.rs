@@ -207,6 +207,15 @@ pub struct ChecksSummary {
     pub total: u32,
 }
 
+impl PrStatus {
+    /// Recompute the checks rollup from `status_check_rollup`. The CLI path does
+    /// this inline after deserializing; the octocrab native path (superzej-svc)
+    /// calls this so both produce an identical summary.
+    pub fn recompute_checks(&mut self) {
+        self.checks = summarize(&self.status_check_rollup);
+    }
+}
+
 fn summarize(runs: &[CheckRun]) -> ChecksSummary {
     let mut s = ChecksSummary::default();
     for r in runs {
