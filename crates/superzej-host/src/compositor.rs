@@ -31,46 +31,79 @@ fn color_attr(c: CellColor) -> ColorAttribute {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CellStyle {
+    fg: CellColor,
+    bg: CellColor,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+}
+
+fn emit_style(surface: &mut Surface, style: CellStyle) {
+    surface.add_change(Change::Attribute(AttributeChange::Foreground(color_attr(
+        style.fg,
+    ))));
+    surface.add_change(Change::Attribute(AttributeChange::Background(color_attr(
+        style.bg,
+    ))));
+    surface.add_change(Change::Attribute(AttributeChange::Intensity(
+        if style.bold {
+            Intensity::Bold
+        } else {
+            Intensity::Normal
+        },
+    )));
+    surface.add_change(Change::Attribute(AttributeChange::Italic(style.italic)));
+    surface.add_change(Change::Attribute(AttributeChange::Underline(
+        if style.underline {
+            Underline::Single
+        } else {
+            Underline::None
+        },
+    )));
+}
+
+fn flush_run(surface: &mut Surface, run: &mut String) {
+    if !run.is_empty() {
+        surface.add_change(Change::Text(std::mem::take(run)));
+    }
+}
+
 /// Paint `emu`'s visible grid into `surface` at `rect`. Cells beyond the
 /// emulator's size are left untouched (chrome owns them).
 pub fn compose_pane(surface: &mut Surface, emu: &dyn PaneEmulator, rect: Rect) {
     let (erows, ecols) = emu.size();
+    let mut current_style: Option<CellStyle> = None;
+    let mut run = String::new();
     for row in 0..rect.rows.min(erows as usize) {
+        flush_run(surface, &mut run);
         surface.add_change(Change::CursorPosition {
             x: Position::Absolute(rect.x),
             y: Position::Absolute(rect.y + row),
         });
         for col in 0..rect.cols.min(ecols as usize) {
             let cell = emu.cell(row as u16, col as u16).unwrap_or_default();
-            surface.add_change(Change::Attribute(AttributeChange::Foreground(color_attr(
-                if cell.inverse { cell.bg } else { cell.fg },
-            ))));
-            surface.add_change(Change::Attribute(AttributeChange::Background(color_attr(
-                if cell.inverse { cell.fg } else { cell.bg },
-            ))));
-            surface.add_change(Change::Attribute(AttributeChange::Intensity(
-                if cell.bold {
-                    Intensity::Bold
-                } else {
-                    Intensity::Normal
-                },
-            )));
-            surface.add_change(Change::Attribute(AttributeChange::Italic(cell.italic)));
-            surface.add_change(Change::Attribute(AttributeChange::Underline(
-                if cell.underline {
-                    Underline::Single
-                } else {
-                    Underline::None
-                },
-            )));
-            let text = if cell.text.is_empty() {
-                " ".to_string()
-            } else {
-                cell.text
+            let style = CellStyle {
+                fg: if cell.inverse { cell.bg } else { cell.fg },
+                bg: if cell.inverse { cell.fg } else { cell.bg },
+                bold: cell.bold,
+                italic: cell.italic,
+                underline: cell.underline,
             };
-            surface.add_change(Change::Text(text));
+            if current_style != Some(style) {
+                flush_run(surface, &mut run);
+                emit_style(surface, style);
+                current_style = Some(style);
+            }
+            if cell.text.is_empty() {
+                run.push(' ');
+            } else {
+                run.push_str(&cell.text);
+            }
         }
     }
+    flush_run(surface, &mut run);
 }
 
 #[cfg(test)]
