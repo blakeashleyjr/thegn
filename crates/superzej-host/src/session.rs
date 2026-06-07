@@ -96,7 +96,12 @@ impl Session {
         // Also fetch any worktrees recorded for this session that aren't in tab_layout yet.
         // This handles migrating/restoring state from older sessions where tab_layout wasn't used.
         if let Ok(wts) = db.worktrees() {
-            let slug = superzej_core::repo::repo_slug(std::path::Path::new(session));
+            let session_path = std::path::Path::new(session);
+            let slug = if session_path.is_absolute() {
+                superzej_core::repo::repo_slug(session_path)
+            } else {
+                session.to_string()
+            };
             for wt in wts {
                 if wt.session_name == session && !tabs.iter().any(|t| t.name == wt.tab_name) {
                     tabs.push(Tab {
