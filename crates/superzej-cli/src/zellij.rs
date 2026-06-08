@@ -266,6 +266,11 @@ pub fn close_tab() -> bool {
     action(&["close-tab"])
 }
 
+/// Close a tab by name.
+pub fn close_tab_name(name: &str) -> bool {
+    action(&["close-tab", name])
+}
+
 pub fn go_to_tab_name(name: &str) -> bool {
     action(&["go-to-tab-name", name])
 }

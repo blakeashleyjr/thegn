@@ -298,6 +298,13 @@ pub enum PinAction {
         #[arg(long = "in-place")]
         in_place: bool,
     },
+    /// Close a running pin tab (unpin from runtime).
+    Close {
+        target: String,
+        /// Session name (passed by the tabbar plugin).
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// List configured pins as JSON (the tabbar's pin-chip feed).
     List {
         #[arg(long)]

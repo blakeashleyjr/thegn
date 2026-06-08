@@ -40,10 +40,13 @@ pub fn run(cfg: &Config, action: PinAction) -> Result<()> {
     match action {
         PinAction::Open { target, session } => open(cfg, &target, session),
         PinAction::Exec { .. } => exec(cfg),
+        PinAction::Close { target, session } => {
+            close(cfg, &target, session);
+            Ok(())
+        }
         PinAction::List { json } => list(cfg, json),
     }
 }
-
 /// The tab name for a pin (`pin:<name>`).
 fn tab_name(name: &str) -> String {
     format!("{PIN_PREFIX}{name}")
@@ -140,6 +143,21 @@ fn open_tab(pin: &Pin) {
         zellij::go_to_tab_name(&tab);
     } else {
         zellij::new_tab(&tab, &cwd, Some(layout));
+    }
+}
+
+/// Close a running pin tab by name or index.
+fn close(cfg: &Config, target: &str, session: Option<String>) {
+    if let Some(s) = session.as_deref() {
+        std::env::set_var("ZELLIJ_SESSION_NAME", s);
+    }
+    let pin = resolve(cfg, target)
+        .unwrap_or_else(|| msg::die(&format!("pin: unknown pin '{target}'")));
+    let tab = tab_name(&pin.name);
+    if zellij::tab_names().iter().any(|t| t == &tab) {
+        zellij::close_tab_name(&tab);
+    } else {
+        msg::info(&format!("pin '{}' is not running", pin.name));
     }
 }
 
