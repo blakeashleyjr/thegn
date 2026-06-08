@@ -269,7 +269,7 @@ entity, not a float — overrides the float reading below), summoned by `Alt-1..
 - [x] 65. Singleton vs multi-instance
 - [x] 66. Persist daemons across workspace switches _(free: a pin tab stays in the session)_
 - [ ] 67. Promote running pane to pinned
-- [ ] 68. Unpin at runtime
+- [x] 68. Unpin at runtime
 - [ ] 69. Top-strip sizing/ratio
 - [x] 70. Program labels + status glyph _(chip label + ●/◌ running/stopped)_
 - [ ] 71. Per-program env injection
