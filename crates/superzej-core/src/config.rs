@@ -193,6 +193,15 @@ pub struct Pin {
     /// Which workspace this pin belongs to (only used when `scope = "workspace"`).
     #[serde(default)]
     pub workspace: Option<String>,
+    /// When to start this pin: "lazy" (on first access) or "eager" (when session starts).
+    #[serde(default)]
+    pub start: PinStart,
+    /// When to restart this pin after it exits.
+    #[serde(default)]
+    pub restart: PinRestart,
+    /// Whether to allow multiple instances or enforce singleton behavior.
+    #[serde(default = "default_true")]
+    pub singleton: bool,
 }
 
 /// When to start a pin.
