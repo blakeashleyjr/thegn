@@ -228,8 +228,7 @@ fn list(cfg: &Config, json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::PinLocation;
-    use crate::config::PinScope;
+    use crate::config::{PinLocation, PinRestart, PinScope, PinStart};
     use std::path::Path;
 
     fn cfg_with(pins: &[(&str, &str)]) -> Config {
@@ -243,6 +242,9 @@ mod tests {
                     location: PinLocation::Tab,
                     scope: PinScope::Global,
                     workspace: None,
+                    start: PinStart::Lazy,
+                    restart: PinRestart::Never,
+                    singleton: true,
                 })
                 .collect(),
             ..Config::default()
@@ -257,6 +259,9 @@ mod tests {
             location,
             scope: PinScope::Global,
             workspace: None,
+            start: PinStart::Lazy,
+            restart: PinRestart::Never,
+            singleton: true,
         }
     }
 

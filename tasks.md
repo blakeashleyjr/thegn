@@ -266,7 +266,7 @@ entity, not a float — overrides the float reading below), summoned by `Alt-1..
 - [x] 62. Pin definition in config — `[[pins]]` name/command/cwd _(args/location/scope deferred)_
 - [x] 63. Eager vs lazy start
 - [x] 64. Restart-on-exit policy
-- [ ] 65. Singleton vs multi-instance
+- [x] 65. Singleton vs multi-instance
 - [x] 66. Persist daemons across workspace switches _(free: a pin tab stays in the session)_
 - [ ] 67. Promote running pane to pinned
 - [ ] 68. Unpin at runtime
