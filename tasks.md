@@ -262,10 +262,10 @@ entity, not a float — overrides the float reading below), summoned by `Alt-1..
 - [~] 58. Add anywhere (into active layout) _(docs/e2e done, pending PR)_
 - [ ] 59. Floating/scratch pin _(tools/drawer/monitors are floats, but not a pin system)_
 - [x] 60. Global pins (everywhere) _(every pin is a session-level tab)_
-- [ ] 61. Workspace-scoped pins
+- [x] 61. Workspace-scoped pins
 - [x] 62. Pin definition in config — `[[pins]]` name/command/cwd _(args/location/scope deferred)_
-- [~] 63. Eager vs lazy start _(lazy implemented; eager deferred)_
-- [ ] 64. Restart-on-exit policy
+- [x] 63. Eager vs lazy start
+- [x] 64. Restart-on-exit policy
 - [ ] 65. Singleton vs multi-instance
 - [x] 66. Persist daemons across workspace switches _(free: a pin tab stays in the session)_
 - [ ] 67. Promote running pane to pinned

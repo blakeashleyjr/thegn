@@ -229,6 +229,7 @@ fn list(cfg: &Config, json: bool) -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::PinLocation;
+    use crate::config::PinScope;
     use std::path::Path;
 
     fn cfg_with(pins: &[(&str, &str)]) -> Config {
@@ -240,6 +241,8 @@ mod tests {
                     command: (*cmd).into(),
                     cwd: None,
                     location: PinLocation::Tab,
+                    scope: PinScope::Global,
+                    workspace: None,
                 })
                 .collect(),
             ..Config::default()
@@ -252,6 +255,8 @@ mod tests {
             command: command.into(),
             cwd: cwd.map(str::to_string),
             location,
+            scope: PinScope::Global,
+            workspace: None,
         }
     }
 

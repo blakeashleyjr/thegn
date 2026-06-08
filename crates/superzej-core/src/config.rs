@@ -157,6 +157,14 @@ config_enum! {
     } default = Tab;
 }
 
+config_enum! {
+    /// Whether a pin is global (all workspaces) or workspace-scoped.
+    pub enum PinScope: "pin scope" {
+        Global = "global" | "everywhere" | "all",
+        Workspace = "workspace" | "local",
+    } default = Global;
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NamedCommand {
     pub name: String,
@@ -166,8 +174,8 @@ pub struct NamedCommand {
 /// A `[[pins]]` entry — a named program that opens either as its own session
 /// tab (`location = "tab"`, the default) or as a tiled pane in the active
 /// layout (`location = "layout"`). Pins are summoned via `Alt-1..9` / the
-/// tabbar's pin chips, are global (reachable from anywhere), and run on the
-/// host (no sandbox wrap). See `src/commands/pin.rs`.
+/// tabbar's pin chips, and can be global (all workspaces) or workspace-scoped.
+/// See `src/commands/pin.rs`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Pin {
     pub name: String,
@@ -179,6 +187,31 @@ pub struct Pin {
     /// Where the pin appears when opened.
     #[serde(default)]
     pub location: PinLocation,
+    /// Whether the pin is global (all workspaces) or workspace-scoped.
+    #[serde(default)]
+    pub scope: PinScope,
+    /// Which workspace this pin belongs to (only used when `scope = "workspace"`).
+    #[serde(default)]
+    pub workspace: Option<String>,
+}
+
+/// When to start a pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PinStart {
+    #[default]
+    Lazy,
+    Eager,
+}
+
+/// When to restart a pin after it exits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PinRestart {
+    #[default]
+    Never,
+    Always,
+    OnFailure,
 }
 
 fn default_true() -> bool {
@@ -1002,6 +1035,18 @@ impl Config {
     /// The pin at 1-based position `idx` (the `Alt-1..9` mapping).
     pub fn pin_by_index(&self, idx: usize) -> Option<&Pin> {
         idx.checked_sub(1).and_then(|i| self.pins.get(i))
+    }
+
+    /// Pins visible in a workspace: global pins + workspace-scoped pins for that workspace.
+    /// When `workspace` is `None`, returns only global pins.
+    pub fn pins_for_workspace(&self, workspace: Option<&str>) -> Vec<&Pin> {
+        self.pins
+            .iter()
+            .filter(|p| match p.scope {
+                PinScope::Global => true,
+                PinScope::Workspace => p.workspace.as_deref() == workspace.or(Some("*")),
+            })
+            .collect()
     }
 
     /// The resource-monitor command for a stat segment: `cpu`/`mem` → the

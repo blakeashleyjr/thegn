@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "superzej substrate-agnostic core: state, git, sandbox, config, theme"
 
+[features]
+test-utils = []
+
 [dependencies]
 # Only for the `clap::ValueEnum` derive on `github::MergeMethod` (a CLI arg type
 # that lives with its domain model). Cheap; keeps core CLI-usable.
