@@ -621,45 +621,6 @@ impl Default for DrawerConfig {
     }
 }
 
-/// Mode-aware keybind tables. The legacy `[keybinds]` table is stored in
-/// `normal` and remains map-like via `Deref`, while nested tables such as
-/// `[keybinds.vim_normal]` add modal layers for the native host.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default)]
-pub struct KeybindsConfig {
-    #[serde(default, flatten)]
-    pub normal: BTreeMap<String, String>,
-    #[serde(default)]
-    pub vim_normal: BTreeMap<String, String>,
-    #[serde(default)]
-    pub vim_insert: BTreeMap<String, String>,
-    #[serde(default)]
-    pub emacs: BTreeMap<String, String>,
-}
-
-impl std::ops::Deref for KeybindsConfig {
-    type Target = BTreeMap<String, String>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.normal
-    }
-}
-
-impl std::ops::DerefMut for KeybindsConfig {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.normal
-    }
-}
-
-impl<'a> IntoIterator for &'a KeybindsConfig {
-    type Item = (&'a String, &'a String);
-    type IntoIter = std::collections::btree_map::Iter<'a, String, String>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.normal.iter()
-    }
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
@@ -690,19 +651,9 @@ pub struct Config {
     pub sandbox: SandboxConfig,
     pub limits: LimitsConfig,
     pub drawer: DrawerConfig,
-<<<<<<< Updated upstream
     /// Rebind a built-in action by id, e.g. `new-worktree = "Ctrl w"`. The flat
     /// table is the global/default layer; nested mode tables are native-host only.
     pub keybinds: KeybindConfig,
-||||||| Stash base
-    /// Rebind a built-in action by id, e.g. `new-worktree = "Ctrl w"` (a plain
-    /// table — kept last so it serializes after all other sub-tables).
-    pub keybinds: BTreeMap<String, String>,
-=======
-    /// Rebind a built-in action by id, e.g. `new-worktree = "Ctrl w"` (a plain
-    /// table — kept last so it serializes after all other sub-tables).
-    pub keybinds: KeybindsConfig,
->>>>>>> Stashed changes
 }
 
 impl Default for Config {
@@ -737,13 +688,7 @@ impl Default for Config {
             sandbox: SandboxConfig::default(),
             limits: LimitsConfig::default(),
             drawer: DrawerConfig::default(),
-<<<<<<< Updated upstream
             keybinds: KeybindConfig::default(),
-||||||| Stash base
-            keybinds: BTreeMap::new(),
-=======
-            keybinds: KeybindsConfig::default(),
->>>>>>> Stashed changes
             actions: Vec::new(),
         }
     }
@@ -1873,7 +1818,7 @@ forward_agent = false
     }
 
     #[test]
-    fn config_parses_mode_specific_keybinds() {
+    fn config_parses_all_mode_specific_keybind_tables() {
         let toml = r#"
             [keybinds]
             new-worktree = "Ctrl w"

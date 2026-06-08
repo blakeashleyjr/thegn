@@ -193,7 +193,7 @@ start name="dev": build
 attach: start
 
 # Build and open the native host in a fresh ghostty window. `ghostty -e` runs the
-# repo-local `target/debug/szhost` directly (no fish autostart and no legacy
+# repo-local `target/debug/szhost` directly (no shell autostart and no legacy
 # zellij/WASM wrapper), with only the instance's isolated XDG state injected.
 start-term name="dev": build
     mkdir -p "$HOME/.superzej-{{name}}/state"
