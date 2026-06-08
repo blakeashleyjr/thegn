@@ -73,10 +73,19 @@ struct State {
     pin_spans: Vec<(usize, usize, usize)>,
 }
 
+/// Placement for a pinned program. The tabbar renders both identically in this
+/// slice; the binary owns the behavior when the chip is activated.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PinLocation {
+    Tab,
+    Layout,
+}
+
 /// A pinned program in the strip: its 1-based `Alt-N` index + display name.
 struct PinChip {
     index: usize,
     name: String,
+    location: PinLocation,
 }
 
 struct Tab {
@@ -277,13 +286,12 @@ impl ZellijPlugin for State {
                 false
             }
             Event::Mouse(Mouse::LeftClick(_line, col)) => {
-                // Pin chips launch-or-focus their `pin:<name>` tab (only the
-                // focused tab gets the click, so no broadcast race).
+                // Pin chips launch-or-focus according to their configured
+                // placement (tab or active-layout pane). Only the focused tab
+                // gets the click, so no broadcast race.
                 if let Some(idx) = self.pin_at(col) {
-                    run_command(
-                        &["superzej", "pin", "open", &idx.to_string()],
-                        BTreeMap::new(),
-                    );
+                    self.refocus_center();
+                    run_pin_open(idx, self.session.as_deref());
                     return false;
                 }
                 match self.col_to_index(col) {
@@ -329,17 +337,15 @@ impl ZellijPlugin for State {
         // Alt-1..9: launch-or-focus the Nth pinned program. The broadcast hits
         // every per-tab instance, so — like select_topbar — only the focused
         // tab's instance acts (else two instances would race `pin open` and
-        // could create duplicate `pin:<name>` tabs). The binary then resolves
-        // the index against config and `go-to-tab`/`new-tab`s as needed.
+        // could create duplicate `pin:<name>` tabs or layout panes). The binary
+        // resolves the index and config placement.
         if let Some(idx) = pin_pipe_index(&pipe.name) {
             if self.my_tab.is_some()
                 && self.my_tab == self.active_tab
                 && self.pins.iter().any(|p| p.index == idx)
             {
-                run_command(
-                    &["superzej", "pin", "open", &idx.to_string()],
-                    BTreeMap::new(),
-                );
+                self.refocus_center();
+                run_pin_open(idx, self.session.as_deref());
             }
             return false;
         }
@@ -569,6 +575,26 @@ fn pin_pipe_index(name: &str) -> Option<usize> {
     name.strip_prefix("superzej_pin_")?.parse().ok()
 }
 
+fn open_pin_args(idx: usize, session: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "superzej".to_string(),
+        "pin".to_string(),
+        "open".to_string(),
+        idx.to_string(),
+    ];
+    if let Some(s) = session.filter(|s| !s.is_empty()) {
+        args.push("--session".to_string());
+        args.push(s.to_string());
+    }
+    args
+}
+
+fn run_pin_open(idx: usize, session: Option<&str>) {
+    let args = open_pin_args(idx, session);
+    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    run_command(&refs, BTreeMap::new());
+}
+
 /// Whether a tab is a pinned-program tab (`pin:<name>` → repo "" / base `pin:…`).
 fn is_pin_tab(t: &Tab) -> bool {
     t.repo.is_empty() && t.base.starts_with("pin:")
@@ -633,25 +659,35 @@ impl State {
             .is_some_and(|(r, b)| r.is_empty() && *b == tab)
     }
 
-    /// Parse `superzej pin list`'s TSV (`index\tname\tcommand`) into the pin
-    /// chips. Returns whether the set changed (so the caller skips no-op
-    /// repaints — pins rarely change within a session).
+    /// Parse `superzej pin list`'s TSV (`index\tname\tlocation\tcommand`) into
+    /// the pin chips. The previous shape was `index\tname\tcommand`; unknown
+    /// third fields are treated as old-format commands and default to tab.
+    /// Returns whether the set changed (so the caller skips no-op repaints —
+    /// pins rarely change within a session).
     fn update_pins(&mut self, stdout: &[u8]) -> bool {
         let s = String::from_utf8_lossy(stdout);
         let pins: Vec<PinChip> = s
             .lines()
             .filter_map(|line| {
-                let mut it = line.split('\t');
-                let index: usize = it.next()?.trim().parse().ok()?;
-                let name = it.next()?.to_string();
-                Some(PinChip { index, name })
+                let fields: Vec<&str> = line.split('\t').collect();
+                let index: usize = fields.first()?.trim().parse().ok()?;
+                let name = fields.get(1)?.to_string();
+                let location = match fields.get(2).map(|s| s.trim()) {
+                    Some("layout") => PinLocation::Layout,
+                    _ => PinLocation::Tab,
+                };
+                Some(PinChip {
+                    index,
+                    name,
+                    location,
+                })
             })
             .collect();
         let changed = pins.len() != self.pins.len()
             || pins
                 .iter()
                 .zip(&self.pins)
-                .any(|(a, b)| a.index != b.index || a.name != b.name);
+                .any(|(a, b)| a.index != b.index || a.name != b.name || a.location != b.location);
         if changed {
             self.pins = pins;
         }
@@ -825,7 +861,7 @@ impl State {
 
 #[cfg(test)]
 mod tests {
-    use super::{State, Tab, pin_pipe_index, split_page, step_sel};
+    use super::{PinLocation, State, Tab, open_pin_args, pin_pipe_index, split_page, step_sel};
 
     #[test]
     fn pin_pipe_index_parses_alt_n() {
@@ -838,16 +874,31 @@ mod tests {
     #[test]
     fn update_pins_parses_tsv() {
         let mut s = State::default();
-        assert!(s.update_pins(b"1\taerc\taerc\n2\tlogs\tjournalctl -f\n"));
+        assert!(s.update_pins(b"1\taerc\ttab\taerc\n2\tlogs\tlayout\tjournalctl -f\n"));
         assert_eq!(s.pins.len(), 2);
         assert_eq!(s.pins[0].index, 1);
         assert_eq!(s.pins[0].name, "aerc");
+        assert_eq!(s.pins[0].location, PinLocation::Tab);
         assert_eq!(s.pins[1].name, "logs");
+        assert_eq!(s.pins[1].location, PinLocation::Layout);
         // Re-parsing the same TSV is a no-op (no needless repaint).
-        assert!(!s.update_pins(b"1\taerc\taerc\n2\tlogs\tjournalctl -f\n"));
+        assert!(!s.update_pins(b"1\taerc\ttab\taerc\n2\tlogs\tlayout\tjournalctl -f\n"));
+        // Old binary/new plugin mismatch: third column was the command; default
+        // the unknown location to tab instead of dropping the chip.
+        assert!(s.update_pins(b"1\taerc\taerc\n"));
+        assert_eq!(s.pins[0].location, PinLocation::Tab);
         // Empty input clears.
         assert!(s.update_pins(b""));
         assert!(s.pins.is_empty());
+    }
+
+    #[test]
+    fn open_pin_args_includes_session_when_known() {
+        assert_eq!(
+            open_pin_args(2, Some("superzej")),
+            ["superzej", "pin", "open", "2", "--session", "superzej"]
+        );
+        assert_eq!(open_pin_args(1, None), ["superzej", "pin", "open", "1"]);
     }
 
     #[test]
