@@ -120,6 +120,7 @@ pub fn fill(surface: &mut Surface, rect: Rect, bg: ColorAttribute) {
 /// What the chrome needs to paint a frame. Populated from session state + DB +
 /// git by the host; kept renderer-agnostic so it's unit-testable.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct FrameModel {
     pub tabs: Vec<String>,
     pub active_tab: usize,

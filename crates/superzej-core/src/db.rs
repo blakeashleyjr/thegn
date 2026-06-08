@@ -44,8 +44,7 @@ impl Db {
     }
 
     /// An isolated in-memory DB (tests): same schema/migration, no file.
-    #[cfg(test)]
-    pub(crate) fn open_memory() -> Result<Db> {
+    pub fn open_memory() -> Result<Db> {
         Self::init(Connection::open_in_memory()?)
     }
 
