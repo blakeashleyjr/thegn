@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 /// The committed example, seeded on first `config edit`.
-const EXAMPLE: &str = include_str!("../../config/config.toml.example");
+const EXAMPLE: &str = include_str!("../../../../config/config.toml.example");
 
 pub fn run(cfg: &Config, action: ConfigAction, path: PathBuf) -> Result<()> {
     match action {

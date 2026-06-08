@@ -13,10 +13,10 @@ use crate::util;
 use std::path::PathBuf;
 
 /// Bundled yazi config, embedded in the binary and seeded at first launch.
-const YAZI_TOML: &str = include_str!("../config/yazi/yazi.toml");
-const KEYMAP_TOML: &str = include_str!("../config/yazi/keymap.toml");
+const YAZI_TOML: &str = include_str!("../../../config/yazi/yazi.toml");
+const KEYMAP_TOML: &str = include_str!("../../../config/yazi/keymap.toml");
 /// `theme.toml` with an `{{ACCENT}}` placeholder (an `#rrggbb`), filled per-open.
-const THEME_TMPL: &str = include_str!("../config/yazi/theme.toml");
+const THEME_TMPL: &str = include_str!("../../../config/yazi/theme.toml");
 
 /// The file manager the drawer runs: an explicit `[drawer] command`, else the
 /// pinned yazi (`SUPERZEJ_YAZI_BIN`), else `yazi` on PATH.

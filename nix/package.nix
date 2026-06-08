@@ -42,28 +42,30 @@ in
     # rusqlite is vendored with the `bundled` feature → no system sqlite needed.
 
     postInstall = ''
-      # Short alias.
+      # The native host is the installed user-facing program during the native
+      # rebuild. Keep the transitional zellij-driven CLI available explicitly.
+      mv $out/bin/superzej $out/bin/superzej-cli
+      mv $out/bin/szhost $out/bin/superzej
       ln -s superzej $out/bin/sj
+      ln -s superzej $out/bin/szhost
 
-      # Expose the pinned zellij under a superzej-private name, and point the
-      # binary at it. superzej drives THIS zellij (its own version, socket and
-      # cache namespace) — never the user's system `zellij`.
+      # Expose the pinned zellij under a superzej-private name for the legacy CLI.
       ln -s ${zellij}/bin/zellij $out/bin/superzej-zellij
 
-      # Same for yazi: expose the pinned build under a private name and point the
-      # drawer at it. superzej drives THIS yazi (its own version + a private
-      # YAZI_CONFIG_HOME) — never the user's system `yazi`.
+      # Same for yazi: expose the pinned build under a private name for the legacy
+      # file drawer path.
       ln -s ${yazi}/bin/yazi $out/bin/superzej-yazi
 
-      # Inject runtime tools onto PATH (so the plugins' `zellij run` resolves to
-      # the pinned build too) and pin the binaries superzej drives.
-      wrapProgram $out/bin/superzej \
+      # The native host itself does not drive zellij/WASM plugins. Wrap the legacy
+      # CLI so old subcommands still get the pinned toolchain when invoked as
+      # `superzej-cli`.
+      wrapProgram $out/bin/superzej-cli \
         --set SUPERZEJ_ZELLIJ_BIN ${zellij}/bin/zellij \
         --set SUPERZEJ_YAZI_BIN ${yazi}/bin/yazi \
         --prefix PATH : ${lib.makeBinPath runtimeDeps}
 
       # Layouts and the zellij config (config/zellij.kdl) are both embedded in the
-      # binary and seeded into superzej's private ~/.superzej/{layouts,zellij.kdl}
+      # legacy CLI and seeded into superzej's private ~/.superzej/{layouts,zellij.kdl}
       # at launch — nothing zellij-related is shipped into the user's config tree.
     '';
 
