@@ -1,0 +1,29 @@
+[package]
+name = "superzej-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "superzej native terminal host: the compositor + in-process chrome"
+
+# Dev binary name during the rebuild; becomes `superzej` once it reaches parity
+# (the transitional zellij driver currently owns that name in superzej-cli).
+[[bin]]
+name = "szhost"
+path = "src/main.rs"
+
+[dependencies]
+superzej-core.workspace = true
+superzej-svc.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Compositor substrate (Phase 1).
+tokio.workspace = true
+portable-pty.workspace = true
+termwiz.workspace = true
+vt100.workspace = true
+nucleo-matcher.workspace = true
+
+[dev-dependencies]
+toml.workspace = true

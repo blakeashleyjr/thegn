@@ -1,23 +1,18 @@
+// The substrate-agnostic core now lives in its own crate. Re-export its modules
+// under `crate::` so the (transitional) zellij-driven command + palette code that
+// references `crate::db`, `crate::config`, … keeps resolving unchanged. The
+// `#[macro_use]` pulls in core's exported `outln!`/`out!` macros crate-wide.
+pub use superzej_core::{
+    config, db, diff_highlight, github, keymap, log, models, msg, out, picker, remote, repo,
+    sandbox, theme, util, worktree, yazi,
+};
+// `out` above already brings the `out!` macro into scope (same path, macro
+// namespace); add `outln!` so `crate::outln!` call sites resolve too.
+pub use superzej_core::outln;
+
 mod cli;
 mod commands;
-mod config;
-mod db;
-mod diff_highlight;
-mod github;
-mod keymap;
-mod log;
-mod models;
-mod msg;
-mod out;
 mod palette;
-mod picker;
-mod remote;
-mod repo;
-mod sandbox;
-mod theme;
-mod util;
-mod worktree;
-mod yazi;
 mod zellij;
 
 use clap::Parser;

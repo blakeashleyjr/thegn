@@ -6,7 +6,7 @@
 use crate::cli::KeysAction;
 use crate::commands::attach;
 use crate::config::Config;
-use crate::keymap::{self, Collision, Context, Scope};
+use crate::keymap::{self, Context, Scope};
 use crate::msg;
 use anyhow::Result;
 
@@ -100,11 +100,11 @@ fn validate(cfg: &Config) -> Result<()> {
     }
     for c in &cols {
         match c {
-            Collision::Duplicate { chord, ids } => msg::error(&format!(
+            keymap::Collision::Duplicate { chord, ids } => msg::error(&format!(
                 "chord {chord:?} bound to multiple actions: {}",
                 ids.join(", ")
             )),
-            Collision::Reserved { chord, id } => msg::error(&format!(
+            keymap::Collision::Reserved { chord, id } => msg::error(&format!(
                 "action {id:?} uses reserved zellij chord {chord:?}"
             )),
         }

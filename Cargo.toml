@@ -1,21 +1,26 @@
-[package]
-name = "superzej"
+[workspace]
+resolver = "2"
+members = [
+  "crates/superzej-core",
+  "crates/superzej-cli",
+  "crates/superzej-svc",
+  "crates/superzej-host",
+]
+# The WASM plugins are built standalone (Nix sandboxes their subdirs); keep them
+# out of the host workspace so a normal `cargo build` never pulls the wasm target.
+exclude = ["plugin"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-description = "Terminal-native git-worktree IDE on top of zellij"
 license = "MIT"
-default-run = "superzej"
 
-[[bin]]
-name = "superzej"
-path = "src/main.rs"
-
-[dependencies]
+[workspace.dependencies]
+# --- shared domain/runtime deps ---
 clap = { version = "4.5", features = ["derive", "env"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Per-repo `.superzej.{yaml,yml}` overlay parsing (toml/json already covered).
 serde_yaml = "0.9"
 toml = "0.8"
 walkdir = "2.5"
@@ -25,40 +30,11 @@ syntect = { version = "5", default-features = false, features = [
   "default-themes",
   "regex-fancy",
 ] }
-# Cross-platform CPU/memory sampling (Linux/macOS/Windows/BSD); only the
-# `system` component is needed — disk/network/etc. are off.
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
-# Timezone-correct local wall-clock for the tabbar widget.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-# NVIDIA GPU utilization. Loads libnvidia-ml at runtime (dlopen), so it's safe
-# to depend on unconditionally — `Nvml::init()` simply errors on machines
-# without it, and we fall back to the OS-native GPU counter (see stats.rs).
 nvml-wrapper = "0.12"
-# Already vendored transitively (via sysinfo); used only to restore the default
-# SIGPIPE disposition at startup so `superzej … | head` exits quietly.
 libc = "0.2"
-# Filesystem change notifications for the `watch` daemon (the panel's live diff
-# refresh). Pure Rust; uses the OS-native backend (inotify on Linux).
 notify = "6"
-
-# --- cmd+k command palette (`superzej menu`) ---
-# iocraft: React-like declarative TUI (flexbox via taffy, components + hooks);
-# drives the full-screen palette. smol is its async runtime (render loop +
-# `smol::Timer` poll ticks).
-iocraft = "0.8.3"
-smol = "2.0.2"
-# nucleo: helix's fuzzy matcher — lock-free streaming over a background
-# threadpool, so matching never blocks the UI thread.
-nucleo = "0.5.0"
-# ripgrep's own internals as libraries: `ignore` for the parallel,
-# .gitignore-aware file walk; grep-searcher/regex for embedded content search.
-ignore = "0.4.26"
-grep-searcher = "0.1.16"
-grep-regex = "0.1.14"
-grep-matcher = "0.1.8"
-# Structured, level-filtered diagnostics. `tracing` is the facade; the subscriber
-# is hand-composed in src/log.rs (a custom branded formatter + a hand-rolled
-# size-capped file sink) — so default-features off and no `tracing-appender`.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = [
   "std",
@@ -67,11 +43,36 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
   "env-filter",
   "registry",
 ] }
-
-[dev-dependencies]
-# Stream combinators for the palette's in-process mock-terminal e2e tests
-# (iocraft's `mock_terminal_render_loop` yields a `Stream<Canvas>`).
+# --- palette (engine + the legacy iocraft view that still lives in the cli) ---
+iocraft = "0.8.3"
+smol = "2.0.2"
+nucleo = "0.5.0"
+nucleo-matcher = "0.3"
+ignore = "0.4.26"
+grep-searcher = "0.1.16"
+grep-regex = "0.1.14"
+grep-matcher = "0.1.8"
 futures = "0.3"
+# --- native host substrate (Phase 1+) ---
+# NOTE: wezterm-term (the plan's first choice for its built-in sixel/kitty image
+# protocols) is NOT published to crates.io — it is an internal WezTerm workspace
+# crate. We use termwiz (published; outer-terminal render + Surface diff/flush +
+# escape parser) and a pluggable `PaneEmulator` trait. The spike's emulator impl
+# is vt100; high-fidelity/graphics swaps in alacritty_terminal + an escape-
+# interception passthrough layer (or a wezterm-term git dep) without touching the
+# compositor — see the host crate's emulator module.
+tokio = { version = "1", features = ["full"] }
+portable-pty = "0.9"
+termwiz = "0.23"
+vt100 = "0.16"
+taffy = "0.5"
+# --- native service layer (Phase 4/5) ---
+octocrab = "0.53"
+russh = "0.61"
+gix = "0.84"
+# --- internal crates ---
+superzej-core = { path = "crates/superzej-core" }
+superzej-svc = { path = "crates/superzej-svc" }
 
 [profile.release]
 strip = true

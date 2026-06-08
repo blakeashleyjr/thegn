@@ -1,0 +1,40 @@
+[package]
+name = "superzej-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "superzej CLI + the (transitional) zellij-driven shell"
+
+[[bin]]
+name = "superzej"
+path = "src/main.rs"
+
+[dependencies]
+superzej-core.workspace = true
+clap.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+toml.workspace = true
+walkdir.workspace = true
+anyhow.workspace = true
+syntect.workspace = true
+sysinfo.workspace = true
+chrono.workspace = true
+nvml-wrapper.workspace = true
+libc.workspace = true
+notify.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# palette (iocraft view still lives here until Phase 3 moves it into the host)
+iocraft.workspace = true
+smol.workspace = true
+nucleo.workspace = true
+ignore.workspace = true
+grep-searcher.workspace = true
+grep-regex.workspace = true
+grep-matcher.workspace = true
+
+[dev-dependencies]
+futures.workspace = true

@@ -26,6 +26,8 @@ pub const END: &str = "// >>> end superzej:keybinds <<<";
 pub enum Plugin {
     Statusbar,
     Tabbar,
+    Sidebar,
+    Panel,
 }
 
 impl Plugin {
@@ -33,6 +35,8 @@ impl Plugin {
         match self {
             Plugin::Statusbar => "statusbar.wasm",
             Plugin::Tabbar => "tabbar.wasm",
+            Plugin::Sidebar => "sidebar.wasm",
+            Plugin::Panel => "panel.wasm",
         }
     }
     fn url(self) -> String {
@@ -52,6 +56,12 @@ pub enum Invocation {
     },
     /// Pipe a named message to a plugin (no command pane flashes).
     Pipe { plugin: Plugin, name: &'static str },
+    /// Send a message directly to a plugin instance via zellij.
+    MessagePlugin {
+        target: Plugin,
+        name: &'static str,
+        payload: &'static str,
+    },
     /// A raw vanilla-zellij action body, e.g. `MoveFocus "Left";`.
     Native { body: &'static str },
     /// A user-defined shell command (`config.toml [[actions]]`).
@@ -471,6 +481,34 @@ pub const BUILTINS: &[Action] = &[
     },
     // Menu-only actions (no default chord).
     Action {
+        id: "focus-sidebar",
+        chords: &["Alt s"],
+        menu_label: "Focus workspace sidebar",
+        hint: "focus-sidebar",
+        invocation: Invocation::MessagePlugin {
+            target: Plugin::Sidebar,
+            name: "superzej_focus_sidebar",
+            payload: "",
+        },
+        scope: Scope::Shared,
+        context: Context::Always,
+        menu: true,
+    },
+    Action {
+        id: "focus-panel",
+        chords: &["Alt p"],
+        menu_label: "Focus diff / PR panel",
+        hint: "focus-panel",
+        invocation: Invocation::MessagePlugin {
+            target: Plugin::Panel,
+            name: "superzej_focus_panel",
+            payload: "",
+        },
+        scope: Scope::Shared,
+        context: Context::Always,
+        menu: true,
+    },
+    Action {
         id: "pr-open",
         chords: &[],
         menu_label: "PR — open in browser",
@@ -721,6 +759,17 @@ fn render_bind(chord: &str, inv: &Invocation) -> String {
             &format!("MessagePlugin \"{}\"", plugin.url()),
             &[format!("name \"{name}\"")],
         ),
+        Invocation::MessagePlugin {
+            target,
+            name,
+            payload,
+        } => {
+            let mut args = vec![format!("name \"{name}\"")];
+            if !payload.is_empty() {
+                args.push(format!("payload \"{payload}\""));
+            }
+            render_block_bind(chord, &format!("MessagePlugin \"{}\"", target.url()), &args)
+        }
     }
 }
 

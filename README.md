@@ -69,6 +69,8 @@ sidebar, tabbar and panel stay pinned).
 | Alt-1..9          | launch / focus pinned programs (`[[pins]]` config)       |
 | Alt-X             | remove worktree + close tab                              |
 
+_The above uses the `Normal` keybind mode. Superzej also ships with native `VimNormal` (with `Space` leader layer) and `Emacs` mode presets; switch modes with `Ctrl-Alt-v` or `Ctrl-Alt-e`._
+
 ## Install
 
 ### Nix / home-manager (recommended)
