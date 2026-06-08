@@ -125,6 +125,10 @@ mod tests {
             "close-worktree",
             "pr-open",
             "pr-create",
+            "focus-sidebar",
+            "focus-panel",
+            "select-bottombar",
+            "select-topbar",
         ];
         for a in keymap::BUILTINS.iter().filter(|a| a.menu) {
             assert!(
