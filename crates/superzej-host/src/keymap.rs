@@ -6,7 +6,6 @@
 
 use termwiz::input::{KeyCode, Modifiers};
 
-<<<<<<< Updated upstream
 use crate::sequence::{Key, MatchResult, SequenceMatcher};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -27,18 +26,6 @@ impl Mode {
         }
     }
 }
-
-||||||| Stash base
-=======
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Mode {
-    Normal,
-    VimNormal,
-    VimInsert,
-    Emacs,
-}
-
->>>>>>> Stashed changes
 /// A host-level action, decoupled from any key. The command palette dispatches
 /// the same set (by `key()`), so keymap and palette share one action vocabulary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +47,10 @@ pub enum Action {
     ToggleSidebar,
     TogglePanel,
     ToggleDrawer,
+    /// Move keyboard focus into the sidebar tree (shows it if hidden).
+    FocusSidebar,
+    /// Move keyboard focus into the right panel (shows it if hidden).
+    FocusPanel,
     OpenPalette,
     Lazygit,
     Yazi,
@@ -69,15 +60,8 @@ pub enum Action {
     ScrollDown,
     CopyPane,
     SwitchMode(Mode),
-    ShellCommand {
-        name: String,
-        run: String,
-        floating: bool,
-        close_on_exit: bool,
-    },
     Quit,
     Custom(u16),
-    SwitchMode(Mode),
 }
 
 impl Action {
@@ -104,6 +88,8 @@ impl Action {
             Action::ToggleSidebar => "toggle-sidebar",
             Action::TogglePanel => "toggle-panel",
             Action::ToggleDrawer => "files-drawer",
+            Action::FocusSidebar => "focus-sidebar",
+            Action::FocusPanel => "focus-panel",
             Action::OpenPalette => "palette",
             Action::Lazygit => "lazygit",
             Action::Yazi => "yazi",
@@ -116,13 +102,8 @@ impl Action {
             Action::SwitchMode(Mode::VimNormal) => "mode-vim-normal",
             Action::SwitchMode(Mode::VimInsert) => "mode-vim-insert",
             Action::SwitchMode(Mode::Emacs) => "mode-emacs",
-            Action::ShellCommand { name, .. } => name.as_str(),
             Action::Quit => "quit",
             Action::Custom(_) => "custom-action",
-            Action::SwitchMode(Mode::Normal) => "mode-normal",
-            Action::SwitchMode(Mode::VimNormal) => "mode-vim-normal",
-            Action::SwitchMode(Mode::VimInsert) => "mode-vim-insert",
-            Action::SwitchMode(Mode::Emacs) => "mode-emacs",
         }
     }
 
@@ -145,6 +126,8 @@ impl Action {
             "toggle-sidebar" => Action::ToggleSidebar,
             "toggle-panel" => Action::TogglePanel,
             "files" | "files-drawer" | "toggle-drawer" => Action::ToggleDrawer,
+            "focus-sidebar" => Action::FocusSidebar,
+            "focus-panel" => Action::FocusPanel,
             "palette" | "menu" => Action::OpenPalette,
             "lazygit" | "tool-lazygit" => Action::Lazygit,
             "yazi" | "tool-yazi" => Action::Yazi,
@@ -155,9 +138,9 @@ impl Action {
             "copy-pane" => Action::CopyPane,
             "quit" => Action::Quit,
             "mode-normal" => Action::SwitchMode(Mode::Normal),
-            "mode-vim-normal" => Action::SwitchMode(Mode::VimNormal),
-            "mode-vim-insert" => Action::SwitchMode(Mode::VimInsert),
-            "mode-emacs" => Action::SwitchMode(Mode::Emacs),
+            "mode-vim-normal" | "vim-normal" => Action::SwitchMode(Mode::VimNormal),
+            "mode-vim-insert" | "vim-insert" => Action::SwitchMode(Mode::VimInsert),
+            "mode-emacs" | "emacs" => Action::SwitchMode(Mode::Emacs),
             _ => return None,
         })
     }
@@ -211,18 +194,18 @@ impl KeyMap {
     pub fn insert_all(&mut self, chord: &str, action: Action) -> Result<(), String> {
         let keys = parse_chord(chord)?;
         for mode in ALL_MODES {
-            self.insert_keys(mode, keys.clone(), action);
+            self.insert_keys(mode, keys.clone(), action.clone());
         }
         Ok(())
     }
 
-    pub fn remove(&mut self, mode: Mode, action: Action) {
+    pub fn remove(&mut self, mode: Mode, action: &Action) {
         if let Some(m) = self.modes.get_mut(&mode) {
             m.remove_action(action);
         }
     }
 
-    pub fn remove_all(&mut self, action: Action) {
+    pub fn remove_all(&mut self, action: &Action) {
         for mode in ALL_MODES {
             self.remove(mode, action);
         }
@@ -311,6 +294,8 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl Alt s", Action::ToggleSidebar).unwrap();
     map.insert_all("Ctrl Alt p", Action::TogglePanel).unwrap();
     map.insert_all("Ctrl Alt f", Action::ToggleDrawer).unwrap();
+    map.insert_all("Alt s", Action::FocusSidebar).unwrap();
+    map.insert_all("Alt p", Action::FocusPanel).unwrap();
     map.insert_all("Ctrl Alt c", Action::CopyPane).unwrap();
     map.insert_all("Ctrl Alt n", Action::SwitchMode(Mode::Normal))
         .unwrap();
@@ -331,6 +316,8 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Alt y", Action::Yazi).unwrap();
     map.insert_all("Alt e", Action::Editor).unwrap();
     map.insert_all("Alt /", Action::Diff).unwrap();
+    map.insert_all("Alt s", Action::FocusSidebar).unwrap();
+    map.insert_all("Alt p", Action::FocusPanel).unwrap();
 
     map.insert_all("Alt h", Action::FocusLeft).unwrap();
     map.insert_all("Alt j", Action::FocusDown).unwrap();
@@ -453,7 +440,7 @@ fn apply_override(
 ) {
     let action = if let Some(idx) = custom_idx {
         Action::Custom(idx)
-    } else if let Some(a) = action_from_id(id) {
+    } else if let Some(a) = Action::from_key(id) {
         a
     } else {
         superzej_core::msg::warn(&format!("host keymap: unknown action {id:?}; ignored"));
@@ -471,50 +458,14 @@ fn apply_override(
     };
 
     if let Some(mode) = mode {
-        map.remove(mode, action);
+        map.remove(mode, &action);
         map.insert_keys(mode, parsed, action);
     } else {
-        map.remove_all(action);
+        map.remove_all(&action);
         for mode in ALL_MODES {
-            map.insert_keys(mode, parsed.clone(), action);
+            map.insert_keys(mode, parsed.clone(), action.clone());
         }
     }
-}
-
-fn action_from_id(id: &str) -> Option<Action> {
-    Some(match id {
-        "new-worktree" => Action::NewWorktree,
-        "new-workspace" => Action::NewWorkspace,
-        "new-tab" => Action::NewTab,
-        "close-worktree" => Action::CloseWorktree,
-        "switch-workspace" | "switch-repo" => Action::SwitchWorkspace,
-        "dashboard" => Action::Dashboard,
-        "next-tab" => Action::NextTab,
-        "prev-tab" => Action::PrevTab,
-        "split-down" | "new-panel-native" => Action::SplitDown,
-        "split-right" | "new-panel" => Action::SplitRight,
-        "focus-left" => Action::FocusLeft,
-        "focus-right" => Action::FocusRight,
-        "focus-up" => Action::FocusUp,
-        "focus-down" => Action::FocusDown,
-        "toggle-sidebar" => Action::ToggleSidebar,
-        "toggle-panel" => Action::TogglePanel,
-        "files" | "files-drawer" | "toggle-drawer" => Action::ToggleDrawer,
-        "menu" | "palette" => Action::OpenPalette,
-        "tool-lazygit" | "lazygit" => Action::Lazygit,
-        "tool-yazi" | "yazi" => Action::Yazi,
-        "tool-editor" | "editor" => Action::Editor,
-        "tool-diff" | "show-diff" | "diff" => Action::Diff,
-        "scroll-up" => Action::ScrollUp,
-        "scroll-down" => Action::ScrollDown,
-        "copy-pane" => Action::CopyPane,
-        "quit" => Action::Quit,
-        "mode-normal" => Action::SwitchMode(Mode::Normal),
-        "mode-vim-normal" | "vim-normal" => Action::SwitchMode(Mode::VimNormal),
-        "mode-vim-insert" | "vim-insert" => Action::SwitchMode(Mode::VimInsert),
-        "mode-emacs" | "emacs" => Action::SwitchMode(Mode::Emacs),
-        _ => return None,
-    })
 }
 
 #[allow(dead_code)]
@@ -523,182 +474,6 @@ pub fn map_key(key: &KeyCode, mods: Modifiers) -> Option<Action> {
         MatchResult::Matched(a) => Some(a),
         _ => None,
     }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct KeyMap {
-    modes: std::collections::HashMap<Mode, crate::sequence::SequenceMatcher>,
-}
-
-impl KeyMap {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn insert(&mut self, mode: Mode, seq: Vec<crate::sequence::Key>, action: Action) {
-        self.modes
-            .entry(mode)
-            .or_default()
-            .add_sequence(seq, action);
-    }
-
-    pub fn dispatch(&mut self, mode: Mode, key: crate::sequence::Key) -> crate::sequence::MatchResult {
-        use crate::sequence::MatchResult;
-
-        if let Some(matcher) = self.modes.get_mut(&mode) {
-            match matcher.feed(key.clone()) {
-                MatchResult::None => {}
-                other => return other,
-            }
-        }
-        if mode != Mode::Normal {
-            if let Some(matcher) = self.modes.get_mut(&Mode::Normal) {
-                return matcher.feed(key);
-            }
-        }
-        MatchResult::None
-    }
-
-    pub fn from_config(cfg: &superzej_core::config::Config) -> Self {
-        let mut map = default_keymap();
-        apply_overrides(&mut map, Mode::Normal, &cfg.keybinds.normal);
-        apply_overrides(&mut map, Mode::VimNormal, &cfg.keybinds.vim_normal);
-        apply_overrides(&mut map, Mode::VimInsert, &cfg.keybinds.vim_insert);
-        apply_overrides(&mut map, Mode::Emacs, &cfg.keybinds.emacs);
-        for action in &cfg.actions {
-            match crate::sequence::Key::parse_sequence(&action.key) {
-                Ok(seq) => map.insert(
-                    Mode::Normal,
-                    seq,
-                    Action::ShellCommand {
-                        name: action.name.clone(),
-                        run: action.run.clone(),
-                        floating: action.floating,
-                        close_on_exit: action.close_on_exit,
-                    },
-                ),
-                Err(e) => superzej_core::config::config_warn(&format!(
-                    "[[actions]] {}: {e}; skipped",
-                    action.name
-                )),
-            }
-        }
-        map
-    }
-
-    fn remove_action_key(&mut self, mode: Mode, key: &str) {
-        if let Some(matcher) = self.modes.get_mut(&mode) {
-            matcher.remove_action_key(key);
-        }
-    }
-}
-
-fn bind(map: &mut KeyMap, mode: Mode, chord: &str, action: Action) {
-    match crate::sequence::Key::parse_sequence(chord) {
-        Ok(seq) => map.insert(mode, seq, action),
-        Err(e) => superzej_core::config::config_warn(&format!(
-            "host keymap: {}: {e}; skipped",
-            chord
-        )),
-    }
-}
-
-fn apply_overrides(map: &mut KeyMap, mode: Mode, overrides: &std::collections::BTreeMap<String, String>) {
-    for (id, chord) in overrides {
-        let Some(action) = Action::from_key(id) else {
-            superzej_core::config::config_warn(&format!(
-                "[keybinds] unknown host action {id:?}; ignored"
-            ));
-            continue;
-        };
-        let action_key = action.key().to_string();
-        map.remove_action_key(mode, &action_key);
-        bind(map, mode, chord, action);
-    }
-}
-
-pub fn default_keymap() -> KeyMap {
-    let mut map = KeyMap::new();
-    // Normal mode preserves the native host's pre-modal global bindings.
-    for (chord, action) in [
-        ("Ctrl q", Action::Quit),
-        ("Ctrl k", Action::OpenPalette),
-        ("Ctrl Alt s", Action::ToggleSidebar),
-        ("Ctrl Alt p", Action::TogglePanel),
-        ("Ctrl Alt f", Action::ToggleDrawer),
-        ("Ctrl Alt c", Action::CopyPane),
-        ("Ctrl Alt v", Action::SwitchMode(Mode::VimNormal)),
-        ("Ctrl Alt e", Action::SwitchMode(Mode::Emacs)),
-        ("Ctrl Alt n", Action::SwitchMode(Mode::Normal)),
-        ("Alt w", Action::NewWorktree),
-        ("Alt W", Action::NewWorkspace),
-        ("Alt t", Action::NewTab),
-        ("Alt X", Action::CloseWorktree),
-        ("Alt o", Action::SwitchWorkspace),
-        ("Alt d", Action::Dashboard),
-        ("Alt n", Action::SplitDown),
-        ("Alt N", Action::SplitRight),
-        ("Alt g", Action::Lazygit),
-        ("Alt y", Action::Yazi),
-        ("Alt e", Action::Editor),
-        ("Alt /", Action::Diff),
-        ("Alt h", Action::FocusLeft),
-        ("Alt j", Action::FocusDown),
-        ("Alt k", Action::FocusUp),
-        ("Alt l", Action::FocusRight),
-        ("Alt Left", Action::PrevTab),
-        ("Alt Right", Action::NextTab),
-        ("Shift PageUp", Action::ScrollUp),
-        ("Shift PageDown", Action::ScrollDown),
-    ] {
-        bind(&mut map, Mode::Normal, chord, action);
-    }
-
-    // Vim-normal preset: pane/tab movement without Alt, sequence scroll, and
-    // explicit mode transitions. Unbound keys still fall through to the pane.
-    for (chord, action) in [
-        ("h", Action::FocusLeft),
-        ("j", Action::FocusDown),
-        ("k", Action::FocusUp),
-        ("l", Action::FocusRight),
-        ("H", Action::PrevTab),
-        ("L", Action::NextTab),
-        ("g g", Action::ScrollUp),
-        ("G", Action::ScrollDown),
-        ("Ctrl u", Action::ScrollUp),
-        ("Ctrl d", Action::ScrollDown),
-        ("i", Action::SwitchMode(Mode::VimInsert)),
-        ("a", Action::SwitchMode(Mode::VimInsert)),
-        ("Esc", Action::SwitchMode(Mode::Normal)),
-        ("Ctrl Alt n", Action::SwitchMode(Mode::Normal)),
-    ] {
-        bind(&mut map, Mode::VimNormal, chord, action);
-    }
-
-    for (chord, action) in [
-        ("Esc", Action::SwitchMode(Mode::VimNormal)),
-        ("Ctrl Alt n", Action::SwitchMode(Mode::Normal)),
-        ("Ctrl Alt e", Action::SwitchMode(Mode::Emacs)),
-    ] {
-        bind(&mut map, Mode::VimInsert, chord, action);
-    }
-
-    for (chord, action) in [
-        ("Ctrl b", Action::FocusLeft),
-        ("Ctrl f", Action::FocusRight),
-        ("Ctrl p", Action::FocusUp),
-        ("Ctrl n", Action::FocusDown),
-        ("Alt b", Action::PrevTab),
-        ("Alt f", Action::NextTab),
-        ("Alt v", Action::ScrollUp),
-        ("Ctrl v", Action::ScrollDown),
-        ("Ctrl Alt n", Action::SwitchMode(Mode::Normal)),
-        ("Ctrl Alt v", Action::SwitchMode(Mode::VimNormal)),
-    ] {
-        bind(&mut map, Mode::Emacs, chord, action);
-    }
-
-    map
 }
 
 #[cfg(test)]
@@ -779,7 +554,6 @@ mod tests {
         assert_eq!(Action::Quit.key(), "quit");
         assert_eq!(Action::ToggleDrawer.key(), "files-drawer");
     }
-<<<<<<< Updated upstream
 
     #[test]
     fn mode_actions_have_stable_keys() {
@@ -884,89 +658,4 @@ mod tests {
             MatchResult::Matched(Action::Quit)
         );
     }
-||||||| Stash base
-=======
-
-    #[test]
-    fn action_keys_include_modes() {
-        assert_eq!(Action::SwitchMode(Mode::Normal).key(), "mode-normal");
-        assert_eq!(Action::SwitchMode(Mode::VimNormal).key(), "mode-vim-normal");
-        assert_eq!(Action::SwitchMode(Mode::VimInsert).key(), "mode-vim-insert");
-        assert_eq!(Action::SwitchMode(Mode::Emacs).key(), "mode-emacs");
-    }
-
-    #[test]
-    fn sequence_matching_advances_state() {
-        use crate::sequence::{Key, MatchResult, SequenceMatcher};
-
-        let mut matcher = SequenceMatcher::new();
-        matcher.add_sequence(vec![Key::char('g'), Key::char('g')], Action::ScrollUp);
-
-        assert_eq!(matcher.feed(Key::char('g')), MatchResult::Pending);
-        assert_eq!(
-            matcher.feed(Key::char('g')),
-            MatchResult::Matched(Action::ScrollUp)
-        );
-    }
-
-    #[test]
-    fn mode_specific_dispatch() {
-        use crate::sequence::{Key, MatchResult};
-
-        let mut map = KeyMap::new();
-        map.insert(Mode::VimNormal, vec![Key::char('j')], Action::FocusDown);
-
-        assert_eq!(map.dispatch(Mode::Normal, Key::char('j')), MatchResult::None);
-        assert_eq!(
-            map.dispatch(Mode::VimNormal, Key::char('j')),
-            MatchResult::Matched(Action::FocusDown)
-        );
-    }
-
-    #[test]
-    fn default_keymap_preserves_existing_global_chords() {
-        use crate::sequence::{Key, MatchResult};
-
-        let mut map = default_keymap();
-        assert_eq!(
-            map.dispatch(Mode::Normal, Key::new(KeyCode::Char('w'), Modifiers::ALT)),
-            MatchResult::Matched(Action::NewWorktree)
-        );
-        assert_eq!(
-            map.dispatch(Mode::Normal, Key::new(KeyCode::Char('k'), Modifiers::CTRL)),
-            MatchResult::Matched(Action::OpenPalette)
-        );
-    }
-
-    #[test]
-    fn config_keymap_supports_normal_and_mode_layers() {
-        use crate::sequence::{Key, MatchResult};
-
-        let cfg: superzej_core::config::Config = toml::from_str(
-            r#"
-            [keybinds]
-            new-worktree = "Ctrl w"
-
-            [keybinds.vim_normal]
-            focus-down = "j"
-            mode-vim-insert = "i"
-            "#,
-        )
-        .unwrap();
-
-        let mut map = KeyMap::from_config(&cfg);
-        assert_eq!(
-            map.dispatch(Mode::Normal, Key::new(KeyCode::Char('w'), Modifiers::CTRL)),
-            MatchResult::Matched(Action::NewWorktree)
-        );
-        assert_eq!(
-            map.dispatch(Mode::VimNormal, Key::char('j')),
-            MatchResult::Matched(Action::FocusDown)
-        );
-        assert_eq!(
-            map.dispatch(Mode::VimNormal, Key::char('i')),
-            MatchResult::Matched(Action::SwitchMode(Mode::VimInsert))
-        );
-    }
->>>>>>> Stashed changes
 }

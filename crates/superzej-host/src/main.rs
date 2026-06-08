@@ -13,6 +13,7 @@ mod keymap;
 mod layout;
 mod palette;
 mod pane;
+mod panel;
 mod run;
 mod sequence;
 mod session;

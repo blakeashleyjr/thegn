@@ -7,7 +7,7 @@ use termwiz::cell::AttributeChange;
 use termwiz::color::{ColorAttribute, SrgbaTuple};
 use termwiz::surface::{Change, Position, Surface};
 
-use crate::compositor::{compose_pane, Rect};
+use crate::compositor::{Rect, compose_pane};
 use crate::emulator::PaneEmulator;
 use superzej_core::theme;
 
@@ -51,6 +51,10 @@ pub fn draw_text(
 /// Draw a transport-neutral plugin [`View`] into a host-owned surface rect.
 /// Plugins supply semantic roles only; this function resolves them against the
 /// current superzej theme/accent and clips to the host-owned slot.
+///
+/// Not yet wired into the live chrome — the plugin API surface (v0) landed
+/// ahead of the host-side contribution renderer; covered by unit tests.
+#[allow(dead_code)]
 pub fn draw_plugin_view(
     surface: &mut Surface,
     rect: Rect,
@@ -75,6 +79,7 @@ pub fn draw_plugin_view(
     }
 }
 
+#[allow(dead_code)]
 fn plugin_role_color(
     role: superzej_core::plugin_api::StyleRole,
     accent_rgb: &str,
@@ -120,7 +125,16 @@ pub struct FrameModel {
     pub active_tab: usize,
     pub sidebar: Vec<String>,
     pub sidebar_selected: usize,
-    pub panel: Vec<String>,
+    /// Per-sidebar-row jump target: the tab index a row activates (`Enter`).
+    /// `None` for non-navigable rows (placeholders). Same length as `sidebar`.
+    pub sidebar_targets: Vec<Option<usize>>,
+    /// True when the sidebar currently owns keyboard focus (drives the
+    /// focus indicator in [`draw_sidebar`]).
+    pub sidebar_focused: bool,
+    /// Structured Diff/PR/Checks payload for the right panel.
+    pub panel: crate::panel::PanelData,
+    /// True when the right panel currently owns keyboard focus.
+    pub panel_focused: bool,
     pub status: String,
     pub accent: String,
 }
@@ -186,11 +200,17 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
 pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
     fill(surface, rect, theme_color(theme::BG0));
     let accent = theme_color(model.accent_or_default());
+    // When focused the header reads "WORKSPACES ◂" to signal it owns input.
+    let title = if model.sidebar_focused {
+        " WORKSPACES \u{25c2}"
+    } else {
+        " WORKSPACES"
+    };
     draw_text(
         surface,
         rect.x,
         rect.y,
-        " WORKSPACES",
+        title,
         accent,
         theme_color(theme::BG0),
         rect.cols,
@@ -200,12 +220,13 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
         if y >= rect.y + rect.rows {
             break;
         }
-        let (fg, bg) = if i == model.sidebar_selected {
+        let selected = i == model.sidebar_selected;
+        let (fg, bg) = if selected {
             (theme_color(theme::TEXT), theme_color(theme::PANEL2))
         } else {
             (theme_color(theme::DIM), theme_color(theme::BG0))
         };
-        if i == model.sidebar_selected {
+        if selected {
             fill(
                 surface,
                 Rect {
@@ -216,6 +237,11 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
                 },
                 bg,
             );
+            // A left-edge accent bar marks the cursor row only while the sidebar
+            // owns keyboard focus, so a stale selection isn't mistaken for focus.
+            if model.sidebar_focused {
+                draw_text(surface, rect.x, y, "\u{2590}", accent, bg, 1);
+            }
         }
         draw_text(
             surface,
@@ -229,22 +255,336 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
     }
 }
 
-pub fn draw_panel(surface: &mut Surface, rect: Rect, model: &FrameModel) {
+/// Draw the tabbed right panel: a `DIFF | PR | CHECKS` tab bar (row 0), the
+/// active tab's body, and a context-sensitive help bar (last row).
+pub fn draw_panel(
+    surface: &mut Surface,
+    rect: Rect,
+    model: &FrameModel,
+    ui: &crate::panel::PanelUi,
+) {
+    use crate::panel::PanelTab;
     fill(surface, rect, theme_color(theme::PANEL));
-    for (i, line) in model.panel.iter().enumerate() {
-        let y = rect.y + i;
-        if y >= rect.y + rect.rows {
+    if rect.rows == 0 || rect.cols == 0 {
+        return;
+    }
+    let accent = theme_color(model.accent_or_default());
+
+    // Row 0: tab bar.
+    draw_panel_tabbar(surface, rect, ui.tab, accent, model.panel_focused);
+
+    // Body: rows 1..rows-1 (leave the last row for the help bar).
+    let body = Rect {
+        x: rect.x,
+        y: rect.y + 1,
+        cols: rect.cols,
+        rows: rect.rows.saturating_sub(2),
+    };
+    match ui.tab {
+        PanelTab::Diff => draw_diff_tab(surface, body, model, ui, accent),
+        PanelTab::Pr => draw_pr_tab(surface, body, model, accent),
+        PanelTab::Checks => draw_checks_tab(surface, body, model),
+    }
+
+    // Last row: help bar.
+    if rect.rows >= 2 {
+        let help_y = rect.y + rect.rows - 1;
+        let hint = panel_help_hint(ui.tab, ui.diff_view);
+        let help_rect = Rect {
+            x: rect.x,
+            y: help_y,
+            cols: rect.cols,
+            rows: 1,
+        };
+        fill(surface, help_rect, theme_color(theme::BG1));
+        draw_text(
+            surface,
+            rect.x + 1,
+            help_y,
+            hint,
+            theme_color(theme::FAINT),
+            theme_color(theme::BG1),
+            rect.cols.saturating_sub(1),
+        );
+    }
+}
+
+fn draw_panel_tabbar(
+    surface: &mut Surface,
+    rect: Rect,
+    active: crate::panel::PanelTab,
+    accent: ColorAttribute,
+    focused: bool,
+) {
+    use crate::panel::PanelTab;
+    let bar = Rect {
+        x: rect.x,
+        y: rect.y,
+        cols: rect.cols,
+        rows: 1,
+    };
+    fill(surface, bar, theme_color(theme::BG1));
+    let mut x = rect.x + 1;
+    for (tab, label) in [
+        (PanelTab::Diff, "DIFF"),
+        (PanelTab::Pr, "PR"),
+        (PanelTab::Checks, "CHECKS"),
+    ] {
+        let seg = format!(" {label} ");
+        let fg = if tab == active {
+            accent
+        } else {
+            theme_color(theme::DIM)
+        };
+        let max = (rect.x + rect.cols).saturating_sub(x);
+        if max == 0 {
             break;
         }
+        draw_text(surface, x, rect.y, &seg, fg, theme_color(theme::BG1), max);
+        x += seg.chars().count();
+    }
+    // A right-aligned focus marker so a focused panel is unmistakable.
+    if focused {
+        let marker = "\u{25c2}";
+        let mx = (rect.x + rect.cols).saturating_sub(2);
+        if mx > x {
+            draw_text(
+                surface,
+                mx,
+                rect.y,
+                marker,
+                accent,
+                theme_color(theme::BG1),
+                1,
+            );
+        }
+    }
+}
+
+fn draw_diff_tab(
+    surface: &mut Surface,
+    rect: Rect,
+    model: &FrameModel,
+    ui: &crate::panel::PanelUi,
+    accent: ColorAttribute,
+) {
+    use crate::panel::DiffView;
+    match ui.diff_view {
+        DiffView::FileList => draw_diff_filelist(surface, rect, model, ui, accent),
+        DiffView::FileDiff => draw_diff_filediff(surface, rect, ui),
+    }
+}
+
+fn draw_diff_filelist(
+    surface: &mut Surface,
+    rect: Rect,
+    model: &FrameModel,
+    ui: &crate::panel::PanelUi,
+    accent: ColorAttribute,
+) {
+    if model.panel.files.is_empty() {
+        draw_text(
+            surface,
+            rect.x + 1,
+            rect.y,
+            "no changes",
+            theme_color(theme::FAINT),
+            theme_color(theme::PANEL),
+            rect.cols.saturating_sub(1),
+        );
+        return;
+    }
+    for (i, f) in model.panel.files.iter().enumerate() {
+        let y = rect.y + i;
+        if i >= rect.rows {
+            break;
+        }
+        let selected = model.panel_focused && i == ui.diff_cursor;
+        let bg = if selected {
+            theme_color(theme::PANEL2)
+        } else {
+            theme_color(theme::PANEL)
+        };
+        if selected {
+            fill(
+                surface,
+                Rect {
+                    x: rect.x,
+                    y,
+                    cols: rect.cols,
+                    rows: 1,
+                },
+                bg,
+            );
+            draw_text(surface, rect.x, y, "\u{2590}", accent, bg, 1);
+        }
+        let status_color = match f.status {
+            'A' => theme_color(theme::GREEN),
+            'D' => theme_color(theme::RED),
+            _ => theme_color(theme::AMBER),
+        };
+        draw_text(
+            surface,
+            rect.x + 1,
+            y,
+            &f.status.to_string(),
+            status_color,
+            bg,
+            1,
+        );
+        draw_text(
+            surface,
+            rect.x + 3,
+            y,
+            &f.path,
+            theme_color(theme::TEXT),
+            bg,
+            rect.cols.saturating_sub(3),
+        );
+    }
+}
+
+fn draw_diff_filediff(surface: &mut Surface, rect: Rect, ui: &crate::panel::PanelUi) {
+    let lines: Vec<&str> = ui.file_diff.lines().collect();
+    for (row, line) in lines.iter().skip(ui.diff_scroll).enumerate() {
+        let y = rect.y + row;
+        if row >= rect.rows {
+            break;
+        }
+        // Color +/- lines; everything else is plain.
+        let fg = match line.as_bytes().first() {
+            Some(b'+') => theme_color(theme::GREEN),
+            Some(b'-') => theme_color(theme::RED),
+            Some(b'@') => theme_color(theme::PURPLE),
+            _ => theme_color(theme::DIM),
+        };
         draw_text(
             surface,
             rect.x + 1,
             y,
             line,
+            fg,
+            theme_color(theme::PANEL),
+            rect.cols.saturating_sub(1),
+        );
+    }
+}
+
+fn draw_pr_tab(surface: &mut Surface, rect: Rect, model: &FrameModel, accent: ColorAttribute) {
+    if let Some(pr) = &model.panel.pr {
+        let state_color = match pr.state.as_str() {
+            "OPEN" => theme_color(theme::GREEN),
+            "MERGED" => theme_color(theme::PURPLE),
+            "CLOSED" => theme_color(theme::RED),
+            _ => theme_color(theme::DIM),
+        };
+        let draft = if pr.is_draft { " (draft)" } else { "" };
+        draw_text(
+            surface,
+            rect.x + 1,
+            rect.y,
+            &format!("#{}", pr.number),
+            accent,
+            theme_color(theme::PANEL),
+            rect.cols.saturating_sub(1),
+        );
+        let num_w = format!("#{}", pr.number).chars().count() + 2;
+        draw_text(
+            surface,
+            rect.x + 1 + num_w,
+            rect.y,
+            &format!("{}{}", pr.state, draft),
+            state_color,
+            theme_color(theme::PANEL),
+            rect.cols.saturating_sub(1 + num_w),
+        );
+        draw_text(
+            surface,
+            rect.x + 1,
+            rect.y + 1,
+            &pr.title,
             theme_color(theme::TEXT),
             theme_color(theme::PANEL),
             rect.cols.saturating_sub(1),
         );
+        if let Some(decision) = &pr.review_decision {
+            draw_text(
+                surface,
+                rect.x + 1,
+                rect.y + 3,
+                decision,
+                theme_color(theme::DIM),
+                theme_color(theme::PANEL),
+                rect.cols.saturating_sub(1),
+            );
+        }
+    } else {
+        let note = model.panel.pr_note.as_deref().unwrap_or("no pull request");
+        draw_text(
+            surface,
+            rect.x + 1,
+            rect.y,
+            note,
+            theme_color(theme::FAINT),
+            theme_color(theme::PANEL),
+            rect.cols.saturating_sub(1),
+        );
+    }
+}
+
+fn draw_checks_tab(surface: &mut Surface, rect: Rect, model: &FrameModel) {
+    use crate::panel::CheckState;
+    if model.panel.checks.is_empty() {
+        draw_text(
+            surface,
+            rect.x + 1,
+            rect.y,
+            "no checks",
+            theme_color(theme::FAINT),
+            theme_color(theme::PANEL),
+            rect.cols.saturating_sub(1),
+        );
+        return;
+    }
+    for (i, c) in model.panel.checks.iter().enumerate() {
+        let y = rect.y + i;
+        if i >= rect.rows {
+            break;
+        }
+        let (glyph, color) = match c.state {
+            CheckState::Pass => ("\u{2713}", theme_color(theme::GREEN)),
+            CheckState::Fail => ("\u{2717}", theme_color(theme::RED)),
+            CheckState::Pending => ("\u{2022}", theme_color(theme::AMBER)),
+        };
+        draw_text(
+            surface,
+            rect.x + 1,
+            y,
+            glyph,
+            color,
+            theme_color(theme::PANEL),
+            1,
+        );
+        draw_text(
+            surface,
+            rect.x + 3,
+            y,
+            &c.name,
+            theme_color(theme::TEXT),
+            theme_color(theme::PANEL),
+            rect.cols.saturating_sub(3),
+        );
+    }
+}
+
+/// The context-sensitive help-bar hint for the active tab/view.
+fn panel_help_hint(tab: crate::panel::PanelTab, view: crate::panel::DiffView) -> &'static str {
+    use crate::panel::{DiffView, PanelTab};
+    match (tab, view) {
+        (PanelTab::Diff, DiffView::FileList) => "1/2/3 tab  j/k move  ↵ open  o edit  esc",
+        (PanelTab::Diff, DiffView::FileDiff) => "j/k scroll  o edit  esc back",
+        (PanelTab::Pr, _) => "1/2/3 tab  o browser  m merge  a approve  c create  esc",
+        (PanelTab::Checks, _) => "1/2/3 tab  r rerun  esc",
     }
 }
 
@@ -254,12 +594,13 @@ pub fn draw_chrome(
     surface: &mut Surface,
     chrome: &crate::layout::ChromeLayout,
     model: &FrameModel,
+    panel_ui: &crate::panel::PanelUi,
 ) {
     if let Some(sb) = chrome.sidebar {
         draw_sidebar(surface, sb, model);
     }
     if let Some(pn) = chrome.panel {
-        draw_panel(surface, pn, model);
+        draw_panel(surface, pn, model, panel_ui);
     }
     draw_tabbar(surface, chrome.tabbar, chrome.tabbar_content(), model);
     draw_statusbar(surface, chrome.statusbar, model);
@@ -274,6 +615,7 @@ pub fn render_tab<'a>(
     center: &crate::center::CenterTree,
     focused: crate::center::PaneId,
     model: &FrameModel,
+    panel_ui: &crate::panel::PanelUi,
     lookup: impl Fn(crate::center::PaneId) -> Option<&'a dyn PaneEmulator>,
 ) {
     let _ = focused; // a non-destructive focus border is a later polish
@@ -282,7 +624,7 @@ pub fn render_tab<'a>(
             compose_pane(surface, emu, rect);
         }
     }
-    draw_chrome(surface, chrome, model);
+    draw_chrome(surface, chrome, model, panel_ui);
 }
 
 #[cfg(test)]
@@ -296,6 +638,36 @@ mod tests {
             .lines()
             .map(|l| l.to_string())
             .collect()
+    }
+
+    #[test]
+    fn sidebar_focus_indicator_appears_only_when_focused() {
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 24,
+            rows: 6,
+        };
+        let model = FrameModel {
+            sidebar: vec!["app".into(), "  home".into()],
+            sidebar_selected: 1,
+            sidebar_focused: true,
+            ..Default::default()
+        };
+        let mut s = Surface::new(24, 6);
+        draw_sidebar(&mut s, rect, &model);
+        let text = s.screen_chars_to_string();
+        assert!(text.contains('\u{25c2}'), "focused header marker: {text:?}");
+
+        let mut unfocused = model.clone();
+        unfocused.sidebar_focused = false;
+        let mut s2 = Surface::new(24, 6);
+        draw_sidebar(&mut s2, rect, &unfocused);
+        let text2 = s2.screen_chars_to_string();
+        assert!(
+            !text2.contains('\u{25c2}'),
+            "no focus marker when unfocused: {text2:?}"
+        );
     }
 
     #[test]
@@ -371,7 +743,7 @@ mod tests {
             ..Default::default()
         };
 
-        draw_chrome(&mut s, &chrome, &model);
+        draw_chrome(&mut s, &chrome, &model, &crate::panel::PanelUi::default());
 
         let l = lines(&s);
         let row = &l[0];
@@ -407,9 +779,15 @@ mod tests {
         let center = crate::center::CenterTree::Leaf(1);
         let mut s = Surface::new(cols, rows);
 
-        render_tab(&mut s, &chrome, &center, 1, &model, |id| {
-            (id == 1).then_some(&emu as &dyn PaneEmulator)
-        });
+        render_tab(
+            &mut s,
+            &chrome,
+            &center,
+            1,
+            &model,
+            &crate::panel::PanelUi::default(),
+            |id| (id == 1).then_some(&emu as &dyn PaneEmulator),
+        );
 
         let l = lines(&s);
         let row = &l[0];
@@ -462,11 +840,19 @@ mod tests {
             ..Default::default()
         };
         let mut s = Surface::new(cols, rows);
-        render_tab(&mut s, &chrome, &center, 1, &model, |id| match id {
-            1 => Some(&left as &dyn PaneEmulator),
-            2 => Some(&right as &dyn PaneEmulator),
-            _ => None,
-        });
+        render_tab(
+            &mut s,
+            &chrome,
+            &center,
+            1,
+            &model,
+            &crate::panel::PanelUi::default(),
+            |id| match id {
+                1 => Some(&left as &dyn PaneEmulator),
+                2 => Some(&right as &dyn PaneEmulator),
+                _ => None,
+            },
+        );
         let text = s.screen_chars_to_string();
         assert!(text.contains("LEFTPANE"), "left pane painted");
         assert!(text.contains("RIGHTPANE"), "right pane painted");
@@ -485,14 +871,30 @@ mod tests {
             tabs: vec!["repo/home".into()],
             active_tab: 0,
             sidebar: vec!["repo".into(), "  feat".into()],
-            panel: vec!["+12 -3".into(), "#42 open".into()],
+            panel: crate::panel::PanelData {
+                branch: "feat".into(),
+                pr: Some(crate::panel::PrSummary {
+                    number: 42,
+                    title: "a pr".into(),
+                    state: "OPEN".into(),
+                    url: "https://example/42".into(),
+                    is_draft: false,
+                    review_decision: None,
+                }),
+                ..Default::default()
+            },
             status: "Cmd-K  Alt-w new  Alt-o switch".into(),
             ..Default::default()
         };
 
         let mut s = Surface::new(cols, rows);
         let center = crate::center::CenterTree::Leaf(1);
-        render_tab(&mut s, &chrome, &center, 1, &model, |id| {
+        // PR tab so the #42 summary is on screen.
+        let panel_ui = crate::panel::PanelUi {
+            tab: crate::panel::PanelTab::Pr,
+            ..Default::default()
+        };
+        render_tab(&mut s, &chrome, &center, 1, &model, &panel_ui, |id| {
             (id == 1).then_some(&emu as &dyn PaneEmulator)
         });
         let l = lines(&s);
@@ -504,6 +906,86 @@ mod tests {
         let all = l.join("\n");
         assert!(all.contains("WORKSPACES"));
         assert!(all.contains("CENTER-CONTENT"));
-        assert!(all.contains("#42 open"));
+        assert!(all.contains("#42"));
+    }
+
+    #[test]
+    fn panel_renders_tab_bar_and_diff_files() {
+        use crate::panel::{DiffFile, PanelData, PanelUi};
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 44,
+            rows: 12,
+        };
+        let model = FrameModel {
+            panel: PanelData {
+                branch: "feat".into(),
+                files: vec![
+                    DiffFile {
+                        status: 'M',
+                        path: "src/main.rs".into(),
+                        added: 3,
+                        deleted: 1,
+                    },
+                    DiffFile {
+                        status: 'A',
+                        path: "src/new.rs".into(),
+                        added: 9,
+                        deleted: 0,
+                    },
+                ],
+                ..Default::default()
+            },
+            panel_focused: true,
+            ..Default::default()
+        };
+        let mut s = Surface::new(44, 12);
+        draw_panel(&mut s, rect, &model, &PanelUi::default());
+        let text = s.screen_chars_to_string();
+        assert!(text.contains("DIFF"), "tab bar: {text:?}");
+        assert!(text.contains("PR"));
+        assert!(text.contains("CHECKS"));
+        assert!(text.contains("src/main.rs"), "file list: {text:?}");
+        assert!(text.contains("src/new.rs"));
+        // Help bar hint for the default Diff:FileList view.
+        assert!(text.contains("open"), "help bar: {text:?}");
+    }
+
+    #[test]
+    fn panel_checks_tab_lists_check_states() {
+        use crate::panel::{CheckLine, CheckState, PanelData, PanelTab, PanelUi};
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 44,
+            rows: 12,
+        };
+        let model = FrameModel {
+            panel: PanelData {
+                checks: vec![
+                    CheckLine {
+                        name: "build".into(),
+                        state: CheckState::Pass,
+                    },
+                    CheckLine {
+                        name: "test".into(),
+                        state: CheckState::Fail,
+                    },
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ui = PanelUi {
+            tab: PanelTab::Checks,
+            ..Default::default()
+        };
+        let mut s = Surface::new(44, 12);
+        draw_panel(&mut s, rect, &model, &ui);
+        let text = s.screen_chars_to_string();
+        assert!(text.contains("build"), "checks: {text:?}");
+        assert!(text.contains("test"));
+        assert!(text.contains("rerun"), "checks help bar: {text:?}");
     }
 }
