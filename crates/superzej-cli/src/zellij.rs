@@ -233,6 +233,30 @@ pub fn new_pane_bare(cwd: &Path, name: &str, direction: &str) -> bool {
     ])
 }
 
+/// Open a named tiled pane running `cmd` at `cwd`. Unlike drawers/floats, this
+/// participates in the active layout and does not close automatically when the
+/// command exits.
+pub fn new_pane_cmd(cwd: &Path, name: &str, direction: &str, cmd: &[&str]) -> bool {
+    let mut a = pane_cmd_args(cwd, name, direction);
+    a.extend(cmd.iter().map(|s| s.to_string()));
+    let refs: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
+    action(&refs)
+}
+
+/// The `new-pane` args (through trailing `--`) for a tiled command pane.
+fn pane_cmd_args(cwd: &Path, name: &str, direction: &str) -> Vec<String> {
+    vec![
+        "new-pane".into(),
+        "--direction".into(),
+        direction.into(),
+        "--cwd".into(),
+        cwd.to_string_lossy().into_owned(),
+        "--name".into(),
+        name.into(),
+        "--".into(),
+    ]
+}
+
 pub fn close_pane() -> bool {
     action(&["close-pane"])
 }
@@ -346,6 +370,24 @@ mod tests {
         assert!(a.windows(2).any(|w| w[0] == "-x" && w[1] == "10%"));
         assert!(a.windows(2).any(|w| w[0] == "--width" && w[1] == "80%"));
         assert!(a.windows(2).any(|w| w[0] == "-y" && w[1] == "50%"));
+    }
+
+    #[test]
+    fn pane_cmd_args_open_named_tiled_pane() {
+        let a = pane_cmd_args(Path::new("/wt"), "\u{1f4cc} logs", "Right");
+        assert_eq!(a[0], "new-pane");
+        assert!(
+            a.windows(2)
+                .any(|w| w[0] == "--direction" && w[1] == "Right")
+        );
+        assert!(a.windows(2).any(|w| w[0] == "--cwd" && w[1] == "/wt"));
+        assert!(
+            a.windows(2)
+                .any(|w| w[0] == "--name" && w[1] == "\u{1f4cc} logs")
+        );
+        assert!(!a.contains(&"--floating".to_string()));
+        assert!(!a.contains(&"--close-on-exit".to_string()));
+        assert_eq!(a.last().unwrap(), "--");
     }
 
     // A trimmed-down but structurally faithful `dump-layout` with two tabs.

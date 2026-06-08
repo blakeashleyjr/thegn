@@ -151,17 +151,21 @@ command = "${EDITOR:-vi} ."
 name = "diff"
 command = "git diff"
 
-# Pinned programs: each becomes its own session tab (`pin:<name>`), summoned from
-# anywhere with Alt-1..9 (in registration order) or the tabbar's pin chips.
-# First press opens the tab and runs the command; later presses focus it. Pins
-# are global and run on the host (no sandbox). Optional `cwd` (defaults to $HOME).
+# Pinned programs: summoned from anywhere with Alt-1..9 (in registration order)
+# or the tabbar's pin chips. Pins are global and run on the host (no sandbox).
+# `location = "tab"` opens/focuses a dedicated `pin:<name>` tab (default).
+# `location = "layout"` adds a tiled pane to the focused tab's active layout.
+# For layout pins, omitted cwd means the focused repo/worktree if resolvable; for
+# tab pins, omitted cwd means $HOME.
 # [[pins]]
 # name = "aerc"
 # command = "aerc"
+# location = "tab"
 #
 # [[pins]]
 # name = "logs"
 # command = "journalctl -f"
+# location = "layout"
 # cwd = "~"
 
 # ── Sandbox / containers ──────────────────────────────────────────────────────
