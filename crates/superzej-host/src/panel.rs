@@ -22,6 +22,7 @@ pub enum PanelTab {
 
 impl PanelTab {
     /// Cycle to the next tab (Tab key).
+    #[allow(dead_code)]
     pub fn next(self) -> Self {
         match self {
             PanelTab::Diff => PanelTab::Pr,
@@ -33,6 +34,7 @@ impl PanelTab {
 
 /// The Diff tab has two stacked views: the file list and a single-file diff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(dead_code)]
 pub enum DiffView {
     #[default]
     FileList,
@@ -42,6 +44,7 @@ pub enum DiffView {
 /// A pass/fail/pending tri-state mirrored from `github::Bucket` (decoupled so
 /// the host doesn't depend on that type in its render path).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum CheckState {
     Pass,
     Fail,
@@ -91,6 +94,7 @@ pub struct PanelData {
 
 /// The panel's interactive state, owned by the event loop.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct PanelUi {
     pub tab: PanelTab,
     pub diff_view: DiffView,
@@ -107,6 +111,7 @@ pub struct PanelUi {
 /// A decoded panel navigation intent. `None` means the key isn't owned by the
 /// panel and should fall through to the global keymap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum PanelNav {
     SelectTab(PanelTab),
     CycleTab,
@@ -127,6 +132,7 @@ pub enum PanelNav {
 /// Map a raw key to a panel nav intent given the current tab/view context.
 /// Context matters: `j`/`k` scroll in FileDiff but move the cursor in FileList,
 /// and the action keys (`m`/`a`/`c`/`r`/`o`) only bind on their relevant tab.
+#[allow(dead_code)]
 pub fn panel_nav_key(key: &KeyCode, tab: PanelTab, view: DiffView) -> Option<PanelNav> {
     match key {
         KeyCode::Char('1') => Some(PanelNav::SelectTab(PanelTab::Diff)),

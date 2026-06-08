@@ -730,7 +730,7 @@ fn sync_drawer_persistence(
             .unwrap_or(false);
 
     if should_be_open && drawer.is_none() {
-        if let Some(id) = panes.spawn(Some(&dir), center).ok() {
+        if let Ok(id) = panes.spawn(Some(&dir), center) {
             *drawer = Some(id);
         }
     } else if !should_be_open && drawer.is_some() {
@@ -1595,7 +1595,7 @@ mod tests {
                     panes.table.remove(&id);
                 }
             } else {
-                let p = panes.spawn(None, chrome.center.clone()).ok();
+                let p = panes.spawn(None, chrome.center).ok();
                 if let Some(id) = p {
                     *drawer = Some(id);
                 }
