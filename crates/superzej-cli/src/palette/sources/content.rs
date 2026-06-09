@@ -8,13 +8,13 @@ use crate::palette::engine::Engine;
 use crate::palette::item::{Action, Row, RowKind};
 use crate::theme;
 use grep_regex::RegexMatcherBuilder;
-use grep_searcher::SearcherBuilder;
 use grep_searcher::sinks::UTF8;
+use grep_searcher::SearcherBuilder;
 use ignore::WalkBuilder;
 use nucleo::Injector;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// Cap on total hits streamed for a single query (keeps the UI bounded). Hitting
 /// it is logged by the caller's footer via `total()` vs this constant.

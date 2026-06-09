@@ -994,10 +994,9 @@ mod tests {
         cfg.keybinds.insert("dashboard".into(), "Alt g".into());
         cfg.keybinds.insert("switch-repo".into(), "Alt [".into()); // reserved
         let cols = detect_collisions(&effective(&cfg));
-        assert!(
-            cols.iter()
-                .any(|c| matches!(c, Collision::Duplicate { .. }))
-        );
+        assert!(cols
+            .iter()
+            .any(|c| matches!(c, Collision::Duplicate { .. })));
         assert!(cols.iter().any(|c| matches!(c, Collision::Reserved { .. })));
     }
 

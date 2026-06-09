@@ -13,7 +13,7 @@
 //! combinations (e.g. Apple GPUs) simply omit the field for now.
 
 use anyhow::Result;
-use sysinfo::{MINIMUM_CPU_UPDATE_INTERVAL, System};
+use sysinfo::{System, MINIMUM_CPU_UPDATE_INTERVAL};
 
 pub fn run() -> Result<()> {
     // Determinism shim for visual-regression tests: `SZ_FAKE_STATS` replaces the

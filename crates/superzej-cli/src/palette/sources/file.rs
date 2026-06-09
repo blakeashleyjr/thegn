@@ -9,8 +9,8 @@ use crate::theme;
 use ignore::{WalkBuilder, WalkState};
 use nucleo::Injector;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Walk `root` on a background thread, streaming file rows into `inj`. Stops
 /// promptly when `cancel` flips (e.g. the user leaves File mode).

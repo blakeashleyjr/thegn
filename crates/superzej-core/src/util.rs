@@ -130,7 +130,11 @@ pub fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 /// The last path component of a string (no trailing-slash handling needed here).

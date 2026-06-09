@@ -1760,11 +1760,9 @@ surface = "todoist.status"
 
     #[test]
     fn validate_str_flags_every_section() {
-        assert!(
-            validate_str("not = valid = toml")
-                .iter()
-                .any(|e| e.contains("syntax"))
-        );
+        assert!(validate_str("not = valid = toml")
+            .iter()
+            .any(|e| e.contains("syntax")));
         let body = "\
 picker = \"x\"
 worktree_mode = \"y\"
@@ -1849,11 +1847,10 @@ format = \"bad\"
         let dir = tmpdir("mounts");
         let sb = cfg.repo_sandbox(&dir);
         // default mount "~/.gitconfig:ro" → tilde expanded, :ro preserved.
-        assert!(
-            sb.mounts
-                .iter()
-                .any(|m| m.ends_with("/.gitconfig:ro") && !m.starts_with('~'))
-        );
+        assert!(sb
+            .mounts
+            .iter()
+            .any(|m| m.ends_with("/.gitconfig:ro") && !m.starts_with('~')));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

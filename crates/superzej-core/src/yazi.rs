@@ -105,7 +105,7 @@ mod tests {
         // Configured command wins.
         assert_eq!(resolve_bin("ranger", Some("/x/yazi".into())), "ranger");
         assert_eq!(resolve_bin("  nnn  ", None), "nnn"); // trimmed
-        // Else the pinned binary.
+                                                         // Else the pinned binary.
         assert_eq!(
             resolve_bin("", Some("/nix/store/x/bin/yazi".into())),
             "/nix/store/x/bin/yazi"
