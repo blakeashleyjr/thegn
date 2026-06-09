@@ -1300,13 +1300,19 @@ fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::NewWorktree => {
-                                // Add a new tab using the current workspace's root.
-                                // In a full implementation this would branch/pick,
-                                // but for the spike we just open a local shell pane in a new tab.
+                                // Add a new worktree tab. The name format is {repo}/{branch}
+                                // where branch is derived from the page number (·1, ·2, etc).
+                                // This creates a distinct worktree entry in the sidebar, separate
+                                // from pages (extra views on the same worktree).
                                 let src = &session.tabs[active];
-                                let n = session.tabs.len();
+                                let (repo, branch) = split_sidebar_tab(&src.name)
+                                    .unwrap_or_else(|| (src.name.clone(), "home".to_string()));
+                                let (_base, _) = split_sidebar_page(&branch);
+                                let new_n = session.tabs.len();
+                                // New worktrees use ·N as their branch name - they'll appear as
+                                // separate entries in the sidebar (distinct from home/feature branches)
                                 let tab = crate::session::Tab {
-                                    name: format!("{} ·{}", src.name, n),
+                                    name: format!("{repo}/·{new_n}"),
                                     kind: crate::session::TabKind::Worktree,
                                     worktree: src.worktree.clone(),
                                     center: crate::center::CenterTree::Leaf(0),
@@ -1674,13 +1680,15 @@ mod tests {
         let mut model = build_initial_model(&session);
 
         // Simulating the Action block manually since the event loop is complex to instantiate
-        let active = session.active;
-        let src = session.tabs[active].clone();
-        let n = session.tabs.len();
+        // NewWorktree creates a new worktree entry (separate branch), not a page of existing worktree
+        let (repo, branch) = split_sidebar_tab(&session.tabs[0].name)
+            .unwrap_or_else(|| (session.tabs[0].name.clone(), "home".to_string()));
+        let (_base, _) = split_sidebar_page(&branch);
+        let new_n = session.tabs.len();
         let tab = crate::session::Tab {
-            name: format!("{} ·{}", src.name, n),
+            name: format!("{}/·{}", repo, new_n),
             kind: crate::session::TabKind::Worktree,
-            worktree: src.worktree.clone(),
+            worktree: session.tabs[0].worktree.clone(),
             center: crate::center::CenterTree::Leaf(0),
             focused_pane: 0,
         };
@@ -1689,9 +1697,9 @@ mod tests {
 
         assert_eq!(session.tabs.len(), 2);
         assert_eq!(session.active, 1);
-        assert_eq!(session.tabs[1].name, "app/home ·1");
+        assert_eq!(session.tabs[1].name, "app/·1");
         assert_eq!(model.active_tab, 1);
-        assert_eq!(model.tabs[1], "app/home ·1");
+        assert_eq!(model.tabs[1], "app/·1");
     }
 
     #[test]
