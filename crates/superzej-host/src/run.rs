@@ -221,6 +221,15 @@ fn load_or_seed_session(cwd: &std::path::Path) -> crate::session::Session {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "workspace".into());
 
+    let mut env_session = std::env::var("SUPERZEJ_SESSION").ok();
+    if let Some(ref s) = env_session {
+        if s == "superzej" {
+            // Ignore the old legacy default
+            env_session = None;
+        }
+    }
+
+    let cwd_str = cwd.to_string_lossy().into_owned();
     let session_name = if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
         // Use the explicit DB in test scenarios
         let path = std::path::Path::new(&state_home).join("superzej/superzej.db");
@@ -228,22 +237,24 @@ fn load_or_seed_session(cwd: &std::path::Path) -> crate::session::Session {
             db.workspaces()
                 .unwrap_or_default()
                 .into_iter()
-                .find(|w| Path::new(&w.repo_path) == cwd || w.repo_path == sess)
+                .find(|w| {
+                    Path::new(&w.repo_path) == cwd || Some(&w.repo_path) == env_session.as_ref()
+                })
                 .map(|w| w.repo_path)
-                .unwrap_or_else(|| sess.clone())
+                .unwrap_or_else(|| env_session.unwrap_or(cwd_str.clone()))
         } else {
-            sess.clone()
+            env_session.unwrap_or(cwd_str)
         }
     } else if let Ok(db) = superzej_core::db::Db::open() {
         // Use the workspace from DB if available for cwd
         db.workspaces()
             .unwrap_or_default()
             .into_iter()
-            .find(|w| Path::new(&w.repo_path) == cwd || w.repo_path == sess)
+            .find(|w| Path::new(&w.repo_path) == cwd || Some(&w.repo_path) == env_session.as_ref())
             .map(|w| w.repo_path)
-            .unwrap_or_else(|| sess.clone())
+            .unwrap_or_else(|| env_session.unwrap_or(cwd_str))
     } else {
-        sess.clone()
+        env_session.unwrap_or(cwd_str)
     };
 
     let Ok(db) = (if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
