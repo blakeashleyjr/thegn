@@ -222,7 +222,7 @@ pub fn Palette(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 gap: 1,
             ) {
                 Text(content: "❯", color: ui::color(accent), weight: Weight::Bold)
-                View(flex_grow: 1.0) {
+                View(flex_grow: 1.0_f32) {
                     TextInput(
                         has_focus: true,
                         color: ui::text(),
@@ -243,8 +243,8 @@ pub fn Palette(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
             }
 
             // --- results (list + optional preview) ---
-            View(flex_grow: 1.0, flex_direction: FlexDirection::Row, padding_top: 1, gap: 1) {
-                View(flex_grow: 1.0, flex_direction: FlexDirection::Column) {
+            View(flex_grow: 1.0_f32, flex_direction: FlexDirection::Row, padding_top: 1, gap: 1) {
+                View(flex_grow: 1.0_f32, flex_direction: FlexDirection::Column) {
                     #(page.into_iter().map(|(row, sel)| {
                         let row_bg: Option<Color> = if sel { Some(tint) } else { None };
                         let label_weight = if sel { Weight::Bold } else { Weight::Normal };
@@ -258,7 +258,7 @@ pub fn Palette(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                             ) {
                                 Text(content: row.glyph, color: ui::color(row.hue))
                                 Text(content: row.label, color: ui::text(), weight: label_weight, wrap: TextWrap::NoWrap)
-                                View(flex_grow: 1.0)
+                                View(flex_grow: 1.0_f32)
                                 Text(content: row.detail, color: ui::faint(), wrap: TextWrap::NoWrap)
                             }
                         }
@@ -284,7 +284,7 @@ pub fn Palette(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
             View(flex_direction: FlexDirection::Row, gap: 2) {
                 Text(content: format!("{} ▸", parsed.mode.label()), color: ui::color(accent))
                 Text(content: format!("{count_label} results"), color: ui::faint())
-                View(flex_grow: 1.0)
+                View(flex_grow: 1.0_f32)
                 Text(content: "↑↓ move", color: ui::faint())
                 Text(content: "↵ run", color: ui::faint())
                 Text(content: if menu { "⇥ back" } else { "⇥ actions" }, color: ui::faint())

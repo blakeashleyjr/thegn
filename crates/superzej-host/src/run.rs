@@ -49,8 +49,51 @@ fn shell_argv_from(shell: &str, login: bool) -> Vec<String> {
     }
 }
 
+fn path_is_executable_file(path: &std::path::Path) -> bool {
+    path.is_file()
+}
+
+fn command_on_path(name: &str) -> Option<String> {
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join(name))
+        .find(|candidate| path_is_executable_file(candidate))
+        .map(|candidate| candidate.to_string_lossy().into_owned())
+}
+
+fn resolve_pane_shell(shell_env: Option<String>) -> String {
+    if let Some(shell) = shell_env {
+        let trimmed = shell.trim();
+        if !trimmed.is_empty() && path_is_executable_file(std::path::Path::new(trimmed)) {
+            return trimmed.to_string();
+        }
+    }
+
+    for name in ["zsh", "bash", "fish", "sh"] {
+        if let Some(shell) = command_on_path(name) {
+            return shell;
+        }
+    }
+
+    for shell in [
+        "/etc/profiles/per-user/blake/bin/zsh",
+        "/run/current-system/sw/bin/zsh",
+        "/bin/zsh",
+        "/run/current-system/sw/bin/bash",
+        "/bin/bash",
+        "/run/current-system/sw/bin/sh",
+        "/bin/sh",
+    ] {
+        if path_is_executable_file(std::path::Path::new(shell)) {
+            return shell.to_string();
+        }
+    }
+
+    "/bin/sh".into()
+}
+
 fn pane_shell_argv() -> Vec<String> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let shell = resolve_pane_shell(std::env::var("SHELL").ok());
     let login = std::env::var("SUPERZEJ_LOGIN_SHELL")
         .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false);
@@ -521,6 +564,25 @@ fn spawn_pr_cache_refresh(session: crate::session::Session) {
     });
 }
 
+/// Replace an externally-dead sole center pane with a fresh shell pane without
+/// closing the workspace tab. Explicit close-pane/close-worktree actions remove
+/// panes from the session before their process exits, so this only handles
+/// unexpected PTY child exits (killed shell, missing old child, etc.).
+fn replace_single_dead_center_pane(
+    tab: &mut crate::session::Tab,
+    dead_id: u32,
+    fresh_id: u32,
+) -> bool {
+    let ids = tab.center.pane_ids();
+    if ids.as_slice() != [dead_id] {
+        return false;
+    }
+
+    tab.center = crate::center::CenterTree::Leaf(fresh_id);
+    tab.focused_pane = fresh_id;
+    true
+}
+
 pub fn main() -> Result<()> {
     let caps = Capabilities::new_from_env().context("term capabilities")?;
     let mut term = new_terminal(caps).context("open terminal")?;
@@ -605,12 +667,24 @@ impl Panes {
         }
         let cwd = (!tab.worktree.is_empty() && std::path::Path::new(&tab.worktree).is_dir())
             .then(|| std::path::PathBuf::from(&tab.worktree))
-            .or_else(|| std::env::current_dir().ok());
+            .or_else(|| std::env::current_dir().ok())
+            .or_else(|| std::env::var("HOME").ok().map(std::path::PathBuf::from));
+
         let mut map = std::collections::HashMap::new();
         for old in &leaves {
             if !map.contains_key(old) {
-                let fresh = self.spawn(cwd.as_deref(), center)?;
-                map.insert(*old, fresh);
+                match self.spawn(cwd.as_deref(), center) {
+                    Ok(fresh) => {
+                        map.insert(*old, fresh);
+                    }
+                    Err(e) => {
+                        let _ = std::fs::write(
+                            "/tmp/szhost-spawn-err.log",
+                            format!("Materialize spawn failed: {e:?}"),
+                        );
+                        return Err(e);
+                    }
+                }
             }
         }
         let old_focus = tab.focused_pane;
@@ -774,6 +848,17 @@ fn event_loop<T: Terminal>(
         }
         let active = session.active;
 
+        if let Ok(size) = buf.terminal().get_screen_size() {
+            if size.rows != rows || size.cols != cols {
+                rows = size.rows;
+                cols = size.cols;
+                chrome = layout::compute(cols, rows, want_sidebar, want_panel);
+                need_relayout = true;
+                buf.resize(cols, rows);
+                dirty = true;
+            }
+        }
+
         // The active tab's panes are spawned lazily on first focus.
         panes.materialize(&mut session.tabs[active], chrome.center)?;
         if need_relayout {
@@ -800,7 +885,10 @@ fn event_loop<T: Terminal>(
             PaneEvent::Exit(id) => {
                 panes.table.remove(&id);
                 // Find the owning tab and either drop the pane from its split
-                // or, if it was the tab's only pane, close the tab.
+                // or, if its only shell died, keep the tab and respawn a fresh
+                // shell. Explicit close-pane/worktree actions remove the pane
+                // from the session before the PTY exit event arrives, so this
+                // path is for external child death (kill -9, bad shell, etc.).
                 if let Some(ti) = session
                     .tabs
                     .iter()
@@ -809,14 +897,28 @@ fn event_loop<T: Terminal>(
                     let sole = session.tabs[ti].center.pane_ids().len() == 1;
                     if sole {
                         if ti == session.active {
-                            session.close_active();
-                        } else {
-                            session.tabs.remove(ti);
-                            if session.active > ti {
-                                session.active -= 1;
+                            // Try worktree dir first, then current_dir, then $HOME as fallback
+                            let cwd = (!session.tabs[ti].worktree.is_empty()
+                                && std::path::Path::new(&session.tabs[ti].worktree).is_dir())
+                            .then(|| std::path::PathBuf::from(&session.tabs[ti].worktree))
+                            .or_else(|| std::env::current_dir().ok())
+                            .or_else(|| std::env::var("HOME").ok().map(std::path::PathBuf::from));
+                            match panes.spawn(cwd.as_deref(), chrome.center) {
+                                Ok(fresh) => {
+                                    replace_single_dead_center_pane(
+                                        &mut session.tabs[ti],
+                                        id,
+                                        fresh,
+                                    );
+                                    model.status = "Pane exited; spawned a fresh shell".into();
+                                    need_relayout = true;
+                                }
+                                Err(err) => {
+                                    model.status = format!("Respawn failed: {err:#}");
+                                    eprintln!("Respawn failed: {err:?}");
+                                }
                             }
                         }
-                        refresh_tab_model(&mut model, &session);
                     } else {
                         session.tabs[ti].center.remove(id);
                         if session.tabs[ti].focused_pane == id {
@@ -1322,6 +1424,14 @@ fn event_loop<T: Terminal>(
                 chrome = layout::compute(cols, rows, want_sidebar, want_panel);
                 need_relayout = true;
                 buf.resize(cols, rows);
+                let _ = buf
+                    .terminal()
+                    .set_screen_size(termwiz::terminal::ScreenSize {
+                        rows,
+                        cols,
+                        xpixel: 0,
+                        ypixel: 0,
+                    });
                 dirty = true;
             }
             Ok(Some(InputEvent::Paste(s))) => {
@@ -1635,6 +1745,32 @@ mod tests {
         assert_eq!(
             shell_argv_from("/opt/custom-shell", false),
             vec!["/opt/custom-shell".to_string()]
+        );
+    }
+
+    #[test]
+    fn external_sole_center_pane_exit_is_replaced_with_fresh_shell_pane() {
+        let mut tab = Tab {
+            name: "app/home".into(),
+            kind: TabKind::Home,
+            worktree: "/tmp/app".into(),
+            center: CenterTree::Leaf(7),
+            focused_pane: 7,
+        };
+
+        assert!(replace_single_dead_center_pane(&mut tab, 7, 42));
+        assert_eq!(tab.center.pane_ids(), vec![42]);
+        assert_eq!(tab.focused_pane, 42);
+    }
+
+    #[test]
+    fn pane_shell_resolution_falls_back_when_shell_env_points_to_missing_binary() {
+        let shell = resolve_pane_shell(Some("/definitely/missing/superzej-shell".into()));
+
+        assert_ne!(shell, "/definitely/missing/superzej-shell");
+        assert!(
+            std::path::Path::new(&shell).is_file(),
+            "fallback shell should exist on disk: {shell}"
         );
     }
 
