@@ -225,11 +225,9 @@ fn runtime_implements_register_subscribe_update_invalidate_emit_and_host_value_v
     runtime
         .subscribe(plugin.clone(), EventKind::Timer)
         .expect("subscriptions are recorded");
-    assert!(
-        runtime
-            .subscriptions()
-            .contains(&(plugin.clone(), EventKind::Timer))
-    );
+    assert!(runtime
+        .subscriptions()
+        .contains(&(plugin.clone(), EventKind::Timer)));
 
     let view = View::line([Span::styled("main", StyleRole::Accent)]);
     runtime

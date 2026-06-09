@@ -151,8 +151,8 @@ fn close(cfg: &Config, target: &str, session: Option<String>) {
     if let Some(s) = session.as_deref() {
         std::env::set_var("ZELLIJ_SESSION_NAME", s);
     }
-    let pin = resolve(cfg, target)
-        .unwrap_or_else(|| msg::die(&format!("pin: unknown pin '{target}'")));
+    let pin =
+        resolve(cfg, target).unwrap_or_else(|| msg::die(&format!("pin: unknown pin '{target}'")));
     let tab = tab_name(&pin.name);
     if zellij::tab_names().iter().any(|t| t == &tab) {
         zellij::close_tab_name(&tab);

@@ -3,11 +3,11 @@
 //! timer so streamed results (file walk / ripgrep) appear without blocking
 //! input; the chosen action is recorded into `Shared` and enacted after exit.
 
-use super::Shared;
 use super::item::{self, Row};
 use super::mode;
 use super::preview;
 use super::ui;
+use super::Shared;
 use iocraft::prelude::*;
 use std::sync::atomic::Ordering;
 use std::time::Duration;

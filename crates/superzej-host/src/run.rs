@@ -923,10 +923,10 @@ fn event_loop<T: Terminal>(
                                     );
                                     model.status = "Pane exited; spawned a fresh shell".into();
                                     need_relayout = true;
+                                    dirty = true;
                                 }
                                 Err(err) => {
                                     model.status = format!("Respawn failed: {err:#}");
-                                    eprintln!("Respawn failed: {err:?}");
                                 }
                             }
                         }

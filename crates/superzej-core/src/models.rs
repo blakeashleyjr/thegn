@@ -73,11 +73,9 @@ mod tests {
             created_at: 1,
             last_active: 2,
         };
-        assert!(
-            serde_json::to_string(&ws)
-                .unwrap()
-                .contains("\"repo_path\":\"/r\"")
-        );
+        assert!(serde_json::to_string(&ws)
+            .unwrap()
+            .contains("\"repo_path\":\"/r\""));
 
         let v = WorktreeView {
             workspace: "w".into(),

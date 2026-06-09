@@ -362,10 +362,9 @@ mod tests {
         assert!(a.windows(2).any(|w| w[0] == "--width" && w[1] == "100%"));
         assert!(a.windows(2).any(|w| w[0] == "--height" && w[1] == "35%"));
         assert!(a.windows(2).any(|w| w[0] == "--cwd" && w[1] == "/wt"));
-        assert!(
-            a.windows(2)
-                .any(|w| w[0] == "--name" && w[1] == "superzej-files")
-        );
+        assert!(a
+            .windows(2)
+            .any(|w| w[0] == "--name" && w[1] == "superzej-files"));
         assert_eq!(a.last().unwrap(), "--"); // command appended after this
     }
 
@@ -381,15 +380,13 @@ mod tests {
     fn pane_cmd_args_open_named_tiled_pane() {
         let a = pane_cmd_args(Path::new("/wt"), "\u{1f4cc} logs", "Right");
         assert_eq!(a[0], "new-pane");
-        assert!(
-            a.windows(2)
-                .any(|w| w[0] == "--direction" && w[1] == "Right")
-        );
+        assert!(a
+            .windows(2)
+            .any(|w| w[0] == "--direction" && w[1] == "Right"));
         assert!(a.windows(2).any(|w| w[0] == "--cwd" && w[1] == "/wt"));
-        assert!(
-            a.windows(2)
-                .any(|w| w[0] == "--name" && w[1] == "\u{1f4cc} logs")
-        );
+        assert!(a
+            .windows(2)
+            .any(|w| w[0] == "--name" && w[1] == "\u{1f4cc} logs"));
         assert!(!a.contains(&"--floating".to_string()));
         assert!(!a.contains(&"--close-on-exit".to_string()));
         assert_eq!(a.last().unwrap(), "--");

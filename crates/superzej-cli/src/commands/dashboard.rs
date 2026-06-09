@@ -36,7 +36,7 @@ fn watch_loop(cfg: &Config) -> Result<()> {
     let interval = cfg.dashboard.interval_secs.max(1);
     loop {
         crate::out!("\x1b[2J\x1b[H"); // clear + home
-        // "✦ superzej" wordmark (magenta star, accent name) + dim subtitle.
+                                      // "✦ superzej" wordmark (magenta star, accent name) + dim subtitle.
         crate::outln!(
             "\x1b[38;2;{}m\u{2726}\x1b[0m \x1b[1m\x1b[38;2;{}msuperzej\x1b[0m \
 \x1b[38;2;{}mworktrees · refresh {interval}s\x1b[0m\n",
