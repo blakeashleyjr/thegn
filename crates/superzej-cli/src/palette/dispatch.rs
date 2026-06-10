@@ -6,10 +6,10 @@
 use super::item::Action;
 use crate::cli::PrAction;
 use crate::config::Config;
-use superzej_core::forge::models::MergeMethod;
 use crate::{commands, util, zellij};
 use anyhow::Result;
 use std::path::Path;
+use superzej_core::forge::models::MergeMethod;
 
 pub fn dispatch(cfg: &Config, action: Action) -> Result<()> {
     match action {

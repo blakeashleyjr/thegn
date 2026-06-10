@@ -7,16 +7,16 @@
 
 use anyhow::{Context, Result};
 use std::path::Path;
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use termwiz::caps::Capabilities;
 use termwiz::input::{InputEvent, KeyCode, Modifiers};
 use termwiz::surface::{Change, Position, Surface};
 use termwiz::terminal::buffered::BufferedTerminal;
-use termwiz::terminal::{Terminal, new_terminal};
+use termwiz::terminal::{new_terminal, Terminal};
 
-use crate::chrome::{FrameModel, render_tab};
+use crate::chrome::{render_tab, FrameModel};
 use crate::compositor::Rect;
 use crate::layout;
 use crate::pane::{PaneEvent, PtyPane};

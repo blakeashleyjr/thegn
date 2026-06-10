@@ -6,7 +6,7 @@
 
 use serde_json::Value;
 use superzej_core::forge::models::{
-    self as github, CheckRun, CreateOpts, ForgeError as GhError, MergeMethod, PanelState, PrPanel,
+    CheckRun, CreateOpts, ForgeError as GhError, MergeMethod, PanelState, PrPanel,
     PrStatus,
 };
 use superzej_core::remote::GitLoc;
@@ -35,10 +35,14 @@ pub struct CliGh;
 
 impl GhBackend for CliGh {
     fn pr_status(&self, loc: &GitLoc) -> Result<PrPanel, GhError> {
-        Ok(superzej_core::forge::get_forge_for_loc(loc).unwrap().pr_status(loc))
+        Ok(superzej_core::forge::get_forge_for_loc(loc)
+            .unwrap()
+            .pr_status(loc))
     }
     fn create_pr(&self, loc: &GitLoc, opts: &CreateOpts) -> Result<String, GhError> {
-        superzej_core::forge::get_forge_for_loc(loc).unwrap().create_pr(loc, opts)
+        superzej_core::forge::get_forge_for_loc(loc)
+            .unwrap()
+            .create_pr(loc, opts)
     }
     fn merge_pr(
         &self,
@@ -47,13 +51,19 @@ impl GhBackend for CliGh {
         delete_branch: bool,
         auto: bool,
     ) -> Result<(), GhError> {
-        superzej_core::forge::get_forge_for_loc(loc).unwrap().merge_pr(loc, method, delete_branch, auto)
+        superzej_core::forge::get_forge_for_loc(loc)
+            .unwrap()
+            .merge_pr(loc, method, delete_branch, auto)
     }
     fn approve(&self, loc: &GitLoc, body: Option<&str>) -> Result<(), GhError> {
-        superzej_core::forge::get_forge_for_loc(loc).unwrap().approve_pr(loc, body)
+        superzej_core::forge::get_forge_for_loc(loc)
+            .unwrap()
+            .approve_pr(loc, body)
     }
     fn rerun_failed(&self, loc: &GitLoc) -> Result<u32, GhError> {
-        superzej_core::forge::get_forge_for_loc(loc).unwrap().rerun_failed_checks(loc)
+        superzej_core::forge::get_forge_for_loc(loc)
+            .unwrap()
+            .rerun_failed_checks(loc)
     }
 }
 
@@ -245,7 +255,10 @@ impl GhBackend for GhNative {
         let (Some(token), Some((owner, repo))) = (resolve_token(), self.owner_repo(loc)) else {
             return self.fallback.pr_status(loc);
         };
-        let branch = superzej_core::forge::get_forge_for_loc(loc).unwrap().pr_status(loc).branch; // cheap rev-parse via core
+        let branch = superzej_core::forge::get_forge_for_loc(loc)
+            .unwrap()
+            .pr_status(loc)
+            .branch; // cheap rev-parse via core
         let client = match octocrab::OctocrabBuilder::new()
             .personal_token(token)
             .build()
@@ -282,8 +295,7 @@ impl GhBackend for GhNative {
         delete_branch: bool,
         auto: bool,
     ) -> Result<(), GhError> {
-        self.fallback
-            .merge_pr(loc, method, delete_branch, auto)
+        self.fallback.merge_pr(loc, method, delete_branch, auto)
     }
     fn approve(&self, loc: &GitLoc, body: Option<&str>) -> Result<(), GhError> {
         self.fallback.approve(loc, body)

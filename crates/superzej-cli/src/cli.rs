@@ -1,8 +1,8 @@
 //! Command-line interface (clap derive).
 
-use superzej_core::forge::models::MergeMethod;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use superzej_core::forge::models::MergeMethod;
 
 #[derive(Parser)]
 #[command(

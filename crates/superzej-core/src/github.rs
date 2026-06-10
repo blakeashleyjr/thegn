@@ -3,7 +3,7 @@
 use crate::forge::models::*;
 use crate::forge::Forge;
 use crate::remote::GitLoc;
-use serde::{Deserialize};
+use serde::Deserialize;
 
 pub struct GitHubForge;
 

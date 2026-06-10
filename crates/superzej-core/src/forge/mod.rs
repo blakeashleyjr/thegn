@@ -1,8 +1,8 @@
 pub mod models;
 pub use models::*;
 
-use crate::remote::GitLoc;
 use crate::github::GitHubForge;
+use crate::remote::GitLoc;
 
 pub trait Forge {
     fn pr_status(&self, loc: &GitLoc) -> PrPanel;
