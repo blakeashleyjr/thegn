@@ -8,6 +8,7 @@
 use anyhow::{Context, Result};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 use std::path::Path;
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc as tokio_mpsc;
@@ -600,7 +601,7 @@ fn replace_single_dead_center_pane(
     true
 }
 
-pub fn main(cli: crate::Cli) -> Result<()> {
+pub async fn main(cli: crate::Cli) -> Result<()> {
     let caps = Capabilities::new_from_env().context("term capabilities")?;
     let mut term = new_terminal(caps).context("open terminal")?;
     term.set_raw_mode().context("raw mode")?;
@@ -664,7 +665,8 @@ pub fn main(cli: crate::Cli) -> Result<()> {
 
     let result = event_loop(
         &mut buf, session, model, model_tx, model_rx, rows, cols, keymap, mode, config_rx,
-    );
+    )
+    .await;
 
     let _ = buf.terminal().exit_alternate_screen();
     let _ = buf.terminal().set_cooked_mode();
@@ -873,7 +875,7 @@ fn sync_drawer_persistence(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn event_loop<T: Terminal>(
+async fn event_loop<T: Terminal>(
     buf: &mut BufferedTerminal<T>,
     mut session: crate::session::Session,
     mut model: FrameModel,
@@ -1030,7 +1032,7 @@ fn event_loop<T: Terminal>(
             return Ok(());
         }
 
-        while let Ok(next_model) = model_rx.try_recv() {
+        while let Some(next_model) = model_rx.try_recv().ok() {
             model = next_model;
             refresh_tab_model(&mut model, &session);
             apply_mode_status(&mut model, mode);

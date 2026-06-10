@@ -18,9 +18,9 @@ use crate::github::{self, PanelState};
 use crate::remote::GitLoc;
 use crate::{util, zellij};
 use anyhow::Result;
-use notify::{recommended_watcher, Event, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher, recommended_watcher};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
+use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::time::Duration;
 
 /// How often the loop wakes to re-check focus and the PR interval.

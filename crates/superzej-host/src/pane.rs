@@ -201,7 +201,10 @@ mod tests {
     fn pty_round_trip_lands_output_in_grid() {
         let (tx, mut rx) = tokio_mpsc::channel(1024);
         let mut pane = PtyPane::spawn(0, &sh("printf 'hello-pty'"), None, 24, 80, tx).unwrap();
-        assert!(drain_until_exit(&mut pane, &mut rx, 5000), "child should exit");
+        assert!(
+            drain_until_exit(&mut pane, &mut rx, 5000),
+            "child should exit"
+        );
         assert_eq!(pane.emulator().row_text(0), Some("hello-pty".to_string()));
     }
 

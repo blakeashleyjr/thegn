@@ -41,11 +41,21 @@ auto_remove_worktree = false
 accent = "#76eede"
 
 # Resource managers opened from the top-bar stats widget: highlight a stat with
-# Super+Alt+Up, cycle CPU/MEM/GPU with ←/→, press Enter to embed it as a pane.
+# Super+Alt+Up, cycle CPU/MEM/Net/GPU with ←/→, press Enter to embed it as a pane.
 # `system` backs the CPU and MEM segments; `gpu` backs the GPU segment.
 [monitor]
 system = "btm"   # CPU/RAM monitor (ClementTsang/bottom); e.g. "htop", "btop"
 gpu = "nvtop"    # GPU monitor
+
+# Top-bar stats widget: icons and refresh rate for CPU/RAM/Network/GPU display.
+# Icons can be text ("CPU") or unicode symbols ("⚡"). GPU shows only if detected.
+[stats]
+refresh-secs = 2           # Polling interval in seconds
+cpu-icon = "CPU"           # Icon for CPU stat
+mem-icon = "MEM"           # Icon for memory stat
+net-icon = "NET"           # Icon for network stat
+gpu-icon = "GPU"           # Icon for GPU stat
+refresh-rates = [1, 2, 5, 10]  # Available rates for Tab keybind cycling
 
 # Bottom file-manager drawer (hidden by default; toggle with Ctrl+Alt+f). Runs a
 # pinned, bundled yazi with its own config kept separate from the system.

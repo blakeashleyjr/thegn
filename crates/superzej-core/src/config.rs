@@ -348,6 +348,38 @@ impl Default for MonitorConfig {
     }
 }
 
+/// `[stats]` — icons and refresh rate for the top-bar stats widget.
+/// Icons can be text ("CPU") or unicode symbols ("⚡"). GPU shows only if detected.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct StatsConfig {
+    /// Polling interval in seconds.
+    pub refresh_secs: f64,
+    /// Icon for CPU stat.
+    pub cpu_icon: String,
+    /// Icon for memory stat.
+    pub mem_icon: String,
+    /// Icon for network stat.
+    pub net_icon: String,
+    /// Icon for GPU stat.
+    pub gpu_icon: String,
+    /// Available refresh rates for keybind cycling (seconds).
+    pub refresh_rates: Vec<f64>,
+}
+
+impl Default for StatsConfig {
+    fn default() -> Self {
+        StatsConfig {
+            refresh_secs: 2.0,
+            cpu_icon: "CPU".into(),
+            mem_icon: "MEM".into(),
+            net_icon: "NET".into(),
+            gpu_icon: "GPU".into(),
+            refresh_rates: vec![1.0, 2.0, 5.0, 10.0],
+        }
+    }
+}
+
 /// `[limits]` — resource ceilings for tools launched in floating panes
 /// (`superzej tool <name>`). When `systemd-run` is available, the tool runs in a
 /// transient `--user --scope` with these caps, so a runaway child (e.g. yazi's
@@ -708,6 +740,7 @@ pub struct Config {
     // --- sub-tables ---
     pub theme: ThemeConfig,
     pub monitor: MonitorConfig,
+    pub stats: StatsConfig,
     pub pr: PrConfig,
     pub dashboard: DashboardConfig,
     pub watch: WatchConfig,
@@ -745,6 +778,7 @@ impl Default for Config {
             plugins: Vec::new(),
             theme: ThemeConfig::default(),
             monitor: MonitorConfig::default(),
+            stats: StatsConfig::default(),
             pr: PrConfig::default(),
             dashboard: DashboardConfig::default(),
             watch: WatchConfig::default(),
@@ -1347,6 +1381,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn try_load_layered_handles_overrides_and_invalid_overrides() {
+        let env = MapEnv::default();
+        let cli_overrides = vec![
+            "theme.accent=#abcdef".to_string(),
+            "invalid.path=123".to_string(),
+            "sandbox.enabled=false".to_string(),
+            "sandbox.remote.host=user@box".to_string(),
+        ];
+
+        let cfg = Config::try_load_layered(&env, &cli_overrides, None).unwrap();
+        assert_eq!(cfg.theme.accent, "#abcdef");
+        assert_eq!(cfg.sandbox.enabled, false);
+        assert_eq!(cfg.sandbox.remote.host, "user@box");
+    }
+
+    #[test]
     fn override_str_parses_types_correctly_and_handles_bad_paths() {
         let mut cfg = Config::default();
         // Number
@@ -1364,6 +1414,13 @@ mod tests {
         assert!(Config::apply_override_str(&mut cfg, "does.not.exist", "value").is_err());
         // Type error: setting a number field to a string that doesn't parse to a number
         assert!(Config::apply_override_str(&mut cfg, "repo_scan_depth", "not_a_number").is_err());
+
+        // Edge cases
+        assert!(Config::apply_override_str(&mut cfg, "theme", "value").is_err());
+        assert!(Config::apply_override_str(&mut cfg, "drawer.height", "\"30%\"").is_ok());
+
+        // Null test
+        assert!(Config::apply_override_str(&mut cfg, "sandbox.remote", "value").is_err());
     }
 
     #[test]
@@ -1399,6 +1456,17 @@ surface = "todoist.status"
         let m = MonitorConfig::default();
         assert_eq!(m.system, "btm");
         assert_eq!(m.gpu, "nvtop");
+    }
+
+    #[test]
+    fn stats_defaults() {
+        let s = StatsConfig::default();
+        assert_eq!(s.refresh_secs, 2.0);
+        assert_eq!(s.cpu_icon, "CPU");
+        assert_eq!(s.mem_icon, "MEM");
+        assert_eq!(s.net_icon, "NET");
+        assert_eq!(s.gpu_icon, "GPU");
+        assert_eq!(s.refresh_rates, vec![1.0, 2.0, 5.0, 10.0]);
     }
 
     #[test]

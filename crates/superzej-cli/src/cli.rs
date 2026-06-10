@@ -280,8 +280,8 @@ pub enum Command {
     /// `cpu=NN mem=NN gpu=NN time=HH:MM` (percents; gpu dropped if unreadable).
     Stats {
         /// Output stats configuration as JSON (icons and refresh rates).
-        #[arg(long)]
-        config: bool,
+        #[arg(long = "stats-config")]
+        stats_config: bool,
     },
     /// (internal) Terminal-activity state per worktree for the sidebar dots —
     /// `tab<TAB>state<TAB>quiet_secs` per line (state: none|active|quiet|acked).
