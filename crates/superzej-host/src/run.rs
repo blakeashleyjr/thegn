@@ -707,6 +707,20 @@ fn replace_single_dead_center_pane(
 }
 
 pub async fn main(cli: crate::Cli) -> Result<()> {
+    let start = std::time::Instant::now();
+    // File-sink logging is opt-in via `SUPERZEJ_LOG` (an env-filter string).
+    // When unset no subscriber is installed at all, so every tracing callsite
+    // collapses to one atomic load — instrumentation is free in the idle case.
+    if std::env::var_os("SUPERZEJ_LOG").is_some() {
+        superzej_core::log::init(
+            superzej_core::log::Role::Host,
+            &superzej_core::config::LogConfig {
+                file: true,
+                ..Default::default()
+            },
+        );
+    }
+
     let caps = Capabilities::new_from_env().context("term capabilities")?;
     let mut term = new_terminal(caps).context("open terminal")?;
     term.set_raw_mode().context("raw mode")?;
@@ -721,14 +735,30 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // `poll_input(None)` returns to drain its channel — the loop is fully
     // event-driven (zero idle wakeups) rather than polled on a 16ms tick.
     let waker = buf.terminal().waker();
+    tracing::info!(
+        target: "szhost::startup",
+        since_start_ms = start.elapsed().as_millis() as u64,
+        "terminal ready (raw mode + alt screen + buffer)"
+    );
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let session = load_or_seed_session(&cwd);
+    tracing::info!(
+        target: "szhost::startup",
+        since_start_ms = start.elapsed().as_millis() as u64,
+        tabs = session.tabs.len(),
+        "session loaded"
+    );
 
     let cfg = superzej_core::config::Config::load_layered(
         &superzej_core::config::ProcessEnv,
         &cli.overrides,
         cli.config.clone(),
+    );
+    tracing::info!(
+        target: "szhost::startup",
+        since_start_ms = start.elapsed().as_millis() as u64,
+        "config loaded"
     );
     let keymap = rebuild_keymap(&cfg, &session);
     let mode = crate::keymap::startup_mode(&cfg);
@@ -791,7 +821,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
 
     let result = event_loop(
         &mut buf, session, model, model_tx, model_rx, rows, cols, keymap, mode, config_rx,
-        refresh_tx, refresh_rx, waker,
+        refresh_tx, refresh_rx, waker, start,
     )
     .await;
 
@@ -887,6 +917,7 @@ impl Panes {
             .or_else(|| std::env::current_dir().ok())
             .or_else(|| std::env::var("HOME").ok().map(std::path::PathBuf::from));
 
+        let spawn_t0 = std::time::Instant::now();
         let mut map = std::collections::HashMap::new();
         for old in &leaves {
             if !map.contains_key(old) {
@@ -904,6 +935,12 @@ impl Panes {
                 }
             }
         }
+        tracing::info!(
+            target: "szhost::startup",
+            spawn_ms = spawn_t0.elapsed().as_millis() as u64,
+            panes = map.len(),
+            "pty panes spawned"
+        );
         let old_focus = tab.focused_pane;
         tab.center.remap(&mut |old| map[&old]);
         tab.focused_pane = map
@@ -1650,8 +1687,11 @@ async fn event_loop<T: Terminal>(
     refresh_tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     mut refresh_rx: tokio_mpsc::UnboundedReceiver<RefreshKind>,
     waker: TerminalWaker,
+    start: std::time::Instant,
 ) -> Result<()> {
     let mut scratch = Surface::new(cols, rows);
+    // One-shot startup milestone: logged after the first diff-flush below.
+    let mut first_frame_logged = false;
     let mut want_sidebar = true;
     let mut want_panel = true;
     // Sidebar interaction + persisted view state (collapse/sort/pins/width).
@@ -2118,6 +2158,14 @@ async fn event_loop<T: Terminal>(
             }
             buf.flush().context("flush")?;
             dirty = false;
+            if !first_frame_logged {
+                first_frame_logged = true;
+                tracing::info!(
+                    target: "szhost::startup",
+                    since_start_ms = start.elapsed().as_millis() as u64,
+                    "first frame flushed"
+                );
+            }
         }
 
         // 3. Block until something happens: a real terminal event, or a
