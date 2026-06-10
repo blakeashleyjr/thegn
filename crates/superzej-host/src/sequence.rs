@@ -166,12 +166,14 @@ mod tests {
         assert_eq!(matcher.feed(Key::char(' ')), MatchResult::Pending);
         let cont = matcher.pending_continuations();
         assert_eq!(cont.len(), 2);
-        assert!(cont
-            .iter()
-            .any(|(k, a)| *k == Key::char('p') && *a == Action::TogglePanel));
-        assert!(cont
-            .iter()
-            .any(|(k, a)| *k == Key::char('s') && *a == Action::ToggleSidebar));
+        assert!(
+            cont.iter()
+                .any(|(k, a)| *k == Key::char('p') && *a == Action::TogglePanel)
+        );
+        assert!(
+            cont.iter()
+                .any(|(k, a)| *k == Key::char('s') && *a == Action::ToggleSidebar)
+        );
     }
 
     #[test]

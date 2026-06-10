@@ -185,18 +185,18 @@ Tor (444) and GPU passthrough (393) as niche opt-ins.
 
 ### A. Core architecture
 
-- [~] 1. Coordinator daemon — host-side Rust service owning all state
-- [x] 2. zellij substrate — multiplexing/rendering layer underneath
-- [x] 3. Thin zellij WASM plugins — dashboard, tree, git, monitor panes
-- [x] 4. Daemon↔plugin IPC — local socket + pipe
-- [x] 5. Single-binary distribution
-- [~] 6. One core, many front doors — TUI/API/MCP share logic
-- [~] 7. Headless daemon — UI attaches/detaches
-- [ ] 8. Daemon supervision — crash recovery
-- [ ] 9. Internal event bus — normalized events _(only pipes + the watch daemon; no first-class bus)_
+- [~] 1. Coordinator core — `superzej-core` owns all state (in-process, not a daemon)
+- [x] 2. ~~zellij substrate~~ — **REMOVED**: the native `superzej-host` compositor owns multiplexing/rendering (termwiz + portable-pty + `CenterTree`)
+- [x] 3. ~~Thin zellij WASM plugins~~ — **REMOVED**: chrome (sidebar/panel/tabbar/statusbar) is in-process in `superzej-host`
+- [ ] 4. ~~Daemon↔plugin IPC~~ — **N/A after strip**: no separate plugin process; the future native plugin API contract lives in `core/plugin_api.rs` (unwired)
+- [x] 5. Single-binary distribution — one `superzej`(=`szhost`); no side artifacts
+- [~] 6. One core, many front doors — TUI (host) + CLI verbs share `superzej-core`; API/MCP still aspirational (AK/AL)
+- [ ] 7. Headless daemon — UI attaches/detaches _(not yet; host is a foreground compositor, state resurrects from SQLite)_
+- [ ] 8. Daemon supervision — crash recovery _(state resurrection only; no supervisor)_
+- [ ] 9. Internal event bus — normalized events _(ad-hoc tokio mpsc in the host loop; no first-class bus)_
 - [x] 10. Embedded state store — sqlite
 - [x] 11. Config hot-reload — without dropping sessions
-- [x] 12. Structured daemon logging
+- [x] 12. Structured logging
 
 ### B. Workspace bar / tree
 
