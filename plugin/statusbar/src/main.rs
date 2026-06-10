@@ -73,6 +73,8 @@ struct State {
     active_tab_pos: Option<usize>, // position of the session's active tab
     session: Option<String>,       // current session name (restore `--session` arg)
     restore_poked: bool,           // restore already requested for this activation
+    focused_pane_command: Option<String>, // The command running in the focused pane (e.g. lazygit, hx)
+    custom_hints: std::collections::BTreeMap<String, Vec<(String, String)>>,
 }
 
 /// Tracked visibility of one controlled chrome surface.
@@ -108,6 +110,7 @@ impl ZellijPlugin for State {
         // Selectable so Super+Alt+Down can focus the bottom bar and route keys.
         set_selectable(true);
         fetch_theme();
+        fetch_hints();
         // Restore any persisted manual-hide (a toggle may have hidden a surface
         // before this per-tab statusbar loaded). Replies tagged vis_sidebar/vis_panel.
         self.pull_visibility();
@@ -143,9 +146,13 @@ impl ZellijPlugin for State {
             // arrives here (the statusbar is always visible, so it never misses
             // one). Recompute auto-hide from the total width and reconcile.
             Event::PaneUpdate(manifest) => {
+                let old_cmd = self.focused_pane_command.clone();
                 self.scan_panes(&manifest);
                 self.reconcile();
                 self.maybe_restore();
+                if self.focused_pane_command != old_cmd {
+                    return true;
+                }
                 false
             }
             Event::RunCommandResult(code, stdout, _, ctx)
@@ -157,6 +164,20 @@ impl ZellijPlugin for State {
                             self.accent = rgb;
                             return true;
                         }
+                    }
+                }
+                false
+            }
+            Event::RunCommandResult(code, stdout, _, ctx)
+                if ctx.get("cmd").map(|s| s.as_str()) == Some("hints") =>
+            {
+                if code == Some(0) {
+                    if let Ok(map) = serde_json::from_slice::<
+                        std::collections::BTreeMap<String, Vec<(String, String)>>,
+                    >(&stdout)
+                    {
+                        self.custom_hints = map;
+                        return true;
                     }
                 }
                 false
@@ -315,7 +336,7 @@ impl ZellijPlugin for State {
             push_raw(&mut out, &mut col, cols, " ", 1);
         }
 
-        for (i, (key, label)) in chips.iter().enumerate() {
+        for (i, (key, label)) in chips.into_iter().enumerate() {
             if i > 0 {
                 push_raw(
                     &mut out,
@@ -357,6 +378,13 @@ fn fetch_theme() {
     let mut ctx = BTreeMap::new();
     ctx.insert("cmd".to_string(), "theme".to_string());
     run_command(&["superzej", "theme"], ctx);
+}
+
+/// Kick off `superzej hints`; the custom hints land via RunCommandResult.
+fn fetch_hints() {
+    let mut ctx = BTreeMap::new();
+    ctx.insert("cmd".to_string(), "hints".to_string());
+    run_command(&["superzej", "hints"], ctx);
 }
 
 /// Outcome of the per-activation drawer-restore check (see `restore_decision`).
@@ -484,6 +512,7 @@ impl State {
         // id so the close pipe can target it, and so restore knows it's open.
         // Absent ⇒ closed (e.g. the user quit yazi, or it was never opened).
         let mut files_id = None;
+        self.focused_pane_command = None;
         for p in panes {
             // The open command palette: the floating pane we spawn as
             // `--name superzej-palette` (see `toggle_palette`).
@@ -498,6 +527,9 @@ impl State {
                 && (p.is_focused || self.center_id.is_none())
             {
                 self.center_id = Some(p.id);
+                if p.is_focused {
+                    self.focused_pane_command = Some(p.title.clone());
+                }
             }
             if p.is_plugin {
                 match p.plugin_url.as_deref() {
@@ -659,51 +691,83 @@ impl State {
     }
 
     /// (key, label) chips for the current mode + tab context.
-    fn chips(&self, mode: InputMode) -> Vec<(&'static str, &'static str)> {
+    fn chips(&self, mode: InputMode) -> Vec<(String, String)> {
         match mode {
             InputMode::Normal => {
                 let mut v = vec![
-                    ("Cmd-K", "menu"),
-                    ("A-←→", "tabs"),
-                    ("S-A-←→", "panes"),
-                    ("A-W", "new repo"),
-                    ("A-w", "worktree"),
-                    ("A-n", "split"),
+                    ("Cmd-K".to_string(), "menu".to_string()),
+                    ("A-←→".to_string(), "tabs".to_string()),
+                    ("S-A-←→".to_string(), "panes".to_string()),
+                    ("A-W".to_string(), "new repo".to_string()),
+                    ("A-w".to_string(), "worktree".to_string()),
+                    ("A-n".to_string(), "split".to_string()),
                 ];
+
+                if let Some(cmd) = &self.focused_pane_command {
+                    let cmd_lower = cmd.to_lowercase();
+                    for (tool_name, hints) in &self.custom_hints {
+                        if cmd_lower.contains(&tool_name.to_lowercase()) {
+                            v.extend(hints.clone());
+                            return v;
+                        }
+                    }
+                }
+
                 if self.worktree_ctx {
-                    v.extend_from_slice(&[("A-g", "lazygit"), ("A-e", "edit"), ("A-X", "close")]);
+                    v.extend_from_slice(&[
+                        ("A-g".to_string(), "lazygit".to_string()),
+                        ("A-e".to_string(), "edit".to_string()),
+                        ("A-X".to_string(), "close".to_string()),
+                    ]);
                 } else {
-                    v.extend_from_slice(&[("A-o", "switch repo"), ("A-d", "dashboard")]);
+                    v.extend_from_slice(&[
+                        ("A-o".to_string(), "switch repo".to_string()),
+                        ("A-d".to_string(), "dashboard".to_string()),
+                    ]);
                 }
                 v
             }
             InputMode::Pane => vec![
-                ("→", "right"),
-                ("↓", "down"),
-                ("x", "close"),
-                ("f", "fullscreen"),
-                ("w", "float"),
-                ("z", "frames"),
-                ("⏎", "done"),
+                ("→".to_string(), "right".to_string()),
+                ("↓".to_string(), "down".to_string()),
+                ("x".to_string(), "close".to_string()),
+                ("f".to_string(), "fullscreen".to_string()),
+                ("w".to_string(), "float".to_string()),
+                ("z".to_string(), "frames".to_string()),
+                ("⏎".to_string(), "done".to_string()),
             ],
             InputMode::Tab => vec![
-                ("n", "new"),
-                ("x", "close"),
-                ("←→", "move"),
-                ("r", "rename"),
-                ("⏎", "done"),
+                ("n".to_string(), "new".to_string()),
+                ("x".to_string(), "close".to_string()),
+                ("←→".to_string(), "move".to_string()),
+                ("r".to_string(), "rename".to_string()),
+                ("⏎".to_string(), "done".to_string()),
             ],
-            InputMode::Resize => vec![("←↑↓→", "resize"), ("+-", "size"), ("⏎", "done")],
-            InputMode::Move => vec![("←↑↓→", "move pane"), ("⏎", "done")],
+            InputMode::Resize => vec![
+                ("←↑↓→".to_string(), "resize".to_string()),
+                ("+-".to_string(), "size".to_string()),
+                ("⏎".to_string(), "done".to_string()),
+            ],
+            InputMode::Move => vec![
+                ("←↑↓→".to_string(), "move pane".to_string()),
+                ("⏎".to_string(), "done".to_string()),
+            ],
             InputMode::Scroll => vec![
-                ("↑↓", "scroll"),
-                ("/", "search"),
-                ("e", "edit"),
-                ("⏎", "done"),
+                ("↑↓".to_string(), "scroll".to_string()),
+                ("/".to_string(), "search".to_string()),
+                ("e".to_string(), "edit".to_string()),
+                ("⏎".to_string(), "done".to_string()),
             ],
-            InputMode::Session => vec![("d", "detach"), ("w", "sessions"), ("⏎", "done")],
-            InputMode::Locked => vec![("Ctrl-g", "unlock")],
-            _ => vec![("⏎", "done"), ("Esc", "cancel")],
+            InputMode::Session => vec![
+                ("d".to_string(), "detach".to_string()),
+                ("w".to_string(), "sessions".to_string()),
+                ("⏎".to_string(), "done".to_string()),
+            ],
+            InputMode::Locked => vec![("Ctrl-g".to_string(), "unlock".to_string())],
+            _ => vec![
+                ("⏎".to_string(), "done".to_string()),
+                ("Esc".to_string(), "cancel".to_string()),
+            ],
         }
     }
 }
@@ -739,4 +803,103 @@ fn push_raw(out: &mut String, col: &mut usize, cols: usize, text: &str, width: u
     }
     out.push_str(text);
     *col += width;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_restore_decision_disarm() {
+        let dec = restore_decision(Some(1), Some(2), true, false, false, true);
+        assert!(matches!(dec, RestoreDecision::Disarm));
+    }
+
+    #[test]
+    fn test_restore_decision_skip_missing() {
+        let dec = restore_decision(None, Some(1), true, false, false, true);
+        assert!(matches!(dec, RestoreDecision::Skip));
+        let dec2 = restore_decision(Some(1), None, true, false, false, true);
+        assert!(matches!(dec2, RestoreDecision::Skip));
+    }
+
+    #[test]
+    fn test_restore_decision_skip_conditions() {
+        // not worktree
+        let dec = restore_decision(Some(1), Some(1), false, false, false, true);
+        assert!(matches!(dec, RestoreDecision::Skip));
+        // files open
+        let dec = restore_decision(Some(1), Some(1), true, true, false, true);
+        assert!(matches!(dec, RestoreDecision::Skip));
+        // already poked
+        let dec = restore_decision(Some(1), Some(1), true, false, true, true);
+        assert!(matches!(dec, RestoreDecision::Skip));
+        // no session
+        let dec = restore_decision(Some(1), Some(1), true, false, false, false);
+        assert!(matches!(dec, RestoreDecision::Skip));
+    }
+
+    #[test]
+    fn test_restore_decision_fire() {
+        let dec = restore_decision(Some(1), Some(1), true, false, false, true);
+        assert!(matches!(dec, RestoreDecision::Fire));
+    }
+
+    #[test]
+    fn test_parse_rgb_line() {
+        assert_eq!(
+            parse_rgb_line(b"255;0;128\n"),
+            Some("255;0;128".to_string())
+        );
+        assert_eq!(
+            parse_rgb_line(b" 255;0;128 \n"),
+            Some("255;0;128".to_string())
+        );
+        // Invalid
+        assert_eq!(parse_rgb_line(b"255;0\n"), None);
+        assert_eq!(parse_rgb_line(b"255;0;128;50\n"), None);
+        assert_eq!(parse_rgb_line(b"abc;0;128\n"), None);
+    }
+
+    #[test]
+    fn test_mode_name() {
+        assert_eq!(mode_name(InputMode::Normal), "MODE");
+        assert_eq!(mode_name(InputMode::Pane), "PANE");
+        assert_eq!(mode_name(InputMode::RenamePane), "RENAME PANE");
+    }
+
+    #[test]
+    fn test_push_raw() {
+        let mut out = String::new();
+        let mut col = 0;
+        let cols = 10;
+
+        // fits
+        push_raw(&mut out, &mut col, cols, "hello", 5);
+        assert_eq!(out, "hello");
+        assert_eq!(col, 5);
+
+        // fits exactly
+        push_raw(&mut out, &mut col, cols, "world", 5);
+        assert_eq!(out, "helloworld");
+        assert_eq!(col, 10);
+
+        // already full
+        push_raw(&mut out, &mut col, cols, "!", 1);
+        assert_eq!(out, "helloworld");
+        assert_eq!(col, 10);
+    }
+
+    #[test]
+    fn test_push_raw_clips() {
+        let mut out = String::new();
+        let mut col = 0;
+        let cols = 5;
+
+        push_raw(&mut out, &mut col, cols, "abc", 3);
+        // Next piece is length 3, only 2 slots remain, so it doesn't push
+        push_raw(&mut out, &mut col, cols, "def", 3);
+        assert_eq!(out, "abc");
+        assert_eq!(col, 5); // col gets clamped to cols
+    }
 }

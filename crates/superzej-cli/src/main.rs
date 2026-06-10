@@ -30,7 +30,7 @@ fn main() {
     }
 
     let args = Cli::parse();
-    
+
     // Add legacy log level mapping to overrides if provided
     let mut overrides = args.overrides.clone();
     if let Some(lvl) = args.log_level.as_deref() {
@@ -140,6 +140,7 @@ fn main() {
         Command::List { json } => commands::list::run(&cfg, json),
         Command::Repos => commands::repos::run(&cfg),
         Command::Recent { count } => commands::recent::run(count),
+        Command::Hints => commands::hints::run(&cfg),
         Command::Status => commands::status::run(&cfg),
         Command::Config { action } => commands::config::run(&cfg, action, effective_path),
         Command::Keys { action } => commands::keys::run(&cfg, action),

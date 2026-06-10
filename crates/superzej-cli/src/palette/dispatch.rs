@@ -54,11 +54,16 @@ pub fn dispatch(cfg: &Config, action: Action) -> Result<()> {
             },
         ),
         Action::PrRerun => commands::pr::run(cfg, PrAction::RerunChecks { worktree: None }),
-        Action::Config => commands::config::run(cfg, crate::cli::ConfigAction::Edit, Config::path()),
+        Action::Config => {
+            commands::config::run(cfg, crate::cli::ConfigAction::Edit, Config::path())
+        }
         Action::ThemePreview => {
-            let accents = ["#76eede", "#ff007f", "#00ff00", "#ffaa00", "#0088ff", "#ff0000", "#ffff00", "#00ffff", "#ff00ff", "#ffffff"];
+            let accents = [
+                "#76eede", "#ff007f", "#00ff00", "#ffaa00", "#0088ff", "#ff0000", "#ffff00",
+                "#00ffff", "#ff00ff", "#ffffff",
+            ];
             let next_accent = accents[fastrand::usize(..accents.len())];
-            
+
             if let Ok(content) = std::fs::read_to_string(Config::path()) {
                 if let Ok(mut doc) = content.parse::<toml_edit::DocumentMut>() {
                     doc["theme"]["accent"] = toml_edit::value(next_accent);
@@ -219,6 +224,7 @@ mod tests {
         let cfg = Config {
             tools: vec![NamedCommand {
                 name: "diff".into(),
+                hints: vec![],
                 command: "git diff".into(),
             }],
             ..Config::default()
@@ -249,6 +255,7 @@ mod tests {
         let cfg = Config {
             tools: vec![NamedCommand {
                 name: "editor".into(),
+                hints: vec![],
                 command: "hx .".into(),
             }],
             ..Config::default()
@@ -260,6 +267,7 @@ mod tests {
         let cfg = Config {
             tools: vec![NamedCommand {
                 name: "editor".into(),
+                hints: vec![],
                 command: "${EDITOR:-vi} .".into(),
             }],
             ..Config::default()

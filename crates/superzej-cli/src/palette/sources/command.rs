@@ -188,6 +188,7 @@ mod tests {
         let mk = |n: &str| NamedCommand {
             name: n.into(),
             command: n.into(),
+            hints: vec![],
         };
         // All four known tools (each has a distinct keybind) plus an unknown one
         // (no keybind) — covers every keybind arm.
