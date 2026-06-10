@@ -200,21 +200,27 @@ Tor (444) and GPU passthrough (393) as niche opt-ins.
 
 ### B. Workspace bar / tree
 
+_Rebuilt natively in `superzej-host` (`sidebar.rs` tree model + `SidebarState`
+focus mode in `run.rs` + `chrome::draw_sidebar`); view state persists in the
+`ui_state` DB table. Press `Alt-s` to focus the tree, then `j/k` move, `Enter`
+open/collapse, `/` filter, `s` sort, `p` pin, `Space` select, `m` menu, `X` bulk
+close, `<`/`>` width, digits quick-jump._
+
 - [x] 13. Left sidebar workspace tree
 - [x] 14. Workspaces = repos (top level)
 - [x] 15. Worktrees nested under workspaces
-- [x] 16. Collapse/expand workspaces
-- [x] 17. Persist collapse state
-- [x] 18. Status glyphs — branch, dirty, ahead/behind
-- [~] 19. Running program/agent indicator per row
+- [x] 16. Collapse/expand workspaces _(native; persisted via `ui_state`)_
+- [x] 17. Persist collapse state _(`ui_state` `collapse:<slug>`)_
+- [x] 18. Status glyphs — branch, dirty, ahead/behind _(gix-native ahead/behind)_
+- [x] 19. Running program/agent indicator per row _(agent glyph via `worktree_agent`)_
 - [x] 20. Contextual auto status dots (zellaude-style) _(host-side state machine; `activity`)_
-- [~] 21. Fuzzy filter the tree
-- [ ] 22. Manual reorder / pin-to-top
-- [~] 23. Sort modes — recent/name/activity
+- [x] 21. Fuzzy filter the tree _(native `/` filter)_
+- [x] 22. Manual reorder / pin-to-top _(native `p`; `ui_state` `pin:<key>`)_
+- [x] 23. Sort modes — recent/name/activity _(native `s` cycle; persisted)_
 - [x] 24. Quick-jump to numbered item
-- [x] 25. Adjustable/collapsible bar width
-- [ ] 26. Multi-select for bulk actions
-- [ ] 27. Row context menu
+- [x] 25. Adjustable/collapsible bar width _(native `<`/`>`; persisted)_
+- [x] 26. Multi-select for bulk actions _(native `Space` mark, `X` bulk close)_
+- [x] 27. Row context menu _(native `m`)_
 - [ ] 28. Badge counts — PRs/unread/alerts per row
 
 ### C. Workspaces (repos)

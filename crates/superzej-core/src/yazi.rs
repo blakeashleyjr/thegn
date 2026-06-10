@@ -116,6 +116,12 @@ mod tests {
     }
 
     #[test]
+    fn bin_resolves_from_config() {
+        // The public wrapper threads `[drawer] command` through resolve_bin.
+        assert_eq!(bin(&cfg_with("ranger", "")), "ranger");
+    }
+
+    #[test]
     fn config_home_default_is_private_under_superzej_dir() {
         let home = config_home(&cfg_with("", "")).unwrap();
         assert_eq!(home, util::superzej_dir().join("yazi"));

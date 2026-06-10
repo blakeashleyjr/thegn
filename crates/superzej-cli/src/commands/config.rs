@@ -100,7 +100,7 @@ fn validate(path: &PathBuf) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, LogLevel, Picker};
+    use crate::config::Config;
 
     #[test]
     fn show_outputs_toml_by_default() {

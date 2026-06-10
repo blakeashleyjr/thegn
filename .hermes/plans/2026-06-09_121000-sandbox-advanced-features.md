@@ -16,10 +16,12 @@ Expand the `SandboxConfig` and `SandboxOverlay` structs to map to new OCI config
 **Objective:** Add `limits.cpu` and `limits.memory` to the `SandboxConfig` and apply them to OCI arguments.
 
 **Files:**
+
 - Modify: `crates/superzej-core/src/config.rs`
 - Modify: `crates/superzej-core/src/sandbox.rs`
 
 **Step 1: Write failing config parsing test**
+
 ```rust
 // In crates/superzej-core/src/config.rs
 #[test]
@@ -40,6 +42,7 @@ Run: `cargo nextest run test_sandbox_limits_parse`
 Expected: FAIL
 
 **Step 3: Write minimal implementation**
+
 ```rust
 // In crates/superzej-core/src/config.rs
 #[derive(Debug, Clone, Default, serde::Deserialize, PartialEq)]
@@ -69,6 +72,7 @@ Run: `cargo nextest run test_sandbox_limits_parse`
 Expected: PASS
 
 **Step 5: Commit**
+
 ```bash
 git add crates/superzej-core/src/config.rs crates/superzej-core/src/sandbox.rs
 git commit -m "feat(sandbox): support cpu and memory resource limits"
@@ -81,10 +85,12 @@ git commit -m "feat(sandbox): support cpu and memory resource limits"
 **Objective:** Allow exposing GPU hardware to the container via `sandbox.gpu = "nvidia" | "intel" | "all"`.
 
 **Files:**
+
 - Modify: `crates/superzej-core/src/config.rs`
 - Modify: `crates/superzej-core/src/sandbox.rs`
 
 **Step 1: Write failing test**
+
 ```rust
 // In crates/superzej-core/src/sandbox.rs
 #[test]
@@ -98,6 +104,7 @@ fn test_oci_create_opts_gpu() {
 ```
 
 **Step 3: Write minimal implementation**
+
 ```rust
 // In config.rs add `pub gpu: Option<String>` to SandboxConfig and Overlay.
 // In sandbox.rs SandboxSpec add `pub gpu: Option<String>`.
@@ -113,6 +120,7 @@ if let Some(gpu) = &spec.gpu {
 ```
 
 **Step 5: Commit**
+
 ```bash
 git add crates/superzej-core/src/config.rs crates/superzej-core/src/sandbox.rs
 git commit -m "feat(sandbox): add gpu passthrough support"
@@ -125,10 +133,12 @@ git commit -m "feat(sandbox): add gpu passthrough support"
 **Objective:** Add `sandbox.volumes` dict mapping `name = "/container/path"` for persistent storage across worktree reboots.
 
 **Files:**
+
 - Modify: `crates/superzej-core/src/config.rs`
 - Modify: `crates/superzej-core/src/sandbox.rs`
 
 **Step 1: Write failing test**
+
 ```rust
 // In sandbox.rs tests
 #[test]
@@ -141,6 +151,7 @@ fn test_oci_create_opts_volumes() {
 ```
 
 **Step 3: Write minimal implementation**
+
 ```rust
 // Add `pub volumes: std::collections::HashMap<String, String>` to SandboxConfig
 // Map it into `SandboxSpec::volumes: Vec<(String, String)>`.
@@ -152,6 +163,7 @@ for (vol_name, dest) in &spec.volumes {
 ```
 
 **Step 5: Commit**
+
 ```bash
 git add crates/superzej-core/src/config.rs crates/superzej-core/src/sandbox.rs
 git commit -m "feat(sandbox): support declarative named volumes"
@@ -164,14 +176,17 @@ git commit -m "feat(sandbox): support declarative named volumes"
 **Objective:** Add a routine to automatically `podman pull` images in the background if they don't exist.
 
 **Files:**
+
 - Modify: `crates/superzej-core/src/sandbox.rs`
 
 **Step 1: Write failing test**
+
 ```rust
 // mock or integration test omitted for brevity; unit test the argument builder
 ```
 
 **Step 3: Write minimal implementation**
+
 ```rust
 pub fn prefetch_image(spec: &SandboxSpec) -> Result<()> {
     if !spec.backend.is_oci() { return Ok(()); }
@@ -180,7 +195,7 @@ pub fn prefetch_image(spec: &SandboxSpec) -> Result<()> {
         let _ = std::process::Command::new(rt)
             .args(["image", "exists", img])
             .output().map_err(|_| anyhow::anyhow!("backend not found"))?;
-        // Simplistic check: if not 0, pull. 
+        // Simplistic check: if not 0, pull.
         // Real implementation:
         std::process::Command::new(rt)
             .args(["pull", img])
@@ -191,6 +206,7 @@ pub fn prefetch_image(spec: &SandboxSpec) -> Result<()> {
 ```
 
 **Step 5: Commit**
+
 ```bash
 git add crates/superzej-core/src/sandbox.rs
 git commit -m "feat(sandbox): add image prefetching logic"
@@ -203,9 +219,11 @@ git commit -m "feat(sandbox): add image prefetching logic"
 **Objective:** Verify the persistent keep-alive container is responsive before entering.
 
 **Files:**
+
 - Modify: `crates/superzej-core/src/sandbox.rs`
 
 **Step 3: Write minimal implementation**
+
 ```rust
 pub fn health_check(spec: &SandboxSpec) -> bool {
     if !spec.backend.is_oci() { return true; }
@@ -219,6 +237,7 @@ pub fn health_check(spec: &SandboxSpec) -> bool {
 ```
 
 **Step 5: Commit**
+
 ```bash
 git add crates/superzej-core/src/sandbox.rs
 git commit -m "feat(sandbox): add pre-entry container health check"
@@ -228,14 +247,16 @@ git commit -m "feat(sandbox): add pre-entry container health check"
 
 ### Task 6: Compose / Multi-Container Translation Layer
 
-**Objective:** Add `sandbox.compose` boolean. If true, translate `.superzej.toml` into a dynamic `docker-compose.yml` or `podman-compose` run. 
-*Note:* This is complex. The MVP will be a configuration flag that simply delegates to a `docker-compose up -d` script on `ensure()`.
+**Objective:** Add `sandbox.compose` boolean. If true, translate `.superzej.toml` into a dynamic `docker-compose.yml` or `podman-compose` run.
+_Note:_ This is complex. The MVP will be a configuration flag that simply delegates to a `docker-compose up -d` script on `ensure()`.
 
 **Files:**
+
 - Modify: `crates/superzej-core/src/config.rs`
 - Modify: `crates/superzej-core/src/sandbox.rs`
 
 **Step 3: Write minimal implementation**
+
 ```rust
 // Add `pub compose: Option<String>` (path to compose file) to config.
 // In `ensure()`:
@@ -247,6 +268,7 @@ if let Some(compose_file) = &spec.compose {
 ```
 
 **Step 5: Commit**
+
 ```bash
 git add crates/superzej-core/src/config.rs crates/superzej-core/src/sandbox.rs
 git commit -m "feat(sandbox): initial docker-compose delegation support"
@@ -259,16 +281,19 @@ git commit -m "feat(sandbox): initial docker-compose delegation support"
 **Objective:** Append `exec` and `ensure` events to an `audit.log` in `$SUPERZEJ_DIR`.
 
 **Files:**
+
 - Modify: `crates/superzej-core/src/log.rs`
 - Modify: `crates/superzej-core/src/sandbox.rs`
 
 **Step 3: Write minimal implementation**
+
 ```rust
-// In `sandbox.rs`, inject tracing calls. 
+// In `sandbox.rs`, inject tracing calls.
 // "User {} spawned agent {} in worktree {} via {}"
 ```
 
 **Step 5: Commit**
+
 ```bash
 git commit -m "feat(sandbox): add sandbox audit logging events"
 ```

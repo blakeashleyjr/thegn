@@ -308,36 +308,14 @@ fn active_tab_path(session: &crate::session::Session) -> std::path::PathBuf {
         .unwrap_or_else(|| ".".into())
 }
 
-fn split_sidebar_tab(name: &str) -> Option<(String, String)> {
-    let (repo, branch) = name.split_once('/')?;
-    (!repo.is_empty()).then(|| (repo.to_string(), branch.to_string()))
-}
-
-fn split_sidebar_page(branch: &str) -> (String, u32) {
-    if let Some((base, suffix)) = branch.rsplit_once(" \u{b7}") {
-        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
-            if let Ok(n) = suffix.parse() {
-                return (base.to_string(), n);
-            }
-        }
-    }
-    (branch.to_string(), 1)
-}
-
-#[derive(Debug, Clone)]
-struct SidebarWorktree {
-    label: String,
-    pages: Vec<(u32, usize, bool)>,
-    active: bool,
-    min_position: usize,
-}
-
-fn build_sidebar_rows(
+/// The ordered `(slug, display)` workspace list backing the tree: every repo
+/// known to the DB (stable slug), plus any live tab's repo prefix not yet in
+/// the DB. The structured tree is then built by [`crate::sidebar::build_rows`].
+fn workspace_list(
     session: &crate::session::Session,
     db: Option<&superzej_core::db::Db>,
-) -> (Vec<String>, usize) {
+) -> Vec<(String, String)> {
     let mut workspaces: Vec<(String, String)> = Vec::new();
-
     if let Some(db) = db {
         if let Ok(rows) = db.workspaces() {
             for w in rows {
@@ -359,94 +337,60 @@ fn build_sidebar_rows(
             }
         }
     }
-
     for tab in &session.tabs {
-        if let Some((repo, _)) = split_sidebar_tab(&tab.name) {
+        if let Some((repo, _)) = crate::sidebar::split_tab(&tab.name) {
             if !workspaces.iter().any(|(s, _)| *s == repo) {
                 workspaces.push((repo.clone(), repo));
             }
         }
     }
+    workspaces
+}
 
-    let mut rows = Vec::new();
-    let mut selected = 0usize;
+/// Gather per-worktree git/agent/activity status for every tab in the session.
+/// Runs on the hydration thread (git can be slow); the event loop merges this
+/// into the tree at render time.
+fn collect_sidebar_status(
+    session: &crate::session::Session,
+    db: &superzej_core::db::Db,
+) -> crate::sidebar::SidebarStatus {
+    use superzej_core::remote::GitLoc;
+    use superzej_svc::git::{GitBackend, GixGit};
+    let git = GixGit::new();
+    let mut status = crate::sidebar::SidebarStatus::default();
 
-    for (repo_slug, display) in workspaces {
-        let repo_row = rows.len();
-        rows.push(display);
-
-        let mut groups: Vec<SidebarWorktree> = Vec::new();
-        for (idx, tab) in session.tabs.iter().enumerate() {
-            let Some((tab_repo, branch)) = split_sidebar_tab(&tab.name) else {
-                continue;
-            };
-            if tab_repo != repo_slug {
-                continue;
-            }
-            let (base, page) = split_sidebar_page(&branch);
-            let active = idx == session.active;
-            if let Some(group) = groups.iter_mut().find(|g| g.label == base) {
-                group.pages.push((page, idx, active));
-                group.active |= active;
-                group.min_position = group.min_position.min(idx);
-            } else {
-                groups.push(SidebarWorktree {
-                    label: base,
-                    pages: vec![(page, idx, active)],
-                    active,
-                    min_position: idx,
-                });
-            }
+    // git glyphs + agent per distinct worktree path.
+    let mut seen = std::collections::HashSet::new();
+    for tab in &session.tabs {
+        if tab.worktree.is_empty() || !seen.insert(tab.worktree.clone()) {
+            continue;
         }
-
-        groups.sort_by_key(|g| (g.label != "home", g.min_position));
-        for group in &mut groups {
-            group.pages.sort_by_key(|(page, pos, _)| (*page, *pos));
+        let path = std::path::Path::new(&tab.worktree);
+        if !path.is_dir() {
+            continue;
         }
-
-        if groups.is_empty() && session.active < session.tabs.len() {
-            if let Some((active_repo, _)) = split_sidebar_tab(&session.tabs[session.active].name) {
-                if active_repo == repo_slug {
-                    selected = repo_row;
-                }
-            }
-        }
-
-        let groups_len = groups.len();
-        for (group_idx, group) in groups.into_iter().enumerate() {
-            let glyph = if group_idx + 1 == groups_len {
-                "\u{2514}"
-            } else {
-                "\u{251c}"
-            };
-            let row_idx = rows.len();
-            rows.push(format!("  {glyph} {}", group.label));
-            if group.active {
-                selected = row_idx;
-            }
-            if group.pages.len() > 1 {
-                for (page_idx, (page, _pos, active)) in group.pages.iter().enumerate() {
-                    let page_glyph = if page_idx + 1 == group.pages.len() {
-                        "\u{2514}"
-                    } else {
-                        "\u{251c}"
-                    };
-                    let row_idx = rows.len();
-                    rows.push(format!("      {page_glyph} \u{b7}{page}"));
-                    if *active {
-                        selected = row_idx;
-                    }
-                }
-            }
+        let loc = GitLoc::for_worktree(path);
+        let dirty = git.status(&loc).map(|v| !v.is_empty()).unwrap_or(false);
+        let (ahead, behind) = git.ahead_behind(&loc).ok().flatten().unwrap_or((0, 0));
+        status.git.insert(
+            tab.worktree.clone(),
+            crate::sidebar::GitGlyphs {
+                dirty,
+                ahead,
+                behind,
+            },
+        );
+        if let Ok(Some(agent)) = db.worktree_agent(&tab.worktree) {
+            status.agent.insert(tab.worktree.clone(), agent);
         }
     }
 
-    if rows.is_empty() {
-        rows.push("no workspaces".into());
-    }
-
-    let selected = selected.min(rows.len().saturating_sub(1));
-    (rows, selected)
+    // Activity dots, keyed by tab name (mirrors the `activity` state machine).
+    status.activity = superzej_core::activity::read_states()
+        .into_iter()
+        .map(|(tab, st)| (tab, crate::sidebar::ActivityState::from_str(&st)))
+        .collect();
+    status
 }
 
 /// A cheap first-frame model: no git, no diff, no DB recents. It gives the
@@ -461,10 +405,6 @@ fn build_initial_model(session: &crate::session::Session) -> FrameModel {
     FrameModel {
         tabs: session.tabs.iter().map(|t| t.name.clone()).collect(),
         active_tab: session.active,
-        sidebar: vec!["hydrating…".into()],
-        sidebar_selected: 0,
-        sidebar_focused: false,
-        sidebar_targets: Vec::new(),
         panel: crate::panel::PanelData {
             branch: active_name,
             ..Default::default()
@@ -475,6 +415,7 @@ fn build_initial_model(session: &crate::session::Session) -> FrameModel {
             env!("SZHOST_BUILD_TIME")
         ),
         accent: superzej_core::theme::TEAL.to_string(),
+        ..Default::default()
     }
 }
 
@@ -492,7 +433,8 @@ fn build_model(session: &crate::session::Session, db: &superzej_core::db::Db) ->
     let git = GixGit::new();
     let branch = git.current_branch(&loc).unwrap_or_else(|_| "—".into());
 
-    let (sidebar, sidebar_selected) = build_sidebar_rows(session, Some(db));
+    let sidebar_workspaces = workspace_list(session, Some(db));
+    let sidebar_status = collect_sidebar_status(session, db);
 
     let mut panel = crate::panel::PanelData {
         branch: branch.clone(),
@@ -532,10 +474,8 @@ fn build_model(session: &crate::session::Session, db: &superzej_core::db::Db) ->
     FrameModel {
         tabs: session.tabs.iter().map(|t| t.name.clone()).collect(),
         active_tab: session.active,
-        sidebar,
-        sidebar_selected,
-        sidebar_focused: false,
-        sidebar_targets: Vec::new(),
+        sidebar_workspaces,
+        sidebar_status,
         panel,
         panel_focused: false,
         status: format!(
@@ -543,6 +483,7 @@ fn build_model(session: &crate::session::Session, db: &superzej_core::db::Db) ->
             env!("SZHOST_BUILD_TIME")
         ),
         accent: superzej_core::theme::TEAL.to_string(),
+        ..Default::default()
     }
 }
 
@@ -558,10 +499,33 @@ fn spawn_model_hydration(
     session: crate::session::Session,
 ) {
     task::spawn_blocking(move || {
+        // Advance the activity FSM (best-effort) so the sidebar dots reflect
+        // live process CPU; the snapshot it writes is then read by build_model.
+        advance_activity(None);
         if let Ok(db) = superzej_core::db::Db::open() {
             let _ = tx.send(build_model(&session, &db));
         }
     });
+}
+
+/// Resolve the `superzej` CLI binary: an explicit `SUPERZEJ_BIN` override, else
+/// `superzej` on `PATH`.
+fn superzej_bin() -> String {
+    std::env::var("SUPERZEJ_BIN").unwrap_or_else(|_| "superzej".to_string())
+}
+
+/// Run `superzej activity [--ack <tab>]` to step / ack the activity state
+/// machine. Best-effort: failures (missing binary, etc.) are ignored, leaving
+/// the sidebar with whatever snapshot already exists.
+fn advance_activity(ack: Option<&str>) {
+    let mut cmd = std::process::Command::new(superzej_bin());
+    cmd.arg("activity");
+    if let Some(tab) = ack {
+        cmd.arg("--ack").arg(tab);
+    }
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let _ = cmd.status();
 }
 
 fn spawn_pr_cache_refresh(session: crate::session::Session) {
@@ -641,16 +605,15 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
                         notify::EventKind::Modify(_)
                             | notify::EventKind::Create(_)
                             | notify::EventKind::Remove(_)
-                    ) {
-                        if last_send.elapsed() > std::time::Duration::from_millis(500) {
-                            let new_cfg_res = superzej_core::config::Config::try_load_layered(
-                                &superzej_core::config::ProcessEnv,
-                                &overrides_clone,
-                                config_clone.clone(),
-                            );
-                            let _ = config_tx.send(new_cfg_res);
-                            last_send = std::time::Instant::now();
-                        }
+                    ) && last_send.elapsed() > std::time::Duration::from_millis(500)
+                    {
+                        let new_cfg_res = superzej_core::config::Config::try_load_layered(
+                            &superzej_core::config::ProcessEnv,
+                            &overrides_clone,
+                            config_clone.clone(),
+                        );
+                        let _ = config_tx.send(new_cfg_res);
+                        last_send = std::time::Instant::now();
                     }
                 }
             }) {
@@ -766,12 +729,425 @@ fn relayout(panes: &mut Panes, tree: &crate::center::CenterTree, center: Rect) {
     }
 }
 
-fn refresh_tab_model(model: &mut FrameModel, session: &crate::session::Session) {
+fn refresh_tab_model(
+    model: &mut FrameModel,
+    session: &crate::session::Session,
+    sb: &mut SidebarState,
+) {
     model.tabs = session.tabs.iter().map(|t| t.name.clone()).collect();
     model.active_tab = session.active;
-    let (sidebar, selected) = build_sidebar_rows(session, None);
-    model.sidebar = sidebar;
-    model.sidebar_selected = selected;
+    // The workspace list can change when tabs are added/closed; refresh it from
+    // live tabs (the DB-backed slugs are merged on the next hydration).
+    if model.sidebar_workspaces.is_empty() {
+        model.sidebar_workspaces = workspace_list(session, None);
+    } else {
+        for (slug, _) in workspace_list(session, None) {
+            if !model.sidebar_workspaces.iter().any(|(s, _)| *s == slug) {
+                model.sidebar_workspaces.push((slug.clone(), slug));
+            }
+        }
+    }
+    sb.rebuild(model, session);
+}
+
+/// Interaction + persisted view state for the workspace tree (items 16–27).
+/// The single source of truth the event loop mutates; [`SidebarState::rebuild`]
+/// derives `FrameModel`'s sidebar fields from it plus the model's data carriers.
+#[derive(Default)]
+struct SidebarState {
+    view: crate::sidebar::ViewState,
+    focused: bool,
+    /// Cursor over the *visible* rows.
+    cursor: usize,
+    filtering: bool,
+    /// Marked visible-row indices for bulk actions (item 26).
+    marked: std::collections::HashSet<usize>,
+    /// Open context menu, if any (item 27).
+    menu: Option<crate::chrome::RowMenu>,
+    /// Adjustable bar width in columns (item 25); `None` = layout default.
+    width: Option<usize>,
+}
+
+impl SidebarState {
+    /// Load persisted collapse/sort/pins/width from `ui_state` for this session.
+    fn load(&mut self, db: &superzej_core::db::Db, scope: &str) {
+        for (key, value) in db.ui_state_in_scope(scope).unwrap_or_default() {
+            if let Some(slug) = key.strip_prefix("collapse:") {
+                if value == "1" {
+                    self.view.collapsed.insert(slug.to_string());
+                }
+            } else if let Some(slug) = key.strip_prefix("pin:") {
+                if value == "1" && !self.view.pins.contains(&slug.to_string()) {
+                    self.view.pins.push(slug.to_string());
+                }
+            } else if key == "sort_mode" {
+                self.view.sort = crate::sidebar::SortMode::from_str(&value);
+            } else if key == "sidebar_cols" {
+                self.width = value.parse().ok();
+            }
+        }
+    }
+
+    /// The currently-selected visible row, if any.
+    fn selected_row<'a>(&self, model: &'a FrameModel) -> Option<&'a crate::sidebar::SidebarRow> {
+        model
+            .sidebar_rows
+            .iter()
+            .filter(|r| r.visible)
+            .nth(self.cursor)
+    }
+
+    /// Number of currently-visible rows.
+    fn visible_len(model: &FrameModel) -> usize {
+        model.sidebar_rows.iter().filter(|r| r.visible).count()
+    }
+
+    /// Rederive `model.sidebar_rows` from its data carriers + this view state,
+    /// then mirror interaction fields into the model for the renderer.
+    fn rebuild(&mut self, model: &mut FrameModel, session: &crate::session::Session) {
+        model.sidebar_rows = crate::sidebar::build_rows(
+            session,
+            &model.sidebar_workspaces,
+            &self.view,
+            &model.sidebar_status,
+        );
+        let visible = Self::visible_len(model);
+        // While unfocused, track the active worktree so opening the sidebar
+        // lands on the current tab; once focused, keep the user's cursor.
+        if !self.focused {
+            self.cursor = visible_index_of_active(model);
+        }
+        if visible == 0 {
+            self.cursor = 0;
+        } else if self.cursor >= visible {
+            self.cursor = visible - 1;
+        }
+        self.sync(model);
+    }
+
+    /// Copy interaction state into the model fields the renderer reads.
+    fn sync(&self, model: &mut FrameModel) {
+        model.sidebar_selected = self.cursor;
+        model.sidebar_focused = self.focused;
+        model.sidebar_filter = self.view.filter.clone();
+        model.sidebar_filtering = self.filtering;
+        model.sidebar_sort = self.view.sort;
+        model.sidebar_marked = self.marked.clone();
+        model.sidebar_menu = self.menu.clone();
+    }
+}
+
+/// What the event loop should do after a sidebar key was handled.
+enum SidebarOutcome {
+    /// Key wasn't for the sidebar; let normal dispatch handle it.
+    NotHandled,
+    /// Handled; just redraw.
+    Redraw,
+    /// Leave sidebar focus (return input to the pane).
+    Defocus,
+    /// Activate the tab at this session index.
+    Activate(usize),
+    /// The layout changed (bar width); recompute chrome.
+    Relayout,
+    /// Close the worktree tabs at these session indices (bulk action).
+    CloseTabs(Vec<usize>),
+}
+
+impl SidebarState {
+    /// Persist a single `ui_state` key for this session's scope.
+    fn persist(&self, session_id: &str, key: &str, value: &str) {
+        if let Ok(db) = superzej_core::db::Db::open() {
+            let _ = db.set_ui_state(session_id, key, value);
+        }
+    }
+
+    /// The session tab index the cursor row activates, if any.
+    fn cursor_tab(&self, model: &FrameModel) -> Option<usize> {
+        self.selected_row(model).and_then(|r| r.tab_target)
+    }
+
+    /// Build the context-menu entries for the cursor row (item 27).
+    fn menu_for_cursor(&self, model: &FrameModel) -> Option<crate::chrome::RowMenu> {
+        use crate::sidebar::RowKind;
+        let row = self.selected_row(model)?;
+        let mut entries = Vec::new();
+        if row.tab_target.is_some() {
+            entries.push(("open", "Open"));
+        }
+        if row.kind == RowKind::Workspace {
+            entries.push(("toggle", "Collapse/expand"));
+        }
+        entries.push(("pin", "Pin / unpin"));
+        if matches!(row.kind, RowKind::Worktree | RowKind::Page) {
+            entries.push(("close", "Close worktree"));
+        }
+        Some(crate::chrome::RowMenu {
+            anchor: self.cursor,
+            entries: entries
+                .into_iter()
+                .map(|(id, label)| crate::chrome::RowMenuEntry {
+                    id: id.into(),
+                    label: label.into(),
+                })
+                .collect(),
+            cursor: 0,
+        })
+    }
+
+    /// Handle a key while the sidebar owns focus. Mutates view/interaction
+    /// state, rebuilds rows, and returns what the loop must do.
+    fn handle_key(
+        &mut self,
+        key: &KeyCode,
+        mods: Modifiers,
+        model: &mut FrameModel,
+        session: &crate::session::Session,
+    ) -> SidebarOutcome {
+        // Filter input sub-mode captures text (item 21).
+        if self.filtering {
+            match key {
+                KeyCode::Escape => {
+                    self.filtering = false;
+                    self.view.filter.clear();
+                }
+                KeyCode::Enter => self.filtering = false,
+                KeyCode::Backspace => {
+                    self.view.filter.pop();
+                }
+                KeyCode::Char(c) if !mods.contains(Modifiers::CTRL) => {
+                    self.view.filter.push(*c);
+                }
+                _ => return SidebarOutcome::Redraw,
+            }
+            self.cursor = 0;
+            self.rebuild(model, session);
+            return SidebarOutcome::Redraw;
+        }
+
+        // Open context menu captures navigation (item 27).
+        if let Some(menu) = &mut self.menu {
+            match key {
+                KeyCode::Escape => {
+                    self.menu = None;
+                }
+                KeyCode::UpArrow | KeyCode::Char('k') => {
+                    menu.cursor = menu.cursor.saturating_sub(1);
+                }
+                KeyCode::DownArrow | KeyCode::Char('j') => {
+                    if menu.cursor + 1 < menu.entries.len() {
+                        menu.cursor += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    let id = menu.entries.get(menu.cursor).map(|e| e.id.clone());
+                    self.menu = None;
+                    if let Some(id) = id {
+                        return self.run_menu_action(&id, model, session);
+                    }
+                }
+                _ => {}
+            }
+            self.sync(model);
+            return SidebarOutcome::Redraw;
+        }
+
+        let visible = Self::visible_len(model);
+        match key {
+            KeyCode::Escape => return SidebarOutcome::Defocus,
+            KeyCode::Char('q') => return SidebarOutcome::Defocus,
+            KeyCode::DownArrow | KeyCode::Char('j') => {
+                if visible > 0 {
+                    self.cursor = (self.cursor + 1).min(visible - 1);
+                }
+            }
+            KeyCode::UpArrow | KeyCode::Char('k') => {
+                self.cursor = self.cursor.saturating_sub(1);
+            }
+            KeyCode::Enter => {
+                // On a workspace row, Enter toggles collapse; elsewhere opens.
+                if let Some(row) = self.selected_row(model) {
+                    if row.kind == crate::sidebar::RowKind::Workspace {
+                        return self.toggle_collapse(model, session);
+                    }
+                    if let Some(t) = row.tab_target {
+                        return SidebarOutcome::Activate(t);
+                    }
+                }
+            }
+            KeyCode::Char('l') | KeyCode::RightArrow => {
+                // Expand a collapsed workspace.
+                if let Some(row) = self.selected_row(model) {
+                    if row.kind == crate::sidebar::RowKind::Workspace && row.collapsed {
+                        return self.toggle_collapse(model, session);
+                    }
+                }
+            }
+            KeyCode::Char('h') | KeyCode::LeftArrow => {
+                // Collapse an expanded workspace.
+                if let Some(row) = self.selected_row(model) {
+                    if row.kind == crate::sidebar::RowKind::Workspace && !row.collapsed {
+                        return self.toggle_collapse(model, session);
+                    }
+                }
+            }
+            KeyCode::Char('/') => {
+                self.filtering = true;
+                self.sync(model);
+            }
+            KeyCode::Char('s') => {
+                self.view.sort = self.view.sort.next();
+                self.persist(&session.id, "sort_mode", self.view.sort.as_str());
+                self.rebuild(model, session);
+            }
+            KeyCode::Char('p') => return self.toggle_pin(model, session),
+            KeyCode::Char(' ') => {
+                // Multi-select toggle (item 26); on workspace rows, collapse.
+                if let Some(row) = self.selected_row(model) {
+                    if row.kind == crate::sidebar::RowKind::Workspace {
+                        return self.toggle_collapse(model, session);
+                    }
+                }
+                if self.marked.contains(&self.cursor) {
+                    self.marked.remove(&self.cursor);
+                } else {
+                    self.marked.insert(self.cursor);
+                }
+                self.sync(model);
+            }
+            KeyCode::Char('m') => {
+                self.menu = self.menu_for_cursor(model);
+                self.sync(model);
+            }
+            KeyCode::Char('X') => {
+                // Bulk close marked worktrees (item 26); fall back to cursor.
+                let targets = self.marked_tab_targets(model);
+                if !targets.is_empty() {
+                    return SidebarOutcome::CloseTabs(targets);
+                }
+            }
+            KeyCode::Char('<') | KeyCode::Char(',') => {
+                return self.adjust_width(-2, session);
+            }
+            KeyCode::Char('>') | KeyCode::Char('.') => {
+                return self.adjust_width(2, session);
+            }
+            KeyCode::Char(c @ '1'..='9') => {
+                // Quick-jump (item 24).
+                let idx = (*c as u8 - b'1') as usize;
+                if idx < visible {
+                    self.cursor = idx;
+                    if let Some(t) = self.cursor_tab(model) {
+                        self.sync(model);
+                        return SidebarOutcome::Activate(t);
+                    }
+                }
+            }
+            _ => return SidebarOutcome::NotHandled,
+        }
+        self.sync(model);
+        SidebarOutcome::Redraw
+    }
+
+    fn marked_tab_targets(&self, model: &FrameModel) -> Vec<usize> {
+        let visible: Vec<&crate::sidebar::SidebarRow> =
+            model.sidebar_rows.iter().filter(|r| r.visible).collect();
+        let mut targets: Vec<usize> = self
+            .marked
+            .iter()
+            .filter_map(|&i| visible.get(i).and_then(|r| r.tab_target))
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        targets
+    }
+
+    fn toggle_collapse(
+        &mut self,
+        model: &mut FrameModel,
+        session: &crate::session::Session,
+    ) -> SidebarOutcome {
+        if let Some(row) = self.selected_row(model) {
+            let slug = row.workspace_slug.clone();
+            let now_collapsed = if self.view.collapsed.contains(&slug) {
+                self.view.collapsed.remove(&slug);
+                false
+            } else {
+                self.view.collapsed.insert(slug.clone());
+                true
+            };
+            self.persist(
+                &session.id,
+                &format!("collapse:{slug}"),
+                if now_collapsed { "1" } else { "0" },
+            );
+            self.rebuild(model, session);
+        }
+        SidebarOutcome::Redraw
+    }
+
+    fn toggle_pin(
+        &mut self,
+        model: &mut FrameModel,
+        session: &crate::session::Session,
+    ) -> SidebarOutcome {
+        if let Some(row) = self.selected_row(model) {
+            let key = row.pin_key.clone();
+            if let Some(pos) = self.view.pins.iter().position(|k| *k == key) {
+                self.view.pins.remove(pos);
+                self.persist(&session.id, &format!("pin:{key}"), "0");
+            } else {
+                self.view.pins.push(key.clone());
+                self.persist(&session.id, &format!("pin:{key}"), "1");
+            }
+            self.rebuild(model, session);
+        }
+        SidebarOutcome::Redraw
+    }
+
+    fn adjust_width(&mut self, delta: i32, session: &crate::session::Session) -> SidebarOutcome {
+        let cur = self.width.unwrap_or(crate::layout::SIDEBAR_COLS) as i32;
+        let next = (cur + delta).clamp(
+            crate::layout::SIDEBAR_MIN_WIDTH as i32,
+            crate::layout::SIDEBAR_MAX_WIDTH as i32,
+        ) as usize;
+        self.width = Some(next);
+        self.persist(&session.id, "sidebar_cols", &next.to_string());
+        SidebarOutcome::Relayout
+    }
+
+    fn run_menu_action(
+        &mut self,
+        id: &str,
+        model: &mut FrameModel,
+        session: &crate::session::Session,
+    ) -> SidebarOutcome {
+        match id {
+            "open" => {
+                if let Some(t) = self.cursor_tab(model) {
+                    return SidebarOutcome::Activate(t);
+                }
+            }
+            "toggle" => return self.toggle_collapse(model, session),
+            "pin" => return self.toggle_pin(model, session),
+            "close" => {
+                if let Some(t) = self.cursor_tab(model) {
+                    return SidebarOutcome::CloseTabs(vec![t]);
+                }
+            }
+            _ => {}
+        }
+        SidebarOutcome::Redraw
+    }
+}
+
+/// The visible-row index of the active row, or 0.
+fn visible_index_of_active(model: &FrameModel) -> usize {
+    model
+        .sidebar_rows
+        .iter()
+        .filter(|r| r.visible)
+        .position(|r| r.active)
+        .unwrap_or(0)
 }
 
 fn switch_to_workspace_tab(
@@ -840,7 +1216,14 @@ async fn event_loop<T: Terminal>(
     let mut scratch = Surface::new(cols, rows);
     let mut want_sidebar = true;
     let mut want_panel = true;
-    let mut chrome = layout::compute(cols, rows, want_sidebar, want_panel);
+    // Sidebar interaction + persisted view state (collapse/sort/pins/width).
+    let mut sb = SidebarState::default();
+    if let Ok(db) = superzej_core::db::Db::open() {
+        sb.load(&db, &session.id);
+    }
+    let mut sidebar_cols = sb.width.unwrap_or(layout::SIDEBAR_COLS);
+    let mut chrome = layout::compute_with_width(cols, rows, want_sidebar, want_panel, sidebar_cols);
+    sb.rebuild(&mut model, &session);
     let mut dirty = true;
     let mut palette: Option<crate::palette::Palette> = None;
 
@@ -850,6 +1233,9 @@ async fn event_loop<T: Terminal>(
     let mut drawer: Option<u32> = None;
     let mut last_model_refresh = Instant::now();
     let mut last_pr_refresh = Instant::now() - PR_REFRESH_INTERVAL;
+    // The last tab name we sent an activity `--ack` for (avoids re-acking every
+    // frame); cleared implicitly when the active tab changes.
+    let mut last_acked_tab: Option<String> = None;
 
     sync_drawer_persistence(&session, &mut panes, &mut drawer, chrome.center);
 
@@ -864,7 +1250,8 @@ async fn event_loop<T: Terminal>(
             if size.rows != rows || size.cols != cols {
                 rows = size.rows;
                 cols = size.cols;
-                chrome = layout::compute(cols, rows, want_sidebar, want_panel);
+                chrome =
+                    layout::compute_with_width(cols, rows, want_sidebar, want_panel, sidebar_cols);
                 need_relayout = true;
                 buf.resize(cols, rows);
                 dirty = true;
@@ -981,9 +1368,9 @@ async fn event_loop<T: Terminal>(
             return Ok(());
         }
 
-        while let Some(next_model) = model_rx.try_recv().ok() {
+        while let Ok(next_model) = model_rx.try_recv() {
             model = next_model;
-            refresh_tab_model(&mut model, &session);
+            refresh_tab_model(&mut model, &session, &mut sb);
             apply_mode_status(&mut model, mode);
             dirty = true;
         }
@@ -997,7 +1384,7 @@ async fn event_loop<T: Terminal>(
                     need_relayout = true;
                 }
                 Err(e) => {
-                    model.status = format!("Config error: {}", e).into();
+                    model.status = format!("Config error: {}", e);
                 }
             }
             dirty = true;
@@ -1006,6 +1393,15 @@ async fn event_loop<T: Terminal>(
         if model_refresh_due(last_model_refresh, now, MODEL_REFRESH_INTERVAL) {
             spawn_model_hydration(model_tx.clone(), session.clone());
             last_model_refresh = now;
+        }
+        // Ack the focused worktree's activity so its "look at me" dot clears
+        // once the user is actually on the tab. Cheap + idempotent; runs off the
+        // main thread so the shell-out never stalls input.
+        if let Some(tab) = session.tabs.get(session.active).map(|t| t.name.clone()) {
+            if last_acked_tab.as_deref() != Some(tab.as_str()) {
+                last_acked_tab = Some(tab.clone());
+                task::spawn_blocking(move || advance_activity(Some(&tab)));
+            }
         }
         if model_refresh_due(last_pr_refresh, now, PR_REFRESH_INTERVAL) {
             spawn_pr_cache_refresh(session.clone());
@@ -1104,7 +1500,7 @@ async fn event_loop<T: Terminal>(
                                             )
                                             .unwrap_or(false)
                                             {
-                                                refresh_tab_model(&mut model, &session);
+                                                refresh_tab_model(&mut model, &session, &mut sb);
                                                 need_relayout = true;
                                                 sync_drawer_persistence(
                                                     &session,
@@ -1118,7 +1514,7 @@ async fn event_loop<T: Terminal>(
                                 } else if let Some(repo_path) = key.strip_prefix("repo:") {
                                     if let Ok(db) = superzej_core::db::Db::open() {
                                         if session.switch_to_workspace(repo_path, &db).is_ok() {
-                                            refresh_tab_model(&mut model, &session);
+                                            refresh_tab_model(&mut model, &session, &mut sb);
                                             need_relayout = true;
                                             sync_drawer_persistence(
                                                 &session,
@@ -1133,7 +1529,7 @@ async fn event_loop<T: Terminal>(
                                         session.tabs.iter().position(|t| t.name == name)
                                     {
                                         session.switch_to(i);
-                                        refresh_tab_model(&mut model, &session);
+                                        refresh_tab_model(&mut model, &session, &mut sb);
                                         need_relayout = true;
                                         sync_drawer_persistence(
                                             &session,
@@ -1159,6 +1555,77 @@ async fn event_loop<T: Terminal>(
                     }
                     dirty = true;
                     continue;
+                }
+                // Modal: when the sidebar owns focus it captures navigation /
+                // tree-management keys before they reach the keymap or pane.
+                if sb.focused {
+                    match sb.handle_key(&k.key, k.modifiers, &mut model, &session) {
+                        SidebarOutcome::NotHandled => { /* fall through to keymap */ }
+                        SidebarOutcome::Redraw => {
+                            dirty = true;
+                            continue;
+                        }
+                        SidebarOutcome::Defocus => {
+                            sb.focused = false;
+                            sb.menu = None;
+                            sb.sync(&mut model);
+                            dirty = true;
+                            continue;
+                        }
+                        SidebarOutcome::Relayout => {
+                            sidebar_cols = sb.width.unwrap_or(layout::SIDEBAR_COLS);
+                            chrome = layout::compute_with_width(
+                                cols,
+                                rows,
+                                want_sidebar,
+                                want_panel,
+                                sidebar_cols,
+                            );
+                            need_relayout = true;
+                            dirty = true;
+                            continue;
+                        }
+                        SidebarOutcome::Activate(t) => {
+                            if t < session.tabs.len() {
+                                session.switch_to(t);
+                                refresh_tab_model(&mut model, &session, &mut sb);
+                                need_relayout = true;
+                                sync_drawer_persistence(
+                                    &session,
+                                    &mut panes,
+                                    &mut drawer,
+                                    chrome.center,
+                                );
+                            }
+                            dirty = true;
+                            continue;
+                        }
+                        SidebarOutcome::CloseTabs(mut targets) => {
+                            // Close from the highest index down so earlier
+                            // indices stay valid as tabs are removed.
+                            targets.sort_unstable_by(|a, b| b.cmp(a));
+                            for t in targets {
+                                if t < session.tabs.len() {
+                                    for id in session.tabs[t].center.pane_ids() {
+                                        panes.table.remove(&id);
+                                    }
+                                    session.switch_to(t);
+                                    session.close_active();
+                                }
+                            }
+                            sb.marked.clear();
+                            refresh_tab_model(&mut model, &session, &mut sb);
+                            need_relayout = true;
+                            sync_drawer_persistence(
+                                &session,
+                                &mut panes,
+                                &mut drawer,
+                                chrome.center,
+                            );
+                            dirty = true;
+                            continue;
+                        }
+                    }
                 }
                 // Global/mode chords are intercepted by the keymap; everything
                 // else is forwarded to the focused pane.
@@ -1247,31 +1714,63 @@ async fn event_loop<T: Terminal>(
                             }
                             Action::ToggleSidebar => {
                                 want_sidebar = !want_sidebar;
-                                chrome = layout::compute(cols, rows, want_sidebar, want_panel);
+                                chrome = layout::compute_with_width(
+                                    cols,
+                                    rows,
+                                    want_sidebar,
+                                    want_panel,
+                                    sidebar_cols,
+                                );
+                                if !want_sidebar && sb.focused {
+                                    sb.focused = false;
+                                    sb.sync(&mut model);
+                                }
                                 need_relayout = true;
                             }
                             Action::TogglePanel => {
                                 want_panel = !want_panel;
-                                chrome = layout::compute(cols, rows, want_sidebar, want_panel);
+                                chrome = layout::compute_with_width(
+                                    cols,
+                                    rows,
+                                    want_sidebar,
+                                    want_panel,
+                                    sidebar_cols,
+                                );
                                 need_relayout = true;
                             }
                             Action::FocusSidebar => {
                                 if !want_sidebar {
                                     want_sidebar = true;
-                                    chrome = layout::compute(cols, rows, want_sidebar, want_panel);
+                                    chrome = layout::compute_with_width(
+                                        cols,
+                                        rows,
+                                        want_sidebar,
+                                        want_panel,
+                                        sidebar_cols,
+                                    );
                                     need_relayout = true;
                                 }
+                                // Take keyboard focus and land the cursor on the
+                                // active worktree.
+                                sb.focused = true;
+                                sb.rebuild(&mut model, &session);
                             }
                             Action::FocusPanel => {
                                 if !want_panel {
                                     want_panel = true;
-                                    chrome = layout::compute(cols, rows, want_sidebar, want_panel);
+                                    chrome = layout::compute_with_width(
+                                        cols,
+                                        rows,
+                                        want_sidebar,
+                                        want_panel,
+                                        sidebar_cols,
+                                    );
                                     need_relayout = true;
                                 }
                             }
                             Action::NextTab => {
                                 session.next_tab();
-                                refresh_tab_model(&mut model, &session);
+                                refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
                                 sync_drawer_persistence(
                                     &session,
@@ -1282,7 +1781,7 @@ async fn event_loop<T: Terminal>(
                             }
                             Action::PrevTab => {
                                 session.prev_tab();
-                                refresh_tab_model(&mut model, &session);
+                                refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
                                 sync_drawer_persistence(
                                     &session,
@@ -1335,7 +1834,7 @@ async fn event_loop<T: Terminal>(
                                             .unwrap_or(&target)
                                             .to_string();
                                         if session.switch_to_workspace(&repo_path, &db).is_ok() {
-                                            refresh_tab_model(&mut model, &session);
+                                            refresh_tab_model(&mut model, &session, &mut sb);
                                             need_relayout = true;
                                             sync_drawer_persistence(
                                                 &session,
@@ -1353,9 +1852,9 @@ async fn event_loop<T: Terminal>(
                                 // This creates a distinct worktree entry in the sidebar, separate
                                 // from pages (extra views on the same worktree).
                                 let src = &session.tabs[active];
-                                let (repo, branch) = split_sidebar_tab(&src.name)
+                                let (repo, branch) = crate::sidebar::split_tab(&src.name)
                                     .unwrap_or_else(|| (src.name.clone(), "home".to_string()));
-                                let (_base, _) = split_sidebar_page(&branch);
+                                let (_base, _) = crate::sidebar::split_page(&branch);
                                 let new_n = session.tabs.len();
                                 // New worktrees use ·N as their branch name - they'll appear as
                                 // separate entries in the sidebar (distinct from home/feature branches)
@@ -1367,7 +1866,7 @@ async fn event_loop<T: Terminal>(
                                     focused_pane: 0,
                                 };
                                 session.add_tab(tab);
-                                refresh_tab_model(&mut model, &session);
+                                refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
                             }
                             Action::NewTab => {
@@ -1382,7 +1881,7 @@ async fn event_loop<T: Terminal>(
                                     focused_pane: 0,
                                 };
                                 session.add_tab(tab);
-                                refresh_tab_model(&mut model, &session);
+                                refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
                             }
                             Action::CloseWorktree => {
@@ -1391,7 +1890,7 @@ async fn event_loop<T: Terminal>(
                                     panes.table.remove(&id);
                                 }
                                 session.close_active();
-                                refresh_tab_model(&mut model, &session);
+                                refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
                             }
                             Action::ScrollUp | Action::ScrollDown => {
@@ -1486,7 +1985,8 @@ async fn event_loop<T: Terminal>(
             Ok(Some(InputEvent::Resized { rows: r, cols: c })) => {
                 rows = r;
                 cols = c;
-                chrome = layout::compute(cols, rows, want_sidebar, want_panel);
+                chrome =
+                    layout::compute_with_width(cols, rows, want_sidebar, want_panel, sidebar_cols);
                 need_relayout = true;
                 buf.resize(cols, rows);
                 let _ = buf
@@ -1560,6 +2060,137 @@ mod tests {
         }
     }
 
+    fn two_worktree_session() -> Session {
+        Session {
+            id: "s1".into(),
+            tabs: vec![
+                Tab {
+                    name: "app/home".into(),
+                    kind: TabKind::Home,
+                    worktree: "/tmp/app".into(),
+                    center: CenterTree::Leaf(0),
+                    focused_pane: 0,
+                },
+                Tab {
+                    name: "app/feat".into(),
+                    kind: TabKind::Worktree,
+                    worktree: "/tmp/app-feat".into(),
+                    center: CenterTree::Leaf(0),
+                    focused_pane: 0,
+                },
+            ],
+            active: 0,
+        }
+    }
+
+    /// A SidebarState whose `persist` writes to a temp DB scope rather than the
+    /// user DB — set via XDG_STATE_HOME guarded by the test itself is avoided;
+    /// instead these tests exercise only in-memory state transitions and the
+    /// rebuilt row visibility (persistence is covered by db.rs::ui_state tests).
+    fn focused_state(model: &mut FrameModel, session: &Session) -> SidebarState {
+        let mut sb = SidebarState {
+            focused: true,
+            ..Default::default()
+        };
+        sb.rebuild(model, session);
+        sb
+    }
+
+    fn press(
+        sb: &mut SidebarState,
+        ch: char,
+        model: &mut FrameModel,
+        session: &Session,
+    ) -> SidebarOutcome {
+        sb.handle_key(&KeyCode::Char(ch), Modifiers::NONE, model, session)
+    }
+
+    #[test]
+    fn sidebar_filter_hides_nonmatching_rows() {
+        let session = two_worktree_session();
+        let mut model = build_initial_model(&session);
+        model.sidebar_workspaces = vec![("app".into(), "app".into())];
+        let mut sb = focused_state(&mut model, &session);
+
+        press(&mut sb, '/', &mut model, &session);
+        for c in "feat".chars() {
+            press(&mut sb, c, &mut model, &session);
+        }
+        let visible: Vec<String> = model
+            .sidebar_rows
+            .iter()
+            .filter(|r| r.visible)
+            .map(|r| r.label.clone())
+            .collect();
+        assert!(visible.contains(&"feat".to_string()));
+        assert!(!visible.contains(&"home".to_string()));
+    }
+
+    #[test]
+    fn sidebar_quick_jump_activates_numbered_row() {
+        let session = two_worktree_session();
+        let mut model = build_initial_model(&session);
+        model.sidebar_workspaces = vec![("app".into(), "app".into())];
+        let mut sb = focused_state(&mut model, &session);
+        // Rows: 1=app(ws) 2=home 3=feat. Jump to 3 -> activate feat's tab.
+        let out = press(&mut sb, '3', &mut model, &session);
+        match out {
+            SidebarOutcome::Activate(t) => assert_eq!(session.tabs[t].name, "app/feat"),
+            _ => panic!("expected Activate"),
+        }
+    }
+
+    #[test]
+    fn sidebar_multiselect_marks_and_bulk_close_targets_marked() {
+        let session = two_worktree_session();
+        let mut model = build_initial_model(&session);
+        model.sidebar_workspaces = vec![("app".into(), "app".into())];
+        let mut sb = focused_state(&mut model, &session);
+        // Move to the home worktree row (index 1) and mark it.
+        press(&mut sb, 'j', &mut model, &session);
+        press(&mut sb, ' ', &mut model, &session);
+        assert!(model.sidebar_marked.contains(&1));
+        // Move to feat (index 2) and mark it too.
+        press(&mut sb, 'j', &mut model, &session);
+        press(&mut sb, ' ', &mut model, &session);
+        let out = sb.handle_key(&KeyCode::Char('X'), Modifiers::NONE, &mut model, &session);
+        match out {
+            SidebarOutcome::CloseTabs(t) => assert_eq!(t.len(), 2),
+            _ => panic!("expected CloseTabs"),
+        }
+    }
+
+    #[test]
+    fn sidebar_width_adjust_clamps_and_relayouts() {
+        // Persisting width opens the global DB; redirect it to a temp dir so the
+        // test never touches the user's state (mirrors the other DB tests here).
+        let state_home = std::env::temp_dir().join(format!("sz-host-width-{}", std::process::id()));
+        std::env::set_var("XDG_STATE_HOME", &state_home);
+
+        let session = one_tab_session();
+        let mut model = build_initial_model(&session);
+        let mut sb = focused_state(&mut model, &session);
+        // Narrow past the minimum: clamps at SIDEBAR_MIN_WIDTH.
+        for _ in 0..20 {
+            let _ = press(&mut sb, '<', &mut model, &session);
+        }
+        assert_eq!(sb.width, Some(crate::layout::SIDEBAR_MIN_WIDTH));
+        let out = press(&mut sb, '>', &mut model, &session);
+        assert!(matches!(out, SidebarOutcome::Relayout));
+
+        std::env::remove_var("XDG_STATE_HOME");
+        let _ = std::fs::remove_dir_all(&state_home);
+    }
+
+    #[test]
+    fn sidebar_escape_defocuses() {
+        let session = one_tab_session();
+        let mut model = build_initial_model(&session);
+        let mut sb = focused_state(&mut model, &session);
+        let out = sb.handle_key(&KeyCode::Escape, Modifiers::NONE, &mut model, &session);
+        assert!(matches!(out, SidebarOutcome::Defocus));
+    }
+
     #[test]
     fn load_or_seed_session_recovers_tabs_from_db_when_present() {
         let state_home = std::env::temp_dir().join(format!("test_db_{}", std::process::id()));
@@ -1610,15 +2241,18 @@ mod tests {
 
         std::env::remove_var("XDG_STATE_HOME");
 
+        let slugs: Vec<&str> = model
+            .sidebar_workspaces
+            .iter()
+            .map(|(s, _)| s.as_str())
+            .collect();
         assert!(
-            model.sidebar.contains(&"repo1".to_string()),
-            "Sidebar should contain repo1, got: {:?}",
-            model.sidebar
+            slugs.contains(&"repo1"),
+            "Sidebar should contain repo1, got: {slugs:?}"
         );
         assert!(
-            model.sidebar.contains(&"repo2".to_string()),
-            "Sidebar should contain repo2, got: {:?}",
-            model.sidebar
+            slugs.contains(&"repo2"),
+            "Sidebar should contain repo2, got: {slugs:?}"
         );
     }
 
@@ -1674,7 +2308,9 @@ mod tests {
         let model = build_initial_model(&session);
         assert_eq!(model.tabs, vec!["app/home".to_string()]);
         assert_eq!(model.active_tab, 0);
-        assert_eq!(model.sidebar, vec!["hydrating…".to_string()]);
+        // The cheap initial model carries no derived rows yet (the event loop
+        // builds them once view state is loaded).
+        assert!(model.sidebar_rows.is_empty());
         assert!(model.panel.branch == "app/home");
         assert!(model.status.contains("Starting szhost"));
     }
@@ -1694,16 +2330,23 @@ mod tests {
         ));
     }
 
+    fn sidebar_labels(model: &FrameModel) -> Vec<String> {
+        model.sidebar_rows.iter().map(|r| r.label.clone()).collect()
+    }
+
     #[test]
     fn refresh_tab_model_updates_sidebar_tree_when_tabs_change() {
         let mut session = one_tab_session();
         let mut model = build_initial_model(&session);
+        let mut sb = SidebarState::default();
 
-        refresh_tab_model(&mut model, &session);
+        refresh_tab_model(&mut model, &session, &mut sb);
         assert!(
-            model.sidebar.iter().any(|row| row.contains("home")),
+            sidebar_labels(&model)
+                .iter()
+                .any(|row| row.contains("home")),
             "sidebar should show the initial home worktree: {:?}",
-            model.sidebar
+            sidebar_labels(&model)
         );
 
         session.add_tab(Tab {
@@ -1713,25 +2356,28 @@ mod tests {
             center: CenterTree::Leaf(0),
             focused_pane: 0,
         });
-        refresh_tab_model(&mut model, &session);
+        refresh_tab_model(&mut model, &session, &mut sb);
 
         assert_eq!(model.active_tab, 1);
         assert!(
-            model.sidebar.iter().any(|row| row.contains("feature-x")),
+            sidebar_labels(&model)
+                .iter()
+                .any(|row| row.contains("feature-x")),
             "sidebar should include newly-created worktree tabs immediately: {:?}",
-            model.sidebar
+            sidebar_labels(&model)
         );
     }
     #[test]
     fn action_new_worktree_adds_tab_and_focuses_it() {
         let mut session = one_tab_session();
         let mut model = build_initial_model(&session);
+        let mut sb = SidebarState::default();
 
         // Simulating the Action block manually since the event loop is complex to instantiate
         // NewWorktree creates a new worktree entry (separate branch), not a page of existing worktree
-        let (repo, branch) = split_sidebar_tab(&session.tabs[0].name)
+        let (repo, branch) = crate::sidebar::split_tab(&session.tabs[0].name)
             .unwrap_or_else(|| (session.tabs[0].name.clone(), "home".to_string()));
-        let (_base, _) = split_sidebar_page(&branch);
+        let (_base, _) = crate::sidebar::split_page(&branch);
         let new_n = session.tabs.len();
         let tab = crate::session::Tab {
             name: format!("{}/·{}", repo, new_n),
@@ -1741,7 +2387,7 @@ mod tests {
             focused_pane: 0,
         };
         session.add_tab(tab);
-        refresh_tab_model(&mut model, &session);
+        refresh_tab_model(&mut model, &session, &mut sb);
 
         assert_eq!(session.tabs.len(), 2);
         assert_eq!(session.active, 1);
@@ -1867,11 +2513,12 @@ mod tests {
             focused_pane: 0,
         });
         let mut model = build_initial_model(&session);
+        let mut sb = SidebarState::default();
         let chrome = layout::compute(160, 40, true, true);
         let before = chrome.clone();
 
         session.switch_to(1);
-        refresh_tab_model(&mut model, &session);
+        refresh_tab_model(&mut model, &session, &mut sb);
 
         assert_eq!(model.active_tab, 1);
         assert_eq!(
