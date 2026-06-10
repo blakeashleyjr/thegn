@@ -47,17 +47,9 @@ pub fn branch_name(root: &Path, human: Option<&str>, cfg: &Config) -> String {
     } else if cfg.name_scheme == NameScheme::Numbered {
         format!("{prefix}pane")
     } else {
-        let pane: u64 = std::env::var("ZELLIJ_PANE_ID")
-            .ok()
-            .and_then(|v| {
-                v.chars()
-                    .filter(|c| c.is_ascii_digit())
-                    .collect::<String>()
-                    .parse()
-                    .ok()
-            })
-            .unwrap_or(0);
-        let seed = pane.wrapping_add(util::now() as u64);
+        // Seed the random adjective-noun name with the pid + wall-clock so
+        // concurrent creates don't collide on the same candidate.
+        let seed = (std::process::id() as u64).wrapping_add(util::now() as u64);
         let adj = ADJ[(seed % ADJ.len() as u64) as usize];
         let noun = NOUN[((seed / 7 + 1) % NOUN.len() as u64) as usize];
         format!("{prefix}{adj}-{noun}")

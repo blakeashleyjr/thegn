@@ -746,12 +746,25 @@ impl Panes {
         cwd: Option<&std::path::Path>,
         center: Rect,
     ) -> Result<u32> {
+        self.spawn_argv_env(argv, cwd, &[], center)
+    }
+
+    /// As [`Panes::spawn_argv`], but injects `env` into the child — used for
+    /// agent panes that expect `SUPERZEJ_WORKTREE`/`SUPERZEJ_BRANCH`.
+    fn spawn_argv_env(
+        &mut self,
+        argv: &[String],
+        cwd: Option<&std::path::Path>,
+        env: &[(String, String)],
+        center: Rect,
+    ) -> Result<u32> {
         let id = self.next_id;
         self.next_id += 1;
-        let pane = PtyPane::spawn(
+        let pane = PtyPane::spawn_with_env(
             id,
             argv,
             cwd,
+            env,
             center.rows.max(1) as u16,
             center.cols.max(1) as u16,
             self.tx.clone(),
@@ -839,6 +852,109 @@ fn tab_cwd(tab: &crate::session::Tab) -> Option<std::path::PathBuf> {
         .or_else(|| std::env::current_dir().ok())
 }
 
+/// A worktree tab awaiting its agent choice. While set, the command palette is
+/// in "agent picker" mode: its selection launches the chosen agent into `tab`
+/// rather than dispatching a command. Escaping defaults to a plain shell so the
+/// tab is never left with no process.
+struct PendingAgent {
+    /// The `{repo_slug}/{branch}` tab name to launch into.
+    tab: String,
+    worktree: String,
+    branch: String,
+}
+
+/// Build the agent-picker palette items for `cfg`: one row per agent/tool, plus
+/// a literal shell. The key is the bare choice name (the `PendingAgent` gate in
+/// the Enter handler routes it to a launch, not a command dispatch).
+fn build_agent_palette(cfg: &superzej_core::config::Config) -> Vec<crate::palette::PaletteItem> {
+    crate::agent::choices(cfg)
+        .into_iter()
+        .map(|name| {
+            let label = format!("{} {name}", superzej_core::theme::agent_glyph(&name));
+            crate::palette::PaletteItem::new(name, label)
+        })
+        .collect()
+}
+
+/// A freshly-created worktree, ready to back a tab + agent launch.
+struct NewWorktree {
+    /// The `{repo_slug}/{branch}` tab name.
+    tab: String,
+    /// The branch created.
+    branch: String,
+    /// Absolute worktree path (local on disk; DB key for the agent launch).
+    path: String,
+}
+
+/// Create a local git worktree off `repo_root`, reusing core's worktree helpers
+/// (the same calls the legacy `new_worktree` command made, minus the zellij
+/// tab). Records it in the DB so the sidebar/dashboard/resurrect pick it up.
+/// Returns `None` (after a branded warning) when the base has no commits or the
+/// `git worktree add` fails.
+fn create_local_worktree(
+    cfg: &superzej_core::config::Config,
+    repo_root: &std::path::Path,
+) -> Option<NewWorktree> {
+    use superzej_core::{db::Db, repo, util, worktree};
+
+    let base = worktree::resolve_base(repo_root, cfg);
+    if util::git_out(repo_root, &["rev-parse", "--verify", "--quiet", &base]).is_none() {
+        superzej_core::msg::warn(&format!(
+            "'{base}' has no commits yet — make an initial commit before adding a worktree."
+        ));
+        return None;
+    }
+
+    let slug = repo::repo_slug(repo_root);
+    let branch = worktree::branch_name(repo_root, None, cfg);
+    let tab = repo::branch_tab(&slug, &branch);
+    let path = worktree::worktree_path(repo_root, &branch, cfg);
+    if !worktree::add(repo_root, &branch, &base, &path, cfg) {
+        superzej_core::msg::warn("could not create the worktree (see the git error above).");
+        return None;
+    }
+    let path = path.to_string_lossy().into_owned();
+
+    if let Ok(db) = Db::open() {
+        let _ = db.put_worktree(&tab, &repo_root.to_string_lossy(), &path, &branch, None);
+    }
+    Some(NewWorktree { tab, branch, path })
+}
+
+/// Launch `choice` into the worktree tab named `pending.tab`: compose the
+/// sandbox-wrapped argv + env (via [`crate::agent::launch_spec`]), spawn it as a
+/// fresh pane, and point that tab's center at the live pane so `materialize`
+/// won't also spawn a plain shell. No-op (returns false) if the tab is gone.
+fn launch_agent_into_tab(
+    cfg: &superzej_core::config::Config,
+    session: &mut crate::session::Session,
+    panes: &mut Panes,
+    pending: &PendingAgent,
+    choice: &str,
+    center: Rect,
+) -> bool {
+    let Some(idx) = session.tabs.iter().position(|t| t.name == pending.tab) else {
+        return false;
+    };
+    let spec = crate::agent::launch_spec(cfg, &pending.worktree, Some(&pending.branch), choice);
+    let cwd = spec.cwd.clone();
+    match panes.spawn_argv_env(&spec.argv, cwd.as_deref(), &spec.env, center) {
+        Ok(id) => {
+            // Reap any panes the tab already had, then back it with the agent pane.
+            for old in session.tabs[idx].center.pane_ids() {
+                panes.table.remove(&old);
+            }
+            session.tabs[idx].center = crate::center::CenterTree::Leaf(id);
+            session.tabs[idx].focused_pane = id;
+            true
+        }
+        Err(e) => {
+            superzej_core::msg::warn(&format!("agent launch failed: {e}"));
+            false
+        }
+    }
+}
+
 fn sync_drawer_persistence(
     session: &crate::session::Session,
     panes: &mut Panes,
@@ -892,6 +1008,9 @@ async fn event_loop<T: Terminal>(
     let mut cheatsheet = false;
     let mut which_key: Vec<crate::keyhint::HintRow> = Vec::new();
     let mut which_key_prefix = String::new();
+    // When set, the open palette is an agent picker for a just-created worktree
+    // tab; its selection launches the agent rather than dispatching a command.
+    let mut pending_agent: Option<PendingAgent> = None;
 
     let (tx, mut rx) = tokio_mpsc::channel::<PaneEvent>(1024);
     let mut panes = Panes::new(tx);
@@ -1056,7 +1175,7 @@ async fn event_loop<T: Terminal>(
                     need_relayout = true;
                 }
                 Err(e) => {
-                    model.status = format!("Config error: {}", e);
+                    model.status = format!("Config error: {e}");
                 }
             }
             dirty = true;
@@ -1161,6 +1280,54 @@ async fn event_loop<T: Terminal>(
                 }
                 // Modal: when the palette is open it captures all keys.
                 if let Some(p) = palette.as_mut() {
+                    // Agent-picker mode: the palette is choosing what to run in a
+                    // just-created worktree tab. Enter launches the choice; Escape
+                    // defaults to a shell so the tab never sits with no process.
+                    if let Some(pending) = pending_agent.as_ref() {
+                        match k.key {
+                            KeyCode::Escape => {
+                                launch_agent_into_tab(
+                                    keymap.config(),
+                                    &mut session,
+                                    &mut panes,
+                                    pending,
+                                    "shell",
+                                    chrome.center,
+                                );
+                                pending_agent = None;
+                                palette = None;
+                                refresh_tab_model(&mut model, &session);
+                                need_relayout = true;
+                            }
+                            KeyCode::Enter => {
+                                let choice = p
+                                    .selected_item()
+                                    .map(|i| i.key.clone())
+                                    .unwrap_or_else(|| "shell".to_string());
+                                launch_agent_into_tab(
+                                    keymap.config(),
+                                    &mut session,
+                                    &mut panes,
+                                    pending,
+                                    &choice,
+                                    chrome.center,
+                                );
+                                pending_agent = None;
+                                palette = None;
+                                refresh_tab_model(&mut model, &session);
+                                need_relayout = true;
+                            }
+                            KeyCode::UpArrow => p.move_up(),
+                            KeyCode::DownArrow => p.move_down(),
+                            KeyCode::Backspace => p.backspace(),
+                            KeyCode::Char(c) if !k.modifiers.contains(Modifiers::CTRL) => {
+                                p.push_char(c)
+                            }
+                            _ => {}
+                        }
+                        dirty = true;
+                        continue;
+                    }
                     match k.key {
                         KeyCode::Escape => palette = None,
                         KeyCode::Enter => {
@@ -1356,19 +1523,15 @@ async fn event_loop<T: Terminal>(
                                 chrome = layout::compute(cols, rows, want_sidebar, want_panel);
                                 need_relayout = true;
                             }
-                            Action::FocusSidebar => {
-                                if !want_sidebar {
-                                    want_sidebar = true;
-                                    chrome = layout::compute(cols, rows, want_sidebar, want_panel);
-                                    need_relayout = true;
-                                }
+                            Action::FocusSidebar if !want_sidebar => {
+                                want_sidebar = true;
+                                chrome = layout::compute(cols, rows, want_sidebar, want_panel);
+                                need_relayout = true;
                             }
-                            Action::FocusPanel => {
-                                if !want_panel {
-                                    want_panel = true;
-                                    chrome = layout::compute(cols, rows, want_sidebar, want_panel);
-                                    need_relayout = true;
-                                }
+                            Action::FocusPanel if !want_panel => {
+                                want_panel = true;
+                                chrome = layout::compute(cols, rows, want_sidebar, want_panel);
+                                need_relayout = true;
                             }
                             Action::NextTab => {
                                 session.next_tab();
@@ -1424,6 +1587,45 @@ async fn event_loop<T: Terminal>(
                                     session.tabs[active].focused_pane = n;
                                 }
                             }
+                            Action::Pin(idx) => {
+                                // Open-or-focus the configured pin at this 1-based
+                                // index as a dedicated `pin:<name>` tab running its
+                                // command (host, no sandbox — pins are global).
+                                if let Some(pin) = keymap.config().pin_by_index(idx as usize) {
+                                    let tab_name = format!("pin:{}", pin.name);
+                                    if let Some(i) =
+                                        session.tabs.iter().position(|t| t.name == tab_name)
+                                    {
+                                        session.switch_to(i);
+                                    } else {
+                                        let cwd = pin.cwd.clone().unwrap_or_else(|| {
+                                            superzej_core::util::home()
+                                                .to_string_lossy()
+                                                .into_owned()
+                                        });
+                                        let argv = vec![
+                                            superzej_core::util::shell(),
+                                            "-lc".to_string(),
+                                            pin.command.clone(),
+                                        ];
+                                        if let Ok(id) = panes.spawn_argv(
+                                            &argv,
+                                            Some(Path::new(&cwd)),
+                                            chrome.center,
+                                        ) {
+                                            session.add_tab(crate::session::Tab {
+                                                name: tab_name,
+                                                kind: crate::session::TabKind::Pinned,
+                                                worktree: cwd,
+                                                center: crate::center::CenterTree::Leaf(id),
+                                                focused_pane: id,
+                                            });
+                                        }
+                                    }
+                                    refresh_tab_model(&mut model, &session);
+                                    need_relayout = true;
+                                }
+                            }
                             Action::NewWorkspace | Action::SwitchWorkspace => {
                                 if let Ok(db) = superzej_core::db::Db::open() {
                                     if let Some(target) = palette
@@ -1449,27 +1651,44 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::NewWorktree => {
-                                // Add a new worktree tab. The name format is {repo}/{branch}
-                                // where branch is derived from the page number (·1, ·2, etc).
-                                // This creates a distinct worktree entry in the sidebar, separate
-                                // from pages (extra views on the same worktree).
-                                let src = &session.tabs[active];
-                                let (repo, branch) = split_sidebar_tab(&src.name)
-                                    .unwrap_or_else(|| (src.name.clone(), "home".to_string()));
-                                let (_base, _) = split_sidebar_page(&branch);
-                                let new_n = session.tabs.len();
-                                // New worktrees use ·N as their branch name - they'll appear as
-                                // separate entries in the sidebar (distinct from home/feature branches)
-                                let tab = crate::session::Tab {
-                                    name: format!("{repo}/·{new_n}"),
-                                    kind: crate::session::TabKind::Worktree,
-                                    worktree: src.worktree.clone(),
-                                    center: crate::center::CenterTree::Leaf(0),
-                                    focused_pane: 0,
-                                };
-                                session.add_tab(tab);
-                                refresh_tab_model(&mut model, &session);
-                                need_relayout = true;
+                                // Create a real git worktree off the active tab's repo, add a
+                                // `{slug}/{branch}` tab for it, then open the agent picker —
+                                // its selection launches the chosen agent into the new tab.
+                                let src_wt = session.tabs[active].worktree.clone();
+                                let repo_root = (!src_wt.is_empty())
+                                    .then(|| superzej_core::repo::main_worktree(Path::new(&src_wt)))
+                                    .flatten()
+                                    .or_else(|| {
+                                        std::env::current_dir()
+                                            .ok()
+                                            .and_then(|c| superzej_core::repo::main_worktree(&c))
+                                    });
+                                if let Some(root) = repo_root {
+                                    if let Some(nw) = create_local_worktree(keymap.config(), &root)
+                                    {
+                                        session.add_tab(crate::session::Tab {
+                                            name: nw.tab.clone(),
+                                            kind: crate::session::TabKind::Worktree,
+                                            worktree: nw.path.clone(),
+                                            center: crate::center::CenterTree::Leaf(0),
+                                            focused_pane: 0,
+                                        });
+                                        refresh_tab_model(&mut model, &session);
+                                        need_relayout = true;
+                                        pending_agent = Some(PendingAgent {
+                                            tab: nw.tab,
+                                            worktree: nw.path,
+                                            branch: nw.branch,
+                                        });
+                                        palette = Some(crate::palette::Palette::new(
+                                            build_agent_palette(keymap.config()),
+                                        ));
+                                    }
+                                } else {
+                                    superzej_core::msg::warn(
+                                        "new-worktree: not inside a git repository",
+                                    );
+                                }
                             }
                             Action::NewTab => {
                                 // A fresh tab on the same worktree (an "extra" page).

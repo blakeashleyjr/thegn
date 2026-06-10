@@ -15,9 +15,9 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::PathBuf;
 
-/// Schema version. v3: workspace=session / worktree=tab remap. v4 (native host):
-/// adds `tab_layout` + `session_state` for DB-driven session resurrect (the
-/// native compositor owns layout, which zellij owned before) — purely additive.
+/// Schema version. v3: workspace / worktree remap. v4 (native host): adds
+/// `tab_layout` + `session_state` for DB-driven session resurrect (the native
+/// compositor owns layout) — purely additive.
 const SCHEMA_VERSION: i64 = 4;
 
 pub struct Db {
@@ -28,10 +28,11 @@ fn db_path() -> PathBuf {
     util::xdg_state_home().join("superzej/superzej.db")
 }
 
-/// The zellij session name (or "default" outside a session). In the v2 model a
-/// session *is* a workspace, so this doubles as the current workspace key.
+/// The current session marker (the repo path the host runs against, or "default"
+/// when unset). Recorded on worktree rows; the native host keys workspaces by
+/// repo path, so this is a coarse fallback only.
 pub fn session() -> String {
-    std::env::var("ZELLIJ_SESSION_NAME").unwrap_or_else(|_| "default".into())
+    std::env::var("SUPERZEJ_SESSION").unwrap_or_else(|_| "default".into())
 }
 
 impl Db {
