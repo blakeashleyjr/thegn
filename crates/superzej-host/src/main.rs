@@ -18,6 +18,27 @@ mod run;
 mod sequence;
 mod session;
 
+use clap::Parser;
+use std::path::PathBuf;
+
+#[derive(Parser, Clone)]
+#[command(name = "szhost", version, about = "superzej native terminal host")]
+pub struct Cli {
+    #[arg(long, global = true)]
+    pub config: Option<PathBuf>,
+    
+    #[arg(long, global = true)]
+    pub log_level: Option<String>,
+    
+    /// Override a config value (e.g. `--set theme.accent=cyan --set drawer.height=15`)
+    #[arg(long = "set", global = true, value_name = "KEY=VALUE")]
+    pub overrides: Vec<String>,
+}
+
 fn main() -> anyhow::Result<()> {
-    run::main()
+    let mut cli = Cli::parse();
+    if let Some(lvl) = cli.log_level.as_deref() {
+        cli.overrides.push(format!("log.level={lvl}"));
+    }
+    run::main(cli)
 }

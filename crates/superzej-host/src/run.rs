@@ -6,6 +6,7 @@
 //! clear-and-redraw → no flashing). The tokio mpsc event loop arrives in Phase 2.
 
 use anyhow::{Context, Result};
+use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant};
@@ -594,7 +595,7 @@ fn replace_single_dead_center_pane(
     true
 }
 
-pub fn main() -> Result<()> {
+pub fn main(cli: crate::Cli) -> Result<()> {
     let caps = Capabilities::new_from_env().context("term capabilities")?;
     let mut term = new_terminal(caps).context("open terminal")?;
     term.set_raw_mode().context("raw mode")?;
@@ -606,8 +607,12 @@ pub fn main() -> Result<()> {
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let session = load_or_seed_session(&cwd);
-    let cfg =
-        superzej_core::config::Config::load_layered(&superzej_core::config::ProcessEnv, None, None);
+
+    let cfg = superzej_core::config::Config::load_layered(
+        &superzej_core::config::ProcessEnv,
+        &cli.overrides,
+        cli.config.clone(),
+    );
     let keymap = crate::keymap::default_keymap_with_config(&cfg);
     let mode = crate::keymap::Mode::Normal;
     let mut model = build_initial_model(&session);
@@ -615,8 +620,44 @@ pub fn main() -> Result<()> {
     let (model_tx, model_rx) = channel::<FrameModel>();
     spawn_model_hydration(model_tx.clone(), session.clone());
 
+    let (config_tx, config_rx) = channel::<Result<superzej_core::config::Config, String>>();
+
+    let config_path = superzej_core::config::Config::path();
+    std::thread::spawn(move || {
+        if let Some(parent) = config_path.parent() {
+            let mut last_send = std::time::Instant::now();
+            let overrides_clone = cli.overrides.clone();
+            let config_clone = cli.config.clone();
+            if let Ok(mut watcher) = recommended_watcher(move |res: notify::Result<Event>| {
+                if let Ok(ev) = res {
+                    if matches!(
+                        ev.kind,
+                        notify::EventKind::Modify(_)
+                            | notify::EventKind::Create(_)
+                            | notify::EventKind::Remove(_)
+                    ) {
+                        if last_send.elapsed() > std::time::Duration::from_millis(500) {
+                            let new_cfg_res = superzej_core::config::Config::try_load_layered(
+                                &superzej_core::config::ProcessEnv,
+                                &overrides_clone,
+                                config_clone.clone(),
+                            );
+                            let _ = config_tx.send(new_cfg_res);
+                            last_send = std::time::Instant::now();
+                        }
+                    }
+                }
+            }) {
+                let _ = watcher.watch(parent, RecursiveMode::NonRecursive);
+                loop {
+                    std::thread::sleep(std::time::Duration::MAX);
+                }
+            }
+        }
+    });
+
     let result = event_loop(
-        &mut buf, session, model, model_tx, model_rx, rows, cols, keymap, mode,
+        &mut buf, session, model, model_tx, model_rx, rows, cols, keymap, mode, config_rx,
     );
 
     let _ = buf.terminal().exit_alternate_screen();
@@ -836,6 +877,7 @@ fn event_loop<T: Terminal>(
     mut cols: usize,
     mut keymap: crate::keymap::KeyMap,
     mut mode: crate::keymap::Mode,
+    config_rx: Receiver<Result<superzej_core::config::Config, String>>,
 ) -> Result<()> {
     let mut scratch = Surface::new(cols, rows);
     let mut want_sidebar = true;
@@ -853,6 +895,7 @@ fn event_loop<T: Terminal>(
 
     sync_drawer_persistence(&session, &mut panes, &mut drawer, chrome.center);
 
+    let mut current_config = keymap.config().clone();
     loop {
         if session.tabs.is_empty() {
             return Ok(()); // last tab closed
@@ -959,6 +1002,21 @@ fn event_loop<T: Terminal>(
             apply_mode_status(&mut model, mode);
             dirty = true;
         }
+
+        while let Ok(cfg_res) = config_rx.try_recv() {
+            match cfg_res {
+                Ok(new_cfg) => {
+                    keymap = crate::keymap::default_keymap_with_config(&new_cfg);
+                    current_config = new_cfg;
+                    model.status = "Config reloaded".into();
+                    need_relayout = true;
+                }
+                Err(e) => {
+                    model.status = format!("Config error: {}", e).into();
+                }
+            }
+            dirty = true;
+        }
         let now = Instant::now();
         if model_refresh_due(last_model_refresh, now, MODEL_REFRESH_INTERVAL) {
             spawn_model_hydration(model_tx.clone(), session.clone());
@@ -988,7 +1046,12 @@ fn event_loop<T: Terminal>(
             );
             if let Some(drawer_id) = drawer {
                 if let Some(p) = panes.table.get(&drawer_id) {
-                    let height = 20.min(rows); // cfg.drawer.height equivalent
+                    let height = current_config
+                        .drawer
+                        .height
+                        .parse::<usize>()
+                        .unwrap_or(20)
+                        .min(rows); // cfg.drawer.height equivalent
                     let rect = Rect {
                         x: 0,
                         y: rows.saturating_sub(height),

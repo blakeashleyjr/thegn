@@ -129,6 +129,14 @@ pub fn rows(cfg: &Config) -> Vec<Row> {
             Action::PrRerun,
             "pr-rerun",
         ),
+        Row::command(
+            "🎨",
+            theme::TEAL,
+            "Theme: Preview accents",
+            "",
+            Action::ThemePreview,
+            "theme-preview",
+        ),
     ];
 
     // Configured tools (lazygit/yazi/editor/diff by default), keyed by name so
