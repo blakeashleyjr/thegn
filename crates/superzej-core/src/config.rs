@@ -169,6 +169,16 @@ config_enum! {
 pub struct NamedCommand {
     pub name: String,
     pub command: String,
+    /// Optional list of hint overrides for the statusbar when this tool is focused.
+    #[serde(default)]
+    pub hints: Vec<CommandHint>,
+}
+
+/// A statusbar hint override for a specific tool.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CommandHint {
+    pub key: String,
+    pub label: String,
 }
 
 /// A `[[pins]]` entry — a named program that opens either as its own session
@@ -977,10 +987,12 @@ impl Config {
                 NamedCommand {
                     name: "claude".into(),
                     command: "claude".into(),
+                    hints: vec![],
                 },
                 NamedCommand {
                     name: "shell".into(),
                     command: "__shell__".into(),
+                    hints: vec![],
                 },
             ];
         }
@@ -989,18 +1001,22 @@ impl Config {
                 NamedCommand {
                     name: "lazygit".into(),
                     command: "lazygit".into(),
+                    hints: vec![],
                 },
                 NamedCommand {
                     name: "yazi".into(),
                     command: "yazi".into(),
+                    hints: vec![],
                 },
                 NamedCommand {
                     name: "editor".into(),
                     command: "${EDITOR:-vi} .".into(),
+                    hints: vec![],
                 },
                 NamedCommand {
                     name: "diff".into(),
                     command: "git diff".into(),
+                    hints: vec![],
                 },
             ];
         }

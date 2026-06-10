@@ -14,6 +14,7 @@ pub mod launch;
 pub mod list;
 pub mod menu;
 pub mod monitor;
+pub mod hints;
 pub mod new_panel;
 pub mod new_tab;
 pub mod new_workspace;
