@@ -954,6 +954,7 @@ impl Config {
         cli_overrides: &[String],
         path: Option<PathBuf>,
     ) -> Result<Self, String> {
+        let _span = tracing::info_span!("config_load_layered").entered();
         let file = path.unwrap_or_else(Self::path);
         let s = std::fs::read_to_string(&file).unwrap_or_else(|_| "".into());
         let mut cfg: Config = toml::from_str(&s).map_err(|e| format!("{e}"))?;
@@ -998,7 +999,7 @@ impl Config {
 
     fn apply_override_str(cfg: &mut Config, key: &str, val: &str) -> Result<(), String> {
         let mut tree = serde_json::to_value(&cfg).map_err(|e| e.to_string())?;
-        
+
         let parts: Vec<&str> = key.split('.').collect();
         let mut current = &mut tree;
         for (i, part) in parts.iter().enumerate() {
@@ -1024,8 +1025,9 @@ impl Config {
                 }
             }
         }
-        
-        let new_cfg: Config = serde_json::from_value(tree).map_err(|e| format!("Type error on {}: {}", key, e))?;
+
+        let new_cfg: Config =
+            serde_json::from_value(tree).map_err(|e| format!("Type error on {}: {}", key, e))?;
         *cfg = new_cfg;
         Ok(())
     }
