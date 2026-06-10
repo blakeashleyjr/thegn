@@ -17,9 +17,9 @@ use termwiz::caps::Capabilities;
 use termwiz::input::{InputEvent, KeyCode, Modifiers};
 use termwiz::surface::{Change, Position, Surface};
 use termwiz::terminal::buffered::BufferedTerminal;
-use termwiz::terminal::{new_terminal, Terminal};
+use termwiz::terminal::{Terminal, new_terminal};
 
-use crate::chrome::{render_tab, FrameModel};
+use crate::chrome::{FrameModel, render_tab};
 use crate::compositor::Rect;
 use crate::layout;
 use crate::pane::{PaneEvent, PtyPane};

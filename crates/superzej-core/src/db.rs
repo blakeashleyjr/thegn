@@ -12,7 +12,7 @@
 use crate::models::{WorkspaceRow, WorktreeRow};
 use crate::util;
 use anyhow::Result;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::path::PathBuf;
 
 /// Schema version. v3: workspace=session / worktree=tab remap. v4 (native host):
@@ -750,11 +750,12 @@ mod tests {
             Some("claude")
         );
         // location: none by default; set via upsert.
-        assert!(db
-            .location_for("/wt/feat")
-            .unwrap()
-            .map(|s| s.is_empty())
-            .unwrap_or(true));
+        assert!(
+            db.location_for("/wt/feat")
+                .unwrap()
+                .map(|s| s.is_empty())
+                .unwrap_or(true)
+        );
         db.put_worktree(
             "app/feat",
             "/x/app",
