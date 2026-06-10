@@ -161,9 +161,10 @@ pub struct FrameModel {
     /// entries, menu cursor).
     pub sidebar_menu: Option<RowMenu>,
     /// Data carriers populated by the hydration thread and consumed by the
-    /// event loop to (re)derive `sidebar_rows`. The (slug, display) workspace
-    /// list in display order, and per-worktree git/agent/activity status.
-    pub sidebar_workspaces: Vec<(String, String)>,
+    /// event loop to (re)derive `sidebar_rows`. The `(slug, display, kind)`
+    /// workspace list in display order (`kind` = "repo" | "dir"), and
+    /// per-worktree git/agent/activity status.
+    pub sidebar_workspaces: Vec<(String, String, String)>,
     pub sidebar_status: crate::sidebar::SidebarStatus,
     /// Structured Diff/PR/Checks payload for the right panel.
     pub panel: crate::panel::PanelData,
@@ -434,6 +435,11 @@ fn compose_sidebar_row(
             };
             text.push_str(caret);
             text.push(' ');
+            // A non-git "dir" workspace gets a folder glyph so it reads
+            // differently from a repo workspace.
+            if row.dir {
+                text.push_str("\u{1f4c1} ");
+            }
             text.push_str(&row.label);
         }
         RowKind::Worktree => {
@@ -1009,6 +1015,7 @@ mod tests {
             activity: crate::sidebar::ActivityState::None,
             visible: true,
             collapsed: false,
+            dir: false,
         }
     }
 
@@ -1079,6 +1086,31 @@ mod tests {
         assert!(text.contains('\u{2191}'), "ahead glyph ↑: {text:?}");
         assert!(text.contains('\u{2193}'), "behind glyph ↓: {text:?}");
         assert!(text.contains('C'), "agent glyph for claude: {text:?}");
+    }
+
+    #[test]
+    fn dir_workspace_renders_folder_glyph() {
+        use crate::sidebar::RowKind;
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 30,
+            rows: 4,
+        };
+        let mut repo_ws = row(RowKind::Workspace, "repo-ws");
+        repo_ws.dir = false;
+        let mut dir_ws = row(RowKind::Workspace, "scratch");
+        dir_ws.dir = true;
+        let model = FrameModel {
+            sidebar_rows: vec![repo_ws, dir_ws],
+            ..Default::default()
+        };
+        let mut s = Surface::new(30, 4);
+        draw_sidebar(&mut s, rect, &model);
+        let text = s.screen_chars_to_string();
+        // The dir workspace carries the folder glyph; the repo one does not.
+        assert!(text.contains('\u{1f4c1}'), "dir folder glyph 📁: {text:?}");
+        assert!(text.contains("scratch") && text.contains("repo-ws"));
     }
 
     #[test]

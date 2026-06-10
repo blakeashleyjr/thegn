@@ -197,7 +197,15 @@ impl Session {
                 center: CenterTree::Leaf(0),
                 focused_pane: 0,
             });
-            let _ = db.put_workspace(repo_path, &base);
+            // A path that resolves to a git main-worktree is a "repo"
+            // workspace; anything else is a plain "dir" workspace.
+            let kind =
+                if superzej_core::repo::main_worktree(std::path::Path::new(repo_path)).is_some() {
+                    "repo"
+                } else {
+                    "dir"
+                };
+            let _ = db.put_workspace(repo_path, &base, kind);
             let _ = db.touch_repo(repo_path, &base);
         }
 

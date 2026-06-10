@@ -222,7 +222,7 @@ close, `<`/`>` width, digits quick-jump._
 - [~] 34. Per-workspace default layout
 - [ ] 35. Per-workspace default program set
 - [~] 36. Per-workspace keybinds
-- [ ] 37. Non-git directory as workspace
+- [x] 37. Non-git directory as workspace _(workspace `kind` repo|dir; insert-only; folder glyph in sidebar)_
 - [ ] 38. Workspace-level env vars
 - [ ] 39. Workspace icon/color label
 - [x] 40. Recent/favorite workspaces
