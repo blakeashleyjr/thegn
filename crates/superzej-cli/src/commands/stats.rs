@@ -22,6 +22,8 @@ pub const DEFAULT_MEM_ICON: &str = "MEM";
 pub const DEFAULT_GPU_ICON: &str = "GPU";
 /// Default refresh interval in seconds.
 pub const DEFAULT_REFRESH_SECS: f64 = 2.0;
+/// Default refresh rates for cycling (in seconds).
+pub const DEFAULT_REFRESH_RATES: &[f64] = &[1.0, 2.0, 5.0, 10.0];
 
 /// Stats configuration: icons and refresh rates for the tabbar widget.
 #[derive(Serialize)]
@@ -30,6 +32,7 @@ pub struct StatsConfig {
     pub mem_icon: String,
     pub gpu_icon: String,
     pub refresh_secs: f64,
+    pub refresh_rates: Vec<f64>,
 }
 
 impl Default for StatsConfig {
@@ -39,6 +42,7 @@ impl Default for StatsConfig {
             mem_icon: DEFAULT_MEM_ICON.to_string(),
             gpu_icon: DEFAULT_GPU_ICON.to_string(),
             refresh_secs: DEFAULT_REFRESH_SECS,
+            refresh_rates: DEFAULT_REFRESH_RATES.to_vec(),
         }
     }
 }
