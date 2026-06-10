@@ -1,59 +1,37 @@
-// `confirm` writes an interactive y/N prompt to stderr (not a diagnostic).
-#![allow(clippy::disallowed_macros)]
+//! Non-interactive CLI verbs folded into the single `superzej`(=`szhost`) binary.
+//!
+//! These are the user-facing commands that used to live in the standalone
+//! `superzej-cli` crate and had no zellij coupling — `pr`, `diff`, `list`,
+//! `repos`, `recent`, `config`. The plugin-bridge commands (status/stats/theme/
+//! hints/workspaces/worktrees/snapshot/activity) were deleted with the zellij
+//! substrate: the native host computes all of that in-process.
+//!
+//! Each verb is a thin shell over `superzej-core`; `run.rs` (the compositor) is
+//! the default when no subcommand is given.
 
-pub mod activity;
-pub mod attach;
-pub mod close_worktree;
 pub mod config;
-pub mod dashboard;
 pub mod diff;
-pub mod files;
-pub mod grant_plugins;
-pub mod hints;
-pub mod keys;
-pub mod launch;
 pub mod list;
-pub mod menu;
-pub mod monitor;
-pub mod new_panel;
-pub mod new_tab;
-pub mod new_workspace;
-pub mod new_worktree;
-pub mod open_worktree;
-pub mod panels;
-pub mod pick_agent;
-pub mod pin;
 pub mod pr;
-pub mod recent;
 pub mod repos;
-pub mod resolve;
-pub mod restore;
-pub mod snapshot;
-pub mod stats;
-pub mod status;
-pub mod theme;
-pub mod tool;
-pub mod watch;
-pub mod workspaces;
-pub mod worktrees;
 
-use crate::{repo, util};
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Resolve the worktree a command targets: explicit arg, else $SUPERZEJ_WORKTREE,
-/// else the git toplevel of the cwd, else the cwd. Mirrors `tool.rs`.
+/// Resolve the worktree a command targets: explicit arg, else `$SUPERZEJ_WORKTREE`,
+/// else the git toplevel of the cwd, else the cwd.
 pub fn resolve_worktree(arg: Option<String>) -> PathBuf {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     arg.map(PathBuf::from)
         .or_else(|| std::env::var("SUPERZEJ_WORKTREE").ok().map(PathBuf::from))
-        .or_else(|| repo::toplevel(&cwd))
+        .or_else(|| superzej_core::repo::toplevel(&cwd))
         .unwrap_or(cwd)
 }
 
 /// Yes/no confirmation (gum if present, else a y/N stdin prompt).
+#[allow(clippy::disallowed_macros)] // a raw interactive prompt, not a log line
 pub fn confirm(message: &str) -> bool {
-    if util::have("gum") {
+    if superzej_core::util::have("gum") {
         return Command::new("gum")
             .args(["confirm", message])
             .status()

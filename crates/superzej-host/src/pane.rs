@@ -32,12 +32,15 @@ pub struct PtyPane {
 
 impl PtyPane {
     /// Spawn `argv` (already composed by `sandbox::enter_argv`) in `cwd` on a
-    /// fresh PTY of `rows`x`cols`. Reader-thread events arrive on `tx`, tagged
-    /// with `id` so a shared channel can carry every pane's output.
-    pub fn spawn(
+    /// fresh PTY of `rows`x`cols`, injecting `env` (key/value pairs) into the
+    /// child — agent panes expect `SUPERZEJ_WORKTREE`/`_BRANCH`; a plain pane
+    /// passes an empty slice. Reader-thread events arrive on `tx`, tagged with
+    /// `id` so a shared channel can carry every pane's output.
+    pub fn spawn_with_env(
         id: u32,
         argv: &[String],
         cwd: Option<&std::path::Path>,
+        env: &[(String, String)],
         rows: u16,
         cols: u16,
         tx: tokio_mpsc::Sender<PaneEvent>,
@@ -58,6 +61,9 @@ impl PtyPane {
             cmd.cwd(dir);
         }
         cmd.env("TERM", "xterm-256color");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
         let child = pair.slave.spawn_command(cmd).context("spawn child")?;
         // Drop the slave so the master sees EOF when the child exits.
         drop(pair.slave);
@@ -191,7 +197,8 @@ mod tests {
     #[test]
     fn pty_round_trip_lands_output_in_grid() {
         let (tx, mut rx) = tokio_mpsc::channel(1024);
-        let mut pane = PtyPane::spawn(0, &sh("printf 'hello-pty'"), None, 24, 80, tx).unwrap();
+        let mut pane =
+            PtyPane::spawn_with_env(0, &sh("printf 'hello-pty'"), None, &[], 24, 80, tx).unwrap();
         assert!(
             drain_until_exit(&mut pane, &mut rx, 5000),
             "child should exit"
@@ -203,7 +210,8 @@ mod tests {
     fn resize_propagates_to_child_via_winsize() {
         // `stty size` prints "rows cols" read from the PTY winsize.
         let (tx, mut rx) = tokio_mpsc::channel(1024);
-        let mut pane = PtyPane::spawn(0, &sh("stty size"), None, 30, 100, tx).unwrap();
+        let mut pane =
+            PtyPane::spawn_with_env(0, &sh("stty size"), None, &[], 30, 100, tx).unwrap();
         assert!(drain_until_exit(&mut pane, &mut rx, 5000));
         assert_eq!(pane.emulator().row_text(0), Some("30 100".to_string()));
     }
@@ -213,8 +221,16 @@ mod tests {
         // A chatty child must not block the reader; we drain a bounded window
         // and drop the pane (reader thread exits when the channel sender errors).
         let (tx, mut rx) = tokio_mpsc::channel(1024);
-        let mut pane =
-            PtyPane::spawn(0, &sh("yes superzej | head -c 200000"), None, 24, 80, tx).unwrap();
+        let mut pane = PtyPane::spawn_with_env(
+            0,
+            &sh("yes superzej | head -c 200000"),
+            None,
+            &[],
+            24,
+            80,
+            tx,
+        )
+        .unwrap();
         let exited = drain_until_exit(&mut pane, &mut rx, 5000);
         assert!(
             exited,

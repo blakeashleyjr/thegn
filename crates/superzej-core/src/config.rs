@@ -243,7 +243,7 @@ fn default_true() -> bool {
 pub struct CustomAction {
     /// Stable id + default menu/hint label.
     pub name: String,
-    /// Key chord (zellij syntax, e.g. "Alt D"); validated by keymap.
+    /// Key chord (e.g. "Alt D"); validated by the host keymap.
     pub key: String,
     /// Shell command line run via `sh -c`.
     pub run: String,
@@ -259,7 +259,7 @@ pub struct CustomAction {
     pub close_on_exit: bool,
 }
 
-/// Host/zellij keybinding overrides. The flat `[keybinds]` table remains the
+/// Host keybinding overrides. The flat `[keybinds]` table remains the
 /// default/global layer for backwards compatibility; nested tables such as
 /// `[keybinds.vim_normal]` override only the native host's named modes.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
@@ -764,7 +764,7 @@ pub struct DrawerConfig {
     /// user's own yazi config (no isolation, no seeding). Any other value is used
     /// verbatim (tilde-expanded).
     pub config_home: String,
-    /// Drawer height as a zellij floating size ("35%" or a row count).
+    /// Drawer height as a percentage ("35%") or a row count.
     pub height: String,
     /// Drawer width: "full" (span the terminal) or "center" (narrower, centered).
     pub width: String,
@@ -1457,7 +1457,7 @@ mod tests {
 
         let cfg = Config::try_load_layered(&env, &cli_overrides, None).unwrap();
         assert_eq!(cfg.theme.accent, "#abcdef");
-        assert_eq!(cfg.sandbox.enabled, false);
+        assert!(!cfg.sandbox.enabled);
         assert_eq!(cfg.sandbox.remote.host, "user@box");
     }
 
@@ -1469,7 +1469,7 @@ mod tests {
         assert_eq!(cfg.repo_scan_depth, 99);
         // Bool
         assert!(Config::apply_override_str(&mut cfg, "sandbox.enabled", "false").is_ok());
-        assert_eq!(cfg.sandbox.enabled, false);
+        assert!(!cfg.sandbox.enabled);
         // String
         assert!(Config::apply_override_str(&mut cfg, "theme.accent", "#123456").is_ok());
         assert_eq!(cfg.theme.accent, "#123456");
@@ -2172,5 +2172,41 @@ forward_agent = false
             "Esc"
         );
         assert_eq!(cfg.keybinds.emacs.get("focus-left").unwrap(), "Ctrl b");
+    }
+
+    #[test]
+    fn agent_and_tool_command_lookup_by_name() {
+        let cfg: Config = toml::from_str(
+            "[[agents]]\nname = 'claude'\ncommand = 'claude --foo'\n\
+             [[tools]]\nname = 'lazygit'\ncommand = 'lazygit'\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.agent_command("claude"), Some("claude --foo"));
+        assert_eq!(cfg.agent_command("nope"), None);
+        assert_eq!(cfg.tool_command("lazygit"), Some("lazygit"));
+        assert_eq!(cfg.tool_command("nope"), None);
+    }
+
+    #[test]
+    fn pin_lookup_by_name_and_index_and_workspace_scope() {
+        let cfg: Config = toml::from_str(
+            "[[pins]]\nname = 'aerc'\ncommand = 'aerc'\n\
+             [[pins]]\nname = 'logs'\ncommand = 'journalctl -f'\nscope = 'workspace'\nworkspace = '/repo'\n",
+        )
+        .unwrap();
+        // By name.
+        assert_eq!(cfg.pin("aerc").map(|p| p.name.as_str()), Some("aerc"));
+        assert!(cfg.pin("missing").is_none());
+        // By 1-based index (0 and out-of-range miss).
+        assert_eq!(cfg.pin_by_index(1).map(|p| p.name.as_str()), Some("aerc"));
+        assert_eq!(cfg.pin_by_index(2).map(|p| p.name.as_str()), Some("logs"));
+        assert!(cfg.pin_by_index(0).is_none());
+        assert!(cfg.pin_by_index(3).is_none());
+        // Workspace scoping: global pin always shows; workspace pin only for its repo.
+        let global_only = cfg.pins_for_workspace(None);
+        assert_eq!(global_only.len(), 1);
+        assert_eq!(global_only[0].name, "aerc");
+        let in_repo = cfg.pins_for_workspace(Some("/repo"));
+        assert_eq!(in_repo.len(), 2);
     }
 }

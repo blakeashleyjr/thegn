@@ -59,8 +59,7 @@ pub fn repo_name_from_path(root: &Path) -> String {
 }
 
 /// A stable, globally-unique slug for a repo — the prefix of every tab that
-/// belongs to it (`"{slug}/…"`). All repos live in one zellij session now, so
-/// tabs are scoped by this prefix rather than by a per-repo session.
+/// belongs to it (`"{slug}/…"`). Tabs are scoped by this prefix.
 ///
 /// The slug is assigned once and persisted (DB), with `-2`/`-3` suffixing when
 /// two repos share a basename (e.g. two different `WASHU` checkouts), so their

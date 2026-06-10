@@ -25,35 +25,15 @@ pub fn xdg_state_home() -> PathBuf {
         .unwrap_or_else(|| home().join(".local/state"))
 }
 
-/// superzej's own home — config, worktrees, zellij socket/cache, activity all
-/// live under here (`~/.superzej`). `SUPERZEJ_DIR` relocates it so a dev/test
-/// instance can run on a fully separate root (its own session namespace, cache,
-/// config and worktrees) without touching your daily-driver superzej. Pair it
-/// with `XDG_STATE_HOME` to also isolate the DB (see `just start-term`).
+/// superzej's own home — config, worktrees, cache, activity all live under here
+/// (`~/.superzej`). `SUPERZEJ_DIR` relocates it so a dev/test instance can run on
+/// a fully separate root (its own cache, config and worktrees) without touching
+/// your daily-driver superzej. Pair it with `XDG_STATE_HOME` to also isolate the
+/// DB (see `just start-term`).
 pub fn superzej_dir() -> PathBuf {
     std::env::var_os("SUPERZEJ_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".superzej"))
-}
-
-/// Where superzej's zellij layouts live. Seeded from the binary into superzej's
-/// own namespace (under `~/.superzej`, NOT the user's `~/.config/zellij`), so a
-/// missing/foreign/personal zellij config can never break the session — superzej
-/// owns these end to end, the same way it owns `~/.superzej/zellij.kdl`.
-/// `SUPERZEJ_DIR` relocates it for dev/test isolation; `SUPERZEJ_LAYOUT_DIR`
-/// overrides it outright (dev: point at the live `layouts/` source so edits take
-/// effect without a re-seed).
-pub fn layout_dir() -> PathBuf {
-    std::env::var_os("SUPERZEJ_LAYOUT_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| superzej_dir().join("layouts"))
-}
-
-/// Where superzej's WASM plugins are deployed. Kept as a literal `~/.local/share`
-/// path (not `$XDG_DATA_HOME`) so it always matches the `file:~/.local/share/...`
-/// references in the session layout — and thus the zellij permission-cache keys.
-pub fn plugin_dir() -> PathBuf {
-    home().join(".local/share/superzej")
 }
 
 /// Expand a leading `~` to `$HOME` (config values may contain it literally).
@@ -201,24 +181,9 @@ pub fn spawn_detached(cmd: &str, cwd: &Path) {
         .spawn();
 }
 
-/// Spawn `prog args...` as a detached background daemon: its own process group
-/// (so a Ctrl-C / SIGINT in the launching terminal doesn't reach it) and null
-/// stdio. Used to start the `watch` daemon just before we exec into zellij — it
-/// is reparented to init when the launching client exits.
-pub fn spawn_daemon(prog: &str, args: &[&str]) {
-    use std::process::Stdio;
-    let _ = Command::new(prog)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn();
-}
-
-/// Set the terminal (pane) window title via OSC. zellij shows it as the pane's
-/// frame title; any program run afterwards (vim, lazygit, …) overrides it as
-/// usual, so this just seeds a sensible default (the branch/worktree name).
+/// Set the terminal (pane) window title via OSC. Any program run afterwards
+/// (vim, lazygit, …) overrides it as usual, so this just seeds a sensible
+/// default (the branch/worktree name).
 pub fn set_terminal_title(title: &str) {
     use std::io::Write;
     crate::out!("\u{1b}]0;{title}\u{07}");
