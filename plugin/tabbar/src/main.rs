@@ -49,6 +49,7 @@ struct State {
     cpu: Option<u8>,
     mem: Option<u8>,
     gpu: Option<u8>,
+    loc: Option<usize>,
     time: String,
     // Keyboard selection of a stat segment, indexing the *present* segments in
     // CPU→MEM→GPU order (GPU drops on boxes with no counter). `Some` means the
@@ -728,6 +729,9 @@ impl State {
         if self.gpu.is_some() {
             v.push("gpu");
         }
+        if self.loc.is_some() {
+            v.push("loc");
+        }
         v
     }
 
@@ -807,7 +811,8 @@ impl State {
     fn update_stats(&mut self, stdout: &[u8]) -> bool {
         let s = String::from_utf8_lossy(stdout);
         let line = s.lines().next().unwrap_or("");
-        let (mut cpu, mut mem, mut gpu, mut time) = (None, None, None, String::new());
+        let (mut cpu, mut mem, mut gpu, mut loc, mut time) =
+            (None, None, None, None, String::new());
         for tok in line.split_whitespace() {
             let Some((k, v)) = tok.split_once('=') else {
                 continue;
@@ -816,14 +821,17 @@ impl State {
                 "cpu" => cpu = v.parse().ok(),
                 "mem" => mem = v.parse().ok(),
                 "gpu" => gpu = v.parse().ok(),
+                "loc" => loc = v.parse().ok(),
                 "time" => time = v.to_string(),
                 _ => {}
             }
         }
-        let changed = (cpu, mem, gpu) != (self.cpu, self.mem, self.gpu) || time != self.time;
+        let changed =
+            (cpu, mem, gpu, loc) != (self.cpu, self.mem, self.gpu, self.loc) || time != self.time;
         self.cpu = cpu;
         self.mem = mem;
         self.gpu = gpu;
+        self.loc = loc;
         self.time = time;
         changed
     }
@@ -875,8 +883,7 @@ impl State {
         // The selected segment is a filled accent chip (BG0 on accent, bold),
         // then RESET back to the grey bar fill so the separator/clock keep it.
         let set_bar = format!("\u{1b}[48;2;{PANEL}m");
-        let metric = |label: &str, v: u8, selected: bool| -> (String, usize) {
-            let val = format!("{v}%");
+        let metric = |label: &str, val: &str, selected: bool| -> (String, usize) {
             let width = label.chars().count() + 1 + val.chars().count();
             let s = if selected {
                 format!(
@@ -891,15 +898,26 @@ impl State {
         let mut parts: Vec<(String, usize)> = Vec::new();
         let mut si: u8 = 0; // stat-segment index, for matching self.sel
         if let Some(c) = self.cpu {
-            parts.push(metric("CPU", c, self.sel == Some(si)));
+            parts.push(metric("CPU", &format!("{c}%"), self.sel == Some(si)));
             si += 1;
         }
         if let Some(m) = self.mem {
-            parts.push(metric("MEM", m, self.sel == Some(si)));
+            parts.push(metric("MEM", &format!("{m}%"), self.sel == Some(si)));
             si += 1;
         }
         if let Some(g) = self.gpu {
-            parts.push(metric("GPU", g, self.sel == Some(si)));
+            parts.push(metric("GPU", &format!("{g}%"), self.sel == Some(si)));
+            si += 1;
+        }
+        if let Some(l) = self.loc {
+            let loc_str = if l >= 1_000_000 {
+                format!("{:.1}M", l as f64 / 1_000_000.0)
+            } else if l >= 1_000 {
+                format!("{:.1}K", l as f64 / 1_000.0)
+            } else {
+                l.to_string()
+            };
+            parts.push(metric("LOC", &loc_str, self.sel == Some(si)));
             si += 1;
         }
         let _ = si;
@@ -1002,6 +1020,7 @@ mod tests {
             cpu,
             mem,
             gpu,
+            loc: None,
             ..State::default()
         }
     }
