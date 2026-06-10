@@ -416,7 +416,7 @@ impl PluginRuntime {
             .filter_map(|c| {
                 c.surface
                     .clone()
-                    .and_then(|s| surface_capability_for(&c.extension_point).map(|cap| (s, cap)))
+                    .zip(surface_capability_for(&c.extension_point))
             })
             .collect();
         Self {

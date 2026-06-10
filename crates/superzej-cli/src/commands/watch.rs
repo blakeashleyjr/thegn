@@ -171,7 +171,7 @@ fn push_diff(url: &str, wt: &str) {
     if let Ok(db) = Db::open() {
         let _ = db.put_diff_cache(wt, &tsv);
     }
-    let payload = serde_json::json!({ "worktree": wt, "files": tsv }).to_string();
+    let payload = format!("{}\n{}", wt, tsv);
     zellij::pipe_plugin(url, "superzej_diff", &payload);
 }
 

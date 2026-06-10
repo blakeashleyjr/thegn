@@ -189,7 +189,7 @@ mod tests {
         let (tx, rx) = channel();
         let mut pane = PtyPane::spawn(0, &sh("printf 'hello-pty'"), None, 24, 80, tx).unwrap();
         assert!(drain_until_exit(&mut pane, &rx, 5000), "child should exit");
-        assert_eq!(pane.emulator().row_text(0), "hello-pty");
+        assert_eq!(pane.emulator().row_text(0), Some("hello-pty".to_string()));
     }
 
     #[test]
@@ -198,7 +198,7 @@ mod tests {
         let (tx, rx) = channel();
         let mut pane = PtyPane::spawn(0, &sh("stty size"), None, 30, 100, tx).unwrap();
         assert!(drain_until_exit(&mut pane, &rx, 5000));
-        assert_eq!(pane.emulator().row_text(0), "30 100");
+        assert_eq!(pane.emulator().row_text(0), Some("30 100".to_string()));
     }
 
     #[test]
@@ -216,7 +216,7 @@ mod tests {
         // The flood scrolled through the grid; some visible row holds the token.
         let emu = pane.emulator();
         let (rows, _) = emu.size();
-        let seen = (0..rows).any(|r| emu.row_text(r).contains("superzej"));
+        let seen = (0..rows).any(|r| emu.row_text(r).unwrap_or_default().contains("superzej"));
         assert!(
             seen,
             "expected the repeated token somewhere in the visible grid"
