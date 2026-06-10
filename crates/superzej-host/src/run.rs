@@ -565,7 +565,10 @@ fn spawn_pr_cache_refresh(session: crate::session::Session) {
             return;
         }
         let loc = superzej_core::remote::GitLoc::for_worktree(&cwd);
-        let panel = superzej_core::github::pr_status(&loc);
+        let Some(forge) = superzej_core::forge::get_forge_for_loc(&loc) else {
+            return;
+        };
+        let panel = forge.pr_status(&loc);
         let Ok(json) = serde_json::to_string(&panel) else {
             return;
         };

@@ -1,6 +1,6 @@
 //! Command-line interface (clap derive).
 
-use crate::github::MergeMethod;
+use superzej_core::forge::models::MergeMethod;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 

@@ -5,8 +5,9 @@
 //! `GH_TOKEN`/`GITHUB_TOKEN` env → `gh auth token` → config field.
 
 use serde_json::Value;
-use superzej_core::github::{
-    self, CheckRun, CreateOpts, GhError, MergeMethod, PanelState, PrPanel, PrStatus,
+use superzej_core::forge::models::{
+    self as github, CheckRun, CreateOpts, ForgeError as GhError, MergeMethod, PanelState, PrPanel,
+    PrStatus,
 };
 use superzej_core::remote::GitLoc;
 
@@ -34,10 +35,10 @@ pub struct CliGh;
 
 impl GhBackend for CliGh {
     async fn pr_status(&self, loc: &GitLoc) -> Result<PrPanel, GhError> {
-        Ok(github::pr_status(loc))
+        Ok(superzej_core::forge::get_forge_for_loc(loc).unwrap().pr_status(loc))
     }
     async fn create_pr(&self, loc: &GitLoc, opts: &CreateOpts) -> Result<String, GhError> {
-        github::create_pr(loc, opts)
+        superzej_core::forge::get_forge_for_loc(loc).unwrap().create_pr(loc, opts)
     }
     async fn merge_pr(
         &self,
@@ -46,13 +47,13 @@ impl GhBackend for CliGh {
         delete_branch: bool,
         auto: bool,
     ) -> Result<(), GhError> {
-        github::merge_pr(loc, method, delete_branch, auto)
+        superzej_core::forge::get_forge_for_loc(loc).unwrap().merge_pr(loc, method, delete_branch, auto)
     }
     async fn approve(&self, loc: &GitLoc, body: Option<&str>) -> Result<(), GhError> {
-        github::approve_pr(loc, body)
+        superzej_core::forge::get_forge_for_loc(loc).unwrap().approve_pr(loc, body)
     }
     async fn rerun_failed(&self, loc: &GitLoc) -> Result<u32, GhError> {
-        github::rerun_failed_checks(loc)
+        superzej_core::forge::get_forge_for_loc(loc).unwrap().rerun_failed_checks(loc)
     }
 }
 
@@ -244,7 +245,7 @@ impl GhBackend for GhNative {
         let (Some(token), Some((owner, repo))) = (resolve_token(), self.owner_repo(loc)) else {
             return self.fallback.pr_status(loc).await;
         };
-        let branch = github::pr_status(loc).branch; // cheap rev-parse via core
+        let branch = superzej_core::forge::get_forge_for_loc(loc).unwrap().pr_status(loc).branch; // cheap rev-parse via core
         let client = match octocrab::OctocrabBuilder::new()
             .personal_token(token)
             .build()

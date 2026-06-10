@@ -9,7 +9,7 @@ use crate::cli::PrAction;
 use crate::commands::{confirm, panels, resolve_worktree};
 use crate::config::Config;
 use crate::db::Db;
-use crate::github::{self, CreateOpts, PanelState, PrPanel};
+use superzej_core::forge::models::{self, CreateOpts, PanelState, PrPanel};
 use crate::remote::GitLoc;
 use crate::{msg, util, zellij};
 use anyhow::Result;
@@ -57,7 +57,7 @@ fn fetch_json(cfg: &Config, loc: &GitLoc, refresh: bool) -> String {
             }
         }
     }
-    let panel = github::pr_status(loc);
+    let panel = superzej_core::forge::get_forge_for_loc(loc).unwrap().pr_status(loc);
     let json = serde_json::to_string(&panel).unwrap_or_default();
     if let Ok(db) = Db::open() {
         let _ = db.put_pr_cache(&wt_s, &panel.branch, &json);
@@ -72,7 +72,7 @@ fn status(cfg: &Config, worktree: Option<String>, json: bool, refresh: bool) -> 
         crate::outln!("{}", fetch_json(cfg, &loc, refresh));
     } else {
         // Always show a fresh human summary on the CLI.
-        let panel = github::pr_status(&loc);
+        let panel = superzej_core::forge::get_forge_for_loc(&loc).unwrap().pr_status(&loc);
         let json = serde_json::to_string(&panel).unwrap_or_default();
         if let Ok(db) = Db::open() {
             let _ = db.put_pr_cache(&loc.path(), &panel.branch, &json);
@@ -113,7 +113,7 @@ fn watch(cfg: &Config, worktree: Option<String>, interval: Option<u64>) -> Resul
     let base = interval.unwrap_or(cfg.watch.pr_interval_secs).max(1);
     let mut delay = base;
     loop {
-        let panel = github::pr_status(&loc);
+        let panel = superzej_core::forge::get_forge_for_loc(&loc).unwrap().pr_status(&loc);
         let json = serde_json::to_string(&panel).unwrap_or_default();
         if let Ok(db) = Db::open() {
             let _ = db.put_pr_cache(&loc.path(), &panel.branch, &json);
@@ -152,38 +152,38 @@ fn create(
         web,
         fill,
     };
-    match github::create_pr(&loc, &opts) {
+    match superzej_core::forge::get_forge_for_loc(&loc).unwrap().create_pr(&loc, &opts) {
         Ok(out) => {
             if !out.is_empty() {
                 crate::outln!("{out}");
             }
             msg::info("PR created");
         }
-        Err(e) => msg::die(&format!("pr create failed: {}", github::describe(&e))),
+        Err(e) => msg::die(&format!("pr create failed: {}", superzej_core::forge::models::ForgeError::message(&e))),
     }
     Ok(())
 }
 
 fn open(worktree: Option<String>) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
-    if let Err(e) = github::open_pr(&loc) {
-        msg::die(&format!("pr open failed: {}", github::describe(&e)));
+    if let Err(e) = superzej_core::forge::get_forge_for_loc(&loc).unwrap().open_pr(&loc) {
+        msg::die(&format!("pr open failed: {}", superzej_core::forge::models::ForgeError::message(&e)));
     }
     Ok(())
 }
 
 fn approve(worktree: Option<String>, body: Option<String>) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
-    match github::approve_pr(&loc, body.as_deref()) {
+    match superzej_core::forge::get_forge_for_loc(&loc).unwrap().approve_pr(&loc, body.as_deref()) {
         Ok(()) => msg::info("PR approved"),
-        Err(e) => msg::die(&format!("pr approve failed: {}", github::describe(&e))),
+        Err(e) => msg::die(&format!("pr approve failed: {}", superzej_core::forge::models::ForgeError::message(&e))),
     }
     Ok(())
 }
 
 fn merge(
     worktree: Option<String>,
-    method: github::MergeMethod,
+    method: superzej_core::forge::models::MergeMethod,
     delete_branch: bool,
     auto: bool,
 ) -> Result<()> {
@@ -192,28 +192,28 @@ fn merge(
         msg::info("cancelled");
         return Ok(());
     }
-    match github::merge_pr(&loc, method, delete_branch, auto) {
+    match superzej_core::forge::get_forge_for_loc(&loc).unwrap().merge_pr(&loc, method, delete_branch, auto) {
         Ok(()) => msg::info("PR merged"),
-        Err(e) => msg::die(&format!("pr merge failed: {}", github::describe(&e))),
+        Err(e) => msg::die(&format!("pr merge failed: {}", superzej_core::forge::models::ForgeError::message(&e))),
     }
     Ok(())
 }
 
 fn rerun(worktree: Option<String>) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
-    match github::rerun_failed_checks(&loc) {
+    match superzej_core::forge::get_forge_for_loc(&loc).unwrap().rerun_failed_checks(&loc) {
         Ok(0) => msg::info("no failed checks to re-run"),
         Ok(n) => msg::info(&format!("re-ran {n} failed workflow run(s)")),
-        Err(e) => msg::die(&format!("pr rerun-checks failed: {}", github::describe(&e))),
+        Err(e) => msg::die(&format!("pr rerun-checks failed: {}", superzej_core::forge::models::ForgeError::message(&e))),
     }
     Ok(())
 }
 
 fn reviews(worktree: Option<String>) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
-    match github::reviews(&loc) {
+    match superzej_core::forge::get_forge_for_loc(&loc).unwrap().reviews(&loc) {
         Ok(json) => crate::outln!("{json}"),
-        Err(e) => msg::die(&format!("pr reviews failed: {}", github::describe(&e))),
+        Err(e) => msg::die(&format!("pr reviews failed: {}", superzej_core::forge::models::ForgeError::message(&e))),
     }
     Ok(())
 }

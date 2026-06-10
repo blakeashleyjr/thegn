@@ -6,7 +6,7 @@
 use super::item::Action;
 use crate::cli::PrAction;
 use crate::config::Config;
-use crate::github::MergeMethod;
+use superzej_core::forge::models::MergeMethod;
 use crate::{commands, util, zellij};
 use anyhow::Result;
 use std::path::Path;
