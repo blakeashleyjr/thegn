@@ -146,6 +146,21 @@ pub fn run(
     };
     let cname = sandbox::container_name(&worktree);
     if let Some(spec) = sandbox::resolve(&sb, &loc, &cname) {
+        if let Ok(db) = Db::open() {
+            let _ = db.set_worktree_sandbox(&worktree, spec.backend.binary());
+        }
+
+        superzej_core::log::audit(&format!(
+            "sandbox: {} backend={} worktree={}",
+            if spec.backend.is_oci() {
+                "oci-start"
+            } else {
+                "host"
+            },
+            spec.backend.binary(),
+            worktree
+        ));
+
         match sandbox::ensure(&spec) {
             Ok(()) => {
                 let argv = sandbox::enter_argv(&spec, &inner);

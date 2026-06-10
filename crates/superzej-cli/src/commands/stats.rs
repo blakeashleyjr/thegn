@@ -53,6 +53,44 @@ pub fn run() -> Result<()> {
         fields.push(format!("gpu={gpu}"));
     }
 
+    if let Ok(wt) = std::env::var("SUPERZEJ_WORKTREE") {
+        if let Ok(db) = crate::db::Db::open() {
+            if let Ok(Some(sb)) = db.worktree_sandbox(&wt) {
+                let backend = match sb.as_str() {
+                    "podman" => superzej_core::sandbox::Backend::Podman,
+                    "docker" => superzej_core::sandbox::Backend::Docker,
+                    _ => superzej_core::sandbox::Backend::None,
+                };
+
+                if backend != superzej_core::sandbox::Backend::None {
+                    let sb_stats =
+                        superzej_core::sandbox::stats(&superzej_core::sandbox::SandboxSpec {
+                            backend,
+                            transport: superzej_core::sandbox::Transport::Local,
+                            image: None,
+                            worktree: std::path::PathBuf::from(&wt),
+                            mounts: vec![],
+                            env: vec![],
+                            network: superzej_core::config::Network::Nat,
+                            ports: vec![],
+                            gpu: None,
+                            limits: superzej_core::sandbox::SandboxLimits::default(),
+                            volumes: vec![],
+                            compose: None,
+                            init_script: None,
+                            devenv: false,
+                            name: superzej_core::sandbox::container_name(&wt),
+                        });
+
+                    if let Some(st) = sb_stats {
+                        fields.push(format!("sb_cpu={}", st.cpu.trim_end_matches('%')));
+                        fields.push(format!("sb_mem={}", st.mem));
+                    }
+                }
+            }
+        }
+    }
+
     fields.push(format!("time={}", chrono::Local::now().format("%H:%M")));
 
     crate::outln!("{}", fields.join(" "));
