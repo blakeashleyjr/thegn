@@ -1554,7 +1554,7 @@ mod tests {
 
         let cfg = Config::try_load_layered(&env, &cli_overrides, None).unwrap();
         assert_eq!(cfg.theme.accent, "#abcdef");
-        assert_eq!(cfg.sandbox.enabled, false);
+        assert!(!cfg.sandbox.enabled);
         assert_eq!(cfg.sandbox.remote.host, "user@box");
     }
 
@@ -1566,7 +1566,7 @@ mod tests {
         assert_eq!(cfg.repo_scan_depth, 99);
         // Bool
         assert!(Config::apply_override_str(&mut cfg, "sandbox.enabled", "false").is_ok());
-        assert_eq!(cfg.sandbox.enabled, false);
+        assert!(!cfg.sandbox.enabled);
         // String
         assert!(Config::apply_override_str(&mut cfg, "theme.accent", "#123456").is_ok());
         assert_eq!(cfg.theme.accent, "#123456");
