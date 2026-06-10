@@ -96,3 +96,47 @@ fn validate(path: &PathBuf) -> Result<()> {
         anyhow::bail!("{} problem(s) in {}", errs.len(), path.display());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, LogLevel, Picker};
+
+    #[test]
+    fn show_outputs_toml_by_default() {
+        let cfg = Config::default();
+        // Just verify it doesn't panic - full output testing would require capturing stdout
+        let result = show(&cfg, false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn show_outputs_json_when_flag_set() {
+        let cfg = Config::default();
+        let result = show(&cfg, true);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn get_returns_known_key() {
+        let cfg = Config::default();
+        // Test getting a known key - "picker" should exist
+        let result = get(&cfg, "picker", false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn get_returns_unknown_key_error() {
+        let cfg = Config::default();
+        // Test getting an unknown key
+        let result = get(&cfg, "nonexistent.key", false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn get_returns_json_when_flag_set() {
+        let cfg = Config::default();
+        let result = get(&cfg, "picker", true);
+        assert!(result.is_ok());
+    }
+}

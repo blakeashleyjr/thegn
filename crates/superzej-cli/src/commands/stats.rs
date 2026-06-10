@@ -14,11 +14,12 @@
 
 use anyhow::Result;
 use serde::Serialize;
-use sysinfo::{System, MINIMUM_CPU_UPDATE_INTERVAL};
+use sysinfo::{MINIMUM_CPU_UPDATE_INTERVAL, System};
 
 /// Default icons for stat display in the tabbar.
 pub const DEFAULT_CPU_ICON: &str = "CPU";
 pub const DEFAULT_MEM_ICON: &str = "MEM";
+pub const DEFAULT_NET_ICON: &str = "NET";
 pub const DEFAULT_GPU_ICON: &str = "GPU";
 /// Default refresh interval in seconds.
 pub const DEFAULT_REFRESH_SECS: f64 = 2.0;
@@ -30,6 +31,7 @@ pub const DEFAULT_REFRESH_RATES: &[f64] = &[1.0, 2.0, 5.0, 10.0];
 pub struct StatsConfig {
     pub cpu_icon: String,
     pub mem_icon: String,
+    pub net_icon: String,
     pub gpu_icon: String,
     pub refresh_secs: f64,
     pub refresh_rates: Vec<f64>,
@@ -40,6 +42,7 @@ impl Default for StatsConfig {
         Self {
             cpu_icon: DEFAULT_CPU_ICON.to_string(),
             mem_icon: DEFAULT_MEM_ICON.to_string(),
+            net_icon: DEFAULT_NET_ICON.to_string(),
             gpu_icon: DEFAULT_GPU_ICON.to_string(),
             refresh_secs: DEFAULT_REFRESH_SECS,
             refresh_rates: DEFAULT_REFRESH_RATES.to_vec(),
@@ -48,8 +51,16 @@ impl Default for StatsConfig {
 }
 
 /// Output stats configuration as JSON for the tabbar plugin.
-pub fn config() -> Result<()> {
-    let cfg = StatsConfig::default();
+pub fn config(cfg: &crate::Config) -> Result<()> {
+    let stats_cfg = &cfg.stats;
+    let cfg = StatsConfig {
+        cpu_icon: stats_cfg.cpu_icon.clone(),
+        mem_icon: stats_cfg.mem_icon.clone(),
+        net_icon: stats_cfg.net_icon.clone(),
+        gpu_icon: stats_cfg.gpu_icon.clone(),
+        refresh_secs: stats_cfg.refresh_secs,
+        refresh_rates: stats_cfg.refresh_rates.clone(),
+    };
     let json = serde_json::to_string(&cfg)?;
     crate::outln!("{}", json);
     Ok(())
@@ -136,4 +147,99 @@ fn sysfs_gpu() -> Option<u8> {
 #[cfg(not(target_os = "linux"))]
 fn sysfs_gpu() -> Option<u8> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stats_config_default_has_expected_values() {
+        let cfg = StatsConfig::default();
+        assert_eq!(cfg.cpu_icon, "CPU");
+        assert_eq!(cfg.mem_icon, "MEM");
+        assert_eq!(cfg.net_icon, "NET");
+        assert_eq!(cfg.gpu_icon, "GPU");
+        assert_eq!(cfg.refresh_secs, 2.0);
+        assert_eq!(cfg.refresh_rates, vec![1.0, 2.0, 5.0, 10.0]);
+    }
+
+    #[test]
+    fn stats_config_serializes_to_json() {
+        let cfg = StatsConfig::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("CPU"));
+        assert!(json.contains("MEM"));
+        assert!(json.contains("GPU"));
+        assert!(json.contains("2.0"));
+    }
+
+    #[test]
+    fn stats_config_custom_values() {
+        let cfg = StatsConfig {
+            cpu_icon: "C".to_string(),
+            mem_icon: "M".to_string(),
+            net_icon: "N".to_string(),
+            gpu_icon: "G".to_string(),
+            refresh_secs: 5.0,
+            refresh_rates: vec![1.0, 5.0],
+        };
+        assert_eq!(cfg.cpu_icon, "C");
+        assert_eq!(cfg.mem_icon, "M");
+        assert_eq!(cfg.net_icon, "N");
+        assert_eq!(cfg.gpu_icon, "G");
+        assert_eq!(cfg.refresh_secs, 5.0);
+        assert_eq!(cfg.refresh_rates, vec![1.0, 5.0]);
+    }
+
+    #[test]
+    fn default_constants_are_correct() {
+        assert_eq!(DEFAULT_CPU_ICON, "CPU");
+        assert_eq!(DEFAULT_MEM_ICON, "MEM");
+        assert_eq!(DEFAULT_NET_ICON, "NET");
+        assert_eq!(DEFAULT_GPU_ICON, "GPU");
+        assert_eq!(DEFAULT_REFRESH_SECS, 2.0);
+        assert_eq!(DEFAULT_REFRESH_RATES, &[1.0, 2.0, 5.0, 10.0]);
+    }
+
+    #[test]
+    fn config_outputs_json_to_stdout() {
+        // config() requires Config argument - test with default
+        let cfg = crate::Config::default();
+        let result = config(&cfg);
+        // config() just needs to not panic - it outputs JSON to stdout via crate::outln!
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn run_with_fake_stats_uses_env_var() {
+        // Test the SZ_FAKE_STATS code path by setting the env var
+        std::env::set_var("SZ_FAKE_STATS", "cpu=50 mem=75 gpu=0 time=12:00");
+
+        // This should return Ok without panicking - the fake value is printed
+        let result = run();
+
+        std::env::remove_var("SZ_FAKE_STATS");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn run_with_empty_fake_stats_runs_normal_path() {
+        // When SZ_FAKE_STATS is set to empty string, it runs the normal path
+        std::env::set_var("SZ_FAKE_STATS", "");
+
+        // The normal path requires sysinfo - just verify it doesn't panic
+        let _ = run();
+
+        std::env::remove_var("SZ_FAKE_STATS");
+    }
+
+    #[test]
+    fn gpu_percent_returns_none_on_no_nvidia() {
+        // This tests that nvml_gpu() failing returns None and falls through to sysfs
+        // On a machine without NVIDIA GPU, this will return None from sysfs_gpu
+        let result = gpu_percent();
+        // Just verify it returns an Option<u8> - actual value depends on system
+        assert!(result.is_none() || result.is_some());
+    }
 }

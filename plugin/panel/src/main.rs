@@ -240,9 +240,11 @@ fn base_tab_name(tab: &str) -> &str {
 
 impl State {
     fn refocus_instant(&mut self) -> bool {
-        let Some(t) = self.active_tab.as_deref() else { return false };
+        let Some(t) = self.active_tab.as_deref() else {
+            return false;
+        };
         let base = base_tab_name(t);
-        
+
         if let Some(wt) = self.tab_to_worktree.get(base).cloned() {
             self.worktree = Some(wt.clone());
             if let Some(files) = self.diff_cache.get(&wt) {
@@ -285,10 +287,10 @@ impl State {
             return false;
         }
         self.identity = Some(id);
-        
+
         // 1. Attempt a 0ms instantaneous paint from local memory cache
         let mut changed = self.refocus_instant();
-        
+
         if self.worktree.is_none() {
             // Fallback clear if we have absolutely nothing
             self.files.clear();
@@ -351,7 +353,7 @@ impl State {
                     if let Some(wt) = new_wt.clone() {
                         let base = base_tab_name(self.active_tab.as_deref().unwrap_or_default());
                         self.tab_to_worktree.insert(base.to_string(), wt.clone());
-                        
+
                         if let Some(files) = v.get("files").and_then(|f| f.as_str()) {
                             self.diff_cache.insert(wt.clone(), parse_files(files));
                         }
@@ -386,7 +388,7 @@ impl State {
                             v.get("worktree").and_then(|w| w.as_str()),
                         ) {
                             self.tab_to_worktree.insert(tab.to_string(), wt.to_string());
-                            
+
                             if let Some(files) = v.get("files").and_then(|f| f.as_str()) {
                                 self.diff_cache.insert(wt.to_string(), parse_files(files));
                             }

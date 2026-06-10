@@ -71,6 +71,10 @@ struct State {
     // Clickable column spans for the pin chips, cached from the last render:
     // (start_col, end_col_exclusive, pin_index).
     pin_spans: Vec<(usize, usize, usize)>,
+    // Refresh rate cycling: configurable rates and current index.
+    refresh_secs: f64,
+    refresh_rates: Vec<f64>,
+    refresh_index: usize,
 }
 
 /// Placement for a pinned program. The tabbar renders both identically in this
@@ -124,6 +128,8 @@ register_plugin!(State);
 impl ZellijPlugin for State {
     fn load(&mut self, _config: BTreeMap<String, String>) {
         self.accent = TEAL.into();
+        // Default refresh rate until config arrives.
+        self.refresh_secs = STATS_SECS;
         request_permission(&[
             PermissionType::ReadApplicationState,   // Tab/Session updates
             PermissionType::ChangeApplicationState, // switch tabs
@@ -144,8 +150,10 @@ impl ZellijPlugin for State {
         set_selectable(true);
         fetch_theme();
         fetch_stats();
+        fetch_stats_config();
         fetch_pins();
-        set_timeout(STATS_SECS);
+        // Use dynamic refresh_secs (defaults to STATS_SECS until config arrives)
+        set_timeout(self.refresh_secs);
     }
 
     fn update(&mut self, event: Event) -> bool {
@@ -179,6 +187,12 @@ impl ZellijPlugin for State {
                 code == Some(0) && self.update_stats(&stdout)
             }
             Event::RunCommandResult(code, stdout, _, ctx)
+                if ctx.get("cmd").map(|s| s.as_str()) == Some("stats_config") =>
+            {
+                // Parse the JSON config (refresh_rates, refresh_secs).
+                code == Some(0) && self.update_stats_config(&stdout)
+            }
+            Event::RunCommandResult(code, stdout, _, ctx)
                 if ctx.get("cmd").map(|s| s.as_str()) == Some("pins") =>
             {
                 code == Some(0) && self.update_pins(&stdout)
@@ -186,7 +200,7 @@ impl ZellijPlugin for State {
             // Re-poll stats and re-arm the timer.
             Event::Timer(_) => {
                 fetch_stats();
-                set_timeout(STATS_SECS);
+                set_timeout(self.refresh_secs);
                 false
             }
             Event::TabUpdate(tabs) => {
@@ -563,6 +577,13 @@ fn fetch_stats() {
     run_command(&["superzej", "stats"], ctx);
 }
 
+/// Kick off `superzej stats --stats-config`; the config (including refresh_rates) lands via RunCommandResult.
+fn fetch_stats_config() {
+    let mut ctx = BTreeMap::new();
+    ctx.insert("cmd".to_string(), "stats_config".to_string());
+    run_command(&["superzej", "stats", "--stats-config"], ctx);
+}
+
 /// Kick off `superzej pin list`; the pin chips land via RunCommandResult.
 fn fetch_pins() {
     let mut ctx = BTreeMap::new();
@@ -711,9 +732,16 @@ impl State {
     }
 
     /// Drive the stat cursor while the top bar is selected (this pane focused).
-    /// ←/h and →/l move it (clamped); Enter opens the monitor; Esc cancels.
+    /// ←/h and →/l move it (clamped); Enter opens the monitor; Esc cancels;
+    /// Tab cycles the refresh rate.
     fn on_key(&mut self, key: KeyWithModifier) -> bool {
         let n = self.stat_kinds().len();
+        // Tab always cycles refresh rate (even if no stats are present).
+        if let BareKey::Tab = key.bare_key {
+            if key.key_modifiers.is_empty() {
+                return self.cycle_refresh_rate();
+            }
+        }
         if n == 0 {
             return false;
         }
@@ -798,6 +826,46 @@ impl State {
         self.gpu = gpu;
         self.time = time;
         changed
+    }
+
+    /// Parse the JSON config from `superzej stats --config` to extract
+    /// `refresh_rates` (array of floats) and `refresh_secs` (current rate).
+    /// Returns whether the config changed (so the caller can skip no-op repaints).
+    fn update_stats_config(&mut self, stdout: &[u8]) -> bool {
+        let s = String::from_utf8_lossy(stdout);
+        let json: serde_json::Value = match serde_json::from_str(&s) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let mut changed = false;
+        // Parse refresh_rates array if present.
+        if let Some(rates) = json.get("refresh_rates").and_then(|v| v.as_array()) {
+            let new_rates: Vec<f64> = rates.iter().filter_map(|v| v.as_f64()).collect();
+            if new_rates != self.refresh_rates {
+                self.refresh_rates = new_rates;
+                changed = true;
+            }
+        }
+        // Parse current refresh_secs if present.
+        if let Some(secs) = json.get("refresh_secs").and_then(|v| v.as_f64()) {
+            if (secs - self.refresh_secs).abs() > 0.001 {
+                self.refresh_secs = secs;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Cycle to the next refresh rate and re-arm the timer. Returns whether the
+    /// rate actually changed (for on_key's return value).
+    fn cycle_refresh_rate(&mut self) -> bool {
+        if self.refresh_rates.is_empty() {
+            return false;
+        }
+        self.refresh_index = (self.refresh_index + 1) % self.refresh_rates.len();
+        self.refresh_secs = self.refresh_rates[self.refresh_index];
+        set_timeout(self.refresh_secs);
+        true
     }
 
     /// The far-right stats strip and its display width (0 when no data has

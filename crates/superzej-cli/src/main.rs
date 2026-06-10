@@ -145,9 +145,9 @@ fn main() {
         Command::Config { action } => commands::config::run(&cfg, action, effective_path),
         Command::Keys { action } => commands::keys::run(&cfg, action),
         Command::Theme => commands::theme::run(&cfg),
-        Command::Stats { config } => {
-            if config {
-                commands::stats::config()
+        Command::Stats { stats_config } => {
+            if stats_config {
+                commands::stats::config(&cfg)
             } else {
                 commands::stats::run()
             }
