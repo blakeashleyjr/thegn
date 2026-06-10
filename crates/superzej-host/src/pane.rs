@@ -129,6 +129,10 @@ impl PtyPane {
                         break;
                     }
                     Ok(n) => {
+                        // One exact-sized Vec per chunk: ownership must cross
+                        // the channel, and the 8K stack buffer is reused, so
+                        // this is the minimal copy (a buffer pool would add
+                        // complexity for no measured win).
                         if tx
                             .blocking_send(PaneEvent::Output(id, buf[..n].to_vec()))
                             .is_err()

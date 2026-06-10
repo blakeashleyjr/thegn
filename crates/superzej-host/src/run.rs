@@ -1097,8 +1097,11 @@ async fn event_loop<T: Terminal>(
             need_relayout = false;
         }
         let focused = session.tabs[active].focused_pane;
-        let tree = session.tabs[active].center.clone();
-        let visible: Vec<u32> = tree.pane_ids();
+        // The drain below only needs the visible pane ids; the tree itself is
+        // cloned inside the render block — only on dirty frames (most wakes
+        // aren't), and after the drain, so an exit-mutated tree renders fresh
+        // this frame instead of one wake late.
+        let visible: Vec<u32> = session.tabs[active].center.pane_ids();
 
         // 1. Drain pending PTY output, routed by pane id. Only output from a pane
         //    visible in the active tab dirties the frame; others advance silently.
@@ -1305,6 +1308,7 @@ async fn event_loop<T: Terminal>(
         //    active tab + the chrome, with the hardware cursor in the focused pane.
         if dirty {
             let frame_t0 = std::time::Instant::now();
+            let tree = session.tabs[active].center.clone();
             if scratch.dimensions() != (cols, rows) {
                 scratch = Surface::new(cols, rows);
             }
