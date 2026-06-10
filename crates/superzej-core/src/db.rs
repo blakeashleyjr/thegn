@@ -130,6 +130,11 @@ impl Db {
               files      TEXT,
               fetched_at INTEGER
             );
+            CREATE TABLE IF NOT EXISTS loc_cache (
+              worktree   TEXT PRIMARY KEY,
+              loc        INTEGER,
+              fetched_at INTEGER
+            );
             -- A stable, globally-unique slug per repo: the prefix of every tab
             -- that repo owns (`{slug}/…`). Assigned once with collision suffixing
             -- so two repos with the same basename get distinct tabs.
@@ -220,6 +225,29 @@ impl Db {
                VALUES(?1,?2,?3)
                ON CONFLICT(worktree) DO UPDATE SET files=?2, fetched_at=?3"#,
             params![worktree, files, util::now()],
+        )?;
+        Ok(())
+    }
+
+    // --- LOC cache ---------------------------------------------------------
+    pub fn get_loc_cache(&self, worktree: &str) -> Result<Option<usize>> {
+        let r = self
+            .conn
+            .query_row(
+                "SELECT loc FROM loc_cache WHERE worktree=?1",
+                params![worktree],
+                |r| r.get::<_, usize>(0),
+            )
+            .ok();
+        Ok(r)
+    }
+
+    pub fn put_loc_cache(&self, worktree: &str, loc: usize) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO loc_cache(worktree,loc,fetched_at)
+               VALUES(?1,?2,?3)
+               ON CONFLICT(worktree) DO UPDATE SET loc=?2, fetched_at=?3"#,
+            params![worktree, loc, util::now()],
         )?;
         Ok(())
     }
