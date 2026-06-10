@@ -178,6 +178,7 @@ fn classify_forgejo_error(stderr: &str) -> ForgeError {
     }
 }
 
+#[allow(unused_variables, dead_code, unused_mut)]
 impl Forge for ForgejoForge {
     fn pr_status(&self, loc: &GitLoc) -> PrPanel {
         let branch = self.get_branch(loc).unwrap_or_default();

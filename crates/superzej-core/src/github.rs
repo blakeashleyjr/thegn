@@ -62,7 +62,7 @@ fn classify(stderr: &str) -> ForgeError {
     }
 }
 
-const PR_FIELDS: &str = "number,title,state,url,isDraft,headRefName,baseRefName,                         mergeable,mergeStateStatus,reviewDecision,statusCheckRollup";
+const PR_FIELDS: &str = "number,title,state,url,isDraft,headRefName,baseRefName,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup";
 
 impl Forge for GitHubForge {
     fn pr_status(&self, loc: &GitLoc) -> PrPanel {
