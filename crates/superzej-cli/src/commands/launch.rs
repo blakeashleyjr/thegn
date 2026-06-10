@@ -22,6 +22,15 @@ const SHELL_HERE: &str = "· shell here";
 pub fn run(cfg: &Config) -> Result<()> {
     let db = Db::open()?;
 
+    std::thread::spawn(|| {
+        if let Ok(db) = Db::open() {
+            if let Ok(wts) = db.worktrees() {
+                let paths: Vec<String> = wts.into_iter().map(|w| w.worktree).collect();
+                let _ = superzej_core::sandbox::run_gc(&paths);
+            }
+        }
+    });
+
     // 1. The cwd is a git repo?
     let cwd = std::env::current_dir().unwrap_or_else(|_| util::home());
     if let Some(root) = repo::main_worktree(&cwd) {
