@@ -4,7 +4,8 @@
 
 **Goal:** Migrate the core native host event loop in `szhost` from a single-threaded blocking loop with `std::sync::mpsc` to a fully asynchronous `tokio` multi-tasking architecture with bounded backpressure.
 
-**Architecture:** 
+**Architecture:**
+
 1. Upgrade `run::main` and `run::event_loop` to be `async fn`.
 2. Wrap synchronous legacy code (e.g. DB reads, Git calls, Github proxy calls) with `tokio::task::spawn_blocking` to prevent blocking the `tokio` runtime, avoiding the need to make `superzej-svc` completely async yet.
 3. Replace the `std::sync::mpsc` unbounded channels feeding the PTY data with a bounded `tokio::sync::mpsc::channel(1024)`.
@@ -19,6 +20,7 @@
 **Objective:** Ensure `tokio` with `full` features is enabled and `Cargo.toml` edition inheritance works.
 
 **Files:**
+
 - Modify: `crates/superzej-host/Cargo.toml`
 
 **Step 1: Check build**
@@ -62,6 +64,7 @@ git commit -m "build: explicitly specify 2021 edition and tokio feature"
 **Objective:** Set up the basic `#[tokio::main]` runtime and make `run::main` and `event_loop` async.
 
 **Files:**
+
 - Modify: `crates/superzej-host/src/main.rs`
 - Modify: `crates/superzej-host/src/run.rs`
 
@@ -103,7 +106,7 @@ async fn event_loop(
 ) -> Result<()> {
 ```
 
-*(Note: Change `Keymap` to `KeyMap`, change `SystemTerminal` to `impl Terminal`, change `model_rx: Receiver` to `mut model_rx` if tokio requires mutability for `.recv()`.)*
+_(Note: Change `Keymap` to `KeyMap`, change `SystemTerminal` to `impl Terminal`, change `model_rx: Receiver` to `mut model_rx` if tokio requires mutability for `.recv()`.)_
 
 **Step 3: Temporarily stub `run.rs` channel usage**
 
@@ -132,6 +135,7 @@ Expected: Failures likely related to `PaneEvent` channels which we fix in Task 3
 **Objective:** Change `spawn_model_hydration` and pane logic to use `tokio::task::spawn_blocking` and `tokio::sync::mpsc`.
 
 **Files:**
+
 - Modify: `crates/superzej-host/src/run.rs`
 - Modify: `crates/superzej-host/src/pane.rs`
 
@@ -204,6 +208,7 @@ while let Ok(ev) = rx.try_recv() {
 **Step 5: Test and Commit**
 
 Run: `cargo test -p superzej-host`
+
 ```bash
 git commit -am "perf(host): migrate event loop to tokio runtime and bounded channels"
 ```

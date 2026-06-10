@@ -641,16 +641,15 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
                         notify::EventKind::Modify(_)
                             | notify::EventKind::Create(_)
                             | notify::EventKind::Remove(_)
-                    ) {
-                        if last_send.elapsed() > std::time::Duration::from_millis(500) {
-                            let new_cfg_res = superzej_core::config::Config::try_load_layered(
-                                &superzej_core::config::ProcessEnv,
-                                &overrides_clone,
-                                config_clone.clone(),
-                            );
-                            let _ = config_tx.send(new_cfg_res);
-                            last_send = std::time::Instant::now();
-                        }
+                    ) && last_send.elapsed() > std::time::Duration::from_millis(500)
+                    {
+                        let new_cfg_res = superzej_core::config::Config::try_load_layered(
+                            &superzej_core::config::ProcessEnv,
+                            &overrides_clone,
+                            config_clone.clone(),
+                        );
+                        let _ = config_tx.send(new_cfg_res);
+                        last_send = std::time::Instant::now();
                     }
                 }
             }) {
@@ -981,7 +980,7 @@ async fn event_loop<T: Terminal>(
             return Ok(());
         }
 
-        while let Some(next_model) = model_rx.try_recv().ok() {
+        while let Ok(next_model) = model_rx.try_recv() {
             model = next_model;
             refresh_tab_model(&mut model, &session);
             apply_mode_status(&mut model, mode);
@@ -997,7 +996,7 @@ async fn event_loop<T: Terminal>(
                     need_relayout = true;
                 }
                 Err(e) => {
-                    model.status = format!("Config error: {}", e).into();
+                    model.status = format!("Config error: {}", e);
                 }
             }
             dirty = true;

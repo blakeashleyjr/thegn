@@ -233,6 +233,11 @@ pub enum Command {
         #[command(subcommand)]
         action: PrAction,
     },
+    /// GitHub Issue data + actions for a worktree.
+    Issue {
+        #[command(subcommand)]
+        action: IssueAction,
+    },
     /// Emit a colorized, non-paged git diff for a worktree.
     Diff {
         #[arg(long)]
@@ -393,6 +398,53 @@ pub enum PrAction {
     Reviews {
         #[arg(long)]
         worktree: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum IssueAction {
+    /// List issues for the repository.
+    List {
+        #[arg(long)]
+        worktree: Option<String>,
+        /// Filter by state (open, closed, all).
+        #[arg(long, default_value = "open")]
+        state: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// View a specific issue.
+    View {
+        #[arg(long)]
+        worktree: Option<String>,
+        /// Issue number.
+        number: u64,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a new issue.
+    Create {
+        #[arg(long)]
+        worktree: Option<String>,
+        /// Issue title.
+        title: String,
+        /// Issue body.
+        #[arg(long)]
+        body: Option<String>,
+        /// Comma-separated labels.
+        #[arg(long)]
+        labels: Option<String>,
+    },
+    /// Add a comment to an issue.
+    Comment {
+        #[arg(long)]
+        worktree: Option<String>,
+        /// Issue number.
+        number: u64,
+        /// Comment body.
+        body: String,
     },
 }
 

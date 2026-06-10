@@ -10,6 +10,7 @@
 pub mod config;
 pub mod db;
 pub mod diff_highlight;
+pub mod forge;
 pub mod github;
 pub mod keymap;
 pub mod log;

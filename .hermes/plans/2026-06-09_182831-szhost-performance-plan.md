@@ -4,7 +4,7 @@
 
 **Goal:** Overhaul the `szhost` (native host) substrate by replacing the initial first-pass jank fixes with robust architectural optimizations: moving to a `tokio` multi-task split, batching terminal rendering via entire rows, bounding PTY channels with backpressure, and reducing IPC overhead for the WASM UI plugins.
 
-**Architecture:** 
+**Architecture:**
 The host drops the single-loop `std::sync::mpsc` design in favor of `tokio`. We split into a dedicated UI/render task and separate I/O tasks for PTY draining. We optimize `termwiz` cell blitting by changing `PaneEmulator` to yield row references instead of individual cells. We replace `serde_json` over `zellij::pipe` with a zero-copy structured or highly optimized text format.
 
 **Tech Stack:** Rust, `tokio`, `termwiz`, `bincode`/`rkyv` (or optimized text serialization).
@@ -16,6 +16,7 @@ The host drops the single-loop `std::sync::mpsc` design in favor of `tokio`. We 
 **Objective:** Split the monolithic `run` loop into a `tokio` app with a dedicated rendering task and separate PTY reader/hydration tasks.
 
 **Files:**
+
 - Modify: `crates/superzej-host/src/main.rs`
 - Modify: `crates/superzej-host/src/run.rs`
 - Modify: `crates/superzej-host/Cargo.toml`
@@ -36,7 +37,7 @@ use tokio::time::timeout;
 // Change signature to async
 pub async fn run_host(...) -> Result<()> {
     let (tx, mut rx) = channel::<HostEvent>(1024);
-    
+
     // Convert existing thread::spawn calls to tokio::spawn
     // Replace `rx.try_recv()` and `rx.recv_timeout()` with `tokio::select!` or `timeout(Duration, rx.recv()).await`
 }
@@ -72,6 +73,7 @@ git commit -m "perf(host): migrate single-thread event loop to tokio"
 **Objective:** Prevent chatty shell panes (e.g. `cat large_file`) from consuming unbounded memory or starving the render loop.
 
 **Files:**
+
 - Modify: `crates/superzej-host/src/pane.rs`
 
 **Step 1: Implement bounded buffer read loops**
@@ -83,14 +85,14 @@ Modify the PTY reader thread spawned in `Pane::new()` to read chunks but drop/co
 
 pub fn new(...) -> Self {
     let (tx, rx) = tokio::sync::mpsc::channel(256); // Bounded channel
-    
+
     tokio::task::spawn_blocking(move || {
         let mut reader = pty.try_clone_reader().unwrap();
         let mut buf = [0u8; 8192];
         while let Ok(n) = reader.read(&mut buf) {
             if n == 0 { break; }
-            
-            // If the channel is full, this `.blocking_send` will yield/block, 
+
+            // If the channel is full, this `.blocking_send` will yield/block,
             // naturally pacing the PTY output rather than flooding RAM.
             if tx.blocking_send(PaneEvent::Data(buf[..n].to_vec())).is_err() {
                 break;
@@ -107,6 +109,7 @@ In `run.rs`, remove the ad-hoc chunk/budget limit since `tokio::select!` and the
 **Step 3: Test and Commit**
 
 Run: `cargo test -p superzej-host`
+
 ```bash
 git add crates/superzej-host/src/pane.rs crates/superzej-host/src/run.rs
 git commit -m "perf(host): implement bounded PTY channels with backpressure"
@@ -119,6 +122,7 @@ git commit -m "perf(host): implement bounded PTY channels with backpressure"
 **Objective:** Reduce the massive allocation churn in the composition layer by fetching entire rows instead of individual grid cells.
 
 **Files:**
+
 - Modify: `crates/superzej-host/src/emulator.rs`
 - Modify: `crates/superzej-host/src/compositor.rs`
 
@@ -129,10 +133,10 @@ git commit -m "perf(host): implement bounded PTY channels with backpressure"
 
 pub trait PaneEmulator: Send {
     // ... existing ...
-    
+
     /// Borrow the underlying row text as a single string if supported
     fn row_text(&self, row: u16) -> Option<String> { None }
-    
+
     /// Fallback for `row_text` implementation in `Vt100Emulator`
 }
 ```
@@ -143,7 +147,7 @@ pub trait PaneEmulator: Send {
 // In `crates/superzej-host/src/compositor.rs`
 pub fn compose_pane(surface: &mut Surface, emu: &dyn PaneEmulator, rect: Rect) {
     let (erows, ecols) = emu.size();
-    
+
     for row in 0..rect.rows.min(erows as usize) {
         // FAST PATH: If the emulator can give us the whole row, blit it directly
         if let Some(text) = emu.row_text(row as u16) {
@@ -154,7 +158,7 @@ pub fn compose_pane(surface: &mut Surface, emu: &dyn PaneEmulator, rect: Rect) {
             surface.add_change(Change::Text(text));
             continue;
         }
-        
+
         // SLOW PATH: Fallback to existing cell-by-cell iteration
         // ... existing cell loop ...
     }
@@ -164,6 +168,7 @@ pub fn compose_pane(surface: &mut Surface, emu: &dyn PaneEmulator, rect: Rect) {
 **Step 3: Test and Commit**
 
 Run: `cargo test -p superzej-host` (Ensure `composing_a_grid_reproduces_its_text` passes).
+
 ```bash
 git add crates/superzej-host/src/emulator.rs crates/superzej-host/src/compositor.rs
 git commit -m "perf(host): implement fast-path row blitting in compositor"
@@ -176,6 +181,7 @@ git commit -m "perf(host): implement fast-path row blitting in compositor"
 **Objective:** Reduce the `serde_json` deserialization cost inside the WASM `panel` plugin when it receives `superzej_diff` and `superzej_pr` pipes.
 
 **Files:**
+
 - Modify: `plugin/panel/src/main.rs`
 - Modify: `crates/superzej-cli/src/commands/watch.rs`
 
@@ -188,7 +194,7 @@ Instead of building a JSON map `{"worktree": wt, "files": tsv}`, serialize the p
 fn push_diff(url: &str, wt: &str) {
     let tsv = diff::files_for(Path::new(wt));
     // ... DB cache logic ...
-    
+
     // Pipe payload: purely text, formatted as "worktree_path\n<TSV DATA>"
     let payload = format!("{}\n{}", wt, tsv);
     zellij::pipe_plugin(url, "superzej_diff", &payload);
@@ -218,6 +224,7 @@ fn push_diff(url: &str, wt: &str) {
 **Step 3: Build Plugins and Commit**
 
 Run: `just build-plugins`
+
 ```bash
 git add plugin/panel/src/main.rs crates/superzej-cli/src/commands/watch.rs
 git commit -m "perf(panel): drop JSON serialization for diff pipes to reduce WASM CPU cost"
