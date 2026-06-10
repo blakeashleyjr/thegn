@@ -17,6 +17,7 @@ mod layout;
 mod palette;
 mod pane;
 mod panel;
+mod pins;
 mod run;
 mod sequence;
 mod session;

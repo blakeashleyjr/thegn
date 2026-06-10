@@ -17,12 +17,20 @@ pub const STATUSBAR_ROWS: usize = 1;
 pub const SIDEBAR_COLS: usize = 20; // ~12% at 160 cols
 pub const PANEL_COLS: usize = 44; // ~27% at 160 cols
 
+/// The strip is suppressed when the band is too short to give it ≥ this many rows
+/// while leaving the center at least this many — i.e. the strip never starves the
+/// center. (Each pin also keeps a 1-row label header.)
+pub const STRIP_MIN_ROWS: usize = 3;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChromeLayout {
     pub tabbar: Rect,
     pub statusbar: Rect,
     pub sidebar: Option<Rect>,
     pub panel: Option<Rect>,
+    /// The top pinned-program strip, when visible (spans the center's columns,
+    /// directly below the tabbar). `None` when hidden or too short.
+    pub strip: Option<Rect>,
     pub center: Rect,
 }
 
@@ -45,22 +53,76 @@ impl ChromeLayout {
 pub const SIDEBAR_MIN_WIDTH: usize = 12;
 pub const SIDEBAR_MAX_WIDTH: usize = 48;
 
-/// Compute the chrome cross with the default sidebar width. (Convenience used
-/// by tests; the live loop calls [`compute_with_width`] with the runtime width.)
+/// Compute the chrome cross with the default sidebar width and no strip.
+/// (Convenience used by tests; the live loop calls [`compute_full`] with the
+/// runtime sidebar width + strip state.)
 #[allow(dead_code)]
 pub fn compute(cols: usize, rows: usize, want_sidebar: bool, want_panel: bool) -> ChromeLayout {
-    compute_with_width(cols, rows, want_sidebar, want_panel, SIDEBAR_COLS)
+    compute_full(
+        cols,
+        rows,
+        want_sidebar,
+        want_panel,
+        SIDEBAR_COLS,
+        false,
+        0.0,
+    )
 }
 
-/// Compute the chrome cross for a `cols`x`rows` screen with an explicit sidebar
-/// width. `want_sidebar`/`want_panel` are the user's toggle state; each is
-/// additionally suppressed when the screen is too narrow.
+/// Compute the chrome cross with an explicit sidebar width, no strip.
 pub fn compute_with_width(
     cols: usize,
     rows: usize,
     want_sidebar: bool,
     want_panel: bool,
     sidebar_cols: usize,
+) -> ChromeLayout {
+    compute_full(
+        cols,
+        rows,
+        want_sidebar,
+        want_panel,
+        sidebar_cols,
+        false,
+        0.0,
+    )
+}
+
+/// Compute the chrome cross, reserving a top strip of `strip_ratio` of the band
+/// when `want_strip` is set and the band is tall enough (else the strip is
+/// suppressed and its rows go to the center). Uses the default sidebar width.
+/// (Convenience used by tests; the live loop calls [`compute_full`].)
+#[allow(dead_code)]
+pub fn compute_with_strip(
+    cols: usize,
+    rows: usize,
+    want_sidebar: bool,
+    want_panel: bool,
+    want_strip: bool,
+    strip_ratio: f32,
+) -> ChromeLayout {
+    compute_full(
+        cols,
+        rows,
+        want_sidebar,
+        want_panel,
+        SIDEBAR_COLS,
+        want_strip,
+        strip_ratio,
+    )
+}
+
+/// The full chrome-cross computation: explicit sidebar width *and* optional top
+/// strip. `want_sidebar`/`want_panel` are the user's toggle state; each is
+/// additionally suppressed when the screen is too narrow.
+pub fn compute_full(
+    cols: usize,
+    rows: usize,
+    want_sidebar: bool,
+    want_panel: bool,
+    sidebar_cols: usize,
+    want_strip: bool,
+    strip_ratio: f32,
 ) -> ChromeLayout {
     let show_sidebar = want_sidebar && cols >= SIDEBAR_MIN_COLS;
     let show_panel = want_panel && cols >= PANEL_MIN_COLS;
@@ -112,11 +174,35 @@ pub fn compute_with_width(
         cols: right,
         rows: band_rows,
     });
-    let center = Rect {
-        x: left,
+
+    let center_x = left;
+    let center_cols = cols.saturating_sub(left + right);
+
+    // Carve a top strip out of the center column when wanted and the band can
+    // spare the rows (strip ≥ STRIP_MIN_ROWS while leaving center ≥ STRIP_MIN_ROWS).
+    let strip_rows = if want_strip {
+        let r = (band_rows as f32 * strip_ratio.clamp(0.0, 0.9)).round() as usize;
+        let r = r.max(STRIP_MIN_ROWS);
+        if band_rows >= r + STRIP_MIN_ROWS {
+            r
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    let strip = (strip_rows > 0).then_some(Rect {
+        x: center_x,
         y: band_y,
-        cols: cols.saturating_sub(left + right),
-        rows: band_rows,
+        cols: center_cols,
+        rows: strip_rows,
+    });
+    let center = Rect {
+        x: center_x,
+        y: band_y + strip_rows,
+        cols: center_cols,
+        rows: band_rows.saturating_sub(strip_rows),
     };
 
     ChromeLayout {
@@ -124,6 +210,7 @@ pub fn compute_with_width(
         statusbar,
         sidebar,
         panel,
+        strip,
         center,
     }
 }
@@ -211,6 +298,43 @@ mod tests {
         assert!(l.sidebar.is_none());
         assert!(l.panel.is_none());
         assert_eq!(l.center.cols, 200);
+    }
+
+    #[test]
+    fn strip_reserves_top_rows_of_the_band_and_shrinks_center() {
+        // 40 rows: band is 38 (tabbar+statusbar take 2). 20% → ~8 rows strip.
+        let l = compute_with_strip(160, 40, true, true, true, 0.2);
+        let strip = l.strip.expect("strip visible");
+        assert_eq!(strip.y, 1, "strip sits directly below the tabbar");
+        assert_eq!(strip.x, l.center.x, "strip spans the center columns");
+        assert_eq!(strip.cols, l.center.cols);
+        // Strip + center exactly tile the band (no gap/overlap).
+        assert_eq!(strip.rows + l.center.rows, 38);
+        assert_eq!(l.center.y, strip.y + strip.rows);
+        assert_eq!(strip.rows, 8); // round(38 * 0.2)
+    }
+
+    #[test]
+    fn strip_absent_when_not_wanted() {
+        let l = compute_with_strip(160, 40, true, true, false, 0.2);
+        assert!(l.strip.is_none());
+        assert_eq!(l.center.y, 1);
+        assert_eq!(l.center.rows, 38);
+    }
+
+    #[test]
+    fn strip_suppressed_when_band_too_short() {
+        // Tiny band: can't give the strip its min rows and keep the center alive.
+        let l = compute_with_strip(160, 6, true, true, true, 0.5);
+        assert!(l.strip.is_none(), "strip suppressed in a short band");
+        assert!(l.center.rows >= 1);
+    }
+
+    #[test]
+    fn strip_clamps_to_min_rows_for_small_ratios() {
+        // A tiny ratio still yields at least STRIP_MIN_ROWS when the band allows.
+        let l = compute_with_strip(160, 40, true, true, true, 0.01);
+        assert_eq!(l.strip.unwrap().rows, STRIP_MIN_ROWS);
     }
 
     #[test]

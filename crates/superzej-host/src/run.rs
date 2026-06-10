@@ -183,6 +183,7 @@ fn key_bytes(key: &KeyCode, mods: Modifiers) -> Option<Vec<u8>> {
 fn build_palette(
     session: &crate::session::Session,
     db: &superzej_core::db::Db,
+    cfg: &superzej_core::config::Config,
 ) -> Vec<crate::palette::PaletteItem> {
     use crate::palette::PaletteItem;
     let mut items = vec![
@@ -194,8 +195,21 @@ fn build_palette(
         PaletteItem::new("open-pr", "Open pull request"),
         PaletteItem::new("files-drawer", "Toggle files drawer"),
         PaletteItem::new("lazygit", "Open lazygit"),
+        PaletteItem::new("toggle-strip", "Toggle pin strip"),
         PaletteItem::new("quit", "Quit superzej"),
     ];
+
+    // Configured pins (scope-filtered to the current workspace): summon by name.
+    let ws = (!session.id.is_empty()).then_some(session.id.as_str());
+    for (i, p) in crate::pins::PinSupervisor::resolve(cfg, ws)
+        .into_iter()
+        .enumerate()
+    {
+        items.push(PaletteItem::new(
+            format!("summon-pin-{}", i + 1),
+            format!("\u{1f4cc} {}", p.display_label()),
+        ));
+    }
 
     // Add active session's tabs
     for t in &session.tabs {
@@ -833,7 +847,8 @@ impl Panes {
     }
 
     /// As [`Panes::spawn_argv`], but injects `env` into the child — used for
-    /// agent panes that expect `SUPERZEJ_WORKTREE`/`SUPERZEJ_BRANCH`.
+    /// agent panes that expect `SUPERZEJ_WORKTREE`/`SUPERZEJ_BRANCH` and for
+    /// per-program env on pinned programs.
     fn spawn_argv_env(
         &mut self,
         argv: &[String],
@@ -923,12 +938,121 @@ fn prewarm_neighbors(panes: &mut Panes, session: &mut crate::session::Session, c
     }
 }
 
+/// Compute the chrome cross with the strip reserved iff the supervisor wants it
+/// shown and has live strip panes, at the runtime sidebar width. Single place so
+/// every recompute agrees.
+fn compute_chrome(
+    cols: usize,
+    rows: usize,
+    want_sidebar: bool,
+    want_panel: bool,
+    sidebar_cols: usize,
+    supervisor: &crate::pins::PinSupervisor,
+) -> layout::ChromeLayout {
+    layout::compute_full(
+        cols,
+        rows,
+        want_sidebar,
+        want_panel,
+        sidebar_cols,
+        supervisor.strip_visible() && supervisor.has_strip_panes(),
+        supervisor.strip_ratio(),
+    )
+}
+
 /// Resize each pane in `tree` to the rect it occupies within `center`.
 fn relayout(panes: &mut Panes, tree: &crate::center::CenterTree, center: Rect) {
     for (id, rect) in tree.layout(center) {
         if let Some(p) = panes.table.get_mut(&id) {
             let _ = p.resize(rect.rows.max(1) as u16, rect.cols.max(1) as u16);
         }
+    }
+}
+
+/// Resize every live strip pane to the rect the supervisor apportions it
+/// (minus the 1-row header).
+fn relayout_strip(panes: &mut Panes, supervisor: &crate::pins::PinSupervisor, strip: Rect) {
+    for (id, rect) in supervisor.strip_layout(strip) {
+        if let Some(p) = panes.table.get_mut(&id) {
+            let body_rows = rect.rows.saturating_sub(1).max(1);
+            let _ = p.resize(body_rows as u16, rect.cols.max(1) as u16);
+        }
+    }
+}
+
+/// Working directory for a pin: explicit `cwd`, else the active tab's worktree,
+/// else `$HOME` / cwd.
+fn pin_cwd(
+    pin: &superzej_core::config::Pin,
+    active_dir: Option<std::path::PathBuf>,
+) -> std::path::PathBuf {
+    if let Some(c) = &pin.cwd {
+        let expanded = superzej_core::util::expand_tilde(c);
+        return std::path::PathBuf::from(expanded);
+    }
+    active_dir
+        .or_else(|| std::env::current_dir().ok())
+        .or_else(|| std::env::var("HOME").ok().map(std::path::PathBuf::from))
+        .unwrap_or_else(|| std::path::PathBuf::from("/"))
+}
+
+/// Persist the supervisor's live pin set to `session_state.pin_state` (best
+/// effort; pin persistence never blocks the loop).
+fn persist_pin_state(supervisor: &crate::pins::PinSupervisor, session_id: &str) {
+    if session_id.is_empty() {
+        return;
+    }
+    if let Ok(db) = superzej_core::db::Db::open() {
+        let _ = db.set_pin_state(session_id, &supervisor.to_json(), now_secs());
+    }
+}
+
+/// Launch-or-focus the pin at 1-based `index` for the current workspace. Returns
+/// an optional status line. Singleton pins that are already live are a no-op
+/// (the strip/float already shows them). Strip/float/layout pins spawn a pane;
+/// tab pins are out of scope for the strip path (handled via the tab system).
+fn summon_pin(
+    index: usize,
+    cfg: &superzej_core::config::Config,
+    session: &crate::session::Session,
+    panes: &mut Panes,
+    supervisor: &mut crate::pins::PinSupervisor,
+    center: Rect,
+) -> Option<String> {
+    let ws = (!session.id.is_empty()).then_some(session.id.as_str());
+    let resolved = crate::pins::PinSupervisor::resolve(cfg, ws);
+    let pin = resolved.get(index.checked_sub(1)?)?;
+    if pin.singleton && supervisor.live_instance(&pin.name).is_some() {
+        return Some(format!("Pin '{}' already running", pin.display_label()));
+    }
+    let active_dir = session.tabs.get(session.active).and_then(tab_cwd);
+    let pin = (*pin).clone();
+    match spawn_pin(&pin, panes, supervisor, active_dir, center) {
+        Some(_) => Some(format!("Launched pin '{}'", pin.display_label())),
+        None => Some(format!("Pin '{}' failed to launch", pin.display_label())),
+    }
+}
+
+/// Spawn a pin's program into a pane and register it with the supervisor.
+/// Sized to the strip body for strip pins, else the center. Returns the pane id.
+fn spawn_pin(
+    pin: &superzej_core::config::Pin,
+    panes: &mut Panes,
+    supervisor: &mut crate::pins::PinSupervisor,
+    active_dir: Option<std::path::PathBuf>,
+    center: Rect,
+) -> Option<u32> {
+    let argv = crate::pins::PinSupervisor::argv(pin);
+    let env: Vec<(String, String)> = crate::pins::PinSupervisor::spawn_env(pin)
+        .into_iter()
+        .collect();
+    let cwd = pin_cwd(pin, active_dir);
+    match panes.spawn_argv_env(&argv, Some(&cwd), &env, center) {
+        Ok(id) => {
+            supervisor.attach(pin, id);
+            Some(id)
+        }
+        Err(_) => None,
     }
 }
 
@@ -1536,7 +1660,17 @@ async fn event_loop<T: Terminal>(
     let mut sidebar_cols = sb.width.unwrap_or(layout::SIDEBAR_COLS);
     // The last tab name we acked activity for (clears its "look at me" dot).
     let mut last_acked_tab: Option<String> = None;
-    let mut chrome = layout::compute_with_width(cols, rows, want_sidebar, want_panel, sidebar_cols);
+
+    // The pin supervisor owns daemon panes independent of tabs/visibility.
+    let mut supervisor = crate::pins::PinSupervisor::from_config(keymap.config());
+    let mut chrome = compute_chrome(
+        cols,
+        rows,
+        want_sidebar,
+        want_panel,
+        sidebar_cols,
+        &supervisor,
+    );
     sb.rebuild(&mut model, &session);
     let mut dirty = true;
     let mut palette: Option<crate::palette::Palette> = None;
@@ -1579,6 +1713,52 @@ async fn event_loop<T: Terminal>(
     // refresh and re-target the diff watcher — so the panel is correct for the
     // new worktree right away (stale-while-revalidate) instead of up to 2s late.
     let mut last_active_worktree: Option<std::path::PathBuf> = Some(active_tab_path(&session));
+
+    // Launch eager pins + resurrect previously-running pins for this workspace.
+    {
+        let ws = (!session.id.is_empty()).then(|| session.id.clone());
+        let active_dir = session.tabs.get(session.active).and_then(tab_cwd);
+
+        // Names to launch: eager pins ∪ persisted (previously-running) pins, in
+        // config order, deduped.
+        let mut to_launch: Vec<superzej_core::config::Pin> =
+            crate::pins::PinSupervisor::eager_pins(&current_config, ws.as_deref())
+                .into_iter()
+                .cloned()
+                .collect();
+        if let Ok(db) = superzej_core::db::Db::open()
+            && let Ok(Some(json)) = db.pin_state(&session.id)
+        {
+            for pp in crate::pins::PinSupervisor::parse_persisted(&json, &current_config) {
+                if !to_launch.iter().any(|p| p.name == pp.name)
+                    && let Some(p) = current_config.pin(&pp.name)
+                {
+                    to_launch.push(p.clone());
+                }
+            }
+        }
+        for pin in &to_launch {
+            spawn_pin(
+                pin,
+                &mut panes,
+                &mut supervisor,
+                active_dir.clone(),
+                chrome.center,
+            );
+        }
+        if supervisor.has_strip_panes() {
+            chrome = compute_chrome(
+                cols,
+                rows,
+                want_sidebar,
+                want_panel,
+                sidebar_cols,
+                &supervisor,
+            );
+            need_relayout = true;
+        }
+        persist_pin_state(&supervisor, &session.id);
+    }
     loop {
         if session.tabs.is_empty() {
             return Ok(()); // last tab closed
@@ -1616,7 +1796,14 @@ async fn event_loop<T: Terminal>(
         {
             rows = size.rows;
             cols = size.cols;
-            chrome = layout::compute_with_width(cols, rows, want_sidebar, want_panel, sidebar_cols);
+            chrome = compute_chrome(
+                cols,
+                rows,
+                want_sidebar,
+                want_panel,
+                sidebar_cols,
+                &supervisor,
+            );
             need_relayout = true;
             buf.resize(cols, rows);
             dirty = true;
@@ -1627,6 +1814,12 @@ async fn event_loop<T: Terminal>(
         if need_relayout {
             let tree = session.tabs[active].center.clone();
             relayout(&mut panes, &tree, chrome.center);
+            if let Some(strip_rect) = chrome.strip {
+                relayout_strip(&mut panes, &supervisor, strip_rect);
+            }
+            // Keep the tabbar chips in sync with the live pin set/health.
+            let ws = (!session.id.is_empty()).then_some(session.id.as_str());
+            model.pins = supervisor.chips(&current_config, ws);
             need_relayout = false;
         }
         let focused = session.tabs[active].focused_pane;
@@ -1659,6 +1852,44 @@ async fn event_loop<T: Terminal>(
                         }
                         PaneEvent::Exit(id) => {
                             panes.table.remove(&id);
+                            // Pin panes are supervised separately from tab panes: the
+                            // supervisor applies the restart policy. (PTY EOF carries no
+                            // exit status, so treat death as a failure for policy purposes.)
+                            if let Some(inst) = supervisor.instance_of_pane(id) {
+                                let name = inst.name.clone();
+                                match supervisor.on_exit(id, false) {
+                                    crate::pins::RestartDecision::Respawn => {
+                                        let active_dir =
+                                            session.tabs.get(session.active).and_then(tab_cwd);
+                                        let pin = current_config
+                                            .pins
+                                            .iter()
+                                            .find(|p| p.name == name)
+                                            .cloned();
+                                        if let Some(pin) = pin {
+                                            let argv = crate::pins::PinSupervisor::argv(&pin);
+                                            let env: Vec<(String, String)> =
+                                                crate::pins::PinSupervisor::spawn_env(&pin)
+                                                    .into_iter()
+                                                    .collect();
+                                            let cwd = pin_cwd(&pin, active_dir);
+                                            if let Ok(fresh) = panes.spawn_argv_env(
+                                                &argv,
+                                                Some(&cwd),
+                                                &env,
+                                                chrome.center,
+                                            ) {
+                                                supervisor.reattach(&name, fresh);
+                                            }
+                                        }
+                                    }
+                                    crate::pins::RestartDecision::Leave => {}
+                                }
+                                persist_pin_state(&supervisor, &session.id);
+                                need_relayout = true;
+                                dirty = true;
+                                continue;
+                            }
                             // Find the owning tab and either drop the pane from its split
                             // or, if its only shell died, keep the tab and respawn a fresh
                             // shell. Explicit close-pane/worktree actions remove the pane
@@ -1735,6 +1966,8 @@ async fn event_loop<T: Terminal>(
             model = next_model;
             refresh_tab_model(&mut model, &session, &mut sb);
             apply_mode_status(&mut model, mode);
+            let ws = (!session.id.is_empty()).then_some(session.id.as_str());
+            model.pins = supervisor.chips(&current_config, ws);
             dirty = true;
         }
 
@@ -1803,6 +2036,30 @@ async fn event_loop<T: Terminal>(
                 &panel_ui,
                 |id| panes.table.get(&id).map(|p| p.emulator()),
             );
+            if let Some(strip_rect) = chrome.strip {
+                let cells: Vec<crate::chrome::StripCell> = supervisor
+                    .strip_layout(strip_rect)
+                    .into_iter()
+                    .filter_map(|(pane, rect)| {
+                        supervisor
+                            .instance_of_pane(pane)
+                            .map(|inst| crate::chrome::StripCell {
+                                pane,
+                                rect,
+                                label: inst.label.clone(),
+                                glyph: inst.health.glyph(),
+                                focused: false,
+                            })
+                    })
+                    .collect();
+                crate::chrome::draw_strip(
+                    &mut scratch,
+                    strip_rect,
+                    &cells,
+                    model.accent_or_default(),
+                    |id| panes.table.get(&id).map(|p| p.emulator()),
+                );
+            }
             if let Some(drawer_id) = drawer
                 && let Some(p) = panes.table.get(&drawer_id)
             {
@@ -1986,6 +2243,40 @@ async fn event_loop<T: Terminal>(
                                         &mut drawer,
                                         chrome.center,
                                     );
+                                } else if let Some(n) = key
+                                    .strip_prefix("summon-pin-")
+                                    .and_then(|s| s.parse::<usize>().ok())
+                                {
+                                    if let Some(s) = summon_pin(
+                                        n,
+                                        &current_config,
+                                        &session,
+                                        &mut panes,
+                                        &mut supervisor,
+                                        chrome.center,
+                                    ) {
+                                        model.status = s;
+                                    }
+                                    chrome = compute_chrome(
+                                        cols,
+                                        rows,
+                                        want_sidebar,
+                                        want_panel,
+                                        sidebar_cols,
+                                        &supervisor,
+                                    );
+                                    need_relayout = true;
+                                } else if key == "toggle-strip" {
+                                    supervisor.toggle_strip();
+                                    chrome = compute_chrome(
+                                        cols,
+                                        rows,
+                                        want_sidebar,
+                                        want_panel,
+                                        sidebar_cols,
+                                        &supervisor,
+                                    );
+                                    need_relayout = true;
                                 }
                                 // Other command keys are also reachable via their
                                 // keybind; their in-palette dispatch lands with the
@@ -2129,7 +2420,9 @@ async fn event_loop<T: Terminal>(
                             Action::OpenPalette => {
                                 if let Ok(db) = superzej_core::db::Db::open() {
                                     palette = Some(crate::palette::Palette::new(build_palette(
-                                        &session, &db,
+                                        &session,
+                                        &db,
+                                        &current_config,
                                     )));
                                 }
                             }
@@ -2181,12 +2474,13 @@ async fn event_loop<T: Terminal>(
                             }
                             Action::ToggleSidebar => {
                                 want_sidebar = !want_sidebar;
-                                chrome = layout::compute_with_width(
+                                chrome = compute_chrome(
                                     cols,
                                     rows,
                                     want_sidebar,
                                     want_panel,
                                     sidebar_cols,
+                                    &supervisor,
                                 );
                                 if !want_sidebar && sb.focused {
                                     sb.focused = false;
@@ -2196,24 +2490,26 @@ async fn event_loop<T: Terminal>(
                             }
                             Action::TogglePanel => {
                                 want_panel = !want_panel;
-                                chrome = layout::compute_with_width(
+                                chrome = compute_chrome(
                                     cols,
                                     rows,
                                     want_sidebar,
                                     want_panel,
                                     sidebar_cols,
+                                    &supervisor,
                                 );
                                 need_relayout = true;
                             }
                             Action::FocusSidebar => {
                                 if !want_sidebar {
                                     want_sidebar = true;
-                                    chrome = layout::compute_with_width(
+                                    chrome = compute_chrome(
                                         cols,
                                         rows,
                                         want_sidebar,
                                         want_panel,
                                         sidebar_cols,
+                                        &supervisor,
                                     );
                                     need_relayout = true;
                                 }
@@ -2223,12 +2519,13 @@ async fn event_loop<T: Terminal>(
                             }
                             Action::FocusPanel if !want_panel => {
                                 want_panel = true;
-                                chrome = layout::compute_with_width(
+                                chrome = compute_chrome(
                                     cols,
                                     rows,
                                     want_sidebar,
                                     want_panel,
                                     sidebar_cols,
+                                    &supervisor,
                                 );
                                 need_relayout = true;
                             }
@@ -2284,45 +2581,6 @@ async fn event_loop<T: Terminal>(
                                 let layout = session.tabs[active].center.layout(chrome.center);
                                 if let Some(n) = crate::center::neighbor(&layout, focused, mv) {
                                     session.tabs[active].focused_pane = n;
-                                }
-                            }
-                            Action::Pin(idx) => {
-                                // Open-or-focus the configured pin at this 1-based
-                                // index as a dedicated `pin:<name>` tab running its
-                                // command (host, no sandbox — pins are global).
-                                if let Some(pin) = keymap.config().pin_by_index(idx as usize) {
-                                    let tab_name = format!("pin:{}", pin.name);
-                                    if let Some(i) =
-                                        session.tabs.iter().position(|t| t.name == tab_name)
-                                    {
-                                        session.switch_to(i);
-                                    } else {
-                                        let cwd = pin.cwd.clone().unwrap_or_else(|| {
-                                            superzej_core::util::home()
-                                                .to_string_lossy()
-                                                .into_owned()
-                                        });
-                                        let argv = vec![
-                                            superzej_core::util::shell(),
-                                            "-lc".to_string(),
-                                            pin.command.clone(),
-                                        ];
-                                        if let Ok(id) = panes.spawn_argv(
-                                            &argv,
-                                            Some(Path::new(&cwd)),
-                                            chrome.center,
-                                        ) {
-                                            session.add_tab(crate::session::Tab {
-                                                name: tab_name,
-                                                kind: crate::session::TabKind::Pinned,
-                                                worktree: cwd,
-                                                center: crate::center::CenterTree::Leaf(id),
-                                                focused_pane: id,
-                                            });
-                                        }
-                                    }
-                                    refresh_tab_model(&mut model, &session, &mut sb);
-                                    need_relayout = true;
                                 }
                             }
                             Action::NewWorkspace | Action::SwitchWorkspace => {
@@ -2476,6 +2734,124 @@ async fn event_loop<T: Terminal>(
                                     drawer = Some(id);
                                 }
                             }
+                            Action::SummonPin(n) => {
+                                let status = summon_pin(
+                                    n as usize,
+                                    &current_config,
+                                    &session,
+                                    &mut panes,
+                                    &mut supervisor,
+                                    chrome.center,
+                                );
+                                if let Some(s) = status {
+                                    model.status = s;
+                                }
+                                persist_pin_state(&supervisor, &session.id);
+                                chrome = compute_chrome(
+                                    cols,
+                                    rows,
+                                    want_sidebar,
+                                    want_panel,
+                                    sidebar_cols,
+                                    &supervisor,
+                                );
+                                need_relayout = true;
+                            }
+                            Action::ToggleStrip => {
+                                supervisor.toggle_strip();
+                                chrome = compute_chrome(
+                                    cols,
+                                    rows,
+                                    want_sidebar,
+                                    want_panel,
+                                    sidebar_cols,
+                                    &supervisor,
+                                );
+                                need_relayout = true;
+                            }
+                            Action::GrowStrip | Action::ShrinkStrip => {
+                                let delta = if action == Action::GrowStrip {
+                                    0.05
+                                } else {
+                                    -0.05
+                                };
+                                supervisor.adjust_ratio(delta);
+                                chrome = compute_chrome(
+                                    cols,
+                                    rows,
+                                    want_sidebar,
+                                    want_panel,
+                                    sidebar_cols,
+                                    &supervisor,
+                                );
+                                need_relayout = true;
+                            }
+                            Action::PromotePin => {
+                                // Promote the focused center pane into the strip. The
+                                // pane keeps its process; it leaves the tab's tree.
+                                let label = session.tabs[active].name.clone();
+                                let removed = session.tabs[active].center.remove(focused);
+                                if removed {
+                                    if let Some(first) =
+                                        session.tabs[active].center.pane_ids().first()
+                                    {
+                                        session.tabs[active].focused_pane = *first;
+                                    }
+                                    let name = format!("promoted-{focused}");
+                                    supervisor.promote(
+                                        &name,
+                                        &label,
+                                        crate::pins::PinPlacement::Strip,
+                                        focused,
+                                    );
+                                    model.status = format!("Promoted pane to strip: {label}");
+                                    persist_pin_state(&supervisor, &session.id);
+                                    chrome = compute_chrome(
+                                        cols,
+                                        rows,
+                                        want_sidebar,
+                                        want_panel,
+                                        sidebar_cols,
+                                        &supervisor,
+                                    );
+                                    need_relayout = true;
+                                } else {
+                                    model.status =
+                                        "Promote: can't promote the sole pane of a tab".into();
+                                }
+                            }
+                            Action::Unpin => {
+                                // Unpin the first live strip pin (or the focused one if a
+                                // strip pane is focused), reaping its process.
+                                let target = supervisor
+                                    .instance_of_pane(focused)
+                                    .map(|i| i.name.clone())
+                                    .or_else(|| {
+                                        supervisor
+                                            .instances()
+                                            .iter()
+                                            .find(|i| i.pane.is_some())
+                                            .map(|i| i.name.clone())
+                                    });
+                                if let Some(name) = target {
+                                    if let Some(pane) = supervisor.unpin(&name) {
+                                        panes.table.remove(&pane);
+                                    }
+                                    model.status = format!("Unpinned {name}");
+                                    persist_pin_state(&supervisor, &session.id);
+                                    chrome = compute_chrome(
+                                        cols,
+                                        rows,
+                                        want_sidebar,
+                                        want_panel,
+                                        sidebar_cols,
+                                        &supervisor,
+                                    );
+                                    need_relayout = true;
+                                } else {
+                                    model.status = "Unpin: no live pin".into();
+                                }
+                            }
                             // New/switch worktree+workspace and tool floats: recognized
                             // and consumed; they land with the sandbox::enter_argv spawn
                             // + branch/repo picker wiring.
@@ -2521,8 +2897,14 @@ async fn event_loop<T: Terminal>(
             Ok(Some(InputEvent::Resized { rows: r, cols: c })) => {
                 rows = r;
                 cols = c;
-                chrome =
-                    layout::compute_with_width(cols, rows, want_sidebar, want_panel, sidebar_cols);
+                chrome = compute_chrome(
+                    cols,
+                    rows,
+                    want_sidebar,
+                    want_panel,
+                    sidebar_cols,
+                    &supervisor,
+                );
                 need_relayout = true;
                 buf.resize(cols, rows);
                 let _ = buf
