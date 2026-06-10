@@ -237,7 +237,7 @@ fn collect_sidebar_status(
             continue;
         }
         let loc = GitLoc::for_worktree(path);
-        let dirty = git.status(&loc).map(|v| !v.is_empty()).unwrap_or(false);
+        let dirty = git.is_dirty(&loc).unwrap_or(false);
         let (ahead, behind) = git.ahead_behind(&loc).ok().flatten().unwrap_or((0, 0));
         status.git.insert(
             tab.worktree.clone(),
