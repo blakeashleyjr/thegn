@@ -1239,6 +1239,7 @@ impl Config {
         match kind {
             "cpu" | "mem" => Some(self.monitor.system.as_str()),
             "gpu" => Some(self.monitor.gpu.as_str()),
+            "loc" => None,
             _ => None,
         }
     }

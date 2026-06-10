@@ -70,6 +70,7 @@ taffy = "0.5"
 octocrab = "0.53"
 russh = "0.61"
 gix = "0.84"
+tokei = "12"
 # --- internal crates ---
 superzej-core = { path = "crates/superzej-core" }
 superzej-svc = { path = "crates/superzej-svc" }

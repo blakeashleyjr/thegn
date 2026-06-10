@@ -9,7 +9,7 @@
 //! PTY, untouched by this seam.
 
 use anyhow::{Context, Result};
-use superzej_core::remote::{remote_home, ssh_base, SshTarget};
+use superzej_core::remote::{SshTarget, remote_home, ssh_base};
 
 #[derive(Debug, Clone)]
 pub struct Output {

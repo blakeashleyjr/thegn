@@ -45,7 +45,7 @@ pub fn write_focus(session: &str, worktree: &str) {
     let _ = std::fs::write(p, worktree);
 }
 
-fn read_focus(session: &str) -> Option<String> {
+pub fn read_focus(session: &str) -> Option<String> {
     std::fs::read_to_string(focus_path(session))
         .ok()
         .map(|s| s.trim().to_string())
@@ -97,6 +97,7 @@ pub fn run(cfg: &Config, session: Option<String>, pr_interval: Option<u64>) -> R
                 if Path::new(wt).is_dir() {
                     watcher = make_watcher(tx.clone(), wt);
                     push_diff(&url, wt); // immediate paint for the new focus
+                    compute_and_cache_loc(wt.to_string());
                     last_pr = 0; // force a PR refresh for the new worktree
                 }
             }
@@ -126,6 +127,7 @@ pub fn run(cfg: &Config, session: Option<String>, pr_interval: Option<u64>) -> R
                 while let Ok(()) = rx.recv_timeout(DEBOUNCE) {}
                 if let Some(wt) = current.as_deref() {
                     push_diff(&url, wt);
+                    compute_and_cache_loc(wt.to_string());
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -186,4 +188,18 @@ fn push_pr(url: &str, wt: &str) -> bool {
     }
     zellij::pipe_plugin(url, "superzej_pr", &json);
     rate_limited
+}
+
+/// Compute LOC using tokei on a background thread to avoid blocking the daemon.
+fn compute_and_cache_loc(wt: String) {
+    std::thread::spawn(move || {
+        let mut languages = tokei::Languages::new();
+        let config = tokei::Config::default();
+        languages.get_statistics(&[&wt], &[], &config);
+        let total_loc = languages.values().map(|l| l.code).sum::<usize>();
+
+        if let Ok(db) = crate::db::Db::open() {
+            let _ = db.put_loc_cache(&wt, total_loc);
+        }
+    });
 }
