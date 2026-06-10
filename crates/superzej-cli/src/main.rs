@@ -30,17 +30,15 @@ fn main() {
     }
 
     let args = Cli::parse();
-
-    // CLI-flag config layer (highest precedence) + the resolved file path.
-    let mut flags = config::ConfigOverlay::default();
+    
+    // Add legacy log level mapping to overrides if provided
+    let mut overrides = args.overrides.clone();
     if let Some(lvl) = args.log_level.as_deref() {
-        match config::LogLevel::from_str_validated(lvl) {
-            Ok(l) => flags.log_level = Some(l),
-            Err(e) => msg::warn(&format!("--log-level: {e}")),
-        }
+        overrides.push(format!("log.level={lvl}"));
     }
+
     let effective_path = args.config.clone().unwrap_or_else(Config::path);
-    let cfg = Config::load_layered(&config::ProcessEnv, Some(flags), args.config.clone());
+    let cfg = Config::load_layered(&config::ProcessEnv, &overrides, args.config.clone());
 
     // Bring up diagnostics now that we have `[log]`. The daemon (whose stdio is
     // nulled) logs only to its file; everything else also writes branded stderr.

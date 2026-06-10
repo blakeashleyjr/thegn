@@ -18,6 +18,9 @@ pub struct Cli {
     /// `SUPERZEJ_LOG` (tracing-style filter) takes precedence for fine control.
     #[arg(long, global = true, value_name = "LEVEL")]
     pub log_level: Option<String>,
+    /// Override a config value (e.g. `--set theme.accent=cyan --set drawer.height=15`)
+    #[arg(long = "set", global = true, value_name = "KEY=VALUE")]
+    pub overrides: Vec<String>,
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -408,6 +411,8 @@ pub enum ConfigAction {
     Edit,
     /// Strictly validate the config file; non-zero exit on any problem.
     Validate,
+    /// Print the JSON schema for editor autocomplete and validation.
+    Schema,
 }
 
 #[derive(Subcommand)]

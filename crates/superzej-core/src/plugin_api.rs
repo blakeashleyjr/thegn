@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::fmt::Display;
 
 /// Semantic version of the API contract itself.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, schemars::JsonSchema)]
 pub struct ApiVersion {
     pub major: u32,
     pub minor: u32,
@@ -50,7 +50,7 @@ impl Serialize for ApiVersion {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(transparent)]
 pub struct PluginId(String);
 
@@ -63,7 +63,7 @@ impl PluginId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(transparent)]
 pub struct ContributionId(String);
 
@@ -76,7 +76,7 @@ impl ContributionId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(transparent)]
 pub struct SurfaceId(String);
 
@@ -87,7 +87,7 @@ impl SurfaceId {
 }
 
 /// A capability grant or request (`kind:target`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(transparent)]
 pub struct Capability(String);
 
@@ -133,7 +133,7 @@ fn surface_capability_for(ep: &ExtensionPoint) -> Option<Capability> {
 }
 
 /// The typed slots the host offers for plugins to fill.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, schemars::JsonSchema)]
 pub enum ExtensionPoint {
     StatusBarSegment,
     SidebarTab,
@@ -148,7 +148,7 @@ pub enum ExtensionPoint {
     Unknown(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CadenceHint {
     OnDemand,
@@ -157,7 +157,7 @@ pub enum CadenceHint {
 }
 
 /// A plugin's request to claim a single ExtensionPoint instance.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Contribution {
     pub id: ContributionId,
     pub extension_point: ExtensionPoint,
@@ -174,7 +174,7 @@ fn default_on_demand() -> CadenceHint {
 }
 
 /// The plugin's identity and its full capability/contribution declaration.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct PluginManifest {
     pub id: PluginId,
     pub name: String,
@@ -321,20 +321,20 @@ pub struct AuditLogEntry {
     pub timestamp_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub enum IoStatus {
     Accepted,
     Rejected(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct IoResult {
     pub status: IoStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct IoRequest {
     pub scheme: String,
     pub target: String,
@@ -382,7 +382,7 @@ fn host_from_url(url: &str) -> &str {
         .unwrap_or(after_scheme)
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Alert {
     pub source: String,
     pub message: String,
@@ -595,7 +595,7 @@ impl PluginRuntime {
 // Render model
 // ----------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub enum StyleRole {
     Default,
     Accent,
@@ -604,7 +604,7 @@ pub enum StyleRole {
     Faint,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Span {
     pub text: String,
     pub role: StyleRole,
@@ -619,7 +619,7 @@ impl Span {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct View {
     pub spans: Vec<Span>,
 }
@@ -713,7 +713,7 @@ impl SurfaceCache {
 // Transport
 // ----------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HostVerb {
     Register,
@@ -728,7 +728,7 @@ pub enum HostVerb {
     HostValue,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginCallback {
     Activate,
@@ -737,7 +737,7 @@ pub enum PluginCallback {
     Deactivate,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, schemars::JsonSchema)]
 pub enum EventKind {
     Timer,
     FocusChanged,
@@ -745,7 +745,7 @@ pub enum EventKind {
     BusMessage,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Event {
     pub kind: EventKind,
     pub payload: serde_json::Value,
@@ -758,7 +758,7 @@ impl Event {
 }
 
 /// JSON-RPC projection
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RpcMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<u64>,

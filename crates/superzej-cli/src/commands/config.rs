@@ -22,6 +22,10 @@ pub fn run(cfg: &Config, action: ConfigAction, path: PathBuf) -> Result<()> {
         ConfigAction::Get { key, json } => get(cfg, &key, json)?,
         ConfigAction::Edit => edit(&path)?,
         ConfigAction::Validate => validate(&path)?,
+        ConfigAction::Schema => {
+            let schema = schemars::schema_for!(Config);
+            crate::outln!("{}", serde_json::to_string_pretty(&schema).unwrap());
+        }
     }
     Ok(())
 }
