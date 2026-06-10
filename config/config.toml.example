@@ -126,6 +126,35 @@ format = "text"           # text | json
 # run = "just deploy"
 # menu = true
 
+# Keybind profiles: a named layer selected by `profile = "<name>"` (or the
+# SUPERZEJ_PROFILE env var / --profile flag). Applied *under* [keybinds], so a
+# global rebind still wins. `default_mode` sets the host mode on launch. The
+# names `vim`/`emacs` also start in the matching mode without an explicit
+# default_mode. Press `Alt ?` in the shell for the full cheatsheet overlay.
+# profile = "vim"
+# [profiles.vim]
+# default_mode = "vim-normal"
+# [profiles.vim.keybinds]
+# focus-down = "j"
+
+# Per-workspace overrides, keyed by repo slug (the workspace tab prefix). Applied
+# above [keybinds] but below a repo-root `.superzej.{toml,yaml,json}` overlay,
+# which may also carry its own [keybinds] table — the most specific layer wins.
+# [workspace.my-repo.keybinds]
+# new-worktree = "Ctrl w"
+
+# Per-program host-action overlays, keyed by the focused pane's program name.
+# These intercept *before* the active mode — useful for binding a host action
+# while a TUI like lazygit is focused.
+# [program_keybinds.lazygit]
+# palette = "Ctrl Alt k"
+
+# Per-program key-injection remaps: rewrite a chord into the program's own keys
+# (the right-hand side is sent to the pane) when it is not claimed as a host
+# action. Single keys only.
+# [program_remap.lazygit]
+# "Ctrl j" = "Enter"
+
 # Coding agents offered in the new-worktree picker.
 # Use "__shell__" for a plain login shell.
 [[agents]]

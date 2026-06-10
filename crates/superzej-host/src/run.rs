@@ -546,6 +546,47 @@ fn build_model(session: &crate::session::Session, db: &superzej_core::db::Db) ->
     }
 }
 
+/// The focused workspace's repo root + slug for per-workspace keybind layering.
+/// `session.id` is the workspace's repo path; the active tab's worktree is the
+/// repo-root overlay source. Both are `None` when no workspace is resolvable.
+fn workspace_context(
+    session: &crate::session::Session,
+) -> (Option<std::path::PathBuf>, Option<String>) {
+    if session.id.is_empty() {
+        return (None, None);
+    }
+    let root = std::path::PathBuf::from(&session.id);
+    let slug = superzej_core::repo::repo_slug(&root);
+    let root = root.is_dir().then_some(root);
+    (root, Some(slug))
+}
+
+/// Rebuild the host keymap for the session's focused workspace (profile +
+/// global + per-workspace + repo-root layers).
+fn rebuild_keymap(
+    cfg: &superzej_core::config::Config,
+    session: &crate::session::Session,
+) -> crate::keymap::KeyMap {
+    let (root, slug) = workspace_context(session);
+    crate::keymap::default_keymap_for(cfg, root.as_deref(), slug.as_deref())
+}
+
+/// A one-line status summary if the resolved keymap has chord conflicts, else
+/// `None`. Non-fatal: drives the launch/reload warning banner.
+fn keybind_conflict_summary(cfg: &superzej_core::config::Config) -> Option<String> {
+    let cols = superzej_core::keymap::detect_collisions(&superzej_core::keymap::effective(cfg));
+    if cols.is_empty() {
+        return None;
+    }
+    for c in &cols {
+        superzej_core::msg::warn(&format!("keybind conflict: {c:?}"));
+    }
+    Some(format!(
+        "\u{26a0} {} keybind conflict(s) — run `sj keys validate`",
+        cols.len()
+    ))
+}
+
 fn apply_mode_status(model: &mut FrameModel, mode: crate::keymap::Mode) {
     model.status = format!(
         "{} mode   Ctrl-Alt-v vim   Ctrl-Alt-e emacs   Ctrl-Alt-n normal   Ctrl-K menu   Alt-w worktree",
@@ -618,10 +659,14 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         &cli.overrides,
         cli.config.clone(),
     );
-    let keymap = crate::keymap::default_keymap_with_config(&cfg);
-    let mode = crate::keymap::Mode::Normal;
+    let keymap = rebuild_keymap(&cfg, &session);
+    let mode = crate::keymap::startup_mode(&cfg);
     let mut model = build_initial_model(&session);
     apply_mode_status(&mut model, mode);
+    // Surface keybind conflicts at launch (non-fatal — the shell always opens).
+    if let Some(summary) = keybind_conflict_summary(&cfg) {
+        model.status = summary;
+    }
     let (model_tx, model_rx) = tokio_mpsc::unbounded_channel::<FrameModel>();
     spawn_model_hydration(model_tx.clone(), session.clone());
 
@@ -843,6 +888,11 @@ async fn event_loop<T: Terminal>(
     let mut chrome = layout::compute(cols, rows, want_sidebar, want_panel);
     let mut dirty = true;
     let mut palette: Option<crate::palette::Palette> = None;
+    // Cheatsheet overlay (Alt-?) and the transient which-key popup (set while a
+    // multi-key prefix is pending). Both render via the shared `keyhint` module.
+    let mut cheatsheet = false;
+    let mut which_key: Vec<crate::keyhint::HintRow> = Vec::new();
+    let mut which_key_prefix = String::new();
 
     let (tx, mut rx) = tokio_mpsc::channel::<PaneEvent>(1024);
     let mut panes = Panes::new(tx);
@@ -854,9 +904,18 @@ async fn event_loop<T: Terminal>(
     sync_drawer_persistence(&session, &mut panes, &mut drawer, chrome.center);
 
     let mut current_config = keymap.config().clone();
+    // The workspace the keymap was last built for; when the focused workspace
+    // changes we rebuild so per-workspace/repo-root keybind layers follow it.
+    let mut keymap_workspace = session.id.clone();
     loop {
         if session.tabs.is_empty() {
             return Ok(()); // last tab closed
+        }
+        // Per-workspace keybinds: rebuild when the focused workspace changed.
+        if session.id != keymap_workspace {
+            keymap = rebuild_keymap(&current_config, &session);
+            keymap.reset();
+            keymap_workspace = session.id.clone();
         }
         let active = session.active;
 
@@ -991,9 +1050,10 @@ async fn event_loop<T: Terminal>(
         while let Ok(cfg_res) = config_rx.try_recv() {
             match cfg_res {
                 Ok(new_cfg) => {
-                    keymap = crate::keymap::default_keymap_with_config(&new_cfg);
+                    keymap = rebuild_keymap(&new_cfg, &session);
+                    model.status = keybind_conflict_summary(&new_cfg)
+                        .unwrap_or_else(|| "Config reloaded".into());
                     current_config = new_cfg;
-                    model.status = "Config reloaded".into();
                     need_relayout = true;
                 }
                 Err(e) => {
@@ -1046,19 +1106,30 @@ async fn event_loop<T: Terminal>(
                     crate::compositor::compose_pane(&mut scratch, p.emulator(), rect);
                 }
             }
+            let screen = Rect {
+                x: 0,
+                y: 0,
+                cols,
+                rows,
+            };
             if let Some(pal) = &palette {
-                pal.render(
+                pal.render(&mut scratch, screen);
+            }
+            let accent = current_config.accent_rgb();
+            if cheatsheet {
+                let groups = crate::keyhint::cheatsheet_groups(&current_config);
+                crate::keyhint::render_cheatsheet(&mut scratch, screen, &groups, &accent);
+            } else if !which_key.is_empty() {
+                crate::keyhint::render_which_key(
                     &mut scratch,
-                    Rect {
-                        x: 0,
-                        y: 0,
-                        cols,
-                        rows,
-                    },
+                    screen,
+                    &which_key_prefix,
+                    &which_key,
+                    &accent,
                 );
             }
             buf.draw_from_screen(&scratch, 0, 0);
-            if palette.is_none() {
+            if palette.is_none() && !cheatsheet {
                 let focused_rect = tree
                     .layout(chrome.center)
                     .into_iter()
@@ -1079,6 +1150,16 @@ async fn event_loop<T: Terminal>(
         // 3. Poll input (also the ~60fps frame tick).
         match buf.terminal().poll_input(Some(Duration::from_millis(16))) {
             Ok(Some(InputEvent::Key(k))) => {
+                // Modal: the cheatsheet swallows all keys; Esc / Alt-? closes it.
+                if cheatsheet {
+                    let close = matches!(k.key, KeyCode::Escape)
+                        || (k.key == KeyCode::Char('?') && k.modifiers.contains(Modifiers::ALT));
+                    if close {
+                        cheatsheet = false;
+                        dirty = true;
+                    }
+                    continue;
+                }
                 // Modal: when the palette is open it captures all keys.
                 if let Some(p) = palette.as_mut() {
                     match k.key {
@@ -1163,10 +1244,31 @@ async fn event_loop<T: Terminal>(
                 // Global/mode chords are intercepted by the keymap; everything
                 // else is forwarded to the focused pane.
                 let input_key = crate::sequence::Key::modified(k.key, k.modifiers);
-                match keymap.dispatch(mode, input_key) {
+                // The program running in the focused (or drawer) pane keys the
+                // per-program overlay + remap layers.
+                let focused_program = panes
+                    .table
+                    .get(&drawer.unwrap_or(focused))
+                    .map(|p| p.program().to_string())
+                    .unwrap_or_default();
+                // Per-program host-action overlay intercepts before the mode
+                // matcher; otherwise fall through to the normal keymap dispatch.
+                let dispatch = match keymap.program_action(&focused_program, &input_key) {
+                    Some(action) => {
+                        keymap.reset();
+                        crate::sequence::MatchResult::Matched(action)
+                    }
+                    None => keymap.dispatch(mode, input_key.clone()),
+                };
+                match dispatch {
                     crate::sequence::MatchResult::Matched(action) => {
                         use crate::keymap::Action;
+                        // A completed chord clears any pending which-key popup.
+                        which_key.clear();
                         match action {
+                            Action::Cheatsheet => {
+                                cheatsheet = true;
+                            }
                             Action::SwitchMode(next) => {
                                 mode = next;
                                 keymap.reset();
@@ -1469,13 +1571,32 @@ async fn event_loop<T: Terminal>(
                         continue;
                     }
                     crate::sequence::MatchResult::Pending => {
+                        // Show the which-key popup of next-key candidates.
+                        which_key_prefix = crate::keyhint::key_hint(&input_key);
+                        which_key =
+                            crate::keyhint::which_key_rows(&keymap.pending_continuations(mode));
                         model.status = format!("{} mode   awaiting next key…", mode.as_str());
                         dirty = true;
                         continue;
                     }
-                    crate::sequence::MatchResult::None => {}
+                    crate::sequence::MatchResult::None => {
+                        // No match (and not pending): dismiss any which-key popup.
+                        which_key.clear();
+                    }
                 }
-                if let Some(bytes) = key_bytes(&k.key, k.modifiers) {
+                // Per-program key-injection remap: an unclaimed chord is rewritten
+                // into the program's own keys before forwarding. Falls back to the
+                // raw keystroke when no remap matches.
+                let remapped: Option<Vec<u8>> = keymap
+                    .program_remap(&focused_program, &input_key)
+                    .map(|keys| {
+                        keys.iter()
+                            .filter_map(|key| key_bytes(&key.code, key.mods))
+                            .flatten()
+                            .collect()
+                    });
+                let bytes = remapped.or_else(|| key_bytes(&k.key, k.modifiers));
+                if let Some(bytes) = bytes {
                     let target_pane = drawer.unwrap_or(focused);
                     if let Some(p) = panes.table.get_mut(&target_pane) {
                         p.write_input(&bytes)?;
