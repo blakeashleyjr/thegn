@@ -79,3 +79,10 @@ superzej-svc = { path = "crates/superzej-svc" }
 [profile.release]
 strip = true
 lto = "thin"
+# Measured and deliberately rejected (`just bench`, 2026-06):
+# - `codegen-units = 1`: warm first frame 52ms -> 59ms (noise; startup is
+#   I/O-bound) for a 6x release build time cost. Revisit only with a render
+#   throughput benchmark that shows a win.
+# - `panic = "abort"`: a panic in a PTY reader thread or hydration worker
+#   currently kills only that thread/task — abort would take down the whole
+#   multiplexer with the user's shells in it.
