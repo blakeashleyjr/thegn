@@ -42,6 +42,7 @@ pub fn run(cfg: &Config, action: PrAction) -> Result<()> {
         PrAction::RerunChecks { worktree } => rerun(worktree),
         PrAction::Reviews { worktree } => reviews(worktree),
         PrAction::Draft { worktree, undo } => draft(worktree, undo),
+        PrAction::Ready { worktree } => ready(worktree),
         PrAction::AutoMerge { worktree, disable } => auto_merge(worktree, disable),
     }
 }
@@ -280,6 +281,21 @@ fn draft(worktree: Option<String>, undo: bool) -> Result<()> {
         }
         Err(e) => msg::die(&format!(
             "pr draft failed: {}",
+            superzej_core::forge::models::ForgeError::message(&e)
+        )),
+    }
+    Ok(())
+}
+
+fn ready(worktree: Option<String>) -> Result<()> {
+    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    match superzej_core::forge::get_forge_for_loc(&loc)
+        .unwrap()
+        .set_draft(&loc, false)
+    {
+        Ok(()) => msg::info("PR marked as ready for review"),
+        Err(e) => msg::die(&format!(
+            "pr ready failed: {}",
             superzej_core::forge::models::ForgeError::message(&e)
         )),
     }

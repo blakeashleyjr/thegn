@@ -382,13 +382,18 @@ pub enum PrAction {
         #[arg(long)]
         worktree: Option<String>,
     },
-    /// Convert the PR to draft or mark it as ready for review.
+    /// Convert the PR to draft.
     Draft {
         #[arg(long)]
         worktree: Option<String>,
         /// Convert to draft instead of marking as ready.
         #[arg(long = "undo")]
         undo: bool,
+    },
+    /// Mark a draft PR as ready for review.
+    Ready {
+        #[arg(long)]
+        worktree: Option<String>,
     },
     /// Enable or disable auto-merge on the PR.
     AutoMerge {
