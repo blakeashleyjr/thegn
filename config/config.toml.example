@@ -161,22 +161,45 @@ command = "${EDITOR:-vi} ."
 name = "diff"
 command = "git diff"
 
+# Top pinned-program strip: a horizontal band above the center that renders
+# `location = "strip"` pins side by side (toggle Ctrl+Alt+t; grow/shrink at
+# runtime). `ratio` is the fraction of the center band it occupies.
+[strip]
+ratio = 0.2
+visible = true
+
 # Pinned programs: summoned from anywhere with Alt-1..9 (in registration order)
-# or the tabbar's pin chips. Pins are global and run on the host (no sandbox).
-# `location = "tab"` opens/focuses a dedicated `pin:<name>` tab (default).
-# `location = "layout"` adds a tiled pane to the focused tab's active layout.
-# For layout pins, omitted cwd means the focused repo/worktree if resolvable; for
-# tab pins, omitted cwd means $HOME.
+# or the tabbar's pin chips. Pins run on the host (no sandbox) and are managed by
+# a supervisor (eager start, restart policy, health, survive workspace switches).
+#
+#   location = "tab"    opens/focuses a dedicated `pin:<name>` tab (default)
+#   location = "layout" adds a tiled pane to the focused tab's active layout
+#   location = "strip"  renders the pin in the top strip
+#   location = "float"  opens the pin as a floating scratch overlay
+#   scope    = "global" (default) | "workspace"   (workspace = which workspace)
+#   start    = "lazy" (default) | "eager"         (eager = launch at session start)
+#   restart  = "never" (default) | "always" | "on-failure"
+#   singleton = true (default)                    (false = allow multiple instances)
+#
+# Optional: `args` (explicit argv, skips the shell), `env` (per-program vars),
+# `label` (strip/chip text), `ratio` (this pin's weight in the strip). For layout/
+# strip pins, omitted cwd means the focused repo/worktree if resolvable; for tab/
+# float pins, omitted cwd means $HOME.
 # [[pins]]
 # name = "aerc"
 # command = "aerc"
-# location = "tab"
+# location = "float"
 #
 # [[pins]]
 # name = "logs"
 # command = "journalctl -f"
-# location = "layout"
+# location = "strip"
+# start = "eager"
+# restart = "always"
+# label = "syslog"
+# ratio = 1.5
 # cwd = "~"
+# env = { RUST_LOG = "info" }
 
 # ── Sandbox / containers ──────────────────────────────────────────────────────
 # Run each worktree's interactive process (agent/shell/tools) inside a

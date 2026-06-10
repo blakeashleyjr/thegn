@@ -37,27 +37,16 @@ unstarted) — by design.
 
 **Notable Phase-1 gaps (candidate next work):**
 
-- **E. Pinned programs / tiles** — the configurable pin system is essentially
-  unstarted; the Phase-1 milestone is literally a "worktree/**pin** manager".
 - **AI. Notification bus** — only activity dots (425) exist; no event→action rules
   (420), desktop notifications (421), or aggregated bus (430).
 - **B.** multi-select/context-menu/badge-count tree polish (26–28).
 
-**▶ Selected next feature: E. Pinned programs / tiles** — build the config-driven
-pin system, the keystone of the "worktree/**pin** manager" Phase-1 milestone.
-Scoped first slice:
-
-- **62** — `[[pins]]` config block (name, command, cwd, `location`, `scope`).
-- **57 / 59** — render a pin to a **top strip** (and reuse the existing float path).
-- **60 / 61** — `scope = global | workspace` resolution.
-- **63 / 66** — eager-vs-lazy start; persist running pins across workspace switches.
-- **70 / 74** — pin label + running/stopped glyph; launch-or-focus toggle (`Alt-1..9`).
-
-Defer to a follow-up slice: 64 (restart-on-exit), 65 (singleton/multi), 67 (promote
-running pane), 68 (unpin at runtime), 69 (strip sizing), 71 (env injection),
-72 (health/auto-restart). Reuse: the `[[tools]]`/`[[agents]]` config + launch path
-(73), the float/embed plumbing from tools/monitors/drawer, and the tabbar/statusbar
-chrome for the strip.
+**✔ E. Pinned programs / tiles — complete on the native host (items 57–74).** The
+full config-driven pin/daemon system ships in `superzej-host`: a `PinSupervisor`
+(`crates/superzej-host/src/pins.rs`) owning daemon panes across tab/workspace
+switches, a real top-strip chrome region + tabbar chips, eager/lazy start,
+restart-on-exit + health, singleton dedupe, promote/unpin at runtime, per-program
+env, and resurrect via `session_state.pin_state`. See §E below for the per-item map.
 
 ---
 
@@ -251,31 +240,38 @@ Tor (444) and GPU passthrough (393) as niche opt-ins.
 - [~] 55. Worktree↔PR mapping
 - [~] 56. Bulk worktree cleanup
 
-### E. Pinned programs / tiles ◀ **NEXT FEATURE TARGET** (see ▶ below)
+### E. Pinned programs / tiles
 
-**Slice 1 (shipped):** pins are their own `pin:<name>` session tabs (a workspace-like
-entity, not a float — overrides the float reading below), summoned by `Alt-1..9`
-/ tabbar pin chips. Global + lazy only. See `src/commands/pin.rs`,
+**Slice 1 (zellij path, shipped):** pins are `pin:<name>` session tabs summoned by
+`Alt-1..9` / tabbar pin chips. Global + lazy only. See `src/commands/pin.rs`,
 `layouts/pin-tab.kdl`, the tabbar chip strip, and `[[pins]]` config.
 
-- [x] 57. Pin to top strip _(tabbar pin chips; the pin itself is its own tab)_
-- [~] 58. Add anywhere (into active layout) _(docs/e2e done, pending PR)_
-- [ ] 59. Floating/scratch pin _(tools/drawer/monitors are floats, but not a pin system)_
-- [x] 60. Global pins (everywhere) _(every pin is a session-level tab)_
-- [x] 61. Workspace-scoped pins
-- [x] 62. Pin definition in config — `[[pins]]` name/command/cwd _(args/location/scope deferred)_
-- [x] 63. Eager vs lazy start
-- [x] 64. Restart-on-exit policy
-- [x] 65. Singleton vs multi-instance
-- [x] 66. Persist daemons across workspace switches _(free: a pin tab stays in the session)_
-- [ ] 67. Promote running pane to pinned
-- [x] 68. Unpin at runtime
-- [ ] 69. Top-strip sizing/ratio
-- [x] 70. Program labels + status glyph _(chip label + ●/◌ running/stopped)_
-- [ ] 71. Per-program env injection
-- [ ] 72. Health monitoring/auto-restart
-- [x] 73. Program adapter — launch/notify/restart spec _(launch-or-focus via `superzej pin open`)_
-- [x] 74. Quick-toggle visibility _(`Alt-1..9` launch-or-focus; chip click)_
+**Slice 2 (native host, shipped):** the full pin/daemon system in `superzej-host`
+— a `PinSupervisor` (`crates/superzej-host/src/pins.rs`) owns daemon panes
+independent of tabs/visibility, a real top-**strip** chrome region
+(`layout.rs::compute_with_strip`, `chrome.rs::draw_strip`), tabbar pin chips, and
+`[[pins]]` extended with `args/env/label/ratio` + `location = strip|float`. Pins
+launch-or-focus via `Alt-1..9`, restart per policy on PTY exit, and resurrect from
+`session_state.pin_state`.
+
+- [x] 57. Pin to top strip _(native: live strip region + tabbar chips)_
+- [~] 58. Add anywhere (into active layout) _(zellij path; native via `location=layout`)_
+- [x] 59. Floating/scratch pin _(native: `location = "float"`)_
+- [x] 60. Global pins (everywhere) _(scope = global)_
+- [x] 61. Workspace-scoped pins _(scope = workspace, matched to session id)_
+- [x] 62. Pin definition in config — `[[pins]]` name/command/cwd/args/env/location/scope
+- [x] 63. Eager vs lazy start _(supervisor launches eager pins at startup)_
+- [x] 64. Restart-on-exit policy _(never/always/on-failure via supervisor `on_exit`)_
+- [x] 65. Singleton vs multi-instance _(supervisor dedupes by name on summon)_
+- [x] 66. Persist daemons across workspace switches _(supervisor outlives tab/ws swaps)_
+- [x] 67. Promote running pane to pinned _(`Ctrl-Alt-P`: focused center pane → strip)_
+- [x] 68. Unpin at runtime _(`Ctrl-Alt-U`; reaps the process)_
+- [x] 69. Top-strip sizing/ratio _(`[strip].ratio`, per-pin `ratio`, `Ctrl-Alt-[`/`]`)_
+- [x] 70. Program labels + status glyph _(label + ●/◌/✖ in strip header + chips)_
+- [x] 71. Per-program env injection _(`env` map → `PtyPane::spawn_with_env`)_
+- [x] 72. Health monitoring/auto-restart _(supervisor liveness + restart on PTY death)_
+- [x] 73. Program adapter — launch/notify/restart spec _(`PinSupervisor::argv`/`on_exit`)_
+- [x] 74. Quick-toggle visibility _(`Alt-1..9` launch-or-focus; `Ctrl-Alt-t` strip toggle)_
 
 ### F. Keybindings
 

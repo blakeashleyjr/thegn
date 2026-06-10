@@ -183,6 +183,9 @@ impl Db {
         // `location` column. Add it in place (ignored if already present) so local
         // worktree history survives — no full migration/reset needed.
         let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN location TEXT", []);
+        // Additive: running-pin set per session (JSON), so the native host can
+        // resurrect strip/float pins (the pin supervisor re-launches them).
+        let _ = conn.execute("ALTER TABLE session_state ADD COLUMN pin_state TEXT", []);
         Ok(Db { conn })
     }
 
@@ -607,6 +610,31 @@ impl Db {
             .optional()?;
         Ok(r.flatten())
     }
+
+    /// Record the running-pin set (an opaque JSON string) for a session without
+    /// disturbing `active_tab`. Used by the native host to resurrect pins.
+    pub fn set_pin_state(&self, session: &str, json: &str, now: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO session_state (session_name, pin_state, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(session_name) DO UPDATE SET pin_state=?2, updated_at=?3",
+            params![session, json, now],
+        )?;
+        Ok(())
+    }
+
+    /// The running-pin JSON recorded for a session, if any.
+    pub fn pin_state(&self, session: &str) -> Result<Option<String>> {
+        let r = self
+            .conn
+            .query_row(
+                "SELECT pin_state FROM session_state WHERE session_name=?1",
+                params![session],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(r.flatten())
+    }
 }
 
 #[cfg(test)]
@@ -666,6 +694,25 @@ mod tests {
         // Upsert moves it.
         db.set_active_tab("s", "app/home", 200).unwrap();
         assert_eq!(db.active_tab("s").unwrap().as_deref(), Some("app/home"));
+    }
+
+    #[test]
+    fn pin_state_persists_without_clobbering_active_tab() {
+        let db = db();
+        assert_eq!(db.pin_state("s").unwrap(), None);
+        // active_tab and pin_state coexist in the same row, set independently.
+        db.set_active_tab("s", "app/home", 10).unwrap();
+        db.set_pin_state("s", r#"[{"name":"mail","placement":"float"}]"#, 20)
+            .unwrap();
+        assert_eq!(db.active_tab("s").unwrap().as_deref(), Some("app/home"));
+        assert_eq!(
+            db.pin_state("s").unwrap().as_deref(),
+            Some(r#"[{"name":"mail","placement":"float"}]"#)
+        );
+        // Updating pin_state leaves active_tab intact.
+        db.set_pin_state("s", "[]", 30).unwrap();
+        assert_eq!(db.active_tab("s").unwrap().as_deref(), Some("app/home"));
+        assert_eq!(db.pin_state("s").unwrap().as_deref(), Some("[]"));
     }
 
     #[test]

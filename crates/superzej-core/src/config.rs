@@ -154,6 +154,8 @@ config_enum! {
     pub enum PinLocation: "pin location" {
         Tab = "tab",
         Layout = "layout" | "pane" | "active_layout" | "active-layout",
+        Strip = "strip" | "top" | "top-strip" | "top_strip",
+        Float = "float" | "floating" | "scratch",
     } default = Tab;
 }
 
@@ -190,6 +192,10 @@ pub struct CommandHint {
 pub struct Pin {
     pub name: String,
     pub command: String,
+    /// Explicit argv. When non-empty it is launched directly (no shell); when
+    /// empty, `command` is run via the login shell (`sh -lc`).
+    #[serde(default)]
+    pub args: Vec<String>,
     /// Working directory for the pin's pane. Tab pins default to `$HOME`; layout
     /// pins default to the focused repo/worktree when it can be resolved.
     #[serde(default)]
@@ -212,6 +218,30 @@ pub struct Pin {
     /// Whether to allow multiple instances or enforce singleton behavior.
     #[serde(default = "default_true")]
     pub singleton: bool,
+    /// Per-program environment variables injected into the pin's process.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Display label override for the strip/chip (defaults to `name`).
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Relative weight of this pin within the top strip (defaults to 1.0).
+    #[serde(default)]
+    pub ratio: Option<f32>,
+}
+
+impl Pin {
+    /// The label shown on the strip/chip (falls back to `name`).
+    pub fn display_label(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.name)
+    }
+
+    /// This pin's strip weight (defaults to 1.0; non-positive values clamp to 1.0).
+    pub fn strip_weight(&self) -> f32 {
+        match self.ratio {
+            Some(r) if r > 0.0 => r,
+            _ => 1.0,
+        }
+    }
 }
 
 /// When to start a pin.
@@ -781,6 +811,34 @@ impl Default for DrawerConfig {
     }
 }
 
+/// `[strip]` — the top pinned-program strip (a horizontal band above the center
+/// rendering live `location = "strip"` pins side by side). Hidden when empty;
+/// toggled with Ctrl+Alt+t and resized at runtime.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct StripConfig {
+    /// Fraction of the center band the strip occupies (0.05–0.9, default 0.2).
+    pub ratio: f32,
+    /// Whether the strip is shown when it has at least one pin (default true).
+    pub visible: bool,
+}
+
+impl Default for StripConfig {
+    fn default() -> Self {
+        StripConfig {
+            ratio: 0.2,
+            visible: true,
+        }
+    }
+}
+
+impl StripConfig {
+    /// The configured ratio clamped to a sane band so the center always survives.
+    pub fn clamped_ratio(&self) -> f32 {
+        self.ratio.clamp(0.05, 0.9)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct Config {
@@ -812,6 +870,7 @@ pub struct Config {
     pub sandbox: SandboxConfig,
     pub limits: LimitsConfig,
     pub drawer: DrawerConfig,
+    pub strip: StripConfig,
     /// Rebind a built-in action by id, e.g. `new-worktree = "Ctrl w"`. The flat
     /// table is the global/default layer; nested mode tables are native-host only.
     pub keybinds: KeybindConfig,
@@ -850,6 +909,7 @@ impl Default for Config {
             sandbox: SandboxConfig::default(),
             limits: LimitsConfig::default(),
             drawer: DrawerConfig::default(),
+            strip: StripConfig::default(),
             keybinds: KeybindConfig::default(),
             actions: Vec::new(),
         }
@@ -1817,6 +1877,78 @@ surface = "todoist.status"
         let errs = validate_str(body);
         assert_eq!(errs.len(), 1, "{errs:?}");
         assert!(errs[0].contains("pins[0].location"), "{errs:?}");
+    }
+
+    #[test]
+    fn pin_location_parses_strip_and_float_with_aliases() {
+        let strip: Config =
+            toml::from_str("[[pins]]\nname='x'\ncommand='c'\nlocation='top-strip'\n").unwrap();
+        assert_eq!(strip.pins[0].location, PinLocation::Strip);
+        assert_eq!(PinLocation::Strip.as_str(), "strip");
+        let float: Config =
+            toml::from_str("[[pins]]\nname='x'\ncommand='c'\nlocation='scratch'\n").unwrap();
+        assert_eq!(float.pins[0].location, PinLocation::Float);
+        assert_eq!(PinLocation::Float.as_str(), "float");
+    }
+
+    #[test]
+    fn pin_extended_fields_parse() {
+        let body = "[[pins]]\nname='logs'\ncommand='journalctl'\nargs=['-f']\n\
+                    label='syslog'\nratio=2.5\n[pins.env]\nRUST_LOG='info'\n";
+        let cfg: Config = toml::from_str(body).unwrap();
+        let p = &cfg.pins[0];
+        assert_eq!(p.args, vec!["-f"]);
+        assert_eq!(p.display_label(), "syslog");
+        assert_eq!(p.strip_weight(), 2.5);
+        assert_eq!(p.env.get("RUST_LOG").map(String::as_str), Some("info"));
+    }
+
+    #[test]
+    fn pin_helpers_fall_back_sensibly() {
+        let cfg: Config = toml::from_str("[[pins]]\nname='bare'\ncommand='c'\n").unwrap();
+        let p = &cfg.pins[0];
+        // No label → name; no/zero ratio → 1.0.
+        assert_eq!(p.display_label(), "bare");
+        assert_eq!(p.strip_weight(), 1.0);
+        let mut neg = p.clone();
+        neg.ratio = Some(-3.0);
+        assert_eq!(neg.strip_weight(), 1.0);
+    }
+
+    #[test]
+    fn strip_config_defaults_and_clamps() {
+        let def = StripConfig::default();
+        assert_eq!(def.ratio, 0.2);
+        assert!(def.visible);
+        let lo = StripConfig {
+            ratio: 0.001,
+            visible: true,
+        };
+        assert_eq!(lo.clamped_ratio(), 0.05);
+        let hi = StripConfig {
+            ratio: 5.0,
+            visible: false,
+        };
+        assert_eq!(hi.clamped_ratio(), 0.9);
+    }
+
+    #[test]
+    fn pins_for_workspace_filters_by_scope() {
+        let body = "[[pins]]\nname='g'\ncommand='c'\nscope='global'\n\
+                    [[pins]]\nname='w'\ncommand='c'\nscope='workspace'\nworkspace='repoA'\n";
+        let cfg: Config = toml::from_str(body).unwrap();
+        let a: Vec<_> = cfg
+            .pins_for_workspace(Some("repoA"))
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        assert_eq!(a, vec!["g", "w"]);
+        let b: Vec<_> = cfg
+            .pins_for_workspace(Some("repoB"))
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        assert_eq!(b, vec!["g"]);
     }
 
     #[test]
