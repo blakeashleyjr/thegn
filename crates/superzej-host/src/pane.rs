@@ -20,15 +20,6 @@ pub enum PaneEvent {
     Exit(u32),
 }
 
-impl PaneEvent {
-    pub fn byte_len(&self) -> usize {
-        match self {
-            PaneEvent::Output(_, b) => b.len(),
-            PaneEvent::Exit(_) => 0,
-        }
-    }
-}
-
 pub struct PtyPane {
     master: Box<dyn MasterPty + Send>,
     #[allow(dead_code)]
@@ -170,7 +161,7 @@ pub fn drain_until_exit(
     rx: &mut tokio_mpsc::Receiver<PaneEvent>,
     deadline_ms: u64,
 ) -> bool {
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
     let start = Instant::now();
     loop {
         let remaining = deadline_ms.saturating_sub(start.elapsed().as_millis() as u64);
