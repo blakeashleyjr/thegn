@@ -7,7 +7,7 @@ use termwiz::cell::AttributeChange;
 use termwiz::color::{ColorAttribute, SrgbaTuple};
 use termwiz::surface::{Change, Position, Surface};
 
-use crate::compositor::{compose_pane, Rect};
+use crate::compositor::{Rect, compose_pane};
 use crate::emulator::PaneEmulator;
 use superzej_core::theme;
 

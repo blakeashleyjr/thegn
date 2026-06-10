@@ -28,11 +28,7 @@ pub fn run(cfg: &Config) -> Result<()> {
         let slug = slugs.entry(v.repo.clone()).or_insert_with(|| {
             let base = {
                 let s = util::slugify(&repo::repo_name_from_path(Path::new(&v.repo)));
-                if s.is_empty() {
-                    "repo".to_string()
-                } else {
-                    s
-                }
+                if s.is_empty() { "repo".to_string() } else { s }
             };
             db.slug_for_repo(&v.repo, &base).unwrap_or(base)
         });
