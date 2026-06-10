@@ -142,13 +142,17 @@ impl Session {
     /// Persist the full tab set + active tab (debounced by the caller on layout
     /// changes — not per keystroke).
     pub fn persist(&self, db: &Db, session: &str, now: i64) -> Result<()> {
-        for (i, tab) in self.tabs.iter().enumerate() {
-            db.put_tab_layout(session, &tab.to_row(i as i64))?;
-        }
-        if let Some(active) = self.tabs.get(self.active) {
-            db.set_active_tab(session, &active.name, now)?;
-        }
-        Ok(())
+        // One transaction for the whole snapshot: a crash mid-loop can't leave
+        // a torn tab list, and N upserts pay one fsync instead of N.
+        db.transaction(|db| {
+            for (i, tab) in self.tabs.iter().enumerate() {
+                db.put_tab_layout(session, &tab.to_row(i as i64))?;
+            }
+            if let Some(active) = self.tabs.get(self.active) {
+                db.set_active_tab(session, &active.name, now)?;
+            }
+            Ok(())
+        })
     }
 
     /// The active tab, if any. (Convenience used by tests; the loop indexes
