@@ -1713,6 +1713,11 @@ async fn event_loop<T: Terminal>(
     if let Ok(db) = superzej_core::db::Db::open() {
         sb.load(&db, &session.id);
     }
+    tracing::info!(
+        target: "szhost::startup",
+        since_start_ms = start.elapsed().as_millis() as u64,
+        "sidebar state loaded"
+    );
     let mut sidebar_cols = sb.width.unwrap_or(layout::SIDEBAR_COLS);
     // The last tab name we acked activity for (clears its "look at me" dot).
     let mut last_acked_tab: Option<String> = None;
@@ -1757,8 +1762,18 @@ async fn event_loop<T: Terminal>(
         &refresh_tx,
         &waker,
     );
+    tracing::info!(
+        target: "szhost::startup",
+        since_start_ms = start.elapsed().as_millis() as u64,
+        "diff watcher targeted"
+    );
 
     sync_drawer_persistence(&session, &mut panes, &mut drawer, chrome.center);
+    tracing::info!(
+        target: "szhost::startup",
+        since_start_ms = start.elapsed().as_millis() as u64,
+        "drawer synced"
+    );
 
     let mut current_config = keymap.config().clone();
     // The workspace the keymap was last built for; when the focused workspace
@@ -1815,6 +1830,11 @@ async fn event_loop<T: Terminal>(
         }
         persist_pin_state(&supervisor, &session.id);
     }
+    tracing::info!(
+        target: "szhost::startup",
+        since_start_ms = start.elapsed().as_millis() as u64,
+        "pins launched, entering loop"
+    );
     loop {
         if session.tabs.is_empty() {
             return Ok(()); // last tab closed
@@ -2186,6 +2206,12 @@ async fn event_loop<T: Terminal>(
                     since_start_ms = start.elapsed().as_millis() as u64,
                     "first frame flushed"
                 );
+                // Benchmark hook (`just bench`): exit right after the first
+                // real frame so hyperfine measures launch → first paint.
+                // `run::main` still tears down the alt screen + raw mode.
+                if std::env::var_os("SUPERZEJ_BENCH_FIRST_FRAME_EXIT").is_some() {
+                    return Ok(());
+                }
             }
         }
 

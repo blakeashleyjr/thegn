@@ -8,6 +8,8 @@
     # coverage gate (`just coverage`) + visual-regression harness
     cargo-llvm-cov
     python3
+    # startup benchmarks (`just bench`)
+    hyperfine
     # treefmt — reads treefmt.toml; versions must match the flake's nixpkgs
     treefmt
     # formatter binaries treefmt.toml references (rustfmt comes from languages.rust below)
