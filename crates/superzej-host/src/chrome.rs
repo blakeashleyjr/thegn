@@ -171,6 +171,8 @@ pub struct FrameModel {
     pub panel_focused: bool,
     pub status: String,
     pub accent: String,
+    /// Pin chips for the tabbar (label + status glyph), in `Alt-N` order.
+    pub pins: Vec<crate::pins::PinChip>,
 }
 
 impl FrameModel {
@@ -194,14 +196,18 @@ pub fn draw_tabbar(surface: &mut Surface, rect: Rect, content: Rect, model: &Fra
     let accent = theme_color(model.accent_or_default());
     let dim = theme_color(theme::DIM);
     let content_end = content.x.saturating_add(content.cols);
+
+    // Right-align the pin chips first so the tab labels know where to stop.
+    let chips_start = draw_pin_chips(surface, content, content_end, model, accent, dim);
+
     let mut x = content.x.saturating_add(1);
     for (i, name) in model.tabs.iter().enumerate() {
-        if x >= content_end {
+        if x >= chips_start {
             break;
         }
         let label = format!(" {name} ");
         let fg = if i == model.active_tab { accent } else { dim };
-        let max = content_end.saturating_sub(x);
+        let max = chips_start.saturating_sub(x);
         draw_text(
             surface,
             x,
@@ -213,6 +219,46 @@ pub fn draw_tabbar(surface: &mut Surface, rect: Rect, content: Rect, model: &Fra
         );
         x += label.chars().count();
     }
+}
+
+/// Render pin chips (`glyph label`) right-aligned in the tabbar content area.
+/// Returns the left-most x the chips occupy, so tab labels can stop before them.
+fn draw_pin_chips(
+    surface: &mut Surface,
+    content: Rect,
+    content_end: usize,
+    model: &FrameModel,
+    accent: ColorAttribute,
+    dim: ColorAttribute,
+) -> usize {
+    if model.pins.is_empty() {
+        return content_end;
+    }
+    // Each chip reads " <glyph> <label> " (the leading index is implicit Alt-N).
+    let chips: Vec<String> = model
+        .pins
+        .iter()
+        .map(|c| format!(" {} {} ", c.glyph, c.label))
+        .collect();
+    let total: usize = chips.iter().map(|s| s.chars().count()).sum();
+    let mut x = content_end.saturating_sub(total).max(content.x);
+    let chips_start = x;
+    let bg = theme_color(theme::BG1);
+    for (chip, pin) in chips.iter().zip(model.pins.iter()) {
+        if x >= content_end {
+            break;
+        }
+        // Running pins read in the accent; stopped/failed read dim.
+        let fg = if pin.glyph == crate::pins::PinHealth::Running.glyph() {
+            accent
+        } else {
+            dim
+        };
+        let max = content_end.saturating_sub(x);
+        draw_text(surface, x, content.y, chip, fg, bg, max);
+        x += chip.chars().count();
+    }
+    chips_start
 }
 
 pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
@@ -825,6 +871,71 @@ fn panel_help_hint(tab: crate::panel::PanelTab, view: crate::panel::DiffView) ->
     }
 }
 
+/// One pin's slot in the top strip: where it sits and how to label it. The
+/// emulator is looked up by the caller via `pane`.
+pub struct StripCell {
+    pub pane: crate::center::PaneId,
+    pub rect: Rect,
+    pub label: String,
+    pub glyph: char,
+    pub focused: bool,
+}
+
+/// Render the top pinned-program strip: for each cell, a 1-row accent header
+/// (`glyph label`) then its live pane below. A 1-col gap between cells reads as a
+/// divider. The strip background is painted first so empty slack is themed.
+pub fn draw_strip<'a>(
+    surface: &mut Surface,
+    strip: Rect,
+    cells: &[StripCell],
+    accent: &str,
+    lookup: impl Fn(crate::center::PaneId) -> Option<&'a dyn PaneEmulator>,
+) {
+    if strip.rows == 0 || strip.cols == 0 {
+        return;
+    }
+    fill(surface, strip, theme_color(theme::BG0));
+    let accent_c = theme_color(accent);
+    let dim = theme_color(theme::DIM);
+    for cell in cells {
+        if cell.rect.rows == 0 || cell.rect.cols == 0 {
+            continue;
+        }
+        // Header row.
+        let header_bg = theme_color(theme::BG1);
+        let header_rect = Rect {
+            x: cell.rect.x,
+            y: cell.rect.y,
+            cols: cell.rect.cols,
+            rows: 1,
+        };
+        fill(surface, header_rect, header_bg);
+        let fg = if cell.focused { accent_c } else { dim };
+        let text = format!(" {} {} ", cell.glyph, cell.label);
+        draw_text(
+            surface,
+            cell.rect.x,
+            cell.rect.y,
+            &text,
+            fg,
+            header_bg,
+            cell.rect.cols,
+        );
+        // Pane body below the header.
+        if cell.rect.rows > 1
+            && let Some(emu) = lookup(cell.pane)
+        {
+            let body = Rect {
+                x: cell.rect.x,
+                y: cell.rect.y + 1,
+                cols: cell.rect.cols,
+                rows: cell.rect.rows - 1,
+            };
+            compose_pane(surface, emu, body);
+        }
+    }
+}
+
 /// Draw the surrounding chrome (sidebar/panel/tabbar/statusbar) — the center is
 /// filled separately by [`render_tab`].
 pub fn draw_chrome(
@@ -1031,6 +1142,68 @@ mod tests {
         let l = lines(&s);
         assert!(l[0].contains("app/home"));
         assert!(l[0].contains("app/feat"));
+    }
+
+    #[test]
+    fn tabbar_renders_pin_chips_right_aligned() {
+        let mut s = Surface::new(80, 1);
+        let model = FrameModel {
+            tabs: vec!["app/home".into()],
+            active_tab: 0,
+            pins: vec![
+                crate::pins::PinChip {
+                    index: 1,
+                    label: "mail".into(),
+                    glyph: crate::pins::PinHealth::Running.glyph(),
+                },
+                crate::pins::PinChip {
+                    index: 2,
+                    label: "logs".into(),
+                    glyph: crate::pins::PinHealth::Stopped.glyph(),
+                },
+            ],
+            ..Default::default()
+        };
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 80,
+            rows: 1,
+        };
+        draw_tabbar(&mut s, rect, rect, &model);
+        let row = &lines(&s)[0];
+        assert!(row.contains("mail"), "chip label present: {row:?}");
+        assert!(row.contains("logs"));
+        assert!(row.contains("app/home"), "tab label still present");
+        // The chips are right of the tab label.
+        let tab_at = row.find("app/home").unwrap();
+        let mail_at = row.find("mail").unwrap();
+        assert!(mail_at > tab_at, "chips render to the right of tabs");
+    }
+
+    #[test]
+    fn strip_draws_header_label_and_glyph() {
+        let mut s = Surface::new(40, 6);
+        let strip = Rect {
+            x: 0,
+            y: 0,
+            cols: 40,
+            rows: 6,
+        };
+        let emu = Vt100Emulator::new(5, 40, 100);
+        let cells = vec![StripCell {
+            pane: 1,
+            rect: strip,
+            label: "syslog".into(),
+            glyph: crate::pins::PinHealth::Running.glyph(),
+            focused: true,
+        }];
+        draw_strip(&mut s, strip, &cells, theme::TEAL, |id| {
+            (id == 1).then_some(&emu as &dyn PaneEmulator)
+        });
+        let header = &lines(&s)[0];
+        assert!(header.contains("syslog"), "header label: {header:?}");
+        assert!(header.contains(crate::pins::PinHealth::Running.glyph()));
     }
 
     #[test]

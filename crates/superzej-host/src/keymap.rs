@@ -61,9 +61,19 @@ pub enum Action {
     CopyPane,
     /// Toggle the full keybinding cheatsheet overlay.
     Cheatsheet,
-    /// Open-or-focus the configured pin at this 1-based index (`Alt-1..9`).
-    Pin(u8),
     SwitchMode(Mode),
+    /// Launch-or-focus the pin at 1-based index N (the `Alt-1..9` mapping).
+    SummonPin(u8),
+    /// Show/hide the top pinned-program strip.
+    ToggleStrip,
+    /// Grow the top strip (more rows).
+    GrowStrip,
+    /// Shrink the top strip (fewer rows).
+    ShrinkStrip,
+    /// Promote the focused center pane into the top strip as a pin.
+    PromotePin,
+    /// Unpin (stop + remove) the focused strip/float pin.
+    Unpin,
     Quit,
     Custom(u16),
 }
@@ -103,13 +113,16 @@ impl Action {
             Action::ScrollDown => "scroll-down",
             Action::CopyPane => "copy-pane",
             Action::Cheatsheet => "cheatsheet",
-            // Pin keys are dynamic (`pin-1`..`pin-9`); the static slot returns the
-            // bare prefix. The palette/run wiring keys pins by index directly.
-            Action::Pin(_) => "pin",
             Action::SwitchMode(Mode::Normal) => "mode-normal",
             Action::SwitchMode(Mode::VimNormal) => "mode-vim-normal",
             Action::SwitchMode(Mode::VimInsert) => "mode-vim-insert",
             Action::SwitchMode(Mode::Emacs) => "mode-emacs",
+            Action::SummonPin(_) => "summon-pin",
+            Action::ToggleStrip => "toggle-strip",
+            Action::GrowStrip => "grow-strip",
+            Action::ShrinkStrip => "shrink-strip",
+            Action::PromotePin => "promote-pin",
+            Action::Unpin => "unpin",
             Action::Quit => "quit",
             Action::Custom(_) => "custom-action",
         }
@@ -146,16 +159,24 @@ impl Action {
             "copy-pane" => Action::CopyPane,
             "cheatsheet" | "keys" | "help" => Action::Cheatsheet,
             "quit" => Action::Quit,
-            // `pin-1`..`pin-9` → open-or-focus the pin at that 1-based index.
-            k if k.starts_with("pin-") => {
-                let idx = k.strip_prefix("pin-").and_then(|n| n.parse::<u8>().ok())?;
-                Action::Pin(idx)
-            }
             "mode-normal" => Action::SwitchMode(Mode::Normal),
             "mode-vim-normal" | "vim-normal" => Action::SwitchMode(Mode::VimNormal),
             "mode-vim-insert" | "vim-insert" => Action::SwitchMode(Mode::VimInsert),
             "mode-emacs" | "emacs" => Action::SwitchMode(Mode::Emacs),
-            _ => return None,
+            "toggle-strip" => Action::ToggleStrip,
+            "grow-strip" => Action::GrowStrip,
+            "shrink-strip" => Action::ShrinkStrip,
+            "promote-pin" => Action::PromotePin,
+            "unpin" => Action::Unpin,
+            // `summon-pin-N` / `pin-N` → SummonPin(N) (1..=9).
+            other => {
+                let n = other
+                    .strip_prefix("summon-pin-")
+                    .or_else(|| other.strip_prefix("pin-"))
+                    .and_then(|s| s.parse::<u8>().ok())
+                    .filter(|n| (1..=9).contains(n))?;
+                Action::SummonPin(n)
+            }
         })
     }
 }
@@ -380,14 +401,21 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Alt Left", Action::PrevTab).unwrap();
     map.insert_all("Alt Right", Action::NextTab).unwrap();
 
-    // Alt-1..9 → open-or-focus configured pins by 1-based registration order.
-    for i in 1..=9u8 {
-        map.insert_all(&format!("Alt {i}"), Action::Pin(i)).unwrap();
-    }
-
     map.insert_all("Shift PageUp", Action::ScrollUp).unwrap();
     map.insert_all("Shift PageDown", Action::ScrollDown)
         .unwrap();
+
+    // Pins: Alt-1..9 launch-or-focus the configured pin in registration order;
+    // strip visibility/sizing and promote/unpin hang off Ctrl-Alt chords.
+    for n in 1u8..=9 {
+        map.insert_all(&format!("Alt {n}"), Action::SummonPin(n))
+            .unwrap();
+    }
+    map.insert_all("Ctrl Alt t", Action::ToggleStrip).unwrap();
+    map.insert_all("Ctrl Alt ]", Action::GrowStrip).unwrap();
+    map.insert_all("Ctrl Alt [", Action::ShrinkStrip).unwrap();
+    map.insert_all("Ctrl Alt P", Action::PromotePin).unwrap();
+    map.insert_all("Ctrl Alt U", Action::Unpin).unwrap();
 
     // Vim-normal mode: one-key navigation plus leader-like Space sequences.
     map.insert(Mode::VimNormal, "h", Action::FocusLeft).unwrap();
@@ -716,28 +744,46 @@ mod tests {
     }
 
     #[test]
-    fn pin_keys_parse_by_index_and_default_keymap_binds_alt_digits() {
-        // `pin-N` round-trips to Action::Pin(N); a bad index is rejected.
-        assert_eq!(Action::from_key("pin-1"), Some(Action::Pin(1)));
-        assert_eq!(Action::from_key("pin-9"), Some(Action::Pin(9)));
-        assert_eq!(Action::from_key("pin-x"), None);
-        // Alt-1..9 are bound in the default keymap.
+    fn mode_actions_have_stable_keys() {
+        assert_eq!(Action::SwitchMode(Mode::Normal).key(), "mode-normal");
+        assert_eq!(Action::SwitchMode(Mode::VimNormal).key(), "mode-vim-normal");
+        assert_eq!(Action::SwitchMode(Mode::VimInsert).key(), "mode-vim-insert");
+        assert_eq!(Action::SwitchMode(Mode::Emacs).key(), "mode-emacs");
+    }
+
+    #[test]
+    fn pin_actions_round_trip_through_keys() {
+        assert_eq!(Action::ToggleStrip.key(), "toggle-strip");
+        assert_eq!(Action::from_key("toggle-strip"), Some(Action::ToggleStrip));
+        assert_eq!(Action::from_key("grow-strip"), Some(Action::GrowStrip));
+        assert_eq!(Action::from_key("shrink-strip"), Some(Action::ShrinkStrip));
+        assert_eq!(Action::from_key("promote-pin"), Some(Action::PromotePin));
+        assert_eq!(Action::from_key("unpin"), Some(Action::Unpin));
+        // SummonPin parses both `summon-pin-N` and `pin-N`, 1..=9 only.
+        assert_eq!(Action::from_key("summon-pin-3"), Some(Action::SummonPin(3)));
+        assert_eq!(Action::from_key("pin-1"), Some(Action::SummonPin(1)));
+        assert_eq!(Action::from_key("pin-9"), Some(Action::SummonPin(9)));
+        assert_eq!(Action::from_key("pin-0"), None);
+        assert_eq!(Action::from_key("pin-99"), None);
+    }
+
+    #[test]
+    fn default_keymap_binds_alt_digits_to_summon_pin() {
         let mut map = default_keymap();
         assert_eq!(
             map.dispatch(
                 Mode::Normal,
                 Key::modified(KeyCode::Char('1'), Modifiers::ALT)
             ),
-            MatchResult::Matched(Action::Pin(1))
+            MatchResult::Matched(Action::SummonPin(1))
         );
-    }
-
-    #[test]
-    fn mode_actions_have_stable_keys() {
-        assert_eq!(Action::SwitchMode(Mode::Normal).key(), "mode-normal");
-        assert_eq!(Action::SwitchMode(Mode::VimNormal).key(), "mode-vim-normal");
-        assert_eq!(Action::SwitchMode(Mode::VimInsert).key(), "mode-vim-insert");
-        assert_eq!(Action::SwitchMode(Mode::Emacs).key(), "mode-emacs");
+        assert_eq!(
+            map.dispatch(
+                Mode::Normal,
+                Key::modified(KeyCode::Char('9'), Modifiers::ALT)
+            ),
+            MatchResult::Matched(Action::SummonPin(9))
+        );
     }
 
     #[test]
