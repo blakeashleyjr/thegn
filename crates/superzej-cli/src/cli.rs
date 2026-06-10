@@ -254,6 +254,9 @@ pub enum Command {
     Repos,
     /// List recently opened repos (history).
     Recent { count: Option<i64> },
+    /// (Internal) Dump configured hints as JSON for the statusbar.
+    #[clap(hide = true)]
+    Hints,
     /// Worktree inventory + key hints.
     Status,
     /// Inspect the effective (layered) configuration.

@@ -142,6 +142,7 @@ fn main() {
         Command::List { json } => commands::list::run(&cfg, json),
         Command::Repos => commands::repos::run(&cfg),
         Command::Recent { count } => commands::recent::run(count),
+        Command::Hints => commands::hints::run(&cfg),
         Command::Status => commands::status::run(&cfg),
         Command::Config { action } => commands::config::run(&cfg, action, effective_path),
         Command::Keys { action } => commands::keys::run(&cfg, action),

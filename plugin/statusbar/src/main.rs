@@ -74,6 +74,7 @@ struct State {
     session: Option<String>,       // current session name (restore `--session` arg)
     restore_poked: bool,           // restore already requested for this activation
     focused_pane_command: Option<String>, // The command running in the focused pane (e.g. lazygit, hx)
+    custom_hints: std::collections::BTreeMap<String, Vec<(String, String)>>,
 }
 
 /// Tracked visibility of one controlled chrome surface.
@@ -109,6 +110,7 @@ impl ZellijPlugin for State {
         // Selectable so Super+Alt+Down can focus the bottom bar and route keys.
         set_selectable(true);
         fetch_theme();
+        fetch_hints();
         // Restore any persisted manual-hide (a toggle may have hidden a surface
         // before this per-tab statusbar loaded). Replies tagged vis_sidebar/vis_panel.
         self.pull_visibility();
@@ -162,6 +164,20 @@ impl ZellijPlugin for State {
                             self.accent = rgb;
                             return true;
                         }
+                    }
+                }
+                false
+            }
+            Event::RunCommandResult(code, stdout, _, ctx)
+                if ctx.get("cmd").map(|s| s.as_str()) == Some("hints") =>
+            {
+                if code == Some(0) {
+                    if let Ok(map) = serde_json::from_slice::<
+                        std::collections::BTreeMap<String, Vec<(String, String)>>,
+                    >(&stdout)
+                    {
+                        self.custom_hints = map;
+                        return true;
                     }
                 }
                 false
@@ -320,7 +336,7 @@ impl ZellijPlugin for State {
             push_raw(&mut out, &mut col, cols, " ", 1);
         }
 
-        for (i, (key, label)) in chips.iter().enumerate() {
+        for (i, (key, label)) in chips.into_iter().enumerate() {
             if i > 0 {
                 push_raw(
                     &mut out,
@@ -362,6 +378,13 @@ fn fetch_theme() {
     let mut ctx = BTreeMap::new();
     ctx.insert("cmd".to_string(), "theme".to_string());
     run_command(&["superzej", "theme"], ctx);
+}
+
+/// Kick off `superzej hints`; the custom hints land via RunCommandResult.
+fn fetch_hints() {
+    let mut ctx = BTreeMap::new();
+    ctx.insert("cmd".to_string(), "hints".to_string());
+    run_command(&["superzej", "hints"], ctx);
 }
 
 /// Outcome of the per-activation drawer-restore check (see `restore_decision`).
@@ -668,66 +691,83 @@ impl State {
     }
 
     /// (key, label) chips for the current mode + tab context.
-    fn chips(&self, mode: InputMode) -> Vec<(&'static str, &'static str)> {
+    fn chips(&self, mode: InputMode) -> Vec<(String, String)> {
         match mode {
             InputMode::Normal => {
                 let mut v = vec![
-                    ("Cmd-K", "menu"),
-                    ("A-←→", "tabs"),
-                    ("S-A-←→", "panes"),
-                    ("A-W", "new repo"),
-                    ("A-w", "worktree"),
-                    ("A-n", "split"),
+                    ("Cmd-K".to_string(), "menu".to_string()),
+                    ("A-←→".to_string(), "tabs".to_string()),
+                    ("S-A-←→".to_string(), "panes".to_string()),
+                    ("A-W".to_string(), "new repo".to_string()),
+                    ("A-w".to_string(), "worktree".to_string()),
+                    ("A-n".to_string(), "split".to_string()),
                 ];
 
                 if let Some(cmd) = &self.focused_pane_command {
                     let cmd_lower = cmd.to_lowercase();
-                    if cmd_lower.contains("lazygit") {
-                        v.extend_from_slice(&[("q", "quit"), ("Space", "commit"), ("?", "help")]);
-                        return v;
-                    } else if cmd_lower.contains("hx") || cmd_lower.contains("vim") {
-                        v.extend_from_slice(&[(":w", "save"), (":q", "quit")]);
-                        return v;
-                    } else if cmd_lower.contains("yazi") {
-                        v.extend_from_slice(&[("q", "quit"), ("/", "search"), ("Enter", "open")]);
-                        return v;
+                    for (tool_name, hints) in &self.custom_hints {
+                        if cmd_lower.contains(&tool_name.to_lowercase()) {
+                            v.extend(hints.clone());
+                            return v;
+                        }
                     }
                 }
 
                 if self.worktree_ctx {
-                    v.extend_from_slice(&[("A-g", "lazygit"), ("A-e", "edit"), ("A-X", "close")]);
+                    v.extend_from_slice(&[
+                        ("A-g".to_string(), "lazygit".to_string()),
+                        ("A-e".to_string(), "edit".to_string()),
+                        ("A-X".to_string(), "close".to_string()),
+                    ]);
                 } else {
-                    v.extend_from_slice(&[("A-o", "switch repo"), ("A-d", "dashboard")]);
+                    v.extend_from_slice(&[
+                        ("A-o".to_string(), "switch repo".to_string()),
+                        ("A-d".to_string(), "dashboard".to_string()),
+                    ]);
                 }
                 v
             }
             InputMode::Pane => vec![
-                ("→", "right"),
-                ("↓", "down"),
-                ("x", "close"),
-                ("f", "fullscreen"),
-                ("w", "float"),
-                ("z", "frames"),
-                ("⏎", "done"),
+                ("→".to_string(), "right".to_string()),
+                ("↓".to_string(), "down".to_string()),
+                ("x".to_string(), "close".to_string()),
+                ("f".to_string(), "fullscreen".to_string()),
+                ("w".to_string(), "float".to_string()),
+                ("z".to_string(), "frames".to_string()),
+                ("⏎".to_string(), "done".to_string()),
             ],
             InputMode::Tab => vec![
-                ("n", "new"),
-                ("x", "close"),
-                ("←→", "move"),
-                ("r", "rename"),
-                ("⏎", "done"),
+                ("n".to_string(), "new".to_string()),
+                ("x".to_string(), "close".to_string()),
+                ("←→".to_string(), "move".to_string()),
+                ("r".to_string(), "rename".to_string()),
+                ("⏎".to_string(), "done".to_string()),
             ],
-            InputMode::Resize => vec![("←↑↓→", "resize"), ("+-", "size"), ("⏎", "done")],
-            InputMode::Move => vec![("←↑↓→", "move pane"), ("⏎", "done")],
+            InputMode::Resize => vec![
+                ("←↑↓→".to_string(), "resize".to_string()),
+                ("+-".to_string(), "size".to_string()),
+                ("⏎".to_string(), "done".to_string()),
+            ],
+            InputMode::Move => vec![
+                ("←↑↓→".to_string(), "move pane".to_string()),
+                ("⏎".to_string(), "done".to_string()),
+            ],
             InputMode::Scroll => vec![
-                ("↑↓", "scroll"),
-                ("/", "search"),
-                ("e", "edit"),
-                ("⏎", "done"),
+                ("↑↓".to_string(), "scroll".to_string()),
+                ("/".to_string(), "search".to_string()),
+                ("e".to_string(), "edit".to_string()),
+                ("⏎".to_string(), "done".to_string()),
             ],
-            InputMode::Session => vec![("d", "detach"), ("w", "sessions"), ("⏎", "done")],
-            InputMode::Locked => vec![("Ctrl-g", "unlock")],
-            _ => vec![("⏎", "done"), ("Esc", "cancel")],
+            InputMode::Session => vec![
+                ("d".to_string(), "detach".to_string()),
+                ("w".to_string(), "sessions".to_string()),
+                ("⏎".to_string(), "done".to_string()),
+            ],
+            InputMode::Locked => vec![("Ctrl-g".to_string(), "unlock".to_string())],
+            _ => vec![
+                ("⏎".to_string(), "done".to_string()),
+                ("Esc".to_string(), "cancel".to_string()),
+            ],
         }
     }
 }
