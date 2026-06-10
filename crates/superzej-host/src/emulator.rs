@@ -60,18 +60,11 @@ pub trait PaneEmulator: Send {
     fn scrollback(&self) -> usize {
         0
     }
-    /// Convenience: the visible text of a row, trailing blanks trimmed.
-    #[allow(dead_code)]
-    fn row_text(&self, row: u16) -> String {
-        let (_, cols) = self.size();
-        let mut s = String::new();
-        for col in 0..cols {
-            match self.cell(row, col) {
-                Some(c) if !c.text.is_empty() => s.push_str(&c.text),
-                _ => s.push(' '),
-            }
-        }
-        s.trim_end().to_string()
+    /// Borrow the underlying row text as a single string if supported.
+    /// Returns `None` if the emulator cannot provide a fast-path row string,
+    /// in which case the compositor will fall back to cell-by-cell iteration.
+    fn row_text(&self, _row: u16) -> Option<String> {
+        None
     }
 }
 
@@ -149,6 +142,18 @@ impl PaneEmulator for Vt100Emulator {
     fn scrollback(&self) -> usize {
         self.parser.screen().scrollback()
     }
+
+    fn row_text(&self, row: u16) -> Option<String> {
+        let (_, cols) = self.size();
+        let mut s = String::new();
+        for col in 0..cols {
+            match self.cell(row, col) {
+                Some(c) if !c.text.is_empty() => s.push_str(&c.text),
+                _ => s.push(' '),
+            }
+        }
+        Some(s.trim_end().to_string())
+    }
 }
 
 #[cfg(test)]
@@ -159,7 +164,7 @@ mod tests {
     fn plain_text_lands_in_the_grid() {
         let mut e = Vt100Emulator::new(24, 80, 0);
         e.advance(b"hello world");
-        assert_eq!(e.row_text(0), "hello world");
+        assert_eq!(e.row_text(0), Some("hello world".to_string()));
         assert_eq!(e.cursor(), (0, 11));
     }
 
@@ -167,8 +172,8 @@ mod tests {
     fn newline_advances_row() {
         let mut e = Vt100Emulator::new(24, 80, 0);
         e.advance(b"line1\r\nline2");
-        assert_eq!(e.row_text(0), "line1");
-        assert_eq!(e.row_text(1), "line2");
+        assert_eq!(e.row_text(0), Some("line1".to_string()));
+        assert_eq!(e.row_text(1), Some("line2".to_string()));
     }
 
     #[test]
@@ -191,7 +196,7 @@ mod tests {
         }
         // Live tail: the last lines are visible, line1 is gone.
         assert_eq!(e.scrollback(), 0);
-        let tail: Vec<String> = (0..3).map(|r| e.row_text(r)).collect();
+        let tail: Vec<String> = (0..3).map(|r| e.row_text(r).unwrap_or_default()).collect();
         assert!(
             tail.iter().any(|l| l == "line5"),
             "tail shows recent: {tail:?}"
@@ -202,7 +207,7 @@ mod tests {
         // (vt100 clamps the offset to the available scrollback).
         e.scroll_up(100);
         assert!(e.scrollback() > 0, "offset advanced into history");
-        let hist: Vec<String> = (0..3).map(|r| e.row_text(r)).collect();
+        let hist: Vec<String> = (0..3).map(|r| e.row_text(r).unwrap_or_default()).collect();
         assert!(
             hist.iter().any(|l| l == "line1"),
             "history shows line1: {hist:?}"
