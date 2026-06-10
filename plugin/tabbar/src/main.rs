@@ -917,8 +917,7 @@ impl State {
             } else {
                 l.to_string()
             };
-            parts.push(metric("LOC", &loc_str, self.sel == Some(si)));
-            si += 1;
+            parts.push(metric("LOC", &loc_str, false));
         }
         let _ = si;
         if !self.time.is_empty() {
