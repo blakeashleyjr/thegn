@@ -41,10 +41,27 @@ impl ChromeLayout {
     }
 }
 
-/// Compute the chrome cross for a `cols`x`rows` screen. `want_sidebar`/
-/// `want_panel` are the user's toggle state; each is additionally suppressed
-/// when the screen is too narrow.
+/// Min/max sidebar width when adjusted at runtime (item 25).
+pub const SIDEBAR_MIN_WIDTH: usize = 12;
+pub const SIDEBAR_MAX_WIDTH: usize = 48;
+
+/// Compute the chrome cross with the default sidebar width. (Convenience used
+/// by tests; the live loop calls [`compute_with_width`] with the runtime width.)
+#[allow(dead_code)]
 pub fn compute(cols: usize, rows: usize, want_sidebar: bool, want_panel: bool) -> ChromeLayout {
+    compute_with_width(cols, rows, want_sidebar, want_panel, SIDEBAR_COLS)
+}
+
+/// Compute the chrome cross for a `cols`x`rows` screen with an explicit sidebar
+/// width. `want_sidebar`/`want_panel` are the user's toggle state; each is
+/// additionally suppressed when the screen is too narrow.
+pub fn compute_with_width(
+    cols: usize,
+    rows: usize,
+    want_sidebar: bool,
+    want_panel: bool,
+    sidebar_cols: usize,
+) -> ChromeLayout {
     let show_sidebar = want_sidebar && cols >= SIDEBAR_MIN_COLS;
     let show_panel = want_panel && cols >= PANEL_MIN_COLS;
 
@@ -67,7 +84,11 @@ pub fn compute(cols: usize, rows: usize, want_sidebar: bool, want_panel: bool) -
     let band_rows = rows.saturating_sub(TABBAR_ROWS + STATUSBAR_ROWS);
 
     // Clamp surface widths so the center keeps at least 1 column.
-    let mut left = if show_sidebar { SIDEBAR_COLS } else { 0 };
+    let mut left = if show_sidebar {
+        sidebar_cols.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH)
+    } else {
+        0
+    };
     let mut right = if show_panel { PANEL_COLS } else { 0 };
     while left + right + 1 > cols && (left > 0 || right > 0) {
         if right >= left && right > 0 {

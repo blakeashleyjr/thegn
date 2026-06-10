@@ -7,6 +7,7 @@
 //! that is enforced by keeping `tokio`, `termwiz`, `iocraft`, and the native
 //! service crates out of this crate's dependency set.
 
+pub mod activity;
 pub mod config;
 pub mod db;
 pub mod diff_highlight;

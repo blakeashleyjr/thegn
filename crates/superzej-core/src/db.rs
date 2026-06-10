@@ -17,8 +17,10 @@ use std::path::PathBuf;
 
 /// Schema version. v3: workspace=session / worktree=tab remap. v4 (native host):
 /// adds `tab_layout` + `session_state` for DB-driven session resurrect (the
-/// native compositor owns layout, which zellij owned before) — purely additive.
-const SCHEMA_VERSION: i64 = 4;
+/// native compositor owns layout, which zellij owned before). v5: adds the
+/// `ui_state` key-value table backing the sidebar's persisted view state
+/// (collapse, sort mode, bar width, pin order) — purely additive.
+const SCHEMA_VERSION: i64 = 5;
 
 pub struct Db {
     conn: Connection,
@@ -173,6 +175,17 @@ impl Db {
               session_name TEXT PRIMARY KEY,
               active_tab   TEXT,
               updated_at   INTEGER
+            );
+            -- v5: a small key-value store for the sidebar's persisted view
+            -- state. `scope` namespaces a key (session_name, a workspace slug,
+            -- or "" for global); `key` is e.g. "collapse:<slug>", "sort_mode",
+            -- "sidebar_cols", "pin:<slug>", "pin_ordinal:<slug>". Survives
+            -- session resurrection alongside the rest of the layout.
+            CREATE TABLE IF NOT EXISTS ui_state (
+              scope TEXT NOT NULL,
+              key   TEXT NOT NULL,
+              value TEXT,
+              PRIMARY KEY (scope, key)
             );
             -- Switch/panel-resolve hot path: worktree lookup keyed by the tab.
             CREATE INDEX IF NOT EXISTS idx_worktrees_session_tab
@@ -607,6 +620,57 @@ impl Db {
             .optional()?;
         Ok(r.flatten())
     }
+
+    // --- ui_state (sidebar view state: collapse, sort, width, pins) ---------
+
+    /// Read a persisted UI-state value, `None` if unset.
+    pub fn get_ui_state(&self, scope: &str, key: &str) -> Result<Option<String>> {
+        let r = self
+            .conn
+            .query_row(
+                "SELECT value FROM ui_state WHERE scope=?1 AND key=?2",
+                params![scope, key],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(r.flatten())
+    }
+
+    /// Upsert a persisted UI-state value for `(scope, key)`.
+    pub fn set_ui_state(&self, scope: &str, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO ui_state (scope, key, value)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(scope, key) DO UPDATE SET value=?3",
+            params![scope, key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a persisted UI-state value (e.g. unpinning). No-op if absent.
+    pub fn del_ui_state(&self, scope: &str, key: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM ui_state WHERE scope=?1 AND key=?2",
+            params![scope, key],
+        )?;
+        Ok(())
+    }
+
+    /// All `(key, value)` pairs in a scope — used to load every collapse/pin
+    /// entry at once on sidebar build.
+    pub fn ui_state_in_scope(&self, scope: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key, value FROM ui_state WHERE scope=?1")?;
+        let rows = stmt
+            .query_map(params![scope], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .filter_map(|(k, v)| v.map(|v| (k, v)))
+            .collect();
+        Ok(rows)
+    }
 }
 
 #[cfg(test)]
@@ -743,6 +807,13 @@ mod tests {
         assert!(db.get_diff_cache("/wt").unwrap().is_none());
         db.put_diff_cache("/wt", "M\tfile.rs").unwrap();
         assert_eq!(db.get_diff_cache("/wt").unwrap().unwrap().0, "M\tfile.rs");
+
+        // loc cache: miss → insert → upsert.
+        assert!(db.get_loc_cache("/wt").unwrap().is_none());
+        db.put_loc_cache("/wt", 123).unwrap();
+        assert_eq!(db.get_loc_cache("/wt").unwrap(), Some(123));
+        db.put_loc_cache("/wt", 456).unwrap();
+        assert_eq!(db.get_loc_cache("/wt").unwrap(), Some(456));
     }
 
     #[test]
@@ -842,5 +913,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         // db_path() still derives the default location from XDG_STATE_HOME.
         assert!(db_path().ends_with("superzej/superzej.db"));
+    }
+
+    #[test]
+    fn ui_state_roundtrip_upsert_and_scope_isolation() {
+        let db = db();
+        // Unset reads as None.
+        assert_eq!(db.get_ui_state("s1", "sort_mode").unwrap(), None);
+
+        // Insert, then read back.
+        db.set_ui_state("s1", "sort_mode", "name").unwrap();
+        assert_eq!(
+            db.get_ui_state("s1", "sort_mode").unwrap(),
+            Some("name".to_string())
+        );
+
+        // Upsert replaces in place (no duplicate row).
+        db.set_ui_state("s1", "sort_mode", "recent").unwrap();
+        assert_eq!(
+            db.get_ui_state("s1", "sort_mode").unwrap(),
+            Some("recent".to_string())
+        );
+
+        // A different scope with the same key is isolated.
+        db.set_ui_state("s2", "sort_mode", "activity").unwrap();
+        assert_eq!(
+            db.get_ui_state("s1", "sort_mode").unwrap(),
+            Some("recent".to_string())
+        );
+
+        // Bulk read of a scope returns only that scope's keys.
+        db.set_ui_state("s1", "collapse:app", "1").unwrap();
+        let mut pairs = db.ui_state_in_scope("s1").unwrap();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("collapse:app".to_string(), "1".to_string()),
+                ("sort_mode".to_string(), "recent".to_string()),
+            ]
+        );
+
+        // Delete removes just that key.
+        db.del_ui_state("s1", "collapse:app").unwrap();
+        assert_eq!(db.get_ui_state("s1", "collapse:app").unwrap(), None);
+        assert_eq!(
+            db.get_ui_state("s1", "sort_mode").unwrap(),
+            Some("recent".to_string())
+        );
     }
 }

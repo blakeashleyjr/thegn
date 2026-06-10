@@ -117,6 +117,23 @@ pub fn fill(surface: &mut Surface, rect: Rect, bg: ColorAttribute) {
     }
 }
 
+/// A row context menu (item 27): a short list of actions scoped to the row the
+/// cursor sat on when it opened.
+#[derive(Debug, Clone, Default)]
+pub struct RowMenu {
+    /// Visible-row index the menu is anchored to (where it's drawn).
+    pub anchor: usize,
+    pub entries: Vec<RowMenuEntry>,
+    pub cursor: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct RowMenuEntry {
+    pub label: String,
+    /// A stable id the event loop dispatches on (e.g. "open", "close", "pin").
+    pub id: String,
+}
+
 /// What the chrome needs to paint a frame. Populated from session state + DB +
 /// git by the host; kept renderer-agnostic so it's unit-testable.
 #[derive(Debug, Clone, Default)]
@@ -124,14 +141,30 @@ pub fn fill(surface: &mut Surface, rect: Rect, bg: ColorAttribute) {
 pub struct FrameModel {
     pub tabs: Vec<String>,
     pub active_tab: usize,
-    pub sidebar: Vec<String>,
+    /// The structured workspace tree. Replaces the old flat `Vec<String>`:
+    /// rows carry kind/depth/status so the renderer composes glyphs itself.
+    pub sidebar_rows: Vec<crate::sidebar::SidebarRow>,
+    /// Selection cursor: an index into the *visible* rows of `sidebar_rows`.
     pub sidebar_selected: usize,
-    /// Per-sidebar-row jump target: the tab index a row activates (`Enter`).
-    /// `None` for non-navigable rows (placeholders). Same length as `sidebar`.
-    pub sidebar_targets: Vec<Option<usize>>,
     /// True when the sidebar currently owns keyboard focus (drives the
-    /// focus indicator in [`draw_sidebar`]).
+    /// focus indicator + per-row digit hints in [`draw_sidebar`]).
     pub sidebar_focused: bool,
+    /// Active fuzzy-filter query echoed in the header (empty = none).
+    pub sidebar_filter: String,
+    /// True while the filter input sub-mode is capturing keystrokes.
+    pub sidebar_filtering: bool,
+    /// The current sort mode, shown in the header.
+    pub sidebar_sort: crate::sidebar::SortMode,
+    /// Row indices (into the visible list) that are multi-selected.
+    pub sidebar_marked: std::collections::HashSet<usize>,
+    /// When `Some`, an open row context menu: (anchor visible-row index,
+    /// entries, menu cursor).
+    pub sidebar_menu: Option<RowMenu>,
+    /// Data carriers populated by the hydration thread and consumed by the
+    /// event loop to (re)derive `sidebar_rows`. The (slug, display) workspace
+    /// list in display order, and per-worktree git/agent/activity status.
+    pub sidebar_workspaces: Vec<(String, String)>,
+    pub sidebar_status: crate::sidebar::SidebarStatus,
     /// Structured Diff/PR/Checks payload for the right panel.
     pub panel: crate::panel::PanelData,
     /// True when the right panel currently owns keyboard focus.
@@ -201,33 +234,70 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
 pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
     fill(surface, rect, theme_color(theme::BG0));
     let accent = theme_color(model.accent_or_default());
-    // When focused the header reads "WORKSPACES ◂" to signal it owns input.
-    let title = if model.sidebar_focused {
-        " WORKSPACES \u{25c2}"
+
+    // Header: either the live filter input, or "WORKSPACES" + sort tag. The
+    // focused marker (◂) signals the sidebar owns input.
+    if model.sidebar_filtering || !model.sidebar_filter.is_empty() {
+        let header = format!(" /{}", model.sidebar_filter);
+        draw_text(
+            surface,
+            rect.x,
+            rect.y,
+            &header,
+            accent,
+            theme_color(theme::BG0),
+            rect.cols,
+        );
     } else {
-        " WORKSPACES"
-    };
-    draw_text(
-        surface,
-        rect.x,
-        rect.y,
-        title,
-        accent,
-        theme_color(theme::BG0),
-        rect.cols,
-    );
-    for (i, item) in model.sidebar.iter().enumerate() {
+        let marker = if model.sidebar_focused {
+            " \u{25c2}"
+        } else {
+            ""
+        };
+        let title = format!(" WORKSPACES{marker}");
+        draw_text(
+            surface,
+            rect.x,
+            rect.y,
+            &title,
+            accent,
+            theme_color(theme::BG0),
+            rect.cols,
+        );
+        // Right-aligned 1-letter sort tag (n/r/a) when focused.
+        if model.sidebar_focused && rect.cols >= 3 {
+            let tag = &model.sidebar_sort.as_str()[..1];
+            draw_text(
+                surface,
+                rect.x + rect.cols - 2,
+                rect.y,
+                tag,
+                theme_color(theme::FAINT),
+                theme_color(theme::BG0),
+                1,
+            );
+        }
+    }
+
+    // Only visible rows are listed; the selection index is into that subset.
+    let visible: Vec<&crate::sidebar::SidebarRow> =
+        model.sidebar_rows.iter().filter(|r| r.visible).collect();
+
+    for (i, row) in visible.iter().enumerate() {
         let y = rect.y + 1 + i;
         if y >= rect.y + rect.rows {
             break;
         }
         let selected = i == model.sidebar_selected;
-        let (fg, bg) = if selected {
-            (theme_color(theme::TEXT), theme_color(theme::PANEL2))
+        let marked = model.sidebar_marked.contains(&i);
+        let bg = if selected {
+            theme_color(theme::PANEL2)
+        } else if marked {
+            theme_color(theme::PANEL)
         } else {
-            (theme_color(theme::DIM), theme_color(theme::BG0))
+            theme_color(theme::BG0)
         };
-        if selected {
+        if selected || marked {
             fill(
                 surface,
                 Rect {
@@ -238,20 +308,186 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
                 },
                 bg,
             );
-            // A left-edge accent bar marks the cursor row only while the sidebar
-            // owns keyboard focus, so a stale selection isn't mistaken for focus.
-            if model.sidebar_focused {
-                draw_text(surface, rect.x, y, "\u{2590}", accent, bg, 1);
-            }
         }
+        // Left-edge accent bar marks the cursor only while focused, so a stale
+        // selection isn't mistaken for focus.
+        if selected && model.sidebar_focused {
+            draw_text(surface, rect.x, y, "\u{2590}", accent, bg, 1);
+        }
+
+        let composed = compose_sidebar_row(row, i, model.sidebar_focused);
+        let fg = if row.active {
+            accent
+        } else if selected {
+            theme_color(theme::TEXT)
+        } else {
+            theme_color(theme::DIM)
+        };
         draw_text(
             surface,
             rect.x + 1,
             y,
-            item,
+            &composed.text,
             fg,
             bg,
             rect.cols.saturating_sub(1),
+        );
+        // Overpaint the status segment (git/agent/activity) in its own colors,
+        // right after the label, when there's room.
+        if let Some(seg) = composed.status {
+            let sx = rect.x + 1 + composed.status_col;
+            if sx < rect.x + rect.cols {
+                draw_text(
+                    surface,
+                    sx,
+                    y,
+                    &seg,
+                    status_seg_color(row),
+                    bg,
+                    (rect.x + rect.cols).saturating_sub(sx),
+                );
+            }
+        }
+    }
+
+    // Row context menu overlay (item 27).
+    if let Some(menu) = &model.sidebar_menu {
+        draw_row_menu(surface, rect, menu, accent);
+    }
+}
+
+/// The text composed for a row plus where its status segment begins (so the
+/// renderer can recolor it). `text` already includes caret/connector/label and
+/// a trailing space before the status; `status` is the git/agent/activity tail.
+struct ComposedRow {
+    text: String,
+    status: Option<String>,
+    status_col: usize,
+}
+
+fn compose_sidebar_row(
+    row: &crate::sidebar::SidebarRow,
+    visible_index: usize,
+    focused: bool,
+) -> ComposedRow {
+    use crate::sidebar::RowKind;
+    let mut text = String::new();
+
+    // Quick-jump number (item 24): a 1-based index shown only while focused,
+    // for the first 9 rows.
+    if focused && visible_index < 9 {
+        text.push_str(&format!("{} ", visible_index + 1));
+    }
+
+    match row.kind {
+        RowKind::Workspace => {
+            let caret = if row.collapsed {
+                "\u{25b8}"
+            } else {
+                "\u{25be}"
+            };
+            text.push_str(caret);
+            text.push(' ');
+            text.push_str(&row.label);
+        }
+        RowKind::Worktree => {
+            text.push_str("  ");
+            text.push_str(activity_dot(row.activity));
+            text.push_str(&row.label);
+        }
+        RowKind::Page => {
+            text.push_str("      ");
+            text.push_str(&row.label);
+        }
+    }
+
+    // Agent glyph (item 19) sits just after the label.
+    if let Some(agent) = &row.agent {
+        text.push(' ');
+        text.push_str(&superzej_core::theme::agent_glyph(agent));
+    }
+
+    // Git glyphs (item 18) form the recolored status tail.
+    let status = row.git.map(|g| {
+        let mut s = String::new();
+        if g.dirty {
+            s.push_str(" \u{25cf}"); // ●
+        }
+        if g.ahead > 0 {
+            s.push_str(&format!(" \u{2191}{}", g.ahead)); // ↑N
+        }
+        if g.behind > 0 {
+            s.push_str(&format!(" \u{2193}{}", g.behind)); // ↓N
+        }
+        s
+    });
+    let status = status.filter(|s| !s.is_empty());
+    let status_col = text.chars().count();
+    ComposedRow {
+        text,
+        status,
+        status_col,
+    }
+}
+
+/// The activity dot prefix for a worktree row (item 20). Active rows pulse via
+/// the accent; quiet rows show a steady amber "look at me"; idle shows nothing.
+fn activity_dot(state: crate::sidebar::ActivityState) -> &'static str {
+    use crate::sidebar::ActivityState::*;
+    match state {
+        Active => "\u{25cf} ", // ● (colored at render via row.active/accent path is separate)
+        Quiet => "\u{25cb} ",  // ○
+        None => "",
+    }
+}
+
+fn status_seg_color(row: &crate::sidebar::SidebarRow) -> ColorAttribute {
+    // Dirty dominates the tail color; otherwise neutral-dim and the ↑↓ read
+    // fine. (Per-glyph coloring is a later refinement.)
+    match row.git {
+        Some(g) if g.dirty => theme_color(theme::AMBER),
+        Some(g) if g.ahead > 0 || g.behind > 0 => theme_color(theme::DIM),
+        _ => theme_color(theme::DIM),
+    }
+}
+
+fn draw_row_menu(surface: &mut Surface, rect: Rect, menu: &RowMenu, accent: ColorAttribute) {
+    let width = rect.cols;
+    let top = (rect.y + 1 + menu.anchor + 1).min(rect.y + rect.rows.saturating_sub(1));
+    for (i, entry) in menu.entries.iter().enumerate() {
+        let y = top + i;
+        if y >= rect.y + rect.rows {
+            break;
+        }
+        let sel = i == menu.cursor;
+        let bg = if sel {
+            theme_color(theme::RAISE)
+        } else {
+            theme_color(theme::PANEL)
+        };
+        fill(
+            surface,
+            Rect {
+                x: rect.x,
+                y,
+                cols: width,
+                rows: 1,
+            },
+            bg,
+        );
+        let fg = if sel {
+            accent
+        } else {
+            theme_color(theme::TEXT)
+        };
+        draw_text(
+            surface,
+            rect.x + 1,
+            y,
+            &format!("\u{203a} {}", entry.label),
+            fg,
+            bg,
+            width.saturating_sub(1),
         );
     }
 }
@@ -641,6 +877,30 @@ mod tests {
             .collect()
     }
 
+    /// Build a minimal sidebar row for renderer tests.
+    fn row(kind: crate::sidebar::RowKind, label: &str) -> crate::sidebar::SidebarRow {
+        crate::sidebar::SidebarRow {
+            kind,
+            depth: if kind == crate::sidebar::RowKind::Workspace {
+                0
+            } else {
+                1
+            },
+            label: label.into(),
+            workspace_slug: "app".into(),
+            tab_target: None,
+            active: false,
+            worktree_path: None,
+            pin_key: label.into(),
+            branch: None,
+            git: None,
+            agent: None,
+            activity: crate::sidebar::ActivityState::None,
+            visible: true,
+            collapsed: false,
+        }
+    }
+
     #[test]
     fn sidebar_focus_indicator_appears_only_when_focused() {
         let rect = Rect {
@@ -649,8 +909,12 @@ mod tests {
             cols: 24,
             rows: 6,
         };
+        use crate::sidebar::RowKind;
         let model = FrameModel {
-            sidebar: vec!["app".into(), "  home".into()],
+            sidebar_rows: vec![
+                row(RowKind::Workspace, "app"),
+                row(RowKind::Worktree, "home"),
+            ],
             sidebar_selected: 1,
             sidebar_focused: true,
             ..Default::default()
@@ -669,6 +933,41 @@ mod tests {
             !text2.contains('\u{25c2}'),
             "no focus marker when unfocused: {text2:?}"
         );
+    }
+
+    #[test]
+    fn sidebar_renders_glyphs_caret_dirty_and_agent() {
+        use crate::sidebar::{ActivityState, GitGlyphs, RowKind};
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 30,
+            rows: 8,
+        };
+        let mut ws = row(RowKind::Workspace, "app");
+        ws.collapsed = false;
+        let mut wt = row(RowKind::Worktree, "feat");
+        wt.git = Some(GitGlyphs {
+            dirty: true,
+            ahead: 2,
+            behind: 1,
+        });
+        wt.agent = Some("claude".into());
+        wt.activity = ActivityState::Active;
+        let model = FrameModel {
+            sidebar_rows: vec![ws, wt],
+            sidebar_selected: 0,
+            sidebar_focused: true,
+            ..Default::default()
+        };
+        let mut s = Surface::new(30, 8);
+        draw_sidebar(&mut s, rect, &model);
+        let text = s.screen_chars_to_string();
+        assert!(text.contains('\u{25be}'), "expanded caret ▾: {text:?}"); // expanded workspace
+        assert!(text.contains("feat"));
+        assert!(text.contains('\u{2191}'), "ahead glyph ↑: {text:?}");
+        assert!(text.contains('\u{2193}'), "behind glyph ↓: {text:?}");
+        assert!(text.contains('C'), "agent glyph for claude: {text:?}");
     }
 
     #[test]
@@ -871,7 +1170,10 @@ mod tests {
         let model = FrameModel {
             tabs: vec!["repo/home".into()],
             active_tab: 0,
-            sidebar: vec!["repo".into(), "  feat".into()],
+            sidebar_rows: vec![
+                row(crate::sidebar::RowKind::Workspace, "repo"),
+                row(crate::sidebar::RowKind::Worktree, "feat"),
+            ],
             panel: crate::panel::PanelData {
                 branch: "feat".into(),
                 pr: Some(crate::panel::PrSummary {

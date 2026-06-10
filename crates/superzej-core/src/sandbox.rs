@@ -733,7 +733,7 @@ pub fn stats(spec: &SandboxSpec) -> Option<SandboxStats> {
     }
     let rt = spec.backend.binary();
     // format: CPUPerc|MemUsage
-    let argv = vec![
+    let argv = [
         rt,
         "stats",
         "--no-stream",
@@ -1018,9 +1018,12 @@ mod tests {
 
         // Cleanup
         let _ = child.kill();
+        let _ = child.wait();
         let loc = crate::remote::GitLoc::Local(std::path::PathBuf::from("/"));
-        let mut cfg = crate::config::SandboxConfig::default();
-        cfg.enabled = true;
+        let cfg = crate::config::SandboxConfig {
+            enabled: true,
+            ..Default::default()
+        };
         teardown(&cfg, &loc, &s.name);
 
         assert_eq!(status.trim(), "200", "Port 8081 was not exposed properly");
@@ -1067,8 +1070,10 @@ mod tests {
 
         // 3. Teardown
         let loc = crate::remote::GitLoc::Local(std::path::PathBuf::from("/"));
-        let mut cfg = crate::config::SandboxConfig::default();
-        cfg.enabled = true;
+        let cfg = crate::config::SandboxConfig {
+            enabled: true,
+            ..Default::default()
+        };
         teardown(&cfg, &loc, &s.name);
 
         // Verify it's gone

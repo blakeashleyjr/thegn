@@ -42,6 +42,10 @@ pub trait GitBackend: Send + Sync {
     fn diff_files(&self, loc: &GitLoc, base: &str) -> Result<Vec<DiffEntry>>;
     fn branches(&self, loc: &GitLoc) -> Result<Vec<Branch>>;
     fn current_branch(&self, loc: &GitLoc) -> Result<String>;
+    /// Commits the current branch is `(ahead, behind)` its upstream tracking
+    /// branch. `None` when the branch has no configured upstream (or HEAD is
+    /// detached) — the sidebar simply omits the ↑/↓ glyphs in that case.
+    fn ahead_behind(&self, loc: &GitLoc) -> Result<Option<(usize, usize)>>;
     fn worktrees(&self, root: &Path) -> Result<Vec<WorktreeInfo>>;
     fn add_worktree(&self, root: &Path, branch: &str, base: &str, path: &Path) -> Result<()>;
     fn remove_worktree(&self, root: &Path, path: &Path, delete_branch: bool) -> Result<()>;
@@ -124,6 +128,27 @@ impl GitBackend for CliGit {
         Ok(run(loc, &["rev-parse", "--abbrev-ref", "HEAD"])?
             .trim()
             .to_string())
+    }
+
+    fn ahead_behind(&self, loc: &GitLoc) -> Result<Option<(usize, usize)>> {
+        // `@{u}` resolves the upstream; the command fails when none is set, so a
+        // non-zero exit is treated as "no upstream" rather than an error.
+        let out = match loc
+            .git_command(&["rev-list", "--left-right", "--count", "@{u}...HEAD"])
+            .output()
+        {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+            _ => return Ok(None),
+        };
+        // Output is "<behind>\t<ahead>": left side is @{u} (commits we lack),
+        // right side is HEAD (commits ahead).
+        let mut it = out.split_whitespace();
+        let behind = it.next().and_then(|s| s.parse().ok());
+        let ahead = it.next().and_then(|s| s.parse().ok());
+        match (ahead, behind) {
+            (Some(a), Some(b)) => Ok(Some((a, b))),
+            _ => Ok(None),
+        }
     }
 
     fn worktrees(&self, root: &Path) -> Result<Vec<WorktreeInfo>> {
@@ -221,6 +246,54 @@ impl GitBackend for GixGit {
         Ok(v)
     }
 
+    fn ahead_behind(&self, loc: &GitLoc) -> Result<Option<(usize, usize)>> {
+        if loc.is_remote() {
+            return self.fallback.ahead_behind(loc);
+        }
+        let repo = gix::discover(loc.path()).context("gix discover")?;
+        // The current branch reference; bail to None when detached / unborn.
+        let Some(head_ref) = repo.head_ref().context("gix head_ref")? else {
+            return Ok(None);
+        };
+        // Its upstream tracking ref (e.g. refs/remotes/origin/main). Absent =>
+        // no upstream configured => no counts.
+        let Some(upstream_name) = head_ref.remote_tracking_ref_name(gix::remote::Direction::Fetch)
+        else {
+            return Ok(None);
+        };
+        let upstream_name = match upstream_name {
+            Ok(n) => n,
+            Err(_) => return Ok(None),
+        };
+        let Ok(mut upstream) = repo.find_reference(upstream_name.as_ref()) else {
+            return Ok(None);
+        };
+
+        let head_id = head_ref.id();
+        let upstream_id = upstream.peel_to_id().context("peel upstream ref")?;
+
+        // ahead = commits reachable from HEAD but not from upstream; behind is
+        // the symmetric reverse. `with_hidden` paints the opposite tip's
+        // ancestry as unwanted so the walk yields exactly the difference.
+        let count_excluding = |tip: gix::ObjectId, hidden: gix::ObjectId| -> Result<usize> {
+            let walk = repo
+                .rev_walk([tip])
+                .with_hidden([hidden])
+                .all()
+                .context("gix rev_walk")?;
+            let mut n = 0usize;
+            for info in walk {
+                info.map_err(|e| anyhow::anyhow!("gix rev_walk item: {e}"))?;
+                n += 1;
+            }
+            Ok(n)
+        };
+
+        let ahead = count_excluding(head_id.detach(), upstream_id.detach())?;
+        let behind = count_excluding(upstream_id.detach(), head_id.detach())?;
+        Ok(Some((ahead, behind)))
+    }
+
     // --- delegated to the CLI fallback ---
     fn status(&self, loc: &GitLoc) -> Result<Vec<FileStatus>> {
         self.fallback.status(loc)
@@ -309,5 +382,87 @@ mod tests {
         // Should not error on a normal repo (content is environment-dependent).
         let _ = CliGit.status(&loc).unwrap();
         let _ = CliGit.diff_files(&loc, "HEAD").unwrap();
+    }
+
+    /// Run `git` in `dir`, panicking on failure (test setup helper).
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@e")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@e")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(ok, "git {} failed in {}", args.join(" "), dir.display());
+    }
+
+    fn commit_empty(dir: &std::path::Path, msg: &str) {
+        git_in(dir, &["commit", "--allow-empty", "-q", "-m", msg]);
+    }
+
+    #[test]
+    fn ahead_behind_counts_divergence_and_is_none_without_upstream() {
+        let base = std::env::temp_dir().join(format!("sz-ab-{}-{:p}", std::process::id(), &0u8));
+        let _ = std::fs::remove_dir_all(&base);
+        let remote = base.join("remote.git");
+        let clone = base.join("clone");
+        std::fs::create_dir_all(&base).unwrap();
+
+        // A bare "remote" with one commit, cloned locally so the clone's branch
+        // has a tracking upstream.
+        git_in(&base, &["init", "-q", "--bare", remote.to_str().unwrap()]);
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        git_in(&seed, &["init", "-q", "-b", "main"]);
+        commit_empty(&seed, "c0");
+        git_in(
+            &seed,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git_in(&seed, &["push", "-q", "origin", "main"]);
+        git_in(
+            &base,
+            &[
+                "clone",
+                "-q",
+                remote.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+
+        let loc = GitLoc::for_worktree(&clone);
+        let gix = GixGit::new();
+        let cli = CliGit;
+
+        // Freshly cloned, in sync with upstream.
+        assert_eq!(gix.ahead_behind(&loc).unwrap(), Some((0, 0)));
+        assert_eq!(cli.ahead_behind(&loc).unwrap(), Some((0, 0)));
+
+        // Two local commits ahead.
+        commit_empty(&clone, "a1");
+        commit_empty(&clone, "a2");
+        assert_eq!(gix.ahead_behind(&loc).unwrap(), Some((2, 0)));
+        assert_eq!(cli.ahead_behind(&loc).unwrap(), Some((2, 0)));
+
+        // Advance the remote by one and refetch: now also 1 behind.
+        commit_empty(&seed, "r1");
+        git_in(&seed, &["push", "-q", "origin", "main"]);
+        git_in(&clone, &["fetch", "-q", "origin"]);
+        assert_eq!(gix.ahead_behind(&loc).unwrap(), Some((2, 1)));
+        assert_eq!(cli.ahead_behind(&loc).unwrap(), Some((2, 1)));
+
+        // A repo with no upstream reports None.
+        let solo = base.join("solo");
+        std::fs::create_dir_all(&solo).unwrap();
+        git_in(&solo, &["init", "-q", "-b", "main"]);
+        commit_empty(&solo, "s0");
+        let solo_loc = GitLoc::for_worktree(&solo);
+        assert_eq!(gix.ahead_behind(&solo_loc).unwrap(), None);
+        assert_eq!(cli.ahead_behind(&solo_loc).unwrap(), None);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
