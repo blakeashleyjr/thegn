@@ -121,6 +121,8 @@ pub struct SidebarRow {
     pub visible: bool,
     /// For Workspace rows: whether its subtree is collapsed (drives the caret).
     pub collapsed: bool,
+    /// For Workspace rows: a non-git "dir" workspace (drives a distinct glyph).
+    pub dir: bool,
 }
 
 /// Per-worktree status sourced from the (possibly slow) git/activity scan on
@@ -182,14 +184,14 @@ struct Group {
 /// `status` carries per-worktree git/agent/activity merged onto rows.
 pub fn build_rows(
     session: &Session,
-    workspaces: &[(String, String)],
+    workspaces: &[(String, String, String)],
     view: &ViewState,
     status: &SidebarStatus,
 ) -> Vec<SidebarRow> {
     let activity = &status.activity;
     let mut rows = Vec::new();
 
-    for (repo_slug, display) in workspaces {
+    for (repo_slug, display, kind) in workspaces {
         let collapsed = view.collapsed.contains(repo_slug);
         rows.push(SidebarRow {
             kind: RowKind::Workspace,
@@ -206,6 +208,7 @@ pub fn build_rows(
             activity: ActivityState::None,
             visible: true,
             collapsed,
+            dir: kind == "dir",
         });
 
         // Group this repo's tabs by worktree base; collect pages per group.
@@ -271,6 +274,7 @@ pub fn build_rows(
                 activity: g.activity,
                 visible: !collapsed,
                 collapsed: false,
+                dir: false,
             });
             if g.pages.len() > 1 {
                 for (page, pos, is_active) in &g.pages {
@@ -289,6 +293,7 @@ pub fn build_rows(
                         activity: ActivityState::None,
                         visible: !collapsed,
                         collapsed: false,
+                        dir: false,
                     });
                 }
             }
@@ -311,6 +316,7 @@ pub fn build_rows(
             activity: ActivityState::None,
             visible: true,
             collapsed: false,
+            dir: false,
         });
     }
 
@@ -528,7 +534,7 @@ mod tests {
             vec![tab("app/feat", "/wt/feat"), tab("app/home", "/wt/home")],
             0,
         );
-        let ws = vec![("app".to_string(), "app".to_string())];
+        let ws = vec![("app".to_string(), "app".to_string(), "repo".to_string())];
         let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity());
         let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
         assert_eq!(labels, vec!["app", "home", "feat"]);
@@ -537,9 +543,23 @@ mod tests {
     }
 
     #[test]
+    fn workspace_kind_sets_dir_flag_on_the_row() {
+        let s = session(vec![], 0);
+        let ws = vec![
+            ("repo".to_string(), "repo".to_string(), "repo".to_string()),
+            ("notes".to_string(), "notes".to_string(), "dir".to_string()),
+        ];
+        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity());
+        let repo_row = rows.iter().find(|r| r.label == "repo").unwrap();
+        let dir_row = rows.iter().find(|r| r.label == "notes").unwrap();
+        assert!(!repo_row.dir, "repo workspace is not a dir");
+        assert!(dir_row.dir, "non-git workspace is flagged dir");
+    }
+
+    #[test]
     fn collapse_hides_children() {
         let s = session(vec![tab("app/home", "/wt/home")], 0);
-        let ws = vec![("app".to_string(), "app".to_string())];
+        let ws = vec![("app".to_string(), "app".to_string(), "repo".to_string())];
         let mut view = ViewState::default();
         view.collapsed.insert("app".to_string());
         let rows = build_rows(&s, &ws, &view, &no_activity());
@@ -556,7 +576,7 @@ mod tests {
             ],
             0,
         );
-        let ws = vec![("app".to_string(), "app".to_string())];
+        let ws = vec![("app".to_string(), "app".to_string(), "repo".to_string())];
         let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity());
         let kinds: Vec<RowKind> = rows.iter().map(|r| r.kind).collect();
         assert_eq!(
@@ -576,7 +596,7 @@ mod tests {
             vec![tab("app/home", "/wt/home"), tab("app/feature-x", "/wt/fx")],
             0,
         );
-        let ws = vec![("app".to_string(), "app".to_string())];
+        let ws = vec![("app".to_string(), "app".to_string(), "repo".to_string())];
         let view = ViewState {
             filter: "feature".into(),
             ..Default::default()
@@ -598,7 +618,7 @@ mod tests {
             vec![tab("app/home", "/wt/home"), tab("app/feat", "/wt/feat")],
             0,
         );
-        let ws = vec![("app".to_string(), "app".to_string())];
+        let ws = vec![("app".to_string(), "app".to_string(), "repo".to_string())];
         let view = ViewState {
             pins: vec!["app/feat".into()],
             ..Default::default()
@@ -617,7 +637,7 @@ mod tests {
             vec![tab("app/home", "/wt/home"), tab("app/busy", "/wt/busy")],
             0,
         );
-        let ws = vec![("app".to_string(), "app".to_string())];
+        let ws = vec![("app".to_string(), "app".to_string(), "repo".to_string())];
         let mut act = no_activity();
         act.activity
             .insert("app/busy".into(), ActivityState::Active);

@@ -200,6 +200,12 @@ impl Db {
         // Additive: running-pin set per session (JSON), so the native host can
         // resurrect strip/float pins (the pin supervisor re-launches them).
         let _ = conn.execute("ALTER TABLE session_state ADD COLUMN pin_state TEXT", []);
+        // Additive: a workspace's kind — "repo" (a git repo) or "dir" (a plain
+        // non-git directory). Defaults keep every pre-existing workspace a repo.
+        let _ = conn.execute(
+            "ALTER TABLE workspaces ADD COLUMN kind TEXT DEFAULT 'repo'",
+            [],
+        );
         Ok(Db { conn })
     }
 
@@ -325,16 +331,18 @@ impl Db {
             .collect())
     }
 
-    // --- workspaces (a registered repo) ------------------------------------
-    /// Record (or refresh) a registered repo. Keyed by repo path — all repos
-    /// share the one UI session now.
-    pub fn put_workspace(&self, repo_path: &str, name: &str) -> Result<()> {
+    // --- workspaces (a registered repo or plain dir) ----------------------
+    /// Record (or refresh) a registered workspace. Keyed by path — all
+    /// workspaces share the one UI session. `kind` is `"repo"` (a git repo) or
+    /// `"dir"` (a plain non-git directory); it is set only on first insert, so a
+    /// later refresh never downgrades a known workspace's kind.
+    pub fn put_workspace(&self, repo_path: &str, name: &str, kind: &str) -> Result<()> {
         let now = util::now();
         self.conn.execute(
-            r#"INSERT INTO workspaces(repo_path,name,created_at,last_active)
-               VALUES(?1,?2,?3,?3)
+            r#"INSERT INTO workspaces(repo_path,name,created_at,last_active,kind)
+               VALUES(?1,?2,?3,?3,?4)
                ON CONFLICT(repo_path) DO UPDATE SET name=?2, last_active=?3"#,
-            params![repo_path, name, now],
+            params![repo_path, name, now, kind],
         )?;
         Ok(())
     }
@@ -389,7 +397,7 @@ impl Db {
     /// All registered repos (for the sidebar / `list`), newest-active first.
     pub fn workspaces(&self) -> Result<Vec<WorkspaceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT repo_path, name, created_at, last_active
+            "SELECT repo_path, name, created_at, last_active, kind
              FROM workspaces ORDER BY last_active DESC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -398,6 +406,10 @@ impl Db {
                 name: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
                 created_at: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
                 last_active: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                kind: r
+                    .get::<_, Option<String>>(4)?
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "repo".into()),
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -819,13 +831,23 @@ mod tests {
     #[test]
     fn workspaces_roundtrip() {
         let db = db();
-        db.put_workspace("/repo", "repo").unwrap();
-        db.put_workspace("/repo", "repo2").unwrap(); // upsert renames
+        db.put_workspace("/repo", "repo", "repo").unwrap();
+        db.put_workspace("/repo", "repo2", "repo").unwrap(); // upsert renames
         let ws = db.workspaces().unwrap();
         assert_eq!(ws.len(), 1);
         assert_eq!(ws[0].repo_path, "/repo");
         assert_eq!(ws[0].name, "repo2");
+        assert_eq!(ws[0].kind, "repo");
         assert!(db.is_known_repo("/repo").unwrap());
+    }
+
+    #[test]
+    fn workspace_kind_is_insert_only() {
+        let db = db();
+        db.put_workspace("/d", "d", "dir").unwrap();
+        // A later refresh passing "repo" must not downgrade an existing dir.
+        db.put_workspace("/d", "d", "repo").unwrap();
+        assert_eq!(db.workspaces().unwrap()[0].kind, "dir");
     }
 
     #[test]

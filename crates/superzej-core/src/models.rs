@@ -2,8 +2,8 @@
 
 use serde::Serialize;
 
-/// A registered repo (a "workspace"), as recorded in the DB. A workspace is
-/// identified by its repo path.
+/// A registered workspace, as recorded in the DB. Identified by its path — a
+/// git repo's main worktree, or a plain directory for a non-repo workspace.
 #[derive(Debug, Clone, Serialize)]
 #[allow(dead_code)]
 pub struct WorkspaceRow {
@@ -11,6 +11,9 @@ pub struct WorkspaceRow {
     pub name: String,
     pub created_at: i64,
     pub last_active: i64,
+    /// `"repo"` (a git repo) or `"dir"` (a plain non-git directory). Git-only
+    /// actions no-op on `dir` workspaces.
+    pub kind: String,
 }
 
 /// A superzej-managed worktree (one per tab) as recorded in the DB. Some fields
@@ -71,6 +74,7 @@ mod tests {
             name: "r".into(),
             created_at: 1,
             last_active: 2,
+            kind: "repo".into(),
         };
         assert!(
             serde_json::to_string(&ws)

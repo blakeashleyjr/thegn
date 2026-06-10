@@ -362,14 +362,15 @@ fn active_tab_path(session: &crate::session::Session) -> std::path::PathBuf {
         .unwrap_or_else(|| ".".into())
 }
 
-/// The ordered `(slug, display)` workspace list backing the tree: every repo
-/// known to the DB (stable slug), plus any live tab's repo prefix not yet in
-/// the DB. The structured tree is then built by [`crate::sidebar::build_rows`].
+/// The ordered `(slug, display, kind)` workspace list backing the tree: every
+/// workspace known to the DB (stable slug; `kind` = "repo" | "dir"), plus any
+/// live tab's repo prefix not yet in the DB. The structured tree is then built
+/// by [`crate::sidebar::build_rows`].
 fn workspace_list(
     session: &crate::session::Session,
     db: Option<&superzej_core::db::Db>,
-) -> Vec<(String, String)> {
-    let mut workspaces: Vec<(String, String)> = Vec::new();
+) -> Vec<(String, String, String)> {
+    let mut workspaces: Vec<(String, String, String)> = Vec::new();
     if let Some(db) = db
         && let Ok(rows) = db.workspaces()
     {
@@ -386,16 +387,17 @@ fn workspace_list(
             let slug = db
                 .slug_for_repo(&w.repo_path, &base)
                 .unwrap_or_else(|_| base.clone());
-            if !workspaces.iter().any(|(s, _)| *s == slug) {
-                workspaces.push((slug, display));
+            if !workspaces.iter().any(|(s, _, _)| *s == slug) {
+                workspaces.push((slug, display, w.kind.clone()));
             }
         }
     }
     for tab in &session.tabs {
         if let Some((repo, _)) = crate::sidebar::split_tab(&tab.name)
-            && !workspaces.iter().any(|(s, _)| *s == repo)
+            && !workspaces.iter().any(|(s, _, _)| *s == repo)
         {
-            workspaces.push((repo.clone(), repo));
+            // Live tabs always belong to a git repo workspace.
+            workspaces.push((repo.clone(), repo, "repo".to_string()));
         }
     }
     workspaces
@@ -1068,9 +1070,9 @@ fn refresh_tab_model(
     if model.sidebar_workspaces.is_empty() {
         model.sidebar_workspaces = workspace_list(session, None);
     } else {
-        for (slug, _) in workspace_list(session, None) {
-            if !model.sidebar_workspaces.iter().any(|(s, _)| *s == slug) {
-                model.sidebar_workspaces.push((slug.clone(), slug));
+        for (slug, display, kind) in workspace_list(session, None) {
+            if !model.sidebar_workspaces.iter().any(|(s, _, _)| *s == slug) {
+                model.sidebar_workspaces.push((slug, display, kind));
             }
         }
     }
@@ -3027,7 +3029,7 @@ mod tests {
     fn sidebar_filter_hides_nonmatching_rows() {
         let session = two_worktree_session();
         let mut model = build_initial_model(&session);
-        model.sidebar_workspaces = vec![("app".into(), "app".into())];
+        model.sidebar_workspaces = vec![("app".into(), "app".into(), "repo".into())];
         let mut sb = focused_state(&mut model, &session);
 
         press(&mut sb, '/', &mut model, &session);
@@ -3048,7 +3050,7 @@ mod tests {
     fn sidebar_quick_jump_activates_numbered_row() {
         let session = two_worktree_session();
         let mut model = build_initial_model(&session);
-        model.sidebar_workspaces = vec![("app".into(), "app".into())];
+        model.sidebar_workspaces = vec![("app".into(), "app".into(), "repo".into())];
         let mut sb = focused_state(&mut model, &session);
         // Rows: 1=app(ws) 2=home 3=feat. Jump to 3 -> activate feat's tab.
         let out = press(&mut sb, '3', &mut model, &session);
@@ -3062,7 +3064,7 @@ mod tests {
     fn sidebar_multiselect_marks_and_bulk_close_targets_marked() {
         let session = two_worktree_session();
         let mut model = build_initial_model(&session);
-        model.sidebar_workspaces = vec![("app".into(), "app".into())];
+        model.sidebar_workspaces = vec![("app".into(), "app".into(), "repo".into())];
         let mut sb = focused_state(&mut model, &session);
         // Move to the home worktree row (index 1) and mark it.
         press(&mut sb, 'j', &mut model, &session);
@@ -3118,7 +3120,7 @@ mod tests {
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
 
         let db = superzej_core::db::Db::open_at(&db_path).unwrap();
-        let _ = db.put_workspace("/tmp/app", "app");
+        let _ = db.put_workspace("/tmp/app", "app", "repo");
         let mk = |name: &str, wt: &str| superzej_core::models::TabLayoutRow {
             tab_name: name.into(),
             kind: "worktree".into(),
@@ -3150,10 +3152,10 @@ mod tests {
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
 
         let db = superzej_core::db::Db::open_at(&db_path).unwrap();
-        let _ = db.put_workspace("/tmp/repo1", "repo1");
+        let _ = db.put_workspace("/tmp/repo1", "repo1", "repo");
         // Ensure some time passes so timestamps are distinctly different
         std::thread::sleep(std::time::Duration::from_millis(10));
-        let _ = db.put_workspace("/tmp/repo2", "repo2");
+        let _ = db.put_workspace("/tmp/repo2", "repo2", "repo");
 
         // SAFETY: test is single-threaded; sets/clears an XDG var around calls.
         unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
@@ -3166,7 +3168,7 @@ mod tests {
         let slugs: Vec<&str> = model
             .sidebar_workspaces
             .iter()
-            .map(|(s, _)| s.as_str())
+            .map(|(s, _, _)| s.as_str())
             .collect();
         assert!(
             slugs.contains(&"repo1"),
@@ -3186,8 +3188,8 @@ mod tests {
             now_secs()
         ));
         let db = superzej_core::db::Db::open_at(&db_path).unwrap();
-        db.put_workspace("/tmp/repo-a", "repo-a").unwrap();
-        db.put_workspace("/tmp/repo-b", "repo-b").unwrap();
+        db.put_workspace("/tmp/repo-a", "repo-a", "repo").unwrap();
+        db.put_workspace("/tmp/repo-b", "repo-b", "repo").unwrap();
 
         let row = |name: &str, ord: i64| superzej_core::models::TabLayoutRow {
             tab_name: name.into(),
