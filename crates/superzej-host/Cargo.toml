@@ -12,6 +12,7 @@ name = "szhost"
 path = "src/main.rs"
 
 [dependencies]
+clap = { workspace = true, features = ["derive"] }
 superzej-core.workspace = true
 superzej-svc.workspace = true
 anyhow.workspace = true
@@ -24,6 +25,7 @@ portable-pty.workspace = true
 termwiz.workspace = true
 vt100.workspace = true
 nucleo-matcher.workspace = true
+notify = "6"
 
 [dev-dependencies]
 toml.workspace = true

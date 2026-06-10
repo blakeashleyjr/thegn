@@ -38,7 +38,7 @@ macro_rules! config_enum {
         } default = $def:ident;
     ) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, schemars::JsonSchema)]
         $vis enum $name { $( $variant ),+ }
 
         impl $name {
@@ -165,7 +165,7 @@ config_enum! {
     } default = Global;
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct NamedCommand {
     pub name: String,
     pub command: String,
@@ -176,7 +176,7 @@ pub struct NamedCommand {
 /// layout (`location = "layout"`). Pins are summoned via `Alt-1..9` / the
 /// tabbar's pin chips, and can be global (all workspaces) or workspace-scoped.
 /// See `src/commands/pin.rs`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Pin {
     pub name: String,
     pub command: String,
@@ -205,7 +205,7 @@ pub struct Pin {
 }
 
 /// When to start a pin.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PinStart {
     #[default]
@@ -214,7 +214,7 @@ pub enum PinStart {
 }
 
 /// When to restart a pin after it exits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PinRestart {
     #[default]
@@ -229,7 +229,7 @@ fn default_true() -> bool {
 
 /// A user-defined keybind action (`[[actions]]`): a chord bound to a shell
 /// command, optionally surfaced in the Cmd+K menu. See `src/keymap.rs`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CustomAction {
     /// Stable id + default menu/hint label.
     pub name: String,
@@ -252,7 +252,7 @@ pub struct CustomAction {
 /// Host/zellij keybinding overrides. The flat `[keybinds]` table remains the
 /// default/global layer for backwards compatibility; nested tables such as
 /// `[keybinds.vim_normal]` override only the native host's named modes.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct KeybindConfig {
     /// Backwards-compatible flat `[keybinds] action-id = "Chord"` entries.
@@ -301,7 +301,7 @@ impl<'a> IntoIterator for &'a KeybindConfig {
 
 /// `[theme]` — visual tuning. Only the accent for now; the rest of the
 /// palette is fixed (src/theme.rs).
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct ThemeConfig {
     /// Focus accent as "#rrggbb" (default the signature teal).
@@ -320,7 +320,7 @@ impl Default for ThemeConfig {
 /// (highlight a stat with Super+Alt+Up, then Enter). Each is a shell command
 /// run in an embedded tiled pane. `system` backs the CPU and MEM segments; `gpu`
 /// backs the GPU segment.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct MonitorConfig {
     /// CPU/RAM monitor (default `btm`, ClementTsang/bottom).
@@ -345,7 +345,7 @@ impl Default for MonitorConfig {
 /// *inside its own cgroup* instead of triggering a global OOM that takes the
 /// terminal session down. Scope teardown on tool exit also reaps orphaned
 /// children. An empty `tool_mem_max` disables containment.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct LimitsConfig {
     /// `MemoryMax` for the tool scope (e.g. "6G"). Empty = no containment.
@@ -364,7 +364,7 @@ impl Default for LimitsConfig {
 }
 
 /// `[pr]` — GitHub PR data feeding the right panel.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct PrConfig {
     /// Cache TTL (seconds) before a live `gh` re-fetch.
@@ -378,7 +378,7 @@ impl Default for PrConfig {
 }
 
 /// `[dashboard]` — the worktree switcher's live refresh.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct DashboardConfig {
     /// Seconds between refreshes of the `--watch` dashboard pane.
@@ -392,7 +392,7 @@ impl Default for DashboardConfig {
 }
 
 /// `[watch]` — the per-session daemon that pushes live panel updates.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct WatchConfig {
     /// Seconds between PR refreshes (back-off applies on rate limits).
@@ -410,7 +410,7 @@ impl Default for WatchConfig {
 /// `[log]` — diagnostics. The stderr sink is always on (level-gated); the file
 /// sink under `dir` is opt-in. `SUPERZEJ_LOG` (env) is a `tracing`-style filter
 /// that overrides `level` per-module.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct LogConfig {
     pub level: LogLevel,
@@ -451,7 +451,7 @@ impl LogConfig {
 
 /// `[sandbox.remote]` — optionally run a worktree on a remote machine. Empty
 /// `host` means local (the default); set it (e.g. `user@devbox`) to enable.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RemoteConfig {
     pub host: String, // "" => local
@@ -485,7 +485,7 @@ impl RemoteConfig {
 /// `[sandbox]` — containerize/sandbox a worktree's interactive process. On by
 /// default; `backend = "auto"` walks `backend_chain` and falls back to the host
 /// shell (with a warning) when nothing is available.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct SandboxConfig {
     pub enabled: bool,
@@ -535,7 +535,7 @@ impl Default for SandboxConfig {
 /// Partial overlay deserialized from a repo-root `.superzej.{toml,yaml,yml,json}`
 /// — only the keys present override the global `[sandbox]`. Also reused for the
 /// `SUPERZEJ_SANDBOX_*` env layer.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct SandboxOverlay {
     pub enabled: Option<bool>,
@@ -551,7 +551,7 @@ pub struct SandboxOverlay {
     pub remote: Option<RemoteOverlay>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RemoteOverlay {
     pub host: Option<String>,
@@ -638,7 +638,7 @@ impl RemoteOverlay {
 }
 
 /// The shape of a repo-root `.superzej.*` file: a `[sandbox]` table overlay.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 struct RepoConfigFile {
     sandbox: SandboxOverlay,
@@ -647,7 +647,7 @@ struct RepoConfigFile {
 /// `[drawer]` — the bottom file-manager drawer (hidden by default, toggled with
 /// Ctrl+Alt+f). Runs yazi by default, with its config kept separate from the
 /// system under a private `config_home`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct DrawerConfig {
     /// File manager to run. Empty ⇒ the pinned yazi (`SUPERZEJ_YAZI_BIN`).
@@ -675,7 +675,7 @@ impl Default for DrawerConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct Config {
     // --- scalar values (must serialize before any sub-table for TOML) ---
@@ -764,7 +764,7 @@ impl EnvSource for ProcessEnv {
 
 /// An in-memory environment (for tests).
 #[cfg(test)]
-#[derive(Default)]
+#[derive(Default, schemars::JsonSchema)]
 pub struct MapEnv(pub BTreeMap<String, String>);
 #[cfg(test)]
 impl EnvSource for MapEnv {
@@ -776,7 +776,7 @@ impl EnvSource for MapEnv {
 /// An all-`Option` mirror of [`Config`] used for the env and CLI-flag layers.
 /// `apply` writes only the set fields onto a base, so each layer overrides the
 /// one below it.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, schemars::JsonSchema)]
 pub struct ConfigOverlay {
     pub worktrees_dir: Option<String>,
     pub workspaces_dir: Option<String>,
@@ -949,28 +949,87 @@ impl Config {
     }
 
     /// Load with all layers: defaults < file (`path` or the default) < env < flags.
-    pub fn load_layered(
+    pub fn try_load_layered(
         env: &dyn EnvSource,
-        flags: Option<ConfigOverlay>,
+        cli_overrides: &[String],
         path: Option<PathBuf>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let file = path.unwrap_or_else(Self::path);
-        let mut cfg: Config = match std::fs::read_to_string(&file) {
-            Ok(s) => toml::from_str(&s).unwrap_or_else(|e| {
-                config_warn(&format!("parse error: {e}; using defaults"));
-                Config::default()
-            }),
-            Err(_) => Config::default(),
-        };
+        let s = std::fs::read_to_string(&file).unwrap_or_else(|_| "".into());
+        let mut cfg: Config = toml::from_str(&s).map_err(|e| format!("{e}"))?;
+
         env_overlay(env).apply(&mut cfg);
-        if let Some(f) = flags {
-            f.apply(&mut cfg);
+
+        // Apply dot-notation overrides
+        for ov in cli_overrides {
+            if let Some((key, val)) = ov.split_once('=') {
+                if let Err(e) = Self::apply_override_str(&mut cfg, key, val) {
+                    config_warn(&format!("--set {key}={val} failed: {e}"));
+                }
+            }
         }
+
         cfg.post_process();
-        cfg
+        Ok(cfg)
     }
 
-    /// Fallback agents/tools, default repo_roots, tilde expansion. Idempotent.
+    /// Load with all layers: defaults < file (`path` or the default) < env < flags.
+    pub fn load_layered(
+        env: &dyn EnvSource,
+        cli_overrides: &[String],
+        path: Option<PathBuf>,
+    ) -> Self {
+        match Self::try_load_layered(env, cli_overrides, path) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                config_warn(&format!("parse error: {e}; using defaults"));
+                let mut cfg = Config::default();
+                env_overlay(env).apply(&mut cfg);
+                for ov in cli_overrides {
+                    if let Some((key, val)) = ov.split_once('=') {
+                        let _ = Self::apply_override_str(&mut cfg, key, val);
+                    }
+                }
+                cfg.post_process();
+                cfg
+            }
+        }
+    }
+
+    fn apply_override_str(cfg: &mut Config, key: &str, val: &str) -> Result<(), String> {
+        let mut tree = serde_json::to_value(&cfg).map_err(|e| e.to_string())?;
+        
+        let parts: Vec<&str> = key.split('.').collect();
+        let mut current = &mut tree;
+        for (i, part) in parts.iter().enumerate() {
+            if i == parts.len() - 1 {
+                if !current.is_object() {
+                    return Err(format!("Invalid path: {}", key));
+                }
+                if let Ok(b) = val.parse::<bool>() {
+                    current[*part] = serde_json::Value::Bool(b);
+                } else if let Ok(n) = val.parse::<u64>() {
+                    current[*part] = serde_json::Value::Number(n.into());
+                } else {
+                    current[*part] = serde_json::Value::String(val.to_string());
+                }
+            } else {
+                if !current.is_object() {
+                    return Err(format!("Invalid path: {}", key));
+                }
+                let next = current.get_mut(*part);
+                match next {
+                    Some(val) => current = val,
+                    None => return Err(format!("Invalid path: {}", key)),
+                }
+            }
+        }
+        
+        let new_cfg: Config = serde_json::from_value(tree).map_err(|e| format!("Type error on {}: {}", key, e))?;
+        *cfg = new_cfg;
+        Ok(())
+    }
+
     fn post_process(&mut self) {
         if self.agents.is_empty() {
             self.agents = vec![
@@ -1270,6 +1329,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn override_str_parses_types_correctly_and_handles_bad_paths() {
+        let mut cfg = Config::default();
+        // Number
+        assert!(Config::apply_override_str(&mut cfg, "repo_scan_depth", "99").is_ok());
+        assert_eq!(cfg.repo_scan_depth, 99);
+        // Bool
+        assert!(Config::apply_override_str(&mut cfg, "sandbox.enabled", "false").is_ok());
+        assert_eq!(cfg.sandbox.enabled, false);
+        // String
+        assert!(Config::apply_override_str(&mut cfg, "theme.accent", "#123456").is_ok());
+        assert_eq!(cfg.theme.accent, "#123456");
+        // Deep error: parent is not an object
+        assert!(Config::apply_override_str(&mut cfg, "repo_scan_depth.invalid", "value").is_err());
+        // Deep error: parent is missing/null
+        assert!(Config::apply_override_str(&mut cfg, "does.not.exist", "value").is_err());
+        // Type error: setting a number field to a string that doesn't parse to a number
+        assert!(Config::apply_override_str(&mut cfg, "repo_scan_depth", "not_a_number").is_err());
+    }
+
+    #[test]
     fn plugin_manifest_config_projection_parses() {
         let cfg: Config = toml::from_str(
             r#"
@@ -1531,7 +1610,7 @@ surface = "todoist.status"
         std::fs::write(&file, "branch_prefix = \"file/\"\npicker = \"gum\"\n").unwrap();
 
         // file only
-        let c = Config::load_layered(&MapEnv::default(), None, Some(file.clone()));
+        let c = Config::load_layered(&MapEnv::default(), &[], Some(file.clone()));
         assert_eq!(c.branch_prefix, "file/");
         assert_eq!(c.picker, Picker::Gum);
 
@@ -1540,16 +1619,15 @@ surface = "todoist.status"
             ("SUPERZEJ_BRANCH_PREFIX", "env/"),
             ("SUPERZEJ_PICKER", "fzf"),
         ]);
-        let c = Config::load_layered(&env, None, Some(file.clone()));
+        let c = Config::load_layered(&env, &[], Some(file.clone()));
         assert_eq!(c.branch_prefix, "env/");
         assert_eq!(c.picker, Picker::Fzf);
 
-        // flag overrides env
-        let flags = ConfigOverlay {
-            picker: Some(Picker::Select),
-            ..Default::default()
-        };
-        let c = Config::load_layered(&env, Some(flags), Some(file));
+        let flags = vec![
+            "branch_prefix=flag/".to_string(),
+            "picker=select".to_string(),
+        ];
+        let c = Config::load_layered(&env, &flags, Some(file));
         assert_eq!(c.picker, Picker::Select);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1673,7 +1751,7 @@ surface = "todoist.status"
             ("SUPERZEJ_SANDBOX_ENABLED", "off"),
             ("SUPERZEJ_SANDBOX_REMOTE_HOST", "user@box"),
         ]);
-        let c = Config::load_layered(&env, None, None);
+        let c = Config::load_layered(&env, &[], None);
         assert_eq!(c.worktrees_dir, "/wt");
         assert_eq!(c.workspaces_dir, "/ws");
         assert_eq!(c.base_branch, "develop");
@@ -1831,7 +1909,7 @@ format = \"bad\"
         let dir = tmpdir("bad");
         let f = dir.join("c.toml");
         std::fs::write(&f, "this is = = not toml\n").unwrap();
-        let c = Config::load_layered(&MapEnv::default(), None, Some(f));
+        let c = Config::load_layered(&MapEnv::default(), &[], Some(f));
         assert_eq!(c.picker, Picker::Auto);
         let _ = std::fs::remove_dir_all(&dir);
     }
