@@ -85,7 +85,10 @@ fn pane_name(name: &str) -> String {
 
 fn open_plan(pin: &Pin, active_dir: Option<PathBuf>) -> OpenPlan {
     match pin.location {
-        PinLocation::Tab => OpenPlan::Tab {
+        // The native top-strip/float placements have no zellij equivalent on this
+        // path; `Float` falls back to a dedicated tab and `Strip` to a tiled layout
+        // pane (the native host renders the real strip/float).
+        PinLocation::Tab | PinLocation::Float => OpenPlan::Tab {
             tab: tab_name(&pin.name),
             cwd: pin
                 .cwd
@@ -94,7 +97,7 @@ fn open_plan(pin: &Pin, active_dir: Option<PathBuf>) -> OpenPlan {
                 .unwrap_or_else(util::home),
             layout: "pin-tab",
         },
-        PinLocation::Layout => OpenPlan::LayoutPane {
+        PinLocation::Layout | PinLocation::Strip => OpenPlan::LayoutPane {
             pane_name: pane_name(&pin.name),
             cwd: pin
                 .cwd
@@ -118,10 +121,10 @@ fn open(cfg: &Config, target: &str, session: Option<String>) -> Result<()> {
     }
     if !zellij::in_zellij() {
         match pin.location {
-            PinLocation::Tab => {
+            PinLocation::Tab | PinLocation::Float => {
                 msg::info(&format!("(not in zellij) would open pin '{}'", pin.name))
             }
-            PinLocation::Layout => msg::info(&format!(
+            PinLocation::Layout | PinLocation::Strip => msg::info(&format!(
                 "(not in zellij) would add pin '{}' into active layout",
                 pin.name
             )),
@@ -129,8 +132,8 @@ fn open(cfg: &Config, target: &str, session: Option<String>) -> Result<()> {
         return Ok(());
     }
     match pin.location {
-        PinLocation::Tab => open_tab(pin),
-        PinLocation::Layout => open_layout(pin, session.as_deref()),
+        PinLocation::Tab | PinLocation::Float => open_tab(pin),
+        PinLocation::Layout | PinLocation::Strip => open_layout(pin, session.as_deref()),
     }
     Ok(())
 }
@@ -256,6 +259,7 @@ mod tests {
                 .map(|(n, cmd)| Pin {
                     name: (*n).into(),
                     command: (*cmd).into(),
+                    args: Vec::new(),
                     cwd: None,
                     location: PinLocation::Tab,
                     scope: PinScope::Global,
@@ -263,6 +267,9 @@ mod tests {
                     start: PinStart::Lazy,
                     restart: PinRestart::Never,
                     singleton: true,
+                    env: Default::default(),
+                    label: None,
+                    ratio: None,
                 })
                 .collect(),
             ..Config::default()
@@ -273,6 +280,7 @@ mod tests {
         Pin {
             name: name.into(),
             command: command.into(),
+            args: Vec::new(),
             cwd: cwd.map(str::to_string),
             location,
             scope: PinScope::Global,
@@ -280,6 +288,9 @@ mod tests {
             start: PinStart::Lazy,
             restart: PinRestart::Never,
             singleton: true,
+            env: Default::default(),
+            label: None,
+            ratio: None,
         }
     }
 

@@ -33,11 +33,28 @@ pub struct PtyPane {
 impl PtyPane {
     /// Spawn `argv` (already composed by `sandbox::enter_argv`) in `cwd` on a
     /// fresh PTY of `rows`x`cols`. Reader-thread events arrive on `tx`, tagged
-    /// with `id` so a shared channel can carry every pane's output.
+    /// with `id` so a shared channel can carry every pane's output. Convenience
+    /// wrapper over [`spawn_with_env`](Self::spawn_with_env) with no extra env;
+    /// the live loop always injects env (even if empty) via `spawn_with_env`.
+    #[cfg(test)]
     pub fn spawn(
         id: u32,
         argv: &[String],
         cwd: Option<&std::path::Path>,
+        rows: u16,
+        cols: u16,
+        tx: tokio_mpsc::Sender<PaneEvent>,
+    ) -> Result<Self> {
+        Self::spawn_with_env(id, argv, cwd, &[], rows, cols, tx)
+    }
+
+    /// Like [`spawn`](Self::spawn) but injects extra `(key, value)` environment
+    /// variables (after `TERM`), used for per-program env on pinned programs.
+    pub fn spawn_with_env(
+        id: u32,
+        argv: &[String],
+        cwd: Option<&std::path::Path>,
+        env: &[(String, String)],
         rows: u16,
         cols: u16,
         tx: tokio_mpsc::Sender<PaneEvent>,
@@ -58,6 +75,9 @@ impl PtyPane {
             cmd.cwd(dir);
         }
         cmd.env("TERM", "xterm-256color");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
         let child = pair.slave.spawn_command(cmd).context("spawn child")?;
         // Drop the slave so the master sees EOF when the child exits.
         drop(pair.slave);
@@ -197,6 +217,24 @@ mod tests {
             "child should exit"
         );
         assert_eq!(pane.emulator().row_text(0), Some("hello-pty".to_string()));
+    }
+
+    #[test]
+    fn injected_env_reaches_the_child() {
+        let (tx, mut rx) = tokio_mpsc::channel(1024);
+        let env = vec![("SZ_PIN_TEST".to_string(), "hello-env".to_string())];
+        let mut pane = PtyPane::spawn_with_env(
+            0,
+            &sh("printf '%s' \"$SZ_PIN_TEST\""),
+            None,
+            &env,
+            24,
+            80,
+            tx,
+        )
+        .unwrap();
+        assert!(drain_until_exit(&mut pane, &mut rx, 5000));
+        assert_eq!(pane.emulator().row_text(0), Some("hello-env".to_string()));
     }
 
     #[test]
