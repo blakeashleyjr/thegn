@@ -599,7 +599,7 @@ entity, not a float — overrides the float reading below), summoned by `Alt-1..
 - [x] 331. PR tracking
 - [x] 332. CI checks status
 - [~] 333. PR review comments
-- [~] 334. Issues
+- [x] 334. Issues
 - [x] 335. Create PR from worktree
 - [x] 336. PR↔worktree mapping
 - [x] 337. Review/approve from TUI
@@ -610,10 +610,10 @@ entity, not a float — overrides the float reading below), summoned by `Alt-1..
 ### AA. Linear / issues
 
 - [ ] 341. Linear issue list
-- [ ] 342. Issue↔task↔worktree linkage
+- [x] 342. Issue↔task↔worktree linkage
 - [ ] 343. Move issue status on merge
 - [ ] 344. Branch/worktree from issue
-- [ ] 345. Comment on issues from TUI
+- [x] 345. Comment on issues from TUI
 - [ ] 346. Cycle/sprint view
 - [ ] 347. Linear MCP/API integration
 - [ ] 348. Generic tracker adapter (Jira etc.)
