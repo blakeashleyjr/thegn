@@ -33,10 +33,24 @@ static READY: AtomicBool = AtomicBool::new(false);
 /// Whether [`init`] has installed the subscriber. `msg` consults this so its
 /// functions fall back to direct stderr before logging is up.
 pub fn ready() -> bool {
-    READY.load(Ordering::Relaxed)
+    READY.load(Ordering::SeqCst)
 }
 
-/// What this process is, so the file sink picks a sensible filename and the
+pub fn audit(event: &str) {
+    let dir = crate::util::superzej_dir();
+    let audit_log = dir.join("audit.log");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&audit_log)
+    {
+        use std::io::Write;
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        let _ = writeln!(file, "[{now}] {event}");
+    }
+}
+
+/// Initialize tracing. Fails silently if called twice (e.g., e2e tests).
 /// daemon (whose stdout/stderr are nulled) skips the pointless stderr layer.
 pub enum Role {
     Cli,

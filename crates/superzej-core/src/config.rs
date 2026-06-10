@@ -527,6 +527,34 @@ impl RemoteConfig {
 /// `[sandbox]` — containerize/sandbox a worktree's interactive process. On by
 /// default; `backend = "auto"` walks `backend_chain` and falls back to the host
 /// shell (with a warning) when nothing is available.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Deserialize,
+    serde::Serialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum FileAccess {
+    #[default]
+    Worktree,
+    All,
+    None,
+}
+
+#[derive(
+    Debug, Clone, Default, serde::Deserialize, PartialEq, Eq, serde::Serialize, schemars::JsonSchema,
+)]
+#[serde(default)]
+pub struct SandboxLimits {
+    pub cpu: Option<String>,
+    pub memory: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct SandboxConfig {
@@ -535,6 +563,12 @@ pub struct SandboxConfig {
     pub backend_chain: Vec<String>, // auto detection order; "none" = host fallback
     pub image: String,              // "" => host-toolchain mode
     pub network: Network,
+    pub file_access: FileAccess,
+    pub ports: Vec<String>, // e.g. ["8080:8080"]
+    pub gpu: Option<String>,
+    pub limits: SandboxLimits,
+    pub volumes: std::collections::HashMap<String, String>,
+    pub compose: Option<String>,
     pub env_passthrough: Vec<String>,
     pub mounts: Vec<String>, // extra binds ("host:dest" or "host"); ":ro" suffix allowed
     pub init_script: String, // runs inside before the agent/shell
@@ -554,6 +588,12 @@ impl Default for SandboxConfig {
                 .collect(),
             image: String::new(),
             network: Network::Nat,
+            file_access: FileAccess::default(),
+            ports: Vec::new(),
+            gpu: None,
+            limits: SandboxLimits::default(),
+            volumes: std::collections::HashMap::new(),
+            compose: None,
             env_passthrough: [
                 "SSH_AUTH_SOCK",
                 "GH_TOKEN",
@@ -585,6 +625,12 @@ pub struct SandboxOverlay {
     pub backend_chain: Option<Vec<String>>,
     pub image: Option<String>,
     pub network: Option<Network>,
+    pub file_access: Option<FileAccess>,
+    pub ports: Option<Vec<String>>,
+    pub gpu: Option<String>,
+    pub limits: Option<SandboxLimits>,
+    pub volumes: Option<std::collections::HashMap<String, String>>,
+    pub compose: Option<String>,
     pub env_passthrough: Option<Vec<String>>,
     pub mounts: Option<Vec<String>>,
     pub init_script: Option<String>,
@@ -620,6 +666,24 @@ impl SandboxOverlay {
         }
         if let Some(v) = self.network {
             base.network = v;
+        }
+        if let Some(v) = self.file_access {
+            base.file_access = v;
+        }
+        if let Some(v) = self.ports {
+            base.ports = v;
+        }
+        if let Some(v) = self.gpu {
+            base.gpu = Some(v);
+        }
+        if let Some(v) = self.limits {
+            base.limits = v;
+        }
+        if let Some(v) = self.volumes {
+            base.volumes = v;
+        }
+        if let Some(v) = self.compose {
+            base.compose = Some(v);
         }
         if let Some(v) = self.env_passthrough {
             base.env_passthrough = v;

@@ -90,6 +90,8 @@ impl Db {
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
 
+        let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN sandbox_backend TEXT", []);
+
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS repos (
@@ -115,7 +117,8 @@ impl Db {
               branch       TEXT,
               agent        TEXT,
               created_at   INTEGER,
-              location     TEXT
+              location     TEXT,
+              sandbox_backend TEXT
             );
             CREATE TABLE IF NOT EXISTS pr_cache (
               worktree   TEXT PRIMARY KEY,
@@ -446,6 +449,27 @@ impl Db {
         Ok(())
     }
 
+    pub fn set_worktree_sandbox(&self, wt: &str, backend: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE worktrees SET sandbox_backend=?2 WHERE worktree=?1",
+            params![wt, backend],
+        )?;
+        Ok(())
+    }
+
+    pub fn worktree_sandbox(&self, wt: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT sandbox_backend FROM worktrees WHERE worktree=?1")?;
+        let mut rows = stmt.query(params![wt])?;
+        if let Some(row) = rows.next()? {
+            let val: Option<String> = row.get(0)?;
+            Ok(val)
+        } else {
+            Ok(None)
+        }
+    }
+
     /// The worktree path for a (session, tab) pair — how the panel plugin maps
     /// the focused tab to a worktree (PaneInfo carries no cwd).
     pub fn worktree_for_tab(&self, session: &str, tab: &str) -> Result<Option<String>> {
@@ -698,6 +722,11 @@ mod tests {
         let db = db();
         db.put_worktree("app/feat", "/x/app", "/wt/feat", "sz/feat", None)
             .unwrap();
+
+        db.set_worktree_sandbox("/wt/feat", "podman").unwrap();
+        let sb = db.worktree_sandbox("/wt/feat").unwrap();
+        assert_eq!(sb, Some("podman".to_string()));
+
         // metadata round-trips
         let all = db.worktrees().unwrap();
         assert_eq!(all.len(), 1);
