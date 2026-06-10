@@ -1,6 +1,7 @@
 pub mod models;
 pub use models::*;
 
+use crate::forgejo::ForgejoForge;
 use crate::github::GitHubForge;
 use crate::remote::GitLoc;
 
@@ -23,6 +24,13 @@ pub trait Forge {
 pub fn detect_forge_from_url(url: &str) -> Option<Box<dyn Forge>> {
     if url.contains("github.com") {
         Some(Box::new(GitHubForge))
+    } else if url.contains("codeberg.org")
+        || url.contains("forgejo")
+        || url.contains("gitea")
+        || url.contains("framagit.org")
+        || url.contains("gitlab")
+    {
+        Some(Box::new(ForgejoForge))
     } else {
         None
     }
