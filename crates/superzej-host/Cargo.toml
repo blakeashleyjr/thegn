@@ -1,7 +1,7 @@
 [package]
 name = "superzej-host"
 version.workspace = true
-edition = "2021"
+edition.workspace = true
 license.workspace = true
 description = "superzej native terminal host: the compositor + in-process chrome"
 
@@ -23,8 +23,8 @@ serde_json.workspace = true
 # the JSON schema (schemars pinned to core's version).
 toml.workspace = true
 schemars = "0.8"
-# Compositor substrate (Phase 1).
-tokio = { workspace = true, features = ["full"] }
+# Compositor substrate (Phase 1). Feature set is pinned at the workspace level.
+tokio = { workspace = true }
 portable-pty.workspace = true
 termwiz.workspace = true
 vt100.workspace = true

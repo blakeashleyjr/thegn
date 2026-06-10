@@ -446,10 +446,10 @@ impl PluginRuntime {
         if let Some(cap) = surface_capability_for(&contribution.extension_point) {
             self.audit(plugin, cap, "register")?;
         }
-        if let Some(surface) = contribution.surface {
-            if let Some(cap) = surface_capability_for(&contribution.extension_point) {
-                self.surface_caps.insert(surface, cap);
-            }
+        if let Some(surface) = contribution.surface
+            && let Some(cap) = surface_capability_for(&contribution.extension_point)
+        {
+            self.surface_caps.insert(surface, cap);
         }
         Ok(())
     }

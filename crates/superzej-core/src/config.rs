@@ -1129,10 +1129,10 @@ impl Config {
 
         // Apply dot-notation overrides
         for ov in cli_overrides {
-            if let Some((key, val)) = ov.split_once('=') {
-                if let Err(e) = Self::apply_override_str(&mut cfg, key, val) {
-                    config_warn(&format!("--set {key}={val} failed: {e}"));
-                }
+            if let Some((key, val)) = ov.split_once('=')
+                && let Err(e) = Self::apply_override_str(&mut cfg, key, val)
+            {
+                config_warn(&format!("--set {key}={val} failed: {e}"));
             }
         }
 
@@ -1326,17 +1326,16 @@ impl Config {
             layers.push(p.keybinds.clone());
         }
         layers.push(self.keybinds.clone());
-        if let Some(slug) = slug {
-            if let Some(ws) = self.workspace.get(slug) {
-                layers.push(ws.keybinds.clone());
-            }
+        if let Some(slug) = slug
+            && let Some(ws) = self.workspace.get(slug)
+        {
+            layers.push(ws.keybinds.clone());
         }
-        if let Some(root) = repo_root {
-            if let Some(overlay) = load_repo_overlay(root) {
-                if !overlay.keybinds.is_empty() {
-                    layers.push(overlay.keybinds);
-                }
-            }
+        if let Some(root) = repo_root
+            && let Some(overlay) = load_repo_overlay(root)
+            && !overlay.keybinds.is_empty()
+        {
+            layers.push(overlay.keybinds);
         }
         layers
     }
@@ -1428,10 +1427,10 @@ pub fn validate_str(body: &str) -> Vec<String> {
         opt: Option<&toml::Value>,
         f: fn(&str) -> Result<(), String>,
     ) {
-        if let Some(toml::Value::String(s)) = opt {
-            if let Err(e) = f(s) {
-                errs.push(format!("{path}: {e}"));
-            }
+        if let Some(toml::Value::String(s)) = opt
+            && let Err(e) = f(s)
+        {
+            errs.push(format!("{path}: {e}"));
         }
     }
     let Some(t) = val.as_table() else {
@@ -2401,17 +2400,18 @@ forward_agent = false
 
     #[test]
     fn process_env_reads_real_vars() {
-        std::env::set_var("SUPERZEJ_TEST_PENV_xyz", "v1");
+        // SAFETY: single-threaded test using uniquely-named vars.
+        unsafe { std::env::set_var("SUPERZEJ_TEST_PENV_xyz", "v1") };
         assert_eq!(
             ProcessEnv.get("SUPERZEJ_TEST_PENV_xyz").as_deref(),
             Some("v1")
         );
         assert!(ProcessEnv.get("SUPERZEJ_TEST_PENV_absent_qqq").is_none());
-        std::env::remove_var("SUPERZEJ_TEST_PENV_xyz");
+        unsafe { std::env::remove_var("SUPERZEJ_TEST_PENV_xyz") };
         // blank values are treated as unset.
-        std::env::set_var("SUPERZEJ_TEST_PENV_blank", "   ");
+        unsafe { std::env::set_var("SUPERZEJ_TEST_PENV_blank", "   ") };
         assert!(ProcessEnv.get("SUPERZEJ_TEST_PENV_blank").is_none());
-        std::env::remove_var("SUPERZEJ_TEST_PENV_blank");
+        unsafe { std::env::remove_var("SUPERZEJ_TEST_PENV_blank") };
     }
 
     #[test]

@@ -565,10 +565,10 @@ fn apply_keybind_layer(map: &mut KeyMap, layer: &superzej_core::config::KeybindC
 /// `default_mode`, else `Normal`. Built-in `vim`/`emacs` profile names map to
 /// their mode even without an explicit `default_mode`.
 pub fn startup_mode(cfg: &superzej_core::config::Config) -> Mode {
-    if let Some(p) = cfg.active_profile() {
-        if let Some(m) = parse_mode(&p.default_mode) {
-            return m;
-        }
+    if let Some(p) = cfg.active_profile()
+        && let Some(m) = parse_mode(&p.default_mode)
+    {
+        return m;
     }
     match cfg.profile.as_str() {
         "vim" => Mode::VimNormal,

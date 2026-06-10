@@ -101,10 +101,11 @@ pub fn discover_repos(cfg: &Config) -> Vec<String> {
             .into_iter()
             .filter_map(|e| e.ok())
         {
-            if entry.file_type().is_dir() && entry.file_name() == ".git" {
-                if let Some(parent) = entry.path().parent() {
-                    found.push(parent.to_string_lossy().into_owned());
-                }
+            if entry.file_type().is_dir()
+                && entry.file_name() == ".git"
+                && let Some(parent) = entry.path().parent()
+            {
+                found.push(parent.to_string_lossy().into_owned());
             }
         }
     }

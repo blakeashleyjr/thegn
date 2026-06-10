@@ -8,7 +8,7 @@ members = [
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
@@ -57,7 +57,12 @@ futures = "0.3"
 # is vt100; high-fidelity/graphics swaps in alacritty_terminal + an escape-
 # interception passthrough layer (or a wezterm-term git dep) without touching the
 # compositor — see the host crate's emulator module.
-tokio = { version = "1", features = ["full"] }
+# Minimal feature set: the host needs a multi-thread runtime (the loop blocks on
+# `poll_input(None)`, so `spawn_blocking` work must run on other threads), the
+# `#[tokio::main]` macro, and mpsc channels. svc's octocrab brings its own
+# reqwest/hyper runtime needs. No `time`/net/fs/process here — the refresh ticker
+# is a plain OS thread and subprocess + git I/O go through `spawn_blocking`.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 portable-pty = "0.9"
 termwiz = "0.23"
 vt100 = "0.16"

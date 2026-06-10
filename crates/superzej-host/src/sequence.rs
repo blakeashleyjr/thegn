@@ -34,13 +34,14 @@ impl Key {
     pub fn modified(code: KeyCode, mods: Modifiers) -> Self {
         // termwiz reports shifted ASCII letters as uppercase chars; normalize
         // parser-created `Shift x` to the same shape so configured chords match.
-        if let KeyCode::Char(c) = code {
-            if mods.contains(Modifiers::SHIFT) && c.is_ascii_alphabetic() {
-                return Self {
-                    code: KeyCode::Char(c.to_ascii_uppercase()),
-                    mods: mods - Modifiers::SHIFT,
-                };
-            }
+        if let KeyCode::Char(c) = code
+            && mods.contains(Modifiers::SHIFT)
+            && c.is_ascii_alphabetic()
+        {
+            return Self {
+                code: KeyCode::Char(c.to_ascii_uppercase()),
+                mods: mods - Modifiers::SHIFT,
+            };
         }
         Self { code, mods }
     }

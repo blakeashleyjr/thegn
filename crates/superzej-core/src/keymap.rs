@@ -837,18 +837,18 @@ pub fn splice_managed_region(existing: &str, generated: &str) -> String {
         return format!("{}{}\n{}", &existing[..b], generated.trim_end(), after);
     }
     // Legacy: replace the first top-level `keybinds { … }` block (brace-matched).
-    if let Some(start) = existing.find("keybinds") {
-        if let Some(open) = existing[start..].find('{') {
-            let abs_open = start + open;
-            if let Some(close) = match_brace(&existing[abs_open..]) {
-                let abs_close = abs_open + close;
-                return format!(
-                    "{}{}\n{}",
-                    &existing[..start],
-                    generated.trim_end(),
-                    existing[abs_close + 1..].trim_start_matches('\n')
-                );
-            }
+    if let Some(start) = existing.find("keybinds")
+        && let Some(open) = existing[start..].find('{')
+    {
+        let abs_open = start + open;
+        if let Some(close) = match_brace(&existing[abs_open..]) {
+            let abs_close = abs_open + close;
+            return format!(
+                "{}{}\n{}",
+                &existing[..start],
+                generated.trim_end(),
+                existing[abs_close + 1..].trim_start_matches('\n')
+            );
         }
     }
     // No keybinds block at all: prepend the region.
