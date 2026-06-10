@@ -9,6 +9,7 @@ mod chrome;
 mod compositor;
 mod copymode;
 mod emulator;
+mod keyhint;
 mod keymap;
 mod layout;
 mod palette;
