@@ -7,8 +7,10 @@
 
 use anyhow::{Context, Result};
 use std::path::Path;
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant};
+
+use tokio::sync::mpsc as tokio_mpsc;
+use tokio::task;
 
 use termwiz::caps::Capabilities;
 use termwiz::input::{InputEvent, KeyCode, Modifiers};
@@ -550,8 +552,8 @@ fn apply_mode_status(model: &mut FrameModel, mode: crate::keymap::Mode) {
     );
 }
 
-fn spawn_model_hydration(tx: Sender<FrameModel>, session: crate::session::Session) {
-    std::thread::spawn(move || {
+fn spawn_model_hydration(tx: tokio_mpsc::UnboundedSender<FrameModel>, session: crate::session::Session) {
+    task::spawn_blocking(move || {
         if let Ok(db) = superzej_core::db::Db::open() {
             let _ = tx.send(build_model(&session, &db));
         }
@@ -559,7 +561,7 @@ fn spawn_model_hydration(tx: Sender<FrameModel>, session: crate::session::Sessio
 }
 
 fn spawn_pr_cache_refresh(session: crate::session::Session) {
-    std::thread::spawn(move || {
+    task::spawn_blocking(move || {
         let cwd = active_tab_path(&session);
         if !cwd.is_dir() {
             return;
@@ -612,7 +614,7 @@ pub fn main() -> Result<()> {
     let mode = crate::keymap::Mode::Normal;
     let mut model = build_initial_model(&session);
     apply_mode_status(&mut model, mode);
-    let (model_tx, model_rx) = channel::<FrameModel>();
+    let (model_tx, model_rx) = tokio_mpsc::unbounded_channel::<FrameModel>();
     spawn_model_hydration(model_tx.clone(), session.clone());
 
     let result = event_loop(
@@ -629,11 +631,11 @@ pub fn main() -> Result<()> {
 struct Panes {
     table: std::collections::HashMap<u32, PtyPane>,
     next_id: u32,
-    tx: std::sync::mpsc::Sender<PaneEvent>,
+    tx: tokio_mpsc::Sender<PaneEvent>,
 }
 
 impl Panes {
-    fn new(tx: std::sync::mpsc::Sender<PaneEvent>) -> Self {
+    fn new(tx: tokio_mpsc::Sender<PaneEvent>) -> Self {
         Self {
             table: std::collections::HashMap::new(),
             next_id: 1,
@@ -765,7 +767,7 @@ struct PtyDrainStats {
 }
 
 fn drain_pty_events(
-    rx: &Receiver<PaneEvent>,
+    rx: &mut tokio_mpsc::Receiver<PaneEvent>,
     budget: PtyDrainBudget,
     mut handle: impl FnMut(PaneEvent),
 ) -> PtyDrainStats {
@@ -781,8 +783,8 @@ fn drain_pty_events(
                 stats.bytes += ev.byte_len();
                 handle(ev);
             }
-            Err(TryRecvError::Empty) => break,
-            Err(TryRecvError::Disconnected) => {
+            Err(tokio_mpsc::error::TryRecvError::Empty) => break,
+            Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
                 stats.disconnected = true;
                 break;
             }
@@ -830,8 +832,8 @@ fn event_loop<T: Terminal>(
     buf: &mut BufferedTerminal<T>,
     mut session: crate::session::Session,
     mut model: FrameModel,
-    model_tx: Sender<FrameModel>,
-    model_rx: Receiver<FrameModel>,
+    model_tx: tokio_mpsc::UnboundedSender<FrameModel>,
+    mut model_rx: tokio_mpsc::UnboundedReceiver<FrameModel>,
     mut rows: usize,
     mut cols: usize,
     mut keymap: crate::keymap::KeyMap,
@@ -844,7 +846,7 @@ fn event_loop<T: Terminal>(
     let mut dirty = true;
     let mut palette: Option<crate::palette::Palette> = None;
 
-    let (tx, rx) = channel::<PaneEvent>();
+    let (tx, mut rx) = tokio_mpsc::channel::<PaneEvent>(1024);
     let mut panes = Panes::new(tx);
     let mut need_relayout = true;
     let mut drawer: Option<u32> = None;
@@ -884,69 +886,89 @@ fn event_loop<T: Terminal>(
         // 1. Drain pending PTY output, routed by pane id. Only output from a pane
         //    visible in the active tab dirties the frame; others advance silently.
         //    The drain is budgeted so a chatty pane cannot starve rendering/input.
-        let drain = drain_pty_events(&rx, PtyDrainBudget::default(), |ev| match ev {
-            PaneEvent::Output(id, b) => {
-                if let Some(p) = panes.table.get_mut(&id) {
-                    p.feed(&b);
-                    if visible.contains(&id) {
-                        dirty = true;
-                    }
-                }
+        let mut disconnected = false;
+        let mut budget_exhausted = false;
+        let mut drain_stats_chunks = 0;
+        let drain_budget = PtyDrainBudget::default();
+        loop {
+            if drain_stats_chunks >= drain_budget.max_chunks {
+                budget_exhausted = true;
+                break;
             }
-            PaneEvent::Exit(id) => {
-                panes.table.remove(&id);
-                // Find the owning tab and either drop the pane from its split
-                // or, if its only shell died, keep the tab and respawn a fresh
-                // shell. Explicit close-pane/worktree actions remove the pane
-                // from the session before the PTY exit event arrives, so this
-                // path is for external child death (kill -9, bad shell, etc.).
-                if let Some(ti) = session
-                    .tabs
-                    .iter()
-                    .position(|t| t.center.pane_ids().contains(&id))
-                {
-                    let sole = session.tabs[ti].center.pane_ids().len() == 1;
-                    if sole {
-                        if ti == session.active {
-                            // Try worktree dir first, then current_dir, then $HOME as fallback
-                            let cwd = (!session.tabs[ti].worktree.is_empty()
-                                && std::path::Path::new(&session.tabs[ti].worktree).is_dir())
-                            .then(|| std::path::PathBuf::from(&session.tabs[ti].worktree))
-                            .or_else(|| std::env::current_dir().ok())
-                            .or_else(|| std::env::var("HOME").ok().map(std::path::PathBuf::from));
-                            match panes.spawn(cwd.as_deref(), chrome.center) {
-                                Ok(fresh) => {
-                                    replace_single_dead_center_pane(
-                                        &mut session.tabs[ti],
-                                        id,
-                                        fresh,
-                                    );
-                                    model.status = "Pane exited; spawned a fresh shell".into();
-                                    need_relayout = true;
+            match rx.try_recv() {
+                Ok(ev) => {
+                    drain_stats_chunks += 1;
+                    match ev {
+                        PaneEvent::Output(id, b) => {
+                            if let Some(p) = panes.table.get_mut(&id) {
+                                p.feed(&b);
+                                if visible.contains(&id) {
                                     dirty = true;
                                 }
-                                Err(err) => {
-                                    model.status = format!("Respawn failed: {err:#}");
+                            }
+                        }
+                        PaneEvent::Exit(id) => {
+                            panes.table.remove(&id);
+                            // Find the owning tab and either drop the pane from its split
+                            // or, if its only shell died, keep the tab and respawn a fresh
+                            // shell. Explicit close-pane/worktree actions remove the pane
+                            // from the session before the PTY exit event arrives, so this
+                            // path is for external child death (kill -9, bad shell, etc.).
+                            if let Some(ti) = session
+                                .tabs
+                                .iter()
+                                .position(|t| t.center.pane_ids().contains(&id))
+                            {
+                                let sole = session.tabs[ti].center.pane_ids().len() == 1;
+                                if sole {
+                                    if ti == session.active {
+                                        // Try worktree dir first, then current_dir, then $HOME as fallback
+                                        let cwd = (!session.tabs[ti].worktree.is_empty()
+                                            && std::path::Path::new(&session.tabs[ti].worktree).is_dir())
+                                        .then(|| std::path::PathBuf::from(&session.tabs[ti].worktree))
+                                        .or_else(|| std::env::current_dir().ok())
+                                        .or_else(|| std::env::var("HOME").ok().map(std::path::PathBuf::from));
+                                        match panes.spawn(cwd.as_deref(), chrome.center) {
+                                            Ok(fresh) => {
+                                                replace_single_dead_center_pane(
+                                                    &mut session.tabs[ti],
+                                                    id,
+                                                    fresh,
+                                                );
+                                                model.status = "Pane exited; spawned a fresh shell".into();
+                                                need_relayout = true;
+                                                dirty = true;
+                                            }
+                                            Err(err) => {
+                                                model.status = format!("Respawn failed: {err:#}");
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    session.tabs[ti].center.remove(id);
+                                    if session.tabs[ti].focused_pane == id {
+                                        if let Some(first) = session.tabs[ti].center.pane_ids().first() {
+                                            session.tabs[ti].focused_pane = *first;
+                                        }
+                                    }
+                                    need_relayout = true;
                                 }
                             }
+                            dirty = true;
                         }
-                    } else {
-                        session.tabs[ti].center.remove(id);
-                        if session.tabs[ti].focused_pane == id {
-                            if let Some(first) = session.tabs[ti].center.pane_ids().first() {
-                                session.tabs[ti].focused_pane = *first;
-                            }
-                        }
-                        need_relayout = true;
                     }
                 }
-                dirty = true;
+                Err(tokio_mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
             }
-        });
-        if drain.disconnected {
+        }
+        if disconnected {
             return Ok(());
         }
-        if drain.budget_exhausted {
+        if budget_exhausted {
             dirty = true;
         }
         if session.tabs.is_empty() {
@@ -1701,7 +1723,7 @@ mod tests {
         let mut session = one_tab_session();
         let chrome = layout::compute(160, 40, true, true);
 
-        let (tx, _rx) = std::sync::mpsc::channel::<PaneEvent>();
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
         let mut panes = Panes::new(tx);
         panes
             .materialize(&mut session.tabs[0], chrome.center)
@@ -1802,14 +1824,14 @@ mod tests {
 
     #[test]
     fn pty_drain_stops_at_chunk_budget() {
-        let (tx, rx) = channel();
-        tx.send(PaneEvent::Output(1, b"one".to_vec())).unwrap();
-        tx.send(PaneEvent::Output(1, b"two".to_vec())).unwrap();
-        tx.send(PaneEvent::Output(1, b"three".to_vec())).unwrap();
+        let (tx, mut rx) = tokio_mpsc::channel(1024);
+        tx.blocking_send(PaneEvent::Output(1, b"one".to_vec())).unwrap();
+        tx.blocking_send(PaneEvent::Output(1, b"two".to_vec())).unwrap();
+        tx.blocking_send(PaneEvent::Output(1, b"three".to_vec())).unwrap();
 
         let mut seen = Vec::new();
         let stats = drain_pty_events(
-            &rx,
+            &mut rx,
             PtyDrainBudget {
                 max_chunks: 2,
                 max_bytes: usize::MAX,
@@ -1824,11 +1846,11 @@ mod tests {
 
     #[test]
     fn pty_drain_reports_disconnected_after_queue_drains() {
-        let (tx, rx) = channel();
-        tx.send(PaneEvent::Output(1, b"one".to_vec())).unwrap();
+        let (tx, mut rx) = tokio_mpsc::channel(1024);
+        tx.blocking_send(PaneEvent::Output(1, b"one".to_vec())).unwrap();
         drop(tx);
 
-        let stats = drain_pty_events(&rx, PtyDrainBudget::default(), |_| {});
+        let stats = drain_pty_events(&mut rx, PtyDrainBudget::default(), |_| {});
         assert_eq!(stats.chunks, 1);
         assert!(stats.disconnected);
     }
