@@ -5,103 +5,109 @@ Guidance for working in this repo. See `README.md` for the user-facing tour and
 
 ## What this is
 
-**superzej** (binary `superzej`, alias `sj`) — a terminal-native git-worktree IDE
-built on [zellij](https://zellij.dev). One zellij **session** holds everything:
-each repo is a `{slug}/home` **tab** (a _workspace_), each git **worktree** is a
-`{slug}/{branch}` **tab**, ordinary panes are _panels_. A left WASM **sidebar**
-switches tabs; a right WASM **panel** shows the focused worktree's diff + GitHub
-PR state. Switching repos/worktrees is always a `switch_tab_to` — **never a
-session change** (no teleport).
+**superzej** (binary `szhost`, installed as `superzej` with `sj`/`szhost`
+aliases) — a terminal-native git-worktree IDE that is its own terminal
+multiplexer. One process, one session: each repo is a workspace, each git
+**worktree** is a tab, and the chrome (sidebar tree, diff/PR panel, tabbar,
+statusbar, pin strip) is rendered in-process. There is **no zellij, no WASM
+plugins, no IPC** — all of that was stripped (Phase 0, commit `bb2ecd4`);
+mentions of it in older docs/comments are historical.
 
-The long game (see `tasks.md`): superzej is two tracks joined by one keystone — an
-**AI-free workspace shell** (the current, shippable product) and an **AI/agent
-layer** bridged by an **LLM proxy**. The shell must never hard-depend on the AI
-layers; AI is strictly additive (that's what makes "AI-free mode", items 511–515,
-free).
+The long game (see `tasks.md`): two tracks joined by one keystone — an
+**AI-free workspace shell** (the current, shippable product) and an AI/agent
+layer bridged by an **LLM proxy**. The shell must never hard-depend on the AI
+layers; AI is strictly additive.
 
 ## Architecture
 
-- **Single Rust binary that shells out.** `superzej` orchestrates `git`,
-  `zellij action …`, `gh`, and `fzf`/`gum`. Not a classic always-on daemon — the
-  only long-running piece is the `watch` command (a `notify` fs-watcher that
-  drives the panel's live diff refresh).
-- **State.** Bundled SQLite at `$XDG_STATE_HOME/superzej/superzej.db` (repo
-  history, workspaces, worktrees, a TTL'd PR cache). **git is the source of
-  truth** for worktrees; the DB is a cache + history layer that survives session
-  resurrection.
-- **Managed zellij namespace.** superzej owns its config: seeds
-  `~/.superzej/zellij.kdl` from `config/zellij.kdl` on first launch (**never
-  overwritten** after) and starts zellij with `--config` it, isolated from the
-  user's `~/.config/zellij`. Layouts under `~/.superzej/layouts/` _are_ re-seeded
-  each launch. Worktrees default to `~/.superzej/worktrees/<repo>/<branch-slug>`.
-- **`SUPERZEJ_SESSION`** marks "our world." `ZELLIJ_*` leaks into every child
-  process, so superzej exports `SUPERZEJ_SESSION` before launching zellij; that —
-  not the generic `ZELLIJ_*` vars — is how a `sj` invocation tells its own session
-  from a foreign or leaked one. This prevents `sj` in any terminal from driving
-  your real zellij session.
-- **WASM plugins are sandboxed renderers** (`plugin/{sidebar,panel,tabbar,statusbar}`).
-  Plugins can't shell out, so the panel drives the `superzej` binary via zellij's
-  `run_command`/`pipe` bridge (`superzej pr status --json`, `superzej diff --stat`,
-  `superzej resolve-worktree`). First-load permissions are pre-granted by
-  `superzej grant-plugins` (run by the installers) — the permission prompt is
-  un-approvable inside fixed/pinned panes.
-- **Sandboxing.** Each worktree's interactive process runs in a container/sandbox
-  by default (`podman` → `docker` → `bwrap` → `none`). The worktree stays on the
-  host and is **bind-mounted into the sandbox at its real path** so host-side git
-  reads (sidebar/panel/PR) keep working. Remote backend runs worktrees on another
-  machine (mosh for the pane, ssh for git + container lifecycle).
+- **Cargo workspace, three crates:**
+  - `crates/superzej-core` — substrate-agnostic, testable domain logic: layered
+    config, SQLite DB, keymap registry, theme, sandbox backends, activity
+    state machine, `gh` wrapper. No tokio/termwiz deps.
+  - `crates/superzej-svc` — service trait seams with graceful degradation:
+    `GitBackend` (gix-native reads, CLI fallback + writes), GitHub (octocrab /
+    `gh`), SSH (russh / `ssh`). Native gaps always fall back to subprocess.
+  - `crates/superzej-host` — the compositor: tokio runtime, portable-pty panes
+    through a pluggable `PaneEmulator` (vt100 today), termwiz `Surface`
+    diff-flush rendering, in-process chrome.
+- **Event model (a hard invariant: ~0% idle CPU).** The loop blocks on termwiz
+  `poll_input(None)` — no tick, no timeout. Every off-thread producer (PTY
+  reader threads, model hydration on `spawn_blocking`, config/diff fs-watchers,
+  the 2s refresh-ticker thread) sends on a tokio mpsc channel **and pulses the
+  `TerminalWaker`**; the loop drains channels on wake and re-renders only when
+  dirty. Never put blocking I/O (git, DB, subprocess) on the loop; never add a
+  polling timeout.
+- **Rendering** is damage-tracked: compose into a scratch `Surface`, then
+  `BufferedTerminal::draw_from_screen` + `flush()` emits only changed cells.
+- **State.** SQLite at `$XDG_STATE_HOME/superzej/superzej.db` (WAL, schema
+  versioned via `user_version`): repos, workspaces, worktrees, PR cache,
+  tab layouts, session + sidebar UI state. **git is the source of truth** for
+  worktrees; the DB is a cache + resurrection layer.
+- **Sandboxing.** Each worktree's interactive process can run in a container
+  (`podman` → `docker` → `bwrap` → `none`); the worktree stays on the host,
+  bind-mounted at its real path so host-side git reads keep working. Remote
+  backend runs worktrees on another machine.
+
+## Performance invariants
+
+"Everything is instant": sub-300ms launch → first frame, <16ms render, 0% idle.
+
+- `SUPERZEJ_LOG=info` writes a **startup waterfall** to
+  `$XDG_STATE_HOME/superzej/logs/szhost.log` (`szhost::startup` events with
+  `since_start_ms`). Frame/hydration timings: `SUPERZEJ_LOG=szhost::frame=debug`
+  / `szhost::hydrate=debug`. No subscriber is installed when `SUPERZEJ_LOG` is
+  unset — instrumentation is free.
+- `just bench` (hyperfine) measures process baseline + real launch→first-frame
+  via `SUPERZEJ_BENCH_FIRST_FRAME_EXIT=1`. Machine-dependent, so not in `ci`;
+  perf commits should record before/after deltas.
+- Expensive setup belongs off-thread (see the diff fs-watcher: recursive
+  inotify registration is ~1s on large worktrees and is done on a background
+  thread, handed back over a channel).
 
 ## Source map
 
-- `src/main.rs`, `src/cli.rs` — entry + clap command tree.
-- `src/commands/*.rs` — one file per subcommand (the CLI surface the UI + plugins
-  call). Notables: `new_worktree`, `new_workspace`, `pick_agent`, `pr`, `diff`,
-  `watch`, `resolve`, `dashboard`, `monitor`, `stats`, `theme`, `grant_plugins`.
-- `src/palette/` — the Cmd-K command palette: a native iocraft TUI (`menu`
-  command), `nucleo` fuzzy matching + embedded ripgrep (`ignore`/`grep-*`).
-- `src/{db,config,keymap,theme,sandbox,remote,github,worktree,repo,zellij}.rs` —
-  the testable core (config layering, keymap/KDL, SQLite, sandbox backends, etc.).
-- `src/log.rs` — hand-composed `tracing` subscriber (branded formatter + size-capped
-  file sink).
-- `plugin/*/src` — the four Rust→WASM `zellij-tile` plugins.
-- `config/` — `config.toml.example` (every superzej key), `zellij.kdl` (seed), `yazi/`.
-- `layouts/` — embedded zellij layouts (re-seeded each launch).
+- `crates/superzej-host/src/main.rs` — clap tree; bare `szhost` launches the
+  compositor, subcommands (`pr`, `issue`, `diff`, `list`, `repos`, `config`)
+  run synchronously from `src/cmd/`.
+- `crates/superzej-host/src/run.rs` — the event loop + startup.
+- `crates/superzej-host/src/` — `chrome.rs` (widget rendering), `sidebar.rs`
+  (tree model), `pins.rs` (`PinSupervisor` daemon panes), `center.rs`
+  (pane-tree layout), `pane.rs`/`emulator.rs` (PTY + vt100), `session.rs`
+  (persist/resurrect), `palette.rs`, `keymap.rs`, `copymode.rs`.
+- `crates/superzej-core/src/` — `config.rs` (layered TOML, `config_enum!`),
+  `db.rs`, `keymap.rs`, `theme.rs`, `sandbox.rs`, `activity.rs`, `log.rs`
+  (branded tracing subscriber + rotating file sink).
+- `config/config.toml.example` — every superzej key, documented.
 - `docs/superpowers/{plans,specs}/` — design docs per feature.
 
 ## Development
 
-Run inside `nix develop` (provides the rust toolchain + `wasm32-wasip1` target + tools).
+Run inside `nix develop` (rust toolchain + tools).
 
 ```sh
-just build           # cargo build (binary only)
-just build-plugins   # build the four WASM plugins
+just build           # cargo build --workspace (debug)
 just test            # unit tests
-just smoke           # hermetic end-to-end test
-just e2e-ui          # plugin/chrome e2e (needs release + plugins)
-just lint            # clippy + theme-sync check
+just smoke           # hermetic end-to-end CLI test
+just lint            # clippy -D warnings + shellcheck + yamllint + taplo
 just coverage        # cargo llvm-cov, gated at 95% lines on the core
-just ci              # fmt-check + lint + build + plugins + test + coverage + smoke + nix-build
+just bench           # startup benchmarks (hyperfine; not part of ci)
+just start name=dev  # run the host with an isolated XDG_STATE_HOME
+just ci              # fmt-check + lint + build + test + coverage + smoke + nix-build
 ```
 
-Nix: `nix profile install .#default` (wrapped binary); plugins via
-`nix build .#superzej-{sidebar,panel,tabbar}`. `nix develop` for the dev shell.
+Nix: `nix profile install .#default`; `nix develop` for the dev shell.
 
 ## Conventions & gotchas
 
-- **Testable core is gated at 95% line coverage** (`src/{config,keymap,db,...}`);
-  I/O / subprocess / WASM glue is excluded from coverage and exercised by
-  `test/smoke.sh` + the e2e suite instead. See `docs/coverage.md`. New core logic
-  needs unit tests.
-- **The theme palette is a _copied_ `theme.rs`**, not a shared crate — Nix
-  sandboxes the plugin subdirs, so the palette is duplicated into each plugin and
-  kept in sync via `just sync-theme` (checked by `just check-theme`/`lint`). Only
-  the `accent` is configurable; the rest of the storm-blue palette is fixed.
-- **This shell often runs _inside_ a live superzej.** zellij-spawning e2e tests
-  leak into the daily DB / shared socket unless sandboxed — isolate
-  `ZELLIJ_SOCKET_DIR` (not just `XDG_STATE_HOME`), and `pkill -9` the sandbox
-  zellij server on cleanup (delete-session leaves zombies; a runaway server can
-  pin CPU >1000%). The e2e harness (`test/nav-ux.py`) is fully self-contained.
-- **`.pre-commit-config.yaml` is a gitignored Nix store symlink** (managed by
-  devenv) — don't edit it directly. `git add` new files before `nix flake check`.
-- Commit/push only when asked; branch off `main` first (see `/branch`). Conventional
-  commit style (`feat(scope):`, `fix(scope):`) matches the history.
+- **Coverage gate: `superzej-core` only, 95% lines.** I/O / subprocess seams
+  (the `cov_ignore` regex in the justfile) are excluded and exercised by
+  `test/smoke.sh` instead. The host and svc crates carry their own unit tests
+  but aren't gated. New core logic needs unit tests.
+- **This shell often runs _inside_ a live superzej.** Anything that opens the
+  DB or spawns the host in tests/benches must isolate `XDG_STATE_HOME`
+  (`just start`/`just bench` already do).
+- **`.pre-commit-config.yaml` is a generated Nix store symlink** (devenv /
+  git-hooks.nix) — edit `devenv.nix`, then re-enter `devenv shell` to
+  regenerate. `git add` new files before `nix flake check`.
+- Commit/push only when asked; branch off `main` first. Conventional commit
+  style (`feat(scope):`, `fix(scope):`) matches the history.
