@@ -140,10 +140,10 @@ impl GitBackend for CliGit {
                     path: p.to_string(),
                     branch: None,
                 });
-            } else if let Some(b) = line.strip_prefix("branch ") {
-                if let Some(w) = cur.as_mut() {
-                    w.branch = Some(b.trim_start_matches("refs/heads/").to_string());
-                }
+            } else if let Some(b) = line.strip_prefix("branch ")
+                && let Some(w) = cur.as_mut()
+            {
+                w.branch = Some(b.trim_start_matches("refs/heads/").to_string());
             }
         }
         if let Some(w) = cur.take() {

@@ -148,10 +148,10 @@ fn print_issue(issue: &Issue) {
     if let Some(created) = &issue.created_at {
         outln!("Created: {created}");
     }
-    if let Some(body) = &issue.body {
-        if !body.is_empty() {
-            outln!("\n{body}");
-        }
+    if let Some(body) = &issue.body
+        && !body.is_empty()
+    {
+        outln!("\n{body}");
     }
 }
 

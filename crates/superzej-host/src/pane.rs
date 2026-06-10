@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 use std::io::Write;
 
+use termwiz::terminal::TerminalWaker;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::emulator::{PaneEmulator, Vt100Emulator};
@@ -51,18 +52,17 @@ pub fn program_name(argv: &[String]) -> String {
     let base = stem(first);
     // A shell running an inline command: `sh -c "exec yazi"` → "yazi".
     let is_shell = matches!(base.as_str(), "sh" | "bash" | "zsh" | "dash" | "fish");
-    if is_shell {
-        if let Some(cmd) = argv
+    if is_shell
+        && let Some(cmd) = argv
             .iter()
             .skip(1)
             .position(|a| a == "-c" || a == "-lc" || a == "-ic")
             .and_then(|i| argv.get(i + 2))
-        {
-            // Strip a leading `exec ` and take the first bare word.
-            let cmd = cmd.trim().strip_prefix("exec ").unwrap_or(cmd.trim());
-            if let Some(word) = cmd.split_whitespace().next() {
-                return stem(word);
-            }
+    {
+        // Strip a leading `exec ` and take the first bare word.
+        let cmd = cmd.trim().strip_prefix("exec ").unwrap_or(cmd.trim());
+        if let Some(word) = cmd.split_whitespace().next() {
+            return stem(word);
         }
     }
     base
@@ -74,6 +74,11 @@ impl PtyPane {
     /// child — agent panes expect `SUPERZEJ_WORKTREE`/`_BRANCH`; a plain pane
     /// passes an empty slice. Reader-thread events arrive on `tx`, tagged with
     /// `id` so a shared channel can carry every pane's output.
+    ///
+    /// `waker` (when present) is pulsed after every send so the main loop's
+    /// blocking `poll_input(None)` returns immediately to drain PTY output — this
+    /// is what makes the loop event-driven (zero idle wakeups) rather than polled.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_with_env(
         id: u32,
         argv: &[String],
@@ -82,6 +87,7 @@ impl PtyPane {
         rows: u16,
         cols: u16,
         tx: tokio_mpsc::Sender<PaneEvent>,
+        waker: Option<TerminalWaker>,
     ) -> Result<Self> {
         let pty = portable_pty::native_pty_system();
         let pair = pty
@@ -117,6 +123,9 @@ impl PtyPane {
                 match reader.read(&mut buf) {
                     Ok(0) => {
                         let _ = tx.blocking_send(PaneEvent::Exit(id));
+                        if let Some(w) = &waker {
+                            let _ = w.wake();
+                        }
                         break;
                     }
                     Ok(n) => {
@@ -126,9 +135,15 @@ impl PtyPane {
                         {
                             break; // consumer gone
                         }
+                        if let Some(w) = &waker {
+                            let _ = w.wake();
+                        }
                     }
                     Err(_) => {
                         let _ = tx.blocking_send(PaneEvent::Exit(id));
+                        if let Some(w) = &waker {
+                            let _ = w.wake();
+                        }
                         break;
                     }
                 }
@@ -258,7 +273,8 @@ mod tests {
     fn pty_round_trip_lands_output_in_grid() {
         let (tx, mut rx) = tokio_mpsc::channel(1024);
         let mut pane =
-            PtyPane::spawn_with_env(0, &sh("printf 'hello-pty'"), None, &[], 24, 80, tx).unwrap();
+            PtyPane::spawn_with_env(0, &sh("printf 'hello-pty'"), None, &[], 24, 80, tx, None)
+                .unwrap();
         assert!(
             drain_until_exit(&mut pane, &mut rx, 5000),
             "child should exit"
@@ -271,7 +287,7 @@ mod tests {
         // `stty size` prints "rows cols" read from the PTY winsize.
         let (tx, mut rx) = tokio_mpsc::channel(1024);
         let mut pane =
-            PtyPane::spawn_with_env(0, &sh("stty size"), None, &[], 30, 100, tx).unwrap();
+            PtyPane::spawn_with_env(0, &sh("stty size"), None, &[], 30, 100, tx, None).unwrap();
         assert!(drain_until_exit(&mut pane, &mut rx, 5000));
         assert_eq!(pane.emulator().row_text(0), Some("30 100".to_string()));
     }
@@ -289,6 +305,7 @@ mod tests {
             24,
             80,
             tx,
+            None,
         )
         .unwrap();
         let exited = drain_until_exit(&mut pane, &mut rx, 5000);

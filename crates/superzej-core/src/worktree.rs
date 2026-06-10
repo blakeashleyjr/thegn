@@ -121,12 +121,12 @@ pub fn add(root: &Path, branch: &str, base: &str, path: &Path, cfg: &Config) -> 
     if cfg.worktree_mode == WorktreeMode::InRepo {
         // Keep .worktrees out of git locally without touching tracked .gitignore.
         let excl = root.join(".git/info/exclude");
-        if let Ok(contents) = std::fs::read_to_string(&excl) {
-            if !contents.lines().any(|l| l == ".worktrees/") {
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&excl) {
-                    let _ = writeln!(f, ".worktrees/");
-                }
+        if let Ok(contents) = std::fs::read_to_string(&excl)
+            && !contents.lines().any(|l| l == ".worktrees/")
+        {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&excl) {
+                let _ = writeln!(f, ".worktrees/");
             }
         }
     }

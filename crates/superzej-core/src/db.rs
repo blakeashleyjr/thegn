@@ -332,10 +332,9 @@ impl Db {
             "SELECT slug FROM repo_slugs WHERE repo_path=?1",
             params![repo_path],
             |r| r.get::<_, String>(0),
-        ) {
-            if !s.is_empty() {
-                return Ok(s);
-            }
+        ) && !s.is_empty()
+        {
+            return Ok(s);
         }
         let taken: std::collections::HashSet<String> = {
             let mut stmt = self
