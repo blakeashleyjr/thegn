@@ -2,6 +2,25 @@ use crate::remote::GitLoc;
 use serde::{Deserialize, Serialize};
 
 /// Distinguishable `gh` (or other forge CLI) failure modes.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Issue {
+    pub number: u64,
+    pub title: String,
+    pub body: Option<String>,
+    pub state: String,
+    pub url: String,
+    pub author: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CreateIssueOpts {
+    pub title: String,
+    pub body: Option<String>,
+    pub labels: Vec<String>,
+}
+
 #[derive(Debug)]
 pub enum ForgeError {
     NotInstalled,

@@ -150,30 +150,6 @@ impl Forge for GitHubForge {
         gh_run(loc, &args)
     }
 
-    fn set_draft(&self, loc: &GitLoc, draft: bool) -> Result<(), ForgeError> {
-        if draft {
-            // Convert to draft: gh pr ready --undo
-            gh_run(loc, &["pr", "ready", "--undo"])
-        } else {
-            // Mark as ready for review: gh pr ready
-            gh_run(loc, &["pr", "ready"])
-        }
-    }
-
-    fn set_auto_merge(&self, loc: &GitLoc, enable: bool) -> Result<(), ForgeError> {
-        if enable {
-            // Enable auto-merge: gh pr merge --auto
-            gh_run(loc, &["pr", "merge", "--auto", "--squash"])
-        } else {
-            // Disable is not directly supported via gh, but we can try
-            // gh doesn't have a direct command to disable auto-merge
-            // We'll return an error for now
-            Err(ForgeError::Other(
-                "gh CLI does not support disabling auto-merge".into(),
-            ))
-        }
-    }
-
     fn reviews(&self, loc: &GitLoc) -> Result<String, ForgeError> {
         gh_out(
             loc,
@@ -218,6 +194,132 @@ impl Forge for GitHubForge {
             }
         }
         Ok(count)
+    }
+
+    fn set_draft(&self, loc: &GitLoc, draft: bool) -> Result<(), ForgeError> {
+        if draft {
+            gh_run(loc, &["pr", "ready", "--undo"])
+        } else {
+            gh_run(loc, &["pr", "ready"])
+        }
+    }
+
+    fn set_auto_merge(&self, loc: &GitLoc, enable: bool) -> Result<(), ForgeError> {
+        if enable {
+            gh_run(loc, &["pr", "merge", "--auto", "--merge"])
+        } else {
+            gh_run(loc, &["pr", "merge", "--auto", "--undo"])
+        }
+    }
+
+    fn list_issues(&self, loc: &GitLoc, state: &str) -> Result<Vec<Issue>, ForgeError> {
+        let json = gh_out(
+            loc,
+            &[
+                "issue",
+                "list",
+                "--state",
+                state,
+                "--json",
+                "number,title,body,state,url,author,createdAt,updatedAt",
+            ],
+        )?;
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct GhIssue {
+            number: u64,
+            title: String,
+            body: String,
+            state: String,
+            url: String,
+            author: GhAuthor,
+        }
+        #[derive(Deserialize)]
+        struct GhAuthor {
+            login: String,
+        }
+        let gh_issues: Vec<GhIssue> = serde_json::from_str(&json).unwrap_or_default();
+        Ok(gh_issues
+            .into_iter()
+            .map(|i| Issue {
+                number: i.number,
+                title: i.title,
+                body: Some(i.body),
+                state: i.state,
+                url: i.url,
+                author: i.author.login,
+                created_at: 0,
+                updated_at: 0,
+            })
+            .collect())
+    }
+
+    fn get_issue(&self, loc: &GitLoc, issue: u64) -> Result<Issue, ForgeError> {
+        let json = gh_out(
+            loc,
+            &[
+                "issue",
+                "view",
+                &issue.to_string(),
+                "--json",
+                "number,title,body,state,url,author,createdAt,updatedAt",
+            ],
+        )?;
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct GhIssue {
+            number: u64,
+            title: String,
+            body: String,
+            state: String,
+            url: String,
+            author: GhAuthor,
+        }
+        #[derive(Deserialize)]
+        struct GhAuthor {
+            login: String,
+        }
+        let i: GhIssue =
+            serde_json::from_str(&json).map_err(|e| ForgeError::Other(e.to_string()))?;
+        Ok(Issue {
+            number: i.number,
+            title: i.title,
+            body: Some(i.body),
+            state: i.state,
+            url: i.url,
+            author: i.author.login,
+            created_at: 0,
+            updated_at: 0,
+        })
+    }
+
+    fn create_issue(&self, loc: &GitLoc, opts: &CreateIssueOpts) -> Result<Issue, ForgeError> {
+        let mut args = vec!["issue".to_string(), "create".to_string()];
+        args.push("--title".into());
+        args.push(opts.title.clone());
+        if let Some(body) = &opts.body {
+            args.push("--body".into());
+            args.push(body.clone());
+        }
+        for l in &opts.labels {
+            args.push("--label".into());
+            args.push(l.clone());
+        }
+        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let out = gh_out(loc, &refs)?;
+        let number = out
+            .split('/')
+            .last()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        self.get_issue(loc, number)
+    }
+
+    fn issue_comment(&self, loc: &GitLoc, issue: u64, body: &str) -> Result<(), ForgeError> {
+        gh_run(
+            loc,
+            &["issue", "comment", &issue.to_string(), "--body", body],
+        )
     }
 }
 
