@@ -28,6 +28,44 @@ pub struct PtyPane {
     emulator: Box<dyn PaneEmulator>,
     rows: u16,
     cols: u16,
+    /// The launched program's short name (e.g. `lazygit`, `yazi`, `nvim`, or the
+    /// shell). Used to key per-program keybind overlays + remaps. Best-effort
+    /// from the spawn argv — not a live foreground-process probe.
+    program: String,
+}
+
+/// Derive a pane's program name from its spawn argv. Handles the common
+/// `sh -c "exec <prog> …"` / `sh -lc "<prog> …"` tool-launch shape by reaching
+/// past the shell to the first word of the command string; otherwise uses the
+/// file stem of `argv[0]`. Returns `""` for an empty argv.
+pub fn program_name(argv: &[String]) -> String {
+    let stem = |s: &str| -> String {
+        std::path::Path::new(s)
+            .file_stem()
+            .map(|o| o.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let Some(first) = argv.first() else {
+        return String::new();
+    };
+    let base = stem(first);
+    // A shell running an inline command: `sh -c "exec yazi"` → "yazi".
+    let is_shell = matches!(base.as_str(), "sh" | "bash" | "zsh" | "dash" | "fish");
+    if is_shell {
+        if let Some(cmd) = argv
+            .iter()
+            .skip(1)
+            .position(|a| a == "-c" || a == "-lc" || a == "-ic")
+            .and_then(|i| argv.get(i + 2))
+        {
+            // Strip a leading `exec ` and take the first bare word.
+            let cmd = cmd.trim().strip_prefix("exec ").unwrap_or(cmd.trim());
+            if let Some(word) = cmd.split_whitespace().next() {
+                return stem(word);
+            }
+        }
+    }
+    base
 }
 
 impl PtyPane {
@@ -98,7 +136,13 @@ impl PtyPane {
             emulator: Box::new(Vt100Emulator::new(rows, cols, 10_000)),
             rows,
             cols,
+            program: program_name(argv),
         })
+    }
+
+    /// The launched program's short name (keys per-program keybind overlays).
+    pub fn program(&self) -> &str {
+        &self.program
     }
 
     /// Feed PTY output into the emulator grid (drain-without-render is just this
@@ -186,6 +230,22 @@ mod tests {
 
     fn sh(script: &str) -> Vec<String> {
         vec!["/bin/sh".into(), "-c".into(), script.into()]
+    }
+
+    #[test]
+    fn program_name_uses_argv0_stem() {
+        assert_eq!(program_name(&["/usr/bin/lazygit".into()]), "lazygit");
+        assert_eq!(program_name(&["nvim".into(), "file".into()]), "nvim");
+        assert_eq!(program_name(&[]), "");
+    }
+
+    #[test]
+    fn program_name_reaches_past_shell_to_inline_command() {
+        // The tool-drawer pattern: `sh -c "exec yazi"` → "yazi".
+        assert_eq!(program_name(&sh("exec yazi")), "yazi");
+        assert_eq!(program_name(&sh("lazygit --version")), "lazygit");
+        // A login shell with no inline command is just the shell.
+        assert_eq!(program_name(&["/bin/zsh".into(), "-i".into()]), "zsh");
     }
 
     #[test]
