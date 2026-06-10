@@ -12,6 +12,9 @@
 //! then the Linux `gpu_busy_percent` sysfs counter (AMD + Intel). Other
 //! combinations (e.g. Apple GPUs) simply omit the field for now.
 
+use crate::commands::watch;
+use crate::db::Db;
+use crate::zellij;
 use anyhow::Result;
 use serde::Serialize;
 use sysinfo::{MINIMUM_CPU_UPDATE_INTERVAL, System};
@@ -102,6 +105,16 @@ pub fn run() -> Result<()> {
 
     if let Some(gpu) = gpu_percent() {
         fields.push(format!("gpu={gpu}"));
+    }
+
+    // Read focused worktree and fetch cached LOC
+    let session = zellij::ui_session();
+    if let Some(wt) = watch::read_focus(&session) {
+        if let Ok(db) = Db::open() {
+            if let Ok(Some(loc)) = db.get_loc_cache(&wt) {
+                fields.push(format!("loc={loc}"));
+            }
+        }
     }
 
     fields.push(format!("time={}", chrono::Local::now().format("%H:%M")));
