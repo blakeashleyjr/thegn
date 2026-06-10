@@ -78,6 +78,19 @@ pub fn compose_pane(surface: &mut Surface, emu: &dyn PaneEmulator, rect: Rect) {
     let mut run = String::new();
     for row in 0..rect.rows.min(erows as usize) {
         flush_run(surface, &mut run);
+
+        // FAST PATH: If the emulator can give us the whole row, blit it directly
+        if let Some(text) = emu.row_text(row as u16) {
+            surface.add_change(Change::CursorPosition {
+                x: Position::Absolute(rect.x),
+                y: Position::Absolute(rect.y + row),
+            });
+            surface.add_change(Change::Text(text));
+            current_style = None; // Reset style tracking since we jumped ahead
+            continue;
+        }
+
+        // SLOW PATH: Fallback to cell-by-cell iteration with style tracking
         surface.add_change(Change::CursorPosition {
             x: Position::Absolute(rect.x),
             y: Position::Absolute(rect.y + row),

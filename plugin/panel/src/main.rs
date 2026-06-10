@@ -173,16 +173,13 @@ impl ZellijPlugin for State {
             // Live diff push from the watch daemon (fs change in the worktree).
             "superzej_diff" => {
                 if let Some(payload) = pipe.payload {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
-                        if let Some(wt) = v.get("worktree").and_then(|w| w.as_str()) {
-                            if let Some(files) = v.get("files").and_then(|f| f.as_str()) {
-                                let parsed = parse_files(files);
-                                self.diff_cache.insert(wt.to_string(), parsed.clone());
-                                if Some(wt) == self.worktree.as_deref() {
-                                    self.files = parsed;
-                                    return true;
-                                }
-                            }
+                    // Optimized manual parse: zero JSON allocation
+                    if let Some((wt, files_tsv)) = payload.split_once('\n') {
+                        let parsed = parse_files(files_tsv);
+                        self.diff_cache.insert(wt.to_string(), parsed.clone());
+                        if Some(wt) == self.worktree.as_deref() {
+                            self.files = parsed;
+                            return true;
                         }
                     }
                 }
