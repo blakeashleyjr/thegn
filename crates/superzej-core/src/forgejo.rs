@@ -56,4 +56,8 @@ impl Forge for ForgejoForge {
     fn issue_comment(&self, loc: &GitLoc, issue: u64, body: &str) -> Result<(), ForgeError> {
         Err(ForgeError::Other("Not implemented".into()))
     }
+
+    fn get_check_logs(&self, loc: &GitLoc, check_name: &str) -> Result<String, ForgeError> {
+        Err(ForgeError::Other("Not implemented".into()))
+    }
 }

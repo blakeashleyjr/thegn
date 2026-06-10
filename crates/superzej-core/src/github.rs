@@ -321,6 +321,10 @@ impl Forge for GitHubForge {
             &["issue", "comment", &issue.to_string(), "--body", body],
         )
     }
+
+    fn get_check_logs(&self, loc: &GitLoc, check_name: &str) -> Result<String, ForgeError> {
+        gh_out(loc, &["run", "view", check_name, "--log"])
+    }
 }
 
 /// Short human-readable description of an error (for CLI output).

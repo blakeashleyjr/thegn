@@ -26,6 +26,8 @@ pub trait Forge {
     fn get_issue(&self, loc: &GitLoc, issue: u64) -> Result<Issue, ForgeError>;
     fn create_issue(&self, loc: &GitLoc, opts: &CreateIssueOpts) -> Result<Issue, ForgeError>;
     fn issue_comment(&self, loc: &GitLoc, issue: u64, body: &str) -> Result<(), ForgeError>;
+
+    fn get_check_logs(&self, loc: &GitLoc, check_name: &str) -> Result<String, ForgeError>;
 }
 
 pub fn extract_issue_from_branch(branch: &str) -> Option<u64> {

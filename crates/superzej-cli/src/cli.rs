@@ -223,6 +223,10 @@ pub enum Command {
         #[command(subcommand)]
         action: PinAction,
     },
+    Issue {
+        #[command(subcommand)]
+        action: IssueAction,
+    },
     /// GitHub PR data + actions for a worktree (feeds the right panel).
     Pr {
         #[command(subcommand)]
@@ -309,6 +313,42 @@ pub enum PinAction {
     List {
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum IssueAction {
+    /// List issues (JSON).
+    List {
+        #[arg(long)]
+        worktree: Option<String>,
+        #[arg(long, default_value = "open")]
+        state: String,
+    },
+    /// View an issue (JSON).
+    View {
+        #[arg(long)]
+        worktree: Option<String>,
+        issue: u64,
+    },
+    /// Create an issue.
+    Create {
+        #[arg(long)]
+        worktree: Option<String>,
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long)]
+        label: Vec<String>,
+    },
+    /// Comment on an issue.
+    Comment {
+        #[arg(long)]
+        worktree: Option<String>,
+        issue: u64,
+        #[arg(long)]
+        body: String,
     },
 }
 

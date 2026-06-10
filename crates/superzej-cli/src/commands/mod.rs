@@ -9,6 +9,7 @@ pub mod dashboard;
 pub mod diff;
 pub mod files;
 pub mod grant_plugins;
+pub mod issue;
 pub mod keys;
 pub mod launch;
 pub mod list;
