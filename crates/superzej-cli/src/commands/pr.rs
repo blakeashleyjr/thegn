@@ -44,6 +44,7 @@ pub fn run(cfg: &Config, action: PrAction) -> Result<()> {
         PrAction::Draft { worktree, undo } => draft(worktree, undo),
         PrAction::Ready { worktree } => ready(worktree),
         PrAction::AutoMerge { worktree, disable } => auto_merge(worktree, disable),
+        PrAction::Logs { worktree, check } => logs(worktree, check),
     }
 }
 
@@ -323,5 +324,15 @@ fn auto_merge(worktree: Option<String>, disable: bool) -> Result<()> {
             superzej_core::forge::models::ForgeError::message(&e)
         )),
     }
+    Ok(())
+}
+
+fn logs(worktree: Option<String>, check: Option<String>) -> Result<()> {
+    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    let forge = superzej_core::forge::get_forge_for_loc(&loc)
+        .ok_or_else(|| anyhow::anyhow!("No supported forge detected"))?;
+    
+    let logs_output = forge.get_check_logs(&loc, check.as_deref().unwrap_or("")).map_err(|e| anyhow::anyhow!("failed to retrieve logs: {}", e.message()))?;
+    crate::outln!("{}", logs_output);
     Ok(())
 }

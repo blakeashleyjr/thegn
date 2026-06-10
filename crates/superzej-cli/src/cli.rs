@@ -443,6 +443,13 @@ pub enum PrAction {
         #[arg(long = "disable")]
         disable: bool,
     },
+    /// Retrieve raw logs from CI checks.
+    Logs {
+        #[arg(long)]
+        worktree: Option<String>,
+        #[arg(long)]
+        check: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
