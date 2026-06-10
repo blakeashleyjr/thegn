@@ -73,6 +73,7 @@ struct State {
     active_tab_pos: Option<usize>, // position of the session's active tab
     session: Option<String>,       // current session name (restore `--session` arg)
     restore_poked: bool,           // restore already requested for this activation
+    focused_pane_command: Option<String>, // The command running in the focused pane (e.g. lazygit, hx)
 }
 
 /// Tracked visibility of one controlled chrome surface.
@@ -143,9 +144,13 @@ impl ZellijPlugin for State {
             // arrives here (the statusbar is always visible, so it never misses
             // one). Recompute auto-hide from the total width and reconcile.
             Event::PaneUpdate(manifest) => {
+                let old_cmd = self.focused_pane_command.clone();
                 self.scan_panes(&manifest);
                 self.reconcile();
                 self.maybe_restore();
+                if self.focused_pane_command != old_cmd {
+                    return true;
+                }
                 false
             }
             Event::RunCommandResult(code, stdout, _, ctx)
@@ -484,6 +489,7 @@ impl State {
         // id so the close pipe can target it, and so restore knows it's open.
         // Absent ⇒ closed (e.g. the user quit yazi, or it was never opened).
         let mut files_id = None;
+        self.focused_pane_command = None;
         for p in panes {
             // The open command palette: the floating pane we spawn as
             // `--name superzej-palette` (see `toggle_palette`).
@@ -498,6 +504,9 @@ impl State {
                 && (p.is_focused || self.center_id.is_none())
             {
                 self.center_id = Some(p.id);
+                if p.is_focused {
+                    self.focused_pane_command = Some(p.title.clone());
+                }
             }
             if p.is_plugin {
                 match p.plugin_url.as_deref() {
@@ -670,6 +679,21 @@ impl State {
                     ("A-w", "worktree"),
                     ("A-n", "split"),
                 ];
+
+                if let Some(cmd) = &self.focused_pane_command {
+                    let cmd_lower = cmd.to_lowercase();
+                    if cmd_lower.contains("lazygit") {
+                        v.extend_from_slice(&[("q", "quit"), ("Space", "commit"), ("?", "help")]);
+                        return v;
+                    } else if cmd_lower.contains("hx") || cmd_lower.contains("vim") {
+                        v.extend_from_slice(&[(":w", "save"), (":q", "quit")]);
+                        return v;
+                    } else if cmd_lower.contains("yazi") {
+                        v.extend_from_slice(&[("q", "quit"), ("/", "search"), ("Enter", "open")]);
+                        return v;
+                    }
+                }
+
                 if self.worktree_ctx {
                     v.extend_from_slice(&[("A-g", "lazygit"), ("A-e", "edit"), ("A-X", "close")]);
                 } else {
@@ -739,4 +763,103 @@ fn push_raw(out: &mut String, col: &mut usize, cols: usize, text: &str, width: u
     }
     out.push_str(text);
     *col += width;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_restore_decision_disarm() {
+        let dec = restore_decision(Some(1), Some(2), true, false, false, true);
+        assert!(matches!(dec, RestoreDecision::Disarm));
+    }
+
+    #[test]
+    fn test_restore_decision_skip_missing() {
+        let dec = restore_decision(None, Some(1), true, false, false, true);
+        assert!(matches!(dec, RestoreDecision::Skip));
+        let dec2 = restore_decision(Some(1), None, true, false, false, true);
+        assert!(matches!(dec2, RestoreDecision::Skip));
+    }
+
+    #[test]
+    fn test_restore_decision_skip_conditions() {
+        // not worktree
+        let dec = restore_decision(Some(1), Some(1), false, false, false, true);
+        assert!(matches!(dec, RestoreDecision::Skip));
+        // files open
+        let dec = restore_decision(Some(1), Some(1), true, true, false, true);
+        assert!(matches!(dec, RestoreDecision::Skip));
+        // already poked
+        let dec = restore_decision(Some(1), Some(1), true, false, true, true);
+        assert!(matches!(dec, RestoreDecision::Skip));
+        // no session
+        let dec = restore_decision(Some(1), Some(1), true, false, false, false);
+        assert!(matches!(dec, RestoreDecision::Skip));
+    }
+
+    #[test]
+    fn test_restore_decision_fire() {
+        let dec = restore_decision(Some(1), Some(1), true, false, false, true);
+        assert!(matches!(dec, RestoreDecision::Fire));
+    }
+
+    #[test]
+    fn test_parse_rgb_line() {
+        assert_eq!(
+            parse_rgb_line(b"255;0;128\n"),
+            Some("255;0;128".to_string())
+        );
+        assert_eq!(
+            parse_rgb_line(b" 255;0;128 \n"),
+            Some("255;0;128".to_string())
+        );
+        // Invalid
+        assert_eq!(parse_rgb_line(b"255;0\n"), None);
+        assert_eq!(parse_rgb_line(b"255;0;128;50\n"), None);
+        assert_eq!(parse_rgb_line(b"abc;0;128\n"), None);
+    }
+
+    #[test]
+    fn test_mode_name() {
+        assert_eq!(mode_name(InputMode::Normal), "MODE");
+        assert_eq!(mode_name(InputMode::Pane), "PANE");
+        assert_eq!(mode_name(InputMode::RenamePane), "RENAME PANE");
+    }
+
+    #[test]
+    fn test_push_raw() {
+        let mut out = String::new();
+        let mut col = 0;
+        let cols = 10;
+
+        // fits
+        push_raw(&mut out, &mut col, cols, "hello", 5);
+        assert_eq!(out, "hello");
+        assert_eq!(col, 5);
+
+        // fits exactly
+        push_raw(&mut out, &mut col, cols, "world", 5);
+        assert_eq!(out, "helloworld");
+        assert_eq!(col, 10);
+
+        // already full
+        push_raw(&mut out, &mut col, cols, "!", 1);
+        assert_eq!(out, "helloworld");
+        assert_eq!(col, 10);
+    }
+
+    #[test]
+    fn test_push_raw_clips() {
+        let mut out = String::new();
+        let mut col = 0;
+        let cols = 5;
+
+        push_raw(&mut out, &mut col, cols, "abc", 3);
+        // Next piece is length 3, only 2 slots remain, so it doesn't push
+        push_raw(&mut out, &mut col, cols, "def", 3);
+        assert_eq!(out, "abc");
+        assert_eq!(col, 5); // col gets clamped to cols
+    }
 }
