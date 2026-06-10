@@ -34,13 +34,14 @@ impl Key {
     pub fn modified(code: KeyCode, mods: Modifiers) -> Self {
         // termwiz reports shifted ASCII letters as uppercase chars; normalize
         // parser-created `Shift x` to the same shape so configured chords match.
-        if let KeyCode::Char(c) = code {
-            if mods.contains(Modifiers::SHIFT) && c.is_ascii_alphabetic() {
-                return Self {
-                    code: KeyCode::Char(c.to_ascii_uppercase()),
-                    mods: mods - Modifiers::SHIFT,
-                };
-            }
+        if let KeyCode::Char(c) = code
+            && mods.contains(Modifiers::SHIFT)
+            && c.is_ascii_alphabetic()
+        {
+            return Self {
+                code: KeyCode::Char(c.to_ascii_uppercase()),
+                mods: mods - Modifiers::SHIFT,
+            };
         }
         Self { code, mods }
     }
@@ -78,6 +79,28 @@ impl SequenceMatcher {
 
     pub fn reset(&mut self) {
         self.current.clear();
+    }
+
+    /// The next-key candidates given the current pending prefix: for every stored
+    /// sequence that begins with `self.current` and is longer, the key that would
+    /// advance it plus the action it ultimately resolves to. Drives the which-key
+    /// popup. Empty when nothing is pending. Deduplicated on the next key.
+    pub fn pending_continuations(&self) -> Vec<(Key, Action)> {
+        // Only meaningful mid-sequence: with no prefix this would list every
+        // first key, which is not what the which-key popup wants.
+        if self.current.is_empty() {
+            return Vec::new();
+        }
+        let mut out: Vec<(Key, Action)> = Vec::new();
+        for (sequence, action) in &self.sequences {
+            if sequence.len() > self.current.len() && sequence.starts_with(&self.current) {
+                let next = sequence[self.current.len()].clone();
+                if !out.iter().any(|(k, _)| *k == next) {
+                    out.push((next, action.clone()));
+                }
+            }
+        }
+        out
     }
 
     pub fn feed(&mut self, key: Key) -> MatchResult {
@@ -129,6 +152,29 @@ mod tests {
         assert_eq!(matcher.feed(Key::char('g')), MatchResult::Pending);
         assert_eq!(matcher.feed(Key::char('x')), MatchResult::None);
         assert_eq!(matcher.feed(Key::char('g')), MatchResult::Pending);
+    }
+
+    #[test]
+    fn pending_continuations_list_next_keys() {
+        let mut matcher = SequenceMatcher::new();
+        matcher.add_sequence(vec![Key::char(' '), Key::char('p')], Action::TogglePanel);
+        matcher.add_sequence(vec![Key::char(' '), Key::char('s')], Action::ToggleSidebar);
+        matcher.add_sequence(vec![Key::char('j')], Action::FocusDown);
+
+        // Nothing pending yet → no continuations.
+        assert!(matcher.pending_continuations().is_empty());
+        // Feed the Space prefix; both Space-sequences are now candidates.
+        assert_eq!(matcher.feed(Key::char(' ')), MatchResult::Pending);
+        let cont = matcher.pending_continuations();
+        assert_eq!(cont.len(), 2);
+        assert!(
+            cont.iter()
+                .any(|(k, a)| *k == Key::char('p') && *a == Action::TogglePanel)
+        );
+        assert!(
+            cont.iter()
+                .any(|(k, a)| *k == Key::char('s') && *a == Action::ToggleSidebar)
+        );
     }
 
     #[test]

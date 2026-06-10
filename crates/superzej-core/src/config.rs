@@ -243,7 +243,7 @@ fn default_true() -> bool {
 pub struct CustomAction {
     /// Stable id + default menu/hint label.
     pub name: String,
-    /// Key chord (zellij syntax, e.g. "Alt D"); validated by keymap.
+    /// Key chord (e.g. "Alt D"); validated by the host keymap.
     pub key: String,
     /// Shell command line run via `sh -c`.
     pub run: String,
@@ -259,7 +259,7 @@ pub struct CustomAction {
     pub close_on_exit: bool,
 }
 
-/// Host/zellij keybinding overrides. The flat `[keybinds]` table remains the
+/// Host keybinding overrides. The flat `[keybinds]` table remains the
 /// default/global layer for backwards compatibility; nested tables such as
 /// `[keybinds.vim_normal]` override only the native host's named modes.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
@@ -307,6 +307,34 @@ impl<'a> IntoIterator for &'a KeybindConfig {
     fn into_iter(self) -> Self::IntoIter {
         self.normal.iter()
     }
+}
+
+/// A named keybind profile (`[profiles.<name>]`). Selected by the top-level
+/// `profile` key (or `SUPERZEJ_PROFILE` / `--profile`). A profile may set the
+/// default native-host mode (`default_mode = "vim-normal" | "emacs" | "normal"`)
+/// and carries its own [`KeybindConfig`] layer, applied under the global
+/// `[keybinds]` table. The built-in `vim`/`emacs` presets live in `keymap.rs`;
+/// a config-defined profile of the same name overrides the preset.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct ProfileConfig {
+    /// Native-host mode this profile starts in (`""` ⇒ leave at Normal).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub default_mode: String,
+    /// Keybind overrides applied as this profile's layer.
+    #[serde(skip_serializing_if = "KeybindConfig::is_empty")]
+    pub keybinds: KeybindConfig,
+}
+
+/// Per-workspace config (`[workspace.<slug>.keybinds]`), keyed by repo slug.
+/// Layered above the global + profile keybinds but below a repo-root
+/// `.superzej.*` overlay. See [`Config::effective_keybinds`].
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct WorkspaceConfig {
+    /// Keybind overrides applied when this workspace is focused.
+    #[serde(skip_serializing_if = "KeybindConfig::is_empty")]
+    pub keybinds: KeybindConfig,
 }
 
 /// `[theme]` — visual tuning. Only the accent for now; the rest of the
@@ -743,11 +771,13 @@ impl RemoteOverlay {
     }
 }
 
-/// The shape of a repo-root `.superzej.*` file: a `[sandbox]` table overlay.
+/// The shape of a repo-root `.superzej.*` file: a `[sandbox]` table overlay
+/// plus an optional `[keybinds]` table (the most-specific keybind layer).
 #[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 struct RepoConfigFile {
     sandbox: SandboxOverlay,
+    keybinds: KeybindConfig,
 }
 
 /// `[drawer]` — the bottom file-manager drawer (hidden by default, toggled with
@@ -764,7 +794,7 @@ pub struct DrawerConfig {
     /// user's own yazi config (no isolation, no seeding). Any other value is used
     /// verbatim (tilde-expanded).
     pub config_home: String,
-    /// Drawer height as a zellij floating size ("35%" or a row count).
+    /// Drawer height as a percentage ("35%") or a row count.
     pub height: String,
     /// Drawer width: "full" (span the terminal) or "center" (narrower, centered).
     pub width: String,
@@ -795,6 +825,10 @@ pub struct Config {
     pub auto_remove_worktree: bool,
     pub repo_roots: Vec<String>,
     pub repo_scan_depth: usize,
+    /// Active keybind profile name (`""` ⇒ none). Selects `[profiles.<name>]`;
+    /// overridden by `SUPERZEJ_PROFILE` / `--profile`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub profile: String,
     // --- arrays of tables (must serialize before any plain sub-table) ---
     pub agents: Vec<NamedCommand>,
     pub tools: Vec<NamedCommand>,
@@ -815,6 +849,22 @@ pub struct Config {
     /// Rebind a built-in action by id, e.g. `new-worktree = "Ctrl w"`. The flat
     /// table is the global/default layer; nested mode tables are native-host only.
     pub keybinds: KeybindConfig,
+    /// Named keybind profiles (`[profiles.<name>]`), selected by `profile`.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub profiles: std::collections::BTreeMap<String, ProfileConfig>,
+    /// Per-workspace config keyed by repo slug (`[workspace.<slug>]`).
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub workspace: std::collections::BTreeMap<String, WorkspaceConfig>,
+    /// Per-program host-action overlays (`[program_keybinds.<program>]`), keyed
+    /// by the focused pane's program name. Consulted before the active mode.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub program_keybinds: std::collections::BTreeMap<String, KeybindConfig>,
+    /// Per-program key-injection remaps (`[program_remap.<program>] "Alt j" = "j"`).
+    /// When the program is focused and the LHS chord is not claimed as a host
+    /// action, the RHS key bytes are written into the pane instead.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub program_remap:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
 }
 
 impl Default for Config {
@@ -852,6 +902,11 @@ impl Default for Config {
             drawer: DrawerConfig::default(),
             keybinds: KeybindConfig::default(),
             actions: Vec::new(),
+            profile: String::new(),
+            profiles: std::collections::BTreeMap::new(),
+            workspace: std::collections::BTreeMap::new(),
+            program_keybinds: std::collections::BTreeMap::new(),
+            program_remap: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -895,6 +950,7 @@ pub struct ConfigOverlay {
     pub name_scheme: Option<NameScheme>,
     pub auto_remove_worktree: Option<bool>,
     pub repo_scan_depth: Option<usize>,
+    pub profile: Option<String>,
     pub accent: Option<String>,
     pub pr_ttl_secs: Option<u64>,
     pub dashboard_interval_secs: Option<u64>,
@@ -926,6 +982,7 @@ impl ConfigOverlay {
         set!(base.name_scheme, self.name_scheme);
         set!(base.auto_remove_worktree, self.auto_remove_worktree);
         set!(base.repo_scan_depth, self.repo_scan_depth);
+        set!(base.profile, self.profile);
         set!(base.theme.accent, self.accent);
         set!(base.pr.ttl_secs, self.pr_ttl_secs);
         set!(base.dashboard.interval_secs, self.dashboard_interval_secs);
@@ -978,6 +1035,7 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     if let Some(v) = env.get("SUPERZEJ_REPO_SCAN_DEPTH") {
         o.repo_scan_depth = parse_num(v, "SUPERZEJ_REPO_SCAN_DEPTH").map(|n| n as usize);
     }
+    o.profile = env.get("SUPERZEJ_PROFILE");
     o.accent = env.get("SUPERZEJ_THEME_ACCENT");
 
     // [pr] — SUPERZEJ_PR_TTL, with deprecated SZ_PR_TTL fallback.
@@ -1071,10 +1129,10 @@ impl Config {
 
         // Apply dot-notation overrides
         for ov in cli_overrides {
-            if let Some((key, val)) = ov.split_once('=') {
-                if let Err(e) = Self::apply_override_str(&mut cfg, key, val) {
-                    config_warn(&format!("--set {key}={val} failed: {e}"));
-                }
+            if let Some((key, val)) = ov.split_once('=')
+                && let Err(e) = Self::apply_override_str(&mut cfg, key, val)
+            {
+                config_warn(&format!("--set {key}={val} failed: {e}"));
             }
         }
 
@@ -1244,6 +1302,44 @@ impl Config {
         }
     }
 
+    /// The active profile config, if `profile` names one in `[profiles]`.
+    pub fn active_profile(&self) -> Option<&ProfileConfig> {
+        if self.profile.is_empty() {
+            None
+        } else {
+            self.profiles.get(&self.profile)
+        }
+    }
+
+    /// The ordered keybind layer stack for a focused context, lowest precedence
+    /// first: profile → global `[keybinds]` → central `[workspace.<slug>]` →
+    /// repo-root `.superzej.*` overlay. The host applies each layer in turn so a
+    /// more-specific binding wins. `repo_root`/`slug` are `None` outside a
+    /// workspace (e.g. the home tab).
+    pub fn effective_keybinds(
+        &self,
+        repo_root: Option<&std::path::Path>,
+        slug: Option<&str>,
+    ) -> Vec<KeybindConfig> {
+        let mut layers = Vec::new();
+        if let Some(p) = self.active_profile() {
+            layers.push(p.keybinds.clone());
+        }
+        layers.push(self.keybinds.clone());
+        if let Some(slug) = slug
+            && let Some(ws) = self.workspace.get(slug)
+        {
+            layers.push(ws.keybinds.clone());
+        }
+        if let Some(root) = repo_root
+            && let Some(overlay) = load_repo_overlay(root)
+            && !overlay.keybinds.is_empty()
+        {
+            layers.push(overlay.keybinds);
+        }
+        layers
+    }
+
     /// The effective sandbox config for a worktree's repo: the global `[sandbox]`
     /// with a repo-root `.superzej.{toml,yaml,yml,json}` overlay applied on top.
     /// Tilde-expands path-bearing fields (mounts, remote_dir).
@@ -1331,10 +1427,10 @@ pub fn validate_str(body: &str) -> Vec<String> {
         opt: Option<&toml::Value>,
         f: fn(&str) -> Result<(), String>,
     ) {
-        if let Some(toml::Value::String(s)) = opt {
-            if let Err(e) = f(s) {
-                errs.push(format!("{path}: {e}"));
-            }
+        if let Some(toml::Value::String(s)) = opt
+            && let Err(e) = f(s)
+        {
+            errs.push(format!("{path}: {e}"));
         }
     }
     let Some(t) = val.as_table() else {
@@ -1753,6 +1849,84 @@ surface = "todoist.status"
         assert!(s.contains("focus-down = \"j\""));
     }
 
+    #[test]
+    fn config_parses_profiles_and_active_profile() {
+        let cfg: Config = toml::from_str(
+            "profile = \"vim\"\n[profiles.vim]\ndefault_mode = \"vim-normal\"\n[profiles.vim.keybinds]\nfocus-down = \"j\"\n",
+        )
+        .unwrap();
+        let p = cfg.active_profile().expect("active profile resolves");
+        assert_eq!(p.default_mode, "vim-normal");
+        assert_eq!(p.keybinds.get("focus-down").map(String::as_str), Some("j"));
+    }
+
+    #[test]
+    fn unknown_profile_has_no_active_profile() {
+        let cfg: Config = toml::from_str("profile = \"nope\"\n").unwrap();
+        assert!(cfg.active_profile().is_none());
+    }
+
+    #[test]
+    fn effective_keybinds_layers_profile_then_global() {
+        let cfg: Config = toml::from_str(
+            "profile = \"vim\"\n[keybinds]\nfocus-down = \"Ctrl j\"\n[profiles.vim.keybinds]\nfocus-down = \"j\"\n",
+        )
+        .unwrap();
+        let layers = cfg.effective_keybinds(None, None);
+        // profile layer first (lowest precedence), then global.
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0].get("focus-down").map(String::as_str), Some("j"));
+        assert_eq!(
+            layers[1].get("focus-down").map(String::as_str),
+            Some("Ctrl j")
+        );
+    }
+
+    #[test]
+    fn effective_keybinds_adds_central_workspace_layer_for_slug() {
+        let cfg: Config = toml::from_str(
+            "[keybinds]\nfocus-down = \"Ctrl j\"\n[workspace.myrepo.keybinds]\nfocus-down = \"Alt j\"\n",
+        )
+        .unwrap();
+        let none = cfg.effective_keybinds(None, None);
+        assert_eq!(none.len(), 1); // global only
+        let with = cfg.effective_keybinds(None, Some("myrepo"));
+        assert_eq!(with.len(), 2);
+        assert_eq!(with[1].get("focus-down").map(String::as_str), Some("Alt j"));
+    }
+
+    #[test]
+    fn repo_overlay_keybinds_are_the_most_specific_layer() {
+        let dir = tmpdir("repo-kb");
+        std::fs::write(
+            dir.join(".superzej.toml"),
+            "[keybinds]\nfocus-down = \"Alt n\"\n",
+        )
+        .unwrap();
+        let cfg: Config = toml::from_str(
+            "[keybinds]\nfocus-down = \"Ctrl j\"\n[workspace.myrepo.keybinds]\nfocus-down = \"Alt j\"\n",
+        )
+        .unwrap();
+        let layers = cfg.effective_keybinds(Some(&dir), Some("myrepo"));
+        // global, central-workspace, repo-root overlay (last = highest precedence).
+        assert_eq!(layers.len(), 3);
+        assert_eq!(
+            layers.last().unwrap().get("focus-down").map(String::as_str),
+            Some("Alt n")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn profile_selectable_via_env() {
+        let env = MapEnv(BTreeMap::from([(
+            "SUPERZEJ_PROFILE".to_string(),
+            "emacs".to_string(),
+        )]));
+        let cfg = Config::load_layered(&env, &[], None);
+        assert_eq!(cfg.profile, "emacs");
+    }
+
     // defaults < file < env < flag, for a scalar and a validated enum.
     #[test]
     fn precedence_default_file_env_flag() {
@@ -1885,6 +2059,7 @@ surface = "todoist.status"
             ("SUPERZEJ_NAME_SCHEME", "numbered"),
             ("SUPERZEJ_AUTO_REMOVE_WORKTREE", "yes"),
             ("SUPERZEJ_REPO_SCAN_DEPTH", "9"),
+            ("SUPERZEJ_PROFILE", "vim"),
             ("SUPERZEJ_THEME_ACCENT", "#abcdef"),
             ("SUPERZEJ_PR_TTL", "11"),
             ("SUPERZEJ_DASHBOARD_INTERVAL", "6"),
@@ -1912,6 +2087,7 @@ surface = "todoist.status"
         assert_eq!(c.name_scheme, NameScheme::Numbered);
         assert!(c.auto_remove_worktree);
         assert_eq!(c.repo_scan_depth, 9);
+        assert_eq!(c.profile, "vim");
         assert_eq!(c.theme.accent, "#abcdef");
         assert_eq!(c.pr.ttl_secs, 11);
         assert_eq!(c.dashboard.interval_secs, 6);
@@ -2089,6 +2265,94 @@ format = \"bad\"
     // A repo overlay that sets *every* sandbox + remote field exercises all the
     // overlay `apply` branches.
     #[test]
+    fn agent_command() {
+        let mut cfg = Config::default();
+        cfg.agents.push(crate::config::NamedCommand {
+            name: "test".into(),
+            command: "echo test".into(),
+            hints: vec![],
+        });
+        assert_eq!(cfg.agent_command("test"), Some("echo test"));
+        assert_eq!(cfg.agent_command("missing"), None);
+    }
+
+    #[test]
+    fn tool_command() {
+        let mut cfg = Config::default();
+        cfg.tools.push(crate::config::NamedCommand {
+            name: "test".into(),
+            command: "echo test".into(),
+            hints: vec![],
+        });
+        assert_eq!(cfg.tool_command("test"), Some("echo test"));
+        assert_eq!(cfg.tool_command("missing"), None);
+    }
+
+    #[test]
+    fn pin_and_pin_by_index() {
+        let mut cfg = Config::default();
+        cfg.pins.push(crate::config::Pin {
+            name: "test".into(),
+            command: "echo test".into(),
+            scope: crate::config::PinScope::Global,
+            workspace: None,
+            cwd: None,
+            start: crate::config::PinStart::Lazy,
+            restart: crate::config::PinRestart::Never,
+            singleton: false,
+            location: crate::config::PinLocation::Tab,
+        });
+        assert_eq!(cfg.pin("test").unwrap().name, "test");
+        assert!(cfg.pin("missing").is_none());
+        assert_eq!(cfg.pin_by_index(1).unwrap().name, "test");
+        assert!(cfg.pin_by_index(0).is_none());
+        assert!(cfg.pin_by_index(2).is_none());
+    }
+
+    #[test]
+    fn pins_for_workspace() {
+        let mut cfg = Config::default();
+        cfg.pins.push(crate::config::Pin {
+            name: "global".into(),
+            command: "echo test".into(),
+            scope: crate::config::PinScope::Global,
+            workspace: None,
+            cwd: None,
+            start: crate::config::PinStart::Lazy,
+            restart: crate::config::PinRestart::Never,
+            singleton: false,
+            location: crate::config::PinLocation::Tab,
+        });
+        cfg.pins.push(crate::config::Pin {
+            name: "local".into(),
+            command: "echo test".into(),
+            scope: crate::config::PinScope::Workspace,
+            workspace: Some("repo".into()),
+            cwd: None,
+            start: crate::config::PinStart::Lazy,
+            restart: crate::config::PinRestart::Never,
+            singleton: false,
+            location: crate::config::PinLocation::Tab,
+        });
+        cfg.pins.push(crate::config::Pin {
+            name: "local_any".into(),
+            command: "echo test".into(),
+            scope: crate::config::PinScope::Workspace,
+            workspace: None,
+            cwd: None,
+            start: crate::config::PinStart::Lazy,
+            restart: crate::config::PinRestart::Never,
+            singleton: false,
+            location: crate::config::PinLocation::Tab,
+        });
+        let none_pins = cfg.pins_for_workspace(None);
+        assert_eq!(none_pins.len(), 1); // just global
+        assert!(none_pins.iter().any(|p| p.name == "global"));
+        let some_pins = cfg.pins_for_workspace(Some("repo"));
+        assert_eq!(some_pins.len(), 2); // global, local
+    }
+
+    #[test]
     fn full_repo_overlay_applies_every_field() {
         let cfg = Config::default();
         let dir = tmpdir("full");
@@ -2136,17 +2400,18 @@ forward_agent = false
 
     #[test]
     fn process_env_reads_real_vars() {
-        std::env::set_var("SUPERZEJ_TEST_PENV_xyz", "v1");
+        // SAFETY: single-threaded test using uniquely-named vars.
+        unsafe { std::env::set_var("SUPERZEJ_TEST_PENV_xyz", "v1") };
         assert_eq!(
             ProcessEnv.get("SUPERZEJ_TEST_PENV_xyz").as_deref(),
             Some("v1")
         );
         assert!(ProcessEnv.get("SUPERZEJ_TEST_PENV_absent_qqq").is_none());
-        std::env::remove_var("SUPERZEJ_TEST_PENV_xyz");
+        unsafe { std::env::remove_var("SUPERZEJ_TEST_PENV_xyz") };
         // blank values are treated as unset.
-        std::env::set_var("SUPERZEJ_TEST_PENV_blank", "   ");
+        unsafe { std::env::set_var("SUPERZEJ_TEST_PENV_blank", "   ") };
         assert!(ProcessEnv.get("SUPERZEJ_TEST_PENV_blank").is_none());
-        std::env::remove_var("SUPERZEJ_TEST_PENV_blank");
+        unsafe { std::env::remove_var("SUPERZEJ_TEST_PENV_blank") };
     }
 
     #[test]
@@ -2172,5 +2437,41 @@ forward_agent = false
             "Esc"
         );
         assert_eq!(cfg.keybinds.emacs.get("focus-left").unwrap(), "Ctrl b");
+    }
+
+    #[test]
+    fn agent_and_tool_command_lookup_by_name() {
+        let cfg: Config = toml::from_str(
+            "[[agents]]\nname = 'claude'\ncommand = 'claude --foo'\n\
+             [[tools]]\nname = 'lazygit'\ncommand = 'lazygit'\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.agent_command("claude"), Some("claude --foo"));
+        assert_eq!(cfg.agent_command("nope"), None);
+        assert_eq!(cfg.tool_command("lazygit"), Some("lazygit"));
+        assert_eq!(cfg.tool_command("nope"), None);
+    }
+
+    #[test]
+    fn pin_lookup_by_name_and_index_and_workspace_scope() {
+        let cfg: Config = toml::from_str(
+            "[[pins]]\nname = 'aerc'\ncommand = 'aerc'\n\
+             [[pins]]\nname = 'logs'\ncommand = 'journalctl -f'\nscope = 'workspace'\nworkspace = '/repo'\n",
+        )
+        .unwrap();
+        // By name.
+        assert_eq!(cfg.pin("aerc").map(|p| p.name.as_str()), Some("aerc"));
+        assert!(cfg.pin("missing").is_none());
+        // By 1-based index (0 and out-of-range miss).
+        assert_eq!(cfg.pin_by_index(1).map(|p| p.name.as_str()), Some("aerc"));
+        assert_eq!(cfg.pin_by_index(2).map(|p| p.name.as_str()), Some("logs"));
+        assert!(cfg.pin_by_index(0).is_none());
+        assert!(cfg.pin_by_index(3).is_none());
+        // Workspace scoping: global pin always shows; workspace pin only for its repo.
+        let global_only = cfg.pins_for_workspace(None);
+        assert_eq!(global_only.len(), 1);
+        assert_eq!(global_only[0].name, "aerc");
+        let in_repo = cfg.pins_for_workspace(Some("/repo"));
+        assert_eq!(in_repo.len(), 2);
     }
 }

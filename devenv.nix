@@ -21,7 +21,6 @@
     yamllint
     # runtime tools superzej shells out to
     git
-    zellij
     fzf
     gum
     lazygit
@@ -29,10 +28,6 @@
     delta
     gh
   ];
-
-  # The WASM plugins (plugin/sidebar, plugin/panel) build via the flake
-  # (`just nix-build-plugins`) or install.sh, which provide the wasm32-wasip1
-  # toolchain — kept out of this nixpkgs dev shell to avoid formatter skew.
 
   # Use the nixpkgs toolchain (no channel/rust-overlay) so rustfmt/clippy match
   # the flake's treefmt + checks exactly — avoids formatter version skew.
@@ -72,11 +67,11 @@
 
     # ── Tiered gates ──────────────────────────────────────────────────────
     # pre-commit stays fast (formatting + lint + unit tests); the heavier
-    # coverage / e2e / visual gates run on pre-push (and in CI via `just ci`).
+    # coverage gate runs on pre-push (and in CI via `just ci`).
     cargo-test = {
       enable = true;
       name = "cargo test";
-      entry = "cargo test --bin superzej";
+      entry = "cargo test --workspace";
       language = "system";
       pass_filenames = false;
       stages = ["pre-commit"];
@@ -89,18 +84,10 @@
       pass_filenames = false;
       stages = ["pre-push"];
     };
-    e2e = {
+    smoke = {
       enable = true;
-      name = "e2e (sandboxed zellij)";
-      entry = "just e2e";
-      language = "system";
-      pass_filenames = false;
-      stages = ["pre-push"];
-    };
-    visual-regression = {
-      enable = true;
-      name = "visual regression";
-      entry = "just visual";
+      name = "smoke (hermetic CLI verbs)";
+      entry = "just smoke";
       language = "system";
       pass_filenames = false;
       stages = ["pre-push"];
@@ -113,7 +100,7 @@
 
   # `devenv test` runs the hooks, then this.
   enterTest = ''
-    cargo build
-    ./test/smoke.sh target/debug/superzej
+    cargo build --workspace
+    ./test/smoke.sh target/debug/szhost
   '';
 }

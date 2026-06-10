@@ -3,9 +3,7 @@
 //! ranking and draws a centered box into the back-buffer `Surface`. Action
 //! dispatch calls host methods directly — no subprocess hop, no IPC.
 //!
-//! The full zellij-era engine (`superzej-cli`'s `palette/`) carries sources +
-//! dispatch that are still zellij-coupled; this is the native view + matcher the
-//! host drives, populated from host state.
+//! This is the native view + matcher the host drives, populated from host state.
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};

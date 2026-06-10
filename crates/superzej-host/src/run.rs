@@ -1,9 +1,12 @@
-//! The spike's interactive loop: own the outer terminal, run one shell pane
-//! inside the chrome cross, render it, route input. Single-threaded poll loop —
-//! `poll_input` doubles as the ~60fps frame tick; pane output is coalesced
-//! between polls and painted via `BufferedTerminal::draw_from_screen` + `flush`,
-//! which diffs against the prior frame and emits only changed cells (no
-//! clear-and-redraw → no flashing). The tokio mpsc event loop arrives in Phase 2.
+//! The interactive loop: own the outer terminal, run one shell pane inside the
+//! chrome cross, render it, route input. Fully event-driven — the loop blocks on
+//! `poll_input(None)` (zero idle wakeups) and every off-thread producer (PTY
+//! readers, model/PR hydration, config + worktree fs-watchers, the refresh
+//! ticker) pulses the termwiz `TerminalWaker` after sending on its tokio channel,
+//! which returns `InputEvent::Wake` so the loop drains its channels and repaints.
+//! Frames are painted via `BufferedTerminal::draw_from_screen` + `flush`, which
+//! diffs against the prior frame and emits only changed cells (no clear-and-redraw
+//! → no flashing).
 
 use anyhow::{Context, Result};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
@@ -17,7 +20,7 @@ use termwiz::caps::Capabilities;
 use termwiz::input::{InputEvent, KeyCode, Modifiers};
 use termwiz::surface::{Change, Position, Surface};
 use termwiz::terminal::buffered::BufferedTerminal;
-use termwiz::terminal::{Terminal, new_terminal};
+use termwiz::terminal::{Terminal, TerminalWaker, new_terminal};
 
 use crate::chrome::{FrameModel, render_tab};
 use crate::compositor::Rect;
@@ -27,8 +30,44 @@ use crate::pane::{PaneEvent, PtyPane};
 const MODEL_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const PR_REFRESH_INTERVAL: Duration = Duration::from_secs(20);
 
-fn model_refresh_due(last_refresh: Instant, now: Instant, interval: Duration) -> bool {
-    now.duration_since(last_refresh) >= interval
+/// A refresh request delivered to the event loop. `Model` rehydrates the
+/// sidebar/panel/diff (cheap, gix-backed, off-thread); `Pr` additionally kicks
+/// the GitHub PR-cache refresh. Both arrive event-driven (worktree fs-watch,
+/// tab switch) and on a low-frequency safety-net interval.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RefreshKind {
+    Model,
+    Pr,
+}
+
+/// Background ticker: emits a `Model` refresh every `MODEL_REFRESH_INTERVAL` and
+/// a `Pr` refresh every `PR_REFRESH_INTERVAL`, pulsing the waker so an idle loop
+/// wakes to service it. This is the staleness backstop; fs-watch + on-switch
+/// refresh handle the common, latency-sensitive cases.
+///
+/// Runs on a dedicated OS thread (not `tokio::spawn`) so it can never be starved
+/// by the main loop blocking a runtime worker in `poll_input(None)` — true even
+/// on a single-core runtime. `PR_REFRESH_INTERVAL` is a whole multiple of
+/// `MODEL_REFRESH_INTERVAL`, so we sleep one model period at a time and emit the
+/// PR tick when the elapsed count divides evenly.
+fn spawn_refresh_ticker(tx: tokio_mpsc::UnboundedSender<RefreshKind>, waker: TerminalWaker) {
+    std::thread::spawn(move || {
+        let pr_every = (PR_REFRESH_INTERVAL.as_secs() / MODEL_REFRESH_INTERVAL.as_secs()).max(1);
+        let mut ticks: u64 = 0;
+        loop {
+            std::thread::sleep(MODEL_REFRESH_INTERVAL);
+            ticks += 1;
+            let kind = if ticks.is_multiple_of(pr_every) {
+                RefreshKind::Pr
+            } else {
+                RefreshKind::Model
+            };
+            if tx.send(kind).is_err() {
+                break; // loop gone
+            }
+            let _ = waker.wake();
+        }
+    });
 }
 
 /// The shell argv used for new panes. Non-login interactive shells are the
@@ -225,11 +264,11 @@ fn load_or_seed_session(cwd: &std::path::Path) -> crate::session::Session {
         .unwrap_or_else(|| "workspace".into());
 
     let mut env_session = std::env::var("SUPERZEJ_SESSION").ok();
-    if let Some(ref s) = env_session {
-        if s == "superzej" {
-            // Ignore the old legacy default
-            env_session = None;
-        }
+    if let Some(ref s) = env_session
+        && s == "superzej"
+    {
+        // Ignore the old legacy default
+        env_session = None;
     }
 
     let cwd_str = cwd.to_string_lossy().into_owned();
@@ -316,32 +355,32 @@ fn workspace_list(
     db: Option<&superzej_core::db::Db>,
 ) -> Vec<(String, String)> {
     let mut workspaces: Vec<(String, String)> = Vec::new();
-    if let Some(db) = db {
-        if let Ok(rows) = db.workspaces() {
-            for w in rows {
-                let display = if w.name.trim().is_empty() {
-                    std::path::Path::new(&w.repo_path)
-                        .file_name()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| w.repo_path.clone())
-                } else {
-                    w.name.clone()
-                };
-                let base = superzej_core::util::slugify(&display);
-                let slug = db
-                    .slug_for_repo(&w.repo_path, &base)
-                    .unwrap_or_else(|_| base.clone());
-                if !workspaces.iter().any(|(s, _)| *s == slug) {
-                    workspaces.push((slug, display));
-                }
+    if let Some(db) = db
+        && let Ok(rows) = db.workspaces()
+    {
+        for w in rows {
+            let display = if w.name.trim().is_empty() {
+                std::path::Path::new(&w.repo_path)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| w.repo_path.clone())
+            } else {
+                w.name.clone()
+            };
+            let base = superzej_core::util::slugify(&display);
+            let slug = db
+                .slug_for_repo(&w.repo_path, &base)
+                .unwrap_or_else(|_| base.clone());
+            if !workspaces.iter().any(|(s, _)| *s == slug) {
+                workspaces.push((slug, display));
             }
         }
     }
     for tab in &session.tabs {
-        if let Some((repo, _)) = crate::sidebar::split_tab(&tab.name) {
-            if !workspaces.iter().any(|(s, _)| *s == repo) {
-                workspaces.push((repo.clone(), repo));
-            }
+        if let Some((repo, _)) = crate::sidebar::split_tab(&tab.name)
+            && !workspaces.iter().any(|(s, _)| *s == repo)
+        {
+            workspaces.push((repo.clone(), repo));
         }
     }
     workspaces
@@ -349,7 +388,7 @@ fn workspace_list(
 
 /// Gather per-worktree git/agent/activity status for every tab in the session.
 /// Runs on the hydration thread (git can be slow); the event loop merges this
-/// into the tree at render time.
+/// into the tree at render time. Also advances the activity FSM in-process.
 fn collect_sidebar_status(
     session: &crate::session::Session,
     db: &superzej_core::db::Db,
@@ -358,6 +397,23 @@ fn collect_sidebar_status(
     use superzej_svc::git::{GitBackend, GixGit};
     let git = GixGit::new();
     let mut status = crate::sidebar::SidebarStatus::default();
+
+    // Advance the activity state machine over the session's managed worktrees,
+    // then read the fresh states (keyed by tab name).
+    let managed: Vec<superzej_core::activity::ManagedWorktree> = session
+        .tabs
+        .iter()
+        .filter(|t| !t.worktree.is_empty())
+        .map(|t| superzej_core::activity::ManagedWorktree {
+            worktree: t.worktree.clone(),
+            tab: t.name.clone(),
+        })
+        .collect();
+    superzej_core::activity::poll_and_save(&managed);
+    status.activity = superzej_core::activity::read_states()
+        .into_iter()
+        .map(|(tab, st)| (tab, crate::sidebar::ActivityState::from_str(&st)))
+        .collect();
 
     // git glyphs + agent per distinct worktree path.
     let mut seen = std::collections::HashSet::new();
@@ -384,12 +440,6 @@ fn collect_sidebar_status(
             status.agent.insert(tab.worktree.clone(), agent);
         }
     }
-
-    // Activity dots, keyed by tab name (mirrors the `activity` state machine).
-    status.activity = superzej_core::activity::read_states()
-        .into_iter()
-        .map(|(tab, st)| (tab, crate::sidebar::ActivityState::from_str(&st)))
-        .collect();
     status
 }
 
@@ -442,21 +492,19 @@ fn build_model(session: &crate::session::Session, db: &superzej_core::db::Db) ->
     };
 
     // Add PR info if cached (native-host replacement for the zellij PR widget).
-    if let Ok(Some((json, _))) = db.get_pr_cache(&loc.path()) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
-            if let Some(state) = v.get("state").and_then(|s| s.as_str()) {
-                if let Some(num) = v.get("number").and_then(|n| n.as_i64()) {
-                    panel.pr = Some(crate::panel::PrSummary {
-                        number: num as u64,
-                        title: String::new(),
-                        state: state.to_string(),
-                        url: String::new(),
-                        is_draft: false,
-                        review_decision: None,
-                    });
-                }
-            }
-        }
+    if let Ok(Some((json, _))) = db.get_pr_cache(&loc.path())
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&json)
+        && let Some(state) = v.get("state").and_then(|s| s.as_str())
+        && let Some(num) = v.get("number").and_then(|n| n.as_i64())
+    {
+        panel.pr = Some(crate::panel::PrSummary {
+            number: num as u64,
+            title: String::new(),
+            state: state.to_string(),
+            url: String::new(),
+            is_draft: false,
+            review_decision: None,
+        });
     }
 
     if let Ok(files) = git.diff_files(&loc, "HEAD") {
@@ -487,6 +535,47 @@ fn build_model(session: &crate::session::Session, db: &superzej_core::db::Db) ->
     }
 }
 
+/// The focused workspace's repo root + slug for per-workspace keybind layering.
+/// `session.id` is the workspace's repo path; the active tab's worktree is the
+/// repo-root overlay source. Both are `None` when no workspace is resolvable.
+fn workspace_context(
+    session: &crate::session::Session,
+) -> (Option<std::path::PathBuf>, Option<String>) {
+    if session.id.is_empty() {
+        return (None, None);
+    }
+    let root = std::path::PathBuf::from(&session.id);
+    let slug = superzej_core::repo::repo_slug(&root);
+    let root = root.is_dir().then_some(root);
+    (root, Some(slug))
+}
+
+/// Rebuild the host keymap for the session's focused workspace (profile +
+/// global + per-workspace + repo-root layers).
+fn rebuild_keymap(
+    cfg: &superzej_core::config::Config,
+    session: &crate::session::Session,
+) -> crate::keymap::KeyMap {
+    let (root, slug) = workspace_context(session);
+    crate::keymap::default_keymap_for(cfg, root.as_deref(), slug.as_deref())
+}
+
+/// A one-line status summary if the resolved keymap has chord conflicts, else
+/// `None`. Non-fatal: drives the launch/reload warning banner.
+fn keybind_conflict_summary(cfg: &superzej_core::config::Config) -> Option<String> {
+    let cols = superzej_core::keymap::detect_collisions(&superzej_core::keymap::effective(cfg));
+    if cols.is_empty() {
+        return None;
+    }
+    for c in &cols {
+        superzej_core::msg::warn(&format!("keybind conflict: {c:?}"));
+    }
+    Some(format!(
+        "\u{26a0} {} keybind conflict(s) — run `sj keys validate`",
+        cols.len()
+    ))
+}
+
 fn apply_mode_status(model: &mut FrameModel, mode: crate::keymap::Mode) {
     model.status = format!(
         "{} mode   Ctrl-Alt-v vim   Ctrl-Alt-e emacs   Ctrl-Alt-n normal   Ctrl-K menu   Alt-w worktree",
@@ -497,38 +586,19 @@ fn apply_mode_status(model: &mut FrameModel, mode: crate::keymap::Mode) {
 fn spawn_model_hydration(
     tx: tokio_mpsc::UnboundedSender<FrameModel>,
     session: crate::session::Session,
+    waker: Option<TerminalWaker>,
 ) {
     task::spawn_blocking(move || {
-        // Advance the activity FSM (best-effort) so the sidebar dots reflect
-        // live process CPU; the snapshot it writes is then read by build_model.
-        advance_activity(None);
-        if let Ok(db) = superzej_core::db::Db::open() {
-            let _ = tx.send(build_model(&session, &db));
+        if let Ok(db) = superzej_core::db::Db::open()
+            && tx.send(build_model(&session, &db)).is_ok()
+            && let Some(w) = &waker
+        {
+            let _ = w.wake();
         }
     });
 }
 
-/// Resolve the `superzej` CLI binary: an explicit `SUPERZEJ_BIN` override, else
-/// `superzej` on `PATH`.
-fn superzej_bin() -> String {
-    std::env::var("SUPERZEJ_BIN").unwrap_or_else(|_| "superzej".to_string())
-}
-
-/// Run `superzej activity [--ack <tab>]` to step / ack the activity state
-/// machine. Best-effort: failures (missing binary, etc.) are ignored, leaving
-/// the sidebar with whatever snapshot already exists.
-fn advance_activity(ack: Option<&str>) {
-    let mut cmd = std::process::Command::new(superzej_bin());
-    cmd.arg("activity");
-    if let Some(tab) = ack {
-        cmd.arg("--ack").arg(tab);
-    }
-    cmd.stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    let _ = cmd.status();
-}
-
-fn spawn_pr_cache_refresh(session: crate::session::Session) {
+fn spawn_pr_cache_refresh(session: crate::session::Session, waker: Option<TerminalWaker>) {
     task::spawn_blocking(move || {
         let cwd = active_tab_path(&session);
         if !cwd.is_dir() {
@@ -542,7 +612,62 @@ fn spawn_pr_cache_refresh(session: crate::session::Session) {
         if let Ok(db) = superzej_core::db::Db::open() {
             let _ = db.put_pr_cache(&loc.path(), &panel.branch, &json);
         }
+        // PR cache landing should surface via a model rehydrate; pulse the waker
+        // so an idle loop repaints promptly.
+        if let Some(w) = &waker {
+            let _ = w.wake();
+        }
     });
+}
+
+/// Bind (or re-bind) the diff fs-watcher to the active worktree path. A no-op if
+/// the active worktree is unchanged. On a debounced filesystem event under the
+/// worktree, pushes `RefreshKind::Model` and pulses the waker so the loop
+/// rehydrates the diff panel promptly. The previous watcher (if any) is dropped,
+/// which unregisters its watch.
+fn retarget_diff_watcher(
+    session: &crate::session::Session,
+    watched: &mut Option<std::path::PathBuf>,
+    watcher: &mut Option<notify::RecommendedWatcher>,
+    refresh_tx: &tokio_mpsc::UnboundedSender<RefreshKind>,
+    waker: &TerminalWaker,
+) {
+    let cwd = active_tab_path(session);
+    if !cwd.is_dir() {
+        return;
+    }
+    if watched.as_deref() == Some(cwd.as_path()) {
+        return; // already watching this worktree
+    }
+
+    let tx = refresh_tx.clone();
+    let w = waker.clone();
+    let mut last_send = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
+    let new_watcher = recommended_watcher(move |res: notify::Result<Event>| {
+        if let Ok(ev) = res
+            && matches!(
+                ev.kind,
+                notify::EventKind::Modify(_)
+                    | notify::EventKind::Create(_)
+                    | notify::EventKind::Remove(_)
+            )
+            && last_send.elapsed() > Duration::from_millis(500)
+        {
+            if tx.send(RefreshKind::Model).is_ok() {
+                let _ = w.wake();
+            }
+            last_send = Instant::now();
+        }
+    });
+
+    if let Ok(mut nw) = new_watcher
+        && nw.watch(&cwd, RecursiveMode::Recursive).is_ok()
+    {
+        *watcher = Some(nw);
+        *watched = Some(cwd);
+    }
 }
 
 /// Replace an externally-dead sole center pane with a fresh shell pane without
@@ -574,6 +699,12 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
 
     let mut buf = BufferedTerminal::new(term).context("buffered terminal")?;
 
+    // Grab the waker after `BufferedTerminal` takes ownership of the terminal.
+    // Every off-thread producer pulses this so the loop's blocking
+    // `poll_input(None)` returns to drain its channel — the loop is fully
+    // event-driven (zero idle wakeups) rather than polled on a 16ms tick.
+    let waker = buf.terminal().waker();
+
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let session = load_or_seed_session(&cwd);
 
@@ -582,39 +713,48 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         &cli.overrides,
         cli.config.clone(),
     );
-    let keymap = crate::keymap::default_keymap_with_config(&cfg);
-    let mode = crate::keymap::Mode::Normal;
+    let keymap = rebuild_keymap(&cfg, &session);
+    let mode = crate::keymap::startup_mode(&cfg);
     let mut model = build_initial_model(&session);
     apply_mode_status(&mut model, mode);
+    // Surface keybind conflicts at launch (non-fatal — the shell always opens).
+    if let Some(summary) = keybind_conflict_summary(&cfg) {
+        model.status = summary;
+    }
     let (model_tx, model_rx) = tokio_mpsc::unbounded_channel::<FrameModel>();
-    spawn_model_hydration(model_tx.clone(), session.clone());
+    spawn_model_hydration(model_tx.clone(), session.clone(), Some(waker.clone()));
 
+    // Config reload events ride a tokio channel so the loop drains them on wake;
+    // the notify watcher thread `send`s + pulses the waker.
     let (config_tx, config_rx) =
-        std::sync::mpsc::channel::<Result<superzej_core::config::Config, String>>();
+        tokio_mpsc::unbounded_channel::<Result<superzej_core::config::Config, String>>();
 
     let config_path = superzej_core::config::Config::path();
+    let config_waker = waker.clone();
     std::thread::spawn(move || {
         if let Some(parent) = config_path.parent() {
             let mut last_send = std::time::Instant::now();
             let overrides_clone = cli.overrides.clone();
             let config_clone = cli.config.clone();
             if let Ok(mut watcher) = recommended_watcher(move |res: notify::Result<Event>| {
-                if let Ok(ev) = res {
-                    if matches!(
+                if let Ok(ev) = res
+                    && matches!(
                         ev.kind,
                         notify::EventKind::Modify(_)
                             | notify::EventKind::Create(_)
                             | notify::EventKind::Remove(_)
-                    ) && last_send.elapsed() > std::time::Duration::from_millis(500)
-                    {
-                        let new_cfg_res = superzej_core::config::Config::try_load_layered(
-                            &superzej_core::config::ProcessEnv,
-                            &overrides_clone,
-                            config_clone.clone(),
-                        );
-                        let _ = config_tx.send(new_cfg_res);
-                        last_send = std::time::Instant::now();
+                    )
+                    && last_send.elapsed() > std::time::Duration::from_millis(500)
+                {
+                    let new_cfg_res = superzej_core::config::Config::try_load_layered(
+                        &superzej_core::config::ProcessEnv,
+                        &overrides_clone,
+                        config_clone.clone(),
+                    );
+                    if config_tx.send(new_cfg_res).is_ok() {
+                        let _ = config_waker.wake();
                     }
+                    last_send = std::time::Instant::now();
                 }
             }) {
                 let _ = watcher.watch(parent, RecursiveMode::NonRecursive);
@@ -625,8 +765,16 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         }
     });
 
+    // Low-frequency safety-net refresh: fs-watching the active worktree drives
+    // prompt diff updates, but a periodic tick still rehydrates non-fs state
+    // (branch moves, PR cache) and bounds staleness. The loop owns the actual
+    // refresh; this thread just pulses a tick + waker on the interval.
+    let (refresh_tx, refresh_rx) = tokio_mpsc::unbounded_channel::<RefreshKind>();
+    spawn_refresh_ticker(refresh_tx.clone(), waker.clone());
+
     let result = event_loop(
         &mut buf, session, model, model_tx, model_rx, rows, cols, keymap, mode, config_rx,
+        refresh_tx, refresh_rx, waker,
     )
     .await;
 
@@ -641,14 +789,29 @@ struct Panes {
     table: std::collections::HashMap<u32, PtyPane>,
     next_id: u32,
     tx: tokio_mpsc::Sender<PaneEvent>,
+    /// Pulsed by reader threads after each send so the main loop's blocking
+    /// `poll_input(None)` wakes to drain PTY output. `None` in unit tests that
+    /// construct `Panes` without a live terminal.
+    waker: Option<TerminalWaker>,
 }
 
 impl Panes {
+    #[cfg(test)]
     fn new(tx: tokio_mpsc::Sender<PaneEvent>) -> Self {
         Self {
             table: std::collections::HashMap::new(),
             next_id: 1,
             tx,
+            waker: None,
+        }
+    }
+
+    fn with_waker(tx: tokio_mpsc::Sender<PaneEvent>, waker: TerminalWaker) -> Self {
+        Self {
+            table: std::collections::HashMap::new(),
+            next_id: 1,
+            tx,
+            waker: Some(waker),
         }
     }
 
@@ -665,15 +828,29 @@ impl Panes {
         cwd: Option<&std::path::Path>,
         center: Rect,
     ) -> Result<u32> {
+        self.spawn_argv_env(argv, cwd, &[], center)
+    }
+
+    /// As [`Panes::spawn_argv`], but injects `env` into the child — used for
+    /// agent panes that expect `SUPERZEJ_WORKTREE`/`SUPERZEJ_BRANCH`.
+    fn spawn_argv_env(
+        &mut self,
+        argv: &[String],
+        cwd: Option<&std::path::Path>,
+        env: &[(String, String)],
+        center: Rect,
+    ) -> Result<u32> {
         let id = self.next_id;
         self.next_id += 1;
-        let pane = PtyPane::spawn(
+        let pane = PtyPane::spawn_with_env(
             id,
             argv,
             cwd,
+            env,
             center.rows.max(1) as u16,
             center.cols.max(1) as u16,
             self.tx.clone(),
+            self.waker.clone(),
         )?;
         self.table.insert(id, pane);
         Ok(id)
@@ -717,6 +894,31 @@ impl Panes {
             .or_else(|| tab.center.pane_ids().first().copied())
             .unwrap_or(0);
         Ok(())
+    }
+}
+
+/// Tab indices to pre-warm: the `radius` neighbors on each side of `active`,
+/// clamped to `[0, len)` and excluding `active` itself. Pure for unit testing.
+fn prewarm_targets(active: usize, len: usize, radius: usize) -> Vec<usize> {
+    if len == 0 || radius == 0 {
+        return Vec::new();
+    }
+    let lo = active.saturating_sub(radius);
+    let hi = (active + radius).min(len.saturating_sub(1));
+    (lo..=hi).filter(|&i| i != active).collect()
+}
+
+/// Radius for pre-warming: immediate neighbors only, so we never fork a child
+/// per tab on a large session.
+const PREWARM_RADIUS: usize = 1;
+
+/// Pre-spawn PTY children for the tabs adjacent to the active one so first focus
+/// of a neighbor is instant. Best-effort: `materialize` spawns + remaps a tab's
+/// leaf ids in place, so a later switch finds the panes already live and returns
+/// early. Errors are ignored (the lazy path will retry on real focus).
+fn prewarm_neighbors(panes: &mut Panes, session: &mut crate::session::Session, center: Rect) {
+    for i in prewarm_targets(session.active, session.tabs.len(), PREWARM_RADIUS) {
+        let _ = panes.materialize(&mut session.tabs[i], center);
     }
 }
 
@@ -976,18 +1178,20 @@ impl SidebarState {
             }
             KeyCode::Char('l') | KeyCode::RightArrow => {
                 // Expand a collapsed workspace.
-                if let Some(row) = self.selected_row(model) {
-                    if row.kind == crate::sidebar::RowKind::Workspace && row.collapsed {
-                        return self.toggle_collapse(model, session);
-                    }
+                if let Some(row) = self.selected_row(model)
+                    && row.kind == crate::sidebar::RowKind::Workspace
+                    && row.collapsed
+                {
+                    return self.toggle_collapse(model, session);
                 }
             }
             KeyCode::Char('h') | KeyCode::LeftArrow => {
                 // Collapse an expanded workspace.
-                if let Some(row) = self.selected_row(model) {
-                    if row.kind == crate::sidebar::RowKind::Workspace && !row.collapsed {
-                        return self.toggle_collapse(model, session);
-                    }
+                if let Some(row) = self.selected_row(model)
+                    && row.kind == crate::sidebar::RowKind::Workspace
+                    && !row.collapsed
+                {
+                    return self.toggle_collapse(model, session);
                 }
             }
             KeyCode::Char('/') => {
@@ -1002,10 +1206,10 @@ impl SidebarState {
             KeyCode::Char('p') => return self.toggle_pin(model, session),
             KeyCode::Char(' ') => {
                 // Multi-select toggle (item 26); on workspace rows, collapse.
-                if let Some(row) = self.selected_row(model) {
-                    if row.kind == crate::sidebar::RowKind::Workspace {
-                        return self.toggle_collapse(model, session);
-                    }
+                if let Some(row) = self.selected_row(model)
+                    && row.kind == crate::sidebar::RowKind::Workspace
+                {
+                    return self.toggle_collapse(model, session);
                 }
                 if self.marked.contains(&self.cursor) {
                     self.marked.remove(&self.cursor);
@@ -1171,6 +1375,109 @@ fn tab_cwd(tab: &crate::session::Tab) -> Option<std::path::PathBuf> {
         .or_else(|| std::env::current_dir().ok())
 }
 
+/// A worktree tab awaiting its agent choice. While set, the command palette is
+/// in "agent picker" mode: its selection launches the chosen agent into `tab`
+/// rather than dispatching a command. Escaping defaults to a plain shell so the
+/// tab is never left with no process.
+struct PendingAgent {
+    /// The `{repo_slug}/{branch}` tab name to launch into.
+    tab: String,
+    worktree: String,
+    branch: String,
+}
+
+/// Build the agent-picker palette items for `cfg`: one row per agent/tool, plus
+/// a literal shell. The key is the bare choice name (the `PendingAgent` gate in
+/// the Enter handler routes it to a launch, not a command dispatch).
+fn build_agent_palette(cfg: &superzej_core::config::Config) -> Vec<crate::palette::PaletteItem> {
+    crate::agent::choices(cfg)
+        .into_iter()
+        .map(|name| {
+            let label = format!("{} {name}", superzej_core::theme::agent_glyph(&name));
+            crate::palette::PaletteItem::new(name, label)
+        })
+        .collect()
+}
+
+/// A freshly-created worktree, ready to back a tab + agent launch.
+struct NewWorktree {
+    /// The `{repo_slug}/{branch}` tab name.
+    tab: String,
+    /// The branch created.
+    branch: String,
+    /// Absolute worktree path (local on disk; DB key for the agent launch).
+    path: String,
+}
+
+/// Create a local git worktree off `repo_root`, reusing core's worktree helpers
+/// (the same calls the legacy `new_worktree` command made, minus the zellij
+/// tab). Records it in the DB so the sidebar/dashboard/resurrect pick it up.
+/// Returns `None` (after a branded warning) when the base has no commits or the
+/// `git worktree add` fails.
+fn create_local_worktree(
+    cfg: &superzej_core::config::Config,
+    repo_root: &std::path::Path,
+) -> Option<NewWorktree> {
+    use superzej_core::{db::Db, repo, util, worktree};
+
+    let base = worktree::resolve_base(repo_root, cfg);
+    if util::git_out(repo_root, &["rev-parse", "--verify", "--quiet", &base]).is_none() {
+        superzej_core::msg::warn(&format!(
+            "'{base}' has no commits yet — make an initial commit before adding a worktree."
+        ));
+        return None;
+    }
+
+    let slug = repo::repo_slug(repo_root);
+    let branch = worktree::branch_name(repo_root, None, cfg);
+    let tab = repo::branch_tab(&slug, &branch);
+    let path = worktree::worktree_path(repo_root, &branch, cfg);
+    if !worktree::add(repo_root, &branch, &base, &path, cfg) {
+        superzej_core::msg::warn("could not create the worktree (see the git error above).");
+        return None;
+    }
+    let path = path.to_string_lossy().into_owned();
+
+    if let Ok(db) = Db::open() {
+        let _ = db.put_worktree(&tab, &repo_root.to_string_lossy(), &path, &branch, None);
+    }
+    Some(NewWorktree { tab, branch, path })
+}
+
+/// Launch `choice` into the worktree tab named `pending.tab`: compose the
+/// sandbox-wrapped argv + env (via [`crate::agent::launch_spec`]), spawn it as a
+/// fresh pane, and point that tab's center at the live pane so `materialize`
+/// won't also spawn a plain shell. No-op (returns false) if the tab is gone.
+fn launch_agent_into_tab(
+    cfg: &superzej_core::config::Config,
+    session: &mut crate::session::Session,
+    panes: &mut Panes,
+    pending: &PendingAgent,
+    choice: &str,
+    center: Rect,
+) -> bool {
+    let Some(idx) = session.tabs.iter().position(|t| t.name == pending.tab) else {
+        return false;
+    };
+    let spec = crate::agent::launch_spec(cfg, &pending.worktree, Some(&pending.branch), choice);
+    let cwd = spec.cwd.clone();
+    match panes.spawn_argv_env(&spec.argv, cwd.as_deref(), &spec.env, center) {
+        Ok(id) => {
+            // Reap any panes the tab already had, then back it with the agent pane.
+            for old in session.tabs[idx].center.pane_ids() {
+                panes.table.remove(&old);
+            }
+            session.tabs[idx].center = crate::center::CenterTree::Leaf(id);
+            session.tabs[idx].focused_pane = id;
+            true
+        }
+        Err(e) => {
+            superzej_core::msg::warn(&format!("agent launch failed: {e}"));
+            false
+        }
+    }
+}
+
 fn sync_drawer_persistence(
     session: &crate::session::Session,
     panes: &mut Panes,
@@ -1193,10 +1500,11 @@ fn sync_drawer_persistence(
         if let Ok(id) = panes.spawn(Some(&dir), center) {
             *drawer = Some(id);
         }
-    } else if !should_be_open && drawer.is_some() {
-        if let Some(id) = drawer.take() {
-            panes.table.remove(&id);
-        }
+    } else if !should_be_open
+        && drawer.is_some()
+        && let Some(id) = drawer.take()
+    {
+        panes.table.remove(&id);
     }
 }
 
@@ -1211,7 +1519,10 @@ async fn event_loop<T: Terminal>(
     mut cols: usize,
     mut keymap: crate::keymap::KeyMap,
     mut mode: crate::keymap::Mode,
-    config_rx: std::sync::mpsc::Receiver<Result<superzej_core::config::Config, String>>,
+    mut config_rx: tokio_mpsc::UnboundedReceiver<Result<superzej_core::config::Config, String>>,
+    refresh_tx: tokio_mpsc::UnboundedSender<RefreshKind>,
+    mut refresh_rx: tokio_mpsc::UnboundedReceiver<RefreshKind>,
+    waker: TerminalWaker,
 ) -> Result<()> {
     let mut scratch = Surface::new(cols, rows);
     let mut want_sidebar = true;
@@ -1222,40 +1533,92 @@ async fn event_loop<T: Terminal>(
         sb.load(&db, &session.id);
     }
     let mut sidebar_cols = sb.width.unwrap_or(layout::SIDEBAR_COLS);
+    // The last tab name we acked activity for (clears its "look at me" dot).
+    let mut last_acked_tab: Option<String> = None;
     let mut chrome = layout::compute_with_width(cols, rows, want_sidebar, want_panel, sidebar_cols);
     sb.rebuild(&mut model, &session);
     let mut dirty = true;
     let mut palette: Option<crate::palette::Palette> = None;
+    // Cheatsheet overlay (Alt-?) and the transient which-key popup (set while a
+    // multi-key prefix is pending). Both render via the shared `keyhint` module.
+    let mut cheatsheet = false;
+    let mut which_key: Vec<crate::keyhint::HintRow> = Vec::new();
+    let mut which_key_prefix = String::new();
+    // When set, the open palette is an agent picker for a just-created worktree
+    // tab; its selection launches the agent rather than dispatching a command.
+    let mut pending_agent: Option<PendingAgent> = None;
 
     let (tx, mut rx) = tokio_mpsc::channel::<PaneEvent>(1024);
-    let mut panes = Panes::new(tx);
+    let mut panes = Panes::with_waker(tx, waker.clone());
     let mut need_relayout = true;
     let mut drawer: Option<u32> = None;
-    let mut last_model_refresh = Instant::now();
-    let mut last_pr_refresh = Instant::now() - PR_REFRESH_INTERVAL;
-    // The last tab name we sent an activity `--ack` for (avoids re-acking every
-    // frame); cleared implicitly when the active tab changes.
-    let mut last_acked_tab: Option<String> = None;
+
+    // Diff fs-watcher: bound to the active worktree, re-targeted on tab switch.
+    // On a (debounced) change it pushes `RefreshKind::Model` into the shared
+    // refresh channel + pulses the waker, so the diff panel updates on file save
+    // instead of waiting for the periodic safety-net tick.
+    let mut watched_worktree: Option<std::path::PathBuf> = None;
+    let mut diff_watcher: Option<notify::RecommendedWatcher> = None;
+    retarget_diff_watcher(
+        &session,
+        &mut watched_worktree,
+        &mut diff_watcher,
+        &refresh_tx,
+        &waker,
+    );
 
     sync_drawer_persistence(&session, &mut panes, &mut drawer, chrome.center);
 
     let mut current_config = keymap.config().clone();
+    // The workspace the keymap was last built for; when the focused workspace
+    // changes we rebuild so per-workspace/repo-root keybind layers follow it.
+    let mut keymap_workspace = session.id.clone();
+    // The active worktree as of the last loop turn. When it changes (any switch
+    // path: keymap tab-nav, palette, sidebar) we kick an immediate model + PR
+    // refresh and re-target the diff watcher — so the panel is correct for the
+    // new worktree right away (stale-while-revalidate) instead of up to 2s late.
+    let mut last_active_worktree: Option<std::path::PathBuf> = Some(active_tab_path(&session));
     loop {
         if session.tabs.is_empty() {
             return Ok(()); // last tab closed
         }
+        // Per-workspace keybinds: rebuild when the focused workspace changed.
+        if session.id != keymap_workspace {
+            keymap = rebuild_keymap(&current_config, &session);
+            keymap.reset();
+            keymap_workspace = session.id.clone();
+        }
         let active = session.active;
 
-        if let Ok(size) = buf.terminal().get_screen_size() {
-            if size.rows != rows || size.cols != cols {
-                rows = size.rows;
-                cols = size.cols;
-                chrome =
-                    layout::compute_with_width(cols, rows, want_sidebar, want_panel, sidebar_cols);
-                need_relayout = true;
-                buf.resize(cols, rows);
-                dirty = true;
-            }
+        // Detect an active-worktree change centrally so every switch path is
+        // covered without per-call-site wiring.
+        let current_worktree = active_tab_path(&session);
+        if last_active_worktree.as_deref() != Some(current_worktree.as_path()) {
+            last_active_worktree = Some(current_worktree.clone());
+            // Immediate hydrate for the newly-focused worktree; the cached panel
+            // stays on screen until the fresh model lands (never blank).
+            spawn_model_hydration(model_tx.clone(), session.clone(), Some(waker.clone()));
+            spawn_pr_cache_refresh(session.clone(), Some(waker.clone()));
+            retarget_diff_watcher(
+                &session,
+                &mut watched_worktree,
+                &mut diff_watcher,
+                &refresh_tx,
+                &waker,
+            );
+            // Pre-warm sibling tabs so first focus of a neighbor is instant.
+            prewarm_neighbors(&mut panes, &mut session, chrome.center);
+        }
+
+        if let Ok(size) = buf.terminal().get_screen_size()
+            && (size.rows != rows || size.cols != cols)
+        {
+            rows = size.rows;
+            cols = size.cols;
+            chrome = layout::compute_with_width(cols, rows, want_sidebar, want_panel, sidebar_cols);
+            need_relayout = true;
+            buf.resize(cols, rows);
+            dirty = true;
         }
 
         // The active tab's panes are spawned lazily on first focus.
@@ -1337,12 +1700,11 @@ async fn event_loop<T: Terminal>(
                                     }
                                 } else {
                                     session.tabs[ti].center.remove(id);
-                                    if session.tabs[ti].focused_pane == id {
-                                        if let Some(first) =
+                                    if session.tabs[ti].focused_pane == id
+                                        && let Some(first) =
                                             session.tabs[ti].center.pane_ids().first()
-                                        {
-                                            session.tabs[ti].focused_pane = *first;
-                                        }
+                                    {
+                                        session.tabs[ti].focused_pane = *first;
                                     }
                                     need_relayout = true;
                                 }
@@ -1378,34 +1740,49 @@ async fn event_loop<T: Terminal>(
         while let Ok(cfg_res) = config_rx.try_recv() {
             match cfg_res {
                 Ok(new_cfg) => {
-                    keymap = crate::keymap::default_keymap_with_config(&new_cfg);
+                    keymap = rebuild_keymap(&new_cfg, &session);
+                    model.status = keybind_conflict_summary(&new_cfg)
+                        .unwrap_or_else(|| "Config reloaded".into());
                     current_config = new_cfg;
-                    model.status = "Config reloaded".into();
                     need_relayout = true;
                 }
                 Err(e) => {
-                    model.status = format!("Config error: {}", e);
+                    model.status = format!("Config error: {e}");
                 }
             }
             dirty = true;
         }
-        let now = Instant::now();
-        if model_refresh_due(last_model_refresh, now, MODEL_REFRESH_INTERVAL) {
-            spawn_model_hydration(model_tx.clone(), session.clone());
-            last_model_refresh = now;
-        }
-        // Ack the focused worktree's activity so its "look at me" dot clears
-        // once the user is actually on the tab. Cheap + idempotent; runs off the
-        // main thread so the shell-out never stalls input.
-        if let Some(tab) = session.tabs.get(session.active).map(|t| t.name.clone()) {
-            if last_acked_tab.as_deref() != Some(tab.as_str()) {
-                last_acked_tab = Some(tab.clone());
-                task::spawn_blocking(move || advance_activity(Some(&tab)));
+
+        // Refresh requests arrive event-driven (worktree fs-watch, on-switch
+        // kick) and on the safety-net ticker. Coalesce all pending into at most
+        // one model + one PR hydrate per wake so a burst of file saves is one
+        // refresh. Both run off-thread and pulse the waker when results land.
+        let mut want_model_refresh = false;
+        let mut want_pr_refresh = false;
+        while let Ok(kind) = refresh_rx.try_recv() {
+            match kind {
+                RefreshKind::Model => want_model_refresh = true,
+                RefreshKind::Pr => {
+                    want_pr_refresh = true;
+                    want_model_refresh = true;
+                }
             }
         }
-        if model_refresh_due(last_pr_refresh, now, PR_REFRESH_INTERVAL) {
-            spawn_pr_cache_refresh(session.clone());
-            last_pr_refresh = now;
+        if want_model_refresh {
+            spawn_model_hydration(model_tx.clone(), session.clone(), Some(waker.clone()));
+        }
+        if want_pr_refresh {
+            spawn_pr_cache_refresh(session.clone(), Some(waker.clone()));
+        }
+
+        // Ack the focused worktree's activity so its "look at me" dot clears
+        // once the user is actually on the tab. Idempotent; off-thread so the
+        // file write never stalls the loop.
+        if let Some(tab) = session.tabs.get(session.active).map(|t| t.name.clone())
+            && last_acked_tab.as_deref() != Some(tab.as_str())
+        {
+            last_acked_tab = Some(tab.clone());
+            task::spawn_blocking(move || superzej_core::activity::ack(&tab));
         }
 
         // 2. Render if anything changed (diff-flush): all visible panes of the
@@ -1425,36 +1802,47 @@ async fn event_loop<T: Terminal>(
                 &panel_ui,
                 |id| panes.table.get(&id).map(|p| p.emulator()),
             );
-            if let Some(drawer_id) = drawer {
-                if let Some(p) = panes.table.get(&drawer_id) {
-                    let height = current_config
-                        .drawer
-                        .height
-                        .parse::<usize>()
-                        .unwrap_or(20)
-                        .min(rows); // cfg.drawer.height equivalent
-                    let rect = Rect {
-                        x: 0,
-                        y: rows.saturating_sub(height),
-                        cols,
-                        rows: height,
-                    };
-                    crate::compositor::compose_pane(&mut scratch, p.emulator(), rect);
-                }
+            if let Some(drawer_id) = drawer
+                && let Some(p) = panes.table.get(&drawer_id)
+            {
+                let height = current_config
+                    .drawer
+                    .height
+                    .parse::<usize>()
+                    .unwrap_or(20)
+                    .min(rows); // cfg.drawer.height equivalent
+                let rect = Rect {
+                    x: 0,
+                    y: rows.saturating_sub(height),
+                    cols,
+                    rows: height,
+                };
+                crate::compositor::compose_pane(&mut scratch, p.emulator(), rect);
             }
+            let screen = Rect {
+                x: 0,
+                y: 0,
+                cols,
+                rows,
+            };
             if let Some(pal) = &palette {
-                pal.render(
+                pal.render(&mut scratch, screen);
+            }
+            let accent = current_config.accent_rgb();
+            if cheatsheet {
+                let groups = crate::keyhint::cheatsheet_groups(&current_config);
+                crate::keyhint::render_cheatsheet(&mut scratch, screen, &groups, &accent);
+            } else if !which_key.is_empty() {
+                crate::keyhint::render_which_key(
                     &mut scratch,
-                    Rect {
-                        x: 0,
-                        y: 0,
-                        cols,
-                        rows,
-                    },
+                    screen,
+                    &which_key_prefix,
+                    &which_key,
+                    &accent,
                 );
             }
             buf.draw_from_screen(&scratch, 0, 0);
-            if palette.is_none() {
+            if palette.is_none() && !cheatsheet {
                 let focused_rect = tree
                     .layout(chrome.center)
                     .into_iter()
@@ -1472,11 +1860,73 @@ async fn event_loop<T: Terminal>(
             dirty = false;
         }
 
-        // 3. Poll input (also the ~60fps frame tick).
-        match buf.terminal().poll_input(Some(Duration::from_millis(16))) {
+        // 3. Block until something happens: a real terminal event, or a
+        //    `waker.wake()` from any producer (PTY reader, model/PR hydration,
+        //    config watcher, diff fs-watch, refresh ticker) which returns
+        //    `InputEvent::Wake`. No timeout → zero idle CPU; we only wake when
+        //    there is work, and render the instant it arrives.
+        match buf.terminal().poll_input(None) {
             Ok(Some(InputEvent::Key(k))) => {
+                // Modal: the cheatsheet swallows all keys; Esc / Alt-? closes it.
+                if cheatsheet {
+                    let close = matches!(k.key, KeyCode::Escape)
+                        || (k.key == KeyCode::Char('?') && k.modifiers.contains(Modifiers::ALT));
+                    if close {
+                        cheatsheet = false;
+                        dirty = true;
+                    }
+                    continue;
+                }
                 // Modal: when the palette is open it captures all keys.
                 if let Some(p) = palette.as_mut() {
+                    // Agent-picker mode: the palette is choosing what to run in a
+                    // just-created worktree tab. Enter launches the choice; Escape
+                    // defaults to a shell so the tab never sits with no process.
+                    if let Some(pending) = pending_agent.as_ref() {
+                        match k.key {
+                            KeyCode::Escape => {
+                                launch_agent_into_tab(
+                                    keymap.config(),
+                                    &mut session,
+                                    &mut panes,
+                                    pending,
+                                    "shell",
+                                    chrome.center,
+                                );
+                                pending_agent = None;
+                                palette = None;
+                                refresh_tab_model(&mut model, &session, &mut sb);
+                                need_relayout = true;
+                            }
+                            KeyCode::Enter => {
+                                let choice = p
+                                    .selected_item()
+                                    .map(|i| i.key.clone())
+                                    .unwrap_or_else(|| "shell".to_string());
+                                launch_agent_into_tab(
+                                    keymap.config(),
+                                    &mut session,
+                                    &mut panes,
+                                    pending,
+                                    &choice,
+                                    chrome.center,
+                                );
+                                pending_agent = None;
+                                palette = None;
+                                refresh_tab_model(&mut model, &session, &mut sb);
+                                need_relayout = true;
+                            }
+                            KeyCode::UpArrow => p.move_up(),
+                            KeyCode::DownArrow => p.move_down(),
+                            KeyCode::Backspace => p.backspace(),
+                            KeyCode::Char(c) if !k.modifiers.contains(Modifiers::CTRL) => {
+                                p.push_char(c)
+                            }
+                            _ => {}
+                        }
+                        dirty = true;
+                        continue;
+                    }
                     match k.key {
                         KeyCode::Escape => palette = None,
                         KeyCode::Enter => {
@@ -1490,45 +1940,16 @@ async fn event_loop<T: Terminal>(
                                     return Ok(());
                                 }
                                 if let Some(payload) = key.strip_prefix("wt:") {
-                                    if let Some((repo_path, tab_name)) = payload.split_once('\t') {
-                                        if let Ok(db) = superzej_core::db::Db::open() {
-                                            if switch_to_workspace_tab(
-                                                &mut session,
-                                                &db,
-                                                repo_path,
-                                                tab_name,
-                                            )
-                                            .unwrap_or(false)
-                                            {
-                                                refresh_tab_model(&mut model, &session, &mut sb);
-                                                need_relayout = true;
-                                                sync_drawer_persistence(
-                                                    &session,
-                                                    &mut panes,
-                                                    &mut drawer,
-                                                    chrome.center,
-                                                );
-                                            }
-                                        }
-                                    }
-                                } else if let Some(repo_path) = key.strip_prefix("repo:") {
-                                    if let Ok(db) = superzej_core::db::Db::open() {
-                                        if session.switch_to_workspace(repo_path, &db).is_ok() {
-                                            refresh_tab_model(&mut model, &session, &mut sb);
-                                            need_relayout = true;
-                                            sync_drawer_persistence(
-                                                &session,
-                                                &mut panes,
-                                                &mut drawer,
-                                                chrome.center,
-                                            );
-                                        }
-                                    }
-                                } else if let Some(name) = key.strip_prefix("tab:") {
-                                    if let Some(i) =
-                                        session.tabs.iter().position(|t| t.name == name)
+                                    if let Some((repo_path, tab_name)) = payload.split_once('\t')
+                                        && let Ok(db) = superzej_core::db::Db::open()
+                                        && switch_to_workspace_tab(
+                                            &mut session,
+                                            &db,
+                                            repo_path,
+                                            tab_name,
+                                        )
+                                        .unwrap_or(false)
                                     {
-                                        session.switch_to(i);
                                         refresh_tab_model(&mut model, &session, &mut sb);
                                         need_relayout = true;
                                         sync_drawer_persistence(
@@ -1538,6 +1959,32 @@ async fn event_loop<T: Terminal>(
                                             chrome.center,
                                         );
                                     }
+                                } else if let Some(repo_path) = key.strip_prefix("repo:") {
+                                    if let Ok(db) = superzej_core::db::Db::open()
+                                        && session.switch_to_workspace(repo_path, &db).is_ok()
+                                    {
+                                        refresh_tab_model(&mut model, &session, &mut sb);
+                                        need_relayout = true;
+                                        sync_drawer_persistence(
+                                            &session,
+                                            &mut panes,
+                                            &mut drawer,
+                                            chrome.center,
+                                        );
+                                    }
+                                } else if let Some(name) = key.strip_prefix("tab:")
+                                    && let Some(i) =
+                                        session.tabs.iter().position(|t| t.name == name)
+                                {
+                                    session.switch_to(i);
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    need_relayout = true;
+                                    sync_drawer_persistence(
+                                        &session,
+                                        &mut panes,
+                                        &mut drawer,
+                                        chrome.center,
+                                    );
                                 }
                                 // Other command keys are also reachable via their
                                 // keybind; their in-palette dispatch lands with the
@@ -1556,8 +2003,6 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
-                // Modal: when the sidebar owns focus it captures navigation /
-                // tree-management keys before they reach the keymap or pane.
                 if sb.focused {
                     match sb.handle_key(&k.key, k.modifiers, &mut model, &session) {
                         SidebarOutcome::NotHandled => { /* fall through to keymap */ }
@@ -1630,10 +2075,31 @@ async fn event_loop<T: Terminal>(
                 // Global/mode chords are intercepted by the keymap; everything
                 // else is forwarded to the focused pane.
                 let input_key = crate::sequence::Key::modified(k.key, k.modifiers);
-                match keymap.dispatch(mode, input_key) {
+                // The program running in the focused (or drawer) pane keys the
+                // per-program overlay + remap layers.
+                let focused_program = panes
+                    .table
+                    .get(&drawer.unwrap_or(focused))
+                    .map(|p| p.program().to_string())
+                    .unwrap_or_default();
+                // Per-program host-action overlay intercepts before the mode
+                // matcher; otherwise fall through to the normal keymap dispatch.
+                let dispatch = match keymap.program_action(&focused_program, &input_key) {
+                    Some(action) => {
+                        keymap.reset();
+                        crate::sequence::MatchResult::Matched(action)
+                    }
+                    None => keymap.dispatch(mode, input_key.clone()),
+                };
+                match dispatch {
                     crate::sequence::MatchResult::Matched(action) => {
                         use crate::keymap::Action;
+                        // A completed chord clears any pending which-key popup.
+                        which_key.clear();
                         match action {
+                            Action::Cheatsheet => {
+                                cheatsheet = true;
+                            }
                             Action::SwitchMode(next) => {
                                 mode = next;
                                 keymap.reset();
@@ -1750,23 +2216,20 @@ async fn event_loop<T: Terminal>(
                                     );
                                     need_relayout = true;
                                 }
-                                // Take keyboard focus and land the cursor on the
-                                // active worktree.
+                                // Take keyboard focus, land on the active worktree.
                                 sb.focused = true;
                                 sb.rebuild(&mut model, &session);
                             }
-                            Action::FocusPanel => {
-                                if !want_panel {
-                                    want_panel = true;
-                                    chrome = layout::compute_with_width(
-                                        cols,
-                                        rows,
-                                        want_sidebar,
-                                        want_panel,
-                                        sidebar_cols,
-                                    );
-                                    need_relayout = true;
-                                }
+                            Action::FocusPanel if !want_panel => {
+                                want_panel = true;
+                                chrome = layout::compute_with_width(
+                                    cols,
+                                    rows,
+                                    want_sidebar,
+                                    want_panel,
+                                    sidebar_cols,
+                                );
+                                need_relayout = true;
                             }
                             Action::NextTab => {
                                 session.next_tab();
@@ -1822,52 +2285,105 @@ async fn event_loop<T: Terminal>(
                                     session.tabs[active].focused_pane = n;
                                 }
                             }
+                            Action::Pin(idx) => {
+                                // Open-or-focus the configured pin at this 1-based
+                                // index as a dedicated `pin:<name>` tab running its
+                                // command (host, no sandbox — pins are global).
+                                if let Some(pin) = keymap.config().pin_by_index(idx as usize) {
+                                    let tab_name = format!("pin:{}", pin.name);
+                                    if let Some(i) =
+                                        session.tabs.iter().position(|t| t.name == tab_name)
+                                    {
+                                        session.switch_to(i);
+                                    } else {
+                                        let cwd = pin.cwd.clone().unwrap_or_else(|| {
+                                            superzej_core::util::home()
+                                                .to_string_lossy()
+                                                .into_owned()
+                                        });
+                                        let argv = vec![
+                                            superzej_core::util::shell(),
+                                            "-lc".to_string(),
+                                            pin.command.clone(),
+                                        ];
+                                        if let Ok(id) = panes.spawn_argv(
+                                            &argv,
+                                            Some(Path::new(&cwd)),
+                                            chrome.center,
+                                        ) {
+                                            session.add_tab(crate::session::Tab {
+                                                name: tab_name,
+                                                kind: crate::session::TabKind::Pinned,
+                                                worktree: cwd,
+                                                center: crate::center::CenterTree::Leaf(id),
+                                                focused_pane: id,
+                                            });
+                                        }
+                                    }
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    need_relayout = true;
+                                }
+                            }
                             Action::NewWorkspace | Action::SwitchWorkspace => {
-                                if let Ok(db) = superzej_core::db::Db::open() {
-                                    if let Some(target) = palette
+                                if let Ok(db) = superzej_core::db::Db::open()
+                                    && let Some(target) = palette
                                         .as_ref()
                                         .and_then(|p| p.selected_item())
                                         .map(|i| i.key.clone())
-                                    {
-                                        let repo_path = target
-                                            .strip_prefix("repo:")
-                                            .unwrap_or(&target)
-                                            .to_string();
-                                        if session.switch_to_workspace(&repo_path, &db).is_ok() {
-                                            refresh_tab_model(&mut model, &session, &mut sb);
-                                            need_relayout = true;
-                                            sync_drawer_persistence(
-                                                &session,
-                                                &mut panes,
-                                                &mut drawer,
-                                                chrome.center,
-                                            );
-                                        }
+                                {
+                                    let repo_path =
+                                        target.strip_prefix("repo:").unwrap_or(&target).to_string();
+                                    if session.switch_to_workspace(&repo_path, &db).is_ok() {
+                                        refresh_tab_model(&mut model, &session, &mut sb);
+                                        need_relayout = true;
+                                        sync_drawer_persistence(
+                                            &session,
+                                            &mut panes,
+                                            &mut drawer,
+                                            chrome.center,
+                                        );
                                     }
                                 }
                             }
                             Action::NewWorktree => {
-                                // Add a new worktree tab. The name format is {repo}/{branch}
-                                // where branch is derived from the page number (·1, ·2, etc).
-                                // This creates a distinct worktree entry in the sidebar, separate
-                                // from pages (extra views on the same worktree).
-                                let src = &session.tabs[active];
-                                let (repo, branch) = crate::sidebar::split_tab(&src.name)
-                                    .unwrap_or_else(|| (src.name.clone(), "home".to_string()));
-                                let (_base, _) = crate::sidebar::split_page(&branch);
-                                let new_n = session.tabs.len();
-                                // New worktrees use ·N as their branch name - they'll appear as
-                                // separate entries in the sidebar (distinct from home/feature branches)
-                                let tab = crate::session::Tab {
-                                    name: format!("{repo}/·{new_n}"),
-                                    kind: crate::session::TabKind::Worktree,
-                                    worktree: src.worktree.clone(),
-                                    center: crate::center::CenterTree::Leaf(0),
-                                    focused_pane: 0,
-                                };
-                                session.add_tab(tab);
-                                refresh_tab_model(&mut model, &session, &mut sb);
-                                need_relayout = true;
+                                // Create a real git worktree off the active tab's repo, add a
+                                // `{slug}/{branch}` tab for it, then open the agent picker —
+                                // its selection launches the chosen agent into the new tab.
+                                let src_wt = session.tabs[active].worktree.clone();
+                                let repo_root = (!src_wt.is_empty())
+                                    .then(|| superzej_core::repo::main_worktree(Path::new(&src_wt)))
+                                    .flatten()
+                                    .or_else(|| {
+                                        std::env::current_dir()
+                                            .ok()
+                                            .and_then(|c| superzej_core::repo::main_worktree(&c))
+                                    });
+                                if let Some(root) = repo_root {
+                                    if let Some(nw) = create_local_worktree(keymap.config(), &root)
+                                    {
+                                        session.add_tab(crate::session::Tab {
+                                            name: nw.tab.clone(),
+                                            kind: crate::session::TabKind::Worktree,
+                                            worktree: nw.path.clone(),
+                                            center: crate::center::CenterTree::Leaf(0),
+                                            focused_pane: 0,
+                                        });
+                                        refresh_tab_model(&mut model, &session, &mut sb);
+                                        need_relayout = true;
+                                        pending_agent = Some(PendingAgent {
+                                            tab: nw.tab,
+                                            worktree: nw.path,
+                                            branch: nw.branch,
+                                        });
+                                        palette = Some(crate::palette::Palette::new(
+                                            build_agent_palette(keymap.config()),
+                                        ));
+                                    }
+                                } else {
+                                    superzej_core::msg::warn(
+                                        "new-worktree: not inside a git repository",
+                                    );
+                                }
                             }
                             Action::NewTab => {
                                 // A fresh tab on the same worktree (an "extra" page).
@@ -1926,10 +2442,10 @@ async fn event_loop<T: Terminal>(
                                     _ => unreachable!(),
                                 };
                                 if let Some(cmd_str) = keymap.config().tool_command(tool_name) {
-                                    if drawer.is_some() {
-                                        if let Some(id) = drawer.take() {
-                                            panes.table.remove(&id);
-                                        }
+                                    if drawer.is_some()
+                                        && let Some(id) = drawer.take()
+                                    {
+                                        panes.table.remove(&id);
                                     }
                                     let argv = tool_drawer_argv(cmd_str);
                                     let p =
@@ -1941,10 +2457,10 @@ async fn event_loop<T: Terminal>(
                             }
                             Action::Yazi => {
                                 // Direct bind for yazi, routed identical to ToggleDrawer but always spawning.
-                                if drawer.is_some() {
-                                    if let Some(id) = drawer.take() {
-                                        panes.table.remove(&id);
-                                    }
+                                if drawer.is_some()
+                                    && let Some(id) = drawer.take()
+                                {
+                                    panes.table.remove(&id);
                                 }
                                 let cwd = tab_cwd(&session.tabs[active]);
                                 let p = keymap
@@ -1968,13 +2484,32 @@ async fn event_loop<T: Terminal>(
                         continue;
                     }
                     crate::sequence::MatchResult::Pending => {
+                        // Show the which-key popup of next-key candidates.
+                        which_key_prefix = crate::keyhint::key_hint(&input_key);
+                        which_key =
+                            crate::keyhint::which_key_rows(&keymap.pending_continuations(mode));
                         model.status = format!("{} mode   awaiting next key…", mode.as_str());
                         dirty = true;
                         continue;
                     }
-                    crate::sequence::MatchResult::None => {}
+                    crate::sequence::MatchResult::None => {
+                        // No match (and not pending): dismiss any which-key popup.
+                        which_key.clear();
+                    }
                 }
-                if let Some(bytes) = key_bytes(&k.key, k.modifiers) {
+                // Per-program key-injection remap: an unclaimed chord is rewritten
+                // into the program's own keys before forwarding. Falls back to the
+                // raw keystroke when no remap matches.
+                let remapped: Option<Vec<u8>> = keymap
+                    .program_remap(&focused_program, &input_key)
+                    .map(|keys| {
+                        keys.iter()
+                            .filter_map(|key| key_bytes(&key.code, key.mods))
+                            .flatten()
+                            .collect()
+                    });
+                let bytes = remapped.or_else(|| key_bytes(&k.key, k.modifiers));
+                if let Some(bytes) = bytes {
                     let target_pane = drawer.unwrap_or(focused);
                     if let Some(p) = panes.table.get_mut(&target_pane) {
                         p.write_input(&bytes)?;
@@ -2165,7 +2700,8 @@ mod tests {
         // Persisting width opens the global DB; redirect it to a temp dir so the
         // test never touches the user's state (mirrors the other DB tests here).
         let state_home = std::env::temp_dir().join(format!("sz-host-width-{}", std::process::id()));
-        std::env::set_var("XDG_STATE_HOME", &state_home);
+        // SAFETY: test is single-threaded; sets/clears an XDG var around calls.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
 
         let session = one_tab_session();
         let mut model = build_initial_model(&session);
@@ -2178,7 +2714,8 @@ mod tests {
         let out = press(&mut sb, '>', &mut model, &session);
         assert!(matches!(out, SidebarOutcome::Relayout));
 
-        std::env::remove_var("XDG_STATE_HOME");
+        // SAFETY: test is single-threaded.
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
         let _ = std::fs::remove_dir_all(&state_home);
     }
 
@@ -2210,11 +2747,12 @@ mod tests {
         db.put_tab_layout("/tmp/app", &mk("app/feat", "/tmp/app-feat"))
             .unwrap();
 
-        std::env::set_var("XDG_STATE_HOME", &state_home);
+        // SAFETY: test is single-threaded; sets/clears an XDG var around one call.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
 
         let session = load_or_seed_session(std::path::Path::new("/tmp/app"));
 
-        std::env::remove_var("XDG_STATE_HOME");
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
 
         assert_eq!(session.tabs.len(), 1);
         assert_eq!(session.tabs[0].name, "app/feat");
@@ -2234,12 +2772,13 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         let _ = db.put_workspace("/tmp/repo2", "repo2");
 
-        std::env::set_var("XDG_STATE_HOME", &state_home);
+        // SAFETY: test is single-threaded; sets/clears an XDG var around calls.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
 
         let session = load_or_seed_session(std::path::Path::new("/tmp/repo1"));
         let model = build_model(&session, &db);
 
-        std::env::remove_var("XDG_STATE_HOME");
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
 
         let slugs: Vec<&str> = model
             .sidebar_workspaces
@@ -2315,23 +2854,25 @@ mod tests {
         assert!(model.status.contains("Starting szhost"));
     }
 
-    #[test]
-    fn native_watch_loop_refreshes_on_interval() {
-        let start = Instant::now();
-        assert!(!model_refresh_due(
-            start,
-            start + MODEL_REFRESH_INTERVAL / 2,
-            MODEL_REFRESH_INTERVAL
-        ));
-        assert!(model_refresh_due(
-            start,
-            start + MODEL_REFRESH_INTERVAL,
-            MODEL_REFRESH_INTERVAL
-        ));
-    }
-
     fn sidebar_labels(model: &FrameModel) -> Vec<String> {
         model.sidebar_rows.iter().map(|r| r.label.clone()).collect()
+    }
+
+    #[test]
+    fn prewarm_targets_returns_clamped_neighbors_excluding_active() {
+        // Middle of a list: both neighbors.
+        assert_eq!(prewarm_targets(2, 5, 1), vec![1, 3]);
+        // First tab: only the right neighbor.
+        assert_eq!(prewarm_targets(0, 5, 1), vec![1]);
+        // Last tab: only the left neighbor.
+        assert_eq!(prewarm_targets(4, 5, 1), vec![3]);
+        // Single tab: nothing to pre-warm.
+        assert_eq!(prewarm_targets(0, 1, 1), Vec::<usize>::new());
+        // Empty / zero-radius: nothing.
+        assert_eq!(prewarm_targets(0, 0, 1), Vec::<usize>::new());
+        assert_eq!(prewarm_targets(2, 5, 0), Vec::<usize>::new());
+        // Wider radius clamps at the ends.
+        assert_eq!(prewarm_targets(1, 5, 2), vec![0, 2, 3]);
     }
 
     #[test]
@@ -2399,7 +2940,8 @@ mod tests {
     #[test]
     fn toggle_drawer_spawns_and_closes_drawer_pane() {
         // The test spawns a drawer, which reads SHELL. Force it to something that exists.
-        std::env::set_var("SHELL", "/bin/sh");
+        // SAFETY: single-threaded test setup.
+        unsafe { std::env::set_var("SHELL", "/bin/sh") };
         let mut session = one_tab_session();
         let chrome = layout::compute(160, 40, true, true);
 
