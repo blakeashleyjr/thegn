@@ -1,7 +1,7 @@
 [package]
 name = "superzej-cli"
 version.workspace = true
-edition.workspace = true
+edition = "2021"
 license.workspace = true
 description = "superzej CLI + the (transitional) zellij-driven shell"
 

@@ -188,11 +188,10 @@ pub fn parse_owner_repo(url: &str) -> Option<(String, String)> {
         .filter(|_| url.contains('@') && !url.contains("://"))
     {
         rest.to_string()
-    } else if let Some(idx) = url.find("://") {
+    } else {
+        let idx = url.find("://")?;
         let after = &url[idx + 3..];
         after.split_once('/').map(|(_, r)| r.to_string())?
-    } else {
-        return None;
     };
     let path = path.strip_suffix(".git").unwrap_or(&path);
     let (owner, repo) = path.split_once('/')?;

@@ -1,7 +1,7 @@
 [package]
 name = "superzej-host"
 version.workspace = true
-edition.workspace = true
+edition = "2021"
 license.workspace = true
 description = "superzej native terminal host: the compositor + in-process chrome"
 
@@ -19,7 +19,7 @@ tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # Compositor substrate (Phase 1).
-tokio.workspace = true
+tokio = { workspace = true, features = ["full"] }
 portable-pty.workspace = true
 termwiz.workspace = true
 vt100.workspace = true
