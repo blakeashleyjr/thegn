@@ -38,6 +38,7 @@ ignore.workspace = true
 grep-searcher.workspace = true
 grep-regex.workspace = true
 grep-matcher.workspace = true
+tokei.workspace = true
 
 [dev-dependencies]
 futures.workspace = true

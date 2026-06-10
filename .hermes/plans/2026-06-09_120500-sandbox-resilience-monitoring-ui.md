@@ -5,6 +5,7 @@
 **Goal:** Complete the sandbox architecture by adding an orphan garbage collector, a resource utilization API, and storing the resolved sandbox backend in SQLite for WASM plugin UI representation.
 
 **Architecture:**
+
 1. **Frontend Integration:** Store the `sandbox_backend` per worktree in the SQLite database so UI components (like the status bar) can render the active backend (🐳, 📦, etc.).
 2. **Resource Monitoring API:** Parse `podman stats`/`docker stats` to surface the CPU and Memory metrics of active sandboxes. We will add a `stats()` function to `crates/superzej-core/src/sandbox.rs` and plumb it into `crates/superzej-cli/src/commands/stats.rs`.
 3. **Orphan Garbage Collection:** OCI persistent containers (`superzej-*`) can be leaked if a user bypasses the Superzej CLI (e.g., `git worktree remove` manually). We will add a `sandbox::run_gc()` routine and invoke it asynchronously on startup in `crates/superzej-cli/src/commands/launch.rs` (the host daemon entrypoint).
@@ -18,10 +19,12 @@
 **Objective:** Extend the database schema to track the resolved sandbox backend and write it during `pick_agent`.
 
 **Files:**
+
 - Modify: `crates/superzej-core/src/db.rs`
 - Modify: `crates/superzej-cli/src/commands/pick_agent.rs`
 
 **Step 1: Write failing DB schema test**
+
 ```rust
 // In crates/superzej-core/src/db.rs -> mod tests { ... }
 #[test]
@@ -37,6 +40,7 @@ fn test_db_stores_sandbox_backend() {
 **Step 2: Run test to verify failure**
 
 **Step 3: Write minimal implementation**
+
 ```rust
 // In crates/superzej-core/src/db.rs
 // 1. In `ensure_tables`, alter `worktrees` table to add `sandbox_backend TEXT`:
@@ -79,6 +83,7 @@ pub fn worktree_sandbox(&self, wt: &str) -> Result<Option<String>> {
 **Step 4: Run test to verify pass**
 
 **Step 5: Commit**
+
 ```bash
 git add crates/superzej-core/src/db.rs crates/superzej-cli/src/commands/pick_agent.rs
 git commit -m "feat(sandbox): track resolved sandbox backend in sqlite"
@@ -91,9 +96,11 @@ git commit -m "feat(sandbox): track resolved sandbox backend in sqlite"
 **Objective:** Add parsing logic for OCI container stats to extract CPU and RAM usage.
 
 **Files:**
+
 - Modify: `crates/superzej-core/src/sandbox.rs`
 
 **Step 1: Write failing parsing test**
+
 ```rust
 // In crates/superzej-core/src/sandbox.rs tests
 #[test]
@@ -108,6 +115,7 @@ fn test_parse_sandbox_stats() {
 **Step 2: Run test to verify failure**
 
 **Step 3: Write minimal implementation**
+
 ```rust
 // In crates/superzej-core/src/sandbox.rs
 
@@ -124,7 +132,7 @@ pub fn stats(spec: &SandboxSpec) -> Option<SandboxStats> {
     let rt = spec.backend.binary();
     // format: CPUPerc|MemUsage
     let argv = vec![rt, "stats", "--no-stream", "--format", "{{.CPUPerc}}|{{.MemUsage}}", &spec.name];
-    
+
     let out = std::process::Command::new(argv[0]).args(&argv[1..]).output().ok()?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     parse_sandbox_stats(stdout.trim())
@@ -144,6 +152,7 @@ fn parse_sandbox_stats(output: &str) -> Option<SandboxStats> {
 **Step 4: Run test to verify pass**
 
 **Step 5: Commit**
+
 ```bash
 git add crates/superzej-core/src/sandbox.rs
 git commit -m "feat(sandbox): parse cpu and memory utilization from oci runtimes"
@@ -156,10 +165,11 @@ git commit -m "feat(sandbox): parse cpu and memory utilization from oci runtimes
 **Objective:** Append the sandbox stats to the `superzej stats` JSON dump so WASM plugins can fetch it.
 
 **Files:**
+
 - Modify: `crates/superzej-cli/src/commands/stats.rs`
 
 **Step 1: Inspect and Modify `stats.rs`**
-*(Since `stats.rs` already exists, inject the `sandbox::stats` call if the active tab is a worktree.)*
+_(Since `stats.rs` already exists, inject the `sandbox::stats` call if the active tab is a worktree.)_
 
 ```rust
 // Pseudo-logic to add inside `stats.rs` (which returns JSON payload to plugins):
@@ -175,6 +185,7 @@ use superzej_core::sandbox;
 ```
 
 **Step 5: Commit**
+
 ```bash
 git add crates/superzej-cli/src/commands/stats.rs
 git commit -m "feat(sandbox): expose live container stats to wasm plugins via cli"
@@ -187,10 +198,12 @@ git commit -m "feat(sandbox): expose live container stats to wasm plugins via cl
 **Objective:** Find `superzej-*` containers that lack a backing worktree in SQLite, and `rm -f` them.
 
 **Files:**
+
 - Modify: `crates/superzej-core/src/sandbox.rs`
 - Modify: `crates/superzej-cli/src/commands/launch.rs` (Daemon startup)
 
 **Step 1: Write failing GC logic test**
+
 ```rust
 // In crates/superzej-core/src/sandbox.rs tests
 #[test]
@@ -208,13 +221,14 @@ fn test_gc_identifies_orphans() {
 ```
 
 **Step 3: Write minimal implementation**
+
 ```rust
 // In sandbox.rs
 pub fn identify_orphans(active_worktrees: &[String], containers: &[String]) -> Vec<String> {
     let active_names: Vec<String> = active_worktrees.iter()
         .map(|w| container_name(w))
         .collect();
-    
+
     containers.iter()
         .filter(|c| c.starts_with("superzej-"))
         .filter(|c| !active_names.contains(c))
@@ -225,14 +239,14 @@ pub fn identify_orphans(active_worktrees: &[String], containers: &[String]) -> V
 pub fn run_gc(db_worktrees: &[String]) -> Result<(), String> {
     for backend in [Backend::Podman, Backend::Docker] {
         if !crate::util::have(backend.binary()) { continue; }
-        
+
         let out = std::process::Command::new(backend.binary())
             .args(["ps", "-a", "--format", "{{.Names}}"])
             .output().map_err(|e| e.to_string())?;
-            
+
         let stdout = String::from_utf8_lossy(&out.stdout);
         let containers: Vec<String> = stdout.lines().map(|s| s.trim().to_string()).collect();
-        
+
         for orphan in identify_orphans(db_worktrees, &containers) {
             let _ = std::process::Command::new(backend.binary())
                 .args(["rm", "-f", &orphan])
@@ -246,6 +260,7 @@ pub fn run_gc(db_worktrees: &[String]) -> Result<(), String> {
 **Step 4: Run test to verify pass**
 
 **Step 5: Hook into Daemon Startup**
+
 ```rust
 // In crates/superzej-cli/src/commands/launch.rs
 
@@ -261,6 +276,7 @@ std::thread::spawn(|| {
 ```
 
 **Step 6: Commit**
+
 ```bash
 git add crates/superzej-core/src/sandbox.rs crates/superzej-cli/src/commands/launch.rs
 git commit -m "feat(sandbox): asynchronous orphan garbage collector on daemon launch"
@@ -269,4 +285,5 @@ git commit -m "feat(sandbox): asynchronous orphan garbage collector on daemon la
 ---
 
 ### Conclusion
+
 This plan ensures all loose ends are tied up: UI visibility (via DB columns), live resource monitoring (via OCI stats scraping), and resilient container lifecycle (via GC).

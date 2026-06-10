@@ -1239,6 +1239,7 @@ impl Config {
         match kind {
             "cpu" | "mem" => Some(self.monitor.system.as_str()),
             "gpu" => Some(self.monitor.gpu.as_str()),
+            "loc" => None,
             _ => None,
         }
     }
@@ -1456,7 +1457,7 @@ mod tests {
 
         let cfg = Config::try_load_layered(&env, &cli_overrides, None).unwrap();
         assert_eq!(cfg.theme.accent, "#abcdef");
-        assert_eq!(cfg.sandbox.enabled, false);
+        assert!(!cfg.sandbox.enabled);
         assert_eq!(cfg.sandbox.remote.host, "user@box");
     }
 
@@ -1468,7 +1469,7 @@ mod tests {
         assert_eq!(cfg.repo_scan_depth, 99);
         // Bool
         assert!(Config::apply_override_str(&mut cfg, "sandbox.enabled", "false").is_ok());
-        assert_eq!(cfg.sandbox.enabled, false);
+        assert!(!cfg.sandbox.enabled);
         // String
         assert!(Config::apply_override_str(&mut cfg, "theme.accent", "#123456").is_ok());
         assert_eq!(cfg.theme.accent, "#123456");
@@ -2087,6 +2088,94 @@ format = \"bad\"
 
     // A repo overlay that sets *every* sandbox + remote field exercises all the
     // overlay `apply` branches.
+    #[test]
+    fn agent_command() {
+        let mut cfg = Config::default();
+        cfg.agents.push(crate::config::NamedCommand {
+            name: "test".into(),
+            command: "echo test".into(),
+            hints: vec![],
+        });
+        assert_eq!(cfg.agent_command("test"), Some("echo test"));
+        assert_eq!(cfg.agent_command("missing"), None);
+    }
+
+    #[test]
+    fn tool_command() {
+        let mut cfg = Config::default();
+        cfg.tools.push(crate::config::NamedCommand {
+            name: "test".into(),
+            command: "echo test".into(),
+            hints: vec![],
+        });
+        assert_eq!(cfg.tool_command("test"), Some("echo test"));
+        assert_eq!(cfg.tool_command("missing"), None);
+    }
+
+    #[test]
+    fn pin_and_pin_by_index() {
+        let mut cfg = Config::default();
+        cfg.pins.push(crate::config::Pin {
+            name: "test".into(),
+            command: "echo test".into(),
+            scope: crate::config::PinScope::Global,
+            workspace: None,
+            cwd: None,
+            start: crate::config::PinStart::Lazy,
+            restart: crate::config::PinRestart::Never,
+            singleton: false,
+            location: crate::config::PinLocation::Tab,
+        });
+        assert_eq!(cfg.pin("test").unwrap().name, "test");
+        assert!(cfg.pin("missing").is_none());
+        assert_eq!(cfg.pin_by_index(1).unwrap().name, "test");
+        assert!(cfg.pin_by_index(0).is_none());
+        assert!(cfg.pin_by_index(2).is_none());
+    }
+
+    #[test]
+    fn pins_for_workspace() {
+        let mut cfg = Config::default();
+        cfg.pins.push(crate::config::Pin {
+            name: "global".into(),
+            command: "echo test".into(),
+            scope: crate::config::PinScope::Global,
+            workspace: None,
+            cwd: None,
+            start: crate::config::PinStart::Lazy,
+            restart: crate::config::PinRestart::Never,
+            singleton: false,
+            location: crate::config::PinLocation::Tab,
+        });
+        cfg.pins.push(crate::config::Pin {
+            name: "local".into(),
+            command: "echo test".into(),
+            scope: crate::config::PinScope::Workspace,
+            workspace: Some("repo".into()),
+            cwd: None,
+            start: crate::config::PinStart::Lazy,
+            restart: crate::config::PinRestart::Never,
+            singleton: false,
+            location: crate::config::PinLocation::Tab,
+        });
+        cfg.pins.push(crate::config::Pin {
+            name: "local_any".into(),
+            command: "echo test".into(),
+            scope: crate::config::PinScope::Workspace,
+            workspace: None,
+            cwd: None,
+            start: crate::config::PinStart::Lazy,
+            restart: crate::config::PinRestart::Never,
+            singleton: false,
+            location: crate::config::PinLocation::Tab,
+        });
+        let none_pins = cfg.pins_for_workspace(None);
+        assert_eq!(none_pins.len(), 1); // just global
+        assert!(none_pins.iter().any(|p| p.name == "global"));
+        let some_pins = cfg.pins_for_workspace(Some("repo"));
+        assert_eq!(some_pins.len(), 2); // global, local
+    }
+
     #[test]
     fn full_repo_overlay_applies_every_field() {
         let cfg = Config::default();

@@ -43,11 +43,7 @@ pub fn run() -> Result<()> {
             // may be a custom workspace name and shouldn't drive the slug.
             let base = {
                 let s = util::slugify(&repo::repo_name_from_path(p));
-                if s.is_empty() {
-                    "repo".to_string()
-                } else {
-                    s
-                }
+                if s.is_empty() { "repo".to_string() } else { s }
             };
             let slug = db.slug_for_repo(&path, &base).unwrap_or(base);
             let name = names

@@ -3,7 +3,7 @@
 // references `crate::db`, `crate::config`, … keeps resolving unchanged. The
 // `#[macro_use]` pulls in core's exported `outln!`/`out!` macros crate-wide.
 pub use superzej_core::{
-    config, db, diff_highlight, github, keymap, log, models, msg, out, picker, remote, repo,
+    config, db, diff_highlight, forge, github, keymap, log, models, msg, out, picker, remote, repo,
     sandbox, theme, util, worktree, yazi,
 };
 // `out` above already brings the `out!` macro into scope (same path, macro
@@ -130,6 +130,7 @@ fn main() {
         Command::Panel { toggle } => commands::panels::panel(toggle),
         Command::Pin { action } => commands::pin::run(&cfg, action),
         Command::Pr { action } => commands::pr::run(&cfg, action),
+        Command::Issue { action } => commands::issue::run(&cfg, action),
         Command::Diff {
             worktree,
             base,
