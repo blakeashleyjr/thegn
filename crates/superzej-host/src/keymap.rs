@@ -777,26 +777,34 @@ mod tests {
 
     #[test]
     fn profile_default_mode_overrides_name_heuristic() {
-        let mut cfg = superzej_core::config::Config::default();
-        cfg.profile = "custom".into();
-        cfg.profiles.insert(
-            "custom".into(),
+        let mut profiles = std::collections::BTreeMap::new();
+        profiles.insert(
+            "custom".to_string(),
             superzej_core::config::ProfileConfig {
                 default_mode: "emacs".into(),
                 keybinds: Default::default(),
             },
         );
+        let cfg = superzej_core::config::Config {
+            profile: "custom".into(),
+            profiles,
+            ..Default::default()
+        };
         assert_eq!(startup_mode(&cfg), Mode::Emacs);
     }
 
     #[test]
     fn global_keybind_beats_profile_layer() {
         // profile binds focus-down → j; global rebinds it → Ctrl j. Global wins.
-        let mut cfg = superzej_core::config::Config::default();
-        cfg.profile = "vim".into();
         let mut prof = superzej_core::config::ProfileConfig::default();
         prof.keybinds.insert("focus-down".into(), "j".into());
-        cfg.profiles.insert("vim".into(), prof);
+        let mut profiles = std::collections::BTreeMap::new();
+        profiles.insert("vim".to_string(), prof);
+        let mut cfg = superzej_core::config::Config {
+            profile: "vim".into(),
+            profiles,
+            ..Default::default()
+        };
         cfg.keybinds.insert("focus-down".into(), "Ctrl j".into());
 
         let mut map = default_keymap_for(&cfg, None, None);
