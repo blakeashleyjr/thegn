@@ -41,6 +41,8 @@ pub fn run(cfg: &Config, action: PrAction) -> Result<()> {
         } => merge(worktree, method, delete_branch, auto),
         PrAction::RerunChecks { worktree } => rerun(worktree),
         PrAction::Reviews { worktree } => reviews(worktree),
+        PrAction::Draft { worktree, undo } => draft(worktree, undo),
+        PrAction::AutoMerge { worktree, disable } => auto_merge(worktree, disable),
     }
 }
 
@@ -254,6 +256,54 @@ fn reviews(worktree: Option<String>) -> Result<()> {
         Ok(json) => crate::outln!("{json}"),
         Err(e) => msg::die(&format!(
             "pr reviews failed: {}",
+            superzej_core::forge::models::ForgeError::message(&e)
+        )),
+    }
+    Ok(())
+}
+
+fn draft(worktree: Option<String>, undo: bool) -> Result<()> {
+    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    // undo=true means convert to draft (undo the "ready" action)
+    // undo=false means mark as ready for review
+    let draft = undo;
+    match superzej_core::forge::get_forge_for_loc(&loc)
+        .unwrap()
+        .set_draft(&loc, draft)
+    {
+        Ok(()) => {
+            if draft {
+                msg::info("PR converted to draft");
+            } else {
+                msg::info("PR marked as ready for review");
+            }
+        }
+        Err(e) => msg::die(&format!(
+            "pr draft failed: {}",
+            superzej_core::forge::models::ForgeError::message(&e)
+        )),
+    }
+    Ok(())
+}
+
+fn auto_merge(worktree: Option<String>, disable: bool) -> Result<()> {
+    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    // disable=false means enable auto-merge
+    // disable=true means disable auto-merge
+    let enable = !disable;
+    match superzej_core::forge::get_forge_for_loc(&loc)
+        .unwrap()
+        .set_auto_merge(&loc, enable)
+    {
+        Ok(()) => {
+            if enable {
+                msg::info("Auto-merge enabled");
+            } else {
+                msg::info("Auto-merge disabled");
+            }
+        }
+        Err(e) => msg::die(&format!(
+            "pr automerge failed: {}",
             superzej_core::forge::models::ForgeError::message(&e)
         )),
     }

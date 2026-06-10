@@ -26,6 +26,8 @@ pub trait GhBackend: Send + Sync {
     ) -> Result<(), GhError>;
     fn approve(&self, loc: &GitLoc, body: Option<&str>) -> Result<(), GhError>;
     fn rerun_failed(&self, loc: &GitLoc) -> Result<u32, GhError>;
+    fn set_draft(&self, loc: &GitLoc, draft: bool) -> Result<(), GhError>;
+    fn set_auto_merge(&self, loc: &GitLoc, enable: bool) -> Result<(), GhError>;
 }
 
 /// The permanent fallback: every op via the `gh` CLI (through superzej-core's
@@ -64,6 +66,16 @@ impl GhBackend for CliGh {
         superzej_core::forge::get_forge_for_loc(loc)
             .unwrap()
             .rerun_failed_checks(loc)
+    }
+    fn set_draft(&self, loc: &GitLoc, draft: bool) -> Result<(), GhError> {
+        superzej_core::forge::get_forge_for_loc(loc)
+            .unwrap()
+            .set_draft(loc, draft)
+    }
+    fn set_auto_merge(&self, loc: &GitLoc, enable: bool) -> Result<(), GhError> {
+        superzej_core::forge::get_forge_for_loc(loc)
+            .unwrap()
+            .set_auto_merge(loc, enable)
     }
 }
 
@@ -302,6 +314,12 @@ impl GhBackend for GhNative {
     }
     fn rerun_failed(&self, loc: &GitLoc) -> Result<u32, GhError> {
         self.fallback.rerun_failed(loc)
+    }
+    fn set_draft(&self, loc: &GitLoc, draft: bool) -> Result<(), GhError> {
+        self.fallback.set_draft(loc, draft)
+    }
+    fn set_auto_merge(&self, loc: &GitLoc, enable: bool) -> Result<(), GhError> {
+        self.fallback.set_auto_merge(loc, enable)
     }
 }
 

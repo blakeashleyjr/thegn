@@ -554,6 +554,20 @@ impl Forge for ForgejoForge {
         // For now, return 0 as a placeholder
         Ok(0)
     }
+
+    fn set_draft(&self, loc: &GitLoc, draft: bool) -> Result<(), ForgeError> {
+        // Forgejo doesn't have a simple API for this, return not implemented
+        Err(ForgeError::Other(
+            "set_draft not implemented for Forgejo".into(),
+        ))
+    }
+
+    fn set_auto_merge(&self, loc: &GitLoc, enable: bool) -> Result<(), ForgeError> {
+        // Forgejo doesn't have a simple API for this, return not implemented
+        Err(ForgeError::Other(
+            "set_auto_merge not implemented for Forgejo".into(),
+        ))
+    }
 }
 
 // --- API response models ----------------------------------------------------

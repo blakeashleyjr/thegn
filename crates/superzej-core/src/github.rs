@@ -150,6 +150,30 @@ impl Forge for GitHubForge {
         gh_run(loc, &args)
     }
 
+    fn set_draft(&self, loc: &GitLoc, draft: bool) -> Result<(), ForgeError> {
+        if draft {
+            // Convert to draft: gh pr ready --undo
+            gh_run(loc, &["pr", "ready", "--undo"])
+        } else {
+            // Mark as ready for review: gh pr ready
+            gh_run(loc, &["pr", "ready"])
+        }
+    }
+
+    fn set_auto_merge(&self, loc: &GitLoc, enable: bool) -> Result<(), ForgeError> {
+        if enable {
+            // Enable auto-merge: gh pr merge --auto
+            gh_run(loc, &["pr", "merge", "--auto", "--squash"])
+        } else {
+            // Disable is not directly supported via gh, but we can try
+            // gh doesn't have a direct command to disable auto-merge
+            // We'll return an error for now
+            Err(ForgeError::Other(
+                "gh CLI does not support disabling auto-merge".into(),
+            ))
+        }
+    }
+
     fn reviews(&self, loc: &GitLoc) -> Result<String, ForgeError> {
         gh_out(
             loc,

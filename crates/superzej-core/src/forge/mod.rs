@@ -17,6 +17,8 @@ pub trait Forge {
         delete_branch: bool,
         auto: bool,
     ) -> Result<(), ForgeError>;
+    fn set_draft(&self, loc: &GitLoc, draft: bool) -> Result<(), ForgeError>;
+    fn set_auto_merge(&self, loc: &GitLoc, enable: bool) -> Result<(), ForgeError>;
     fn reviews(&self, loc: &GitLoc) -> Result<String, ForgeError>;
     fn rerun_failed_checks(&self, loc: &GitLoc) -> Result<u32, ForgeError>;
 }
