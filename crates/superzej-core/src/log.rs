@@ -54,7 +54,12 @@ pub fn audit(event: &str) {
 /// daemon (whose stdout/stderr are nulled) skips the pointless stderr layer.
 pub enum Role {
     Cli,
-    Watch { session: String },
+    Watch {
+        session: String,
+    },
+    /// The native compositor: file sink only — stderr would write into the
+    /// alternate screen and corrupt the frame.
+    Host,
 }
 
 impl Role {
@@ -62,6 +67,7 @@ impl Role {
         match self {
             Role::Cli => "superzej.log".into(),
             Role::Watch { session } => format!("watch-{}.log", crate::util::slugify(session)),
+            Role::Host => "szhost.log".into(),
         }
     }
     fn wants_stderr(&self) -> bool {
