@@ -660,6 +660,7 @@ fn retarget_diff_watcher(
     session: &crate::session::Session,
     watched: &mut Option<std::path::PathBuf>,
     watcher: &mut Option<notify::RecommendedWatcher>,
+    watcher_tx: &tokio_mpsc::UnboundedSender<(std::path::PathBuf, notify::RecommendedWatcher)>,
     refresh_tx: &tokio_mpsc::UnboundedSender<RefreshKind>,
     waker: &TerminalWaker,
 ) {
@@ -670,35 +671,48 @@ fn retarget_diff_watcher(
     if watched.as_deref() == Some(cwd.as_path()) {
         return; // already watching this worktree
     }
+    *watched = Some(cwd.clone());
 
+    // Build + recursively register the watcher off-thread: on a large worktree
+    // the recursive inotify registration walks every directory (~1s on this
+    // repo) and must never block startup or a tab switch. The old watcher is
+    // dropped off-thread too — removing thousands of watches isn't free. The
+    // finished watcher comes back via `watcher_tx`; the loop adopts it if the
+    // user hasn't switched away again. Until it lands, the 2s safety-net tick
+    // covers diff refresh.
+    let old = watcher.take();
     let tx = refresh_tx.clone();
+    let wtx = watcher_tx.clone();
     let w = waker.clone();
-    let mut last_send = Instant::now()
-        .checked_sub(Duration::from_secs(1))
-        .unwrap_or_else(Instant::now);
-    let new_watcher = recommended_watcher(move |res: notify::Result<Event>| {
-        if let Ok(ev) = res
-            && matches!(
-                ev.kind,
-                notify::EventKind::Modify(_)
-                    | notify::EventKind::Create(_)
-                    | notify::EventKind::Remove(_)
-            )
-            && last_send.elapsed() > Duration::from_millis(500)
-        {
-            if tx.send(RefreshKind::Model).is_ok() {
-                let _ = w.wake();
+    std::thread::spawn(move || {
+        drop(old);
+        let mut last_send = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        let wake = w.clone();
+        let new_watcher = recommended_watcher(move |res: notify::Result<Event>| {
+            if let Ok(ev) = res
+                && matches!(
+                    ev.kind,
+                    notify::EventKind::Modify(_)
+                        | notify::EventKind::Create(_)
+                        | notify::EventKind::Remove(_)
+                )
+                && last_send.elapsed() > Duration::from_millis(500)
+            {
+                if tx.send(RefreshKind::Model).is_ok() {
+                    let _ = wake.wake();
+                }
+                last_send = Instant::now();
             }
-            last_send = Instant::now();
+        });
+        if let Ok(mut nw) = new_watcher
+            && nw.watch(&cwd, RecursiveMode::Recursive).is_ok()
+            && wtx.send((cwd, nw)).is_ok()
+        {
+            let _ = w.wake();
         }
     });
-
-    if let Ok(mut nw) = new_watcher
-        && nw.watch(&cwd, RecursiveMode::Recursive).is_ok()
-    {
-        *watcher = Some(nw);
-        *watched = Some(cwd);
-    }
 }
 
 /// Replace an externally-dead sole center pane with a fresh shell pane without
@@ -1755,10 +1769,16 @@ async fn event_loop<T: Terminal>(
     // instead of waiting for the periodic safety-net tick.
     let mut watched_worktree: Option<std::path::PathBuf> = None;
     let mut diff_watcher: Option<notify::RecommendedWatcher> = None;
+    // Finished watchers arrive here from the retarget threads (see
+    // `retarget_diff_watcher`); the loop adopts the one matching the
+    // currently-watched worktree and drops stale ones.
+    let (watcher_tx, mut watcher_rx) =
+        tokio_mpsc::unbounded_channel::<(std::path::PathBuf, notify::RecommendedWatcher)>();
     retarget_diff_watcher(
         &session,
         &mut watched_worktree,
         &mut diff_watcher,
+        &watcher_tx,
         &refresh_tx,
         &waker,
     );
@@ -1860,6 +1880,7 @@ async fn event_loop<T: Terminal>(
                 &session,
                 &mut watched_worktree,
                 &mut diff_watcher,
+                &watcher_tx,
                 &refresh_tx,
                 &waker,
             );
@@ -2045,6 +2066,14 @@ async fn event_loop<T: Terminal>(
             let ws = (!session.id.is_empty()).then_some(session.id.as_str());
             model.pins = supervisor.chips(&current_config, ws);
             dirty = true;
+        }
+
+        // Adopt freshly-registered diff watchers; drop stale ones (the user
+        // switched worktrees again before the recursive registration finished).
+        while let Ok((path, nw)) = watcher_rx.try_recv() {
+            if watched_worktree.as_deref() == Some(path.as_path()) {
+                diff_watcher = Some(nw);
+            }
         }
 
         while let Ok(cfg_res) = config_rx.try_recv() {
