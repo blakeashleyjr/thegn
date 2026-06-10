@@ -254,6 +254,7 @@ pub fn now_secs() -> i64 {
 /// restores it). The native host owns this — it's the resurrect path that
 /// replaced zellij's session serialization.
 fn load_or_seed_session(cwd: &std::path::Path) -> crate::session::Session {
+    let _span = tracing::info_span!("load_or_seed_session").entered();
     use crate::center::CenterTree;
     use crate::session::{Session, Tab, TabKind};
 
