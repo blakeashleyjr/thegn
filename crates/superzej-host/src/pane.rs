@@ -6,7 +6,8 @@
 use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 use std::io::Write;
-use std::sync::mpsc::{Receiver, Sender};
+
+use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::emulator::{PaneEmulator, Vt100Emulator};
 
@@ -48,7 +49,7 @@ impl PtyPane {
         cwd: Option<&std::path::Path>,
         rows: u16,
         cols: u16,
-        tx: Sender<PaneEvent>,
+        tx: tokio_mpsc::Sender<PaneEvent>,
     ) -> Result<Self> {
         let pty = portable_pty::native_pty_system();
         let pair = pty
@@ -73,21 +74,26 @@ impl PtyPane {
         let writer = pair.master.take_writer().context("take_writer")?;
         let mut reader = pair.master.try_clone_reader().context("clone_reader")?;
 
+        // Use std::thread::spawn for the reader - it doesn't require a Tokio runtime
+        // but can still use blocking_send on the tokio channel
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => {
-                        let _ = tx.send(PaneEvent::Exit(id));
+                        let _ = tx.blocking_send(PaneEvent::Exit(id));
                         break;
                     }
                     Ok(n) => {
-                        if tx.send(PaneEvent::Output(id, buf[..n].to_vec())).is_err() {
+                        if tx
+                            .blocking_send(PaneEvent::Output(id, buf[..n].to_vec()))
+                            .is_err()
+                        {
                             break; // consumer gone
                         }
                     }
                     Err(_) => {
-                        let _ = tx.send(PaneEvent::Exit(id));
+                        let _ = tx.blocking_send(PaneEvent::Exit(id));
                         break;
                     }
                 }
@@ -157,9 +163,13 @@ impl PtyPane {
 
 /// Block (with a deadline) draining `rx` into the pane until the child exits or
 /// the deadline passes. Test/helper for headless round-trips; the interactive
-/// loop drains the same channel via `tokio::select!`.
+/// loop drains the same channel via `try_recv`.
 #[allow(dead_code)]
-pub fn drain_until_exit(pane: &mut PtyPane, rx: &Receiver<PaneEvent>, deadline_ms: u64) -> bool {
+pub fn drain_until_exit(
+    pane: &mut PtyPane,
+    rx: &mut tokio_mpsc::Receiver<PaneEvent>,
+    deadline_ms: u64,
+) -> bool {
     use std::time::{Duration, Instant};
     let start = Instant::now();
     loop {
@@ -167,10 +177,14 @@ pub fn drain_until_exit(pane: &mut PtyPane, rx: &Receiver<PaneEvent>, deadline_m
         if remaining == 0 {
             return false;
         }
-        match rx.recv_timeout(Duration::from_millis(remaining)) {
-            Ok(PaneEvent::Output(_, b)) => pane.feed(&b),
-            Ok(PaneEvent::Exit(_)) => return true,
-            Err(_) => return false,
+        // Use blocking recv in a loop with timeout
+        match rx.blocking_recv() {
+            Some(PaneEvent::Output(_, b)) => pane.feed(&b),
+            Some(PaneEvent::Exit(_)) => return true,
+            None => return false,
+        }
+        if start.elapsed().as_millis() as u64 >= deadline_ms {
+            return false;
         }
     }
 }
@@ -178,7 +192,6 @@ pub fn drain_until_exit(pane: &mut PtyPane, rx: &Receiver<PaneEvent>, deadline_m
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc::channel;
 
     fn sh(script: &str) -> Vec<String> {
         vec!["/bin/sh".into(), "-c".into(), script.into()]
@@ -186,29 +199,29 @@ mod tests {
 
     #[test]
     fn pty_round_trip_lands_output_in_grid() {
-        let (tx, rx) = channel();
+        let (tx, mut rx) = tokio_mpsc::channel(1024);
         let mut pane = PtyPane::spawn(0, &sh("printf 'hello-pty'"), None, 24, 80, tx).unwrap();
-        assert!(drain_until_exit(&mut pane, &rx, 5000), "child should exit");
-        assert_eq!(pane.emulator().row_text(0), "hello-pty");
+        assert!(drain_until_exit(&mut pane, &mut rx, 5000), "child should exit");
+        assert_eq!(pane.emulator().row_text(0), Some("hello-pty".to_string()));
     }
 
     #[test]
     fn resize_propagates_to_child_via_winsize() {
         // `stty size` prints "rows cols" read from the PTY winsize.
-        let (tx, rx) = channel();
+        let (tx, mut rx) = tokio_mpsc::channel(1024);
         let mut pane = PtyPane::spawn(0, &sh("stty size"), None, 30, 100, tx).unwrap();
-        assert!(drain_until_exit(&mut pane, &rx, 5000));
-        assert_eq!(pane.emulator().row_text(0), "30 100");
+        assert!(drain_until_exit(&mut pane, &mut rx, 5000));
+        assert_eq!(pane.emulator().row_text(0), Some("30 100".to_string()));
     }
 
     #[test]
     fn backpressure_does_not_deadlock_on_a_flood() {
         // A chatty child must not block the reader; we drain a bounded window
         // and drop the pane (reader thread exits when the channel sender errors).
-        let (tx, rx) = channel();
+        let (tx, mut rx) = tokio_mpsc::channel(1024);
         let mut pane =
             PtyPane::spawn(0, &sh("yes superzej | head -c 200000"), None, 24, 80, tx).unwrap();
-        let exited = drain_until_exit(&mut pane, &rx, 5000);
+        let exited = drain_until_exit(&mut pane, &mut rx, 5000);
         assert!(
             exited,
             "flood should drain and the child should exit cleanly"
@@ -216,7 +229,7 @@ mod tests {
         // The flood scrolled through the grid; some visible row holds the token.
         let emu = pane.emulator();
         let (rows, _) = emu.size();
-        let seen = (0..rows).any(|r| emu.row_text(r).contains("superzej"));
+        let seen = (0..rows).any(|r| emu.row_text(r).unwrap_or_default().contains("superzej"));
         assert!(
             seen,
             "expected the repeated token somewhere in the visible grid"

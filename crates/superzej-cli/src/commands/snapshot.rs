@@ -12,8 +12,33 @@ use crate::db::{self, Db};
 use anyhow::Result;
 use serde_json::{json, Map, Value};
 
-pub fn run(session: Option<String>, tab: Option<String>) -> Result<()> {
+pub fn run(session: Option<String>, tab: Option<String>, all: bool) -> Result<()> {
     let session = session.unwrap_or_else(db::session);
+
+    if all {
+        let mut results = Vec::new();
+        if let Ok(db) = Db::open() {
+            if let Ok(wts) = db.worktrees() {
+                for w in wts.into_iter().filter(|w| w.session_name == session) {
+                    let mut obj = Map::new();
+                    obj.insert("tab".into(), json!(w.tab_name));
+                    obj.insert("worktree".into(), json!(w.worktree));
+                    if let Ok(Some((pr_json, _))) = db.get_pr_cache(&w.worktree) {
+                        if let Ok(v) = serde_json::from_str::<Value>(&pr_json) {
+                            obj.insert("pr".into(), v);
+                        }
+                    }
+                    if let Ok(Some((files, _))) = db.get_diff_cache(&w.worktree) {
+                        obj.insert("files".into(), json!(files));
+                    }
+                    results.push(Value::Object(obj));
+                }
+            }
+        }
+        crate::outln!("{}", Value::Array(results));
+        return Ok(());
+    }
+
     let worktree = tab
         .as_deref()
         .and_then(|t| resolve::resolve_tab_worktree(&session, t));

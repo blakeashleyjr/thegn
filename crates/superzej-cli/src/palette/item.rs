@@ -26,6 +26,7 @@ pub enum Action {
     PrApprove,
     PrMerge,
     PrRerun,
+    #[allow(dead_code)]
     Config,
     ThemePreview,
     // --- dynamic, context-aware ---
