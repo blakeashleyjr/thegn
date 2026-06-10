@@ -241,6 +241,100 @@ impl Palette {
     }
 }
 
+/// Build the palette's item list: the command actions + a nav row per open tab
+/// (`tab:<name>`), ordered by frecency for the empty-query view (the host port
+/// of the old engine's command + nav + frecency sources).
+pub(crate) fn build_palette(
+    session: &crate::session::Session,
+    db: &superzej_core::db::Db,
+    cfg: &superzej_core::config::Config,
+) -> Vec<crate::palette::PaletteItem> {
+    use crate::palette::PaletteItem;
+    let mut items = vec![
+        PaletteItem::new("new-worktree", "New worktree"),
+        PaletteItem::new("new-workspace", "New workspace"),
+        PaletteItem::new("switch-workspace", "Switch workspace"),
+        PaletteItem::new("close-worktree", "Close worktree"),
+        PaletteItem::new("show-diff", "Show diff"),
+        PaletteItem::new("open-pr", "Open pull request"),
+        PaletteItem::new("files-drawer", "Toggle files drawer"),
+        PaletteItem::new("lazygit", "Open lazygit"),
+        PaletteItem::new("toggle-strip", "Toggle pin strip"),
+        PaletteItem::new("quit", "Quit superzej"),
+    ];
+
+    // Configured pins (scope-filtered to the current workspace): summon by name.
+    let ws = (!session.id.is_empty()).then_some(session.id.as_str());
+    for (i, p) in crate::pins::PinSupervisor::resolve(cfg, ws)
+        .into_iter()
+        .enumerate()
+    {
+        items.push(PaletteItem::new(
+            format!("summon-pin-{}", i + 1),
+            format!("\u{1f4cc} {}", p.display_label()),
+        ));
+    }
+
+    // Add active session's tabs
+    for t in &session.tabs {
+        items.push(PaletteItem::new(
+            format!("tab:{}", t.name),
+            format!("→ {}", t.name),
+        ));
+    }
+
+    // Add persisted worktrees from other workspaces so the palette can jump
+    // directly to a worktree tab and persist that target workspace's active tab.
+    if let Ok(worktrees) = db.worktrees() {
+        for wt in worktrees {
+            if session.tabs.iter().any(|t| t.name == wt.tab_name) {
+                continue;
+            }
+            let label = if wt.branch.trim().is_empty() {
+                wt.tab_name.clone()
+            } else {
+                wt.branch.clone()
+            };
+            items.push(PaletteItem::new(
+                format!("wt:{}\t{}", wt.repo_root, wt.tab_name),
+                format!("⎇ {label}"),
+            ));
+        }
+    }
+
+    // Add workspaces (repos) for switching
+    if let Ok(workspaces) = db.workspaces() {
+        for w in workspaces {
+            // Don't add the current workspace as a switch target
+            if w.repo_path != session.id {
+                let name = w.name;
+                items.push(PaletteItem::new(
+                    format!("repo:{}", w.repo_path),
+                    format!("✦ {}", name),
+                ));
+            }
+        }
+    }
+
+    let usage = db.palette_usage().unwrap_or_default();
+    crate::palette::order_by_frecency(items, &usage)
+}
+
+/// Build the agent-picker palette items for `cfg`: one row per agent/tool, plus
+/// a literal shell. The key is the bare choice name (the `PendingAgent` gate in
+/// the Enter handler routes it to a launch, not a command dispatch).
+pub(crate) fn build_agent_palette(
+    cfg: &superzej_core::config::Config,
+) -> Vec<crate::palette::PaletteItem> {
+    crate::agent::choices(cfg)
+        .into_iter()
+        .map(|name| {
+            let label = format!("{} {name}", superzej_core::theme::agent_glyph(&name));
+            crate::palette::PaletteItem::new(name, label)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
