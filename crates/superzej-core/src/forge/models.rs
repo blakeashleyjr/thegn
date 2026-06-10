@@ -119,6 +119,8 @@ pub struct PrStatus {
     /// Computed by `pr_status` (ignored on input, emitted on output).
     #[serde(default, skip_deserializing)]
     pub checks: ChecksSummary,
+    #[serde(default)]
+    pub linked_issue: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

@@ -609,7 +609,7 @@ entity, not a float — overrides the float reading below), summoned by `Alt-1..
 
 ### AA. Linear / issues
 
-- [ ] 341. Linear issue list
+- [x] 341. Linear issue list
 - [x] 342. Issue↔task↔worktree linkage
 - [ ] 343. Move issue status on merge
 - [ ] 344. Branch/worktree from issue

@@ -764,14 +764,20 @@ impl State {
                 let title = pr.get("title").and_then(|v| v.as_str()).unwrap_or("");
                 let state = pr.get("state").and_then(|v| v.as_str()).unwrap_or("");
                 let draft = pr.get("isDraft").and_then(|v| v.as_bool()).unwrap_or(false);
+                let linked = pr.get("linked_issue").and_then(|v| v.as_u64());
                 let review = pr
                     .get("reviewDecision")
                     .and_then(|v| v.as_str())
                     .unwrap_or("—");
                 let d = if draft { " draft" } else { "" };
+                let linked_text = if let Some(i) = linked {
+                    format!(" (Issue #{})", i)
+                } else {
+                    "".to_string()
+                };
                 push(
                     out,
-                    &format!("\u{1b}[1mPR #{num}\u{1b}[0m {state}{d}"),
+                    &format!("\u{1b}[1mPR #{num}\u{1b}[0m {state}{d}{linked_text}"),
                     cols,
                 );
                 push(out, &format!("  {title}"), cols);

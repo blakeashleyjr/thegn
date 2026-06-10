@@ -187,6 +187,7 @@ pub fn parse_graphql_pr(resp: &Value, worktree: &str, branch: &str, now: i64) ->
                     .map(str::to_string),
                 status_check_rollup: rollup,
                 checks: Default::default(),
+                linked_issue: superzej_core::forge::extract_issue_from_branch(branch),
             };
             pr.recompute_checks();
             PanelState::Pr(Box::new(pr))

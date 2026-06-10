@@ -72,6 +72,7 @@ impl Forge for GitHubForge {
         let state = match gh_out(loc, &["pr", "view", "--json", PR_FIELDS]) {
             Ok(json) => match serde_json::from_str::<PrStatus>(&json) {
                 Ok(mut pr) => {
+                    pr.linked_issue = crate::forge::extract_issue_from_branch(&branch);
                     pr.checks = summarize(&pr.status_check_rollup);
                     PanelState::Pr(Box::new(pr))
                 }
@@ -323,7 +324,20 @@ impl Forge for GitHubForge {
     }
 
     fn get_check_logs(&self, loc: &GitLoc, check_name: &str) -> Result<String, ForgeError> {
-        gh_out(loc, &["run", "view", check_name, "--log"])
+        let mut args: Vec<String> = vec!["run".into(), "view".into()];
+        if !check_name.is_empty() {
+            args.push("--job".into());
+            args.push(check_name.into());
+        }
+        args.push("--log".into());
+        
+        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let out = loc.gh_command(&refs).output().map_err(|e| ForgeError::Other(e.to_string()))?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        } else {
+            Err(ForgeError::Other(String::from_utf8_lossy(&out.stderr).trim().to_string()))
+        }
     }
 }
 
