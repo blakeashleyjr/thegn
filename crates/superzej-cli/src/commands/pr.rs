@@ -88,7 +88,7 @@ fn status(cfg: &Config, worktree: Option<String>, json: bool, refresh: bool) -> 
 
 fn print_summary(p: &PrPanel) {
     match &p.state {
-        PanelState::NoGh => crate::outln!("gh CLI not installed"),
+        PanelState::NoForgeCli => crate::outln!("Forge CLI not installed"),
         PanelState::NotAuthenticated => crate::outln!("gh not authenticated (run: gh auth login)"),
         PanelState::NoPr => crate::outln!(
             "branch '{}': no PR yet  (create: superzej pr create)",

@@ -305,7 +305,7 @@ impl Forge for ForgejoForge {
                     },
                 }
             }
-            Err(ForgeError::NotInstalled) => PanelState::NoGh,
+            Err(ForgeError::NotInstalled) => PanelState::NoForgeCli,
             Err(ForgeError::NotAuthenticated) => PanelState::NotAuthenticated,
             Err(ForgeError::NoPr) => PanelState::NoPr,
             Err(ForgeError::RateLimited) => PanelState::RateLimited,

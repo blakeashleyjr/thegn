@@ -67,7 +67,7 @@ pub struct PrPanel {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PanelState {
-    NoGh,
+    NoForgeCli,
     NotAuthenticated,
     NoPr,
     RateLimited,
