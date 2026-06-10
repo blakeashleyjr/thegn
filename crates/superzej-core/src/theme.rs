@@ -1,15 +1,8 @@
-//! The superzej design system: one storm-blue palette shared by the host CLI
-//! and all four zellij plugins.
+//! The superzej design system: one storm-blue palette for the native host's
+//! in-process chrome (sidebar, panel, tabbar, statusbar).
 //!
-//! CANONICAL COPY: src/theme.rs. The plugin crates each carry a byte-identical
-//! committed copy at plugin/<name>/src/theme.rs (the Nix plugin builds sandbox
-//! each crate's subdir, so a shared path-dependency crate can't work). Edit
-//! THIS file, then run `just sync-theme` to refresh the copies; `just lint`
-//! fails on drift.
-//!
-//! Colors are "R;G;B" fragments ready for `\x1b[38;2;{}m` / `\x1b[48;2;{}m`,
-//! the form the plugins already build escapes from. Values are the mockup's
-//! gamut-mapped sRGB — do not re-derive from oklch.
+//! Colors are "R;G;B" fragments ready for `\x1b[38;2;{}m` / `\x1b[48;2;{}m`.
+//! Values are the mockup's gamut-mapped sRGB — do not re-derive from oklch.
 #![allow(dead_code)]
 
 // ---- surfaces ----

@@ -156,12 +156,12 @@ pub fn split_tab(name: &str) -> Option<(String, String)> {
 /// Split a worktree branch's `base ·N` page suffix; returns `(base, page)` with
 /// page 1 when there's no suffix.
 pub fn split_page(branch: &str) -> (String, u32) {
-    if let Some((base, suffix)) = branch.rsplit_once(" \u{b7}") {
-        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
-            if let Ok(n) = suffix.parse() {
-                return (base.to_string(), n);
-            }
-        }
+    if let Some((base, suffix)) = branch.rsplit_once(" \u{b7}")
+        && !suffix.is_empty()
+        && suffix.chars().all(|c| c.is_ascii_digit())
+        && let Ok(n) = suffix.parse()
+    {
+        return (base.to_string(), n);
     }
     (branch.to_string(), 1)
 }
@@ -449,10 +449,10 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
             }
             RowKind::Worktree => {
                 last_worktree = Some(i);
-                if keep[i] {
-                    if let Some(w) = last_workspace {
-                        keep[w] = true; // surface the parent repo header
-                    }
+                if keep[i]
+                    && let Some(w) = last_workspace
+                {
+                    keep[w] = true; // surface the parent repo header
                 }
             }
             RowKind::Page => {

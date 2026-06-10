@@ -2,9 +2,8 @@
 
 use serde::Serialize;
 
-/// A registered repo (a "workspace"), as recorded in the DB. All repos share the
-/// one zellij session now — a workspace is identified by its repo path, not a
-/// per-repo session.
+/// A registered repo (a "workspace"), as recorded in the DB. A workspace is
+/// identified by its repo path.
 #[derive(Debug, Clone, Serialize)]
 #[allow(dead_code)]
 pub struct WorkspaceRow {
@@ -14,8 +13,8 @@ pub struct WorkspaceRow {
     pub last_active: i64,
 }
 
-/// A superzej-managed worktree (= a zellij tab) as recorded in the DB. Some
-/// fields are carried for the sidebar/panel plugins even if `list` ignores them.
+/// A superzej-managed worktree (one per tab) as recorded in the DB. Some fields
+/// are carried for the sidebar/panel even if `list` ignores them.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct WorktreeRow {

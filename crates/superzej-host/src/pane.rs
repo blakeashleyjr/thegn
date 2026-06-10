@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 use std::io::Write;
 
+use termwiz::terminal::TerminalWaker;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::emulator::{PaneEmulator, Vt100Emulator};
@@ -28,19 +29,65 @@ pub struct PtyPane {
     emulator: Box<dyn PaneEmulator>,
     rows: u16,
     cols: u16,
+    /// The launched program's short name (e.g. `lazygit`, `yazi`, `nvim`, or the
+    /// shell). Used to key per-program keybind overlays + remaps. Best-effort
+    /// from the spawn argv — not a live foreground-process probe.
+    program: String,
+}
+
+/// Derive a pane's program name from its spawn argv. Handles the common
+/// `sh -c "exec <prog> …"` / `sh -lc "<prog> …"` tool-launch shape by reaching
+/// past the shell to the first word of the command string; otherwise uses the
+/// file stem of `argv[0]`. Returns `""` for an empty argv.
+pub fn program_name(argv: &[String]) -> String {
+    let stem = |s: &str| -> String {
+        std::path::Path::new(s)
+            .file_stem()
+            .map(|o| o.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let Some(first) = argv.first() else {
+        return String::new();
+    };
+    let base = stem(first);
+    // A shell running an inline command: `sh -c "exec yazi"` → "yazi".
+    let is_shell = matches!(base.as_str(), "sh" | "bash" | "zsh" | "dash" | "fish");
+    if is_shell
+        && let Some(cmd) = argv
+            .iter()
+            .skip(1)
+            .position(|a| a == "-c" || a == "-lc" || a == "-ic")
+            .and_then(|i| argv.get(i + 2))
+    {
+        // Strip a leading `exec ` and take the first bare word.
+        let cmd = cmd.trim().strip_prefix("exec ").unwrap_or(cmd.trim());
+        if let Some(word) = cmd.split_whitespace().next() {
+            return stem(word);
+        }
+    }
+    base
 }
 
 impl PtyPane {
     /// Spawn `argv` (already composed by `sandbox::enter_argv`) in `cwd` on a
-    /// fresh PTY of `rows`x`cols`. Reader-thread events arrive on `tx`, tagged
-    /// with `id` so a shared channel can carry every pane's output.
-    pub fn spawn(
+    /// fresh PTY of `rows`x`cols`, injecting `env` (key/value pairs) into the
+    /// child — agent panes expect `SUPERZEJ_WORKTREE`/`_BRANCH`; a plain pane
+    /// passes an empty slice. Reader-thread events arrive on `tx`, tagged with
+    /// `id` so a shared channel can carry every pane's output.
+    ///
+    /// `waker` (when present) is pulsed after every send so the main loop's
+    /// blocking `poll_input(None)` returns immediately to drain PTY output — this
+    /// is what makes the loop event-driven (zero idle wakeups) rather than polled.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_env(
         id: u32,
         argv: &[String],
         cwd: Option<&std::path::Path>,
+        env: &[(String, String)],
         rows: u16,
         cols: u16,
         tx: tokio_mpsc::Sender<PaneEvent>,
+        waker: Option<TerminalWaker>,
     ) -> Result<Self> {
         let pty = portable_pty::native_pty_system();
         let pair = pty
@@ -58,6 +105,9 @@ impl PtyPane {
             cmd.cwd(dir);
         }
         cmd.env("TERM", "xterm-256color");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
         let child = pair.slave.spawn_command(cmd).context("spawn child")?;
         // Drop the slave so the master sees EOF when the child exits.
         drop(pair.slave);
@@ -73,6 +123,9 @@ impl PtyPane {
                 match reader.read(&mut buf) {
                     Ok(0) => {
                         let _ = tx.blocking_send(PaneEvent::Exit(id));
+                        if let Some(w) = &waker {
+                            let _ = w.wake();
+                        }
                         break;
                     }
                     Ok(n) => {
@@ -82,9 +135,15 @@ impl PtyPane {
                         {
                             break; // consumer gone
                         }
+                        if let Some(w) = &waker {
+                            let _ = w.wake();
+                        }
                     }
                     Err(_) => {
                         let _ = tx.blocking_send(PaneEvent::Exit(id));
+                        if let Some(w) = &waker {
+                            let _ = w.wake();
+                        }
                         break;
                     }
                 }
@@ -98,7 +157,13 @@ impl PtyPane {
             emulator: Box::new(Vt100Emulator::new(rows, cols, 10_000)),
             rows,
             cols,
+            program: program_name(argv),
         })
+    }
+
+    /// The launched program's short name (keys per-program keybind overlays).
+    pub fn program(&self) -> &str {
+        &self.program
     }
 
     /// Feed PTY output into the emulator grid (drain-without-render is just this
@@ -189,9 +254,27 @@ mod tests {
     }
 
     #[test]
+    fn program_name_uses_argv0_stem() {
+        assert_eq!(program_name(&["/usr/bin/lazygit".into()]), "lazygit");
+        assert_eq!(program_name(&["nvim".into(), "file".into()]), "nvim");
+        assert_eq!(program_name(&[]), "");
+    }
+
+    #[test]
+    fn program_name_reaches_past_shell_to_inline_command() {
+        // The tool-drawer pattern: `sh -c "exec yazi"` → "yazi".
+        assert_eq!(program_name(&sh("exec yazi")), "yazi");
+        assert_eq!(program_name(&sh("lazygit --version")), "lazygit");
+        // A login shell with no inline command is just the shell.
+        assert_eq!(program_name(&["/bin/zsh".into(), "-i".into()]), "zsh");
+    }
+
+    #[test]
     fn pty_round_trip_lands_output_in_grid() {
         let (tx, mut rx) = tokio_mpsc::channel(1024);
-        let mut pane = PtyPane::spawn(0, &sh("printf 'hello-pty'"), None, 24, 80, tx).unwrap();
+        let mut pane =
+            PtyPane::spawn_with_env(0, &sh("printf 'hello-pty'"), None, &[], 24, 80, tx, None)
+                .unwrap();
         assert!(
             drain_until_exit(&mut pane, &mut rx, 5000),
             "child should exit"
@@ -203,7 +286,8 @@ mod tests {
     fn resize_propagates_to_child_via_winsize() {
         // `stty size` prints "rows cols" read from the PTY winsize.
         let (tx, mut rx) = tokio_mpsc::channel(1024);
-        let mut pane = PtyPane::spawn(0, &sh("stty size"), None, 30, 100, tx).unwrap();
+        let mut pane =
+            PtyPane::spawn_with_env(0, &sh("stty size"), None, &[], 30, 100, tx, None).unwrap();
         assert!(drain_until_exit(&mut pane, &mut rx, 5000));
         assert_eq!(pane.emulator().row_text(0), Some("30 100".to_string()));
     }
@@ -213,8 +297,17 @@ mod tests {
         // A chatty child must not block the reader; we drain a bounded window
         // and drop the pane (reader thread exits when the channel sender errors).
         let (tx, mut rx) = tokio_mpsc::channel(1024);
-        let mut pane =
-            PtyPane::spawn(0, &sh("yes superzej | head -c 200000"), None, 24, 80, tx).unwrap();
+        let mut pane = PtyPane::spawn_with_env(
+            0,
+            &sh("yes superzej | head -c 200000"),
+            None,
+            &[],
+            24,
+            80,
+            tx,
+            None,
+        )
+        .unwrap();
         let exited = drain_until_exit(&mut pane, &mut rx, 5000);
         assert!(
             exited,

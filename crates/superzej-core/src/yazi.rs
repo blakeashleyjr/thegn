@@ -1,12 +1,11 @@
 //! The bottom file-manager drawer's yazi: a private, version-pinned build with a
-//! private config dir, fully isolated from the user's system yazi — mirroring how
-//! `zellij.rs` isolates the zellij superzej drives.
+//! private config dir, fully isolated from the user's system yazi.
 //!
 //! - binary: `SUPERZEJ_YAZI_BIN` (wired by Nix to the pinned `superzej-yazi`);
 //! - config: `YAZI_CONFIG_HOME` = `<superzej-dir>/yazi` by default, seeded once
-//!   from the bundled defaults below and never overwritten (same contract as the
-//!   managed `~/.superzej/zellij.kdl`). Only the derived `theme.toml` is
-//!   regenerated, from the superzej accent, so the drawer matches the palette.
+//!   from the bundled defaults below and never overwritten. Only the derived
+//!   `theme.toml` is regenerated, from the superzej accent, so the drawer matches
+//!   the palette.
 
 use crate::config::Config;
 use crate::util;

@@ -164,7 +164,7 @@ self: {
       key = lib.mkOption {
         type = lib.types.str;
         example = "Alt D";
-        description = "Key chord (zellij syntax).";
+        description = "Key chord (e.g. \"Alt D\").";
       };
       run = lib.mkOption {
         type = lib.types.str;
@@ -428,28 +428,9 @@ in {
   config = lib.mkIf cfg.enable {
     home.packages = [cfg.package];
 
-    # superzej reads this TOML config.
+    # superzej reads this TOML config. The native host owns its own chrome
+    # (sidebar/panel/tabbar/statusbar) in-process — there are no WASM plugins to
+    # deploy and no permissions to pre-grant.
     xdg.configFile."superzej/config.toml".source = configFile;
-
-    # NOTE: layouts are NOT shipped into the user's ~/.config/zellij. superzej
-    # embeds them in the binary and seeds them into its own private layout dir
-    # (~/.superzej/layouts) at launch, resolving them via an absolute --layout
-    # path / --layout-dir. This keeps superzej fully independent of the user's
-    # zellij config — and means adding a layout can never drift between the
-    # package and this module again. See src/commands/attach.rs (seed_layouts).
-
-    # Deploy the WASM plugins to the literal paths the session layout references
-    # (file:~/.local/share/superzej/{sidebar,panel,tabbar,statusbar}.wasm). home.file
-    # is relative to $HOME, so this matches regardless of $XDG_DATA_HOME.
-    home.file.".local/share/superzej/sidebar.wasm".source = "${self.packages.${pkgs.system}.superzej-sidebar}/share/superzej/sidebar.wasm";
-    home.file.".local/share/superzej/panel.wasm".source = "${self.packages.${pkgs.system}.superzej-panel}/share/superzej/panel.wasm";
-    home.file.".local/share/superzej/tabbar.wasm".source = "${self.packages.${pkgs.system}.superzej-tabbar}/share/superzej/tabbar.wasm";
-    home.file.".local/share/superzej/statusbar.wasm".source = "${self.packages.${pkgs.system}.superzej-statusbar}/share/superzej/statusbar.wasm";
-
-    # Pre-grant the plugins' zellij permissions so the first session never shows
-    # the "Allow? (y/n)" prompt. Idempotent; merges into permissions.kdl.
-    home.activation.superzejGrantPlugins = lib.hm.dag.entryAfter ["writeBoundary"] ''
-      $DRY_RUN_CMD ${cfg.package}/bin/superzej grant-plugins
-    '';
   };
 }
