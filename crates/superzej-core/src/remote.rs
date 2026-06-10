@@ -239,10 +239,11 @@ mod tests {
         assert_eq!(argv[0], "ssh");
         assert!(argv.iter().any(|a| a == "-p"));
         assert!(argv.iter().any(|a| a == "user@box"));
-        assert!(argv
-            .last()
-            .unwrap()
-            .contains("git -C /remote/wt status --short"));
+        assert!(
+            argv.last()
+                .unwrap()
+                .contains("git -C /remote/wt status --short")
+        );
     }
 
     #[test]
