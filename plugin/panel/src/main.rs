@@ -10,7 +10,7 @@
 //! keys run the matching `superzej pr …` subcommand — safe ones inline,
 //! destructive/interactive ones (merge/create/approve) in a floating pane.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use zellij_tile::prelude::*;
 
 // The watch daemon pushes diff/PR updates on change, so this is just a
@@ -60,6 +60,16 @@ struct State {
     session: Option<String>,
     active_tab: Option<String>,
     identity: Option<(String, String)>,
+
+    /// Map tab base names to worktree paths
+    tab_to_worktree: HashMap<String, String>,
+    /// diff cache: worktree path -> files
+    diff_cache: HashMap<String, Vec<FileEntry>>,
+    /// pr cache: worktree path -> PR JSON
+    pr_cache: HashMap<String, serde_json::Value>,
+    /// Has the bulk cache preload been requested?
+    preloaded: bool,
+
     worktree: Option<String>,
     pr: Option<serde_json::Value>,
     status_line: String,
@@ -109,6 +119,23 @@ impl ZellijPlugin for State {
             }
             Event::TabUpdate(tabs) => {
                 self.active_tab = tabs.iter().find(|t| t.active).map(|t| t.name.clone());
+
+                if !self.preloaded && self.session.is_some() {
+                    self.preloaded = true;
+                    let mut ctx = std::collections::BTreeMap::new();
+                    ctx.insert("cmd".to_string(), "snapshot-all".to_string());
+                    run_command(
+                        &[
+                            "superzej",
+                            "panel-snapshot",
+                            "--all",
+                            "--session",
+                            self.session.as_deref().unwrap_or_default(),
+                        ],
+                        ctx,
+                    );
+                }
+
                 self.refocus()
             }
             Event::PaneUpdate(manifest) => self.refresh_focus(&manifest),
@@ -132,12 +159,12 @@ impl ZellijPlugin for State {
             "superzej_pr" => {
                 if let Some(payload) = pipe.payload {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
-                        // Only accept pushes for the worktree we're showing.
-                        let same =
-                            v.get("worktree").and_then(|w| w.as_str()) == self.worktree.as_deref();
-                        if same {
-                            self.pr = Some(v);
-                            return true;
+                        if let Some(wt) = v.get("worktree").and_then(|w| w.as_str()) {
+                            self.pr_cache.insert(wt.to_string(), v.clone());
+                            if Some(wt) == self.worktree.as_deref() {
+                                self.pr = Some(v);
+                                return true;
+                            }
                         }
                     }
                 }
@@ -147,12 +174,14 @@ impl ZellijPlugin for State {
             "superzej_diff" => {
                 if let Some(payload) = pipe.payload {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
-                        let same =
-                            v.get("worktree").and_then(|w| w.as_str()) == self.worktree.as_deref();
-                        if same {
+                        if let Some(wt) = v.get("worktree").and_then(|w| w.as_str()) {
                             if let Some(files) = v.get("files").and_then(|f| f.as_str()) {
-                                self.files = parse_files(files);
-                                return true;
+                                let parsed = parse_files(files);
+                                self.diff_cache.insert(wt.to_string(), parsed.clone());
+                                if Some(wt) == self.worktree.as_deref() {
+                                    self.files = parsed;
+                                    return true;
+                                }
                             }
                         }
                     }
@@ -204,7 +233,32 @@ impl ZellijPlugin for State {
     }
 }
 
+// Strip the ` ·N` page suffix to map multi-pane tabs to their root worktree tab
+fn base_tab_name(tab: &str) -> &str {
+    match tab.find(" \u{b7}") {
+        Some(idx) => &tab[..idx],
+        None => tab,
+    }
+}
+
 impl State {
+    fn refocus_instant(&mut self) -> bool {
+        let Some(t) = self.active_tab.as_deref() else { return false };
+        let base = base_tab_name(t);
+        
+        if let Some(wt) = self.tab_to_worktree.get(base).cloned() {
+            self.worktree = Some(wt.clone());
+            if let Some(files) = self.diff_cache.get(&wt) {
+                self.files = files.clone();
+            } else {
+                self.files.clear();
+            }
+            self.pr = self.pr_cache.get(&wt).cloned();
+            return true; // We changed state, request a render
+        }
+        false
+    }
+
     /// Update `self.focused` from the pane manifest (find our own plugin pane).
     fn refresh_focus(&mut self, manifest: &PaneManifest) -> bool {
         let Some(id) = self.my_id else { return false };
@@ -234,18 +288,27 @@ impl State {
             return false;
         }
         self.identity = Some(id);
-        self.worktree = None;
-        self.pr = None;
-        self.files.clear();
-        // Phase 1: one cheap call returns the worktree + whatever is cached
-        // (PR + diff), so we paint instantly; on_result then hydrates live.
-        let mut ctx = BTreeMap::new();
+        
+        // 1. Attempt a 0ms instantaneous paint from local memory cache
+        let mut changed = self.refocus_instant();
+        
+        if self.worktree.is_none() {
+            // Fallback clear if we have absolutely nothing
+            self.files.clear();
+            self.pr = None;
+            changed = true;
+        }
+
+        // 2. STILL run single-tab panel-snapshot in the background.
+        // This ensures newly created tabs get resolved properly, and triggers
+        // the watch daemon to focus the new worktree path.
+        let mut ctx = std::collections::BTreeMap::new();
         ctx.insert("cmd".to_string(), "snapshot".to_string());
         run_command(
             &["superzej", "panel-snapshot", "--session", &s, "--tab", &t],
             ctx,
         );
-        true
+        changed
     }
 
     /// Phase 2: live hydration — `superzej pr status` + `superzej diff --files`
@@ -287,7 +350,23 @@ impl State {
                 // Phase 1: paint from cache (worktree + cached PR/diff), then
                 // start the live fetch to hydrate.
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) {
-                    self.worktree = v.get("worktree").and_then(|w| w.as_str()).map(String::from);
+                    let new_wt = v.get("worktree").and_then(|w| w.as_str()).map(String::from);
+                    if let Some(wt) = new_wt.clone() {
+                        let base = base_tab_name(self.active_tab.as_deref().unwrap_or_default());
+                        self.tab_to_worktree.insert(base.to_string(), wt.clone());
+                        
+                        if let Some(files) = v.get("files").and_then(|f| f.as_str()) {
+                            self.diff_cache.insert(wt.clone(), parse_files(files));
+                        }
+                        if let Some(pr) = v.get("pr") {
+                            if !pr.is_null() {
+                                self.pr_cache.insert(wt.clone(), pr.clone());
+                            }
+                        }
+                    }
+
+                    // Apply to current view
+                    self.worktree = new_wt;
                     if let Some(pr) = v.get("pr") {
                         if !pr.is_null() {
                             self.pr = Some(pr.clone());
@@ -301,6 +380,30 @@ impl State {
                     }
                 }
                 true
+            }
+            Some("snapshot-all") => {
+                if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(text.trim()) {
+                    for v in arr {
+                        if let (Some(tab), Some(wt)) = (
+                            v.get("tab").and_then(|t| t.as_str()),
+                            v.get("worktree").and_then(|w| w.as_str()),
+                        ) {
+                            self.tab_to_worktree.insert(tab.to_string(), wt.to_string());
+                            
+                            if let Some(files) = v.get("files").and_then(|f| f.as_str()) {
+                                self.diff_cache.insert(wt.to_string(), parse_files(files));
+                            }
+                            if let Some(pr) = v.get("pr") {
+                                if !pr.is_null() {
+                                    self.pr_cache.insert(wt.to_string(), pr.clone());
+                                }
+                            }
+                        }
+                    }
+                    // Try an immediate refocus in case the active tab matches now
+                    return self.refocus_instant();
+                }
+                false
             }
             Some("pr") => {
                 self.pr = serde_json::from_str(text.trim()).ok();
