@@ -72,6 +72,22 @@ pub enum Action {
         #[arg(long)]
         worktree: Option<String>,
     },
+    /// Mark the PR ready for review (or `--undo` back to draft).
+    Ready {
+        #[arg(long)]
+        worktree: Option<String>,
+        /// Convert the PR back to a draft instead of marking it ready.
+        #[arg(long)]
+        undo: bool,
+    },
+    /// Enable (or `--disable`) auto-merge for the PR.
+    AutoMerge {
+        #[arg(long)]
+        worktree: Option<String>,
+        /// Disable auto-merge instead of enabling it.
+        #[arg(long)]
+        disable: bool,
+    },
 }
 
 pub fn run(action: Action) -> Result<()> {
@@ -96,6 +112,8 @@ pub fn run(action: Action) -> Result<()> {
         } => merge(worktree, method, delete_branch, auto),
         Action::RerunChecks { worktree } => rerun(worktree),
         Action::Reviews { worktree } => reviews(worktree),
+        Action::Ready { worktree, undo } => ready(worktree, undo),
+        Action::AutoMerge { worktree, disable } => auto_merge(worktree, disable),
     }
 }
 
@@ -217,6 +235,27 @@ fn reviews(worktree: Option<String>) -> Result<()> {
     match github::reviews(&loc) {
         Ok(json) => outln!("{json}"),
         Err(e) => msg::die(&format!("pr reviews failed: {}", github::describe(&e))),
+    }
+    Ok(())
+}
+
+fn ready(worktree: Option<String>, undo: bool) -> Result<()> {
+    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    // `undo` converts the PR back to a draft; otherwise mark it ready.
+    match github::set_draft_pr(&loc, undo) {
+        Ok(()) if undo => msg::info("PR converted to draft"),
+        Ok(()) => msg::info("PR marked as ready for review"),
+        Err(e) => msg::die(&format!("pr ready failed: {}", github::describe(&e))),
+    }
+    Ok(())
+}
+
+fn auto_merge(worktree: Option<String>, disable: bool) -> Result<()> {
+    let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
+    match github::set_auto_merge(&loc, !disable) {
+        Ok(()) if disable => msg::info("auto-merge disabled"),
+        Ok(()) => msg::info("auto-merge enabled"),
+        Err(e) => msg::die(&format!("pr auto-merge failed: {}", github::describe(&e))),
     }
     Ok(())
 }
