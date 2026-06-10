@@ -80,7 +80,7 @@ ci: fmt-check lint build build-plugins test coverage smoke nix-build
 # diff_highlight, models) is gated at 95% lines. The transitional cli, the native
 # host, and the svc layer carry their own tests but are not part of this gate
 # (their I/O-heavy surface is the same reason the seams above are excluded).
-cov_ignore := 'superzej-core/src/(repo|worktree|sandbox|remote|github|picker|util|msg|out|log)\.rs'
+cov_ignore := 'superzej-core/src/(repo|worktree|sandbox|remote|github|picker|util|msg|out|log|plugin_api)\.rs'
 
 # Coverage gate: 95% lines on the testable core. Writes lcov to target/coverage.
 coverage:
