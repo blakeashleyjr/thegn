@@ -8,7 +8,6 @@
 use anyhow::{Context, Result};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 use std::path::Path;
-use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc as tokio_mpsc;
@@ -790,55 +789,6 @@ fn switch_to_workspace_tab(
     Ok(true)
 }
 
-#[derive(Debug, Clone, Copy)]
-struct PtyDrainBudget {
-    max_chunks: usize,
-    max_bytes: usize,
-}
-
-impl Default for PtyDrainBudget {
-    fn default() -> Self {
-        Self {
-            max_chunks: 64,
-            max_bytes: 512 * 1024,
-        }
-    }
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct PtyDrainStats {
-    chunks: usize,
-    bytes: usize,
-    budget_exhausted: bool,
-    disconnected: bool,
-}
-
-fn drain_pty_events(
-    rx: &mut tokio_mpsc::Receiver<PaneEvent>,
-    budget: PtyDrainBudget,
-    mut handle: impl FnMut(PaneEvent),
-) -> PtyDrainStats {
-    let mut stats = PtyDrainStats::default();
-    loop {
-        if stats.chunks >= budget.max_chunks || stats.bytes >= budget.max_bytes {
-            stats.budget_exhausted = true;
-            break;
-        }
-        match rx.try_recv() {
-            Ok(ev) => {
-                stats.chunks += 1;
-                stats.bytes += ev.byte_len();
-                handle(ev);
-            }
-            Err(tokio_mpsc::error::TryRecvError::Empty) => break,
-            Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
-                stats.disconnected = true;
-                break;
-            }
-        }
-    }
-    stats
-}
 fn tab_cwd(tab: &crate::session::Tab) -> Option<std::path::PathBuf> {
     (!tab.worktree.is_empty() && std::path::Path::new(&tab.worktree).is_dir())
         .then(|| std::path::PathBuf::from(&tab.worktree))
@@ -938,9 +888,9 @@ async fn event_loop<T: Terminal>(
         let mut disconnected = false;
         let mut budget_exhausted = false;
         let mut drain_stats_chunks = 0;
-        let drain_budget = PtyDrainBudget::default();
+
         loop {
-            if drain_stats_chunks >= drain_budget.max_chunks {
+            if drain_stats_chunks >= 64 {
                 budget_exhausted = true;
                 break;
             }
@@ -992,7 +942,6 @@ async fn event_loop<T: Terminal>(
                                                 model.status =
                                                     "Pane exited; spawned a fresh shell".into();
                                                 need_relayout = true;
-                                                dirty = true;
                                             }
                                             Err(err) => {
                                                 model.status = format!("Respawn failed: {err:#}");
@@ -1905,43 +1854,6 @@ mod tests {
         let argv = tool_drawer_argv("${EDITOR:-vi} .");
         assert_eq!(argv[1], "-lc");
         assert_eq!(argv[2], "exec ${EDITOR:-vi} .");
-    }
-
-    #[test]
-    fn pty_drain_stops_at_chunk_budget() {
-        let (tx, mut rx) = tokio_mpsc::channel(1024);
-        tx.blocking_send(PaneEvent::Output(1, b"one".to_vec()))
-            .unwrap();
-        tx.blocking_send(PaneEvent::Output(1, b"two".to_vec()))
-            .unwrap();
-        tx.blocking_send(PaneEvent::Output(1, b"three".to_vec()))
-            .unwrap();
-
-        let mut seen = Vec::new();
-        let stats = drain_pty_events(
-            &mut rx,
-            PtyDrainBudget {
-                max_chunks: 2,
-                max_bytes: usize::MAX,
-            },
-            |ev| seen.push(ev.byte_len()),
-        );
-        assert_eq!(stats.chunks, 2);
-        assert_eq!(seen, vec![3, 3]);
-        assert!(stats.budget_exhausted);
-        assert!(matches!(rx.try_recv(), Ok(PaneEvent::Output(_, b)) if b == b"three"));
-    }
-
-    #[test]
-    fn pty_drain_reports_disconnected_after_queue_drains() {
-        let (tx, mut rx) = tokio_mpsc::channel(1024);
-        tx.blocking_send(PaneEvent::Output(1, b"one".to_vec()))
-            .unwrap();
-        drop(tx);
-
-        let stats = drain_pty_events(&mut rx, PtyDrainBudget::default(), |_| {});
-        assert_eq!(stats.chunks, 1);
-        assert!(stats.disconnected);
     }
 
     #[test]
