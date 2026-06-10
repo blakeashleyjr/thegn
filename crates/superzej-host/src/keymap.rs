@@ -1,8 +1,8 @@
 //! The host keymap: terminal key chords → host `Action`s. The native host owns
-//! input routing (zellij did before), so global chords are intercepted here and
-//! everything else is forwarded to the focused pane. Mirrors the bindings in
-//! `config/zellij.kdl` (Alt-w new worktree, Alt-o switch, Ctrl-Alt-s/p toggles,
-//! splits, focus moves, …). Pure + unit-tested; the loop calls `map_key`.
+//! input routing, so global chords are intercepted here and everything else is
+//! forwarded to the focused pane (Alt-w new worktree, Alt-o switch, Ctrl-Alt-s/p
+//! toggles, Alt-1..9 pins, splits, focus moves, …). User overrides come from
+//! `[keybinds]` in the config. Pure + unit-tested; the loop calls `map_key`.
 
 use termwiz::input::{KeyCode, Modifiers};
 
@@ -59,6 +59,8 @@ pub enum Action {
     ScrollUp,
     ScrollDown,
     CopyPane,
+    /// Open-or-focus the configured pin at this 1-based index (`Alt-1..9`).
+    Pin(u8),
     SwitchMode(Mode),
     Quit,
     Custom(u16),
@@ -98,6 +100,9 @@ impl Action {
             Action::ScrollUp => "scroll-up",
             Action::ScrollDown => "scroll-down",
             Action::CopyPane => "copy-pane",
+            // Pin keys are dynamic (`pin-1`..`pin-9`); the static slot returns the
+            // bare prefix. The palette/run wiring keys pins by index directly.
+            Action::Pin(_) => "pin",
             Action::SwitchMode(Mode::Normal) => "mode-normal",
             Action::SwitchMode(Mode::VimNormal) => "mode-vim-normal",
             Action::SwitchMode(Mode::VimInsert) => "mode-vim-insert",
@@ -137,6 +142,11 @@ impl Action {
             "scroll-down" => Action::ScrollDown,
             "copy-pane" => Action::CopyPane,
             "quit" => Action::Quit,
+            // `pin-1`..`pin-9` → open-or-focus the pin at that 1-based index.
+            k if k.starts_with("pin-") => {
+                let idx = k.strip_prefix("pin-").and_then(|n| n.parse::<u8>().ok())?;
+                Action::Pin(idx)
+            }
             "mode-normal" => Action::SwitchMode(Mode::Normal),
             "mode-vim-normal" | "vim-normal" => Action::SwitchMode(Mode::VimNormal),
             "mode-vim-insert" | "vim-insert" => Action::SwitchMode(Mode::VimInsert),
@@ -325,6 +335,11 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Alt l", Action::FocusRight).unwrap();
     map.insert_all("Alt Left", Action::PrevTab).unwrap();
     map.insert_all("Alt Right", Action::NextTab).unwrap();
+
+    // Alt-1..9 → open-or-focus configured pins by 1-based registration order.
+    for i in 1..=9u8 {
+        map.insert_all(&format!("Alt {i}"), Action::Pin(i)).unwrap();
+    }
 
     map.insert_all("Shift PageUp", Action::ScrollUp).unwrap();
     map.insert_all("Shift PageDown", Action::ScrollDown)
@@ -553,6 +568,23 @@ mod tests {
         assert_eq!(Action::NewWorktree.key(), "new-worktree");
         assert_eq!(Action::Quit.key(), "quit");
         assert_eq!(Action::ToggleDrawer.key(), "files-drawer");
+    }
+
+    #[test]
+    fn pin_keys_parse_by_index_and_default_keymap_binds_alt_digits() {
+        // `pin-N` round-trips to Action::Pin(N); a bad index is rejected.
+        assert_eq!(Action::from_key("pin-1"), Some(Action::Pin(1)));
+        assert_eq!(Action::from_key("pin-9"), Some(Action::Pin(9)));
+        assert_eq!(Action::from_key("pin-x"), None);
+        // Alt-1..9 are bound in the default keymap.
+        let mut map = default_keymap();
+        assert_eq!(
+            map.dispatch(
+                Mode::Normal,
+                Key::modified(KeyCode::Char('1'), Modifiers::ALT)
+            ),
+            MatchResult::Matched(Action::Pin(1))
+        );
     }
 
     #[test]

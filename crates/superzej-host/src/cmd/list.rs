@@ -1,13 +1,12 @@
-//! `superzej list [--json]` — inventory of managed worktrees, reconciled against
-//! git. `collect` is shared with the dashboard.
+//! `superzej list` — inventory of managed worktrees, reconciled against git.
 
-use crate::config::Config;
-use crate::db::Db;
-use crate::models::WorktreeView;
-use crate::{repo, util, worktree};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
+use superzej_core::config::Config;
+use superzej_core::db::Db;
+use superzej_core::models::WorktreeView;
+use superzej_core::{outln, repo, theme, util};
 
 fn is_managed(path: &str, branch: &str, cfg: &Config) -> bool {
     path.starts_with(&cfg.worktrees_dir)
@@ -19,14 +18,12 @@ fn is_managed(path: &str, branch: &str, cfg: &Config) -> bool {
 pub fn collect(cfg: &Config) -> Result<Vec<WorktreeView>> {
     let db = Db::open()?;
 
-    // DB metadata (created_at, agent) keyed by worktree path.
     let meta: HashMap<String, (i64, String)> = db
         .worktrees()?
         .into_iter()
         .map(|w| (w.worktree, (w.created_at, w.agent)))
         .collect();
 
-    // repo path -> display name (the workspace), for the WORKSPACE column.
     let sessions: HashMap<String, String> = db
         .workspaces()?
         .into_iter()
@@ -39,24 +36,18 @@ pub fn collect(cfg: &Config) -> Result<Vec<WorktreeView>> {
 
     let mut out = Vec::new();
     for repo_path in repos {
-        let repo_dir = Path::new(&repo_path);
-        if !repo_dir.is_dir() {
-            continue;
-        }
         let name = sessions
             .get(&repo_path)
             .cloned()
-            .unwrap_or_else(|| repo::repo_name(repo_dir));
-        let base = worktree::default_branch(repo_dir);
-
-        let porcelain = match util::git_out(repo_dir, &["worktree", "list", "--porcelain"]) {
-            Some(s) => s,
-            None => continue,
+            .unwrap_or_else(|| repo::repo_name_from_path(Path::new(&repo_path)));
+        let base = superzej_core::worktree::default_branch(Path::new(&repo_path));
+        let Some(porc) = util::git_out(Path::new(&repo_path), &["worktree", "list", "--porcelain"])
+        else {
+            continue;
         };
-
         let mut wt_path = String::new();
         let mut wt_branch = String::new();
-        for line in porcelain.lines().chain(std::iter::once("")) {
+        for line in porc.lines().chain(std::iter::once("")) {
             if let Some(p) = line.strip_prefix("worktree ") {
                 wt_path = p.to_string();
             } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
@@ -90,7 +81,6 @@ fn view(
         if let Some(s) = util::git_out(p, &["status", "--porcelain"]) {
             dirty = s.lines().filter(|l| !l.is_empty()).count() as i64;
         }
-        // "--left-right --count base...HEAD" => "<behind>\t<ahead>".
         if let Some(s) = util::git_out(
             p,
             &[
@@ -120,21 +110,15 @@ fn view(
     }
 }
 
-pub fn run(cfg: &Config, json: bool) -> Result<()> {
-    use crate::theme;
+pub fn run(cfg: &Config) -> Result<()> {
     use std::io::IsTerminal;
 
     let rows = collect(cfg)?;
-    if json {
-        crate::outln!("{}", serde_json::to_string(&rows)?);
-        return Ok(());
-    }
     if rows.is_empty() {
-        crate::outln!("No worktrees yet. Press Alt-W to open a workspace, Alt-w for a worktree.");
+        outln!("No worktrees yet. Press Alt-W to open a workspace, Alt-w for a worktree.");
         return Ok(());
     }
 
-    // Color only when writing to a terminal (piped output stays clean).
     let tty = std::io::stdout().is_terminal();
     let accent = cfg.accent_rgb();
     let c = |on: &str, s: &str| -> String {
@@ -145,7 +129,7 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
         }
     };
 
-    crate::outln!(
+    outln!(
         "{}",
         c(
             theme::FAINT,
@@ -171,7 +155,6 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
         } else {
             c(theme::GHOST, &format!("{:>6}", r.dirty))
         };
-        // AGENT column: identity glyph chip + name in the agent's hue.
         let agent = if r.agent.is_empty() {
             String::new()
         } else if tty {
@@ -184,7 +167,7 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
         } else {
             r.agent.clone()
         };
-        crate::outln!(
+        outln!(
             "{} {} {} {} {} {}  {}",
             c(theme::TEXT, &format!("{:<16.16}", r.workspace)),
             c(&accent, &format!("{:<26.26}", r.branch)),

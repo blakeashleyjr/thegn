@@ -15,6 +15,7 @@
 **Objective:** Extend `superzej panel-snapshot` to dump the cache for all worktrees in a session.
 
 **Files:**
+
 - Modify: `crates/superzej-cli/src/commands/snapshot.rs`
 - Modify: `crates/superzej-cli/src/cli.rs`
 
@@ -56,7 +57,7 @@ pub fn run(session: Option<String>, tab: Option<String>, all: bool) -> Result<()
                     let mut obj = Map::new();
                     obj.insert("tab".into(), json!(w.tab_name));
                     obj.insert("worktree".into(), json!(w.worktree));
-                    
+
                     if let Ok(Some((pr_json, _))) = db.get_pr_cache(&w.worktree) {
                         if let Ok(v) = serde_json::from_str::<Value>(&pr_json) {
                             obj.insert("pr".into(), v);
@@ -95,6 +96,7 @@ git commit -m "feat(cli): add --all flag to panel-snapshot to bulk dump caches"
 **Objective:** Add `HashMap` caches to the panel plugin's `State` and update them when pipe messages arrive.
 
 **Files:**
+
 - Modify: `plugin/panel/src/main.rs`
 
 **Step 1: Add cache structures to `State`**
@@ -107,14 +109,14 @@ use std::collections::HashMap;
 #[derive(Default)]
 struct State {
     // ... existing fields ...
-    
+
     /// tab_name -> worktree path
     tab_to_worktree: HashMap<String, String>,
     /// worktree -> files
     diff_cache: HashMap<String, Vec<FileEntry>>,
     /// worktree -> pr JSON
     pr_cache: HashMap<String, serde_json::Value>,
-    
+
     /// Track if we have already preloaded the cache
     preloaded: bool,
 }
@@ -172,6 +174,7 @@ git commit -m "feat(panel): track diff and pr cache in plugin memory"
 **Objective:** Fetch the bulk snapshot on plugin load and parse it into the caches.
 
 **Files:**
+
 - Modify: `plugin/panel/src/main.rs`
 
 **Step 1: Trigger the preload in `update`**
@@ -210,7 +213,7 @@ git commit -m "feat(panel): track diff and pr cache in plugin memory"
                             v.get("worktree").and_then(|w| w.as_str()),
                         ) {
                             self.tab_to_worktree.insert(tab.to_string(), wt.to_string());
-                            
+
                             if let Some(files) = v.get("files").and_then(|f| f.as_str()) {
                                 self.diff_cache.insert(wt.to_string(), parse_files(files));
                             }
@@ -244,6 +247,7 @@ git commit -m "feat(panel): preload all session caches on startup"
 **Objective:** Wire up `refocus()` to look at the memory cache for a 0ms first-paint, falling back to a background `panel-snapshot` query to handle newly-created tabs.
 
 **Files:**
+
 - Modify: `plugin/panel/src/main.rs`
 
 **Step 1: Write `refocus_instant` and modify `refocus`**
@@ -262,7 +266,7 @@ fn base_tab_name(tab: &str) -> &str {
     fn refocus_instant(&mut self) -> bool {
         let Some(t) = self.active_tab.as_deref() else { return false };
         let base = base_tab_name(t);
-        
+
         if let Some(wt) = self.tab_to_worktree.get(base).cloned() {
             self.worktree = Some(wt.clone());
             if let Some(files) = self.diff_cache.get(&wt) {
@@ -285,10 +289,10 @@ fn base_tab_name(tab: &str) -> &str {
             return false;
         }
         self.identity = Some(id);
-        
+
         // 1. Attempt a 0ms instantaneous paint from local memory cache
         let mut changed = self.refocus_instant();
-        
+
         if self.worktree.is_none() {
             // Fallback clear if we have absolutely nothing
             self.files.clear();
@@ -305,7 +309,7 @@ fn base_tab_name(tab: &str) -> &str {
             &["superzej", "panel-snapshot", "--session", &s, "--tab", &t],
             ctx,
         );
-        
+
         changed
     }
 ```
@@ -316,11 +320,11 @@ fn base_tab_name(tab: &str) -> &str {
             Some("snapshot") => {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) {
                     let new_wt = v.get("worktree").and_then(|w| w.as_str()).map(String::from);
-                    
+
                     if let Some(wt) = new_wt.clone() {
                         let base = base_tab_name(self.active_tab.as_deref().unwrap_or_default());
                         self.tab_to_worktree.insert(base.to_string(), wt.clone());
-                        
+
                         if let Some(files) = v.get("files").and_then(|f| f.as_str()) {
                             self.diff_cache.insert(wt.clone(), parse_files(files));
                         }

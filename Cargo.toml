@@ -2,13 +2,9 @@
 resolver = "2"
 members = [
   "crates/superzej-core",
-  "crates/superzej-cli",
   "crates/superzej-svc",
   "crates/superzej-host",
 ]
-# The WASM plugins are built standalone (Nix sandboxes their subdirs); keep them
-# out of the host workspace so a normal `cargo build` never pulls the wasm target.
-exclude = ["plugin"]
 
 [workspace.package]
 version = "0.1.0"
