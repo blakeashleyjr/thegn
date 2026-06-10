@@ -39,6 +39,12 @@ pub struct WorktreeInfo {
 /// Reads go native (gix) for local locs; writes and remote stay CLI.
 pub trait GitBackend: Send + Sync {
     fn status(&self, loc: &GitLoc) -> Result<Vec<FileStatus>>;
+    /// Whether the worktree has any local changes — staged, unstaged, or
+    /// untracked — i.e. `git status --porcelain` non-emptiness. The boolean
+    /// the sidebar's dirty glyph needs, without paying for the full file list.
+    fn is_dirty(&self, loc: &GitLoc) -> Result<bool> {
+        Ok(!self.status(loc)?.is_empty())
+    }
     fn diff_files(&self, loc: &GitLoc, base: &str) -> Result<Vec<DiffEntry>>;
     fn branches(&self, loc: &GitLoc) -> Result<Vec<Branch>>;
     fn current_branch(&self, loc: &GitLoc) -> Result<String>;
@@ -215,6 +221,28 @@ impl GixGit {
 }
 
 impl GitBackend for GixGit {
+    fn is_dirty(&self, loc: &GitLoc) -> Result<bool> {
+        if loc.is_remote() {
+            return self.fallback.is_dirty(loc);
+        }
+        let repo = gix::discover(loc.path()).context("gix discover")?;
+        // The full status iterator (HEAD↔index, index↔worktree, untracked
+        // dirwalk), early-exiting on the first entry. Deliberately NOT gix's
+        // `Repository::is_dirty()`: that disables the dirwalk and would miss
+        // untracked-only worktrees that the CLI fallback (`git status
+        // --porcelain`) reports — a silent sidebar-glyph semantics change.
+        let mut iter = repo
+            .status(gix::progress::Discard)
+            .context("gix status")?
+            .into_iter(Vec::<gix::bstr::BString>::new())
+            .context("gix status iter")?;
+        Ok(iter
+            .next()
+            .transpose()
+            .context("gix status item")?
+            .is_some())
+    }
+
     fn current_branch(&self, loc: &GitLoc) -> Result<String> {
         if loc.is_remote() {
             return self.fallback.current_branch(loc);
@@ -401,6 +429,46 @@ mod tests {
 
     fn commit_empty(dir: &std::path::Path, msg: &str) {
         git_in(dir, &["commit", "--allow-empty", "-q", "-m", msg]);
+    }
+
+    #[test]
+    fn gix_and_cli_agree_on_is_dirty() {
+        let base = std::env::temp_dir().join(format!("sz-dirty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        git_in(&base, &["init", "-q", "-b", "main"]);
+        commit_empty(&base, "c0");
+
+        let loc = GitLoc::for_worktree(&base);
+        let gix = GixGit::new();
+        let cli = CliGit;
+
+        // Clean repo: both clean.
+        assert!(!cli.is_dirty(&loc).unwrap());
+        assert!(!gix.is_dirty(&loc).unwrap());
+
+        // Untracked-only: porcelain reports `??`; gix must agree (this is the
+        // case gix's own `Repository::is_dirty()` would miss).
+        std::fs::write(base.join("new.txt"), "hello").unwrap();
+        assert!(cli.is_dirty(&loc).unwrap());
+        assert!(gix.is_dirty(&loc).unwrap());
+
+        // Staged change: both dirty.
+        git_in(&base, &["add", "new.txt"]);
+        assert!(cli.is_dirty(&loc).unwrap());
+        assert!(gix.is_dirty(&loc).unwrap());
+
+        // Committed: clean again.
+        git_in(&base, &["commit", "-q", "-m", "c1"]);
+        assert!(!cli.is_dirty(&loc).unwrap());
+        assert!(!gix.is_dirty(&loc).unwrap());
+
+        // Unstaged modification of a tracked file: both dirty.
+        std::fs::write(base.join("new.txt"), "changed").unwrap();
+        assert!(cli.is_dirty(&loc).unwrap());
+        assert!(gix.is_dirty(&loc).unwrap());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
