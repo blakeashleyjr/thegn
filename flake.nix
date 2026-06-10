@@ -124,6 +124,8 @@
             shellcheck
             yamllint
             taplo
+            # startup benchmarks (`just bench`)
+            hyperfine
             # pty visual-regression harnesses (test/*.py reconstruct the screen)
             (python3.withPackages (ps: with ps; [pyte]))
             # runtime tools superzej shells out to
