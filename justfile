@@ -24,13 +24,17 @@ host *args: build
     {{bin}} {{args}}
 
 # Startup benchmarks (hyperfine; needs the dev shell). Not part of `just ci` —
-# timings are machine-dependent. First run = process/clap baseline; second =
-# real launch → first diff-flushed frame (termwiz needs a PTY, so wrap in
-# `script`, which adds a small constant overhead — fine for A/B deltas).
-# Isolated XDG_STATE_HOME so the bench never touches the daily DB.
+# timings are machine-dependent. Three numbers: process/clap baseline; cold
+# launch → first diff-flushed frame (fresh state: pays schema creation + first
+# seed, i.e. the once-per-machine path); warm launch → first frame (existing
+# state: the daily path). termwiz needs a PTY, so wrap in `script`, which adds
+# a small constant overhead — fine for A/B deltas. Isolated XDG_STATE_HOME so
+# the bench never touches the daily DB.
 bench: release
     hyperfine --warmup 3 'target/release/szhost --version'
     hyperfine --warmup 3 --prepare 'rm -rf /tmp/sz-bench-state' \
+      "script -qec 'env XDG_STATE_HOME=/tmp/sz-bench-state SUPERZEJ_BENCH_FIRST_FRAME_EXIT=1 target/release/szhost' /dev/null"
+    hyperfine --warmup 3 \
       "script -qec 'env XDG_STATE_HOME=/tmp/sz-bench-state SUPERZEJ_BENCH_FIRST_FRAME_EXIT=1 target/release/szhost' /dev/null"
 
 # Build the Nix package; symlinks ./result.

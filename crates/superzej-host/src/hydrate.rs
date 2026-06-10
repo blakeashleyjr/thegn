@@ -85,10 +85,22 @@ pub(crate) fn load_or_seed_session(cwd: &std::path::Path) -> crate::session::Ses
     }
 
     let cwd_str = cwd.to_string_lossy().into_owned();
-    let session_name = if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
-        // Use the explicit DB in test scenarios
+    // One DB handle for both the workspace lookup and the resurrect below —
+    // every `open` re-runs pragmas + migration checks, so don't repeat it.
+    // `XDG_STATE_HOME` selects the explicit DB in test/bench scenarios.
+    let db = if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
         let path = std::path::Path::new(&state_home).join("superzej/superzej.db");
-        if let Ok(db) = superzej_core::db::Db::open_at(&path) {
+        superzej_core::db::Db::open_at(&path)
+    } else {
+        superzej_core::db::Db::open()
+    };
+
+    // Prefer the workspace the DB already knows for this cwd (or the inherited
+    // SUPERZEJ_SESSION); else fall back to the env value, else the cwd itself.
+    let session_name = db
+        .as_ref()
+        .ok()
+        .and_then(|db| {
             db.workspaces()
                 .unwrap_or_default()
                 .into_iter()
@@ -96,28 +108,11 @@ pub(crate) fn load_or_seed_session(cwd: &std::path::Path) -> crate::session::Ses
                     Path::new(&w.repo_path) == cwd || Some(&w.repo_path) == env_session.as_ref()
                 })
                 .map(|w| w.repo_path)
-                .unwrap_or_else(|| env_session.unwrap_or(cwd_str.clone()))
-        } else {
-            env_session.unwrap_or(cwd_str)
-        }
-    } else if let Ok(db) = superzej_core::db::Db::open() {
-        // Use the workspace from DB if available for cwd
-        db.workspaces()
-            .unwrap_or_default()
-            .into_iter()
-            .find(|w| Path::new(&w.repo_path) == cwd || Some(&w.repo_path) == env_session.as_ref())
-            .map(|w| w.repo_path)
-            .unwrap_or_else(|| env_session.unwrap_or(cwd_str))
-    } else {
-        env_session.unwrap_or(cwd_str)
-    };
+        })
+        .or(env_session)
+        .unwrap_or(cwd_str);
 
-    let Ok(db) = (if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
-        let path = std::path::Path::new(&state_home).join("superzej/superzej.db");
-        superzej_core::db::Db::open_at(&path)
-    } else {
-        superzej_core::db::Db::open()
-    }) else {
+    let Ok(db) = db else {
         // No DB — synthesize an ephemeral single-tab session.
         return Session {
             id: sess.to_string(),
