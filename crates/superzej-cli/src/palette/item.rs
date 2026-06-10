@@ -26,6 +26,8 @@ pub enum Action {
     PrApprove,
     PrMerge,
     PrRerun,
+    Config,
+    ThemePreview,
     // --- dynamic, context-aware ---
     OpenFile(PathBuf),
     OpenFileAt(PathBuf, usize),
