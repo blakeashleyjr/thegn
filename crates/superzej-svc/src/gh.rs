@@ -15,17 +15,17 @@ use superzej_core::remote::GitLoc;
 /// blocking subprocess on `spawn_blocking`.
 #[allow(async_fn_in_trait)]
 pub trait GhBackend: Send + Sync {
-    async fn pr_status(&self, loc: &GitLoc) -> Result<PrPanel, GhError>;
-    async fn create_pr(&self, loc: &GitLoc, opts: &CreateOpts) -> Result<String, GhError>;
-    async fn merge_pr(
+    fn pr_status(&self, loc: &GitLoc) -> Result<PrPanel, GhError>;
+    fn create_pr(&self, loc: &GitLoc, opts: &CreateOpts) -> Result<String, GhError>;
+    fn merge_pr(
         &self,
         loc: &GitLoc,
         method: MergeMethod,
         delete_branch: bool,
         auto: bool,
     ) -> Result<(), GhError>;
-    async fn approve(&self, loc: &GitLoc, body: Option<&str>) -> Result<(), GhError>;
-    async fn rerun_failed(&self, loc: &GitLoc) -> Result<u32, GhError>;
+    fn approve(&self, loc: &GitLoc, body: Option<&str>) -> Result<(), GhError>;
+    fn rerun_failed(&self, loc: &GitLoc) -> Result<u32, GhError>;
 }
 
 /// The permanent fallback: every op via the `gh` CLI (through superzej-core's
@@ -34,13 +34,13 @@ pub trait GhBackend: Send + Sync {
 pub struct CliGh;
 
 impl GhBackend for CliGh {
-    async fn pr_status(&self, loc: &GitLoc) -> Result<PrPanel, GhError> {
+    fn pr_status(&self, loc: &GitLoc) -> Result<PrPanel, GhError> {
         Ok(superzej_core::forge::get_forge_for_loc(loc).unwrap().pr_status(loc))
     }
-    async fn create_pr(&self, loc: &GitLoc, opts: &CreateOpts) -> Result<String, GhError> {
+    fn create_pr(&self, loc: &GitLoc, opts: &CreateOpts) -> Result<String, GhError> {
         superzej_core::forge::get_forge_for_loc(loc).unwrap().create_pr(loc, opts)
     }
-    async fn merge_pr(
+    fn merge_pr(
         &self,
         loc: &GitLoc,
         method: MergeMethod,
@@ -49,10 +49,10 @@ impl GhBackend for CliGh {
     ) -> Result<(), GhError> {
         superzej_core::forge::get_forge_for_loc(loc).unwrap().merge_pr(loc, method, delete_branch, auto)
     }
-    async fn approve(&self, loc: &GitLoc, body: Option<&str>) -> Result<(), GhError> {
+    fn approve(&self, loc: &GitLoc, body: Option<&str>) -> Result<(), GhError> {
         superzej_core::forge::get_forge_for_loc(loc).unwrap().approve_pr(loc, body)
     }
-    async fn rerun_failed(&self, loc: &GitLoc) -> Result<u32, GhError> {
+    fn rerun_failed(&self, loc: &GitLoc) -> Result<u32, GhError> {
         superzej_core::forge::get_forge_for_loc(loc).unwrap().rerun_failed_checks(loc)
     }
 }
@@ -237,13 +237,13 @@ impl GhNative {
 }
 
 impl GhBackend for GhNative {
-    async fn pr_status(&self, loc: &GitLoc) -> Result<PrPanel, GhError> {
+    fn pr_status(&self, loc: &GitLoc) -> Result<PrPanel, GhError> {
         // Native path only for local locs with a token + resolvable origin.
         if loc.is_remote() {
-            return self.fallback.pr_status(loc).await;
+            return self.fallback.pr_status(loc);
         }
         let (Some(token), Some((owner, repo))) = (resolve_token(), self.owner_repo(loc)) else {
-            return self.fallback.pr_status(loc).await;
+            return self.fallback.pr_status(loc);
         };
         let branch = superzej_core::forge::get_forge_for_loc(loc).unwrap().pr_status(loc).branch; // cheap rev-parse via core
         let client = match octocrab::OctocrabBuilder::new()
@@ -251,13 +251,16 @@ impl GhBackend for GhNative {
             .build()
         {
             Ok(c) => c,
-            Err(_) => return self.fallback.pr_status(loc).await,
+            Err(_) => return self.fallback.pr_status(loc),
         };
         let body = serde_json::json!({
             "query": PR_QUERY,
             "variables": { "owner": owner, "repo": repo, "head": branch },
         });
-        match client.graphql::<Value>(&body).await {
+        // Note: the original code had an async call to `client.graphql` which will block or error here.
+        // We'll replace it with a sync call since we changed the trait to sync.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        match runtime.block_on(client.graphql::<Value>(&body)) {
             Ok(resp) if resp.get("errors").is_none() => Ok(parse_graphql_pr(
                 &resp,
                 &loc.path(),
@@ -265,14 +268,14 @@ impl GhBackend for GhNative {
                 superzej_core::util::now(),
             )),
             // GraphQL errors or transport failure → CLI fallback (keeps working).
-            _ => self.fallback.pr_status(loc).await,
+            _ => self.fallback.pr_status(loc),
         }
     }
 
-    async fn create_pr(&self, loc: &GitLoc, opts: &CreateOpts) -> Result<String, GhError> {
-        self.fallback.create_pr(loc, opts).await
+    fn create_pr(&self, loc: &GitLoc, opts: &CreateOpts) -> Result<String, GhError> {
+        self.fallback.create_pr(loc, opts)
     }
-    async fn merge_pr(
+    fn merge_pr(
         &self,
         loc: &GitLoc,
         method: MergeMethod,
@@ -281,13 +284,12 @@ impl GhBackend for GhNative {
     ) -> Result<(), GhError> {
         self.fallback
             .merge_pr(loc, method, delete_branch, auto)
-            .await
     }
-    async fn approve(&self, loc: &GitLoc, body: Option<&str>) -> Result<(), GhError> {
-        self.fallback.approve(loc, body).await
+    fn approve(&self, loc: &GitLoc, body: Option<&str>) -> Result<(), GhError> {
+        self.fallback.approve(loc, body)
     }
-    async fn rerun_failed(&self, loc: &GitLoc) -> Result<u32, GhError> {
-        self.fallback.rerun_failed(loc).await
+    fn rerun_failed(&self, loc: &GitLoc) -> Result<u32, GhError> {
+        self.fallback.rerun_failed(loc)
     }
 }
 
