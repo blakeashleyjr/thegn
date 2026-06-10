@@ -13,7 +13,43 @@
 //! combinations (e.g. Apple GPUs) simply omit the field for now.
 
 use anyhow::Result;
+use serde::Serialize;
 use sysinfo::{System, MINIMUM_CPU_UPDATE_INTERVAL};
+
+/// Default icons for stat display in the tabbar.
+pub const DEFAULT_CPU_ICON: &str = "CPU";
+pub const DEFAULT_MEM_ICON: &str = "MEM";
+pub const DEFAULT_GPU_ICON: &str = "GPU";
+/// Default refresh interval in seconds.
+pub const DEFAULT_REFRESH_SECS: f64 = 2.0;
+
+/// Stats configuration: icons and refresh rates for the tabbar widget.
+#[derive(Serialize)]
+pub struct StatsConfig {
+    pub cpu_icon: String,
+    pub mem_icon: String,
+    pub gpu_icon: String,
+    pub refresh_secs: f64,
+}
+
+impl Default for StatsConfig {
+    fn default() -> Self {
+        Self {
+            cpu_icon: DEFAULT_CPU_ICON.to_string(),
+            mem_icon: DEFAULT_MEM_ICON.to_string(),
+            gpu_icon: DEFAULT_GPU_ICON.to_string(),
+            refresh_secs: DEFAULT_REFRESH_SECS,
+        }
+    }
+}
+
+/// Output stats configuration as JSON for the tabbar plugin.
+pub fn config() -> Result<()> {
+    let cfg = StatsConfig::default();
+    let json = serde_json::to_string(&cfg)?;
+    crate::outln!("{}", json);
+    Ok(())
+}
 
 pub fn run() -> Result<()> {
     // Determinism shim for visual-regression tests: `SZ_FAKE_STATS` replaces the

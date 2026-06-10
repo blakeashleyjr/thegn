@@ -144,7 +144,13 @@ fn main() {
         Command::Config { action } => commands::config::run(&cfg, action, effective_path),
         Command::Keys { action } => commands::keys::run(&cfg, action),
         Command::Theme => commands::theme::run(&cfg),
-        Command::Stats => commands::stats::run(),
+        Command::Stats { config } => {
+            if config {
+                commands::stats::config()
+            } else {
+                commands::stats::run()
+            }
+        }
         Command::Activity { ack } => commands::activity::run(ack),
     };
 
