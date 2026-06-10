@@ -83,7 +83,7 @@ fn main() {
         Command::Menu { tab } => commands::menu::run(&cfg, tab),
         Command::GrantPlugins => commands::grant_plugins::run(),
         Command::ResolveWorktree { session, tab } => commands::resolve::run(session, tab),
-        Command::PanelSnapshot { session, tab } => commands::snapshot::run(session, tab),
+        Command::PanelSnapshot { session, tab, all } => commands::snapshot::run(session, tab, all),
         Command::Watch {
             session,
             pr_interval,

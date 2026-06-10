@@ -116,6 +116,8 @@ pub enum Command {
         session: Option<String>,
         #[arg(long)]
         tab: Option<String>,
+        #[arg(long, help = "Dump cache for all session worktrees")]
+        all: bool,
     },
     /// (internal) Per-session daemon: fs-watch the focused worktree and push
     /// live diff/PR updates to the panel. Auto-spawned by `attach`.
