@@ -329,6 +329,28 @@ pub fn merge_pr(
     gh_run(loc, &args)
 }
 
+/// Convert the worktree's PR to a draft (`draft = true`) or mark it ready for
+/// review (`draft = false`). Ported from the forge-features work.
+pub fn set_draft_pr(loc: &GitLoc, draft: bool) -> Result<(), GhError> {
+    let flag = if draft { "--undo" } else { "" };
+    // `gh pr ready` marks ready; `gh pr ready --undo` converts back to draft.
+    let mut args = vec!["pr", "ready"];
+    if !flag.is_empty() {
+        args.push(flag);
+    }
+    gh_run(loc, &args)
+}
+
+/// Enable (`enable = true`) or disable auto-merge for the worktree's PR.
+pub fn set_auto_merge(loc: &GitLoc, enable: bool) -> Result<(), GhError> {
+    let args = if enable {
+        vec!["pr", "merge", "--auto", "--squash"]
+    } else {
+        vec!["pr", "merge", "--disable-auto"]
+    };
+    gh_run(loc, &args)
+}
+
 /// Print review comments / reviews as JSON.
 pub fn reviews(loc: &GitLoc) -> Result<String, GhError> {
     gh_out(

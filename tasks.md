@@ -602,7 +602,7 @@ launch-or-focus via `Alt-1..9`, restart per policy on PTY exit, and resurrect fr
 - [x] 332. CI checks status
 - [~] 333. PR review comments
 - [~] 334. Issues
-- [x] 335. Create PR from worktree
+- [x] 335. Create PR from worktree _(+ draft/ready toggle + auto-merge enable/disable)_
 - [x] 336. PR↔worktree mapping
 - [x] 337. Review/approve from TUI
 - [~] 338. PR event notifications
