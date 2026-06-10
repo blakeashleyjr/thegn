@@ -292,6 +292,20 @@ impl Db {
         Ok(r)
     }
 
+    /// Run `f` inside a single SQLite transaction: commit on `Ok`, roll back
+    /// on `Err` (the dropped transaction rolls back). Multi-statement writes
+    /// (e.g. persisting a whole session's tab list) must use this so a crash
+    /// mid-sequence can't leave a torn half-write — and batched writes pay one
+    /// fsync instead of one per statement. Uses `unchecked_transaction`
+    /// because `Db` methods take `&self`; do NOT nest `transaction` calls
+    /// (SQLite has no nested BEGIN).
+    pub fn transaction<T>(&self, f: impl FnOnce(&Db) -> Result<T>) -> Result<T> {
+        let tx = self.conn.unchecked_transaction()?;
+        let out = f(self)?;
+        tx.commit()?;
+        Ok(out)
+    }
+
     // --- repo history (launcher recents) -----------------------------------
     pub fn touch_repo(&self, path: &str, name: &str) -> Result<()> {
         let now = util::now();
@@ -352,32 +366,36 @@ impl Db {
     /// `-2`, `-3`, … on collision with a *different* repo, then persists it.
     /// Two repos with the same basename therefore get distinct tab namespaces.
     pub fn slug_for_repo(&self, repo_path: &str, base: &str) -> Result<String> {
-        if let Ok(s) = self.conn.query_row(
-            "SELECT slug FROM repo_slugs WHERE repo_path=?1",
-            params![repo_path],
-            |r| r.get::<_, String>(0),
-        ) && !s.is_empty()
-        {
-            return Ok(s);
-        }
-        let taken: std::collections::HashSet<String> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT slug FROM repo_slugs WHERE repo_path != ?1")?;
-            let rows = stmt.query_map(params![repo_path], |r| r.get::<_, String>(0))?;
-            rows.filter_map(|r| r.ok()).collect()
-        };
-        let mut cand = base.to_string();
-        let mut n = 1;
-        while taken.contains(&cand) {
-            n += 1;
-            cand = format!("{base}-{n}");
-        }
-        self.conn.execute(
-            "INSERT OR REPLACE INTO repo_slugs(repo_path, slug) VALUES(?1, ?2)",
-            params![repo_path, cand],
-        )?;
-        Ok(cand)
+        // One transaction around the read-check-insert so two processes can't
+        // both pass the uniqueness scan and claim the same slug.
+        self.transaction(|db| {
+            if let Ok(s) = db.conn.query_row(
+                "SELECT slug FROM repo_slugs WHERE repo_path=?1",
+                params![repo_path],
+                |r| r.get::<_, String>(0),
+            ) && !s.is_empty()
+            {
+                return Ok(s);
+            }
+            let taken: std::collections::HashSet<String> = {
+                let mut stmt = db
+                    .conn
+                    .prepare("SELECT slug FROM repo_slugs WHERE repo_path != ?1")?;
+                let rows = stmt.query_map(params![repo_path], |r| r.get::<_, String>(0))?;
+                rows.filter_map(|r| r.ok()).collect()
+            };
+            let mut cand = base.to_string();
+            let mut n = 1;
+            while taken.contains(&cand) {
+                n += 1;
+                cand = format!("{base}-{n}");
+            }
+            db.conn.execute(
+                "INSERT OR REPLACE INTO repo_slugs(repo_path, slug) VALUES(?1, ?2)",
+                params![repo_path, cand],
+            )?;
+            Ok(cand)
+        })
     }
 
     /// Whether superzej already knows this repo (registered, or in recents).
@@ -719,6 +737,32 @@ mod tests {
 
     fn db() -> Db {
         Db::open_memory().unwrap()
+    }
+
+    #[test]
+    fn transaction_commits_on_ok_and_passes_value_through() {
+        let db = db();
+        let n = db
+            .transaction(|db| {
+                db.touch_repo("/r/a", "a")?;
+                db.touch_repo("/r/b", "b")?;
+                Ok(42)
+            })
+            .unwrap();
+        assert_eq!(n, 42);
+        assert_eq!(db.recent_repos(10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn transaction_rolls_back_on_err() {
+        let db = db();
+        let res: Result<()> = db.transaction(|db| {
+            db.touch_repo("/r/a", "a")?;
+            anyhow::bail!("boom")
+        });
+        assert!(res.is_err());
+        // The insert before the error must not be visible.
+        assert!(db.recent_repos(10).unwrap().is_empty());
     }
 
     #[test]
