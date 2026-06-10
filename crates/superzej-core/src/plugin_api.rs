@@ -76,7 +76,9 @@ impl ContributionId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize, schemars::JsonSchema,
+)]
 #[serde(transparent)]
 pub struct SurfaceId(String);
 
@@ -416,7 +418,7 @@ impl PluginRuntime {
             .filter_map(|c| {
                 c.surface
                     .clone()
-                    .and_then(|s| surface_capability_for(&c.extension_point).map(|cap| (s, cap)))
+                    .zip(surface_capability_for(&c.extension_point))
             })
             .collect();
         Self {
