@@ -21,6 +21,22 @@ pub fn sandbox() -> PathBuf {
             std::env::set_var("ZELLIJ_SOCKET_DIR", dir.join("run"));
             std::env::remove_var("ZELLIJ");
             std::env::remove_var("ZELLIJ_SESSION_NAME");
+            // Scrub inherited git env: when the suite runs inside a git hook
+            // (e.g. prek's pre-commit), git exports GIT_DIR / GIT_WORK_TREE /
+            // GIT_INDEX_FILE pointing at the *real* repo. Those leak into the
+            // `git` children these tests spawn (temp_git_repo, branches), so a
+            // temp dir is treated as the real repo. Remove them for isolation.
+            for var in [
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "GIT_INDEX_FILE",
+                "GIT_COMMON_DIR",
+                "GIT_PREFIX",
+                "GIT_CONFIG",
+                "GIT_CONFIG_GLOBAL",
+            ] {
+                std::env::remove_var(var);
+            }
             dir
         })
         .clone()
