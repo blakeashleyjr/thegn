@@ -1,7 +1,7 @@
 [package]
 name = "superzej-svc"
 version.workspace = true
-edition.workspace = true
+edition = "2021"
 license.workspace = true
 description = "superzej native service layer: git/GitHub/ssh behind traits with CLI fallbacks"
 
