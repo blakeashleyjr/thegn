@@ -414,6 +414,7 @@ fn collect_sidebar_status(
     use superzej_svc::git::{GitBackend, GixGit};
     let git = GixGit::new();
     let mut status = crate::sidebar::SidebarStatus::default();
+    let t0 = std::time::Instant::now();
 
     // Advance the activity state machine over the session's managed worktrees,
     // then read the fresh states (keyed by tab name).
@@ -457,6 +458,12 @@ fn collect_sidebar_status(
             status.agent.insert(tab.worktree.clone(), agent);
         }
     }
+    tracing::debug!(
+        target: "szhost::hydrate",
+        status_ms = t0.elapsed().as_millis() as u64,
+        worktrees = seen.len(),
+        "sidebar status collected"
+    );
     status
 }
 
@@ -495,6 +502,7 @@ fn build_model(session: &crate::session::Session, db: &superzej_core::db::Db) ->
     use superzej_core::remote::GitLoc;
     use superzej_svc::git::{GitBackend, GixGit};
 
+    let t0 = std::time::Instant::now();
     let cwd = active_tab_path(session);
     let loc = GitLoc::for_worktree(&cwd);
     let git = GixGit::new();
@@ -536,6 +544,12 @@ fn build_model(session: &crate::session::Session, db: &superzej_core::db::Db) ->
             .collect();
     }
 
+    tracing::debug!(
+        target: "szhost::hydrate",
+        build_model_ms = t0.elapsed().as_millis() as u64,
+        diff_files = panel.files.len(),
+        "model hydrated"
+    );
     FrameModel {
         tabs: session.tabs.iter().map(|t| t.name.clone()).collect(),
         active_tab: session.active,
@@ -2064,6 +2078,7 @@ async fn event_loop<T: Terminal>(
         // 2. Render if anything changed (diff-flush): all visible panes of the
         //    active tab + the chrome, with the hardware cursor in the focused pane.
         if dirty {
+            let frame_t0 = std::time::Instant::now();
             if scratch.dimensions() != (cols, rows) {
                 scratch = Surface::new(cols, rows);
             }
@@ -2158,6 +2173,12 @@ async fn event_loop<T: Terminal>(
             }
             buf.flush().context("flush")?;
             dirty = false;
+            tracing::debug!(
+                target: "szhost::frame",
+                render_ms = frame_t0.elapsed().as_millis() as u64,
+                drain_chunks = drain_stats_chunks,
+                "frame flushed"
+            );
             if !first_frame_logged {
                 first_frame_logged = true;
                 tracing::info!(
