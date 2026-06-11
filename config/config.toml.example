@@ -99,6 +99,25 @@ refresh-secs = 2           # Polling interval in seconds
 battery-warn = 25               # red at/below this percent
 refresh-rates = [1, 2, 5, 10]  # Click the top-right stats block to cycle
 
+# Prometheus scrape targets for the sidebar METRICS section. superzej scrapes
+# each /metrics endpoint directly; no Prometheus server is required. Values are
+# filtered by the allowlist below before reaching the UI.
+[metrics]
+interval-secs = 5        # Scrape interval in seconds (SUPERZEJ_METRICS_INTERVAL_SECS)
+timeout-ms = 500         # Request timeout in milliseconds
+max-body-bytes = 1048576 # Max response size (1 MiB)
+
+# Example: monitor a local model-proxy service.
+# [[metrics.targets]]
+# name = "model-proxy"
+# url = "http://127.0.0.1:9091/metrics"
+# metrics = [
+#   "http_requests_total",
+#   "process_resident_memory_bytes",
+#   "model_proxy_active_requests",
+#]
+# labels = { instance = "local" } # optional exact-match labels
+
 # Bottom file-manager drawer (hidden by default; toggle with Ctrl+Alt+f). Runs a
 # pinned, bundled yazi with its own config kept separate from the system.
 [drawer]

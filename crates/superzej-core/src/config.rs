@@ -721,6 +721,50 @@ impl LogConfig {
     }
 }
 
+/// `[metrics]` — Prometheus scrape targets for sidebar metrics display.
+/// Each target is scraped directly via HTTP; no Prometheus server required.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct MetricsConfig {
+    /// Scrape interval in seconds.
+    #[serde(alias = "interval-secs")]
+    pub interval_secs: f64,
+    /// Request timeout in milliseconds.
+    #[serde(alias = "timeout-ms")]
+    pub timeout_ms: u64,
+    /// Max response body size in bytes (prevent runaway).
+    #[serde(alias = "max-body-bytes")]
+    pub max_body_bytes: usize,
+    /// Scrape targets.
+    pub targets: Vec<MetricsTarget>,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        MetricsConfig {
+            interval_secs: 5.0,
+            timeout_ms: 500,
+            max_body_bytes: 1_048_576, // 1 MiB
+            targets: Vec::new(),
+        }
+    }
+}
+
+/// One Prometheus scrape target.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct MetricsTarget {
+    /// Display name in the sidebar.
+    pub name: String,
+    /// URL to scrape (e.g., `http://localhost:9091/metrics`).
+    pub url: String,
+    /// Metrics to display (allowlist). Empty = all.
+    #[serde(default)]
+    pub metrics: Vec<String>,
+    /// Optional labels to match (e.g., `instance="localhost:9091"`).
+    #[serde(default)]
+    pub labels: std::collections::BTreeMap<String, String>,
+}
+
 /// `[sandbox.remote]` — optionally run a worktree on a remote machine. Empty
 /// `host` means local (the default); set it (e.g. `user@devbox`) to enable.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -1119,6 +1163,7 @@ pub struct Config {
     pub theme: ThemeConfig,
     pub monitor: MonitorConfig,
     pub stats: StatsConfig,
+    pub metrics: MetricsConfig,
     pub bars: BarsConfig,
     pub pr: PrConfig,
     pub dashboard: DashboardConfig,
@@ -1177,6 +1222,7 @@ impl Default for Config {
             theme: ThemeConfig::default(),
             monitor: MonitorConfig::default(),
             stats: StatsConfig::default(),
+            metrics: MetricsConfig::default(),
             bars: BarsConfig::default(),
             pr: PrConfig::default(),
             dashboard: DashboardConfig::default(),
@@ -1243,6 +1289,9 @@ pub struct ConfigOverlay {
     pub pr_ttl_secs: Option<u64>,
     pub dashboard_interval_secs: Option<u64>,
     pub watch_pr_interval_secs: Option<u64>,
+    pub metrics_interval_secs: Option<f64>,
+    pub metrics_timeout_ms: Option<u64>,
+    pub metrics_max_body_bytes: Option<usize>,
     pub log_level: Option<LogLevel>,
     pub log_file: Option<bool>,
     pub log_dir: Option<String>,
@@ -1279,6 +1328,9 @@ impl ConfigOverlay {
         set!(base.pr.ttl_secs, self.pr_ttl_secs);
         set!(base.dashboard.interval_secs, self.dashboard_interval_secs);
         set!(base.watch.pr_interval_secs, self.watch_pr_interval_secs);
+        set!(base.metrics.interval_secs, self.metrics_interval_secs);
+        set!(base.metrics.timeout_ms, self.metrics_timeout_ms);
+        set!(base.metrics.max_body_bytes, self.metrics_max_body_bytes);
         set!(base.log.level, self.log_level);
         set!(base.log.file, self.log_file);
         set!(base.log.dir, self.log_dir);
@@ -1303,6 +1355,15 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
             Ok(n) => Some(n),
             Err(_) => {
                 config_warn(&format!("{key}: not a number ({raw:?}); ignoring"));
+                None
+            }
+        }
+    };
+    let parse_float = |raw: String, key: &str| -> Option<f64> {
+        match raw.trim().parse::<f64>() {
+            Ok(n) if n.is_finite() => Some(n),
+            _ => {
+                config_warn(&format!("{key}: not a finite number ({raw:?}); ignoring"));
                 None
             }
         }
@@ -1348,6 +1409,18 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     }
     if let Some(v) = env.get("SUPERZEJ_WATCH_PR_INTERVAL") {
         o.watch_pr_interval_secs = parse_num(v, "SUPERZEJ_WATCH_PR_INTERVAL");
+    }
+
+    // [metrics]
+    if let Some(v) = env.get("SUPERZEJ_METRICS_INTERVAL_SECS") {
+        o.metrics_interval_secs = parse_float(v, "SUPERZEJ_METRICS_INTERVAL_SECS");
+    }
+    if let Some(v) = env.get("SUPERZEJ_METRICS_TIMEOUT_MS") {
+        o.metrics_timeout_ms = parse_num(v, "SUPERZEJ_METRICS_TIMEOUT_MS");
+    }
+    if let Some(v) = env.get("SUPERZEJ_METRICS_MAX_BODY_BYTES") {
+        o.metrics_max_body_bytes =
+            parse_num(v, "SUPERZEJ_METRICS_MAX_BODY_BYTES").map(|n| n as usize);
     }
 
     // [log]
@@ -1547,6 +1620,9 @@ impl Config {
             .iter()
             .map(|r| util::expand_tilde(r))
             .collect();
+        self.metrics.interval_secs = self.metrics.interval_secs.max(1.0);
+        self.metrics.timeout_ms = self.metrics.timeout_ms.clamp(100, 30_000);
+        self.metrics.max_body_bytes = self.metrics.max_body_bytes.max(1);
     }
 
     pub fn agent_command(&self, name: &str) -> Option<&str> {
@@ -1753,6 +1829,9 @@ impl Config {
             "pr.ttl_secs" => self.pr.ttl_secs.to_string(),
             "dashboard.interval_secs" => self.dashboard.interval_secs.to_string(),
             "watch.pr_interval_secs" => self.watch.pr_interval_secs.to_string(),
+            "metrics.interval_secs" => self.metrics.interval_secs.to_string(),
+            "metrics.timeout_ms" => self.metrics.timeout_ms.to_string(),
+            "metrics.max_body_bytes" => self.metrics.max_body_bytes.to_string(),
             "log.level" => self.log.level.to_string(),
             "log.file" => self.log.file.to_string(),
             "log.dir" => self.log.dir_path().to_string_lossy().into_owned(),
@@ -2551,6 +2630,56 @@ surface = "todoist.status"
         assert_eq!(back.sandbox.backend, c.sandbox.backend);
     }
 
+    #[test]
+    fn metrics_config_defaults_and_toml_parse() {
+        let default = MetricsConfig::default();
+        assert_eq!(default.interval_secs, 5.0);
+        assert_eq!(default.timeout_ms, 500);
+        assert_eq!(default.max_body_bytes, 1_048_576);
+        assert!(default.targets.is_empty());
+
+        let cfg: Config = toml::from_str(
+            r#"
+            [metrics]
+            interval_secs = 2.5
+            timeout_ms = 250
+            max_body_bytes = 4096
+
+            [[metrics.targets]]
+            name = "model-proxy"
+            url = "http://127.0.0.1:9091/metrics"
+            metrics = ["http_requests_total", "process_resident_memory_bytes"]
+            labels = { instance = "local" }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.metrics.interval_secs, 2.5);
+        assert_eq!(cfg.metrics.timeout_ms, 250);
+        assert_eq!(cfg.metrics.max_body_bytes, 4096);
+        assert_eq!(cfg.metrics.targets.len(), 1);
+        let target = &cfg.metrics.targets[0];
+        assert_eq!(target.name, "model-proxy");
+        assert_eq!(target.url, "http://127.0.0.1:9091/metrics");
+        assert_eq!(target.metrics[0], "http_requests_total");
+        assert_eq!(
+            target.labels.get("instance").map(String::as_str),
+            Some("local")
+        );
+    }
+
+    #[test]
+    fn metrics_env_overlay_clamps_runtime_bounds() {
+        let env = map_env(&[
+            ("SUPERZEJ_METRICS_INTERVAL_SECS", "0.2"),
+            ("SUPERZEJ_METRICS_TIMEOUT_MS", "10"),
+            ("SUPERZEJ_METRICS_MAX_BODY_BYTES", "0"),
+        ]);
+        let c = Config::load_layered(&env, &[], None);
+        assert_eq!(c.metrics.interval_secs, 1.0);
+        assert_eq!(c.metrics.timeout_ms, 100);
+        assert_eq!(c.metrics.max_body_bytes, 1);
+    }
+
     // Exercise every env knob (and the canonical/deprecated/bad-value paths) so
     // the layering is covered, not just spot-checked.
     #[test]
@@ -2570,6 +2699,9 @@ surface = "todoist.status"
             ("SUPERZEJ_PR_TTL", "11"),
             ("SUPERZEJ_DASHBOARD_INTERVAL", "6"),
             ("SUPERZEJ_WATCH_PR_INTERVAL", "13"),
+            ("SUPERZEJ_METRICS_INTERVAL_SECS", "3.5"),
+            ("SUPERZEJ_METRICS_TIMEOUT_MS", "750"),
+            ("SUPERZEJ_METRICS_MAX_BODY_BYTES", "2048"),
             ("SUPERZEJ_LOG_LEVEL", "debug"),
             ("SUPERZEJ_LOG_FILE", "true"),
             ("SUPERZEJ_LOG_DIR", "/logs"),
@@ -2598,6 +2730,9 @@ surface = "todoist.status"
         assert_eq!(c.pr.ttl_secs, 11);
         assert_eq!(c.dashboard.interval_secs, 6);
         assert_eq!(c.watch.pr_interval_secs, 13);
+        assert_eq!(c.metrics.interval_secs, 3.5);
+        assert_eq!(c.metrics.timeout_ms, 750);
+        assert_eq!(c.metrics.max_body_bytes, 2048);
         assert_eq!(c.log.level, LogLevel::Debug);
         assert!(c.log.file);
         assert_eq!(c.log.dir, "/logs");
@@ -2650,6 +2785,9 @@ surface = "todoist.status"
             "pr.ttl_secs",
             "dashboard.interval_secs",
             "watch.pr_interval_secs",
+            "metrics.interval_secs",
+            "metrics.timeout_ms",
+            "metrics.max_body_bytes",
             "log.level",
             "log.file",
             "log.dir",
