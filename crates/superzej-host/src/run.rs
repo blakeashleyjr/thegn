@@ -100,12 +100,7 @@ fn context_hints(
     panel_ui: &crate::panel::PanelUi,
     cfg: &superzej_core::config::Config,
 ) -> String {
-    let chord = |id: &str| -> Option<String> {
-        superzej_core::keymap::effective(cfg)
-            .into_iter()
-            .find(|r| r.id == id)
-            .and_then(|r| r.chords.first().map(|c| c.to_hint()))
-    };
+    let chord = |id: &str| -> Option<String> { crate::keymap::chord_hint_for(cfg, id) };
     let hint = |label: &str, id: &str| chord(id).map(|c| format!("{c} {label}"));
     if focus.locked {
         return hint("unlock", "toggle-key-lock").unwrap_or_else(|| "Ctrl-g unlock".into());
@@ -117,7 +112,10 @@ fn context_hints(
             hint("tab", "prev-tab").or_else(|| chord("next-tab").map(|c| format!("{c} tab"))),
             hint("worktree", "prev-worktree")
                 .or_else(|| chord("next-worktree").map(|c| format!("{c} worktree"))),
-            hint("split", "new-pane"),
+            hint("close tab", "close-tab"),
+            hint("smart split", "new-pane"),
+            hint("split↓", "split-down"),
+            hint("split→", "split-right"),
             hint("zoom", "zoom"),
             hint("menu", "palette"),
         ]
@@ -3432,6 +3430,7 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+                let mut forced_palette_action: Option<crate::keymap::Action> = None;
                 // Modal: when the palette is open it captures all keys.
                 if let Some(p) = palette.as_mut() {
                     // Agent-picker mode: the palette is choosing what to run in a
@@ -3635,6 +3634,15 @@ async fn event_loop<T: Terminal>(
                                         &supervisor,
                                     );
                                     need_relayout = true;
+                                } else if let Some(action) = crate::keymap::Action::from_key(&key) {
+                                    forced_palette_action = Some(action);
+                                } else if let Some(idx) = keymap
+                                    .custom_actions()
+                                    .iter()
+                                    .position(|action| action.name == key)
+                                {
+                                    forced_palette_action =
+                                        Some(crate::keymap::Action::Custom(idx as u16));
                                 }
                                 // Other command keys are also reachable via their
                                 // keybind; their in-palette dispatch lands with the
@@ -3650,8 +3658,10 @@ async fn event_loop<T: Terminal>(
                         }
                         _ => {}
                     }
-                    dirty = true;
-                    continue;
+                    if forced_palette_action.is_none() {
+                        dirty = true;
+                        continue;
+                    }
                 }
                 // The Ctrl+g keybind lock: while locked, every key except
                 // Ctrl+g itself goes straight to the focused pane.
@@ -3675,7 +3685,8 @@ async fn event_loop<T: Terminal>(
                 // Sidebar zone: unmodified keys drive the tree (j/k, Enter, /,
                 // …). Ctrl/Alt chords fall through to the keymap so the
                 // spatial focus moves and tab switches still work from here.
-                if focus.sidebar()
+                if forced_palette_action.is_none()
+                    && focus.sidebar()
                     && !k.modifiers.contains(Modifiers::CTRL)
                     && !k.modifiers.contains(Modifiers::ALT)
                 {
@@ -3809,7 +3820,8 @@ async fn event_loop<T: Terminal>(
                     }
                 }
                 // Panel zone: unmodified keys drive the Diff/PR/Checks widgets.
-                if focus.panel()
+                if forced_palette_action.is_none()
+                    && focus.panel()
                     && !k.modifiers.contains(Modifiers::CTRL)
                     && !k.modifiers.contains(Modifiers::ALT)
                 {
@@ -4158,12 +4170,17 @@ async fn event_loop<T: Terminal>(
                     .unwrap_or_default();
                 // Per-program host-action overlay intercepts before the mode
                 // matcher; otherwise fall through to the normal keymap dispatch.
-                let dispatch = match keymap.program_action(&focused_program, &input_key) {
-                    Some(action) => {
-                        keymap.reset();
-                        crate::sequence::MatchResult::Matched(action)
+                let dispatch = if let Some(action) = forced_palette_action.take() {
+                    keymap.reset();
+                    crate::sequence::MatchResult::Matched(action)
+                } else {
+                    match keymap.program_action(&focused_program, &input_key) {
+                        Some(action) => {
+                            keymap.reset();
+                            crate::sequence::MatchResult::Matched(action)
+                        }
+                        None => keymap.dispatch(mode, input_key.clone()),
                     }
-                    None => keymap.dispatch(mode, input_key.clone()),
                 };
                 match dispatch {
                     crate::sequence::MatchResult::Matched(action) => {
@@ -5146,6 +5163,31 @@ mod tests {
             ],
             active: 0,
         }
+    }
+
+    #[test]
+    fn center_context_hints_include_close_tab_and_split_controls() {
+        let cfg = superzej_core::config::Config::default();
+        let focus = crate::focus::FocusState::default();
+        let panel = crate::panel::PanelUi::default();
+        let hints = context_hints(&focus, &panel, &cfg);
+
+        assert!(hints.contains("Alt-X close tab"), "hints were {hints}");
+        assert!(hints.contains("Alt-p smart split"), "hints were {hints}");
+        assert!(hints.contains("Alt-n split↓"), "hints were {hints}");
+        assert!(hints.contains("Alt-N split→"), "hints were {hints}");
+    }
+
+    #[test]
+    fn center_context_hints_follow_keybind_overrides() {
+        let mut cfg = superzej_core::config::Config::default();
+        cfg.keybinds.insert("close-tab".into(), "Ctrl Alt x".into());
+        let focus = crate::focus::FocusState::default();
+        let panel = crate::panel::PanelUi::default();
+        let hints = context_hints(&focus, &panel, &cfg);
+
+        assert!(hints.contains("Ctrl-Alt-x close tab"), "hints were {hints}");
+        assert!(!hints.contains("Alt-X close tab"), "hints were {hints}");
     }
 
     #[test]

@@ -241,6 +241,39 @@ impl Palette {
     }
 }
 
+/// Build the static command/action rows for Cmd-K from the native host action
+/// registry. Labels include the effective chord so the palette doubles as
+/// searchable keybind help; custom `[[actions]]` with `menu = true` join the
+/// same list automatically.
+pub(crate) fn build_command_palette_items(
+    cfg: &superzej_core::config::Config,
+) -> Vec<crate::palette::PaletteItem> {
+    let mut items: Vec<crate::palette::PaletteItem> = crate::keymap::action_specs()
+        .iter()
+        .filter(|spec| spec.palette)
+        .map(|spec| {
+            let label = crate::keymap::chord_hint_for(cfg, spec.id)
+                .map(|chord| format!("{}  ({chord})", spec.label))
+                .unwrap_or_else(|| spec.label.to_string());
+            crate::palette::PaletteItem::new(spec.id, label)
+        })
+        .collect();
+
+    for action in &cfg.actions {
+        if !action.menu {
+            continue;
+        }
+        let label = if action.key.trim().is_empty() {
+            action.name.clone()
+        } else {
+            format!("{}  ({})", action.name, action.key.replace(' ', "-"))
+        };
+        items.push(crate::palette::PaletteItem::new(action.name.clone(), label));
+    }
+
+    items
+}
+
 /// Build the palette's item list: the command actions + a nav row per open tab
 /// (`tab:<name>`), ordered by frecency for the empty-query view (the host port
 /// of the old engine's command + nav + frecency sources).
@@ -250,18 +283,7 @@ pub(crate) fn build_palette(
     cfg: &superzej_core::config::Config,
 ) -> Vec<crate::palette::PaletteItem> {
     use crate::palette::PaletteItem;
-    let mut items = vec![
-        PaletteItem::new("new-worktree", "New worktree"),
-        PaletteItem::new("new-workspace", "New workspace"),
-        PaletteItem::new("switch-workspace", "Switch workspace"),
-        PaletteItem::new("close-worktree", "Close worktree"),
-        PaletteItem::new("show-diff", "Show diff"),
-        PaletteItem::new("open-pr", "Open pull request"),
-        PaletteItem::new("files-drawer", "Toggle files drawer"),
-        PaletteItem::new("lazygit", "Open lazygit"),
-        PaletteItem::new("toggle-strip", "Toggle pin strip"),
-        PaletteItem::new("quit", "Quit superzej"),
-    ];
+    let mut items = build_command_palette_items(cfg);
 
     // Configured pins (scope-filtered to the current workspace): summon by name.
     let ws = (!session.id.is_empty()).then_some(session.id.as_str());
@@ -446,6 +468,69 @@ mod tests {
         p.backspace();
         p.backspace();
         assert_eq!(p.matches().len(), 4, "cleared query shows all again");
+    }
+
+    #[test]
+    fn command_palette_surfaces_every_registered_keybind() {
+        let cfg = superzej_core::config::Config::default();
+        let items = build_command_palette_items(&cfg);
+        let keys: std::collections::BTreeSet<&str> = items.iter().map(|i| i.key.as_str()).collect();
+
+        for key in [
+            "close-tab",
+            "new-pane",
+            "split-down",
+            "split-right",
+            "focus-left",
+            "focus-right",
+            "toggle-key-lock",
+            "cheatsheet",
+        ] {
+            assert!(
+                keys.contains(key),
+                "palette missing registered keybind {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_palette_labels_include_effective_chords() {
+        let mut cfg = superzej_core::config::Config::default();
+        cfg.keybinds.insert("close-tab".into(), "Ctrl Alt x".into());
+        let items = build_command_palette_items(&cfg);
+        let close = items
+            .iter()
+            .find(|i| i.key == "close-tab")
+            .expect("close-tab item");
+        assert!(
+            close.label.contains("Ctrl-Alt-x"),
+            "label was {}",
+            close.label
+        );
+    }
+
+    #[test]
+    fn command_palette_includes_custom_menu_actions_with_chords() {
+        let mut cfg = superzej_core::config::Config::default();
+        cfg.actions.push(superzej_core::config::CustomAction {
+            name: "run-tests".into(),
+            key: "Ctrl Alt r".into(),
+            run: "just test".into(),
+            menu: true,
+            hint: Some("tests".into()),
+            floating: true,
+            close_on_exit: true,
+        });
+        let items = build_command_palette_items(&cfg);
+        let custom = items
+            .iter()
+            .find(|i| i.key == "run-tests")
+            .expect("custom menu action");
+        assert!(
+            custom.label.contains("Ctrl-Alt-r"),
+            "label was {}",
+            custom.label
+        );
     }
 
     #[test]

@@ -94,6 +94,361 @@ pub enum Action {
     Custom(u16),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActionSpec {
+    /// Stable action id; matches [`Action::key`] and command-palette dispatch.
+    pub id: &'static str,
+    /// Human label shown in the command palette and help surfaces.
+    pub label: &'static str,
+    /// Short label for compact bottom-bar hints.
+    pub hint: &'static str,
+    /// Built-in normal-mode/default chords. Config layers may override these.
+    pub default_chords: &'static [&'static str],
+    /// Whether this action should be surfaced in the command palette.
+    pub palette: bool,
+}
+
+/// Native-host action registry: one table drives palette rows, compact hints,
+/// and tests that every real host action is discoverable. Keep ids aligned with
+/// [`Action::key`] / [`Action::from_key`]; legacy aliases stay in `from_key`.
+pub const ACTION_SPECS: &[ActionSpec] = &[
+    ActionSpec {
+        id: "new-worktree",
+        label: "New worktree",
+        hint: "worktree",
+        default_chords: &["Alt w"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "new-workspace",
+        label: "New workspace",
+        hint: "workspace",
+        default_chords: &["Alt W"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "new-tab",
+        label: "New tab — same worktree",
+        hint: "tab",
+        default_chords: &["Alt t"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "new-pane",
+        label: "New pane — smart split",
+        hint: "smart split",
+        default_chords: &["Alt p"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "split-down",
+        label: "Split pane down",
+        hint: "split↓",
+        default_chords: &["Alt n"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "split-right",
+        label: "Split pane right",
+        hint: "split→",
+        default_chords: &["Alt N"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "zoom",
+        label: "Toggle zoom",
+        hint: "zoom",
+        default_chords: &["Ctrl Alt z"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "cycle-theme",
+        label: "Cycle theme",
+        hint: "theme",
+        default_chords: &["Ctrl Alt t"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "close-tab",
+        label: "Close tab",
+        hint: "close tab",
+        default_chords: &["Alt X"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "close-worktree",
+        label: "Close worktree",
+        hint: "close worktree",
+        default_chords: &["Alt x"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "switch-workspace",
+        label: "Switch workspace",
+        hint: "switch",
+        default_chords: &["Alt o"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "dashboard",
+        label: "Dashboard",
+        hint: "dashboard",
+        default_chords: &["Alt d"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "prev-tab",
+        label: "Previous tab",
+        hint: "prev tab",
+        default_chords: &["Alt Left"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "next-tab",
+        label: "Next tab",
+        hint: "next tab",
+        default_chords: &["Alt Right"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "prev-worktree",
+        label: "Previous worktree",
+        hint: "prev worktree",
+        default_chords: &["Alt Up"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "next-worktree",
+        label: "Next worktree",
+        hint: "next worktree",
+        default_chords: &["Alt Down"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "focus-left",
+        label: "Focus left",
+        hint: "focus←",
+        default_chords: &["Ctrl Left", "Ctrl h"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "focus-right",
+        label: "Focus right",
+        hint: "focus→",
+        default_chords: &["Ctrl Right", "Ctrl l"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "focus-up",
+        label: "Focus up",
+        hint: "focus↑",
+        default_chords: &["Ctrl Up", "Ctrl k"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "focus-down",
+        label: "Focus down",
+        hint: "focus↓",
+        default_chords: &["Ctrl Down", "Ctrl j"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "toggle-sidebar",
+        label: "Toggle sidebar",
+        hint: "sidebar",
+        default_chords: &["Ctrl Alt s"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "toggle-panel",
+        label: "Toggle diff / PR panel",
+        hint: "panel",
+        default_chords: &["Ctrl Alt p"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "files-drawer",
+        label: "Toggle files drawer",
+        hint: "drawer",
+        default_chords: &["Ctrl Alt f"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "focus-sidebar",
+        label: "Focus workspace sidebar",
+        hint: "sidebar",
+        default_chords: &["Alt s"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "focus-panel",
+        label: "Focus diff / PR panel",
+        hint: "panel",
+        default_chords: &["Alt ."],
+        palette: true,
+    },
+    ActionSpec {
+        id: "palette",
+        label: "Command palette",
+        hint: "menu",
+        default_chords: &["Ctrl Space"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "lazygit",
+        label: "Open lazygit",
+        hint: "lazygit",
+        default_chords: &["Alt g"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "yazi",
+        label: "Open yazi drawer",
+        hint: "yazi",
+        default_chords: &["Alt y"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "editor",
+        label: "Open editor",
+        hint: "editor",
+        default_chords: &["Alt e"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "show-diff",
+        label: "Open git diff",
+        hint: "diff",
+        default_chords: &["Alt /"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "scroll-up",
+        label: "Scroll pane up",
+        hint: "scroll↑",
+        default_chords: &["Shift PageUp"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "scroll-down",
+        label: "Scroll pane down",
+        hint: "scroll↓",
+        default_chords: &["Shift PageDown"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "copy-pane",
+        label: "Copy pane contents",
+        hint: "copy",
+        default_chords: &["Ctrl Alt c"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "cheatsheet",
+        label: "Show keybinding cheatsheet",
+        hint: "keys",
+        default_chords: &["Alt ?"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "toggle-key-lock",
+        label: "Lock/unlock keybinds (pass through)",
+        hint: "lock",
+        default_chords: &["Ctrl g"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "mode-normal",
+        label: "Switch to Normal mode",
+        hint: "normal",
+        default_chords: &["Ctrl Alt n"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "mode-vim-normal",
+        label: "Switch to Vim-normal mode",
+        hint: "vim",
+        default_chords: &["Ctrl Alt v"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "mode-vim-insert",
+        label: "Switch to Vim-insert mode",
+        hint: "insert",
+        default_chords: &[],
+        palette: true,
+    },
+    ActionSpec {
+        id: "mode-emacs",
+        label: "Switch to Emacs mode",
+        hint: "emacs",
+        default_chords: &["Ctrl Alt e"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "toggle-strip",
+        label: "Toggle pin strip",
+        hint: "pins",
+        default_chords: &["Ctrl Alt b"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "grow-strip",
+        label: "Grow pin strip",
+        hint: "pins+",
+        default_chords: &["Ctrl Alt ]"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "shrink-strip",
+        label: "Shrink pin strip",
+        hint: "pins-",
+        default_chords: &["Ctrl Alt ["],
+        palette: true,
+    },
+    ActionSpec {
+        id: "promote-pin",
+        label: "Promote pane to pin strip",
+        hint: "pin pane",
+        default_chords: &["Ctrl Alt P"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "unpin",
+        label: "Unpin focused/first pin",
+        hint: "unpin",
+        default_chords: &["Ctrl Alt U"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "quit",
+        label: "Quit superzej",
+        hint: "quit",
+        default_chords: &["Ctrl q"],
+        palette: true,
+    },
+];
+
+pub fn action_specs() -> &'static [ActionSpec] {
+    ACTION_SPECS
+}
+
+pub fn action_spec(id: &str) -> Option<&'static ActionSpec> {
+    ACTION_SPECS.iter().find(|s| s.id == id)
+}
+
+pub fn chord_hint_for(cfg: &superzej_core::config::Config, id: &str) -> Option<String> {
+    let mut chord = action_spec(id)
+        .and_then(|s| s.default_chords.first().copied())
+        .map(str::to_string);
+    for layer in cfg.effective_keybinds(None, None) {
+        if let Some(override_chord) = layer.normal.get(id) {
+            chord = Some(override_chord.clone());
+        }
+    }
+    chord.map(|c| c.replace(' ', "-"))
+}
+
 impl Action {
     /// Stable key (matches the palette item keys, so a palette selection and a
     /// keybinding resolve to the same dispatch). Exercised by tests; the unified
@@ -460,7 +815,7 @@ pub fn default_keymap() -> KeyMap {
         map.insert_all(&format!("Alt {n}"), Action::SummonPin(n))
             .unwrap();
     }
-    map.insert_all("Ctrl Alt t", Action::ToggleStrip).unwrap();
+    map.insert_all("Ctrl Alt b", Action::ToggleStrip).unwrap();
     map.insert_all("Ctrl Alt ]", Action::GrowStrip).unwrap();
     map.insert_all("Ctrl Alt [", Action::ShrinkStrip).unwrap();
     map.insert_all("Ctrl Alt P", Action::PromotePin).unwrap();
@@ -813,6 +1168,32 @@ mod tests {
         assert_eq!(Action::NewWorktree.key(), "new-worktree");
         assert_eq!(Action::Quit.key(), "quit");
         assert_eq!(Action::ToggleDrawer.key(), "files-drawer");
+    }
+
+    #[test]
+    fn action_registry_default_chords_are_unique() {
+        let mut seen = std::collections::BTreeMap::<&str, &str>::new();
+        for spec in action_specs() {
+            for chord in spec.default_chords {
+                if let Some(prev) = seen.insert(chord, spec.id) {
+                    panic!(
+                        "default chord {chord} is registered to both {prev} and {}",
+                        spec.id
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn action_registry_ids_resolve_to_actions() {
+        for spec in action_specs() {
+            assert!(
+                Action::from_key(spec.id).is_some(),
+                "registered palette action {} must dispatch",
+                spec.id
+            );
+        }
     }
 
     #[test]
