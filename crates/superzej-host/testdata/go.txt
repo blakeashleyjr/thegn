@@ -1,0 +1,8 @@
+=== RUN   TestAdds
+--- PASS: TestAdds (0.00s)
+=== RUN   TestBreaks
+    add_test.go:4: want 5
+--- FAIL: TestBreaks (0.00s)
+FAIL
+FAIL	szfix	0.003s
+FAIL

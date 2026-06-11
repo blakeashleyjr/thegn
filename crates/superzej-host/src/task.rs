@@ -403,6 +403,14 @@ fn detect_fallback(worktree: &Path) -> Option<TestTask> {
     if has("dub.json") || has("dub.sdl") {
         return Some(TestTask::new("dub test", "dub test", "d"));
     }
+    if has("deno.json") || has("deno.jsonc") {
+        // deno writes a JUnit report to stdout (no file), parsed via the Report
+        // path's stdout fallback.
+        return Some(
+            TestTask::new("deno test", "deno test --reporter junit", "junit")
+                .with_ingestion(Ingestion::Report),
+        );
+    }
     if has("package.json") {
         let pkg = std::fs::read_to_string(worktree.join("package.json")).unwrap_or_default();
         if pkg.contains("vitest") {
@@ -619,14 +627,18 @@ pub fn parse_task_outcome(outcome: &TaskOutcome) -> Vec<TestNode> {
         // (e.g. the runner failed before emitting any events).
     }
     if outcome.task.ingestion == Ingestion::Report {
-        if let Some(glob) = &outcome.task.report_glob {
-            let nodes = crate::testkit::report::parse_glob(Path::new(&outcome.worktree), glob);
-            if !nodes.is_empty() {
-                return nodes;
-            }
+        // File-based report (Maven/Gradle/sbt/.NET/PHP) when a glob is set;
+        // otherwise the runner wrote the report to stdout (e.g. deno --reporter
+        // junit), so parse the captured output directly.
+        let nodes = match &outcome.task.report_glob {
+            Some(glob) => crate::testkit::report::parse_glob(Path::new(&outcome.worktree), glob),
+            None => crate::testkit::report::parse_report(&outcome.stdout_stderr),
+        };
+        if !nodes.is_empty() {
+            return nodes;
         }
-        // No report files (build failed before producing them): fall through to
-        // the synthetic node so the user still sees the failure.
+        // No report (build failed before producing one): fall through to the
+        // synthetic node so the user still sees the failure.
     }
     let mut nodes = panel::parse_test_output(&outcome.stdout_stderr);
     if nodes.is_empty() {

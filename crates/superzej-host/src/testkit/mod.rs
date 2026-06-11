@@ -9,3 +9,6 @@
 
 pub mod json;
 pub mod report;
+
+#[cfg(test)]
+mod golden;
