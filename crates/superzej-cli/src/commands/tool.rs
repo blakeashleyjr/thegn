@@ -4,7 +4,7 @@
 use crate::config::Config;
 use crate::db::Db;
 use crate::remote::GitLoc;
-use crate::{msg, repo, sandbox, util, zellij};
+use crate::{msg, repo, sandbox, util, yazi, zellij};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
@@ -35,6 +35,10 @@ pub fn run(cfg: &Config, name: &str, worktree: Option<String>, file: Option<Stri
         .unwrap_or_else(|| msg::die(&format!("tool: unknown tool '{name}'")))
         .to_string();
 
+    if name == "yazi" {
+        cmd = yazi_tool_inner(yazi::ensure_config(cfg).as_deref(), &worktree, &cmd);
+    }
+
     // 'diff' uses delta as pager when available for nicer output.
     if name == "diff" && util::have("delta") {
         cmd = "git -c core.pager=delta diff".to_string();
@@ -62,7 +66,11 @@ pub fn run(cfg: &Config, name: &str, worktree: Option<String>, file: Option<Stri
             }
             _ => {
                 let sh = util::shell();
-                let inner = mem_contain(cfg, &cmd);
+                let inner = if name == "yazi" {
+                    mem_contain_yazi(cfg, &cmd)
+                } else {
+                    mem_contain(cfg, &cmd)
+                };
                 zellij::new_float(&worktree, name, &[&sh, "-lc", &inner]);
             }
         }
@@ -125,10 +133,25 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+fn yazi_tool_inner(cfg_home: Option<&std::path::Path>, worktree: &Path, cmd: &str) -> String {
+    let mut inner = String::new();
+    if let Some(home) = cfg_home {
+        inner.push_str(&format!(
+            "export YAZI_CONFIG_HOME={}; ",
+            sh_quote(&home.to_string_lossy())
+        ));
+    }
+    inner.push_str(&format!(
+        "export SUPERZEJ_WORKTREE={}; ",
+        sh_quote(&worktree.to_string_lossy())
+    ));
+    inner.push_str(&format!("exec {cmd}"));
+    inner
+}
+
 /// Wrap a host tool command in a memory-capped transient systemd scope so a
-/// runaway child (notably yazi's `ueberzugpp` image previewer, which can leak to
-/// tens of GB and trigger a global OOM that kills the terminal) is OOM-killed
-/// inside its own cgroup instead. Scope teardown on exit also reaps orphans.
+/// runaway child is OOM-killed inside its own cgroup instead of triggering a
+/// global OOM that kills the terminal. Scope teardown on exit also reaps orphans.
 /// Falls back to the bare command when containment is disabled (empty
 /// `tool_mem_max`) or `systemd-run` is unavailable (non-systemd hosts).
 fn mem_contain(cfg: &Config, cmd: &str) -> String {
@@ -141,4 +164,78 @@ fn mem_contain(cfg: &Config, cmd: &str) -> String {
          -p MemoryMax={} -p MemorySwapMax={} -- {cmd}",
         lim.tool_mem_max, lim.tool_mem_swap_max
     )
+}
+
+/// Use drawer-specific safety limits for `superzej tool yazi`, because it has the
+/// same image-preview helper risk as the files drawer.
+fn mem_contain_yazi(cfg: &Config, cmd: &str) -> String {
+    mem_contain_yazi_with(cfg, cmd, util::have("systemd-run"))
+}
+
+fn mem_contain_yazi_with(cfg: &Config, cmd: &str, systemd_available: bool) -> String {
+    if !cfg.drawer.contain || !systemd_available {
+        return cmd.to_string();
+    }
+    let mut parts = vec!["systemd-run --user --scope --quiet --collect".to_string()];
+    for (key, value) in [
+        ("MemoryMax", cfg.drawer.memory_max.trim()),
+        ("MemorySwapMax", cfg.drawer.memory_swap_max.trim()),
+        ("CPUQuota", cfg.drawer.cpu_quota.trim()),
+    ] {
+        if !value.is_empty() {
+            parts.push(format!("-p {key}={value}"));
+        }
+    }
+    parts.push(format!("-- {} -lc {}", util::shell(), sh_quote(cmd)));
+    parts.join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn yazi_tool_inner_exports_private_config_and_worktree() {
+        let inner = yazi_tool_inner(Some(Path::new("/cfg/yazi")), Path::new("/wt"), "yazi");
+
+        assert!(inner.contains("export YAZI_CONFIG_HOME='/cfg/yazi';"));
+        assert!(inner.contains("export SUPERZEJ_WORKTREE='/wt';"));
+        assert!(inner.ends_with("exec yazi"));
+    }
+
+    #[test]
+    fn yazi_tool_containment_uses_drawer_limits_and_child_shell() {
+        let cfg = Config::default();
+        let wrapped = mem_contain_yazi_with(&cfg, "export X=1; exec yazi", true);
+
+        assert!(wrapped.starts_with("systemd-run --user --scope --quiet --collect"));
+        assert!(wrapped.contains("-p MemoryMax=2G"));
+        assert!(wrapped.contains("-p MemorySwapMax=512M"));
+        assert!(wrapped.contains("-p CPUQuota=200%"));
+        assert!(wrapped.contains(" -lc 'export X=1; exec yazi'"));
+    }
+
+    #[test]
+    fn yazi_tool_containment_omits_empty_properties() {
+        let mut cfg = Config::default();
+        cfg.drawer.memory_swap_max.clear();
+        cfg.drawer.cpu_quota.clear();
+        let wrapped = mem_contain_yazi_with(&cfg, "exec yazi", true);
+
+        assert!(wrapped.contains("-p MemoryMax=2G"));
+        assert!(!wrapped.contains("MemorySwapMax="));
+        assert!(!wrapped.contains("CPUQuota="));
+    }
+
+    #[test]
+    fn yazi_tool_containment_can_be_disabled() {
+        let mut cfg = Config::default();
+        cfg.drawer.contain = false;
+
+        assert_eq!(mem_contain_yazi_with(&cfg, "exec yazi", true), "exec yazi");
+        assert_eq!(
+            mem_contain_yazi_with(&Config::default(), "exec yazi", false),
+            "exec yazi"
+        );
+    }
 }

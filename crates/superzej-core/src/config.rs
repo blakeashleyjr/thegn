@@ -768,6 +768,20 @@ pub struct DrawerConfig {
     pub height: String,
     /// Drawer width: "full" (span the terminal) or "center" (narrower, centered).
     pub width: String,
+    /// Whether the bundled/private yazi config allows image preview backends.
+    pub image_previews: bool,
+    /// Whether drawer yazi launches should be wrapped in a user systemd scope.
+    pub contain: bool,
+    /// `MemoryMax` for the drawer scope. Empty = omit this property.
+    pub memory_max: String,
+    /// `MemorySwapMax` for the drawer scope. Empty = omit this property.
+    pub memory_swap_max: String,
+    /// `CPUQuota` for the drawer scope. Empty = omit this property.
+    pub cpu_quota: String,
+    /// Maximum hidden drawers to keep alive in native hosts. Zero disables pooling.
+    pub pool_limit: usize,
+    /// Whether yazi drawers may be prewarmed before the user opens them.
+    pub prewarm: bool,
 }
 
 impl Default for DrawerConfig {
@@ -777,6 +791,13 @@ impl Default for DrawerConfig {
             config_home: String::new(),
             height: "35%".into(),
             width: "full".into(),
+            image_previews: false,
+            contain: true,
+            memory_max: "2G".into(),
+            memory_swap_max: "512M".into(),
+            cpu_quota: "200%".into(),
+            pool_limit: 1,
+            prewarm: false,
         }
     }
 }
@@ -1685,6 +1706,13 @@ surface = "todoist.status"
         assert_eq!(d.config_home, ""); // empty = private default
         assert_eq!(d.height, "35%");
         assert_eq!(d.width, "full");
+        assert!(!d.image_previews);
+        assert!(d.contain);
+        assert_eq!(d.memory_max, "2G");
+        assert_eq!(d.memory_swap_max, "512M");
+        assert_eq!(d.cpu_quota, "200%");
+        assert_eq!(d.pool_limit, 1);
+        assert!(!d.prewarm);
     }
 
     #[test]
@@ -1693,18 +1721,32 @@ surface = "todoist.status"
         assert_eq!(cfg.drawer.height, "35%");
         assert_eq!(cfg.drawer.width, "full");
         assert_eq!(cfg.drawer.command, "");
+        assert!(!cfg.drawer.image_previews);
+        assert!(cfg.drawer.contain);
+        assert_eq!(cfg.drawer.memory_max, "2G");
+        assert_eq!(cfg.drawer.memory_swap_max, "512M");
+        assert_eq!(cfg.drawer.cpu_quota, "200%");
+        assert_eq!(cfg.drawer.pool_limit, 1);
+        assert!(!cfg.drawer.prewarm);
     }
 
     #[test]
     fn drawer_section_overrides_parse() {
         let cfg: Config = toml::from_str(
-            "[drawer]\ncommand = \"ranger\"\nconfig_home = \"system\"\nheight = \"50%\"\nwidth = \"center\"\n",
+            "[drawer]\ncommand = \"ranger\"\nconfig_home = \"system\"\nheight = \"50%\"\nwidth = \"center\"\nimage_previews = true\ncontain = false\nmemory_max = \"4G\"\nmemory_swap_max = \"0\"\ncpu_quota = \"50%\"\npool_limit = 0\nprewarm = true\n",
         )
         .unwrap();
         assert_eq!(cfg.drawer.command, "ranger");
         assert_eq!(cfg.drawer.config_home, "system");
         assert_eq!(cfg.drawer.height, "50%");
         assert_eq!(cfg.drawer.width, "center");
+        assert!(cfg.drawer.image_previews);
+        assert!(!cfg.drawer.contain);
+        assert_eq!(cfg.drawer.memory_max, "4G");
+        assert_eq!(cfg.drawer.memory_swap_max, "0");
+        assert_eq!(cfg.drawer.cpu_quota, "50%");
+        assert_eq!(cfg.drawer.pool_limit, 0);
+        assert!(cfg.drawer.prewarm);
     }
 
     #[test]
@@ -1714,6 +1756,10 @@ surface = "todoist.status"
         assert_eq!(cfg.drawer.height, "20%");
         assert_eq!(cfg.drawer.width, "full");
         assert_eq!(cfg.drawer.command, "");
+        assert!(!cfg.drawer.image_previews);
+        assert!(cfg.drawer.contain);
+        assert_eq!(cfg.drawer.pool_limit, 1);
+        assert!(!cfg.drawer.prewarm);
     }
 
     #[test]

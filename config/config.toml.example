@@ -69,6 +69,20 @@ config_home = ""
 # Drawer geometry. height: "35%" or a row count. width: "full" | "center".
 height = "35%"
 width = "full"
+# Image previews are off by default in the bundled/private yazi config. Text/code
+# previews remain on. With config_home = "system", superzej does not rewrite your
+# yazi config, so containment below is still the safety net.
+image_previews = false
+# Run yazi and preview helper children in a bounded user systemd scope when
+# systemd-run is available. Empty limit strings omit that property.
+contain = true
+memory_max = "2G"
+memory_swap_max = "512M"
+cpu_quota = "200%"
+# Native-host keepalive controls; current zellij drawer is spawn-on-open/close-on-
+# dismiss, so these are forward-compatible with the native pooled drawer.
+pool_limit = 1
+prewarm = false
 
 # GitHub PR data feeding the right panel.
 [pr]
