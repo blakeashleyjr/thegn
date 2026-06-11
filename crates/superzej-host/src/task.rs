@@ -343,6 +343,40 @@ fn detect_fallback(worktree: &Path) -> Option<TestTask> {
         // CTest runs the suite; ctest's stdout is a stable per-test text format.
         return Some(TestTask::new("ctest", "ctest --output-on-failure", "ctest"));
     }
+    // JVM / .NET: stdout is unusable, but each writes machine report files we
+    // parse after the run (JUnit XML / TRX).
+    if has("pom.xml") {
+        return Some(
+            TestTask::new("maven", "mvn -q test", "junit")
+                .with_ingestion(Ingestion::Report)
+                .with_report_glob("target/surefire-reports/*.xml"),
+        );
+    }
+    if has("build.gradle") || has("build.gradle.kts") {
+        return Some(
+            TestTask::new("gradle", "gradle test", "junit")
+                .with_ingestion(Ingestion::Report)
+                .with_report_glob("build/test-results/**/*.xml"),
+        );
+    }
+    if has("build.sbt") {
+        return Some(
+            TestTask::new("sbt", "sbt test", "junit")
+                .with_ingestion(Ingestion::Report)
+                .with_report_glob("target/test-reports/*.xml"),
+        );
+    }
+    if has_dotnet_project(worktree) {
+        return Some(
+            TestTask::new(
+                "dotnet test",
+                "dotnet test --logger \"trx;LogFileName=sz.trx\"",
+                "trx",
+            )
+            .with_ingestion(Ingestion::Report)
+            .with_report_glob("TestResults/*.trx"),
+        );
+    }
     if has("package.json") {
         let pkg = std::fs::read_to_string(worktree.join("package.json")).unwrap_or_default();
         if pkg.contains("vitest") {
@@ -354,6 +388,20 @@ fn detect_fallback(worktree: &Path) -> Option<TestTask> {
         return Some(TestTask::new("npm test", "npm test", "javascript"));
     }
     None
+}
+
+fn has_dotnet_project(worktree: &Path) -> bool {
+    std::fs::read_dir(worktree)
+        .map(|entries| {
+            entries.flatten().any(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|ext| ext == "sln" || ext == "csproj")
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn has_just_test(worktree: &Path) -> bool {
@@ -529,6 +577,16 @@ pub fn parse_task_outcome(outcome: &TaskOutcome) -> Vec<TestNode> {
         // Fall through to the synthetic single-node result below on empty JSON
         // (e.g. the runner failed before emitting any events).
     }
+    if outcome.task.ingestion == Ingestion::Report {
+        if let Some(glob) = &outcome.task.report_glob {
+            let nodes = crate::testkit::report::parse_glob(Path::new(&outcome.worktree), glob);
+            if !nodes.is_empty() {
+                return nodes;
+            }
+        }
+        // No report files (build failed before producing them): fall through to
+        // the synthetic node so the user still sees the failure.
+    }
     let mut nodes = panel::parse_test_output(&outcome.stdout_stderr);
     if nodes.is_empty() {
         let state = if outcome.exit_code == Some(0) {
@@ -625,9 +683,17 @@ mod tests {
                 Ingestion::Text,
             ),
             ("CMakeLists.txt", "project(x)\n", "ctest", Ingestion::Text),
+            ("pom.xml", "<project/>\n", "junit", Ingestion::Report),
+            (
+                "build.gradle.kts",
+                "plugins {}\n",
+                "junit",
+                Ingestion::Report,
+            ),
+            ("build.sbt", "name := \"x\"\n", "junit", Ingestion::Report),
         ];
         for (file, body, matcher, ingestion) in cases {
-            let wt = temp_dir(&format!("detect-{matcher}"));
+            let wt = temp_dir(&format!("detect-{}-{}", matcher, file.replace('.', "_")));
             std::fs::write(wt.join(file), body).unwrap();
             let task = detect_test_task(&wt, &Config::default()).unwrap();
             assert_eq!(&task.matcher, matcher, "matcher for {file}");
@@ -815,6 +881,44 @@ mod tests {
                 "nextest json should yield a fail node: {nodes:?}"
             );
         }
+        let _ = std::fs::remove_dir_all(wt);
+    }
+
+    /// Report-file ingestion through the real dispatcher: a JUnit file on disk
+    /// (as Maven/Gradle would write) is parsed when the task's ingestion=Report.
+    #[test]
+    fn report_ingestion_reads_junit_from_disk() {
+        let wt = temp_dir("report");
+        let reports = wt.join("target/surefire-reports");
+        std::fs::create_dir_all(&reports).unwrap();
+        std::fs::write(
+            reports.join("TEST-MathTests.xml"),
+            r#"<testsuite><testcase name="adds" classname="com.x.M"/>
+               <testcase name="broken" classname="com.x.M"><failure>at com.x.M.broken(M.java:9)</failure></testcase>
+               </testsuite>"#,
+        )
+        .unwrap();
+        let task = TestTask::new("maven", "mvn -q test", "junit")
+            .with_ingestion(crate::panel::Ingestion::Report)
+            .with_report_glob("target/surefire-reports/*.xml");
+        let outcome = TaskOutcome {
+            worktree: wt.to_string_lossy().into_owned(),
+            generation: 1,
+            task,
+            exit_code: Some(1),
+            duration_ms: 1,
+            truncated: false,
+            stdout_stderr: String::new(),
+        };
+        let nodes = parse_task_outcome(&outcome);
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n.id == "com.x.M::adds" && n.state == TestState::Pass)
+        );
+        let f = nodes.iter().find(|n| n.id == "com.x.M::broken").unwrap();
+        assert_eq!(f.state, TestState::Fail);
+        assert_eq!(f.location.as_ref().unwrap().line, 9);
         let _ = std::fs::remove_dir_all(wt);
     }
 

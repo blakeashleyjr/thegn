@@ -570,14 +570,18 @@ fn extract_location(line: &str) -> Option<TestLocation> {
         let Some((path, rest)) = token.rsplit_once(':') else {
             continue;
         };
-        let (path, line_part, column) = if let Some((path, line_part)) = path.rsplit_once(':') {
-            (path, line_part, rest.parse::<usize>().ok())
+        let (path, line_part, col_part) = if let Some((path, line_part)) = path.rsplit_once(':') {
+            (path, line_part, Some(rest))
         } else {
             (path, rest, None)
         };
-        let Ok(line_no) = line_part.parse::<usize>() else {
-            continue;
+        // The numeric segments may carry trailing junk in XML/stack traces
+        // (e.g. `MathTests.java:14)</failure>`); take the leading digit run.
+        let line_no = match leading_usize(line_part) {
+            Some(n) => n,
+            None => continue,
         };
+        let column = col_part.and_then(leading_usize);
         if path.is_empty() || (!path.contains('.') && !path.contains('/')) {
             continue;
         }
@@ -588,6 +592,12 @@ fn extract_location(line: &str) -> Option<TestLocation> {
         });
     }
     None
+}
+
+/// Parse the leading run of ASCII digits (e.g. `"14)</failure>"` → `14`).
+fn leading_usize(s: &str) -> Option<usize> {
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
 }
 
 pub fn first_failure_message(output: &str) -> Option<String> {
