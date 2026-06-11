@@ -10,8 +10,9 @@ use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use superzej_core::config::{Config, LimitsConfig, Task, TaskKind};
 
@@ -133,19 +134,42 @@ pub fn cancel_slot(slot: &str) {
     }
 }
 
+/// Outcome of one capped child run.
+struct CapOutput {
+    exit_code: Option<i32>,
+    truncated: bool,
+    /// True iff the watchdog killed the process group at the deadline.
+    timed_out: bool,
+    text: String,
+}
+
+/// Private `CARGO_TARGET_DIR` for superzej-spawned cargo, so discovery/tests
+/// never block on the build-directory lock held by the user's own
+/// `cargo`/rust-analyzer. `None` when isolation is disabled.
+fn isolated_cargo_target(worktree: &Path, limits: &LimitsConfig) -> Option<PathBuf> {
+    limits
+        .isolated_target_dir
+        .then(|| worktree.join("target").join("superzej"))
+}
+
 /// Run `command` in `worktree` under a CPU/mem cap and a single-flight `slot`,
 /// capturing bounded combined stdout+stderr. Kills any older job in the slot
-/// first. Returns `(exit_code, truncated, captured)`.
+/// first. A non-zero `timeout` arms a watchdog that kills the process group at
+/// the deadline (so a run wedged on a build lock can't hang the panel forever).
 fn run_capped(
     command: &str,
     worktree: &Path,
     limits: &LimitsConfig,
     slot: &str,
     generation: u64,
-) -> (Option<i32>, bool, String) {
+    timeout: Option<Duration>,
+) -> CapOutput {
+    // `-c`, NOT `-lc`: a login shell re-sources the user's profile on every
+    // spawn — pure overhead on a path meant to be cheap, with surprising
+    // side effects. Run the command in a plain non-interactive shell.
     let inner = vec![
         superzej_core::util::shell(),
-        "-lc".to_string(),
+        "-c".to_string(),
         command.to_string(),
     ];
     let argv = wrap_capped(&inner, limits, detect_cap_backend());
@@ -159,6 +183,9 @@ fn run_capped(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(target) = isolated_cargo_target(worktree, limits) {
+        cmd.env("CARGO_TARGET_DIR", target);
+    }
     #[cfg(unix)]
     {
         cmd.process_group(0);
@@ -166,12 +193,41 @@ fn run_capped(
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return (None, false, format!("failed to spawn task: {e}")),
+        Err(e) => {
+            return CapOutput {
+                exit_code: None,
+                truncated: false,
+                timed_out: false,
+                text: format!("failed to spawn task: {e}"),
+            };
+        }
     };
     let pgid = child.id() as i32;
     if let Ok(mut map) = registry().lock() {
         map.insert(slot.to_string(), (generation, pgid));
     }
+
+    // Watchdog: kill the whole process group if the deadline passes before the
+    // child exits. `done` lets the main thread retire the watchdog promptly.
+    let done = Arc::new(AtomicBool::new(false));
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let watchdog = timeout.filter(|d| !d.is_zero()).map(|deadline| {
+        let done = done.clone();
+        let timed_out = timed_out.clone();
+        std::thread::spawn(move || {
+            let end = Instant::now() + deadline;
+            while Instant::now() < end {
+                if done.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if !done.load(Ordering::Relaxed) {
+                timed_out.store(true, Ordering::Relaxed);
+                kill_group(pgid);
+            }
+        })
+    });
 
     // Read stdout and stderr concurrently on threads: reading one to EOF while
     // the child fills the other pipe's buffer would deadlock. Each stream is
@@ -193,6 +249,10 @@ fn run_capped(
         b
     });
     let status = child.wait();
+    done.store(true, Ordering::Relaxed);
+    if let Some(w) = watchdog {
+        let _ = w.join();
+    }
     let mut buf = out_h.join().unwrap_or_default();
     let errbuf = err_h.join().unwrap_or_default();
     let truncated = buf.len() >= MAX_CAPTURE_BYTES || errbuf.len() >= MAX_CAPTURE_BYTES;
@@ -211,12 +271,18 @@ fn run_capped(
         map.remove(slot);
     }
 
-    let exit_code = status.ok().and_then(|s| s.code());
-    (
-        exit_code,
+    CapOutput {
+        exit_code: status.ok().and_then(|s| s.code()),
         truncated,
-        String::from_utf8_lossy(&buf).into_owned(),
-    )
+        timed_out: timed_out.load(Ordering::Relaxed),
+        text: String::from_utf8_lossy(&buf).into_owned(),
+    }
+}
+
+/// Translate a `LimitsConfig` timeout knob (seconds, 0 = disabled) to a
+/// `Duration` the watchdog understands.
+fn secs_to_timeout(secs: u64) -> Option<Duration> {
+    (secs > 0).then(|| Duration::from_secs(secs))
 }
 
 #[derive(Debug, Clone)]
@@ -279,6 +345,55 @@ fn ingestion_for_matcher(matcher: &str) -> crate::panel::Ingestion {
         "tap" | "bats" | "prove" | "busted" | "pgtap" => Ingestion::Tap,
         _ => Ingestion::Text,
     }
+}
+
+/// Build manifests whose change should invalidate discovery (deps/targets may
+/// have shifted). Source-file edits don't appear here — those mark results
+/// stale via the fs-watch and are picked up by an explicit refresh/run.
+const FINGERPRINT_MANIFESTS: &[&str] = &[
+    "Cargo.toml",
+    "Cargo.lock",
+    "go.mod",
+    "go.sum",
+    "pyproject.toml",
+    "pytest.ini",
+    "tox.ini",
+    "package.json",
+    "pubspec.yaml",
+    "mix.exs",
+    "build.zig",
+    "CMakeLists.txt",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "build.sbt",
+    "deno.json",
+    "deno.jsonc",
+    "rebar.config",
+    "dune-project",
+    "gleam.toml",
+    "flake.nix",
+    "justfile",
+];
+
+/// A cheap, stable fingerprint of the worktree's build manifests (name + size +
+/// mtime). Two equal fingerprints mean discovery can be safely reused without
+/// re-spawning any subprocess. Reads metadata only — no file contents.
+pub fn manifest_fingerprint(worktree: &Path) -> String {
+    let mut parts = Vec::new();
+    for name in FINGERPRINT_MANIFESTS {
+        let Ok(meta) = std::fs::metadata(worktree.join(name)) else {
+            continue;
+        };
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        parts.push(format!("{name}:{}:{mtime}", meta.len()));
+    }
+    parts.join("|")
 }
 
 pub fn detect_test_task(worktree: &Path, cfg: &Config) -> Option<TestTask> {
@@ -541,15 +656,34 @@ pub fn run_task(
 ) -> TaskOutcome {
     let started = Instant::now();
     let slot = format!("{}:run", worktree.display());
-    let (exit_code, truncated, stdout_stderr) =
-        run_capped(&task.command, &worktree, limits, &slot, generation);
+    let out = run_capped(
+        &task.command,
+        &worktree,
+        limits,
+        &slot,
+        generation,
+        secs_to_timeout(limits.test_timeout_secs),
+    );
+    let stdout_stderr = if out.timed_out {
+        format!(
+            "test run exceeded {}s and was stopped\n{}",
+            limits.test_timeout_secs, out.text
+        )
+    } else {
+        out.text
+    };
     TaskOutcome {
         worktree: worktree.to_string_lossy().into_owned(),
         generation,
         task,
-        exit_code,
+        // A timeout kill is a failure, not a clean exit.
+        exit_code: if out.timed_out {
+            Some(124)
+        } else {
+            out.exit_code
+        },
         duration_ms: started.elapsed().as_millis(),
-        truncated,
+        truncated: out.truncated,
         stdout_stderr,
     }
 }
@@ -561,7 +695,17 @@ pub fn discover_tests(
     limits: &LimitsConfig,
 ) -> DiscoveryOutcome {
     let wt = worktree.to_string_lossy().into_owned();
-    let Some(command) = discovery_command(&task) else {
+    let slot = format!("{}:disc", worktree.display());
+    let timeout = secs_to_timeout(limits.discover_timeout_secs);
+
+    // Cargo: enumerate test *targets* from `cargo metadata`. This reads only the
+    // manifests — no compile, no build-directory lock — so discovery is instant
+    // regardless of build state. Per-test results fill in on the first run.
+    let command = if matches!(task.matcher.as_str(), "cargo-test" | "nextest") {
+        "cargo metadata --no-deps --format-version 1"
+    } else if let Some(c) = discovery_command(&task) {
+        c
+    } else {
         return DiscoveryOutcome {
             worktree: wt,
             generation,
@@ -570,13 +714,25 @@ pub fn discover_tests(
             error: Some("target discovery is not available for this test command".into()),
         };
     };
-    let slot = format!("{}:disc", worktree.display());
-    let (exit_code, _truncated, text) = run_capped(command, &worktree, limits, &slot, generation);
-    if exit_code == Some(0) {
-        let nodes = if task.matcher == "nix-flake" {
-            crate::testkit::json::parse_nix_flake_show(&text)
-        } else {
-            discovery_output_to_nodes(&task.matcher, &text)
+
+    let out = run_capped(command, &worktree, limits, &slot, generation, timeout);
+    if out.timed_out {
+        return DiscoveryOutcome {
+            worktree: wt,
+            generation,
+            task,
+            nodes: Vec::new(),
+            error: Some(format!(
+                "test discovery timed out after {}s — another build may be holding the cargo lock",
+                limits.discover_timeout_secs
+            )),
+        };
+    }
+    if out.exit_code == Some(0) {
+        let nodes = match task.matcher.as_str() {
+            "cargo-test" | "nextest" => parse_cargo_metadata_targets(&out.text),
+            "nix-flake" => crate::testkit::json::parse_nix_flake_show(&out.text),
+            _ => discovery_output_to_nodes(&task.matcher, &out.text),
         };
         DiscoveryOutcome {
             worktree: wt,
@@ -591,15 +747,83 @@ pub fn discover_tests(
             generation,
             task,
             nodes: Vec::new(),
-            error: Some(text.trim().chars().take(200).collect()),
+            error: Some(out.text.trim().chars().take(200).collect()),
         }
     }
 }
 
+/// Parse `cargo metadata --no-deps` JSON into one placeholder node per testable
+/// target (libs, bins, and integration tests). Granularity is target-level: the
+/// individual `#[test]` functions are populated by an actual run. Nodes are
+/// grouped by package and carry the target's source file so "open" jumps there.
+fn parse_cargo_metadata_targets(json: &str) -> Vec<TestNode> {
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(packages) = root.get("packages").and_then(|p| p.as_array()) else {
+        return Vec::new();
+    };
+    let mut nodes = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for pkg in packages {
+        let pkg_name = pkg.get("name").and_then(|n| n.as_str()).unwrap_or("crate");
+        let Some(targets) = pkg.get("targets").and_then(|t| t.as_array()) else {
+            continue;
+        };
+        for target in targets {
+            // `test: true` marks targets that produce a test binary (lib, bin,
+            // and `[[test]]` integration targets); examples/benches are false.
+            if !target
+                .get("test")
+                .and_then(|t| t.as_bool())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let tname = target.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            let kind = target
+                .get("kind")
+                .and_then(|k| k.as_array())
+                .and_then(|a| a.first())
+                .and_then(|k| k.as_str())
+                .unwrap_or("test");
+            // Group by package; label distinguishes the target within it.
+            let label = if kind == "lib" || tname == pkg_name {
+                format!("{kind} tests")
+            } else {
+                tname.to_string()
+            };
+            let id = format!("{pkg_name}::{label}");
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let location = target
+                .get("src_path")
+                .and_then(|p| p.as_str())
+                .map(|p| TestLocation {
+                    path: p.to_string(),
+                    line: 1,
+                    column: None,
+                });
+            nodes.push(TestNode {
+                id,
+                label,
+                depth: 0,
+                kind: TestNodeKind::Test,
+                state: TestState::Unknown,
+                location,
+                message: None,
+                placeholder: true,
+            });
+        }
+    }
+    panel::tree_from_flat_tests(nodes)
+}
+
 fn discovery_command(task: &TestTask) -> Option<&'static str> {
     match task.matcher.as_str() {
-        // `cargo test --list` lists tests regardless of nextest.
-        "cargo-test" | "nextest" => Some("cargo test --workspace -- --list"),
+        // NB: cargo (`cargo-test`/`nextest`) is handled in `discover_tests` via
+        // `cargo metadata` (no compile) and never reaches here.
         "go-test" => Some("go test -list . ./..."),
         "pytest" => Some("pytest --collect-only -q"),
         "swift" => Some("swift test --list-tests"),
@@ -629,6 +853,7 @@ fn discovery_output_to_nodes(matcher: &str, text: &str) -> Vec<TestNode> {
             state: TestState::Unknown,
             location: None,
             message: None,
+            placeholder: false,
         });
     }
     panel::tree_from_flat_tests(nodes)
@@ -718,6 +943,7 @@ pub fn parse_task_outcome(outcome: &TaskOutcome) -> Vec<TestNode> {
             state,
             location: first_location(&outcome.stdout_stderr),
             message: panel::first_failure_message(&outcome.stdout_stderr),
+            placeholder: false,
         });
     }
     panel::tree_from_flat_tests(nodes)
@@ -1008,14 +1234,29 @@ mod tests {
         let loc = failed.location.as_ref().expect("failure has a location");
         assert!(loc.path.ends_with("src/lib.rs"), "loc was {loc:?}");
 
-        // Real discovery via `cargo test -- --list` finds both targets.
+        // Discovery is metadata-based (no compile, no build lock): it lists the
+        // crate's testable *targets*, marked as placeholders until a run fills
+        // in the per-test results.
         let disc = discover_tests(wt.clone(), 2, task, &uncapped());
         assert!(disc.error.is_none(), "discovery error: {:?}", disc.error);
-        let labels: Vec<&str> = disc.nodes.iter().map(|n| n.label.as_str()).collect();
+        let target = disc
+            .nodes
+            .iter()
+            .find(|n| n.kind == TestNodeKind::Test)
+            .expect("discovery should list at least one test target");
+        assert!(target.placeholder, "discovered targets are placeholders");
         assert!(
-            labels.iter().any(|l| l.contains("passes"))
-                && labels.iter().any(|l| l.contains("fails")),
-            "discovery should list both tests: {labels:?}"
+            target.id.contains("sze2e"),
+            "target id should name the package: {}",
+            target.id
+        );
+        assert!(
+            target
+                .location
+                .as_ref()
+                .is_some_and(|l| l.path.ends_with("src/lib.rs")),
+            "target should point at its source file: {:?}",
+            target.location
         );
 
         let _ = std::fs::remove_dir_all(wt);
@@ -1195,7 +1436,7 @@ mod tests {
         let slot2 = slot.clone();
         let handle = std::thread::spawn(move || {
             // Sleeps 30s unless its process group is killed.
-            run_capped("sleep 30", &wt, &uncapped(), &slot2, 1)
+            run_capped("sleep 30", &wt, &uncapped(), &slot2, 1, None)
         });
         // Wait for the child to register, then supersede it.
         let mut waited = 0;
@@ -1205,10 +1446,61 @@ mod tests {
         }
         cancel_slot(&slot);
         let start = Instant::now();
-        let (_code, _trunc, _out) = handle.join().unwrap();
+        let out = handle.join().unwrap();
         assert!(
             start.elapsed().as_secs() < 10,
             "cancelled run should return promptly, not after the full sleep"
         );
+        assert!(!out.timed_out, "this run was cancelled, not timed out");
+    }
+
+    /// The watchdog kills a run that overruns its deadline and flags it as a
+    /// timeout — the no-hang-forever guarantee.
+    #[test]
+    fn run_capped_timeout_kills_and_flags() {
+        let wt = temp_dir("timeout");
+        let slot = format!("{}:run", wt.display());
+        let start = Instant::now();
+        let out = run_capped(
+            "sleep 30",
+            &wt,
+            &uncapped(),
+            &slot,
+            1,
+            Some(Duration::from_millis(300)),
+        );
+        assert!(
+            start.elapsed().as_secs() < 10,
+            "timed-out run should return at the deadline, not after the full sleep"
+        );
+        assert!(out.timed_out, "the deadline should mark the run timed out");
+        let _ = std::fs::remove_dir_all(wt);
+    }
+
+    /// Metadata-based cargo discovery parses targets without compiling.
+    #[test]
+    fn cargo_metadata_targets_parse_to_placeholders() {
+        let json = r#"{
+            "packages": [
+                {"name": "demo", "targets": [
+                    {"name": "demo", "kind": ["lib"], "test": true, "src_path": "/r/src/lib.rs"},
+                    {"name": "it", "kind": ["test"], "test": true, "src_path": "/r/tests/it.rs"},
+                    {"name": "ex", "kind": ["example"], "test": false, "src_path": "/r/examples/ex.rs"}
+                ]}
+            ]
+        }"#;
+        let nodes = parse_cargo_metadata_targets(json);
+        let tests: Vec<_> = nodes
+            .iter()
+            .filter(|n| n.kind == TestNodeKind::Test)
+            .collect();
+        assert_eq!(
+            tests.len(),
+            2,
+            "lib + integration, not the example: {tests:?}"
+        );
+        assert!(tests.iter().all(|n| n.placeholder));
+        assert!(tests.iter().any(|n| n.id == "demo::lib tests"));
+        assert!(tests.iter().any(|n| n.id == "demo::it"));
     }
 }

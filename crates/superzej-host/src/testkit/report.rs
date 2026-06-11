@@ -159,6 +159,7 @@ fn node(
         state,
         location: loc,
         message: msg,
+        placeholder: false,
     }
 }
 

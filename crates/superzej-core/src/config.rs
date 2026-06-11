@@ -602,6 +602,21 @@ pub struct LimitsConfig {
     /// Max concurrent test/discovery jobs across all worktrees. 1 keeps an
     /// explicit run from competing with another worktree's run for cores.
     pub test_max_parallel: usize,
+    /// Wall-clock ceiling (seconds) for an explicit test run before its process
+    /// group is killed. Generous, since suites legitimately take a while; the
+    /// point is that a wedged run (e.g. blocked on a build lock) can't hang the
+    /// panel forever. 0 disables the deadline.
+    pub test_timeout_secs: u64,
+    /// Wall-clock ceiling (seconds) for test *discovery*. Discovery should be
+    /// near-instant (we use no-compile listing where possible), so a short cap
+    /// surfaces "another build holds the cargo lock" instead of spinning. 0
+    /// disables the deadline.
+    pub discover_timeout_secs: u64,
+    /// Run superzej-spawned `cargo` (test + discovery) under a private
+    /// `CARGO_TARGET_DIR` (`<worktree>/target/superzej`) so it never blocks on
+    /// the build-directory lock held by the user's own `cargo`/rust-analyzer.
+    /// Costs a separate artifact cache; set false to share the default `target`.
+    pub isolated_target_dir: bool,
 }
 
 impl Default for LimitsConfig {
@@ -613,6 +628,9 @@ impl Default for LimitsConfig {
             test_mem_max: "4G".into(),
             test_nice: 10,
             test_max_parallel: 1,
+            test_timeout_secs: 1800,
+            discover_timeout_secs: 45,
+            isolated_target_dir: true,
         }
     }
 }

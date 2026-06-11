@@ -1710,9 +1710,17 @@ fn maybe_discover_tests(
 ) {
     let wt = active_tab_path(session);
     sync_tests_for_worktree(ui, &wt, cfg);
-    if ui.tests.task.is_some() && !ui.tests.discovered && !ui.tests.discovering {
+    // Skip discovery when a prior run/discovery already covered this manifest
+    // state: a fresh fingerprint match means nothing relevant changed, so reuse
+    // the cache and spawn no subprocess at all.
+    let current_fp = crate::task::manifest_fingerprint(&wt);
+    let fp_changed = ui.tests.fingerprint != current_fp;
+    if ui.tests.task.is_some() && !ui.tests.discovering && (!ui.tests.discovered || fp_changed) {
         *generation += 1;
         ui.tests.discovering = true;
+        // Record the fingerprint up front so we don't re-trigger while the
+        // discovery we just launched is still in flight.
+        ui.tests.fingerprint = current_fp;
         if let Some(task) = ui.tests.task.clone() {
             spawn_test_discovery(tx, waker, wt, *generation, task, cfg.limits.clone(), sem);
         }
@@ -4415,6 +4423,10 @@ async fn event_loop<T: Terminal>(
                                     test_generation += 1;
                                     panel_ui.tests.discovering = true;
                                     panel_ui.tests.summary.error = None;
+                                    // Force re-discovery and record the current
+                                    // fingerprint so the auto-gate stays quiet after.
+                                    panel_ui.tests.fingerprint =
+                                        crate::task::manifest_fingerprint(&wt);
                                     spawn_test_discovery(
                                         test_discovery_tx.clone(),
                                         waker.clone(),
