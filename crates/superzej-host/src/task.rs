@@ -413,6 +413,15 @@ fn detect_fallback(worktree: &Path) -> Option<TestTask> {
         }
         return Some(TestTask::new("npm test", "npm test", "javascript"));
     }
+    // Lowest priority: a pure-Nix repo with no language manifest. A polyglot
+    // repo (e.g. Cargo.toml + flake.nix) still uses its language runner above.
+    if has("flake.nix") {
+        return Some(TestTask::new(
+            "flake checks",
+            "nix flake check -L",
+            "nix-flake",
+        ));
+    }
     None
 }
 
@@ -500,7 +509,11 @@ pub fn discover_tests(
     let slot = format!("{}:disc", worktree.display());
     let (exit_code, _truncated, text) = run_capped(command, &worktree, limits, &slot, generation);
     if exit_code == Some(0) {
-        let nodes = discovery_output_to_nodes(&task.matcher, &text);
+        let nodes = if task.matcher == "nix-flake" {
+            crate::testkit::json::parse_nix_flake_show(&text)
+        } else {
+            discovery_output_to_nodes(&task.matcher, &text)
+        };
         DiscoveryOutcome {
             worktree: wt,
             generation,
@@ -528,6 +541,8 @@ fn discovery_command(task: &TestTask) -> Option<&'static str> {
         "swift" => Some("swift test --list-tests"),
         // `ctest -N` ("show only") prints `Test #N: name` without running.
         "ctest" => Some("ctest -N"),
+        // Enumerate flake checks as targets (JSON, parsed specially).
+        "nix-flake" => Some("nix flake show --json"),
         _ => None,
     }
 }
@@ -746,6 +761,32 @@ mod tests {
             assert_eq!(task.ingestion, *ingestion, "ingestion for {file}");
             let _ = std::fs::remove_dir_all(wt);
         }
+    }
+
+    #[test]
+    fn flake_nix_is_lowest_priority_and_polyglot_prefers_language() {
+        // Pure-nix repo → flake checks.
+        let nixonly = temp_dir("nixonly");
+        std::fs::write(nixonly.join("flake.nix"), "{ outputs = _: {}; }\n").unwrap();
+        assert_eq!(
+            detect_test_task(&nixonly, &Config::default())
+                .unwrap()
+                .matcher,
+            "nix-flake"
+        );
+        let _ = std::fs::remove_dir_all(nixonly);
+
+        // Cargo + flake → the language runner wins (cargo/nextest), not nix.
+        let poly = temp_dir("polyglot");
+        std::fs::write(poly.join("flake.nix"), "{ outputs = _: {}; }\n").unwrap();
+        std::fs::write(
+            poly.join("Cargo.toml"),
+            "[package]\nname='x'\nversion='0.1.0'",
+        )
+        .unwrap();
+        let m = detect_test_task(&poly, &Config::default()).unwrap().matcher;
+        assert!(matches!(m.as_str(), "cargo-test" | "nextest"), "got {m}");
+        let _ = std::fs::remove_dir_all(poly);
     }
 
     #[test]

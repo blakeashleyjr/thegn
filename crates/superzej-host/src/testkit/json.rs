@@ -163,6 +163,37 @@ fn parse_dart(text: &str) -> Vec<TestNode> {
         .collect()
 }
 
+/// `nix flake show --json`: enumerate `checks.<system>.<name>` as discovery
+/// targets. Node id is `<system>::<name>` so the tree groups by system; the
+/// runner reconstructs `.#checks.<system>.<name>` from it.
+pub fn parse_nix_flake_show(text: &str) -> Vec<TestNode> {
+    let Ok(doc) = serde_json::from_str::<Value>(text) else {
+        return Vec::new();
+    };
+    let Some(systems) = doc.get("checks").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (system, checks) in systems {
+        let Some(names) = checks.as_object() else {
+            continue;
+        };
+        for name in names.keys() {
+            let id = format!("{system}::{name}");
+            out.push(TestNode {
+                id: id.clone(),
+                label: name.clone(),
+                depth: 0,
+                kind: TestNodeKind::Test,
+                state: TestState::Unknown,
+                location: None,
+                message: None,
+            });
+        }
+    }
+    panel::tree_from_flat_tests(out)
+}
+
 /// RSpec `--format json`: a single document with an `examples` array, each
 /// `{ description, status, file_path, line_number, exception }`.
 fn parse_rspec(text: &str) -> Vec<TestNode> {
@@ -283,6 +314,25 @@ mod tests {
         let f = by("Calc breaks").unwrap();
         assert_eq!(f.state, TestState::Fail);
         assert_eq!(f.location.unwrap().line, 8);
+    }
+
+    #[test]
+    fn nix_flake_show_enumerates_checks_per_system() {
+        let text = r#"{
+          "checks": {
+            "x86_64-linux": {
+              "build": {"type":"derivation","name":"build"},
+              "lint":  {"type":"derivation","name":"lint"}
+            }
+          },
+          "packages": {"x86_64-linux": {"default": {"type":"derivation"}}}
+        }"#;
+        let nodes = parse_nix_flake_show(text);
+        let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"x86_64-linux::build"));
+        assert!(ids.contains(&"x86_64-linux::lint"));
+        // No packages leak in as checks.
+        assert!(!ids.iter().any(|i| i.contains("default")));
     }
 
     #[test]
