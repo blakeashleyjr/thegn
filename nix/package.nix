@@ -5,7 +5,6 @@
   installShellFiles,
   # runtime tools superzej shells out to
   git,
-  zellij,
   fzf,
   gum,
   lazygit,
@@ -17,7 +16,7 @@
   # PATH so previews work inside the file-manager drawer.
   yaziDeps ? [],
 }: let
-  runtimeDeps = [git zellij fzf gum lazygit yazi delta gh coreutils] ++ yaziDeps;
+  runtimeDeps = [git fzf gum lazygit yazi delta gh coreutils] ++ yaziDeps;
 in
   rustPlatform.buildRustPackage {
     pname = "superzej";
@@ -41,36 +40,31 @@ in
 
     # rusqlite is vendored with the `bundled` feature → no system sqlite needed.
 
+    # The host's PTY/pane tests spawn a real `/bin/sh` on a pseudo-terminal,
+    # which the hermetic Nix sandbox has neither — they pass under `just test`
+    # (and `just ci` gates on test + coverage + smoke before this build). So the
+    # package build itself just compiles + installs.
+    doCheck = false;
+
     postInstall = ''
-      # The native host is the installed user-facing program during the native
-      # rebuild. Keep the transitional zellij-driven CLI available explicitly.
-      mv $out/bin/superzej $out/bin/superzej-cli
+      # The native host (`szhost`) is the user-facing program. Install it as
+      # `superzej`, with `sj`/`szhost` aliases.
       mv $out/bin/szhost $out/bin/superzej
       ln -s superzej $out/bin/sj
       ln -s superzej $out/bin/szhost
 
-      # Expose the pinned zellij under a superzej-private name for the legacy CLI.
-      ln -s ${zellij}/bin/zellij $out/bin/superzej-zellij
-
-      # Same for yazi: expose the pinned build under a private name for the legacy
-      # file drawer path.
+      # Expose the pinned yazi under a superzej-private name for the file drawer.
       ln -s ${yazi}/bin/yazi $out/bin/superzej-yazi
 
-      # The native host itself does not drive zellij/WASM plugins. Wrap the legacy
-      # CLI so old subcommands still get the pinned toolchain when invoked as
-      # `superzej-cli`.
-      wrapProgram $out/bin/superzej-cli \
-        --set SUPERZEJ_ZELLIJ_BIN ${zellij}/bin/zellij \
+      # Wrap the binary so it finds the pinned yazi + the tools it shells out to
+      # (git/lazygit/delta/gh) regardless of the user's PATH.
+      wrapProgram $out/bin/superzej \
         --set SUPERZEJ_YAZI_BIN ${yazi}/bin/yazi \
         --prefix PATH : ${lib.makeBinPath runtimeDeps}
-
-      # Layouts and the zellij config (config/zellij.kdl) are both embedded in the
-      # legacy CLI and seeded into superzej's private ~/.superzej/{layouts,zellij.kdl}
-      # at launch — nothing zellij-related is shipped into the user's config tree.
     '';
 
     meta = {
-      description = "Terminal-native git-worktree IDE on top of zellij";
+      description = "Terminal-native git-worktree IDE";
       mainProgram = "superzej";
       license = lib.licenses.mit;
       platforms = lib.platforms.linux;

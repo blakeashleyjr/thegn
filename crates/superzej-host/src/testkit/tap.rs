@@ -15,10 +15,11 @@ pub fn parse(text: &str) -> Vec<TestNode> {
         let line = raw.trim_start();
         if let Some(diag) = line.strip_prefix('#') {
             // Attach the first location we see to the most recent failing test.
-            if let Some(last) = nodes.last_mut() {
-                if last.state == TestState::Fail && last.location.is_none() {
-                    last.location = tap_location(diag);
-                }
+            if let Some(last) = nodes.last_mut()
+                && last.state == TestState::Fail
+                && last.location.is_none()
+            {
+                last.location = tap_location(diag);
             }
             continue;
         }
@@ -53,15 +54,15 @@ pub fn parse(text: &str) -> Vec<TestNode> {
 /// `ok`/`not ok` must be followed by a space, a digit, or end-of-line so we
 /// don't match words like "oktober".
 fn tap_status(line: &str) -> Option<(bool, &str)> {
-    if let Some(rest) = line.strip_prefix("not ok") {
-        if boundary(rest) {
-            return Some((false, rest));
-        }
+    if let Some(rest) = line.strip_prefix("not ok")
+        && boundary(rest)
+    {
+        return Some((false, rest));
     }
-    if let Some(rest) = line.strip_prefix("ok") {
-        if boundary(rest) {
-            return Some((true, rest));
-        }
+    if let Some(rest) = line.strip_prefix("ok")
+        && boundary(rest)
+    {
+        return Some((true, rest));
     }
     None
 }

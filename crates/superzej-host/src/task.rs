@@ -126,10 +126,10 @@ fn kill_group(_pgid: i32) {}
 /// Kill whatever is currently registered in `slot` (used when a newer job
 /// supersedes an in-flight one). Public for the supersede path in `run.rs`.
 pub fn cancel_slot(slot: &str) {
-    if let Ok(mut map) = registry().lock() {
-        if let Some((_, pgid)) = map.remove(slot) {
-            kill_group(pgid);
-        }
+    if let Ok(mut map) = registry().lock()
+        && let Some((_, pgid)) = map.remove(slot)
+    {
+        kill_group(pgid);
     }
 }
 
@@ -202,14 +202,13 @@ fn run_capped(
     }
 
     // Deregister iff we still own the slot (a newer job may have replaced us).
-    if let Ok(mut map) = registry().lock() {
-        if map
+    if let Ok(mut map) = registry().lock()
+        && map
             .get(slot)
             .map(|(g, _)| *g == generation)
             .unwrap_or(false)
-        {
-            map.remove(slot);
-        }
+    {
+        map.remove(slot);
     }
 
     let exit_code = status.ok().and_then(|s| s.code());
@@ -507,10 +506,10 @@ fn has_test_file_ext(worktree: &Path, ext: &str) -> bool {
 fn has_just_test(worktree: &Path) -> bool {
     for name in ["justfile", "Justfile", ".justfile"] {
         let path = worktree.join(name);
-        if let Ok(s) = std::fs::read_to_string(path) {
-            if s.lines().any(|l| l.trim_start().starts_with("test:")) {
-                return true;
-            }
+        if let Ok(s) = std::fs::read_to_string(path)
+            && s.lines().any(|l| l.trim_start().starts_with("test:"))
+        {
+            return true;
         }
     }
     false

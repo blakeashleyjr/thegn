@@ -214,6 +214,37 @@ impl CenterTree {
     }
 }
 
+/// Horizontal padding (cells) between a pane's frame ring and its content,
+/// each side — `[theme] pane_padding`. A process-global because the framed
+/// layout is computed from pure render paths everywhere; the loop stores it
+/// at startup and on config reload.
+pub static PANE_HPAD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Inset a rect by the pane's frame ring (1 cell) plus the configured
+/// horizontal padding. Degenerate rects collapse toward zero.
+pub fn inset(r: Rect) -> Rect {
+    let pad = PANE_HPAD.load(std::sync::atomic::Ordering::Relaxed);
+    Rect {
+        x: r.x + 1 + pad,
+        y: r.y + 1,
+        cols: r.cols.saturating_sub(2 + 2 * pad),
+        rows: r.rows.saturating_sub(2),
+    }
+}
+
+impl CenterTree {
+    /// Like [`CenterTree::layout`], but every pane reserves a 1-cell frame ring:
+    /// yields `(pane, frame rect, content rect)`. The frame is where
+    /// `borders::draw_pane_frames` paints; the content rect is what the PTY and
+    /// emulator surface get.
+    pub fn layout_framed(&self, rect: Rect) -> Vec<(PaneId, Rect, Rect)> {
+        self.layout(rect)
+            .into_iter()
+            .map(|(p, r)| (p, r, inset(r)))
+            .collect()
+    }
+}
+
 /// A focus-move direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Move {

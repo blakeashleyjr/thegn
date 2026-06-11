@@ -103,7 +103,8 @@ config_enum! {
     /// enum lives in `sandbox.rs`). `Auto` walks `backend_chain`.
     pub enum SandboxBackend: "sandbox backend" {
         Auto = "auto",
-        Podman = "podman",
+        Podman = "podman" | "podman-rootless" | "rootless-podman",
+        PodmanRootful = "podman-rootful" | "rootful-podman",
         Docker = "docker",
         Bwrap = "bwrap" | "bubblewrap",
         Systemd = "systemd" | "systemd-run",
@@ -154,6 +155,8 @@ config_enum! {
     pub enum PinLocation: "pin location" {
         Tab = "tab",
         Layout = "layout" | "pane" | "active_layout" | "active-layout",
+        Strip = "strip" | "top" | "top-strip" | "top_strip",
+        Float = "float" | "floating" | "scratch",
     } default = Tab;
 }
 
@@ -190,6 +193,10 @@ pub struct CommandHint {
 pub struct Pin {
     pub name: String,
     pub command: String,
+    /// Explicit argv. When non-empty it is launched directly (no shell); when
+    /// empty, `command` is run via the login shell (`sh -lc`).
+    #[serde(default)]
+    pub args: Vec<String>,
     /// Working directory for the pin's pane. Tab pins default to `$HOME`; layout
     /// pins default to the focused repo/worktree when it can be resolved.
     #[serde(default)]
@@ -212,6 +219,30 @@ pub struct Pin {
     /// Whether to allow multiple instances or enforce singleton behavior.
     #[serde(default = "default_true")]
     pub singleton: bool,
+    /// Per-program environment variables injected into the pin's process.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Display label override for the strip/chip (defaults to `name`).
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Relative weight of this pin within the top strip (defaults to 1.0).
+    #[serde(default)]
+    pub ratio: Option<f32>,
+}
+
+impl Pin {
+    /// The label shown on the strip/chip (falls back to `name`).
+    pub fn display_label(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.name)
+    }
+
+    /// This pin's strip weight (defaults to 1.0; non-positive values clamp to 1.0).
+    pub fn strip_weight(&self) -> f32 {
+        match self.ratio {
+            Some(r) if r > 0.0 => r,
+            _ => 1.0,
+        }
+    }
 }
 
 /// When to start a pin.
@@ -283,7 +314,7 @@ fn default_true() -> bool {
 pub struct CustomAction {
     /// Stable id + default menu/hint label.
     pub name: String,
-    /// Key chord (zellij syntax, e.g. "Alt D"); validated by keymap.
+    /// Key chord (e.g. "Alt D"); validated by the host keymap.
     pub key: String,
     /// Shell command line run via `sh -c`.
     pub run: String,
@@ -299,7 +330,7 @@ pub struct CustomAction {
     pub close_on_exit: bool,
 }
 
-/// Host/zellij keybinding overrides. The flat `[keybinds]` table remains the
+/// Host keybinding overrides. The flat `[keybinds]` table remains the
 /// default/global layer for backwards compatibility; nested tables such as
 /// `[keybinds.vim_normal]` override only the native host's named modes.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
@@ -349,21 +380,93 @@ impl<'a> IntoIterator for &'a KeybindConfig {
     }
 }
 
-/// `[theme]` — visual tuning. Only the accent for now; the rest of the
-/// palette is fixed (src/theme.rs).
+/// A named keybind profile (`[profiles.<name>]`). Selected by the top-level
+/// `profile` key (or `SUPERZEJ_PROFILE` / `--profile`). A profile may set the
+/// default native-host mode (`default_mode = "vim-normal" | "emacs" | "normal"`)
+/// and carries its own [`KeybindConfig`] layer, applied under the global
+/// `[keybinds]` table. The built-in `vim`/`emacs` presets live in `keymap.rs`;
+/// a config-defined profile of the same name overrides the preset.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct ProfileConfig {
+    /// Native-host mode this profile starts in (`""` ⇒ leave at Normal).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub default_mode: String,
+    /// Keybind overrides applied as this profile's layer.
+    #[serde(skip_serializing_if = "KeybindConfig::is_empty")]
+    pub keybinds: KeybindConfig,
+}
+
+/// Per-workspace config (`[workspace.<slug>.keybinds]`), keyed by repo slug.
+/// Layered above the global + profile keybinds but below a repo-root
+/// `.superzej.*` overlay. See [`Config::effective_keybinds`].
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct WorkspaceConfig {
+    /// Keybind overrides applied when this workspace is focused.
+    #[serde(skip_serializing_if = "KeybindConfig::is_empty")]
+    pub keybinds: KeybindConfig,
+}
+
+/// `[theme]` — visual tuning: the accent, the focus frame color, and optional
+/// per-surface overrides of the whole chrome palette (`[theme.colors]`).
+/// Invalid hex values warn-and-default; they never block startup.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct ThemeConfig {
+    /// Named palette preset: "storm" (default), "light", "abyss", "ember",
+    /// "aurora". `[theme.colors]` overrides apply on top.
+    pub preset: String,
     /// Focus accent as "#rrggbb" (default the signature teal).
     pub accent: String,
+    /// Frame/highlight color of the focused pane, tab, and chrome edge
+    /// (default light blue).
+    pub focus_border: String,
+    /// Horizontal breathing room (cells) between a pane's frame and its
+    /// content, each side.
+    pub pane_padding: u16,
+    /// Optional overrides for every chrome surface/text color.
+    pub colors: ThemeColors,
 }
 
 impl Default for ThemeConfig {
     fn default() -> Self {
         ThemeConfig {
+            preset: "storm".into(),
             accent: "#76eede".into(),
+            focus_border: "#9bd1ff".into(),
+            pane_padding: 0,
+            colors: ThemeColors::default(),
         }
     }
+}
+
+/// `[theme.colors]` — all optional "#rrggbb" overrides; unset keys keep the
+/// built-in storm-blue defaults (src/theme.rs).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct ThemeColors {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bg0: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bg1: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub panel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub panel2: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raise: Option<String>,
+    /// Frame lines around unfocused panes and chrome edges (light grey).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub border: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dim: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub faint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ghost: Option<String>,
 }
 
 /// `[monitor]` — the resource managers opened from the top-bar stats widget
@@ -403,6 +506,12 @@ pub struct StatsConfig {
     pub net_icon: String,
     /// Icon for GPU stat.
     pub gpu_icon: String,
+    /// Icon for the battery stat (discharging).
+    pub battery_icon: String,
+    /// Icon shown while the battery is charging / on AC.
+    pub battery_charging_icon: String,
+    /// Battery percentage at/below which the widget turns red.
+    pub battery_warn: u8,
     /// Available refresh rates for keybind cycling (seconds).
     pub refresh_rates: Vec<f64>,
 }
@@ -411,11 +520,58 @@ impl Default for StatsConfig {
     fn default() -> Self {
         StatsConfig {
             refresh_secs: 2.0,
-            cpu_icon: "CPU".into(),
-            mem_icon: "MEM".into(),
-            net_icon: "NET".into(),
-            gpu_icon: "GPU".into(),
+            // Nerd Font glyphs by default (the bundled alacritty profile ships
+            // a Nerd Font); set plain text ("CPU") if your font lacks them.
+            cpu_icon: "\u{f4bc}".into(),
+            mem_icon: "\u{efc5}".into(),
+            net_icon: "\u{f06f3}".into(),
+            // Same-width glyph family as the others (the old gpu glyph
+            // rendered narrower in the bundled Nerd Font).
+            gpu_icon: "\u{f0fb2}".into(),
+            battery_icon: "\u{f0079}".into(),
+            battery_charging_icon: "\u{f0084}".into(),
+            battery_warn: 25,
             refresh_rates: vec![1.0, 2.0, 5.0, 10.0],
+        }
+    }
+}
+
+/// `[bars]` — the customizable widget bars framing the workspace. Each slot is
+/// an ordered widget-id list; unknown ids warn and are skipped. Built-ins:
+/// `brand` (superzej + version), `cpu`, `mem`, `gpu`, `net`, `battery`,
+/// `date`, `clock` (top bar) and `keyhints` (context-dependent keybinds),
+/// `pr` (forge + PR number/state), `status` (transient messages + the
+/// keybind-lock badge) for the bottom bar.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct BarsConfig {
+    pub top_left: Vec<String>,
+    pub top_right: Vec<String>,
+    pub bottom_left: Vec<String>,
+    pub bottom_right: Vec<String>,
+    /// chrono format string for the `date` widget.
+    pub date_format: String,
+    /// chrono format string for the `clock` widget.
+    pub clock_format: String,
+}
+
+impl Default for BarsConfig {
+    fn default() -> Self {
+        BarsConfig {
+            top_left: vec!["brand".into()],
+            top_right: vec![
+                "cpu".into(),
+                "mem".into(),
+                "gpu".into(),
+                "net".into(),
+                "battery".into(),
+                "date".into(),
+                "clock".into(),
+            ],
+            bottom_left: vec!["keyhints".into()],
+            bottom_right: vec!["pr".into(), "loc".into(), "status".into()],
+            date_format: "%a %b %-d".into(),
+            clock_format: "%H:%M".into(),
         }
     }
 }
@@ -596,9 +752,12 @@ impl RemoteConfig {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum FileAccess {
-    #[default]
     Worktree,
+    #[default]
+    WorktreePlusCaches,
+    Custom,
     All,
+    Host,
     None,
 }
 
@@ -616,7 +775,9 @@ pub struct SandboxLimits {
 pub struct SandboxConfig {
     pub enabled: bool,
     pub backend: SandboxBackend,
-    pub backend_chain: Vec<String>, // auto detection order; "none" = host fallback
+    /// Default selection for new worktrees; `auto` means use `backend_chain`.
+    pub default_backend: SandboxBackend,
+    pub backend_chain: Vec<String>, // auto detection order; "host" = host fallback
     pub image: String,              // "" => host-toolchain mode
     pub network: Network,
     pub file_access: FileAccess,
@@ -626,7 +787,9 @@ pub struct SandboxConfig {
     pub volumes: std::collections::HashMap<String, String>,
     pub compose: Option<String>,
     pub env_passthrough: Vec<String>,
-    pub mounts: Vec<String>, // extra binds ("host:dest" or "host"); ":ro" suffix allowed
+    /// Add common language build caches to `worktree_plus_caches` sandboxes.
+    pub auto_caches: bool,
+    pub mounts: Vec<String>, // extra binds ("host:dest[:ro|rw|cache]" or "host"); suffix allowed
     pub init_script: String, // runs inside before the agent/shell
     pub devenv: bool,        // wrap inner cmd with `devenv shell --`
     pub on_missing: OnMissing,
@@ -638,10 +801,17 @@ impl Default for SandboxConfig {
         SandboxConfig {
             enabled: true,
             backend: SandboxBackend::Auto,
-            backend_chain: ["podman", "docker", "bwrap", "none"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            default_backend: SandboxBackend::Auto,
+            backend_chain: [
+                "podman-rootless",
+                "podman-rootful",
+                "docker",
+                "bwrap",
+                "host",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
             image: String::new(),
             network: Network::Nat,
             file_access: FileAccess::default(),
@@ -661,6 +831,7 @@ impl Default for SandboxConfig {
             .iter()
             .map(|s| s.to_string())
             .collect(),
+            auto_caches: true,
             mounts: vec!["~/.gitconfig:ro".into()],
             init_script: String::new(),
             devenv: false,
@@ -678,6 +849,7 @@ impl Default for SandboxConfig {
 pub struct SandboxOverlay {
     pub enabled: Option<bool>,
     pub backend: Option<SandboxBackend>,
+    pub default_backend: Option<SandboxBackend>,
     pub backend_chain: Option<Vec<String>>,
     pub image: Option<String>,
     pub network: Option<Network>,
@@ -688,6 +860,7 @@ pub struct SandboxOverlay {
     pub volumes: Option<std::collections::HashMap<String, String>>,
     pub compose: Option<String>,
     pub env_passthrough: Option<Vec<String>>,
+    pub auto_caches: Option<bool>,
     pub mounts: Option<Vec<String>>,
     pub init_script: Option<String>,
     pub devenv: Option<bool>,
@@ -713,6 +886,9 @@ impl SandboxOverlay {
         }
         if let Some(v) = self.backend {
             base.backend = v;
+        }
+        if let Some(v) = self.default_backend {
+            base.default_backend = v;
         }
         if let Some(v) = self.backend_chain {
             base.backend_chain = v;
@@ -744,6 +920,9 @@ impl SandboxOverlay {
         if let Some(v) = self.env_passthrough {
             base.env_passthrough = v;
         }
+        if let Some(v) = self.auto_caches {
+            base.auto_caches = v;
+        }
         if let Some(v) = self.mounts {
             base.mounts = v;
         }
@@ -764,10 +943,12 @@ impl SandboxOverlay {
     fn is_empty(&self) -> bool {
         self.enabled.is_none()
             && self.backend.is_none()
+            && self.default_backend.is_none()
             && self.backend_chain.is_none()
             && self.image.is_none()
             && self.network.is_none()
             && self.env_passthrough.is_none()
+            && self.auto_caches.is_none()
             && self.mounts.is_none()
             && self.init_script.is_none()
             && self.devenv.is_none()
@@ -799,11 +980,13 @@ impl RemoteOverlay {
     }
 }
 
-/// The shape of a repo-root `.superzej.*` file: a `[sandbox]` table overlay.
+/// The shape of a repo-root `.superzej.*` file: a `[sandbox]` table overlay
+/// plus an optional `[keybinds]` table (the most-specific keybind layer).
 #[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 struct RepoConfigFile {
     sandbox: SandboxOverlay,
+    keybinds: KeybindConfig,
 }
 
 /// `[drawer]` — the bottom file-manager drawer (hidden by default, toggled with
@@ -820,10 +1003,24 @@ pub struct DrawerConfig {
     /// user's own yazi config (no isolation, no seeding). Any other value is used
     /// verbatim (tilde-expanded).
     pub config_home: String,
-    /// Drawer height as a zellij floating size ("35%" or a row count).
+    /// Drawer height as a percentage ("35%") or a row count.
     pub height: String,
     /// Drawer width: "full" (span the terminal) or "center" (narrower, centered).
     pub width: String,
+    /// Whether the bundled/private yazi config allows image preview backends.
+    pub image_previews: bool,
+    /// Whether drawer yazi launches should be wrapped in a user systemd scope.
+    pub contain: bool,
+    /// `MemoryMax` for the drawer scope. Empty = omit this property.
+    pub memory_max: String,
+    /// `MemorySwapMax` for the drawer scope. Empty = omit this property.
+    pub memory_swap_max: String,
+    /// `CPUQuota` for the drawer scope. Empty = omit this property.
+    pub cpu_quota: String,
+    /// Maximum hidden drawers to keep alive in native hosts. Zero disables pooling.
+    pub pool_limit: usize,
+    /// Whether yazi drawers may be prewarmed before the user opens them.
+    pub prewarm: bool,
 }
 
 impl Default for DrawerConfig {
@@ -833,7 +1030,42 @@ impl Default for DrawerConfig {
             config_home: String::new(),
             height: "35%".into(),
             width: "full".into(),
+            image_previews: false,
+            contain: true,
+            memory_max: "2G".into(),
+            memory_swap_max: "512M".into(),
+            cpu_quota: "200%".into(),
+            pool_limit: 1,
+            prewarm: false,
         }
+    }
+}
+
+/// `[strip]` — the top pinned-program strip (a horizontal band above the center
+/// rendering live `location = "strip"` pins side by side). Hidden when empty;
+/// toggled with Ctrl+Alt+t and resized at runtime.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct StripConfig {
+    /// Fraction of the center band the strip occupies (0.05–0.9, default 0.2).
+    pub ratio: f32,
+    /// Whether the strip is shown when it has at least one pin (default true).
+    pub visible: bool,
+}
+
+impl Default for StripConfig {
+    fn default() -> Self {
+        StripConfig {
+            ratio: 0.2,
+            visible: true,
+        }
+    }
+}
+
+impl StripConfig {
+    /// The configured ratio clamped to a sane band so the center always survives.
+    pub fn clamped_ratio(&self) -> f32 {
+        self.ratio.clamp(0.05, 0.9)
     }
 }
 
@@ -849,8 +1081,15 @@ pub struct Config {
     pub worktree_mode: WorktreeMode,
     pub name_scheme: NameScheme,
     pub auto_remove_worktree: bool,
+    /// Ask before destructive worktree actions (deleting a worktree from
+    /// disk via the sidebar). Set `false` to act immediately.
+    pub confirm_delete: bool,
     pub repo_roots: Vec<String>,
     pub repo_scan_depth: usize,
+    /// Active keybind profile name (`""` ⇒ none). Selects `[profiles.<name>]`;
+    /// overridden by `SUPERZEJ_PROFILE` / `--profile`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub profile: String,
     // --- arrays of tables (must serialize before any plain sub-table) ---
     pub agents: Vec<NamedCommand>,
     pub tools: Vec<NamedCommand>,
@@ -862,6 +1101,7 @@ pub struct Config {
     pub theme: ThemeConfig,
     pub monitor: MonitorConfig,
     pub stats: StatsConfig,
+    pub bars: BarsConfig,
     pub pr: PrConfig,
     pub dashboard: DashboardConfig,
     pub watch: WatchConfig,
@@ -869,9 +1109,26 @@ pub struct Config {
     pub sandbox: SandboxConfig,
     pub limits: LimitsConfig,
     pub drawer: DrawerConfig,
+    pub strip: StripConfig,
     /// Rebind a built-in action by id, e.g. `new-worktree = "Ctrl w"`. The flat
     /// table is the global/default layer; nested mode tables are native-host only.
     pub keybinds: KeybindConfig,
+    /// Named keybind profiles (`[profiles.<name>]`), selected by `profile`.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub profiles: std::collections::BTreeMap<String, ProfileConfig>,
+    /// Per-workspace config keyed by repo slug (`[workspace.<slug>]`).
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub workspace: std::collections::BTreeMap<String, WorkspaceConfig>,
+    /// Per-program host-action overlays (`[program_keybinds.<program>]`), keyed
+    /// by the focused pane's program name. Consulted before the active mode.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub program_keybinds: std::collections::BTreeMap<String, KeybindConfig>,
+    /// Per-program key-injection remaps (`[program_remap.<program>] "Alt j" = "j"`).
+    /// When the program is focused and the LHS chord is not claimed as a host
+    /// action, the RHS key bytes are written into the pane instead.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub program_remap:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
 }
 
 impl Default for Config {
@@ -891,6 +1148,7 @@ impl Default for Config {
             worktree_mode: WorktreeMode::Global,
             name_scheme: NameScheme::Words,
             auto_remove_worktree: false,
+            confirm_delete: true,
             repo_roots: Vec::new(),
             repo_scan_depth: 5,
             agents: Vec::new(),
@@ -901,6 +1159,7 @@ impl Default for Config {
             theme: ThemeConfig::default(),
             monitor: MonitorConfig::default(),
             stats: StatsConfig::default(),
+            bars: BarsConfig::default(),
             pr: PrConfig::default(),
             dashboard: DashboardConfig::default(),
             watch: WatchConfig::default(),
@@ -908,8 +1167,14 @@ impl Default for Config {
             sandbox: SandboxConfig::default(),
             limits: LimitsConfig::default(),
             drawer: DrawerConfig::default(),
+            strip: StripConfig::default(),
             keybinds: KeybindConfig::default(),
             actions: Vec::new(),
+            profile: String::new(),
+            profiles: std::collections::BTreeMap::new(),
+            workspace: std::collections::BTreeMap::new(),
+            program_keybinds: std::collections::BTreeMap::new(),
+            program_remap: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -953,7 +1218,10 @@ pub struct ConfigOverlay {
     pub name_scheme: Option<NameScheme>,
     pub auto_remove_worktree: Option<bool>,
     pub repo_scan_depth: Option<usize>,
+    pub profile: Option<String>,
     pub accent: Option<String>,
+    pub focus_border: Option<String>,
+    pub frame_border: Option<String>,
     pub pr_ttl_secs: Option<u64>,
     pub dashboard_interval_secs: Option<u64>,
     pub watch_pr_interval_secs: Option<u64>,
@@ -984,7 +1252,12 @@ impl ConfigOverlay {
         set!(base.name_scheme, self.name_scheme);
         set!(base.auto_remove_worktree, self.auto_remove_worktree);
         set!(base.repo_scan_depth, self.repo_scan_depth);
+        set!(base.profile, self.profile);
         set!(base.theme.accent, self.accent);
+        set!(base.theme.focus_border, self.focus_border);
+        if self.frame_border.is_some() {
+            base.theme.colors.border = self.frame_border;
+        }
         set!(base.pr.ttl_secs, self.pr_ttl_secs);
         set!(base.dashboard.interval_secs, self.dashboard_interval_secs);
         set!(base.watch.pr_interval_secs, self.watch_pr_interval_secs);
@@ -1036,7 +1309,10 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     if let Some(v) = env.get("SUPERZEJ_REPO_SCAN_DEPTH") {
         o.repo_scan_depth = parse_num(v, "SUPERZEJ_REPO_SCAN_DEPTH").map(|n| n as usize);
     }
+    o.profile = env.get("SUPERZEJ_PROFILE");
     o.accent = env.get("SUPERZEJ_THEME_ACCENT");
+    o.focus_border = env.get("SUPERZEJ_THEME_FOCUS_BORDER");
+    o.frame_border = env.get("SUPERZEJ_THEME_BORDER");
 
     // [pr] — SUPERZEJ_PR_TTL, with deprecated SZ_PR_TTL fallback.
     if let Some(v) = env.get("SUPERZEJ_PR_TTL") {
@@ -1129,10 +1405,10 @@ impl Config {
 
         // Apply dot-notation overrides
         for ov in cli_overrides {
-            if let Some((key, val)) = ov.split_once('=') {
-                if let Err(e) = Self::apply_override_str(&mut cfg, key, val) {
-                    config_warn(&format!("--set {key}={val} failed: {e}"));
-                }
+            if let Some((key, val)) = ov.split_once('=')
+                && let Err(e) = Self::apply_override_str(&mut cfg, key, val)
+            {
+                config_warn(&format!("--set {key}={val} failed: {e}"));
             }
         }
 
@@ -1309,6 +1585,44 @@ impl Config {
         }
     }
 
+    /// The active profile config, if `profile` names one in `[profiles]`.
+    pub fn active_profile(&self) -> Option<&ProfileConfig> {
+        if self.profile.is_empty() {
+            None
+        } else {
+            self.profiles.get(&self.profile)
+        }
+    }
+
+    /// The ordered keybind layer stack for a focused context, lowest precedence
+    /// first: profile → global `[keybinds]` → central `[workspace.<slug>]` →
+    /// repo-root `.superzej.*` overlay. The host applies each layer in turn so a
+    /// more-specific binding wins. `repo_root`/`slug` are `None` outside a
+    /// workspace (e.g. the home tab).
+    pub fn effective_keybinds(
+        &self,
+        repo_root: Option<&std::path::Path>,
+        slug: Option<&str>,
+    ) -> Vec<KeybindConfig> {
+        let mut layers = Vec::new();
+        if let Some(p) = self.active_profile() {
+            layers.push(p.keybinds.clone());
+        }
+        layers.push(self.keybinds.clone());
+        if let Some(slug) = slug
+            && let Some(ws) = self.workspace.get(slug)
+        {
+            layers.push(ws.keybinds.clone());
+        }
+        if let Some(root) = repo_root
+            && let Some(overlay) = load_repo_overlay(root)
+            && !overlay.keybinds.is_empty()
+        {
+            layers.push(overlay.keybinds);
+        }
+        layers
+    }
+
     /// The effective sandbox config for a worktree's repo: the global `[sandbox]`
     /// with a repo-root `.superzej.{toml,yaml,yml,json}` overlay applied on top.
     /// Tilde-expands path-bearing fields (mounts, remote_dir).
@@ -1344,6 +1658,44 @@ impl Config {
         }
     }
 
+    /// Resolve the full chrome palette: built-in defaults overlaid with any
+    /// `[theme]` / `[theme.colors]` overrides. Invalid hex keeps the default.
+    pub fn palette(&self) -> crate::theme::Palette {
+        self.palette_with_preset(&self.theme.preset)
+    }
+
+    /// The palette for a named preset with this config's `[theme.colors]` +
+    /// accent/focus overrides applied — the live theme-cycle uses this.
+    pub fn palette_with_preset(&self, preset: &str) -> crate::theme::Palette {
+        let mut p = crate::theme::preset(preset).unwrap_or_default();
+        let set = |slot: &mut String, hex: &Option<String>| {
+            if let Some(rgb) = hex.as_deref().and_then(parse_hex_rgb) {
+                *slot = rgb;
+            }
+        };
+        let c = &self.theme.colors;
+        set(&mut p.bg0, &c.bg0);
+        set(&mut p.bg1, &c.bg1);
+        set(&mut p.panel, &c.panel);
+        set(&mut p.panel2, &c.panel2);
+        set(&mut p.raise, &c.raise);
+        set(&mut p.border, &c.border);
+        set(&mut p.text, &c.text);
+        set(&mut p.dim, &c.dim);
+        set(&mut p.faint, &c.faint);
+        set(&mut p.ghost, &c.ghost);
+        // Only override the preset's focus/accent when the user actually
+        // customized them (the built-in defaults would clobber presets).
+        let default_theme = ThemeConfig::default();
+        if self.theme.focus_border != default_theme.focus_border {
+            set(&mut p.focus, &Some(self.theme.focus_border.clone()));
+        }
+        if self.theme.accent != default_theme.accent {
+            p.accent = self.accent_rgb();
+        }
+        p
+    }
+
     /// Look up a dotted config key as a bare string (for `config get` and the
     /// plugin feed). `None` for an unknown key.
     pub fn get_dotted(&self, key: &str) -> Option<String> {
@@ -1356,9 +1708,30 @@ impl Config {
             "worktree_mode" => self.worktree_mode.to_string(),
             "name_scheme" => self.name_scheme.to_string(),
             "auto_remove_worktree" => self.auto_remove_worktree.to_string(),
+            "confirm_delete" => self.confirm_delete.to_string(),
             "repo_scan_depth" => self.repo_scan_depth.to_string(),
             "repo_roots" => self.repo_roots.join("\n"),
+            "theme.preset" => self.theme.preset.clone(),
             "theme.accent" => self.theme.accent.clone(),
+            "theme.focus_border" => self.theme.focus_border.clone(),
+            "theme.pane_padding" => self.theme.pane_padding.to_string(),
+            _ if key.starts_with("theme.colors.") => {
+                let c = &self.theme.colors;
+                let slot = match &key["theme.colors.".len()..] {
+                    "bg0" => &c.bg0,
+                    "bg1" => &c.bg1,
+                    "panel" => &c.panel,
+                    "panel2" => &c.panel2,
+                    "raise" => &c.raise,
+                    "border" => &c.border,
+                    "text" => &c.text,
+                    "dim" => &c.dim,
+                    "faint" => &c.faint,
+                    "ghost" => &c.ghost,
+                    _ => return None,
+                };
+                slot.clone().unwrap_or_default()
+            }
             "pr.ttl_secs" => self.pr.ttl_secs.to_string(),
             "dashboard.interval_secs" => self.dashboard.interval_secs.to_string(),
             "watch.pr_interval_secs" => self.watch.pr_interval_secs.to_string(),
@@ -1396,10 +1769,10 @@ pub fn validate_str(body: &str) -> Vec<String> {
         opt: Option<&toml::Value>,
         f: fn(&str) -> Result<(), String>,
     ) {
-        if let Some(toml::Value::String(s)) = opt {
-            if let Err(e) = f(s) {
-                errs.push(format!("{path}: {e}"));
-            }
+        if let Some(toml::Value::String(s)) = opt
+            && let Err(e) = f(s)
+        {
+            errs.push(format!("{path}: {e}"));
         }
     }
     let Some(t) = val.as_table() else {
@@ -1592,10 +1965,14 @@ surface = "todoist.status"
     fn stats_defaults() {
         let s = StatsConfig::default();
         assert_eq!(s.refresh_secs, 2.0);
-        assert_eq!(s.cpu_icon, "CPU");
-        assert_eq!(s.mem_icon, "MEM");
-        assert_eq!(s.net_icon, "NET");
-        assert_eq!(s.gpu_icon, "GPU");
+        // Nerd Font glyphs by default; overridable to plain text.
+        assert_eq!(s.cpu_icon, "\u{f4bc}");
+        assert_eq!(s.mem_icon, "\u{efc5}");
+        assert_eq!(s.net_icon, "\u{f06f3}");
+        assert_eq!(s.gpu_icon, "\u{f0fb2}");
+        assert_eq!(s.battery_icon, "\u{f0079}");
+        assert_eq!(s.battery_charging_icon, "\u{f0084}");
+        assert_eq!(s.battery_warn, 25);
         assert_eq!(s.refresh_rates, vec![1.0, 2.0, 5.0, 10.0]);
     }
 
@@ -1662,6 +2039,7 @@ surface = "todoist.status"
         let good = Config {
             theme: ThemeConfig {
                 accent: "#FFffFF".into(),
+                ..ThemeConfig::default()
             },
             ..Config::default()
         };
@@ -1670,11 +2048,55 @@ surface = "todoist.status"
         let bad = Config {
             theme: ThemeConfig {
                 accent: "not-a-color".into(),
+                ..ThemeConfig::default()
             },
             ..Config::default()
         };
         assert_eq!(bad.accent_hex(), "#76eede");
         assert_eq!(bad.accent_rgb(), crate::theme::TEAL);
+    }
+
+    #[test]
+    fn palette_defaults_match_builtins() {
+        let p = Config::default().palette();
+        assert_eq!(p, crate::theme::Palette::default());
+        assert_eq!(p.focus, crate::theme::FOCUS); // #9bd1ff
+        assert_eq!(p.border, crate::theme::FRAME); // light grey default
+        assert_eq!(p.accent, crate::theme::TEAL);
+    }
+
+    #[test]
+    fn palette_applies_overrides_and_skips_bad_hex() {
+        let mut cfg = Config::default();
+        cfg.theme.focus_border = "#102030".into();
+        cfg.theme.colors.bg0 = Some("#000000".into());
+        cfg.theme.colors.border = Some("#fff".into()); // short form
+        cfg.theme.colors.text = Some("nope".into()); // invalid -> default
+        let p = cfg.palette();
+        assert_eq!(p.focus, "16;32;48");
+        assert_eq!(p.bg0, "0;0;0");
+        assert_eq!(p.border, "255;255;255");
+        assert_eq!(p.text, crate::theme::TEXT);
+    }
+
+    #[test]
+    fn theme_keys_via_get_set_and_env() {
+        let mut cfg = Config::default();
+        assert!(Config::apply_override_str(&mut cfg, "theme.focus_border", "#abcdef").is_ok());
+        assert!(Config::apply_override_str(&mut cfg, "theme.colors.bg1", "#111111").is_ok());
+        assert_eq!(cfg.get_dotted("theme.focus_border").unwrap(), "#abcdef");
+        assert_eq!(cfg.get_dotted("theme.colors.bg1").unwrap(), "#111111");
+        assert_eq!(cfg.get_dotted("theme.colors.bg0").unwrap(), "");
+        assert_eq!(cfg.get_dotted("theme.colors.bogus"), None);
+
+        let env = map_env(&[
+            ("SUPERZEJ_THEME_FOCUS_BORDER", "#010203"),
+            ("SUPERZEJ_THEME_BORDER", "#040506"),
+        ]);
+        let mut base = Config::default();
+        env_overlay(&env).apply(&mut base);
+        assert_eq!(base.theme.focus_border, "#010203");
+        assert_eq!(base.theme.colors.border.as_deref(), Some("#040506"));
     }
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {
@@ -1750,6 +2172,13 @@ surface = "todoist.status"
         assert_eq!(d.config_home, ""); // empty = private default
         assert_eq!(d.height, "35%");
         assert_eq!(d.width, "full");
+        assert!(!d.image_previews);
+        assert!(d.contain);
+        assert_eq!(d.memory_max, "2G");
+        assert_eq!(d.memory_swap_max, "512M");
+        assert_eq!(d.cpu_quota, "200%");
+        assert_eq!(d.pool_limit, 1);
+        assert!(!d.prewarm);
     }
 
     #[test]
@@ -1758,18 +2187,32 @@ surface = "todoist.status"
         assert_eq!(cfg.drawer.height, "35%");
         assert_eq!(cfg.drawer.width, "full");
         assert_eq!(cfg.drawer.command, "");
+        assert!(!cfg.drawer.image_previews);
+        assert!(cfg.drawer.contain);
+        assert_eq!(cfg.drawer.memory_max, "2G");
+        assert_eq!(cfg.drawer.memory_swap_max, "512M");
+        assert_eq!(cfg.drawer.cpu_quota, "200%");
+        assert_eq!(cfg.drawer.pool_limit, 1);
+        assert!(!cfg.drawer.prewarm);
     }
 
     #[test]
     fn drawer_section_overrides_parse() {
         let cfg: Config = toml::from_str(
-            "[drawer]\ncommand = \"ranger\"\nconfig_home = \"system\"\nheight = \"50%\"\nwidth = \"center\"\n",
+            "[drawer]\ncommand = \"ranger\"\nconfig_home = \"system\"\nheight = \"50%\"\nwidth = \"center\"\nimage_previews = true\ncontain = false\nmemory_max = \"4G\"\nmemory_swap_max = \"0\"\ncpu_quota = \"50%\"\npool_limit = 0\nprewarm = true\n",
         )
         .unwrap();
         assert_eq!(cfg.drawer.command, "ranger");
         assert_eq!(cfg.drawer.config_home, "system");
         assert_eq!(cfg.drawer.height, "50%");
         assert_eq!(cfg.drawer.width, "center");
+        assert!(cfg.drawer.image_previews);
+        assert!(!cfg.drawer.contain);
+        assert_eq!(cfg.drawer.memory_max, "4G");
+        assert_eq!(cfg.drawer.memory_swap_max, "0");
+        assert_eq!(cfg.drawer.cpu_quota, "50%");
+        assert_eq!(cfg.drawer.pool_limit, 0);
+        assert!(cfg.drawer.prewarm);
     }
 
     #[test]
@@ -1779,6 +2222,10 @@ surface = "todoist.status"
         assert_eq!(cfg.drawer.height, "20%");
         assert_eq!(cfg.drawer.width, "full");
         assert_eq!(cfg.drawer.command, "");
+        assert!(!cfg.drawer.image_previews);
+        assert!(cfg.drawer.contain);
+        assert_eq!(cfg.drawer.pool_limit, 1);
+        assert!(!cfg.drawer.prewarm);
     }
 
     #[test]
@@ -1816,6 +2263,84 @@ surface = "todoist.status"
         assert!(s.contains("new-worktree = \"Ctrl w\""));
         assert!(s.contains("[keybinds.vim_normal]"));
         assert!(s.contains("focus-down = \"j\""));
+    }
+
+    #[test]
+    fn config_parses_profiles_and_active_profile() {
+        let cfg: Config = toml::from_str(
+            "profile = \"vim\"\n[profiles.vim]\ndefault_mode = \"vim-normal\"\n[profiles.vim.keybinds]\nfocus-down = \"j\"\n",
+        )
+        .unwrap();
+        let p = cfg.active_profile().expect("active profile resolves");
+        assert_eq!(p.default_mode, "vim-normal");
+        assert_eq!(p.keybinds.get("focus-down").map(String::as_str), Some("j"));
+    }
+
+    #[test]
+    fn unknown_profile_has_no_active_profile() {
+        let cfg: Config = toml::from_str("profile = \"nope\"\n").unwrap();
+        assert!(cfg.active_profile().is_none());
+    }
+
+    #[test]
+    fn effective_keybinds_layers_profile_then_global() {
+        let cfg: Config = toml::from_str(
+            "profile = \"vim\"\n[keybinds]\nfocus-down = \"Ctrl j\"\n[profiles.vim.keybinds]\nfocus-down = \"j\"\n",
+        )
+        .unwrap();
+        let layers = cfg.effective_keybinds(None, None);
+        // profile layer first (lowest precedence), then global.
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0].get("focus-down").map(String::as_str), Some("j"));
+        assert_eq!(
+            layers[1].get("focus-down").map(String::as_str),
+            Some("Ctrl j")
+        );
+    }
+
+    #[test]
+    fn effective_keybinds_adds_central_workspace_layer_for_slug() {
+        let cfg: Config = toml::from_str(
+            "[keybinds]\nfocus-down = \"Ctrl j\"\n[workspace.myrepo.keybinds]\nfocus-down = \"Alt j\"\n",
+        )
+        .unwrap();
+        let none = cfg.effective_keybinds(None, None);
+        assert_eq!(none.len(), 1); // global only
+        let with = cfg.effective_keybinds(None, Some("myrepo"));
+        assert_eq!(with.len(), 2);
+        assert_eq!(with[1].get("focus-down").map(String::as_str), Some("Alt j"));
+    }
+
+    #[test]
+    fn repo_overlay_keybinds_are_the_most_specific_layer() {
+        let dir = tmpdir("repo-kb");
+        std::fs::write(
+            dir.join(".superzej.toml"),
+            "[keybinds]\nfocus-down = \"Alt n\"\n",
+        )
+        .unwrap();
+        let cfg: Config = toml::from_str(
+            "[keybinds]\nfocus-down = \"Ctrl j\"\n[workspace.myrepo.keybinds]\nfocus-down = \"Alt j\"\n",
+        )
+        .unwrap();
+        let layers = cfg.effective_keybinds(Some(&dir), Some("myrepo"));
+        // global, central-workspace, repo-root overlay (last = highest precedence).
+        assert_eq!(layers.len(), 3);
+        assert_eq!(
+            layers.last().unwrap().get("focus-down").map(String::as_str),
+            Some("Alt n")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn profile_selectable_via_env() {
+        let env = MapEnv(BTreeMap::from([(
+            "SUPERZEJ_PROFILE".to_string(),
+            "emacs".to_string(),
+        )]));
+        let cfg = Config::load_layered(&env, &[], None);
+        assert_eq!(cfg.profile, "emacs");
     }
 
     // defaults < file < env < flag, for a scalar and a validated enum.
@@ -1885,6 +2410,78 @@ surface = "todoist.status"
     }
 
     #[test]
+    fn pin_location_parses_strip_and_float_with_aliases() {
+        let strip: Config =
+            toml::from_str("[[pins]]\nname='x'\ncommand='c'\nlocation='top-strip'\n").unwrap();
+        assert_eq!(strip.pins[0].location, PinLocation::Strip);
+        assert_eq!(PinLocation::Strip.as_str(), "strip");
+        let float: Config =
+            toml::from_str("[[pins]]\nname='x'\ncommand='c'\nlocation='scratch'\n").unwrap();
+        assert_eq!(float.pins[0].location, PinLocation::Float);
+        assert_eq!(PinLocation::Float.as_str(), "float");
+    }
+
+    #[test]
+    fn pin_extended_fields_parse() {
+        let body = "[[pins]]\nname='logs'\ncommand='journalctl'\nargs=['-f']\n\
+                    label='syslog'\nratio=2.5\n[pins.env]\nRUST_LOG='info'\n";
+        let cfg: Config = toml::from_str(body).unwrap();
+        let p = &cfg.pins[0];
+        assert_eq!(p.args, vec!["-f"]);
+        assert_eq!(p.display_label(), "syslog");
+        assert_eq!(p.strip_weight(), 2.5);
+        assert_eq!(p.env.get("RUST_LOG").map(String::as_str), Some("info"));
+    }
+
+    #[test]
+    fn pin_helpers_fall_back_sensibly() {
+        let cfg: Config = toml::from_str("[[pins]]\nname='bare'\ncommand='c'\n").unwrap();
+        let p = &cfg.pins[0];
+        // No label → name; no/zero ratio → 1.0.
+        assert_eq!(p.display_label(), "bare");
+        assert_eq!(p.strip_weight(), 1.0);
+        let mut neg = p.clone();
+        neg.ratio = Some(-3.0);
+        assert_eq!(neg.strip_weight(), 1.0);
+    }
+
+    #[test]
+    fn strip_config_defaults_and_clamps() {
+        let def = StripConfig::default();
+        assert_eq!(def.ratio, 0.2);
+        assert!(def.visible);
+        let lo = StripConfig {
+            ratio: 0.001,
+            visible: true,
+        };
+        assert_eq!(lo.clamped_ratio(), 0.05);
+        let hi = StripConfig {
+            ratio: 5.0,
+            visible: false,
+        };
+        assert_eq!(hi.clamped_ratio(), 0.9);
+    }
+
+    #[test]
+    fn pins_for_workspace_filters_by_scope() {
+        let body = "[[pins]]\nname='g'\ncommand='c'\nscope='global'\n\
+                    [[pins]]\nname='w'\ncommand='c'\nscope='workspace'\nworkspace='repoA'\n";
+        let cfg: Config = toml::from_str(body).unwrap();
+        let a: Vec<_> = cfg
+            .pins_for_workspace(Some("repoA"))
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        assert_eq!(a, vec!["g", "w"]);
+        let b: Vec<_> = cfg
+            .pins_for_workspace(Some("repoB"))
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        assert_eq!(b, vec!["g"]);
+    }
+
+    #[test]
     fn deprecated_sz_pr_ttl_still_read() {
         let env = map_env(&[("SZ_PR_TTL", "7")]);
         let o = env_overlay(&env);
@@ -1950,6 +2547,7 @@ surface = "todoist.status"
             ("SUPERZEJ_NAME_SCHEME", "numbered"),
             ("SUPERZEJ_AUTO_REMOVE_WORKTREE", "yes"),
             ("SUPERZEJ_REPO_SCAN_DEPTH", "9"),
+            ("SUPERZEJ_PROFILE", "vim"),
             ("SUPERZEJ_THEME_ACCENT", "#abcdef"),
             ("SUPERZEJ_PR_TTL", "11"),
             ("SUPERZEJ_DASHBOARD_INTERVAL", "6"),
@@ -1977,6 +2575,7 @@ surface = "todoist.status"
         assert_eq!(c.name_scheme, NameScheme::Numbered);
         assert!(c.auto_remove_worktree);
         assert_eq!(c.repo_scan_depth, 9);
+        assert_eq!(c.profile, "vim");
         assert_eq!(c.theme.accent, "#abcdef");
         assert_eq!(c.pr.ttl_secs, 11);
         assert_eq!(c.dashboard.interval_secs, 6);
@@ -2215,6 +2814,10 @@ format = \"bad\"
             restart: crate::config::PinRestart::Never,
             singleton: false,
             location: crate::config::PinLocation::Tab,
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            label: None,
+            ratio: None,
         });
         assert_eq!(cfg.pin("test").unwrap().name, "test");
         assert!(cfg.pin("missing").is_none());
@@ -2236,6 +2839,10 @@ format = \"bad\"
             restart: crate::config::PinRestart::Never,
             singleton: false,
             location: crate::config::PinLocation::Tab,
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            label: None,
+            ratio: None,
         });
         cfg.pins.push(crate::config::Pin {
             name: "local".into(),
@@ -2247,6 +2854,10 @@ format = \"bad\"
             restart: crate::config::PinRestart::Never,
             singleton: false,
             location: crate::config::PinLocation::Tab,
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            label: None,
+            ratio: None,
         });
         cfg.pins.push(crate::config::Pin {
             name: "local_any".into(),
@@ -2258,6 +2869,10 @@ format = \"bad\"
             restart: crate::config::PinRestart::Never,
             singleton: false,
             location: crate::config::PinLocation::Tab,
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            label: None,
+            ratio: None,
         });
         let none_pins = cfg.pins_for_workspace(None);
         assert_eq!(none_pins.len(), 1); // just global
@@ -2314,17 +2929,18 @@ forward_agent = false
 
     #[test]
     fn process_env_reads_real_vars() {
-        std::env::set_var("SUPERZEJ_TEST_PENV_xyz", "v1");
+        // SAFETY: single-threaded test using uniquely-named vars.
+        unsafe { std::env::set_var("SUPERZEJ_TEST_PENV_xyz", "v1") };
         assert_eq!(
             ProcessEnv.get("SUPERZEJ_TEST_PENV_xyz").as_deref(),
             Some("v1")
         );
         assert!(ProcessEnv.get("SUPERZEJ_TEST_PENV_absent_qqq").is_none());
-        std::env::remove_var("SUPERZEJ_TEST_PENV_xyz");
+        unsafe { std::env::remove_var("SUPERZEJ_TEST_PENV_xyz") };
         // blank values are treated as unset.
-        std::env::set_var("SUPERZEJ_TEST_PENV_blank", "   ");
+        unsafe { std::env::set_var("SUPERZEJ_TEST_PENV_blank", "   ") };
         assert!(ProcessEnv.get("SUPERZEJ_TEST_PENV_blank").is_none());
-        std::env::remove_var("SUPERZEJ_TEST_PENV_blank");
+        unsafe { std::env::remove_var("SUPERZEJ_TEST_PENV_blank") };
     }
 
     #[test]
@@ -2350,5 +2966,41 @@ forward_agent = false
             "Esc"
         );
         assert_eq!(cfg.keybinds.emacs.get("focus-left").unwrap(), "Ctrl b");
+    }
+
+    #[test]
+    fn agent_and_tool_command_lookup_by_name() {
+        let cfg: Config = toml::from_str(
+            "[[agents]]\nname = 'claude'\ncommand = 'claude --foo'\n\
+             [[tools]]\nname = 'lazygit'\ncommand = 'lazygit'\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.agent_command("claude"), Some("claude --foo"));
+        assert_eq!(cfg.agent_command("nope"), None);
+        assert_eq!(cfg.tool_command("lazygit"), Some("lazygit"));
+        assert_eq!(cfg.tool_command("nope"), None);
+    }
+
+    #[test]
+    fn pin_lookup_by_name_and_index_and_workspace_scope() {
+        let cfg: Config = toml::from_str(
+            "[[pins]]\nname = 'aerc'\ncommand = 'aerc'\n\
+             [[pins]]\nname = 'logs'\ncommand = 'journalctl -f'\nscope = 'workspace'\nworkspace = '/repo'\n",
+        )
+        .unwrap();
+        // By name.
+        assert_eq!(cfg.pin("aerc").map(|p| p.name.as_str()), Some("aerc"));
+        assert!(cfg.pin("missing").is_none());
+        // By 1-based index (0 and out-of-range miss).
+        assert_eq!(cfg.pin_by_index(1).map(|p| p.name.as_str()), Some("aerc"));
+        assert_eq!(cfg.pin_by_index(2).map(|p| p.name.as_str()), Some("logs"));
+        assert!(cfg.pin_by_index(0).is_none());
+        assert!(cfg.pin_by_index(3).is_none());
+        // Workspace scoping: global pin always shows; workspace pin only for its repo.
+        let global_only = cfg.pins_for_workspace(None);
+        assert_eq!(global_only.len(), 1);
+        assert_eq!(global_only[0].name, "aerc");
+        let in_repo = cfg.pins_for_workspace(Some("/repo"));
+        assert_eq!(in_repo.len(), 2);
     }
 }
