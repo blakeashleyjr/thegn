@@ -3140,8 +3140,8 @@ async fn event_loop<T: Terminal>(
                 full_repaint = true;
             }
             crate::chrome::clear_frame(&mut scratch);
-            // Card titles: "{program} · {worktree-leaf}" from the spawn argv —
-            // best-effort but cheap (no OSC-title capture yet).
+            // Card titles: "{title} · {worktree-leaf}" — the OSC window title
+            // the app sets, else the program name derived from the spawn argv.
             let title_leaf = model
                 .worktree
                 .rsplit_once('/')
@@ -3160,10 +3160,18 @@ async fn event_loop<T: Terminal>(
                         .table
                         .get(&id)
                         .map(|p| {
+                            // Prefer the OSC window title the app sets (zsh +
+                            // starship, tmux, etc.); fall back to the program
+                            // name derived from the spawn argv.
+                            let name = p
+                                .emulator()
+                                .title()
+                                .filter(|t| !t.trim().is_empty())
+                                .unwrap_or_else(|| p.program().to_string());
                             if title_leaf.is_empty() {
-                                p.program().to_string()
+                                name
                             } else {
-                                format!("{} \u{00b7} {}", p.program(), title_leaf)
+                                format!("{name} \u{00b7} {title_leaf}")
                             }
                         })
                         .unwrap_or_default()

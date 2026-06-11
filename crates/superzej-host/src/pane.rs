@@ -62,7 +62,13 @@ pub fn program_name(argv: &[String]) -> String {
         // Strip a leading `exec ` and take the first bare word.
         let cmd = cmd.trim().strip_prefix("exec ").unwrap_or(cmd.trim());
         if let Some(word) = cmd.split_whitespace().next() {
-            return stem(word);
+            // Only descend when the word is a literal program path — a word
+            // carrying shell metacharacters (e.g. the `${SHELL:-/bin/sh}`
+            // login-shell placeholder) is not a path; stemming it yields
+            // garbage like `sh}`, so fall back to the outer shell name.
+            if !word.contains(['$', '{', '}', '(', ')', '`']) {
+                return stem(word);
+            }
         }
     }
     base
@@ -274,6 +280,17 @@ mod tests {
         assert_eq!(program_name(&sh("lazygit --version")), "lazygit");
         // A login shell with no inline command is just the shell.
         assert_eq!(program_name(&["/bin/zsh".into(), "-i".into()]), "zsh");
+        // Regression: the `${SHELL:-/bin/sh} -l` login-shell placeholder must
+        // not be stemmed into garbage like `sh}` — fall back to the outer
+        // shell name instead.
+        assert_eq!(
+            program_name(&[
+                "/bin/zsh".into(),
+                "-lc".into(),
+                "${SHELL:-/bin/sh} -l".into(),
+            ]),
+            "zsh"
+        );
     }
 
     #[test]

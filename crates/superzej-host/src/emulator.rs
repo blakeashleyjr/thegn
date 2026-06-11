@@ -45,6 +45,11 @@ pub trait PaneEmulator: Send {
     fn size(&self) -> (u16, u16);
     /// Cell at `(row, col)`, or `None` if out of range.
     fn cell(&self, row: u16, col: u16) -> Option<GridCell>;
+    /// The OSC window title (OSC 0/2) the app last set, if any. `None` when the
+    /// app has set no title, so callers can fall back to a derived name.
+    fn title(&self) -> Option<String> {
+        None
+    }
     /// Cursor position as `(row, col)`.
     fn cursor(&self) -> (u16, u16);
     /// Whether the cursor should be drawn (hidden in some modes).
@@ -94,9 +99,23 @@ pub enum MouseMode {
     AnyMotion,
 }
 
+/// Captures the OSC window title (OSC 0/2) the app sets. vt100 surfaces titles
+/// through a `Callbacks` impl rather than a `Screen` getter, so we sink the
+/// latest one here and read it back via `Parser::callbacks()`.
+#[derive(Debug, Default)]
+pub struct TitleSink {
+    title: String,
+}
+
+impl vt100::Callbacks for TitleSink {
+    fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
+        self.title = String::from_utf8_lossy(title).into_owned();
+    }
+}
+
 /// The `vt100`-backed spike emulator.
 pub struct Vt100Emulator {
-    parser: vt100::Parser,
+    parser: vt100::Parser<TitleSink>,
     /// Partial CSI carried between `advance` chunks for the HVP rewrite.
     hvp_carry: Vec<u8>,
 }
@@ -104,7 +123,7 @@ pub struct Vt100Emulator {
 impl Vt100Emulator {
     pub fn new(rows: u16, cols: u16, scrollback: usize) -> Self {
         Self {
-            parser: vt100::Parser::new(rows, cols, scrollback),
+            parser: vt100::Parser::new_with_callbacks(rows, cols, scrollback, TitleSink::default()),
             hvp_carry: Vec::new(),
         }
     }
@@ -188,6 +207,11 @@ impl PaneEmulator for Vt100Emulator {
             underline: cell.underline(),
             inverse: cell.inverse(),
         })
+    }
+
+    fn title(&self) -> Option<String> {
+        let t = &self.parser.callbacks().title;
+        (!t.is_empty()).then(|| t.clone())
     }
 
     fn cursor(&self) -> (u16, u16) {
@@ -310,6 +334,19 @@ mod tests {
         // The styling is intact on the cells themselves.
         let c = e.cell(1, 0).unwrap();
         assert_eq!(c.fg, CellColor::Indexed(1));
+    }
+
+    #[test]
+    fn osc_window_title_is_captured() {
+        let mut e = Vt100Emulator::new(24, 80, 0);
+        // No title set yet → None (so callers fall back to a derived name).
+        assert_eq!(e.title(), None);
+        // OSC 2 (BEL-terminated) sets the window title.
+        e.advance(b"\x1b]2;my-title\x07");
+        assert_eq!(e.title(), Some("my-title".to_string()));
+        // OSC 0 sets both icon name and title; a later title overwrites.
+        e.advance(b"\x1b]0;newer\x07");
+        assert_eq!(e.title(), Some("newer".to_string()));
     }
 
     #[test]
