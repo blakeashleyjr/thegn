@@ -172,7 +172,21 @@ fn run_capped(
         "-c".to_string(),
         command.to_string(),
     ];
-    let argv = wrap_capped(&inner, limits, detect_cap_backend());
+    run_capped_argv(&inner, worktree, limits, slot, generation, timeout)
+}
+
+/// Like [`run_capped`] but runs a prebuilt argv directly (no shell), so callers
+/// passing user/pattern data — e.g. the ripgrep source scan — never have to
+/// shell-quote. `inner[0]` is the program; the cap wrapper is prepended.
+fn run_capped_argv(
+    inner: &[String],
+    worktree: &Path,
+    limits: &LimitsConfig,
+    slot: &str,
+    generation: u64,
+    timeout: Option<Duration>,
+) -> CapOutput {
+    let argv = wrap_capped(inner, limits, detect_cap_backend());
 
     // Supersede any older job in this slot.
     cancel_slot(slot);
@@ -688,6 +702,180 @@ pub fn run_task(
     }
 }
 
+/// A no-compile source scan for one ecosystem: file globs to search and the
+/// regexes that mark a test declaration. The matched name is pulled out by
+/// [`extract_test_name`], so a single extractor serves every language.
+struct ScanRule {
+    globs: &'static [&'static str],
+    /// Patterns use POSIX classes (`[[:space:]]`, `[[:alnum:]_]`) so the same
+    /// string works for both ripgrep (Rust regex) and the GNU `grep -E`
+    /// fallback.
+    patterns: &'static [&'static str],
+}
+
+/// The ripgrep source-scan ruleset, keyed by matcher. This is the general form
+/// of the cargo `metadata` fix: enumerate tests by reading source — no compile,
+/// no build lock — for toolchains that would otherwise compile to list (Go,
+/// Swift) or that had no discovery at all (JS, Elixir, Zig, Ruby).
+fn scan_rule(matcher: &str) -> Option<ScanRule> {
+    let rule = match matcher {
+        "go-test" => ScanRule {
+            globs: &["*_test.go"],
+            patterns: &["^[[:space:]]*func[[:space:]]+(Test|Benchmark|Fuzz|Example)[[:alnum:]_]*"],
+        },
+        "swift" => ScanRule {
+            globs: &["*Tests.swift", "*Test.swift"],
+            patterns: &["func[[:space:]]+test[[:alnum:]_]*[[:space:]]*\\("],
+        },
+        "jest" | "vitest" | "javascript" => ScanRule {
+            globs: &[
+                "*.test.js",
+                "*.test.ts",
+                "*.test.jsx",
+                "*.test.tsx",
+                "*.test.mjs",
+                "*.spec.js",
+                "*.spec.ts",
+                "*.spec.jsx",
+                "*.spec.tsx",
+            ],
+            patterns: &["\\b(it|test)[[:space:]]*\\([[:space:]]*[\"'`]"],
+        },
+        "elixir" => ScanRule {
+            globs: &["*_test.exs", "*_test.ex"],
+            patterns: &["^[[:space:]]*test[[:space:]]+\""],
+        },
+        "zig" => ScanRule {
+            globs: &["*.zig"],
+            patterns: &["^[[:space:]]*test[[:space:]]+\""],
+        },
+        "ruby" | "rspec" => ScanRule {
+            globs: &["*_spec.rb", "*_test.rb"],
+            patterns: &[
+                "^[[:space:]]*it[[:space:]]+[\"']",
+                "^[[:space:]]*def[[:space:]]+test_[[:alnum:]_]*",
+            ],
+        },
+        _ => return None,
+    };
+    Some(rule)
+}
+
+/// Build the argv for a source scan: ripgrep when available (respects
+/// `.gitignore`, fast), else a GNU `grep -rnE` fallback. Both emit
+/// `path:line:text` so [`parse_scan_output`] is backend-agnostic.
+fn build_scan_argv(rule: &ScanRule) -> Vec<String> {
+    let mut argv: Vec<String> = Vec::new();
+    if on_path("rg") {
+        argv.extend(
+            [
+                "rg",
+                "--no-heading",
+                "--line-number",
+                "--no-messages",
+                "--color=never",
+            ]
+            .map(String::from),
+        );
+        for g in rule.globs {
+            argv.push("-g".into());
+            argv.push((*g).into());
+        }
+        for p in rule.patterns {
+            argv.push("-e".into());
+            argv.push((*p).into());
+        }
+        argv.push(".".into());
+    } else {
+        argv.extend(["grep", "-rnE"].map(String::from));
+        for g in rule.globs {
+            argv.push(format!("--include={g}"));
+        }
+        for p in rule.patterns {
+            argv.push("-e".into());
+            argv.push((*p).into());
+        }
+        argv.push(".".into());
+    }
+    argv
+}
+
+/// Pull a test name out of one matched source line. Handles both declaration
+/// shapes with no per-language config: `<keyword> <ident>` (Go `func`, Python
+/// `def`/`class`, Swift `func`, …) and `<keyword> "name"` / `it('name')`
+/// (Elixir/Zig `test "…"`, JS `it`/`test`). Tries the identifier form first,
+/// then the quoted form.
+fn extract_test_name(line: &str) -> Option<String> {
+    const KEYWORDS: &[&str] = &["func", "def", "class", "function", "fn", "sub"];
+    // `<keyword> <ident>` — the token right after a declaration keyword.
+    let toks: Vec<&str> = line
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .filter(|t| !t.is_empty())
+        .collect();
+    for (i, t) in toks.iter().enumerate() {
+        if KEYWORDS.contains(t)
+            && let Some(raw) = toks.get(i + 1)
+        {
+            let name: String = raw
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+    }
+    // `<keyword> "name"` / `it('name')` — the first quoted string on the line.
+    let first_quote = ['"', '\'', '`']
+        .iter()
+        .filter_map(|q| line.find(*q).map(|i| (i, *q)))
+        .min_by_key(|(i, _)| *i)?;
+    let (start, q) = first_quote;
+    let rest = &line[start + 1..];
+    let end = rest.find(q)?;
+    let name = &rest[..end];
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Parse `path:line:text` scan output into jumpable placeholder nodes (grouped
+/// by file, superseded by a real run).
+fn parse_scan_output(text: &str) -> Vec<TestNode> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut nodes = Vec::new();
+    for line in text.lines() {
+        let mut it = line.splitn(3, ':');
+        let (Some(path), Some(lineno), Some(rest)) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        let Ok(lineno) = lineno.parse::<usize>() else {
+            continue;
+        };
+        let Some(name) = extract_test_name(rest) else {
+            continue;
+        };
+        let path = path.trim_start_matches("./").to_string();
+        let id = format!("{path}::{name}");
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        nodes.push(TestNode {
+            id,
+            label: name,
+            depth: 0,
+            kind: TestNodeKind::Test,
+            state: TestState::Unknown,
+            location: Some(TestLocation {
+                path,
+                line: lineno,
+                column: None,
+            }),
+            message: None,
+            placeholder: true,
+        });
+    }
+    panel::tree_from_flat_tests(nodes)
+}
+
 pub fn discover_tests(
     worktree: PathBuf,
     generation: u64,
@@ -697,6 +885,32 @@ pub fn discover_tests(
     let wt = worktree.to_string_lossy().into_owned();
     let slot = format!("{}:disc", worktree.display());
     let timeout = secs_to_timeout(limits.discover_timeout_secs);
+
+    // Source-scan ecosystems (no compile, no build lock): ripgrep for test
+    // declarations. rg/grep exit 1 on "no matches" — not an error here.
+    if let Some(rule) = scan_rule(task.matcher.as_str()) {
+        let argv = build_scan_argv(&rule);
+        let out = run_capped_argv(&argv, &worktree, limits, &slot, generation, timeout);
+        if out.timed_out {
+            return DiscoveryOutcome {
+                worktree: wt,
+                generation,
+                task,
+                nodes: Vec::new(),
+                error: Some(format!(
+                    "test discovery timed out after {}s",
+                    limits.discover_timeout_secs
+                )),
+            };
+        }
+        return DiscoveryOutcome {
+            worktree: wt,
+            generation,
+            task,
+            nodes: parse_scan_output(&out.text),
+            error: None,
+        };
+    }
 
     // Cargo: enumerate test *targets* from `cargo metadata`. This reads only the
     // manifests — no compile, no build-directory lock — so discovery is instant
@@ -823,10 +1037,10 @@ fn parse_cargo_metadata_targets(json: &str) -> Vec<TestNode> {
 fn discovery_command(task: &TestTask) -> Option<&'static str> {
     match task.matcher.as_str() {
         // NB: cargo (`cargo-test`/`nextest`) is handled in `discover_tests` via
-        // `cargo metadata` (no compile) and never reaches here.
-        "go-test" => Some("go test -list . ./..."),
+        // `cargo metadata`, and the source-scan ecosystems (go, swift, js,
+        // elixir, zig, ruby) via `scan_rule` — both no-compile, before here.
+        // pytest collection imports modules but neither compiles nor locks.
         "pytest" => Some("pytest --collect-only -q"),
-        "swift" => Some("swift test --list-tests"),
         // `ctest -N` ("show only") prints `Test #N: name` without running.
         "ctest" => Some("ctest -N"),
         // Enumerate flake checks as targets (JSON, parsed specially).
@@ -1502,5 +1716,100 @@ mod tests {
         assert!(tests.iter().all(|n| n.placeholder));
         assert!(tests.iter().any(|n| n.id == "demo::lib tests"));
         assert!(tests.iter().any(|n| n.id == "demo::it"));
+    }
+
+    #[test]
+    fn extract_test_name_handles_every_declaration_shape() {
+        // <keyword> <ident>
+        assert_eq!(
+            extract_test_name("func TestAdd(t *testing.T) {").as_deref(),
+            Some("TestAdd")
+        );
+        assert_eq!(
+            extract_test_name("    func testParsesJson() throws {").as_deref(),
+            Some("testParsesJson")
+        );
+        assert_eq!(
+            extract_test_name("    def test_widget_renders(self):").as_deref(),
+            Some("test_widget_renders")
+        );
+        assert_eq!(
+            extract_test_name("class TestMath:").as_deref(),
+            Some("TestMath")
+        );
+        // <keyword> "name" / it('name')
+        assert_eq!(
+            extract_test_name("  test \"adds two numbers\" do").as_deref(),
+            Some("adds two numbers")
+        );
+        assert_eq!(
+            extract_test_name("  it('renders the header', () => {").as_deref(),
+            Some("renders the header")
+        );
+        assert_eq!(
+            extract_test_name("test(`templated name`, async () => {").as_deref(),
+            Some("templated name")
+        );
+        // Non-test lines yield nothing.
+        assert_eq!(extract_test_name("let x = 3;"), None);
+    }
+
+    #[test]
+    fn parse_scan_output_builds_jumpable_placeholders_grouped_by_file() {
+        let out = "./pkg/math_test.go:12:func TestAdd(t *testing.T) {\n\
+                   ./pkg/math_test.go:20:func TestSub(t *testing.T) {\n\
+                   not-a-match-line\n";
+        let nodes = parse_scan_output(out);
+        let tests: Vec<_> = nodes
+            .iter()
+            .filter(|n| n.kind == TestNodeKind::Test)
+            .collect();
+        assert_eq!(tests.len(), 2, "two go tests: {tests:?}");
+        assert!(tests.iter().all(|n| n.placeholder));
+        let add = tests.iter().find(|n| n.label == "TestAdd").unwrap();
+        assert_eq!(add.id, "pkg/math_test.go::TestAdd");
+        let loc = add.location.as_ref().expect("jumpable location");
+        assert_eq!((loc.path.as_str(), loc.line), ("pkg/math_test.go", 12));
+    }
+
+    /// End-to-end source-scan discovery against a REAL Go module: no `go`
+    /// invocation, no compile — just ripgrep/grep over `*_test.go`. Verifies the
+    /// generalized (cargo-metadata-style) instant discovery on another
+    /// toolchain. Skipped if neither rg nor grep is present.
+    #[test]
+    fn e2e_go_scan_discovers_without_compiling() {
+        if !on_path("rg") && !on_path("grep") {
+            return;
+        }
+        let wt = temp_dir("e2e-go-scan");
+        std::fs::write(wt.join("go.mod"), "module demo\n\ngo 1.21\n").unwrap();
+        std::fs::write(
+            wt.join("math_test.go"),
+            "package demo\n\nimport \"testing\"\n\n\
+             func TestAdd(t *testing.T) { if 2+2 != 4 { t.Fail() } }\n\
+             func TestSub(t *testing.T) {}\n\
+             func helper() {}\n",
+        )
+        .unwrap();
+
+        let task = detect_test_task(&wt, &Config::default()).unwrap();
+        assert_eq!(task.matcher, "go-test");
+        let disc = discover_tests(wt.clone(), 1, task, &uncapped());
+        assert!(disc.error.is_none(), "discovery error: {:?}", disc.error);
+        let labels: Vec<&str> = disc
+            .nodes
+            .iter()
+            .filter(|n| n.kind == TestNodeKind::Test)
+            .map(|n| n.label.as_str())
+            .collect();
+        assert!(
+            labels.contains(&"TestAdd") && labels.contains(&"TestSub"),
+            "scan should find both test funcs (not the helper): {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"helper"),
+            "non-test funcs excluded: {labels:?}"
+        );
+        let _ = std::fs::remove_dir_all(wt);
     }
 }
