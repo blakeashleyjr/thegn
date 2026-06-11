@@ -1,6 +1,6 @@
 # superzej — roadmap & progress
 
-528 features across 43 groups (A–AQ). The list is really **two tracks joined by
+533 features across 43 groups (A–AQ). The list is really **two tracks joined by
 one keystone**: an AI-free _shell_ track and an AI track, bridged by the **proxy**.
 That shape drives the phasing below. Original numbering is preserved; gaps are
 deliberate cuts (499, 500, 502, 505, 506, 507, 510 dropped from the moonshot set;
@@ -81,6 +81,8 @@ L0  Foundation (daemon, zellij, event bus, state, config)
 
 Profiles, the event bus, and the audit log are cross-cutting and must be seeded
 early even though most consumers arrive late — retrofitting observability hurts.
+The profile/subprofile firewall is now designed end-to-end (see H. and
+`docs/superpowers/specs/2026-06-11-profiles-subprofiles-design.md`).
 
 ---
 
@@ -341,7 +343,18 @@ task registry (AQ 520–522) and worktree templates (54); new work targets
 - [ ] 99. Layout import/export
 - [~] 100. Auto-layout by terminal size
 
-### H. Profiles
+### H. Profiles & subprofiles
+
+Design approved (2026-06-11): `docs/superpowers/specs/2026-06-11-profiles-subprofiles-design.md`.
+Locked decisions: **(1)** a profile is a complete firewall realized as a
+**separate OS process + scope root** — multiple windows run concurrently, one
+per profile; **(2)** shared base config + per-profile overrides; **(3)**
+firewall covers state/DB, config/theme, credentials + git identity, and
+sandbox/network policy. The firewall is enforced by **rerooting the process
+environment once at startup** (the codebase is already env-driven). A
+**subprofile** scopes a single subsystem (`workspace` / `comms` / later `ai`)
+inside a profile and switches **in-process** — e.g. unified dev but Comms split
+into work/personal (see AM. 479–480, 536–539 below).
 
 - [ ] 101. Profiles (work/personal/etc.)
 - [ ] 102. Per-profile workspaces
@@ -353,6 +366,10 @@ task registry (AQ 520–522) and worktree templates (54); new work targets
 - [ ] 108. Profile switcher
 - [ ] 109. Separate state dirs per profile
 - [ ] 110. Profile-scoped audit logs
+- [ ] 536. Subprofiles — per-subsystem identity/storage split within a profile (Comms work/personal)
+- [ ] 537. Subprofile switcher — in-subsystem, in-process rebind (teardown + bind)
+- [ ] 538. Subsystem abstraction — `workspace`/`comms`/`ai` own storage + cred scope + pane set
+- [ ] 539. Multi-process model — one window per profile, `flock` singleton, terminal-spawn switcher
 
 ### I. Session persistence
 
@@ -835,6 +852,7 @@ non-agent processes and plain task panes._
 - [ ] 478. Cross-tile actions — email→task, agent→Matrix
 - [ ] 479. Unified comms inbox
 - [ ] 480. Workspace presets — comms/dev/personal
+- [ ] 540. Comms as a subprofile-aware subsystem — per-subprofile accounts/storage/creds (first consumer of H. 536–538; design `docs/superpowers/specs/2026-06-11-profiles-subprofiles-design.md`)
 
 ### AN. Audit / logging / replay
 
