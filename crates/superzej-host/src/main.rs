@@ -18,6 +18,7 @@ mod run;
 mod sequence;
 mod session;
 mod task;
+mod testkit;
 
 use clap::Parser;
 use std::path::PathBuf;
