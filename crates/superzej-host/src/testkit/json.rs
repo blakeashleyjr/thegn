@@ -30,6 +30,7 @@ fn node(id: &str, state: TestState, loc: Option<TestLocation>, msg: Option<Strin
         state,
         location: loc,
         message: msg,
+        placeholder: false,
     }
 }
 
@@ -188,6 +189,7 @@ pub fn parse_nix_flake_show(text: &str) -> Vec<TestNode> {
                 state: TestState::Unknown,
                 location: None,
                 message: None,
+                placeholder: false,
             });
         }
     }

@@ -98,6 +98,11 @@ pub struct TestNode {
     pub location: Option<TestLocation>,
     #[serde(default)]
     pub message: Option<String>,
+    /// A discovery-only placeholder (e.g. a cargo test *target* surfaced by
+    /// `cargo metadata` before any run). Dropped once real per-test results
+    /// arrive — see [`TestPanelState::merge_results`].
+    #[serde(default)]
+    pub placeholder: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,6 +152,11 @@ pub struct TestCache {
     pub summary: TestSummary,
     #[serde(default)]
     pub discovered: bool,
+    /// Fingerprint of the worktree's build manifests at discovery time. When it
+    /// still matches on a later open, discovery is skipped entirely (no
+    /// subprocess) — see `maybe_discover_tests`.
+    #[serde(default)]
+    pub fingerprint: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -166,6 +176,9 @@ pub struct TestPanelState {
     pub cursor: usize,
     pub scroll: usize,
     pub filter: String,
+    /// Manifest fingerprint recorded at the last discovery. Compared against a
+    /// freshly-computed one to decide whether discovery can be skipped.
+    pub fingerprint: String,
 }
 
 impl TestPanelState {
@@ -176,12 +189,14 @@ impl TestPanelState {
             nodes: self.by_id.values().cloned().collect(),
             summary: self.summary.clone(),
             discovered: self.discovered,
+            fingerprint: self.fingerprint.clone(),
         }
     }
 
     pub fn apply_cache(&mut self, cache: TestCache) {
         self.task = cache.task;
         self.discovered = cache.discovered;
+        self.fingerprint = cache.fingerprint;
         self.by_id = cache
             .nodes
             .into_iter()
@@ -198,7 +213,17 @@ impl TestPanelState {
     /// land as `Unknown`; an existing test only gains a discovery location if it
     /// didn't have one.
     pub fn merge_discovered(&mut self, incoming: &[TestNode]) {
+        // Once a run has produced real per-test rows, coarse discovery
+        // placeholders (cargo metadata targets) add nothing — suppress them so
+        // re-discovery (e.g. after a manifest change) doesn't resurrect them.
+        let have_real = self
+            .by_id
+            .values()
+            .any(|n| n.kind == TestNodeKind::Test && !n.placeholder);
         for n in incoming.iter().filter(|n| n.kind == TestNodeKind::Test) {
+            if n.placeholder && have_real {
+                continue;
+            }
             self.by_id
                 .entry(n.id.clone())
                 .and_modify(|existing| {
@@ -215,9 +240,19 @@ impl TestPanelState {
         self.refresh();
     }
 
-    /// Upsert run results: the latest run wins for each reported test.
+    /// Upsert run results: the latest run wins for each reported test. Real
+    /// results supersede discovery placeholders (coarse `cargo metadata`
+    /// targets), so the moment a run reports actual tests the target stand-ins
+    /// drop out and only real per-test rows remain.
     pub fn merge_results(&mut self, incoming: &[TestNode]) {
-        for n in incoming.iter().filter(|n| n.kind == TestNodeKind::Test) {
+        let real: Vec<&TestNode> = incoming
+            .iter()
+            .filter(|n| n.kind == TestNodeKind::Test && !n.placeholder)
+            .collect();
+        if !real.is_empty() {
+            self.by_id.retain(|_, n| !n.placeholder);
+        }
+        for n in real {
             self.by_id.insert(n.id.clone(), n.clone());
         }
         self.discovered = true;
@@ -363,6 +398,7 @@ pub fn tree_failed_first(tests: Vec<TestNode>) -> Vec<TestNode> {
             state: TestState::Unknown,
             location: None,
             message: None,
+            placeholder: false,
         });
         for mut t in ts {
             t.depth = 1;
@@ -388,6 +424,7 @@ fn group_flat(tests: Vec<TestNode>) -> Vec<TestNode> {
                 state: TestState::Unknown,
                 location: None,
                 message: None,
+                placeholder: false,
             });
             last_group = group;
         }
@@ -508,6 +545,7 @@ fn test_node(
         state,
         location,
         message,
+        placeholder: false,
     }
 }
 
@@ -634,6 +672,55 @@ mod tests {
         assert_eq!(test_nodes(&st.nodes).len(), 1);
         assert!(st.task.is_some());
         assert!(st.discovered);
+    }
+
+    fn placeholder_node(id: &str) -> TestNode {
+        TestNode {
+            placeholder: true,
+            ..test_node(id, TestState::Unknown, None, None)
+        }
+    }
+
+    #[test]
+    fn run_results_supersede_discovery_placeholders() {
+        let mut st = TestPanelState::default();
+        // Cargo metadata discovery seeds coarse target placeholders.
+        st.merge_discovered(&[
+            placeholder_node("demo::lib tests"),
+            placeholder_node("demo::it"),
+        ]);
+        assert_eq!(test_nodes(&st.nodes).len(), 2, "placeholders shown pre-run");
+        // A real run reports per-test rows; placeholders must drop out.
+        st.merge_results(&[
+            test_node("config::tests::a", TestState::Pass, None, None),
+            test_node("db::tests::b", TestState::Fail, None, None),
+        ]);
+        let tests = test_nodes(&st.nodes);
+        assert_eq!(tests.len(), 2, "only real rows remain");
+        assert!(
+            tests.iter().all(|n| !n.placeholder),
+            "no placeholders survive a real run: {tests:?}"
+        );
+        // Re-discovery (e.g. after a manifest change) must not resurrect them.
+        st.merge_discovered(&[placeholder_node("demo::lib tests")]);
+        assert!(
+            test_nodes(&st.nodes).iter().all(|n| !n.placeholder),
+            "real results suppress re-seeded placeholders"
+        );
+    }
+
+    #[test]
+    fn fingerprint_survives_cache_roundtrip() {
+        let mut st = TestPanelState {
+            fingerprint: "Cargo.toml:120:1700".into(),
+            ..Default::default()
+        };
+        st.merge_results(&[test_node("a::b", TestState::Pass, None, None)]);
+        let json = serde_json::to_string(&st.to_cache()).unwrap();
+        let mut restored = TestPanelState::default();
+        restored.apply_cache(serde_json::from_str(&json).unwrap());
+        assert_eq!(restored.fingerprint, "Cargo.toml:120:1700");
+        assert!(restored.discovered);
     }
 
     #[test]
