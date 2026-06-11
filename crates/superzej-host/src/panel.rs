@@ -78,12 +78,31 @@ pub struct PrSummary {
     pub review_decision: Option<String>,
 }
 
+/// How a runner's output is turned into test results. Text scraping is the
+/// fragile baseline; structured JSON and post-run report files are preferred
+/// where a toolchain offers them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Ingestion {
+    #[default]
+    Text,
+    Json,
+    Report,
+}
+
 /// A configured/detected test task that can be run in a worktree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TestTask {
     pub name: String,
     pub command: String,
     pub matcher: String,
+    /// How to parse this task's results (default: text scraping).
+    #[serde(default)]
+    pub ingestion: Ingestion,
+    /// For `Ingestion::Report`: a worktree-relative glob of report files to read
+    /// after the run completes (e.g. `target/surefire-reports/*.xml`).
+    #[serde(default)]
+    pub report_glob: Option<String>,
 }
 
 impl TestTask {
@@ -96,7 +115,22 @@ impl TestTask {
             name: name.into(),
             command: command.into(),
             matcher: matcher.into(),
+            ingestion: Ingestion::Text,
+            report_glob: None,
         }
+    }
+
+    // Used by the JSON/Report matchers landing in later phases.
+    #[allow(dead_code)]
+    pub fn with_ingestion(mut self, ingestion: Ingestion) -> Self {
+        self.ingestion = ingestion;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_report_glob(mut self, glob: impl Into<String>) -> Self {
+        self.report_glob = Some(glob.into());
+        self
     }
 }
 
@@ -246,6 +280,16 @@ impl TestPanelState {
         self.summary = summarize_nodes(&self.nodes);
         self.summary.running = self.running;
         self.summary.stale = self.stale;
+    }
+
+    /// Mark cached results as stale (e.g. on a file change). This is the ONLY
+    /// thing a file-change/watch path is allowed to do: it never starts a run or
+    /// discovery — superzej never auto-runs tests. Pure: keeps task/nodes intact.
+    /// Wired to the opt-in watch toggle in a later phase.
+    #[allow(dead_code)]
+    pub fn mark_stale(&mut self) {
+        self.stale = true;
+        self.summary.stale = true;
     }
 }
 
@@ -563,6 +607,24 @@ mod tests {
         let failed = nodes.iter().find(|n| n.id == "activity::quiet").unwrap();
         assert_eq!(failed.state, TestState::Fail);
         assert_eq!(failed.location.as_ref().unwrap().line, 123);
+    }
+
+    #[test]
+    fn mark_stale_is_pure_and_never_clears_results() {
+        let mut st = TestPanelState {
+            task: Some(TestTask::new("cargo test", "cargo test", "cargo-test")),
+            nodes: vec![test_node("a::b", TestState::Pass, None, None)],
+            discovered: true,
+            ..Default::default()
+        };
+        st.recompute_summary();
+        st.mark_stale();
+        // Stale flag set on both state and summary; results preserved (the watch
+        // path marks stale, it never spawns a run).
+        assert!(st.stale && st.summary.stale);
+        assert_eq!(st.nodes.len(), 1);
+        assert!(st.task.is_some());
+        assert!(st.discovered);
     }
 
     #[test]

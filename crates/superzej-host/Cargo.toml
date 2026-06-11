@@ -26,6 +26,7 @@ termwiz.workspace = true
 vt100.workspace = true
 nucleo-matcher.workspace = true
 notify = "6"
+libc.workspace = true
 
 [dev-dependencies]
 toml.workspace = true

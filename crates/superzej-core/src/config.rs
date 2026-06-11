@@ -434,6 +434,18 @@ pub struct LimitsConfig {
     pub tool_mem_max: String,
     /// `MemorySwapMax` for the tool scope (e.g. "1G").
     pub tool_mem_swap_max: String,
+    /// `CPUQuota` for test/discovery runs (e.g. "150%" = 1.5 cores). Empty =
+    /// uncapped. superzej never auto-runs tests, but an explicit run is still
+    /// capped so a heavy suite can't pin the machine.
+    pub test_cpu_quota: String,
+    /// `MemoryMax` for test/discovery runs (e.g. "4G"). Empty = uncapped.
+    pub test_mem_max: String,
+    /// `nice` increment applied to test/discovery runs when no systemd scope is
+    /// available (and as `Nice=` inside the scope when it is). 0 disables.
+    pub test_nice: i32,
+    /// Max concurrent test/discovery jobs across all worktrees. 1 keeps an
+    /// explicit run from competing with another worktree's run for cores.
+    pub test_max_parallel: usize,
 }
 
 impl Default for LimitsConfig {
@@ -441,6 +453,10 @@ impl Default for LimitsConfig {
         LimitsConfig {
             tool_mem_max: "6G".into(),
             tool_mem_swap_max: "1G".into(),
+            test_cpu_quota: "150%".into(),
+            test_mem_max: "4G".into(),
+            test_nice: 10,
+            test_max_parallel: 1,
         }
     }
 }
