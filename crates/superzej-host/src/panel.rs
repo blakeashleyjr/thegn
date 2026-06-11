@@ -449,6 +449,24 @@ pub fn parse_test_output(output: &str) -> Vec<TestNode> {
                 first_location.clone(),
                 first_failure_message(output),
             ));
+        } else if let Some(name) = swift_result(trimmed, "passed") {
+            nodes.push(test_node(name, TestState::Pass, None, None));
+        } else if let Some(name) = swift_result(trimmed, "failed") {
+            nodes.push(test_node(
+                name,
+                TestState::Fail,
+                first_location.clone(),
+                first_failure_message(output),
+            ));
+        } else if let Some(name) = ctest_result(trimmed, "Passed") {
+            nodes.push(test_node(name, TestState::Pass, None, None));
+        } else if let Some(name) = ctest_result(trimmed, "Failed") {
+            nodes.push(test_node(
+                name,
+                TestState::Fail,
+                first_location.clone(),
+                first_failure_message(output),
+            ));
         } else if trimmed.starts_with('✓') || trimmed.starts_with("PASS ") {
             nodes.push(test_node(
                 trimmed.trim_start_matches('✓').trim(),
@@ -466,6 +484,29 @@ pub fn parse_test_output(output: &str) -> Vec<TestNode> {
         }
     }
     dedup_nodes(nodes)
+}
+
+/// XCTest / swift-testing line: `Test Case '-[Module.Suite testX]' passed (…)`
+/// or `Test Case 'Suite.testX' failed (…)`.
+fn swift_result(line: &str, verb: &str) -> Option<String> {
+    let rest = line.strip_prefix("Test Case ")?;
+    if !rest.contains(&format!(" {verb}")) {
+        return None;
+    }
+    let inner = rest.trim_start_matches('\'');
+    let name = inner.split('\'').next().unwrap_or(inner).trim();
+    let name = name.trim_start_matches("-[").trim_end_matches(']');
+    (!name.is_empty()).then(|| name.replace(' ', "."))
+}
+
+/// CTest line: `    1/3 Test #1: suite.name .......   Passed    0.01 sec`.
+fn ctest_result(line: &str, verb: &str) -> Option<String> {
+    if !line.contains("Test #") || !line.contains(verb) {
+        return None;
+    }
+    let after = line.split_once(':')?.1;
+    let name = after.split_whitespace().next()?;
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 fn test_node(
@@ -625,6 +666,39 @@ mod tests {
         assert_eq!(st.nodes.len(), 1);
         assert!(st.task.is_some());
         assert!(st.discovered);
+    }
+
+    #[test]
+    fn parses_swift_xctest_pass_and_fail() {
+        let out = "Test Case '-[AppTests.MathTests testAdds]' passed (0.001 seconds).\n\
+                   Test Case '-[AppTests.MathTests testBroken]' failed (0.002 seconds).\n\
+                   /x/Tests/MathTests.swift:14: error: -[AppTests.MathTests testBroken]";
+        let nodes = parse_test_output(out);
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n.id.contains("testAdds") && n.state == TestState::Pass)
+        );
+        let failed = nodes.iter().find(|n| n.id.contains("testBroken")).unwrap();
+        assert_eq!(failed.state, TestState::Fail);
+        assert_eq!(failed.location.as_ref().unwrap().line, 14);
+    }
+
+    #[test]
+    fn parses_ctest_pass_and_fail() {
+        let out = "    1/2 Test #1: math.adds .........   Passed    0.01 sec\n\
+                       2/2 Test #2: math.broken ......***Failed    0.01 sec";
+        let nodes = parse_test_output(out);
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n.id == "math.adds" && n.state == TestState::Pass)
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n.id == "math.broken" && n.state == TestState::Fail)
+        );
     }
 
     #[test]

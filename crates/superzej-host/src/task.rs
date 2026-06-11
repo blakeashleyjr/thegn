@@ -289,26 +289,61 @@ pub fn detect_test_task(worktree: &Path, cfg: &Config) -> Option<TestTask> {
 }
 
 fn detect_fallback(worktree: &Path) -> Option<TestTask> {
+    use crate::panel::Ingestion;
+    let has = |f: &str| worktree.join(f).exists();
+
     if has_just_test(worktree) {
         return Some(TestTask::new("just test", "just test", "generic"));
     }
-    if worktree.join("Cargo.toml").exists() {
+    if has("Cargo.toml") {
+        // Prefer nextest (structured JSON + timing) when it's installed.
+        if on_path("cargo-nextest") {
+            // libtest-json is gated behind an experimental env flag in nextest;
+            // the inline assignment is fine because we run via `sh -lc`.
+            return Some(
+                TestTask::new(
+                    "cargo nextest",
+                    "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 \
+                     cargo nextest run --message-format libtest-json",
+                    "nextest",
+                )
+                .with_ingestion(Ingestion::Json),
+            );
+        }
         return Some(TestTask::new(
             "cargo test",
             "cargo test --workspace",
             "cargo-test",
         ));
     }
-    if worktree.join("go.mod").exists() {
+    if has("go.mod") {
         return Some(TestTask::new("go test", "go test ./...", "go-test"));
     }
-    if worktree.join("pyproject.toml").exists()
-        || worktree.join("pytest.ini").exists()
-        || worktree.join("tox.ini").exists()
-    {
+    if has("pyproject.toml") || has("pytest.ini") || has("tox.ini") {
         return Some(TestTask::new("pytest", "pytest", "pytest"));
     }
-    if worktree.join("package.json").exists() {
+    if has("pubspec.yaml") {
+        let pubspec = std::fs::read_to_string(worktree.join("pubspec.yaml")).unwrap_or_default();
+        let is_flutter = pubspec.contains("flutter:") || pubspec.contains("sdk: flutter");
+        return Some(if is_flutter {
+            TestTask::new("flutter test", "flutter test --reporter json", "flutter")
+                .with_ingestion(Ingestion::Json)
+        } else {
+            TestTask::new("dart test", "dart test --reporter json", "dart")
+                .with_ingestion(Ingestion::Json)
+        });
+    }
+    if has("Package.swift") {
+        return Some(TestTask::new("swift test", "swift test", "swift"));
+    }
+    if has("mix.exs") {
+        return Some(TestTask::new("mix test", "mix test", "elixir"));
+    }
+    if has("CMakeLists.txt") {
+        // CTest runs the suite; ctest's stdout is a stable per-test text format.
+        return Some(TestTask::new("ctest", "ctest --output-on-failure", "ctest"));
+    }
+    if has("package.json") {
         let pkg = std::fs::read_to_string(worktree.join("package.json")).unwrap_or_default();
         if pkg.contains("vitest") {
             return Some(TestTask::new("vitest", "npm test -- --run", "vitest"));
@@ -412,9 +447,13 @@ pub fn discover_tests(
 
 fn discovery_command(task: &TestTask) -> Option<&'static str> {
     match task.matcher.as_str() {
-        "cargo-test" => Some("cargo test --workspace -- --list"),
+        // `cargo test --list` lists tests regardless of nextest.
+        "cargo-test" | "nextest" => Some("cargo test --workspace -- --list"),
         "go-test" => Some("go test -list . ./..."),
         "pytest" => Some("pytest --collect-only -q"),
+        "swift" => Some("swift test --list-tests"),
+        // `ctest -N` ("show only") prints `Test #N: name` without running.
+        "ctest" => Some("ctest -N"),
         _ => None,
     }
 }
@@ -448,10 +487,18 @@ fn discovery_test_name(matcher: &str, line: &str) -> Option<String> {
     match matcher {
         // `cargo test -- --list` prints `path::to::test: test` (and `…: benchmark`),
         // plus `N tests, M benchmarks` summaries and blank lines.
-        "cargo-test" => line
+        "cargo-test" | "nextest" => line
             .strip_suffix(": test")
             .or_else(|| line.strip_suffix(": benchmark"))
             .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty()),
+        // `swift test --list-tests` prints `Suite/testMethod` per line.
+        "swift" => (line.contains('/') && !line.contains(' ')).then(|| line.to_string()),
+        // `ctest -N` prints `  Test #3: suite.name`; ignore the `Total Tests` line.
+        "ctest" => line
+            .split_once(':')
+            .filter(|(head, _)| head.trim_start().starts_with("Test #"))
+            .map(|(_, name)| name.trim().to_string())
             .filter(|n| !n.is_empty()),
         // `go test -list` prints one bare test name per line plus `ok …`/`?  …`
         // build/result lines.
@@ -470,6 +517,18 @@ fn discovery_test_name(matcher: &str, line: &str) -> Option<String> {
 }
 
 pub fn parse_task_outcome(outcome: &TaskOutcome) -> Vec<TestNode> {
+    use crate::panel::Ingestion;
+    // Structured ingestion is preferred where the runner provides it; text
+    // scraping is the fragile fallback. Report-file ingestion lands in a later
+    // phase (parsed from disk by the caller, not from captured stdout).
+    if outcome.task.ingestion == Ingestion::Json {
+        let nodes = crate::testkit::json::parse(&outcome.task.matcher, &outcome.stdout_stderr);
+        if !nodes.is_empty() {
+            return nodes;
+        }
+        // Fall through to the synthetic single-node result below on empty JSON
+        // (e.g. the runner failed before emitting any events).
+    }
     let mut nodes = panel::parse_test_output(&outcome.stdout_stderr);
     if nodes.is_empty() {
         let state = if outcome.exit_code == Some(0) {
@@ -543,6 +602,41 @@ mod tests {
     }
 
     #[test]
+    fn detects_tier_a_manifests_with_right_matcher_and_ingestion() {
+        use crate::panel::Ingestion;
+        let cases: &[(&str, &str, &str, Ingestion)] = &[
+            ("pubspec.yaml", "name: x\n", "dart", Ingestion::Json),
+            (
+                "pubspec.yaml",
+                "name: x\ndependencies:\n  flutter:\n    sdk: flutter\n",
+                "flutter",
+                Ingestion::Json,
+            ),
+            (
+                "Package.swift",
+                "// swift-tools-version:5.9\n",
+                "swift",
+                Ingestion::Text,
+            ),
+            (
+                "mix.exs",
+                "defmodule X do\nend\n",
+                "elixir",
+                Ingestion::Text,
+            ),
+            ("CMakeLists.txt", "project(x)\n", "ctest", Ingestion::Text),
+        ];
+        for (file, body, matcher, ingestion) in cases {
+            let wt = temp_dir(&format!("detect-{matcher}"));
+            std::fs::write(wt.join(file), body).unwrap();
+            let task = detect_test_task(&wt, &Config::default()).unwrap();
+            assert_eq!(&task.matcher, matcher, "matcher for {file}");
+            assert_eq!(task.ingestion, *ingestion, "ingestion for {file}");
+            let _ = std::fs::remove_dir_all(wt);
+        }
+    }
+
+    #[test]
     fn cargo_manifest_fallback_detects_test_task() {
         let wt = temp_dir("cargo");
         std::fs::write(
@@ -551,8 +645,13 @@ mod tests {
         )
         .unwrap();
         let task = detect_test_task(&wt, &Config::default()).unwrap();
-        assert_eq!(task.matcher, "cargo-test");
-        assert!(task.command.contains("cargo test"));
+        // nextest is preferred when installed; otherwise plain cargo test.
+        assert!(
+            matches!(task.matcher.as_str(), "cargo-test" | "nextest"),
+            "matcher was {}",
+            task.matcher
+        );
+        assert!(task.command.contains("cargo"));
         let _ = std::fs::remove_dir_all(wt);
     }
 
@@ -611,9 +710,9 @@ mod tests {
         )
         .unwrap();
 
-        // Detection picks up the real Cargo.toml.
+        // Detection picks up the real Cargo.toml (nextest if installed).
         let task = detect_test_task(&wt, &Config::default()).unwrap();
-        assert_eq!(task.matcher, "cargo-test");
+        assert!(matches!(task.matcher.as_str(), "cargo-test" | "nextest"));
 
         // Run the real test command (single-threaded for stable output).
         let run_task_spec =
@@ -661,6 +760,61 @@ mod tests {
             nodes.iter().any(|n| n.state == TestState::Pass),
             "generic ✓ line should parse as pass: {nodes:?}"
         );
+        let _ = std::fs::remove_dir_all(wt);
+    }
+
+    /// End-to-end JSON ingestion against REAL nextest: scaffold a cargo project
+    /// with a pass + a fail, run nextest's experimental libtest-json, and confirm
+    /// the JSON parser maps results. Skips unless nextest emits that format.
+    #[test]
+    fn e2e_nextest_json_real_repo() {
+        if !on_path("cargo") || !on_path("cargo-nextest") {
+            return;
+        }
+        let wt = temp_dir("e2e-nextest");
+        git_init(&wt);
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(
+            wt.join("Cargo.toml"),
+            "[package]\nname = \"szjson\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            wt.join("src/lib.rs"),
+            "#[cfg(test)]\nmod tests {\n\
+             #[test] fn passes() { assert!(true); }\n\
+             #[test] fn fails() { assert!(false); }\n}\n",
+        )
+        .unwrap();
+
+        let task = TestTask::new(
+            "cargo nextest",
+            "NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --message-format libtest-json",
+            "nextest",
+        )
+        .with_ingestion(crate::panel::Ingestion::Json);
+        let outcome = run_task(wt.clone(), 1, task, &uncapped());
+
+        // Only assert structured results if this nextest version actually emitted
+        // libtest-json `"type":"test"` events; otherwise the experimental format
+        // isn't supported here and we skip without failing.
+        if outcome.stdout_stderr.contains("\"type\": \"test\"")
+            || outcome.stdout_stderr.contains("\"type\":\"test\"")
+        {
+            let nodes = parse_task_outcome(&outcome);
+            assert!(
+                nodes
+                    .iter()
+                    .any(|n| n.id.contains("passes") && n.state == TestState::Pass),
+                "nextest json should yield a pass node: {nodes:?}"
+            );
+            assert!(
+                nodes
+                    .iter()
+                    .any(|n| n.id.contains("fails") && n.state == TestState::Fail),
+                "nextest json should yield a fail node: {nodes:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(wt);
     }
 
