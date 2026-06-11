@@ -547,8 +547,13 @@ fn cargo_fail(line: &str) -> Option<String> {
     })
 }
 
-fn pytest_result(line: &str, suffix: &str) -> Option<String> {
-    line.strip_suffix(suffix).map(|s| s.trim().to_string())
+fn pytest_result(line: &str, marker: &str) -> Option<String> {
+    // pytest -v prints `path::test PASSED   [ NN%]` — the status is mid-line,
+    // not a suffix. The node id before it always contains `::`, which also keeps
+    // us off the `FAILED path::test - msg` short-summary line (no leading space).
+    let idx = line.find(marker)?;
+    let name = line[..idx].trim();
+    (name.contains("::")).then(|| name.to_string())
 }
 
 fn go_result(line: &str, prefix: &str) -> Option<String> {
