@@ -17,6 +17,7 @@ pub mod forge;
 pub mod github;
 pub mod keymap;
 pub mod log;
+pub mod metrics;
 pub mod models;
 pub mod msg;
 pub mod out;

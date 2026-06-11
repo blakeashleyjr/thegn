@@ -303,6 +303,8 @@ pub struct FrameModel {
     pub keyhints: String,
     /// Latest system stats reading for the top bar.
     pub stats: crate::stats::StatsSnapshot,
+    /// Latest Prometheus scrape state for the sidebar metrics section.
+    pub metrics: crate::metrics::MetricsState,
     /// tokei line count for the active worktree (bottom-bar widget).
     pub loc: Option<u64>,
     /// Widget-bar layout (`[bars]`) and stat icons (`[stats]`).
@@ -1017,10 +1019,17 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
     let visible: Vec<&crate::sidebar::SidebarRow> =
         model.sidebar_rows.iter().filter(|r| r.visible).collect();
 
+    let metrics_rows = if rect.rows > 10 && !model.metrics.targets.is_empty() {
+        6.min(rect.rows.saturating_sub(4))
+    } else {
+        0
+    };
+    let list_bottom = rect.y + rect.rows.saturating_sub(metrics_rows);
+
     for (i, row) in visible.iter().enumerate() {
         // +2: header row, then one blank breathing-room row.
         let y = rect.y + 2 + i;
-        if y >= rect.y + rect.rows {
+        if y >= list_bottom {
             break;
         }
         let selected = i == model.sidebar_selected;
@@ -1094,6 +1103,108 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
     // Row context menu overlay (item 27).
     if let Some(menu) = &model.sidebar_menu {
         draw_row_menu(surface, rect, menu, accent);
+    }
+
+    if metrics_rows > 0 {
+        draw_metrics_section(
+            surface,
+            Rect {
+                x: rect.x,
+                y: rect.y + rect.rows - metrics_rows,
+                cols: rect.cols,
+                rows: metrics_rows,
+            },
+            model,
+        );
+    }
+}
+
+fn draw_metrics_section(surface: &mut Surface, rect: Rect, model: &FrameModel) {
+    if rect.rows < 2 || rect.cols == 0 {
+        return;
+    }
+
+    let line = "\u{2500}".repeat(rect.cols);
+    draw_text(
+        surface,
+        rect.x,
+        rect.y,
+        &line,
+        col(S::Border),
+        col(S::Panel),
+        rect.cols,
+    );
+    draw_text_bold(
+        surface,
+        rect.x + 1,
+        rect.y,
+        " METRICS ",
+        col(S::Text),
+        col(S::Panel),
+        rect.cols.saturating_sub(1),
+    );
+
+    let mut y = rect.y + 1;
+    let max_y = rect.y + rect.rows;
+    for target in &model.metrics.targets {
+        if y >= max_y {
+            break;
+        }
+        let (dot, dot_fg, health) = match target.health {
+            crate::metrics::MetricHealth::Up => ("\u{25cf}", theme_color(theme::GREEN), "up"),
+            crate::metrics::MetricHealth::Stale => ("\u{25cb}", col(S::Dim), "stale"),
+            crate::metrics::MetricHealth::Error => ("\u{25cb}", theme_color(theme::RED), "err"),
+        };
+        draw_text(surface, rect.x + 1, y, dot, dot_fg, col(S::Panel), 1);
+        let label = format!("{} {}", target.name, health);
+        draw_text(
+            surface,
+            rect.x + 3,
+            y,
+            &label,
+            col(S::Text),
+            col(S::Panel),
+            rect.cols.saturating_sub(3),
+        );
+        y += 1;
+
+        match target.health {
+            crate::metrics::MetricHealth::Up => {
+                for sample in target.samples.iter().take(3) {
+                    if y >= max_y {
+                        break;
+                    }
+                    let value = crate::metrics::format_sample_value(sample.value);
+                    let line = format!("  {} {}", sample.name, value);
+                    draw_text(
+                        surface,
+                        rect.x + 1,
+                        y,
+                        &line,
+                        col(S::Dim),
+                        col(S::Panel),
+                        rect.cols.saturating_sub(1),
+                    );
+                    y += 1;
+                }
+            }
+            crate::metrics::MetricHealth::Stale | crate::metrics::MetricHealth::Error => {
+                if y < max_y {
+                    let err = target.error.as_deref().unwrap_or("scrape failed");
+                    let line = format!("  err: {err}");
+                    draw_text(
+                        surface,
+                        rect.x + 1,
+                        y,
+                        &line,
+                        col(S::Faint),
+                        col(S::Panel),
+                        rect.cols.saturating_sub(1),
+                    );
+                    y += 1;
+                }
+            }
+        }
     }
 }
 

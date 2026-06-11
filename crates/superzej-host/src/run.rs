@@ -302,6 +302,8 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // refresh; this thread just pulses a tick + waker on the interval.
     let (refresh_tx, refresh_rx) = tokio_mpsc::unbounded_channel::<RefreshKind>();
     let (stats_tx, stats_rx) = tokio_mpsc::unbounded_channel::<crate::stats::StatsSnapshot>();
+    let (metrics_tx, metrics_rx) = tokio_mpsc::unbounded_channel::<crate::metrics::MetricsState>();
+    crate::metrics::spawn_metrics_supervisor(cfg.metrics.clone(), metrics_tx, waker.clone());
     // The stats cadence is user-cyclable at runtime (click the top-right
     // stats block); the ticker thread reads it per tick.
     let stats_interval_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
@@ -329,6 +331,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         refresh_tx,
         refresh_rx,
         stats_rx,
+        metrics_rx,
         stats_interval_ms,
         waker,
         start,
@@ -2312,6 +2315,7 @@ async fn event_loop<T: Terminal>(
     refresh_tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     mut refresh_rx: tokio_mpsc::UnboundedReceiver<RefreshKind>,
     mut stats_rx: tokio_mpsc::UnboundedReceiver<crate::stats::StatsSnapshot>,
+    mut metrics_rx: tokio_mpsc::UnboundedReceiver<crate::metrics::MetricsState>,
     stats_interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     waker: TerminalWaker,
     start: std::time::Instant,
@@ -3025,8 +3029,10 @@ async fn event_loop<T: Terminal>(
                 doc_cache.clear();
             }
             let stats = std::mem::take(&mut model.stats);
+            let metrics = std::mem::take(&mut model.metrics);
             model = next_model;
             model.stats = stats;
+            model.metrics = metrics;
             refresh_tab_model(&mut model, &session, &mut sb);
             apply_mode_status(&mut model, mode);
             model.accent = current_config.accent_rgb();
@@ -3041,6 +3047,14 @@ async fn event_loop<T: Terminal>(
         while let Ok(snap) = stats_rx.try_recv() {
             if model.stats != snap {
                 model.stats = snap;
+                dirty = true;
+            }
+        }
+
+        // Fresh metrics readings from the scrape supervisor (sidebar section).
+        while let Ok(state) = metrics_rx.try_recv() {
+            if model.metrics != state {
+                model.metrics = state;
                 dirty = true;
             }
         }

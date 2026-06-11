@@ -166,6 +166,9 @@ plugins via `nix build .#superzej-sidebar .#superzej-panel .#superzej-tabbar`. s
   `programs.superzej.themeAccent`) recolors every superzej surface: the plugin
   chrome, pickers, dashboard, and `list`. The rest of the storm-blue palette is
   fixed.
+- **sidebar metrics** — `[metrics]` can list Prometheus `/metrics` endpoints to
+  scrape directly. The sidebar shows target health and allowlisted metric values;
+  no Prometheus server is required.
 - **zellij behavior** (keybinds, options, theme) — edit the managed config at
   `~/.superzej/zellij.kdl` (seeded from [`config/zellij.kdl`](config/zellij.kdl); never
   overwritten once it exists). To adopt a new shipped theme on an existing

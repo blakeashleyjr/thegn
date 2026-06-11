@@ -20,6 +20,7 @@ mod keyhint;
 mod keymap;
 mod layout;
 mod logotype;
+mod metrics;
 mod mousefilter;
 mod palette;
 mod pane;
