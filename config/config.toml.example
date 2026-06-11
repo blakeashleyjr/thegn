@@ -249,9 +249,44 @@ name = "diff"
 command = "git diff"
 
 # General tasks: surfaced in the Tests panel and, later, Problems/Timeline/Search
-# Everywhere. `kind = "test"` makes a task eligible for test discovery/runs. If no
-# test task is configured, superzej falls back to manifest sniffing (just/Cargo/go/
-# pytest/package.json).
+# Everywhere. `kind = "test"` makes a task eligible for test discovery/runs.
+#
+# Tasks come from three sources:
+#   1. explicit [[tasks]] entries below;
+#   2. static discovery from existing runners/manifests (Justfile, Makefile,
+#      Taskfile.yml, package.json, Cargo.toml, go.mod, pyproject.toml,
+#      docker-compose.yml/compose.yaml, flake.nix, Procfile);
+#   3. semantic aliases such as dev/test/lint/build/up that resolve to the best
+#      explicit or discovered task in the current workspace/worktree.
+#
+# Discovery parses files only; superzej does not execute arbitrary project code
+# while switching worktrees. Commands run only after an explicit user action.
+#
+# [tasks.discovery]
+# enabled = true
+# providers = [
+#   "just",
+#   "make",
+#   "taskfile",
+#   "package-json",
+#   "cargo",
+#   "go",
+#   "python",
+#   "docker-compose",
+#   "nix",
+#   "procfile",
+# ]
+#
+# [tasks.aliases]
+# dev = ["just:dev", "npm:dev", "vite:dev", "cargo:run", "compose:up"]
+# test = ["just:test", "cargo:test", "npm:test", "pytest", "go:test", "nix:check"]
+# lint = ["just:lint", "cargo:clippy", "npm:lint", "ruff"]
+# build = ["just:build", "cargo:build", "npm:build", "nix:build"]
+# up = ["compose:up", "just:up"]
+# logs = ["compose:logs", "just:logs"]
+#
+# If no test task is configured, superzej falls back to the discovered `test`
+# alias/provider chain instead of requiring manual config.
 # [[tasks]]
 # name = "cargo test"
 # kind = "test"

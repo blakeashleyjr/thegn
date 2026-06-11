@@ -134,22 +134,52 @@ Architectural seam:
 pins (E), actions (M), and session/layout groups.
 
 Graphical IDEs usually have run configurations. superzej's terminal-native
-version should be a small, explicit task registry:
+version should be a small task registry with three sources:
 
-- named task with command, args, cwd, env, scope, and optional matcher;
+- **explicit tasks** from `[[tasks]]` config entries: command, args, cwd, env,
+  scope, kind, and optional matcher;
+- **discovered tasks** inherited from existing project runners/manifests such as
+  `Justfile`, `Makefile`, `Taskfile.yml`, `package.json`, `Cargo.toml`,
+  `go.mod`, `pyproject.toml`, `docker-compose.yml` / `compose.yaml`,
+  `flake.nix`, and `Procfile`;
+- **semantic aliases** (`dev`, `test`, `lint`, `fmt`, `build`, `check`, `serve`,
+  `up`, `down`, `logs`, `shell`) that resolve to the best explicit or discovered
+  task available in the current workspace/worktree.
+
+Tasks should:
+
 - launch in current pane, split, tab, drawer, or pin;
-- stop/restart/rerun controls;
-- task output capture for Problems and Tests;
-- pre/post hooks later through the event bus.
+- support stop/restart/rerun controls;
+- capture output for Problems and Tests;
+- feed Search Everywhere and later Timeline/DAP launch configurations;
+- support pre/post hooks later through the event bus.
+
+Alias resolution is deterministic and overridable. For example, `dev` should
+prefer an explicit `[[tasks]] name = "dev"`, then common local runners such as
+`just dev`, `package.json` `dev`, `vite --host`, `cargo run`, or
+`docker compose up`. `test` similarly prefers explicit config, then `just test`,
+`cargo test`, JS package test scripts, `pytest`, `go test ./...`, and finally
+project-level checks such as `nix flake check` where appropriate.
+
+Discovery must be static and safe: parse known manifest files, do not execute
+arbitrary discovery scripts on worktree switch, treat manifest strings as
+untrusted data, and run commands only after an explicit user action.
 
 Architectural seam:
 
 - `crates/superzej-core/src/config.rs` already has rich program-like config in
   `[[pins]]`; `[[tasks]]` should reuse that shape rather than inventing a new
   command DSL.
+- Task discovery should live behind pure provider functions that return normalized
+  task specs from static manifests (`Justfile`, `package.json`, `Cargo.toml`,
+  compose files, etc.) without executing project code.
+- Alias resolution should be a small, testable policy layer over explicit and
+  discovered tasks, with config overrides for provider order and disabled aliases.
 - Launching should reuse pure `LaunchSpec` composition from
   `crates/superzej-host/src/agent.rs` and pane spawning from the host.
-- Palette entries should be generated from the task registry.
+- Palette entries should be generated from the normalized task registry, including
+  both concrete provider rows (`cargo:test`, `compose:up`) and semantic aliases
+  (`Run test`, `Run dev`).
 
 ### Search Everywhere palette
 

@@ -880,8 +880,8 @@ their original groups._
 - [ ] 517. Test status rollups — pass/fail/running state in panel, sidebar, and statusbar
 - [ ] 518. Run/debug selected test — nearest/file/package/failed-test actions, DAP handoff later
 - [ ] 519. Problems / diagnostics panel — compiler/linter/config/LSP diagnostics with file:line jumps
-- [ ] 520. Named task registry — `[[tasks]]` command/cwd/env/scope definitions
-- [ ] 521. Task lifecycle controls — run/stop/restart/rerun from palette/panel/keybinds
+- [ ] 520. Named task registry — `[[tasks]]` (explicit config) + discovered providers (just, cargo, npm, etc.) and aliases
+- [ ] 521. Task lifecycle controls — run/stop/restart/rerun from palette/panel/keybinds for any task
 - [ ] 522. Task output capture + problem matching — feed Tests and Problems without polling
 - [ ] 523. Search Everywhere provider aggregation — actions, files, symbols, tasks, tests, problems, git, worktrees
 - [ ] 524. Non-agent process attention routing — exited/failed/waiting panes join the attention queue

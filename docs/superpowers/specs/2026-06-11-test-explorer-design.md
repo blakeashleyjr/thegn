@@ -64,6 +64,10 @@ The goal is a Tests surface that answers six questions quickly:
    sidebar/statusbar state survives tab switches and restarts. Full history is
    deferred.
 4. **First ecosystems.** Prioritize Rust/cargo, JS/TS, Python/pytest, and Go.
+5. **Inherited tasks + aliases.** The task substrate should ingest tasks from
+   existing runners/manifests and expose semantic aliases (`dev`, `test`, `lint`,
+   `build`, `up`, etc.) rather than requiring every command to be hand-copied
+   into `[[tasks]]`.
 
 ## Architecture
 
@@ -90,19 +94,37 @@ args = ["run", "test", "--", "--run"]
 matcher = "vitest"
 ```
 
-A task is a named command with command/args/cwd/env/scope plus optional matcher
-metadata. `kind = "test"` makes it eligible for the Tests panel; other kinds
-(`build`, `lint`, `run`, `custom`) become Problems/Timeline/Search Everywhere
-inputs later.
+A task is a normalized named command with command/args/cwd/env/scope plus
+optional kind/matcher metadata. `kind = "test"` makes it eligible for the Tests
+panel; other kinds (`build`, `lint`, `run`, `custom`) become
+Problems/Timeline/Search Everywhere inputs later.
 
-When no configured test task exists, superzej keeps a best-effort fallback
-detector:
+Task specs come from three layers, highest priority first:
+
+1. **Explicit config:** `[[tasks]]` entries in layered superzej config.
+2. **Static provider discovery:** parse existing runner/manifests such as
+   `Justfile`, `Makefile`, `Taskfile.yml`, `package.json`, `Cargo.toml`,
+   `go.mod`, `pyproject.toml`, `docker-compose.yml` / `compose.yaml`,
+   `flake.nix`, and `Procfile`.
+3. **Semantic aliases:** stable names like `test`, `dev`, `lint`, `fmt`, `build`,
+   `check`, `serve`, `up`, `down`, `logs`, and `shell` resolved over explicit and
+   discovered tasks.
+
+Discovery should be safe and cheap: parse files, do not execute arbitrary project
+commands on worktree switch, and run only after explicit user action. Provider
+rows should remain visible alongside aliases, e.g. `cargo:test`, `npm:dev`,
+`just:test`, `compose:up`, plus `Run test` / `Run dev` aliases.
+
+When no configured test task exists, superzej resolves the `test` alias from the
+provider registry. The default priority should prefer explicit config, then common
+local test runners:
 
 1. `just test`
 2. `Cargo.toml` → `cargo test --workspace`
 3. `go.mod` → `go test ./...`
 4. `pyproject.toml` / pytest → `pytest`
 5. `package.json` → vitest/jest/npm script detection
+6. `nix flake check` when no narrower test command exists
 
 ### Host task runner
 
@@ -210,10 +232,10 @@ Search Everywhere later indexes task/test IDs so the palette can show:
 ## Data flow
 
 ```text
-config / fallback detector
+explicit config / static providers / aliases
         │
         ▼
-TaskSpec registry
+Normalized TaskSpec registry
         │
         ├── lazy discovery request ─────► background worker
         │                                  │
@@ -346,8 +368,9 @@ The panel should produce actionable states:
 
 ## Sequencing
 
-1. **Task registry and detected fallback.** Add the core task model and keep the
-   existing manifest detector as fallback.
+1. **Task registry, providers, and aliases.** Add the core task model, static
+   provider discovery, and deterministic alias resolution so existing runners are
+   inherited before users write config.
 2. **Task runner substrate.** Replace one-off test execution with a general
    off-thread task runner and bounded result events.
 3. **Tests panel tree.** Convert the flat Tests panel into a lazy discovered tree
@@ -366,6 +389,10 @@ The panel should produce actionable states:
 Implementation plans should include:
 
 - pure config tests for `[[tasks]]` parsing/defaults;
+- static provider discovery tests for Justfile, package.json, Cargo.toml,
+  docker-compose/compose files, pyproject.toml, go.mod, and flake.nix;
+- alias-resolution tests for `dev`, `test`, `lint`, `build`, `up`, and explicit
+  config overriding discovered tasks;
 - fixture parser tests for cargo, go test, pytest, jest, and vitest output;
 - discovery command selection tests;
 - target-tree build/collapse/filter tests;
