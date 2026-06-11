@@ -1,0 +1,5 @@
+File "test/dune", line 1, characters 12-21:
+1 | (test (name test_calc))
+                ^^^^^^^^^
+adds ok
+Fatal error: exception Assert_failure("test/test_calc.ml", 4, 2)

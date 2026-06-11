@@ -88,6 +88,8 @@ pub enum Ingestion {
     Text,
     Json,
     Report,
+    /// Test Anything Protocol (bats, prove, busted, pgTAP, node --test, …).
+    Tap,
 }
 
 /// A configured/detected test task that can be run in a worktree.

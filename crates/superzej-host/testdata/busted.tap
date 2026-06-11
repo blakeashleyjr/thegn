@@ -1,0 +1,9 @@
+ok 1 - calc adds
+not ok 2 - calc breaks
+# spec/calc_spec.lua @ 3
+# Failure message: spec/calc_spec.lua:3: Expected objects to be the same.
+# Passed in:
+# (boolean) false
+# Expected:
+# (boolean) true
+1..2

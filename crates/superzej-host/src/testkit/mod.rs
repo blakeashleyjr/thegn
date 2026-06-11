@@ -9,6 +9,7 @@
 
 pub mod json;
 pub mod report;
+pub mod tap;
 
 #[cfg(test)]
 mod golden;

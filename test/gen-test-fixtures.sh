@@ -106,5 +106,86 @@ EOF
   check php phpunit.junit.xml
 fi
 
+# --- bats (Bash) → TAP -----------------------------------------------------
+if sel bats; then
+  d="$WORK/bats"; mkdir -p "$d/test"
+  printf '@test "adds" { [ $((2+2)) -eq 4 ]; }\n@test "breaks" { [ $((2+2)) -eq 5 ]; }\n' >"$d/test/calc.bats"
+  ( cd "$d" && nix shell nixpkgs#bats -c bats --formatter tap test ) >"$OUT/bats.tap" 2>/dev/null
+  check bats bats.tap
+fi
+
+# --- perl (prove) → TAP ----------------------------------------------------
+if sel perl; then
+  d="$WORK/perl"; mkdir -p "$d/t"
+  printf 'use Test::More tests => 2;\nok(2+2 == 4, "adds");\nok(2+2 == 5, "breaks");\n' >"$d/t/basic.t"
+  ( cd "$d" && nix shell nixpkgs#perl -c prove -v t/ ) >"$OUT/perl.tap" 2>/dev/null
+  check perl perl.tap
+fi
+
+# --- lua (busted) → TAP ----------------------------------------------------
+if sel lua; then
+  d="$WORK/lua"; mkdir -p "$d/spec"
+  printf 'describe("calc", function()\n  it("adds", function() assert.is_true(2+2 == 4) end)\n  it("breaks", function() assert.is_true(2+2 == 5) end)\nend)\n' >"$d/spec/calc_spec.lua"
+  ( cd "$d" && nix shell nixpkgs#luajitPackages.busted -c busted -o TAP spec ) >"$OUT/busted.tap" 2>/dev/null
+  check lua busted.tap
+fi
+
+# --- gleam → text ----------------------------------------------------------
+if sel gleam; then
+  d="$WORK/gleam"; mkdir -p "$d/src" "$d/test"
+  printf 'name = "szfix"\nversion = "1.0.0"\n\n[dependencies]\ngleam_stdlib = ">= 0.34.0 and < 2.0.0"\n\n[dev-dependencies]\ngleeunit = ">= 1.0.0 and < 2.0.0"\n' >"$d/gleam.toml"
+  printf 'import gleeunit\npub fn main() { gleeunit.main() }\n' >"$d/src/szfix.gleam"
+  printf 'import gleeunit/should\npub fn adds_test() { should.equal(2 + 2, 4) }\npub fn breaks_test() { should.equal(2 + 2, 5) }\n' >"$d/test/szfix_test.gleam"
+  ( cd "$d" && nix shell nixpkgs#gleam nixpkgs#erlang nixpkgs#rebar3 -c gleam test ) >"$OUT/gleam.txt" 2>&1
+  check gleam gleam.txt
+fi
+
+# --- dart → JSON -----------------------------------------------------------
+if sel dart; then
+  d="$WORK/dart"; mkdir -p "$d/test"
+  printf 'name: szfix\nenvironment:\n  sdk: ">=3.0.0 <4.0.0"\ndev_dependencies:\n  test: any\n' >"$d/pubspec.yaml"
+  printf "import 'package:test/test.dart';\nvoid main() {\n  test('adds', () => expect(2 + 2, 4));\n  test('breaks', () => expect(2 + 2, 5));\n}\n" >"$d/test/calc_test.dart"
+  ( cd "$d" && nix shell nixpkgs#dart -c bash -c 'dart pub get >/dev/null 2>&1 && dart test --reporter json' ) >"$OUT/dart.json" 2>/dev/null
+  check dart dart.json
+fi
+
+# --- dotnet / .NET → TRX ---------------------------------------------------
+if sel dotnet; then
+  d="$WORK/net"; mkdir -p "$d"
+  cat >"$d/szfix.csproj" <<'EOF'
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net8.0</TargetFramework><Nullable>enable</Nullable></PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.*" />
+    <PackageReference Include="xunit" Version="2.*" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.*" />
+  </ItemGroup>
+</Project>
+EOF
+  printf 'using Xunit;\npublic class CalcTest {\n  [Fact] public void Adds() => Assert.Equal(4, 2 + 2);\n  [Fact] public void Breaks() => Assert.Equal(5, 2 + 2);\n}\n' >"$d/CalcTest.cs"
+  ( cd "$d" && nix shell nixpkgs#dotnet-sdk -c bash -c 'dotnet test --logger "trx;LogFileName=sz.trx" >/dev/null 2>&1; cat TestResults/sz.trx' ) >"$OUT/dotnet.trx" 2>/dev/null
+  check dotnet dotnet.trx
+fi
+
+# --- gleam → text ----------------------------------------------------------
+if sel gleam; then
+  d="$WORK/gleam"; mkdir -p "$d/src" "$d/test"
+  printf 'name = "szfix"\nversion = "1.0.0"\n\n[dependencies]\ngleam_stdlib = ">= 0.34.0 and < 2.0.0"\n\n[dev-dependencies]\ngleeunit = ">= 1.0.0 and < 2.0.0"\n' >"$d/gleam.toml"
+  printf 'import gleeunit\npub fn main() { gleeunit.main() }\n' >"$d/src/szfix.gleam"
+  printf 'import gleeunit/should\npub fn adds_test() { should.equal(2 + 2, 4) }\npub fn breaks_test() { should.equal(2 + 2, 5) }\n' >"$d/test/szfix_test.gleam"
+  ( cd "$d" && nix shell nixpkgs#gleam nixpkgs#erlang nixpkgs#rebar3 -c gleam test ) >"$OUT/gleam.txt" 2>&1
+  check gleam gleam.txt
+fi
+
+# --- ocaml / dune → text ---------------------------------------------------
+if sel ocaml; then
+  d="$WORK/ml"; mkdir -p "$d/test"
+  printf '(lang dune 3.0)\n' >"$d/dune-project"
+  printf '(test (name test_calc))\n' >"$d/test/dune"
+  printf 'let () =\n  assert (2 + 2 = 4);\n  Printf.printf "adds ok\\n";\n  assert (2 + 2 = 5)\n' >"$d/test/test_calc.ml"
+  ( cd "$d" && nix shell nixpkgs#dune_3 nixpkgs#ocaml -c dune runtest ) >"$OUT/ocaml.txt" 2>&1
+  check ocaml ocaml.txt
+fi
+
 echo "fixtures in $OUT:"
 ls -1 "$OUT"
