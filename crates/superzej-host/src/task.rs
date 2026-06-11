@@ -273,7 +273,7 @@ fn test_task_from_config(t: &Task) -> TestTask {
 fn ingestion_for_matcher(matcher: &str) -> crate::panel::Ingestion {
     use crate::panel::Ingestion;
     match matcher {
-        "nextest" | "libtest-json" | "dart" | "flutter" | "deno" | "bun" | "ctest" => {
+        "nextest" | "libtest-json" | "dart" | "flutter" | "deno" | "bun" | "rspec" => {
             Ingestion::Json
         }
         "junit" | "trx" | "gradle" | "maven" | "dotnet" | "sbt" => Ingestion::Report,
@@ -376,6 +376,32 @@ fn detect_fallback(worktree: &Path) -> Option<TestTask> {
             .with_ingestion(Ingestion::Report)
             .with_report_glob("TestResults/*.trx"),
         );
+    }
+    // Tier C — text scrapers / lighter integrations.
+    if has("rebar.config") {
+        return Some(TestTask::new("rebar3 eunit", "rebar3 eunit", "erlang"));
+    }
+    if has("build.zig") {
+        return Some(TestTask::new("zig build test", "zig build test", "zig"));
+    }
+    if has(".rspec") {
+        return Some(
+            TestTask::new("rspec", "rspec --format json", "rspec").with_ingestion(Ingestion::Json),
+        );
+    }
+    if has("phpunit.xml") || has("phpunit.xml.dist") {
+        return Some(
+            TestTask::new("phpunit", "phpunit --log-junit target/phpunit.xml", "junit")
+                .with_ingestion(Ingestion::Report)
+                .with_report_glob("target/phpunit.xml"),
+        );
+    }
+    if has("Gemfile") {
+        // No `.rspec` → assume minitest via rake (sparse text; synthetic result).
+        return Some(TestTask::new("rake test", "rake test", "ruby"));
+    }
+    if has("dub.json") || has("dub.sdl") {
+        return Some(TestTask::new("dub test", "dub test", "d"));
     }
     if has("package.json") {
         let pkg = std::fs::read_to_string(worktree.join("package.json")).unwrap_or_default();
@@ -691,6 +717,26 @@ mod tests {
                 Ingestion::Report,
             ),
             ("build.sbt", "name := \"x\"\n", "junit", Ingestion::Report),
+            (
+                "rebar.config",
+                "{erl_opts, []}.\n",
+                "erlang",
+                Ingestion::Text,
+            ),
+            (
+                "build.zig",
+                "pub fn build() void {}\n",
+                "zig",
+                Ingestion::Text,
+            ),
+            (
+                ".rspec",
+                "--require spec_helper\n",
+                "rspec",
+                Ingestion::Json,
+            ),
+            ("phpunit.xml", "<phpunit/>\n", "junit", Ingestion::Report),
+            ("dub.json", "{\"name\":\"x\"}\n", "d", Ingestion::Text),
         ];
         for (file, body, matcher, ingestion) in cases {
             let wt = temp_dir(&format!("detect-{}-{}", matcher, file.replace('.', "_")));

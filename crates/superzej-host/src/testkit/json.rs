@@ -13,6 +13,7 @@ use crate::panel::{self, TestLocation, TestNode, TestNodeKind, TestState};
 pub fn parse(matcher: &str, text: &str) -> Vec<TestNode> {
     let nodes = match matcher {
         "dart" | "flutter" => parse_dart(text),
+        "rspec" => parse_rspec(text),
         // nextest `--message-format libtest-json[-plus]` and cargo libtest
         // `--format json` share the per-test object shape.
         _ => parse_libtest(text),
@@ -162,6 +163,60 @@ fn parse_dart(text: &str) -> Vec<TestNode> {
         .collect()
 }
 
+/// RSpec `--format json`: a single document with an `examples` array, each
+/// `{ description, status, file_path, line_number, exception }`.
+fn parse_rspec(text: &str) -> Vec<TestNode> {
+    let start = match text.find('{') {
+        Some(i) => i,
+        None => return Vec::new(),
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&text[start..]) else {
+        return Vec::new();
+    };
+    let Some(examples) = doc.get("examples").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    examples
+        .iter()
+        .map(|ex| {
+            let name = ex
+                .get("full_description")
+                .or_else(|| ex.get("description"))
+                .and_then(Value::as_str)
+                .unwrap_or("<example>")
+                .to_string();
+            let status = ex.get("status").and_then(Value::as_str).unwrap_or("");
+            let state = match status {
+                "passed" => TestState::Pass,
+                "pending" => TestState::Skip,
+                _ => TestState::Fail,
+            };
+            let loc = match (
+                ex.get("file_path").and_then(Value::as_str),
+                ex.get("line_number").and_then(Value::as_i64),
+            ) {
+                (Some(p), Some(l)) => Some(TestLocation {
+                    path: p.trim_start_matches("./").to_string(),
+                    line: l as usize,
+                    column: None,
+                }),
+                _ => None,
+            };
+            let msg = ex
+                .get("exception")
+                .and_then(|e| e.get("message"))
+                .and_then(Value::as_str)
+                .map(|m| m.chars().take(160).collect());
+            node(
+                &name,
+                state,
+                if state == TestState::Fail { loc } else { None },
+                msg,
+            )
+        })
+        .collect()
+}
+
 fn dart_location(t: &Value) -> Option<TestLocation> {
     let url = t.get("url").and_then(Value::as_str)?;
     let path = url.strip_prefix("file://").unwrap_or(url).to_string();
@@ -212,6 +267,22 @@ mod tests {
         let fail = nodes.iter().find(|n| n.id == "is broken").unwrap();
         assert_eq!(fail.state, TestState::Fail);
         assert!(fail.message.as_deref().unwrap().contains("Expected"));
+    }
+
+    #[test]
+    fn rspec_json_maps_examples_with_location() {
+        let text = r#"{"version":"3.12","examples":[
+          {"description":"adds","full_description":"Calc adds","status":"passed","file_path":"./spec/calc_spec.rb","line_number":4},
+          {"description":"breaks","full_description":"Calc breaks","status":"failed","file_path":"./spec/calc_spec.rb","line_number":8,"exception":{"message":"expected 5 got 4"}},
+          {"description":"todo","full_description":"Calc todo","status":"pending","file_path":"./spec/calc_spec.rb","line_number":12}],
+          "summary_line":"3 examples, 1 failure, 1 pending"}"#;
+        let nodes = parse("rspec", text);
+        let by = |id: &str| nodes.iter().find(|n| n.id == id).cloned();
+        assert_eq!(by("Calc adds").unwrap().state, TestState::Pass);
+        assert_eq!(by("Calc todo").unwrap().state, TestState::Skip);
+        let f = by("Calc breaks").unwrap();
+        assert_eq!(f.state, TestState::Fail);
+        assert_eq!(f.location.unwrap().line, 8);
     }
 
     #[test]
