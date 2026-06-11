@@ -1778,28 +1778,107 @@ fn refresh_files_tree(panel_ui: &mut crate::panel::PanelUi, session: &crate::ses
 /// (cursor position and yazi state survive), showing takes it back
 /// instantly, and the worktree-change detector pre-warms the pool so the
 /// first toggle never waits on yazi's startup.
+///
+/// The pool is bounded by `[drawer].pool_limit`: hidden drawers are held in
+/// insertion order and the oldest is evicted (its pane torn down) once the
+/// limit is exceeded, so invisible yazi instances cannot accumulate without
+/// limit. `pool_limit = 0` disables pooling entirely (hiding kills the pane).
 #[derive(Default)]
 struct DrawerPool {
-    hidden: std::collections::HashMap<String, u32>,
+    /// `(dir-key, pane-id)` in insertion order; front is the oldest (next to evict).
+    hidden: std::collections::VecDeque<(String, u32)>,
 }
 
 impl DrawerPool {
     fn key(dir: &std::path::Path) -> String {
         superzej_core::util::slugify(&dir.to_string_lossy())
     }
-    fn stash(&mut self, dir: &std::path::Path, id: u32) {
-        self.hidden.insert(Self::key(dir), id);
+    /// Stash `id` for `dir`, enforcing `limit`. A `limit` of 0 tears the pane
+    /// down immediately (no pool); otherwise the oldest entries beyond the
+    /// limit are evicted and their panes dropped from the table.
+    fn stash(&mut self, dir: &std::path::Path, id: u32, limit: usize, panes: &mut Panes) {
+        if limit == 0 {
+            panes.table.remove(&id);
+            return;
+        }
+        let key = Self::key(dir);
+        self.remove_key(&key, panes);
+        self.hidden.push_back((key, id));
+        while self.hidden.len() > limit {
+            if let Some((_, evicted)) = self.hidden.pop_front() {
+                panes.table.remove(&evicted);
+            }
+        }
     }
     fn take(&mut self, dir: &std::path::Path) -> Option<u32> {
-        self.hidden.remove(&Self::key(dir))
+        let key = Self::key(dir);
+        let idx = self.hidden.iter().position(|(k, _)| k == &key)?;
+        self.hidden.remove(idx).map(|(_, id)| id)
     }
     fn contains(&self, dir: &std::path::Path) -> bool {
-        self.hidden.contains_key(&Self::key(dir))
+        let key = Self::key(dir);
+        self.hidden.iter().any(|(k, _)| k == &key)
+    }
+    /// Drop a pooled entry by pane id (e.g. its yazi exited on its own).
+    fn remove_id(&mut self, id: u32) -> bool {
+        let Some(idx) = self.hidden.iter().position(|(_, hid)| *hid == id) else {
+            return false;
+        };
+        self.hidden.remove(idx);
+        true
+    }
+    /// Drop the pooled entry for `key`, tearing down its pane.
+    fn remove_key(&mut self, key: &str, panes: &mut Panes) {
+        if let Some(idx) = self.hidden.iter().position(|(k, _)| k == key)
+            && let Some((_, id)) = self.hidden.remove(idx)
+        {
+            panes.table.remove(&id);
+        }
     }
     /// All pooled pane ids (workspace switch reaps them).
     fn drain_ids(&mut self) -> Vec<u32> {
-        self.hidden.drain().map(|(_, id)| id).collect()
+        self.hidden.drain(..).map(|(_, id)| id).collect()
     }
+}
+
+/// Wrap a drawer yazi argv in a bounded user `systemd-run --scope` so its whole
+/// process tree — including image-preview helpers such as `ueberzugpp`, which
+/// can leak to tens of GB — is OOM-killed inside its own cgroup instead of
+/// triggering a global OOM that takes the terminal session down. Empty limit
+/// strings omit only that property. Containment is skipped when disabled, when
+/// `systemd-run` is unavailable, or when the resolved sandbox already launches
+/// through `systemd-run` (avoids a nested scope that would escape the bound).
+fn contain_yazi_argv(
+    cfg: &superzej_core::config::Config,
+    cmd: Vec<String>,
+    systemd_available: bool,
+) -> Vec<String> {
+    if !cfg.drawer.contain
+        || !systemd_available
+        || cmd.first().map(String::as_str) == Some("systemd-run")
+    {
+        return cmd;
+    }
+    let mut wrapped = vec![
+        "systemd-run".to_string(),
+        "--user".into(),
+        "--scope".into(),
+        "--quiet".into(),
+        "--collect".into(),
+    ];
+    for (key, value) in [
+        ("MemoryMax", cfg.drawer.memory_max.trim()),
+        ("MemorySwapMax", cfg.drawer.memory_swap_max.trim()),
+        ("CPUQuota", cfg.drawer.cpu_quota.trim()),
+    ] {
+        if !value.is_empty() {
+            wrapped.push("-p".into());
+            wrapped.push(format!("{key}={value}"));
+        }
+    }
+    wrapped.push("--".into());
+    wrapped.extend(cmd);
+    wrapped
 }
 
 /// Spawn a fresh (hidden or visible) yazi pane for `dir`; falls back to a
@@ -1838,8 +1917,9 @@ fn spawn_yazi_pane(
         let wt = dir.to_string_lossy().into_owned();
         let spec = crate::agent::launch_spec(cfg, &wt, None, "yazi");
         let yenv = crate::panes::yazi_env(cfg);
+        let argv = contain_yazi_argv(cfg, spec.argv, superzej_core::util::have("systemd-run"));
         return panes
-            .spawn_argv_env(&spec.argv, spec.cwd.as_deref().or(Some(dir)), &yenv, center)
+            .spawn_argv_env(&argv, spec.cwd.as_deref().or(Some(dir)), &yenv, center)
             .ok();
     }
     spawn_worktree_shell_pane(panes, cfg, dir, center).ok()
@@ -1873,16 +1953,20 @@ fn show_yazi_drawer(
 }
 
 /// Hide the visible drawer, keeping its pane alive in the pool under the dir
-/// it was opened for (`home`; `fallback` covers pre-tracking drawers).
+/// it was opened for (`home`; `fallback` covers pre-tracking drawers). The
+/// stash honors `[drawer].pool_limit`, evicting/tearing down older drawers.
+#[allow(clippy::too_many_arguments)]
 fn hide_drawer_into_pool(
     drawer: &mut Option<u32>,
     pool: &mut DrawerPool,
     home: &mut Option<std::path::PathBuf>,
     fallback: &std::path::Path,
+    cfg: &superzej_core::config::Config,
+    panes: &mut Panes,
 ) {
     if let Some(id) = drawer.take() {
         let key = home.take().unwrap_or_else(|| fallback.to_path_buf());
-        pool.stash(&key, id);
+        pool.stash(&key, id, cfg.drawer.pool_limit, panes);
     }
 }
 
@@ -2004,12 +2088,12 @@ fn sync_drawer_persistence(
     // The visible drawer belongs to whichever worktree opened it; on a
     // mismatch stash it under ITS home before deciding for the new one.
     if drawer.is_some() && home.as_deref() != Some(dir.as_path()) {
-        hide_drawer_into_pool(drawer, pool, home, &dir);
+        hide_drawer_into_pool(drawer, pool, home, &dir, cfg, panes);
     }
     if should_be_open && drawer.is_none() {
         show_yazi_drawer(panes, drawer, pool, home, cfg, &dir, center);
     } else if !should_be_open && drawer.is_some() {
-        hide_drawer_into_pool(drawer, pool, home, &dir);
+        hide_drawer_into_pool(drawer, pool, home, &dir, cfg, panes);
     }
 }
 
@@ -2341,8 +2425,11 @@ async fn event_loop<T: Terminal>(
             // Pre-warm sibling tabs so first focus of a neighbor is instant.
             prewarm_neighbors(&mut panes, &mut session, chrome.center, keymap.config());
             // And the new worktree's hidden yazi drawer, so the first toggle
-            // never waits on yazi's startup.
-            if drawer.is_none()
+            // never waits on yazi's startup. Off by default ([drawer].prewarm)
+            // so invisible yazi instances never accumulate unbidden.
+            if keymap.config().drawer.prewarm
+                && keymap.config().drawer.pool_limit > 0
+                && drawer.is_none()
                 && keymap.config().tool_command("yazi").is_some()
                 && !drawer_pool.contains(&current_worktree)
                 && let Some(id) = spawn_yazi_pane(
@@ -2352,7 +2439,12 @@ async fn event_loop<T: Terminal>(
                     chrome.center,
                 )
             {
-                drawer_pool.stash(&current_worktree, id);
+                drawer_pool.stash(
+                    &current_worktree,
+                    id,
+                    keymap.config().drawer.pool_limit,
+                    &mut panes,
+                );
             }
         }
 
@@ -2505,6 +2597,30 @@ async fn event_loop<T: Terminal>(
                         }
                         PaneEvent::Exit(id) => {
                             panes.table.remove(&id);
+                            // The visible yazi drawer died on its own (e.g. its
+                            // contained scope hit the memory limit). Clear it,
+                            // mark the worktree's drawer closed, and surface why.
+                            if drawer == Some(id) {
+                                drawer = None;
+                                if let Some(dir) =
+                                    drawer_home.take().or_else(|| active_cwd(&session))
+                                {
+                                    let key = superzej_core::util::slugify(&dir.to_string_lossy());
+                                    let ddir = superzej_core::util::superzej_dir().join("drawer");
+                                    let _ = std::fs::create_dir_all(&ddir);
+                                    let _ = std::fs::write(ddir.join(key), "false");
+                                }
+                                model.status = "Files drawer exited; if image previews \
+                                    were enabled it may have hit the drawer memory limit."
+                                    .into();
+                                dirty = true;
+                                continue;
+                            }
+                            // A pooled (hidden) drawer's yazi exited; just forget it.
+                            if drawer_pool.remove_id(id) {
+                                dirty = true;
+                                continue;
+                            }
                             // Pin panes are supervised separately from tab panes: the
                             // supervisor applies the restart policy. (PTY EOF carries no
                             // exit status, so treat death as a failure for policy purposes.)
@@ -2978,14 +3094,16 @@ async fn event_loop<T: Terminal>(
                 tokio::task::spawn_blocking(superzej_core::diff_highlight::warm);
                 dirty = true;
                 let _ = waker.wake();
-                if drawer.is_none()
+                if keymap.config().drawer.prewarm
+                    && keymap.config().drawer.pool_limit > 0
+                    && drawer.is_none()
                     && keymap.config().tool_command("yazi").is_some()
                     && let Some(dir) = active_cwd(&session)
                     && !drawer_pool.contains(&dir)
                     && let Some(id) =
                         spawn_yazi_pane(&mut panes, keymap.config(), Some(&dir), chrome.center)
                 {
-                    drawer_pool.stash(&dir, id);
+                    drawer_pool.stash(&dir, id, keymap.config().drawer.pool_limit, &mut panes);
                 }
             }
         }
@@ -3987,6 +4105,8 @@ async fn event_loop<T: Terminal>(
                                             &mut drawer_pool,
                                             &mut drawer_home,
                                             &cwd,
+                                            keymap.config(),
+                                            &mut panes,
                                         );
                                     } else if let Some(id) = drawer.take() {
                                         panes.table.remove(&id);
@@ -4103,6 +4223,8 @@ async fn event_loop<T: Terminal>(
                                             &mut drawer_pool,
                                             &mut drawer_home,
                                             &cwd,
+                                            keymap.config(),
+                                            &mut panes,
                                         );
                                         let key =
                                             superzej_core::util::slugify(&cwd.to_string_lossy());
@@ -4688,39 +4810,23 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::Yazi => {
-                                // Direct bind for yazi, routed identical to ToggleDrawer but always spawning.
-                                if drawer.is_some()
-                                    && let Some(id) = drawer.take()
-                                {
+                                // Direct bind for yazi: always replace the visible drawer
+                                // with a fresh, contained yazi pane for the active worktree
+                                // (routed through spawn_yazi_pane so it inherits the same
+                                // systemd-run memory/swap/CPU bound as the toggle path).
+                                if let Some(id) = drawer.take() {
                                     panes.table.remove(&id);
+                                    drawer_home = None;
                                 }
                                 let cwd = active_cwd(&session);
-                                let yenv = crate::panes::yazi_env(keymap.config());
-                                let p = keymap
-                                    .config()
-                                    .tool_command("yazi")
-                                    .map(tool_drawer_argv)
-                                    .and_then(|argv| {
-                                        panes
-                                            .spawn_argv_env(
-                                                &argv,
-                                                cwd.as_deref(),
-                                                &yenv,
-                                                chrome.center,
-                                            )
-                                            .ok()
-                                    })
-                                    .or_else(|| {
-                                        spawn_worktree_shell_pane(
-                                            &mut panes,
-                                            keymap.config(),
-                                            cwd.as_deref(),
-                                            chrome.center,
-                                        )
-                                        .ok()
-                                    });
-                                if let Some(id) = p {
+                                if let Some(id) = spawn_yazi_pane(
+                                    &mut panes,
+                                    keymap.config(),
+                                    cwd.as_deref(),
+                                    chrome.center,
+                                ) {
                                     drawer = Some(id);
+                                    drawer_home = cwd;
                                 }
                             }
                             Action::SummonPin(n) => {
@@ -5040,6 +5146,77 @@ mod tests {
             ],
             active: 0,
         }
+    }
+
+    #[test]
+    fn contain_yazi_argv_wraps_scope_with_drawer_limits() {
+        let cfg = superzej_core::config::Config::default();
+        let argv = contain_yazi_argv(&cfg, vec!["yazi".into()], true);
+
+        assert_eq!(argv[0], "systemd-run");
+        assert!(argv.contains(&"--user".to_string()));
+        assert!(argv.contains(&"--scope".to_string()));
+        assert!(argv.contains(&"--collect".to_string()));
+        assert!(argv.contains(&"MemoryMax=2G".to_string()));
+        assert!(argv.contains(&"MemorySwapMax=512M".to_string()));
+        assert!(argv.contains(&"CPUQuota=200%".to_string()));
+        // The wrapped command follows the `--` separator.
+        let sep = argv.iter().position(|a| a == "--").unwrap();
+        assert_eq!(&argv[sep + 1..], &["yazi".to_string()]);
+    }
+
+    #[test]
+    fn contain_yazi_argv_omits_empty_limits_and_can_disable() {
+        let mut cfg = superzej_core::config::Config::default();
+        cfg.drawer.memory_swap_max.clear();
+        cfg.drawer.cpu_quota.clear();
+        let argv = contain_yazi_argv(&cfg, vec!["yazi".into()], true);
+        assert_eq!(argv[0], "systemd-run");
+        assert!(argv.contains(&"MemoryMax=2G".to_string()));
+        assert!(!argv.iter().any(|a| a.starts_with("MemorySwapMax=")));
+        assert!(!argv.iter().any(|a| a.starts_with("CPUQuota=")));
+
+        // Disabled, missing systemd-run, or an already-wrapped sandbox argv all
+        // pass the command through untouched.
+        cfg.drawer.contain = false;
+        assert_eq!(
+            contain_yazi_argv(&cfg, vec!["yazi".into()], true),
+            vec!["yazi"]
+        );
+        cfg.drawer.contain = true;
+        assert_eq!(
+            contain_yazi_argv(&cfg, vec!["yazi".into()], false),
+            vec!["yazi"]
+        );
+        let nested = vec!["systemd-run".to_string(), "--user".into(), "--pty".into()];
+        assert_eq!(contain_yazi_argv(&cfg, nested.clone(), true), nested);
+    }
+
+    #[test]
+    fn drawer_pool_respects_zero_limit_and_evicts_oldest() {
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
+        let mut panes = Panes::new(tx);
+        let mut pool = DrawerPool::default();
+        let a = std::path::Path::new("/tmp/a");
+        let b = std::path::Path::new("/tmp/b");
+
+        // limit 0 = no pooling; the just-hidden pane is torn down immediately.
+        pool.stash(a, 1, 0, &mut panes);
+        assert!(!pool.contains(a));
+
+        // limit 1 keeps only the most recent; stashing b evicts a.
+        pool.stash(a, 1, 1, &mut panes);
+        assert!(pool.contains(a));
+        pool.stash(b, 2, 1, &mut panes);
+        assert!(!pool.contains(a));
+        assert!(pool.contains(b));
+        assert_eq!(pool.take(b), Some(2));
+        assert!(!pool.contains(b));
+
+        // remove_id forgets a pooled drawer whose yazi exited on its own.
+        pool.stash(a, 3, 2, &mut panes);
+        assert!(pool.remove_id(3));
+        assert!(!pool.remove_id(3));
     }
 
     /// A SidebarState whose `persist` writes to a temp DB scope rather than the

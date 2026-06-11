@@ -111,6 +111,22 @@ config_home = ""
 # Drawer geometry. height: "35%" or a row count. width: "full" | "center".
 height = "35%"
 width = "full"
+# Image previews are off by default in the bundled/private yazi config. Text/code
+# previews remain on. With config_home = "system", superzej does not rewrite your
+# yazi config, so containment below is still the safety net.
+image_previews = false
+# Run yazi and preview helper children in a bounded user systemd scope when
+# systemd-run is available. Empty limit strings omit that property.
+contain = true
+memory_max = "2G"
+memory_swap_max = "512M"
+cpu_quota = "200%"
+# Hidden-drawer keepalive: pool_limit caps how many hidden yazi panes are kept
+# warm (oldest evicted past the limit; 0 = hide kills the pane). prewarm spawns a
+# hidden drawer per worktree so the first toggle is instant — off by default so
+# invisible yazi instances never accumulate unbidden.
+pool_limit = 1
+prewarm = false
 
 # GitHub PR data feeding the right panel.
 [pr]
