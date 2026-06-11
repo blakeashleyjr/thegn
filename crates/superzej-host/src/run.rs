@@ -905,6 +905,66 @@ fn selected_test_location(ui: &crate::panel::PanelUi) -> Option<crate::panel::Te
     ui.tests.selected_node().and_then(|n| n.location.clone())
 }
 
+/// Resolve where to open the selected test: its captured `file:line` if present,
+/// else locate its definition by name with ripgrep/grep (so *any* test — not
+/// just failures — opens instantly). Returns `(absolute_path, line)`.
+fn resolve_open_target(
+    session: &crate::session::Session,
+    ui: &crate::panel::PanelUi,
+) -> Option<(String, usize)> {
+    if let Some(loc) = selected_test_location(ui) {
+        return Some((resolve_loc_path(session, &loc.path), loc.line));
+    }
+    let node = ui.tests.selected_node()?;
+    let wt = active_worktree(session)?;
+    locate_test_in_repo(&wt, &node.id).map(|(rel, line)| (resolve_loc_path(session, &rel), line))
+}
+
+/// Best-effort search for a test definition by name. Tries ripgrep, then grep;
+/// runs from the worktree so hits are worktree-relative. Brief and user-initiated.
+fn locate_test_in_repo(worktree: &std::path::Path, test_id: &str) -> Option<(String, usize)> {
+    let rg = on_path("rg");
+    for pat in crate::panel::locate_regexes(test_id) {
+        let out = if rg {
+            std::process::Command::new("rg")
+                .args([
+                    "--no-heading",
+                    "--line-number",
+                    "--max-count",
+                    "1",
+                    "-e",
+                    &pat,
+                    ".",
+                ])
+                .current_dir(worktree)
+                .output()
+        } else {
+            std::process::Command::new("grep")
+                .args(["-rnE", "--max-count=1", &pat, "."])
+                .current_dir(worktree)
+                .output()
+        };
+        let Ok(out) = out else { continue };
+        let text = String::from_utf8_lossy(&out.stdout);
+        if let Some(hit) = text.lines().next() {
+            // `./path:line:...` → (path, line)
+            let mut it = hit.trim_start_matches("./").splitn(3, ':');
+            if let (Some(path), Some(line)) = (it.next(), it.next()) {
+                if let Ok(n) = line.parse::<usize>() {
+                    return Some((path.to_string(), n));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn on_path(bin: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
+        .unwrap_or(false)
+}
+
 /// Resolve a (possibly worktree-relative) failure path to something the editor
 /// can open: absolute paths pass through; relative ones join the active worktree.
 fn resolve_loc_path(session: &crate::session::Session, path: &str) -> String {
@@ -1162,10 +1222,10 @@ async fn event_loop<T: Terminal>(
                 if let Some(err) = discovery.error {
                     panel_ui.tests.summary.error = Some(err);
                 } else {
-                    panel_ui.tests.nodes = discovery.nodes;
-                    panel_ui.tests.discovered = true;
+                    // Merge: seed newly-found tests as Unknown without disturbing
+                    // statuses from prior runs.
+                    panel_ui.tests.merge_discovered(&discovery.nodes);
                     panel_ui.tests.summary.error = None;
-                    panel_ui.tests.recompute_summary();
                 }
                 persist_tests_for_worktree(&panel_ui, &discovery.worktree);
                 dirty = true;
@@ -1177,10 +1237,11 @@ async fn event_loop<T: Terminal>(
                 panel_ui.tests.running = false;
                 let truncated = outcome.truncated;
                 panel_ui.tests.task = Some(outcome.task.clone());
-                panel_ui.tests.nodes = crate::task::parse_task_outcome(&outcome);
-                panel_ui.tests.discovered = true;
-                panel_ui.tests.stale = false;
-                panel_ui.tests.recompute_summary();
+                // Merge: the latest run updates each reported test's status while
+                // leaving other tests' most-recent status intact.
+                panel_ui
+                    .tests
+                    .merge_results(&crate::task::parse_task_outcome(&outcome));
                 if outcome.exit_code != Some(0) && panel_ui.tests.summary.failed == 0 {
                     panel_ui.tests.summary.failed = 1;
                 }
@@ -1506,12 +1567,14 @@ async fn event_loop<T: Terminal>(
                             }
                             PanelNav::Open | PanelNav::OpenEditor | PanelNav::Enter => {
                                 if panel_ui.tab == PanelTab::Tests {
-                                    if let Some(loc) = selected_test_location(&panel_ui) {
-                                        // Open the failure at file:line in the editor drawer.
-                                        let path = resolve_loc_path(&session, &loc.path);
+                                    // Any test opens instantly: captured failure
+                                    // location, else located by name (rg/grep).
+                                    if let Some((path, line)) =
+                                        resolve_open_target(&session, &panel_ui)
+                                    {
                                         let cmd = format!(
                                             "${{EDITOR:-vi}} +{} {}",
-                                            loc.line,
+                                            line,
                                             shell_quote(&path)
                                         );
                                         if let Some(id) = drawer.take() {
@@ -1525,10 +1588,40 @@ async fn event_loop<T: Terminal>(
                                         ) {
                                             drawer = Some(id);
                                         }
-                                        model.status = format!("opened {}:{}", loc.path, loc.line);
+                                        model.status = format!("opened {path}:{line}");
                                     } else {
-                                        model.status =
-                                            "No failure location on selected test".into();
+                                        model.status = "Could not locate the selected test".into();
+                                    }
+                                }
+                            }
+                            PanelNav::Peek => {
+                                // Read-only peek in the bat pager at the test's line.
+                                if panel_ui.tab == PanelTab::Tests {
+                                    if let Some((path, line)) =
+                                        resolve_open_target(&session, &panel_ui)
+                                    {
+                                        let bat = current_config
+                                            .tool_command("bat")
+                                            .unwrap_or("bat --paging=always")
+                                            .to_string();
+                                        let cmd = format!(
+                                            "{bat} --highlight-line {line} {}",
+                                            shell_quote(&path)
+                                        );
+                                        if let Some(id) = drawer.take() {
+                                            panes.table.remove(&id);
+                                        }
+                                        let argv = tool_drawer_argv(&cmd);
+                                        if let Ok(id) = panes.spawn_argv(
+                                            &argv,
+                                            tab_cwd(&session.tabs[active]).as_deref(),
+                                            chrome.center,
+                                        ) {
+                                            drawer = Some(id);
+                                        }
+                                        model.status = format!("peek {path}:{line}");
+                                    } else {
+                                        model.status = "Could not locate the selected test".into();
                                     }
                                 }
                             }
