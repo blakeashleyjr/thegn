@@ -932,11 +932,21 @@ fn test_task_for_nav(
     };
     let mut task = base;
     match task.matcher.as_str() {
-        "cargo-test" => task.command = format!("{} {}", task.command, shell_quote(&target.id)),
+        "cargo-test" | "nextest" => {
+            task.command = format!("{} {}", task.command, shell_quote(&target.id))
+        }
         "go-test" => task.command = format!("{} -run {}", task.command, shell_quote(&target.id)),
-        "pytest" => task.command = format!("{} {}", task.command, shell_quote(&target.id)),
+        "pytest" | "swift" => {
+            task.command = format!("{} {}", task.command, shell_quote(&target.id))
+        }
         "vitest" | "jest" | "javascript" => {
             task.command = format!("{} {}", task.command, shell_quote(&target.id));
+        }
+        // A single flake check builds just that attr (`<system>::<name>` →
+        // `.#checks.<system>.<name>`).
+        "nix-flake" => {
+            let attr = format!("checks.{}", target.id.replace("::", "."));
+            task.command = format!("nix build -L {}", shell_quote(&format!(".#{attr}")));
         }
         _ => {}
     }
