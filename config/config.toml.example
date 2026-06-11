@@ -290,6 +290,11 @@ command = "git diff"
 # test_mem_max = "4G"        # memory cap for a test run; "" = uncapped
 # test_nice = 10             # niceness for test runs (0 disables)
 # test_max_parallel = 1      # max concurrent test/discovery jobs across worktrees
+# test_timeout_secs = 1800   # kill a wedged test run after N seconds (0 disables)
+# discover_timeout_secs = 45 # discovery should be instant; cap it so a held
+#                            #   cargo build-lock surfaces an error, not a spinner
+# isolated_target_dir = true # run superzej's cargo under <worktree>/target/superzej
+#                            #   so discovery/tests never block on the user's build lock
 
 # Top pinned-program strip: a horizontal band above the center that renders
 # `location = "strip"` pins side by side (toggle Ctrl+Alt+t; grow/shrink at
