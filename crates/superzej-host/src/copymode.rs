@@ -14,14 +14,17 @@ pub struct Selection {
 }
 
 impl Selection {
-    /// Begin a selection at `anchor` (the mouse-down / cursor-start point). Wired
-    /// when the mouse-drag UX lands; the geometry it feeds is already tested.
-    #[allow(dead_code)]
+    /// Begin a selection at `anchor` (the mouse-down point).
     pub fn new(anchor: (u16, u16)) -> Self {
         Self {
             anchor,
             cursor: anchor,
         }
+    }
+
+    /// Ordered bounds for the mouse-selection overlay renderer.
+    pub fn ordered(&self) -> (u16, u16, u16, u16) {
+        self.bounds()
     }
 
     /// Ordered bounds `(start_row, start_col, end_row, end_col)` with start ≤ end.

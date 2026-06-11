@@ -98,29 +98,79 @@ pub fn launch_spec(cfg: &Config, worktree: &str, branch: Option<&str>, choice: &
     ];
 
     // Wrap the chosen program in the worktree's sandbox/container (and/or the
-    // mosh/ssh transport for a remote worktree). Falls back to a bare login
-    // shell-cmd when the sandbox is disabled / resolves to `none`.
-    let sb = cfg.repo_sandbox(&repo_root);
+    // mosh/ssh transport for a remote worktree). Auto walks the configured chain;
+    // a persisted worktree choice (from the new-worktree picker) narrows the
+    // candidates. Host is an explicit last fallback, labeled in the DB.
+    let mut sb = cfg.repo_sandbox(&repo_root);
+    if let Ok(db) = Db::open()
+        && let Ok(Some(saved)) = db.worktree_sandbox(worktree)
+        && !saved.trim().is_empty()
+        && saved.trim() != "auto"
+        && let Ok(b) = superzej_core::config::SandboxBackend::from_str_validated(&saved)
+    {
+        sb.backend = b;
+    }
     let cname = sandbox::container_name(worktree);
-    if let Some(spec) = sandbox::resolve(&sb, &loc, &cname) {
-        if let Ok(db) = Db::open() {
-            let _ = db.set_worktree_sandbox(worktree, spec.backend.binary());
-        }
-        if sandbox::ensure(&spec).is_ok() {
-            return LaunchSpec {
-                argv: sandbox::enter_argv(&spec, &cmd),
-                cwd,
-                env,
-            };
+    for candidate in sandbox_candidates(&sb) {
+        if let Some(spec) = sandbox::resolve(&candidate, &loc, &cname) {
+            if spec.backend == sandbox::Backend::None {
+                break;
+            }
+            match sandbox::ensure(&spec) {
+                Ok(()) => {
+                    if let Ok(db) = Db::open() {
+                        let _ = db.set_worktree_sandbox(worktree, spec.backend.label());
+                    }
+                    return LaunchSpec {
+                        argv: sandbox::enter_argv(&spec, &cmd),
+                        cwd,
+                        env,
+                    };
+                }
+                Err(e) => superzej_core::msg::warn(&format!(
+                    "sandbox {} failed for {worktree}: {e}; trying next backend",
+                    spec.backend.label()
+                )),
+            }
+        } else if candidate.backend == superzej_core::config::SandboxBackend::None {
+            break;
         }
     }
 
-    // No sandbox: run the command through a login shell so PATH/env expand.
+    if let Ok(db) = Db::open() {
+        let _ = db.set_worktree_sandbox(worktree, "host");
+    }
+    // Host fallback: run the command through a login shell so PATH/env expand.
     LaunchSpec {
         argv: vec![superzej_core::util::shell(), "-lc".to_string(), cmd],
         cwd,
         env,
     }
+}
+
+fn sandbox_candidates(
+    sb: &superzej_core::config::SandboxConfig,
+) -> Vec<superzej_core::config::SandboxConfig> {
+    if sb.backend != superzej_core::config::SandboxBackend::Auto {
+        return vec![sb.clone()];
+    }
+    let mut out = Vec::new();
+    for name in &sb.backend_chain {
+        if let Ok(backend) = superzej_core::config::SandboxBackend::from_str_validated(name) {
+            let mut c = sb.clone();
+            c.backend = backend;
+            out.push(c);
+        }
+    }
+    if !out
+        .iter()
+        .any(|c| c.backend == superzej_core::config::SandboxBackend::None)
+    {
+        let mut c = sb.clone();
+        c.backend = superzej_core::config::SandboxBackend::None;
+        out.push(c);
+    }
+    out
 }
 
 #[cfg(test)]

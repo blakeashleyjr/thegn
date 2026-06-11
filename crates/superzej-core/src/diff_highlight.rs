@@ -59,6 +59,14 @@ const FG_PREFIX_REMOVE: &str = "\x1b[38;2;247;118;142m";
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Pre-load the syntect syntax + theme sets (the lazy first load costs
+/// ~100-300ms). Call from a background thread at startup so the first
+/// drill-in never stalls the user.
+pub fn warm() {
+    let _ = syntax_set();
+    let _ = theme();
+}
+
 /// Apply syntax highlighting to a single file's raw git diff output.
 ///
 /// `diff_text` is the raw diff (e.g. from `git diff` without `--color`).
@@ -136,6 +144,40 @@ pub fn highlight_diff(diff_text: &str, file_path: &str) -> String {
     out
 }
 
+/// Apply syntax highlighting to a whole file (no diff structure): every line
+/// is colored per the file's language. Returns ANSI text for the host's
+/// span-based panel renderer (the Files tab's preview drill-in).
+pub fn highlight_file(text: &str, file_path: &str) -> String {
+    let ss = syntax_set();
+    let theme = theme();
+
+    let path = std::path::Path::new(file_path);
+    let syntax = ss
+        .find_syntax_by_extension(path.extension().and_then(|e| e.to_str()).unwrap_or(""))
+        .or_else(|| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| ss.find_syntax_by_extension(n))
+        })
+        .unwrap_or_else(|| ss.find_syntax_plain_text());
+
+    let mut highlighter = HighlightLines::new(syntax, theme);
+    let mut out = String::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            out.push('\n');
+            continue;
+        }
+        let ranges = highlighter.highlight_line(line, ss).unwrap_or_default();
+        for (style, chunk) in &ranges {
+            out.push_str(&style_ansi(style, None));
+            out.push_str(chunk);
+        }
+        out.push_str("\x1b[0m\n");
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Helper — build ANSI escape sequence for a syntect style + optional diff bg.
 // ---------------------------------------------------------------------------
@@ -206,6 +248,26 @@ diff --git a/x.rs b/x.rs
         // whole-filename fallback path (Makefile has no extension).
         let out2 = highlight_diff(" all:\n", "Makefile");
         assert!(!out2.is_empty());
+    }
+
+    #[test]
+    fn warm_loads_the_lazy_sets() {
+        warm();
+        // After warming, highlighting is immediate and well-formed.
+        assert!(highlight_file("fn x() {}\n", "a.rs").contains("\x1b[38;2;"));
+    }
+
+    #[test]
+    fn highlight_file_colors_lines_and_preserves_blanks() {
+        let out = highlight_file("fn main() {}\n\nlet x = 1;\n", "x.rs");
+        // Each non-empty line ends with a reset; blank lines survive.
+        assert!(out.contains("\x1b[38;2;")); // syntect fg colors present
+        assert!(out.contains("\x1b[0m\n"));
+        assert_eq!(out.lines().count(), 3);
+        assert!(out.lines().nth(1).unwrap().is_empty());
+        // Unknown extensions fall back to plain text without panicking.
+        let plain = highlight_file("hello\n", "f.unknownext");
+        assert!(plain.ends_with("\x1b[0m\n"));
     }
 
     #[test]

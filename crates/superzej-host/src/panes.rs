@@ -91,6 +91,54 @@ pub(crate) fn tool_drawer_argv(command: &str) -> Vec<String> {
     ]
 }
 
+/// Env for spawning yazi: an isolated `YAZI_CONFIG_HOME` so the user's own
+/// `~/.config/yazi` (often written for a different yazi version — schema
+/// breakage shows as TOML errors on every launch) can't break the drawer.
+/// `[drawer] config_home`: `""` = a private superzej dir seeded once from the
+/// bundled config, `"system"` = the user's own config, else an explicit path.
+pub(crate) fn yazi_env(cfg: &superzej_core::config::Config) -> Vec<(String, String)> {
+    let home = cfg.drawer.config_home.trim();
+    let dir = match home {
+        "system" => return Vec::new(),
+        "" => {
+            let dir = superzej_core::util::superzej_dir().join("yazi");
+            if let Err(e) = seed_yazi_config(&dir) {
+                tracing::warn!(target: "szhost", error = %e, "yazi config seed failed");
+                return Vec::new();
+            }
+            dir
+        }
+        path => std::path::PathBuf::from(superzej_core::util::expand_tilde(path)),
+    };
+    vec![(
+        "YAZI_CONFIG_HOME".into(),
+        dir.to_string_lossy().into_owned(),
+    )]
+}
+
+/// Write the bundled yazi config files into `dir` (only the missing ones, so
+/// user tweaks to the private copy survive).
+fn seed_yazi_config(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    for (name, body) in [
+        ("yazi.toml", include_str!("../../../config/yazi/yazi.toml")),
+        (
+            "theme.toml",
+            include_str!("../../../config/yazi/theme.toml"),
+        ),
+        (
+            "keymap.toml",
+            include_str!("../../../config/yazi/keymap.toml"),
+        ),
+    ] {
+        let p = dir.join(name);
+        if !p.exists() {
+            std::fs::write(p, body)?;
+        }
+    }
+    Ok(())
+}
+
 /// The global pane registry. A tab's panes are identified by the real ids in its
 /// `CenterTree`; this just owns the live `PtyPane`s keyed by id.
 pub(crate) struct Panes {
@@ -167,18 +215,21 @@ impl Panes {
 
     /// Ensure every leaf in `tab.center` is backed by a live pane. On first focus
     /// (or after resurrect, whose ids are stale) this spawns fresh panes and
-    /// remaps the tree's leaf ids + the focused id onto them.
+    /// remaps the tree's leaf ids + the focused id onto them. `worktree` is the
+    /// owning group's dir (tabs spawn their shells there).
     pub(crate) fn materialize(
         &mut self,
         tab: &mut crate::session::Tab,
+        worktree: &str,
         center: Rect,
+        cfg: &superzej_core::config::Config,
     ) -> Result<()> {
         let leaves = tab.center.pane_ids();
         if leaves.iter().all(|id| self.table.contains_key(id)) {
             return Ok(()); // already live
         }
-        let cwd = (!tab.worktree.is_empty() && std::path::Path::new(&tab.worktree).is_dir())
-            .then(|| std::path::PathBuf::from(&tab.worktree))
+        let cwd = (!worktree.is_empty() && std::path::Path::new(worktree).is_dir())
+            .then(|| std::path::PathBuf::from(worktree))
             .or_else(|| std::env::current_dir().ok())
             .or_else(|| std::env::var("HOME").ok().map(std::path::PathBuf::from));
 
@@ -186,7 +237,13 @@ impl Panes {
         let mut map = std::collections::HashMap::new();
         for old in &leaves {
             if !map.contains_key(old) {
-                match self.spawn(cwd.as_deref(), center) {
+                let spec = crate::agent::launch_spec(cfg, worktree, None, "shell");
+                match self.spawn_argv_env(
+                    &spec.argv,
+                    spec.cwd.as_deref().or(cwd.as_deref()),
+                    &spec.env,
+                    center,
+                ) {
                     Ok(fresh) => {
                         map.insert(*old, fresh);
                     }
@@ -232,25 +289,44 @@ fn prewarm_targets(active: usize, len: usize, radius: usize) -> Vec<usize> {
 /// per tab on a large session.
 const PREWARM_RADIUS: usize = 1;
 
-/// Pre-spawn PTY children for the tabs adjacent to the active one so first focus
-/// of a neighbor is instant. Best-effort: `materialize` spawns + remaps a tab's
-/// leaf ids in place, so a later switch finds the panes already live and returns
-/// early. Errors are ignored (the lazy path will retry on real focus).
+/// Pre-spawn PTY children for the tabs adjacent to the active one (within the
+/// active worktree) and for the neighboring worktrees' active tabs, so first
+/// focus of a neighbor is instant. Best-effort: `materialize` spawns + remaps a
+/// tab's leaf ids in place, so a later switch finds the panes already live and
+/// returns early. Errors are ignored (the lazy path will retry on real focus).
 pub(crate) fn prewarm_neighbors(
     panes: &mut Panes,
     session: &mut crate::session::Session,
     center: Rect,
+    cfg: &superzej_core::config::Config,
 ) {
-    for i in prewarm_targets(session.active, session.tabs.len(), PREWARM_RADIUS) {
-        let _ = panes.materialize(&mut session.tabs[i], center);
+    if session.worktrees.is_empty() {
+        return;
+    }
+    // Sibling tabs within the active worktree.
+    let g = &mut session.worktrees[session.active];
+    let path = g.path.clone();
+    for ti in prewarm_targets(g.active_tab, g.tabs.len(), PREWARM_RADIUS) {
+        let _ = panes.materialize(&mut g.tabs[ti], &path, center, cfg);
+    }
+    // Neighboring worktrees: their remembered active tab.
+    for gi in prewarm_targets(session.active, session.worktrees.len(), PREWARM_RADIUS) {
+        let g = &mut session.worktrees[gi];
+        let path = g.path.clone();
+        let at = g.active_tab.min(g.tabs.len().saturating_sub(1));
+        if let Some(tab) = g.tabs.get_mut(at) {
+            let _ = panes.materialize(tab, &path, center, cfg);
+        }
     }
 }
 
-/// Resize each pane in `tree` to the rect it occupies within `center`.
+/// Resize each pane in `tree` to its CONTENT rect within `center` (inside the
+/// 1-cell border ring the framed layout reserves — the PTY must agree with
+/// what `compose_pane` paints).
 pub(crate) fn relayout(panes: &mut Panes, tree: &crate::center::CenterTree, center: Rect) {
-    for (id, rect) in tree.layout(center) {
+    for (id, _, content) in tree.layout_framed(center) {
         if let Some(p) = panes.table.get_mut(&id) {
-            let _ = p.resize(rect.rows.max(1) as u16, rect.cols.max(1) as u16);
+            let _ = p.resize(content.rows.max(1) as u16, content.cols.max(1) as u16);
         }
     }
 }
@@ -292,20 +368,13 @@ pub(crate) fn replace_single_dead_center_pane(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::center::CenterTree;
     use crate::layout;
-    use crate::session::{Session, Tab, TabKind};
+    use crate::session::{GroupKind, Session, WorktreeGroup};
 
     fn one_tab_session() -> Session {
         Session {
             id: "s1".into(),
-            tabs: vec![Tab {
-                name: "app/home".into(),
-                kind: TabKind::Home,
-                worktree: "/tmp/app".into(),
-                center: CenterTree::Leaf(0),
-                focused_pane: 0,
-            }],
+            worktrees: vec![WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/app")],
             active: 0,
         }
     }
@@ -337,8 +406,14 @@ mod tests {
 
         let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
         let mut panes = Panes::new(tx);
+        let path = session.worktrees[0].path.clone();
         panes
-            .materialize(&mut session.tabs[0], chrome.center)
+            .materialize(
+                &mut session.worktrees[0].tabs[0],
+                &path,
+                chrome.center,
+                &superzej_core::config::Config::default(),
+            )
             .unwrap();
 
         let mut drawer: Option<u32> = None;
@@ -395,13 +470,9 @@ mod tests {
 
     #[test]
     fn external_sole_center_pane_exit_is_replaced_with_fresh_shell_pane() {
-        let mut tab = Tab {
-            name: "app/home".into(),
-            kind: TabKind::Home,
-            worktree: "/tmp/app".into(),
-            center: CenterTree::Leaf(7),
-            focused_pane: 7,
-        };
+        let mut tab = crate::session::Tab::new("1");
+        tab.center = crate::center::CenterTree::Leaf(7);
+        tab.focused_pane = 7;
 
         assert!(replace_single_dead_center_pane(&mut tab, 7, 42));
         assert_eq!(tab.center.pane_ids(), vec![42]);

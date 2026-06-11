@@ -5,26 +5,33 @@
 //! `Surface` that diff-flushes to the outer terminal (the "no-flash" mechanism).
 
 mod agent;
+mod ansi;
+mod borders;
 mod center;
 mod chrome;
 mod cmd;
 mod compositor;
 mod copymode;
 mod emulator;
+mod focus;
 mod hydrate;
 mod input;
 mod keyhint;
 mod keymap;
 mod layout;
+mod logotype;
+mod mousefilter;
 mod palette;
 mod pane;
 mod panel;
 mod panes;
 mod pins;
+mod queries;
 mod run;
 mod sequence;
 mod session;
 mod sidebar;
+mod stats;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -92,8 +99,7 @@ pub enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let mut cli = Cli::parse();
     if let Some(lvl) = cli.log_level.as_deref() {
         cli.overrides.push(format!("log.level={lvl}"));
@@ -104,7 +110,15 @@ async fn main() -> anyhow::Result<()> {
     if let Some(command) = cli.command.take() {
         return run_subcommand(&cli, command);
     }
-    run::main(cli).await
+
+    // Manual runtime instead of #[tokio::main]: dropping a Runtime blocks on
+    // every in-flight spawn_blocking task, so quitting would wait out whatever
+    // hydration is mid-flight (git/tokei/podman subprocesses — easily 100ms+).
+    // shutdown_background detaches those; exit is as instant as launch.
+    let rt = tokio::runtime::Runtime::new()?;
+    let result = rt.block_on(run::main(cli));
+    rt.shutdown_background();
+    result
 }
 
 /// Dispatch a non-interactive verb. Loads the layered config (the verbs that

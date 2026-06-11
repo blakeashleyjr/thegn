@@ -11,6 +11,66 @@ use crate::compositor::{Rect, compose_pane};
 use crate::emulator::PaneEmulator;
 use superzej_core::theme;
 
+/// The resolved chrome palette. A process-global because every draw helper
+/// needs it and threading it through each call would touch every signature;
+/// the event loop writes it (startup + config reload), render-time code only
+/// reads. Defaults match the built-in storm-blue theme.
+static PALETTE: std::sync::LazyLock<std::sync::RwLock<theme::Palette>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(theme::Palette::default()));
+
+/// Install the resolved palette (startup and live config reload).
+pub fn set_palette(p: theme::Palette) {
+    if let Ok(mut g) = PALETTE.write() {
+        *g = p;
+    }
+}
+
+/// A palette slot, resolvable to a live color via [`col`]. Kept complete even
+/// where a slot has no call site yet, so new chrome picks from one vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum S {
+    Bg0,
+    Bg1,
+    Panel,
+    Panel2,
+    Raise,
+    Border,
+    Focus,
+    Text,
+    Dim,
+    Faint,
+    Ghost,
+}
+
+/// Resolve a palette slot to a termwiz color (reads the live palette).
+pub fn col(s: S) -> ColorAttribute {
+    let p = PALETTE.read().expect("palette lock");
+    theme_color(match s {
+        S::Bg0 => &p.bg0,
+        S::Bg1 => &p.bg1,
+        S::Panel => &p.panel,
+        S::Panel2 => &p.panel2,
+        S::Raise => &p.raise,
+        S::Border => &p.border,
+        S::Focus => &p.focus,
+        S::Text => &p.text,
+        S::Dim => &p.dim,
+        S::Faint => &p.faint,
+        S::Ghost => &p.ghost,
+    })
+}
+
+/// The focus color's "R;G;B" fragment (for `theme::blend` tints).
+pub fn focus_rgb() -> String {
+    PALETTE.read().expect("palette lock").focus.clone()
+}
+
+/// The panel surface's "R;G;B" fragment (the base for tints on chrome zones).
+pub fn panel_rgb() -> String {
+    PALETTE.read().expect("palette lock").panel.clone()
+}
+
 /// Parse a theme `"r;g;b"` triple into a termwiz color.
 pub fn theme_color(triple: &str) -> ColorAttribute {
     let mut it = triple
@@ -25,6 +85,58 @@ pub fn theme_color(triple: &str) -> ColorAttribute {
         )),
         _ => ColorAttribute::Default,
     }
+}
+
+/// As [`draw_text`], with an underline (the active panel-tab affordance).
+pub fn draw_text_underlined(
+    surface: &mut Surface,
+    x: usize,
+    y: usize,
+    text: &str,
+    fg: ColorAttribute,
+    bg: ColorAttribute,
+    max_cols: usize,
+) {
+    surface.add_change(Change::CursorPosition {
+        x: Position::Absolute(x),
+        y: Position::Absolute(y),
+    });
+    surface.add_change(Change::Attribute(AttributeChange::Foreground(fg)));
+    surface.add_change(Change::Attribute(AttributeChange::Background(bg)));
+    surface.add_change(Change::Attribute(AttributeChange::Underline(
+        termwiz::cell::Underline::Single,
+    )));
+    let clipped: String = text.chars().take(max_cols).collect();
+    surface.add_change(Change::Text(clipped));
+    surface.add_change(Change::Attribute(AttributeChange::Underline(
+        termwiz::cell::Underline::None,
+    )));
+}
+
+/// As [`draw_text`], in bold (section titles, headers).
+pub fn draw_text_bold(
+    surface: &mut Surface,
+    x: usize,
+    y: usize,
+    text: &str,
+    fg: ColorAttribute,
+    bg: ColorAttribute,
+    max_cols: usize,
+) {
+    surface.add_change(Change::CursorPosition {
+        x: Position::Absolute(x),
+        y: Position::Absolute(y),
+    });
+    surface.add_change(Change::Attribute(AttributeChange::Foreground(fg)));
+    surface.add_change(Change::Attribute(AttributeChange::Background(bg)));
+    surface.add_change(Change::Attribute(AttributeChange::Intensity(
+        termwiz::cell::Intensity::Bold,
+    )));
+    let clipped: String = text.chars().take(max_cols).collect();
+    surface.add_change(Change::Text(clipped));
+    surface.add_change(Change::Attribute(AttributeChange::Intensity(
+        termwiz::cell::Intensity::Normal,
+    )));
 }
 
 /// Write `text` at `(x, y)`, clipped to `max_cols`, with the given colors. Does
@@ -64,7 +176,7 @@ pub fn draw_plugin_view(
     if rect.rows == 0 || rect.cols == 0 {
         return;
     }
-    fill(surface, rect, theme_color(theme::BG1));
+    fill(surface, rect, col(S::Bg1));
     let mut x = rect.x;
     let max_x = rect.x + rect.cols;
     for span in &view.spans {
@@ -72,7 +184,7 @@ pub fn draw_plugin_view(
             break;
         }
         let fg = plugin_role_color(span.role, accent_rgb);
-        let bg = theme_color(theme::BG1);
+        let bg = col(S::Bg1);
         let max_cols = max_x.saturating_sub(x);
         draw_text(surface, x, rect.y, &span.text, fg, bg, max_cols);
         x += span.text.chars().take(max_cols).count();
@@ -86,11 +198,11 @@ fn plugin_role_color(
 ) -> ColorAttribute {
     use superzej_core::plugin_api::StyleRole;
     match role {
-        StyleRole::Default => theme_color(theme::TEXT),
+        StyleRole::Default => col(S::Text),
         StyleRole::Accent => theme_color(accent_rgb),
         StyleRole::Warning => theme_color(theme::AMBER),
         StyleRole::Error => theme_color(theme::RED),
-        StyleRole::Faint => theme_color(theme::FAINT),
+        StyleRole::Faint => col(S::Faint),
     }
 }
 
@@ -98,7 +210,7 @@ fn plugin_role_color(
 /// physical terminal clear: `BufferedTerminal` still diffs this logical state
 /// against its prior frame and emits only changed cells.
 pub fn clear_frame(surface: &mut Surface) {
-    surface.add_change(Change::ClearScreen(theme_color(theme::BG0)));
+    surface.add_change(Change::ClearScreen(col(S::Bg0)));
 }
 
 /// Fill `rect` with spaces on `bg` (a solid background block).
@@ -139,7 +251,11 @@ pub struct RowMenuEntry {
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
 pub struct FrameModel {
+    /// The active worktree group's name ("app/feat") — the tabbar's left label.
+    pub worktree: String,
+    /// The active worktree's tab chip titles (tabs live WITHIN a worktree).
     pub tabs: Vec<String>,
+    /// Index of the active chip in `tabs`.
     pub active_tab: usize,
     /// The structured workspace tree. Replaces the old flat `Vec<String>`:
     /// rows carry kind/depth/status so the renderer composes glyphs itself.
@@ -164,16 +280,39 @@ pub struct FrameModel {
     /// event loop to (re)derive `sidebar_rows`. The `(slug, display, kind)`
     /// workspace list in display order (`kind` = "repo" | "dir"), and
     /// per-worktree git/agent/activity status.
-    pub sidebar_workspaces: Vec<(String, String, String)>,
+    pub sidebar_workspaces: Vec<(String, String, String, String)>,
     pub sidebar_status: crate::sidebar::SidebarStatus,
+    /// Worktrees registered for workspaces NOT loaded in the session (their
+    /// sidebar rows switch workspace on activate).
+    pub sidebar_db_worktrees: Vec<crate::sidebar::DbWorktree>,
     /// Structured Diff/PR/Checks payload for the right panel.
     pub panel: crate::panel::PanelData,
     /// True when the right panel currently owns keyboard focus.
     pub panel_focused: bool,
+    /// True when the center zone owns keyboard focus (drives the focused
+    /// pane's light-blue frame ring; sidebar/panel focus dims every ring).
+    pub center_focused: bool,
+    /// True while the Ctrl+g keybind lock is on (statusbar indicator).
+    pub key_locked: bool,
+    /// True while a zone is zoomed fullscreen (statusbar indicator).
+    pub zoomed: bool,
+    /// Transient message (errors, "Config reloaded", copy confirmations).
     pub status: String,
+    /// Context-dependent keybind hints for the bottom bar (rebuilt per focus
+    /// zone — the dynamic replacement for per-panel help rows).
+    pub keyhints: String,
+    /// Latest system stats reading for the top bar.
+    pub stats: crate::stats::StatsSnapshot,
+    /// tokei line count for the active worktree (bottom-bar widget).
+    pub loc: Option<u64>,
+    /// Widget-bar layout (`[bars]`) and stat icons (`[stats]`).
+    pub bars: superzej_core::config::BarsConfig,
+    pub stats_icons: superzej_core::config::StatsConfig,
     pub accent: String,
     /// Pin chips for the tabbar (label + status glyph), in `Alt-N` order.
     pub pins: Vec<crate::pins::PinChip>,
+    /// Running containers (superzej-owned first) for the SANDBOXES section.
+    pub containers: Vec<superzej_core::sandbox::ContainerInfo>,
 }
 
 impl FrameModel {
@@ -186,43 +325,271 @@ impl FrameModel {
     }
 }
 
-pub fn draw_tabbar(surface: &mut Surface, rect: Rect, content: Rect, model: &FrameModel) {
-    if rect.rows == 0 {
-        return;
+/// The worktree label parts for the nav row: `(workspace, leaf)`. The
+/// workspace prefix renders uppercased (display form of the canonical slug);
+/// single-segment names render as the leaf alone.
+fn worktree_parts(model: &FrameModel) -> Option<(String, String)> {
+    if model.worktree.is_empty() {
+        return None;
     }
-    fill(surface, rect, theme_color(theme::BG1));
-    if content.rows == 0 || content.cols == 0 {
-        return;
-    }
-    let accent = theme_color(model.accent_or_default());
-    let dim = theme_color(theme::DIM);
-    let content_end = content.x.saturating_add(content.cols);
-
-    // Right-align the pin chips first so the tab labels know where to stop.
-    let chips_start = draw_pin_chips(surface, content, content_end, model, accent, dim);
-
-    let mut x = content.x.saturating_add(1);
-    for (i, name) in model.tabs.iter().enumerate() {
-        if x >= chips_start {
-            break;
-        }
-        let label = format!(" {name} ");
-        let fg = if i == model.active_tab { accent } else { dim };
-        let max = chips_start.saturating_sub(x);
-        draw_text(
-            surface,
-            x,
-            content.y,
-            &label,
-            fg,
-            theme_color(theme::BG1),
-            max,
-        );
-        x += label.chars().count();
+    match model.worktree.split_once('/') {
+        Some((ws, leaf)) => Some((ws.to_uppercase(), leaf.to_string())),
+        None => Some((String::new(), model.worktree.clone())),
     }
 }
 
-/// Render pin chips (`glyph label`) right-aligned in the tabbar content area.
+/// Where the right-aligned pin chips begin in the tab strip (the tab chips
+/// must stop before this column).
+fn pin_chips_start(model: &FrameModel, strip: Rect) -> usize {
+    let end = strip.x + strip.cols;
+    if model.pins.is_empty() {
+        return end;
+    }
+    let total: usize = model
+        .pins
+        .iter()
+        .map(|c| format!(" {} {} ", c.glyph, c.label).chars().count())
+        .sum();
+    end.saturating_sub(total).max(strip.x)
+}
+
+/// The tab chips' `(x, width, tab index)` spans inside the center tab bar —
+/// the single source of truth consumed by BOTH [`draw_center_tabs`]
+/// (placement) and [`center_tab_hit`] (mouse), so they can never drift apart.
+fn strip_chip_spans(model: &FrameModel, strip: Rect) -> Vec<(usize, usize, usize)> {
+    let mut spans = Vec::new();
+    if strip.rows == 0 || strip.cols == 0 {
+        return spans;
+    }
+    let end = pin_chips_start(model, strip);
+    let mut x = strip.x + 1;
+    if let Some((ws, leaf)) = worktree_parts(model) {
+        if !ws.is_empty() {
+            x += ws.chars().count() + 3; // "WS ▸ "
+        }
+        x += leaf.chars().count() + 2; // "leaf" + gap
+    }
+    for (i, title) in model.tabs.iter().enumerate() {
+        let w = title.chars().count() + 2; // " {title} "
+        if x + w > end {
+            break;
+        }
+        spans.push((x, w, i));
+        x += w + 1;
+    }
+    spans
+}
+
+/// Which tab chip sits at column `x` of the center tab bar (mouse hit-test).
+/// Shares its span math with the renderer via [`strip_chip_spans`].
+pub fn center_tab_hit(model: &FrameModel, strip: Rect, x: usize) -> Option<usize> {
+    strip_chip_spans(model, strip)
+        .into_iter()
+        .find(|(sx, w, _)| x >= *sx && x < sx + w)
+        .map(|(_, _, i)| i)
+}
+
+/// Which panel-tab segment sits at column `x` of the panel's switcher row
+/// (mouse hit-test). Mirrors [`draw_panel_tabs`] via [`PANEL_TABS`].
+pub fn panel_tab_hit(panel: Rect, x: usize) -> Option<crate::panel::PanelTab> {
+    let mut cx = panel.x + 1;
+    for (tab, label) in PANEL_TABS {
+        let w = label.chars().count() + 2;
+        if x >= cx && x < cx + w {
+            return Some(tab);
+        }
+        cx += w + 1;
+    }
+    None
+}
+
+/// Brand slot widths for the masthead text logo.
+/// " ◆ superzej v0.0.0 " — glyph + name + version…
+const BRAND_FULL_COLS: usize = 20;
+/// …or just " ◆ superzej " on narrower screens…
+const BRAND_COMPACT_COLS: usize = 13;
+/// …and nothing below this (content wins).
+const MASTHEAD_FULL_MIN_COLS: usize = 96;
+const MASTHEAD_COMPACT_MIN_COLS: usize = 60;
+
+/// How many masthead columns the brand occupies at a given terminal width.
+/// The stats cluster starts after these columns.
+pub fn masthead_brand_cols(cols: usize) -> usize {
+    if cols >= MASTHEAD_FULL_MIN_COLS {
+        BRAND_FULL_COLS
+    } else if cols >= MASTHEAD_COMPACT_MIN_COLS {
+        BRAND_COMPACT_COLS
+    } else {
+        0
+    }
+}
+
+/// The total columns a kept subset of the right cluster occupies
+/// (widget widths + " · " separators + 1 right margin).
+fn cluster_width(parts: &[(String, usize)], kept: &[usize]) -> usize {
+    if kept.is_empty() {
+        return 0;
+    }
+    kept.iter().map(|&i| parts[i].1).sum::<usize>() + 3 * (kept.len() - 1) + 1
+}
+
+/// Drop right-cluster widgets in priority order — `date` first, then `gpu` —
+/// until the cluster fits `avail` columns. (The brand/logo is the caller's
+/// final sacrifice.) Returns the surviving indices in display order.
+fn fit_stats_cluster(parts: &[(String, usize)], avail: usize) -> Vec<usize> {
+    let mut kept: Vec<usize> = (0..parts.len()).collect();
+    for victim in ["date", "gpu"] {
+        if cluster_width(parts, &kept) <= avail {
+            break;
+        }
+        kept.retain(|&i| parts[i].0 != victim);
+    }
+    kept
+}
+
+/// The single-row masthead: a regular-font text brand on the left and the
+/// `[bars]`-configured stats cluster on the right. When width runs short the
+/// masthead degrades gracefully — date drops first, then GPU, then the brand
+/// shrinks and finally disappears — so nothing ever clips mid-glyph. (The
+/// pixel wordmark survives on the empty-state splash.)
+pub fn draw_masthead(
+    surface: &mut Surface,
+    layout: &crate::layout::ChromeLayout,
+    model: &FrameModel,
+) {
+    let rect = layout.masthead;
+    if rect.rows == 0 || rect.cols == 0 {
+        return;
+    }
+    fill(surface, rect, col(S::Panel));
+    let accent = theme_color(model.accent_or_default());
+    let bg = col(S::Panel);
+
+    // Resolve the right cluster once; pick the widest brand that still lets
+    // the (possibly thinned) cluster fit.
+    let parts: Vec<(String, MastheadWidget)> = model
+        .bars
+        .top_right
+        .iter()
+        .filter_map(|id| masthead_widget(id, model).map(|w| (id.clone(), w)))
+        .collect();
+    let widths: Vec<(String, usize)> = parts
+        .iter()
+        .map(|(id, w)| (id.clone(), w.text.chars().count()))
+        .collect();
+    let mut brand_cols = masthead_brand_cols(rect.cols);
+    let kept = loop {
+        let avail = rect.cols.saturating_sub(brand_cols.max(1));
+        let kept = fit_stats_cluster(&widths, avail);
+        if cluster_width(&widths, &kept) <= avail || brand_cols == 0 {
+            break kept;
+        }
+        brand_cols = if brand_cols >= BRAND_FULL_COLS {
+            BRAND_COMPACT_COLS
+        } else {
+            0
+        };
+    };
+
+    if brand_cols > 0 {
+        draw_text(surface, rect.x + 1, rect.y, "\u{25c6} ", accent, bg, 2);
+        draw_text(surface, rect.x + 3, rect.y, "superzej", col(S::Text), bg, 8);
+        if brand_cols >= BRAND_FULL_COLS {
+            draw_text(
+                surface,
+                rect.x + 12,
+                rect.y,
+                concat!("v", env!("CARGO_PKG_VERSION")),
+                col(S::Faint),
+                bg,
+                brand_cols.saturating_sub(13),
+            );
+        }
+    }
+
+    let cluster: Vec<&MastheadWidget> = kept.iter().map(|&i| &parts[i].1).collect();
+    draw_masthead_cluster(surface, layout.masthead_stats_row(), &cluster, brand_cols);
+    draw_masthead_left(surface, layout.masthead_stats_row(), model, brand_cols);
+}
+
+/// The center column's tab bar, directly below the divider: the worktree
+/// label, the tab chips in a recessed container, and the pin chips
+/// right-aligned. Tabs live WITHIN the active worktree — `model.tabs` is that
+/// worktree's chip strip only.
+fn draw_center_tabs(surface: &mut Surface, strip: Rect, model: &FrameModel) {
+    if strip.rows == 0 || strip.cols == 0 {
+        return;
+    }
+    let accent = theme_color(model.accent_or_default());
+    let dim = col(S::Dim);
+    let bg = col(S::Bg0);
+    let end = strip.x + strip.cols;
+    fill(
+        surface,
+        Rect {
+            x: strip.x,
+            y: strip.y,
+            cols: strip.cols,
+            rows: 1,
+        },
+        bg,
+    );
+
+    draw_pin_chips(surface, strip, end, model, accent, dim);
+    let chips_end = pin_chips_start(model, strip);
+
+    let mut x = strip.x + 1;
+    if let Some((ws, leaf)) = worktree_parts(model) {
+        if !ws.is_empty() {
+            draw_text(
+                surface,
+                x,
+                strip.y,
+                &ws,
+                col(S::Dim),
+                bg,
+                chips_end.saturating_sub(x),
+            );
+            x += ws.chars().count();
+            draw_text(
+                surface,
+                x,
+                strip.y,
+                " \u{25b8} ",
+                col(S::Ghost),
+                bg,
+                chips_end.saturating_sub(x).min(3),
+            );
+            x += 3;
+        }
+        draw_text(
+            surface,
+            x,
+            strip.y,
+            &leaf,
+            accent,
+            bg,
+            chips_end.saturating_sub(x),
+        );
+    }
+
+    // The chips render as padded pills: the active tab in the focus color on
+    // a raised focus tint, inactive tabs quiet on a raised surface — easy to
+    // scan, clearly grouped, clearly clickable.
+    let focus = col(S::Focus);
+    let pill = theme_color(&theme::blend_over(&focus_rgb(), &panel_rgb(), 0.28));
+    for (sx, w, i) in strip_chip_spans(model, strip) {
+        let chip = format!(" {} ", model.tabs[i]);
+        let (fg, chip_bg) = if i == model.active_tab {
+            (focus, pill)
+        } else {
+            (dim, col(S::Panel))
+        };
+        draw_text(surface, sx, strip.y, &chip, fg, chip_bg, w);
+    }
+}
+
+/// Render pin chips (`glyph label`) right-aligned in the tab-strip area.
 /// Returns the left-most x the chips occupy, so tab labels can stop before them.
 fn draw_pin_chips(
     surface: &mut Surface,
@@ -244,7 +611,7 @@ fn draw_pin_chips(
     let total: usize = chips.iter().map(|s| s.chars().count()).sum();
     let mut x = content_end.saturating_sub(total).max(content.x);
     let chips_start = x;
-    let bg = theme_color(theme::BG1);
+    let bg = col(S::Panel);
     for (chip, pin) in chips.iter().zip(model.pins.iter()) {
         if x >= content_end {
             break;
@@ -262,28 +629,367 @@ fn draw_pin_chips(
     chips_start
 }
 
+/// A resolved masthead widget: its text plus the color it earned (stats turn
+/// amber/red as they cross pressure thresholds; quiet otherwise).
+struct MastheadWidget {
+    text: String,
+    fg: ColorAttribute,
+}
+
+/// Utilization pressure for threshold coloring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Level {
+    Normal,
+    Warn,
+    Crit,
+}
+
+/// Percent-based pressure: ≥80% warns, ≥92% is critical.
+fn stat_level(pct: u8) -> Level {
+    if pct >= 92 {
+        Level::Crit
+    } else if pct >= 80 {
+        Level::Warn
+    } else {
+        Level::Normal
+    }
+}
+
+/// Ratio-based pressure (memory): ≥85% warns, ≥95% is critical.
+fn ratio_level(used: f32, total: f32) -> Level {
+    if total <= 0.0 {
+        return Level::Normal;
+    }
+    let r = used / total;
+    if r >= 0.95 {
+        Level::Crit
+    } else if r >= 0.85 {
+        Level::Warn
+    } else {
+        Level::Normal
+    }
+}
+
+fn level_color(level: Level) -> ColorAttribute {
+    match level {
+        Level::Normal => col(S::Dim),
+        Level::Warn => theme_color(theme::AMBER),
+        Level::Crit => theme_color(theme::RED),
+    }
+}
+
+/// Resolve a masthead widget id to its display text + color; `None` hides the
+/// widget (no data yet, GPU absent, unknown id).
+fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> {
+    let s = &model.stats;
+    let ic = &model.stats_icons;
+    let w = |text: String, fg: ColorAttribute| MastheadWidget { text, fg };
+    match id {
+        "brand" => Some(w(
+            format!("superzej v{}", env!("CARGO_PKG_VERSION")),
+            theme_color(model.accent_or_default()),
+        )),
+        "cpu" => s.cpu_pct.map(|p| {
+            w(
+                format!("{} {p:>2}%", ic.cpu_icon),
+                level_color(stat_level(p)),
+            )
+        }),
+        "mem" => s.mem_gib.map(|(u, t)| {
+            w(
+                format!("{} {u:.1}/{t:.0}G", ic.mem_icon),
+                level_color(ratio_level(u, t)),
+            )
+        }),
+        "gpu" => s.gpu_pct.map(|p| {
+            w(
+                format!("{}  {p:>2}%", ic.gpu_icon),
+                level_color(stat_level(p)),
+            )
+        }),
+        "net" => s.net_bps.map(|(rx, tx)| {
+            w(
+                format!(
+                    "{} \u{2193}{} \u{2191}{}",
+                    ic.net_icon,
+                    crate::stats::fmt_rate(rx).trim(),
+                    crate::stats::fmt_rate(tx).trim()
+                ),
+                col(S::Dim),
+            )
+        }),
+        "battery" => s.battery.map(|(p, charging)| {
+            let icon = if charging {
+                &ic.battery_charging_icon
+            } else {
+                &ic.battery_icon
+            };
+            // Red at/below the configurable threshold; quiet otherwise. The
+            // charging state shows through the swapped icon.
+            let fg = if p <= ic.battery_warn {
+                theme_color(theme::RED)
+            } else {
+                col(S::Dim)
+            };
+            w(format!("{icon} {p:>2}%"), fg)
+        }),
+        "date" => Some(w(
+            chrono::Local::now()
+                .format(&model.bars.date_format)
+                .to_string(),
+            col(S::Dim),
+        )),
+        "clock" => Some(w(
+            chrono::Local::now()
+                .format(&model.bars.clock_format)
+                .to_string(),
+            col(S::Dim),
+        )),
+        _ => None,
+    }
+}
+
+/// `owner/repo` parsed from a forge PR/issue URL
+/// (`https://github.com/owner/repo/pull/7` → `owner/repo`).
+fn forge_repo_from_url(url: &str) -> Option<String> {
+    let rest = url.split("://").nth(1)?;
+    let mut parts = rest.split('/');
+    let _host = parts.next()?;
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
+}
+
+/// Resolve a BOTTOM-bar widget id to its display text + color.
+fn bottombar_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> {
+    let w = |text: String, fg: ColorAttribute| MastheadWidget { text, fg };
+    match id {
+        "keyhints" => {
+            (!model.keyhints.is_empty()).then(|| w(model.keyhints.clone(), col(S::Faint)))
+        }
+        "loc" => model.loc.map(|n| {
+            let compact = if n >= 1_000_000 {
+                format!("{:.1}M", n as f64 / 1_000_000.0)
+            } else if n >= 1_000 {
+                format!("{:.1}k", n as f64 / 1_000.0)
+            } else {
+                n.to_string()
+            };
+            w(format!("{compact} LOC"), col(S::Dim))
+        }),
+        // Forge + PR number, colored by state: open green, draft/queued
+        // amber, closed and merged purple. Hidden when no PR exists.
+        "pr" => model.panel.pr.as_ref().map(|pr| {
+            let repo = forge_repo_from_url(&pr.url).unwrap_or_default();
+            let fg = if pr.is_draft {
+                theme_color(theme::AMBER)
+            } else {
+                match pr.state.as_str() {
+                    "OPEN" => theme_color(theme::GREEN),
+                    "CLOSED" | "MERGED" => theme_color(theme::PURPLE),
+                    _ => theme_color(theme::AMBER),
+                }
+            };
+            if repo.is_empty() {
+                w(format!("#{}", pr.number), fg)
+            } else {
+                w(format!("{repo} #{}", pr.number), fg)
+            }
+        }),
+        "status" => (!model.status.is_empty()).then(|| w(model.status.clone(), col(S::Dim))),
+        _ => None,
+    }
+}
+
+/// `[bars] top_left` widgets drawn after the brand slot (the `brand` id is
+/// owned by the masthead's slot logic and skipped here).
+fn draw_masthead_left(surface: &mut Surface, rect: Rect, model: &FrameModel, brand_cols: usize) {
+    if rect.rows == 0 || rect.cols == 0 {
+        return;
+    }
+    let bg = col(S::Panel);
+    let sep = " \u{00b7} ";
+    let end = rect.x + rect.cols;
+    let mut x = rect.x + brand_cols.max(1);
+    let mut first = true;
+    for id in &model.bars.top_left {
+        if id == "brand" {
+            continue;
+        }
+        let Some(wd) = masthead_widget(id, model) else {
+            continue;
+        };
+        if !first && x < end {
+            draw_text(surface, x, rect.y, sep, col(S::Ghost), bg, 3);
+            x += 3;
+        }
+        draw_text(
+            surface,
+            x,
+            rect.y,
+            &wd.text,
+            wd.fg,
+            bg,
+            end.saturating_sub(x),
+        );
+        x += wd.text.chars().count();
+        first = false;
+    }
+}
+
+/// The pre-fitted right cluster, right-aligned with `·` separators. The
+/// caller has already dropped whatever wouldn't fit (see `draw_masthead`).
+fn draw_masthead_cluster(
+    surface: &mut Surface,
+    rect: Rect,
+    parts: &[&MastheadWidget],
+    brand_cols: usize,
+) {
+    if rect.rows == 0 || rect.cols == 0 || parts.is_empty() {
+        return;
+    }
+    let bg = col(S::Panel);
+    let sep = " \u{00b7} ";
+    let end = rect.x + rect.cols;
+    let total: usize =
+        parts.iter().map(|p| p.text.chars().count()).sum::<usize>() + 3 * (parts.len() - 1) + 1;
+    let mut rx = end
+        .saturating_sub(total)
+        .max(rect.x + brand_cols.max(1) + 1);
+    for (i, p) in parts.iter().enumerate() {
+        if i > 0 {
+            draw_text(surface, rx, rect.y, sep, col(S::Ghost), bg, 3);
+            rx += 3;
+        }
+        draw_text(
+            surface,
+            rx,
+            rect.y,
+            &p.text,
+            p.fg,
+            bg,
+            end.saturating_sub(rx),
+        );
+        rx += p.text.chars().count();
+    }
+}
+
+/// The bottom widget bar: `[bars] bottom_left` (context keybind hints by
+/// default) left-aligned, `bottom_right` (transient status) right-aligned,
+/// with the keybind-lock badge always outermost-right when active.
 pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
     if rect.rows == 0 {
         return;
     }
-    fill(surface, rect, theme_color(theme::BG1));
-    draw_text(
-        surface,
-        rect.x + 1,
-        rect.y,
-        &model.status,
-        theme_color(theme::FAINT),
-        theme_color(theme::BG1),
-        rect.cols.saturating_sub(1),
-    );
+    fill(surface, rect, col(S::Panel));
+    let mut end = rect.x + rect.cols;
+
+    if model.zoomed {
+        let badge = "\u{26f6} ZOOM ";
+        let bx = end.saturating_sub(badge.chars().count());
+        draw_text(
+            surface,
+            bx,
+            rect.y,
+            badge,
+            theme_color(theme::PURPLE),
+            col(S::Panel),
+            badge.chars().count(),
+        );
+        end = bx.saturating_sub(1);
+    }
+    // The lock badge is safety-critical: always rightmost while locked.
+    if model.key_locked {
+        let badge = "\u{2301} LOCKED ";
+        let bx = end.saturating_sub(badge.chars().count());
+        draw_text(
+            surface,
+            bx,
+            rect.y,
+            badge,
+            theme_color(theme::AMBER),
+            col(S::Panel),
+            badge.chars().count(),
+        );
+        end = bx.saturating_sub(1);
+    }
+
+    let mut x = rect.x + 1;
+    for (i, id) in model.bars.bottom_left.iter().enumerate() {
+        let Some(wd) = bottombar_widget(id, model) else {
+            continue;
+        };
+        if i > 0 && x < end {
+            draw_text(
+                surface,
+                x,
+                rect.y,
+                " \u{00b7} ",
+                col(S::Ghost),
+                col(S::Panel),
+                3,
+            );
+            x += 3;
+        }
+        draw_text(
+            surface,
+            x,
+            rect.y,
+            &wd.text,
+            wd.fg,
+            col(S::Panel),
+            end.saturating_sub(x),
+        );
+        x += wd.text.chars().count();
+    }
+
+    // Right side: per-widget colors (e.g. the PR state), drawn piecewise.
+    let parts: Vec<MastheadWidget> = model
+        .bars
+        .bottom_right
+        .iter()
+        .filter_map(|id| bottombar_widget(id, model))
+        .collect();
+    if !parts.is_empty() {
+        let total: usize =
+            parts.iter().map(|p| p.text.chars().count()).sum::<usize>() + 3 * (parts.len() - 1) + 1;
+        let mut rx = end.saturating_sub(total).max(x + 1);
+        for (i, p) in parts.iter().enumerate() {
+            if i > 0 {
+                draw_text(
+                    surface,
+                    rx,
+                    rect.y,
+                    " \u{00b7} ",
+                    col(S::Ghost),
+                    col(S::Panel),
+                    3,
+                );
+                rx += 3;
+            }
+            draw_text(
+                surface,
+                rx,
+                rect.y,
+                &p.text,
+                p.fg,
+                col(S::Panel),
+                end.saturating_sub(rx),
+            );
+            rx += p.text.chars().count();
+        }
+    }
 }
 
 pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
-    fill(surface, rect, theme_color(theme::BG0));
+    fill(surface, rect, col(S::Panel));
     let accent = theme_color(model.accent_or_default());
 
-    // Header: either the live filter input, or "WORKSPACES" + sort tag. The
-    // focused marker (◂) signals the sidebar owns input.
+    // Header: the live filter input, or the "WORKSPACES" section title — in
+    // the accent so the column titles pop against the tinted zone.
     if model.sidebar_filtering || !model.sidebar_filter.is_empty() {
         let header = format!(" /{}", model.sidebar_filter);
         draw_text(
@@ -292,38 +998,19 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             rect.y,
             &header,
             accent,
-            theme_color(theme::BG0),
+            col(S::Panel),
             rect.cols,
         );
     } else {
-        let marker = if model.sidebar_focused {
-            " \u{25c2}"
-        } else {
-            ""
-        };
-        let title = format!(" WORKSPACES{marker}");
-        draw_text(
+        draw_text_bold(
             surface,
             rect.x,
             rect.y,
-            &title,
-            accent,
-            theme_color(theme::BG0),
+            " WORKSPACES",
+            col(S::Text),
+            col(S::Panel),
             rect.cols,
         );
-        // Right-aligned 1-letter sort tag (n/r/a) when focused.
-        if model.sidebar_focused && rect.cols >= 3 {
-            let tag = &model.sidebar_sort.as_str()[..1];
-            draw_text(
-                surface,
-                rect.x + rect.cols - 2,
-                rect.y,
-                tag,
-                theme_color(theme::FAINT),
-                theme_color(theme::BG0),
-                1,
-            );
-        }
     }
 
     // Only visible rows are listed; the selection index is into that subset.
@@ -331,20 +1018,27 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
         model.sidebar_rows.iter().filter(|r| r.visible).collect();
 
     for (i, row) in visible.iter().enumerate() {
-        let y = rect.y + 1 + i;
+        // +2: header row, then one blank breathing-room row.
+        let y = rect.y + 2 + i;
         if y >= rect.y + rect.rows {
             break;
         }
         let selected = i == model.sidebar_selected;
         let marked = model.sidebar_marked.contains(&i);
+        // The active worktree/tab row carries the focus-tint pill (same
+        // highlight language as the masthead's active chip), blended over the
+        // zone's panel tint so it never punches a dark hole in the surface.
+        let pill = theme_color(&theme::blend_over(&focus_rgb(), &panel_rgb(), 0.16));
         let bg = if selected {
-            theme_color(theme::PANEL2)
+            col(S::Panel2)
+        } else if row.active {
+            pill
         } else if marked {
-            theme_color(theme::PANEL)
+            col(S::Raise)
         } else {
-            theme_color(theme::BG0)
+            col(S::Panel)
         };
-        if selected || marked {
+        if selected || marked || row.active {
             fill(
                 surface,
                 Rect {
@@ -359,16 +1053,16 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
         // Left-edge accent bar marks the cursor only while focused, so a stale
         // selection isn't mistaken for focus.
         if selected && model.sidebar_focused {
-            draw_text(surface, rect.x, y, "\u{2590}", accent, bg, 1);
+            draw_text(surface, rect.x, y, "\u{2590}", col(S::Focus), bg, 1);
         }
 
-        let composed = compose_sidebar_row(row, i, model.sidebar_focused);
+        let composed = compose_sidebar_row(row);
         let fg = if row.active {
-            accent
+            col(S::Focus)
         } else if selected {
-            theme_color(theme::TEXT)
+            col(S::Text)
         } else {
-            theme_color(theme::DIM)
+            col(S::Dim)
         };
         draw_text(
             surface,
@@ -412,19 +1106,9 @@ struct ComposedRow {
     status_col: usize,
 }
 
-fn compose_sidebar_row(
-    row: &crate::sidebar::SidebarRow,
-    visible_index: usize,
-    focused: bool,
-) -> ComposedRow {
+fn compose_sidebar_row(row: &crate::sidebar::SidebarRow) -> ComposedRow {
     use crate::sidebar::RowKind;
     let mut text = String::new();
-
-    // Quick-jump number (item 24): a 1-based index shown only while focused,
-    // for the first 9 rows.
-    if focused && visible_index < 9 {
-        text.push_str(&format!("{} ", visible_index + 1));
-    }
 
     match row.kind {
         RowKind::Workspace => {
@@ -445,10 +1129,6 @@ fn compose_sidebar_row(
         RowKind::Worktree => {
             text.push_str("  ");
             text.push_str(activity_dot(row.activity));
-            text.push_str(&row.label);
-        }
-        RowKind::Page => {
-            text.push_str("      ");
             text.push_str(&row.label);
         }
     }
@@ -498,8 +1178,8 @@ fn status_seg_color(row: &crate::sidebar::SidebarRow) -> ColorAttribute {
     // fine. (Per-glyph coloring is a later refinement.)
     match row.git {
         Some(g) if g.dirty => theme_color(theme::AMBER),
-        Some(g) if g.ahead > 0 || g.behind > 0 => theme_color(theme::DIM),
-        _ => theme_color(theme::DIM),
+        Some(g) if g.ahead > 0 || g.behind > 0 => col(S::Dim),
+        _ => col(S::Dim),
     }
 }
 
@@ -512,11 +1192,8 @@ fn draw_row_menu(surface: &mut Surface, rect: Rect, menu: &RowMenu, accent: Colo
             break;
         }
         let sel = i == menu.cursor;
-        let bg = if sel {
-            theme_color(theme::RAISE)
-        } else {
-            theme_color(theme::PANEL)
-        };
+        // Panel2/Raise so the menu reads as raised above the Panel-tinted zone.
+        let bg = if sel { col(S::Raise) } else { col(S::Panel2) };
         fill(
             surface,
             Rect {
@@ -527,11 +1204,7 @@ fn draw_row_menu(surface: &mut Surface, rect: Rect, menu: &RowMenu, accent: Colo
             },
             bg,
         );
-        let fg = if sel {
-            accent
-        } else {
-            theme_color(theme::TEXT)
-        };
+        let fg = if sel { accent } else { col(S::Text) };
         draw_text(
             surface,
             rect.x + 1,
@@ -544,8 +1217,148 @@ fn draw_row_menu(surface: &mut Surface, rect: Rect, menu: &RowMenu, accent: Colo
     }
 }
 
-/// Draw the tabbed right panel: a `DIFF | PR | CHECKS` tab bar (row 0), the
-/// active tab's body, and a context-sensitive help bar (last row).
+/// Split the panel rect into (body, sandbox section): the bottom quarter
+/// (min 4 rows) hosts the SANDBOXES status when the panel is tall enough.
+/// Single source of truth for rendering, scroll math, and mouse hit-tests.
+pub fn panel_split(rect: Rect) -> (Rect, Option<Rect>) {
+    if rect.rows < 12 {
+        return (rect, None);
+    }
+    let sandbox_rows = (rect.rows / 4).max(4);
+    let body = Rect {
+        x: rect.x,
+        y: rect.y,
+        cols: rect.cols,
+        rows: rect.rows - sandbox_rows,
+    };
+    let sandbox = Rect {
+        x: rect.x,
+        y: rect.y + body.rows,
+        cols: rect.cols,
+        rows: sandbox_rows,
+    };
+    (body, Some(sandbox))
+}
+
+/// The SANDBOXES section: a quiet rule, then one row per running container —
+/// superzej-owned sandboxes first (green ● when Up), others summarized.
+fn empty_dash(s: &str) -> &str {
+    if s.is_empty() { "-" } else { s }
+}
+
+fn draw_sandbox_section(surface: &mut Surface, rect: Rect, model: &FrameModel) {
+    if rect.rows < 2 {
+        return;
+    }
+    // Section rule + title.
+    let line = "\u{2500}".repeat(rect.cols);
+    draw_text(
+        surface,
+        rect.x,
+        rect.y,
+        &line,
+        col(S::Border),
+        col(S::Panel),
+        rect.cols,
+    );
+    draw_text_bold(
+        surface,
+        rect.x + 1,
+        rect.y,
+        " SANDBOXES ",
+        col(S::Text),
+        col(S::Panel),
+        rect.cols.saturating_sub(1),
+    );
+    let body_rows = rect.rows - 1;
+    if model.containers.is_empty() {
+        draw_text(
+            surface,
+            rect.x + 1,
+            rect.y + 1,
+            "none running",
+            col(S::Faint),
+            col(S::Panel),
+            rect.cols.saturating_sub(1),
+        );
+        return;
+    }
+    let ours: Vec<_> = model.containers.iter().filter(|c| c.ours).collect();
+    let others = model.containers.len() - ours.len();
+    let mut y = rect.y + 1;
+    let max_y = rect.y + rect.rows;
+    let mut shown = 0usize;
+    for c in &ours {
+        if y >= max_y || shown + 1 >= body_rows {
+            break;
+        }
+        let up = c.status.starts_with("Up");
+        let (dot, dot_fg) = if up {
+            ("\u{25cf}", theme_color(theme::GREEN))
+        } else {
+            ("\u{25cb}", col(S::Dim))
+        };
+        draw_text(surface, rect.x + 1, y, dot, dot_fg, col(S::Panel), 1);
+        let name = c
+            .name
+            .strip_prefix(superzej_core::sandbox::CONTAINER_PREFIX)
+            .unwrap_or(&c.name);
+        draw_text(
+            surface,
+            rect.x + 3,
+            y,
+            name,
+            col(S::Text),
+            col(S::Panel),
+            rect.cols.saturating_sub(3),
+        );
+        let mut bits = vec![c.backend.clone(), c.status.clone()];
+        if !c.cpu.is_empty() || !c.mem.is_empty() || !c.net.is_empty() {
+            bits.push(format!(
+                "cpu {} ram {} net {}",
+                empty_dash(&c.cpu),
+                empty_dash(&c.mem),
+                empty_dash(&c.net)
+            ));
+        }
+        if !c.mounts.is_empty() {
+            bits.push(c.mounts.clone());
+        }
+        let detail = bits.join(" · ");
+        let dx = rect.x + 3 + name.chars().count() + 2;
+        if dx < rect.x + rect.cols {
+            draw_text(
+                surface,
+                dx,
+                y,
+                &detail,
+                col(S::Dim),
+                col(S::Panel),
+                (rect.x + rect.cols).saturating_sub(dx),
+            );
+        }
+        y += 1;
+        shown += 1;
+    }
+    let hidden_ours = ours.len().saturating_sub(shown);
+    if (others > 0 || hidden_ours > 0) && y < max_y {
+        let extra = others + hidden_ours;
+        draw_text(
+            surface,
+            rect.x + 1,
+            y,
+            &format!("+ {extra} other container(s)"),
+            col(S::Faint),
+            col(S::Panel),
+            rect.cols.saturating_sub(1),
+        );
+    }
+}
+
+/// Draw the right panel: the DIFF/FILES/PR/CHECKS switcher on its first row
+/// (level with the sidebar header and the center tab bar, all directly below
+/// the divider) and the active tab's body beneath. (Contextual key hints live
+/// on the bottom bar, not here.)
 pub fn draw_panel(
     surface: &mut Surface,
     rect: Rect,
@@ -553,100 +1366,183 @@ pub fn draw_panel(
     ui: &crate::panel::PanelUi,
 ) {
     use crate::panel::PanelTab;
-    fill(surface, rect, theme_color(theme::PANEL));
+    fill(surface, rect, col(S::Panel));
     if rect.rows == 0 || rect.cols == 0 {
         return;
     }
     let accent = theme_color(model.accent_or_default());
 
-    // Row 0: tab bar.
-    draw_panel_tabbar(surface, rect, ui.tab, accent, model.panel_focused);
+    draw_panel_tabs(
+        surface,
+        rect,
+        rect.y,
+        ui.tab,
+        model.accent_or_default(),
+        model.panel_focused,
+    );
 
-    // Body: rows 1..rows-1 (leave the last row for the help bar).
+    // Bottom quarter: live sandbox/container status; the tab body gets the
+    // rest (below the switcher row and one blank breathing-room row).
+    let (zone, sandbox) = panel_split(rect);
     let body = Rect {
-        x: rect.x,
-        y: rect.y + 1,
-        cols: rect.cols,
-        rows: rect.rows.saturating_sub(2),
+        x: zone.x,
+        y: zone.y + 2,
+        cols: zone.cols,
+        rows: zone.rows.saturating_sub(2),
     };
     match ui.tab {
         PanelTab::Diff => draw_diff_tab(surface, body, model, ui, accent),
+        PanelTab::Files => draw_files_tab(surface, body, model, ui, accent),
         PanelTab::Pr => draw_pr_tab(surface, body, model, accent),
         PanelTab::Checks => draw_checks_tab(surface, body, model),
+        PanelTab::Tests => draw_tests_tab(surface, body, ui),
     }
+    if let Some(sb) = sandbox {
+        draw_sandbox_section(surface, sb, model);
+    }
+}
 
-    // Last row: help bar.
-    if rect.rows >= 2 {
-        let help_y = rect.y + rect.rows - 1;
-        let hint = panel_help_hint(ui.tab, ui.diff_view);
-        let help_rect = Rect {
-            x: rect.x,
-            y: help_y,
-            cols: rect.cols,
-            rows: 1,
-        };
-        fill(surface, help_rect, theme_color(theme::BG1));
+/// The Files tab: the worktree's tracked+untracked files as an accordion
+/// tree in the sidebar's visual language — carets on directories, indented
+/// leaves, the cursor row raised with the accent edge bar.
+fn draw_files_tab(
+    surface: &mut Surface,
+    rect: Rect,
+    model: &FrameModel,
+    ui: &crate::panel::PanelUi,
+    accent: ColorAttribute,
+) {
+    if ui.files_preview {
+        // Path header, then the highlighted document.
         draw_text(
             surface,
             rect.x + 1,
-            help_y,
-            hint,
-            theme_color(theme::FAINT),
-            theme_color(theme::BG1),
+            rect.y,
+            &ui.focused_path,
+            col(S::Text),
+            col(S::Panel),
+            rect.cols.saturating_sub(1),
+        );
+        let body = Rect {
+            x: rect.x,
+            y: rect.y + 2,
+            cols: rect.cols,
+            rows: rect.rows.saturating_sub(2),
+        };
+        draw_ansi_document(surface, body, &ui.file_diff, ui.diff_scroll);
+        return;
+    }
+    if ui.files.is_empty() {
+        draw_text(
+            surface,
+            rect.x + 1,
+            rect.y,
+            "no files",
+            col(S::Faint),
+            col(S::Panel),
+            rect.cols.saturating_sub(1),
+        );
+        return;
+    }
+    let visible = crate::panel::visible_file_indices(&ui.files, &ui.files_collapsed);
+    for (row, vi) in visible.iter().skip(ui.files_scroll).enumerate() {
+        let y = rect.y + row;
+        if row >= rect.rows {
+            break;
+        }
+        let entry = &ui.files[*vi];
+        let i = ui.files_scroll + row;
+        let selected = model.panel_focused && i == ui.files_cursor;
+        let bg = if selected {
+            col(S::Panel2)
+        } else {
+            col(S::Panel)
+        };
+        if selected {
+            fill(
+                surface,
+                Rect {
+                    x: rect.x,
+                    y,
+                    cols: rect.cols,
+                    rows: 1,
+                },
+                bg,
+            );
+            draw_text(surface, rect.x, y, "\u{2590}", accent, bg, 1);
+        }
+        let mut text = "  ".repeat(entry.depth as usize);
+        if entry.is_dir {
+            text.push_str(if ui.files_collapsed.contains(&entry.path) {
+                "\u{25b8} "
+            } else {
+                "\u{25be} "
+            });
+        } else {
+            text.push_str("  ");
+        }
+        text.push_str(&entry.name);
+        let fg = if selected {
+            col(S::Text)
+        } else if entry.is_dir {
+            col(S::Faint)
+        } else {
+            col(S::Dim)
+        };
+        draw_text(
+            surface,
+            rect.x + 1,
+            y,
+            &text,
+            fg,
+            bg,
             rect.cols.saturating_sub(1),
         );
     }
 }
 
-fn draw_panel_tabbar(
+/// The panel tab switcher entries, in nav-row order. Shared by the renderer
+/// and [`panel_tab_hit`] so the segments can never drift apart.
+const PANEL_TABS: [(crate::panel::PanelTab, &str); 5] = [
+    (crate::panel::PanelTab::Diff, "DIFF"),
+    (crate::panel::PanelTab::Files, "FILES"),
+    (crate::panel::PanelTab::Pr, "PR"),
+    (crate::panel::PanelTab::Checks, "CHECKS"),
+    (crate::panel::PanelTab::Tests, "TESTS"),
+];
+
+/// The DIFF/FILES/PR/CHECKS switcher, drawn on the masthead's nav row over
+/// the panel's columns.
+fn draw_panel_tabs(
     surface: &mut Surface,
-    rect: Rect,
+    panel: Rect,
+    y: usize,
     active: crate::panel::PanelTab,
-    accent: ColorAttribute,
+    accent_rgb: &str,
     focused: bool,
 ) {
-    use crate::panel::PanelTab;
-    let bar = Rect {
-        x: rect.x,
-        y: rect.y,
-        cols: rect.cols,
-        rows: 1,
-    };
-    fill(surface, bar, theme_color(theme::BG1));
-    let mut x = rect.x + 1;
-    for (tab, label) in [
-        (PanelTab::Diff, "DIFF"),
-        (PanelTab::Pr, "PR"),
-        (PanelTab::Checks, "CHECKS"),
-    ] {
+    // The active segment reads as a raised pill in the accent; inactive
+    // segments stay quiet on the panel tint. Underline marks keyboard focus.
+    let accent = theme_color(accent_rgb);
+    let pill = theme_color(&theme::blend_over(accent_rgb, &panel_rgb(), 0.22));
+    let mut x = panel.x + 1;
+    for (tab, label) in PANEL_TABS {
         let seg = format!(" {label} ");
-        let fg = if tab == active {
-            accent
-        } else {
-            theme_color(theme::DIM)
-        };
-        let max = (rect.x + rect.cols).saturating_sub(x);
+        let max = (panel.x + panel.cols).saturating_sub(x);
         if max == 0 {
             break;
         }
-        draw_text(surface, x, rect.y, &seg, fg, theme_color(theme::BG1), max);
-        x += seg.chars().count();
-    }
-    // A right-aligned focus marker so a focused panel is unmistakable.
-    if focused {
-        let marker = "\u{25c2}";
-        let mx = (rect.x + rect.cols).saturating_sub(2);
-        if mx > x {
-            draw_text(
-                surface,
-                mx,
-                rect.y,
-                marker,
-                accent,
-                theme_color(theme::BG1),
-                1,
-            );
+        let (fg, bg) = if tab == active {
+            (accent, pill)
+        } else {
+            (col(S::Text), col(S::Panel))
+        };
+        if tab == active && focused {
+            draw_text_underlined(surface, x, y, &seg, fg, bg, max);
+        } else {
+            draw_text_bold(surface, x, y, &seg, fg, bg, max);
         }
+        x += seg.chars().count() + 1;
     }
 }
 
@@ -677,8 +1573,8 @@ fn draw_diff_filelist(
             rect.x + 1,
             rect.y,
             "no changes",
-            theme_color(theme::FAINT),
-            theme_color(theme::PANEL),
+            col(S::Faint),
+            col(S::Panel),
             rect.cols.saturating_sub(1),
         );
         return;
@@ -690,9 +1586,9 @@ fn draw_diff_filelist(
         }
         let selected = model.panel_focused && i == ui.diff_cursor;
         let bg = if selected {
-            theme_color(theme::PANEL2)
+            col(S::Panel2)
         } else {
-            theme_color(theme::PANEL)
+            col(S::Panel)
         };
         if selected {
             fill(
@@ -726,36 +1622,80 @@ fn draw_diff_filelist(
             rect.x + 3,
             y,
             &f.path,
-            theme_color(theme::TEXT),
+            col(S::Text),
             bg,
             rect.cols.saturating_sub(3),
         );
     }
 }
 
+/// The drilled-in single-file diff: rendered as an ANSI document.
 fn draw_diff_filediff(surface: &mut Surface, rect: Rect, ui: &crate::panel::PanelUi) {
-    let lines: Vec<&str> = ui.file_diff.lines().collect();
-    for (row, line) in lines.iter().skip(ui.diff_scroll).enumerate() {
-        let y = rect.y + row;
-        if row >= rect.rows {
+    draw_ansi_document(surface, rect, &ui.file_diff, ui.diff_scroll);
+}
+
+/// Render an ANSI document (syntect-highlighted diff or file preview):
+/// escapes parsed into colored spans (never drawn raw), soft-wrapped to the
+/// rect width, with a line's bg tint extended across the full row so e.g.
+/// diff hunks read as blocks. Scrolling stays in logical lines.
+fn draw_ansi_document(surface: &mut Surface, rect: Rect, text: &str, scroll: usize) {
+    if rect.cols < 4 || rect.rows == 0 {
+        return;
+    }
+    let width = rect.cols.saturating_sub(2); // 1-col gutter each side
+    let default_fg = col(S::Dim);
+    let mut y = rect.y;
+    'lines: for line in text.lines().skip(scroll) {
+        if y >= rect.y + rect.rows {
             break;
         }
-        // Color +/- lines; everything else is plain.
-        let fg = match line.as_bytes().first() {
-            Some(b'+') => theme_color(theme::GREEN),
-            Some(b'-') => theme_color(theme::RED),
-            Some(b'@') => theme_color(theme::PURPLE),
-            _ => theme_color(theme::DIM),
+        let spans = crate::ansi::parse_spans(line);
+        let row_bg = spans
+            .iter()
+            .find_map(|s| s.bg)
+            .unwrap_or_else(|| col(S::Panel));
+        let tint_row = |surface: &mut Surface, y: usize| {
+            fill(
+                surface,
+                Rect {
+                    x: rect.x,
+                    y,
+                    cols: rect.cols,
+                    rows: 1,
+                },
+                row_bg,
+            );
         };
-        draw_text(
-            surface,
-            rect.x + 1,
-            y,
-            line,
-            fg,
-            theme_color(theme::PANEL),
-            rect.cols.saturating_sub(1),
-        );
+        tint_row(surface, y);
+        let mut x = 0usize;
+        for span in &spans {
+            let fg = span.fg.unwrap_or(default_fg);
+            let bg = span.bg.unwrap_or(row_bg);
+            let mut rest: &str = &span.text;
+            while !rest.is_empty() {
+                let avail = width.saturating_sub(x);
+                if avail == 0 {
+                    // Soft-wrap onto a fresh tinted row.
+                    y += 1;
+                    if y >= rect.y + rect.rows {
+                        break 'lines;
+                    }
+                    tint_row(surface, y);
+                    x = 0;
+                    continue;
+                }
+                let cut = rest
+                    .char_indices()
+                    .nth(avail)
+                    .map(|(i, _)| i)
+                    .unwrap_or(rest.len());
+                let (head, tail) = rest.split_at(cut);
+                draw_text(surface, rect.x + 1 + x, y, head, fg, bg, avail);
+                x += head.chars().count();
+                rest = tail;
+            }
+        }
+        y += 1;
     }
 }
 
@@ -765,7 +1705,7 @@ fn draw_pr_tab(surface: &mut Surface, rect: Rect, model: &FrameModel, accent: Co
             "OPEN" => theme_color(theme::GREEN),
             "MERGED" => theme_color(theme::PURPLE),
             "CLOSED" => theme_color(theme::RED),
-            _ => theme_color(theme::DIM),
+            _ => col(S::Dim),
         };
         let draft = if pr.is_draft { " (draft)" } else { "" };
         draw_text(
@@ -774,7 +1714,7 @@ fn draw_pr_tab(surface: &mut Surface, rect: Rect, model: &FrameModel, accent: Co
             rect.y,
             &format!("#{}", pr.number),
             accent,
-            theme_color(theme::PANEL),
+            col(S::Panel),
             rect.cols.saturating_sub(1),
         );
         let num_w = format!("#{}", pr.number).chars().count() + 2;
@@ -784,7 +1724,7 @@ fn draw_pr_tab(surface: &mut Surface, rect: Rect, model: &FrameModel, accent: Co
             rect.y,
             &format!("{}{}", pr.state, draft),
             state_color,
-            theme_color(theme::PANEL),
+            col(S::Panel),
             rect.cols.saturating_sub(1 + num_w),
         );
         draw_text(
@@ -792,8 +1732,8 @@ fn draw_pr_tab(surface: &mut Surface, rect: Rect, model: &FrameModel, accent: Co
             rect.x + 1,
             rect.y + 1,
             &pr.title,
-            theme_color(theme::TEXT),
-            theme_color(theme::PANEL),
+            col(S::Text),
+            col(S::Panel),
             rect.cols.saturating_sub(1),
         );
         if let Some(decision) = &pr.review_decision {
@@ -802,8 +1742,8 @@ fn draw_pr_tab(surface: &mut Surface, rect: Rect, model: &FrameModel, accent: Co
                 rect.x + 1,
                 rect.y + 3,
                 decision,
-                theme_color(theme::DIM),
-                theme_color(theme::PANEL),
+                col(S::Dim),
+                col(S::Panel),
                 rect.cols.saturating_sub(1),
             );
         }
@@ -814,8 +1754,8 @@ fn draw_pr_tab(surface: &mut Surface, rect: Rect, model: &FrameModel, accent: Co
             rect.x + 1,
             rect.y,
             note,
-            theme_color(theme::FAINT),
-            theme_color(theme::PANEL),
+            col(S::Faint),
+            col(S::Panel),
             rect.cols.saturating_sub(1),
         );
     }
@@ -829,8 +1769,8 @@ fn draw_checks_tab(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             rect.x + 1,
             rect.y,
             "no checks",
-            theme_color(theme::FAINT),
-            theme_color(theme::PANEL),
+            col(S::Faint),
+            col(S::Panel),
             rect.cols.saturating_sub(1),
         );
         return;
@@ -845,35 +1785,86 @@ fn draw_checks_tab(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             CheckState::Fail => ("\u{2717}", theme_color(theme::RED)),
             CheckState::Pending => ("\u{2022}", theme_color(theme::AMBER)),
         };
-        draw_text(
-            surface,
-            rect.x + 1,
-            y,
-            glyph,
-            color,
-            theme_color(theme::PANEL),
-            1,
-        );
+        draw_text(surface, rect.x + 1, y, glyph, color, col(S::Panel), 1);
         draw_text(
             surface,
             rect.x + 3,
             y,
             &c.name,
-            theme_color(theme::TEXT),
-            theme_color(theme::PANEL),
+            col(S::Text),
+            col(S::Panel),
             rect.cols.saturating_sub(3),
         );
     }
 }
 
 /// The context-sensitive help-bar hint for the active tab/view.
-fn panel_help_hint(tab: crate::panel::PanelTab, view: crate::panel::DiffView) -> &'static str {
+pub(crate) fn panel_help_hint(
+    tab: crate::panel::PanelTab,
+    view: crate::panel::DiffView,
+) -> &'static str {
     use crate::panel::{DiffView, PanelTab};
     match (tab, view) {
-        (PanelTab::Diff, DiffView::FileList) => "1/2/3 tab  j/k move  ↵ open  o edit  esc",
-        (PanelTab::Diff, DiffView::FileDiff) => "j/k scroll  o edit  esc back",
-        (PanelTab::Pr, _) => "1/2/3 tab  o browser  m merge  a approve  c create  esc",
-        (PanelTab::Checks, _) => "1/2/3 tab  r rerun  esc",
+        (PanelTab::Diff, DiffView::FileList) => "1-4 tab  ↵ diff  J/K walk  t/s tab/pane  o edit",
+        (PanelTab::Diff, DiffView::FileDiff) => {
+            "j/k scroll  J/K next/prev file  t/s tab/pane  o edit  esc"
+        }
+        (PanelTab::Files, _) => "↵ open/fold  J/K walk  t/s tab/pane  o/e edit  O extern  y yazi",
+        (PanelTab::Pr, _) => "1-5 tab  o browser  m merge  a approve  c create  esc",
+        (PanelTab::Checks, _) => "1-5 tab  r rerun  esc",
+        (PanelTab::Tests, _) => "r run tests  j/k scroll  esc",
+    }
+}
+
+/// The Tests tab: detected framework + run state, then one indicator row per
+/// parsed test (✓ green, ✗ red, ○ skipped), summary on top.
+fn draw_tests_tab(surface: &mut Surface, rect: Rect, ui: &crate::panel::PanelUi) {
+    use crate::panel::TestState;
+    let header = match (&ui.tests_cmd, ui.tests_running) {
+        (_, true) => "running\u{2026}".to_string(),
+        (Some((fw, _)), false) if ui.tests_lines.is_empty() && ui.tests_summary.is_empty() => {
+            format!("{fw} detected \u{2014} press r to run")
+        }
+        (Some((fw, _)), false) => format!("{fw}: {}", ui.tests_summary),
+        (None, false) => "no test framework detected".to_string(),
+    };
+    draw_text(
+        surface,
+        rect.x + 1,
+        rect.y,
+        &header,
+        col(S::Dim),
+        col(S::Panel),
+        rect.cols.saturating_sub(1),
+    );
+    for (row, t) in ui
+        .tests_lines
+        .iter()
+        .skip(ui.tests_scroll)
+        .enumerate()
+        .take(rect.rows.saturating_sub(2))
+    {
+        let y = rect.y + 2 + row;
+        let (glyph, color) = match t.state {
+            TestState::Pass => ("\u{2713}", theme_color(theme::GREEN)),
+            TestState::Fail => ("\u{2717}", theme_color(theme::RED)),
+            TestState::Skip => ("\u{25cb}", theme_color(theme::AMBER)),
+        };
+        draw_text(surface, rect.x + 1, y, glyph, color, col(S::Panel), 1);
+        let fg = if t.state == TestState::Fail {
+            col(S::Text)
+        } else {
+            col(S::Dim)
+        };
+        draw_text(
+            surface,
+            rect.x + 3,
+            y,
+            &t.name,
+            fg,
+            col(S::Panel),
+            rect.cols.saturating_sub(3),
+        );
     }
 }
 
@@ -900,15 +1891,15 @@ pub fn draw_strip<'a>(
     if strip.rows == 0 || strip.cols == 0 {
         return;
     }
-    fill(surface, strip, theme_color(theme::BG0));
+    fill(surface, strip, col(S::Bg0));
     let accent_c = theme_color(accent);
-    let dim = theme_color(theme::DIM);
+    let dim = col(S::Dim);
     for cell in cells {
         if cell.rect.rows == 0 || cell.rect.cols == 0 {
             continue;
         }
-        // Header row.
-        let header_bg = theme_color(theme::BG1);
+        // Header row (chrome furniture — the panel tint).
+        let header_bg = col(S::Panel);
         let header_rect = Rect {
             x: cell.rect.x,
             y: cell.rect.y,
@@ -942,8 +1933,8 @@ pub fn draw_strip<'a>(
     }
 }
 
-/// Draw the surrounding chrome (sidebar/panel/tabbar/statusbar) — the center is
-/// filled separately by [`render_tab`].
+/// Draw the surrounding chrome (sidebar/panel/masthead/statusbar) — the center
+/// is filled separately by [`render_tab`].
 pub fn draw_chrome(
     surface: &mut Surface,
     chrome: &crate::layout::ChromeLayout,
@@ -956,13 +1947,85 @@ pub fn draw_chrome(
     if let Some(pn) = chrome.panel {
         draw_panel(surface, pn, model, panel_ui);
     }
-    draw_tabbar(surface, chrome.tabbar, chrome.tabbar_content(), model);
+    draw_columns_frame(surface, chrome);
+    draw_center_tabs(surface, chrome.center_tabs, model);
+    draw_masthead(surface, chrome, model);
     draw_statusbar(surface, chrome.statusbar, model);
 }
 
-/// Compose a multi-pane tab: lay the `center` tree out within `chrome.center`,
-/// paint each visible pane (resolved via `lookup`), draw a 1-row accent header
-/// above the focused split when there's more than one pane, then the chrome.
+/// The horizontal rule that caps all three columns directly below the
+/// masthead. The columns themselves separate by tint alone: the 1-col gutters
+/// either side of the center stay on the dark `bg0`, so the terminal well
+/// reads clearly against the tinted sidebar/panel without any vertical bars.
+fn draw_columns_frame(surface: &mut Surface, chrome: &crate::layout::ChromeLayout) {
+    if chrome.divider.rows > 0 {
+        let line = "\u{2500}".repeat(chrome.divider.cols);
+        draw_text(
+            surface,
+            0,
+            chrome.divider.y,
+            &line,
+            col(S::Border),
+            col(S::Panel),
+            chrome.divider.cols,
+        );
+    }
+}
+
+/// A centered confirmation modal: `msg` on a raised surface inside a
+/// focus-colored frame, with the `y / N` affordance. Drawn above everything
+/// while a destructive action awaits its answer.
+pub fn draw_confirm(surface: &mut Surface, screen: Rect, msg: &str) {
+    if screen.rows < 5 || screen.cols < 12 {
+        return;
+    }
+    let inner = msg.chars().count().clamp(16, screen.cols.saturating_sub(6));
+    let w = inner + 4;
+    let h = 5;
+    let x = screen.x + (screen.cols - w) / 2;
+    let y = screen.y + (screen.rows - h) / 2;
+    let rect = Rect {
+        x,
+        y,
+        cols: w,
+        rows: h,
+    };
+    fill(surface, rect, col(S::Raise));
+    crate::borders::draw_card(
+        surface,
+        rect,
+        "",
+        &crate::borders::CardStyle {
+            border: col(S::Focus),
+            title: col(S::Focus),
+            bg: col(S::Raise),
+        },
+    );
+    draw_text(
+        surface,
+        x + 2,
+        y + 1,
+        msg,
+        col(S::Text),
+        col(S::Raise),
+        inner,
+    );
+    draw_text(
+        surface,
+        x + 2,
+        y + 3,
+        "y confirm   any other key cancels",
+        col(S::Faint),
+        col(S::Raise),
+        inner,
+    );
+}
+
+/// Compose a multi-pane tab: lay the `center` tree out within `chrome.center`
+/// with every pane's 1-cell frame ring reserved, paint each visible pane's
+/// content (resolved via `lookup`), draw the frames (focused ring in the
+/// focus color when the center zone owns the keyboard), then the chrome.
+#[allow(clippy::too_many_arguments)]
 pub fn render_tab<'a>(
     surface: &mut Surface,
     chrome: &crate::layout::ChromeLayout,
@@ -971,12 +2034,47 @@ pub fn render_tab<'a>(
     model: &FrameModel,
     panel_ui: &crate::panel::PanelUi,
     lookup: impl Fn(crate::center::PaneId) -> Option<&'a dyn PaneEmulator>,
+    title_of: &dyn Fn(crate::center::PaneId) -> String,
 ) {
-    let _ = focused; // a non-destructive focus border is a later polish
-    for (id, rect) in center.layout(chrome.center) {
-        if let Some(emu) = lookup(id) {
-            compose_pane(surface, emu, rect);
+    let frames = center.layout_framed(chrome.center);
+    // "Empty center" = no visible leaf has a live emulator behind it (fresh
+    // launch before the first pane materializes, or every pane died). The
+    // splash replaces what used to render as a black hole, and disappears on
+    // the exact frame a pane shows up.
+    let any_live = frames.iter().any(|(id, _, _)| lookup(*id).is_some());
+    if any_live {
+        // The pane card owns the full center band. Paint the outside/ring
+        // background before composing terminal content so no default black halo
+        // can remain around the blue/white focus divider.
+        fill(surface, chrome.center, col(S::Panel));
+        for (id, _, content) in &frames {
+            if let Some(emu) = lookup(*id) {
+                compose_pane(surface, emu, *content);
+            }
         }
+        // The focused pane keeps a distinct ring at all times: focus blue
+        // while the center owns the keyboard, white while the sidebar/panel
+        // does — so the return target stays obvious without reading as live.
+        let ring = if model.center_focused {
+            col(S::Focus)
+        } else {
+            col(S::Text)
+        };
+        crate::borders::draw_pane_frames(
+            surface,
+            &frames,
+            Some(focused),
+            &crate::borders::FrameStyle {
+                border: col(S::Border),
+                focus: ring,
+                bg: col(S::Panel),
+                title: col(S::Dim),
+                title_focused: ring,
+            },
+            title_of,
+        );
+    } else {
+        crate::logotype::draw_splash(surface, chrome.center, model);
     }
     draw_chrome(surface, chrome, model, panel_ui);
 }
@@ -1040,7 +2138,10 @@ mod tests {
         let mut s = Surface::new(24, 6);
         draw_sidebar(&mut s, rect, &model);
         let text = s.screen_chars_to_string();
-        assert!(text.contains('\u{25c2}'), "focused header marker: {text:?}");
+        // The cursor's left-edge accent bar appears only while focused.
+        assert!(text.contains('\u{2590}'), "focused cursor bar: {text:?}");
+        // No quick-jump digits in the labels (flat look).
+        assert!(!text.contains("1 app"), "no digit hints: {text:?}");
 
         let mut unfocused = model.clone();
         unfocused.sidebar_focused = false;
@@ -1048,8 +2149,8 @@ mod tests {
         draw_sidebar(&mut s2, rect, &unfocused);
         let text2 = s2.screen_chars_to_string();
         assert!(
-            !text2.contains('\u{25c2}'),
-            "no focus marker when unfocused: {text2:?}"
+            !text2.contains('\u{2590}'),
+            "no cursor bar when unfocused: {text2:?}"
         );
     }
 
@@ -1116,15 +2217,7 @@ mod tests {
     #[test]
     fn clear_frame_removes_stale_cells_from_logical_surface() {
         let mut s = Surface::new(20, 3);
-        draw_text(
-            &mut s,
-            0,
-            0,
-            "STALE",
-            theme_color(theme::TEXT),
-            theme_color(theme::BG1),
-            20,
-        );
+        draw_text(&mut s, 0, 0, "STALE", col(S::Text), col(S::Bg1), 20);
         assert!(s.screen_chars_to_string().contains("STALE"));
 
         clear_frame(&mut s);
@@ -1157,30 +2250,45 @@ mod tests {
     }
 
     #[test]
-    fn tabbar_shows_tab_names() {
-        let mut s = Surface::new(80, 1);
+    fn center_tabs_show_worktree_label_and_chips() {
+        let mut s = Surface::new(80, 2);
         let model = FrameModel {
-            tabs: vec!["app/home".into(), "app/feat".into()],
+            worktree: "washu/home".into(),
+            tabs: vec!["1".into(), "2".into()],
             active_tab: 1,
             ..Default::default()
         };
-        let rect = Rect {
+        let strip = Rect {
             x: 0,
-            y: 0,
+            y: 1,
             cols: 80,
             rows: 1,
         };
-        draw_tabbar(&mut s, rect, rect, &model);
-        let l = lines(&s);
-        assert!(l[0].contains("app/home"));
-        assert!(l[0].contains("app/feat"));
+        draw_center_tabs(&mut s, strip, &model);
+        let row = &lines(&s)[1];
+        // The slug prefix renders uppercased, the leaf in accent, the chips
+        // as padded pills after the label.
+        assert!(row.contains("WASHU \u{25b8} home"), "{row:?}");
+        let leaf_at = row.find(" home").unwrap();
+        assert!(row[leaf_at..].contains(" 1 "), "{row:?}");
+        assert!(row[leaf_at..].contains(" 2 "), "{row:?}");
+        // Hit-test agrees with the rendered chip positions: the spans say
+        // where chips draw, and a hit inside the first span returns tab 0.
+        let spans = strip_chip_spans(&model, strip);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(center_tab_hit(&model, strip, spans[0].0), Some(0));
+        assert_eq!(center_tab_hit(&model, strip, spans[1].0 + 1), Some(1));
+        assert_eq!(center_tab_hit(&model, strip, 0), None);
+        // And the drawn cell at the first span really is the chip text.
+        let chip0: String = row.chars().skip(spans[0].0).take(spans[0].1).collect();
+        assert_eq!(chip0, " 1 ");
     }
 
     #[test]
-    fn tabbar_renders_pin_chips_right_aligned() {
+    fn center_tabs_render_pin_chips_right_aligned() {
         let mut s = Surface::new(80, 1);
         let model = FrameModel {
-            tabs: vec!["app/home".into()],
+            tabs: vec!["1".into()],
             active_tab: 0,
             pins: vec![
                 crate::pins::PinChip {
@@ -1196,21 +2304,100 @@ mod tests {
             ],
             ..Default::default()
         };
-        let rect = Rect {
+        let strip = Rect {
             x: 0,
             y: 0,
             cols: 80,
             rows: 1,
         };
-        draw_tabbar(&mut s, rect, rect, &model);
+        draw_center_tabs(&mut s, strip, &model);
         let row = &lines(&s)[0];
         assert!(row.contains("mail"), "chip label present: {row:?}");
         assert!(row.contains("logs"));
-        assert!(row.contains("app/home"), "tab label still present");
-        // The chips are right of the tab label.
-        let tab_at = row.find("app/home").unwrap();
+        let spans = strip_chip_spans(&model, strip);
+        assert_eq!(spans.len(), 1, "tab chip still present");
+        // The pins are right of the tab chip.
         let mail_at = row.find("mail").unwrap();
-        assert!(mail_at > tab_at, "chips render to the right of tabs");
+        assert!(mail_at > spans[0].0, "pins render to the right of tabs");
+    }
+
+    #[test]
+    fn stats_cluster_drops_date_then_gpu_when_tight() {
+        let parts: Vec<(String, usize)> = [
+            ("cpu", 7),
+            ("mem", 11),
+            ("gpu", 7),
+            ("net", 14),
+            ("date", 10),
+            ("clock", 5),
+        ]
+        .into_iter()
+        .map(|(id, w)| (id.to_string(), w))
+        .collect();
+        // Plenty of room: everything survives.
+        let all = fit_stats_cluster(&parts, 200);
+        assert_eq!(all.len(), 6);
+        // Tight: date goes first…
+        let full = cluster_width(&parts, &all);
+        let no_date = fit_stats_cluster(&parts, full - 1);
+        assert!(!no_date.iter().any(|&i| parts[i].0 == "date"));
+        assert!(no_date.iter().any(|&i| parts[i].0 == "gpu"));
+        // …then gpu.
+        let tighter = cluster_width(&parts, &no_date);
+        let no_gpu = fit_stats_cluster(&parts, tighter - 1);
+        assert!(!no_gpu.iter().any(|&i| parts[i].0 == "gpu"));
+        assert!(no_gpu.iter().any(|&i| parts[i].0 == "clock"));
+    }
+
+    #[test]
+    fn masthead_brand_breakpoints() {
+        assert_eq!(masthead_brand_cols(160), BRAND_FULL_COLS);
+        assert_eq!(masthead_brand_cols(96), BRAND_FULL_COLS);
+        assert_eq!(masthead_brand_cols(95), BRAND_COMPACT_COLS);
+        assert_eq!(masthead_brand_cols(60), BRAND_COMPACT_COLS);
+        assert_eq!(masthead_brand_cols(59), 0);
+    }
+
+    #[test]
+    fn masthead_stats_use_quiet_separators_and_threshold_colors() {
+        let chrome = layout::compute(160, 10, false, false);
+        let model = FrameModel {
+            stats: crate::stats::StatsSnapshot {
+                cpu_pct: Some(95),
+                mem_gib: Some((10.0, 64.0)),
+                ..Default::default()
+            },
+            bars: superzej_core::config::BarsConfig {
+                top_right: vec!["cpu".into(), "mem".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut s = Surface::new(160, 10);
+        draw_masthead(&mut s, &chrome, &model);
+        let row = &lines(&s)[0];
+        assert!(row.contains(" \u{00b7} "), "dot separator: {row:?}");
+        assert!(
+            !row.contains('\u{2502}'),
+            "no heavy bar separators: {row:?}"
+        );
+        // 95% CPU renders in the critical (red) color.
+        let pct_col = row.find("95%").unwrap();
+        let pct_chars = row[..pct_col].chars().count();
+        let cells = s.screen_cells();
+        assert_eq!(
+            cells[0][pct_chars].attrs().foreground(),
+            theme_color(theme::RED),
+            "critical cpu reads in red"
+        );
+        drop(cells);
+        assert_eq!(stat_level(79), Level::Normal);
+        assert_eq!(stat_level(80), Level::Warn);
+        assert_eq!(stat_level(92), Level::Crit);
+        assert_eq!(ratio_level(54.4, 64.0), Level::Warn);
+        assert_eq!(ratio_level(10.0, 64.0), Level::Normal);
+        assert_eq!(ratio_level(63.0, 64.0), Level::Crit);
+        assert_eq!(ratio_level(1.0, 0.0), Level::Normal);
     }
 
     #[test]
@@ -1239,45 +2426,57 @@ mod tests {
     }
 
     #[test]
-    fn tabbar_labels_start_in_center_content_area_when_sidebar_is_visible() {
+    fn center_tab_bar_sits_below_the_divider() {
         let chrome = layout::compute(160, 10, true, true);
         let mut s = Surface::new(160, 10);
         let model = FrameModel {
-            tabs: vec!["repo/home".into(), "repo/feat".into()],
+            worktree: "repo/home".into(),
+            tabs: vec!["1".into(), "2".into()],
             active_tab: 0,
             ..Default::default()
         };
 
         draw_chrome(&mut s, &chrome, &model, &crate::panel::PanelUi::default());
 
+        let brand_cols = masthead_brand_cols(160);
         let l = lines(&s);
-        let row = &l[0];
-        let far_left: String = row.chars().take(chrome.center.x).collect();
-        let center_band: String = row
-            .chars()
-            .skip(chrome.center.x)
-            .take(chrome.center.cols)
-            .collect();
-
+        // The masthead carries only brand + stats; the worktree label and
+        // chips live on the center tab bar below the divider.
         assert!(
-            !far_left.contains("repo/home") && !far_left.contains("repo/feat"),
-            "tab labels should not draw in sidebar columns: {row:?}"
+            !l[0].contains("REPO"),
+            "masthead carries no nav labels: {:?}",
+            &l[0]
         );
+        let tabs_row = &l[chrome.center_tabs.y];
         assert!(
-            center_band.contains("repo/home") && center_band.contains("repo/feat"),
-            "tab labels should draw in center band: {row:?}"
+            tabs_row.contains("REPO \u{25b8} home"),
+            "worktree label on the center tab bar: {tabs_row:?}"
+        );
+        // The divider rule caps the columns above the tab bar.
+        assert!(
+            l[chrome.divider.y].contains("\u{2500}\u{2500}\u{2500}"),
+            "divider rule: {:?}",
+            &l[chrome.divider.y]
+        );
+        // The text brand occupies the masthead's brand slot.
+        let brand_zone: String = l[0].chars().take(brand_cols).collect();
+        assert!(
+            brand_zone.contains("superzej"),
+            "text brand on the masthead: {:?}",
+            &l[0]
         );
     }
 
     #[test]
-    fn full_frame_tab_label_is_center_aligned_not_far_left() {
+    fn full_frame_tab_chip_lands_on_the_center_tab_bar() {
         let cols = 160usize;
         let rows = 10usize;
         let chrome = layout::compute(cols, rows, true, true);
         let mut emu = Vt100Emulator::new(chrome.center.rows as u16, chrome.center.cols as u16, 0);
         emu.advance(b"CENTER");
         let model = FrameModel {
-            tabs: vec!["repo/home".into()],
+            worktree: "repo/home".into(),
+            tabs: vec!["1".into()],
             active_tab: 0,
             ..Default::default()
         };
@@ -1292,24 +2491,18 @@ mod tests {
             &model,
             &crate::panel::PanelUi::default(),
             |id| (id == 1).then_some(&emu as &dyn PaneEmulator),
+            &|_| String::new(),
         );
 
         let l = lines(&s);
-        let row = &l[0];
-        let far_left: String = row.chars().take(chrome.center.x).collect();
-        let center_band: String = row
-            .chars()
-            .skip(chrome.center.x)
-            .take(chrome.center.cols)
-            .collect();
-
+        let spans = strip_chip_spans(&model, chrome.center_tabs);
+        assert_eq!(spans.len(), 1);
+        let tabs_row = &l[chrome.center_tabs.y];
+        let chip: String = tabs_row.chars().skip(spans[0].0).take(spans[0].1).collect();
+        assert_eq!(chip, " 1 ", "tab chip on the center tab bar: {tabs_row:?}");
         assert!(
-            !far_left.contains("repo/home"),
-            "tab label should not flash/draw at far-left: {row:?}"
-        );
-        assert!(
-            center_band.contains("repo/home"),
-            "tab label should appear in center band: {row:?}"
+            tabs_row.contains("REPO \u{25b8} home"),
+            "worktree label beside the chips: {tabs_row:?}"
         );
     }
 
@@ -1357,10 +2550,58 @@ mod tests {
                 2 => Some(&right as &dyn PaneEmulator),
                 _ => None,
             },
+            &|id| format!("pane-{id}"),
         );
         let text = s.screen_chars_to_string();
         assert!(text.contains("LEFTPANE"), "left pane painted");
         assert!(text.contains("RIGHTPANE"), "right pane painted");
+        // Card titles ride the top border of each pane frame.
+        assert!(text.contains(" pane-1 "), "embedded card title: {text:?}");
+        assert!(text.contains(" pane-2 "));
+    }
+
+    #[test]
+    fn render_tab_shows_splash_when_no_live_panes() {
+        let cols = 160usize;
+        let rows = 40usize;
+        let chrome = layout::compute(cols, rows, true, true);
+        let model = FrameModel {
+            worktree: "repo/home".into(),
+            tabs: vec!["1".into()],
+            ..Default::default()
+        };
+        let center = crate::center::CenterTree::Leaf(1);
+        let mut s = Surface::new(cols, rows);
+        render_tab(
+            &mut s,
+            &chrome,
+            &center,
+            1,
+            &model,
+            &crate::panel::PanelUi::default(),
+            |_| None,
+            &|_| String::new(),
+        );
+        let l = lines(&s);
+        // The splash wordmark lands inside the center band, with chrome intact.
+        let mid = &l[chrome.center.y + chrome.center.rows / 2 - 1];
+        let band: String = l[chrome.center.y..chrome.center.y + chrome.center.rows]
+            .iter()
+            .map(|r| {
+                r.chars()
+                    .skip(chrome.center.x)
+                    .take(chrome.center.cols)
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            band.contains("Ctrl-Space"),
+            "splash hints in center: {mid:?}"
+        );
+        assert!(band.chars().any(|c| "▀▄█".contains(c)), "splash wordmark");
+        assert!(l.join("\n").contains("WORKSPACES"), "chrome still drawn");
+        // No card rings drawn around the empty center.
+        assert!(!band.contains('\u{256d}'), "no pane card on empty center");
     }
 
     #[test]
@@ -1392,6 +2633,10 @@ mod tests {
                 ..Default::default()
             },
             status: "Cmd-K  Alt-w new  Alt-o switch".into(),
+            bars: superzej_core::config::BarsConfig {
+                bottom_left: vec!["status".into()],
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -1402,15 +2647,35 @@ mod tests {
             tab: crate::panel::PanelTab::Pr,
             ..Default::default()
         };
-        render_tab(&mut s, &chrome, &center, 1, &model, &panel_ui, |id| {
-            (id == 1).then_some(&emu as &dyn PaneEmulator)
-        });
+        render_tab(
+            &mut s,
+            &chrome,
+            &center,
+            1,
+            &model,
+            &panel_ui,
+            |id| (id == 1).then_some(&emu as &dyn PaneEmulator),
+            &|_| String::new(),
+        );
         let l = lines(&s);
 
-        // Tabbar (row 0) carries the tab name; statusbar (last row) the hints.
-        assert!(l[0].contains("repo/home"), "tabbar: {:?}", l[0]);
+        // Masthead: the text brand on row 0; the tab chip rides the center
+        // tab bar; the panel switcher tops the panel column; the statusbar
+        // (last row) carries the status widget.
+        assert!(l[0].contains("superzej"), "brand: {:?}", l[0]);
+        let tabs_row = &l[chrome.center_tabs.y];
+        assert!(
+            tabs_row.contains("repo/home") || tabs_row.contains(" repo/home "),
+            "tab chip on the center tab bar: {tabs_row:?}"
+        );
+        let panel_rect = chrome.panel.unwrap();
+        let switcher: String = l[panel_rect.y].chars().skip(panel_rect.x).collect();
+        assert!(
+            switcher.contains("DIFF") && switcher.contains("CHECKS"),
+            "panel switcher tops the panel: {switcher:?}"
+        );
         assert!(l[rows - 1].contains("Cmd-K"), "status: {:?}", l[rows - 1]);
-        // Sidebar title and the center content both present somewhere.
+        // Sidebar title and center content all present.
         let all = l.join("\n");
         assert!(all.contains("WORKSPACES"));
         assert!(all.contains("CENTER-CONTENT"));
@@ -1451,13 +2716,86 @@ mod tests {
         let mut s = Surface::new(44, 12);
         draw_panel(&mut s, rect, &model, &PanelUi::default());
         let text = s.screen_chars_to_string();
-        assert!(text.contains("DIFF"), "tab bar: {text:?}");
-        assert!(text.contains("PR"));
-        assert!(text.contains("CHECKS"));
+        // The DIFF/FILES/PR/CHECKS switcher tops the panel column, body below.
+        let first = text.lines().next().unwrap_or_default();
+        assert!(
+            first.contains("DIFF") && first.contains("FILES") && first.contains("CHECKS"),
+            "switcher row: {first:?}"
+        );
         assert!(text.contains("src/main.rs"), "file list: {text:?}");
         assert!(text.contains("src/new.rs"));
-        // Help bar hint for the default Diff:FileList view.
-        assert!(text.contains("open"), "help bar: {text:?}");
+        // The help text moved to the bottom bar; the panel body stays clean
+        // but the hint provider still serves the Diff:FileList context.
+        assert!(!text.contains("open"), "no in-panel help bar: {text:?}");
+        assert!(
+            panel_help_hint(
+                crate::panel::PanelTab::Diff,
+                crate::panel::DiffView::FileList
+            )
+            .contains("diff")
+        );
+    }
+
+    #[test]
+    fn sandbox_section_renders_in_the_bottom_quarter() {
+        use superzej_core::sandbox::ContainerInfo;
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 44,
+            rows: 24,
+        };
+        let (zone, sandbox) = panel_split(rect);
+        let sb = sandbox.expect("tall panel gets a sandbox section");
+        assert_eq!(zone.rows + sb.rows, 24);
+        assert!(sb.rows >= 4 && sb.rows == 24 / 4);
+        assert_eq!(sb.y, zone.y + zone.rows);
+
+        let model = FrameModel {
+            containers: vec![
+                ContainerInfo {
+                    name: "superzej-wt-feat".into(),
+                    image: "ubuntu:24.04".into(),
+                    status: "Up 2 hours".into(),
+                    ours: true,
+                    backend: "podman-rootless".into(),
+                    cpu: String::new(),
+                    mem: String::new(),
+                    net: String::new(),
+                    containment: "worktree+caches".into(),
+                    mounts: String::new(),
+                },
+                ContainerInfo {
+                    name: "registry".into(),
+                    image: "registry:2".into(),
+                    status: "Up 3 days".into(),
+                    ours: false,
+                    backend: "docker".into(),
+                    cpu: String::new(),
+                    mem: String::new(),
+                    net: String::new(),
+                    containment: "worktree+caches".into(),
+                    mounts: String::new(),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut s = Surface::new(44, 24);
+        draw_panel(&mut s, rect, &model, &crate::panel::PanelUi::default());
+        let text = s.screen_chars_to_string();
+        assert!(text.contains("SANDBOXES"), "{text:?}");
+        assert!(text.contains("wt-feat"), "prefix stripped: {text:?}");
+        assert!(!text.contains("superzej-wt-feat"));
+        assert!(text.contains("+ 1 other container"), "{text:?}");
+
+        // Short panels skip the section entirely.
+        let (_, none) = panel_split(Rect {
+            x: 0,
+            y: 0,
+            cols: 44,
+            rows: 10,
+        });
+        assert!(none.is_none());
     }
 
     #[test]
@@ -1494,6 +2832,13 @@ mod tests {
         let text = s.screen_chars_to_string();
         assert!(text.contains("build"), "checks: {text:?}");
         assert!(text.contains("test"));
-        assert!(text.contains("rerun"), "checks help bar: {text:?}");
+        // Hints live on the bottom bar now; the provider still knows Checks.
+        assert!(
+            panel_help_hint(
+                crate::panel::PanelTab::Checks,
+                crate::panel::DiffView::FileList
+            )
+            .contains("rerun")
+        );
     }
 }

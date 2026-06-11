@@ -31,7 +31,143 @@ pub const RED: &str = "247;118;142";
 pub const CORAL: &str = "240;145;125"; // claude
 pub const BLUE: &str = "120;170;245"; // shell
 
+// ---- focus / frame defaults (overridable via `[theme]`, see Palette) ----
+pub const FRAME: &str = "170;177;196"; // pane/edge frame lines (#aab1c4)
+pub const FOCUS: &str = "155;209;255"; // focused frame + highlights (#9bd1ff)
+
 pub const RESET: &str = "\u{1b}[0m";
+
+/// The resolved chrome palette: every surface, text, and frame color the host
+/// renders with, as "R;G;B" fragments. Defaults mirror the constants above;
+/// `Config::palette()` overlays any `[theme]` / `[theme.colors]` overrides so
+/// chrome code reads colors from here instead of the constants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Palette {
+    pub bg0: String,
+    pub bg1: String,
+    pub panel: String,
+    pub panel2: String,
+    pub raise: String,
+    /// Frame lines around panes and chrome edges (light grey by default).
+    pub border: String,
+    /// The frame/highlight color of whatever owns focus (light blue default).
+    pub focus: String,
+    pub text: String,
+    pub dim: String,
+    pub faint: String,
+    pub ghost: String,
+    pub accent: String,
+}
+
+impl Default for Palette {
+    fn default() -> Self {
+        Palette {
+            bg0: BG0.into(),
+            bg1: BG1.into(),
+            panel: PANEL.into(),
+            panel2: PANEL2.into(),
+            raise: RAISE.into(),
+            border: FRAME.into(),
+            focus: FOCUS.into(),
+            text: TEXT.into(),
+            dim: DIM.into(),
+            faint: FAINT.into(),
+            ghost: GHOST.into(),
+            accent: TEAL.into(),
+        }
+    }
+}
+
+/// Build a palette from 12 "R;G;B" fragments, in field order.
+fn pal(c: [&str; 12]) -> Palette {
+    Palette {
+        bg0: c[0].into(),
+        bg1: c[1].into(),
+        panel: c[2].into(),
+        panel2: c[3].into(),
+        raise: c[4].into(),
+        border: c[5].into(),
+        focus: c[6].into(),
+        text: c[7].into(),
+        dim: c[8].into(),
+        faint: c[9].into(),
+        ghost: c[10].into(),
+        accent: c[11].into(),
+    }
+}
+
+/// The selectable preset names, in cycle order.
+pub const PRESETS: &[&str] = &["storm", "light", "abyss", "ember", "aurora"];
+
+/// A named palette preset. `[theme.colors]` overrides still apply on top, so
+/// every preset stays fully customizable. `None` for unknown names.
+pub fn preset(name: &str) -> Option<Palette> {
+    Some(match name {
+        // The storm-blue default.
+        "storm" | "" => Palette::default(),
+        // A paper-bright light mode with an ink text ramp and deep-teal accent.
+        "light" => pal([
+            "245;246;250",
+            "236;238;245",
+            "228;231;240",
+            "213;218;232",
+            "201;208;226",
+            "148;156;180",
+            "38;99;176",
+            "30;34;46",
+            "88;95;114",
+            "136;143;162",
+            "182;188;203",
+            "0;138;125",
+        ]),
+        // True-black OLED with an electric cyan focus and mint accent.
+        "abyss" => pal([
+            "0;0;0",
+            "8;10;14",
+            "13;16;22",
+            "22;27;36",
+            "31;37;49",
+            "56;64;84",
+            "0;229;255",
+            "214;222;236",
+            "141;151;171",
+            "94;102;120",
+            "58;64;80",
+            "94;234;212",
+        ]),
+        // Warm charcoal with amber focus and coral accent — firelight.
+        "ember" => pal([
+            "24;20;18",
+            "30;25;22",
+            "38;31;27",
+            "50;40;34",
+            "61;49;42",
+            "106;88;75",
+            "255;176;102",
+            "240;230;220",
+            "181;166;151",
+            "131;116;103",
+            "89;77;67",
+            "255;122;89",
+        ]),
+        // Deep violet night with lavender focus and mint accent — aurora.
+        "aurora" => pal([
+            "16;14;26",
+            "21;18;34",
+            "28;24;44",
+            "38;33;58",
+            "49;43;73",
+            "86;76;120",
+            "168;130;255",
+            "228;226;244",
+            "163;159;187",
+            "113;109;139",
+            "75;71;101",
+            "94;245;190",
+        ]),
+        _ => return None,
+    })
+}
 
 /// Foreground escape for an "R;G;B" triple.
 pub fn fg(rgb: &str) -> String {
@@ -47,10 +183,11 @@ pub fn bold() -> &'static str {
     "\u{1b}[1m"
 }
 
-/// Lerp a hue toward BG0: `t` is how much of the hue survives (0.0 = pure
-/// BG0, 1.0 = pure hue). `blend(hue, 0.16)` approximates the mockup's
-/// 16%-alpha pill/selection tints on the storm-blue base.
-pub fn blend(hue: &str, t: f32) -> String {
+/// Lerp a hue toward an arbitrary base color: `t` is how much of the hue
+/// survives (0.0 = pure base, 1.0 = pure hue). Use this for alpha-style tints
+/// on tinted surfaces (e.g. a focus pill on the panel background), where
+/// blending toward BG0 would punch a dark hole in the surface.
+pub fn blend_over(hue: &str, base: &str, t: f32) -> String {
     let p = |s: &str| -> [f32; 3] {
         let mut it = s.split(';').map(|n| n.parse::<f32>().unwrap_or(0.0));
         [
@@ -59,9 +196,16 @@ pub fn blend(hue: &str, t: f32) -> String {
             it.next().unwrap_or(0.0),
         ]
     };
-    let (h, b) = (p(hue), p(BG0));
+    let (h, b) = (p(hue), p(base));
     let c = |i: usize| (b[i] + (h[i] - b[i]) * t).round() as u8;
     format!("{};{};{}", c(0), c(1), c(2))
+}
+
+/// Lerp a hue toward BG0: `t` is how much of the hue survives (0.0 = pure
+/// BG0, 1.0 = pure hue). `blend(hue, 0.16)` approximates the mockup's
+/// 16%-alpha pill/selection tints on the storm-blue base.
+pub fn blend(hue: &str, t: f32) -> String {
+    blend_over(hue, BG0, t)
 }
 
 /// Identity hue for an agent/tool name. Known names get their signature hue;
@@ -143,6 +287,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn presets_resolve_and_cycle_names_are_complete() {
+        for name in PRESETS {
+            let p = preset(name).expect(name);
+            // Every fragment parses as R;G;B.
+            for frag in [&p.bg0, &p.text, &p.accent, &p.focus] {
+                assert_eq!(frag.split(';').count(), 3, "{name}: {frag}");
+            }
+        }
+        assert_eq!(preset(""), Some(Palette::default()));
+        assert!(preset("nope").is_none());
+        // Light mode really is light (bg brighter than text).
+        let l = preset("light").unwrap();
+        let lum = |s: &str| s.split(';').map(|n| n.parse::<u32>().unwrap()).sum::<u32>();
+        assert!(lum(&l.bg0) > lum(&l.text));
+    }
+
+    #[test]
     fn blend_endpoints() {
         assert_eq!(blend(GREEN, 0.0), BG0);
         assert_eq!(blend(GREEN, 1.0), GREEN);
@@ -154,6 +315,28 @@ mod tests {
         let t = blend(GREEN, 0.16);
         let g: Vec<u8> = t.split(';').map(|n| n.parse().unwrap()).collect();
         assert!(g[1] > 22 && g[1] < 121); // between BG0.g and GREEN.g
+    }
+
+    #[test]
+    fn blend_over_endpoints_and_midpoint() {
+        assert_eq!(blend_over(GREEN, PANEL, 0.0), PANEL);
+        assert_eq!(blend_over(GREEN, PANEL, 1.0), GREEN);
+        // Midpoint is the per-channel average (rounded).
+        assert_eq!(blend_over("100;200;0", "0;100;200", 0.5), "50;150;100");
+    }
+
+    #[test]
+    fn blend_delegates_to_blend_over_bg0() {
+        for t in [0.0, 0.16, 0.5, 1.0] {
+            assert_eq!(blend(AMBER, t), blend_over(AMBER, BG0, t));
+        }
+    }
+
+    #[test]
+    fn blend_over_tolerates_malformed_fragments() {
+        // Unparseable channels degrade to 0 instead of panicking.
+        assert_eq!(blend_over("not;a;color", "0;0;0", 1.0), "0;0;0");
+        assert_eq!(blend_over("10;20", "0;0;0", 1.0), "10;20;0");
     }
 
     #[test]

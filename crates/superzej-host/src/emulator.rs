@@ -66,19 +66,93 @@ pub trait PaneEmulator: Send {
     fn row_text(&self, _row: u16) -> Option<String> {
         None
     }
+    /// DECCKM: when set, arrows/Home/End must be sent SS3-encoded (`ESC O A`).
+    fn application_cursor(&self) -> bool {
+        false
+    }
+    /// Bracketed paste: when set, pastes are wrapped in `ESC[200~ … ESC[201~`.
+    fn bracketed_paste(&self) -> bool {
+        false
+    }
+    /// The mouse reporting the app requested: `(mode, SGR encoding?)`. The
+    /// host forwards matching mouse events into the pane instead of using
+    /// them for its own selection (hold Shift to force host selection).
+    fn mouse_mode(&self) -> (MouseMode, bool) {
+        (MouseMode::None, false)
+    }
+}
+
+/// Mouse reporting level an app can request (DECSET 9/1000/1002/1003),
+/// normalized away from any one library's enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MouseMode {
+    #[default]
+    None,
+    Press,
+    PressRelease,
+    ButtonMotion,
+    AnyMotion,
 }
 
 /// The `vt100`-backed spike emulator.
 pub struct Vt100Emulator {
     parser: vt100::Parser,
+    /// Partial CSI carried between `advance` chunks for the HVP rewrite.
+    hvp_carry: Vec<u8>,
 }
 
 impl Vt100Emulator {
     pub fn new(rows: u16, cols: u16, scrollback: usize) -> Self {
         Self {
             parser: vt100::Parser::new(rows, cols, scrollback),
+            hvp_carry: Vec::new(),
         }
     }
+}
+
+/// vt100 0.16 implements CUP (`CSI r;c H`) but not its ANSI twin HVP
+/// (`CSI r;c f`) — which btop uses EXCLUSIVELY for positioning, so its whole
+/// frame collapses into a garble. Rewrite `f` finals (digit/`;` params only)
+/// to `H` before parsing. Stateful: a CSI split across PTY read chunks is
+/// carried into the next call (capped so binary noise can't grow it).
+pub(crate) fn rewrite_hvp(input: &[u8], carry: &mut Vec<u8>) -> Vec<u8> {
+    let mut data = std::mem::take(carry);
+    data.extend_from_slice(input);
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] == 0x1b && data.get(i + 1) == Some(&b'[') {
+            let mut j = i + 2;
+            while j < data.len() && matches!(data[j], 0x20..=0x3f) {
+                j += 1;
+            }
+            if j >= data.len() {
+                // Incomplete CSI at the chunk edge: carry it (bounded).
+                if data.len() - i <= 64 {
+                    carry.extend_from_slice(&data[i..]);
+                } else {
+                    out.extend_from_slice(&data[i..]);
+                }
+                break;
+            }
+            let fin = data[j];
+            out.extend_from_slice(&data[i..j]);
+            if fin == b'f'
+                && data[i + 2..j]
+                    .iter()
+                    .all(|b| matches!(b, b'0'..=b'9' | b';'))
+            {
+                out.push(b'H');
+            } else {
+                out.push(fin);
+            }
+            i = j + 1;
+        } else {
+            out.push(data[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 fn conv_color(c: vt100::Color) -> CellColor {
@@ -91,7 +165,8 @@ fn conv_color(c: vt100::Color) -> CellColor {
 
 impl PaneEmulator for Vt100Emulator {
     fn advance(&mut self, bytes: &[u8]) {
-        self.parser.process(bytes);
+        let fixed = rewrite_hvp(bytes, &mut self.hvp_carry);
+        self.parser.process(&fixed);
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
@@ -148,11 +223,54 @@ impl PaneEmulator for Vt100Emulator {
         let mut s = String::new();
         for col in 0..cols {
             match self.cell(row, col) {
-                Some(c) if !c.text.is_empty() => s.push_str(&c.text),
+                Some(c) => {
+                    // The fast path blits plain text with no attributes — any
+                    // styling on the row (colors, bold, …) must take the
+                    // cell-by-cell path or the styling is silently dropped.
+                    if c.bold
+                        || c.italic
+                        || c.underline
+                        || c.inverse
+                        || c.fg != CellColor::Default
+                        || c.bg != CellColor::Default
+                    {
+                        return None;
+                    }
+                    if c.text.is_empty() {
+                        s.push(' ');
+                    } else {
+                        s.push_str(&c.text);
+                    }
+                }
                 _ => s.push(' '),
             }
         }
-        Some(s.trim_end().to_string())
+        // Full width — a trimmed blit would leave stale cells from a previous
+        // frame visible past the new text (garbled htop/btop).
+        Some(s)
+    }
+
+    fn application_cursor(&self) -> bool {
+        self.parser.screen().application_cursor()
+    }
+
+    fn bracketed_paste(&self) -> bool {
+        self.parser.screen().bracketed_paste()
+    }
+
+    fn mouse_mode(&self) -> (MouseMode, bool) {
+        use vt100::MouseProtocolEncoding as E;
+        use vt100::MouseProtocolMode as M;
+        let screen = self.parser.screen();
+        let mode = match screen.mouse_protocol_mode() {
+            M::None => MouseMode::None,
+            M::Press => MouseMode::Press,
+            M::PressRelease => MouseMode::PressRelease,
+            M::ButtonMotion => MouseMode::ButtonMotion,
+            M::AnyMotion => MouseMode::AnyMotion,
+        };
+        let sgr = matches!(screen.mouse_protocol_encoding(), E::Sgr);
+        (mode, sgr)
     }
 }
 
@@ -164,16 +282,48 @@ mod tests {
     fn plain_text_lands_in_the_grid() {
         let mut e = Vt100Emulator::new(24, 80, 0);
         e.advance(b"hello world");
-        assert_eq!(e.row_text(0), Some("hello world".to_string()));
+        assert_eq!(
+            e.row_text(0).map(|r| r.trim_end().to_string()),
+            Some("hello world".to_string())
+        );
         assert_eq!(e.cursor(), (0, 11));
+    }
+
+    #[test]
+    fn styled_rows_refuse_the_fast_path_so_color_survives() {
+        let mut e = Vt100Emulator::new(24, 80, 0);
+        e.advance(b"plain\r\n\x1b[31mred text\x1b[0m\r\n\x1b[1mbold\x1b[0m");
+        // Unstyled rows blit fast…
+        assert_eq!(
+            e.row_text(0).map(|r| r.trim_end().to_string()),
+            Some("plain".to_string())
+        );
+        assert_eq!(
+            e.row_text(0).map(|r| r.chars().count()),
+            Some(80),
+            "fast-path rows are full width so stale cells get overwritten"
+        );
+        // …but any colored/bold row must go cell-by-cell (the fast path would
+        // strip its attributes).
+        assert_eq!(e.row_text(1), None, "colored row must not fast-path");
+        assert_eq!(e.row_text(2), None, "bold row must not fast-path");
+        // The styling is intact on the cells themselves.
+        let c = e.cell(1, 0).unwrap();
+        assert_eq!(c.fg, CellColor::Indexed(1));
     }
 
     #[test]
     fn newline_advances_row() {
         let mut e = Vt100Emulator::new(24, 80, 0);
         e.advance(b"line1\r\nline2");
-        assert_eq!(e.row_text(0), Some("line1".to_string()));
-        assert_eq!(e.row_text(1), Some("line2".to_string()));
+        assert_eq!(
+            e.row_text(0).map(|r| r.trim_end().to_string()),
+            Some("line1".to_string())
+        );
+        assert_eq!(
+            e.row_text(1).map(|r| r.trim_end().to_string()),
+            Some("line2".to_string())
+        );
     }
 
     #[test]
@@ -196,7 +346,9 @@ mod tests {
         }
         // Live tail: the last lines are visible, line1 is gone.
         assert_eq!(e.scrollback(), 0);
-        let tail: Vec<String> = (0..3).map(|r| e.row_text(r).unwrap_or_default()).collect();
+        let tail: Vec<String> = (0..3)
+            .map(|r| e.row_text(r).unwrap_or_default().trim_end().to_string())
+            .collect();
         assert!(
             tail.iter().any(|l| l == "line5"),
             "tail shows recent: {tail:?}"
@@ -207,7 +359,9 @@ mod tests {
         // (vt100 clamps the offset to the available scrollback).
         e.scroll_up(100);
         assert!(e.scrollback() > 0, "offset advanced into history");
-        let hist: Vec<String> = (0..3).map(|r| e.row_text(r).unwrap_or_default()).collect();
+        let hist: Vec<String> = (0..3)
+            .map(|r| e.row_text(r).unwrap_or_default().trim_end().to_string())
+            .collect();
         assert!(
             hist.iter().any(|l| l == "line1"),
             "history shows line1: {hist:?}"
@@ -223,5 +377,32 @@ mod tests {
         let mut e = Vt100Emulator::new(24, 80, 0);
         e.resize(40, 100);
         assert_eq!(e.size(), (40, 100));
+    }
+
+    #[test]
+    fn hvp_rewrites_to_cup_including_split_chunks() {
+        let mut carry = Vec::new();
+        // Plain rewrite, params preserved; H and other finals untouched.
+        let out = rewrite_hvp(b"\x1b[14;5fX\x1b[2;3Hy\x1b[1C", &mut carry);
+        assert_eq!(out, b"\x1b[14;5HX\x1b[2;3Hy\x1b[1C");
+        assert!(carry.is_empty());
+        // Non-numeric params (private modes) keep their final byte.
+        let out = rewrite_hvp(b"\x1b[?25f", &mut carry);
+        assert_eq!(out, b"\x1b[?25f");
+        // Split across chunks: the partial CSI carries over.
+        let out1 = rewrite_hvp(b"ab\x1b[40;", &mut carry);
+        assert_eq!(out1, b"ab");
+        assert!(!carry.is_empty());
+        let out2 = rewrite_hvp(b"12f!", &mut carry);
+        assert_eq!(out2, b"\x1b[40;12H!");
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn emulator_positions_via_hvp_like_btop() {
+        let mut emu = Vt100Emulator::new(10, 40, 0);
+        emu.advance(b"\x1b[3;5fBTOP");
+        assert_eq!(emu.cell(2, 4).unwrap().text, "B");
+        assert_eq!(emu.cell(2, 7).unwrap().text, "P");
     }
 }

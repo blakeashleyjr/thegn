@@ -40,23 +40,50 @@ pub(crate) enum RefreshKind {
 /// PR tick when the elapsed count divides evenly.
 pub(crate) fn spawn_refresh_ticker(
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
+    stats_tx: tokio_mpsc::UnboundedSender<crate::stats::StatsSnapshot>,
+    stats_interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     waker: TerminalWaker,
 ) {
+    use std::sync::atomic::Ordering;
     std::thread::spawn(move || {
-        let pr_every = (PR_REFRESH_INTERVAL.as_secs() / MODEL_REFRESH_INTERVAL.as_secs()).max(1);
+        // 1s granularity so the user-cycled stats rate (1/2/5/10s) is honored;
+        // model/PR refreshes keep their own multiples.
+        let tick = Duration::from_secs(1);
+        let model_every = MODEL_REFRESH_INTERVAL.as_secs();
+        let pr_every = PR_REFRESH_INTERVAL.as_secs();
         let mut ticks: u64 = 0;
+        // System stats for the top bar ride the same thread/cadence — the
+        // /proc reads never touch the event loop.
+        let mut sampler = crate::stats::StatsSampler::new();
+        let _ = stats_tx.send(sampler.sample()); // prime counters for rate deltas
+        let mut last_stats = Instant::now();
         loop {
-            std::thread::sleep(MODEL_REFRESH_INTERVAL);
+            std::thread::sleep(tick);
             ticks += 1;
-            let kind = if ticks.is_multiple_of(pr_every) {
-                RefreshKind::Pr
-            } else {
-                RefreshKind::Model
-            };
-            if tx.send(kind).is_err() {
-                break; // loop gone
+            let mut wake = false;
+            if ticks.is_multiple_of(model_every) {
+                let kind = if ticks.is_multiple_of(pr_every) {
+                    RefreshKind::Pr
+                } else {
+                    RefreshKind::Model
+                };
+                if tx.send(kind).is_err() {
+                    break; // loop gone
+                }
+                wake = true;
             }
-            let _ = waker.wake();
+            let interval =
+                Duration::from_millis(stats_interval_ms.load(Ordering::Relaxed).max(500));
+            if last_stats.elapsed() >= interval {
+                last_stats = Instant::now();
+                if stats_tx.send(sampler.sample()).is_err() {
+                    break;
+                }
+                wake = true;
+            }
+            if wake {
+                let _ = waker.wake();
+            }
         }
     });
 }
@@ -65,10 +92,12 @@ pub(crate) fn spawn_refresh_ticker(
 /// worktree if the session is empty (and persisting it so the next launch
 /// restores it). The native host owns this — it's the resurrect path that
 /// replaced zellij's session serialization.
-pub(crate) fn load_or_seed_session(cwd: &std::path::Path) -> crate::session::Session {
+///
+/// The `bool` is true when the session was freshly SEEDED (first launch / new
+/// workspace) rather than resurrected — the launch splash shows only then.
+pub(crate) fn load_or_seed_session(cwd: &std::path::Path) -> (crate::session::Session, bool) {
     let _span = tracing::info_span!("load_or_seed_session").entered();
-    use crate::center::CenterTree;
-    use crate::session::{Session, Tab, TabKind};
+    use crate::session::{GroupKind, Session, WorktreeGroup};
 
     let sess = superzej_core::db::session();
     let base = cwd
@@ -113,46 +142,110 @@ pub(crate) fn load_or_seed_session(cwd: &std::path::Path) -> crate::session::Ses
         .unwrap_or(cwd_str);
 
     let Ok(db) = db else {
-        // No DB — synthesize an ephemeral single-tab session.
-        return Session {
-            id: sess.to_string(),
-            tabs: vec![Tab {
-                name: format!("{base}/home"),
-                kind: TabKind::Home,
-                worktree: cwd.to_string_lossy().into_owned(),
-                center: CenterTree::Leaf(0),
-                focused_pane: 0,
-            }],
-            active: 0,
+        // No DB — synthesize an ephemeral single-worktree session. Best-effort
+        // slug (no DB to consult): the slugified basename matches what
+        // `slug_for_repo` would assign absent a collision.
+        let slug = {
+            let s = superzej_core::util::slugify(&base);
+            if s.is_empty() { "repo".to_string() } else { s }
         };
+        return (
+            Session {
+                id: sess.to_string(),
+                worktrees: vec![WorktreeGroup::new(
+                    superzej_core::repo::home_tab(&slug),
+                    GroupKind::Home,
+                    cwd.to_string_lossy().into_owned(),
+                )],
+                active: 0,
+            },
+            true,
+        );
     };
 
     let mut session = Session::resurrect(&db, &session_name).unwrap_or_default();
-    if session.tabs.is_empty() {
-        session.tabs.push(Tab {
-            name: format!("{base}/home"),
-            kind: TabKind::Home,
-            worktree: cwd.to_string_lossy().into_owned(),
-            center: CenterTree::Leaf(0),
-            focused_pane: 0,
-        });
+
+    // git is the source of truth for worktrees on disk: drop resurrected
+    // groups whose local dir vanished (deleted/moved outside superzej), and
+    // forget their registry rows so nothing re-adopts them. Remote worktrees
+    // (a `location` in the registry) are exempt — their path isn't local.
+    let remote: std::collections::HashSet<String> = db
+        .worktrees()
+        .map(|rows| {
+            rows.into_iter()
+                .filter(|w| !w.location.is_empty())
+                .map(|w| w.worktree)
+                .collect()
+        })
+        .unwrap_or_default();
+    let active_name = session.active_group().map(|g| g.name.clone());
+    let before = session.worktrees.len();
+    let dead: Vec<crate::session::WorktreeGroup> = {
+        let (live, dead) =
+            session
+                .worktrees
+                .drain(..)
+                .partition(|g: &crate::session::WorktreeGroup| {
+                    g.path.is_empty() || remote.contains(&g.path) || Path::new(&g.path).is_dir()
+                });
+        session.worktrees = live;
+        dead
+    };
+    if session.worktrees.len() != before {
+        for g in &dead {
+            let _ = db.del_worktree(&g.path);
+        }
+        session.active = active_name
+            .and_then(|n| session.worktrees.iter().position(|g| g.name == n))
+            .unwrap_or(0);
+        let _ = session.persist(&db, &session_name, now_secs());
+        tracing::info!(
+            target: "szhost::startup",
+            pruned = dead.len(),
+            "stale worktrees pruned (dirs gone from disk)"
+        );
+    }
+
+    let mut seeded = false;
+    if session.worktrees.is_empty() {
+        // Key the home group by the canonical DB slug (`{slug}/home`), never
+        // the raw basename — the sidebar dedupes workspaces by this prefix.
+        let slug = superzej_core::repo::repo_slug_with(&db, std::path::Path::new(&session_name));
+        session.worktrees.push(WorktreeGroup::new(
+            superzej_core::repo::home_tab(&slug),
+            GroupKind::Home,
+            cwd.to_string_lossy().into_owned(),
+        ));
         session.active = 0;
+        seeded = true;
         let _ = session.persist(&db, &session_name, now_secs());
     }
     session.id = session_name; // Need to add id to session
-    session
+    (session, seeded)
 }
 
 pub(crate) fn active_tab_path(session: &crate::session::Session) -> std::path::PathBuf {
     session
-        .tabs
-        .get(session.active)
-        .and_then(|t| {
-            (!t.worktree.is_empty() && std::path::Path::new(&t.worktree).is_dir())
-                .then(|| std::path::PathBuf::from(&t.worktree))
+        .active_group()
+        .and_then(|g| {
+            (!g.path.is_empty() && std::path::Path::new(&g.path).is_dir())
+                .then(|| std::path::PathBuf::from(&g.path))
         })
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| ".".into())
+}
+
+/// The tabbar strip for the active worktree: (worktree label, tab chip titles,
+/// active chip index).
+pub(crate) fn tab_strip(session: &crate::session::Session) -> (String, Vec<String>, usize) {
+    match session.active_group() {
+        Some(g) => (
+            g.name.clone(),
+            g.tabs.iter().map(|t| t.title.clone()).collect(),
+            g.active_tab,
+        ),
+        None => (String::new(), Vec::new(), 0),
+    }
 }
 
 /// The ordered `(slug, display, kind)` workspace list backing the tree: every
@@ -162,8 +255,8 @@ pub(crate) fn active_tab_path(session: &crate::session::Session) -> std::path::P
 pub(crate) fn workspace_list(
     session: &crate::session::Session,
     db: Option<&superzej_core::db::Db>,
-) -> Vec<(String, String, String)> {
-    let mut workspaces: Vec<(String, String, String)> = Vec::new();
+) -> Vec<(String, String, String, String)> {
+    let mut db_backed: Vec<(String, String, String, String)> = Vec::new();
     if let Some(db) = db
         && let Ok(rows) = db.workspaces()
     {
@@ -180,20 +273,68 @@ pub(crate) fn workspace_list(
             let slug = db
                 .slug_for_repo(&w.repo_path, &base)
                 .unwrap_or_else(|_| base.clone());
-            if !workspaces.iter().any(|(s, _, _)| *s == slug) {
-                workspaces.push((slug, display, w.kind.clone()));
+            if !db_backed.iter().any(|(s, _, _, _)| *s == slug) {
+                db_backed.push((slug, display, w.kind.clone(), w.repo_path.clone()));
             }
         }
     }
-    for tab in &session.tabs {
-        if let Some((repo, _)) = crate::sidebar::split_tab(&tab.name)
-            && !workspaces.iter().any(|(s, _, _)| *s == repo)
+    let mut live: Vec<(String, String, String, String)> = Vec::new();
+    for g in &session.worktrees {
+        if let Some((repo, _)) = crate::sidebar::split_tab(&g.name)
+            && !live.iter().any(|(s, _, _, _)| *s == repo)
         {
-            // Live tabs always belong to a git repo workspace.
-            workspaces.push((repo.clone(), repo, "repo".to_string()));
+            // Live worktrees always belong to a git repo workspace. The empty
+            // repo_path marks this as a live fallback (no DB row yet).
+            live.push((repo.clone(), repo, "repo".to_string(), String::new()));
         }
     }
-    workspaces
+    merge_workspace_lists(db_backed, live)
+}
+
+/// Merge DB-backed workspace entries (authoritative; order preserved) with
+/// live-session fallback entries, keyed by canonical slug. Entries with an
+/// empty `repo_path` in `db_backed` are live fallbacks from a previous merge —
+/// they are dropped and re-derived from `live`, so a stale fallback (e.g. left
+/// behind by a workspace switch) can never accumulate or duplicate.
+pub(crate) fn merge_workspace_lists(
+    db_backed: Vec<(String, String, String, String)>,
+    live: Vec<(String, String, String, String)>,
+) -> Vec<(String, String, String, String)> {
+    let mut out = db_backed;
+    out.retain(|(_, _, _, path)| !path.is_empty());
+    for entry in live {
+        if !out.iter().any(|(slug, _, _, _)| *slug == entry.0) {
+            out.push(entry);
+        }
+    }
+    out
+}
+
+/// Worktrees registered in the DB, ready for the sidebar's cross-workspace
+/// rows: one entry per registry row whose dir still exists (or is remote).
+pub(crate) fn db_worktree_list(db: &superzej_core::db::Db) -> Vec<crate::sidebar::DbWorktree> {
+    let mut out = Vec::new();
+    for w in db.worktrees().unwrap_or_default() {
+        // git is the source of truth: a local registry row whose dir vanished
+        // (deleted outside superzej) is dead — delete it here (we're on the
+        // hydration thread) instead of merely hiding it, so deceased
+        // worktrees stop resurfacing in the tree. Remote rows are exempt.
+        if w.location.is_empty() && !std::path::Path::new(&w.worktree).is_dir() {
+            let _ = db.del_worktree(&w.worktree);
+            continue;
+        }
+        let Some((slug, branch)) = crate::sidebar::split_tab(&w.tab_name) else {
+            continue;
+        };
+        out.push(crate::sidebar::DbWorktree {
+            slug,
+            branch,
+            repo_path: w.repo_root.clone(),
+            tab_name: w.tab_name.clone(),
+            path: w.worktree.clone(),
+        });
+    }
+    out
 }
 
 /// Gather per-worktree git/agent/activity status for every tab in the session.
@@ -212,12 +353,12 @@ fn collect_sidebar_status(
     // Advance the activity state machine over the session's managed worktrees,
     // then read the fresh states (keyed by tab name).
     let managed: Vec<superzej_core::activity::ManagedWorktree> = session
-        .tabs
+        .worktrees
         .iter()
-        .filter(|t| !t.worktree.is_empty())
-        .map(|t| superzej_core::activity::ManagedWorktree {
-            worktree: t.worktree.clone(),
-            tab: t.name.clone(),
+        .filter(|g| !g.path.is_empty())
+        .map(|g| superzej_core::activity::ManagedWorktree {
+            worktree: g.path.clone(),
+            tab: g.name.clone(),
         })
         .collect();
     superzej_core::activity::poll_and_save(&managed);
@@ -228,11 +369,11 @@ fn collect_sidebar_status(
 
     // git glyphs + agent per distinct worktree path.
     let mut seen = std::collections::HashSet::new();
-    for tab in &session.tabs {
-        if tab.worktree.is_empty() || !seen.insert(tab.worktree.clone()) {
+    for g in &session.worktrees {
+        if g.path.is_empty() || !seen.insert(g.path.clone()) {
             continue;
         }
-        let path = std::path::Path::new(&tab.worktree);
+        let path = std::path::Path::new(&g.path);
         if !path.is_dir() {
             continue;
         }
@@ -240,15 +381,15 @@ fn collect_sidebar_status(
         let dirty = git.is_dirty(&loc).unwrap_or(false);
         let (ahead, behind) = git.ahead_behind(&loc).ok().flatten().unwrap_or((0, 0));
         status.git.insert(
-            tab.worktree.clone(),
+            g.path.clone(),
             crate::sidebar::GitGlyphs {
                 dirty,
                 ahead,
                 behind,
             },
         );
-        if let Ok(Some(agent)) = db.worktree_agent(&tab.worktree) {
-            status.agent.insert(tab.worktree.clone(), agent);
+        if let Ok(Some(agent)) = db.worktree_agent(&g.path) {
+            status.agent.insert(g.path.clone(), agent);
         }
     }
     tracing::debug!(
@@ -260,18 +401,44 @@ fn collect_sidebar_status(
     status
 }
 
+/// tokei line count for `path`, cached in `loc_cache` (hydration thread —
+/// tokei walks the whole tree). Stale cache (>5 min) refreshes in place;
+/// missing tokei yields `None` and the widget hides.
+fn worktree_loc(db: &superzej_core::db::Db, path: &std::path::Path) -> Option<u64> {
+    const TTL_SECS: i64 = 300;
+    let key = path.to_string_lossy().into_owned();
+    if let Ok(Some((loc, fetched_at))) = db.get_loc_cache_entry(&key)
+        && now_secs() - fetched_at < TTL_SECS
+    {
+        return Some(loc as u64);
+    }
+    let out = std::process::Command::new("tokei")
+        .args(["--output", "json"])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let code = v.get("Total")?.get("code")?.as_u64()?;
+    let _ = db.put_loc_cache(&key, code as usize);
+    Some(code)
+}
+
 /// A cheap first-frame model: no git, no diff, no DB recents. It gives the
 /// user immediate chrome/status while the expensive model hydrates in the
 /// background.
 pub(crate) fn build_initial_model(session: &crate::session::Session) -> FrameModel {
     let active_name = session
-        .tabs
-        .get(session.active)
-        .map(|t| t.name.clone())
+        .active_group()
+        .map(|g| g.name.clone())
         .unwrap_or_else(|| "workspace/home".into());
+    let (worktree, tabs, active_tab) = tab_strip(session);
     FrameModel {
-        tabs: session.tabs.iter().map(|t| t.name.clone()).collect(),
-        active_tab: session.active,
+        worktree,
+        tabs,
+        active_tab,
         panel: crate::panel::PanelData {
             branch: active_name,
             ..Default::default()
@@ -305,7 +472,9 @@ pub(crate) fn build_model(
     let branch = git.current_branch(&loc).unwrap_or_else(|_| "—".into());
 
     let sidebar_workspaces = workspace_list(session, Some(db));
+    let sidebar_db_worktrees = db_worktree_list(db);
     let sidebar_status = collect_sidebar_status(session, db);
+    let loc_count = worktree_loc(db, &cwd);
 
     let mut panel = crate::panel::PanelData {
         branch: branch.clone(),
@@ -346,15 +515,20 @@ pub(crate) fn build_model(
         diff_files = panel.files.len(),
         "model hydrated"
     );
+    let (worktree, tabs, active_tab) = tab_strip(session);
     FrameModel {
-        tabs: session.tabs.iter().map(|t| t.name.clone()).collect(),
-        active_tab: session.active,
+        worktree,
+        tabs,
+        active_tab,
         sidebar_workspaces,
+        sidebar_db_worktrees,
         sidebar_status,
+        loc: loc_count,
+        containers: superzej_core::sandbox::running_containers(),
         panel,
         panel_focused: false,
         status: format!(
-            "Cmd-K menu   Alt-w worktree   Alt-o switch   Ctrl-Q quit  [build {}]",
+            "Ctrl-Space menu   Alt-w worktree   Alt-o switch   Ctrl-q quit  [build {}]",
             env!("SZHOST_BUILD_TIME")
         ),
         accent: superzej_core::theme::TEAL.to_string(),
@@ -362,14 +536,18 @@ pub(crate) fn build_model(
     }
 }
 
+/// `gen` tags the result so the event loop can drop models that were spawned
+/// before a workspace/worktree switch but land after it (spawn_blocking tasks
+/// complete out of order; a stale model would resurrect the old sidebar).
 pub(crate) fn spawn_model_hydration(
-    tx: tokio_mpsc::UnboundedSender<FrameModel>,
+    tx: tokio_mpsc::UnboundedSender<(u64, FrameModel)>,
+    generation: u64,
     session: crate::session::Session,
     waker: Option<TerminalWaker>,
 ) {
     task::spawn_blocking(move || {
         if let Ok(db) = superzej_core::db::Db::open()
-            && tx.send(build_model(&session, &db)).is_ok()
+            && tx.send((generation, build_model(&session, &db))).is_ok()
             && let Some(w) = &waker
         {
             let _ = w.wake();
@@ -469,19 +647,12 @@ pub(crate) fn retarget_diff_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::center::CenterTree;
-    use crate::session::{Session, Tab, TabKind};
+    use crate::session::{GroupKind, Session, WorktreeGroup};
 
     fn one_tab_session() -> Session {
         Session {
             id: "s1".into(),
-            tabs: vec![Tab {
-                name: "app/home".into(),
-                kind: TabKind::Home,
-                worktree: "/tmp/app".into(),
-                center: CenterTree::Leaf(0),
-                focused_pane: 0,
-            }],
+            worktrees: vec![WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/app")],
             active: 0,
         }
     }
@@ -490,12 +661,92 @@ mod tests {
     fn initial_model_is_cheap_and_marks_hydration_pending() {
         let session = one_tab_session();
         let model = build_initial_model(&session);
-        assert_eq!(model.tabs, vec!["app/home".to_string()]);
+        assert_eq!(model.worktree, "app/home");
+        assert_eq!(model.tabs, vec!["1".to_string()]);
         assert_eq!(model.active_tab, 0);
         // The cheap initial model carries no derived rows yet (the event loop
         // builds them once view state is loaded).
         assert!(model.sidebar_rows.is_empty());
         assert!(model.panel.branch == "app/home");
         assert!(model.status.contains("Starting szhost"));
+    }
+
+    /// Workspace tuple: (slug, display, kind, repo_path).
+    fn ws(slug: &str, path: &str) -> (String, String, String, String) {
+        (
+            slug.to_string(),
+            slug.to_uppercase(),
+            "repo".to_string(),
+            path.to_string(),
+        )
+    }
+
+    #[test]
+    fn merge_keeps_db_order_and_appends_unknown_live_at_end() {
+        let merged = merge_workspace_lists(
+            vec![ws("alpha", "/r/alpha"), ws("beta", "/r/beta")],
+            vec![ws("beta", ""), ws("gamma", "")],
+        );
+        let slugs: Vec<_> = merged.iter().map(|(s, _, _, _)| s.as_str()).collect();
+        assert_eq!(slugs, vec!["alpha", "beta", "gamma"]);
+        assert_eq!(merged[1].3, "/r/beta", "DB entry wins over live fallback");
+    }
+
+    #[test]
+    fn merge_drops_stale_live_fallback_entries() {
+        // "old" is a live fallback (empty path) from a workspace we already
+        // switched away from: it must not survive a refresh that no longer
+        // lists it as live.
+        let merged = merge_workspace_lists(
+            vec![ws("alpha", "/r/alpha"), ws("old", "")],
+            vec![ws("alpha", "")],
+        );
+        let slugs: Vec<_> = merged.iter().map(|(s, _, _, _)| s.as_str()).collect();
+        assert_eq!(slugs, vec!["alpha"]);
+    }
+
+    #[test]
+    fn merge_is_idempotent_and_never_duplicates_by_slug() {
+        let db_backed = vec![ws("alpha", "/r/alpha")];
+        let live = vec![ws("alpha", ""), ws("new", "")];
+        let once = merge_workspace_lists(db_backed, live.clone());
+        let twice = merge_workspace_lists(once.clone(), live);
+        assert_eq!(once, twice);
+        assert_eq!(twice.len(), 2);
+    }
+
+    #[test]
+    fn workspace_list_with_db_lists_current_workspace_once() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let p = std::env::temp_dir().join(format!(
+            "sj-hydrate-test-{}-{}/db.sqlite",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        let db = superzej_core::db::Db::open_at(&p).unwrap();
+
+        // A mixed-case repo registered in the DB, with its live home group
+        // named by the canonical slug (as the host now creates it).
+        db.put_workspace("/tmp/WASHU", "WASHU", "repo").unwrap();
+        let slug = superzej_core::repo::repo_slug_with(&db, std::path::Path::new("/tmp/WASHU"));
+        let session = Session {
+            id: "/tmp/WASHU".into(),
+            worktrees: vec![WorktreeGroup::new(
+                superzej_core::repo::home_tab(&slug),
+                GroupKind::Home,
+                "/tmp/WASHU",
+            )],
+            active: 0,
+        };
+
+        let list = workspace_list(&session, Some(&db));
+        assert_eq!(list.len(), 1, "live + DB entries collapse to one: {list:?}");
+        assert_eq!(list[0].0, "washu");
+        assert_eq!(
+            list[0].3, "/tmp/WASHU",
+            "the DB-backed entry (with path) wins"
+        );
     }
 }

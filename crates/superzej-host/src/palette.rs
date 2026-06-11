@@ -275,19 +275,20 @@ pub(crate) fn build_palette(
         ));
     }
 
-    // Add active session's tabs
-    for t in &session.tabs {
+    // Add the session's open worktrees (the palette jumps to a worktree; its
+    // remembered active tab is restored).
+    for g in &session.worktrees {
         items.push(PaletteItem::new(
-            format!("tab:{}", t.name),
-            format!("→ {}", t.name),
+            format!("tab:{}", g.name),
+            format!("→ {}", g.name),
         ));
     }
 
     // Add persisted worktrees from other workspaces so the palette can jump
-    // directly to a worktree tab and persist that target workspace's active tab.
+    // directly to a worktree and persist that target workspace's active tab.
     if let Ok(worktrees) = db.worktrees() {
         for wt in worktrees {
-            if session.tabs.iter().any(|t| t.name == wt.tab_name) {
+            if session.worktrees.iter().any(|g| g.name == wt.tab_name) {
                 continue;
             }
             let label = if wt.branch.trim().is_empty() {
@@ -320,6 +321,27 @@ pub(crate) fn build_palette(
     crate::palette::order_by_frecency(items, &usage)
 }
 
+/// Build the sandbox picker shown before the agent picker for a new worktree.
+pub(crate) fn build_sandbox_palette(
+    cfg: &superzej_core::config::Config,
+) -> Vec<crate::palette::PaletteItem> {
+    let def = cfg.sandbox.default_backend.as_str();
+    let mut rows = vec![
+        ("auto", "Auto (configured chain)"),
+        ("podman-rootless", "Rootless Podman"),
+        ("podman-rootful", "Rootful Podman"),
+        ("docker", "Docker"),
+        ("bwrap", "Bubblewrap"),
+        ("host", "Host / uncontained"),
+    ];
+    rows.sort_by_key(|(k, _)| if *k == def { 0 } else { 1 });
+    rows.into_iter()
+        .map(|(key, label)| {
+            let suffix = if key == def { "  default" } else { "" };
+            crate::palette::PaletteItem::new(format!("sandbox:{key}"), format!("▣ {label}{suffix}"))
+        })
+        .collect()
+}
 /// Build the agent-picker palette items for `cfg`: one row per agent/tool, plus
 /// a literal shell. The key is the bare choice name (the `PendingAgent` gate in
 /// the Enter handler routes it to a launch, not a command dispatch).

@@ -1,77 +1,131 @@
-//! The host's session model: the ordered tab list and which is active, plus the
-//! bridge to SQLite for resurrect/persist. The native host owns layout (zellij
-//! did before); this is what rebuilds the workspace on cold start.
+//! The host's session model: worktree groups (one per git worktree, shown in
+//! the sidebar) each owning an ordered set of tabs, plus the bridge to SQLite
+//! for resurrect/persist. Tabs live *within* a worktree — the tabbar shows the
+//! active group's tabs only; Alt+←/→ cycles tabs, Alt+↑/↓ moves between groups.
 //!
-//! Tab ↔ row conversion is pure (and unit-tested); the DB calls are a thin shell
-//! over `superzej_core::db`'s v4 `tab_layout`/`session_state`.
+//! Group/Tab ↔ row conversion is pure (and unit-tested); the DB calls are a
+//! thin shell over `superzej_core::db`'s v6 `tab_groups`/`group_tabs`.
 
 use anyhow::Result;
 use superzej_core::db::Db;
-use superzej_core::models::TabLayoutRow;
+use superzej_core::models::{GroupTabRow, TabGroupRow};
 
 use crate::center::CenterTree;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TabKind {
+pub enum GroupKind {
+    /// The repo's main checkout.
     Home,
-    Worktree,
-    Extra,
-    Pinned,
+    /// A branch worktree.
+    Branch,
 }
 
-impl TabKind {
+impl GroupKind {
     fn as_str(self) -> &'static str {
         match self {
-            TabKind::Home => "home",
-            TabKind::Worktree => "worktree",
-            TabKind::Extra => "extra",
-            TabKind::Pinned => "pinned",
+            GroupKind::Home => "home",
+            GroupKind::Branch => "branch",
         }
     }
-    fn parse(s: &str) -> TabKind {
+    fn parse(s: &str) -> GroupKind {
         match s {
-            "home" => TabKind::Home,
-            "extra" => TabKind::Extra,
-            "pinned" => TabKind::Pinned,
-            _ => TabKind::Worktree,
+            "home" => GroupKind::Home,
+            _ => GroupKind::Branch,
         }
     }
 }
 
+/// One tab inside a worktree group: a pane tree and which leaf has focus.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tab {
-    pub name: String,
-    pub kind: TabKind,
-    /// Owning worktree path (empty for home/pinned).
-    pub worktree: String,
+    /// Short chip title ("1", "2", … by default; renamable later).
+    pub title: String,
     pub center: CenterTree,
     pub focused_pane: u32,
 }
 
 impl Tab {
+    pub fn new(title: impl Into<String>) -> Tab {
+        Tab {
+            title: title.into(),
+            center: CenterTree::Leaf(0),
+            focused_pane: 0,
+        }
+    }
+
     /// Reconstruct a tab from its persisted row. A malformed `pane_tree` falls
     /// back to a single pane rather than failing the whole resurrect.
-    pub fn from_row(row: &TabLayoutRow) -> Tab {
+    pub fn from_row(row: &GroupTabRow) -> Tab {
         let center =
             serde_json::from_str::<CenterTree>(&row.pane_tree).unwrap_or(CenterTree::Leaf(0));
         Tab {
-            name: row.tab_name.clone(),
-            kind: TabKind::parse(&row.kind),
-            worktree: row.worktree.clone(),
+            title: if row.title.is_empty() {
+                (row.ordinal + 1).to_string()
+            } else {
+                row.title.clone()
+            },
             center,
             focused_pane: row.focused_pane.max(0) as u32,
         }
     }
 
-    /// Serialize this tab to a persistable row at the given display order.
-    pub fn to_row(&self, ordinal: i64) -> TabLayoutRow {
-        TabLayoutRow {
-            tab_name: self.name.clone(),
-            kind: self.kind.as_str().to_string(),
-            worktree: self.worktree.clone(),
-            pane_tree: serde_json::to_string(&self.center).unwrap_or_else(|_| "0".into()),
+    /// Serialize this tab to a persistable row at the given position.
+    pub fn to_row(&self, group: &str, ordinal: i64) -> GroupTabRow {
+        GroupTabRow {
+            group_name: group.to_string(),
             ordinal,
+            title: self.title.clone(),
+            pane_tree: serde_json::to_string(&self.center).unwrap_or_else(|_| "0".into()),
             focused_pane: self.focused_pane as i64,
+        }
+    }
+}
+
+/// One worktree in the session: what the sidebar lists and what the tabbar
+/// scopes to. Owns its tabs; always has at least one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorktreeGroup {
+    /// Display name, e.g. "app/feat" — unique within the session.
+    pub name: String,
+    pub kind: GroupKind,
+    /// Worktree dir on disk.
+    pub path: String,
+    pub tabs: Vec<Tab>,
+    pub active_tab: usize,
+}
+
+impl WorktreeGroup {
+    pub fn new(name: impl Into<String>, kind: GroupKind, path: impl Into<String>) -> Self {
+        WorktreeGroup {
+            name: name.into(),
+            kind,
+            path: path.into(),
+            tabs: vec![Tab::new("1")],
+            active_tab: 0,
+        }
+    }
+
+    pub fn active_tab(&self) -> Option<&Tab> {
+        self.tabs.get(self.active_tab)
+    }
+
+    pub fn active_tab_mut(&mut self) -> Option<&mut Tab> {
+        self.tabs.get_mut(self.active_tab)
+    }
+
+    /// Append a tab titled with the next free ordinal and focus it.
+    pub fn add_tab(&mut self) -> usize {
+        self.tabs.push(Tab::new((self.tabs.len() + 1).to_string()));
+        self.active_tab = self.tabs.len() - 1;
+        self.active_tab
+    }
+
+    /// Re-title ordinal-style tabs after a removal so chips read "1 2 3".
+    fn renumber(&mut self) {
+        for (i, t) in self.tabs.iter_mut().enumerate() {
+            if t.title.chars().all(|c| c.is_ascii_digit()) {
+                t.title = (i + 1).to_string();
+            }
         }
     }
 }
@@ -79,101 +133,199 @@ impl Tab {
 #[derive(Debug, Clone, Default)]
 pub struct Session {
     pub id: String,
-    pub tabs: Vec<Tab>,
+    pub worktrees: Vec<WorktreeGroup>,
+    /// Index of the active worktree group.
     pub active: usize,
 }
 
 impl Session {
-    /// Rebuild the session from the DB (cold-start resurrect). Tabs come back in
-    /// persisted order; the active tab is restored from `session_state`.
+    /// Rebuild the session from the DB (cold-start resurrect). Groups come back
+    /// in persisted order; the active group is restored from `session_state`.
     pub fn resurrect(db: &Db, session: &str) -> Result<Session> {
-        let mut tabs: Vec<Tab> = db
-            .tabs_for_session(session)?
+        let tab_rows = db.group_tabs_for_session(session)?;
+        let mut worktrees: Vec<WorktreeGroup> = db
+            .groups_for_session(session)?
             .iter()
-            .map(Tab::from_row)
+            .map(|g| {
+                let mut tabs: Vec<Tab> = tab_rows
+                    .iter()
+                    .filter(|t| t.group_name == g.name)
+                    .map(Tab::from_row)
+                    .collect();
+                if tabs.is_empty() {
+                    tabs.push(Tab::new("1"));
+                }
+                let active_tab = (g.active_tab.max(0) as usize).min(tabs.len() - 1);
+                WorktreeGroup {
+                    name: g.name.clone(),
+                    kind: GroupKind::parse(&g.kind),
+                    path: g.worktree.clone(),
+                    tabs,
+                    active_tab,
+                }
+            })
             .collect();
 
-        // Also fetch any worktrees recorded for this session that aren't in tab_layout yet.
-        // This handles migrating/restoring state from older sessions where tab_layout wasn't used.
+        // Canonical workspace slug (DB-assigned, `{slug}/…` tab prefix) — only
+        // path-keyed sessions have one. For non-path session names fall back
+        // to the name itself for registry matching (legacy behavior).
+        let session_path = std::path::Path::new(session);
+        let canonical = session_path
+            .is_absolute()
+            .then(|| superzej_core::repo::repo_slug_with(db, session_path));
+        let slug = canonical.clone().unwrap_or_else(|| session.to_string());
+
+        // Also adopt worktrees recorded for this session that aren't in
+        // tab_groups yet (state from sessions that predate layout persistence).
         if let Ok(wts) = db.worktrees() {
-            let session_path = std::path::Path::new(session);
-            let slug = if session_path.is_absolute() {
-                superzej_core::repo::repo_slug(session_path)
-            } else {
-                session.to_string()
-            };
             for wt in wts {
-                if wt.session_name == session && !tabs.iter().any(|t| t.name == wt.tab_name) {
-                    tabs.push(Tab {
-                        name: wt.tab_name.clone(),
-                        kind: TabKind::Worktree,
-                        worktree: wt.worktree.clone(),
-                        center: CenterTree::Leaf(0),
-                        focused_pane: 0,
-                    });
-                } else if wt.session_name.is_empty()
-                    && wt.repo_root == session
-                    && wt.tab_name.starts_with(&slug)
-                    && !tabs.iter().any(|t| t.name == wt.tab_name)
+                // git is the source of truth: a local registry row whose dir
+                // vanished (worktree deleted outside superzej) is stale —
+                // never resurrect it. Remote rows (location set) are kept.
+                if wt.location.is_empty() && !std::path::Path::new(&wt.worktree).is_dir() {
+                    continue;
+                }
+                let known = |ws: &[WorktreeGroup]| ws.iter().any(|g| g.name == wt.tab_name);
+                // Adopt rows registered to this session, plus any row whose
+                // repo_root is this workspace and whose tab carries our slug
+                // prefix — regardless of the (possibly legacy) session_name,
+                // so worktrees never silently vanish from the tree at start.
+                let adopt = (wt.session_name == session && !known(&worktrees))
+                    || (wt.repo_root == session
+                        && wt.tab_name.starts_with(&format!("{slug}/"))
+                        && !known(&worktrees));
+                if adopt {
+                    worktrees.push(WorktreeGroup::new(
+                        wt.tab_name.clone(),
+                        GroupKind::Branch,
+                        wt.worktree.clone(),
+                    ));
+                }
+            }
+        }
+
+        // Home groups persisted by older binaries carry the raw dir basename
+        // (`WASHU/home`) instead of the canonical slug (`washu/home`) — rename
+        // them so the `{slug}/…` prefix invariant holds. Idempotent; the next
+        // layout persist makes it stick. Skip a rename that would collide with
+        // an existing group (mixed-version leftovers keep their legacy name).
+        if let Some(slug) = &canonical {
+            let names: std::collections::HashSet<String> =
+                worktrees.iter().map(|g| g.name.clone()).collect();
+            for g in &mut worktrees {
+                if g.kind == GroupKind::Home
+                    && let Some((prefix, branch)) = crate::sidebar::split_tab(&g.name)
+                    && prefix != *slug
                 {
-                    // Pre-v3 or missing session_name fallback
-                    tabs.push(Tab {
-                        name: wt.tab_name.clone(),
-                        kind: TabKind::Worktree,
-                        worktree: wt.worktree.clone(),
-                        center: CenterTree::Leaf(0),
-                        focused_pane: 0,
-                    });
+                    let target = format!("{slug}/{branch}");
+                    if !names.contains(&target) {
+                        g.name = target;
+                    }
                 }
             }
         }
 
         let active = db
             .active_tab(session)?
-            .and_then(|name| tabs.iter().position(|t| t.name == name))
+            .and_then(|name| {
+                worktrees.iter().position(|g| g.name == name).or_else(|| {
+                    // The persisted active-tab name may predate the rename.
+                    let slug = canonical.as_ref()?;
+                    crate::sidebar::split_tab(&name).and_then(|(_, branch)| {
+                        let renamed = format!("{slug}/{branch}");
+                        worktrees
+                            .iter()
+                            .position(|g| g.name == renamed && g.kind == GroupKind::Home)
+                    })
+                })
+            })
             .unwrap_or(0);
         Ok(Session {
             id: session.to_string(),
-            tabs,
+            worktrees,
             active,
         })
     }
 
-    /// Persist the full tab set + active tab (debounced by the caller on layout
-    /// changes — not per keystroke).
+    /// Persist the full layout snapshot + active group (debounced by the caller
+    /// on layout changes — not per keystroke). Clear-then-insert in one
+    /// transaction so closed/renamed groups can't linger.
     pub fn persist(&self, db: &Db, session: &str, now: i64) -> Result<()> {
-        // One transaction for the whole snapshot: a crash mid-loop can't leave
-        // a torn tab list, and N upserts pay one fsync instead of N.
         db.transaction(|db| {
-            for (i, tab) in self.tabs.iter().enumerate() {
-                db.put_tab_layout(session, &tab.to_row(i as i64))?;
+            db.clear_session_layout(session)?;
+            for (gi, g) in self.worktrees.iter().enumerate() {
+                db.put_tab_group(
+                    session,
+                    &TabGroupRow {
+                        name: g.name.clone(),
+                        kind: g.kind.as_str().to_string(),
+                        worktree: g.path.clone(),
+                        ordinal: gi as i64,
+                        active_tab: g.active_tab as i64,
+                    },
+                )?;
+                for (ti, tab) in g.tabs.iter().enumerate() {
+                    db.put_group_tab(session, &tab.to_row(&g.name, ti as i64))?;
+                }
             }
-            if let Some(active) = self.tabs.get(self.active) {
+            if let Some(active) = self.worktrees.get(self.active) {
                 db.set_active_tab(session, &active.name, now)?;
             }
             Ok(())
         })
     }
 
-    /// The active tab, if any. (Convenience used by tests; the loop indexes
-    /// `tabs[active]` directly for mutable access.)
-    #[allow(dead_code)]
-    pub fn active_tab(&self) -> Option<&Tab> {
-        self.tabs.get(self.active)
+    pub fn active_group(&self) -> Option<&WorktreeGroup> {
+        self.worktrees.get(self.active)
     }
 
-    /// Append a tab and focus it; returns its index.
-    pub fn add_tab(&mut self, tab: Tab) -> usize {
-        self.tabs.push(tab);
-        self.active = self.tabs.len() - 1;
+    pub fn active_group_mut(&mut self) -> Option<&mut WorktreeGroup> {
+        self.worktrees.get_mut(self.active)
+    }
+
+    /// The active tab of the active group, if any.
+    pub fn active_tab(&self) -> Option<&Tab> {
+        self.active_group().and_then(|g| g.active_tab())
+    }
+
+    pub fn active_tab_mut(&mut self) -> Option<&mut Tab> {
+        self.active_group_mut().and_then(|g| g.active_tab_mut())
+    }
+
+    /// Every tab in the session with its (group, tab) coordinates.
+    pub fn iter_tabs(&self) -> impl Iterator<Item = (usize, usize, &Tab)> {
+        self.worktrees
+            .iter()
+            .enumerate()
+            .flat_map(|(gi, g)| g.tabs.iter().enumerate().map(move |(ti, t)| (gi, ti, t)))
+    }
+
+    /// Mutable access to a tab by coordinates.
+    pub fn tab_mut(&mut self, gi: usize, ti: usize) -> Option<&mut Tab> {
+        self.worktrees.get_mut(gi).and_then(|g| g.tabs.get_mut(ti))
+    }
+
+    /// Append a worktree group and focus it (its first tab); returns its index.
+    pub fn add_group(&mut self, group: WorktreeGroup) -> usize {
+        self.worktrees.push(group);
+        self.active = self.worktrees.len() - 1;
         self.active
     }
 
-    /// Focus the tab at `idx` (clamped); no-op if empty. (Wired to the palette's
-    /// tab-nav dispatch.)
+    /// Focus the group at `idx` (clamped); no-op if empty.
     pub fn switch_to(&mut self, idx: usize) {
-        if !self.tabs.is_empty() {
-            self.active = idx.min(self.tabs.len() - 1);
+        if !self.worktrees.is_empty() {
+            self.active = idx.min(self.worktrees.len() - 1);
+        }
+    }
+
+    /// Focus a (group, tab) pair, clamped.
+    pub fn switch_to_tab(&mut self, gi: usize, ti: usize) {
+        self.switch_to(gi);
+        if let Some(g) = self.active_group_mut()
+            && !g.tabs.is_empty()
+        {
+            g.active_tab = ti.min(g.tabs.len() - 1);
         }
     }
 
@@ -186,21 +338,24 @@ impl Session {
         self.persist(db, &self.id, now)?;
 
         let new_session = Session::resurrect(db, repo_path)?;
-        let mut tabs = new_session.tabs;
+        let mut worktrees = new_session.worktrees;
         let active = new_session.active;
 
-        if tabs.is_empty() {
+        if worktrees.is_empty() {
             let base = std::path::Path::new(repo_path)
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "workspace".into());
-            tabs.push(Tab {
-                name: format!("{base}/home"),
-                kind: TabKind::Home,
-                worktree: repo_path.to_string(),
-                center: CenterTree::Leaf(0),
-                focused_pane: 0,
-            });
+            // The `{slug}/…` prefix is the canonical workspace key everywhere
+            // (sidebar grouping, ui_state, worktree registry); naming the home
+            // group by the raw basename here would desync it from the DB slug
+            // and duplicate the workspace in the sidebar tree.
+            let slug = superzej_core::repo::repo_slug_with(db, std::path::Path::new(repo_path));
+            worktrees.push(WorktreeGroup::new(
+                superzej_core::repo::home_tab(&slug),
+                GroupKind::Home,
+                repo_path,
+            ));
             // A path that resolves to a git main-worktree is a "repo"
             // workspace; anything else is a plain "dir" workspace.
             let kind =
@@ -214,38 +369,86 @@ impl Session {
         }
 
         self.id = repo_path.to_string();
-        self.tabs = tabs;
+        self.worktrees = worktrees;
         self.active = active;
         self.persist(db, &self.id, now)?;
 
         Ok(())
     }
 
-    /// Cycle focus to the next tab (wraps).
+    /// Cycle to the next tab within the active group (wraps).
     pub fn next_tab(&mut self) {
-        if !self.tabs.is_empty() {
-            self.active = (self.active + 1) % self.tabs.len();
+        if let Some(g) = self.active_group_mut()
+            && !g.tabs.is_empty()
+        {
+            g.active_tab = (g.active_tab + 1) % g.tabs.len();
         }
     }
 
-    /// Cycle focus to the previous tab (wraps).
+    /// Cycle to the previous tab within the active group (wraps).
     pub fn prev_tab(&mut self) {
-        if !self.tabs.is_empty() {
-            self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
+        if let Some(g) = self.active_group_mut()
+            && !g.tabs.is_empty()
+        {
+            g.active_tab = (g.active_tab + g.tabs.len() - 1) % g.tabs.len();
         }
     }
 
-    /// Close the active tab; focus the previous one. Returns the removed tab.
-    pub fn close_active(&mut self) -> Option<Tab> {
-        if self.tabs.is_empty() {
+    /// Move to the next worktree group (wraps); it restores its own active tab.
+    pub fn next_worktree(&mut self) {
+        if !self.worktrees.is_empty() {
+            self.active = (self.active + 1) % self.worktrees.len();
+        }
+    }
+
+    /// Move to the previous worktree group (wraps).
+    pub fn prev_worktree(&mut self) {
+        if !self.worktrees.is_empty() {
+            self.active = (self.active + self.worktrees.len() - 1) % self.worktrees.len();
+        }
+    }
+
+    /// Close the active tab. When it was the group's last tab, the whole group
+    /// leaves the session (the worktree on disk is untouched) and the removed
+    /// group is returned so the caller can clean up panes/DB.
+    pub fn close_active_tab(&mut self) -> CloseResult {
+        let Some(g) = self.active_group_mut() else {
+            return CloseResult::Nothing;
+        };
+        if g.tabs.len() > 1 {
+            let removed = g.tabs.remove(g.active_tab);
+            if g.active_tab >= g.tabs.len() {
+                g.active_tab = g.tabs.len() - 1;
+            }
+            g.renumber();
+            return CloseResult::Tab(removed);
+        }
+        self.close_active_group()
+            .map(CloseResult::Group)
+            .unwrap_or(CloseResult::Nothing)
+    }
+
+    /// Remove the active group entirely; focus the previous one.
+    pub fn close_active_group(&mut self) -> Option<WorktreeGroup> {
+        if self.worktrees.is_empty() {
             return None;
         }
-        let removed = self.tabs.remove(self.active);
-        if self.active >= self.tabs.len() {
-            self.active = self.tabs.len().saturating_sub(1);
+        let removed = self.worktrees.remove(self.active);
+        if self.active >= self.worktrees.len() {
+            self.active = self.worktrees.len().saturating_sub(1);
         }
         Some(removed)
     }
+}
+
+/// What `close_active_tab` removed.
+#[derive(Debug, PartialEq)]
+pub enum CloseResult {
+    /// A tab closed; the group lives on.
+    Tab(Tab),
+    /// The group's last tab closed, removing the whole group.
+    Group(WorktreeGroup),
+    Nothing,
 }
 
 #[cfg(test)]
@@ -267,11 +470,9 @@ mod tests {
     }
 
     #[test]
-    fn tab_row_roundtrip_preserves_tree_and_kind() {
+    fn tab_row_roundtrip_preserves_tree() {
         let tab = Tab {
-            name: "app/feat".into(),
-            kind: TabKind::Worktree,
-            worktree: "/wt/feat".into(),
+            title: "2".into(),
             center: CenterTree::Split {
                 dir: Dir::Row,
                 children: vec![
@@ -287,85 +488,190 @@ mod tests {
             },
             focused_pane: 1,
         };
-        let back = Tab::from_row(&tab.to_row(3));
+        let back = Tab::from_row(&tab.to_row("app/feat", 1));
         assert_eq!(tab, back);
     }
 
     #[test]
     fn malformed_pane_tree_degrades_to_single_pane() {
-        let row = TabLayoutRow {
-            tab_name: "x/home".into(),
-            kind: "home".into(),
-            worktree: String::new(),
-            pane_tree: "this is not json".into(),
+        let row = GroupTabRow {
+            group_name: "x/home".into(),
             ordinal: 0,
+            title: String::new(),
+            pane_tree: "this is not json".into(),
             focused_pane: 0,
         };
         let tab = Tab::from_row(&row);
         assert_eq!(tab.center, CenterTree::Leaf(0));
-        assert_eq!(tab.kind, TabKind::Home);
+        assert_eq!(tab.title, "1", "empty title falls back to ordinal+1");
     }
 
-    fn tab(name: &str) -> Tab {
-        Tab {
-            name: name.into(),
-            kind: TabKind::Worktree,
-            worktree: format!("/wt/{name}"),
-            center: CenterTree::Leaf(0),
-            focused_pane: 0,
-        }
+    fn group(name: &str) -> WorktreeGroup {
+        WorktreeGroup::new(name, GroupKind::Branch, format!("/wt/{name}"))
     }
 
     #[test]
-    fn tab_ops_add_switch_cycle_and_close() {
+    fn group_and_tab_cycling() {
         let mut s = Session::default();
-        s.add_tab(tab("a"));
-        s.add_tab(tab("b"));
-        s.add_tab(tab("c"));
-        assert_eq!(s.active_tab().unwrap().name, "c"); // add focuses
+        s.add_group(group("a"));
+        s.add_group(group("b"));
+        assert_eq!(s.active_group().unwrap().name, "b"); // add focuses
 
-        s.next_tab(); // wraps c -> a
-        assert_eq!(s.active_tab().unwrap().name, "a");
-        s.prev_tab(); // wraps a -> c
-        assert_eq!(s.active_tab().unwrap().name, "c");
-        s.switch_to(1);
-        assert_eq!(s.active_tab().unwrap().name, "b");
+        // Tabs cycle within the group only.
+        s.active_group_mut().unwrap().add_tab();
+        s.active_group_mut().unwrap().add_tab();
+        assert_eq!(s.active_group().unwrap().tabs.len(), 3);
+        assert_eq!(s.active_group().unwrap().active_tab, 2);
+        s.next_tab(); // wraps 2 -> 0
+        assert_eq!(s.active_group().unwrap().active_tab, 0);
+        s.prev_tab(); // wraps 0 -> 2
+        assert_eq!(s.active_group().unwrap().active_tab, 2);
+        assert_eq!(s.active, 1, "tab cycling never leaves the group");
 
-        let removed = s.close_active().unwrap();
-        assert_eq!(removed.name, "b");
-        assert_eq!(s.tabs.len(), 2);
-        // Focus stays valid (now at index 1 -> "c").
-        assert_eq!(s.active_tab().unwrap().name, "c");
+        // Worktree cycling restores each group's own active tab.
+        s.next_worktree(); // b -> a (wraps)
+        assert_eq!(s.active_group().unwrap().name, "a");
+        assert_eq!(s.active_group().unwrap().active_tab, 0);
+        s.prev_worktree();
+        assert_eq!(s.active_group().unwrap().name, "b");
+        assert_eq!(s.active_group().unwrap().active_tab, 2);
+    }
 
-        s.close_active();
-        s.close_active();
-        assert!(s.active_tab().is_none(), "empty session has no active tab");
-        assert_eq!(s.close_active(), None);
+    #[test]
+    fn close_tab_then_group_semantics() {
+        let mut s = Session::default();
+        s.add_group(group("a"));
+        s.add_group(group("b"));
+        s.active_group_mut().unwrap().add_tab();
+
+        // Closing a non-last tab keeps the group and renumbers chips.
+        assert!(matches!(s.close_active_tab(), CloseResult::Tab(_)));
+        let g = s.active_group().unwrap();
+        assert_eq!(g.tabs.len(), 1);
+        assert_eq!(g.tabs[0].title, "1");
+
+        // Closing the last tab removes the whole group.
+        match s.close_active_tab() {
+            CloseResult::Group(g) => assert_eq!(g.name, "b"),
+            other => panic!("expected group close, got {other:?}"),
+        }
+        assert_eq!(s.worktrees.len(), 1);
+        assert_eq!(s.active_group().unwrap().name, "a");
+
+        match s.close_active_tab() {
+            CloseResult::Group(g) => assert_eq!(g.name, "a"),
+            other => panic!("expected group close, got {other:?}"),
+        }
+        assert_eq!(s.close_active_tab(), CloseResult::Nothing);
+        assert!(s.active_group().is_none());
+    }
+
+    #[test]
+    fn switch_to_tab_clamps() {
+        let mut s = Session::default();
+        s.add_group(group("a"));
+        s.switch_to_tab(9, 9);
+        assert_eq!(s.active, 0);
+        assert_eq!(s.active_group().unwrap().active_tab, 0);
     }
 
     #[test]
     fn persist_then_resurrect_reproduces_the_session() {
         let db = temp_db();
         let sess = "s";
-        let make = |name: &str, kind: TabKind, pane: u32| Tab {
-            name: name.into(),
-            kind,
-            worktree: format!("/wt/{name}"),
-            center: CenterTree::Leaf(pane),
-            focused_pane: pane,
-        };
+        let mut home = WorktreeGroup::new("app/home", GroupKind::Home, "/r");
+        home.tabs[0].center = CenterTree::Leaf(0);
+        let mut feat = WorktreeGroup::new("app/feat", GroupKind::Branch, "/wt/feat");
+        feat.add_tab();
+        feat.tabs[1].center = CenterTree::Leaf(2);
+        feat.tabs[1].focused_pane = 2;
         let session = Session {
             id: sess.to_string(),
-            tabs: vec![
-                make("app/home", TabKind::Home, 0),
-                make("app/feat", TabKind::Worktree, 2),
-            ],
+            worktrees: vec![home, feat],
             active: 1,
         };
         session.persist(&db, sess, 1234).unwrap();
 
         let back = Session::resurrect(&db, sess).unwrap();
-        assert_eq!(back.tabs, session.tabs);
-        assert_eq!(back.active, 1, "active tab restored from session_state");
+        assert_eq!(back.worktrees, session.worktrees);
+        assert_eq!(back.active, 1, "active group restored from session_state");
+        assert_eq!(back.active_group().unwrap().active_tab, 1);
+
+        // Persist again after closing a group: the snapshot replaces (no stale
+        // rows from the clear-then-insert).
+        let mut s2 = back;
+        s2.close_active_group();
+        s2.persist(&db, sess, 1235).unwrap();
+        let back2 = Session::resurrect(&db, sess).unwrap();
+        assert_eq!(back2.worktrees.len(), 1);
+        assert_eq!(back2.worktrees[0].name, "app/home");
+    }
+
+    #[test]
+    fn switch_to_workspace_names_home_group_with_canonical_slug() {
+        let db = temp_db();
+        let mut s = Session {
+            id: "/r/old".into(),
+            ..Default::default()
+        };
+        s.switch_to_workspace("/r/WASHU", &db).unwrap();
+        assert_eq!(
+            s.worktrees[0].name, "washu/home",
+            "home group is keyed by the DB slug, not the raw basename"
+        );
+        assert_eq!(s.worktrees[0].kind, GroupKind::Home);
+
+        // A different path with the same basename gets the -2 suffixed slug.
+        let mut s2 = Session {
+            id: "/r/old".into(),
+            ..Default::default()
+        };
+        s2.switch_to_workspace("/elsewhere/WASHU", &db).unwrap();
+        assert_eq!(s2.worktrees[0].name, "washu-2/home");
+    }
+
+    #[test]
+    fn resurrect_normalizes_legacy_home_prefix_and_preserves_active() {
+        let db = temp_db();
+        let repo = "/r/WASHU";
+        // Legacy layout: raw-basename home group + canonical branch group,
+        // with the active tab persisted under the legacy name.
+        let legacy = Session {
+            id: repo.into(),
+            worktrees: vec![
+                WorktreeGroup::new("washu/feat", GroupKind::Branch, "/wt/feat"),
+                WorktreeGroup::new("WASHU/home", GroupKind::Home, repo),
+            ],
+            active: 1,
+        };
+        legacy.persist(&db, repo, 1).unwrap();
+
+        let s = Session::resurrect(&db, repo).unwrap();
+        let names: Vec<_> = s.worktrees.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, vec!["washu/feat", "washu/home"]);
+        assert_eq!(s.active, 1, "active group survives the rename");
+    }
+
+    #[test]
+    fn resurrect_skips_home_rename_that_would_collide() {
+        let db = temp_db();
+        let repo = "/r/WASHU";
+        let legacy = Session {
+            id: repo.into(),
+            worktrees: vec![
+                WorktreeGroup::new("washu/home", GroupKind::Home, repo),
+                WorktreeGroup::new("WASHU/home", GroupKind::Home, "/r/other-checkout"),
+            ],
+            active: 0,
+        };
+        legacy.persist(&db, repo, 1).unwrap();
+
+        let s = Session::resurrect(&db, repo).unwrap();
+        let names: Vec<_> = s.worktrees.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["washu/home", "WASHU/home"],
+            "a rename that would duplicate an existing group name is skipped"
+        );
     }
 }

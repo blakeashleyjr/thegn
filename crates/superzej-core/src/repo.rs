@@ -76,6 +76,18 @@ pub fn repo_slug(root: &Path) -> String {
         .unwrap_or(base)
 }
 
+/// Canonical slug for a repo via an existing DB handle — same contract as
+/// [`repo_slug`] but without opening a second connection or spawning git
+/// (the name is path-derived, so `root` must already be a repo root).
+pub fn repo_slug_with(db: &crate::db::Db, root: &Path) -> String {
+    let base = {
+        let s = util::slugify(&repo_name_from_path(root));
+        if s.is_empty() { "repo".to_string() } else { s }
+    };
+    db.slug_for_repo(&root.to_string_lossy(), &base)
+        .unwrap_or(base)
+}
+
 /// Tab name for a repo's main checkout (its "home" tab).
 pub fn home_tab(slug: &str) -> String {
     format!("{slug}/home")

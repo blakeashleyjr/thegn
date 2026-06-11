@@ -91,6 +91,34 @@ check "list runs without error" \
 check "recent runs without error" \
   "'$SZ' recent >/dev/null 2>&1"
 
+# v5 → v6 layout migration: seed a legacy flat tab_layout (pages as " ·N" name
+# suffixes) into the state DB, open it once, and assert it transformed into
+# worktree groups (tabs-within-a-worktree) with the legacy table dropped.
+if command -v sqlite3 >/dev/null 2>&1; then
+  DB="$XDG_STATE_HOME/superzej/superzej.db"
+  mkdir -p "$(dirname "$DB")"
+  sqlite3 "$DB" <<'SQL'
+PRAGMA user_version = 5;
+CREATE TABLE IF NOT EXISTS tab_layout (
+  session_name TEXT, tab_name TEXT, kind TEXT, worktree TEXT,
+  pane_tree TEXT, ordinal INTEGER, focused_pane INTEGER,
+  PRIMARY KEY (session_name, tab_name));
+INSERT INTO tab_layout VALUES
+  ('/r', 'app/home',    'home',     '/r',       '{"leaf":0}', 0, 0),
+  ('/r', 'app/feat',    'worktree', '/wt/feat', '{"leaf":1}', 1, 0),
+  ('/r', 'app/feat ·2', 'worktree', '/wt/feat', '{"leaf":2}', 2, 0);
+SQL
+  "$SZ" list >/dev/null 2>&1 || true
+  groups="$(sqlite3 "$DB" "SELECT count(*) FROM tab_groups WHERE session_name='/r'")"
+  feat_tabs="$(sqlite3 "$DB" "SELECT count(*) FROM group_tabs WHERE session_name='/r' AND group_name='app/feat'")"
+  legacy="$(sqlite3 "$DB" "SELECT count(*) FROM sqlite_master WHERE name='tab_layout'")"
+  check "v5 tab_layout migrates into worktree groups (v6)" "[[ '$groups' -eq 2 ]]"
+  check "page suffixes become tabs within the worktree" "[[ '$feat_tabs' -eq 2 ]]"
+  check "legacy tab_layout is dropped after migration" "[[ '$legacy' -eq 0 ]]"
+else
+  echo "  skip v5→v6 migration check (sqlite3 not on PATH)"
+fi
+
 echo
 if [[ $fail -eq 0 ]]; then
   printf '\033[32mall smoke checks passed\033[0m\n'
