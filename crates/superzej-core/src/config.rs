@@ -233,6 +233,46 @@ pub enum PinRestart {
     OnFailure,
 }
 
+/// A general task kind. Tests are the first first-class consumer; other kinds
+/// feed Problems, Timeline, and Search Everywhere without inventing a second
+/// command model.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskKind {
+    #[default]
+    Custom,
+    Test,
+    Build,
+    Lint,
+    Run,
+}
+
+/// A `[[tasks]]` entry — a named command that can be run from the host and whose
+/// output can be parsed by feature-specific consumers (Tests, Problems, Timeline).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct Task {
+    pub name: String,
+    pub command: String,
+    /// Extra argv fragments appended to `command` by the host runner.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Working directory, relative to the worktree when not absolute.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Environment overrides for the task process.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Kind-specific routing; `test` tasks feed the Tests panel.
+    #[serde(default)]
+    pub kind: TaskKind,
+    /// Optional output/discovery matcher (`cargo-test`, `pytest`, `go-test`, ...).
+    #[serde(default)]
+    pub matcher: Option<String>,
+    /// Scope label (`worktree`, `workspace`, or custom); currently informational.
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -799,6 +839,7 @@ pub struct Config {
     pub agents: Vec<NamedCommand>,
     pub tools: Vec<NamedCommand>,
     pub pins: Vec<Pin>,
+    pub tasks: Vec<Task>,
     pub actions: Vec<CustomAction>,
     pub plugins: Vec<crate::plugin_api::PluginManifest>,
     // --- sub-tables ---
@@ -839,6 +880,7 @@ impl Default for Config {
             agents: Vec::new(),
             tools: Vec::new(),
             pins: Vec::new(),
+            tasks: Vec::new(),
             plugins: Vec::new(),
             theme: ThemeConfig::default(),
             monitor: MonitorConfig::default(),
@@ -1209,6 +1251,13 @@ impl Config {
             .iter()
             .find(|t| t.name == name)
             .map(|t| t.command.as_str())
+    }
+
+    pub fn test_tasks(&self) -> Vec<&Task> {
+        self.tasks
+            .iter()
+            .filter(|t| t.kind == TaskKind::Test)
+            .collect()
     }
 
     /// The pin with the given name.
@@ -2110,6 +2159,31 @@ format = \"bad\"
         });
         assert_eq!(cfg.tool_command("test"), Some("echo test"));
         assert_eq!(cfg.tool_command("missing"), None);
+    }
+
+    #[test]
+    fn tasks_parse_and_filter_tests() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[tasks]]
+            name = "unit"
+            command = "cargo"
+            args = ["test"]
+            kind = "test"
+            matcher = "cargo-test"
+
+            [[tasks]]
+            name = "serve"
+            command = "npm run dev"
+            kind = "run"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.tasks.len(), 2);
+        let tests = cfg.test_tasks();
+        assert_eq!(tests.len(), 1);
+        assert_eq!(tests[0].name, "unit");
+        assert_eq!(tests[0].matcher.as_deref(), Some("cargo-test"));
     }
 
     #[test]

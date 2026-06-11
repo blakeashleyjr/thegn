@@ -285,6 +285,7 @@ pub fn draw_panel(
         PanelTab::Diff => draw_diff_tab(surface, body, model, ui, accent),
         PanelTab::Pr => draw_pr_tab(surface, body, model, accent),
         PanelTab::Checks => draw_checks_tab(surface, body, model),
+        PanelTab::Tests => draw_tests_tab(surface, body, ui, accent),
     }
 
     // Last row: help bar.
@@ -330,6 +331,7 @@ fn draw_panel_tabbar(
         (PanelTab::Diff, "DIFF"),
         (PanelTab::Pr, "PR"),
         (PanelTab::Checks, "CHECKS"),
+        (PanelTab::Tests, "TESTS"),
     ] {
         let seg = format!(" {label} ");
         let fg = if tab == active {
@@ -578,14 +580,136 @@ fn draw_checks_tab(surface: &mut Surface, rect: Rect, model: &FrameModel) {
     }
 }
 
+fn draw_tests_tab(
+    surface: &mut Surface,
+    rect: Rect,
+    ui: &crate::panel::PanelUi,
+    accent: ColorAttribute,
+) {
+    use crate::panel::{TestNodeKind, TestState};
+    let tests = &ui.tests;
+    let header = if let Some(task) = &tests.task {
+        let mut label = format!("{} — {}", task.name, tests.summary.label());
+        if tests.discovering {
+            label.push_str(" · discovering…");
+        }
+        if tests.stale || tests.summary.stale {
+            label.push_str(" · stale");
+        }
+        label
+    } else {
+        "no test task detected — add [[tasks]] or a known manifest".into()
+    };
+    if rect.rows == 0 {
+        return;
+    }
+    draw_text(
+        surface,
+        rect.x + 1,
+        rect.y,
+        &header,
+        theme_color(theme::FAINT),
+        theme_color(theme::PANEL),
+        rect.cols.saturating_sub(1),
+    );
+    if rect.rows <= 1 {
+        return;
+    }
+    if let Some(err) = tests.summary.error.as_deref() {
+        draw_text(
+            surface,
+            rect.x + 1,
+            rect.y + 1,
+            err,
+            theme_color(theme::RED),
+            theme_color(theme::PANEL),
+            rect.cols.saturating_sub(1),
+        );
+    }
+    let visible = tests.visible_indices();
+    if visible.is_empty() {
+        let msg = if tests.task.is_some() {
+            "press u to discover targets or R to run all tests"
+        } else {
+            "no test task detected"
+        };
+        draw_text(
+            surface,
+            rect.x + 1,
+            rect.y + 1,
+            msg,
+            theme_color(theme::DIM),
+            theme_color(theme::PANEL),
+            rect.cols.saturating_sub(1),
+        );
+        return;
+    }
+    for (row, idx) in visible.iter().skip(tests.scroll).enumerate() {
+        if row + 1 >= rect.rows {
+            break;
+        }
+        let Some(node) = tests.nodes.get(*idx) else {
+            continue;
+        };
+        let y = rect.y + row + 1;
+        let selected = row + tests.scroll == tests.cursor;
+        let bg = if selected {
+            theme_color(theme::PANEL2)
+        } else {
+            theme_color(theme::PANEL)
+        };
+        if selected {
+            fill(
+                surface,
+                Rect {
+                    x: rect.x,
+                    y,
+                    cols: rect.cols,
+                    rows: 1,
+                },
+                bg,
+            );
+            draw_text(surface, rect.x, y, "▐", accent, bg, 1);
+        }
+        let (glyph, color) = match (node.kind, node.state) {
+            (TestNodeKind::Group, _) => ("▸", theme_color(theme::DIM)),
+            (_, TestState::Pass) => ("✓", theme_color(theme::GREEN)),
+            (_, TestState::Fail) => ("✗", theme_color(theme::RED)),
+            (_, TestState::Skip) => ("○", theme_color(theme::AMBER)),
+            (_, TestState::Running) => ("…", theme_color(theme::AMBER)),
+            (_, TestState::Unknown) => ("○", theme_color(theme::DIM)),
+        };
+        let indent = "  ".repeat(node.depth.min(4));
+        let mut label = format!("{indent}{}", node.label);
+        if let Some(loc) = &node.location {
+            label.push_str(&format!("  {}:{}", loc.path, loc.line));
+        }
+        draw_text(surface, rect.x + 1, y, glyph, color, bg, 1);
+        draw_text(
+            surface,
+            rect.x + 3,
+            y,
+            &label,
+            if node.kind == TestNodeKind::Group {
+                theme_color(theme::DIM)
+            } else {
+                theme_color(theme::TEXT)
+            },
+            bg,
+            rect.cols.saturating_sub(3),
+        );
+    }
+}
+
 /// The context-sensitive help-bar hint for the active tab/view.
 fn panel_help_hint(tab: crate::panel::PanelTab, view: crate::panel::DiffView) -> &'static str {
     use crate::panel::{DiffView, PanelTab};
     match (tab, view) {
-        (PanelTab::Diff, DiffView::FileList) => "1/2/3 tab  j/k move  ↵ open  o edit  esc",
+        (PanelTab::Diff, DiffView::FileList) => "1/2/3/4 tab  j/k move  ↵ open  o edit  esc",
         (PanelTab::Diff, DiffView::FileDiff) => "j/k scroll  o edit  esc back",
-        (PanelTab::Pr, _) => "1/2/3 tab  o browser  m merge  a approve  c create  esc",
-        (PanelTab::Checks, _) => "1/2/3 tab  r rerun  esc",
+        (PanelTab::Pr, _) => "1/2/3/4 tab  o browser  m merge  a approve  c create  esc",
+        (PanelTab::Checks, _) => "1/2/3/4 tab  r rerun  esc",
+        (PanelTab::Tests, _) => "r run  R all  f failed  u refresh  o/e open  d debug  esc",
     }
 }
 

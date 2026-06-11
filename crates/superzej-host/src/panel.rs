@@ -1,23 +1,23 @@
-//! The right panel: a tabbed Diff / PR / Checks view over the focused worktree.
+//! The right panel: a tabbed Diff / PR / Checks / Tests view over the focused worktree.
 //!
 //! Split into two halves:
-//! - [`PanelData`] — the git/GitHub payload, rebuilt by the host's background
-//!   model hydration and carried on the `FrameModel`. Cheap to clone, `Send`.
-//! - [`PanelUi`] — the interactive state (current tab, file cursor, scroll,
-//!   drill-in view). Owned by the event loop so it survives data refreshes.
+//! - [`PanelData`] — git/GitHub payload rebuilt by background hydration.
+//! - [`PanelUi`] — interactive state (current tab, file cursor, Tests tree, scroll).
 //!
-//! Rendering lives in `chrome.rs` next to the other `draw_*` surfaces; this
-//! module owns the data model + the pure key→intent navigation logic.
+//! Rendering lives in `chrome.rs`; this module owns data shapes and pure
+//! key→intent/test parsing logic.
 
+use serde::{Deserialize, Serialize};
 use termwiz::input::KeyCode;
 
-/// Which of the three panel tabs is showing.
+/// Which panel tab is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PanelTab {
     #[default]
     Diff,
     Pr,
     Checks,
+    Tests,
 }
 
 impl PanelTab {
@@ -27,7 +27,8 @@ impl PanelTab {
         match self {
             PanelTab::Diff => PanelTab::Pr,
             PanelTab::Pr => PanelTab::Checks,
-            PanelTab::Checks => PanelTab::Diff,
+            PanelTab::Checks => PanelTab::Tests,
+            PanelTab::Tests => PanelTab::Diff,
         }
     }
 }
@@ -41,8 +42,7 @@ pub enum DiffView {
     FileDiff,
 }
 
-/// A pass/fail/pending tri-state mirrored from `github::Bucket` (decoupled so
-/// the host doesn't depend on that type in its render path).
+/// A pass/fail/pending tri-state mirrored from `github::Bucket`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum CheckState {
@@ -54,7 +54,6 @@ pub enum CheckState {
 /// One changed file in the Diff tab's file list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffFile {
-    /// A single-char status glyph: `A` added, `D` deleted, `M` modified.
     pub status: char,
     pub path: String,
     pub added: u32,
@@ -79,15 +78,183 @@ pub struct PrSummary {
     pub review_decision: Option<String>,
 }
 
+/// A configured/detected test task that can be run in a worktree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestTask {
+    pub name: String,
+    pub command: String,
+    pub matcher: String,
+}
+
+impl TestTask {
+    pub fn new(
+        name: impl Into<String>,
+        command: impl Into<String>,
+        matcher: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            command: command.into(),
+            matcher: matcher.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TestState {
+    Pass,
+    Fail,
+    Skip,
+    Running,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TestNodeKind {
+    Group,
+    Test,
+    Failure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestLocation {
+    pub path: String,
+    pub line: usize,
+    #[serde(default)]
+    pub column: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestNode {
+    pub id: String,
+    pub label: String,
+    pub depth: usize,
+    pub kind: TestNodeKind,
+    pub state: TestState,
+    #[serde(default)]
+    pub location: Option<TestLocation>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestSummary {
+    pub passed: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub running: bool,
+    pub stale: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl TestSummary {
+    pub fn label(&self) -> String {
+        if let Some(err) = &self.error {
+            return format!("error: {err}");
+        }
+        let mut parts = Vec::new();
+        if self.running {
+            parts.push("running".to_string());
+        }
+        if self.passed > 0 {
+            parts.push(format!("{} passed", self.passed));
+        }
+        if self.failed > 0 {
+            parts.push(format!("{} failed", self.failed));
+        }
+        if self.skipped > 0 {
+            parts.push(format!("{} skipped", self.skipped));
+        }
+        if parts.is_empty() {
+            "not run".into()
+        } else {
+            parts.join(" · ")
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestCache {
+    #[serde(default)]
+    pub task: Option<TestTask>,
+    #[serde(default)]
+    pub nodes: Vec<TestNode>,
+    #[serde(default)]
+    pub summary: TestSummary,
+    #[serde(default)]
+    pub discovered: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+pub struct TestPanelState {
+    pub task: Option<TestTask>,
+    pub nodes: Vec<TestNode>,
+    pub summary: TestSummary,
+    pub discovered: bool,
+    pub discovering: bool,
+    pub running: bool,
+    pub stale: bool,
+    pub cursor: usize,
+    pub scroll: usize,
+    pub filter: String,
+}
+
+impl TestPanelState {
+    pub fn to_cache(&self) -> TestCache {
+        TestCache {
+            task: self.task.clone(),
+            nodes: self.nodes.clone(),
+            summary: self.summary.clone(),
+            discovered: self.discovered,
+        }
+    }
+
+    pub fn apply_cache(&mut self, cache: TestCache) {
+        self.task = cache.task;
+        self.nodes = cache.nodes;
+        self.summary = cache.summary;
+        self.discovered = cache.discovered;
+        self.cursor = self
+            .cursor
+            .min(self.visible_indices().len().saturating_sub(1));
+    }
+
+    pub fn visible_indices(&self) -> Vec<usize> {
+        let q = self.filter.trim().to_ascii_lowercase();
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| {
+                q.is_empty()
+                    || n.label.to_ascii_lowercase().contains(&q)
+                    || n.id.to_ascii_lowercase().contains(&q)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub fn selected_node(&self) -> Option<&TestNode> {
+        let visible = self.visible_indices();
+        visible
+            .get(self.cursor)
+            .and_then(|idx| self.nodes.get(*idx))
+    }
+
+    pub fn recompute_summary(&mut self) {
+        self.summary = summarize_nodes(&self.nodes);
+        self.summary.running = self.running;
+        self.summary.stale = self.stale;
+    }
+}
+
 /// The panel's data payload (git + GitHub), rebuilt on background refresh.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PanelData {
     pub branch: String,
     pub files: Vec<DiffFile>,
-    /// `Some` when a PR exists; `None` otherwise (see `pr_note`).
     pub pr: Option<PrSummary>,
-    /// A short human note when there's no PR ("no pull request", "gh not
-    /// authenticated", an error). Shown in the PR tab body.
     pub pr_note: Option<String>,
     pub checks: Vec<CheckLine>,
 }
@@ -98,14 +265,11 @@ pub struct PanelData {
 pub struct PanelUi {
     pub tab: PanelTab,
     pub diff_view: DiffView,
-    /// Cursor row in the Diff file list.
     pub diff_cursor: usize,
-    /// Half-page scroll offset for the FileDiff body.
     pub diff_scroll: usize,
-    /// Raw (already-highlighted) diff text for the drilled-in file.
     pub file_diff: String,
-    /// Path of the file currently drilled into (for the help bar / re-fetch).
     pub focused_path: String,
+    pub tests: TestPanelState,
 }
 
 /// A decoded panel navigation intent. `None` means the key isn't owned by the
@@ -117,50 +281,241 @@ pub enum PanelNav {
     CycleTab,
     Up,
     Down,
-    /// Enter: drill into the selected file (Diff:FileList only).
     Enter,
-    /// Esc: back out of FileDiff, or leave the panel from a top-level view.
     Back,
-    /// `o`: open file in editor (Diff) or PR in browser (PR tab).
     Open,
+    OpenEditor,
     Merge,
     Approve,
     Create,
     Rerun,
+    RunAll,
+    RunFailed,
+    Refresh,
+    Debug,
 }
 
-/// Map a raw key to a panel nav intent given the current tab/view context.
-/// Context matters: `j`/`k` scroll in FileDiff but move the cursor in FileList,
-/// and the action keys (`m`/`a`/`c`/`r`/`o`) only bind on their relevant tab.
-#[allow(dead_code)]
 pub fn panel_nav_key(key: &KeyCode, tab: PanelTab, view: DiffView) -> Option<PanelNav> {
     match key {
         KeyCode::Char('1') => Some(PanelNav::SelectTab(PanelTab::Diff)),
         KeyCode::Char('2') => Some(PanelNav::SelectTab(PanelTab::Pr)),
         KeyCode::Char('3') => Some(PanelNav::SelectTab(PanelTab::Checks)),
+        KeyCode::Char('4') => Some(PanelNav::SelectTab(PanelTab::Tests)),
         KeyCode::Tab => Some(PanelNav::CycleTab),
         KeyCode::UpArrow | KeyCode::Char('k') => Some(PanelNav::Up),
         KeyCode::DownArrow | KeyCode::Char('j') => Some(PanelNav::Down),
-        KeyCode::Enter => {
-            if tab == PanelTab::Diff && view == DiffView::FileList {
-                Some(PanelNav::Enter)
-            } else {
-                None
-            }
-        }
+        KeyCode::Enter => match tab {
+            PanelTab::Diff if view == DiffView::FileList => Some(PanelNav::Enter),
+            PanelTab::Tests => Some(PanelNav::Enter),
+            _ => None,
+        },
         KeyCode::Escape => Some(PanelNav::Back),
         KeyCode::Char('o') => match tab {
-            PanelTab::Diff | PanelTab::Pr => Some(PanelNav::Open),
+            PanelTab::Diff | PanelTab::Pr | PanelTab::Tests => Some(PanelNav::Open),
             PanelTab::Checks => None,
         },
+        KeyCode::Char('e') if tab == PanelTab::Tests => Some(PanelNav::OpenEditor),
         KeyCode::Char('m') if tab == PanelTab::Pr => Some(PanelNav::Merge),
         KeyCode::Char('a') if tab == PanelTab::Pr => Some(PanelNav::Approve),
         KeyCode::Char('c') if tab == PanelTab::Pr => Some(PanelNav::Create),
-        KeyCode::Char('r') if matches!(tab, PanelTab::Pr | PanelTab::Checks) => {
+        KeyCode::Char('r') if matches!(tab, PanelTab::Pr | PanelTab::Checks | PanelTab::Tests) => {
             Some(PanelNav::Rerun)
         }
+        KeyCode::Char('R') if tab == PanelTab::Tests => Some(PanelNav::RunAll),
+        KeyCode::Char('f') if tab == PanelTab::Tests => Some(PanelNav::RunFailed),
+        KeyCode::Char('u') if tab == PanelTab::Tests => Some(PanelNav::Refresh),
+        KeyCode::Char('d') if tab == PanelTab::Tests => Some(PanelNav::Debug),
         _ => None,
     }
+}
+
+pub fn summarize_nodes(nodes: &[TestNode]) -> TestSummary {
+    let mut s = TestSummary::default();
+    for n in nodes.iter().filter(|n| n.kind == TestNodeKind::Test) {
+        match n.state {
+            TestState::Pass => s.passed += 1,
+            TestState::Fail => s.failed += 1,
+            TestState::Skip => s.skipped += 1,
+            _ => {}
+        }
+    }
+    s
+}
+
+pub fn tree_from_flat_tests(mut tests: Vec<TestNode>) -> Vec<TestNode> {
+    if tests.is_empty() {
+        return tests;
+    }
+    tests.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut out = Vec::new();
+    let mut last_group = String::new();
+    for mut t in tests {
+        let group = t.id.split("::").next().unwrap_or("tests").to_string();
+        if group != last_group {
+            out.push(TestNode {
+                id: format!("group:{group}"),
+                label: group.clone(),
+                depth: 0,
+                kind: TestNodeKind::Group,
+                state: TestState::Unknown,
+                location: None,
+                message: None,
+            });
+            last_group = group;
+        }
+        t.depth = 1;
+        out.push(t);
+    }
+    out
+}
+
+pub fn parse_test_output(output: &str) -> Vec<TestNode> {
+    let locations = extract_locations(output);
+    let first_location = locations.first().cloned();
+    let mut nodes = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(name) = cargo_pass(trimmed) {
+            nodes.push(test_node(name, TestState::Pass, None, None));
+        } else if let Some(name) = cargo_fail(trimmed) {
+            nodes.push(test_node(
+                name,
+                TestState::Fail,
+                first_location.clone(),
+                first_failure_message(output),
+            ));
+        } else if let Some(name) = pytest_result(trimmed, " PASSED") {
+            nodes.push(test_node(name, TestState::Pass, None, None));
+        } else if let Some(name) = pytest_result(trimmed, " FAILED") {
+            nodes.push(test_node(
+                name,
+                TestState::Fail,
+                first_location.clone(),
+                first_failure_message(output),
+            ));
+        } else if let Some(name) = go_result(trimmed, "--- PASS:") {
+            nodes.push(test_node(name, TestState::Pass, None, None));
+        } else if let Some(name) = go_result(trimmed, "--- FAIL:") {
+            nodes.push(test_node(
+                name,
+                TestState::Fail,
+                first_location.clone(),
+                first_failure_message(output),
+            ));
+        } else if trimmed.starts_with('✓') || trimmed.starts_with("PASS ") {
+            nodes.push(test_node(
+                trimmed.trim_start_matches('✓').trim(),
+                TestState::Pass,
+                None,
+                None,
+            ));
+        } else if trimmed.starts_with('✗') || trimmed.starts_with("FAIL ") {
+            nodes.push(test_node(
+                trimmed.trim_start_matches('✗').trim(),
+                TestState::Fail,
+                first_location.clone(),
+                first_failure_message(output),
+            ));
+        }
+    }
+    dedup_nodes(nodes)
+}
+
+fn test_node(
+    name: impl Into<String>,
+    state: TestState,
+    location: Option<TestLocation>,
+    message: Option<String>,
+) -> TestNode {
+    let name = name.into();
+    TestNode {
+        id: name.clone(),
+        label: name,
+        depth: 0,
+        kind: TestNodeKind::Test,
+        state,
+        location,
+        message,
+    }
+}
+
+fn dedup_nodes(nodes: Vec<TestNode>) -> Vec<TestNode> {
+    let mut seen = std::collections::BTreeMap::<String, TestNode>::new();
+    for n in nodes {
+        seen.insert(n.id.clone(), n);
+    }
+    seen.into_values().collect()
+}
+
+fn cargo_pass(line: &str) -> Option<String> {
+    line.strip_prefix("test ")
+        .and_then(|s| s.split_once(" ... ok").map(|(name, _)| name.to_string()))
+}
+
+fn cargo_fail(line: &str) -> Option<String> {
+    line.strip_prefix("test ").and_then(|s| {
+        s.split_once(" ... FAILED")
+            .map(|(name, _)| name.to_string())
+    })
+}
+
+fn pytest_result(line: &str, suffix: &str) -> Option<String> {
+    line.strip_suffix(suffix).map(|s| s.trim().to_string())
+}
+
+fn go_result(line: &str, prefix: &str) -> Option<String> {
+    line.strip_prefix(prefix)
+        .map(str::trim)
+        .and_then(|s| s.split_whitespace().next())
+        .map(str::to_string)
+}
+
+pub fn extract_locations(output: &str) -> Vec<TestLocation> {
+    output.lines().filter_map(extract_location).collect()
+}
+
+fn extract_location(line: &str) -> Option<TestLocation> {
+    for token in line.split_whitespace() {
+        let token = token
+            .trim_matches(|c: char| matches!(c, '(' | ')' | '[' | ']' | ',' | ';' | '\'' | '"'))
+            .trim_end_matches(':');
+        let Some((path, rest)) = token.rsplit_once(':') else {
+            continue;
+        };
+        let (path, line_part, column) = if let Some((path, line_part)) = path.rsplit_once(':') {
+            (path, line_part, rest.parse::<usize>().ok())
+        } else {
+            (path, rest, None)
+        };
+        let Ok(line_no) = line_part.parse::<usize>() else {
+            continue;
+        };
+        if path.is_empty() || (!path.contains('.') && !path.contains('/')) {
+            continue;
+        }
+        return Some(TestLocation {
+            path: path.to_string(),
+            line: line_no,
+            column,
+        });
+    }
+    None
+}
+
+pub fn first_failure_message(output: &str) -> Option<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .find(|l| {
+            l.contains("assert")
+                || l.contains("panicked")
+                || l.contains("Error")
+                || l.contains("FAILED")
+        })
+        .map(|s| s.chars().take(160).collect())
 }
 
 #[cfg(test)]
@@ -168,10 +523,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tab_cycles_diff_pr_checks() {
+    fn tab_cycles_diff_pr_checks_tests() {
         assert_eq!(PanelTab::Diff.next(), PanelTab::Pr);
         assert_eq!(PanelTab::Pr.next(), PanelTab::Checks);
-        assert_eq!(PanelTab::Checks.next(), PanelTab::Diff);
+        assert_eq!(PanelTab::Checks.next(), PanelTab::Tests);
+        assert_eq!(PanelTab::Tests.next(), PanelTab::Diff);
     }
 
     #[test]
@@ -189,51 +545,41 @@ mod tests {
             panel_nav_key(&KeyCode::Char('3'), PanelTab::Diff, d),
             Some(PanelNav::SelectTab(PanelTab::Checks))
         );
-    }
-
-    #[test]
-    fn enter_drills_only_in_diff_filelist() {
         assert_eq!(
-            panel_nav_key(&KeyCode::Enter, PanelTab::Diff, DiffView::FileList),
-            Some(PanelNav::Enter)
-        );
-        assert_eq!(
-            panel_nav_key(&KeyCode::Enter, PanelTab::Diff, DiffView::FileDiff),
-            None
-        );
-        assert_eq!(
-            panel_nav_key(&KeyCode::Enter, PanelTab::Pr, DiffView::FileList),
-            None
+            panel_nav_key(&KeyCode::Char('4'), PanelTab::Diff, d),
+            Some(PanelNav::SelectTab(PanelTab::Tests))
         );
     }
 
     #[test]
-    fn action_keys_are_tab_scoped() {
-        let d = DiffView::FileList;
-        // m/a/c only on PR tab.
-        assert_eq!(
-            panel_nav_key(&KeyCode::Char('m'), PanelTab::Pr, d),
-            Some(PanelNav::Merge)
+    fn parses_cargo_output_with_failure_location() {
+        let out = "test db::roundtrip ... ok\ntest activity::quiet ... FAILED\nthread 'activity::quiet' panicked at crates/superzej-core/src/activity.rs:123:9:\nassertion failed";
+        let nodes = parse_test_output(out);
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n.id == "db::roundtrip" && n.state == TestState::Pass)
         );
-        assert_eq!(panel_nav_key(&KeyCode::Char('m'), PanelTab::Diff, d), None);
-        // r on PR and Checks.
-        assert_eq!(
-            panel_nav_key(&KeyCode::Char('r'), PanelTab::Checks, d),
-            Some(PanelNav::Rerun)
+        let failed = nodes.iter().find(|n| n.id == "activity::quiet").unwrap();
+        assert_eq!(failed.state, TestState::Fail);
+        assert_eq!(failed.location.as_ref().unwrap().line, 123);
+    }
+
+    #[test]
+    fn tree_groups_by_prefix() {
+        let nodes = tree_from_flat_tests(vec![
+            test_node("core::a", TestState::Pass, None, None),
+            test_node("host::b", TestState::Fail, None, None),
+        ]);
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n.kind == TestNodeKind::Group && n.label == "core")
         );
-        assert_eq!(panel_nav_key(&KeyCode::Char('r'), PanelTab::Diff, d), None);
-        // o on Diff (edit) and PR (browser), not Checks.
-        assert_eq!(
-            panel_nav_key(&KeyCode::Char('o'), PanelTab::Diff, d),
-            Some(PanelNav::Open)
-        );
-        assert_eq!(
-            panel_nav_key(&KeyCode::Char('o'), PanelTab::Pr, d),
-            Some(PanelNav::Open)
-        );
-        assert_eq!(
-            panel_nav_key(&KeyCode::Char('o'), PanelTab::Checks, d),
-            None
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n.kind == TestNodeKind::Group && n.label == "host")
         );
     }
 }

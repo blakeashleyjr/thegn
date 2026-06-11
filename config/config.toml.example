@@ -161,6 +161,25 @@ command = "${EDITOR:-vi} ."
 name = "diff"
 command = "git diff"
 
+# General tasks: surfaced in the Tests panel and, later, Problems/Timeline/Search
+# Everywhere. `kind = "test"` makes a task eligible for test discovery/runs. If no
+# test task is configured, superzej falls back to manifest sniffing (just/Cargo/go/
+# pytest/package.json).
+# [[tasks]]
+# name = "cargo test"
+# kind = "test"
+# command = "cargo"
+# args = ["test", "--workspace"]
+# cwd = "."
+# scope = "worktree"
+# matcher = "cargo-test"
+
+# [[tasks]]
+# name = "pytest"
+# kind = "test"
+# command = "pytest"
+# matcher = "pytest"
+
 # Pinned programs: summoned from anywhere with Alt-1..9 (in registration order)
 # or the tabbar's pin chips. Pins are global and run on the host (no sandbox).
 # `location = "tab"` opens/focuses a dedicated `pin:<name>` tab (default).

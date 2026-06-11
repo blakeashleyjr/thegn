@@ -823,6 +823,109 @@ fn sync_drawer_persistence(
     }
 }
 
+fn active_worktree(session: &crate::session::Session) -> Option<std::path::PathBuf> {
+    session
+        .tabs
+        .get(session.active)
+        .and_then(|t| (!t.worktree.is_empty()).then(|| std::path::PathBuf::from(&t.worktree)))
+        .or_else(|| std::env::current_dir().ok())
+}
+
+fn sync_tests_for_worktree(
+    ui: &mut crate::panel::PanelUi,
+    worktree: &std::path::Path,
+    cfg: &superzej_core::config::Config,
+) {
+    let worktree_str = worktree.to_string_lossy();
+    let cached = superzej_core::db::Db::open()
+        .ok()
+        .and_then(|db| db.get_test_cache(&worktree_str).ok().flatten())
+        .and_then(|(json, _)| serde_json::from_str::<crate::panel::TestCache>(&json).ok());
+    if let Some(cache) = cached {
+        ui.tests.apply_cache(cache);
+    }
+    if ui.tests.task.is_none() {
+        ui.tests.task = crate::task::detect_test_task(worktree, cfg);
+    }
+}
+
+fn persist_tests_for_worktree(ui: &crate::panel::PanelUi, worktree: &str) {
+    if let Ok(json) = serde_json::to_string(&ui.tests.to_cache()) {
+        if let Ok(db) = superzej_core::db::Db::open() {
+            let _ = db.put_test_cache(worktree, &json);
+        }
+    }
+}
+
+fn spawn_test_discovery(
+    tx: tokio_mpsc::UnboundedSender<crate::task::DiscoveryOutcome>,
+    worktree: std::path::PathBuf,
+    generation: u64,
+    task_spec: crate::panel::TestTask,
+) {
+    task::spawn_blocking(move || {
+        let result = crate::task::discover_tests(worktree, generation, task_spec);
+        let _ = tx.send(result);
+    });
+}
+
+fn spawn_test_run_task(
+    tx: tokio_mpsc::UnboundedSender<crate::task::TaskOutcome>,
+    worktree: std::path::PathBuf,
+    generation: u64,
+    task_spec: crate::panel::TestTask,
+) {
+    task::spawn_blocking(move || {
+        let result = crate::task::run_task(worktree, generation, task_spec);
+        let _ = tx.send(result);
+    });
+}
+
+fn selected_test_location(ui: &crate::panel::PanelUi) -> Option<crate::panel::TestLocation> {
+    ui.tests.selected_node().and_then(|n| n.location.clone())
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn test_task_for_nav(
+    ui: &crate::panel::PanelUi,
+    nav: crate::panel::PanelNav,
+    base: crate::panel::TestTask,
+) -> crate::panel::TestTask {
+    use crate::panel::{PanelNav, TestNodeKind, TestState};
+    let selected = ui
+        .tests
+        .selected_node()
+        .filter(|n| n.kind == TestNodeKind::Test);
+    let failed = ui
+        .tests
+        .nodes
+        .iter()
+        .find(|n| n.kind == TestNodeKind::Test && n.state == TestState::Fail);
+    let target = match nav {
+        PanelNav::Rerun => selected,
+        PanelNav::RunFailed => failed.or(selected),
+        _ => None,
+    };
+    let Some(target) = target else {
+        return base;
+    };
+    let mut task = base;
+    match task.matcher.as_str() {
+        "cargo-test" => task.command = format!("{} {}", task.command, shell_quote(&target.id)),
+        "go-test" => task.command = format!("{} -run {}", task.command, shell_quote(&target.id)),
+        "pytest" => task.command = format!("{} {}", task.command, shell_quote(&target.id)),
+        "vitest" | "jest" | "javascript" => {
+            task.command = format!("{} {}", task.command, shell_quote(&target.id));
+        }
+        _ => {}
+    }
+    task.name = format!("{} ({})", task.name, target.label);
+    task
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn event_loop<T: Terminal>(
     buf: &mut BufferedTerminal<T>,
@@ -849,6 +952,13 @@ async fn event_loop<T: Terminal>(
     let mut drawer: Option<u32> = None;
     let mut last_model_refresh = Instant::now();
     let mut last_pr_refresh = Instant::now() - PR_REFRESH_INTERVAL;
+    let mut panel_ui = crate::panel::PanelUi::default();
+    let (test_run_tx, mut test_run_rx) =
+        tokio_mpsc::unbounded_channel::<crate::task::TaskOutcome>();
+    let (test_discovery_tx, mut test_discovery_rx) =
+        tokio_mpsc::unbounded_channel::<crate::task::DiscoveryOutcome>();
+    let mut test_generation: u64 = 0;
+    let mut loaded_tests_worktree = String::new();
 
     sync_drawer_persistence(&session, &mut panes, &mut drawer, chrome.center);
 
@@ -858,6 +968,14 @@ async fn event_loop<T: Terminal>(
             return Ok(()); // last tab closed
         }
         let active = session.active;
+        if let Some(wt) = active_worktree(&session) {
+            let wt_s = wt.to_string_lossy().into_owned();
+            if wt_s != loaded_tests_worktree {
+                sync_tests_for_worktree(&mut panel_ui, &wt, &current_config);
+                loaded_tests_worktree = wt_s;
+                dirty = true;
+            }
+        }
 
         if let Ok(size) = buf.terminal().get_screen_size() {
             if size.rows != rows || size.cols != cols {
@@ -987,11 +1105,59 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
 
+        while let Ok(discovery) = test_discovery_rx.try_recv() {
+            if discovery.generation == test_generation
+                && discovery.worktree == loaded_tests_worktree
+            {
+                panel_ui.tests.discovering = false;
+                panel_ui.tests.task = Some(discovery.task);
+                if let Some(err) = discovery.error {
+                    panel_ui.tests.summary.error = Some(err);
+                } else {
+                    panel_ui.tests.nodes = discovery.nodes;
+                    panel_ui.tests.discovered = true;
+                    panel_ui.tests.summary.error = None;
+                    panel_ui.tests.recompute_summary();
+                }
+                persist_tests_for_worktree(&panel_ui, &discovery.worktree);
+                dirty = true;
+            }
+        }
+
+        while let Ok(outcome) = test_run_rx.try_recv() {
+            if outcome.generation == test_generation && outcome.worktree == loaded_tests_worktree {
+                panel_ui.tests.running = false;
+                let truncated = outcome.truncated;
+                panel_ui.tests.task = Some(outcome.task.clone());
+                panel_ui.tests.nodes = crate::task::parse_task_outcome(&outcome);
+                panel_ui.tests.discovered = true;
+                panel_ui.tests.stale = false;
+                panel_ui.tests.recompute_summary();
+                if outcome.exit_code != Some(0) && panel_ui.tests.summary.failed == 0 {
+                    panel_ui.tests.summary.failed = 1;
+                }
+                if truncated {
+                    panel_ui.tests.summary.error =
+                        Some("output truncated before parsing completed".into());
+                } else {
+                    panel_ui.tests.summary.error = None;
+                }
+                persist_tests_for_worktree(&panel_ui, &outcome.worktree);
+                model.status = format!(
+                    "Tests finished in {}ms: {}",
+                    outcome.duration_ms,
+                    panel_ui.tests.summary.label()
+                );
+                dirty = true;
+            }
+        }
+
         while let Ok(cfg_res) = config_rx.try_recv() {
             match cfg_res {
                 Ok(new_cfg) => {
                     keymap = crate::keymap::default_keymap_with_config(&new_cfg);
                     current_config = new_cfg;
+                    loaded_tests_worktree.clear();
                     model.status = "Config reloaded".into();
                     need_relayout = true;
                 }
@@ -1018,7 +1184,6 @@ async fn event_loop<T: Terminal>(
                 scratch = Surface::new(cols, rows);
             }
             crate::chrome::clear_frame(&mut scratch);
-            let panel_ui = crate::panel::PanelUi::default();
             render_tab(
                 &mut scratch,
                 &chrome,
@@ -1159,6 +1324,122 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+                if model.panel_focused {
+                    if let Some(nav) =
+                        crate::panel::panel_nav_key(&k.key, panel_ui.tab, panel_ui.diff_view)
+                    {
+                        use crate::panel::{PanelNav, PanelTab};
+                        match nav {
+                            PanelNav::SelectTab(tab) => {
+                                panel_ui.tab = tab;
+                                if tab == PanelTab::Tests {
+                                    if let Some(wt) = active_worktree(&session) {
+                                        sync_tests_for_worktree(
+                                            &mut panel_ui,
+                                            &wt,
+                                            &current_config,
+                                        );
+                                        if panel_ui.tests.task.is_some()
+                                            && !panel_ui.tests.discovered
+                                            && !panel_ui.tests.discovering
+                                        {
+                                            test_generation += 1;
+                                            panel_ui.tests.discovering = true;
+                                            if let Some(task) = panel_ui.tests.task.clone() {
+                                                spawn_test_discovery(
+                                                    test_discovery_tx.clone(),
+                                                    wt,
+                                                    test_generation,
+                                                    task,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            PanelNav::CycleTab => panel_ui.tab = panel_ui.tab.next(),
+                            PanelNav::Up => {
+                                if panel_ui.tab == PanelTab::Tests {
+                                    panel_ui.tests.cursor = panel_ui.tests.cursor.saturating_sub(1);
+                                    if panel_ui.tests.cursor < panel_ui.tests.scroll {
+                                        panel_ui.tests.scroll = panel_ui.tests.cursor;
+                                    }
+                                }
+                            }
+                            PanelNav::Down => {
+                                if panel_ui.tab == PanelTab::Tests {
+                                    let max =
+                                        panel_ui.tests.visible_indices().len().saturating_sub(1);
+                                    panel_ui.tests.cursor = (panel_ui.tests.cursor + 1).min(max);
+                                }
+                            }
+                            PanelNav::Rerun | PanelNav::RunAll | PanelNav::RunFailed => {
+                                if panel_ui.tab == PanelTab::Tests {
+                                    if let (Some(wt), Some(base_task)) =
+                                        (active_worktree(&session), panel_ui.tests.task.clone())
+                                    {
+                                        let task_spec =
+                                            test_task_for_nav(&panel_ui, nav, base_task);
+                                        test_generation += 1;
+                                        panel_ui.tests.running = true;
+                                        panel_ui.tests.summary.running = true;
+                                        panel_ui.tests.summary.error = None;
+                                        model.status = format!("Running tests: {}", task_spec.name);
+                                        spawn_test_run_task(
+                                            test_run_tx.clone(),
+                                            wt,
+                                            test_generation,
+                                            task_spec,
+                                        );
+                                    } else {
+                                        model.status = "No test task detected".into();
+                                    }
+                                }
+                            }
+                            PanelNav::Refresh => {
+                                if panel_ui.tab == PanelTab::Tests {
+                                    if let (Some(wt), Some(task_spec)) =
+                                        (active_worktree(&session), panel_ui.tests.task.clone())
+                                    {
+                                        test_generation += 1;
+                                        panel_ui.tests.discovering = true;
+                                        panel_ui.tests.summary.error = None;
+                                        spawn_test_discovery(
+                                            test_discovery_tx.clone(),
+                                            wt,
+                                            test_generation,
+                                            task_spec,
+                                        );
+                                    } else {
+                                        model.status = "No test task detected".into();
+                                    }
+                                }
+                            }
+                            PanelNav::Open | PanelNav::OpenEditor | PanelNav::Enter => {
+                                if panel_ui.tab == PanelTab::Tests {
+                                    if let Some(loc) = selected_test_location(&panel_ui) {
+                                        model.status =
+                                            format!("test failure: {}:{}", loc.path, loc.line);
+                                    } else {
+                                        model.status =
+                                            "No failure location on selected test".into();
+                                    }
+                                }
+                            }
+                            PanelNav::Debug => {
+                                model.status =
+                                    "Debug selected test: DAP support is planned (AQ 525–528)"
+                                        .into();
+                            }
+                            PanelNav::Back => {
+                                model.panel_focused = false;
+                            }
+                            _ => {}
+                        }
+                        dirty = true;
+                        continue;
+                    }
+                }
                 // Global/mode chords are intercepted by the keymap; everything
                 // else is forwarded to the focused pane.
                 let input_key = crate::sequence::Key::modified(k.key, k.modifiers);
@@ -1260,6 +1541,8 @@ async fn event_loop<T: Terminal>(
                                     chrome = layout::compute(cols, rows, want_sidebar, want_panel);
                                     need_relayout = true;
                                 }
+                                model.sidebar_focused = true;
+                                model.panel_focused = false;
                             }
                             Action::FocusPanel => {
                                 if !want_panel {
@@ -1267,6 +1550,8 @@ async fn event_loop<T: Terminal>(
                                     chrome = layout::compute(cols, rows, want_sidebar, want_panel);
                                     need_relayout = true;
                                 }
+                                model.panel_focused = true;
+                                model.sidebar_focused = false;
                             }
                             Action::NextTab => {
                                 session.next_tab();
