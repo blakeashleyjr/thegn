@@ -407,12 +407,14 @@ mod tests {
         let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
         let mut panes = Panes::new(tx);
         let path = session.worktrees[0].path.clone();
+        let mut cfg = superzej_core::config::Config::default();
+        cfg.sandbox.enabled = false;
         panes
             .materialize(
                 &mut session.worktrees[0].tabs[0],
                 &path,
                 chrome.center,
-                &superzej_core::config::Config::default(),
+                &cfg,
             )
             .unwrap();
 
