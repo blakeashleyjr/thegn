@@ -45,6 +45,7 @@ pub fn parse(text: &str) -> Vec<TestNode> {
             state,
             location: None,
             message: None,
+            placeholder: false,
         });
     }
     panel::tree_from_flat_tests(nodes)
