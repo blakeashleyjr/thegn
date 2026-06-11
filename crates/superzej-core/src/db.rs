@@ -153,6 +153,13 @@ impl Db {
               loc        INTEGER,
               fetched_at INTEGER
             );
+            -- Latest test-explorer state per worktree. This is a cache, not a
+            -- history log: full timelines live in the later activity/audit layer.
+            CREATE TABLE IF NOT EXISTS test_cache (
+              worktree   TEXT PRIMARY KEY,
+              json       TEXT,
+              fetched_at INTEGER
+            );
             -- A stable, globally-unique slug per repo: the prefix of every tab
             -- that repo owns (`{slug}/…`). Assigned once with collision suffixing
             -- so two repos with the same basename get distinct tabs.
@@ -276,6 +283,29 @@ impl Db {
                VALUES(?1,?2,?3)
                ON CONFLICT(worktree) DO UPDATE SET files=?2, fetched_at=?3"#,
             params![worktree, files, util::now()],
+        )?;
+        Ok(())
+    }
+
+    // --- latest test cache (per worktree; feeds Tests panel + sidebar rollups) -
+    pub fn get_test_cache(&self, worktree: &str) -> Result<Option<(String, i64)>> {
+        let r = self
+            .conn
+            .query_row(
+                "SELECT json, fetched_at FROM test_cache WHERE worktree=?1",
+                params![worktree],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .ok();
+        Ok(r)
+    }
+
+    pub fn put_test_cache(&self, worktree: &str, json: &str) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO test_cache(worktree,json,fetched_at)
+               VALUES(?1,?2,?3)
+               ON CONFLICT(worktree) DO UPDATE SET json=?2, fetched_at=?3"#,
+            params![worktree, json, util::now()],
         )?;
         Ok(())
     }
@@ -1261,6 +1291,18 @@ mod tests {
         assert!(db.get_diff_cache("/wt").unwrap().is_none());
         db.put_diff_cache("/wt", "M\tfile.rs").unwrap();
         assert_eq!(db.get_diff_cache("/wt").unwrap().unwrap().0, "M\tfile.rs");
+
+        assert!(db.get_test_cache("/wt").unwrap().is_none());
+        db.put_test_cache("/wt", "{\"summary\":\"ok\"}").unwrap();
+        assert_eq!(
+            db.get_test_cache("/wt").unwrap().unwrap().0,
+            "{\"summary\":\"ok\"}"
+        );
+        db.put_test_cache("/wt", "{\"summary\":\"fail\"}").unwrap();
+        assert_eq!(
+            db.get_test_cache("/wt").unwrap().unwrap().0,
+            "{\"summary\":\"fail\"}"
+        );
 
         // loc cache: miss → insert → upsert.
         assert!(db.get_loc_cache("/wt").unwrap().is_none());

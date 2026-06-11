@@ -32,6 +32,8 @@ mod sequence;
 mod session;
 mod sidebar;
 mod stats;
+mod task;
+mod testkit;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
