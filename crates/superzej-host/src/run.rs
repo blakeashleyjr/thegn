@@ -862,10 +862,20 @@ fn spawn_test_discovery(
     worktree: std::path::PathBuf,
     generation: u64,
     task_spec: crate::panel::TestTask,
+    limits: superzej_core::config::LimitsConfig,
+    sem: std::sync::Arc<tokio::sync::Semaphore>,
 ) {
-    task::spawn_blocking(move || {
-        let result = crate::task::discover_tests(worktree, generation, task_spec);
-        let _ = tx.send(result);
+    tokio::spawn(async move {
+        // Bound concurrent test/discovery jobs so multiple worktrees can't each
+        // launch a full build and saturate cores. Permit is held across the run.
+        let _permit = sem.acquire_owned().await;
+        let result = task::spawn_blocking(move || {
+            crate::task::discover_tests(worktree, generation, task_spec, &limits)
+        })
+        .await;
+        if let Ok(result) = result {
+            let _ = tx.send(result);
+        }
     });
 }
 
@@ -874,10 +884,18 @@ fn spawn_test_run_task(
     worktree: std::path::PathBuf,
     generation: u64,
     task_spec: crate::panel::TestTask,
+    limits: superzej_core::config::LimitsConfig,
+    sem: std::sync::Arc<tokio::sync::Semaphore>,
 ) {
-    task::spawn_blocking(move || {
-        let result = crate::task::run_task(worktree, generation, task_spec);
-        let _ = tx.send(result);
+    tokio::spawn(async move {
+        let _permit = sem.acquire_owned().await;
+        let result = task::spawn_blocking(move || {
+            crate::task::run_task(worktree, generation, task_spec, &limits)
+        })
+        .await;
+        if let Ok(result) = result {
+            let _ = tx.send(result);
+        }
     });
 }
 
@@ -959,6 +977,11 @@ async fn event_loop<T: Terminal>(
         tokio_mpsc::unbounded_channel::<crate::task::DiscoveryOutcome>();
     let mut test_generation: u64 = 0;
     let mut loaded_tests_worktree = String::new();
+    // Bounds concurrent test/discovery jobs across worktrees (no auto-runs; this
+    // only caps explicit ones so they can't collectively pin the machine).
+    let test_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(
+        keymap.config().limits.test_max_parallel.max(1),
+    ));
 
     sync_drawer_persistence(&session, &mut panes, &mut drawer, chrome.center);
 
@@ -1351,6 +1374,8 @@ async fn event_loop<T: Terminal>(
                                                     wt,
                                                     test_generation,
                                                     task,
+                                                    current_config.limits.clone(),
+                                                    test_sem.clone(),
                                                 );
                                             }
                                         }
@@ -1390,6 +1415,8 @@ async fn event_loop<T: Terminal>(
                                             wt,
                                             test_generation,
                                             task_spec,
+                                            current_config.limits.clone(),
+                                            test_sem.clone(),
                                         );
                                     } else {
                                         model.status = "No test task detected".into();
@@ -1409,6 +1436,8 @@ async fn event_loop<T: Terminal>(
                                             wt,
                                             test_generation,
                                             task_spec,
+                                            current_config.limits.clone(),
+                                            test_sem.clone(),
                                         );
                                     } else {
                                         model.status = "No test task detected".into();

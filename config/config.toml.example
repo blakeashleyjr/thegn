@@ -180,6 +180,18 @@ command = "git diff"
 # command = "pytest"
 # matcher = "pytest"
 
+# Resource ceilings. superzej NEVER auto-runs tests; these only cap an *explicit*
+# run/discovery so a heavy suite can't pin the machine. When `systemd-run` is
+# available, runs go in a transient `--user --scope` with these caps; otherwise
+# they fall back to `nice`. Empty quota/mem = uncapped; test_nice = 0 disables.
+[limits]
+# tool_mem_max = "6G"        # memory cap for floating tool panes
+# tool_mem_swap_max = "1G"
+# test_cpu_quota = "150%"    # 150% = 1.5 cores for a test run; "" = uncapped
+# test_mem_max = "4G"        # memory cap for a test run; "" = uncapped
+# test_nice = 10             # niceness for test runs (0 disables)
+# test_max_parallel = 1      # max concurrent test/discovery jobs across worktrees
+
 # Pinned programs: summoned from anywhere with Alt-1..9 (in registration order)
 # or the tabbar's pin chips. Pins are global and run on the host (no sandbox).
 # `location = "tab"` opens/focuses a dedicated `pin:<name>` tab (default).

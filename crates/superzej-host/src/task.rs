@@ -5,15 +5,220 @@
 //! loop over a channel. That keeps command execution off the render/input loop
 //! while avoiding a daemon or polling thread.
 
+use std::collections::HashMap;
+use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use superzej_core::config::{Config, Task, TaskKind};
+use superzej_core::config::{Config, LimitsConfig, Task, TaskKind};
 
 use crate::panel::{self, TestLocation, TestNode, TestNodeKind, TestState, TestTask};
 
 const MAX_CAPTURE_BYTES: usize = 256 * 1024;
+
+/// How a capped child gets its CPU/mem ceiling. Resolved once from `PATH`;
+/// `wrap_capped` is pure over it so it can be unit-tested deterministically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapBackend {
+    /// `systemd-run --user --scope` with `CPUQuota`/`MemoryMax`/`Nice`.
+    Systemd,
+    /// `nice -n N` (and `ionice -c3` when present) — no hard cgroup cap.
+    Nice,
+    /// No wrapper available; run bare.
+    None,
+}
+
+fn on_path(bin: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
+        .unwrap_or(false)
+}
+
+pub fn detect_cap_backend() -> CapBackend {
+    if on_path("systemd-run") {
+        CapBackend::Systemd
+    } else if on_path("nice") {
+        CapBackend::Nice
+    } else {
+        CapBackend::None
+    }
+}
+
+fn limits_disabled(limits: &LimitsConfig) -> bool {
+    limits.test_cpu_quota.trim().is_empty()
+        && limits.test_mem_max.trim().is_empty()
+        && limits.test_nice == 0
+}
+
+/// Wrap `argv` so an explicit test run is CPU/memory-capped and can't pin the
+/// machine. Pure over `backend` for testability. Returns `argv` unchanged when
+/// all limits are disabled or no backend is available.
+pub fn wrap_capped(argv: &[String], limits: &LimitsConfig, backend: CapBackend) -> Vec<String> {
+    if limits_disabled(limits) {
+        return argv.to_vec();
+    }
+    match backend {
+        CapBackend::Systemd => {
+            let mut v = vec![
+                "systemd-run".to_string(),
+                "--user".into(),
+                "--scope".into(),
+                "--quiet".into(),
+                "--collect".into(),
+            ];
+            if !limits.test_cpu_quota.trim().is_empty() {
+                v.push("-p".into());
+                v.push(format!("CPUQuota={}", limits.test_cpu_quota.trim()));
+            }
+            if !limits.test_mem_max.trim().is_empty() {
+                v.push("-p".into());
+                v.push(format!("MemoryMax={}", limits.test_mem_max.trim()));
+            }
+            if limits.test_nice != 0 {
+                v.push("--nice".into());
+                v.push(limits.test_nice.to_string());
+            }
+            v.push("--".into());
+            v.extend_from_slice(argv);
+            v
+        }
+        CapBackend::Nice => {
+            let mut v = Vec::new();
+            if on_path("ionice") {
+                v.extend(["ionice".into(), "-c3".into()]);
+            }
+            if limits.test_nice != 0 {
+                v.extend(["nice".into(), "-n".into(), limits.test_nice.to_string()]);
+            }
+            if v.is_empty() {
+                return argv.to_vec();
+            }
+            v.extend_from_slice(argv);
+            v
+        }
+        CapBackend::None => argv.to_vec(),
+    }
+}
+
+/// Live child registry for single-flight + real cancellation. Keyed by a logical
+/// slot (`"<worktree>:run"` / `"<worktree>:disc"`); the value is `(generation,
+/// process-group id)`. Starting a newer job in the same slot kills the older
+/// group so a superseded `cargo test` stops burning CPU immediately.
+fn registry() -> &'static Mutex<HashMap<String, (u64, i32)>> {
+    static R: OnceLock<Mutex<HashMap<String, (u64, i32)>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(unix)]
+fn kill_group(pgid: i32) {
+    // Negative pid would also work via `kill(2)`; killpg is explicit.
+    unsafe {
+        libc::killpg(pgid, libc::SIGTERM);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_group(_pgid: i32) {}
+
+/// Kill whatever is currently registered in `slot` (used when a newer job
+/// supersedes an in-flight one). Public for the supersede path in `run.rs`.
+pub fn cancel_slot(slot: &str) {
+    if let Ok(mut map) = registry().lock() {
+        if let Some((_, pgid)) = map.remove(slot) {
+            kill_group(pgid);
+        }
+    }
+}
+
+/// Run `command` in `worktree` under a CPU/mem cap and a single-flight `slot`,
+/// capturing bounded combined stdout+stderr. Kills any older job in the slot
+/// first. Returns `(exit_code, truncated, captured)`.
+fn run_capped(
+    command: &str,
+    worktree: &Path,
+    limits: &LimitsConfig,
+    slot: &str,
+    generation: u64,
+) -> (Option<i32>, bool, String) {
+    let inner = vec![
+        superzej_core::util::shell(),
+        "-lc".to_string(),
+        command.to_string(),
+    ];
+    let argv = wrap_capped(&inner, limits, detect_cap_backend());
+
+    // Supersede any older job in this slot.
+    cancel_slot(slot);
+
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..])
+        .current_dir(worktree)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return (None, false, format!("failed to spawn task: {e}")),
+    };
+    let pgid = child.id() as i32;
+    if let Ok(mut map) = registry().lock() {
+        map.insert(slot.to_string(), (generation, pgid));
+    }
+
+    // Read stdout and stderr concurrently on threads: reading one to EOF while
+    // the child fills the other pipe's buffer would deadlock. Each stream is
+    // capped, so a chatty suite can't blow memory.
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let out_h = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        if let Some(o) = stdout {
+            let _ = o.take(MAX_CAPTURE_BYTES as u64).read_to_end(&mut b);
+        }
+        b
+    });
+    let err_h = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        if let Some(e) = stderr {
+            let _ = e.take(MAX_CAPTURE_BYTES as u64).read_to_end(&mut b);
+        }
+        b
+    });
+    let status = child.wait();
+    let mut buf = out_h.join().unwrap_or_default();
+    let errbuf = err_h.join().unwrap_or_default();
+    let truncated = buf.len() >= MAX_CAPTURE_BYTES || errbuf.len() >= MAX_CAPTURE_BYTES;
+    buf.extend_from_slice(&errbuf);
+    if buf.len() > MAX_CAPTURE_BYTES {
+        buf.truncate(MAX_CAPTURE_BYTES);
+    }
+
+    // Deregister iff we still own the slot (a newer job may have replaced us).
+    if let Ok(mut map) = registry().lock() {
+        if map
+            .get(slot)
+            .map(|(g, _)| *g == generation)
+            .unwrap_or(false)
+        {
+            map.remove(slot);
+        }
+    }
+
+    let exit_code = status.ok().and_then(|s| s.code());
+    (
+        exit_code,
+        truncated,
+        String::from_utf8_lossy(&buf).into_owned(),
+    )
+}
 
 #[derive(Debug, Clone)]
 pub struct TaskOutcome {
@@ -49,13 +254,30 @@ fn test_task_from_config(t: &Task) -> TestTask {
         command.push(' ');
         command.push_str(&t.args.join(" "));
     }
+    let matcher = t
+        .matcher
+        .clone()
+        .unwrap_or_else(|| infer_matcher(&t.command));
+    let ingestion = ingestion_for_matcher(&matcher);
     TestTask {
         name: t.name.clone(),
         command,
-        matcher: t
-            .matcher
-            .clone()
-            .unwrap_or_else(|| infer_matcher(&t.command)),
+        matcher,
+        ingestion,
+        report_glob: None,
+    }
+}
+
+/// Default ingestion mode for a matcher id. Text is the safe baseline; JSON/
+/// Report matchers (added in later phases) override this.
+fn ingestion_for_matcher(matcher: &str) -> crate::panel::Ingestion {
+    use crate::panel::Ingestion;
+    match matcher {
+        "nextest" | "libtest-json" | "dart" | "flutter" | "deno" | "bun" | "ctest" => {
+            Ingestion::Json
+        }
+        "junit" | "trx" | "gradle" | "maven" | "dotnet" | "sbt" => Ingestion::Report,
+        _ => Ingestion::Text,
     }
 }
 
@@ -129,86 +351,62 @@ fn infer_matcher(command: &str) -> String {
     .into()
 }
 
-pub fn run_task(worktree: PathBuf, generation: u64, task: TestTask) -> TaskOutcome {
+pub fn run_task(
+    worktree: PathBuf,
+    generation: u64,
+    task: TestTask,
+    limits: &LimitsConfig,
+) -> TaskOutcome {
     let started = Instant::now();
-    let out = Command::new(superzej_core::util::shell())
-        .arg("-lc")
-        .arg(&task.command)
-        .current_dir(&worktree)
-        .output();
-    let duration_ms = started.elapsed().as_millis();
-    match out {
-        Ok(out) => {
-            let mut bytes = out.stdout;
-            bytes.extend_from_slice(&out.stderr);
-            let truncated = bytes.len() > MAX_CAPTURE_BYTES;
-            if truncated {
-                bytes.truncate(MAX_CAPTURE_BYTES);
-            }
-            TaskOutcome {
-                worktree: worktree.to_string_lossy().into_owned(),
-                generation,
-                task,
-                exit_code: out.status.code(),
-                duration_ms,
-                truncated,
-                stdout_stderr: String::from_utf8_lossy(&bytes).into_owned(),
-            }
-        }
-        Err(e) => TaskOutcome {
-            worktree: worktree.to_string_lossy().into_owned(),
-            generation,
-            task,
-            exit_code: None,
-            duration_ms,
-            truncated: false,
-            stdout_stderr: format!("failed to run task: {e}"),
-        },
+    let slot = format!("{}:run", worktree.display());
+    let (exit_code, truncated, stdout_stderr) =
+        run_capped(&task.command, &worktree, limits, &slot, generation);
+    TaskOutcome {
+        worktree: worktree.to_string_lossy().into_owned(),
+        generation,
+        task,
+        exit_code,
+        duration_ms: started.elapsed().as_millis(),
+        truncated,
+        stdout_stderr,
     }
 }
 
-pub fn discover_tests(worktree: PathBuf, generation: u64, task: TestTask) -> DiscoveryOutcome {
-    let command = discovery_command(&task);
-    let Some(command) = command else {
+pub fn discover_tests(
+    worktree: PathBuf,
+    generation: u64,
+    task: TestTask,
+    limits: &LimitsConfig,
+) -> DiscoveryOutcome {
+    let wt = worktree.to_string_lossy().into_owned();
+    let Some(command) = discovery_command(&task) else {
         return DiscoveryOutcome {
-            worktree: worktree.to_string_lossy().into_owned(),
+            worktree: wt,
             generation,
             task,
             nodes: Vec::new(),
             error: Some("target discovery is not available for this test command".into()),
         };
     };
-    let out = Command::new(superzej_core::util::shell())
-        .arg("-lc")
-        .arg(command)
-        .current_dir(&worktree)
-        .output();
-    match out {
-        Ok(out) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout).into_owned();
-            let nodes = discovery_output_to_nodes(&task.matcher, &text);
-            DiscoveryOutcome {
-                worktree: worktree.to_string_lossy().into_owned(),
-                generation,
-                task,
-                nodes,
-                error: None,
-            }
+    let slot = format!("{}:disc", worktree.display());
+    let (exit_code, _truncated, text) = run_capped(command, &worktree, limits, &slot, generation);
+    if exit_code == Some(0) {
+        let nodes = discovery_output_to_nodes(&task.matcher, &text);
+        DiscoveryOutcome {
+            worktree: wt,
+            generation,
+            task,
+            nodes,
+            error: None,
         }
-        Ok(out) => DiscoveryOutcome {
-            worktree: worktree.to_string_lossy().into_owned(),
+    } else {
+        DiscoveryOutcome {
+            worktree: wt,
             generation,
             task,
             nodes: Vec::new(),
-            error: Some(String::from_utf8_lossy(&out.stderr).trim().to_string()),
-        },
-        Err(e) => DiscoveryOutcome {
-            worktree: worktree.to_string_lossy().into_owned(),
-            generation,
-            task,
-            nodes: Vec::new(),
-            error: Some(e.to_string()),
-        },
+            error: Some(text.trim().chars().take(200).collect()),
+        }
     }
 }
 
@@ -305,6 +503,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// Caps fully disabled → runs bare, so e2e is deterministic and doesn't
+    /// depend on systemd-run/nice being present in the test sandbox.
+    fn uncapped() -> LimitsConfig {
+        LimitsConfig {
+            test_cpu_quota: String::new(),
+            test_mem_max: String::new(),
+            test_nice: 0,
+            test_max_parallel: 1,
+            ..LimitsConfig::default()
+        }
     }
 
     #[test]
@@ -408,7 +618,7 @@ mod tests {
         // Run the real test command (single-threaded for stable output).
         let run_task_spec =
             TestTask::new("cargo test", "cargo test -- --test-threads=1", "cargo-test");
-        let outcome = run_task(wt.clone(), 1, run_task_spec);
+        let outcome = run_task(wt.clone(), 1, run_task_spec, &uncapped());
         let nodes = parse_task_outcome(&outcome);
 
         assert_eq!(outcome.exit_code, Some(101), "real cargo test should fail");
@@ -426,7 +636,7 @@ mod tests {
         assert!(loc.path.ends_with("src/lib.rs"), "loc was {loc:?}");
 
         // Real discovery via `cargo test -- --list` finds both targets.
-        let disc = discover_tests(wt.clone(), 2, task);
+        let disc = discover_tests(wt.clone(), 2, task, &uncapped());
         assert!(disc.error.is_none(), "discovery error: {:?}", disc.error);
         let labels: Vec<&str> = disc.nodes.iter().map(|n| n.label.as_str()).collect();
         assert!(
@@ -444,7 +654,7 @@ mod tests {
     fn e2e_generic_shell_task_runs_real_process() {
         let wt = temp_dir("e2e-generic");
         let task = TestTask::new("echo-pass", "echo '✓ widget::works' && true", "generic");
-        let outcome = run_task(wt.clone(), 1, task);
+        let outcome = run_task(wt.clone(), 1, task, &uncapped());
         assert_eq!(outcome.exit_code, Some(0));
         let nodes = parse_task_outcome(&outcome);
         assert!(
@@ -452,5 +662,77 @@ mod tests {
             "generic ✓ line should parse as pass: {nodes:?}"
         );
         let _ = std::fs::remove_dir_all(wt);
+    }
+
+    // --- Phase 0 resource-discipline tests ---------------------------------
+
+    #[test]
+    fn wrap_capped_disabled_is_passthrough() {
+        let argv = vec!["sh".into(), "-lc".into(), "true".into()];
+        // Even with a systemd backend, all-disabled limits must not wrap.
+        let out = wrap_capped(&argv, &uncapped(), CapBackend::Systemd);
+        assert_eq!(out, argv);
+    }
+
+    #[test]
+    fn wrap_capped_systemd_sets_cpu_mem_nice_scope() {
+        let argv = vec!["sh".into(), "-lc".into(), "cargo test".into()];
+        let limits = LimitsConfig {
+            test_cpu_quota: "150%".into(),
+            test_mem_max: "4G".into(),
+            test_nice: 10,
+            ..LimitsConfig::default()
+        };
+        let out = wrap_capped(&argv, &limits, CapBackend::Systemd);
+        assert_eq!(out[0], "systemd-run");
+        assert!(out.contains(&"--scope".to_string()));
+        assert!(out.contains(&"CPUQuota=150%".to_string()));
+        assert!(out.contains(&"MemoryMax=4G".to_string()));
+        assert!(out.windows(2).any(|w| w[0] == "--nice" && w[1] == "10"));
+        // The real command is preserved after the `--` separator.
+        let sep = out.iter().position(|s| s == "--").unwrap();
+        assert_eq!(&out[sep + 1..], &argv[..]);
+    }
+
+    #[test]
+    fn wrap_capped_nice_prefixes_when_no_systemd() {
+        let argv = vec!["sh".into(), "-lc".into(), "go test ./...".into()];
+        let limits = LimitsConfig {
+            test_cpu_quota: String::new(),
+            test_mem_max: String::new(),
+            test_nice: 5,
+            ..LimitsConfig::default()
+        };
+        let out = wrap_capped(&argv, &limits, CapBackend::Nice);
+        let nice = out.iter().position(|s| s == "nice").expect("nice prefix");
+        assert_eq!(out[nice + 1], "-n");
+        assert_eq!(out[nice + 2], "5");
+        assert!(out.ends_with(&argv));
+    }
+
+    /// Single-flight + real cancellation: a long run is killed when a newer job
+    /// supersedes it (or `cancel_slot` is called), so it stops burning CPU.
+    #[test]
+    fn run_capped_cancel_kills_the_process_group() {
+        let wt = temp_dir("cancel");
+        let slot = format!("{}:run", wt.display());
+        let slot2 = slot.clone();
+        let handle = std::thread::spawn(move || {
+            // Sleeps 30s unless its process group is killed.
+            run_capped("sleep 30", &wt, &uncapped(), &slot2, 1)
+        });
+        // Wait for the child to register, then supersede it.
+        let mut waited = 0;
+        while registry().lock().unwrap().get(&slot).is_none() && waited < 100 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 1;
+        }
+        cancel_slot(&slot);
+        let start = Instant::now();
+        let (_code, _trunc, _out) = handle.join().unwrap();
+        assert!(
+            start.elapsed().as_secs() < 10,
+            "cancelled run should return promptly, not after the full sleep"
+        );
     }
 }
