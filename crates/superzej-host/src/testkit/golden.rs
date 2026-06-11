@@ -78,6 +78,20 @@ fn golden_deno_junit() {
 }
 
 #[test]
+fn golden_maven_surefire_junit() {
+    let nodes = report::parse_report(include_str!("../../testdata/maven.junit.xml"));
+    let (pass, fail, _) = counts(&nodes);
+    assert_eq!((pass, fail), (1, 1), "real maven surefire junit: {nodes:?}");
+}
+
+#[test]
+fn golden_dotnet_trx() {
+    let nodes = report::parse_report(include_str!("../../testdata/dotnet.trx"));
+    let (pass, fail, _) = counts(&nodes);
+    assert_eq!((pass, fail), (1, 1), "real dotnet trx: {nodes:?}");
+}
+
+#[test]
 fn golden_phpunit_junit() {
     let nodes = report::parse_report(include_str!("../../testdata/phpunit.junit.xml"));
     let (pass, fail, _) = counts(&nodes);

@@ -187,5 +187,55 @@ if sel ocaml; then
   check ocaml ocaml.txt
 fi
 
+# --- java / maven → JUnit XML ----------------------------------------------
+if sel maven; then
+  d="$WORK/mvn"; mkdir -p "$d/src/test/java"
+  cat >"$d/pom.xml" <<'EOF'
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>sz</groupId><artifactId>szfix</artifactId><version>1.0</version>
+  <properties><maven.compiler.release>17</maven.compiler.release></properties>
+  <dependencies>
+    <dependency><groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter</artifactId><version>5.10.2</version><scope>test</scope></dependency>
+  </dependencies>
+  <build><plugins>
+    <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-surefire-plugin</artifactId><version>3.2.5</version></plugin>
+  </plugins></build>
+</project>
+EOF
+  cat >"$d/src/test/java/CalcTest.java" <<'EOF'
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+class CalcTest {
+  @Test void adds() { assertEquals(4, 2 + 2); }
+  @Test void breaks() { assertEquals(5, 2 + 2); }
+}
+EOF
+  ( cd "$d" && nix shell nixpkgs#maven nixpkgs#jdk17 -c bash -c 'mvn -q -o test >/dev/null 2>&1; cat target/surefire-reports/*.xml 2>/dev/null || mvn -q test >/dev/null 2>&1; cat target/surefire-reports/*.xml 2>/dev/null' ) >"$OUT/maven.junit.xml" 2>/dev/null
+  check maven maven.junit.xml
+fi
+
+# --- swift → text (XCTest) -------------------------------------------------
+if sel swift; then
+  d="$WORK/sw"; mkdir -p "$d/Sources/szfix" "$d/Tests/szfixTests"
+  cat >"$d/Package.swift" <<'EOF'
+// swift-tools-version:5.9
+import PackageDescription
+let package = Package(name: "szfix",
+  targets: [ .target(name: "szfix"), .testTarget(name: "szfixTests", dependencies: ["szfix"]) ])
+EOF
+  printf 'public func add(_ a: Int, _ b: Int) -> Int { a + b }\n' >"$d/Sources/szfix/szfix.swift"
+  cat >"$d/Tests/szfixTests/CalcTests.swift" <<'EOF'
+import XCTest
+@testable import szfix
+final class CalcTests: XCTestCase {
+  func testAdds() { XCTAssertEqual(add(2, 2), 4) }
+  func testBreaks() { XCTAssertEqual(add(2, 2), 5) }
+}
+EOF
+  ( cd "$d" && nix shell nixpkgs#swift -c swift test ) >"$OUT/swift.txt" 2>&1
+  check swift swift.txt
+fi
+
 echo "fixtures in $OUT:"
 ls -1 "$OUT"
