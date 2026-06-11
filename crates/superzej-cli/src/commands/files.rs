@@ -77,14 +77,17 @@ pub fn run(
             // `superzej` it shells out to — e.g. the `q` close keybind —
             // resolves this worktree).
             let fm = yazi::bin(cfg);
-            let inner = spawn_inner(cfg_home.as_deref(), &wt, &fm);
-            let sh = util::shell();
             let reveal = reveal.unwrap_or_default();
-            let mut cmd: Vec<&str> = vec![&sh, "-lc", &inner, "_"];
-            if !reveal.is_empty() {
-                cmd.push(&reveal);
-            }
-            zellij::new_drawer(&wt, PANE_NAME, &cfg.drawer.height, &cfg.drawer.width, &cmd);
+            let cmd = drawer_command(
+                cfg,
+                cfg_home.as_deref(),
+                &wt,
+                &fm,
+                &reveal,
+                util::have("systemd-run"),
+            );
+            let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+            zellij::new_drawer(&wt, PANE_NAME, &cfg.drawer.height, &cfg.drawer.width, &refs);
             persist(&key, true);
         }
     }
@@ -117,9 +120,52 @@ fn decide(close: bool, present: bool, restore: bool, persisted_open: bool) -> Ac
     }
 }
 
-/// The `sh -lc` script that exports the private config home + worktree marker
-/// then execs the file manager. `fm` is left unquoted so a configured command
-/// can carry args; the optional reveal path is passed as `$1`.
+/// Build the command argv for the drawer pane. The inner shell exports the yazi
+/// config/worktree env, then optional systemd scope containment wraps that process
+/// tree so image preview helpers cannot escape the configured limits.
+fn drawer_command(
+    cfg: &Config,
+    cfg_home: Option<&std::path::Path>,
+    worktree: &std::path::Path,
+    fm: &str,
+    reveal: &str,
+    systemd_available: bool,
+) -> Vec<String> {
+    let inner = spawn_inner(cfg_home, worktree, fm);
+    let mut cmd = vec![util::shell(), "-lc".into(), inner, "_".into()];
+    if !reveal.is_empty() {
+        cmd.push(reveal.into());
+    }
+    contain_drawer_argv(cfg, cmd, systemd_available)
+}
+
+fn contain_drawer_argv(cfg: &Config, cmd: Vec<String>, systemd_available: bool) -> Vec<String> {
+    if !cfg.drawer.contain || !systemd_available {
+        return cmd;
+    }
+
+    let mut wrapped = vec![
+        "systemd-run".into(),
+        "--user".into(),
+        "--scope".into(),
+        "--quiet".into(),
+        "--collect".into(),
+    ];
+    for (key, value) in [
+        ("MemoryMax", cfg.drawer.memory_max.trim()),
+        ("MemorySwapMax", cfg.drawer.memory_swap_max.trim()),
+        ("CPUQuota", cfg.drawer.cpu_quota.trim()),
+    ] {
+        if !value.is_empty() {
+            wrapped.push("-p".into());
+            wrapped.push(format!("{key}={value}"));
+        }
+    }
+    wrapped.push("--".into());
+    wrapped.extend(cmd);
+    wrapped
+}
+
 fn spawn_inner(cfg_home: Option<&std::path::Path>, worktree: &std::path::Path, fm: &str) -> String {
     let mut inner = String::new();
     if let Some(home) = cfg_home {
@@ -202,6 +248,92 @@ mod tests {
         p
     }
 
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn cfg_for_run(config_home: &Path) -> Config {
+        let mut cfg = Config::default();
+        cfg.drawer.command = "true".into();
+        cfg.drawer.config_home = config_home.to_string_lossy().into_owned();
+        cfg.drawer.contain = false;
+        cfg
+    }
+
+    #[test]
+    fn run_spawn_and_close_persist_state_in_session() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tmpdir();
+        let wt = dir.join("repo");
+        std::fs::create_dir_all(&wt).unwrap();
+        let state = dir.join("state");
+        let cfg = cfg_for_run(&dir.join("yazi"));
+        std::env::set_var("SUPERZEJ_DIR", &state);
+        std::env::set_var("ZELLIJ_SESSION_NAME", "sz-test-no-session");
+
+        run(
+            &cfg,
+            Some("README.md".into()),
+            Some(wt.to_string_lossy().into_owned()),
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        let key = util::slugify(&wt.to_string_lossy());
+        assert!(persisted_open_in(&state.join("drawer"), &key));
+
+        run(
+            &cfg,
+            None,
+            Some(wt.to_string_lossy().into_owned()),
+            None,
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(!persisted_open_in(&state.join("drawer"), &key));
+
+        std::env::remove_var("ZELLIJ_SESSION_NAME");
+        std::env::remove_var("SUPERZEJ_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_restore_closed_worktree_is_noop() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tmpdir();
+        let wt = dir.join("repo");
+        std::fs::create_dir_all(&wt).unwrap();
+        let state = dir.join("state");
+        let cfg = cfg_for_run(&dir.join("yazi"));
+        let key = util::slugify(&wt.to_string_lossy());
+        persist_in(&state.join("drawer"), &key, false);
+        std::env::set_var("SUPERZEJ_DIR", &state);
+        std::env::set_var("ZELLIJ_SESSION_NAME", "sz-test-no-session");
+
+        run(
+            &cfg,
+            None,
+            Some(wt.to_string_lossy().into_owned()),
+            None,
+            None,
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(!persisted_open_in(&state.join("drawer"), &key));
+
+        std::env::remove_var("ZELLIJ_SESSION_NAME");
+        std::env::remove_var("SUPERZEJ_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_tab_worktree_missing_tab_returns_none() {
+        assert!(resolve_tab_worktree("definitely-missing-tab").is_none());
+    }
+
     #[test]
     fn decide_close_wins() {
         // --close always closes, regardless of presence/restore/persistence.
@@ -267,6 +399,63 @@ mod tests {
         // A configured command with flags must reach the shell intact.
         let inner = spawn_inner(None, Path::new("/wt"), "ranger --cmd=foo");
         assert!(inner.contains("exec ranger --cmd=foo \"$@\""));
+    }
+
+    #[test]
+    fn drawer_command_wraps_yazi_in_systemd_scope_with_limits() {
+        let cfg = Config::default();
+        let cmd = drawer_command(
+            &cfg,
+            Some(Path::new("/cfg/yazi")),
+            Path::new("/wt"),
+            "yazi",
+            "images/logo.png",
+            true,
+        );
+
+        assert_eq!(cmd[0], "systemd-run");
+        assert!(cmd.contains(&"--user".to_string()));
+        assert!(cmd.contains(&"--scope".to_string()));
+        assert!(cmd.contains(&"--collect".to_string()));
+        assert!(cmd.contains(&"MemoryMax=2G".to_string()));
+        assert!(cmd.contains(&"MemorySwapMax=512M".to_string()));
+        assert!(cmd.contains(&"CPUQuota=200%".to_string()));
+        assert!(
+            cmd.iter()
+                .any(|arg| arg.contains("YAZI_CONFIG_HOME='/cfg/yazi'"))
+        );
+        assert_eq!(cmd.last().map(String::as_str), Some("images/logo.png"));
+    }
+
+    #[test]
+    fn drawer_command_omits_empty_limit_properties() {
+        let mut cfg = Config::default();
+        cfg.drawer.memory_swap_max.clear();
+        cfg.drawer.cpu_quota.clear();
+        let cmd = drawer_command(&cfg, None, Path::new("/wt"), "yazi", "", true);
+
+        assert!(cmd.contains(&"MemoryMax=2G".to_string()));
+        assert!(!cmd.iter().any(|arg| arg.starts_with("MemorySwapMax=")));
+        assert!(!cmd.iter().any(|arg| arg.starts_with("CPUQuota=")));
+    }
+
+    #[test]
+    fn drawer_command_leaves_argv_unwrapped_when_containment_disabled() {
+        let mut cfg = Config::default();
+        cfg.drawer.contain = false;
+        let cmd = drawer_command(&cfg, None, Path::new("/wt"), "yazi", "", true);
+
+        assert_ne!(cmd[0], "systemd-run");
+        assert!(cmd.iter().any(|arg| arg.contains("exec yazi")));
+    }
+
+    #[test]
+    fn drawer_command_leaves_argv_unwrapped_without_systemd_run() {
+        let cfg = Config::default();
+        let cmd = drawer_command(&cfg, None, Path::new("/wt"), "yazi", "", false);
+
+        assert_ne!(cmd[0], "systemd-run");
+        assert!(cmd.iter().any(|arg| arg.contains("exec yazi")));
     }
 
     #[test]

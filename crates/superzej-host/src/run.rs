@@ -794,10 +794,176 @@ fn tab_cwd(tab: &crate::session::Tab) -> Option<std::path::PathBuf> {
         .or_else(|| std::env::current_dir().ok())
 }
 
+#[derive(Default)]
+struct DrawerPool {
+    hidden: std::collections::VecDeque<(String, u32)>,
+}
+
+impl DrawerPool {
+    fn key(dir: &std::path::Path) -> String {
+        superzej_core::util::slugify(&dir.to_string_lossy())
+    }
+
+    fn take(&mut self, dir: &std::path::Path) -> Option<u32> {
+        let key = Self::key(dir);
+        let idx = self.hidden.iter().position(|(k, _)| k == &key)?;
+        self.hidden.remove(idx).map(|(_, id)| id)
+    }
+
+    fn stash(&mut self, dir: &std::path::Path, id: u32, limit: usize, panes: &mut Panes) {
+        if limit == 0 {
+            panes.table.remove(&id);
+            return;
+        }
+        let key = Self::key(dir);
+        self.remove_key(&key, panes);
+        self.hidden.push_back((key, id));
+        while self.hidden.len() > limit {
+            if let Some((_, evicted)) = self.hidden.pop_front() {
+                panes.table.remove(&evicted);
+            }
+        }
+    }
+
+    fn remove_id(&mut self, id: u32) -> bool {
+        let Some(idx) = self.hidden.iter().position(|(_, hid)| *hid == id) else {
+            return false;
+        };
+        self.hidden.remove(idx);
+        true
+    }
+
+    fn remove_key(&mut self, key: &str, panes: &mut Panes) {
+        if let Some(idx) = self.hidden.iter().position(|(k, _)| k == key) {
+            if let Some((_, id)) = self.hidden.remove(idx) {
+                panes.table.remove(&id);
+            }
+        }
+    }
+
+    fn contains(&self, dir: &std::path::Path) -> bool {
+        let key = Self::key(dir);
+        self.hidden.iter().any(|(k, _)| k == &key)
+    }
+}
+
+fn persist_drawer_state(dir: &std::path::Path, open: bool) {
+    let key = superzej_core::util::slugify(&dir.to_string_lossy());
+    let state_dir = superzej_core::util::superzej_dir().join("drawer");
+    let _ = std::fs::create_dir_all(&state_dir);
+    let _ = std::fs::write(state_dir.join(key), if open { "true" } else { "false" });
+}
+
+fn contain_yazi_argv(
+    cfg: &superzej_core::config::Config,
+    cmd: Vec<String>,
+    systemd_available: bool,
+) -> Vec<String> {
+    if !cfg.drawer.contain || !systemd_available {
+        return cmd;
+    }
+    let mut wrapped = vec![
+        "systemd-run".into(),
+        "--user".into(),
+        "--scope".into(),
+        "--quiet".into(),
+        "--collect".into(),
+    ];
+    for (key, value) in [
+        ("MemoryMax", cfg.drawer.memory_max.trim()),
+        ("MemorySwapMax", cfg.drawer.memory_swap_max.trim()),
+        ("CPUQuota", cfg.drawer.cpu_quota.trim()),
+    ] {
+        if !value.is_empty() {
+            wrapped.push("-p".into());
+            wrapped.push(format!("{key}={value}"));
+        }
+    }
+    wrapped.push("--".into());
+    wrapped.extend(cmd);
+    wrapped
+}
+
+fn yazi_drawer_argv(
+    cfg: &superzej_core::config::Config,
+    worktree: &std::path::Path,
+    systemd_available: bool,
+) -> Vec<String> {
+    let cfg_home = superzej_core::yazi::ensure_config(cfg);
+    let fm = superzej_core::yazi::bin(cfg);
+    let mut inner = String::new();
+    if let Some(home) = cfg_home.as_deref() {
+        inner.push_str(&format!(
+            "export YAZI_CONFIG_HOME={}; ",
+            superzej_core::util::sh_quote(&home.to_string_lossy())
+        ));
+    }
+    inner.push_str(&format!(
+        "export SUPERZEJ_WORKTREE={}; ",
+        superzej_core::util::sh_quote(&worktree.to_string_lossy())
+    ));
+    inner.push_str(&format!("exec {fm}"));
+    contain_yazi_argv(
+        cfg,
+        vec![superzej_core::util::shell(), "-lc".into(), inner],
+        systemd_available,
+    )
+}
+
+fn spawn_yazi_pane(
+    panes: &mut Panes,
+    cfg: &superzej_core::config::Config,
+    dir: &std::path::Path,
+    center: Rect,
+) -> Option<u32> {
+    let argv = yazi_drawer_argv(cfg, dir, superzej_core::util::have("systemd-run"));
+    panes.spawn_argv(&argv, Some(dir), center).ok()
+}
+
+fn show_yazi_drawer(
+    panes: &mut Panes,
+    drawer: &mut Option<u32>,
+    pool: &mut DrawerPool,
+    home: &mut Option<std::path::PathBuf>,
+    cfg: &superzej_core::config::Config,
+    dir: &std::path::Path,
+    center: Rect,
+) {
+    if drawer.is_some() {
+        return;
+    }
+    if let Some(id) = pool.take(dir) {
+        *drawer = Some(id);
+        *home = Some(dir.to_path_buf());
+        return;
+    }
+    if let Some(id) = spawn_yazi_pane(panes, cfg, dir, center) {
+        *drawer = Some(id);
+        *home = Some(dir.to_path_buf());
+    }
+}
+
+fn hide_drawer_into_pool(
+    drawer: &mut Option<u32>,
+    pool: &mut DrawerPool,
+    home: &mut Option<std::path::PathBuf>,
+    fallback: &std::path::Path,
+    cfg: &superzej_core::config::Config,
+    panes: &mut Panes,
+) {
+    if let Some(id) = drawer.take() {
+        let key = home.take().unwrap_or_else(|| fallback.to_path_buf());
+        pool.stash(&key, id, cfg.drawer.pool_limit, panes);
+    }
+}
+
 fn sync_drawer_persistence(
     session: &crate::session::Session,
     panes: &mut Panes,
     drawer: &mut Option<u32>,
+    pool: &mut DrawerPool,
+    home: &mut Option<std::path::PathBuf>,
+    cfg: &superzej_core::config::Config,
     center: Rect,
 ) {
     let Some(tab) = session.tabs.get(session.active) else {
@@ -812,13 +978,20 @@ fn sync_drawer_persistence(
             .map(|s| s.trim() == "true")
             .unwrap_or(false);
 
+    if drawer.is_some() && home.as_deref() != Some(dir.as_path()) {
+        hide_drawer_into_pool(drawer, pool, home, &dir, cfg, panes);
+    }
     if should_be_open && drawer.is_none() {
-        if let Ok(id) = panes.spawn(Some(&dir), center) {
-            *drawer = Some(id);
-        }
+        show_yazi_drawer(panes, drawer, pool, home, cfg, &dir, center);
     } else if !should_be_open && drawer.is_some() {
-        if let Some(id) = drawer.take() {
-            panes.table.remove(&id);
+        hide_drawer_into_pool(drawer, pool, home, &dir, cfg, panes);
+    } else if !should_be_open
+        && cfg.drawer.prewarm
+        && cfg.drawer.pool_limit > 0
+        && !pool.contains(&dir)
+    {
+        if let Some(id) = spawn_yazi_pane(panes, cfg, &dir, center) {
+            pool.stash(&dir, id, cfg.drawer.pool_limit, panes);
         }
     }
 }
@@ -847,10 +1020,20 @@ async fn event_loop<T: Terminal>(
     let mut panes = Panes::new(tx);
     let mut need_relayout = true;
     let mut drawer: Option<u32> = None;
+    let mut drawer_pool = DrawerPool::default();
+    let mut drawer_home: Option<std::path::PathBuf> = None;
     let mut last_model_refresh = Instant::now();
     let mut last_pr_refresh = Instant::now() - PR_REFRESH_INTERVAL;
 
-    sync_drawer_persistence(&session, &mut panes, &mut drawer, chrome.center);
+    sync_drawer_persistence(
+        &session,
+        &mut panes,
+        &mut drawer,
+        &mut drawer_pool,
+        &mut drawer_home,
+        keymap.config(),
+        chrome.center,
+    );
 
     let mut current_config = keymap.config().clone();
     loop {
@@ -907,6 +1090,19 @@ async fn event_loop<T: Terminal>(
                         }
                         PaneEvent::Exit(id) => {
                             panes.table.remove(&id);
+                            if drawer == Some(id) {
+                                drawer = None;
+                                if let Some(dir) = drawer_home.take() {
+                                    persist_drawer_state(&dir, false);
+                                }
+                                model.status = "Files drawer exited; if previews were enabled, it may have hit the drawer memory limit.".into();
+                                dirty = true;
+                                continue;
+                            }
+                            if drawer_pool.remove_id(id) {
+                                dirty = true;
+                                continue;
+                            }
                             // Find the owning tab and either drop the pane from its split
                             // or, if its only shell died, keep the tab and respawn a fresh
                             // shell. Explicit close-pane/worktree actions remove the pane
@@ -1109,6 +1305,9 @@ async fn event_loop<T: Terminal>(
                                                     &session,
                                                     &mut panes,
                                                     &mut drawer,
+                                                    &mut drawer_pool,
+                                                    &mut drawer_home,
+                                                    keymap.config(),
                                                     chrome.center,
                                                 );
                                             }
@@ -1123,6 +1322,9 @@ async fn event_loop<T: Terminal>(
                                                 &session,
                                                 &mut panes,
                                                 &mut drawer,
+                                                &mut drawer_pool,
+                                                &mut drawer_home,
+                                                keymap.config(),
                                                 chrome.center,
                                             );
                                         }
@@ -1138,6 +1340,9 @@ async fn event_loop<T: Terminal>(
                                             &session,
                                             &mut panes,
                                             &mut drawer,
+                                            &mut drawer_pool,
+                                            &mut drawer_home,
+                                            keymap.config(),
                                             chrome.center,
                                         );
                                     }
@@ -1199,48 +1404,34 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::ToggleDrawer => {
+                                let cwd = tab_cwd(&session.tabs[active]);
                                 if drawer.is_some() {
-                                    // Reap the drawer pane
-                                    if let Some(id) = drawer.take() {
+                                    if let Some(dir) = cwd.as_deref() {
+                                        hide_drawer_into_pool(
+                                            &mut drawer,
+                                            &mut drawer_pool,
+                                            &mut drawer_home,
+                                            dir,
+                                            keymap.config(),
+                                            &mut panes,
+                                        );
+                                        persist_drawer_state(dir, false);
+                                    } else if let Some(id) = drawer.take() {
                                         panes.table.remove(&id);
-                                        let cwd = tab_cwd(&session.tabs[active]);
-                                        if let Some(dir) = cwd {
-                                            let key = superzej_core::util::slugify(
-                                                &dir.to_string_lossy(),
-                                            );
-                                            let dir =
-                                                superzej_core::util::superzej_dir().join("drawer");
-                                            let _ = std::fs::write(dir.join(key), "false");
-                                        }
+                                        drawer_home = None;
                                     }
-                                } else {
-                                    // Spawn the drawer pane.
-                                    // In a full implementation we'd read `~/.superzej/drawer/slug`
-                                    // and use yazi::bin(&cfg), but for the spike we'll just spawn
-                                    // yazi in the active worktree.
-                                    let cwd = tab_cwd(&session.tabs[active]);
-                                    let p = keymap
-                                        .config()
-                                        .tool_command("yazi")
-                                        .map(tool_drawer_argv)
-                                        .and_then(|argv| {
-                                            panes
-                                                .spawn_argv(&argv, cwd.as_deref(), chrome.center)
-                                                .ok()
-                                        })
-                                        .or_else(|| {
-                                            panes.spawn(cwd.as_deref(), chrome.center).ok()
-                                        });
-                                    if let Some(id) = p {
-                                        drawer = Some(id);
-                                    }
-                                    if let Some(dir) = cwd {
-                                        let key =
-                                            superzej_core::util::slugify(&dir.to_string_lossy());
-                                        let dir =
-                                            superzej_core::util::superzej_dir().join("drawer");
-                                        let _ = std::fs::create_dir_all(&dir);
-                                        let _ = std::fs::write(dir.join(key), "true");
+                                } else if let Some(dir) = cwd.as_deref() {
+                                    show_yazi_drawer(
+                                        &mut panes,
+                                        &mut drawer,
+                                        &mut drawer_pool,
+                                        &mut drawer_home,
+                                        keymap.config(),
+                                        dir,
+                                        chrome.center,
+                                    );
+                                    if drawer.is_some() {
+                                        persist_drawer_state(dir, true);
                                     }
                                 }
                             }
@@ -1276,6 +1467,9 @@ async fn event_loop<T: Terminal>(
                                     &session,
                                     &mut panes,
                                     &mut drawer,
+                                    &mut drawer_pool,
+                                    &mut drawer_home,
+                                    keymap.config(),
                                     chrome.center,
                                 );
                             }
@@ -1287,6 +1481,9 @@ async fn event_loop<T: Terminal>(
                                     &session,
                                     &mut panes,
                                     &mut drawer,
+                                    &mut drawer_pool,
+                                    &mut drawer_home,
+                                    keymap.config(),
                                     chrome.center,
                                 );
                             }
@@ -1340,6 +1537,9 @@ async fn event_loop<T: Terminal>(
                                                 &session,
                                                 &mut panes,
                                                 &mut drawer,
+                                                &mut drawer_pool,
+                                                &mut drawer_home,
+                                                keymap.config(),
                                                 chrome.center,
                                             );
                                         }
@@ -1440,23 +1640,23 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::Yazi => {
-                                // Direct bind for yazi, routed identical to ToggleDrawer but always spawning.
-                                if drawer.is_some() {
-                                    if let Some(id) = drawer.take() {
-                                        panes.table.remove(&id);
-                                    }
+                                // Direct bind for yazi: always replace the visible drawer with
+                                // a fresh, managed yazi pane for the active worktree.
+                                if let Some(id) = drawer.take() {
+                                    panes.table.remove(&id);
+                                    drawer_home = None;
                                 }
                                 let cwd = tab_cwd(&session.tabs[active]);
-                                let p = keymap
-                                    .config()
-                                    .tool_command("yazi")
-                                    .map(tool_drawer_argv)
-                                    .and_then(|argv| {
-                                        panes.spawn_argv(&argv, cwd.as_deref(), chrome.center).ok()
-                                    })
-                                    .or_else(|| panes.spawn(cwd.as_deref(), chrome.center).ok());
-                                if let Some(id) = p {
-                                    drawer = Some(id);
+                                if let Some(dir) = cwd.as_deref() {
+                                    if let Some(id) = spawn_yazi_pane(
+                                        &mut panes,
+                                        keymap.config(),
+                                        dir,
+                                        chrome.center,
+                                    ) {
+                                        drawer = Some(id);
+                                        drawer_home = Some(dir.to_path_buf());
+                                    }
                                 }
                             }
                             // New/switch worktree+workspace and tool floats: recognized
@@ -1747,6 +1947,62 @@ mod tests {
         assert_eq!(session.tabs[1].name, "app/·1");
         assert_eq!(model.active_tab, 1);
         assert_eq!(model.tabs[1], "app/·1");
+    }
+
+    #[test]
+    fn host_yazi_argv_wraps_scope_with_drawer_limits() {
+        let mut cfg = superzej_core::config::Config::default();
+        cfg.drawer.config_home = "system".into();
+        let argv = yazi_drawer_argv(&cfg, std::path::Path::new("/wt"), true);
+
+        assert_eq!(argv[0], "systemd-run");
+        assert!(argv.contains(&"--user".to_string()));
+        assert!(argv.contains(&"--scope".to_string()));
+        assert!(argv.contains(&"--collect".to_string()));
+        assert!(argv.contains(&"MemoryMax=2G".to_string()));
+        assert!(argv.contains(&"MemorySwapMax=512M".to_string()));
+        assert!(argv.contains(&"CPUQuota=200%".to_string()));
+        assert!(argv.iter().any(|arg| arg.contains("SUPERZEJ_WORKTREE=/wt")));
+        assert!(!argv.iter().any(|arg| arg.contains("YAZI_CONFIG_HOME")));
+    }
+
+    #[test]
+    fn host_yazi_argv_omits_empty_limits_and_can_disable_scope() {
+        let mut cfg = superzej_core::config::Config::default();
+        cfg.drawer.config_home = "system".into();
+        cfg.drawer.memory_swap_max.clear();
+        cfg.drawer.cpu_quota.clear();
+        let argv = yazi_drawer_argv(&cfg, std::path::Path::new("/wt"), true);
+
+        assert_eq!(argv[0], "systemd-run");
+        assert!(argv.contains(&"MemoryMax=2G".to_string()));
+        assert!(!argv.iter().any(|arg| arg.starts_with("MemorySwapMax=")));
+        assert!(!argv.iter().any(|arg| arg.starts_with("CPUQuota=")));
+
+        cfg.drawer.contain = false;
+        let bare = yazi_drawer_argv(&cfg, std::path::Path::new("/wt"), true);
+        assert_ne!(bare[0], "systemd-run");
+        assert!(bare.iter().any(|arg| arg.contains("exec ")));
+    }
+
+    #[test]
+    fn drawer_pool_respects_zero_limit_and_evicts_oldest() {
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
+        let mut panes = Panes::new(tx);
+        let mut pool = DrawerPool::default();
+        let a = std::path::Path::new("/tmp/a");
+        let b = std::path::Path::new("/tmp/b");
+
+        pool.stash(a, 1, 0, &mut panes);
+        assert!(!pool.contains(a));
+
+        pool.stash(a, 1, 1, &mut panes);
+        assert!(pool.contains(a));
+        pool.stash(b, 2, 1, &mut panes);
+        assert!(!pool.contains(a));
+        assert!(pool.contains(b));
+        assert_eq!(pool.take(b), Some(2));
+        assert!(!pool.contains(b));
     }
 
     #[test]
