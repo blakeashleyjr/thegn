@@ -357,6 +357,17 @@ mod tests {
         // ~2/3 of the window while a document view is open.
         assert_eq!(expanded.panel.unwrap().cols, 160 * 2 / 3);
         assert!(expanded.center.cols >= 1);
+        assert!(
+            resting.center.cols > expanded.center.cols,
+            "center should widen when the document panel retracts"
+        );
+
+        let hidden = compute_full(160, 40, true, false, false, false, SIDEBAR_COLS, false, 0.0);
+        assert!(hidden.panel.is_none());
+        assert!(
+            hidden.center.cols > resting.center.cols,
+            "center should widen further when the panel is hidden"
+        );
         // On a small forced screen the clamp still leaves a live center.
         let tiny = compute_full(60, 20, false, true, true, true, SIDEBAR_COLS, false, 0.0);
         assert!(tiny.panel.unwrap().cols >= PANEL_COLS);
