@@ -276,7 +276,8 @@ fn ingestion_for_matcher(matcher: &str) -> crate::panel::Ingestion {
         "nextest" | "libtest-json" | "dart" | "flutter" | "deno" | "bun" | "rspec" => {
             Ingestion::Json
         }
-        "junit" | "trx" | "gradle" | "maven" | "dotnet" | "sbt" => Ingestion::Report,
+        "junit" | "trx" | "nunit" | "gradle" | "maven" | "dotnet" | "sbt" => Ingestion::Report,
+        "tap" | "bats" | "prove" | "busted" | "pgtap" => Ingestion::Tap,
         _ => Ingestion::Text,
     }
 }
@@ -403,6 +404,41 @@ fn detect_fallback(worktree: &Path) -> Option<TestTask> {
     if has("dub.json") || has("dub.sdl") {
         return Some(TestTask::new("dub test", "dub test", "d"));
     }
+    // TAP-emitting ecosystems (one parser covers them all).
+    if has_test_file_ext(worktree, ".bats") {
+        return Some(
+            TestTask::new("bats", "bats --formatter tap .", "bats").with_ingestion(Ingestion::Tap),
+        );
+    }
+    if has_test_file_ext(worktree, "_spec.lua") || has(".busted") {
+        return Some(
+            TestTask::new("busted", "busted -o TAP", "busted").with_ingestion(Ingestion::Tap),
+        );
+    }
+    if has("cpanfile") || has("Makefile.PL") || has("dist.ini") || has_test_file_ext(worktree, ".t")
+    {
+        // prove -v echoes each test's raw TAP inline (plus a summary we ignore).
+        return Some(TestTask::new("prove", "prove -v t/", "prove").with_ingestion(Ingestion::Tap));
+    }
+    // PowerShell / Pester → NUnit XML report on stdout.
+    if has_test_file_ext(worktree, ".Tests.ps1") {
+        return Some(
+            TestTask::new(
+                "pester",
+                "pwsh -NoProfile -Command \"Invoke-Pester -CI -Output Minimal\"",
+                "nunit",
+            )
+            .with_ingestion(Ingestion::Report)
+            .with_report_glob("testResults.xml"),
+        );
+    }
+    // OCaml / dune and Gleam: sparse text → synthetic result from exit code.
+    if has("dune-project") {
+        return Some(TestTask::new("dune test", "dune runtest", "ocaml"));
+    }
+    if has("gleam.toml") {
+        return Some(TestTask::new("gleam test", "gleam test", "gleam"));
+    }
     if has("deno.json") || has("deno.jsonc") {
         // deno writes a JUnit report to stdout (no file), parsed via the Report
         // path's stdout fallback.
@@ -440,11 +476,32 @@ fn has_dotnet_project(worktree: &Path) -> bool {
                 e.path()
                     .extension()
                     .and_then(|s| s.to_str())
-                    .map(|ext| ext == "sln" || ext == "csproj")
+                    // C#, F#, and VB.NET project/solution files.
+                    .map(|ext| matches!(ext, "sln" | "csproj" | "fsproj" | "vbproj"))
                     .unwrap_or(false)
             })
         })
         .unwrap_or(false)
+}
+
+/// Whether any file under `worktree` (root + common test dirs) has `ext`.
+fn has_test_file_ext(worktree: &Path, ext: &str) -> bool {
+    for sub in ["", "test", "tests", "spec", "t"] {
+        let dir = if sub.is_empty() {
+            worktree.to_path_buf()
+        } else {
+            worktree.join(sub)
+        };
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_file() && p.to_string_lossy().ends_with(ext) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn has_just_test(worktree: &Path) -> bool {
@@ -626,6 +683,13 @@ pub fn parse_task_outcome(outcome: &TaskOutcome) -> Vec<TestNode> {
         // Fall through to the synthetic single-node result below on empty JSON
         // (e.g. the runner failed before emitting any events).
     }
+    if outcome.task.ingestion == Ingestion::Tap {
+        let nodes = crate::testkit::tap::parse(&outcome.stdout_stderr);
+        if !nodes.is_empty() {
+            return nodes;
+        }
+        // No TAP lines parsed: fall through to the synthetic node.
+    }
     if outcome.task.ingestion == Ingestion::Report {
         // File-based report (Maven/Gradle/sbt/.NET/PHP) when a glob is set;
         // otherwise the runner wrote the report to stdout (e.g. deno --reporter
@@ -779,6 +843,14 @@ mod tests {
             ),
             ("phpunit.xml", "<phpunit/>\n", "junit", Ingestion::Report),
             ("dub.json", "{\"name\":\"x\"}\n", "d", Ingestion::Text),
+            ("deno.json", "{}\n", "junit", Ingestion::Report),
+            (
+                "dune-project",
+                "(lang dune 3.0)\n",
+                "ocaml",
+                Ingestion::Text,
+            ),
+            ("gleam.toml", "name = \"x\"\n", "gleam", Ingestion::Text),
         ];
         for (file, body, matcher, ingestion) in cases {
             let wt = temp_dir(&format!("detect-{}-{}", matcher, file.replace('.', "_")));
@@ -786,6 +858,29 @@ mod tests {
             let task = detect_test_task(&wt, &Config::default()).unwrap();
             assert_eq!(&task.matcher, matcher, "matcher for {file}");
             assert_eq!(task.ingestion, *ingestion, "ingestion for {file}");
+            let _ = std::fs::remove_dir_all(wt);
+        }
+    }
+
+    #[test]
+    fn detects_file_scan_ecosystems_with_tap_where_possible() {
+        use crate::panel::Ingestion;
+        // (file under a test dir, matcher, ingestion)
+        let cases: &[(&str, &str, Ingestion)] = &[
+            ("test/calc.bats", "bats", Ingestion::Tap),
+            ("spec/calc_spec.lua", "busted", Ingestion::Tap),
+            ("t/basic.t", "prove", Ingestion::Tap),
+            ("Calc.Tests.ps1", "nunit", Ingestion::Report),
+            ("App.fsproj", "trx", Ingestion::Report),
+        ];
+        for (rel, matcher, ingestion) in cases {
+            let wt = temp_dir(&format!("fscan-{matcher}"));
+            let p = wt.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "x").unwrap();
+            let task = detect_test_task(&wt, &Config::default()).unwrap();
+            assert_eq!(&task.matcher, matcher, "matcher for {rel}");
+            assert_eq!(task.ingestion, *ingestion, "ingestion for {rel}");
             let _ = std::fs::remove_dir_all(wt);
         }
     }

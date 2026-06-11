@@ -12,7 +12,7 @@
 
 use crate::panel::{self, TestNodeKind, TestState};
 use crate::task::{self, TaskOutcome};
-use crate::testkit::{json, report};
+use crate::testkit::{json, report, tap};
 
 fn counts(nodes: &[panel::TestNode]) -> (usize, usize, usize) {
     let tests: Vec<_> = nodes
@@ -53,6 +53,13 @@ fn golden_nextest_libtest_json() {
 }
 
 #[test]
+fn golden_dart_json() {
+    let nodes = json::parse("dart", include_str!("../../testdata/dart.json"));
+    let (pass, fail, _) = counts(&nodes);
+    assert_eq!((pass, fail), (1, 1), "real dart test json: {nodes:?}");
+}
+
+#[test]
 fn golden_rspec_json() {
     let nodes = json::parse("rspec", include_str!("../../testdata/rspec.json"));
     let (pass, fail, _) = counts(&nodes);
@@ -78,6 +85,38 @@ fn golden_phpunit_junit() {
     assert!(
         has_fail_with_location(&nodes),
         "phpunit failure has CalcTest.php:5"
+    );
+}
+
+// --- TAP ingestion (bats / prove / busted) ---------------------------------
+
+#[test]
+fn golden_bats_tap() {
+    let nodes = tap::parse(include_str!("../../testdata/bats.tap"));
+    let (pass, fail, _) = counts(&nodes);
+    assert_eq!((pass, fail), (1, 1), "real bats tap: {nodes:?}");
+    // bats diagnostic: `# (in test file test/calc.bats, line 2)`
+    assert!(
+        has_fail_with_location(&nodes),
+        "bats failure has a location"
+    );
+}
+
+#[test]
+fn golden_perl_prove_tap() {
+    let nodes = tap::parse(include_str!("../../testdata/perl.tap"));
+    let (pass, fail, _) = counts(&nodes);
+    assert_eq!((pass, fail), (1, 1), "real perl prove tap: {nodes:?}");
+}
+
+#[test]
+fn golden_lua_busted_tap() {
+    let nodes = tap::parse(include_str!("../../testdata/busted.tap"));
+    let (pass, fail, _) = counts(&nodes);
+    assert_eq!((pass, fail), (1, 1), "real busted tap: {nodes:?}");
+    assert!(
+        has_fail_with_location(&nodes),
+        "busted failure has a location"
     );
 }
 
@@ -137,5 +176,15 @@ fn golden_elixir_text_synthetic_fail_with_location() {
     assert!(
         has_fail_with_location(&nodes),
         "real elixir failure carries calc_test.exs:N: {nodes:?}"
+    );
+}
+
+#[test]
+fn golden_ocaml_text_synthetic_fail() {
+    // dune runtest output is sparse; a failing run yields a synthetic fail node.
+    let nodes = synthetic("ocaml", include_str!("../../testdata/ocaml.txt"));
+    assert!(
+        nodes.iter().any(|n| n.state == TestState::Fail),
+        "real ocaml failing run yields a fail node: {nodes:?}"
     );
 }

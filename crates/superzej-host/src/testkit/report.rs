@@ -25,8 +25,11 @@ pub fn parse_glob(worktree: &Path, glob: &str) -> Vec<TestNode> {
 
 /// Detect format by content and parse. Public for fixture tests.
 pub fn parse_report(text: &str) -> Vec<TestNode> {
-    if text.contains("<UnitTestResult") || text.contains("<TestRun") {
+    if text.contains("<UnitTestResult") {
         parse_trx(text)
+    } else if text.contains("<test-case") {
+        // NUnit (Pester / .NET NUnit). Hyphenated tag, unlike JUnit's `<testcase`.
+        parse_nunit(text)
     } else {
         parse_junit(text)
     }
@@ -90,6 +93,52 @@ fn parse_trx(text: &str) -> Vec<TestNode> {
             panel::extract_locations(body).into_iter().next()
         } else {
             None
+        };
+        nodes.push(node(&name, state, location, msg));
+    }
+    nodes
+}
+
+/// NUnit XML (`<test-case>` — Pester `-CI`/NUnitXml and .NET NUnit). NUnit3 uses
+/// `result="Passed|Failed|Skipped"`; NUnit2/Pester-v4 uses `success="True"` +
+/// `executed="True"`.
+fn parse_nunit(text: &str) -> Vec<TestNode> {
+    let mut nodes = Vec::new();
+    for chunk in text.split("<test-case").skip(1) {
+        let Some(gt) = chunk.find('>') else { continue };
+        let attrs = &chunk[..gt];
+        let body = chunk
+            .split_once("</test-case>")
+            .map(|(b, _)| b)
+            .unwrap_or("");
+        let name = attr(attrs, "fullname")
+            .or_else(|| attr(attrs, "name"))
+            .unwrap_or_else(|| "<test>".into());
+        let state = if let Some(result) = attr(attrs, "result") {
+            match result.as_str() {
+                "Passed" | "Success" => TestState::Pass,
+                "Skipped" | "Ignored" | "Inconclusive" | "NotRunnable" => TestState::Skip,
+                _ => TestState::Fail,
+            }
+        } else {
+            // NUnit2 / older Pester: success + executed attributes.
+            let executed = attr(attrs, "executed").as_deref() != Some("False");
+            let success = attr(attrs, "success").as_deref() == Some("True");
+            if !executed {
+                TestState::Skip
+            } else if success {
+                TestState::Pass
+            } else {
+                TestState::Fail
+            }
+        };
+        let (msg, location) = if state == TestState::Fail {
+            (
+                panel::first_failure_message(body),
+                panel::extract_locations(body).into_iter().next(),
+            )
+        } else {
+            (None, None)
         };
         nodes.push(node(&name, state, location, msg));
     }
@@ -207,6 +256,25 @@ mod tests {
         assert_eq!(by("Adds").unwrap().state, TestState::Pass);
         assert_eq!(by("Broken").unwrap().state, TestState::Fail);
         assert_eq!(by("Wip").unwrap().state, TestState::Skip);
+    }
+
+    #[test]
+    fn nunit_maps_result_and_success_forms() {
+        // NUnit3 (result=) and NUnit2/Pester (success=) in one document.
+        let xml = r#"<test-run>
+  <test-case fullname="M.Adds" name="Adds" result="Passed"/>
+  <test-case fullname="M.Broken" name="Broken" result="Failed">
+    <failure><stack-trace>at C:\x\Calc.Tests.ps1:line 9</stack-trace></failure>
+  </test-case>
+  <test-case name="Old.Skipped" executed="False" success="False"/>
+  <test-case name="Old.Pass" executed="True" success="True"/>
+</test-run>"#;
+        let nodes = parse_report(xml);
+        let by = |id: &str| nodes.iter().find(|n| n.id == id).cloned();
+        assert_eq!(by("M.Adds").unwrap().state, TestState::Pass);
+        assert_eq!(by("M.Broken").unwrap().state, TestState::Fail);
+        assert_eq!(by("Old.Skipped").unwrap().state, TestState::Skip);
+        assert_eq!(by("Old.Pass").unwrap().state, TestState::Pass);
     }
 
     #[test]

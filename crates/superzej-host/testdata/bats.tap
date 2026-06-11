@@ -1,0 +1,5 @@
+1..2
+ok 1 adds
+not ok 2 breaks
+# (in test file test/calc.bats, line 2)
+#   `@test "breaks" { [ $((2+2)) -eq 5 ]; }' failed
