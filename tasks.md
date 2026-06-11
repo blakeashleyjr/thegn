@@ -1,6 +1,6 @@
 # superzej — roadmap & progress
 
-503 features across 42 groups (A–AP). The list is really **two tracks joined by
+528 features across 43 groups (A–AQ). The list is really **two tracks joined by
 one keystone**: an AI-free _shell_ track and an AI track, bridged by the **proxy**.
 That shape drives the phasing below. Original numbering is preserved; gaps are
 deliberate cuts (499, 500, 502, 505, 506, 507, 510 dropped from the moonshot set;
@@ -37,6 +37,9 @@ unstarted) — by design.
 
 **Notable Phase-1 gaps (candidate next work):**
 
+- **IDE Tier 1 shell parity** — full native git management, task/test/problems
+  surfaces, Search Everywhere, and attention routing are now scoped in
+  `docs/superpowers/specs/2026-06-10-ide-feature-tiers-design.md`.
 - **E. Pinned programs / tiles** — the configurable pin system is essentially
   unstarted; the Phase-1 milestone is literally a "worktree/**pin** manager".
 - **AI. Notification bus** — only activity dots (425) exist; no event→action rules
@@ -115,6 +118,23 @@ every feature here must **not hard-depend on AI**.
 - **Milestone:** a genuinely useful zellij worktree/pin manager. Ship, dogfood,
   get users — de-risks the whole project before any AI complexity.
 
+#### Graphical-IDE-inspired tiers
+
+The IDE tier overlay is defined in
+`docs/superpowers/specs/2026-06-10-ide-feature-tiers-design.md` and maps onto the
+existing phases rather than creating a new phase taxonomy.
+
+- **Tier 1 (Phase 1 / Phase-1 tail):** complete the AI-free shell's IDE parity:
+  full native git management **Y (319–330)**, Search Everywhere **M (161–170) +
+  AQ (523)**, run/task configs **AQ (520–522)**, test explorer **AQ (516–518)**,
+  Problems panel **AQ (519)**, and attention routing **AI (419–430), S (256), T
+  (259), AQ (524)**.
+- **Tier 2 (Phase 4 differentiation):** deeper language/runtime tooling once the
+  Tier-1 surfaces exist: DAP debugging **AQ (525–528)**, LSP navigation/symbols
+  **AQ (529–532)**, worktree timeline/history **AQ (533–534) + AN (481–488)**,
+  and unified layout+task templates **D (54), G (89/94/95/99), AM (480), AQ
+  (535)**.
+
 ### Phase 2 — Sandbox + inference plumbing · P1 · the AI substrate
 
 Buildable in parallel with Phase 1's tail; **validatable standalone** (point an
@@ -146,6 +166,9 @@ The "magical" layer; mostly composition of what's built.
 
 - **Semantic git X (309–317)** → upgrades review/merge (264, 265, 266, 270). sem alone
   (309–313, 317) enriches Phase-1 git, so pull earlier opportunistically.
+- **IDE Tier 2 AQ (525–535)** — DAP/LSP client substrates, debug panels,
+  symbol/reference navigation, worktree timeline/history, and layout+task
+  templates compose the Phase-1 shell surfaces into deeper IDE workflows.
 - **GitHub Z (331–340)** + **Linear AA (341–348)**
 - **API AK (445–454)** + **MCP server AL (455–466)** + governors (436) gating recursive
   spawn (461)
@@ -234,6 +257,9 @@ Tor (444) and GPU passthrough (393) as niche opt-ins.
 
 ### D. Worktrees
 
+_Tier-2 layout/task templates generalize worktree templates (54) with native
+`CenterTree` layouts, Tier-1 tasks, pins, and sandbox/container presets._
+
 - [x] 41. Create worktree from workspace
 - [x] 42. Pick base branch on create
 - [~] 43. Branch naming templates
@@ -296,6 +322,9 @@ entity, not a float — overrides the float reading below), summoned by `Alt-1..
 
 ### G. Panes & layouts
 
+_Tier-2 layout/task templates compose this native layout model with the Tier-1
+task registry (AQ 520–522) and worktree templates (54); new work targets
+`CenterTree`, not legacy zellij KDL layouts._
 - [x] 89. Per-workspace layout templates (KDL)
 - [x] 90. Save arrangement as default
 - [x] 91. Split/resize/move/zoom/close
@@ -386,6 +415,9 @@ entity, not a float — overrides the float reading below), summoned by `Alt-1..
 
 ### M. Command palette / launcher
 
+_Tier-1 Search Everywhere builds on this group: command/action search stays here,
+while AQ 523 tracks the cross-provider aggregation of files, tasks, problems,
+tests, symbols, git objects, and worktrees._
 - [x] 161. Fuzzy command palette
 - [x] 162. Launch any program
 - [x] 163. Jump to any workspace/worktree
@@ -487,6 +519,8 @@ entity, not a float — overrides the float reading below), summoned by `Alt-1..
 
 ### S. Agent observability
 
+_Tier-1 attention routing reuses the lightweight activity-dot model for agents;
+rich token/tool telemetry remains Phase 3 once proxy/adapters exist._
 - [ ] 243. Contextual auto status dots
 - [ ] 244. abtop-style fleet view
 - [ ] 245. "Working now?" live indicator
@@ -506,6 +540,8 @@ entity, not a float — overrides the float reading below), summoned by `Alt-1..
 
 ### T. Agent review & merge
 
+_Tier-1 attention routing keeps the existing one-key jump and review/merge flows
+as the agent-specific side of the broader attention queue._
 - [~] 259. Needs-attention jump (one key)
 - [x] 260. Diff review pane (highlighted)
 - [~] 261. Unified/side-by-side toggle
@@ -581,6 +617,9 @@ entity, not a float — overrides the float reading below), summoned by `Alt-1..
 
 ### Y. Git integration
 
+_Tier-1 full git management is the cohesive milestone for this group: complete
+native staging/commit, branch, stash, conflict, history, and rebase flows while
+keeping `lazygit` as the fallback escape hatch._
 - [x] 319. Per-worktree status/diff
 - [~] 320. Stage/commit from TUI
 - [~] 321. Merge/rebase from TUI
@@ -711,6 +750,9 @@ entity, not a float — overrides the float reading below), summoned by `Alt-1..
 
 ### AI. Notifications
 
+_Tier-1 attention routing uses this group for the event→action bus, desktop
+notifications, and aggregation. AQ 524 extends the same attention model to
+non-agent processes and plain task panes._
 - [~] 419. fs-watch triggers (notify) _(notify wired, but only drives panel diff refresh)_
 - [ ] 420. Rules engine — event→action
 - [ ] 421. Desktop notifications (notify-rust) _(no notify-rust dep yet)_
@@ -817,6 +859,35 @@ entity, not a float — overrides the float reading below), summoned by `Alt-1..
 - [ ] 504. Scriptable automations / macros — event-bus triggers → action-API actions
 - [ ] 508. Whole-workspace snapshot (env+state) — Nix devshell + container checkpoint + session snapshot
 - [ ] 509. Offline mode (local models only) — offline aggregate of local upstreams; graceful degradation
+
+### AQ. IDE tooling
+
+_Tier 1 and Tier 2 are defined in
+`docs/superpowers/specs/2026-06-10-ide-feature-tiers-design.md`. This group holds
+new IDE-shaped capabilities that were not already covered by existing roadmap
+groups; existing git, palette, notification, layout, and editor items remain in
+their original groups._
+
+- [ ] 516. Test explorer tree — discover and render runnable test targets per worktree
+- [ ] 517. Test status rollups — pass/fail/running state in panel, sidebar, and statusbar
+- [ ] 518. Run/debug selected test — nearest/file/package/failed-test actions, DAP handoff later
+- [ ] 519. Problems / diagnostics panel — compiler/linter/config/LSP diagnostics with file:line jumps
+- [ ] 520. Named task registry — `[[tasks]]` command/cwd/env/scope definitions
+- [ ] 521. Task lifecycle controls — run/stop/restart/rerun from palette/panel/keybinds
+- [ ] 522. Task output capture + problem matching — feed Tests and Problems without polling
+- [ ] 523. Search Everywhere provider aggregation — actions, files, symbols, tasks, tests, problems, git, worktrees
+- [ ] 524. Non-agent process attention routing — exited/failed/waiting panes join the attention queue
+- [ ] 525. DAP client substrate — debug adapter JSON-RPC service seam in `superzej-svc`
+- [ ] 526. Debug breakpoints and stepping — continue/pause/step controls and breakpoint state
+- [ ] 527. Debug variables/watch/call-stack panel — inspect runtime state in the right panel
+- [ ] 528. Debug launch/attach configurations — task-backed debug profiles per workspace
+- [ ] 529. LSP client substrate — language-server JSON-RPC service seam in `superzej-svc`
+- [ ] 530. Go-to-definition and find-references — navigate via `$EDITOR`/panel handoff, not in-place editing
+- [ ] 531. Document/workspace symbols — feed Search Everywhere and outline/reference views
+- [ ] 532. Hover/signature/code-action preview — read-only context and previewable actions
+- [ ] 533. Per-worktree local timeline — git/files/tasks/tests/agents/checks activity history
+- [ ] 534. Restore/compare from local timeline — inspect or recover local snapshots where available
+- [ ] 535. Unified layout+task template — native `CenterTree` layout + tasks + pins + sandbox preset
 
 ### AI-free mode (audience-widener)
 
