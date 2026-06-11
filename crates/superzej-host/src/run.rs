@@ -155,6 +155,8 @@ fn build_palette(
         PaletteItem::new("open-pr", "Open pull request"),
         PaletteItem::new("files-drawer", "Toggle files drawer"),
         PaletteItem::new("lazygit", "Open lazygit"),
+        PaletteItem::new("run-tests", "Run all tests"),
+        PaletteItem::new("run-failed-tests", "Run failed tests"),
         PaletteItem::new("quit", "Quit superzej"),
     ];
 
@@ -903,6 +905,19 @@ fn selected_test_location(ui: &crate::panel::PanelUi) -> Option<crate::panel::Te
     ui.tests.selected_node().and_then(|n| n.location.clone())
 }
 
+/// Resolve a (possibly worktree-relative) failure path to something the editor
+/// can open: absolute paths pass through; relative ones join the active worktree.
+fn resolve_loc_path(session: &crate::session::Session, path: &str) -> String {
+    let p = std::path::Path::new(path);
+    if p.is_absolute() {
+        return path.to_string();
+    }
+    match active_worktree(session) {
+        Some(wt) => wt.join(path).to_string_lossy().into_owned(),
+        None => path.to_string(),
+    }
+}
+
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -1339,6 +1354,41 @@ async fn event_loop<T: Terminal>(
                                             chrome.center,
                                         );
                                     }
+                                } else if key == "run-tests" || key == "run-failed-tests" {
+                                    // Search-Everywhere → explicit, capped test run
+                                    // (never auto-run; this is a user action).
+                                    panel_ui.tab = crate::panel::PanelTab::Tests;
+                                    if let Some(wt) = active_worktree(&session) {
+                                        sync_tests_for_worktree(
+                                            &mut panel_ui,
+                                            &wt,
+                                            &current_config,
+                                        );
+                                        if let Some(base) = panel_ui.tests.task.clone() {
+                                            let nav = if key == "run-failed-tests" {
+                                                crate::panel::PanelNav::RunFailed
+                                            } else {
+                                                crate::panel::PanelNav::RunAll
+                                            };
+                                            let task_spec = test_task_for_nav(&panel_ui, nav, base);
+                                            test_generation += 1;
+                                            panel_ui.tests.running = true;
+                                            panel_ui.tests.summary.running = true;
+                                            panel_ui.tests.summary.error = None;
+                                            model.status =
+                                                format!("Running tests: {}", task_spec.name);
+                                            spawn_test_run_task(
+                                                test_run_tx.clone(),
+                                                wt,
+                                                test_generation,
+                                                task_spec,
+                                                current_config.limits.clone(),
+                                                test_sem.clone(),
+                                            );
+                                        } else {
+                                            model.status = "No test task detected".into();
+                                        }
+                                    }
                                 }
                                 // Other command keys are also reachable via their
                                 // keybind; their in-palette dispatch lands with the
@@ -1457,8 +1507,25 @@ async fn event_loop<T: Terminal>(
                             PanelNav::Open | PanelNav::OpenEditor | PanelNav::Enter => {
                                 if panel_ui.tab == PanelTab::Tests {
                                     if let Some(loc) = selected_test_location(&panel_ui) {
-                                        model.status =
-                                            format!("test failure: {}:{}", loc.path, loc.line);
+                                        // Open the failure at file:line in the editor drawer.
+                                        let path = resolve_loc_path(&session, &loc.path);
+                                        let cmd = format!(
+                                            "${{EDITOR:-vi}} +{} {}",
+                                            loc.line,
+                                            shell_quote(&path)
+                                        );
+                                        if let Some(id) = drawer.take() {
+                                            panes.table.remove(&id);
+                                        }
+                                        let argv = tool_drawer_argv(&cmd);
+                                        if let Ok(id) = panes.spawn_argv(
+                                            &argv,
+                                            tab_cwd(&session.tabs[active]).as_deref(),
+                                            chrome.center,
+                                        ) {
+                                            drawer = Some(id);
+                                        }
+                                        model.status = format!("opened {}:{}", loc.path, loc.line);
                                     } else {
                                         model.status =
                                             "No failure location on selected test".into();
@@ -1466,9 +1533,16 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             PanelNav::Debug => {
-                                model.status =
-                                    "Debug selected test: DAP support is planned (AQ 525–528)"
-                                        .into();
+                                if let (Some(node), Some(task)) =
+                                    (panel_ui.tests.selected_node(), &panel_ui.tests.task)
+                                {
+                                    model.status =
+                                        crate::task::dap_launch_descriptor(task, &node.id);
+                                } else {
+                                    model.status =
+                                        "Select a test to prepare a debug launch (DAP: AQ 525–528)"
+                                            .into();
+                                }
                             }
                             PanelNav::Back => {
                                 model.panel_focused = false;

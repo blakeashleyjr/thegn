@@ -652,6 +652,21 @@ fn first_location(output: &str) -> Option<TestLocation> {
     panel::extract_locations(output).into_iter().next()
 }
 
+/// A one-line, copyable debug-launch descriptor for the selected test. This is
+/// the handoff shape a future DAP client (AQ 525–528) consumes; today it just
+/// surfaces the exact command a user could run under a debugger. Pure/testable.
+pub fn dap_launch_descriptor(task: &TestTask, target_id: &str) -> String {
+    let runner = task.command.split_whitespace().next().unwrap_or("test");
+    match task.matcher.as_str() {
+        "cargo-test" | "nextest" => {
+            format!("debug: cargo test {target_id} (adapter: codelldb)")
+        }
+        "pytest" => format!("debug: pytest {target_id} (adapter: debugpy)"),
+        "go-test" => format!("debug: dlv test -run {target_id} (adapter: delve)"),
+        _ => format!("debug: {runner} {target_id} (adapter: tbd)"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1007,6 +1022,16 @@ mod tests {
         assert_eq!(f.state, TestState::Fail);
         assert_eq!(f.location.as_ref().unwrap().line, 9);
         let _ = std::fs::remove_dir_all(wt);
+    }
+
+    #[test]
+    fn dap_descriptor_is_runner_specific() {
+        let cargo = TestTask::new("cargo test", "cargo test --workspace", "cargo-test");
+        assert!(dap_launch_descriptor(&cargo, "mod::it").contains("cargo test mod::it"));
+        let py = TestTask::new("pytest", "pytest", "pytest");
+        assert!(dap_launch_descriptor(&py, "t::k").contains("debugpy"));
+        let go = TestTask::new("go test", "go test ./...", "go-test");
+        assert!(dap_launch_descriptor(&go, "TestX").contains("dlv"));
     }
 
     // --- Phase 0 resource-discipline tests ---------------------------------

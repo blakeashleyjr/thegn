@@ -380,3 +380,59 @@ Implementation plans should include:
 All code must preserve the project invariants: 0% idle CPU, damage-tracked
 rendering, no blocking I/O on the host loop, and an AI-free shell whose AI
 features are strictly additive.
+
+## Implemented: multi-ecosystem ingestion + resource discipline
+
+The Test Explorer shipped well beyond the original cargo/go/pytest/jest/vitest
+text matchers. See the matching design notes in
+`2026-06-10-ide-feature-tiers-design.md`.
+
+### Ingestion modes (`crates/superzej-host/src/testkit/`)
+
+- **Text** (`panel::parse_test_output`) — cargo, go, pytest, jest/vitest, swift,
+  ctest; the fragile baseline.
+- **JSON** (`testkit/json.rs`) — libtest/nextest, dart/flutter, rspec, and the
+  `nix flake show` enumerator. Precise pass/fail/skip + `file:line` from the tool.
+- **Report** (`testkit/report.rs`) — JUnit XML (Maven/Gradle/sbt/PHP) and TRX
+  (.NET), parsed from disk after the run via `TestTask.report_glob`.
+
+`TestTask.ingestion` selects the parser in `task::parse_task_outcome`.
+
+### Ecosystems detected (`task::detect_fallback`, lowest match wins last)
+
+cargo (→ nextest when installed), go, pytest, dart/flutter, swift, elixir, ctest,
+Maven, Gradle, sbt, .NET, erlang, zig, ruby (rspec/minitest), php, d, npm
+(vitest/jest), and **Nix flake checks** as the lowest-priority fallback so a
+polyglot repo still uses its language runner.
+
+### Resource discipline (the hard constraints)
+
+- **Never auto-runs.** Discovery is lazy (panel open / `u`); runs are explicit
+  (`r`/`R`/`f` or the Search-Everywhere rows). The fs-watcher only ever
+  `mark_stale`s — `TestPanelState::mark_stale` is the sole file-change effect.
+- **Never pins a CPU.** Every run/discovery child is wrapped by
+  `task::wrap_capped` in a `systemd-run --user --scope` (`CPUQuota`/`MemoryMax`/
+  `Nice`) or `nice`/`ionice` fallback; knobs in `[limits]`
+  (`test_cpu_quota`/`test_mem_max`/`test_nice`/`test_max_parallel`).
+- **Single-flight + real cancellation.** A per-worktree slot registry kills the
+  prior run's process group (`killpg`) when a newer run supersedes it.
+- **Bounded + concurrency-capped.** Combined output capped at 256 KB read
+  deadlock-free on threads; a global semaphore bounds concurrent jobs.
+
+### Depth shipped
+
+- Jump-to-failure opens `$EDITOR +line file` in the drawer (`o`/`e`/`Enter`).
+- `d` produces a runner-specific DAP launch descriptor (handoff for AQ 525–528).
+- Search Everywhere exposes "Run all tests" / "Run failed tests".
+
+### Deferred follow-ups
+
+- **Live per-test streaming** — the runner currently delivers one batched
+  result; converting `run_capped` to emit incremental `TestEvent`s (tests flip
+  green/red live) is a clean next step on the same channel.
+- **Per-test timing + flaky detection** — add `duration_ms` to `TestNode` and
+  populate from the JSON modes (libtest `exec_time`, dart `time`).
+- **Inline assertion diff rendering** — currently the failure message surfaces on
+  the status line; rendering it (and `left == right` diffs) under the node is next.
+- **Opt-in watch** — a per-worktree toggle that, when on, `mark_stale`s on change
+  and (optionally) enqueues one capped single-flight run; default stays off.
