@@ -8,3 +8,4 @@
 //! `Ingestion` mode so adding a structured runner never touches the text path.
 
 pub mod json;
+pub mod report;
