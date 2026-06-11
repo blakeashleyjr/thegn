@@ -709,7 +709,7 @@ fn panel_help_hint(tab: crate::panel::PanelTab, view: crate::panel::DiffView) ->
         (PanelTab::Diff, DiffView::FileDiff) => "j/k scroll  o edit  esc back",
         (PanelTab::Pr, _) => "1/2/3/4 tab  o browser  m merge  a approve  c create  esc",
         (PanelTab::Checks, _) => "1/2/3/4 tab  r rerun  esc",
-        (PanelTab::Tests, _) => "r run  R all  f failed  u refresh  o/e open  d debug  esc",
+        (PanelTab::Tests, _) => "r run  R all  f failed  u refresh  o open  b peek  d debug  esc",
     }
 }
 

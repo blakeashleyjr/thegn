@@ -8,6 +8,7 @@
 //! key→intent/test parsing logic.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use termwiz::input::KeyCode;
 
 /// Which panel tab is showing.
@@ -226,6 +227,10 @@ pub struct TestCache {
 #[allow(dead_code)]
 pub struct TestPanelState {
     pub task: Option<TestTask>,
+    /// Flat source of truth: every known test keyed by id, carrying its
+    /// most-recent status. Discovery seeds it; each run upserts.
+    by_id: BTreeMap<String, TestNode>,
+    /// Derived display tree (grouped, failed-on-top). Rebuilt on every merge.
     pub nodes: Vec<TestNode>,
     pub summary: TestSummary,
     pub discovered: bool,
@@ -241,7 +246,8 @@ impl TestPanelState {
     pub fn to_cache(&self) -> TestCache {
         TestCache {
             task: self.task.clone(),
-            nodes: self.nodes.clone(),
+            // Persist the flat per-test source so most-recent status survives.
+            nodes: self.by_id.values().cloned().collect(),
             summary: self.summary.clone(),
             discovered: self.discovered,
         }
@@ -249,12 +255,57 @@ impl TestPanelState {
 
     pub fn apply_cache(&mut self, cache: TestCache) {
         self.task = cache.task;
-        self.nodes = cache.nodes;
-        self.summary = cache.summary;
         self.discovered = cache.discovered;
+        self.by_id = cache
+            .nodes
+            .into_iter()
+            .filter(|n| n.kind == TestNodeKind::Test)
+            .map(|n| (n.id.clone(), n))
+            .collect();
+        self.refresh();
         self.cursor = self
             .cursor
             .min(self.visible_indices().len().saturating_sub(1));
+    }
+
+    /// Seed newly-discovered tests without disturbing known statuses. New ids
+    /// land as `Unknown`; an existing test only gains a discovery location if it
+    /// didn't have one.
+    pub fn merge_discovered(&mut self, incoming: &[TestNode]) {
+        for n in incoming.iter().filter(|n| n.kind == TestNodeKind::Test) {
+            self.by_id
+                .entry(n.id.clone())
+                .and_modify(|existing| {
+                    if existing.location.is_none() && n.location.is_some() {
+                        existing.location = n.location.clone();
+                    }
+                })
+                .or_insert_with(|| TestNode {
+                    state: TestState::Unknown,
+                    ..n.clone()
+                });
+        }
+        self.discovered = true;
+        self.refresh();
+    }
+
+    /// Upsert run results: the latest run wins for each reported test.
+    pub fn merge_results(&mut self, incoming: &[TestNode]) {
+        for n in incoming.iter().filter(|n| n.kind == TestNodeKind::Test) {
+            self.by_id.insert(n.id.clone(), n.clone());
+        }
+        self.discovered = true;
+        self.stale = false;
+        self.refresh();
+    }
+
+    /// Recompute the summary and rebuild the display tree (failed-on-top).
+    fn refresh(&mut self) {
+        let flat: Vec<TestNode> = self.by_id.values().cloned().collect();
+        self.summary = summarize_nodes(&flat);
+        self.summary.running = self.running;
+        self.summary.stale = self.stale;
+        self.nodes = tree_failed_first(flat);
     }
 
     pub fn visible_indices(&self) -> Vec<usize> {
@@ -276,12 +327,6 @@ impl TestPanelState {
         visible
             .get(self.cursor)
             .and_then(|idx| self.nodes.get(*idx))
-    }
-
-    pub fn recompute_summary(&mut self) {
-        self.summary = summarize_nodes(&self.nodes);
-        self.summary.running = self.running;
-        self.summary.stale = self.stale;
     }
 
     /// Mark cached results as stale (e.g. on a file change). This is the ONLY
@@ -339,6 +384,8 @@ pub enum PanelNav {
     RunFailed,
     Refresh,
     Debug,
+    /// Peek the selected test in the `bat` pager (read-only).
+    Peek,
 }
 
 pub fn panel_nav_key(key: &KeyCode, tab: PanelTab, view: DiffView) -> Option<PanelNav> {
@@ -371,8 +418,41 @@ pub fn panel_nav_key(key: &KeyCode, tab: PanelTab, view: DiffView) -> Option<Pan
         KeyCode::Char('f') if tab == PanelTab::Tests => Some(PanelNav::RunFailed),
         KeyCode::Char('u') if tab == PanelTab::Tests => Some(PanelNav::Refresh),
         KeyCode::Char('d') if tab == PanelTab::Tests => Some(PanelNav::Debug),
+        KeyCode::Char('b') if tab == PanelTab::Tests => Some(PanelNav::Peek),
         _ => None,
     }
+}
+
+/// The bare test name from a node id (last `::` segment, last whitespace word):
+/// `core::config::loads` → `loads`; `Calc adds` → `adds`; `t.py::test_x` → `test_x`.
+pub fn test_name_of(test_id: &str) -> &str {
+    let seg = test_id.rsplit("::").next().unwrap_or(test_id).trim();
+    seg.rsplit(|c: char| c.is_whitespace() || c == '.')
+        .find(|t| !t.is_empty())
+        .unwrap_or(seg)
+}
+
+/// Ordered ripgrep patterns to locate a test's definition when the runner gave
+/// no `file:line`. Strongest (def keyword) first, then quoted, then bare word.
+/// Used by the editor/peek "open any test" fallback.
+pub fn locate_regexes(test_id: &str) -> Vec<String> {
+    let name = regex_escape(test_name_of(test_id));
+    vec![
+        format!("(fn|def|func|sub|it|test|describe|@test)[ \\t\"'(]+{name}"),
+        format!("[\"']{name}[\"']"),
+        format!("\\b{name}\\b"),
+    ]
+}
+
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if "\\.^$|?*+()[]{}".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 pub fn summarize_nodes(nodes: &[TestNode]) -> TestSummary {
@@ -393,10 +473,71 @@ pub fn tree_from_flat_tests(mut tests: Vec<TestNode>) -> Vec<TestNode> {
         return tests;
     }
     tests.sort_by(|a, b| a.id.cmp(&b.id));
+    group_flat(tests)
+}
+
+/// Sort priority so failures float to the top of the explorer (and a group
+/// containing a failure sorts above all-passing groups).
+fn status_rank(s: TestState) -> u8 {
+    match s {
+        TestState::Fail => 0,
+        TestState::Running => 1,
+        TestState::Skip => 2,
+        TestState::Unknown => 3,
+        TestState::Pass => 4,
+    }
+}
+
+fn group_of(id: &str) -> String {
+    id.split("::").next().unwrap_or("tests").to_string()
+}
+
+/// Build the display tree with **failed on top**: groups are ordered by their
+/// worst (lowest-rank) member, and tests within a group by status then id.
+pub fn tree_failed_first(tests: Vec<TestNode>) -> Vec<TestNode> {
+    if tests.is_empty() {
+        return tests;
+    }
+    // Bucket tests by group, tracking each group's worst status.
+    let mut groups: BTreeMap<String, Vec<TestNode>> = BTreeMap::new();
+    for t in tests {
+        groups.entry(group_of(&t.id)).or_default().push(t);
+    }
+    let mut ordered: Vec<(String, Vec<TestNode>)> = groups.into_iter().collect();
+    let worst = |ts: &[TestNode]| ts.iter().map(|t| status_rank(t.state)).min().unwrap_or(3);
+    ordered.sort_by(|(an, at), (bn, bt)| worst(at).cmp(&worst(bt)).then(an.cmp(bn)));
+
+    let mut out = Vec::new();
+    for (group, mut ts) in ordered {
+        ts.sort_by(|a, b| {
+            status_rank(a.state)
+                .cmp(&status_rank(b.state))
+                .then(a.id.cmp(&b.id))
+        });
+        out.push(TestNode {
+            id: format!("group:{group}"),
+            label: group,
+            depth: 0,
+            kind: TestNodeKind::Group,
+            state: TestState::Unknown,
+            location: None,
+            message: None,
+        });
+        for mut t in ts {
+            t.depth = 1;
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// Group already-sorted tests by `::` prefix, inserting group headers (preserves
+/// the incoming order within each group).
+fn group_flat(tests: Vec<TestNode>) -> Vec<TestNode> {
     let mut out = Vec::new();
     let mut last_group = String::new();
     for mut t in tests {
-        let group = t.id.split("::").next().unwrap_or("tests").to_string();
+        let group = group_of(&t.id);
         if group != last_group {
             out.push(TestNode {
                 id: format!("group:{group}"),
@@ -671,18 +812,64 @@ mod tests {
     fn mark_stale_is_pure_and_never_clears_results() {
         let mut st = TestPanelState {
             task: Some(TestTask::new("cargo test", "cargo test", "cargo-test")),
-            nodes: vec![test_node("a::b", TestState::Pass, None, None)],
-            discovered: true,
             ..Default::default()
         };
-        st.recompute_summary();
+        st.merge_results(&[test_node("a::b", TestState::Pass, None, None)]);
         st.mark_stale();
         // Stale flag set on both state and summary; results preserved (the watch
         // path marks stale, it never spawns a run).
         assert!(st.stale && st.summary.stale);
-        assert_eq!(st.nodes.len(), 1);
+        assert_eq!(test_nodes(&st.nodes).len(), 1);
         assert!(st.task.is_some());
         assert!(st.discovered);
+    }
+
+    #[test]
+    fn merge_keeps_all_tests_with_most_recent_status_failed_on_top() {
+        let mut st = TestPanelState::default();
+        // Discovery seeds three tests as Unknown.
+        st.merge_discovered(&[
+            test_node("m::a", TestState::Unknown, None, None),
+            test_node("m::b", TestState::Unknown, None, None),
+            test_node("z::c", TestState::Unknown, None, None),
+        ]);
+        assert_eq!(test_nodes(&st.nodes).len(), 3);
+        // A run reports only a/c; b keeps its prior (Unknown) status.
+        st.merge_results(&[
+            test_node("m::a", TestState::Pass, None, None),
+            test_node("z::c", TestState::Fail, None, None),
+        ]);
+        let tests = test_nodes(&st.nodes);
+        assert_eq!(tests.len(), 3, "all known tests still listed");
+        assert_eq!(
+            tests.iter().find(|n| n.id == "m::a").unwrap().state,
+            TestState::Pass
+        );
+        assert_eq!(
+            tests.iter().find(|n| n.id == "m::b").unwrap().state,
+            TestState::Unknown,
+            "untouched test retains its last status"
+        );
+        // Failed-on-top: group z (contains the fail) sorts before group m.
+        let first_test = test_nodes(&st.nodes)[0];
+        assert_eq!(first_test.id, "z::c", "failure floats to the top");
+    }
+
+    fn test_nodes(nodes: &[TestNode]) -> Vec<&TestNode> {
+        nodes
+            .iter()
+            .filter(|n| n.kind == TestNodeKind::Test)
+            .collect()
+    }
+
+    #[test]
+    fn test_name_and_locate_patterns() {
+        assert_eq!(test_name_of("core::config::loads"), "loads");
+        assert_eq!(test_name_of("t.py::test_adds"), "test_adds");
+        assert_eq!(test_name_of("Calc adds"), "adds");
+        let pats = locate_regexes("m::adds");
+        assert!(pats[0].contains("adds") && pats[0].contains("fn|def"));
+        assert!(pats.iter().any(|p| p.contains("[\"']adds")));
     }
 
     #[test]
