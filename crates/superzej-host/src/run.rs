@@ -2736,6 +2736,28 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
             }
         }
+        // A drilled-in document (single-file diff / file preview) widens the
+        // panel to a reading width; closing it retracts. Keep this before the
+        // relayout gate so the resized center pane PTYs match the frame that is
+        // about to render; otherwise the event loop can block with a stale PTY
+        // width after the panel retracts.
+        if panel_ui.drilled() != panel_expanded {
+            panel_expanded = panel_ui.drilled();
+            chrome = compute_chrome(
+                cols,
+                rows,
+                want_sidebar,
+                want_panel,
+                panel_forced,
+                panel_expanded,
+                sidebar_cols,
+                zoom,
+                &supervisor,
+            );
+            need_relayout = true;
+            dirty = true;
+        }
+
         if need_relayout {
             let tree = if zoom == Some(crate::focus::Zone::Center) {
                 crate::center::CenterTree::Leaf(focused_pane_id(&session))
@@ -3105,26 +3127,6 @@ async fn event_loop<T: Terminal>(
         model.key_locked = focus.locked;
         model.zoomed = zoom.is_some();
         model.keyhints = context_hints(&focus, &panel_ui, keymap.config());
-
-        // A drilled-in document (single-file diff / file preview) widens the
-        // panel to a reading width; closing it retracts. Central detector so
-        // every open/close path is covered without per-call-site wiring.
-        if panel_ui.drilled() != panel_expanded {
-            panel_expanded = panel_ui.drilled();
-            chrome = compute_chrome(
-                cols,
-                rows,
-                want_sidebar,
-                want_panel,
-                panel_forced,
-                panel_expanded,
-                sidebar_cols,
-                zoom,
-                &supervisor,
-            );
-            need_relayout = true;
-            dirty = true;
-        }
 
         // 2. Render if anything changed (diff-flush): all visible panes of the
         //    active tab + the chrome, with the hardware cursor in the focused pane.
