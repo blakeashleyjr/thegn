@@ -40,27 +40,16 @@ unstarted) — by design.
 - **IDE Tier 1 shell parity** — full native git management, task/test/problems
   surfaces, Search Everywhere, and attention routing are now scoped in
   `docs/superpowers/specs/2026-06-10-ide-feature-tiers-design.md`.
-- **E. Pinned programs / tiles** — the configurable pin system is essentially
-  unstarted; the Phase-1 milestone is literally a "worktree/**pin** manager".
 - **AI. Notification bus** — only activity dots (425) exist; no event→action rules
   (420), desktop notifications (421), or aggregated bus (430).
 - **B.** multi-select/context-menu/badge-count tree polish (26–28).
 
-**▶ Selected next feature: E. Pinned programs / tiles** — build the config-driven
-pin system, the keystone of the "worktree/**pin** manager" Phase-1 milestone.
-Scoped first slice:
-
-- **62** — `[[pins]]` config block (name, command, cwd, `location`, `scope`).
-- **57 / 59** — render a pin to a **top strip** (and reuse the existing float path).
-- **60 / 61** — `scope = global | workspace` resolution.
-- **63 / 66** — eager-vs-lazy start; persist running pins across workspace switches.
-- **70 / 74** — pin label + running/stopped glyph; launch-or-focus toggle (`Alt-1..9`).
-
-Defer to a follow-up slice: 64 (restart-on-exit), 65 (singleton/multi), 67 (promote
-running pane), 68 (unpin at runtime), 69 (strip sizing), 71 (env injection),
-72 (health/auto-restart). Reuse: the `[[tools]]`/`[[agents]]` config + launch path
-(73), the float/embed plumbing from tools/monitors/drawer, and the tabbar/statusbar
-chrome for the strip.
+**✔ E. Pinned programs / tiles — complete on the native host (items 57–74).** The
+full config-driven pin/daemon system ships in `superzej-host`: a `PinSupervisor`
+(`crates/superzej-host/src/pins.rs`) owning daemon panes across tab/workspace
+switches, a real top-strip chrome region + tabbar chips, eager/lazy start,
+restart-on-exit + health, singleton dedupe, promote/unpin at runtime, per-program
+env, and resurrect via `session_state.pin_state`. See §E below for the per-item map.
 
 ---
 
@@ -208,36 +197,42 @@ Tor (444) and GPU passthrough (393) as niche opt-ins.
 
 ### A. Core architecture
 
-- [~] 1. Coordinator daemon — host-side Rust service owning all state
-- [x] 2. zellij substrate — multiplexing/rendering layer underneath
-- [x] 3. Thin zellij WASM plugins — dashboard, tree, git, monitor panes
-- [x] 4. Daemon↔plugin IPC — local socket + pipe
-- [x] 5. Single-binary distribution
-- [~] 6. One core, many front doors — TUI/API/MCP share logic
-- [~] 7. Headless daemon — UI attaches/detaches
-- [ ] 8. Daemon supervision — crash recovery
-- [ ] 9. Internal event bus — normalized events _(only pipes + the watch daemon; no first-class bus)_
+- [~] 1. Coordinator core — `superzej-core` owns all state (in-process, not a daemon)
+- [x] 2. ~~zellij substrate~~ — **REMOVED**: the native `superzej-host` compositor owns multiplexing/rendering (termwiz + portable-pty + `CenterTree`)
+- [x] 3. ~~Thin zellij WASM plugins~~ — **REMOVED**: chrome (sidebar/panel/tabbar/statusbar) is in-process in `superzej-host`
+- [ ] 4. ~~Daemon↔plugin IPC~~ — **N/A after strip**: no separate plugin process; the future native plugin API contract lives in `core/plugin_api.rs` (unwired)
+- [x] 5. Single-binary distribution — one `superzej`(=`szhost`); no side artifacts
+- [~] 6. One core, many front doors — TUI (host) + CLI verbs share `superzej-core`; API/MCP still aspirational (AK/AL)
+- [ ] 7. Headless daemon — UI attaches/detaches _(not yet; host is a foreground compositor, state resurrects from SQLite)_
+- [ ] 8. Daemon supervision — crash recovery _(state resurrection only; no supervisor)_
+- [ ] 9. Internal event bus — normalized events _(ad-hoc tokio mpsc in the host loop; no first-class bus)_
 - [x] 10. Embedded state store — sqlite
 - [x] 11. Config hot-reload — without dropping sessions
-- [x] 12. Structured daemon logging
+- [x] 12. Structured logging
 
 ### B. Workspace bar / tree
+
+_Rebuilt natively in `superzej-host` (`sidebar.rs` tree model + `SidebarState`
+focus mode in `run.rs` + `chrome::draw_sidebar`); view state persists in the
+`ui_state` DB table. Press `Alt-s` to focus the tree, then `j/k` move, `Enter`
+open/collapse, `/` filter, `s` sort, `p` pin, `Space` select, `m` menu, `X` bulk
+close, `<`/`>` width, digits quick-jump._
 
 - [x] 13. Left sidebar workspace tree
 - [x] 14. Workspaces = repos (top level)
 - [x] 15. Worktrees nested under workspaces
-- [x] 16. Collapse/expand workspaces
-- [x] 17. Persist collapse state
-- [x] 18. Status glyphs — branch, dirty, ahead/behind
-- [~] 19. Running program/agent indicator per row
+- [x] 16. Collapse/expand workspaces _(native; persisted via `ui_state`)_
+- [x] 17. Persist collapse state _(`ui_state` `collapse:<slug>`)_
+- [x] 18. Status glyphs — branch, dirty, ahead/behind _(gix-native ahead/behind)_
+- [x] 19. Running program/agent indicator per row _(agent glyph via `worktree_agent`)_
 - [x] 20. Contextual auto status dots (zellaude-style) _(host-side state machine; `activity`)_
-- [~] 21. Fuzzy filter the tree
-- [ ] 22. Manual reorder / pin-to-top
-- [~] 23. Sort modes — recent/name/activity
+- [x] 21. Fuzzy filter the tree _(native `/` filter)_
+- [x] 22. Manual reorder / pin-to-top _(native `p`; `ui_state` `pin:<key>`)_
+- [x] 23. Sort modes — recent/name/activity _(native `s` cycle; persisted)_
 - [x] 24. Quick-jump to numbered item
-- [x] 25. Adjustable/collapsible bar width
-- [ ] 26. Multi-select for bulk actions
-- [ ] 27. Row context menu
+- [x] 25. Adjustable/collapsible bar width _(native `<`/`>`; persisted)_
+- [x] 26. Multi-select for bulk actions _(native `Space` mark, `X` bulk close)_
+- [x] 27. Row context menu _(native `m`)_
 - [ ] 28. Badge counts — PRs/unread/alerts per row
 
 ### C. Workspaces (repos)
@@ -250,7 +245,7 @@ Tor (444) and GPU passthrough (393) as niche opt-ins.
 - [~] 34. Per-workspace default layout
 - [ ] 35. Per-workspace default program set
 - [~] 36. Per-workspace keybinds
-- [ ] 37. Non-git directory as workspace
+- [x] 37. Non-git directory as workspace _(workspace `kind` repo|dir; insert-only; folder glyph in sidebar)_
 - [ ] 38. Workspace-level env vars
 - [ ] 39. Workspace icon/color label
 - [x] 40. Recent/favorite workspaces
@@ -277,31 +272,38 @@ _Tier-2 layout/task templates generalize worktree templates (54) with native
 - [~] 55. Worktree↔PR mapping
 - [~] 56. Bulk worktree cleanup
 
-### E. Pinned programs / tiles ◀ **NEXT FEATURE TARGET** (see ▶ below)
+### E. Pinned programs / tiles
 
-**Slice 1 (shipped):** pins are their own `pin:<name>` session tabs (a workspace-like
-entity, not a float — overrides the float reading below), summoned by `Alt-1..9`
-/ tabbar pin chips. Global + lazy only. See `src/commands/pin.rs`,
+**Slice 1 (zellij path, shipped):** pins are `pin:<name>` session tabs summoned by
+`Alt-1..9` / tabbar pin chips. Global + lazy only. See `src/commands/pin.rs`,
 `layouts/pin-tab.kdl`, the tabbar chip strip, and `[[pins]]` config.
 
-- [x] 57. Pin to top strip _(tabbar pin chips; the pin itself is its own tab)_
-- [~] 58. Add anywhere (into active layout) _(docs/e2e done, pending PR)_
-- [ ] 59. Floating/scratch pin _(tools/drawer/monitors are floats, but not a pin system)_
-- [x] 60. Global pins (everywhere) _(every pin is a session-level tab)_
-- [x] 61. Workspace-scoped pins
-- [x] 62. Pin definition in config — `[[pins]]` name/command/cwd _(args/location/scope deferred)_
-- [x] 63. Eager vs lazy start
-- [x] 64. Restart-on-exit policy
-- [x] 65. Singleton vs multi-instance
-- [x] 66. Persist daemons across workspace switches _(free: a pin tab stays in the session)_
-- [ ] 67. Promote running pane to pinned
-- [x] 68. Unpin at runtime
-- [ ] 69. Top-strip sizing/ratio
-- [x] 70. Program labels + status glyph _(chip label + ●/◌ running/stopped)_
-- [ ] 71. Per-program env injection
-- [ ] 72. Health monitoring/auto-restart
-- [x] 73. Program adapter — launch/notify/restart spec _(launch-or-focus via `superzej pin open`)_
-- [x] 74. Quick-toggle visibility _(`Alt-1..9` launch-or-focus; chip click)_
+**Slice 2 (native host, shipped):** the full pin/daemon system in `superzej-host`
+— a `PinSupervisor` (`crates/superzej-host/src/pins.rs`) owns daemon panes
+independent of tabs/visibility, a real top-**strip** chrome region
+(`layout.rs::compute_with_strip`, `chrome.rs::draw_strip`), tabbar pin chips, and
+`[[pins]]` extended with `args/env/label/ratio` + `location = strip|float`. Pins
+launch-or-focus via `Alt-1..9`, restart per policy on PTY exit, and resurrect from
+`session_state.pin_state`.
+
+- [x] 57. Pin to top strip _(native: live strip region + tabbar chips)_
+- [~] 58. Add anywhere (into active layout) _(zellij path; native via `location=layout`)_
+- [x] 59. Floating/scratch pin _(native: `location = "float"`)_
+- [x] 60. Global pins (everywhere) _(scope = global)_
+- [x] 61. Workspace-scoped pins _(scope = workspace, matched to session id)_
+- [x] 62. Pin definition in config — `[[pins]]` name/command/cwd/args/env/location/scope
+- [x] 63. Eager vs lazy start _(supervisor launches eager pins at startup)_
+- [x] 64. Restart-on-exit policy _(never/always/on-failure via supervisor `on_exit`)_
+- [x] 65. Singleton vs multi-instance _(supervisor dedupes by name on summon)_
+- [x] 66. Persist daemons across workspace switches _(supervisor outlives tab/ws swaps)_
+- [x] 67. Promote running pane to pinned _(`Ctrl-Alt-P`: focused center pane → strip)_
+- [x] 68. Unpin at runtime _(`Ctrl-Alt-U`; reaps the process)_
+- [x] 69. Top-strip sizing/ratio _(`[strip].ratio`, per-pin `ratio`, `Ctrl-Alt-[`/`]`)_
+- [x] 70. Program labels + status glyph _(label + ●/◌/✖ in strip header + chips)_
+- [x] 71. Per-program env injection _(`env` map → `PtyPane::spawn_with_env`)_
+- [x] 72. Health monitoring/auto-restart _(supervisor liveness + restart on PTY death)_
+- [x] 73. Program adapter — launch/notify/restart spec _(`PinSupervisor::argv`/`on_exit`)_
+- [x] 74. Quick-toggle visibility _(`Alt-1..9` launch-or-focus; `Ctrl-Alt-t` strip toggle)_
 
 ### F. Keybindings
 
@@ -325,6 +327,7 @@ entity, not a float — overrides the float reading below), summoned by `Alt-1..
 _Tier-2 layout/task templates compose this native layout model with the Tier-1
 task registry (AQ 520–522) and worktree templates (54); new work targets
 `CenterTree`, not legacy zellij KDL layouts._
+
 - [x] 89. Per-workspace layout templates (KDL)
 - [x] 90. Save arrangement as default
 - [x] 91. Split/resize/move/zoom/close
@@ -418,6 +421,7 @@ task registry (AQ 520–522) and worktree templates (54); new work targets
 _Tier-1 Search Everywhere builds on this group: command/action search stays here,
 while AQ 523 tracks the cross-provider aggregation of files, tasks, problems,
 tests, symbols, git objects, and worktrees._
+
 - [x] 161. Fuzzy command palette
 - [x] 162. Launch any program
 - [x] 163. Jump to any workspace/worktree
@@ -521,6 +525,7 @@ tests, symbols, git objects, and worktrees._
 
 _Tier-1 attention routing reuses the lightweight activity-dot model for agents;
 rich token/tool telemetry remains Phase 3 once proxy/adapters exist._
+
 - [ ] 243. Contextual auto status dots
 - [ ] 244. abtop-style fleet view
 - [ ] 245. "Working now?" live indicator
@@ -542,6 +547,7 @@ rich token/tool telemetry remains Phase 3 once proxy/adapters exist._
 
 _Tier-1 attention routing keeps the existing one-key jump and review/merge flows
 as the agent-specific side of the broader attention queue._
+
 - [~] 259. Needs-attention jump (one key)
 - [x] 260. Diff review pane (highlighted)
 - [~] 261. Unified/side-by-side toggle
@@ -620,6 +626,7 @@ as the agent-specific side of the broader attention queue._
 _Tier-1 full git management is the cohesive milestone for this group: complete
 native staging/commit, branch, stash, conflict, history, and rebase flows while
 keeping `lazygit` as the fallback escape hatch._
+
 - [x] 319. Per-worktree status/diff
 - [~] 320. Stage/commit from TUI
 - [~] 321. Merge/rebase from TUI
@@ -639,7 +646,7 @@ keeping `lazygit` as the fallback escape hatch._
 - [x] 332. CI checks status
 - [~] 333. PR review comments
 - [~] 334. Issues
-- [x] 335. Create PR from worktree
+- [x] 335. Create PR from worktree _(+ draft/ready toggle + auto-merge enable/disable)_
 - [x] 336. PR↔worktree mapping
 - [x] 337. Review/approve from TUI
 - [~] 338. PR event notifications
@@ -753,6 +760,7 @@ keeping `lazygit` as the fallback escape hatch._
 _Tier-1 attention routing uses this group for the event→action bus, desktop
 notifications, and aggregation. AQ 524 extends the same attention model to
 non-agent processes and plain task panes._
+
 - [~] 419. fs-watch triggers (notify) _(notify wired, but only drives panel diff refresh)_
 - [ ] 420. Rules engine — event→action
 - [ ] 421. Desktop notifications (notify-rust) _(no notify-rust dep yet)_

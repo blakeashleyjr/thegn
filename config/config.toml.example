@@ -26,6 +26,8 @@ name_scheme = "words"
 
 # Remove the worktree automatically when its pane closes.
 auto_remove_worktree = false
+# Ask before destructive worktree actions (sidebar delete-from-disk).
+confirm_delete = true
 
 # ── Overriding any setting at runtime ─────────────────────────────────────────
 # Precedence (low → high): built-in defaults < this file < SUPERZEJ_* env vars
@@ -36,9 +38,31 @@ auto_remove_worktree = false
 # get <dotted.key>` prints one value; `superzej config validate` checks it.
 
 # Visual tuning. The focus accent recolors every superzej surface (plugins,
-# pickers, dashboard); the rest of the storm-blue palette is fixed.
+# pickers, dashboard). `focus_border` frames whatever owns focus — the focused
+# pane's border ring, the active tab chip, the active worktree row, and the
+# focused chrome edge. Unfocused frames use `colors.border` (light grey).
 [theme]
+# Named palette preset: "storm" (default), "light", "abyss", "ember", "aurora".
+# Cycle live with Ctrl+Alt+t; [theme.colors] overrides apply on top.
+preset = "storm"
 accent = "#76eede"
+focus_border = "#9bd1ff"
+# Horizontal breathing room (cells) between a pane's frame and its content.
+pane_padding = 0
+
+# Optional: override any chrome surface/text color (all "#rrggbb"; unset keys
+# keep the built-in storm-blue palette). Invalid hex warns and keeps default.
+[theme.colors]
+# bg0 = "#14161f"     # deepest background (sidebar)
+# bg1 = "#1a1d29"     # bars / surfaces (tabbar, statusbar, panel)
+# panel = "#212432"   # panel lists
+# panel2 = "#282c3e"  # selection / hover
+# raise = "#2f3448"   # raised (context menus)
+# border = "#aab1c4"  # pane/edge frame lines
+# text = "#e0e4f0"    # primary text
+# dim = "#9aa0b4"     # secondary text
+# faint = "#656b80"   # tertiary / labels
+# ghost = "#484d60"   # connectors / disabled
 
 # Resource managers opened from the top-bar stats widget: highlight a stat with
 # Super+Alt+Up, cycle CPU/MEM/Net/GPU with ←/→, press Enter to embed it as a pane.
@@ -47,15 +71,33 @@ accent = "#76eede"
 system = "btm"   # CPU/RAM monitor (ClementTsang/bottom); e.g. "htop", "btop"
 gpu = "nvtop"    # GPU monitor
 
+# The customizable widget bars framing the workspace. Each slot is an ordered
+# list of widget ids; unknown ids are skipped. Top-bar widgets: "brand"
+# (superzej + version), "cpu", "mem", "gpu" (NVIDIA only; hidden if absent),
+# "net", "date", "clock". Bottom-bar widgets: "keyhints" (context-dependent
+# keybinds for the focused zone), "status" (transient messages).
+[bars]
+top_left = ["brand"]
+top_right = ["cpu", "mem", "gpu", "net", "battery", "date", "clock"]
+bottom_left = ["keyhints"]
+bottom_right = ["pr", "loc", "status"]   # "loc" = tokei line count (needs tokei)
+# chrono format strings for the date/clock widgets.
+date_format = "%a %b %-d"
+clock_format = "%H:%M"
+
 # Top-bar stats widget: icons and refresh rate for CPU/RAM/Network/GPU display.
 # Icons can be text ("CPU") or unicode symbols ("⚡"). GPU shows only if detected.
 [stats]
 refresh-secs = 2           # Polling interval in seconds
-cpu-icon = "CPU"           # Icon for CPU stat
-mem-icon = "MEM"           # Icon for memory stat
-net-icon = "NET"           # Icon for network stat
-gpu-icon = "GPU"           # Icon for GPU stat
-refresh-rates = [1, 2, 5, 10]  # Available rates for Tab keybind cycling
+# Icons default to Nerd Font glyphs; set plain text if your font lacks them.
+# cpu-icon = "CPU"
+# mem-icon = "MEM"
+# net-icon = "NET"
+# gpu-icon = "GPU"              # default glyph is padded to match other stat icons
+# battery-icon = "BAT"          # discharging icon
+# battery-charging-icon = "CHG" # shown while charging / on AC
+battery-warn = 25               # red at/below this percent
+refresh-rates = [1, 2, 5, 10]  # Click the top-right stats block to cycle
 
 # Bottom file-manager drawer (hidden by default; toggle with Ctrl+Alt+f). Runs a
 # pinned, bundled yazi with its own config kept separate from the system.
@@ -69,6 +111,22 @@ config_home = ""
 # Drawer geometry. height: "35%" or a row count. width: "full" | "center".
 height = "35%"
 width = "full"
+# Image previews are off by default in the bundled/private yazi config. Text/code
+# previews remain on. With config_home = "system", superzej does not rewrite your
+# yazi config, so containment below is still the safety net.
+image_previews = false
+# Run yazi and preview helper children in a bounded user systemd scope when
+# systemd-run is available. Empty limit strings omit that property.
+contain = true
+memory_max = "2G"
+memory_swap_max = "512M"
+cpu_quota = "200%"
+# Hidden-drawer keepalive: pool_limit caps how many hidden yazi panes are kept
+# warm (oldest evicted past the limit; 0 = hide kills the pane). prewarm spawns a
+# hidden drawer per worktree so the first toggle is instant — off by default so
+# invisible yazi instances never accumulate unbidden.
+pool_limit = 1
+prewarm = false
 
 # GitHub PR data feeding the right panel.
 [pr]
@@ -125,6 +183,35 @@ format = "text"           # text | json
 # key = "Alt D"
 # run = "just deploy"
 # menu = true
+
+# Keybind profiles: a named layer selected by `profile = "<name>"` (or the
+# SUPERZEJ_PROFILE env var / --profile flag). Applied *under* [keybinds], so a
+# global rebind still wins. `default_mode` sets the host mode on launch. The
+# names `vim`/`emacs` also start in the matching mode without an explicit
+# default_mode. Press `Alt ?` in the shell for the full cheatsheet overlay.
+# profile = "vim"
+# [profiles.vim]
+# default_mode = "vim-normal"
+# [profiles.vim.keybinds]
+# focus-down = "j"
+
+# Per-workspace overrides, keyed by repo slug (the workspace tab prefix). Applied
+# above [keybinds] but below a repo-root `.superzej.{toml,yaml,json}` overlay,
+# which may also carry its own [keybinds] table — the most specific layer wins.
+# [workspace.my-repo.keybinds]
+# new-worktree = "Ctrl w"
+
+# Per-program host-action overlays, keyed by the focused pane's program name.
+# These intercept *before* the active mode — useful for binding a host action
+# while a TUI like lazygit is focused.
+# [program_keybinds.lazygit]
+# palette = "Ctrl Alt k"
+
+# Per-program key-injection remaps: rewrite a chord into the program's own keys
+# (the right-hand side is sent to the pane) when it is not claimed as a host
+# action. Single keys only.
+# [program_remap.lazygit]
+# "Ctrl j" = "Enter"
 
 # Coding agents offered in the new-worktree picker.
 # Use "__shell__" for a plain login shell.
@@ -204,22 +291,45 @@ command = "git diff"
 # test_nice = 10             # niceness for test runs (0 disables)
 # test_max_parallel = 1      # max concurrent test/discovery jobs across worktrees
 
+# Top pinned-program strip: a horizontal band above the center that renders
+# `location = "strip"` pins side by side (toggle Ctrl+Alt+t; grow/shrink at
+# runtime). `ratio` is the fraction of the center band it occupies.
+[strip]
+ratio = 0.2
+visible = true
+
 # Pinned programs: summoned from anywhere with Alt-1..9 (in registration order)
-# or the tabbar's pin chips. Pins are global and run on the host (no sandbox).
-# `location = "tab"` opens/focuses a dedicated `pin:<name>` tab (default).
-# `location = "layout"` adds a tiled pane to the focused tab's active layout.
-# For layout pins, omitted cwd means the focused repo/worktree if resolvable; for
-# tab pins, omitted cwd means $HOME.
+# or the tabbar's pin chips. Pins run on the host (no sandbox) and are managed by
+# a supervisor (eager start, restart policy, health, survive workspace switches).
+#
+#   location = "tab"    opens/focuses a dedicated `pin:<name>` tab (default)
+#   location = "layout" adds a tiled pane to the focused tab's active layout
+#   location = "strip"  renders the pin in the top strip
+#   location = "float"  opens the pin as a floating scratch overlay
+#   scope    = "global" (default) | "workspace"   (workspace = which workspace)
+#   start    = "lazy" (default) | "eager"         (eager = launch at session start)
+#   restart  = "never" (default) | "always" | "on-failure"
+#   singleton = true (default)                    (false = allow multiple instances)
+#
+# Optional: `args` (explicit argv, skips the shell), `env` (per-program vars),
+# `label` (strip/chip text), `ratio` (this pin's weight in the strip). For layout/
+# strip pins, omitted cwd means the focused repo/worktree if resolvable; for tab/
+# float pins, omitted cwd means $HOME.
 # [[pins]]
 # name = "aerc"
 # command = "aerc"
-# location = "tab"
+# location = "float"
 #
 # [[pins]]
 # name = "logs"
 # command = "journalctl -f"
-# location = "layout"
+# location = "strip"
+# start = "eager"
+# restart = "always"
+# label = "syslog"
+# ratio = 1.5
 # cwd = "~"
+# env = { RUST_LOG = "info" }
 
 # ── Sandbox / containers ──────────────────────────────────────────────────────
 # Run each worktree's interactive process (agent/shell/tools) inside a
@@ -230,19 +340,26 @@ command = "git diff"
 # `[sandbox]` table (only the keys you set override these).
 [sandbox]
 enabled = true
-# auto | podman | docker | bwrap | systemd | apple | wsl | none
+# auto | podman-rootless | podman-rootful | docker | bwrap | systemd | apple | wsl | host
 backend = "auto"
-# Detection order for "auto"; "none" = run on the host (always works).
-backend_chain = ["podman", "docker", "bwrap", "none"]
-# Empty => host-toolchain mode (bwrap/systemd reuse your installed tools).
-# Set an OCI image to get a reproducible env via podman/docker.
+# Default selection in the new-worktree sandbox picker.
+default_backend = "auto"
+# Detection order for "auto"; "host" = uncontained host fallback (last by default).
+backend_chain = ["podman-rootless", "podman-rootful", "docker", "bwrap", "host"]
+# Empty => use the built-in OCI default image for podman/docker, or host-toolchain
+# mode for bwrap/systemd. Set an OCI image to get a reproducible env.
 image = ""
 # nat (egress, no inbound) | host | none. Coding agents need egress, so "none"
 # will break API-backed agents.
 network = "nat"
+# File access: worktree | worktree_plus_caches | custom | all | host | none.
+# worktree_plus_caches mounts common build caches by default without exposing HOME.
+file_access = "worktree_plus_caches"
+auto_caches = true
 # Host env vars forwarded into the sandbox (agent/git auth lives here).
 env_passthrough = ["SSH_AUTH_SOCK", "GH_TOKEN", "GITHUB_TOKEN", "ANTHROPIC_API_KEY", "TERM", "COLORTERM"]
-# Extra bind mounts: "host", "host:ro", "host:dest", or "host:dest:ro".
+# Extra bind mounts: "host", "host:ro", "host:dest", "host:dest:ro", or
+# "host:dest:cache" (read-write cache, grouped in the sandbox summary).
 mounts = ["~/.gitconfig:ro"]
 # Shell run inside before the agent/shell (e.g. tool setup).
 init_script = ""

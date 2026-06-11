@@ -1,0 +1,181 @@
+//! Keyboard/mouse input encoding: translate termwiz events into the byte
+//! sequences a terminal application expects on its stdin.
+
+use termwiz::input::{KeyCode, Modifiers};
+
+use crate::emulator::MouseMode;
+
+/// Translate a termwiz key event into the bytes a terminal app expects on
+/// stdin (normal cursor-key mode).
+pub(crate) fn key_bytes(key: &KeyCode, mods: Modifiers) -> Option<Vec<u8>> {
+    key_bytes_mode(key, mods, false)
+}
+
+/// As [`key_bytes`], honoring DECCKM: when the app set application cursor
+/// keys, unmodified arrows/Home/End are SS3-encoded (`ESC O A`) — full-screen
+/// apps (htop, less, vim) expect exactly the encoding their terminfo entry
+/// advertises, and feeding CSI arrows instead reads as a bare `ESC` (which
+/// htop treats as "reset to top").
+pub(crate) fn key_bytes_mode(key: &KeyCode, mods: Modifiers, app_cursor: bool) -> Option<Vec<u8>> {
+    if app_cursor && mods.is_empty() {
+        let ss3 = |c: u8| Some(vec![0x1b, b'O', c]);
+        match key {
+            KeyCode::UpArrow => return ss3(b'A'),
+            KeyCode::DownArrow => return ss3(b'B'),
+            KeyCode::RightArrow => return ss3(b'C'),
+            KeyCode::LeftArrow => return ss3(b'D'),
+            KeyCode::Home => return ss3(b'H'),
+            KeyCode::End => return ss3(b'F'),
+            _ => {}
+        }
+    }
+    match key {
+        KeyCode::Char(c) => {
+            if mods.contains(Modifiers::CTRL) {
+                let b = (c.to_ascii_uppercase() as u8).wrapping_sub(0x40);
+                Some(vec![b & 0x1f])
+            } else {
+                let mut buf = [0u8; 4];
+                Some(c.encode_utf8(&mut buf).as_bytes().to_vec())
+            }
+        }
+        KeyCode::Enter => Some(vec![b'\r']),
+        KeyCode::Backspace => Some(vec![0x7f]),
+        KeyCode::Tab => Some(vec![b'\t']),
+        KeyCode::Escape => Some(vec![0x1b]),
+        KeyCode::LeftArrow => Some(b"\x1b[D".to_vec()),
+        KeyCode::RightArrow => Some(b"\x1b[C".to_vec()),
+        KeyCode::UpArrow => Some(b"\x1b[A".to_vec()),
+        KeyCode::DownArrow => Some(b"\x1b[B".to_vec()),
+        KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
+        KeyCode::Home => Some(b"\x1b[H".to_vec()),
+        KeyCode::End => Some(b"\x1b[F".to_vec()),
+        _ => None,
+    }
+}
+
+/// A mouse event normalized for pane forwarding, with 0-based pane-relative
+/// cell coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaneMouse {
+    Press(u8), // 0 = left, 1 = middle, 2 = right
+    Release(u8),
+    /// Motion with this button held (left drag etc.).
+    Drag(u8),
+    /// Motion with no button held (AnyMotion only).
+    Move,
+    WheelUp,
+    WheelDown,
+}
+
+/// Encode a mouse event for the app inside a pane, honoring the reporting
+/// `mode` it requested and its encoding (SGR vs legacy X10 bytes). Returns
+/// `None` when the mode doesn't include this event kind. `col`/`row` are
+/// 0-based pane-relative cells.
+pub(crate) fn encode_mouse(
+    ev: PaneMouse,
+    mode: MouseMode,
+    sgr: bool,
+    col: u16,
+    row: u16,
+) -> Option<Vec<u8>> {
+    let wanted = match (ev, mode) {
+        (_, MouseMode::None) => false,
+        (PaneMouse::Press(_) | PaneMouse::WheelUp | PaneMouse::WheelDown, _) => true,
+        (PaneMouse::Release(_), m) => m != MouseMode::Press,
+        (PaneMouse::Drag(_), MouseMode::ButtonMotion | MouseMode::AnyMotion) => true,
+        (PaneMouse::Move, MouseMode::AnyMotion) => true,
+        _ => false,
+    };
+    if !wanted {
+        return None;
+    }
+    let (code, release) = match ev {
+        PaneMouse::Press(b) => (b, false),
+        PaneMouse::Release(b) => (b, true),
+        PaneMouse::Drag(b) => (b + 32, false),
+        PaneMouse::Move => (35, false),
+        PaneMouse::WheelUp => (64, false),
+        PaneMouse::WheelDown => (65, false),
+    };
+    let (x, y) = (col as u32 + 1, row as u32 + 1);
+    if sgr {
+        let fin = if release { 'm' } else { 'M' };
+        Some(format!("\x1b[<{code};{x};{y}{fin}").into_bytes())
+    } else {
+        // Legacy X10 bytes: 32 + code (release reports button 3), 32 + coord.
+        let code = if release { 3 } else { code };
+        let clamp = |v: u32| (32 + v).min(255) as u8;
+        Some(vec![0x1b, b'[', b'M', 32 + code, clamp(x), clamp(y)])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_cursor_switches_arrows_to_ss3() {
+        assert_eq!(
+            key_bytes_mode(&KeyCode::UpArrow, Modifiers::NONE, true).unwrap(),
+            b"\x1bOA"
+        );
+        assert_eq!(
+            key_bytes_mode(&KeyCode::UpArrow, Modifiers::NONE, false).unwrap(),
+            b"\x1b[A"
+        );
+        // Modified arrows keep CSI even in app-cursor mode.
+        assert_eq!(
+            key_bytes_mode(&KeyCode::UpArrow, Modifiers::CTRL, true),
+            key_bytes(&KeyCode::UpArrow, Modifiers::CTRL)
+        );
+        assert_eq!(
+            key_bytes_mode(&KeyCode::Home, Modifiers::NONE, true).unwrap(),
+            b"\x1bOH"
+        );
+    }
+
+    #[test]
+    fn mouse_encoding_honors_mode_and_format() {
+        use crate::emulator::MouseMode as M;
+        // Press always reports (when any mode is on), SGR formats with M.
+        assert_eq!(
+            encode_mouse(PaneMouse::Press(0), M::PressRelease, true, 4, 9).unwrap(),
+            b"\x1b[<0;5;10M"
+        );
+        // Release uses lowercase m in SGR, suppressed entirely in Press mode.
+        assert_eq!(
+            encode_mouse(PaneMouse::Release(0), M::PressRelease, true, 4, 9).unwrap(),
+            b"\x1b[<0;5;10m"
+        );
+        assert!(encode_mouse(PaneMouse::Release(0), M::Press, true, 4, 9).is_none());
+        // Drag only in motion modes; +32 button code.
+        assert!(encode_mouse(PaneMouse::Drag(0), M::PressRelease, true, 1, 1).is_none());
+        assert_eq!(
+            encode_mouse(PaneMouse::Drag(0), M::ButtonMotion, true, 1, 1).unwrap(),
+            b"\x1b[<32;2;2M"
+        );
+        // Bare motion only in AnyMotion.
+        assert!(encode_mouse(PaneMouse::Move, M::ButtonMotion, true, 0, 0).is_none());
+        assert_eq!(
+            encode_mouse(PaneMouse::Move, M::AnyMotion, true, 0, 0).unwrap(),
+            b"\x1b[<35;1;1M"
+        );
+        // Wheel.
+        assert_eq!(
+            encode_mouse(PaneMouse::WheelUp, M::Press, true, 0, 0).unwrap(),
+            b"\x1b[<64;1;1M"
+        );
+        // Legacy X10 byte encoding.
+        assert_eq!(
+            encode_mouse(PaneMouse::Press(0), M::PressRelease, false, 0, 0).unwrap(),
+            vec![0x1b, b'[', b'M', 32, 33, 33]
+        );
+        assert_eq!(
+            encode_mouse(PaneMouse::Release(0), M::PressRelease, false, 0, 0).unwrap(),
+            vec![0x1b, b'[', b'M', 35, 33, 33]
+        );
+        // Nothing when the app didn't ask.
+        assert!(encode_mouse(PaneMouse::Press(0), M::None, true, 0, 0).is_none());
+    }
+}

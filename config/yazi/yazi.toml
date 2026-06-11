@@ -19,6 +19,19 @@ max_width = 1000
 max_height = 1000
 tab_size = 2
 
+# BEGIN SUPERZEJ MANAGED IMAGE PREVIEW POLICY
+# Keep image preview helpers such as ueberzugpp out of the default drawer. Text
+# previews still work; set [drawer].image_previews = true to remove this block
+# from the private generated config.
+[plugin]
+prepend_previewers = [
+  { mime = "image/*", run = "noop" },
+]
+prepend_preloaders = [
+  { mime = "image/*", run = "noop" },
+]
+# END SUPERZEJ MANAGED IMAGE PREVIEW POLICY
+
 # Route "edit" (Enter/o on a text file) through superzej so it opens in
 # superzej's editor surface (honoring $VISUAL/$EDITOR and GUI editors) rather
 # than a raw editor inside the drawer. Non-blocking: superzej spawns the editor

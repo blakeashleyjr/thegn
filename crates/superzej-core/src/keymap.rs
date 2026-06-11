@@ -205,7 +205,7 @@ pub const BUILTINS: &[Action] = &[
     },
     Action {
         id: "close-worktree",
-        chords: &["Alt X"],
+        chords: &["Alt x"],
         menu_label: "Close worktree (+ its tab)",
         hint: "close",
         invocation: run_float!("close-worktree"),
@@ -238,7 +238,7 @@ pub const BUILTINS: &[Action] = &[
     },
     Action {
         id: "menu",
-        chords: &["Super k"],
+        chords: &["Ctrl Space"],
         menu_label: "Command palette",
         hint: "menu",
         // Super+K routes through the statusbar so it's a real toggle: a bare
@@ -382,7 +382,7 @@ pub const BUILTINS: &[Action] = &[
     Action {
         id: "prev-tab",
         chords: &["Alt Left"],
-        menu_label: "Previous tab",
+        menu_label: "Previous tab (within worktree)",
         hint: "tabs",
         invocation: Invocation::Native {
             body: "GoToPreviousTab;",
@@ -394,7 +394,7 @@ pub const BUILTINS: &[Action] = &[
     Action {
         id: "next-tab",
         chords: &["Alt Right"],
-        menu_label: "Next tab",
+        menu_label: "Next tab (within worktree)",
         hint: "tabs",
         invocation: Invocation::Native {
             body: "GoToNextTab;",
@@ -404,10 +404,54 @@ pub const BUILTINS: &[Action] = &[
         menu: false,
     },
     Action {
+        id: "prev-worktree",
+        chords: &["Alt Up"],
+        menu_label: "Previous worktree",
+        hint: "worktrees",
+        invocation: Invocation::Native {
+            body: "GoToPreviousTab;",
+        },
+        scope: Scope::Shared,
+        context: Context::Always,
+        menu: false,
+    },
+    Action {
+        id: "next-worktree",
+        chords: &["Alt Down"],
+        menu_label: "Next worktree",
+        hint: "worktrees",
+        invocation: Invocation::Native {
+            body: "GoToNextTab;",
+        },
+        scope: Scope::Shared,
+        context: Context::Always,
+        menu: false,
+    },
+    Action {
+        id: "close-tab",
+        chords: &["Alt X"],
+        menu_label: "Close tab (last one closes the worktree)",
+        hint: "tabs",
+        invocation: Invocation::Native { body: "CloseTab;" },
+        scope: Scope::Shared,
+        context: Context::Always,
+        menu: false,
+    },
+    Action {
+        id: "toggle-key-lock",
+        chords: &["Ctrl g"],
+        menu_label: "Lock/unlock keybinds (pass keys to pane)",
+        hint: "lock",
+        invocation: Invocation::Native { body: ";" },
+        scope: Scope::Shared,
+        context: Context::Always,
+        menu: false,
+    },
+    Action {
         id: "focus-left",
-        chords: &["Alt h", "Super Alt Left", "Super Alt h"],
-        menu_label: "Focus pane left",
-        hint: "panes",
+        chords: &["Ctrl Left", "Ctrl h"],
+        menu_label: "Focus left (pane → sidebar)",
+        hint: "focus",
         invocation: Invocation::Native {
             body: "MoveFocus \"Left\";",
         },
@@ -417,9 +461,9 @@ pub const BUILTINS: &[Action] = &[
     },
     Action {
         id: "focus-down",
-        chords: &["Alt j"],
-        menu_label: "Focus pane down",
-        hint: "panes",
+        chords: &["Ctrl Down", "Ctrl j"],
+        menu_label: "Focus down (pane / row / widget)",
+        hint: "focus",
         invocation: Invocation::Native {
             body: "MoveFocus \"Down\";",
         },
@@ -429,9 +473,9 @@ pub const BUILTINS: &[Action] = &[
     },
     Action {
         id: "focus-up",
-        chords: &["Alt k"],
-        menu_label: "Focus pane up",
-        hint: "panes",
+        chords: &["Ctrl Up", "Ctrl k"],
+        menu_label: "Focus up (pane / row / widget)",
+        hint: "focus",
         invocation: Invocation::Native {
             body: "MoveFocus \"Up\";",
         },
@@ -441,9 +485,9 @@ pub const BUILTINS: &[Action] = &[
     },
     Action {
         id: "focus-right",
-        chords: &["Alt l", "Super Alt Right", "Super Alt l"],
-        menu_label: "Focus pane right",
-        hint: "panes",
+        chords: &["Ctrl Right", "Ctrl l"],
+        menu_label: "Focus right (pane → panel)",
+        hint: "focus",
         invocation: Invocation::Native {
             body: "MoveFocus \"Right\";",
         },
@@ -496,7 +540,7 @@ pub const BUILTINS: &[Action] = &[
     },
     Action {
         id: "focus-panel",
-        chords: &["Alt p"],
+        chords: &["Alt ."],
         menu_label: "Focus diff / PR panel",
         hint: "focus-panel",
         invocation: Invocation::MessagePlugin {
@@ -565,12 +609,12 @@ const fn pin_action(
     }
 }
 
-/// Vanilla-zellij chords superzej deliberately keeps; a user override landing on
-/// one is flagged by `keys validate`.
-const RESERVED: &[&str] = &[
-    "Alt [", "Alt ]", "Ctrl p", "Ctrl t", "Ctrl n", "Ctrl s", "Ctrl o", "Ctrl h", "Ctrl g",
-    "Ctrl b", "Ctrl q",
-];
+/// Terminal-critical chords: claiming one steals interrupt/EOF/suspend from
+/// every program in every pane, so a user override landing on one is flagged
+/// by `keys validate`. (The zellij-era modal chords are gone — the native host
+/// owns input, and Ctrl+g/Ctrl+hjkl are deliberate superzej bindings with the
+/// Ctrl+g lock as the escape hatch.)
+const RESERVED: &[&str] = &["Ctrl c", "Ctrl d", "Ctrl z"];
 
 // ─── Resolution: builtins + overrides + custom ──────────────────────────────
 
@@ -837,18 +881,18 @@ pub fn splice_managed_region(existing: &str, generated: &str) -> String {
         return format!("{}{}\n{}", &existing[..b], generated.trim_end(), after);
     }
     // Legacy: replace the first top-level `keybinds { … }` block (brace-matched).
-    if let Some(start) = existing.find("keybinds") {
-        if let Some(open) = existing[start..].find('{') {
-            let abs_open = start + open;
-            if let Some(close) = match_brace(&existing[abs_open..]) {
-                let abs_close = abs_open + close;
-                return format!(
-                    "{}{}\n{}",
-                    &existing[..start],
-                    generated.trim_end(),
-                    existing[abs_close + 1..].trim_start_matches('\n')
-                );
-            }
+    if let Some(start) = existing.find("keybinds")
+        && let Some(open) = existing[start..].find('{')
+    {
+        let abs_open = start + open;
+        if let Some(close) = match_brace(&existing[abs_open..]) {
+            let abs_close = abs_open + close;
+            return format!(
+                "{}{}\n{}",
+                &existing[..start],
+                generated.trim_end(),
+                existing[abs_close + 1..].trim_start_matches('\n')
+            );
         }
     }
     // No keybinds block at all: prepend the region.
@@ -930,7 +974,7 @@ mod tests {
         // A pipe (MessagePlugin) is multi-line with its `name` child.
         assert!(kdl.contains("        bind \"Ctrl Alt s\" {\n            MessagePlugin \"file:~/.local/share/superzej/statusbar.wasm\" {\n                name \"superzej_toggle_sidebar\"\n            }\n        }\n"));
         // A bare native action stays on one line.
-        assert!(kdl.contains("        bind \"Alt h\" { MoveFocus \"Left\"; }\n"));
+        assert!(kdl.contains("        bind \"Ctrl Left\" { MoveFocus \"Left\"; }\n"));
         // tab-mode override present
         assert!(kdl.contains("    tab {\n"));
         assert!(kdl.contains("SwitchToMode \"Normal\""));
@@ -992,7 +1036,7 @@ mod tests {
         // Force a duplicate + a reserved hit.
         cfg.keybinds.insert("dashboard".into(), "Alt w".into()); // dup with default new-worktree? new-worktree now Ctrl w, so Alt w free → use Alt g (tool-lazygit)
         cfg.keybinds.insert("dashboard".into(), "Alt g".into());
-        cfg.keybinds.insert("switch-repo".into(), "Alt [".into()); // reserved
+        cfg.keybinds.insert("switch-repo".into(), "Ctrl c".into()); // reserved
         let cols = detect_collisions(&effective(&cfg));
         assert!(
             cols.iter()

@@ -1,12 +1,15 @@
 //! superzej-core — the substrate-agnostic heart of superzej.
 //!
-//! Everything here is independent of the UI substrate (zellij today, the native
-//! host tomorrow): SQLite state, git/worktree/repo logic, the sandbox + remote
-//! transport seams, config layering, the theme palette, and structured logging.
-//! No module here references a multiplexer, a terminal emulator, or a renderer —
-//! that is enforced by keeping `tokio`, `termwiz`, `iocraft`, and the native
-//! service crates out of this crate's dependency set.
+//! Everything here is independent of the UI substrate (the native host): SQLite
+//! state, git/worktree/repo logic, the sandbox + remote transport seams, config
+//! layering, the theme palette, and structured logging. No module here references
+//! a multiplexer, a terminal emulator, or a renderer — that is enforced by keeping
+//! `tokio`, `termwiz`, and the native service crates out of this crate's
+//! dependency set. The `keymap` module is the keybinding *registry* (effective
+//! bindings + collision detection for the cheatsheet/`keys validate`); the host
+//! owns terminal chord→Action routing.
 
+pub mod activity;
 pub mod config;
 pub mod db;
 pub mod diff_highlight;
