@@ -153,7 +153,7 @@ pub(crate) struct Panes {
 
 impl Panes {
     #[cfg(test)]
-    fn new(tx: tokio_mpsc::Sender<PaneEvent>) -> Self {
+    pub(crate) fn new(tx: tokio_mpsc::Sender<PaneEvent>) -> Self {
         Self {
             table: std::collections::HashMap::new(),
             next_id: 1,

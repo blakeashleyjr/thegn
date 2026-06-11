@@ -14,6 +14,21 @@ use std::path::PathBuf;
 /// Bundled yazi config, embedded in the binary and seeded at first launch.
 const YAZI_TOML: &str = include_str!("../../../config/yazi/yazi.toml");
 const KEYMAP_TOML: &str = include_str!("../../../config/yazi/keymap.toml");
+/// The managed yazi.toml block that disables image preview/preload helpers.
+const IMAGE_POLICY_BEGIN: &str = "# BEGIN SUPERZEJ MANAGED IMAGE PREVIEW POLICY";
+const IMAGE_POLICY_END: &str = "# END SUPERZEJ MANAGED IMAGE PREVIEW POLICY";
+const IMAGE_POLICY_BLOCK: &str = r#"# BEGIN SUPERZEJ MANAGED IMAGE PREVIEW POLICY
+# Keep image preview helpers such as ueberzugpp out of the default drawer. Text
+# previews still work; set [drawer].image_previews = true to remove this block
+# from the private generated config.
+[plugin]
+prepend_previewers = [
+  { mime = "image/*", run = "noop" },
+]
+prepend_preloaders = [
+  { mime = "image/*", run = "noop" },
+]
+# END SUPERZEJ MANAGED IMAGE PREVIEW POLICY"#;
 /// `theme.toml` with an `{{ACCENT}}` placeholder (an `#rrggbb`), filled per-open.
 const THEME_TMPL: &str = include_str!("../../../config/yazi/theme.toml");
 
@@ -56,6 +71,7 @@ pub fn ensure_config(cfg: &Config) -> Option<PathBuf> {
     let dir = config_home(cfg)?;
     let _ = std::fs::create_dir_all(&dir);
     seed_once(&dir, "yazi.toml", YAZI_TOML);
+    apply_image_preview_policy(&dir, cfg.drawer.image_previews);
     seed_once(&dir, "keymap.toml", KEYMAP_TOML);
     write_theme(&dir, &cfg.accent_hex());
     Some(dir)
@@ -67,6 +83,44 @@ fn seed_once(dir: &std::path::Path, name: &str, contents: &str) {
     if !path.exists() {
         let _ = std::fs::write(path, contents);
     }
+}
+
+/// Add or remove superzej's managed image-preview policy in `yazi.toml`.
+/// Existing users may already have a private config seeded before the safe block
+/// existed; append the block only when there is no `[plugin]` table to collide
+/// with. Containment still protects user-customized configs we cannot rewrite.
+fn apply_image_preview_policy(dir: &std::path::Path, enabled: bool) {
+    let path = dir.join("yazi.toml");
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let next = if enabled {
+        remove_managed_image_policy(&body)
+    } else if body.contains(IMAGE_POLICY_BEGIN) || body.lines().any(|l| l.trim() == "[plugin]") {
+        body.clone()
+    } else {
+        format!("{}\n\n{}\n", body.trim_end(), IMAGE_POLICY_BLOCK)
+    };
+    if next != body {
+        let _ = std::fs::write(path, next);
+    }
+}
+
+fn remove_managed_image_policy(body: &str) -> String {
+    let Some(start) = body.find(IMAGE_POLICY_BEGIN) else {
+        return body.to_string();
+    };
+    let Some(end_rel) = body[start..].find(IMAGE_POLICY_END) else {
+        return body.to_string();
+    };
+    let end = start + end_rel + IMAGE_POLICY_END.len();
+    let mut next = String::with_capacity(body.len());
+    next.push_str(body[..start].trim_end());
+    next.push_str(body[end..].trim_start_matches(['\r', '\n']));
+    if !next.ends_with('\n') {
+        next.push('\n');
+    }
+    next
 }
 
 /// Regenerate `theme.toml` from the accent (an `#rrggbb`). Always overwritten —
@@ -160,7 +214,62 @@ mod tests {
     }
 
     #[test]
-    fn ensure_config_never_overwrites_user_edits_but_regenerates_theme() {
+    fn ensure_config_disables_image_previews_by_default() {
+        let dir = tmpdir();
+        let cfg = cfg_with("", dir.to_str().unwrap());
+
+        ensure_config(&cfg).unwrap();
+        let yazi = std::fs::read_to_string(dir.join("yazi.toml")).unwrap();
+        assert!(yazi.contains(IMAGE_POLICY_BEGIN));
+        assert!(yazi.contains("mime = \"image/*\", run = \"noop\""));
+        assert!(yazi.contains("prepend_preloaders"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_config_image_preview_opt_in_removes_managed_block() {
+        let dir = tmpdir();
+        let mut cfg = cfg_with("", dir.to_str().unwrap());
+        ensure_config(&cfg).unwrap();
+
+        cfg.drawer.image_previews = true;
+        ensure_config(&cfg).unwrap();
+        let yazi = std::fs::read_to_string(dir.join("yazi.toml")).unwrap();
+        assert!(!yazi.contains(IMAGE_POLICY_BEGIN));
+        assert!(!yazi.contains(IMAGE_POLICY_END));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_config_adds_policy_to_old_default_without_plugin_table() {
+        let dir = tmpdir();
+        let cfg = cfg_with("", dir.to_str().unwrap());
+        std::fs::write(
+            dir.join("yazi.toml"),
+            "[mgr]\nratio = [1, 3, 4]\n\n[preview]\ntab_size = 2\n",
+        )
+        .unwrap();
+
+        ensure_config(&cfg).unwrap();
+        let yazi = std::fs::read_to_string(dir.join("yazi.toml")).unwrap();
+        assert!(yazi.contains(IMAGE_POLICY_BEGIN));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_config_does_not_append_policy_to_user_plugin_table() {
+        let dir = tmpdir();
+        let cfg = cfg_with("", dir.to_str().unwrap());
+        std::fs::write(dir.join("yazi.toml"), "[plugin]\nprepend_previewers = []\n").unwrap();
+
+        ensure_config(&cfg).unwrap();
+        let yazi = std::fs::read_to_string(dir.join("yazi.toml")).unwrap();
+        assert!(!yazi.contains(IMAGE_POLICY_BEGIN));
+        assert_eq!(yazi.matches("[plugin]").count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn ensure_config_preserves_user_edits_while_applying_policy_and_regenerates_theme() {
         let dir = tmpdir();
         let cfg = cfg_with("", dir.to_str().unwrap());
         ensure_config(&cfg).unwrap();
@@ -171,11 +280,12 @@ mod tests {
         std::fs::write(dir.join("theme.toml"), "stale {{ACCENT}}\n").unwrap();
 
         ensure_config(&cfg).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dir.join("yazi.toml")).unwrap(),
-            "# my edits\n",
-            "yazi.toml preserved"
+        let yazi = std::fs::read_to_string(dir.join("yazi.toml")).unwrap();
+        assert!(
+            yazi.starts_with("# my edits\n"),
+            "yazi.toml edits preserved"
         );
+        assert!(yazi.contains(IMAGE_POLICY_BEGIN), "safe policy appended");
         assert_eq!(
             std::fs::read_to_string(dir.join("keymap.toml")).unwrap(),
             "# my keys\n",
