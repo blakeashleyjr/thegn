@@ -31,7 +31,7 @@ fn color_attr(c: CellColor) -> ColorAttribute {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct CellStyle {
     fg: CellColor,
     bg: CellColor,
@@ -79,14 +79,19 @@ pub fn compose_pane(surface: &mut Surface, emu: &dyn PaneEmulator, rect: Rect) {
     for row in 0..rect.rows.min(erows as usize) {
         flush_run(surface, &mut run);
 
-        // FAST PATH: If the emulator can give us the whole row, blit it directly
+        // FAST PATH: an all-default-attribute row blits as one plain string.
+        // (`row_text` returns None for any styled row, so colors never take
+        // this path.) Reset attributes first — the previous row's run may have
+        // left colors active.
         if let Some(text) = emu.row_text(row as u16) {
+            if current_style.take().is_some() {
+                emit_style(surface, CellStyle::default());
+            }
             surface.add_change(Change::CursorPosition {
                 x: Position::Absolute(rect.x),
                 y: Position::Absolute(rect.y + row),
             });
             surface.add_change(Change::Text(text));
-            current_style = None; // Reset style tracking since we jumped ahead
             continue;
         }
 
@@ -117,6 +122,57 @@ pub fn compose_pane(surface: &mut Surface, emu: &dyn PaneEmulator, rect: Rect) {
         }
     }
     flush_run(surface, &mut run);
+}
+
+/// Paint the mouse-selection highlight over a pane's `content` rect: selected
+/// cells keep their glyph and foreground, on `bg`. Extract-style spans (first
+/// row from the anchor column, middle rows full, last row to the cursor) so
+/// the highlight matches exactly what auto-copy yields. Call after
+/// [`compose_pane`]; never paints outside `content`.
+pub fn overlay_selection(
+    surface: &mut Surface,
+    content: Rect,
+    sel: &crate::copymode::Selection,
+    bg: termwiz::color::ColorAttribute,
+) {
+    let (sr, sc, er, ec) = sel.ordered();
+    let last_col = content.cols.saturating_sub(1);
+    // Read the composed cells back first (screen_cells borrows mutably).
+    let mut patches: Vec<(usize, usize, String, termwiz::color::ColorAttribute)> = Vec::new();
+    {
+        let cells = surface.screen_cells();
+        for r in sr..=er.min(content.rows.saturating_sub(1) as u16) {
+            let (from, to) = if sr == er {
+                (sc, ec)
+            } else if r == sr {
+                (sc, last_col as u16)
+            } else if r == er {
+                (0, ec)
+            } else {
+                (0, last_col as u16)
+            };
+            let y = content.y + r as usize;
+            for c in from..=to.min(last_col as u16) {
+                let x = content.x + c as usize;
+                if let Some(cell) = cells.get(y).and_then(|row| row.get(x)) {
+                    patches.push((x, y, cell.str().to_string(), cell.attrs().foreground()));
+                }
+            }
+        }
+    }
+    for (x, y, text, fg) in patches {
+        surface.add_change(Change::CursorPosition {
+            x: Position::Absolute(x),
+            y: Position::Absolute(y),
+        });
+        surface.add_change(Change::Attribute(AttributeChange::Foreground(fg)));
+        surface.add_change(Change::Attribute(AttributeChange::Background(bg)));
+        surface.add_change(Change::Text(if text.is_empty() {
+            " ".into()
+        } else {
+            text
+        }));
+    }
 }
 
 #[cfg(test)]

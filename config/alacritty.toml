@@ -1,0 +1,41 @@
+# Alacritty profile for running superzej (`just start-term`): tuned for a
+# compositor that owns its own chrome, scrollback, and selection.
+
+[window]
+# superzej draws its own bars; no native decorations or padding.
+decorations = "None"
+padding = { x = 0, y = 4 } # a touch of air between the bar and the window edge
+dynamic_padding = false
+startup_mode = "Maximized"
+# Fully opaque: superzej's storm-blue surfaces are the design; compositor
+# transparency just muddies the tint contrast between the chrome zones.
+opacity = 1.0
+
+[font]
+# Match the ghostty daily-driver setup: Nerd Font glyphs back the bar icons,
+# and a touch of extra line height keeps the chrome airy.
+normal = { family = "FiraCode Nerd Font" }
+size = 13
+offset = { x = 0, y = 2 }
+glyph_offset = { x = 0, y = 1 }
+
+[scrolling]
+# The host owns scrollback (per-pane, Shift+PgUp / mouse wheel); the outer
+# terminal keeping its own history just wastes memory and confuses paging.
+history = 0
+
+[cursor]
+style = { shape = "Block", blinking = "Never" }
+unfocused_hollow = true
+
+[mouse]
+# Don't obscure the host's hover/drag selection.
+hide_when_typing = true
+
+[colors.primary]
+# Match the storm-blue chrome so resize flashes blend in.
+background = "#14161f"
+foreground = "#e0e4f0"
+
+[env]
+TERM = "xterm-256color"

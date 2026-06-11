@@ -28,7 +28,10 @@ use std::process::Command;
 /// has no `Auto` — auto resolution is what produces a concrete `Backend`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
+    /// Rootless podman (default podman invocation).
     Podman,
+    /// Rootful podman via non-interactive sudo (`sudo -n podman`).
+    PodmanRootful,
     Docker,
     Bwrap,
     Systemd,
@@ -40,7 +43,8 @@ pub enum Backend {
 impl Backend {
     fn parse(s: &str) -> Option<Backend> {
         Some(match s {
-            "podman" => Backend::Podman,
+            "podman" | "podman-rootless" | "rootless-podman" => Backend::Podman,
+            "podman-rootful" | "rootful-podman" => Backend::PodmanRootful,
             "docker" => Backend::Docker,
             "bwrap" | "bubblewrap" => Backend::Bwrap,
             "systemd" | "systemd-run" => Backend::Systemd,
@@ -57,6 +61,7 @@ impl Backend {
         Some(match b {
             SandboxBackend::Auto => return None,
             SandboxBackend::Podman => Backend::Podman,
+            SandboxBackend::PodmanRootful => Backend::PodmanRootful,
             SandboxBackend::Docker => Backend::Docker,
             SandboxBackend::Bwrap => Backend::Bwrap,
             SandboxBackend::Systemd => Backend::Systemd,
@@ -67,9 +72,22 @@ impl Backend {
     }
 
     /// The executable to probe / invoke for this backend.
+    pub fn label(self) -> &'static str {
+        match self {
+            Backend::Podman => "podman-rootless",
+            Backend::PodmanRootful => "podman-rootful",
+            Backend::Docker => "docker",
+            Backend::Bwrap => "bwrap",
+            Backend::Systemd => "systemd",
+            Backend::Apple => "apple",
+            Backend::Wsl => "wsl",
+            Backend::None => "host",
+        }
+    }
+
     pub fn binary(self) -> &'static str {
         match self {
-            Backend::Podman => "podman",
+            Backend::Podman | Backend::PodmanRootful => "podman",
             Backend::Docker => "docker",
             Backend::Bwrap => "bwrap",
             Backend::Systemd => "systemd-run",
@@ -84,7 +102,11 @@ impl Backend {
     pub fn is_oci(self) -> bool {
         matches!(
             self,
-            Backend::Podman | Backend::Docker | Backend::Apple | Backend::Wsl
+            Backend::Podman
+                | Backend::PodmanRootful
+                | Backend::Docker
+                | Backend::Apple
+                | Backend::Wsl
         )
     }
 
@@ -130,6 +152,7 @@ pub struct Mount {
     pub host: String,
     pub dest: String,
     pub ro: bool,
+    pub cache: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -188,29 +211,40 @@ pub fn resolve(cfg: &SandboxConfig, loc: &GitLoc, name: &str) -> Option<SandboxS
         .filter(|p| p.as_path() != worktree && !worktree.starts_with(p));
 
     let mut mounts = vec![];
+    let add_worktree_mounts = |mounts: &mut Vec<Mount>| {
+        mounts.push(Mount {
+            host: loc.path(),
+            dest: loc.path(),
+            ro: false,
+            cache: false,
+        });
+        if let Some(gc) = &git_common {
+            let g = gc.to_string_lossy().into_owned();
+            mounts.push(Mount {
+                host: g.clone(),
+                dest: g,
+                ro: false,
+                cache: false,
+            });
+        }
+    };
     match cfg.file_access {
-        FileAccess::All => {
+        FileAccess::All | FileAccess::Host => {
             mounts.push(Mount {
                 host: "/".into(),
                 dest: "/".into(),
                 ro: false,
+                cache: false,
             });
         }
-        FileAccess::Worktree => {
-            mounts.push(Mount {
-                host: loc.path(),
-                dest: loc.path(),
-                ro: false,
-            });
-            if let Some(gc) = &git_common {
-                let g = gc.to_string_lossy().into_owned();
-                mounts.push(Mount {
-                    host: g.clone(),
-                    dest: g,
-                    ro: false,
-                });
+        FileAccess::Worktree => add_worktree_mounts(&mut mounts),
+        FileAccess::WorktreePlusCaches => {
+            add_worktree_mounts(&mut mounts);
+            if cfg.auto_caches {
+                mounts.extend(auto_cache_mounts());
             }
         }
+        FileAccess::Custom => add_worktree_mounts(&mut mounts),
         FileAccess::None => {}
     }
 
@@ -255,45 +289,231 @@ pub fn resolve(cfg: &SandboxConfig, loc: &GitLoc, name: &str) -> Option<SandboxS
     })
 }
 
+/// Name prefix for every container superzej creates (per-worktree sandboxes).
+pub const CONTAINER_PREFIX: &str = "superzej-";
+
 /// The deterministic per-worktree container name, derived from the worktree path
 /// so the create site (pick_agent) and `teardown` (close_worktree) always agree —
 /// local or remote, no DB slug lookup needed.
 pub fn container_name(worktree: &str) -> String {
-    format!("superzej-{}", util::slugify(worktree))
+    format!("{CONTAINER_PREFIX}{}", util::slugify(worktree))
 }
 
-/// Transport for a worktree: remote when its location is remote (kind from the
-/// configured `[sandbox.remote] transport`), else local.
-fn transport_from_loc(cfg: &SandboxConfig, loc: &GitLoc) -> Transport {
-    match loc.ssh() {
-        None => Transport::Local,
-        Some(ssh) => {
-            let kind = if cfg.remote.transport == RemoteTransport::Ssh {
-                TransportKind::Ssh
-            } else {
-                TransportKind::Mosh
-            };
-            Transport::Remote(Remote {
-                host: ssh.host.clone(),
-                port: ssh.port,
-                forward_agent: ssh.forward_agent,
-                kind,
-            })
+/// One running container, as listed by the OCI runtime — feeds the panel's
+/// SANDBOXES section. `ours` marks superzej-created (prefix-named) ones.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerInfo {
+    pub name: String,
+    pub image: String,
+    pub status: String,
+    pub ours: bool,
+    pub backend: String,
+    pub cpu: String,
+    pub mem: String,
+    pub net: String,
+    pub containment: String,
+    pub mounts: String,
+}
+
+fn container_info(name: String, image: String, status: String, backend: &str) -> ContainerInfo {
+    let ours = name.starts_with(CONTAINER_PREFIX);
+    ContainerInfo {
+        name,
+        image,
+        status,
+        ours,
+        backend: backend.to_string(),
+        cpu: String::new(),
+        mem: String::new(),
+        net: String::new(),
+        containment: "worktree+caches".into(),
+        mounts: String::new(),
+    }
+}
+
+/// Parse `podman ps --format json` (one JSON array; `Names` is a list).
+pub fn parse_podman_ps(json: &str) -> Vec<ContainerInfo> {
+    let Ok(rows) = serde_json::from_str::<Vec<serde_json::Value>>(json) else {
+        return Vec::new();
+    };
+    rows.into_iter()
+        .filter_map(|r| {
+            let name = r.get("Names")?.as_array()?.first()?.as_str()?.to_string();
+            let image = r.get("Image").and_then(|v| v.as_str()).unwrap_or("").into();
+            let status = r
+                .get("Status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .into();
+            Some(container_info(name, image, status, "podman"))
+        })
+        .collect()
+}
+
+/// Parse `docker ps --format '{{json .}}'` (NDJSON; `Names` is a string).
+pub fn parse_docker_ps(ndjson: &str) -> Vec<ContainerInfo> {
+    ndjson
+        .lines()
+        .filter_map(|line| {
+            let r: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+            let name = r.get("Names")?.as_str()?.to_string();
+            let image = r.get("Image").and_then(|v| v.as_str()).unwrap_or("").into();
+            let status = r
+                .get("Status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .into();
+            Some(container_info(name, image, status, "docker"))
+        })
+        .collect()
+}
+
+/// The running containers, superzej-owned first. Probes rootless podman,
+/// rootful podman, then docker; one fast subprocess on the caller's
+/// (background) thread. Empty when no OCI runtime is installed.
+pub fn running_containers() -> Vec<ContainerInfo> {
+    let mut out = Vec::new();
+    if let Some(stdout) = run_local_output(
+        &backend_prefix(Backend::Podman),
+        &["ps", "--format", "json"],
+    ) {
+        let mut rows = parse_podman_ps(&stdout);
+        apply_stats(&mut rows, &oci_stats(Backend::Podman));
+        out.extend(rows);
+    }
+    if let Some(stdout) = run_local_output(
+        &backend_prefix(Backend::PodmanRootful),
+        &["ps", "--format", "json"],
+    ) {
+        let mut rows = parse_podman_ps(&stdout);
+        for r in &mut rows {
+            r.backend = "podman-rootful".into();
+        }
+        apply_stats(&mut rows, &oci_stats(Backend::PodmanRootful));
+        out.extend(rows);
+    }
+    if out.is_empty()
+        && let Some(stdout) = run_local_output(
+            &backend_prefix(Backend::Docker),
+            &["ps", "--format", "{{json .}}"],
+        )
+    {
+        let mut rows = parse_docker_ps(&stdout);
+        apply_stats(&mut rows, &oci_stats(Backend::Docker));
+        out.extend(rows);
+    }
+    out.sort_by_key(|c| (!c.ours, c.name.clone()));
+    out
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ContainerStat {
+    pub cpu: String,
+    pub mem: String,
+    pub net: String,
+}
+
+fn apply_stats(
+    rows: &mut [ContainerInfo],
+    stats: &std::collections::HashMap<String, ContainerStat>,
+) {
+    for r in rows {
+        if let Some(st) = stats.get(&r.name) {
+            r.cpu = st.cpu.clone();
+            r.mem = st.mem.clone();
+            r.net = st.net.clone();
         }
     }
 }
 
-/// Choose a backend: honor an explicit choice when available, else walk the
-/// chain. Image presence filters candidates (OCI runtimes need an image; bwrap/
-/// systemd reuse the host toolchain). Always resolvable — the chain ends in
-/// `none` (host).
+fn oci_stats(backend: Backend) -> std::collections::HashMap<String, ContainerStat> {
+    let mut map = std::collections::HashMap::new();
+    let Some(stdout) = run_local_output(
+        &backend_prefix(backend),
+        &["stats", "--no-stream", "--format", "json"],
+    ) else {
+        return map;
+    };
+    for (name, st) in parse_stats_rows(&stdout) {
+        map.insert(name, st);
+    }
+    map
+}
+
+pub fn parse_stats_rows(output: &str) -> Vec<(String, ContainerStat)> {
+    let parse_one = |v: serde_json::Value| -> Option<(String, ContainerStat)> {
+        let name = v
+            .get("Name")
+            .or_else(|| v.get("Names"))?
+            .as_str()?
+            .to_string();
+        let cpu = v
+            .get("CPUPerc")
+            .or_else(|| v.get("CPU"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let mem = v
+            .get("MemUsage")
+            .or_else(|| v.get("Mem"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let net = v
+            .get("NetIO")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        Some((name, ContainerStat { cpu, mem, net }))
+    };
+    if let Ok(rows) = serde_json::from_str::<Vec<serde_json::Value>>(output) {
+        return rows.into_iter().filter_map(parse_one).collect();
+    }
+    output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .filter_map(parse_one)
+        .collect()
+}
+
+fn transport_from_loc(cfg: &SandboxConfig, loc: &GitLoc) -> Transport {
+    if let Some(ssh) = loc.ssh() {
+        let kind = match cfg.remote.transport {
+            RemoteTransport::Ssh => TransportKind::Ssh,
+            RemoteTransport::Mosh => TransportKind::Mosh,
+        };
+        Transport::Remote(Remote {
+            host: ssh.host.clone(),
+            port: ssh.port,
+            forward_agent: ssh.forward_agent,
+            kind,
+        })
+    } else if cfg.remote.is_remote() {
+        let kind = match cfg.remote.transport {
+            RemoteTransport::Ssh => TransportKind::Ssh,
+            RemoteTransport::Mosh => TransportKind::Mosh,
+        };
+        Transport::Remote(Remote {
+            host: cfg.remote.host.clone(),
+            port: cfg.remote.port,
+            forward_agent: cfg.remote.forward_agent,
+            kind,
+        })
+    } else {
+        Transport::Local
+    }
+}
+
 fn pick_backend(cfg: &SandboxConfig, transport: &Transport) -> Option<Backend> {
-    let image_set = !cfg.image.trim().is_empty();
     let suitable = |b: Backend| -> bool {
         match b {
             Backend::None => true,
-            _ if b.is_oci() => image_set,
-            _ if b.is_host_toolchain() => !image_set,
+            _ if b.is_oci() => true,
+            _ if b.is_host_toolchain() => true,
             _ => false,
         }
     };
@@ -354,7 +574,12 @@ fn on_missing(cfg: &SandboxConfig, what: &str) {
 fn available(transport: &Transport, backend: Backend) -> bool {
     let bin = backend.binary();
     match transport {
-        Transport::Local => util::have(bin),
+        Transport::Local => match backend {
+            Backend::PodmanRootful => {
+                run_local_output(&backend_prefix(backend), &["version"]).is_some()
+            }
+            _ => util::have(bin),
+        },
         Transport::Remote(r) => {
             let mut argv = Transport::ssh_base(r, true);
             argv.push(r.host.clone());
@@ -419,16 +644,18 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
     let _ = prefetch_image(spec);
 
     let rt = spec.backend.binary();
-    if run_control(spec, &[rt, "container", "inspect", &spec.name]).unwrap_or(false) {
+    let mut inspect = backend_prefix(spec.backend);
+    inspect.extend(["container".into(), "inspect".into(), spec.name.clone()]);
+    if run_control_owned(spec, &inspect).unwrap_or(false) {
         return Ok(()); // already running
     }
-    let mut argv: Vec<String> = vec![
-        rt.into(),
+    let mut argv: Vec<String> = backend_prefix(spec.backend);
+    argv.extend([
         "run".into(),
         "-d".into(),
         "--name".into(),
         spec.name.clone(),
-    ];
+    ]);
     argv.extend(oci_create_opts(spec));
     argv.push(
         spec.image
@@ -436,7 +663,7 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
             .unwrap_or_else(|| "docker.io/library/debian:stable".into()),
     );
     argv.extend(["sleep".into(), "infinity".into()]);
-    if run_control(spec, &argv.iter().map(String::as_str).collect::<Vec<_>>()).unwrap_or(false) {
+    if run_control_owned(spec, &argv).unwrap_or(false) {
         Ok(())
     } else {
         anyhow::bail!("could not start {rt} container '{}'", spec.name)
@@ -451,10 +678,16 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
     }
     let transport = transport_from_loc(cfg, loc);
     // Try whichever OCI runtimes are available; the container only exists under one.
-    for b in [Backend::Podman, Backend::Docker, Backend::Apple] {
+    for b in [
+        Backend::Podman,
+        Backend::PodmanRootful,
+        Backend::Docker,
+        Backend::Apple,
+    ] {
         if available(&transport, b) {
-            let rt = b.binary();
-            let _ = run_control_t(&transport, &[rt, "rm", "-f", name]);
+            let mut argv = backend_prefix(b);
+            argv.extend(["rm".into(), "-f".into(), name.to_string()]);
+            let _ = run_control_t_owned(&transport, &argv);
         }
     }
 }
@@ -495,9 +728,13 @@ fn wrap_script(spec: &SandboxSpec, inner: &str) -> String {
 fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
     let wt = spec.worktree.to_string_lossy().into_owned();
     match spec.backend {
-        Backend::Podman | Backend::Docker | Backend::Apple | Backend::Wsl => {
-            let rt = spec.backend.binary();
-            let mut v = vec![rt.to_string(), "exec".into(), "-it".into()];
+        Backend::Podman
+        | Backend::PodmanRootful
+        | Backend::Docker
+        | Backend::Apple
+        | Backend::Wsl => {
+            let mut v = backend_prefix(spec.backend);
+            v.extend(["exec".into(), "-it".into()]);
             if spec.file_access != FileAccess::None {
                 v.extend(["--workdir".into(), wt]);
             }
@@ -516,12 +753,32 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
         }
         Backend::Bwrap => {
             let mut v = vec!["bwrap".to_string()];
-            // Share the host runtime read-only, then bind the writable worktree.
-            if spec.file_access == FileAccess::All {
+            if matches!(spec.file_access, FileAccess::All | FileAccess::Host) {
                 v.extend(["--dev-bind".into(), "/".into(), "/".into()]);
             } else {
-                v.extend(["--ro-bind".into(), "/".into(), "/".into()]);
-                v.extend(["--dev-bind".into(), "/dev".into(), "/dev".into()]);
+                // Do not expose host / wholesale. Bind the runtime substrate read-only,
+                // then add the explicit worktree/cache mounts below.
+                for path in [
+                    "/nix/store",
+                    "/run/current-system",
+                    "/bin",
+                    "/usr",
+                    "/lib",
+                    "/lib64",
+                    "/etc",
+                ] {
+                    if std::path::Path::new(path).exists() {
+                        v.extend(["--ro-bind".into(), path.into(), path.into()]);
+                    }
+                }
+                v.extend([
+                    "--dev".into(),
+                    "/dev".into(),
+                    "--proc".into(),
+                    "/proc".into(),
+                    "--tmpfs".into(),
+                    "/tmp".into(),
+                ]);
             }
             if spec.file_access != FileAccess::None {
                 v.extend(["--chdir".into(), wt]);
@@ -582,6 +839,11 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
     let mut v = Vec::new();
     match spec.backend {
         Backend::Podman => v.extend(["--userns".into(), "keep-id".into()]),
+        Backend::PodmanRootful => {
+            if let (Transport::Local, Some((uid, gid))) = (&spec.transport, local_uid_gid()) {
+                v.extend(["--user".into(), format!("{uid}:{gid}")]);
+            }
+        }
         Backend::Docker => {
             if let (Transport::Local, Some((uid, gid))) = (&spec.transport, local_uid_gid()) {
                 v.extend(["--user".into(), format!("{uid}:{gid}")]);
@@ -655,21 +917,37 @@ fn transport_wrap(r: &Remote, backend_argv: &[String]) -> Vec<String> {
     }
 }
 
-/// Run a control-plane command (locally, or on the remote over ssh). Returns
-/// whether it succeeded.
-fn run_control(spec: &SandboxSpec, argv: &[&str]) -> Option<bool> {
-    run_control_t(&spec.transport, argv)
+fn backend_prefix(backend: Backend) -> Vec<String> {
+    match backend {
+        Backend::PodmanRootful => vec!["sudo".into(), "-n".into(), "podman".into()],
+        _ => vec![backend.binary().into()],
+    }
 }
 
-fn run_control_t(transport: &Transport, argv: &[&str]) -> Option<bool> {
+fn run_local_output(prefix: &[String], args: &[&str]) -> Option<String> {
+    let (cmd, rest) = prefix.split_first()?;
+    let mut c = Command::new(cmd);
+    c.args(rest).args(args);
+    let out = c.output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Run a control-plane command (locally, or on the remote over ssh). Returns
+/// whether it succeeded.
+fn run_control_owned(spec: &SandboxSpec, argv: &[String]) -> Option<bool> {
+    run_control_t_owned(&spec.transport, argv)
+}
+
+fn run_control_t_owned(transport: &Transport, argv: &[String]) -> Option<bool> {
     let argv: Vec<String> = match transport {
-        Transport::Local => argv.iter().map(|s| s.to_string()).collect(),
+        Transport::Local => argv.to_vec(),
         Transport::Remote(r) => {
-            let owned: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
             let mut v = Transport::ssh_base(r, true);
             v.push(r.host.clone());
             v.push("--".into());
-            v.push(util::sh_join(&owned));
+            v.push(util::sh_join(argv));
             v
         }
     };
@@ -689,6 +967,42 @@ fn local_uid_gid() -> Option<(u32, u32)> {
     Some((u, g))
 }
 
+fn auto_cache_mounts() -> Vec<Mount> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() {
+        return Vec::new();
+    }
+    let candidates = [
+        ".cargo/registry",
+        ".cargo/git",
+        ".rustup",
+        ".npm",
+        ".cache/pnpm",
+        ".cache/yarn",
+        "go/pkg/mod",
+        ".cache/go-build",
+        ".cache/pip",
+        ".cache/uv",
+        ".m2/repository",
+        ".gradle/caches",
+    ];
+    candidates
+        .iter()
+        .filter_map(|rel| {
+            let p = std::path::Path::new(&home).join(rel);
+            p.is_dir().then(|| {
+                let s = p.to_string_lossy().into_owned();
+                Mount {
+                    host: s.clone(),
+                    dest: s,
+                    ro: false,
+                    cache: true,
+                }
+            })
+        })
+        .collect()
+}
+
 fn parse_mount(spec: &str) -> Mount {
     // "host", "host:ro", or "host:dest" / "host:dest:ro".
     let parts: Vec<&str> = spec.split(':').collect();
@@ -697,26 +1011,43 @@ fn parse_mount(spec: &str) -> Mount {
             host: (*host).into(),
             dest: (*host).into(),
             ro: false,
+            cache: false,
         },
         [host, "ro"] => Mount {
             host: (*host).into(),
             dest: (*host).into(),
             ro: true,
+            cache: false,
+        },
+        [host, "cache"] => Mount {
+            host: (*host).into(),
+            dest: (*host).into(),
+            ro: false,
+            cache: true,
         },
         [host, dest] => Mount {
             host: (*host).into(),
             dest: (*dest).into(),
             ro: false,
+            cache: false,
         },
         [host, dest, "ro"] => Mount {
             host: (*host).into(),
             dest: (*dest).into(),
             ro: true,
+            cache: false,
+        },
+        [host, dest, "cache"] => Mount {
+            host: (*host).into(),
+            dest: (*dest).into(),
+            ro: false,
+            cache: true,
         },
         _ => Mount {
             host: spec.into(),
             dest: spec.into(),
             ro: false,
+            cache: false,
         },
     }
 }
@@ -816,11 +1147,13 @@ mod tests {
                     host: "/wt/feat".into(),
                     dest: "/wt/feat".into(),
                     ro: false,
+                    cache: false,
                 },
                 Mount {
                     host: "/repo/.git".into(),
                     dest: "/repo/.git".into(),
                     ro: false,
+                    cache: false,
                 },
             ],
             env: vec![("GH_TOKEN".into(), "abc".into())],
@@ -860,7 +1193,7 @@ mod tests {
         let argv = enter_argv(&s, "claude");
         assert_eq!(argv[0], "bwrap");
         let joined = argv.join(" ");
-        assert!(joined.contains("--ro-bind / /"));
+        assert!(!joined.contains("--ro-bind / /"));
         assert!(joined.contains("--bind /wt/feat /wt/feat"));
         assert!(joined.contains("--bind /repo/.git /repo/.git"));
         assert!(joined.contains("--chdir /wt/feat"));
@@ -1132,7 +1465,8 @@ mod tests {
             Mount {
                 host: "~/.gitconfig".into(),
                 dest: "~/.gitconfig".into(),
-                ro: true
+                ro: true,
+                cache: false,
             }
         );
         assert_eq!(
@@ -1140,8 +1474,32 @@ mod tests {
             Mount {
                 host: "/a".into(),
                 dest: "/b".into(),
-                ro: false
+                ro: false,
+                cache: false,
             }
         );
+    }
+
+    #[test]
+    fn podman_and_docker_ps_parse_and_mark_ours() {
+        let podman = r#"[
+          {"Names": ["superzej-wt-feat"], "Image": "ubuntu:24.04", "Status": "Up 2 hours"},
+          {"Names": ["registry"], "Image": "registry:2", "Status": "Up 3 days"}
+        ]"#;
+        let rows = parse_podman_ps(podman);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].ours && rows[0].name == "superzej-wt-feat");
+        assert!(!rows[1].ours);
+        assert_eq!(rows[1].image, "registry:2");
+
+        let docker = "{\"Names\": \"superzej-x\", \"Image\": \"alpine\", \"Status\": \"Up 5 minutes\"}\n{\"Names\": \"db\", \"Image\": \"postgres:16\", \"Status\": \"Up 1 hour\"}";
+        let rows = parse_docker_ps(docker);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].ours);
+        assert_eq!(rows[1].name, "db");
+
+        // Garbage degrades to empty, never panics.
+        assert!(parse_podman_ps("not json").is_empty());
+        assert!(parse_docker_ps("not json").is_empty());
     }
 }

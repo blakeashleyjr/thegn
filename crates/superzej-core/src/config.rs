@@ -103,7 +103,8 @@ config_enum! {
     /// enum lives in `sandbox.rs`). `Auto` walks `backend_chain`.
     pub enum SandboxBackend: "sandbox backend" {
         Auto = "auto",
-        Podman = "podman",
+        Podman = "podman" | "podman-rootless" | "rootless-podman",
+        PodmanRootful = "podman-rootful" | "rootful-podman",
         Docker = "docker",
         Bwrap = "bwrap" | "bubblewrap",
         Systemd = "systemd" | "systemd-run",
@@ -367,21 +368,65 @@ pub struct WorkspaceConfig {
     pub keybinds: KeybindConfig,
 }
 
-/// `[theme]` — visual tuning. Only the accent for now; the rest of the
-/// palette is fixed (src/theme.rs).
+/// `[theme]` — visual tuning: the accent, the focus frame color, and optional
+/// per-surface overrides of the whole chrome palette (`[theme.colors]`).
+/// Invalid hex values warn-and-default; they never block startup.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct ThemeConfig {
+    /// Named palette preset: "storm" (default), "light", "abyss", "ember",
+    /// "aurora". `[theme.colors]` overrides apply on top.
+    pub preset: String,
     /// Focus accent as "#rrggbb" (default the signature teal).
     pub accent: String,
+    /// Frame/highlight color of the focused pane, tab, and chrome edge
+    /// (default light blue).
+    pub focus_border: String,
+    /// Horizontal breathing room (cells) between a pane's frame and its
+    /// content, each side.
+    pub pane_padding: u16,
+    /// Optional overrides for every chrome surface/text color.
+    pub colors: ThemeColors,
 }
 
 impl Default for ThemeConfig {
     fn default() -> Self {
         ThemeConfig {
+            preset: "storm".into(),
             accent: "#76eede".into(),
+            focus_border: "#9bd1ff".into(),
+            pane_padding: 0,
+            colors: ThemeColors::default(),
         }
     }
+}
+
+/// `[theme.colors]` — all optional "#rrggbb" overrides; unset keys keep the
+/// built-in storm-blue defaults (src/theme.rs).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct ThemeColors {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bg0: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bg1: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub panel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub panel2: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raise: Option<String>,
+    /// Frame lines around unfocused panes and chrome edges (light grey).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub border: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dim: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub faint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ghost: Option<String>,
 }
 
 /// `[monitor]` — the resource managers opened from the top-bar stats widget
@@ -421,6 +466,12 @@ pub struct StatsConfig {
     pub net_icon: String,
     /// Icon for GPU stat.
     pub gpu_icon: String,
+    /// Icon for the battery stat (discharging).
+    pub battery_icon: String,
+    /// Icon shown while the battery is charging / on AC.
+    pub battery_charging_icon: String,
+    /// Battery percentage at/below which the widget turns red.
+    pub battery_warn: u8,
     /// Available refresh rates for keybind cycling (seconds).
     pub refresh_rates: Vec<f64>,
 }
@@ -429,11 +480,58 @@ impl Default for StatsConfig {
     fn default() -> Self {
         StatsConfig {
             refresh_secs: 2.0,
-            cpu_icon: "CPU".into(),
-            mem_icon: "MEM".into(),
-            net_icon: "NET".into(),
-            gpu_icon: "GPU".into(),
+            // Nerd Font glyphs by default (the bundled alacritty profile ships
+            // a Nerd Font); set plain text ("CPU") if your font lacks them.
+            cpu_icon: "\u{f4bc}".into(),
+            mem_icon: "\u{efc5}".into(),
+            net_icon: "\u{f06f3}".into(),
+            // Same-width glyph family as the others (the old gpu glyph
+            // rendered narrower in the bundled Nerd Font).
+            gpu_icon: "\u{f0fb2}".into(),
+            battery_icon: "\u{f0079}".into(),
+            battery_charging_icon: "\u{f0084}".into(),
+            battery_warn: 25,
             refresh_rates: vec![1.0, 2.0, 5.0, 10.0],
+        }
+    }
+}
+
+/// `[bars]` — the customizable widget bars framing the workspace. Each slot is
+/// an ordered widget-id list; unknown ids warn and are skipped. Built-ins:
+/// `brand` (superzej + version), `cpu`, `mem`, `gpu`, `net`, `battery`,
+/// `date`, `clock` (top bar) and `keyhints` (context-dependent keybinds),
+/// `pr` (forge + PR number/state), `status` (transient messages + the
+/// keybind-lock badge) for the bottom bar.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct BarsConfig {
+    pub top_left: Vec<String>,
+    pub top_right: Vec<String>,
+    pub bottom_left: Vec<String>,
+    pub bottom_right: Vec<String>,
+    /// chrono format string for the `date` widget.
+    pub date_format: String,
+    /// chrono format string for the `clock` widget.
+    pub clock_format: String,
+}
+
+impl Default for BarsConfig {
+    fn default() -> Self {
+        BarsConfig {
+            top_left: vec!["brand".into()],
+            top_right: vec![
+                "cpu".into(),
+                "mem".into(),
+                "gpu".into(),
+                "net".into(),
+                "battery".into(),
+                "date".into(),
+                "clock".into(),
+            ],
+            bottom_left: vec!["keyhints".into()],
+            bottom_right: vec!["pr".into(), "loc".into(), "status".into()],
+            date_format: "%a %b %-d".into(),
+            clock_format: "%H:%M".into(),
         }
     }
 }
@@ -598,9 +696,12 @@ impl RemoteConfig {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum FileAccess {
-    #[default]
     Worktree,
+    #[default]
+    WorktreePlusCaches,
+    Custom,
     All,
+    Host,
     None,
 }
 
@@ -618,7 +719,9 @@ pub struct SandboxLimits {
 pub struct SandboxConfig {
     pub enabled: bool,
     pub backend: SandboxBackend,
-    pub backend_chain: Vec<String>, // auto detection order; "none" = host fallback
+    /// Default selection for new worktrees; `auto` means use `backend_chain`.
+    pub default_backend: SandboxBackend,
+    pub backend_chain: Vec<String>, // auto detection order; "host" = host fallback
     pub image: String,              // "" => host-toolchain mode
     pub network: Network,
     pub file_access: FileAccess,
@@ -628,7 +731,9 @@ pub struct SandboxConfig {
     pub volumes: std::collections::HashMap<String, String>,
     pub compose: Option<String>,
     pub env_passthrough: Vec<String>,
-    pub mounts: Vec<String>, // extra binds ("host:dest" or "host"); ":ro" suffix allowed
+    /// Add common language build caches to `worktree_plus_caches` sandboxes.
+    pub auto_caches: bool,
+    pub mounts: Vec<String>, // extra binds ("host:dest[:ro|rw|cache]" or "host"); suffix allowed
     pub init_script: String, // runs inside before the agent/shell
     pub devenv: bool,        // wrap inner cmd with `devenv shell --`
     pub on_missing: OnMissing,
@@ -640,10 +745,17 @@ impl Default for SandboxConfig {
         SandboxConfig {
             enabled: true,
             backend: SandboxBackend::Auto,
-            backend_chain: ["podman", "docker", "bwrap", "none"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            default_backend: SandboxBackend::Auto,
+            backend_chain: [
+                "podman-rootless",
+                "podman-rootful",
+                "docker",
+                "bwrap",
+                "host",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
             image: String::new(),
             network: Network::Nat,
             file_access: FileAccess::default(),
@@ -663,6 +775,7 @@ impl Default for SandboxConfig {
             .iter()
             .map(|s| s.to_string())
             .collect(),
+            auto_caches: true,
             mounts: vec!["~/.gitconfig:ro".into()],
             init_script: String::new(),
             devenv: false,
@@ -680,6 +793,7 @@ impl Default for SandboxConfig {
 pub struct SandboxOverlay {
     pub enabled: Option<bool>,
     pub backend: Option<SandboxBackend>,
+    pub default_backend: Option<SandboxBackend>,
     pub backend_chain: Option<Vec<String>>,
     pub image: Option<String>,
     pub network: Option<Network>,
@@ -690,6 +804,7 @@ pub struct SandboxOverlay {
     pub volumes: Option<std::collections::HashMap<String, String>>,
     pub compose: Option<String>,
     pub env_passthrough: Option<Vec<String>>,
+    pub auto_caches: Option<bool>,
     pub mounts: Option<Vec<String>>,
     pub init_script: Option<String>,
     pub devenv: Option<bool>,
@@ -715,6 +830,9 @@ impl SandboxOverlay {
         }
         if let Some(v) = self.backend {
             base.backend = v;
+        }
+        if let Some(v) = self.default_backend {
+            base.default_backend = v;
         }
         if let Some(v) = self.backend_chain {
             base.backend_chain = v;
@@ -746,6 +864,9 @@ impl SandboxOverlay {
         if let Some(v) = self.env_passthrough {
             base.env_passthrough = v;
         }
+        if let Some(v) = self.auto_caches {
+            base.auto_caches = v;
+        }
         if let Some(v) = self.mounts {
             base.mounts = v;
         }
@@ -766,10 +887,12 @@ impl SandboxOverlay {
     fn is_empty(&self) -> bool {
         self.enabled.is_none()
             && self.backend.is_none()
+            && self.default_backend.is_none()
             && self.backend_chain.is_none()
             && self.image.is_none()
             && self.network.is_none()
             && self.env_passthrough.is_none()
+            && self.auto_caches.is_none()
             && self.mounts.is_none()
             && self.init_script.is_none()
             && self.devenv.is_none()
@@ -881,6 +1004,9 @@ pub struct Config {
     pub worktree_mode: WorktreeMode,
     pub name_scheme: NameScheme,
     pub auto_remove_worktree: bool,
+    /// Ask before destructive worktree actions (deleting a worktree from
+    /// disk via the sidebar). Set `false` to act immediately.
+    pub confirm_delete: bool,
     pub repo_roots: Vec<String>,
     pub repo_scan_depth: usize,
     /// Active keybind profile name (`""` ⇒ none). Selects `[profiles.<name>]`;
@@ -897,6 +1023,7 @@ pub struct Config {
     pub theme: ThemeConfig,
     pub monitor: MonitorConfig,
     pub stats: StatsConfig,
+    pub bars: BarsConfig,
     pub pr: PrConfig,
     pub dashboard: DashboardConfig,
     pub watch: WatchConfig,
@@ -943,6 +1070,7 @@ impl Default for Config {
             worktree_mode: WorktreeMode::Global,
             name_scheme: NameScheme::Words,
             auto_remove_worktree: false,
+            confirm_delete: true,
             repo_roots: Vec::new(),
             repo_scan_depth: 5,
             agents: Vec::new(),
@@ -952,6 +1080,7 @@ impl Default for Config {
             theme: ThemeConfig::default(),
             monitor: MonitorConfig::default(),
             stats: StatsConfig::default(),
+            bars: BarsConfig::default(),
             pr: PrConfig::default(),
             dashboard: DashboardConfig::default(),
             watch: WatchConfig::default(),
@@ -1012,6 +1141,8 @@ pub struct ConfigOverlay {
     pub repo_scan_depth: Option<usize>,
     pub profile: Option<String>,
     pub accent: Option<String>,
+    pub focus_border: Option<String>,
+    pub frame_border: Option<String>,
     pub pr_ttl_secs: Option<u64>,
     pub dashboard_interval_secs: Option<u64>,
     pub watch_pr_interval_secs: Option<u64>,
@@ -1044,6 +1175,10 @@ impl ConfigOverlay {
         set!(base.repo_scan_depth, self.repo_scan_depth);
         set!(base.profile, self.profile);
         set!(base.theme.accent, self.accent);
+        set!(base.theme.focus_border, self.focus_border);
+        if self.frame_border.is_some() {
+            base.theme.colors.border = self.frame_border;
+        }
         set!(base.pr.ttl_secs, self.pr_ttl_secs);
         set!(base.dashboard.interval_secs, self.dashboard_interval_secs);
         set!(base.watch.pr_interval_secs, self.watch_pr_interval_secs);
@@ -1097,6 +1232,8 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     }
     o.profile = env.get("SUPERZEJ_PROFILE");
     o.accent = env.get("SUPERZEJ_THEME_ACCENT");
+    o.focus_border = env.get("SUPERZEJ_THEME_FOCUS_BORDER");
+    o.frame_border = env.get("SUPERZEJ_THEME_BORDER");
 
     // [pr] — SUPERZEJ_PR_TTL, with deprecated SZ_PR_TTL fallback.
     if let Some(v) = env.get("SUPERZEJ_PR_TTL") {
@@ -1435,6 +1572,44 @@ impl Config {
         }
     }
 
+    /// Resolve the full chrome palette: built-in defaults overlaid with any
+    /// `[theme]` / `[theme.colors]` overrides. Invalid hex keeps the default.
+    pub fn palette(&self) -> crate::theme::Palette {
+        self.palette_with_preset(&self.theme.preset)
+    }
+
+    /// The palette for a named preset with this config's `[theme.colors]` +
+    /// accent/focus overrides applied — the live theme-cycle uses this.
+    pub fn palette_with_preset(&self, preset: &str) -> crate::theme::Palette {
+        let mut p = crate::theme::preset(preset).unwrap_or_default();
+        let set = |slot: &mut String, hex: &Option<String>| {
+            if let Some(rgb) = hex.as_deref().and_then(parse_hex_rgb) {
+                *slot = rgb;
+            }
+        };
+        let c = &self.theme.colors;
+        set(&mut p.bg0, &c.bg0);
+        set(&mut p.bg1, &c.bg1);
+        set(&mut p.panel, &c.panel);
+        set(&mut p.panel2, &c.panel2);
+        set(&mut p.raise, &c.raise);
+        set(&mut p.border, &c.border);
+        set(&mut p.text, &c.text);
+        set(&mut p.dim, &c.dim);
+        set(&mut p.faint, &c.faint);
+        set(&mut p.ghost, &c.ghost);
+        // Only override the preset's focus/accent when the user actually
+        // customized them (the built-in defaults would clobber presets).
+        let default_theme = ThemeConfig::default();
+        if self.theme.focus_border != default_theme.focus_border {
+            set(&mut p.focus, &Some(self.theme.focus_border.clone()));
+        }
+        if self.theme.accent != default_theme.accent {
+            p.accent = self.accent_rgb();
+        }
+        p
+    }
+
     /// Look up a dotted config key as a bare string (for `config get` and the
     /// plugin feed). `None` for an unknown key.
     pub fn get_dotted(&self, key: &str) -> Option<String> {
@@ -1447,9 +1622,30 @@ impl Config {
             "worktree_mode" => self.worktree_mode.to_string(),
             "name_scheme" => self.name_scheme.to_string(),
             "auto_remove_worktree" => self.auto_remove_worktree.to_string(),
+            "confirm_delete" => self.confirm_delete.to_string(),
             "repo_scan_depth" => self.repo_scan_depth.to_string(),
             "repo_roots" => self.repo_roots.join("\n"),
+            "theme.preset" => self.theme.preset.clone(),
             "theme.accent" => self.theme.accent.clone(),
+            "theme.focus_border" => self.theme.focus_border.clone(),
+            "theme.pane_padding" => self.theme.pane_padding.to_string(),
+            _ if key.starts_with("theme.colors.") => {
+                let c = &self.theme.colors;
+                let slot = match &key["theme.colors.".len()..] {
+                    "bg0" => &c.bg0,
+                    "bg1" => &c.bg1,
+                    "panel" => &c.panel,
+                    "panel2" => &c.panel2,
+                    "raise" => &c.raise,
+                    "border" => &c.border,
+                    "text" => &c.text,
+                    "dim" => &c.dim,
+                    "faint" => &c.faint,
+                    "ghost" => &c.ghost,
+                    _ => return None,
+                };
+                slot.clone().unwrap_or_default()
+            }
             "pr.ttl_secs" => self.pr.ttl_secs.to_string(),
             "dashboard.interval_secs" => self.dashboard.interval_secs.to_string(),
             "watch.pr_interval_secs" => self.watch.pr_interval_secs.to_string(),
@@ -1683,10 +1879,14 @@ surface = "todoist.status"
     fn stats_defaults() {
         let s = StatsConfig::default();
         assert_eq!(s.refresh_secs, 2.0);
-        assert_eq!(s.cpu_icon, "CPU");
-        assert_eq!(s.mem_icon, "MEM");
-        assert_eq!(s.net_icon, "NET");
-        assert_eq!(s.gpu_icon, "GPU");
+        // Nerd Font glyphs by default; overridable to plain text.
+        assert_eq!(s.cpu_icon, "\u{f4bc}");
+        assert_eq!(s.mem_icon, "\u{efc5}");
+        assert_eq!(s.net_icon, "\u{f06f3}");
+        assert_eq!(s.gpu_icon, "\u{f0fb2}");
+        assert_eq!(s.battery_icon, "\u{f0079}");
+        assert_eq!(s.battery_charging_icon, "\u{f0084}");
+        assert_eq!(s.battery_warn, 25);
         assert_eq!(s.refresh_rates, vec![1.0, 2.0, 5.0, 10.0]);
     }
 
@@ -1753,6 +1953,7 @@ surface = "todoist.status"
         let good = Config {
             theme: ThemeConfig {
                 accent: "#FFffFF".into(),
+                ..ThemeConfig::default()
             },
             ..Config::default()
         };
@@ -1761,11 +1962,55 @@ surface = "todoist.status"
         let bad = Config {
             theme: ThemeConfig {
                 accent: "not-a-color".into(),
+                ..ThemeConfig::default()
             },
             ..Config::default()
         };
         assert_eq!(bad.accent_hex(), "#76eede");
         assert_eq!(bad.accent_rgb(), crate::theme::TEAL);
+    }
+
+    #[test]
+    fn palette_defaults_match_builtins() {
+        let p = Config::default().palette();
+        assert_eq!(p, crate::theme::Palette::default());
+        assert_eq!(p.focus, crate::theme::FOCUS); // #9bd1ff
+        assert_eq!(p.border, crate::theme::FRAME); // light grey default
+        assert_eq!(p.accent, crate::theme::TEAL);
+    }
+
+    #[test]
+    fn palette_applies_overrides_and_skips_bad_hex() {
+        let mut cfg = Config::default();
+        cfg.theme.focus_border = "#102030".into();
+        cfg.theme.colors.bg0 = Some("#000000".into());
+        cfg.theme.colors.border = Some("#fff".into()); // short form
+        cfg.theme.colors.text = Some("nope".into()); // invalid -> default
+        let p = cfg.palette();
+        assert_eq!(p.focus, "16;32;48");
+        assert_eq!(p.bg0, "0;0;0");
+        assert_eq!(p.border, "255;255;255");
+        assert_eq!(p.text, crate::theme::TEXT);
+    }
+
+    #[test]
+    fn theme_keys_via_get_set_and_env() {
+        let mut cfg = Config::default();
+        assert!(Config::apply_override_str(&mut cfg, "theme.focus_border", "#abcdef").is_ok());
+        assert!(Config::apply_override_str(&mut cfg, "theme.colors.bg1", "#111111").is_ok());
+        assert_eq!(cfg.get_dotted("theme.focus_border").unwrap(), "#abcdef");
+        assert_eq!(cfg.get_dotted("theme.colors.bg1").unwrap(), "#111111");
+        assert_eq!(cfg.get_dotted("theme.colors.bg0").unwrap(), "");
+        assert_eq!(cfg.get_dotted("theme.colors.bogus"), None);
+
+        let env = map_env(&[
+            ("SUPERZEJ_THEME_FOCUS_BORDER", "#010203"),
+            ("SUPERZEJ_THEME_BORDER", "#040506"),
+        ]);
+        let mut base = Config::default();
+        env_overlay(&env).apply(&mut base);
+        assert_eq!(base.theme.focus_border, "#010203");
+        assert_eq!(base.theme.colors.border.as_deref(), Some("#040506"));
     }
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {

@@ -3777,7 +3777,9 @@ name = "superzej-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
+ "libc",
  "notify",
  "nucleo-matcher",
  "portable-pty",

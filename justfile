@@ -125,11 +125,12 @@ start name="dev": build
 # Alias for `start`.
 attach: start
 
-# Build and open the native host in a fresh ghostty window, with only the
-# instance's isolated XDG state injected.
+# Build and open the native host in a fresh alacritty window (optimized
+# profile: no decorations, no outer scrollback — the host owns both), with only
+# the instance's isolated XDG state injected.
 start-term name="dev": build
     mkdir -p "$HOME/.superzej-{{name}}/state"
-    setsid -f ghostty -e env \
+    setsid -f alacritty --config-file "$PWD/config/alacritty.toml" -e env \
       "XDG_STATE_HOME=$HOME/.superzej-{{name}}/state" \
       "$PWD/{{bin}}"
 
@@ -156,3 +157,16 @@ dev-tui name="dev":
 clean:
     cargo clean
     rm -f result result-*
+
+# --- fonts ------------------------------------------------------------------
+
+# Installed Nerd Font families (candidates for `just font`).
+fonts:
+    @fc-list : family | tr ',' '\n' | grep -i 'nerd font' | grep -iv 'mono\b.*propo\|propo' | sort -u
+
+# Switch the bundled alacritty profile's font live (alacritty live-reloads,
+# so the change is instant in a running session). e.g.
+#   just font name="JetBrainsMono Nerd Font"
+font name:
+    sed -i 's/^normal = { family = ".*" }$/normal = { family = "{{name}}" }/' config/alacritty.toml
+    @echo "font → {{name}} (alacritty live-reloads in place)"

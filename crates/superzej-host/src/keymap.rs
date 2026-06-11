@@ -33,11 +33,24 @@ pub enum Action {
     NewWorktree,
     NewWorkspace,
     NewTab,
+    /// Zellij-style smart split: along the focused pane's longer dimension.
+    NewPane,
+    /// Fullscreen the focused zone (pane / sidebar / panel); toggles off.
+    ToggleZoom,
+    /// Cycle through the named theme presets (storm → light → abyss → …).
+    CycleTheme,
+    /// Close the active tab within the worktree (closing the last tab closes
+    /// the whole worktree group).
+    CloseTab,
     CloseWorktree,
     SwitchWorkspace,
     Dashboard,
     NextTab,
     PrevTab,
+    /// Move to the next worktree group (Alt+Down); restores its active tab.
+    NextWorktree,
+    /// Move to the previous worktree group (Alt+Up).
+    PrevWorktree,
     SplitDown,
     SplitRight,
     FocusLeft,
@@ -61,6 +74,9 @@ pub enum Action {
     CopyPane,
     /// Toggle the full keybinding cheatsheet overlay.
     Cheatsheet,
+    /// Toggle the Ctrl+g keybind lock: while locked every key except Ctrl+g
+    /// passes through to the focused pane (compositor chords are suspended).
+    ToggleKeyLock,
     SwitchMode(Mode),
     /// Launch-or-focus the pin at 1-based index N (the `Alt-1..9` mapping).
     SummonPin(u8),
@@ -88,11 +104,17 @@ impl Action {
             Action::NewWorktree => "new-worktree",
             Action::NewWorkspace => "new-workspace",
             Action::NewTab => "new-tab",
+            Action::NewPane => "new-pane",
+            Action::ToggleZoom => "zoom",
+            Action::CycleTheme => "cycle-theme",
+            Action::CloseTab => "close-tab",
             Action::CloseWorktree => "close-worktree",
             Action::SwitchWorkspace => "switch-workspace",
             Action::Dashboard => "dashboard",
             Action::NextTab => "next-tab",
             Action::PrevTab => "prev-tab",
+            Action::NextWorktree => "next-worktree",
+            Action::PrevWorktree => "prev-worktree",
             Action::SplitDown => "split-down",
             Action::SplitRight => "split-right",
             Action::FocusLeft => "focus-left",
@@ -113,6 +135,7 @@ impl Action {
             Action::ScrollDown => "scroll-down",
             Action::CopyPane => "copy-pane",
             Action::Cheatsheet => "cheatsheet",
+            Action::ToggleKeyLock => "toggle-key-lock",
             Action::SwitchMode(Mode::Normal) => "mode-normal",
             Action::SwitchMode(Mode::VimNormal) => "mode-vim-normal",
             Action::SwitchMode(Mode::VimInsert) => "mode-vim-insert",
@@ -133,11 +156,17 @@ impl Action {
             "new-worktree" => Action::NewWorktree,
             "new-workspace" => Action::NewWorkspace,
             "new-tab" => Action::NewTab,
+            "new-pane" => Action::NewPane,
+            "zoom" | "toggle-zoom" | "fullscreen" => Action::ToggleZoom,
+            "cycle-theme" | "theme" => Action::CycleTheme,
+            "close-tab" => Action::CloseTab,
             "close-worktree" => Action::CloseWorktree,
             "switch-workspace" | "switch-repo" => Action::SwitchWorkspace,
             "dashboard" => Action::Dashboard,
             "next-tab" => Action::NextTab,
             "prev-tab" => Action::PrevTab,
+            "next-worktree" => Action::NextWorktree,
+            "prev-worktree" => Action::PrevWorktree,
             "split-down" | "new-panel-native" => Action::SplitDown,
             "split-right" | "new-panel" => Action::SplitRight,
             "focus-left" => Action::FocusLeft,
@@ -158,6 +187,7 @@ impl Action {
             "scroll-down" => Action::ScrollDown,
             "copy-pane" => Action::CopyPane,
             "cheatsheet" | "keys" | "help" => Action::Cheatsheet,
+            "toggle-key-lock" | "key-lock" | "lock" => Action::ToggleKeyLock,
             "quit" => Action::Quit,
             "mode-normal" => Action::SwitchMode(Mode::Normal),
             "mode-vim-normal" | "vim-normal" => Action::SwitchMode(Mode::VimNormal),
@@ -363,12 +393,16 @@ pub fn default_keymap() -> KeyMap {
     // Global defaults: work in every host mode, so Vim/Emacs modes never trap
     // users away from workspace/pane management.
     map.insert_all("Ctrl q", Action::Quit).unwrap();
-    map.insert_all("Ctrl k", Action::OpenPalette).unwrap();
+    // Palette lives on Ctrl+Space (Ctrl+k is a focus move; see below).
+    map.insert_all("Ctrl Space", Action::OpenPalette).unwrap();
+    // The keybind lock: Ctrl+g suspends every compositor chord (the loop
+    // checks the lock before this map) so panes get Ctrl keys back.
+    map.insert_all("Ctrl g", Action::ToggleKeyLock).unwrap();
     map.insert_all("Ctrl Alt s", Action::ToggleSidebar).unwrap();
     map.insert_all("Ctrl Alt p", Action::TogglePanel).unwrap();
     map.insert_all("Ctrl Alt f", Action::ToggleDrawer).unwrap();
     map.insert_all("Alt s", Action::FocusSidebar).unwrap();
-    map.insert_all("Alt p", Action::FocusPanel).unwrap();
+    map.insert_all("Alt .", Action::FocusPanel).unwrap();
     map.insert_all("Ctrl Alt c", Action::CopyPane).unwrap();
     // Full keybinding cheatsheet. `Alt ?` avoids stealing `?` from panes.
     map.insert_all("Alt ?", Action::Cheatsheet).unwrap();
@@ -382,7 +416,11 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Alt w", Action::NewWorktree).unwrap();
     map.insert_all("Alt W", Action::NewWorkspace).unwrap();
     map.insert_all("Alt t", Action::NewTab).unwrap();
-    map.insert_all("Alt X", Action::CloseWorktree).unwrap();
+    map.insert_all("Alt p", Action::NewPane).unwrap();
+    map.insert_all("Ctrl Alt z", Action::ToggleZoom).unwrap();
+    map.insert_all("Ctrl Alt t", Action::CycleTheme).unwrap();
+    map.insert_all("Alt x", Action::CloseWorktree).unwrap();
+    map.insert_all("Alt X", Action::CloseTab).unwrap();
     map.insert_all("Alt o", Action::SwitchWorkspace).unwrap();
     map.insert_all("Alt d", Action::Dashboard).unwrap();
     map.insert_all("Alt n", Action::SplitDown).unwrap();
@@ -392,14 +430,25 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Alt e", Action::Editor).unwrap();
     map.insert_all("Alt /", Action::Diff).unwrap();
     map.insert_all("Alt s", Action::FocusSidebar).unwrap();
-    map.insert_all("Alt p", Action::FocusPanel).unwrap();
 
-    map.insert_all("Alt h", Action::FocusLeft).unwrap();
-    map.insert_all("Alt j", Action::FocusDown).unwrap();
-    map.insert_all("Alt k", Action::FocusUp).unwrap();
-    map.insert_all("Alt l", Action::FocusRight).unwrap();
+    // Ctrl owns focus: one spatial graph across sidebar ← panes → panel.
+    // Arrows always work; h/j/k/l mirror them (kitty-protocol terminals
+    // disambiguate; on legacy terminals those keys pass through and the
+    // arrows carry the feature). Ctrl+g suspends all of these.
+    map.insert_all("Ctrl Left", Action::FocusLeft).unwrap();
+    map.insert_all("Ctrl Down", Action::FocusDown).unwrap();
+    map.insert_all("Ctrl Up", Action::FocusUp).unwrap();
+    map.insert_all("Ctrl Right", Action::FocusRight).unwrap();
+    map.insert_all("Ctrl h", Action::FocusLeft).unwrap();
+    map.insert_all("Ctrl j", Action::FocusDown).unwrap();
+    map.insert_all("Ctrl k", Action::FocusUp).unwrap();
+    map.insert_all("Ctrl l", Action::FocusRight).unwrap();
+    // Alt owns tabs/worktrees: ←/→ cycles tabs WITHIN the active worktree,
+    // ↑/↓ moves between worktrees (each restores its own active tab).
     map.insert_all("Alt Left", Action::PrevTab).unwrap();
     map.insert_all("Alt Right", Action::NextTab).unwrap();
+    map.insert_all("Alt Up", Action::PrevWorktree).unwrap();
+    map.insert_all("Alt Down", Action::NextWorktree).unwrap();
 
     map.insert_all("Shift PageUp", Action::ScrollUp).unwrap();
     map.insert_all("Shift PageDown", Action::ScrollDown)
@@ -468,8 +517,7 @@ pub fn default_keymap() -> KeyMap {
     // still reach the shell.
     map.insert(Mode::Emacs, "Alt x", Action::OpenPalette)
         .unwrap();
-    map.insert(Mode::Emacs, "Ctrl g", Action::SwitchMode(Mode::Normal))
-        .unwrap();
+    // (Ctrl+g is the global keybind lock; mode-switching stays on Ctrl+Alt+n.)
     map.insert(Mode::Emacs, "Ctrl x Ctrl c", Action::Quit)
         .unwrap();
     map.insert(Mode::Emacs, "Ctrl x k", Action::CloseWorktree)
@@ -682,7 +730,8 @@ mod tests {
 
     #[test]
     fn ctrl_and_ctrl_alt_distinguished() {
-        assert_eq!(k('k', Modifiers::CTRL), Some(Action::OpenPalette));
+        assert_eq!(k(' ', Modifiers::CTRL), Some(Action::OpenPalette));
+        assert_eq!(k('g', Modifiers::CTRL), Some(Action::ToggleKeyLock));
         assert_eq!(k('q', Modifiers::CTRL), Some(Action::Quit));
         assert_eq!(
             k('s', Modifiers::CTRL | Modifiers::ALT),
@@ -702,8 +751,20 @@ mod tests {
 
     #[test]
     fn focus_and_tab_nav() {
-        assert_eq!(k('h', Modifiers::ALT), Some(Action::FocusLeft));
-        assert_eq!(k('l', Modifiers::ALT), Some(Action::FocusRight));
+        // Ctrl owns focus: arrows and hjkl both move spatially.
+        assert_eq!(k('h', Modifiers::CTRL), Some(Action::FocusLeft));
+        assert_eq!(k('j', Modifiers::CTRL), Some(Action::FocusDown));
+        assert_eq!(k('k', Modifiers::CTRL), Some(Action::FocusUp));
+        assert_eq!(k('l', Modifiers::CTRL), Some(Action::FocusRight));
+        assert_eq!(
+            map_key(&KeyCode::LeftArrow, Modifiers::CTRL),
+            Some(Action::FocusLeft)
+        );
+        assert_eq!(
+            map_key(&KeyCode::UpArrow, Modifiers::CTRL),
+            Some(Action::FocusUp)
+        );
+        // Alt owns tabs (within the worktree) and worktrees (vertical).
         assert_eq!(
             map_key(&KeyCode::LeftArrow, Modifiers::ALT),
             Some(Action::PrevTab)
@@ -712,6 +773,17 @@ mod tests {
             map_key(&KeyCode::RightArrow, Modifiers::ALT),
             Some(Action::NextTab)
         );
+        assert_eq!(
+            map_key(&KeyCode::UpArrow, Modifiers::ALT),
+            Some(Action::PrevWorktree)
+        );
+        assert_eq!(
+            map_key(&KeyCode::DownArrow, Modifiers::ALT),
+            Some(Action::NextWorktree)
+        );
+        // Alt+hjkl no longer claims focus moves (forwards to the pane).
+        assert_eq!(k('h', Modifiers::ALT), None);
+        assert_eq!(k('l', Modifiers::ALT), None);
     }
 
     #[test]

@@ -105,6 +105,9 @@ impl PtyPane {
             cmd.cwd(dir);
         }
         cmd.env("TERM", "xterm-256color");
+        // The emulator parses 24-bit SGR; advertise it so apps (btop, modern
+        // CLIs) pick truecolor instead of degraded 256-color ramps.
+        cmd.env("COLORTERM", "truecolor");
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -283,7 +286,12 @@ mod tests {
             drain_until_exit(&mut pane, &mut rx, 5000),
             "child should exit"
         );
-        assert_eq!(pane.emulator().row_text(0), Some("hello-pty".to_string()));
+        assert_eq!(
+            pane.emulator()
+                .row_text(0)
+                .map(|r| r.trim_end().to_string()),
+            Some("hello-pty".to_string())
+        );
     }
 
     #[test]
@@ -293,7 +301,12 @@ mod tests {
         let mut pane =
             PtyPane::spawn_with_env(0, &sh("stty size"), None, &[], 30, 100, tx, None).unwrap();
         assert!(drain_until_exit(&mut pane, &mut rx, 5000));
-        assert_eq!(pane.emulator().row_text(0), Some("30 100".to_string()));
+        assert_eq!(
+            pane.emulator()
+                .row_text(0)
+                .map(|r| r.trim_end().to_string()),
+            Some("30 100".to_string())
+        );
     }
 
     #[test]

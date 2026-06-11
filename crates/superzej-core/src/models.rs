@@ -32,18 +32,32 @@ pub struct WorktreeRow {
     pub location: String,
 }
 
-/// A persisted tab's layout (native host, schema v4). The `pane_tree` is the
+/// A persisted worktree group (native host, schema v6): one worktree shown in
+/// the sidebar, owning an ordered set of tabs (`GroupTabRow`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabGroupRow {
+    /// Display name, e.g. "app/feat" — unique within a session.
+    pub name: String,
+    /// "home" (the main checkout) or "branch".
+    pub kind: String,
+    /// Worktree dir on disk (empty only for legacy rows with no path).
+    pub worktree: String,
+    pub ordinal: i64,
+    /// Index of the group's active tab (restored when switching back).
+    pub active_tab: i64,
+}
+
+/// A persisted tab inside a worktree group (schema v6). The `pane_tree` is the
 /// serialized `CenterTree` (host-owned); core treats it as an opaque blob so the
 /// layout model can evolve without touching the schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TabLayoutRow {
-    pub tab_name: String,
-    pub kind: String,
-    /// Owning worktree path (empty for home/pinned tabs).
-    pub worktree: String,
+pub struct GroupTabRow {
+    pub group_name: String,
+    pub ordinal: i64,
+    /// Short display title for the tab chip ("1", "zsh", …).
+    pub title: String,
     /// Serialized pane tree (opaque JSON to core).
     pub pane_tree: String,
-    pub ordinal: i64,
     pub focused_pane: i64,
 }
 
