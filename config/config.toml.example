@@ -248,6 +248,49 @@ command = "${EDITOR:-vi} ."
 name = "diff"
 command = "git diff"
 
+# General tasks: surfaced in the Tests panel and, later, Problems/Timeline/Search
+# Everywhere. `kind = "test"` makes a task eligible for test discovery/runs. If no
+# test task is configured, superzej falls back to manifest sniffing (just/Cargo/go/
+# pytest/package.json).
+# [[tasks]]
+# name = "cargo test"
+# kind = "test"
+# command = "cargo"
+# args = ["test", "--workspace"]
+# cwd = "."
+# scope = "worktree"
+# matcher = "cargo-test"
+
+# [[tasks]]
+# name = "pytest"
+# kind = "test"
+# command = "pytest"
+# matcher = "pytest"
+
+# matcher selects how output is parsed. Built-in matchers:
+#   text:   cargo-test, go-test, pytest, jest, vitest, swift, ctest, elixir, …
+#   json:   nextest, dart, flutter, rspec
+#   report: junit (maven/gradle/sbt/php/deno), trx/nunit (.NET, Pester) — set
+#           report_glob to the file(s), e.g. report_glob = "target/**/*.xml"
+#   tap:    bats, prove (perl), busted (lua), pgTAP, node --test, anything TAP
+# [[tasks]]
+# name = "bats"
+# kind = "test"
+# command = "bats --formatter tap ."
+# matcher = "tap"
+
+# Resource ceilings. superzej NEVER auto-runs tests; these only cap an *explicit*
+# run/discovery so a heavy suite can't pin the machine. When `systemd-run` is
+# available, runs go in a transient `--user --scope` with these caps; otherwise
+# they fall back to `nice`. Empty quota/mem = uncapped; test_nice = 0 disables.
+[limits]
+# tool_mem_max = "6G"        # memory cap for floating tool panes
+# tool_mem_swap_max = "1G"
+# test_cpu_quota = "150%"    # 150% = 1.5 cores for a test run; "" = uncapped
+# test_mem_max = "4G"        # memory cap for a test run; "" = uncapped
+# test_nice = 10             # niceness for test runs (0 disables)
+# test_max_parallel = 1      # max concurrent test/discovery jobs across worktrees
+
 # Top pinned-program strip: a horizontal band above the center that renders
 # `location = "strip"` pins side by side (toggle Ctrl+Alt+t; grow/shrink at
 # runtime). `ratio` is the fraction of the center band it occupies.

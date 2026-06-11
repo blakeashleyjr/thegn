@@ -1493,42 +1493,228 @@ fn drain_key_repeats(
 
 /// Run the detected test command off-thread; results (parsed indicator
 /// lines + summary) ride the channel back to the loop with a waker pulse.
-fn spawn_test_run(
-    tx: tokio_mpsc::UnboundedSender<(Vec<crate::panel::TestLine>, String)>,
+/// Run a test task off the loop, capped + single-flight (see `crate::task`),
+/// delivering a `TaskOutcome` and pulsing the waker. A global semaphore bounds
+/// concurrent jobs.
+#[allow(clippy::too_many_arguments)]
+fn spawn_test_run_task(
+    tx: tokio_mpsc::UnboundedSender<crate::task::TaskOutcome>,
     waker: TerminalWaker,
     worktree: std::path::PathBuf,
-    command: String,
+    generation: u64,
+    task_spec: crate::panel::TestTask,
+    limits: superzej_core::config::LimitsConfig,
+    sem: std::sync::Arc<tokio::sync::Semaphore>,
 ) {
-    tokio::task::spawn_blocking(move || {
-        let out = std::process::Command::new(superzej_core::util::shell())
-            .arg("-lc")
-            .arg(&command)
-            .current_dir(&worktree)
-            .output();
-        let (lines, summary) = match out {
-            Ok(o) => {
-                let text = format!(
-                    "{}\n{}",
-                    String::from_utf8_lossy(&o.stdout),
-                    String::from_utf8_lossy(&o.stderr)
-                );
-                let lines = crate::panel::parse_test_output(&text);
-                let summary = if lines.is_empty() {
-                    if o.status.success() {
-                        "passed (no per-test output recognized)".to_string()
-                    } else {
-                        format!("failed ({})", o.status)
-                    }
-                } else {
-                    crate::panel::test_summary(&lines)
-                };
-                (lines, summary)
-            }
-            Err(e) => (Vec::new(), format!("could not run: {e}")),
-        };
-        let _ = tx.send((lines, summary));
-        let _ = waker.wake();
+    tokio::spawn(async move {
+        let _permit = sem.acquire_owned().await;
+        if let Ok(outcome) = tokio::task::spawn_blocking(move || {
+            crate::task::run_task(worktree, generation, task_spec, &limits)
+        })
+        .await
+        {
+            let _ = tx.send(outcome);
+            let _ = waker.wake();
+        }
     });
+}
+
+/// Lazily discover a task's test targets off the loop (capped, single-flight).
+#[allow(clippy::too_many_arguments)]
+fn spawn_test_discovery(
+    tx: tokio_mpsc::UnboundedSender<crate::task::DiscoveryOutcome>,
+    waker: TerminalWaker,
+    worktree: std::path::PathBuf,
+    generation: u64,
+    task_spec: crate::panel::TestTask,
+    limits: superzej_core::config::LimitsConfig,
+    sem: std::sync::Arc<tokio::sync::Semaphore>,
+) {
+    tokio::spawn(async move {
+        let _permit = sem.acquire_owned().await;
+        if let Ok(result) = tokio::task::spawn_blocking(move || {
+            crate::task::discover_tests(worktree, generation, task_spec, &limits)
+        })
+        .await
+        {
+            let _ = tx.send(result);
+            let _ = waker.wake();
+        }
+    });
+}
+
+/// Load cached test state for a worktree and detect its task if none is known.
+/// Reading only — never spawns a run (no auto-run).
+fn sync_tests_for_worktree(
+    ui: &mut crate::panel::PanelUi,
+    worktree: &std::path::Path,
+    cfg: &superzej_core::config::Config,
+) {
+    let key = worktree.to_string_lossy();
+    if let Some(cache) = superzej_core::db::Db::open()
+        .ok()
+        .and_then(|db| db.get_test_cache(&key).ok().flatten())
+        .and_then(|(json, _)| serde_json::from_str::<crate::panel::TestCache>(&json).ok())
+    {
+        ui.tests.apply_cache(cache);
+    }
+    if ui.tests.task.is_none() {
+        ui.tests.task = crate::task::detect_test_task(worktree, cfg);
+    }
+}
+
+fn persist_tests_for_worktree(ui: &crate::panel::PanelUi, worktree: &str) {
+    if let Ok(json) = serde_json::to_string(&ui.tests.to_cache())
+        && let Ok(db) = superzej_core::db::Db::open()
+    {
+        let _ = db.put_test_cache(worktree, &json);
+    }
+}
+
+fn test_shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Resolve a (possibly worktree-relative) failure path to an absolute path the
+/// editor can open.
+fn resolve_loc_path(worktree: &std::path::Path, path: &str) -> String {
+    let p = std::path::Path::new(path);
+    if p.is_absolute() {
+        path.to_string()
+    } else {
+        worktree.join(path).to_string_lossy().into_owned()
+    }
+}
+
+/// Where to open the selected test: its captured `file:line` if present, else
+/// located by name with ripgrep/grep so *any* test opens (not just failures).
+fn resolve_open_target(
+    ui: &crate::panel::PanelUi,
+    worktree: &std::path::Path,
+) -> Option<(String, usize)> {
+    if let Some(node) = ui.tests.selected_node() {
+        if let Some(loc) = &node.location {
+            return Some((resolve_loc_path(worktree, &loc.path), loc.line));
+        }
+        return locate_test_in_repo(worktree, &node.id)
+            .map(|(rel, line)| (resolve_loc_path(worktree, &rel), line));
+    }
+    None
+}
+
+fn on_path(bin: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
+        .unwrap_or(false)
+}
+
+/// Best-effort search for a test definition by name (ripgrep, then grep).
+fn locate_test_in_repo(worktree: &std::path::Path, test_id: &str) -> Option<(String, usize)> {
+    let rg = on_path("rg");
+    for pat in crate::panel::locate_regexes(test_id) {
+        let out = if rg {
+            std::process::Command::new("rg")
+                .args([
+                    "--no-heading",
+                    "--line-number",
+                    "--max-count",
+                    "1",
+                    "-e",
+                    &pat,
+                    ".",
+                ])
+                .current_dir(worktree)
+                .output()
+        } else {
+            std::process::Command::new("grep")
+                .args(["-rnE", "--max-count=1", &pat, "."])
+                .current_dir(worktree)
+                .output()
+        };
+        let Ok(out) = out else { continue };
+        let text = String::from_utf8_lossy(&out.stdout);
+        if let Some(hit) = text.lines().next() {
+            let mut it = hit.trim_start_matches("./").splitn(3, ':');
+            if let (Some(path), Some(line)) = (it.next(), it.next())
+                && let Ok(n) = line.parse::<usize>()
+            {
+                return Some((path.to_string(), n));
+            }
+        }
+    }
+    None
+}
+
+/// For `Rerun`/`RunFailed`, narrow the base task command to the selected/failed
+/// test where the runner supports it; otherwise run the whole suite.
+fn test_task_for_nav(
+    ui: &crate::panel::PanelUi,
+    nav: crate::panel::PanelNav,
+    base: crate::panel::TestTask,
+) -> crate::panel::TestTask {
+    use crate::panel::{PanelNav, TestNodeKind, TestState};
+    let selected = ui
+        .tests
+        .selected_node()
+        .filter(|n| n.kind == TestNodeKind::Test);
+    let failed = ui
+        .tests
+        .nodes
+        .iter()
+        .find(|n| n.kind == TestNodeKind::Test && n.state == TestState::Fail);
+    let target = match nav {
+        PanelNav::Rerun => selected,
+        PanelNav::RunFailed => failed.or(selected),
+        _ => None,
+    };
+    let Some(target) = target else {
+        return base;
+    };
+    let mut task = base;
+    match task.matcher.as_str() {
+        "cargo-test" | "nextest" => {
+            task.command = format!("{} {}", task.command, test_shell_quote(&target.id))
+        }
+        "go-test" => {
+            task.command = format!("{} -run {}", task.command, test_shell_quote(&target.id))
+        }
+        "pytest" | "swift" => {
+            task.command = format!("{} {}", task.command, test_shell_quote(&target.id))
+        }
+        "vitest" | "jest" | "javascript" => {
+            task.command = format!("{} {}", task.command, test_shell_quote(&target.id))
+        }
+        "nix-flake" => {
+            let attr = format!("checks.{}", target.id.replace("::", "."));
+            task.command = format!("nix build -L {}", test_shell_quote(&format!(".#{attr}")));
+        }
+        _ => {}
+    }
+    task.name = format!("{} ({})", task.name, target.label);
+    task
+}
+
+/// Entering the Tests tab: ensure cached state is loaded and kick a lazy,
+/// capped discovery if we haven't discovered targets yet. Never runs tests.
+#[allow(clippy::too_many_arguments)]
+fn maybe_discover_tests(
+    ui: &mut crate::panel::PanelUi,
+    session: &crate::session::Session,
+    generation: &mut u64,
+    tx: tokio_mpsc::UnboundedSender<crate::task::DiscoveryOutcome>,
+    waker: TerminalWaker,
+    cfg: &superzej_core::config::Config,
+    sem: std::sync::Arc<tokio::sync::Semaphore>,
+) {
+    let wt = active_tab_path(session);
+    sync_tests_for_worktree(ui, &wt, cfg);
+    if ui.tests.task.is_some() && !ui.tests.discovered && !ui.tests.discovering {
+        *generation += 1;
+        ui.tests.discovering = true;
+        if let Some(task) = ui.tests.task.clone() {
+            spawn_test_discovery(tx, waker, wt, *generation, task, cfg.limits.clone(), sem);
+        }
+    }
 }
 
 /// The active tab's focused pane id (0 when no tab exists).
@@ -1588,12 +1774,19 @@ fn scroll_panel(
             };
         }
         crate::panel::PanelTab::Tests => {
-            let max = panel_ui.tests_lines.len().saturating_sub(body_rows);
-            panel_ui.tests_scroll = if up {
-                panel_ui.tests_scroll.saturating_sub(n)
+            // Move the selection cursor (drives select/open), keeping it in view.
+            let visible = panel_ui.tests.visible_indices().len();
+            let max = visible.saturating_sub(1);
+            panel_ui.tests.cursor = if up {
+                panel_ui.tests.cursor.saturating_sub(n)
             } else {
-                (panel_ui.tests_scroll + n).min(max)
+                (panel_ui.tests.cursor + n).min(max)
             };
+            if panel_ui.tests.cursor < panel_ui.tests.scroll {
+                panel_ui.tests.scroll = panel_ui.tests.cursor;
+            } else if body_rows > 0 && panel_ui.tests.cursor >= panel_ui.tests.scroll + body_rows {
+                panel_ui.tests.scroll = panel_ui.tests.cursor + 1 - body_rows;
+            }
         }
         crate::panel::PanelTab::Files => {
             let visible =
@@ -2144,9 +2337,19 @@ async fn event_loop<T: Terminal>(
     // background preloader feeds it through; Shift+J/K hits are instant.
     let mut doc_cache: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let (doc_tx, mut doc_rx) = tokio_mpsc::unbounded_channel::<(String, String)>();
-    // Test-run results from the background runner.
-    let (tests_tx, mut tests_rx) =
-        tokio_mpsc::unbounded_channel::<(Vec<crate::panel::TestLine>, String)>();
+    // Test-explorer results from the background runner/discoverer (capped,
+    // single-flight). Two channels: run outcomes and discovery outcomes.
+    let (test_run_tx, mut test_run_rx) =
+        tokio_mpsc::unbounded_channel::<crate::task::TaskOutcome>();
+    let (test_discovery_tx, mut test_discovery_rx) =
+        tokio_mpsc::unbounded_channel::<crate::task::DiscoveryOutcome>();
+    let mut test_generation: u64 = 0;
+    let mut loaded_tests_worktree = String::new();
+    // Bounds concurrent test/discovery jobs across worktrees so explicit runs
+    // can't collectively pin the machine. superzej never auto-runs tests.
+    let test_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(
+        keymap.config().limits.test_max_parallel.max(1),
+    ));
     // Keys currently being fetched by the preloader (dedupes hover storms).
     let mut doc_inflight: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Sidebar interaction + persisted view state (collapse/sort/pins/width).
@@ -2402,6 +2605,11 @@ async fn event_loop<T: Terminal>(
             last_active_worktree = Some(current_worktree.clone());
             // A selection anchored in the previous worktree's pane is stale.
             mouse_sel = None;
+            // Load this worktree's cached test state (most-recent status) so the
+            // Tests tab shows it instantly; discovery stays lazy (on tab open).
+            panel_ui.tests = crate::panel::TestPanelState::default();
+            sync_tests_for_worktree(&mut panel_ui, &current_worktree, keymap.config());
+            loaded_tests_worktree = current_worktree.to_string_lossy().into_owned();
             // Immediate hydrate for the newly-focused worktree; the cached panel
             // stays on screen until the fresh model lands (never blank).
             hydration_gen += 1;
@@ -2727,12 +2935,45 @@ async fn event_loop<T: Terminal>(
         // Hydrated models replace the whole FrameModel; re-apply the loop-owned
         // fields (stats, bars, accent, pins, hints). Stale generations are
         // dropped — a fresh hydration is always in flight for the current one.
-        while let Ok((lines, summary)) = tests_rx.try_recv() {
-            panel_ui.tests_lines = lines;
-            panel_ui.tests_summary = summary;
-            panel_ui.tests_running = false;
-            panel_ui.tests_scroll = 0;
-            dirty = true;
+        // Discovery results: seed newly-found tests as Unknown (merge, not
+        // replace). Stale generations / other worktrees are dropped.
+        while let Ok(d) = test_discovery_rx.try_recv() {
+            if d.generation == test_generation && d.worktree == loaded_tests_worktree {
+                panel_ui.tests.discovering = false;
+                panel_ui.tests.task = Some(d.task);
+                if let Some(err) = d.error {
+                    panel_ui.tests.summary.error = Some(err);
+                } else {
+                    panel_ui.tests.merge_discovered(&d.nodes);
+                    panel_ui.tests.summary.error = None;
+                }
+                persist_tests_for_worktree(&panel_ui, &d.worktree);
+                dirty = true;
+            }
+        }
+        // Run results: the latest run upserts each reported test's status while
+        // leaving other tests' most-recent status intact.
+        while let Ok(outcome) = test_run_rx.try_recv() {
+            if outcome.generation == test_generation && outcome.worktree == loaded_tests_worktree {
+                panel_ui.tests.running = false;
+                panel_ui.tests.task = Some(outcome.task.clone());
+                panel_ui
+                    .tests
+                    .merge_results(&crate::task::parse_task_outcome(&outcome));
+                if outcome.exit_code != Some(0) && panel_ui.tests.summary.failed == 0 {
+                    panel_ui.tests.summary.failed = 1;
+                }
+                panel_ui.tests.summary.error = outcome
+                    .truncated
+                    .then(|| "output truncated before parsing completed".to_string());
+                persist_tests_for_worktree(&panel_ui, &outcome.worktree);
+                model.status = format!(
+                    "Tests finished in {:.1}s: {}",
+                    outcome.duration_ms as f64 / 1000.0,
+                    panel_ui.tests.summary.label()
+                );
+                dirty = true;
+            }
         }
 
         // Bank preloaded documents (capped — it's a small LRU-ish pool).
@@ -3317,8 +3558,14 @@ async fn event_loop<T: Terminal>(
                                     refresh_files_tree(&mut panel_ui, &session);
                                 }
                                 if t == crate::panel::PanelTab::Tests {
-                                    panel_ui.tests_cmd = crate::panel::detect_test_command(
-                                        &active_tab_path(&session),
+                                    maybe_discover_tests(
+                                        &mut panel_ui,
+                                        &session,
+                                        &mut test_generation,
+                                        test_discovery_tx.clone(),
+                                        waker.clone(),
+                                        keymap.config(),
+                                        test_sem.clone(),
                                     );
                                 }
                             }
@@ -3844,8 +4091,14 @@ async fn event_loop<T: Terminal>(
                                     refresh_files_tree(&mut panel_ui, &session);
                                 }
                                 if t == PanelTab::Tests {
-                                    panel_ui.tests_cmd = crate::panel::detect_test_command(
-                                        &active_tab_path(&session),
+                                    maybe_discover_tests(
+                                        &mut panel_ui,
+                                        &session,
+                                        &mut test_generation,
+                                        test_discovery_tx.clone(),
+                                        waker.clone(),
+                                        keymap.config(),
+                                        test_sem.clone(),
                                     );
                                 }
                             }
@@ -3857,8 +4110,14 @@ async fn event_loop<T: Terminal>(
                                     refresh_files_tree(&mut panel_ui, &session);
                                 }
                                 if panel_ui.tab == PanelTab::Tests {
-                                    panel_ui.tests_cmd = crate::panel::detect_test_command(
-                                        &active_tab_path(&session),
+                                    maybe_discover_tests(
+                                        &mut panel_ui,
+                                        &session,
+                                        &mut test_generation,
+                                        test_discovery_tx.clone(),
+                                        waker.clone(),
+                                        keymap.config(),
+                                        test_sem.clone(),
                                     );
                                 }
                             }
@@ -3935,7 +4194,9 @@ async fn event_loop<T: Terminal>(
                                     &waker,
                                 );
                             }
-                            PanelNav::Open | PanelNav::OpenEditorPane => {
+                            PanelNav::Open | PanelNav::OpenEditorPane
+                                if panel_ui.tab != PanelTab::Tests =>
+                            {
                                 // Open the selected file in the editor — `o`
                                 // in a fresh center tab, `e` in a split pane
                                 // (the bottom drawer is no longer used).
@@ -4132,22 +4393,115 @@ async fn event_loop<T: Terminal>(
                                     drawer_home = Some(dir.clone());
                                 }
                             }
-                            PanelNav::Rerun if panel_ui.tab == PanelTab::Tests => {
-                                if panel_ui.tests_cmd.is_none() {
-                                    panel_ui.tests_cmd = crate::panel::detect_test_command(
-                                        &active_tab_path(&session),
-                                    );
+                            PanelNav::Rerun | PanelNav::RunAll | PanelNav::RunFailed
+                                if panel_ui.tab == PanelTab::Tests =>
+                            {
+                                let wt = active_tab_path(&session);
+                                sync_tests_for_worktree(&mut panel_ui, &wt, keymap.config());
+                                if let Some(base) = panel_ui.tests.task.clone() {
+                                    if !panel_ui.tests.running {
+                                        let task_spec = test_task_for_nav(&panel_ui, nav, base);
+                                        test_generation += 1;
+                                        panel_ui.tests.running = true;
+                                        panel_ui.tests.summary.running = true;
+                                        panel_ui.tests.summary.error = None;
+                                        model.status = format!("Running tests: {}", task_spec.name);
+                                        spawn_test_run_task(
+                                            test_run_tx.clone(),
+                                            waker.clone(),
+                                            wt,
+                                            test_generation,
+                                            task_spec,
+                                            keymap.config().limits.clone(),
+                                            test_sem.clone(),
+                                        );
+                                    }
+                                } else {
+                                    model.status = "No test task detected".into();
                                 }
-                                if let Some((_, cmd)) = panel_ui.tests_cmd.clone()
-                                    && !panel_ui.tests_running
-                                {
-                                    panel_ui.tests_running = true;
-                                    spawn_test_run(
-                                        tests_tx.clone(),
+                            }
+                            PanelNav::Refresh if panel_ui.tab == PanelTab::Tests => {
+                                let wt = active_tab_path(&session);
+                                sync_tests_for_worktree(&mut panel_ui, &wt, keymap.config());
+                                if let Some(task) = panel_ui.tests.task.clone() {
+                                    test_generation += 1;
+                                    panel_ui.tests.discovering = true;
+                                    panel_ui.tests.summary.error = None;
+                                    spawn_test_discovery(
+                                        test_discovery_tx.clone(),
                                         waker.clone(),
-                                        active_tab_path(&session),
-                                        cmd,
+                                        wt,
+                                        test_generation,
+                                        task,
+                                        keymap.config().limits.clone(),
+                                        test_sem.clone(),
                                     );
+                                } else {
+                                    model.status = "No test task detected".into();
+                                }
+                            }
+                            PanelNav::Open if panel_ui.tab == PanelTab::Tests => {
+                                let wt = active_tab_path(&session);
+                                if let Some((path, line)) = resolve_open_target(&panel_ui, &wt) {
+                                    let editor = keymap
+                                        .config()
+                                        .tool_command("editor")
+                                        .unwrap_or("${EDITOR:-vi} .")
+                                        .trim();
+                                    let editor = editor.strip_suffix(" .").unwrap_or(editor);
+                                    let cmd =
+                                        format!("{editor} +{line} {}", test_shell_quote(&path));
+                                    let cwd = active_cwd(&session);
+                                    open_command_tab(
+                                        &mut session,
+                                        &mut panes,
+                                        &cmd,
+                                        cwd.as_deref(),
+                                        chrome.center,
+                                    );
+                                    focus.zone = crate::focus::Zone::Center;
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    need_relayout = true;
+                                } else {
+                                    model.status = "Could not locate the selected test".into();
+                                }
+                            }
+                            PanelNav::Peek if panel_ui.tab == PanelTab::Tests => {
+                                let wt = active_tab_path(&session);
+                                if let Some((path, line)) = resolve_open_target(&panel_ui, &wt) {
+                                    let bat = keymap
+                                        .config()
+                                        .tool_command("bat")
+                                        .unwrap_or("bat --paging=always")
+                                        .to_string();
+                                    let cmd = format!(
+                                        "{bat} --highlight-line {line} {}",
+                                        test_shell_quote(&path)
+                                    );
+                                    let cwd = active_cwd(&session);
+                                    open_command_pane(
+                                        &mut session,
+                                        &mut panes,
+                                        focused,
+                                        &cmd,
+                                        cwd.as_deref(),
+                                        chrome.center,
+                                    );
+                                    focus.zone = crate::focus::Zone::Center;
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    need_relayout = true;
+                                } else {
+                                    model.status = "Could not locate the selected test".into();
+                                }
+                            }
+                            PanelNav::Debug if panel_ui.tab == PanelTab::Tests => {
+                                if let (Some(node), Some(task)) =
+                                    (panel_ui.tests.selected_node(), &panel_ui.tests.task)
+                                {
+                                    model.status =
+                                        crate::task::dap_launch_descriptor(task, &node.id);
+                                } else {
+                                    model.status = "Select a test to prepare a debug launch".into();
                                 }
                             }
                             // PR-tab actions (merge/approve/create/rerun) land

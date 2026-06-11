@@ -1812,22 +1812,30 @@ pub(crate) fn panel_help_hint(
         (PanelTab::Files, _) => "↵ open/fold  J/K walk  t/s tab/pane  o/e edit  O extern  y yazi",
         (PanelTab::Pr, _) => "1-5 tab  o browser  m merge  a approve  c create  esc",
         (PanelTab::Checks, _) => "1-5 tab  r rerun  esc",
-        (PanelTab::Tests, _) => "r run tests  j/k scroll  esc",
+        (PanelTab::Tests, _) => "r run  R all  f failed  u refresh  o open  b peek  d debug  esc",
     }
 }
 
 /// The Tests tab: detected framework + run state, then one indicator row per
 /// parsed test (✓ green, ✗ red, ○ skipped), summary on top.
 fn draw_tests_tab(surface: &mut Surface, rect: Rect, ui: &crate::panel::PanelUi) {
-    use crate::panel::TestState;
-    let header = match (&ui.tests_cmd, ui.tests_running) {
-        (_, true) => "running\u{2026}".to_string(),
-        (Some((fw, _)), false) if ui.tests_lines.is_empty() && ui.tests_summary.is_empty() => {
-            format!("{fw} detected \u{2014} press r to run")
+    use crate::panel::{TestNodeKind, TestState};
+    let tests = &ui.tests;
+    let header = if let Some(task) = &tests.task {
+        let mut label = format!("{} \u{2014} {}", task.name, tests.summary.label());
+        if tests.discovering {
+            label.push_str(" \u{00b7} discovering\u{2026}");
         }
-        (Some((fw, _)), false) => format!("{fw}: {}", ui.tests_summary),
-        (None, false) => "no test framework detected".to_string(),
+        if tests.stale || tests.summary.stale {
+            label.push_str(" \u{00b7} stale");
+        }
+        label
+    } else {
+        "no test task detected".to_string()
     };
+    if rect.rows == 0 {
+        return;
+    }
     draw_text(
         surface,
         rect.x + 1,
@@ -1837,32 +1845,76 @@ fn draw_tests_tab(surface: &mut Surface, rect: Rect, ui: &crate::panel::PanelUi)
         col(S::Panel),
         rect.cols.saturating_sub(1),
     );
-    for (row, t) in ui
-        .tests_lines
-        .iter()
-        .skip(ui.tests_scroll)
-        .enumerate()
-        .take(rect.rows.saturating_sub(2))
-    {
-        let y = rect.y + 2 + row;
-        let (glyph, color) = match t.state {
-            TestState::Pass => ("\u{2713}", theme_color(theme::GREEN)),
-            TestState::Fail => ("\u{2717}", theme_color(theme::RED)),
-            TestState::Skip => ("\u{25cb}", theme_color(theme::AMBER)),
-        };
-        draw_text(surface, rect.x + 1, y, glyph, color, col(S::Panel), 1);
-        let fg = if t.state == TestState::Fail {
-            col(S::Text)
+    let visible = tests.visible_indices();
+    if visible.is_empty() {
+        let msg = if tests.task.is_some() {
+            "press u to discover targets or R to run all tests"
         } else {
+            "no test task detected"
+        };
+        draw_text(
+            surface,
+            rect.x + 1,
+            rect.y + 2,
+            msg,
+            col(S::Dim),
+            col(S::Panel),
+            rect.cols.saturating_sub(1),
+        );
+        return;
+    }
+    for (row, idx) in visible.iter().skip(tests.scroll).enumerate() {
+        if row + 2 >= rect.rows {
+            break;
+        }
+        let Some(node) = tests.nodes.get(*idx) else {
+            continue;
+        };
+        let y = rect.y + 2 + row;
+        let selected = row + tests.scroll == tests.cursor;
+        let bg = if selected {
+            col(S::Panel2)
+        } else {
+            col(S::Panel)
+        };
+        if selected {
+            fill(
+                surface,
+                Rect {
+                    x: rect.x,
+                    y,
+                    cols: rect.cols,
+                    rows: 1,
+                },
+                bg,
+            );
+        }
+        let (glyph, color) = match (node.kind, node.state) {
+            (TestNodeKind::Group, _) => ("\u{25b8}", col(S::Dim)),
+            (_, TestState::Pass) => ("\u{2713}", theme_color(theme::GREEN)),
+            (_, TestState::Fail) => ("\u{2717}", theme_color(theme::RED)),
+            (_, TestState::Skip) => ("\u{25cb}", theme_color(theme::AMBER)),
+            (_, TestState::Running) => ("\u{2026}", theme_color(theme::AMBER)),
+            (_, TestState::Unknown) => ("\u{25cb}", col(S::Dim)),
+        };
+        let indent = "  ".repeat(node.depth.min(4));
+        let mut label = format!("{indent}{}", node.label);
+        if let Some(loc) = &node.location {
+            label.push_str(&format!("  {}:{}", loc.path, loc.line));
+        }
+        draw_text(surface, rect.x + 1, y, glyph, color, bg, 1);
+        let fg = if node.kind == TestNodeKind::Group {
             col(S::Dim)
+        } else {
+            col(S::Text)
         };
         draw_text(
             surface,
             rect.x + 3,
             y,
-            &t.name,
+            &label,
             fg,
-            col(S::Panel),
+            bg,
             rect.cols.saturating_sub(3),
         );
     }
@@ -2445,7 +2497,7 @@ mod tests {
         assert!(
             !l[0].contains("REPO"),
             "masthead carries no nav labels: {:?}",
-            &l[0]
+            l[0]
         );
         let tabs_row = &l[chrome.center_tabs.y];
         assert!(
@@ -2456,14 +2508,14 @@ mod tests {
         assert!(
             l[chrome.divider.y].contains("\u{2500}\u{2500}\u{2500}"),
             "divider rule: {:?}",
-            &l[chrome.divider.y]
+            l[chrome.divider.y]
         );
         // The text brand occupies the masthead's brand slot.
         let brand_zone: String = l[0].chars().take(brand_cols).collect();
         assert!(
             brand_zone.contains("superzej"),
             "text brand on the masthead: {:?}",
-            &l[0]
+            l[0]
         );
     }
 

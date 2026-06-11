@@ -37,129 +37,10 @@ impl PanelTab {
     }
 }
 
-/// One test's outcome on the Tests tab.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TestState {
-    Pass,
-    Fail,
-    Skip,
-}
-
-/// One parsed test result line.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TestLine {
-    pub name: String,
-    pub state: TestState,
-}
-
-/// Detect the worktree's test runner from its manifest files. Returns
-/// `(framework label, command)`; a `just test` recipe wins (the repo's own
-/// convention), then language manifests.
-pub fn detect_test_command(worktree: &std::path::Path) -> Option<(String, String)> {
-    let has = |f: &str| worktree.join(f).is_file();
-    if has("justfile")
-        && std::fs::read_to_string(worktree.join("justfile"))
-            .map(|s| s.lines().any(|l| l.starts_with("test")))
-            .unwrap_or(false)
-    {
-        return Some(("just".into(), "just test".into()));
-    }
-    if has("Cargo.toml") {
-        return Some(("cargo".into(), "cargo test --workspace".into()));
-    }
-    if has("go.mod") {
-        return Some(("go".into(), "go test ./...".into()));
-    }
-    if has("pyproject.toml") || has("pytest.ini") || has("setup.py") || has("setup.cfg") {
-        return Some(("pytest".into(), "pytest -v --no-header".into()));
-    }
-    if has("package.json") {
-        let pkg = std::fs::read_to_string(worktree.join("package.json")).unwrap_or_default();
-        if pkg.contains("\"vitest\"") {
-            return Some(("vitest".into(), "npx vitest run".into()));
-        }
-        if pkg.contains("\"jest\"") {
-            return Some(("jest".into(), "npx jest --colors=false".into()));
-        }
-        if pkg.contains("\"test\"") {
-            return Some(("npm".into(), "npm test --silent".into()));
-        }
-    }
-    None
-}
-
-/// Classify a test-runner output stream into per-test indicator lines.
-/// Framework-agnostic: recognizes cargo (`test x ... ok|FAILED|ignored`),
-/// go (`--- PASS/FAIL/SKIP: x`), pytest -v (`x PASSED|FAILED|SKIPPED`), and
-/// the ✓/✗ unicode markers jest/vitest print. Unrecognized lines are skipped.
-pub fn parse_test_output(out: &str) -> Vec<TestLine> {
-    let mut lines = Vec::new();
-    for raw in out.lines() {
-        let l = raw.trim();
-        let push = |lines: &mut Vec<TestLine>, name: &str, state: TestState| {
-            let name = name.trim().trim_end_matches("...").trim().to_string();
-            if !name.is_empty() {
-                lines.push(TestLine { name, state });
-            }
-        };
-        if let Some(rest) = l.strip_prefix("test ") {
-            // cargo: `test path::name ... ok` (skip the `test result:` line).
-            if rest.starts_with("result:") {
-                continue;
-            }
-            if let Some((name, verdict)) = rest.rsplit_once("... ") {
-                let state = match verdict.trim() {
-                    "ok" => TestState::Pass,
-                    "FAILED" => TestState::Fail,
-                    "ignored" => TestState::Skip,
-                    v if v.starts_with("ignored") => TestState::Skip,
-                    _ => continue,
-                };
-                push(&mut lines, name, state);
-            }
-        } else if let Some(rest) = l.strip_prefix("--- PASS: ") {
-            push(
-                &mut lines,
-                rest.split_whitespace().next().unwrap_or(rest),
-                TestState::Pass,
-            );
-        } else if let Some(rest) = l.strip_prefix("--- FAIL: ") {
-            push(
-                &mut lines,
-                rest.split_whitespace().next().unwrap_or(rest),
-                TestState::Fail,
-            );
-        } else if let Some(rest) = l.strip_prefix("--- SKIP: ") {
-            push(
-                &mut lines,
-                rest.split_whitespace().next().unwrap_or(rest),
-                TestState::Skip,
-            );
-        } else if let Some(name) = l.strip_suffix(" PASSED") {
-            push(&mut lines, name, TestState::Pass);
-        } else if let Some(name) = l.strip_suffix(" FAILED") {
-            push(&mut lines, name, TestState::Fail);
-        } else if let Some(name) = l.strip_suffix(" SKIPPED") {
-            push(&mut lines, name, TestState::Skip);
-        } else if let Some(rest) = l.strip_prefix("\u{2713} ") {
-            push(&mut lines, rest, TestState::Pass);
-        } else if let Some(rest) = l.strip_prefix("\u{2717} ") {
-            push(&mut lines, rest, TestState::Fail);
-        }
-    }
-    lines
-}
-
-/// Summarize parsed results: `12 passed · 1 failed · 2 skipped`.
-pub fn test_summary(lines: &[TestLine]) -> String {
-    let count = |s: TestState| lines.iter().filter(|l| l.state == s).count();
-    format!(
-        "{} passed \u{00b7} {} failed \u{00b7} {} skipped",
-        count(TestState::Pass),
-        count(TestState::Fail),
-        count(TestState::Skip)
-    )
-}
+// The Tests model (TestState/TestTask/TestNode/TestPanelState + parsers, tree,
+// and locate helpers) lives in `testkit::model` and is re-exported so the panel
+// and chrome keep using `crate::panel::TestNode` etc.
+pub use crate::testkit::model::*;
 
 /// The Diff tab has two stacked views: the file list and a single-file diff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -319,11 +200,9 @@ pub struct PanelUi {
     /// is open on the Files tab.
     pub files_preview: bool,
     /// Tests tab: detected `(framework, command)`, latest results, and state.
-    pub tests_cmd: Option<(String, String)>,
-    pub tests_lines: Vec<TestLine>,
-    pub tests_summary: String,
-    pub tests_running: bool,
-    pub tests_scroll: usize,
+    /// Tests tab: the full test-explorer state (detected task, per-test status
+    /// map, display tree, cursor/scroll/filter).
+    pub tests: TestPanelState,
 }
 
 impl PanelUi {
@@ -377,6 +256,12 @@ pub enum PanelNav {
     Approve,
     Create,
     Rerun,
+    /// Tests: run all / run failed / refresh discovery / peek in bat / debug.
+    RunAll,
+    RunFailed,
+    Refresh,
+    Peek,
+    Debug,
 }
 
 /// Map a raw key to a panel nav intent given the current tab/view context.
@@ -401,9 +286,18 @@ pub fn panel_nav_key(key: &KeyCode, tab: PanelTab, view: DiffView) -> Option<Pan
         },
         KeyCode::Escape => Some(PanelNav::Back),
         KeyCode::Char('o') => match tab {
-            PanelTab::Diff | PanelTab::Files | PanelTab::Pr => Some(PanelNav::Open),
-            PanelTab::Checks | PanelTab::Tests => None,
+            PanelTab::Diff | PanelTab::Files | PanelTab::Pr | PanelTab::Tests => {
+                Some(PanelNav::Open)
+            }
+            PanelTab::Checks => None,
         },
+        // Tests-tab actions (TAP/JSON/report explorer): run-all/failed, refresh
+        // discovery, peek in bat, debug handoff.
+        KeyCode::Char('R') if tab == PanelTab::Tests => Some(PanelNav::RunAll),
+        KeyCode::Char('f') if tab == PanelTab::Tests => Some(PanelNav::RunFailed),
+        KeyCode::Char('u') if tab == PanelTab::Tests => Some(PanelNav::Refresh),
+        KeyCode::Char('b') if tab == PanelTab::Tests => Some(PanelNav::Peek),
+        KeyCode::Char('d') if tab == PanelTab::Tests => Some(PanelNav::Debug),
         KeyCode::Char('O') if tab == PanelTab::Files => Some(PanelNav::OpenExternal),
         KeyCode::Char('J') if matches!(tab, PanelTab::Diff | PanelTab::Files) => {
             Some(PanelNav::NextDoc)
@@ -442,55 +336,6 @@ mod tests {
         assert_eq!(PanelTab::Pr.next(), PanelTab::Checks);
         assert_eq!(PanelTab::Checks.next(), PanelTab::Tests);
         assert_eq!(PanelTab::Tests.next(), PanelTab::Diff);
-    }
-
-    #[test]
-    fn test_output_parses_cargo_go_pytest_and_js_markers() {
-        let out = "\
-test core::a ... ok
-test core::b ... FAILED
-test core::c ... ignored
-test result: FAILED. 1 passed; 1 failed
---- PASS: TestAlpha (0.01s)
---- FAIL: TestBeta
-tests/test_x.py::test_one PASSED
-tests/test_x.py::test_two SKIPPED
-\u{2713} renders the header
-\u{2717} crashes on resize
-random noise line
-";
-        let lines = parse_test_output(out);
-        let states: Vec<(&str, TestState)> =
-            lines.iter().map(|l| (l.name.as_str(), l.state)).collect();
-        assert!(states.contains(&("core::a", TestState::Pass)));
-        assert!(states.contains(&("core::b", TestState::Fail)));
-        assert!(states.contains(&("core::c", TestState::Skip)));
-        assert!(states.contains(&("TestAlpha", TestState::Pass)));
-        assert!(states.contains(&("TestBeta", TestState::Fail)));
-        assert!(states.contains(&("tests/test_x.py::test_one", TestState::Pass)));
-        assert!(states.contains(&("renders the header", TestState::Pass)));
-        assert!(states.contains(&("crashes on resize", TestState::Fail)));
-        assert_eq!(lines.len(), 9, "noise + result lines skipped");
-        assert_eq!(
-            test_summary(&lines),
-            "4 passed \u{00b7} 3 failed \u{00b7} 2 skipped"
-        );
-    }
-
-    #[test]
-    fn detect_test_command_prefers_just_then_manifests() {
-        let base = std::env::temp_dir().join(format!("sz-tests-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
-        assert_eq!(detect_test_command(&base), None);
-        std::fs::write(base.join("Cargo.toml"), "[package]").unwrap();
-        assert_eq!(
-            detect_test_command(&base).unwrap().1,
-            "cargo test --workspace"
-        );
-        std::fs::write(base.join("justfile"), "test:\n    cargo test\n").unwrap();
-        assert_eq!(detect_test_command(&base).unwrap().0, "just");
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

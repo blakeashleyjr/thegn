@@ -1,0 +1,10 @@
+{"type":"suite","event":"started","test_count":3}
+{"type":"test","event":"started","name":"szfix::szfix$tests::wip"}
+{"type":"test","event":"started","name":"szfix::szfix$tests::breaks"}
+{"type":"test","event":"started","name":"szfix::szfix$tests::adds"}
+{"type":"test","event":"ignored","name":"szfix::szfix$tests::wip"}
+{"type":"test","event":"ok","name":"szfix::szfix$tests::adds","exec_time":0.00514596}
+{"type":"suite","event":"ok","passed":1,"failed":0,"ignored":1,"measured":0,"filtered_out":0,"exec_time":0.00514596}
+{"type":"suite","event":"started","test_count":3}
+{"type":"test","event":"failed","name":"szfix::szfix$tests::breaks","exec_time":0.005206695,"stdout":"\nthread 'tests::breaks' (3172919) panicked at src/lib.rs:4:21:\nassertion `left == right` failed\n  left: 4\n right: 5\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n"}
+{"type":"suite","event":"failed","passed":0,"failed":1,"ignored":1,"measured":0,"filtered_out":1,"exec_time":0.005206695}
