@@ -814,6 +814,11 @@ impl SidebarState {
         model.sidebar_marked = self.marked.clone();
         model.sidebar_menu = self.menu.clone();
     }
+
+    fn focus_active_row(&mut self, model: &mut FrameModel) {
+        self.cursor = visible_index_of_active(model);
+        self.sync(model);
+    }
 }
 
 /// What the event loop should do after a sidebar key was handled.
@@ -900,7 +905,7 @@ impl SidebarState {
         // Filter input sub-mode captures text (item 21).
         if self.filtering {
             match key {
-                KeyCode::Escape => {
+                key if crate::input::is_escape_key(key) => {
                     self.filtering = false;
                     self.view.filter.clear();
                 }
@@ -921,7 +926,7 @@ impl SidebarState {
         // Open context menu captures navigation (item 27).
         if let Some(menu) = &mut self.menu {
             match key {
-                KeyCode::Escape => {
+                key if crate::input::is_escape_key(key) => {
                     self.menu = None;
                 }
                 KeyCode::UpArrow | KeyCode::Char('k') => {
@@ -947,7 +952,7 @@ impl SidebarState {
 
         let visible = Self::visible_len(model);
         match key {
-            KeyCode::Escape => return SidebarOutcome::Defocus,
+            key if crate::input::is_escape_key(key) => return SidebarOutcome::Defocus,
             KeyCode::Char('q') => return SidebarOutcome::Defocus,
             KeyCode::DownArrow | KeyCode::Char('j') => {
                 if visible > 0 {
@@ -1334,6 +1339,18 @@ fn deletable_group_targets(
     (kept, skipped)
 }
 
+fn forget_worktree_group(
+    db: &superzej_core::db::Db,
+    session_id: &str,
+    group: &crate::session::WorktreeGroup,
+) {
+    if !group.path.is_empty() {
+        let _ = db.del_worktree(&group.path);
+    }
+    let _ = db.del_worktree_for_tab(session_id, &group.name);
+    let _ = db.delete_tab_group(session_id, &group.name);
+}
+
 fn delete_groups(
     session: &mut crate::session::Session,
     panes: &mut Panes,
@@ -1361,9 +1378,9 @@ fn delete_groups(
             // lingering dir is re-adopted on the next launch and looks like a
             // failed delete. Make sure the directory is actually gone.
             let _ = std::fs::remove_dir_all(&path);
-            if let Some(db) = &db {
-                let _ = db.del_worktree(&path);
-            }
+        }
+        if let Some(db) = &db {
+            forget_worktree_group(db, &session.id, &session.worktrees[gi]);
         }
         for tab in &session.worktrees[gi].tabs {
             for id in tab.center.pane_ids() {
@@ -1951,6 +1968,112 @@ enum GitInputKind {
         collected: std::collections::BTreeMap<String, String>,
         remaining: Vec<(String, String)>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostInputKind {
+    NewWorkspace,
+}
+
+fn begin_new_workspace_prompt(
+    host_input: &mut Option<(menu::InputOverlay, HostInputKind)>,
+    model: &mut FrameModel,
+) {
+    *host_input = Some((
+        menu::InputOverlay::new("new workspace — path or URL", ""),
+        HostInputKind::NewWorkspace,
+    ));
+    model.status = "Create workspace: enter path or URL (Esc cancels)".into();
+}
+
+fn looks_like_git_url(input: &str) -> bool {
+    input.starts_with("http://")
+        || input.starts_with("https://")
+        || input.starts_with("ssh://")
+        || input.starts_with("git://")
+        || input.starts_with("git@")
+}
+
+fn workspace_repo_name_from_url(input: &str) -> String {
+    let trimmed = input.trim_end_matches('/');
+    let tail = trimmed.rsplit(['/', ':']).next().unwrap_or(trimmed);
+    let name = tail.strip_suffix(".git").unwrap_or(tail);
+    let slug = superzej_core::util::slugify(name);
+    if slug.is_empty() {
+        "workspace".into()
+    } else {
+        name.to_string()
+    }
+}
+
+#[cfg(test)]
+fn create_workspace_from_input(
+    input: &str,
+    session: &mut crate::session::Session,
+    db: &superzej_core::db::Db,
+) -> Result<std::path::PathBuf> {
+    create_workspace_from_input_with_config(
+        input,
+        session,
+        db,
+        &superzej_core::config::Config::default(),
+    )
+}
+
+fn create_workspace_from_input_with_config(
+    input: &str,
+    session: &mut crate::session::Session,
+    db: &superzej_core::db::Db,
+    cfg: &superzej_core::config::Config,
+) -> Result<std::path::PathBuf> {
+    let input = input.trim();
+    anyhow::ensure!(!input.is_empty(), "no workspace path or URL given");
+
+    let root = if looks_like_git_url(input) {
+        let repo_name = workspace_repo_name_from_url(input);
+        let dest = std::path::PathBuf::from(superzej_core::util::expand_tilde(&cfg.workspaces_dir))
+            .join(repo_name);
+        if !dest.exists() {
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("create {}", parent.display()))?;
+            }
+            let status = std::process::Command::new("git")
+                .arg("clone")
+                .arg(input)
+                .arg(&dest)
+                .status()
+                .with_context(|| format!("git clone {input} {}", dest.display()))?;
+            anyhow::ensure!(status.success(), "git clone failed for {input}");
+        }
+        std::fs::canonicalize(&dest).unwrap_or(dest)
+    } else {
+        let expanded = superzej_core::util::expand_tilde(input);
+        let path = std::path::PathBuf::from(expanded);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        anyhow::ensure!(path.is_dir(), "path does not exist: {}", path.display());
+        let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+        superzej_core::repo::main_worktree(&canonical).unwrap_or(canonical)
+    };
+
+    let root_s = root.to_string_lossy().into_owned();
+    let name = root
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "workspace".into());
+    let kind = if superzej_core::repo::main_worktree(&root).is_some() {
+        "repo"
+    } else {
+        "dir"
+    };
+    db.put_workspace(&root_s, &name, kind)?;
+    db.touch_repo(&root_s, &name)?;
+    session.switch_to_workspace(&root_s, db)?;
+    Ok(root)
 }
 
 /// A follow-up only the loop body can perform (it owns session/panes).
@@ -3887,10 +4010,7 @@ fn drawer_cancel_key(key: &KeyCode, modifiers: Modifiers) -> bool {
     if modifiers.contains(Modifiers::CTRL) || modifiers.contains(Modifiers::ALT) {
         return false;
     }
-    matches!(
-        key,
-        KeyCode::Escape | KeyCode::Char('q') | KeyCode::Char('Q')
-    )
+    crate::input::is_escape_key(key) || matches!(key, KeyCode::Char('q') | KeyCode::Char('Q'))
 }
 
 fn palette_cancel_key(
@@ -3898,7 +4018,7 @@ fn palette_cancel_key(
     key: &KeyCode,
     modifiers: Modifiers,
 ) -> bool {
-    if matches!(key, KeyCode::Escape) {
+    if crate::input::is_escape_key(key) {
         return true;
     }
     if modifiers.contains(Modifiers::CTRL)
@@ -4114,6 +4234,7 @@ async fn event_loop<T: Terminal>(
     // the palette (Option, keys first, painted last).
     let mut active_menu: Option<MenuOverlay> = None;
     let mut git_input: Option<(menu::InputOverlay, GitInputKind)> = None;
+    let mut host_input: Option<(menu::InputOverlay, HostInputKind)> = None;
     // A live rebase_status read is out (dedupes the safety-net re-kicks).
     let mut rebase_sync_inflight = false;
     // A computed undo/redo plan awaiting its confirm pick.
@@ -5479,6 +5600,9 @@ async fn event_loop<T: Terminal>(
             if let Some((inp, _)) = &git_input {
                 inp.render(&mut scratch, screen);
             }
+            if let Some((inp, _)) = &host_input {
+                inp.render(&mut scratch, screen);
+            }
             let accent = current_config.accent_rgb();
             if !which_key.is_empty() {
                 crate::keyhint::render_which_key(
@@ -5987,6 +6111,7 @@ async fn event_loop<T: Terminal>(
                         model.status = delete_groups(&mut session, &mut panes, targets);
                         sb.marked.clear();
                         refresh_tab_model(&mut model, &session, &mut sb);
+                        sb.focus_active_row(&mut model);
                         need_relayout = true;
                         sync_drawer_persistence(
                             &session,
@@ -6004,6 +6129,75 @@ async fn event_loop<T: Terminal>(
                     continue;
                 }
                 let mut forced_palette_action: Option<crate::keymap::Action> = None;
+                // Modal: host text input overlays (workspace creation, etc.)
+                // capture all keys before palettes/panels so the shortcut gives
+                // immediate visible feedback and a focused input target.
+                if host_input.is_some() {
+                    let outcome = host_input
+                        .as_mut()
+                        .map(|(inp, _)| inp.handle_key(&k.key, k.modifiers))
+                        .unwrap_or(menu::InputOutcome::Pending);
+                    match outcome {
+                        menu::InputOutcome::Pending => {}
+                        menu::InputOutcome::Cancel => {
+                            host_input = None;
+                            model.status = "workspace creation cancelled".into();
+                        }
+                        menu::InputOutcome::Submit(text) => {
+                            if let Some((_, kind)) = host_input.take() {
+                                match kind {
+                                    HostInputKind::NewWorkspace => {
+                                        let outgoing = session_pane_ids(&session);
+                                        match superzej_core::db::Db::open()
+                                            .context("open superzej db")
+                                            .and_then(|db| {
+                                                create_workspace_from_input_with_config(
+                                                    &text,
+                                                    &mut session,
+                                                    &db,
+                                                    &current_config,
+                                                )
+                                            }) {
+                                            Ok(path) => {
+                                                for id in outgoing {
+                                                    panes.table.remove(&id);
+                                                }
+                                                if let Some(id) = drawer.take() {
+                                                    panes.table.remove(&id);
+                                                }
+                                                for id in drawer_pool.drain_ids() {
+                                                    panes.table.remove(&id);
+                                                }
+                                                focus.zone = crate::focus::Zone::Center;
+                                                refresh_tab_model(&mut model, &session, &mut sb);
+                                                sync_drawer_persistence(
+                                                    &session,
+                                                    &mut panes,
+                                                    &mut drawer,
+                                                    &mut drawer_pool,
+                                                    &mut drawer_home,
+                                                    keymap.config(),
+                                                    chrome.center,
+                                                );
+                                                model.status = format!(
+                                                    "workspace created: {}",
+                                                    path.display()
+                                                );
+                                                need_relayout = true;
+                                            }
+                                            Err(e) => {
+                                                model.status =
+                                                    format!("workspace create failed: {e}");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    dirty = true;
+                    continue;
+                }
                 // Modal: an open git option/confirm menu captures all keys.
                 if let Some(m) = active_menu.as_mut() {
                     match m.handle_key(&k.key, k.modifiers) {
@@ -6134,7 +6328,7 @@ async fn event_loop<T: Terminal>(
                                 f.editing = false;
                             }
                         }
-                        KeyCode::Escape => {
+                        key if crate::input::is_escape_key(&key) => {
                             panel_ui.git.filter = None;
                         }
                         KeyCode::Backspace => {
@@ -6187,7 +6381,7 @@ async fn event_loop<T: Terminal>(
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
                             }
-                            KeyCode::Escape => {
+                            key if crate::input::is_escape_key(&key) => {
                                 if let Some(pending) = pending_agent.as_mut()
                                     && pending.choosing_sandbox
                                 {
@@ -6473,7 +6667,7 @@ async fn event_loop<T: Terminal>(
                     && !k.modifiers.contains(Modifiers::CTRL)
                     && !k.modifiers.contains(Modifiers::ALT)
                 {
-                    if k.key == KeyCode::Escape {
+                    if crate::input::is_escape_key(&k.key) {
                         focus.zone = crate::focus::Zone::Center;
                     }
                     dirty = true;
@@ -6536,7 +6730,7 @@ async fn event_loop<T: Terminal>(
                             continue;
                         }
                         SidebarOutcome::DeleteGroups(targets) => {
-                            let (targets, skipped_home) =
+                            let (mut targets, skipped_home) =
                                 deletable_group_targets(&session, targets);
                             let names: Vec<String> = targets
                                 .iter()
@@ -6562,9 +6756,26 @@ async fn event_loop<T: Terminal>(
                                     targets,
                                 ));
                             } else {
+                                // Capture the active group name to restore focus after indices shift
+                                let active_group_name =
+                                    session.active_group().map(|g| g.name.clone());
+
+                                // Sort targets descending so deletion doesn't shift upcoming indices
+                                targets.sort_unstable_by(|a, b| b.cmp(a));
+
                                 model.status = delete_groups(&mut session, &mut panes, targets);
+
+                                // Restore focus based on stable name
+                                if let Some(target_name) = active_group_name
+                                    && let Some(new_idx) =
+                                        session.worktrees.iter().position(|g| g.name == target_name)
+                                {
+                                    session.switch_to(new_idx);
+                                }
+
                                 sb.marked.clear();
                                 refresh_tab_model(&mut model, &session, &mut sb);
+                                sb.focus_active_row(&mut model);
                                 need_relayout = true;
                                 sync_drawer_persistence(
                                     &session,
@@ -6589,9 +6800,17 @@ async fn event_loop<T: Terminal>(
 
                             // Close from the highest index down so earlier
                             // indices stay valid as groups are removed.
+                            let db = superzej_core::db::Db::open().ok();
                             targets.sort_unstable_by(|a, b| b.cmp(a));
                             for gi in targets {
                                 if gi < session.worktrees.len() {
+                                    if let Some(db) = &db {
+                                        forget_worktree_group(
+                                            db,
+                                            &session.id,
+                                            &session.worktrees[gi],
+                                        );
+                                    }
                                     for tab in &session.worktrees[gi].tabs {
                                         for id in tab.center.pane_ids() {
                                             panes.table.remove(&id);
@@ -6618,6 +6837,7 @@ async fn event_loop<T: Terminal>(
                             persist_session_layout(&session);
                             sb.marked.clear();
                             refresh_tab_model(&mut model, &session, &mut sb);
+                            sb.focus_active_row(&mut model);
                             need_relayout = true;
                             sync_drawer_persistence(
                                 &session,
@@ -7349,7 +7569,7 @@ async fn event_loop<T: Terminal>(
                         }
                         // Esc in section mode returns to the terminal (row
                         // mode's Esc is claimed by the accordion map).
-                        (_, KeyCode::Escape) => {
+                        (_, key) if crate::input::is_escape_key(&key) => {
                             focus.zone = crate::focus::Zone::Center;
                             true
                         }
@@ -7860,7 +8080,10 @@ async fn event_loop<T: Terminal>(
                                     }
                                 }
                             }
-                            Action::NewWorkspace | Action::SwitchWorkspace => {
+                            Action::NewWorkspace => {
+                                begin_new_workspace_prompt(&mut host_input, &mut model);
+                            }
+                            Action::SwitchWorkspace => {
                                 if let Ok(db) = superzej_core::db::Db::open()
                                     && let Some(target) = palette
                                         .as_ref()
@@ -7989,6 +8212,9 @@ async fn event_loop<T: Terminal>(
                                                 panes.table.remove(&id);
                                             }
                                         }
+                                        if let Ok(db) = superzej_core::db::Db::open() {
+                                            forget_worktree_group(&db, &session.id, &g);
+                                        }
                                     }
                                     crate::session::CloseResult::Nothing => {}
                                 }
@@ -8014,7 +8240,11 @@ async fn event_loop<T: Terminal>(
                                         }
                                     }
                                 }
-                                session.close_active_group();
+                                if let Some(g) = session.close_active_group()
+                                    && let Ok(db) = superzej_core::db::Db::open()
+                                {
+                                    forget_worktree_group(&db, &session.id, &g);
+                                }
                                 persist_session_layout(&session);
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
@@ -8406,6 +8636,102 @@ mod tests {
     }
 
     #[test]
+    fn forgetting_closed_worktree_registry_prevents_restart_readoption() {
+        let root = std::env::temp_dir().join(format!(
+            "superzej-close-worktree-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let repo = root.join("app");
+        let feat = root.join("app-feat");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&feat).unwrap();
+        let db = superzej_core::db::Db::open_at(&root.join("state/superzej.db")).unwrap();
+        let repo_s = repo.to_string_lossy().into_owned();
+        let feat_s = feat.to_string_lossy().into_owned();
+        let mut session = Session {
+            id: repo_s.clone(),
+            worktrees: vec![
+                WorktreeGroup::new("app/home", GroupKind::Home, &repo_s),
+                WorktreeGroup::new("app/feat", GroupKind::Branch, &feat_s),
+            ],
+            active: 1,
+        };
+        session.persist(&db, &repo_s, now_secs()).unwrap();
+        db.put_worktree("app/feat", &repo_s, &feat_s, "feat", None)
+            .unwrap();
+
+        let closing = session.worktrees[1].clone();
+        forget_worktree_group(&db, &session.id, &closing);
+        session.close_active_group();
+        session.persist(&db, &repo_s, now_secs()).unwrap();
+
+        let resurrected = Session::resurrect(&db, &repo_s).unwrap();
+        assert_eq!(
+            resurrected
+                .worktrees
+                .iter()
+                .map(|g| g.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["app/home"]
+        );
+        assert!(
+            db.worktree_for_tab(&superzej_core::db::session(), "app/feat")
+                .unwrap()
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn new_workspace_action_starts_path_or_url_input() {
+        let mut model = FrameModel::default();
+        let mut host_input = None;
+
+        begin_new_workspace_prompt(&mut host_input, &mut model);
+
+        let (input, kind) = host_input.expect("new workspace should open an input overlay");
+        assert_eq!(kind, HostInputKind::NewWorkspace);
+        assert!(
+            input.title.contains("path or URL"),
+            "prompt title should explain accepted input: {:?}",
+            input.title
+        );
+        assert!(
+            model.status.contains("path or URL"),
+            "status should make shortcut/menu feedback visible: {:?}",
+            model.status
+        );
+    }
+
+    #[test]
+    fn workspace_input_accepts_existing_directory_workspace() {
+        let db_root = std::env::temp_dir().join(format!(
+            "superzej-test-db-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let db = superzej_core::db::Db::open_at(&db_root.join("superzej.db")).unwrap();
+        let mut session = crate::session::Session {
+            id: "/old".into(),
+            ..Default::default()
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "superzej-test-ws-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = create_workspace_from_input(dir.to_str().unwrap(), &mut session, &db)
+            .expect("plain directory workspaces should be accepted");
+
+        assert_eq!(path, dir);
+        assert_eq!(session.id, dir.to_string_lossy());
+        assert_eq!(db.workspaces().unwrap()[0].kind, "dir");
+    }
+
+    #[test]
     fn center_context_hints_include_close_tab_and_split_controls() {
         let cfg = superzej_core::config::Config::default();
         let focus = crate::focus::FocusState::default();
@@ -8506,6 +8832,7 @@ mod tests {
     #[test]
     fn drawer_cancel_keys_hide_the_file_picker() {
         assert!(drawer_cancel_key(&KeyCode::Escape, Modifiers::NONE));
+        assert!(drawer_cancel_key(&KeyCode::Char('\x1b'), Modifiers::NONE));
         assert!(drawer_cancel_key(&KeyCode::Char('q'), Modifiers::NONE));
         assert!(drawer_cancel_key(&KeyCode::Char('Q'), Modifiers::SHIFT));
         assert!(!drawer_cancel_key(&KeyCode::Char('q'), Modifiers::CTRL));
@@ -8519,6 +8846,11 @@ mod tests {
             "JetBrainsMono Nerd Font",
         )]);
         assert!(palette_cancel_key(&p, &KeyCode::Escape, Modifiers::NONE));
+        assert!(palette_cancel_key(
+            &p,
+            &KeyCode::Char('\x1b'),
+            Modifiers::NONE
+        ));
         assert!(palette_cancel_key(&p, &KeyCode::Char('c'), Modifiers::CTRL));
         assert!(palette_cancel_key(&p, &KeyCode::Char('q'), Modifiers::NONE));
 
@@ -8540,6 +8872,11 @@ mod tests {
             Modifiers::NONE
         ));
         assert!(palette_cancel_key(&p, &KeyCode::Escape, Modifiers::NONE));
+        assert!(palette_cancel_key(
+            &p,
+            &KeyCode::Char('\x1b'),
+            Modifiers::NONE
+        ));
     }
 
     /// A SidebarState whose `persist` writes to a temp DB scope rather than the
@@ -8629,6 +8966,25 @@ mod tests {
             }
             _ => panic!("expected CloseGroups"),
         }
+    }
+
+    #[test]
+    fn sidebar_destructive_actions_reanchor_cursor_to_active_row() {
+        let mut session = two_worktree_session();
+        let mut model = build_initial_model(&session);
+        model.sidebar_workspaces = vec![("app".into(), "app".into(), "repo".into(), String::new())];
+        let mut sb = focused_state(&mut model, &session);
+        sb.cursor = 0; // stale cursor on the workspace header after a delete/re-sort
+
+        session.switch_to(1);
+        refresh_tab_model(&mut model, &session, &mut sb);
+        sb.focus_active_row(&mut model);
+
+        let row = sb
+            .selected_row(&model)
+            .expect("active row should be visible");
+        assert!(row.active, "cursor should land on active row, got {row:?}");
+        assert_eq!(row.label, "feat");
     }
 
     #[test]

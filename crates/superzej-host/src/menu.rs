@@ -196,8 +196,11 @@ impl MenuOverlay {
         if mods.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER) {
             return MenuOutcome::Pending;
         }
+        if crate::input::is_escape_key(key) {
+            return MenuOutcome::Cancel;
+        }
         match key {
-            KeyCode::Escape | KeyCode::Char('q') => MenuOutcome::Cancel,
+            KeyCode::Char('q') => MenuOutcome::Cancel,
             KeyCode::DownArrow | KeyCode::Char('j') => {
                 self.selected = (self.selected + 1).min(self.items.len().saturating_sub(1));
                 MenuOutcome::Pending
@@ -619,8 +622,10 @@ impl InputOverlay {
         if mods.contains(Modifiers::ALT) || mods.contains(Modifiers::SUPER) {
             return InputOutcome::Pending;
         }
+        if crate::input::is_escape_key(key) {
+            return InputOutcome::Cancel;
+        }
         match key {
-            KeyCode::Escape => InputOutcome::Cancel,
             KeyCode::Enter => InputOutcome::Submit(self.value.clone()),
             KeyCode::Backspace => {
                 self.value.pop();
@@ -752,6 +757,11 @@ mod tests {
     fn esc_and_q_cancel() {
         let mut m = three();
         assert_eq!(m.handle_key(&KeyCode::Escape, NONE), MenuOutcome::Cancel);
+        assert_eq!(
+            m.handle_key(&KeyCode::Char('\x1b'), NONE),
+            MenuOutcome::Cancel,
+            "CSI-u/fixterms Esc decodes as a literal ESC char"
+        );
         assert_eq!(m.handle_key(&KeyCode::Char('q'), NONE), MenuOutcome::Cancel);
     }
 
@@ -1011,6 +1021,12 @@ mod tests {
             i.handle_key(&KeyCode::Char('c'), Modifiers::CTRL),
             InputOutcome::Cancel
         );
+        assert_eq!(
+            i.handle_key(&KeyCode::Char('\x1b'), NONE),
+            InputOutcome::Cancel,
+            "CSI-u/fixterms Esc must cancel, not edit the text"
+        );
+        assert_eq!(i.value(), "fix");
         // Other ctrl-chords pass through without editing.
         assert_eq!(
             i.handle_key(&KeyCode::Char('x'), Modifiers::CTRL),
