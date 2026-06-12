@@ -219,6 +219,10 @@ pub struct SandboxSpec {
     pub compose: Option<String>,
     pub init_script: Option<String>,
     pub devenv: bool,
+    /// Absolute path to the `devenv` binary on the host (resolved at spec-build
+    /// time when `devenv = true`). Used in `wrap_script` so OCI containers don't
+    /// rely on `devenv` being on their PATH.
+    pub devenv_path: Option<String>,
     pub name: String,
 }
 
@@ -330,6 +334,9 @@ pub fn resolve(cfg: &SandboxConfig, loc: &GitLoc, name: &str) -> Option<SandboxS
             || (!loc.is_remote()
                 && PathBuf::from(loc.path()).join("devenv.nix").is_file()
                 && util::have("devenv")),
+        // Resolve the absolute devenv path at spec-build time so OCI containers
+        // (which don't inherit the host PATH) can still exec it directly.
+        devenv_path: util::which_path("devenv"),
         name: name.to_string(),
     })
 }
@@ -804,7 +811,11 @@ fn wrap_script(spec: &SandboxSpec, inner: &str) -> String {
         s.push('\n');
     }
     if spec.devenv {
-        s.push_str(&format!("exec devenv shell -- {inner}"));
+        // Prefer the absolute path resolved at spec-build time so OCI containers
+        // (which don't inherit the host PATH) can exec devenv without it being on
+        // their default PATH.
+        let devenv = spec.devenv_path.as_deref().unwrap_or("devenv");
+        s.push_str(&format!("exec {devenv} shell -- {inner}"));
     } else {
         s.push_str(&format!("exec {inner}"));
     }
@@ -1297,6 +1308,7 @@ mod tests {
             init_script: None,
             file_access: FileAccess::Worktree,
             devenv: false,
+            devenv_path: None,
             name: "superzej-repo-feat".into(),
         }
     }

@@ -184,9 +184,9 @@ fn with_flow_chips(mut header: Vec<PanelRow>, ui: &PanelUi) -> Vec<PanelRow> {
     header
 }
 
-/// Indent a content line by 4 cells (the mockup's section-content inset).
+/// Indent a content line by 2 cells (tight section-content inset).
 fn indent(line: Line) -> Line {
-    const PAD: usize = 4;
+    const PAD: usize = 2;
     match line {
         Line::Blank => Line::Blank,
         Line::Fill { ch, fg } => Line::Fill { ch, fg },
@@ -205,7 +205,7 @@ fn indent(line: Line) -> Line {
 }
 
 /// The content geometry handed to section builders: the panel width minus
-/// the 4-cell indent + 1-cell right pad, and a post-skeleton row estimate.
+/// the 2-cell indent + 1-cell right pad, and a post-skeleton row estimate.
 fn section_ctx<'a>(
     model: &'a FrameModel,
     ui: &'a PanelUi,
@@ -216,7 +216,7 @@ fn section_ctx<'a>(
     SectionCtx {
         model,
         ui,
-        cols: cols.saturating_sub(5),
+        cols: cols.saturating_sub(3),
         rows: rows.saturating_sub(header_len + ui.order.len() + 2),
     }
 }
