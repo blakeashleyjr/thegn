@@ -107,17 +107,25 @@ impl GhError {
 // --- serde model ----------------------------------------------------------
 
 /// The full panel feed for one worktree (flattened state + metadata).
-#[derive(Debug, Clone, Serialize)]
+/// Round-trips through the `pr_cache` table; every extension field is
+/// `#[serde(default)]` so old cached rows keep deserializing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrPanel {
     #[serde(flatten)]
     pub state: PanelState,
     pub worktree: String,
     pub branch: String,
     pub fetched_at: i64,
+    /// Review threads of the open PR (unresolved first), best-effort.
+    #[serde(default)]
+    pub threads: Vec<ReviewThreadRow>,
+    /// Open repo issues (a small page), best-effort.
+    #[serde(default)]
+    pub issues: Vec<IssueRow>,
 }
 
 /// The per-worktree PR state, internally tagged by `kind` for the plugin.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PanelState {
     NoGh,
@@ -126,6 +134,29 @@ pub enum PanelState {
     RateLimited,
     Error { message: String },
     Pr(Box<PrStatus>),
+}
+
+/// One review thread, flattened to its first comment for the panel rows.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewThreadRow {
+    pub author: String,
+    pub path: String,
+    #[serde(default)]
+    pub line: Option<u64>,
+    /// First-comment excerpt (single line, capped).
+    pub snippet: String,
+    pub resolved: bool,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// One open issue for the panel's ISSUES block.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IssueRow {
+    pub number: u64,
+    pub title: String,
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 /// Deserialized from `gh pr view --json …`, plus a computed checks rollup.
@@ -171,6 +202,26 @@ pub struct CheckRun {
     pub workflow_name: Option<String>,
     #[serde(default)]
     pub details_url: Option<String>,
+    /// RFC3339 start/finish stamps (CheckRun shape) — per-check durations.
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+}
+
+impl CheckRun {
+    /// Seconds the check ran (completed) or has been running (started only,
+    /// measured against `now` epoch seconds). `None` without a start stamp.
+    pub fn duration_secs(&self, now: i64) -> Option<i64> {
+        let parse = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|t| t.timestamp())
+        };
+        let start = self.started_at.as_deref().and_then(parse)?;
+        let end = self.completed_at.as_deref().and_then(parse).unwrap_or(now);
+        Some((end - start).max(0))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,7 +309,162 @@ pub fn pr_status(loc: &GitLoc) -> PrPanel {
         worktree: loc.path(),
         branch,
         fetched_at: crate::util::now(),
+        threads: Vec::new(),
+        issues: Vec::new(),
     }
+}
+
+/// As [`pr_status`], plus best-effort review threads + open issues — the
+/// background cache-refresh feed. Extra fetches never fail the panel: any
+/// error just leaves the corresponding list empty.
+pub fn pr_status_full(loc: &GitLoc) -> PrPanel {
+    let mut panel = pr_status(loc);
+    if let PanelState::Pr(pr) = &panel.state
+        && let Some((owner, repo)) = owner_repo_from_url(&pr.url)
+    {
+        panel.threads = review_threads(loc, &owner, &repo, pr.number).unwrap_or_default();
+    }
+    panel.issues = issue_list(loc, 10).unwrap_or_default();
+    panel
+}
+
+/// `(owner, repo)` from a GitHub PR/issue/repo URL
+/// (`https://github.com/OWNER/REPO[/...]`). Forge-host agnostic: any host
+/// with the same path shape parses.
+pub fn owner_repo_from_url(url: &str) -> Option<(String, String)> {
+    let rest = url.split("://").nth(1)?;
+    let mut parts = rest.split('/');
+    let _host = parts.next()?;
+    let owner = parts.next()?.trim();
+    let repo = parts.next()?.trim();
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((owner.to_string(), repo.to_string()))
+}
+
+const THREADS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){\
+repository(owner:$owner,name:$name){pullRequest(number:$number){\
+reviewThreads(first:20){nodes{isResolved comments(first:1){nodes{\
+author{login} path line body createdAt}}}}}}}";
+
+/// Fetch the PR's review threads via `gh api graphql` (the `pr view` JSON
+/// fields don't expose threads).
+pub fn review_threads(
+    loc: &GitLoc,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Result<Vec<ReviewThreadRow>, GhError> {
+    let num = number.to_string();
+    let owner_arg = format!("owner={owner}");
+    let name_arg = format!("name={repo}");
+    let num_arg = format!("number={num}");
+    let query_arg = format!("query={THREADS_QUERY}");
+    let json = gh_out(
+        loc,
+        &[
+            "api", "graphql", "-f", &query_arg, "-f", &owner_arg, "-f", &name_arg, "-F", &num_arg,
+        ],
+    )?;
+    Ok(parse_review_threads(&json))
+}
+
+/// Parse the GraphQL reviewThreads response into rows (unresolved first).
+pub fn parse_review_threads(json: &str) -> Vec<ReviewThreadRow> {
+    let v: serde_json::Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let nodes = v
+        .pointer("/data/repository/pullRequest/reviewThreads/nodes")
+        .and_then(|n| n.as_array());
+    let Some(nodes) = nodes else {
+        return Vec::new();
+    };
+    let mut rows: Vec<ReviewThreadRow> = nodes
+        .iter()
+        .filter_map(|t| {
+            let resolved = t
+                .get("isResolved")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false);
+            let c = t.pointer("/comments/nodes/0")?;
+            let body = c.get("body").and_then(|s| s.as_str()).unwrap_or_default();
+            let snippet: String = body
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .take(80)
+                .collect();
+            Some(ReviewThreadRow {
+                author: c
+                    .pointer("/author/login")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
+                path: c
+                    .get("path")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                line: c.get("line").and_then(|n| n.as_u64()),
+                snippet,
+                resolved,
+                created_at: c
+                    .get("createdAt")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+        })
+        .collect();
+    rows.sort_by_key(|r| r.resolved);
+    rows
+}
+
+/// Fetch a small page of open issues (`gh issue list --json …`).
+pub fn issue_list(loc: &GitLoc, limit: usize) -> Result<Vec<IssueRow>, GhError> {
+    let limit = limit.to_string();
+    let json = gh_out(
+        loc,
+        &[
+            "issue",
+            "list",
+            "--json",
+            "number,title,labels",
+            "--limit",
+            &limit,
+        ],
+    )?;
+    Ok(parse_issue_list(&json))
+}
+
+/// Parse `gh issue list --json number,title,labels` output.
+pub fn parse_issue_list(json: &str) -> Vec<IssueRow> {
+    let v: Vec<serde_json::Value> = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    v.iter()
+        .filter_map(|i| {
+            Some(IssueRow {
+                number: i.get("number")?.as_u64()?,
+                title: i.get("title")?.as_str()?.to_string(),
+                labels: i
+                    .get("labels")
+                    .and_then(|l| l.as_array())
+                    .map(|l| {
+                        l.iter()
+                            .filter_map(|x| x.get("name").and_then(|n| n.as_str()))
+                            .map(String::from)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
 }
 
 // --- actions --------------------------------------------------------------
@@ -417,6 +623,138 @@ mod tests {
             state: state.map(String::from),
             workflow_name: None,
             details_url: None,
+            started_at: None,
+            completed_at: None,
+        }
+    }
+
+    #[test]
+    fn check_duration_from_stamps() {
+        let mut c = cr("COMPLETED", Some("SUCCESS"), None);
+        assert_eq!(c.duration_secs(0), None); // no start stamp
+        c.started_at = Some("2026-06-11T10:00:00Z".into());
+        c.completed_at = Some("2026-06-11T10:02:41Z".into());
+        assert_eq!(c.duration_secs(0), Some(161));
+        // Running check: measured against `now`.
+        c.completed_at = None;
+        let start = chrono::DateTime::parse_from_rfc3339("2026-06-11T10:00:00Z")
+            .unwrap()
+            .timestamp();
+        assert_eq!(c.duration_secs(start + 72), Some(72));
+        // Clock skew never yields negative durations.
+        assert_eq!(c.duration_secs(start - 100), Some(0));
+        // Garbage stamps degrade to None.
+        c.started_at = Some("not-a-date".into());
+        assert_eq!(c.duration_secs(0), None);
+    }
+
+    #[test]
+    fn owner_repo_parses_pr_and_repo_urls() {
+        assert_eq!(
+            owner_repo_from_url("https://github.com/acme/superzej/pull/142"),
+            Some(("acme".into(), "superzej".into()))
+        );
+        assert_eq!(
+            owner_repo_from_url("https://github.com/acme/superzej"),
+            Some(("acme".into(), "superzej".into()))
+        );
+        assert_eq!(
+            owner_repo_from_url("https://ghe.corp.example/org/repo/pull/1"),
+            Some(("org".into(), "repo".into()))
+        );
+        assert_eq!(owner_repo_from_url("https://github.com/onlyowner"), None);
+        assert_eq!(owner_repo_from_url("not a url"), None);
+        assert_eq!(owner_repo_from_url(""), None);
+    }
+
+    #[test]
+    fn parse_review_threads_flattens_and_sorts_unresolved_first() {
+        let json = r#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[
+            {"isResolved":true,"comments":{"nodes":[
+                {"author":{"login":"dev"},"path":"session.rs","line":9,
+                 "body":"resolved earlier","createdAt":"2026-06-11T08:00:00Z"}]}},
+            {"isResolved":false,"comments":{"nodes":[
+                {"author":{"login":"mira"},"path":"session.rs","line":42,
+                 "body":"ttl from cfg\nsecond line ignored","createdAt":"2026-06-11T11:43:00Z"}]}},
+            {"isResolved":false,"comments":{"nodes":[]}}
+        ]}}}}}"#;
+        let rows = parse_review_threads(json);
+        // The empty-comments thread is dropped; unresolved sorts first.
+        assert_eq!(rows.len(), 2);
+        assert!(!rows[0].resolved);
+        assert_eq!(rows[0].author, "mira");
+        assert_eq!(rows[0].path, "session.rs");
+        assert_eq!(rows[0].line, Some(42));
+        assert_eq!(rows[0].snippet, "ttl from cfg");
+        assert!(rows[1].resolved);
+        // Garbage and shape misses degrade to empty.
+        assert!(parse_review_threads("not json").is_empty());
+        assert!(parse_review_threads("{}").is_empty());
+    }
+
+    #[test]
+    fn parse_issue_list_extracts_labels() {
+        let json = r#"[
+            {"number":98,"title":"panel flicker on resize",
+             "labels":[{"name":"P1"},{"name":"bug"}]},
+            {"number":87,"title":"document keymap layer","labels":[]},
+            {"bogus":true}
+        ]"#;
+        let rows = parse_issue_list(json);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].number, 98);
+        assert_eq!(rows[0].labels, vec!["P1".to_string(), "bug".to_string()]);
+        assert!(rows[1].labels.is_empty());
+        assert!(parse_issue_list("nope").is_empty());
+        assert!(parse_issue_list("[]").is_empty());
+    }
+
+    #[test]
+    fn pr_panel_round_trips_with_and_without_extension_fields() {
+        // A fresh panel serializes; old cached JSON (no threads/issues keys)
+        // still deserializes thanks to serde defaults.
+        let panel = PrPanel {
+            state: PanelState::NoPr,
+            worktree: "/wt".into(),
+            branch: "main".into(),
+            fetched_at: 1,
+            threads: vec![ReviewThreadRow {
+                author: "mira".into(),
+                path: "a.rs".into(),
+                line: Some(1),
+                snippet: "s".into(),
+                resolved: false,
+                created_at: String::new(),
+            }],
+            issues: vec![IssueRow {
+                number: 5,
+                title: "t".into(),
+                labels: vec![],
+            }],
+        };
+        let json = serde_json::to_string(&panel).unwrap();
+        let back: PrPanel = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.threads.len(), 1);
+        assert_eq!(back.issues[0].number, 5);
+
+        let legacy = r#"{"kind":"no_pr","worktree":"/wt","branch":"main","fetched_at":1}"#;
+        let back: PrPanel = serde_json::from_str(legacy).unwrap();
+        assert!(matches!(back.state, PanelState::NoPr));
+        assert!(back.threads.is_empty() && back.issues.is_empty());
+
+        // A full Pr state with checks round-trips through the cache too.
+        let pr_json = r#"{"kind":"pr","number":142,"title":"session cache","state":"OPEN",
+            "url":"https://github.com/a/r/pull/142","isDraft":false,
+            "statusCheckRollup":[{"name":"build","status":"COMPLETED","conclusion":"SUCCESS",
+            "startedAt":"2026-06-11T10:00:00Z","completedAt":"2026-06-11T10:01:00Z"}],
+            "worktree":"/wt","branch":"feat","fetched_at":2}"#;
+        let back: PrPanel = serde_json::from_str(pr_json).unwrap();
+        match &back.state {
+            PanelState::Pr(pr) => {
+                assert_eq!(pr.number, 142);
+                assert_eq!(pr.status_check_rollup[0].duration_secs(0), Some(60));
+            }
+            other => panic!("expected Pr, got {other:?}"),
         }
     }
 
@@ -475,6 +813,8 @@ mod tests {
             worktree: "/tmp/wt".into(),
             branch: "sz/x".into(),
             fetched_at: 0,
+            threads: Vec::new(),
+            issues: Vec::new(),
         };
         let v: serde_json::Value = serde_json::to_value(&panel).unwrap();
         assert_eq!(v["kind"], "no_pr");
@@ -494,6 +834,8 @@ mod tests {
             worktree: "/tmp/wt".into(),
             branch: "sz/x".into(),
             fetched_at: 0,
+            threads: Vec::new(),
+            issues: Vec::new(),
         };
         let v: serde_json::Value = serde_json::to_value(&panel).unwrap();
         // The plugin reads these flattened keys.

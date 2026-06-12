@@ -35,22 +35,22 @@ pub(crate) enum RefreshKind {
 ///
 /// Runs on a dedicated OS thread (not `tokio::spawn`) so it can never be starved
 /// by the main loop blocking a runtime worker in `poll_input(None)` — true even
-/// on a single-core runtime. `PR_REFRESH_INTERVAL` is a whole multiple of
-/// `MODEL_REFRESH_INTERVAL`, so we sleep one model period at a time and emit the
-/// PR tick when the elapsed count divides evenly.
+/// on a single-core runtime. The thread sleeps in 500ms half-ticks: fine enough
+/// for the Telemetry section's live graphs (`stats_live` set while it's open)
+/// while the model/PR cadences keep their 2s/20s rates as whole multiples of
+/// the half-tick.
 pub(crate) fn spawn_refresh_ticker(
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     stats_tx: tokio_mpsc::UnboundedSender<crate::stats::StatsSnapshot>,
     stats_interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    stats_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
     waker: TerminalWaker,
 ) {
     use std::sync::atomic::Ordering;
     std::thread::spawn(move || {
-        // 1s granularity so the user-cycled stats rate (1/2/5/10s) is honored;
-        // model/PR refreshes keep their own multiples.
-        let tick = Duration::from_secs(1);
-        let model_every = MODEL_REFRESH_INTERVAL.as_secs();
-        let pr_every = PR_REFRESH_INTERVAL.as_secs();
+        let tick = Duration::from_millis(500);
+        let model_every = MODEL_REFRESH_INTERVAL.as_millis() as u64 / 500;
+        let pr_every = PR_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let mut ticks: u64 = 0;
         // System stats for the top bar ride the same thread/cadence — the
         // /proc reads never touch the event loop.
@@ -72,9 +72,11 @@ pub(crate) fn spawn_refresh_ticker(
                 }
                 wake = true;
             }
+            // Live mode (telemetry layer open) samples every half-tick;
+            // otherwise the user-cycled rate (1/2/5/10s) is honored.
             let interval =
                 Duration::from_millis(stats_interval_ms.load(Ordering::Relaxed).max(500));
-            if last_stats.elapsed() >= interval {
+            if stats_live.load(Ordering::Relaxed) || last_stats.elapsed() >= interval {
                 last_stats = Instant::now();
                 if stats_tx.send(sampler.sample()).is_err() {
                     break;
@@ -124,21 +126,21 @@ pub(crate) fn load_or_seed_session(cwd: &std::path::Path) -> (crate::session::Se
         superzej_core::db::Db::open()
     };
 
-    // Prefer the workspace the DB already knows for this cwd (or the inherited
-    // SUPERZEJ_SESSION); else fall back to the env value, else the cwd itself.
-    let session_name = db
-        .as_ref()
-        .ok()
-        .and_then(|db| {
-            db.workspaces()
-                .unwrap_or_default()
-                .into_iter()
-                .find(|w| {
-                    Path::new(&w.repo_path) == cwd || Some(&w.repo_path) == env_session.as_ref()
-                })
-                .map(|w| w.repo_path)
+    // sj is directory-agnostic: the launch directory never selects (or
+    // creates) a workspace. An inherited SUPERZEJ_SESSION wins (so child shells
+    // stay in the same session); otherwise we reopen the most-recently-active
+    // workspace recorded in the DB (`workspaces()` is `last_active DESC`). Only
+    // a genuine first run — no env, no DB history — falls back to the cwd.
+    let session_name = env_session
+        .clone()
+        .or_else(|| {
+            db.as_ref().ok().and_then(|db| {
+                db.workspaces()
+                    .ok()
+                    .and_then(|ws| ws.into_iter().next())
+                    .map(|w| w.repo_path)
+            })
         })
-        .or(env_session)
         .unwrap_or(cwd_str);
 
     let Ok(db) = db else {
@@ -211,10 +213,17 @@ pub(crate) fn load_or_seed_session(cwd: &std::path::Path) -> (crate::session::Se
         // Key the home group by the canonical DB slug (`{slug}/home`), never
         // the raw basename — the sidebar dedupes workspaces by this prefix.
         let slug = superzej_core::repo::repo_slug_with(&db, std::path::Path::new(&session_name));
+        // Directory-agnostic: anchor the home group at the session's own path
+        // (the resolved workspace), not the launch cwd.
+        let home_path = if Path::new(&session_name).is_dir() {
+            session_name.clone()
+        } else {
+            cwd.to_string_lossy().into_owned()
+        };
         session.worktrees.push(WorktreeGroup::new(
             superzej_core::repo::home_tab(&slug),
             GroupKind::Home,
-            cwd.to_string_lossy().into_owned(),
+            home_path,
         ));
         session.active = 0;
         seeded = true;
@@ -453,6 +462,83 @@ pub(crate) fn build_initial_model(session: &crate::session::Session) -> FrameMod
     }
 }
 
+/// What the open panel needs from this hydration pass — lets `build_model`
+/// skip work for closed sections (the git log, the file count).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct HydrateHints {
+    pub open: crate::panel::Section,
+    pub expanded: bool,
+}
+
+/// Map the typed PR cache into the panel's pr/checks/threads/issues fields.
+fn apply_pr_cache(panel: &mut crate::panel::PanelData, cached: superzej_core::github::PrPanel) {
+    use superzej_core::github::{Bucket, PanelState, check_bucket};
+    let now = superzej_core::util::now();
+    match cached.state {
+        PanelState::Pr(pr) => {
+            panel.pr = Some(crate::panel::PrSummary {
+                number: pr.number,
+                title: pr.title.clone(),
+                state: pr.state.clone(),
+                url: pr.url.clone(),
+                is_draft: pr.is_draft,
+                review_decision: pr.review_decision.clone(),
+            });
+            panel.pr_base = pr.base_ref_name.clone();
+            panel.checks = pr
+                .status_check_rollup
+                .iter()
+                .map(|c| crate::panel::CheckLine {
+                    name: c.name.clone(),
+                    state: match check_bucket(c) {
+                        Bucket::Pass => crate::panel::CheckState::Pass,
+                        Bucket::Fail => crate::panel::CheckState::Fail,
+                        Bucket::Pending => crate::panel::CheckState::Pending,
+                    },
+                    duration_secs: c.duration_secs(now),
+                    details_url: c.details_url.clone(),
+                })
+                .collect();
+        }
+        PanelState::NoGh => panel.pr_note = Some("gh CLI not installed".into()),
+        PanelState::NotAuthenticated => panel.pr_note = Some("gh not authenticated".into()),
+        PanelState::NoPr => panel.pr_note = Some("no pull request".into()),
+        PanelState::RateLimited => panel.pr_note = Some("GitHub rate limited".into()),
+        PanelState::Error { message } => panel.pr_note = Some(message),
+    }
+    panel.threads = cached.threads;
+    panel.issues = cached.issues;
+}
+
+/// The header's "resolved X/Y" denominator: the first-seen unresolved count
+/// of the current merge, persisted per worktree and cleared when the merge
+/// ends. `None` (no bar) until a count is known.
+fn merge_total(
+    db: &superzej_core::db::Db,
+    worktree: &str,
+    in_merge: bool,
+    unresolved: usize,
+) -> Option<usize> {
+    let key = format!("merge_total:{worktree}");
+    if !in_merge {
+        let _ = db.set_ui_state("panel", &key, "");
+        return None;
+    }
+    let stored = db
+        .get_ui_state("panel", &key)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<usize>().ok());
+    match stored {
+        Some(total) if total >= unresolved.max(1) => Some(total),
+        _ if unresolved > 0 => {
+            let _ = db.set_ui_state("panel", &key, &unresolved.to_string());
+            Some(unresolved)
+        }
+        other => other,
+    }
+}
+
 /// Build the chrome model from the resurrected session + the current worktree's
 /// git state (best-effort — the host stays up even with no repo / no DB). This
 /// is the in-process data flow the chrome relies on: read core + svc directly,
@@ -461,6 +547,7 @@ pub(crate) fn build_initial_model(session: &crate::session::Session) -> FrameMod
 pub(crate) fn build_model(
     session: &crate::session::Session,
     db: &superzej_core::db::Db,
+    hints: HydrateHints,
 ) -> FrameModel {
     use superzej_core::remote::GitLoc;
     use superzej_svc::git::{GitBackend, GixGit};
@@ -481,38 +568,69 @@ pub(crate) fn build_model(
         ..Default::default()
     };
 
-    // Add PR info if cached (native-host replacement for the zellij PR widget).
+    // The typed PR cache: summary + checks + review threads + issues.
     if let Ok(Some((json, _))) = db.get_pr_cache(&loc.path())
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&json)
-        && let Some(state) = v.get("state").and_then(|s| s.as_str())
-        && let Some(num) = v.get("number").and_then(|n| n.as_i64())
+        && let Ok(cached) = serde_json::from_str::<superzej_core::github::PrPanel>(&json)
     {
-        panel.pr = Some(crate::panel::PrSummary {
-            number: num as u64,
-            title: String::new(),
-            state: state.to_string(),
-            url: String::new(),
-            is_draft: false,
-            review_decision: None,
-        });
+        apply_pr_cache(&mut panel, cached);
     }
 
-    if let Ok(files) = git.diff_files(&loc, "HEAD") {
-        panel.files = files
-            .iter()
-            .map(|f| crate::panel::DiffFile {
-                status: f.path.chars().next().unwrap_or('M'),
-                path: f.path.clone(),
-                added: f.added,
-                deleted: f.deleted,
-            })
-            .collect();
+    let diff_entries = git.diff_files(&loc, "HEAD").unwrap_or_default();
+    panel.files = diff_entries
+        .iter()
+        .map(|f| crate::panel::DiffFile {
+            status: f.path.chars().next().unwrap_or('M'),
+            path: f.path.clone(),
+            added: f.added,
+            deleted: f.deleted,
+        })
+        .collect();
+
+    // Changes section: porcelain status joined with the diffstat.
+    let status = git.status(&loc).unwrap_or_default();
+    panel.changes = crate::panel::build_change_rows(&status, &diff_entries);
+
+    // Header zone: upstream divergence + merge-in-progress banner.
+    panel.ahead_behind = git.ahead_behind(&loc).ok().flatten();
+    let unresolved = superzej_svc::git::conflict_count(&status);
+    let merge_info = git.merge_state(&loc).ok().flatten();
+    let total = merge_total(db, &loc.path(), merge_info.is_some(), unresolved);
+    panel.merge = merge_info.map(|m| crate::panel::MergeBanner {
+        label: m.kind.label().to_string(),
+        onto: m.onto,
+        unresolved,
+        total,
+    });
+    panel.stash_count = git.stash_count(&loc).unwrap_or(0);
+
+    // The git section's LOG block — only fetched while that section is open.
+    if hints.open == crate::panel::Section::Git {
+        let n = if hints.expanded { 12 } else { 6 };
+        panel.log = git.log_graph(&loc, n).unwrap_or_default();
+    }
+
+    // Tests section snapshot from the cache (summary + failures + history).
+    if let Ok(Some((json, _))) = db.get_test_cache(&loc.path())
+        && let Ok(cache) = serde_json::from_str::<crate::testkit::model::TestCache>(&json)
+    {
+        panel.tests = Some(crate::panel::tests_lite(&cache));
+    }
+
+    // Tracked-file count for the files summary — only while files is open
+    // (`git ls-files` is cheap but not free on big repos every 2s).
+    if hints.open == crate::panel::Section::Files
+        && let Ok(out) = loc.git_command(&["ls-files"]).output()
+        && out.status.success()
+    {
+        panel.file_count = Some(out.stdout.iter().filter(|&&b| b == b'\n').count() as u64);
     }
 
     tracing::debug!(
         target: "szhost::hydrate",
         build_model_ms = t0.elapsed().as_millis() as u64,
         diff_files = panel.files.len(),
+        changes = panel.changes.len(),
+        merging = panel.merge.is_some(),
         "model hydrated"
     );
     let (worktree, tabs, active_tab) = tab_strip(session);
@@ -544,10 +662,13 @@ pub(crate) fn spawn_model_hydration(
     generation: u64,
     session: crate::session::Session,
     waker: Option<TerminalWaker>,
+    hints: HydrateHints,
 ) {
     task::spawn_blocking(move || {
         if let Ok(db) = superzej_core::db::Db::open()
-            && tx.send((generation, build_model(&session, &db))).is_ok()
+            && tx
+                .send((generation, build_model(&session, &db, hints)))
+                .is_ok()
             && let Some(w) = &waker
         {
             let _ = w.wake();
@@ -565,7 +686,9 @@ pub(crate) fn spawn_pr_cache_refresh(
             return;
         }
         let loc = superzej_core::remote::GitLoc::for_worktree(&cwd);
-        let panel = superzej_core::github::pr_status(&loc);
+        // The full feed: PR + checks + review threads + issues (extras are
+        // best-effort and never fail the panel).
+        let panel = superzej_core::github::pr_status_full(&loc);
         let Ok(json) = serde_json::to_string(&panel) else {
             return;
         };

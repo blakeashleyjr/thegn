@@ -142,6 +142,22 @@ impl TestSummary {
     }
 }
 
+/// One completed test run, for the panel's HISTORY block.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestRunRec {
+    /// Epoch seconds when the run finished.
+    pub at: i64,
+    pub passed: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub branch: String,
+}
+
+/// Runs kept in [`TestCache::history`] (newest first).
+pub const TEST_HISTORY_CAP: usize = 20;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TestCache {
     #[serde(default)]
@@ -157,6 +173,9 @@ pub struct TestCache {
     /// subprocess) — see `maybe_discover_tests`.
     #[serde(default)]
     pub fingerprint: String,
+    /// Recent completed runs, newest first, capped at [`TEST_HISTORY_CAP`].
+    #[serde(default)]
+    pub history: Vec<TestRunRec>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -179,9 +198,17 @@ pub struct TestPanelState {
     /// Manifest fingerprint recorded at the last discovery. Compared against a
     /// freshly-computed one to decide whether discovery can be skipped.
     pub fingerprint: String,
+    /// Recent completed runs, newest first (rides the cache).
+    pub history: Vec<TestRunRec>,
 }
 
 impl TestPanelState {
+    /// Record a completed run at the head of the history (capped).
+    pub fn push_history(&mut self, rec: TestRunRec) {
+        self.history.insert(0, rec);
+        self.history.truncate(TEST_HISTORY_CAP);
+    }
+
     pub fn to_cache(&self) -> TestCache {
         TestCache {
             task: self.task.clone(),
@@ -190,6 +217,7 @@ impl TestPanelState {
             summary: self.summary.clone(),
             discovered: self.discovered,
             fingerprint: self.fingerprint.clone(),
+            history: self.history.clone(),
         }
     }
 
@@ -197,6 +225,7 @@ impl TestPanelState {
         self.task = cache.task;
         self.discovered = cache.discovered;
         self.fingerprint = cache.fingerprint;
+        self.history = cache.history;
         self.by_id = cache
             .nodes
             .into_iter()

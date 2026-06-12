@@ -1,8 +1,8 @@
 //! The focus model: one zone owns the keyboard at any time, and Ctrl+direction
 //! moves focus across one spatial graph — sidebar ← center panes → panel, with
-//! up/down moving within whatever currently has focus (sidebar rows, tiled
-//! panes, panel widgets). Replaces the old disconnected booleans
-//! (`sb.focused` / `model.panel_focused`).
+//! the masthead above and the statusbar below, and up/down moving within
+//! whatever currently has focus (sidebar rows, tiled panes, panel sections).
+//! Replaces the old disconnected booleans (`sb.focused` / `model.panel_focused`).
 //!
 //! `route` is pure (zone × direction × visibility × pane geometry → a move) so
 //! the whole matrix is unit-testable without a terminal.
@@ -10,14 +10,18 @@
 use crate::center::{Move, PaneId, neighbor};
 use crate::compositor::Rect;
 
-/// What can own keyboard focus (modal overlays — palette, cheatsheet — sit
-/// above this and capture keys before the zone is consulted).
+/// What can own keyboard focus (the command palette sits above this and
+/// captures keys before the zone is consulted).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Zone {
     Sidebar,
     #[default]
     Center,
     Panel,
+    /// The top bar (brand + stats cluster).
+    Masthead,
+    /// The bottom bar (hints + status widgets).
+    Statusbar,
 }
 
 /// The session's focus state: the zone, plus the Ctrl+g keybind lock. While
@@ -37,6 +41,16 @@ impl FocusState {
     }
     pub fn center(&self) -> bool {
         self.zone == Zone::Center
+    }
+    pub fn masthead(&self) -> bool {
+        self.zone == Zone::Masthead
+    }
+    pub fn statusbar(&self) -> bool {
+        self.zone == Zone::Statusbar
+    }
+    /// A chrome bar owns the keyboard (Esc returns to the center).
+    pub fn bar(&self) -> bool {
+        matches!(self.zone, Zone::Masthead | Zone::Statusbar)
     }
 }
 
@@ -64,8 +78,9 @@ pub struct RouteCtx<'a> {
 }
 
 /// Resolve Ctrl+direction from `zone`. The screen is the map: leaving the
-/// leftmost pane lands in the sidebar, the rightmost in the panel; hidden
-/// chrome is skipped (a hidden sidebar is not a focus target).
+/// leftmost pane lands in the sidebar, the rightmost in the panel, the top
+/// edge in the masthead, the bottom edge in the statusbar; hidden chrome is
+/// skipped (a hidden sidebar is not a focus target — the bars are always up).
 pub fn route(zone: Zone, dir: Move, ctx: &RouteCtx) -> FocusMove {
     match zone {
         Zone::Center => {
@@ -75,6 +90,8 @@ pub fn route(zone: Zone, dir: Move, ctx: &RouteCtx) -> FocusMove {
             match dir {
                 Move::Left if ctx.sidebar_visible => FocusMove::Enter(Zone::Sidebar),
                 Move::Right if ctx.panel_visible => FocusMove::Enter(Zone::Panel),
+                Move::Up => FocusMove::Enter(Zone::Masthead),
+                Move::Down => FocusMove::Enter(Zone::Statusbar),
                 _ => FocusMove::None,
             }
         }
@@ -89,6 +106,16 @@ pub fn route(zone: Zone, dir: Move, ctx: &RouteCtx) -> FocusMove {
             Move::Up => FocusMove::WithinZone(-1),
             Move::Down => FocusMove::WithinZone(1),
             Move::Right => FocusMove::None,
+        },
+        // The bars sit above/below everything: down/up returns to the center
+        // (left/right are reserved for widget selection within the bar).
+        Zone::Masthead => match dir {
+            Move::Down => FocusMove::Enter(Zone::Center),
+            _ => FocusMove::None,
+        },
+        Zone::Statusbar => match dir {
+            Move::Up => FocusMove::Enter(Zone::Center),
+            _ => FocusMove::None,
         },
     }
 }
@@ -160,15 +187,69 @@ mod tests {
             route(Zone::Center, Move::Right, &ctx(&l, 2, true, false)),
             FocusMove::None
         );
-        // Vertical edges are graph edges.
+    }
+
+    #[test]
+    fn center_vertical_edges_reach_the_bars() {
+        let l = two_panes();
         assert_eq!(
             route(Zone::Center, Move::Up, &ctx(&l, 1, true, true)),
-            FocusMove::None
+            FocusMove::Enter(Zone::Masthead)
         );
         assert_eq!(
             route(Zone::Center, Move::Down, &ctx(&l, 1, true, true)),
-            FocusMove::None
+            FocusMove::Enter(Zone::Statusbar)
         );
+        // Stacked panes still move between panes first.
+        let stacked = vec![
+            (
+                1,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    cols: 100,
+                    rows: 20,
+                },
+            ),
+            (
+                2,
+                Rect {
+                    x: 0,
+                    y: 20,
+                    cols: 100,
+                    rows: 20,
+                },
+            ),
+        ];
+        assert_eq!(
+            route(Zone::Center, Move::Down, &ctx(&stacked, 1, true, true)),
+            FocusMove::CenterPane(2)
+        );
+        assert_eq!(
+            route(Zone::Center, Move::Down, &ctx(&stacked, 2, true, true)),
+            FocusMove::Enter(Zone::Statusbar)
+        );
+        assert_eq!(
+            route(Zone::Center, Move::Up, &ctx(&stacked, 1, true, true)),
+            FocusMove::Enter(Zone::Masthead)
+        );
+    }
+
+    #[test]
+    fn bars_return_to_center_and_dead_end_outward() {
+        let l = two_panes();
+        let c = ctx(&l, 1, true, true);
+        assert_eq!(
+            route(Zone::Masthead, Move::Down, &c),
+            FocusMove::Enter(Zone::Center)
+        );
+        assert_eq!(route(Zone::Masthead, Move::Up, &c), FocusMove::None);
+        assert_eq!(route(Zone::Masthead, Move::Left, &c), FocusMove::None);
+        assert_eq!(
+            route(Zone::Statusbar, Move::Up, &c),
+            FocusMove::Enter(Zone::Center)
+        );
+        assert_eq!(route(Zone::Statusbar, Move::Down, &c), FocusMove::None);
     }
 
     #[test]
@@ -206,11 +287,15 @@ mod tests {
     #[test]
     fn focus_state_helpers() {
         let mut f = FocusState::default();
-        assert!(f.center() && !f.sidebar() && !f.panel());
+        assert!(f.center() && !f.sidebar() && !f.panel() && !f.bar());
         f.zone = Zone::Sidebar;
         assert!(f.sidebar());
         f.zone = Zone::Panel;
         assert!(f.panel());
+        f.zone = Zone::Masthead;
+        assert!(f.masthead() && f.bar());
+        f.zone = Zone::Statusbar;
+        assert!(f.statusbar() && f.bar());
     }
 
     #[test]
@@ -218,8 +303,16 @@ mod tests {
         assert!(forwards_to_pane(Zone::Center, false));
         assert!(!forwards_to_pane(Zone::Sidebar, false));
         assert!(!forwards_to_pane(Zone::Panel, false));
+        assert!(!forwards_to_pane(Zone::Masthead, false));
+        assert!(!forwards_to_pane(Zone::Statusbar, false));
         // An open drawer steals input from every zone.
-        for z in [Zone::Center, Zone::Sidebar, Zone::Panel] {
+        for z in [
+            Zone::Center,
+            Zone::Sidebar,
+            Zone::Panel,
+            Zone::Masthead,
+            Zone::Statusbar,
+        ] {
             assert!(forwards_to_pane(z, true));
         }
     }

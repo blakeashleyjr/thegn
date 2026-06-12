@@ -23,6 +23,51 @@ pub const PANEL_COLS: usize = 44; // ~27% at 160 cols
 /// center. (Each pin also keeps a 1-row label header.)
 pub const STRIP_MIN_ROWS: usize = 3;
 
+/// The right panel's width state, cycled by `e` while the panel is focused.
+/// `Normal` is the resting reading width; `Half` claims half the window; `Full`
+/// fills the whole band (sidebar + center suppressed), bounded only by the top
+/// masthead and bottom statusbar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PanelWidth {
+    #[default]
+    Normal,
+    Half,
+    Full,
+}
+
+impl PanelWidth {
+    /// Advance Normal → Half → Full → Normal.
+    pub fn cycle(self) -> Self {
+        match self {
+            PanelWidth::Normal => PanelWidth::Half,
+            PanelWidth::Half => PanelWidth::Full,
+            PanelWidth::Full => PanelWidth::Normal,
+        }
+    }
+
+    /// Whether the panel is widened past its resting size (drives deep content).
+    pub fn is_expanded(self) -> bool {
+        !matches!(self, PanelWidth::Normal)
+    }
+
+    /// Stable key for persistence.
+    pub fn as_key(self) -> &'static str {
+        match self {
+            PanelWidth::Normal => "normal",
+            PanelWidth::Half => "half",
+            PanelWidth::Full => "full",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Self {
+        match s {
+            "half" => PanelWidth::Half,
+            "full" => PanelWidth::Full,
+            _ => PanelWidth::Normal,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChromeLayout {
     /// The single-row bar above everything: text brand left, stats right.
@@ -76,7 +121,7 @@ pub fn compute(cols: usize, rows: usize, want_sidebar: bool, want_panel: bool) -
         want_sidebar,
         want_panel,
         false,
-        false,
+        PanelWidth::Normal,
         SIDEBAR_COLS,
         false,
         0.0,
@@ -98,7 +143,7 @@ pub fn compute_with_width(
         want_sidebar,
         want_panel,
         false,
-        false,
+        PanelWidth::Normal,
         sidebar_cols,
         false,
         0.0,
@@ -124,7 +169,7 @@ pub fn compute_with_strip(
         want_sidebar,
         want_panel,
         false,
-        false,
+        PanelWidth::Normal,
         SIDEBAR_COLS,
         want_strip,
         strip_ratio,
@@ -137,8 +182,8 @@ pub fn compute_with_strip(
 /// `panel_forced` (an explicit user un-hide on a small screen) overrides the
 /// panel's threshold so it keeps its readable width, up to nearly the full
 /// screen (the clamp below always leaves the center ≥ 1 column).
-/// `panel_expanded` (a drilled-in diff / file preview) widens the panel to a
-/// reading width of ~2/3 of the window while the view is open.
+/// `panel_width` (cycled by the accordion's `e` key) widens the panel: `Half`
+/// claims half the window, `Full` fills the whole band (sidebar suppressed).
 #[allow(clippy::too_many_arguments)]
 pub fn compute_full(
     cols: usize,
@@ -146,12 +191,13 @@ pub fn compute_full(
     want_sidebar: bool,
     want_panel: bool,
     panel_forced: bool,
-    panel_expanded: bool,
+    panel_width: PanelWidth,
     sidebar_cols: usize,
     want_strip: bool,
     strip_ratio: f32,
 ) -> ChromeLayout {
-    let show_sidebar = want_sidebar && cols >= SIDEBAR_MIN_COLS;
+    // A full-width panel claims the whole band — the sidebar steps aside.
+    let show_sidebar = want_sidebar && cols >= SIDEBAR_MIN_COLS && panel_width != PanelWidth::Full;
     let show_panel = want_panel && (cols >= PANEL_MIN_COLS || panel_forced);
 
     let masthead = Rect {
@@ -191,13 +237,14 @@ pub fn compute_full(
         0
     };
     let mut right = if show_panel {
-        if panel_expanded {
-            // A drilled-in document view earns a reading width: ~2/3 of the
-            // window (never less than the resting width); the clamp below
-            // still trades it back if the screen can't afford it.
-            (cols * 2 / 3).max(PANEL_COLS)
-        } else {
-            PANEL_COLS
+        match panel_width {
+            // Resting reading width.
+            PanelWidth::Normal => PANEL_COLS,
+            // Half the window (never below the resting width on a small screen).
+            PanelWidth::Half => (cols / 2).max(PANEL_COLS),
+            // The whole band: ask for everything and let the clamp below trade
+            // it back to leave the center its mandatory single column.
+            PanelWidth::Full => cols.saturating_sub(2),
         }
     } else {
         0
@@ -350,15 +397,61 @@ mod tests {
     }
 
     #[test]
-    fn expanded_panel_takes_a_reading_width_and_retracts() {
-        let resting = compute_full(160, 40, true, true, false, false, SIDEBAR_COLS, false, 0.0);
-        let expanded = compute_full(160, 40, true, true, false, true, SIDEBAR_COLS, false, 0.0);
+    fn panel_width_cycle_normal_half_full() {
+        let resting = compute_full(
+            160,
+            40,
+            true,
+            true,
+            false,
+            PanelWidth::Normal,
+            SIDEBAR_COLS,
+            false,
+            0.0,
+        );
+        let half = compute_full(
+            160,
+            40,
+            true,
+            true,
+            false,
+            PanelWidth::Half,
+            SIDEBAR_COLS,
+            false,
+            0.0,
+        );
+        let full = compute_full(
+            160,
+            40,
+            true,
+            true,
+            false,
+            PanelWidth::Full,
+            SIDEBAR_COLS,
+            false,
+            0.0,
+        );
         assert_eq!(resting.panel.unwrap().cols, PANEL_COLS);
-        // ~2/3 of the window while a document view is open.
-        assert_eq!(expanded.panel.unwrap().cols, 160 * 2 / 3);
-        assert!(expanded.center.cols >= 1);
+        // Half claims ~half the window (≥ resting), center stays alive.
+        assert!(half.panel.unwrap().cols >= 160 / 2);
+        assert!(half.center.cols >= 1);
+        // Full fills the band: the sidebar steps aside and the panel takes
+        // nearly everything, leaving the center its mandatory single column.
+        assert!(full.sidebar.is_none(), "full-width panel hides the sidebar");
+        assert!(full.panel.unwrap().cols >= 160 - 4);
+        assert!(full.center.cols >= 1);
         // On a small forced screen the clamp still leaves a live center.
-        let tiny = compute_full(60, 20, false, true, true, true, SIDEBAR_COLS, false, 0.0);
+        let tiny = compute_full(
+            60,
+            20,
+            false,
+            true,
+            true,
+            PanelWidth::Half,
+            SIDEBAR_COLS,
+            false,
+            0.0,
+        );
         assert!(tiny.panel.unwrap().cols >= PANEL_COLS);
         assert!(tiny.center.cols >= 1);
     }

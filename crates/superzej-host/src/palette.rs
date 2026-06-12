@@ -7,13 +7,12 @@
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
-use termwiz::cell::{AttributeChange, Intensity};
-use termwiz::color::ColorAttribute;
-use termwiz::surface::{Change, Position, Surface};
+use termwiz::surface::Surface;
 
-use crate::chrome::theme_color;
+use crate::chrome::S;
 use crate::compositor::Rect;
-use superzej_core::theme;
+use crate::layer::{Anchor, LayerSpec, open_layer};
+use crate::seg::{self, Line, Tok, seg, sp};
 
 /// A selectable palette row. `key` is the stable dispatch/frecency key; `label`
 /// is what the user sees and what fuzzy matching runs against.
@@ -68,7 +67,6 @@ pub struct Palette {
     selected: usize,
     /// Indices into `items`, best match first (or original order when empty).
     matches: Vec<usize>,
-    accent: String,
 }
 
 impl Palette {
@@ -79,7 +77,6 @@ impl Palette {
             query: String::new(),
             selected: 0,
             matches: Vec::new(),
-            accent: theme::TEAL.to_string(),
         };
         p.recompute();
         p
@@ -158,86 +155,93 @@ impl Palette {
         }
     }
 
-    /// Draw the palette as a centered box within `screen`.
+    /// Draw the palette as the boxed "jump" layer (dim backdrop + shadow,
+    /// upper-third anchor). The badge reads " menu " — the honest name for
+    /// the Ctrl+Space binding (the mockup's ⌘K chip).
     pub fn render(&self, surface: &mut Surface, screen: Rect) {
-        let box_cols = (screen.cols * 6 / 10).clamp(20, 100).min(screen.cols);
-        let max_rows = 12usize;
-        let box_rows = (self.matches.len() + 2).clamp(3, max_rows).min(screen.rows);
-        let x = screen.x + (screen.cols.saturating_sub(box_cols)) / 2;
-        let y = screen.y + (screen.rows.saturating_sub(box_rows)) / 3;
-        let rect = Rect {
-            x,
-            y,
-            cols: box_cols,
-            rows: box_rows,
+        const COLS: usize = 66;
+        const MAX_ITEMS: usize = 10;
+        let shown = self.matches.len().min(MAX_ITEMS);
+        let spec = LayerSpec {
+            title: "jump".into(),
+            badge: Some(" menu ".into()),
+            cols: COLS,
+            rows: shown + 4, // prompt + rule + items + rule + footer
+            anchor: Anchor::TopThird,
+            ..LayerSpec::default()
+        };
+        let Some(inner) = open_layer(surface, screen, &spec) else {
+            return;
+        };
+        let panel = Tok::Slot(S::Panel);
+        let rule = Line::Fill {
+            ch: '╌',
+            fg: Tok::Slot(S::Ghost3),
         };
 
-        let bg = theme_color(theme::PANEL);
-        crate::chrome::fill(surface, rect, bg);
+        // Prompt row: accent chevron, live query (ghost placeholder when empty).
+        let mut prompt = vec![seg(Tok::Slot(S::Accent), "❯ ").bold()];
+        if self.query.is_empty() {
+            prompt.push(seg(Tok::Slot(S::Ghost3), "type to filter…"));
+        } else {
+            prompt.push(seg(Tok::Slot(S::Text), self.query.clone()));
+        }
+        seg::draw_line(
+            surface,
+            inner.x,
+            inner.y,
+            inner.cols,
+            &Line::segs(prompt),
+            panel,
+        );
+        if inner.rows < 2 {
+            return;
+        }
+        seg::draw_line(surface, inner.x, inner.y + 1, inner.cols, &rule, panel);
 
-        // Query line.
-        surface.add_change(Change::CursorPosition {
-            x: Position::Absolute(x + 1),
-            y: Position::Absolute(y),
-        });
-        surface.add_change(Change::Attribute(AttributeChange::Foreground(theme_color(
-            &self.accent,
-        ))));
-        surface.add_change(Change::Attribute(AttributeChange::Background(bg)));
-        surface.add_change(Change::Attribute(AttributeChange::Intensity(
-            Intensity::Bold,
-        )));
-        let prompt = format!("› {}", self.query);
-        let clipped: String = prompt.chars().take(box_cols.saturating_sub(2)).collect();
-        surface.add_change(Change::Text(clipped));
-
-        // Result rows.
-        let rows_avail = box_rows.saturating_sub(2);
+        // Item rows; the selected row carries the accent selection tint.
+        let rows_avail = inner.rows.saturating_sub(4);
         for (row, &item_idx) in self.matches.iter().take(rows_avail).enumerate() {
             let Some(item) = self.items.get(item_idx) else {
                 continue;
             };
-            let ry = y + 2 + row;
-            let (fg, rbg) = if row == self.selected {
-                (theme_color(theme::TEXT), theme_color(theme::PANEL2))
+            let selected = row == self.selected;
+            let pad = if selected { Tok::SelAccent } else { panel };
+            let name = if selected {
+                seg(Tok::Slot(S::Text), item.label.clone()).bold()
             } else {
-                (theme_color(theme::DIM), bg)
+                seg(Tok::Slot(S::Dim), item.label.clone())
             };
-            if row == self.selected {
-                crate::chrome::fill(
-                    surface,
-                    Rect {
-                        x,
-                        y: ry,
-                        cols: box_cols,
-                        rows: 1,
-                    },
-                    rbg,
-                );
-            }
-            surface.add_change(Change::CursorPosition {
-                x: Position::Absolute(x + 2),
-                y: Position::Absolute(ry),
-            });
-            surface.add_change(Change::Attribute(AttributeChange::Foreground(fg)));
-            surface.add_change(Change::Attribute(AttributeChange::Background(rbg)));
-            surface.add_change(Change::Attribute(AttributeChange::Intensity(
-                Intensity::Normal,
-            )));
-            let label: String = item
-                .label
-                .chars()
-                .take(box_cols.saturating_sub(3))
-                .collect();
-            surface.add_change(Change::Text(label));
+            seg::draw_line(
+                surface,
+                inner.x,
+                inner.y + 2 + row,
+                inner.cols,
+                &Line::segs(vec![sp(1), name]),
+                pad,
+            );
         }
-        // Reset attrs so subsequent draws aren't tinted.
-        surface.add_change(Change::Attribute(AttributeChange::Foreground(
-            ColorAttribute::Default,
-        )));
-        surface.add_change(Change::Attribute(AttributeChange::Background(
-            ColorAttribute::Default,
-        )));
+
+        // Footer: navigation hints + the live match count.
+        if inner.rows >= 4 {
+            let fy = inner.y + inner.rows - 2;
+            seg::draw_line(surface, inner.x, fy, inner.cols, &rule, panel);
+            let footer = Line::split(
+                vec![
+                    seg(Tok::Slot(S::Ghost2), "↑↓"),
+                    seg(Tok::Slot(S::Ghost), " move   "),
+                    seg(Tok::Slot(S::Ghost2), "↵"),
+                    seg(Tok::Slot(S::Ghost), " run   "),
+                    seg(Tok::Slot(S::Ghost2), "esc"),
+                    seg(Tok::Slot(S::Ghost), " dismiss"),
+                ],
+                vec![seg(
+                    Tok::Slot(S::Ghost3),
+                    format!("{} matches", self.matches.len()),
+                )],
+            );
+            seg::draw_line(surface, inner.x, fy + 1, inner.cols, &footer, panel);
+        }
     }
 }
 
@@ -484,7 +488,6 @@ mod tests {
             "focus-left",
             "focus-right",
             "toggle-key-lock",
-            "cheatsheet",
         ] {
             assert!(
                 keys.contains(key),
@@ -548,7 +551,10 @@ mod tests {
             },
         );
         let text = s.screen_chars_to_string();
-        assert!(text.contains("› work"), "query prompt drawn");
+        assert!(text.contains("❯ work"), "query prompt drawn: {text:?}");
         assert!(text.contains("New work"), "a matching label drawn");
+        assert!(text.contains("jump"), "layer title drawn");
+        assert!(text.contains("menu"), "badge drawn");
+        assert!(text.contains("matches"), "footer count drawn");
     }
 }

@@ -72,8 +72,6 @@ pub enum Action {
     ScrollUp,
     ScrollDown,
     CopyPane,
-    /// Toggle the full keybinding cheatsheet overlay.
-    Cheatsheet,
     /// Toggle the Ctrl+g keybind lock: while locked every key except Ctrl+g
     /// passes through to the focused pane (compositor chords are suspended).
     ToggleKeyLock,
@@ -344,13 +342,6 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         palette: true,
     },
     ActionSpec {
-        id: "cheatsheet",
-        label: "Show keybinding cheatsheet",
-        hint: "keys",
-        default_chords: &["Alt ?"],
-        palette: true,
-    },
-    ActionSpec {
         id: "toggle-key-lock",
         label: "Lock/unlock keybinds (pass through)",
         hint: "lock",
@@ -489,7 +480,6 @@ impl Action {
             Action::ScrollUp => "scroll-up",
             Action::ScrollDown => "scroll-down",
             Action::CopyPane => "copy-pane",
-            Action::Cheatsheet => "cheatsheet",
             Action::ToggleKeyLock => "toggle-key-lock",
             Action::SwitchMode(Mode::Normal) => "mode-normal",
             Action::SwitchMode(Mode::VimNormal) => "mode-vim-normal",
@@ -541,7 +531,6 @@ impl Action {
             "scroll-up" => Action::ScrollUp,
             "scroll-down" => Action::ScrollDown,
             "copy-pane" => Action::CopyPane,
-            "cheatsheet" | "keys" | "help" => Action::Cheatsheet,
             "toggle-key-lock" | "key-lock" | "lock" => Action::ToggleKeyLock,
             "quit" => Action::Quit,
             "mode-normal" => Action::SwitchMode(Mode::Normal),
@@ -759,8 +748,6 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Alt s", Action::FocusSidebar).unwrap();
     map.insert_all("Alt .", Action::FocusPanel).unwrap();
     map.insert_all("Ctrl Alt c", Action::CopyPane).unwrap();
-    // Full keybinding cheatsheet. `Alt ?` avoids stealing `?` from panes.
-    map.insert_all("Alt ?", Action::Cheatsheet).unwrap();
     map.insert_all("Ctrl Alt n", Action::SwitchMode(Mode::Normal))
         .unwrap();
     map.insert_all("Ctrl Alt v", Action::SwitchMode(Mode::VimNormal))
