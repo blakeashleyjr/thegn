@@ -39,6 +39,8 @@ pub enum Action {
     ToggleZoom,
     /// Cycle through the named theme presets (storm → light → abyss → …).
     CycleTheme,
+    /// Pick a font family from fontconfig and patch the live alacritty profile.
+    SwitchFont,
     /// Close the active tab within the worktree (closing the last tab closes
     /// the whole worktree group).
     CloseTab,
@@ -167,17 +169,24 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         palette: true,
     },
     ActionSpec {
+        id: "switch-font",
+        label: "Switch font",
+        hint: "font",
+        default_chords: &["Alt f", "Alt F"],
+        palette: true,
+    },
+    ActionSpec {
         id: "close-tab",
         label: "Close tab",
         hint: "close tab",
-        default_chords: &["Alt X"],
+        default_chords: &["Alt x"],
         palette: true,
     },
     ActionSpec {
         id: "close-worktree",
         label: "Close worktree",
         hint: "close worktree",
-        default_chords: &["Alt x"],
+        default_chords: &["Alt X"],
         palette: true,
     },
     ActionSpec {
@@ -453,6 +462,7 @@ impl Action {
             Action::NewPane => "new-pane",
             Action::ToggleZoom => "zoom",
             Action::CycleTheme => "cycle-theme",
+            Action::SwitchFont => "switch-font",
             Action::CloseTab => "close-tab",
             Action::CloseWorktree => "close-worktree",
             Action::SwitchWorkspace => "switch-workspace",
@@ -504,6 +514,7 @@ impl Action {
             "new-pane" => Action::NewPane,
             "zoom" | "toggle-zoom" | "fullscreen" => Action::ToggleZoom,
             "cycle-theme" | "theme" => Action::CycleTheme,
+            "switch-font" | "font" => Action::SwitchFont,
             "close-tab" => Action::CloseTab,
             "close-worktree" => Action::CloseWorktree,
             "switch-workspace" | "switch-repo" => Action::SwitchWorkspace,
@@ -761,8 +772,10 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Alt p", Action::NewPane).unwrap();
     map.insert_all("Ctrl Alt z", Action::ToggleZoom).unwrap();
     map.insert_all("Ctrl Alt t", Action::CycleTheme).unwrap();
-    map.insert_all("Alt x", Action::CloseWorktree).unwrap();
-    map.insert_all("Alt X", Action::CloseTab).unwrap();
+    map.insert_all("Alt f", Action::SwitchFont).unwrap();
+    map.insert_all("Alt F", Action::SwitchFont).unwrap();
+    map.insert_all("Alt x", Action::CloseTab).unwrap();
+    map.insert_all("Alt X", Action::CloseWorktree).unwrap();
     map.insert_all("Alt o", Action::SwitchWorkspace).unwrap();
     map.insert_all("Alt d", Action::Dashboard).unwrap();
     map.insert_all("Alt n", Action::SplitDown).unwrap();
@@ -840,7 +853,9 @@ pub fn default_keymap() -> KeyMap {
         .unwrap();
     map.insert(Mode::VimNormal, "Space t", Action::NewTab)
         .unwrap();
-    map.insert(Mode::VimNormal, "Space x", Action::CloseWorktree)
+    map.insert(Mode::VimNormal, "Space x", Action::CloseTab)
+        .unwrap();
+    map.insert(Mode::VimNormal, "Space X", Action::CloseWorktree)
         .unwrap();
     map.insert(Mode::VimNormal, "Space q", Action::Quit)
         .unwrap();
@@ -1155,6 +1170,30 @@ mod tests {
         assert_eq!(Action::NewWorktree.key(), "new-worktree");
         assert_eq!(Action::Quit.key(), "quit");
         assert_eq!(Action::ToggleDrawer.key(), "files-drawer");
+        assert_eq!(Action::SwitchFont.key(), "switch-font");
+    }
+
+    #[test]
+    fn switch_font_is_registered_and_bound() {
+        assert_eq!(Action::from_key("switch-font"), Some(Action::SwitchFont));
+        assert_eq!(Action::from_key("font"), Some(Action::SwitchFont));
+        assert_eq!(
+            action_spec("switch-font").unwrap().default_chords,
+            &["Alt f", "Alt F"]
+        );
+        assert_eq!(k('f', Modifiers::ALT), Some(Action::SwitchFont));
+        assert_eq!(k('F', Modifiers::ALT), Some(Action::SwitchFont));
+    }
+
+    #[test]
+    fn close_tab_is_lowercase_alt_x_and_close_worktree_is_shift_alt_x() {
+        assert_eq!(action_spec("close-tab").unwrap().default_chords, &["Alt x"]);
+        assert_eq!(
+            action_spec("close-worktree").unwrap().default_chords,
+            &["Alt X"]
+        );
+        assert_eq!(k('x', Modifiers::ALT), Some(Action::CloseTab));
+        assert_eq!(k('X', Modifiers::ALT), Some(Action::CloseWorktree));
     }
 
     #[test]

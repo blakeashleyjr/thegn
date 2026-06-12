@@ -18,7 +18,11 @@
 pub mod budget;
 pub mod docs;
 pub mod frame;
+pub mod gitfull;
+pub mod gitui;
+pub mod graph;
 pub mod sections;
+pub mod staging;
 
 use termwiz::input::{KeyCode, Modifiers};
 
@@ -39,6 +43,9 @@ pub enum PanelHit {
 pub enum Section {
     #[default]
     Changes,
+    Commits,
+    Branches,
+    Stash,
     Git,
     Files,
     Tests,
@@ -52,8 +59,11 @@ pub enum Section {
 /// The accordion's built-in display order — the default when `[panel]
 /// sections` is unset. The live order (config-reordered, possibly trimmed)
 /// rides on [`PanelUi::order`]; the numbered jump keys index THAT.
-pub const SECTION_ORDER: [Section; 9] = [
+pub const SECTION_ORDER: [Section; 12] = [
     Section::Changes,
+    Section::Commits,
+    Section::Branches,
+    Section::Stash,
     Section::Git,
     Section::Files,
     Section::Tests,
@@ -69,6 +79,9 @@ impl Section {
     pub fn label(self) -> &'static str {
         match self {
             Section::Changes => "changes",
+            Section::Commits => "commits",
+            Section::Branches => "branches",
+            Section::Stash => "stash",
             Section::Git => "git",
             Section::Files => "files",
             Section::Tests => "tests",
@@ -77,6 +90,26 @@ impl Section {
             Section::Db => "db",
             Section::Telemetry => "telemetry",
             Section::Keys => "keys",
+        }
+    }
+
+    /// The lazygit-family sections that share [`gitui::GitUi`] state and the
+    /// Full-width git frame.
+    pub fn is_git_family(self) -> bool {
+        matches!(
+            self,
+            Section::Changes | Section::Commits | Section::Branches | Section::Stash | Section::Git
+        )
+    }
+
+    /// The git context a git-family section's list maps to.
+    pub fn home_view(self) -> Option<gitui::GitView> {
+        match self {
+            Section::Changes => Some(gitui::GitView::Files),
+            Section::Commits => Some(gitui::GitView::Commits),
+            Section::Branches => Some(gitui::GitView::Branches),
+            Section::Stash => Some(gitui::GitView::Stash),
+            _ => None,
         }
     }
 
@@ -209,6 +242,52 @@ pub struct PrSummary {
     pub review_decision: Option<String>,
 }
 
+/// A branch row's PR badge, joined from the per-repo `pr_branch_cache`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrBadge {
+    pub number: u64,
+    pub state: String,
+    pub is_draft: bool,
+    pub url: String,
+}
+
+/// One row of the branches section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchRow {
+    pub name: String,
+    pub is_head: bool,
+    pub upstream: Option<String>,
+    pub ahead: usize,
+    pub behind: usize,
+    pub upstream_gone: bool,
+    pub sha: String,
+    pub date: i64,
+    pub subject: String,
+    pub pr: Option<PrBadge>,
+}
+
+/// One row of the commits section (structured, parents included for the
+/// graph).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitRow {
+    pub sha: String,
+    pub short: String,
+    pub subject: String,
+    pub author: String,
+    pub date: i64,
+    pub refs: String,
+    pub parents: Vec<String>,
+}
+
+/// One row of the stash section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StashRow {
+    pub index: usize,
+    pub sha: String,
+    pub date: i64,
+    pub message: String,
+}
+
 /// The panel's data payload (git + GitHub), rebuilt on background refresh.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PanelData {
@@ -238,6 +317,12 @@ pub struct PanelData {
     pub tests: Option<TestsLite>,
     /// Total tracked-file count for the files summary ("214 · 29.5k loc").
     pub file_count: Option<u64>,
+    /// Local branches with upstream/divergence + PR badges (branches section).
+    pub branches: Vec<BranchRow>,
+    /// Structured recent commits (commits section + graph feed).
+    pub commits: Vec<CommitRow>,
+    /// Stash entries (stash section).
+    pub stashes: Vec<StashRow>,
 }
 
 /// One row of the Files tab's accordion tree, in display order.
@@ -326,6 +411,8 @@ pub struct PanelUi {
     pub diff_hunk: usize,
     /// Loop-fetched documents the section bodies render from.
     pub docs: docs::PanelDocs,
+    /// The git-family interaction state (lazygit contexts, marks, flows).
+    pub git: gitui::GitUi,
 }
 
 impl Default for PanelUi {
@@ -343,6 +430,7 @@ impl Default for PanelUi {
             scroll: 0,
             diff_hunk: 0,
             docs: docs::PanelDocs::default(),
+            git: gitui::GitUi::default(),
         }
     }
 }
@@ -508,10 +596,11 @@ pub enum PanelMsg {
 /// *action* keys (run tests, merge PR, …) are resolved by the event loop on
 /// top of this.
 ///
-/// Navigation is single-layered: a focused panel always walks the open
-/// section's items — plain Down/j (Up/k) step item-by-item, while
-/// Shift+Down/j (Shift+Up/k) hop to the next/previous section. Enter activates
-/// the highlighted row; Esc leaves.
+/// Navigation is single-layered. Plain Down/j (Up/k) walk the panel as one
+/// flat list: step through the open section's items, then flow into the
+/// adjacent accordion (every accordion is visited — one with no items is just
+/// passed through). Shift+Down/j (Shift+Up/k) skip straight to the next/
+/// previous accordion header. Enter activates the highlighted row; Esc leaves.
 pub fn accordion_key(key: &KeyCode, mods: Modifiers, ui: &PanelUi) -> Option<PanelMsg> {
     let shift = mods.contains(Modifiers::SHIFT);
     // Always-available jumps (the view cycle, numbered section jumps) read
@@ -545,9 +634,9 @@ mod tests {
 
     #[test]
     fn section_order_jump_and_cycle() {
-        assert_eq!(SECTION_ORDER.len(), 9);
+        assert_eq!(SECTION_ORDER.len(), 12);
         let ui = PanelUi::default(); // open = Changes, built-in order
-        assert_eq!(ui.next_section(), Section::Git);
+        assert_eq!(ui.next_section(), Section::Commits);
         assert_eq!(ui.prev_section(), Section::Keys); // wraps
         let keys = PanelUi {
             open: Section::Keys,
@@ -751,15 +840,15 @@ mod tests {
         // Digits jump (indexing the LIVE order) and `e` cycles the view.
         assert_eq!(
             accordion_key(&KeyCode::Char('3'), none, &ui),
-            Some(PanelMsg::Open(Section::Files))
+            Some(PanelMsg::Open(Section::Branches))
         );
         assert_eq!(
             accordion_key(&KeyCode::Char('8'), none, &ui),
-            Some(PanelMsg::Open(Section::Telemetry))
+            Some(PanelMsg::Open(Section::Debug))
         );
         assert_eq!(
             accordion_key(&KeyCode::Char('9'), none, &ui),
-            Some(PanelMsg::Open(Section::Keys))
+            Some(PanelMsg::Open(Section::Sandbox))
         );
         // A digit past the visible count is not an accordion intent.
         let trimmed = PanelUi {

@@ -36,7 +36,7 @@ fn hue(h: Hue) -> Tok {
 /// The header zone: branch + divergence, the merge banner when one is in
 /// progress (chip, conflicts, resolved bar), a dirty summary otherwise,
 /// then the rule. Row count varies (2..=5); the budget gets the real number.
-fn header_rows(model: &FrameModel, focused: bool) -> Vec<PanelRow> {
+pub(super) fn header_rows(model: &FrameModel, focused: bool) -> Vec<PanelRow> {
     let data = &model.panel;
     let mut rows: Vec<PanelRow> = Vec::new();
 
@@ -131,6 +131,59 @@ fn header_rows(model: &FrameModel, focused: bool) -> Vec<PanelRow> {
     rows
 }
 
+/// Compact header chips for the active git flows (bisect / diff-mode /
+/// patch) and the in-flight mutation spinner, so a modal flow stays visible
+/// at Normal/Half width too (the Full git frame renders its own richer
+/// status). No timers: the spinner advances on the docs tick the stats
+/// sampler already drives.
+fn flow_chips(ui: &PanelUi) -> Vec<Seg> {
+    use crate::panel::gitui::GitFlow;
+    let short = |s: &str| s.chars().take(7).collect::<String>();
+    let mut chips: Vec<Seg> = Vec::new();
+    if let Some(p) = &ui.git.pending {
+        chips.push(seg(
+            Tok::Slot(S::Accent),
+            format!("{} {} ", viz::spin(ui.docs.tick), p.label),
+        ));
+    }
+    match &ui.git.flow {
+        GitFlow::Bisect(b) => {
+            let label = match &b.culprit {
+                Some(c) => format!(" BISECT {} ", short(c)),
+                None => " BISECT ".to_string(),
+            };
+            chips.push(Seg::chip(hue(Hue::Purple), label));
+            chips.push(sp(1));
+        }
+        GitFlow::Diffing(m) => {
+            chips.push(Seg::chip(hue(Hue::Blue), format!(" DIFF vs {} ", short(m))));
+            chips.push(sp(1));
+        }
+        GitFlow::Patch(p) => {
+            chips.push(Seg::chip(hue(Hue::Teal), format!(" PATCH {} ", p.marked())));
+            chips.push(sp(1));
+        }
+        GitFlow::Rebase(_) | GitFlow::None => {}
+    }
+    chips
+}
+
+/// Prepend the flow chips to the header's branch row (its right side).
+fn with_flow_chips(mut header: Vec<PanelRow>, ui: &PanelUi) -> Vec<PanelRow> {
+    let chips = flow_chips(ui);
+    if chips.is_empty() {
+        return header;
+    }
+    if let Some(first) = header.first_mut()
+        && let Line::Split { r, .. } = &mut first.line
+    {
+        let mut new_r = chips;
+        new_r.append(r);
+        *r = new_r;
+    }
+    header
+}
+
 /// Indent a content line by 4 cells (the mockup's section-content inset).
 fn indent(line: Line) -> Line {
     const PAD: usize = 4;
@@ -179,9 +232,12 @@ pub fn build_panel(
     focused: bool,
 ) -> PanelFrame {
     if ui.width == crate::layout::PanelWidth::Full {
+        if ui.open.is_git_family() {
+            return super::gitfull::build_git_full(model, ui, cols, rows, focused);
+        }
         return build_full(model, ui, cols, rows, focused);
     }
-    let header = header_rows(model, focused);
+    let header = with_flow_chips(header_rows(model, focused), ui);
     let ctx = section_ctx(model, ui, cols, rows, header.len());
     let content_raw = sections::content(ui.open, &ctx);
     let plan = budget::allocate(rows, header.len(), content_raw.len(), ui.order.len());
@@ -331,7 +387,7 @@ fn build_full(
     rows: usize,
     focused: bool,
 ) -> PanelFrame {
-    let header = header_rows(model, focused);
+    let header = with_flow_chips(header_rows(model, focused), ui);
     let (rail, mut spans) = rail_rows_and_spans(ui, cols);
     let plan = budget::allocate_full(rows, header.len(), rail.len());
 
@@ -493,7 +549,7 @@ mod tests {
             hits.iter()
                 .filter(|h| matches!(h, PanelHit::OpenSection(_)))
                 .count()
-                == 9
+                == crate::panel::SECTION_ORDER.len()
         );
         assert!(frame.rows.len() <= 50);
     }

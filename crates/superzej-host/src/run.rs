@@ -23,14 +23,17 @@ use termwiz::terminal::{Terminal, TerminalWaker, new_terminal};
 
 use crate::chrome::{FrameModel, render_tab};
 use crate::compositor::Rect;
+use crate::gitmut::{GitOp, GitOpResult};
 use crate::hydrate::{
     RefreshKind, active_tab_path, build_initial_model, load_or_seed_session, retarget_diff_watcher,
     spawn_model_hydration, spawn_pr_cache_refresh, spawn_refresh_ticker, workspace_list,
 };
 use crate::input::key_bytes;
 use crate::layout;
+use crate::menu::{self, MenuChoice, MenuOverlay};
 use crate::palette::{build_agent_palette, build_palette, build_sandbox_palette};
 use crate::pane::PaneEvent;
+use crate::panel::gitui::{self, GitFlow, GitMsg, GitView, StagePane};
 use crate::panes::{
     Panes, prewarm_requests, relayout, relayout_strip, replace_single_dead_center_pane,
     tool_drawer_argv,
@@ -1270,37 +1273,26 @@ fn panel_geom(chrome: &layout::ChromeLayout) -> (usize, usize) {
         .unwrap_or((layout::PANEL_COLS, 40))
 }
 
-/// The next section after `from` (no wrap, live order) with at least one
-/// actionable row — the cursor flows into it when Down is pressed at the
-/// bottom of `from`, and empty accordions are skipped. None when nothing
-/// non-empty follows.
-fn next_nonempty_section(
+/// The accordion immediately after `from` in the live order (no wrap) — the
+/// cursor flows into it when Down is pressed at the bottom of `from`. Every
+/// accordion is visited, including those with no actionable rows (you land on
+/// the header and the next Down flows onward). None at the last accordion.
+fn next_section_in_order(
     from: crate::panel::Section,
-    model: &FrameModel,
     ui: &crate::panel::PanelUi,
-    geom: (usize, usize),
 ) -> Option<crate::panel::Section> {
     let idx = ui.order.iter().position(|&s| s == from)?;
-    ui.order[idx + 1..]
-        .iter()
-        .copied()
-        .find(|&s| crate::panel::frame::section_rows(s, model, ui, geom.0, geom.1) > 0)
+    ui.order.get(idx + 1).copied()
 }
 
-/// The previous non-empty section before `from` (no wrap, live order); the
+/// The accordion immediately before `from` in the live order (no wrap); the
 /// cursor flows into its LAST item when Up is pressed at the top of `from`.
-fn prev_nonempty_section(
+fn prev_section_in_order(
     from: crate::panel::Section,
-    model: &FrameModel,
     ui: &crate::panel::PanelUi,
-    geom: (usize, usize),
 ) -> Option<crate::panel::Section> {
     let idx = ui.order.iter().position(|&s| s == from)?;
-    ui.order[..idx]
-        .iter()
-        .rev()
-        .copied()
-        .find(|&s| crate::panel::frame::section_rows(s, model, ui, geom.0, geom.1) > 0)
+    idx.checked_sub(1).and_then(|i| ui.order.get(i).copied())
 }
 
 /// A worktree group's working directory, falling back to the process cwd.
@@ -1667,6 +1659,1689 @@ fn spawn_pr_action<F>(
             let _ = waker.wake();
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// The git mutation pipeline: every lazygit-style write flows through ONE
+// runner — `enqueue_git_op` rejects while one is in flight, runs the op on
+// `spawn_blocking`, and the result rides `gitop_tx` back with a waker pulse.
+// `handle_git_msg` turns the pure `GitMsg` intents from `gitui::git_key`
+// into ops / state changes; `dispatch_menu_choice` does the same for the
+// option/confirm menus. Both are plain functions so the event-loop match
+// stays readable.
+// ---------------------------------------------------------------------------
+
+/// Which flow a SUCCESSFUL op closes (computed at dispatch — results only
+/// carry the op's label).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlowEnd {
+    None,
+    Rebase,
+    Bisect,
+    Patch,
+}
+
+fn flow_end_of(op: &GitOp) -> FlowEnd {
+    match op {
+        GitOp::RebaseAbort
+        | GitOp::RebaseContinue
+        | GitOp::RebaseSkip
+        | GitOp::RebaseInteractive { .. }
+        | GitOp::RebaseBranch { .. }
+        | GitOp::RebaseOnto { .. }
+        | GitOp::Squash { .. }
+        | GitOp::Fixup { .. }
+        | GitOp::Drop { .. }
+        | GitOp::MoveCommit { .. }
+        | GitOp::AmendOldCommit { .. } => FlowEnd::Rebase,
+        GitOp::BisectReset => FlowEnd::Bisect,
+        GitOp::PatchApply { .. }
+        | GitOp::PatchRemoveFromCommit { .. }
+        | GitOp::PatchSplit { .. }
+        | GitOp::PatchToIndex { .. } => FlowEnd::Patch,
+        _ => FlowEnd::None,
+    }
+}
+
+/// One finished mutation, tagged with everything the intake needs.
+struct GitOpDone {
+    generation: u64,
+    label: &'static str,
+    touches_remote: bool,
+    flow_end: FlowEnd,
+    clear_clipboard: bool,
+    result: GitOpResult,
+}
+
+/// Run `op` off the loop (one at a time — a request while busy is rejected
+/// with a status note, lazygit-style; queueing compound git ops invites
+/// disaster). The result lands on `tx` with a waker pulse.
+fn enqueue_git_op(
+    op: GitOp,
+    git: &mut gitui::GitUi,
+    status: &mut String,
+    session: &crate::session::Session,
+    override_gpg: bool,
+    tx: &tokio_mpsc::UnboundedSender<GitOpDone>,
+    waker: &TerminalWaker,
+) {
+    if let Some(p) = &git.pending {
+        *status = format!("git busy: {}", p.label);
+        return;
+    }
+    let label = op.label();
+    let touches_remote = op.touches_remote();
+    let flow_end = flow_end_of(&op);
+    let clear_clipboard = matches!(op, GitOp::CherryPick { .. });
+    git.pending = Some(gitui::PendingOp {
+        label: label.to_string(),
+    });
+    *status = format!("{label}…");
+    let generation = git.op_gen;
+    let wt = active_tab_path(session);
+    let tx = tx.clone();
+    let wk = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        let loc = superzej_core::remote::GitLoc::for_worktree(&wt);
+        let result = crate::gitmut::execute(op, &loc, override_gpg);
+        if tx
+            .send(GitOpDone {
+                generation,
+                label,
+                touches_remote,
+                flow_end,
+                clear_clipboard,
+                result,
+            })
+            .is_ok()
+        {
+            let _ = wk.wake();
+        }
+    });
+}
+
+/// A fetched git document for the line-cursor views.
+enum GitDoc {
+    Stage(gitui::StageDocState),
+    CommitFiles(Vec<(String, u32, u32)>),
+    Patch(gitui::StageDocState),
+    /// A paused rebase's live state (`None` when the pause vanished before
+    /// the read landed).
+    Rebase(Option<superzej_svc::git::RebaseStatus>),
+}
+
+/// Fetch the staging view's diff (unstaged|staged per pane) off the loop and
+/// flatten it; generation-tagged like the hunk fetches.
+fn spawn_stage_doc_fetch(
+    generation: u64,
+    session: &crate::session::Session,
+    path: String,
+    pane: StagePane,
+    tx: &tokio_mpsc::UnboundedSender<(u64, GitDoc)>,
+    waker: &TerminalWaker,
+) {
+    let wt = active_tab_path(session);
+    let tx = tx.clone();
+    let wk = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        use superzej_svc::git::GitBackend;
+        let loc = superzej_core::remote::GitLoc::for_worktree(&wt);
+        let git = superzej_svc::git::CliGit;
+        let diff = match pane {
+            StagePane::Unstaged => git.unstaged_diff(&loc, &path),
+            StagePane::Staged => git.staged_diff(&loc, &path),
+        }
+        .unwrap_or_default();
+        let doc = crate::panel::staging::build(&path, &diff);
+        let state = gitui::StageDocState {
+            path,
+            pane,
+            doc,
+            diff,
+        };
+        if tx.send((generation, GitDoc::Stage(state))).is_ok() {
+            let _ = wk.wake();
+        }
+    });
+}
+
+/// Fetch a paused rebase's live state off the loop, so the TODO editor
+/// always works on `rebase-merge/git-rebase-todo` as it actually is (never
+/// the stale pre-rebase plan, never blind to external edits).
+fn spawn_rebase_status_fetch(
+    generation: u64,
+    session: &crate::session::Session,
+    tx: &tokio_mpsc::UnboundedSender<(u64, GitDoc)>,
+    waker: &TerminalWaker,
+) {
+    let wt = active_tab_path(session);
+    let tx = tx.clone();
+    let wk = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        use superzej_svc::git::RebaseOps;
+        let loc = superzej_core::remote::GitLoc::for_worktree(&wt);
+        let status = superzej_svc::git::CliGit.rebase_status(&loc).ok().flatten();
+        if tx.send((generation, GitDoc::Rebase(status))).is_ok() {
+            let _ = wk.wake();
+        }
+    });
+}
+
+/// Fetch a drilled commit's file list (numstat) off the loop.
+fn spawn_commit_files_fetch(
+    generation: u64,
+    session: &crate::session::Session,
+    sha: String,
+    tx: &tokio_mpsc::UnboundedSender<(u64, GitDoc)>,
+    waker: &TerminalWaker,
+) {
+    let wt = active_tab_path(session);
+    let tx = tx.clone();
+    let wk = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        use superzej_core::patch::LineKind;
+        use superzej_svc::git::GitBackend;
+        let loc = superzej_core::remote::GitLoc::for_worktree(&wt);
+        let git = superzej_svc::git::CliGit;
+        // `sha^..sha` covers ordinary commits; a root commit has no parent,
+        // so fall back to counting the commit diff's own +/- lines.
+        let files: Vec<(String, u32, u32)> = match git.diff_refs(&loc, &format!("{sha}^"), &sha) {
+            Ok(v) if !v.is_empty() => v
+                .into_iter()
+                .map(|d| (d.path, d.added, d.deleted))
+                .collect(),
+            _ => git
+                .commit_diff(&loc, &sha, None)
+                .map(|d| {
+                    superzej_core::patch::parse_patch(&d)
+                        .into_iter()
+                        .map(|f| {
+                            let (a, del) = f.hunks.iter().flat_map(|h| &h.lines).fold(
+                                (0u32, 0u32),
+                                |(a, d), l| match l.kind {
+                                    LineKind::Add => (a + 1, d),
+                                    LineKind::Del => (a, d + 1),
+                                    _ => (a, d),
+                                },
+                            );
+                            (f.new_path.clone(), a, del)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        if tx.send((generation, GitDoc::CommitFiles(files))).is_ok() {
+            let _ = wk.wake();
+        }
+    });
+}
+
+/// Fetch one file of a drilled commit's diff (the patch-building doc).
+fn spawn_patch_doc_fetch(
+    generation: u64,
+    session: &crate::session::Session,
+    sha: String,
+    path: String,
+    tx: &tokio_mpsc::UnboundedSender<(u64, GitDoc)>,
+    waker: &TerminalWaker,
+) {
+    let wt = active_tab_path(session);
+    let tx = tx.clone();
+    let wk = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        use superzej_svc::git::GitBackend;
+        let loc = superzej_core::remote::GitLoc::for_worktree(&wt);
+        let diff = superzej_svc::git::CliGit
+            .commit_diff(&loc, &sha, Some(&path))
+            .unwrap_or_default();
+        let doc = crate::panel::staging::build(&path, &diff);
+        let state = gitui::StageDocState {
+            path,
+            pane: StagePane::Unstaged,
+            doc,
+            diff,
+        };
+        if tx.send((generation, GitDoc::Patch(state))).is_ok() {
+            let _ = wk.wake();
+        }
+    });
+}
+
+/// The read-only wiring `handle_git_msg` / `dispatch_menu_choice` need.
+struct GitWires<'a> {
+    session: &'a crate::session::Session,
+    cfg: &'a superzej_core::config::Config,
+    op_tx: &'a tokio_mpsc::UnboundedSender<GitOpDone>,
+    doc_tx: &'a tokio_mpsc::UnboundedSender<(u64, GitDoc)>,
+    waker: &'a TerminalWaker,
+}
+
+/// The loop-owned overlay slots the git layer drives.
+struct GitOverlays<'a> {
+    menu: &'a mut Option<MenuOverlay>,
+    input: &'a mut Option<(menu::InputOverlay, GitInputKind)>,
+    /// A destructive op awaiting its `[y]` (the menu carries tag "git-op").
+    confirm_op: &'a mut Option<GitOp>,
+    /// `cfg.git_commands` indices behind the open custom-commands menu.
+    custom_cmds: &'a mut Vec<usize>,
+}
+
+/// What a submitted git input overlay means.
+enum GitInputKind {
+    Commit,
+    Reword {
+        sha: String,
+    },
+    StashPush,
+    PatchSplit {
+        sha: String,
+        patch: String,
+    },
+    BranchCreate,
+    BranchRename {
+        old: String,
+    },
+    /// One prompt of a custom command; `remaining` are `(key, title)` pairs.
+    CustomPrompt {
+        cmd: usize,
+        key: String,
+        collected: std::collections::BTreeMap<String, String>,
+        remaining: Vec<(String, String)>,
+    },
+}
+
+/// A follow-up only the loop body can perform (it owns session/panes).
+#[must_use]
+enum GitAfter {
+    None,
+    /// Run the `Action::NewWorktree` flow.
+    NewWorktree,
+    /// Spawn this command into a fresh center tab (custom-command
+    /// `output = "terminal"`).
+    Terminal(String),
+}
+
+fn short_sha(sha: &str) -> String {
+    sha.chars().take(7).collect()
+}
+
+fn sel_change(ui: &crate::panel::PanelUi, model: &FrameModel) -> Option<crate::panel::ChangeRow> {
+    gitui::source_at(&ui.git, GitView::Files, &model.panel)
+        .and_then(|i| model.panel.changes.get(i).cloned())
+}
+
+fn sel_commit(ui: &crate::panel::PanelUi, model: &FrameModel) -> Option<crate::panel::CommitRow> {
+    gitui::source_at(&ui.git, GitView::Commits, &model.panel)
+        .and_then(|i| model.panel.commits.get(i).cloned())
+}
+
+fn sel_branch(ui: &crate::panel::PanelUi, model: &FrameModel) -> Option<crate::panel::BranchRow> {
+    gitui::source_at(&ui.git, GitView::Branches, &model.panel)
+        .and_then(|i| model.panel.branches.get(i).cloned())
+}
+
+fn sel_stash(ui: &crate::panel::PanelUi, model: &FrameModel) -> Option<crate::panel::StashRow> {
+    gitui::source_at(&ui.git, GitView::Stash, &model.panel)
+        .and_then(|i| model.panel.stashes.get(i).cloned())
+}
+
+/// The line-cursor views' active document.
+fn active_line_doc(git: &gitui::GitUi) -> Option<&gitui::StageDocState> {
+    match git.focus {
+        GitView::Staging => git.stage_doc.as_ref(),
+        GitView::PatchBuilding => git.patch_doc.as_ref(),
+        _ => None,
+    }
+}
+
+/// Stash `op` behind a yes/no confirm menu (tag "git-op").
+fn confirm_git_op(
+    ov: &mut GitOverlays<'_>,
+    title: &str,
+    body: impl Into<String>,
+    danger: bool,
+    op: GitOp,
+) {
+    *ov.confirm_op = Some(op);
+    *ov.menu = Some(menu::confirm_menu(
+        title,
+        body,
+        "git-op",
+        String::new(),
+        danger,
+    ));
+}
+
+/// The custom-commands `context` label a git view filters on.
+fn custom_context_label(view: GitView) -> &'static str {
+    match view {
+        GitView::Files | GitView::Staging => "files",
+        GitView::Branches => "branches",
+        GitView::Commits | GitView::CommitFiles | GitView::PatchBuilding | GitView::RebaseTodo => {
+            "commits"
+        }
+        GitView::Stash => "stash",
+    }
+}
+
+/// The template context for custom commands, built from the CURRENT
+/// selection (expansion happens at pick/submit time, lazygit-style).
+fn git_template_ctx(
+    panel_ui: &crate::panel::PanelUi,
+    model: &FrameModel,
+    session: &crate::session::Session,
+    prompts: std::collections::BTreeMap<String, String>,
+) -> superzej_core::custom_cmd::TemplateCtx {
+    use superzej_core::custom_cmd::{BranchVars, CommitVars, StashVars, TemplateCtx};
+    TemplateCtx {
+        selected_commit: sel_commit(panel_ui, model).map(|c| CommitVars {
+            sha: c.sha,
+            short: c.short,
+            subject: c.subject,
+            author: c.author,
+        }),
+        selected_branch: sel_branch(panel_ui, model).map(|b| BranchVars {
+            name: b.name,
+            upstream: b.upstream,
+        }),
+        checked_out_branch: Some(BranchVars {
+            name: model.panel.branch.clone(),
+            upstream: None,
+        }),
+        selected_file: sel_change(panel_ui, model).map(|c| c.path),
+        selected_stash: sel_stash(panel_ui, model).map(|s| StashVars {
+            index: s.index,
+            message: s.message,
+        }),
+        worktree_path: Some(active_tab_path(session).to_string_lossy().into_owned()),
+        prompt_responses: prompts,
+    }
+}
+
+/// Expand + run custom command `idx` with the collected prompt responses.
+fn run_custom_command(
+    idx: usize,
+    prompts: std::collections::BTreeMap<String, String>,
+    panel_ui: &mut crate::panel::PanelUi,
+    model: &mut FrameModel,
+    wires: &GitWires<'_>,
+) -> GitAfter {
+    use superzej_core::config::GitCmdOutput;
+    let Some(cmd) = wires.cfg.git_commands.get(idx) else {
+        return GitAfter::None;
+    };
+    let ctx = git_template_ctx(panel_ui, model, wires.session, prompts);
+    match superzej_core::custom_cmd::expand(&cmd.command, &ctx) {
+        Ok(line) => match cmd.output {
+            GitCmdOutput::Terminal => GitAfter::Terminal(line),
+            out => {
+                enqueue_git_op(
+                    GitOp::Custom {
+                        command: line,
+                        capture: out == GitCmdOutput::Popup,
+                    },
+                    &mut panel_ui.git,
+                    &mut model.status,
+                    wires.session,
+                    wires.cfg.git.override_gpg,
+                    wires.op_tx,
+                    wires.waker,
+                );
+                GitAfter::None
+            }
+        },
+        Err(e) => {
+            model.status = e.to_string();
+            GitAfter::None
+        }
+    }
+}
+
+/// Render the custom patch from the marked lines across every fetched patch
+/// doc. `reverse=true` for the removal flows (remove/split/move-to-index) —
+/// see `svc::git::patch`; forward for plain applies.
+fn render_marked_patch(git: &gitui::GitUi, reverse: bool) -> Option<String> {
+    let GitFlow::Patch(p) = &git.flow else {
+        return None;
+    };
+    let mut out = String::new();
+    for (path, marks) in &p.marks {
+        if marks.is_empty() {
+            continue;
+        }
+        let Some(docst) = git.patch_docs.get(path) else {
+            continue;
+        };
+        let files = superzej_core::patch::parse_patch(&docst.diff);
+        let Some(file) = files.first() else {
+            continue;
+        };
+        let sel = crate::panel::staging::to_selection(&docst.doc, marks.iter().copied());
+        if let Some(piece) = superzej_core::patch::transform(file, &sel, reverse) {
+            out.push_str(&piece);
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Open a PR url in the browser, detached (no `gh` needed).
+fn open_url_detached(url: &str) {
+    let _ = std::process::Command::new("xdg-open")
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Turn one decoded [`GitMsg`] into ops / state changes. Navigation mutates
+/// [`gitui::GitUi`] directly; effects flow through the mutation runner (with
+/// destructive ones parked behind a confirm menu first).
+#[allow(clippy::too_many_lines)]
+fn handle_git_msg(
+    msg: GitMsg,
+    panel_ui: &mut crate::panel::PanelUi,
+    model: &mut FrameModel,
+    wires: &GitWires<'_>,
+    ov: &mut GitOverlays<'_>,
+) -> GitAfter {
+    let enqueue = |panel_ui: &mut crate::panel::PanelUi, model: &mut FrameModel, op: GitOp| {
+        enqueue_git_op(
+            op,
+            &mut panel_ui.git,
+            &mut model.status,
+            wires.session,
+            wires.cfg.git.override_gpg,
+            wires.op_tx,
+            wires.waker,
+        );
+    };
+    match msg {
+        // ---- navigation -------------------------------------------------
+        GitMsg::CursorDown | GitMsg::CursorUp => {
+            let down = msg == GitMsg::CursorDown;
+            match panel_ui.git.focus {
+                GitView::RebaseTodo => {
+                    if let GitFlow::Rebase(r) = &mut panel_ui.git.flow {
+                        let max = r.todos.len().saturating_sub(1);
+                        r.cursor = if down {
+                            (r.cursor + 1).min(max)
+                        } else {
+                            r.cursor.saturating_sub(1)
+                        };
+                    }
+                }
+                GitView::Staging | GitView::PatchBuilding => {
+                    let cur = panel_ui.git.staging.as_ref().map_or(0, |s| s.cursor);
+                    let next = active_line_doc(&panel_ui.git)
+                        .map(|d| gitui::step_cursor(&d.doc, cur, down));
+                    if let (Some(next), Some(s)) = (next, panel_ui.git.staging.as_mut()) {
+                        s.cursor = next;
+                    }
+                }
+                _ => {}
+            }
+        }
+        GitMsg::RangeDown | GitMsg::RangeUp => {
+            let down = msg == GitMsg::RangeDown;
+            match panel_ui.git.focus {
+                GitView::Staging | GitView::PatchBuilding => {
+                    let cur = panel_ui.git.staging.as_ref().map_or(0, |s| s.cursor);
+                    let next = active_line_doc(&panel_ui.git)
+                        .map(|d| gitui::step_cursor(&d.doc, cur, down));
+                    if let (Some(next), Some(s)) = (next, panel_ui.git.staging.as_mut()) {
+                        if s.anchor.is_none() {
+                            s.anchor = Some(s.cursor);
+                        }
+                        s.cursor = next;
+                    }
+                }
+                v => {
+                    let len = gitui::list_len(&panel_ui.git, v, &model.panel);
+                    let cur = panel_ui.git.cur.get(v);
+                    if panel_ui.git.sel_anchor.is_none() {
+                        panel_ui.git.sel_anchor = Some(cur);
+                    }
+                    let next = if down {
+                        (cur + 1).min(len.saturating_sub(1))
+                    } else {
+                        cur.saturating_sub(1)
+                    };
+                    panel_ui.git.cur.set(v, next);
+                    panel_ui.cursor = next;
+                }
+            }
+        }
+        GitMsg::ToggleRangeMode => match panel_ui.git.focus {
+            GitView::Staging | GitView::PatchBuilding => {
+                if let Some(s) = panel_ui.git.staging.as_mut() {
+                    s.anchor = match s.anchor {
+                        Some(_) => None,
+                        None => Some(s.cursor),
+                    };
+                }
+            }
+            v => {
+                panel_ui.git.sel_anchor = match panel_ui.git.sel_anchor {
+                    Some(_) => None,
+                    None => Some(panel_ui.git.cur.get(v)),
+                };
+            }
+        },
+        GitMsg::TogglePane => {
+            if panel_ui.git.focus == GitView::Staging {
+                let kicked = panel_ui.git.staging.as_mut().map(|s| {
+                    s.pane = match s.pane {
+                        StagePane::Unstaged => StagePane::Staged,
+                        StagePane::Staged => StagePane::Unstaged,
+                    };
+                    s.cursor = 0;
+                    s.anchor = None;
+                    (s.path.clone(), s.pane)
+                });
+                if let Some((path, pane)) = kicked {
+                    spawn_stage_doc_fetch(
+                        panel_ui.git.op_gen,
+                        wires.session,
+                        path,
+                        pane,
+                        wires.doc_tx,
+                        wires.waker,
+                    );
+                }
+            }
+        }
+        GitMsg::NextHunk | GitMsg::PrevHunk => {
+            let cur = panel_ui.git.staging.as_ref().map_or(0, |s| s.cursor);
+            let next = active_line_doc(&panel_ui.git).and_then(|d| {
+                if msg == GitMsg::NextHunk {
+                    crate::panel::staging::next_hunk(&d.doc, cur)
+                } else {
+                    crate::panel::staging::prev_hunk(&d.doc, cur)
+                }
+            });
+            if let (Some(next), Some(s)) = (next, panel_ui.git.staging.as_mut()) {
+                s.cursor = next;
+                s.anchor = None;
+            }
+        }
+        GitMsg::Drill => match panel_ui.git.focus {
+            GitView::Files => {
+                if let Some(row) = sel_change(panel_ui, model) {
+                    // An untracked file has no diff to line-stage: record it
+                    // with intent-to-add first (`git add -N`), which turns
+                    // its whole content into stageable Add lines.
+                    if row.stage == crate::panel::Stage::Untracked {
+                        enqueue(
+                            panel_ui,
+                            model,
+                            GitOp::IntentToAdd {
+                                path: row.path.clone(),
+                            },
+                        );
+                    }
+                    let mut s = gitui::StagingUi::new(&row.path);
+                    if row.stage == crate::panel::Stage::Staged {
+                        s.pane = StagePane::Staged;
+                    }
+                    let pane = s.pane;
+                    panel_ui.git.stage_doc = None;
+                    panel_ui.git.staging = Some(s);
+                    panel_ui.git.focus = GitView::Staging;
+                    spawn_stage_doc_fetch(
+                        panel_ui.git.op_gen,
+                        wires.session,
+                        row.path,
+                        pane,
+                        wires.doc_tx,
+                        wires.waker,
+                    );
+                }
+            }
+            GitView::Commits => {
+                if let Some(c) = sel_commit(panel_ui, model) {
+                    panel_ui.git.drilled_commit = Some(c.sha.clone());
+                    panel_ui.git.commit_files.clear();
+                    panel_ui.git.cur.commit_files = 0;
+                    panel_ui.cursor = 0;
+                    panel_ui.git.focus = GitView::CommitFiles;
+                    spawn_commit_files_fetch(
+                        panel_ui.git.op_gen,
+                        wires.session,
+                        c.sha,
+                        wires.doc_tx,
+                        wires.waker,
+                    );
+                }
+            }
+            GitView::CommitFiles => {
+                let file = panel_ui
+                    .git
+                    .commit_files
+                    .get(panel_ui.git.cur.commit_files)
+                    .map(|(p, _, _)| p.clone());
+                if let (Some(path), Some(sha)) = (file, panel_ui.git.drilled_commit.clone()) {
+                    match &mut panel_ui.git.flow {
+                        GitFlow::Patch(p) => p.path = path.clone(),
+                        f => {
+                            *f = GitFlow::Patch(gitui::PatchUi {
+                                commit: sha.clone(),
+                                path: path.clone(),
+                                marks: Default::default(),
+                            })
+                        }
+                    }
+                    panel_ui.git.patch_doc = None;
+                    panel_ui.git.staging = Some(gitui::StagingUi::new(&path));
+                    panel_ui.git.focus = GitView::PatchBuilding;
+                    spawn_patch_doc_fetch(
+                        panel_ui.git.op_gen,
+                        wires.session,
+                        sha,
+                        path,
+                        wires.doc_tx,
+                        wires.waker,
+                    );
+                }
+            }
+            GitView::Branches => {
+                model.status = "branch log renders from the commits list".into();
+            }
+            GitView::Stash => {
+                model.status = "stash diff renders in the main region".into();
+            }
+            _ => {}
+        },
+        GitMsg::Back => {
+            let git = &mut panel_ui.git;
+            if git.filter.is_some() {
+                git.filter = None;
+            } else if git.staging.as_ref().is_some_and(|s| s.anchor.is_some()) {
+                if let Some(s) = git.staging.as_mut() {
+                    s.anchor = None;
+                }
+            } else if git.sel_anchor.is_some() {
+                git.sel_anchor = None;
+            } else {
+                match git.focus {
+                    GitView::Staging => {
+                        git.staging = None;
+                        git.stage_doc = None;
+                        git.focus = panel_ui.open.home_view().unwrap_or(GitView::Files);
+                    }
+                    GitView::PatchBuilding => {
+                        git.staging = None;
+                        git.focus = GitView::CommitFiles;
+                    }
+                    GitView::CommitFiles => {
+                        git.drilled_commit = None;
+                        git.commit_files.clear();
+                        git.focus = GitView::Commits;
+                    }
+                    GitView::RebaseTodo => {
+                        if !matches!(&git.flow, GitFlow::Rebase(r) if r.running) {
+                            git.flow = GitFlow::None;
+                        }
+                        git.focus = GitView::Commits;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // ---- staging / patch building ------------------------------------
+        GitMsg::StageLines => match panel_ui.git.focus {
+            GitView::Staging => {
+                let op = panel_ui
+                    .git
+                    .staging
+                    .as_ref()
+                    .zip(panel_ui.git.stage_doc.as_ref())
+                    .map(|(s, d)| {
+                        let indices = gitui::sel_pairs(&d.doc, s.selection());
+                        (indices, d.path.clone(), d.diff.clone(), d.pane)
+                    });
+                match op {
+                    Some((indices, _, _, _)) if indices.is_empty() => {
+                        model.status = "nothing stageable selected".into();
+                    }
+                    Some((indices, path, diff, pane)) => {
+                        if let Some(s) = panel_ui.git.staging.as_mut() {
+                            s.anchor = None;
+                        }
+                        let target = match pane {
+                            StagePane::Unstaged => crate::gitmut::StageTarget::Unstaged,
+                            StagePane::Staged => crate::gitmut::StageTarget::Staged,
+                        };
+                        enqueue(
+                            panel_ui,
+                            model,
+                            GitOp::StageLines {
+                                path,
+                                diff,
+                                indices,
+                                target,
+                            },
+                        );
+                    }
+                    None => {}
+                }
+            }
+            GitView::PatchBuilding => {
+                // Pure: toggle marks for the selected range.
+                let sel = panel_ui.git.staging.as_ref().map(|s| s.selection());
+                let toggles: Vec<usize> = sel
+                    .and_then(|sel| {
+                        panel_ui.git.patch_doc.as_ref().map(|d| {
+                            sel.filter(|&i| crate::panel::staging::selectable(&d.doc, i))
+                                .collect()
+                        })
+                    })
+                    .unwrap_or_default();
+                let path = panel_ui.git.staging.as_ref().map(|s| s.path.clone());
+                if let (Some(path), GitFlow::Patch(p)) = (path, &mut panel_ui.git.flow) {
+                    let marks = p.marks.entry(path).or_default();
+                    for i in toggles {
+                        if !marks.remove(&i) {
+                            marks.insert(i);
+                        }
+                    }
+                    model.status = format!("{} line(s) in patch", p.marked());
+                }
+                if let Some(s) = panel_ui.git.staging.as_mut() {
+                    s.anchor = None;
+                }
+            }
+            _ => {}
+        },
+        GitMsg::SelectHunk => {
+            let cur = panel_ui.git.staging.as_ref().map_or(0, |s| s.cursor);
+            let range = active_line_doc(&panel_ui.git).and_then(|d| {
+                let r = crate::panel::staging::hunk_range(&d.doc, cur)?;
+                // Rest the cursor on the hunk's last CURSORABLE line.
+                let end = (*r.start()..=*r.end())
+                    .rev()
+                    .find(|&i| crate::panel::staging::cursorable(&d.doc, i))?;
+                Some((*r.start(), end))
+            });
+            if let (Some((start, end)), Some(s)) = (range, panel_ui.git.staging.as_mut()) {
+                s.anchor = Some(start);
+                s.cursor = end;
+            }
+        }
+        GitMsg::DiscardLines => {
+            if panel_ui.git.focus == GitView::Staging {
+                let op = panel_ui
+                    .git
+                    .staging
+                    .as_ref()
+                    .zip(panel_ui.git.stage_doc.as_ref())
+                    .map(|(s, d)| {
+                        (
+                            gitui::sel_pairs(&d.doc, s.selection()),
+                            d.path.clone(),
+                            d.diff.clone(),
+                        )
+                    });
+                if let Some((indices, path, diff)) = op {
+                    if indices.is_empty() {
+                        model.status = "nothing selected to discard".into();
+                    } else {
+                        confirm_git_op(
+                            ov,
+                            "discard lines?",
+                            format!(
+                                "discards {} line(s) of {path} — unrecoverable",
+                                indices.len()
+                            ),
+                            true,
+                            GitOp::DiscardLines {
+                                path,
+                                diff,
+                                indices,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        GitMsg::StageAll => {
+            // Toggle, lazygit-style: when everything is already staged the
+            // same key empties the index instead.
+            let all_staged = !model.panel.changes.is_empty()
+                && model
+                    .panel
+                    .changes
+                    .iter()
+                    .all(|c| c.stage == crate::panel::Stage::Staged);
+            if all_staged {
+                confirm_git_op(
+                    ov,
+                    "unstage all?",
+                    "unstages every change",
+                    false,
+                    GitOp::UnstageAll,
+                );
+            } else {
+                confirm_git_op(
+                    ov,
+                    "stage all?",
+                    "stages every change",
+                    false,
+                    GitOp::StageAll,
+                );
+            }
+        }
+        // ---- files ---------------------------------------------------------
+        GitMsg::StageToggleFile => match panel_ui.git.focus {
+            GitView::RebaseTodo => {
+                if let GitFlow::Rebase(r) = &mut panel_ui.git.flow {
+                    gitui::todo_toggle_at(&mut r.todos, r.cursor);
+                }
+            }
+            _ => {
+                if let Some(row) = sel_change(panel_ui, model) {
+                    enqueue(
+                        panel_ui,
+                        model,
+                        GitOp::StageFile {
+                            path: row.path,
+                            unstage: row.stage == crate::panel::Stage::Staged,
+                        },
+                    );
+                }
+            }
+        },
+        GitMsg::DiscardFile => {
+            if let Some(row) = sel_change(panel_ui, model) {
+                confirm_git_op(
+                    ov,
+                    "discard?",
+                    format!("discards {} — unrecoverable", row.path),
+                    true,
+                    GitOp::DiscardFile {
+                        path: row.path,
+                        untracked: row.stage == crate::panel::Stage::Untracked,
+                    },
+                );
+            }
+        }
+        // ---- commits ---------------------------------------------------------
+        GitMsg::Commit => {
+            *ov.input = Some((
+                menu::InputOverlay::new("commit message", ""),
+                GitInputKind::Commit,
+            ));
+        }
+        GitMsg::Reword => {
+            if let Some(c) = sel_commit(panel_ui, model) {
+                *ov.input = Some((
+                    menu::InputOverlay::new(format!("reword {}", c.short), c.subject),
+                    GitInputKind::Reword { sha: c.sha },
+                ));
+            }
+        }
+        GitMsg::Squash | GitMsg::Fixup => {
+            if let Some((oldest, targets)) = gitui::commit_selection(&panel_ui.git, &model.panel) {
+                panel_ui.git.sel_anchor = None;
+                let op = if msg == GitMsg::Squash {
+                    GitOp::Squash { oldest, targets }
+                } else {
+                    GitOp::Fixup { oldest, targets }
+                };
+                enqueue(panel_ui, model, op);
+            }
+        }
+        GitMsg::Drop => {
+            if let Some((oldest, targets)) = gitui::commit_selection(&panel_ui.git, &model.panel) {
+                panel_ui.git.sel_anchor = None;
+                confirm_git_op(
+                    ov,
+                    "drop?",
+                    format!("drops {} commit(s) from history", targets.len()),
+                    true,
+                    GitOp::Drop { oldest, targets },
+                );
+            }
+        }
+        GitMsg::Edit => {
+            if let Some(c) = sel_commit(panel_ui, model) {
+                panel_ui.git.flow = GitFlow::Rebase(gitui::RebaseUi {
+                    running: true,
+                    ..Default::default()
+                });
+                enqueue(panel_ui, model, GitOp::EditStop { sha: c.sha });
+            }
+        }
+        GitMsg::MoveUp | GitMsg::MoveDown => {
+            let up = msg == GitMsg::MoveUp;
+            match panel_ui.git.focus {
+                GitView::RebaseTodo => {
+                    if let GitFlow::Rebase(r) = &mut panel_ui.git.flow {
+                        r.cursor = gitui::todo_move(&mut r.todos, r.cursor, up);
+                    }
+                }
+                _ => {
+                    if let Some(c) = sel_commit(panel_ui, model) {
+                        enqueue(panel_ui, model, GitOp::MoveCommit { sha: c.sha, up });
+                    }
+                }
+            }
+        }
+        GitMsg::AmendStaged => {
+            if let Some(c) = sel_commit(panel_ui, model) {
+                // Amending HEAD needs no rebase — a plain `--amend` is
+                // cheaper and conflict-free.
+                let is_head = model.panel.commits.first().map(|h| &h.sha) == Some(&c.sha);
+                let op = if is_head {
+                    GitOp::AmendHead
+                } else {
+                    GitOp::AmendOldCommit { target: c.sha }
+                };
+                confirm_git_op(
+                    ov,
+                    "amend?",
+                    format!("amends staged changes into {}", c.short),
+                    false,
+                    op,
+                );
+            }
+        }
+        GitMsg::Revert => {
+            if let Some(c) = sel_commit(panel_ui, model) {
+                confirm_git_op(
+                    ov,
+                    "revert?",
+                    format!("reverts {} with a new inverse commit", c.short),
+                    false,
+                    GitOp::Revert { sha: c.sha },
+                );
+            }
+        }
+        GitMsg::CopyCommits => {
+            let shas: Vec<String> = gitui::selected_sources(&panel_ui.git, &model.panel)
+                .into_iter()
+                .filter_map(|i| model.panel.commits.get(i).map(|c| c.sha.clone()))
+                .collect();
+            for sha in shas {
+                if !panel_ui.git.clipboard.contains(&sha) {
+                    panel_ui.git.clipboard.push(sha);
+                }
+            }
+            panel_ui.git.sel_anchor = None;
+            model.status = format!("{} copied", panel_ui.git.clipboard.len());
+        }
+        GitMsg::PasteCommits => {
+            if panel_ui.git.clipboard.is_empty() {
+                model.status = "nothing copied".into();
+            } else {
+                // The clipboard holds newest-first; the executor wants
+                // oldest-first.
+                let shas: Vec<String> = panel_ui.git.clipboard.iter().rev().cloned().collect();
+                confirm_git_op(
+                    ov,
+                    "cherry-pick?",
+                    format!("cherry-picks {} commit(s) onto HEAD", shas.len()),
+                    false,
+                    GitOp::CherryPick { shas },
+                );
+            }
+        }
+        GitMsg::EnterInteractive => {
+            // A rebase already in progress owns the editor — `i` jumps to
+            // it rather than clobbering the live flow with a fresh plan.
+            if matches!(&panel_ui.git.flow, GitFlow::Rebase(r) if r.running) {
+                panel_ui.git.focus = GitView::RebaseTodo;
+            } else if let Some((base, todos)) = gitui::todo_from_commits(&model.panel.commits) {
+                panel_ui.git.flow = GitFlow::Rebase(gitui::RebaseUi {
+                    base,
+                    todos,
+                    ..Default::default()
+                });
+                panel_ui.git.focus = GitView::RebaseTodo;
+            } else {
+                model.status = "no commits loaded".into();
+            }
+        }
+        GitMsg::ConfirmRebase => {
+            let op = match &mut panel_ui.git.flow {
+                GitFlow::Rebase(r) if !r.running => {
+                    r.running = true;
+                    Some(GitOp::RebaseInteractive {
+                        base: r.base.clone(),
+                        todo: r.todos.clone(),
+                    })
+                }
+                // A PAUSED rebase: confirm rewrites the still-pending
+                // entries in place (reorder/retag/drop mid-flight). The op
+                // carries the as-read baseline and the backend refuses to
+                // clobber a todo that changed on disk since; an unsynced
+                // editor (live read still out) can't rewrite at all.
+                GitFlow::Rebase(r) if r.running && r.todos_synced => {
+                    Some(GitOp::RewritePendingTodo {
+                        todo: r.todos.clone(),
+                        baseline: r.baseline.clone(),
+                    })
+                }
+                GitFlow::Rebase(_) => {
+                    model.status = "loading live rebase todo — retry in a moment".into();
+                    None
+                }
+                _ => None,
+            };
+            if let Some(op) = op {
+                enqueue(panel_ui, model, op);
+            }
+        }
+        GitMsg::TodoSetAction(action) => {
+            if let GitFlow::Rebase(r) = &mut panel_ui.git.flow {
+                gitui::todo_retag_at(&mut r.todos, r.cursor, action);
+            }
+        }
+        GitMsg::MarkBase => {
+            if let Some(c) = sel_commit(panel_ui, model) {
+                panel_ui.git.mark_base = match panel_ui.git.mark_base.take() {
+                    Some(m) if m == c.sha => None,
+                    _ => {
+                        model.status = format!("rebase base marked: {}", c.short);
+                        Some(c.sha)
+                    }
+                };
+            }
+        }
+        GitMsg::ToggleDiffMark => {
+            if let Some(c) = sel_commit(panel_ui, model) {
+                if matches!(&panel_ui.git.flow, GitFlow::Diffing(m) if *m == c.sha) {
+                    *ov.menu = Some(menu::diff_menu(&c.short));
+                } else {
+                    panel_ui.git.diff_mark = Some(c.sha.clone());
+                    panel_ui.git.flow = GitFlow::Diffing(c.sha);
+                    model.status = format!("diffing against {}", c.short);
+                }
+            }
+        }
+        GitMsg::CheckoutSel => match panel_ui.git.focus {
+            GitView::Branches => {
+                if let Some(b) = sel_branch(panel_ui, model) {
+                    if b.is_head {
+                        model.status = "already checked out".into();
+                    } else {
+                        enqueue(panel_ui, model, GitOp::Checkout { refname: b.name });
+                    }
+                }
+            }
+            _ => {
+                if let Some(c) = sel_commit(panel_ui, model) {
+                    confirm_git_op(
+                        ov,
+                        "checkout commit?",
+                        format!("checks out {} (detached HEAD)", c.short),
+                        false,
+                        GitOp::Checkout { refname: c.sha },
+                    );
+                }
+            }
+        },
+        GitMsg::ResetMenu => {
+            let (sha, short) = match panel_ui.git.focus {
+                GitView::Files => ("HEAD".to_string(), "HEAD".to_string()),
+                _ => match sel_commit(panel_ui, model) {
+                    Some(c) => (c.sha, c.short),
+                    None => return GitAfter::None,
+                },
+            };
+            *ov.menu = Some(menu::reset_menu(&sha, &short));
+        }
+        GitMsg::OpenMenu(kind) => match kind {
+            gitui::MenuKind::Rebase => {
+                // The continue family is chosen by the live conflict banner:
+                // `m` during a cherry-pick/merge conflict drives THOSE
+                // sequencers, not the rebase one.
+                let banner = model.panel.merge.as_ref().map(|m| m.label.clone());
+                *ov.menu = Some(match banner.as_deref() {
+                    Some("CHERRY-PICK") => menu::cherry_conflict_menu(),
+                    Some("MERGING") => menu::merge_conflict_menu(),
+                    Some("REVERTING") => menu::revert_conflict_menu(),
+                    other => {
+                        let conflicted = matches!(&panel_ui.git.flow, GitFlow::Rebase(r) if r.conflict)
+                            || other.is_some();
+                        menu::rebase_menu(conflicted)
+                    }
+                });
+            }
+            gitui::MenuKind::Patch => {
+                *ov.menu = Some(menu::patch_menu());
+            }
+            gitui::MenuKind::Bisect => {
+                *ov.menu = Some(menu::bisect_menu(matches!(
+                    panel_ui.git.flow,
+                    GitFlow::Bisect(_)
+                )));
+            }
+            gitui::MenuKind::BranchActions => {
+                if let Some(b) = sel_branch(panel_ui, model) {
+                    *ov.menu = Some(menu::branch_actions_menu(&b.name, b.is_head));
+                }
+            }
+            gitui::MenuKind::CustomCommands => {
+                let ctx_label = custom_context_label(panel_ui.git.focus);
+                let mut seen = std::collections::HashSet::new();
+                let mut pairs: Vec<(char, String)> = Vec::new();
+                ov.custom_cmds.clear();
+                for (i, c) in wires.cfg.git_commands.iter().enumerate() {
+                    if c.context != "global" && c.context != ctx_label {
+                        continue;
+                    }
+                    let key = c.key.chars().next().unwrap_or('?');
+                    if !seen.insert(key.to_ascii_lowercase()) {
+                        continue; // duplicate hotkey: first one wins
+                    }
+                    ov.custom_cmds.push(i);
+                    pairs.push((
+                        key,
+                        c.description.clone().unwrap_or_else(|| c.command.clone()),
+                    ));
+                }
+                if pairs.is_empty() {
+                    model.status = "no custom commands for this view ([[git_commands]])".into();
+                } else {
+                    *ov.menu = Some(menu::custom_commands_menu(&pairs));
+                }
+            }
+        },
+        // ---- branches ---------------------------------------------------
+        GitMsg::Pull => enqueue(panel_ui, model, GitOp::Pull),
+        GitMsg::Push => enqueue(
+            panel_ui,
+            model,
+            GitOp::Push {
+                force: superzej_svc::git::ForceMode::None,
+            },
+        ),
+        GitMsg::FastForward => {
+            if let Some(b) = sel_branch(panel_ui, model) {
+                enqueue(
+                    panel_ui,
+                    model,
+                    GitOp::FastForward {
+                        branch: b.name,
+                        current: b.is_head,
+                    },
+                );
+            }
+        }
+        GitMsg::RebaseOntoSel => {
+            if let Some(b) = sel_branch(panel_ui, model) {
+                if b.is_head {
+                    model.status = "cannot rebase a branch onto itself".into();
+                } else if let Some(marked_base) = panel_ui.git.mark_base.clone() {
+                    confirm_git_op(
+                        ov,
+                        "rebase onto?",
+                        format!(
+                            "rebases commits after {} onto {}",
+                            short_sha(&marked_base),
+                            b.name
+                        ),
+                        false,
+                        GitOp::RebaseOnto {
+                            target: b.name,
+                            marked_base,
+                        },
+                    );
+                } else {
+                    enqueue(panel_ui, model, GitOp::RebaseBranch { branch: b.name });
+                }
+            }
+        }
+        GitMsg::DeleteSel => {
+            if let Some(b) = sel_branch(panel_ui, model) {
+                if b.is_head {
+                    model.status = "cannot delete the checked-out branch".into();
+                } else {
+                    confirm_git_op(
+                        ov,
+                        "delete branch?",
+                        format!("deletes {}", b.name),
+                        true,
+                        GitOp::DeleteBranch {
+                            name: b.name,
+                            force: false,
+                        },
+                    );
+                }
+            }
+        }
+        GitMsg::CreateWorktree => return GitAfter::NewWorktree,
+        GitMsg::OpenPrInBrowser => {
+            match sel_branch(panel_ui, model).and_then(|b| b.pr.map(|p| p.url)) {
+                Some(url) => {
+                    open_url_detached(&url);
+                    model.status = "opened PR in the browser".into();
+                }
+                None => model.status = "no PR for this branch".into(),
+            }
+        }
+        // ---- stash --------------------------------------------------------
+        GitMsg::StashPush => {
+            *ov.input = Some((
+                menu::InputOverlay::new("stash message", ""),
+                GitInputKind::StashPush,
+            ));
+        }
+        GitMsg::StashApply => {
+            if let Some(s) = sel_stash(panel_ui, model) {
+                enqueue(panel_ui, model, GitOp::StashApply { index: s.index });
+            }
+        }
+        GitMsg::StashPop => {
+            if let Some(s) = sel_stash(panel_ui, model) {
+                enqueue(panel_ui, model, GitOp::StashPop { index: s.index });
+            }
+        }
+        GitMsg::StashDrop => {
+            if let Some(s) = sel_stash(panel_ui, model) {
+                confirm_git_op(
+                    ov,
+                    "drop stash?",
+                    format!("drops stash@{{{}}}: {}", s.index, s.message),
+                    true,
+                    GitOp::StashDrop { index: s.index },
+                );
+            }
+        }
+        // ---- global-ish ---------------------------------------------------
+        GitMsg::Undo => enqueue(panel_ui, model, GitOp::UndoPlan { redo: false }),
+        GitMsg::Redo => enqueue(panel_ui, model, GitOp::UndoPlan { redo: true }),
+        GitMsg::Cheatsheet => {
+            let view = panel_ui.git.focus;
+            let pairs: Vec<(String, String)> = gitui::context_keys(view)
+                .iter()
+                .map(|ck| (ck.chord.to_string(), ck.label.to_string()))
+                .collect();
+            *ov.menu = Some(menu::keybinds_menu(view.label(), &pairs));
+        }
+        GitMsg::FilterStart => {
+            let view = panel_ui.git.focus;
+            if gitui::list_labels(view, &model.panel).is_some() {
+                panel_ui.git.filter = Some(gitui::ListFilter {
+                    view,
+                    query: String::new(),
+                    editing: true,
+                    map: gitui::display_map(&panel_ui.git, view, &model.panel),
+                });
+            } else {
+                model.status = "filter is not available in this view".into();
+            }
+        }
+    }
+    GitAfter::None
+}
+
+/// Resolve a picked menu choice into ops / state changes (the exhaustive
+/// counterpart of the constructors in `crate::menu`).
+#[allow(clippy::too_many_lines)]
+fn dispatch_menu_choice(
+    choice: MenuChoice,
+    panel_ui: &mut crate::panel::PanelUi,
+    model: &mut FrameModel,
+    wires: &GitWires<'_>,
+    ov: &mut GitOverlays<'_>,
+    pending_undo: &mut Option<(superzej_core::reflog::UndoPlan, bool)>,
+) -> GitAfter {
+    use superzej_svc::git::{ForceMode, ResetMode};
+    let enqueue = |panel_ui: &mut crate::panel::PanelUi, model: &mut FrameModel, op: GitOp| {
+        enqueue_git_op(
+            op,
+            &mut panel_ui.git,
+            &mut model.status,
+            wires.session,
+            wires.cfg.git.override_gpg,
+            wires.op_tx,
+            wires.waker,
+        );
+    };
+    match choice {
+        MenuChoice::RebaseContinue => enqueue(panel_ui, model, GitOp::RebaseContinue),
+        MenuChoice::RebaseAbort => enqueue(panel_ui, model, GitOp::RebaseAbort),
+        MenuChoice::RebaseSkip => enqueue(panel_ui, model, GitOp::RebaseSkip),
+        MenuChoice::ResetSoft(sha) => enqueue(
+            panel_ui,
+            model,
+            GitOp::ResetTo {
+                sha,
+                mode: ResetMode::Soft,
+            },
+        ),
+        MenuChoice::ResetMixed(sha) => enqueue(
+            panel_ui,
+            model,
+            GitOp::ResetTo {
+                sha,
+                mode: ResetMode::Mixed,
+            },
+        ),
+        MenuChoice::ResetHard(sha) => enqueue(
+            panel_ui,
+            model,
+            GitOp::ResetTo {
+                sha,
+                mode: ResetMode::Hard,
+            },
+        ),
+        MenuChoice::Nuke => enqueue(panel_ui, model, GitOp::Nuke),
+        MenuChoice::PatchApply | MenuChoice::PatchApplyReverse => {
+            match render_marked_patch(&panel_ui.git, false) {
+                Some(patch) => enqueue(
+                    panel_ui,
+                    model,
+                    GitOp::PatchApply {
+                        patch,
+                        reverse: choice == MenuChoice::PatchApplyReverse,
+                    },
+                ),
+                None => model.status = "no lines marked".into(),
+            }
+        }
+        MenuChoice::PatchToIndex => {
+            let sha = match &panel_ui.git.flow {
+                GitFlow::Patch(p) => Some(p.commit.clone()),
+                _ => None,
+            };
+            match (sha, render_marked_patch(&panel_ui.git, true)) {
+                (Some(sha), Some(patch)) => {
+                    enqueue(panel_ui, model, GitOp::PatchToIndex { sha, patch })
+                }
+                _ => model.status = "no lines marked".into(),
+            }
+        }
+        MenuChoice::PatchNewCommit => {
+            let sha = match &panel_ui.git.flow {
+                GitFlow::Patch(p) => Some(p.commit.clone()),
+                _ => None,
+            };
+            match (sha, render_marked_patch(&panel_ui.git, true)) {
+                (Some(sha), Some(patch)) => {
+                    *ov.input = Some((
+                        menu::InputOverlay::new("new commit message", ""),
+                        GitInputKind::PatchSplit { sha, patch },
+                    ));
+                }
+                _ => model.status = "no lines marked".into(),
+            }
+        }
+        MenuChoice::PatchRemoveFromCommit => {
+            let sha = match &panel_ui.git.flow {
+                GitFlow::Patch(p) => Some(p.commit.clone()),
+                _ => None,
+            };
+            match (sha, render_marked_patch(&panel_ui.git, true)) {
+                (Some(sha), Some(patch)) => {
+                    enqueue(panel_ui, model, GitOp::PatchRemoveFromCommit { sha, patch })
+                }
+                _ => model.status = "no lines marked".into(),
+            }
+        }
+        MenuChoice::PatchReset => {
+            if let GitFlow::Patch(p) = &mut panel_ui.git.flow {
+                p.marks.clear();
+                model.status = "patch reset".into();
+            }
+        }
+        MenuChoice::DiffSwap => {
+            model.status = "diff sides swap is not wired yet".into();
+        }
+        MenuChoice::DiffExit => {
+            panel_ui.git.flow = GitFlow::None;
+            panel_ui.git.diff_mark = None;
+            model.status = "diff mode off".into();
+        }
+        MenuChoice::BisectStart => {
+            panel_ui.git.flow = GitFlow::Bisect(gitui::BisectUi {
+                bad_term: "bad".into(),
+                good_term: "good".into(),
+                ..Default::default()
+            });
+            enqueue(
+                panel_ui,
+                model,
+                GitOp::BisectStart {
+                    bad: None,
+                    good: None,
+                },
+            );
+        }
+        MenuChoice::BisectMarkGood => enqueue(
+            panel_ui,
+            model,
+            GitOp::BisectMark {
+                term: "good".into(),
+            },
+        ),
+        MenuChoice::BisectMarkBad => {
+            enqueue(panel_ui, model, GitOp::BisectMark { term: "bad".into() })
+        }
+        MenuChoice::BisectSkip => enqueue(panel_ui, model, GitOp::BisectSkip),
+        MenuChoice::BisectReset => enqueue(panel_ui, model, GitOp::BisectReset),
+        MenuChoice::BranchDelete { name, force } => {
+            enqueue(panel_ui, model, GitOp::DeleteBranch { name, force })
+        }
+        MenuChoice::BranchForcePush => enqueue(
+            panel_ui,
+            model,
+            GitOp::Push {
+                force: ForceMode::WithLease,
+            },
+        ),
+        MenuChoice::BranchPush => enqueue(
+            panel_ui,
+            model,
+            GitOp::Push {
+                force: ForceMode::None,
+            },
+        ),
+        MenuChoice::BranchPull => enqueue(panel_ui, model, GitOp::Pull),
+        MenuChoice::BranchSetUpstream(name) => {
+            let q = superzej_core::util::sh_quote(&name);
+            enqueue(
+                panel_ui,
+                model,
+                GitOp::Custom {
+                    command: format!("git branch --set-upstream-to=origin/{q} {q}"),
+                    capture: false,
+                },
+            );
+        }
+        MenuChoice::BranchRename(name) => {
+            *ov.input = Some((
+                menu::InputOverlay::new(format!("rename {name}"), name.clone()),
+                GitInputKind::BranchRename { old: name },
+            ));
+        }
+        MenuChoice::BranchMerge(name) => enqueue(panel_ui, model, GitOp::Merge { branch: name }),
+        MenuChoice::BranchCreate => {
+            *ov.input = Some((
+                menu::InputOverlay::new("new branch name", ""),
+                GitInputKind::BranchCreate,
+            ));
+        }
+        MenuChoice::CherryContinue => enqueue(panel_ui, model, GitOp::CherryContinue),
+        MenuChoice::CherryAbort => enqueue(panel_ui, model, GitOp::CherryAbort),
+        MenuChoice::CherrySkip => enqueue(panel_ui, model, GitOp::CherrySkip),
+        MenuChoice::RevertContinue => enqueue(panel_ui, model, GitOp::RevertContinue),
+        MenuChoice::RevertAbort => enqueue(panel_ui, model, GitOp::RevertAbort),
+        MenuChoice::BranchFetch => enqueue(panel_ui, model, GitOp::Fetch),
+        MenuChoice::MergeContinue => enqueue(panel_ui, model, GitOp::MergeContinue),
+        MenuChoice::MergeAbort => enqueue(panel_ui, model, GitOp::MergeAbort),
+        MenuChoice::CustomCommand(i) => {
+            if let Some(&idx) = ov.custom_cmds.get(i) {
+                let prompts: Vec<(String, String)> = wires
+                    .cfg
+                    .git_commands
+                    .get(idx)
+                    .map(|c| {
+                        c.prompts
+                            .iter()
+                            .map(|p| {
+                                (
+                                    p.key.clone(),
+                                    p.title.clone().unwrap_or_else(|| p.key.clone()),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                match prompts.split_first() {
+                    None => {
+                        return run_custom_command(idx, Default::default(), panel_ui, model, wires);
+                    }
+                    Some(((key, title), rest)) => {
+                        *ov.input = Some((
+                            menu::InputOverlay::new(title.clone(), ""),
+                            GitInputKind::CustomPrompt {
+                                cmd: idx,
+                                key: key.clone(),
+                                collected: Default::default(),
+                                remaining: rest.to_vec(),
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+        MenuChoice::ConfirmUndo | MenuChoice::ConfirmRedo => {
+            if let Some((plan, _redo)) = pending_undo.take() {
+                // Always autostash: the plan may hard-reset over a dirty
+                // tree, and parking the dirt is strictly safer than failing.
+                enqueue(
+                    panel_ui,
+                    model,
+                    GitOp::UndoApply {
+                        plan,
+                        autostash: true,
+                    },
+                );
+            }
+        }
+        MenuChoice::Confirm { tag: "git-op", .. } => {
+            if let Some(op) = ov.confirm_op.take() {
+                enqueue(panel_ui, model, op);
+            }
+        }
+        MenuChoice::Confirm { .. } | MenuChoice::Dismiss => {
+            *ov.confirm_op = None;
+        }
+    }
+    GitAfter::None
+}
+
+/// Resolve a submitted git input overlay into its op (or the next prompt of
+/// a custom-command chain).
+fn handle_git_input_submit(
+    kind: GitInputKind,
+    text: String,
+    panel_ui: &mut crate::panel::PanelUi,
+    model: &mut FrameModel,
+    wires: &GitWires<'_>,
+    ov: &mut GitOverlays<'_>,
+) -> GitAfter {
+    let enqueue = |panel_ui: &mut crate::panel::PanelUi, model: &mut FrameModel, op: GitOp| {
+        enqueue_git_op(
+            op,
+            &mut panel_ui.git,
+            &mut model.status,
+            wires.session,
+            wires.cfg.git.override_gpg,
+            wires.op_tx,
+            wires.waker,
+        );
+    };
+    let trimmed = text.trim().to_string();
+    let require = |model: &mut FrameModel| {
+        if trimmed.is_empty() {
+            model.status = "empty input — cancelled".into();
+            true
+        } else {
+            false
+        }
+    };
+    match kind {
+        GitInputKind::Commit => {
+            if !require(model) {
+                enqueue(panel_ui, model, GitOp::Commit { message: text });
+            }
+        }
+        GitInputKind::Reword { sha } => {
+            if !require(model) {
+                enqueue(panel_ui, model, GitOp::Reword { sha, message: text });
+            }
+        }
+        GitInputKind::StashPush => {
+            if !require(model) {
+                enqueue(panel_ui, model, GitOp::StashPush { message: text });
+            }
+        }
+        GitInputKind::PatchSplit { sha, patch } => {
+            if !require(model) {
+                enqueue(
+                    panel_ui,
+                    model,
+                    GitOp::PatchSplit {
+                        sha,
+                        patch,
+                        message: text,
+                    },
+                );
+            }
+        }
+        GitInputKind::BranchCreate => {
+            if !require(model) {
+                enqueue(
+                    panel_ui,
+                    model,
+                    GitOp::CreateBranch {
+                        name: trimmed,
+                        base: "HEAD".into(),
+                    },
+                );
+            }
+        }
+        GitInputKind::BranchRename { old } => {
+            if !require(model) {
+                let from = superzej_core::util::sh_quote(&old);
+                let to = superzej_core::util::sh_quote(&trimmed);
+                enqueue(
+                    panel_ui,
+                    model,
+                    GitOp::Custom {
+                        command: format!("git branch -m {from} {to}"),
+                        capture: false,
+                    },
+                );
+            }
+        }
+        GitInputKind::CustomPrompt {
+            cmd,
+            key,
+            mut collected,
+            mut remaining,
+        } => {
+            collected.insert(key, text);
+            if remaining.is_empty() {
+                return run_custom_command(cmd, collected, panel_ui, model, wires);
+            }
+            let (next_key, title) = remaining.remove(0);
+            *ov.input = Some((
+                menu::InputOverlay::new(title, ""),
+                GitInputKind::CustomPrompt {
+                    cmd,
+                    key: next_key,
+                    collected,
+                    remaining,
+                },
+            ));
+        }
+    }
+    GitAfter::None
 }
 
 /// Normalize legacy control-key encodings so configured chords match on
@@ -2205,6 +3880,49 @@ fn hide_drawer_into_pool(
     }
 }
 
+fn drawer_cancel_key(key: &KeyCode, modifiers: Modifiers) -> bool {
+    if modifiers.contains(Modifiers::CTRL) || modifiers.contains(Modifiers::ALT) {
+        return false;
+    }
+    matches!(
+        key,
+        KeyCode::Escape | KeyCode::Char('q') | KeyCode::Char('Q')
+    )
+}
+
+fn palette_cancel_key(
+    palette: &crate::palette::Palette,
+    key: &KeyCode,
+    modifiers: Modifiers,
+) -> bool {
+    if matches!(key, KeyCode::Escape) {
+        return true;
+    }
+    if modifiers.contains(Modifiers::CTRL)
+        && matches!(
+            key,
+            KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Char('g') | KeyCode::Char('G')
+        )
+    {
+        return true;
+    }
+    if modifiers.contains(Modifiers::CTRL) || modifiers.contains(Modifiers::ALT) {
+        return false;
+    }
+    palette.query().is_empty()
+        && matches!(key, KeyCode::Char('q') | KeyCode::Char('Q'))
+        && palette
+            .matches()
+            .iter()
+            .all(|item| item.key.starts_with("font:"))
+}
+
+fn persist_session_layout(session: &crate::session::Session) {
+    if let Ok(db) = superzej_core::db::Db::open() {
+        let _ = session.persist(&db, &session.id, now_secs());
+    }
+}
+
 /// A worktree awaiting its agent choice. While set, the command palette is
 /// in "agent picker" mode: its selection launches the chosen agent into the
 /// group named `tab` rather than dispatching a command. Escaping defaults to a
@@ -2383,6 +4101,23 @@ async fn event_loop<T: Terminal>(
     // re-selects while a fetch is still out.
     let (hunk_tx, mut hunk_rx) =
         tokio_mpsc::unbounded_channel::<(u64, String, Vec<superzej_svc::git::Hunk>)>();
+    // The git mutation runner + the line-cursor document fetches (staging
+    // diff, drilled-commit files, patch doc). Results are tagged with
+    // `panel_ui.git.op_gen` so a worktree switch kills strays on arrival.
+    let (gitop_tx, mut gitop_rx) = tokio_mpsc::unbounded_channel::<GitOpDone>();
+    let (gitdoc_tx, mut gitdoc_rx) = tokio_mpsc::unbounded_channel::<(u64, GitDoc)>();
+    // The open git option/confirm menu and text-input overlay — held like
+    // the palette (Option, keys first, painted last).
+    let mut active_menu: Option<MenuOverlay> = None;
+    let mut git_input: Option<(menu::InputOverlay, GitInputKind)> = None;
+    // A live rebase_status read is out (dedupes the safety-net re-kicks).
+    let mut rebase_sync_inflight = false;
+    // A computed undo/redo plan awaiting its confirm pick.
+    let mut pending_undo: Option<(superzej_core::reflog::UndoPlan, bool)> = None;
+    // A destructive git op parked behind the open confirm menu.
+    let mut pending_confirm_op: Option<GitOp> = None;
+    // `cfg.git_commands` indices behind the open custom-commands menu rows.
+    let mut custom_menu_cmds: Vec<usize> = Vec::new();
     // Pane launch specs resolved off-thread: `launch_spec` walks the sandbox
     // chain (podman ensure can pull an image — seconds to minutes on a cold
     // or wedged runtime) and MUST NOT run on the loop. The loop requests
@@ -2718,6 +4453,16 @@ async fn event_loop<T: Terminal>(
             materialize_inflight = None;
             panel_ui.chg_sel = None;
             panel_ui.hunks_gen = hydration_gen;
+            // Git interaction state is per-worktree: cursors, flows, marks
+            // and fetched docs all reset; `op_gen` bumps so in-flight op/doc
+            // results die on arrival. Overlays target the old worktree.
+            panel_ui.git.reset_for_worktree();
+            rebase_sync_inflight = false;
+            active_menu = None;
+            git_input = None;
+            pending_undo = None;
+            pending_confirm_op = None;
+            custom_menu_cmds.clear();
             // Panel documents are per-worktree: drop the caches, raise the
             // acceptance cutoff so in-flight fetches die on arrival, and
             // refetch whatever the open (section, width) still needs (the
@@ -3143,6 +4888,214 @@ async fn event_loop<T: Terminal>(
             }
         }
 
+        // Finished git mutations: clear the pending lock, surface the
+        // outcome, close ended flows, and rehydrate (even failures may have
+        // half-moved state). Stale generations died with their worktree.
+        while let Ok(done) = gitop_rx.try_recv() {
+            if done.generation != panel_ui.git.op_gen {
+                continue;
+            }
+            panel_ui.git.pending = None;
+            let mut rehydrate = true;
+            match done.result {
+                GitOpResult::Ok(note) => {
+                    model.status = note.unwrap_or_else(|| format!("{} ✓", done.label));
+                    match done.flow_end {
+                        FlowEnd::Rebase => {
+                            if matches!(panel_ui.git.flow, GitFlow::Rebase(_)) {
+                                panel_ui.git.flow = GitFlow::None;
+                                if panel_ui.git.focus == GitView::RebaseTodo {
+                                    panel_ui.git.focus = GitView::Commits;
+                                }
+                            }
+                        }
+                        FlowEnd::Bisect => {
+                            if matches!(panel_ui.git.flow, GitFlow::Bisect(_)) {
+                                panel_ui.git.flow = GitFlow::None;
+                            }
+                        }
+                        FlowEnd::Patch => {
+                            if matches!(panel_ui.git.flow, GitFlow::Patch(_)) {
+                                panel_ui.git.flow = GitFlow::None;
+                                if matches!(
+                                    panel_ui.git.focus,
+                                    GitView::PatchBuilding | GitView::CommitFiles
+                                ) {
+                                    panel_ui.git.focus = GitView::Commits;
+                                }
+                            }
+                        }
+                        FlowEnd::None => {}
+                    }
+                    if done.clear_clipboard {
+                        panel_ui.git.clipboard.clear();
+                    }
+                    // A landed stage/discard moves lines between panes:
+                    // refetch the staging doc the cursor is parked on.
+                    if let Some(s) = &panel_ui.git.staging {
+                        spawn_stage_doc_fetch(
+                            panel_ui.git.op_gen,
+                            &session,
+                            s.path.clone(),
+                            s.pane,
+                            &gitdoc_tx,
+                            &waker,
+                        );
+                    }
+                    // A landed live-todo rewrite changed the disk todo: the
+                    // editor's baseline is stale until the re-read lands.
+                    if done.label == "editing todo"
+                        && let GitFlow::Rebase(r) = &mut panel_ui.git.flow
+                    {
+                        r.todos_synced = false;
+                    }
+                }
+                GitOpResult::Stopped(out) => {
+                    let conflict = out == superzej_svc::git::RebaseOutcome::Conflict;
+                    model.status = if conflict {
+                        "conflict — resolve, then m → continue".into()
+                    } else {
+                        "rebase paused (edit) — m → continue".into()
+                    };
+                    match &mut panel_ui.git.flow {
+                        GitFlow::Rebase(r) => {
+                            r.running = true;
+                            r.conflict = conflict;
+                            // The sequencer consumed entries; whatever the
+                            // editor holds is no longer the live todo.
+                            r.todos_synced = false;
+                        }
+                        flow => {
+                            *flow = GitFlow::Rebase(gitui::RebaseUi {
+                                running: true,
+                                conflict,
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+                GitOpResult::Culprit(sha) => {
+                    model.status = format!("first bad commit: {}", short_sha(&sha));
+                    if let GitFlow::Bisect(b) = &mut panel_ui.git.flow {
+                        b.culprit = Some(sha);
+                    }
+                }
+                GitOpResult::Plan { plan, redo } => {
+                    rehydrate = false;
+                    let verb = if redo { "redo" } else { "undo" };
+                    match &plan {
+                        superzej_core::reflog::UndoPlan::Nothing => {
+                            model.status = format!("nothing to {verb}");
+                        }
+                        plan => {
+                            let body = match plan {
+                                superzej_core::reflog::UndoPlan::HardResetTo {
+                                    undoing, ..
+                                } => undoing.clone(),
+                                superzej_core::reflog::UndoPlan::Checkout { branch, undoing } => {
+                                    format!("{undoing} (back to {branch})")
+                                }
+                                superzej_core::reflog::UndoPlan::Nothing => unreachable!(),
+                            };
+                            pending_undo = Some((plan.clone(), redo));
+                            active_menu = Some(menu::undo_confirm_menu(body, redo));
+                        }
+                    }
+                }
+                GitOpResult::Output(text) => {
+                    if text.trim().is_empty() {
+                        model.status = format!("{} ✓ (no output)", done.label);
+                    } else {
+                        active_menu = Some(menu::output_menu("output", &text));
+                    }
+                }
+                GitOpResult::Err(msg) => {
+                    model.status = msg;
+                    // A refused rewrite (todo changed on disk) — or any
+                    // other failure mid-pause — warrants a fresh read so
+                    // the editor shows what's actually pending.
+                    if done.label == "editing todo"
+                        && let GitFlow::Rebase(r) = &mut panel_ui.git.flow
+                    {
+                        r.todos_synced = false;
+                    }
+                }
+            }
+            if rehydrate {
+                let _ = refresh_tx.send(if done.touches_remote {
+                    crate::hydrate::RefreshKind::Pr
+                } else {
+                    crate::hydrate::RefreshKind::Model
+                });
+            }
+            // Safety net: a running-but-unsynced TODO editor always gets a
+            // live read (deduped by the inflight flag, killed on worktree
+            // switch by the generation tag).
+            if matches!(&panel_ui.git.flow, GitFlow::Rebase(r) if r.running && !r.todos_synced)
+                && !rebase_sync_inflight
+            {
+                rebase_sync_inflight = true;
+                spawn_rebase_status_fetch(panel_ui.git.op_gen, &session, &gitdoc_tx, &waker);
+            }
+            dirty = true;
+        }
+
+        // Fetched git documents for the line-cursor views (generation-tagged
+        // like the hunk previews).
+        while let Ok((generation, doc)) = gitdoc_rx.try_recv() {
+            if generation != panel_ui.git.op_gen {
+                continue;
+            }
+            match doc {
+                GitDoc::Stage(state) => {
+                    if let Some(s) = panel_ui.git.staging.as_mut()
+                        && s.path == state.path
+                        && s.pane == state.pane
+                    {
+                        s.cursor = crate::panel::staging::clamp_cursor(&state.doc, s.cursor);
+                        if s.anchor.is_some_and(|a| a >= state.doc.lines.len()) {
+                            s.anchor = None;
+                        }
+                        panel_ui.git.stage_doc = Some(state);
+                    }
+                }
+                GitDoc::CommitFiles(files) => {
+                    panel_ui.git.commit_files = files;
+                    let max = panel_ui.git.commit_files.len().saturating_sub(1);
+                    let cur = panel_ui.git.cur.get(GitView::CommitFiles).min(max);
+                    panel_ui.git.cur.set(GitView::CommitFiles, cur);
+                }
+                GitDoc::Patch(state) => {
+                    panel_ui
+                        .git
+                        .patch_docs
+                        .insert(state.path.clone(), state.clone());
+                    panel_ui.git.patch_doc = Some(state);
+                }
+                GitDoc::Rebase(status) => {
+                    rebase_sync_inflight = false;
+                    if let GitFlow::Rebase(r) = &mut panel_ui.git.flow {
+                        match status {
+                            Some(st) if r.running => {
+                                r.todos = st.remaining.clone();
+                                r.baseline = st.remaining;
+                                r.todos_synced = true;
+                                r.done = st.done.len();
+                                r.stopped_sha = st.stopped_sha;
+                                r.conflict = st.paused == superzej_svc::git::PauseReason::Conflict;
+                                r.cursor = r.cursor.min(r.todos.len().saturating_sub(1));
+                            }
+                            // The pause vanished before the read landed (a
+                            // fast --continue elsewhere); hydration's banner
+                            // sync clears the flow — just drop the read.
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            dirty = true;
+        }
+
         // Resolved launch specs: finish the deferred materialize (lazy focus
         // path and pre-warm alike). Results for a worktree/tab that vanished
         // mid-flight are dropped; `materialize_with_specs` itself skips
@@ -3202,6 +5155,27 @@ async fn event_loop<T: Terminal>(
             let stats = std::mem::take(&mut model.stats);
             model = next_model;
             model.stats = stats;
+            // Mirror an externally-started (or externally-finished) rebase
+            // into the git flow state, so the TODO view and conflict chrome
+            // track `git rebase` runs from any terminal.
+            {
+                let banner = model
+                    .panel
+                    .merge
+                    .as_ref()
+                    .map(|m| (m.label.as_str(), m.unresolved));
+                if let Some(note) = gitui::sync_rebase_flow(&mut panel_ui.git, banner) {
+                    model.status = note.to_string();
+                }
+                // An externally-started rebase arrives here with an empty,
+                // unsynced editor: load the live pending todo for it.
+                if matches!(&panel_ui.git.flow, GitFlow::Rebase(r) if r.running && !r.todos_synced)
+                    && !rebase_sync_inflight
+                {
+                    rebase_sync_inflight = true;
+                    spawn_rebase_status_fetch(panel_ui.git.op_gen, &session, &gitdoc_tx, &waker);
+                }
+            }
             refresh_tab_model(&mut model, &session, &mut sb);
             apply_mode_status(&mut model, mode);
             model.accent = current_config.accent_rgb();
@@ -3482,6 +5456,12 @@ async fn event_loop<T: Terminal>(
             };
             if let Some(pal) = &palette {
                 pal.render(&mut scratch, screen);
+            }
+            if let Some(m) = &active_menu {
+                m.render(&mut scratch, screen);
+            }
+            if let Some((inp, _)) = &git_input {
+                inp.render(&mut scratch, screen);
             }
             let accent = current_config.accent_rgb();
             if !which_key.is_empty() {
@@ -4008,6 +5988,169 @@ async fn event_loop<T: Terminal>(
                     continue;
                 }
                 let mut forced_palette_action: Option<crate::keymap::Action> = None;
+                // Modal: an open git option/confirm menu captures all keys.
+                if let Some(m) = active_menu.as_mut() {
+                    match m.handle_key(&k.key, k.modifiers) {
+                        menu::MenuOutcome::Pending => {}
+                        menu::MenuOutcome::Cancel => {
+                            active_menu = None;
+                            pending_confirm_op = None;
+                            pending_undo = None;
+                        }
+                        menu::MenuOutcome::Pick(choice) => {
+                            active_menu = None;
+                            let wires = GitWires {
+                                session: &session,
+                                cfg: keymap.config(),
+                                op_tx: &gitop_tx,
+                                doc_tx: &gitdoc_tx,
+                                waker: &waker,
+                            };
+                            let mut ov = GitOverlays {
+                                menu: &mut active_menu,
+                                input: &mut git_input,
+                                confirm_op: &mut pending_confirm_op,
+                                custom_cmds: &mut custom_menu_cmds,
+                            };
+                            match dispatch_menu_choice(
+                                choice,
+                                &mut panel_ui,
+                                &mut model,
+                                &wires,
+                                &mut ov,
+                                &mut pending_undo,
+                            ) {
+                                GitAfter::None => {}
+                                GitAfter::NewWorktree => {
+                                    forced_palette_action =
+                                        Some(crate::keymap::Action::NewWorktree);
+                                }
+                                GitAfter::Terminal(cmd) => {
+                                    let cwd = active_cwd(&session);
+                                    open_command_tab(
+                                        &mut session,
+                                        &mut panes,
+                                        &cmd,
+                                        cwd.as_deref(),
+                                        chrome.center,
+                                    );
+                                    focus.zone = crate::focus::Zone::Center;
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    need_relayout = true;
+                                }
+                            }
+                        }
+                    }
+                    dirty = true;
+                    if forced_palette_action.is_none() {
+                        continue;
+                    }
+                }
+                // Modal: a git text-input overlay (commit message, reword,
+                // prompts, …) captures all keys.
+                if git_input.is_some() {
+                    let outcome = git_input
+                        .as_mut()
+                        .map(|(inp, _)| inp.handle_key(&k.key, k.modifiers))
+                        .unwrap_or(menu::InputOutcome::Pending);
+                    match outcome {
+                        menu::InputOutcome::Pending => {}
+                        menu::InputOutcome::Cancel => {
+                            git_input = None;
+                            model.status = "cancelled".into();
+                        }
+                        menu::InputOutcome::Submit(text) => {
+                            if let Some((_, kind)) = git_input.take() {
+                                let wires = GitWires {
+                                    session: &session,
+                                    cfg: keymap.config(),
+                                    op_tx: &gitop_tx,
+                                    doc_tx: &gitdoc_tx,
+                                    waker: &waker,
+                                };
+                                let mut ov = GitOverlays {
+                                    menu: &mut active_menu,
+                                    input: &mut git_input,
+                                    confirm_op: &mut pending_confirm_op,
+                                    custom_cmds: &mut custom_menu_cmds,
+                                };
+                                match handle_git_input_submit(
+                                    kind,
+                                    text,
+                                    &mut panel_ui,
+                                    &mut model,
+                                    &wires,
+                                    &mut ov,
+                                ) {
+                                    GitAfter::None => {}
+                                    GitAfter::NewWorktree => {
+                                        forced_palette_action =
+                                            Some(crate::keymap::Action::NewWorktree);
+                                    }
+                                    GitAfter::Terminal(cmd) => {
+                                        let cwd = active_cwd(&session);
+                                        open_command_tab(
+                                            &mut session,
+                                            &mut panes,
+                                            &cmd,
+                                            cwd.as_deref(),
+                                            chrome.center,
+                                        );
+                                        focus.zone = crate::focus::Zone::Center;
+                                        refresh_tab_model(&mut model, &session, &mut sb);
+                                        need_relayout = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    dirty = true;
+                    if forced_palette_action.is_none() {
+                        continue;
+                    }
+                }
+                // The git filter line eats printable keys while editing.
+                if focus.panel() && panel_ui.git.filter.as_ref().is_some_and(|f| f.editing) {
+                    let mut consumed = true;
+                    match k.key {
+                        KeyCode::Enter => {
+                            if let Some(f) = panel_ui.git.filter.as_mut() {
+                                f.editing = false;
+                            }
+                        }
+                        KeyCode::Escape => {
+                            panel_ui.git.filter = None;
+                        }
+                        KeyCode::Backspace => {
+                            if let Some(f) = panel_ui.git.filter.as_mut() {
+                                f.query.pop();
+                            }
+                        }
+                        KeyCode::Char(c)
+                            if !k.modifiers.contains(Modifiers::CTRL)
+                                && !k.modifiers.contains(Modifiers::ALT) =>
+                        {
+                            if let Some(f) = panel_ui.git.filter.as_mut() {
+                                f.query.push(c);
+                            }
+                        }
+                        _ => consumed = false,
+                    }
+                    if consumed {
+                        // Recompute display space; stale cursors/anchors are
+                        // the classic filtered-list bug.
+                        let view = panel_ui.git.focus;
+                        let map = gitui::display_map(&panel_ui.git, view, &model.panel);
+                        let cur = panel_ui.git.cur.get(view).min(map.len().saturating_sub(1));
+                        panel_ui.git.cur.set(view, cur);
+                        panel_ui.git.sel_anchor = None;
+                        if let Some(f) = panel_ui.git.filter.as_mut() {
+                            f.map = map;
+                        }
+                        dirty = true;
+                        continue;
+                    }
+                }
                 // Modal: when the palette is open it captures all keys.
                 if let Some(p) = palette.as_mut() {
                     // Agent-picker mode: the palette is choosing what to run in a
@@ -4017,6 +6160,17 @@ async fn event_loop<T: Terminal>(
                     // real agent choice replaces the pane.
                     if pending_agent.is_some() {
                         match k.key {
+                            KeyCode::Char('c')
+                            | KeyCode::Char('C')
+                            | KeyCode::Char('g')
+                            | KeyCode::Char('G')
+                                if k.modifiers.contains(Modifiers::CTRL) =>
+                            {
+                                pending_agent = None;
+                                palette = None;
+                                refresh_tab_model(&mut model, &session, &mut sb);
+                                need_relayout = true;
+                            }
                             KeyCode::Escape => {
                                 if let Some(pending) = pending_agent.as_mut()
                                     && pending.choosing_sandbox
@@ -4082,6 +6236,11 @@ async fn event_loop<T: Terminal>(
                         dirty = true;
                         continue;
                     }
+                    if palette_cancel_key(p, &k.key, k.modifiers) {
+                        palette = None;
+                        dirty = true;
+                        continue;
+                    }
                     match k.key {
                         KeyCode::Escape => palette = None,
                         KeyCode::Enter => {
@@ -4091,10 +6250,22 @@ async fn event_loop<T: Terminal>(
                                 if let Ok(db) = superzej_core::db::Db::open() {
                                     let _ = db.bump_palette_usage(&key);
                                 }
-                                if key == "quit" {
+                                if let Some(family) = key.strip_prefix("font:") {
+                                    match crate::font::apply_font_family(family) {
+                                        Ok(path) => {
+                                            model.status =
+                                                format!("Font → {family} ({})", path.display());
+                                        }
+                                        Err(e) => model.status = format!("Font switch failed: {e}"),
+                                    }
+                                    palette = None;
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    need_relayout = true;
+                                    dirty = true;
+                                    continue;
+                                } else if key == "quit" {
                                     return Ok(());
-                                }
-                                if let Some(payload) = key.strip_prefix("wt:") {
+                                } else if let Some(payload) = key.strip_prefix("wt:") {
                                     let outgoing = session_pane_ids(&session);
                                     if let Some((repo_path, tab_name)) = payload.split_once('\t')
                                         && let Ok(db) = superzej_core::db::Db::open()
@@ -4259,6 +6430,26 @@ async fn event_loop<T: Terminal>(
                     }
                     continue;
                 }
+                if drawer.is_some() && drawer_cancel_key(&k.key, k.modifiers) {
+                    if let Some(cwd) = active_cwd(&session) {
+                        hide_drawer_into_pool(
+                            &mut drawer,
+                            &mut drawer_pool,
+                            &mut drawer_home,
+                            &cwd,
+                            keymap.config(),
+                            &mut panes,
+                        );
+                        let key = superzej_core::util::slugify(&cwd.to_string_lossy());
+                        let dir = superzej_core::util::superzej_dir().join("drawer");
+                        let _ = std::fs::create_dir_all(&dir);
+                        let _ = std::fs::write(dir.join(key), "false");
+                    } else if let Some(id) = drawer.take() {
+                        panes.table.remove(&id);
+                    }
+                    dirty = true;
+                    continue;
+                }
                 // Bar zones (masthead/statusbar): no widget interaction is
                 // wired yet — Esc returns to the center; everything else is
                 // swallowed (bars never forward to a pane).
@@ -4375,6 +6566,11 @@ async fn event_loop<T: Terminal>(
                         SidebarOutcome::CloseGroups(targets) => {
                             let (mut targets, skipped_home) =
                                 deletable_group_targets(&session, targets);
+
+                            // Capture the *name* of the active group before deletion,
+                            // because its index will shift as groups below it are removed.
+                            let active_group_name = session.active_group().map(|g| g.name.clone());
+
                             // Close from the highest index down so earlier
                             // indices stay valid as groups are removed.
                             targets.sort_unstable_by(|a, b| b.cmp(a));
@@ -4389,9 +6585,21 @@ async fn event_loop<T: Terminal>(
                                     session.close_active_group();
                                 }
                             }
+
+                            // Restore focus to the group that was active before bulk-delete
+                            // (if it survived). If it was deleted, `close_active_group()`
+                            // above already applied the fallback clamping.
+                            if let Some(target_name) = active_group_name
+                                && let Some(new_idx) =
+                                    session.worktrees.iter().position(|g| g.name == target_name)
+                            {
+                                session.switch_to(new_idx);
+                            }
+
                             if skipped_home > 0 {
                                 model.status = "Root workspace cannot be closed".into();
                             }
+                            persist_session_layout(&session);
                             sb.marked.clear();
                             refresh_tab_model(&mut model, &session, &mut sb);
                             need_relayout = true;
@@ -4407,6 +6615,55 @@ async fn event_loop<T: Terminal>(
                             dirty = true;
                             continue;
                         }
+                    }
+                }
+                // Panel zone, git-family contexts: the table-driven git keys
+                // resolve BEFORE the accordion (space = stage-line in the
+                // staging view, stage-file in the files list, …). Ctrl is
+                // carved out only for the chords git explicitly claims
+                // (Ctrl+j/k move commits, Ctrl+p patch menu).
+                if forced_palette_action.is_none()
+                    && focus.panel()
+                    && !k.modifiers.contains(Modifiers::ALT)
+                    && (!k.modifiers.contains(Modifiers::CTRL)
+                        || gitui::git_claims_ctrl(&panel_ui, &k.key))
+                    && let Some(msg) = gitui::git_key(&k.key, k.modifiers, &panel_ui)
+                {
+                    let wires = GitWires {
+                        session: &session,
+                        cfg: keymap.config(),
+                        op_tx: &gitop_tx,
+                        doc_tx: &gitdoc_tx,
+                        waker: &waker,
+                    };
+                    let mut ov = GitOverlays {
+                        menu: &mut active_menu,
+                        input: &mut git_input,
+                        confirm_op: &mut pending_confirm_op,
+                        custom_cmds: &mut custom_menu_cmds,
+                    };
+                    match handle_git_msg(msg, &mut panel_ui, &mut model, &wires, &mut ov) {
+                        GitAfter::None => {}
+                        GitAfter::NewWorktree => {
+                            forced_palette_action = Some(crate::keymap::Action::NewWorktree);
+                        }
+                        GitAfter::Terminal(cmd) => {
+                            let cwd = active_cwd(&session);
+                            open_command_tab(
+                                &mut session,
+                                &mut panes,
+                                &cmd,
+                                cwd.as_deref(),
+                                chrome.center,
+                            );
+                            focus.zone = crate::focus::Zone::Center;
+                            refresh_tab_model(&mut model, &session, &mut sb);
+                            need_relayout = true;
+                        }
+                    }
+                    dirty = true;
+                    if forced_palette_action.is_none() {
+                        continue;
                     }
                 }
                 // Panel zone: unmodified keys drive the accordion — the pure
@@ -4548,14 +6805,12 @@ async fn event_loop<T: Terminal>(
                                 if up {
                                     if panel_ui.cursor > 0 {
                                         panel_ui.cursor = panel_ui.cursor.saturating_sub(repeat);
-                                    } else if let Some(s) = prev_nonempty_section(
-                                        panel_ui.open,
-                                        &model,
-                                        &panel_ui,
-                                        geom,
-                                    ) {
+                                    } else if let Some(s) =
+                                        prev_section_in_order(panel_ui.open, &panel_ui)
+                                    {
                                         // Top of the list: flow into the previous
-                                        // non-empty accordion, landing on its last row.
+                                        // accordion, landing on its last row (or its
+                                        // header when it has no actionable rows).
                                         let last = crate::panel::frame::section_rows(
                                             s, &model, &panel_ui, geom.0, geom.1,
                                         )
@@ -4578,10 +6833,11 @@ async fn event_loop<T: Terminal>(
                                 } else if count > 0 && panel_ui.cursor < max {
                                     panel_ui.cursor = (panel_ui.cursor + repeat).min(max);
                                 } else if let Some(s) =
-                                    next_nonempty_section(panel_ui.open, &model, &panel_ui, geom)
+                                    next_section_in_order(panel_ui.open, &panel_ui)
                                 {
-                                    // Bottom of the list (or an empty accordion): flow
-                                    // into the next non-empty one at its first row.
+                                    // Bottom of the list (or an accordion with no
+                                    // actionable rows): flow into the next accordion
+                                    // at its first row (its header when empty).
                                     open_panel_section(
                                         s,
                                         &mut panel_ui,
@@ -4681,6 +6937,9 @@ async fn event_loop<T: Terminal>(
                                         need_relayout = true;
                                     }
                                 }
+                                // Drill handling for the git-family lists
+                                // arrives with the GitMsg dispatch layer.
+                                Section::Commits | Section::Branches | Section::Stash => {}
                                 Section::Debug
                                 | Section::Sandbox
                                 | Section::Db
@@ -5144,6 +7403,17 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::Quit => return Ok(()),
+                            Action::SwitchFont => match crate::font::font_palette_items() {
+                                Ok(items) if items.is_empty() => {
+                                    model.status = "No fonts found via fc-list".into();
+                                }
+                                Ok(items) => {
+                                    palette = Some(crate::palette::Palette::new(items));
+                                }
+                                Err(e) => {
+                                    model.status = format!("Font list failed: {e}");
+                                }
+                            },
                             Action::OpenPalette => {
                                 if let Ok(db) = superzej_core::db::Db::open() {
                                     palette = Some(crate::palette::Palette::new(build_palette(
@@ -5706,6 +7976,7 @@ async fn event_loop<T: Terminal>(
                                     }
                                     crate::session::CloseResult::Nothing => {}
                                 }
+                                persist_session_layout(&session);
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
                             }
@@ -5728,6 +7999,7 @@ async fn event_loop<T: Terminal>(
                                     }
                                 }
                                 session.close_active_group();
+                                persist_session_layout(&session);
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
                             }
@@ -6125,7 +8397,7 @@ mod tests {
         let hints = context_hints(&focus, &panel, &cfg);
 
         let has = |c: &str, l: &str| hints.iter().any(|(hc, hl)| hc == c && hl == l);
-        assert!(has("Alt-X", "close tab"), "hints were {hints:?}");
+        assert!(has("Alt-x", "close tab"), "hints were {hints:?}");
         assert!(has("Alt-p", "smart split"), "hints were {hints:?}");
         assert!(has("Alt-n", "split↓"), "hints were {hints:?}");
         assert!(has("Alt-N", "split→"), "hints were {hints:?}");
@@ -6141,7 +8413,7 @@ mod tests {
 
         let has = |c: &str, l: &str| hints.iter().any(|(hc, hl)| hc == c && hl == l);
         assert!(has("Ctrl-Alt-x", "close tab"), "hints were {hints:?}");
-        assert!(!has("Alt-X", "close tab"), "hints were {hints:?}");
+        assert!(!has("Alt-x", "close tab"), "hints were {hints:?}");
     }
 
     #[test]
@@ -6213,6 +8485,45 @@ mod tests {
         pool.stash(a, 3, 2, &mut panes);
         assert!(pool.remove_id(3));
         assert!(!pool.remove_id(3));
+    }
+
+    #[test]
+    fn drawer_cancel_keys_hide_the_file_picker() {
+        assert!(drawer_cancel_key(&KeyCode::Escape, Modifiers::NONE));
+        assert!(drawer_cancel_key(&KeyCode::Char('q'), Modifiers::NONE));
+        assert!(drawer_cancel_key(&KeyCode::Char('Q'), Modifiers::SHIFT));
+        assert!(!drawer_cancel_key(&KeyCode::Char('q'), Modifiers::CTRL));
+        assert!(!drawer_cancel_key(&KeyCode::Char('j'), Modifiers::NONE));
+    }
+
+    #[test]
+    fn font_palette_has_escape_ctrl_c_and_empty_q_cancels() {
+        let mut p = crate::palette::Palette::new(vec![crate::palette::PaletteItem::new(
+            "font:JetBrainsMono Nerd Font",
+            "JetBrainsMono Nerd Font",
+        )]);
+        assert!(palette_cancel_key(&p, &KeyCode::Escape, Modifiers::NONE));
+        assert!(palette_cancel_key(&p, &KeyCode::Char('c'), Modifiers::CTRL));
+        assert!(palette_cancel_key(&p, &KeyCode::Char('q'), Modifiers::NONE));
+
+        p.push_char('j');
+        assert!(!palette_cancel_key(
+            &p,
+            &KeyCode::Char('q'),
+            Modifiers::NONE
+        ));
+    }
+
+    #[test]
+    fn generic_command_palette_does_not_treat_plain_q_as_cancel() {
+        let p =
+            crate::palette::Palette::new(vec![crate::palette::PaletteItem::new("quit", "Quit")]);
+        assert!(!palette_cancel_key(
+            &p,
+            &KeyCode::Char('q'),
+            Modifiers::NONE
+        ));
+        assert!(palette_cancel_key(&p, &KeyCode::Escape, Modifiers::NONE));
     }
 
     /// A SidebarState whose `persist` writes to a temp DB scope rather than the
@@ -6297,7 +8608,9 @@ mod tests {
         press(&mut sb, ' ', &mut model, &session);
         let out = sb.handle_key(&KeyCode::Char('X'), Modifiers::NONE, &mut model, &session);
         match out {
-            SidebarOutcome::CloseGroups(t) => assert_eq!(t.len(), 2),
+            SidebarOutcome::CloseGroups(t) => {
+                assert_eq!(t.len(), 2);
+            }
             _ => panic!("expected CloseGroups"),
         }
     }

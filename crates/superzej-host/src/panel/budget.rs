@@ -146,9 +146,9 @@ mod tests {
 
     #[test]
     fn overflow_reserves_the_more_row() {
-        // fixed = 4 + 9 + 2 = 15; rows 20 → budget 5; content 20 → 5 rows
+        // fixed = 4 + 12 + 2 = 18; rows 23 → budget 5; content 20 → 5 rows
         // granted (4 real + the "+N more" row), hidden = 20 - 4 = 16.
-        let p = allocate(20, 4, 20, SECTIONS);
+        let p = allocate(23, 4, 20, SECTIONS);
         assert_eq!(p.content_rows, 5);
         assert_eq!(p.overflow, Some(16));
         assert!(!p.airy);
@@ -163,9 +163,9 @@ mod tests {
 
     #[test]
     fn short_panel_sheds_header_detail_but_keeps_branch_row() {
-        // rows 12: fixed(4)=15 > 12 → header shrinks to 1 (fixed = 12), zero
+        // rows 15: fixed(4)=18 > 15 → header shrinks to 1 (fixed = 15), zero
         // content budget.
-        let p = allocate(12, 4, 10, SECTIONS);
+        let p = allocate(15, 4, 10, SECTIONS);
         assert_eq!(p.header_rows, 1);
         assert_eq!(p.content_rows, 0);
         assert_eq!(p.overflow, None);

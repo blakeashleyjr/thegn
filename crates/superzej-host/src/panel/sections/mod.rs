@@ -11,10 +11,13 @@ use crate::seg::{self, Line, Seg, Tok, seg, sp};
 
 use super::{ChangeRow, PanelData, PanelHit, PanelUi, Section, Stage};
 
+mod branches;
 mod changes;
+pub(crate) mod commits;
 mod git;
 mod keys;
 mod misc;
+mod stash;
 mod telemetry;
 
 // Token shorthands (the mockup's class vocabulary), shared by the builders.
@@ -181,6 +184,50 @@ fn two_col(left: &[Vec<Seg>], right: &[Vec<Seg>], left_w: usize, gap: usize) -> 
         .collect()
 }
 
+/// A hint row built from a git context's key table (the same data that
+/// drives dispatch, so the hints can never drift).
+pub(super) fn context_hint_row(view: crate::panel::gitui::GitView) -> PanelRow {
+    let keys = crate::panel::gitui::context_keys(view);
+    let pairs: Vec<(&str, &str)> = keys.iter().take(5).map(|c| (c.chord, c.label)).collect();
+    hint_row(&pairs)
+}
+
+/// The live filter line for a git list view (`❯ query  n/m`), when `/` is
+/// active on it.
+pub(super) fn filter_row(
+    ui: &PanelUi,
+    view: crate::panel::gitui::GitView,
+    total: usize,
+) -> Option<PanelRow> {
+    let f = ui.git.filter.as_ref().filter(|f| f.view == view)?;
+    let shown = f.map.len();
+    Some(PanelRow::plain(Line::split(
+        vec![
+            seg(ac(), "❯ "),
+            seg(t(), f.query.clone()).bold(),
+            if f.editing { seg(ac(), "▏") } else { sp(0) },
+        ],
+        vec![seg(g2(), format!("{shown}/{total}"))],
+    )))
+}
+
+/// The display-ordered source indices of a git list under its filter
+/// (identity when no filter is live on `view`).
+pub(super) fn filtered_indices(
+    ui: &PanelUi,
+    view: crate::panel::gitui::GitView,
+    len: usize,
+    label: impl Fn(usize) -> String,
+) -> Vec<usize> {
+    match &ui.git.filter {
+        Some(f) if f.view == view && !f.query.is_empty() => {
+            let labels: Vec<String> = (0..len).map(label).collect();
+            crate::panel::gitui::fuzzy_filter(&labels, &f.query)
+        }
+        _ => (0..len).collect(),
+    }
+}
+
 // ---- summaries (the closed row's right side) -------------------------------
 
 pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> {
@@ -199,6 +246,34 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
                     seg(g(), " "),
                     seg(hue(Hue::Red), format!("−{del}")),
                 ]
+            }
+        }
+        Section::Commits => match data.commits.first() {
+            Some(c) => vec![
+                seg(ac(), c.short.clone()),
+                seg(g(), format!(" {}", truncate_summary(&c.subject, 18))),
+            ],
+            None => vec![seg(g2(), "—")],
+        },
+        Section::Branches => {
+            let n = data.branches.len();
+            let prs = data.branches.iter().filter(|b| b.pr.is_some()).count();
+            if prs > 0 {
+                vec![
+                    seg(g(), format!("{n} · ")),
+                    seg(hue(Hue::Green), format!("⬤ {prs} pr")),
+                ]
+            } else if n > 0 {
+                vec![seg(g(), n.to_string())]
+            } else {
+                vec![seg(g2(), "—")]
+            }
+        }
+        Section::Stash => {
+            if data.stashes.is_empty() {
+                vec![seg(g2(), "—")]
+            } else {
+                vec![seg(g(), data.stashes.len().to_string())]
             }
         }
         Section::Git => match &data.pr {
@@ -299,6 +374,15 @@ fn pr_state_hue(state: &str, draft: bool) -> Tok {
     }
 }
 
+/// Clip a summary string to `max` chars with an ellipsis.
+fn truncate_summary(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{}…", cut.trim_end())
+}
+
 fn compact_count(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
@@ -315,6 +399,9 @@ fn compact_count(n: u64) -> String {
 pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
     match section {
         Section::Changes => changes::content(ctx),
+        Section::Commits => commits::content(ctx),
+        Section::Branches => branches::content(ctx),
+        Section::Stash => stash::content(ctx),
         Section::Git => git::content(ctx),
         Section::Files => misc::files(ctx),
         Section::Tests => misc::tests(ctx),
@@ -419,6 +506,38 @@ mod spec {
         m.stats.cpu_cores = vec![10, 90];
         m.stats.mem_gib = Some((8.0, 16.0));
         m.stats.net_bps = Some((2048, 1024));
+        m.panel.commits = vec![crate::panel::CommitRow {
+            sha: "abc1234def".into(),
+            short: "abc1234".into(),
+            subject: "feat: land the views".into(),
+            author: "Blake Ashley".into(),
+            date: 1,
+            refs: "HEAD -> main".into(),
+            parents: vec![],
+        }];
+        m.panel.branches = vec![crate::panel::BranchRow {
+            name: "feat/views".into(),
+            is_head: true,
+            upstream: Some("origin/feat/views".into()),
+            ahead: 2,
+            behind: 1,
+            upstream_gone: false,
+            sha: "abc1234def".into(),
+            date: 1,
+            subject: "feat: land the views".into(),
+            pr: Some(crate::panel::PrBadge {
+                number: 7,
+                state: "OPEN".into(),
+                is_draft: false,
+                url: "https://github.com/o/r/pull/7".into(),
+            }),
+        }];
+        m.panel.stashes = vec![crate::panel::StashRow {
+            index: 0,
+            sha: "abc1234def".into(),
+            date: 1,
+            message: "WIP on main: tinkering".into(),
+        }];
         m
     }
 
