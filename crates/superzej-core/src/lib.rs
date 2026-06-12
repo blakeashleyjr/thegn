@@ -11,8 +11,6 @@
 
 pub mod activity;
 pub mod config;
-pub mod history;
-pub mod search;
 pub mod custom_cmd;
 pub mod db;
 pub mod diff_highlight;
@@ -21,6 +19,7 @@ pub mod forge;
 pub mod github;
 pub mod gitrefs;
 pub mod gitviz;
+pub mod history;
 pub mod keymap;
 pub mod log;
 pub mod metrics;
@@ -35,6 +34,7 @@ pub mod reflog;
 pub mod remote;
 pub mod repo;
 pub mod sandbox;
+pub mod search;
 pub mod theme;
 pub mod util;
 pub mod viz;

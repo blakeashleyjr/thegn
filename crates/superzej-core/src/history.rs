@@ -214,13 +214,19 @@ mod tests {
     #[test]
     fn ansi_stripper_removes_sgr_sequences() {
         assert_eq!(strip("\x1b[31mhello\x1b[0m"), "hello");
-        assert_eq!(strip("\x1b[1;32mbold green\x1b[0m world"), "bold green world");
+        assert_eq!(
+            strip("\x1b[1;32mbold green\x1b[0m world"),
+            "bold green world"
+        );
     }
 
     #[test]
     fn ansi_stripper_passes_plain_text_unchanged() {
         assert_eq!(strip("hello world"), "hello world");
-        assert_eq!(strip("no escape sequences here"), "no escape sequences here");
+        assert_eq!(
+            strip("no escape sequences here"),
+            "no escape sequences here"
+        );
     }
 
     #[test]
@@ -328,12 +334,7 @@ mod tests {
 
     // ── feed_bytes_to_history ─────────────────────────────────────────────────
 
-    fn feed_str(
-        s: &str,
-        buf: &mut HistoryBuffer,
-        partial: &mut Vec<u8>,
-        st: &mut AnsiStripper,
-    ) {
+    fn feed_str(s: &str, buf: &mut HistoryBuffer, partial: &mut Vec<u8>, st: &mut AnsiStripper) {
         feed_bytes_to_history(s.as_bytes(), buf, partial, st);
     }
 

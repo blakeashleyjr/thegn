@@ -239,7 +239,11 @@ impl SearchOverlay {
         if inner.rows >= 4 {
             let fy = inner.y + inner.rows - 2;
             seg::draw_line(surface, inner.x, fy, inner.cols, &rule, panel);
-            let count_str = format!("{} result{}", matches.len(), if matches.len() == 1 { "" } else { "s" });
+            let count_str = format!(
+                "{} result{}",
+                matches.len(),
+                if matches.len() == 1 { "" } else { "s" }
+            );
             let footer = Line::split(
                 vec![
                     seg(Tok::Slot(S::Ghost2), "↑↓"),
@@ -261,7 +265,10 @@ impl SearchOverlay {
 fn is_escape(key: &KeyCode, mods: Modifiers) -> bool {
     matches!(key, KeyCode::Escape)
         || (mods.contains(Modifiers::CTRL)
-            && matches!(key, KeyCode::Char('g') | KeyCode::Char('G') | KeyCode::Char('c') | KeyCode::Char('C')))
+            && matches!(
+                key,
+                KeyCode::Char('g') | KeyCode::Char('G') | KeyCode::Char('c') | KeyCode::Char('C')
+            ))
 }
 
 /// Truncate `s` to at most `max_cols` display columns, appending `…` if
@@ -422,7 +429,12 @@ mod tests {
         let srcs: Vec<SearchSource<'_>> = vec![(1, "pane", &buf)];
         let ov = SearchOverlay::new(SearchScope::Pane(1), 1, 100);
         let mut surface = Surface::new(80, 24);
-        let rect = Rect { x: 0, y: 0, cols: 80, rows: 24 };
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 80,
+            rows: 24,
+        };
         ov.render(&mut surface, rect); // must not panic
     }
 
@@ -432,7 +444,12 @@ mod tests {
         let _srcs: Vec<SearchSource<'_>> = vec![(1, "pane", &buf)];
         let ov = SearchOverlay::new(SearchScope::Pane(1), 1, 100);
         let mut surface = Surface::new(10, 4);
-        let rect = Rect { x: 0, y: 0, cols: 10, rows: 4 };
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 10,
+            rows: 4,
+        };
         ov.render(&mut surface, rect); // must not panic
     }
 
