@@ -60,71 +60,49 @@ pub struct LaunchSpec {
     pub env: Vec<(String, String)>,
 }
 
-/// Compose the [`LaunchSpec`] for running `choice` in `worktree`. Records the
-/// choice (and any sandbox backend) in the DB, mirroring the zellij path's
-/// side effects so the dashboard/`--resume` keep working.
+/// The settled sandbox for a worktree: the resolved+ensured spec, or `None`
+/// for the host fallback. `backend_label` is what the DB records ("host" when
+/// no sandbox stuck).
+#[derive(Debug, Clone)]
+pub struct SandboxOutcome {
+    pub spec: Option<sandbox::SandboxSpec>,
+    pub backend_label: String,
+}
+
+/// Resolve and `ensure` the sandbox for `worktree` — the BLOCKING half of a
+/// launch (container inspect/image pull/start can take seconds-to-minutes), so
+/// callers must keep it off the event loop. No DB access: `backend_choice` is
+/// the persisted/explicit backend label (empty or "auto" walks the chain).
 ///
-/// `branch` is the worktree's branch (for the pane env + title); `None` falls
-/// back to the worktree basename.
-pub fn launch_spec(cfg: &Config, worktree: &str, branch: Option<&str>, choice: &str) -> LaunchSpec {
-    let loc = GitLoc::for_worktree(Path::new(worktree));
-    let cmd = resolve_command(cfg, choice);
-
-    // Record the choice for the dashboard / `--resume` (keyed by worktree path).
-    if let Ok(db) = Db::open() {
-        let _ = db.set_worktree_agent(worktree, choice);
-    }
-
-    // The local repo root drives the per-repo sandbox overlay + slug. Prefer the
-    // DB (carries remote worktrees with no local cwd), else climb from the path.
-    let repo_root: PathBuf = Db::open()
-        .ok()
-        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| repo::main_worktree(Path::new(worktree)))
-        .unwrap_or_else(|| PathBuf::from(worktree));
-
-    // Local worktrees run in their own dir; remote worktrees have no local dir
-    // (the transport cd's on the remote), so the pane cwd stays unset.
-    let cwd = (!loc.is_remote()).then(|| PathBuf::from(worktree));
-
-    let env = vec![
-        ("SUPERZEJ_WORKTREE".to_string(), worktree.to_string()),
-        (
-            "SUPERZEJ_BRANCH".to_string(),
-            branch.unwrap_or_default().to_string(),
-        ),
-    ];
-
-    // Wrap the chosen program in the worktree's sandbox/container (and/or the
-    // mosh/ssh transport for a remote worktree). Auto walks the configured chain;
-    // a persisted worktree choice (from the new-worktree picker) narrows the
-    // candidates. Host is an explicit last fallback, labeled in the DB.
-    let mut sb = cfg.repo_sandbox(&repo_root);
-    if let Ok(db) = Db::open()
-        && let Ok(Some(saved)) = db.worktree_sandbox(worktree)
-        && !saved.trim().is_empty()
-        && saved.trim() != "auto"
-        && let Ok(b) = superzej_core::config::SandboxBackend::from_str_validated(&saved)
+/// Wraps in the worktree's sandbox/container (and/or the mosh/ssh transport
+/// for a remote worktree). Auto walks the configured chain; an explicit choice
+/// narrows the candidates. Host is the last fallback.
+pub fn prepare_sandbox(
+    cfg: &Config,
+    repo_root: &Path,
+    worktree: &str,
+    loc: &GitLoc,
+    backend_choice: Option<&str>,
+) -> SandboxOutcome {
+    let mut sb = cfg.repo_sandbox(repo_root);
+    if let Some(saved) = backend_choice.map(str::trim)
+        && !saved.is_empty()
+        && saved != "auto"
+        && let Ok(b) = superzej_core::config::SandboxBackend::from_str_validated(saved)
     {
         sb.backend = b;
     }
     let cname = sandbox::container_name(worktree);
     for candidate in sandbox_candidates(&sb) {
-        if let Some(spec) = sandbox::resolve(&candidate, &loc, &cname) {
+        if let Some(spec) = sandbox::resolve(&candidate, loc, &cname) {
             if spec.backend == sandbox::Backend::None {
                 break;
             }
             match sandbox::ensure(&spec) {
                 Ok(()) => {
-                    if let Ok(db) = Db::open() {
-                        let _ = db.set_worktree_sandbox(worktree, spec.backend.label());
-                    }
-                    return LaunchSpec {
-                        argv: sandbox::enter_argv(&spec, &cmd),
-                        cwd,
-                        env,
+                    return SandboxOutcome {
+                        backend_label: spec.backend.label().to_string(),
+                        spec: Some(spec),
                     };
                 }
                 Err(e) => superzej_core::msg::warn(&format!(
@@ -136,16 +114,74 @@ pub fn launch_spec(cfg: &Config, worktree: &str, branch: Option<&str>, choice: &
             break;
         }
     }
+    SandboxOutcome {
+        spec: None,
+        backend_label: "host".to_string(),
+    }
+}
 
+/// Pure composition of the final [`LaunchSpec`] from a settled sandbox: argv
+/// (sandbox-wrapped, or a bare login shell on the host fallback), cwd, env.
+pub fn compose_spec(
+    cfg: &Config,
+    worktree: &str,
+    branch: Option<&str>,
+    choice: &str,
+    loc: &GitLoc,
+    sb: &SandboxOutcome,
+) -> LaunchSpec {
+    let cmd = resolve_command(cfg, choice);
+    // Local worktrees run in their own dir; remote worktrees have no local dir
+    // (the transport cd's on the remote), so the pane cwd stays unset.
+    let cwd = (!loc.is_remote()).then(|| PathBuf::from(worktree));
+    let env = vec![
+        ("SUPERZEJ_WORKTREE".to_string(), worktree.to_string()),
+        (
+            "SUPERZEJ_BRANCH".to_string(),
+            branch.unwrap_or_default().to_string(),
+        ),
+    ];
+    let argv = match &sb.spec {
+        Some(spec) => sandbox::enter_argv(spec, &cmd),
+        // Host fallback: run the command through a login shell so PATH/env expand.
+        None => vec![superzej_core::util::shell(), "-lc".to_string(), cmd],
+    };
+    LaunchSpec { argv, cwd, env }
+}
+
+/// Compose the [`LaunchSpec`] for running `choice` in `worktree`. Records the
+/// choice (and any sandbox backend) in the DB, mirroring the zellij path's
+/// side effects so the dashboard/`--resume` keep working.
+///
+/// `branch` is the worktree's branch (for the pane env + title); `None` falls
+/// back to the worktree basename.
+pub fn launch_spec(cfg: &Config, worktree: &str, branch: Option<&str>, choice: &str) -> LaunchSpec {
+    let loc = GitLoc::for_worktree(Path::new(worktree));
+
+    // Record the choice for the dashboard / `--resume` (keyed by worktree path).
+    let saved_backend = match Db::open() {
+        Ok(db) => {
+            let _ = db.set_worktree_agent(worktree, choice);
+            db.worktree_sandbox(worktree).ok().flatten()
+        }
+        Err(_) => None,
+    };
+
+    // The local repo root drives the per-repo sandbox overlay + slug. Prefer the
+    // DB (carries remote worktrees with no local cwd), else climb from the path.
+    let repo_root: PathBuf = Db::open()
+        .ok()
+        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| repo::main_worktree(Path::new(worktree)))
+        .unwrap_or_else(|| PathBuf::from(worktree));
+
+    let outcome = prepare_sandbox(cfg, &repo_root, worktree, &loc, saved_backend.as_deref());
     if let Ok(db) = Db::open() {
-        let _ = db.set_worktree_sandbox(worktree, "host");
+        let _ = db.set_worktree_sandbox(worktree, &outcome.backend_label);
     }
-    // Host fallback: run the command through a login shell so PATH/env expand.
-    LaunchSpec {
-        argv: vec![superzej_core::util::shell(), "-lc".to_string(), cmd],
-        cwd,
-        env,
-    }
+    compose_spec(cfg, worktree, branch, choice, &loc, &outcome)
 }
 
 fn sandbox_candidates(
@@ -209,5 +245,46 @@ mod tests {
         assert_eq!(resolve_command(&cfg, "shell"), shell_inner());
         // Unknown label degrades to a shell.
         assert_eq!(resolve_command(&cfg, "nope"), shell_inner());
+    }
+
+    #[test]
+    fn compose_spec_host_fallback_is_login_shell() {
+        let cfg = cfg_with(&[("claude", "claude --foo")], &[]);
+        let loc = GitLoc::from_db("/wt/x", None);
+        let host = SandboxOutcome {
+            spec: None,
+            backend_label: "host".into(),
+        };
+        let spec = compose_spec(&cfg, "/wt/x", Some("sz/x"), "claude", &loc, &host);
+        assert_eq!(
+            spec.argv,
+            vec![
+                superzej_core::util::shell(),
+                "-lc".to_string(),
+                "claude --foo".to_string()
+            ]
+        );
+        assert_eq!(spec.cwd, Some(PathBuf::from("/wt/x")));
+        assert!(
+            spec.env
+                .contains(&("SUPERZEJ_WORKTREE".to_string(), "/wt/x".to_string()))
+        );
+        assert!(
+            spec.env
+                .contains(&("SUPERZEJ_BRANCH".to_string(), "sz/x".to_string()))
+        );
+    }
+
+    #[test]
+    fn prepare_sandbox_none_backend_falls_to_host() {
+        let mut cfg = Config::default();
+        cfg.sandbox.backend = superzej_core::config::SandboxBackend::None;
+        let loc = GitLoc::from_db("/wt/x", None);
+        let out = prepare_sandbox(&cfg, Path::new("/repo"), "/wt/x", &loc, None);
+        assert!(out.spec.is_none());
+        assert_eq!(out.backend_label, "host");
+        // An explicit "none" choice behaves the same as the configured backend.
+        let out = prepare_sandbox(&cfg, Path::new("/repo"), "/wt/x", &loc, Some("none"));
+        assert!(out.spec.is_none());
     }
 }
