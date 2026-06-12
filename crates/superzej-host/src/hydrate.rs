@@ -609,6 +609,77 @@ pub(crate) fn build_model(
         panel.log = git.log_graph(&loc, n).unwrap_or_default();
     }
 
+    // The lazygit-family lists — hints-gated so an idle Normal-width panel
+    // pays only for what's visible. The Full git frame shows every list, so
+    // any open git-family section at Full hydrates them all.
+    let git_family_full = hints.expanded && hints.open.is_git_family();
+    if hints.open == crate::panel::Section::Commits || git_family_full {
+        let n = if hints.expanded { 80 } else { 20 };
+        panel.commits = git
+            .log_commits(&loc, n)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| crate::panel::CommitRow {
+                sha: c.sha,
+                short: c.short,
+                subject: c.subject,
+                author: c.author,
+                date: c.date,
+                refs: c.refs,
+                parents: c.parents,
+            })
+            .collect();
+    }
+    if hints.open == crate::panel::Section::Branches || git_family_full {
+        // The per-repo open-PR cache joins onto branch rows by head ref.
+        let badges: Vec<superzej_core::github::PrHeader> = db
+            .get_pr_branch_cache(&loc.path())
+            .ok()
+            .flatten()
+            .map(|(json, _)| superzej_core::github::parse_pr_headers(&json))
+            .unwrap_or_default();
+        panel.branches =
+            git.branches_full(&loc)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|b| {
+                    let pr = badges.iter().find(|p| p.head_ref == b.name).map(|p| {
+                        crate::panel::PrBadge {
+                            number: p.number,
+                            state: p.state.clone(),
+                            is_draft: p.is_draft,
+                            url: p.url.clone(),
+                        }
+                    });
+                    crate::panel::BranchRow {
+                        name: b.name,
+                        is_head: b.is_head,
+                        upstream: b.upstream,
+                        ahead: b.ahead,
+                        behind: b.behind,
+                        upstream_gone: b.upstream_gone,
+                        sha: b.sha,
+                        date: b.date,
+                        subject: b.subject,
+                        pr,
+                    }
+                })
+                .collect();
+    }
+    if hints.open == crate::panel::Section::Stash || git_family_full {
+        panel.stashes = git
+            .stash_list(&loc)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| crate::panel::StashRow {
+                index: s.index,
+                sha: s.sha,
+                date: s.date,
+                message: s.message,
+            })
+            .collect();
+    }
+
     // Tests section snapshot from the cache (summary + failures + history).
     if let Ok(Some((json, _))) = db.get_test_cache(&loc.path())
         && let Ok(cache) = serde_json::from_str::<crate::testkit::model::TestCache>(&json)
@@ -680,6 +751,8 @@ pub(crate) fn spawn_pr_cache_refresh(
     session: crate::session::Session,
     waker: Option<TerminalWaker>,
 ) {
+    let branch_session = session.clone();
+    let branch_waker = waker.clone();
     task::spawn_blocking(move || {
         let cwd = active_tab_path(&session);
         if !cwd.is_dir() {
@@ -699,6 +772,38 @@ pub(crate) fn spawn_pr_cache_refresh(
         // so an idle loop repaints promptly.
         if let Some(w) = &waker {
             let _ = w.wake();
+        }
+    });
+    // Sibling feed: the repo's open-PR headers (`pr_branch_cache`) join onto
+    // branch rows as PR badges and back the branches view's open-in-browser.
+    // GhBackend::pr_list is async (octocrab native, gh-CLI fallback), so it
+    // runs on its own blocking thread under a throwaway current-thread
+    // runtime — neither the subprocess fallback nor the HTTP wait can ever
+    // touch the event loop.
+    task::spawn_blocking(move || {
+        let cwd = active_tab_path(&branch_session);
+        if !cwd.is_dir() {
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        let loc = superzej_core::remote::GitLoc::for_worktree(&cwd);
+        let prs = rt.block_on(async {
+            use superzej_svc::gh::{GhBackend, GhNative};
+            GhNative::new().pr_list(&loc).await
+        });
+        if let Ok(prs) = prs
+            && let Ok(json) = serde_json::to_string(&prs)
+            && let Ok(db) = superzej_core::db::Db::open()
+        {
+            let _ = db.put_pr_branch_cache(&loc.path(), &json);
+            if let Some(w) = &branch_waker {
+                let _ = w.wake();
+            }
         }
     });
 }

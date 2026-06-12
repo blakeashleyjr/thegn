@@ -118,8 +118,11 @@ run *args: build
 
 # Build and run the native host locally in an isolated state root.
 start name="dev": build
-    mkdir -p "$HOME/.superzej-{{name}}/state"
-    XDG_STATE_HOME="$HOME/.superzej-{{name}}/state" \
+    state="$HOME/.superzej-{{name}}/state"; run="$HOME/.superzej-{{name}}/run"; pidfile="$run/szhost.pid"; mkdir -p "$state" "$run"; \
+      if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then kill "$(cat "$pidfile")" 2>/dev/null || true; fi; \
+      echo $$ > "$pidfile"; exec env \
+      "SUPERZEJ_ALACRITTY_CONFIG=$PWD/config/alacritty.toml" \
+      "XDG_STATE_HOME=$state" \
       {{bin}}
 
 # Alias for `start`.
@@ -129,9 +132,13 @@ attach: start
 # profile: no decorations, no outer scrollback — the host owns both), with only
 # the instance's isolated XDG state injected.
 start-term name="dev": build
-    mkdir -p "$HOME/.superzej-{{name}}/state"
-    setsid -f alacritty --config-file "$PWD/config/alacritty.toml" -e env \
-      "XDG_STATE_HOME=$HOME/.superzej-{{name}}/state" \
+    state="$HOME/.superzej-{{name}}/state"; run="$HOME/.superzej-{{name}}/run"; pidfile="$run/szhost.pid"; mkdir -p "$state" "$run"; \
+      if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then kill "$(cat "$pidfile")" 2>/dev/null || true; fi; \
+      setsid -f alacritty --config-file "$PWD/config/alacritty.toml" -e sh -lc \
+      'pidfile="$1"; shift; echo $$ > "$pidfile"; exec env "$@"' \
+      sh "$pidfile" \
+      "SUPERZEJ_ALACRITTY_CONFIG=$PWD/config/alacritty.toml" \
+      "XDG_STATE_HOME=$state" \
       "$PWD/{{bin}}"
 
 # Install/update the native superzej host onto your PATH (standalone, non-Nix):

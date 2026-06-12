@@ -1286,14 +1286,20 @@ pub(crate) fn panel_help_pairs(ui: &crate::panel::PanelUi) -> Vec<(String, Strin
         .map(|(c, l)| (c.to_string(), l.to_string()))
         .collect();
     }
+    // The git-family lists draw their hints from the focused context's key
+    // table (the same data that drives dispatch and the `?` cheatsheet, so
+    // the help bar can never drift). The Git section keeps its PR actions.
+    if ui.open.is_git_family() && ui.open != Section::Git {
+        return crate::panel::gitui::context_keys(ui.git.focus)
+            .iter()
+            .take(6)
+            .map(|ck| (ck.chord.to_string(), ck.label.to_string()))
+            .collect();
+    }
     let pairs: &[(&str, &str)] = match ui.open {
-        Section::Changes => &[
-            ("j/k", "row"),
-            ("↵", "preview"),
-            ("space", "stage"),
-            ("o", "edit"),
-            ("esc", "back"),
-        ],
+        Section::Changes | Section::Commits | Section::Branches | Section::Stash => {
+            unreachable!("git-family sections returned above")
+        }
         Section::Git => &[
             ("j/k", "row"),
             ("M", "merge"),
@@ -2211,7 +2217,11 @@ mod tests {
             .filter(|(_, h)| matches!(h, PanelHit::OpenSection(_)))
             .map(|(y, _)| *y)
             .collect();
-        assert_eq!(section_rows.len(), 9, "hits: {hits:?}");
+        assert_eq!(
+            section_rows.len(),
+            crate::panel::SECTION_ORDER.len(),
+            "hits: {hits:?}"
+        );
         let mut dedup = section_rows.clone();
         dedup.dedup();
         assert_eq!(dedup, section_rows, "section rows are distinct + ordered");

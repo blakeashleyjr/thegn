@@ -163,6 +163,31 @@ interval_secs = 4      # refresh cadence (SUPERZEJ_DASHBOARD_INTERVAL)
 [watch]
 pr_interval_secs = 20  # PR refresh cadence (SUPERZEJ_WATCH_PR_INTERVAL)
 
+# Git write-operation knobs for the panel's lazygit-style features
+# (line staging, interactive rebase, cherry-pick, bisect, undo, …).
+[git]
+override_gpg = false   # true => history rewrites pass -c commit.gpgSign=false
+                       # -c tag.gpgSign=false, so a gpg passphrase prompt can
+                       # never hang a background operation
+
+# User-defined git commands, surfaced in the git panel's custom-commands menu
+# (`x`). `command` is a template expanded against the current selection — see
+# the list below — then run via `sh -c`. The `| quote` filter shell-quotes a
+# value. Referencing an empty selection is an error, never a silent "".
+#   {{.SelectedCommit.Sha}} / .Short / .Subject / .Author
+#   {{.SelectedBranch.Name}} / .Upstream      (also .SelectedLocalBranch.*)
+#   {{.CheckedOutBranch.Name}} / .Upstream
+#   {{.SelectedFile}}   {{.SelectedStash.Index}} / .Message
+#   {{.WorktreePath}}   {{.Form.<Key>}}        (a prompt response)
+#
+# [[git_commands]]
+# key = "P"                    # hotkey inside the custom-commands menu
+# context = "branches"         # commits | branches | files | stash | global
+# command = "git push --force-with-lease origin {{.SelectedBranch.Name | quote}}"
+# description = "force-push selected branch"
+# output = "popup"             # none | popup | terminal
+# prompts = [{ type = "input", title = "Confirm branch", key = "Branch" }]
+
 # Diagnostics. stderr is always on (level-gated, branded, colored on a TTY); the
 # file sink is opt-in. SUPERZEJ_LOG is a tracing-style filter that refines the
 # level per-module, e.g. SUPERZEJ_LOG=debug,superzej::db=trace
@@ -191,6 +216,7 @@ format = "text"           # text | json
 [keybinds]
 # new-worktree = "Ctrl w"
 # toggle-sidebar = "Alt s"
+# switch-font = "Alt f"  # opens the realtime font picker (alacritty profile)
 
 # You can also scope rebinds to a specific mode:
 [keybinds.vim_normal]

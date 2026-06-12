@@ -28,6 +28,17 @@ cat >"$XDG_CONFIG_HOME/superzej/config.toml" <<EOF
 worktrees_dir = "$TMP/wt"
 name_scheme = "numbered"
 repo_roots = ["$TMP/code"]
+
+# The lazygit-suite git keys must parse and validate.
+[git]
+override_gpg = true
+
+[[git_commands]]
+key = "p"
+context = "branches"
+command = "git push {{.SelectedBranch.Name | quote}}"
+output = "popup"
+prompts = [{ type = "input", title = "Remote", key = "Remote" }]
 EOF
 
 fail=0

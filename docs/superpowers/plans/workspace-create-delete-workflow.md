@@ -19,7 +19,7 @@
 | Palette: "new-workspace", "switch-workspace" entries                         | ✅ Exists                  |
 | Palette: workspace entries (✦ repo_name) as switch targets                   | ✅ Complete                |
 | Keybind: `Alt W` → `NewWorkspace`, `Alt o` → `SwitchWorkspace`               | ✅ Complete                |
-| Keybind: `Alt X` → `CloseWorktree` (closes active tab)                       | ✅ Complete                |
+| Keybind: `Alt x` → `CloseTab`, `Alt X` → `CloseWorktree`                     | ✅ Complete                |
 
 ### What's partially implemented
 
