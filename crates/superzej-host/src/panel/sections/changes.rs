@@ -99,7 +99,7 @@ fn hunk_preview(c: &ChangeRow, ui: &PanelUi, deep: bool) -> Vec<PanelRow> {
     let mut rows = Vec::new();
     if c.stage == Stage::Untracked {
         rows.push(PanelRow::plain(Line::segs(vec![
-            sp(2),
+            sp(1),
             seg(g2(), "▾ "),
             seg(f(), "untracked"),
             seg(g(), " · not in index"),
@@ -116,7 +116,7 @@ fn hunk_preview(c: &ChangeRow, ui: &PanelUi, deep: bool) -> Vec<PanelRow> {
                 };
                 rows.push(PanelRow::plain(Line::split(
                     vec![
-                        sp(2),
+                        sp(1),
                         seg(g2(), "▾ "),
                         seg(header_tok, h.header.clone()),
                         seg(g(), format!(" {}", h.func)),
@@ -139,17 +139,17 @@ fn hunk_preview(c: &ChangeRow, ui: &PanelUi, deep: bool) -> Vec<PanelRow> {
                         _ => "  ",
                     };
                     rows.push(PanelRow::plain(Line::segs(vec![
-                        sp(4),
+                        sp(2),
                         seg(tok, format!("{mark}{text}")),
                     ])));
                 }
                 if h.truncated || h.lines.len() > line_cap {
-                    rows.push(PanelRow::plain(Line::segs(vec![sp(4), seg(g2(), "…")])));
+                    rows.push(PanelRow::plain(Line::segs(vec![sp(2), seg(g2(), "…")])));
                 }
             }
         }
         _ => rows.push(PanelRow::plain(Line::segs(vec![
-            sp(2),
+            sp(1),
             seg(g2(), "▾ loading hunks…"),
         ]))),
     }
@@ -165,7 +165,7 @@ fn diff_cell(cell: Option<&SbsCell>, w: usize) -> Vec<Seg> {
         return vec![sp(w)];
     };
     let (fg, bg) = match cell.kind {
-        CellKind::Context => (d(), None),
+        CellKind::Context => (t(), None),
         CellKind::Removed => (hue(Hue::Red), Some(crate::seg::Tok::Sel(Hue::Red, 14))),
         CellKind::Added => (hue(Hue::Green), Some(crate::seg::Tok::Sel(Hue::Green, 14))),
     };

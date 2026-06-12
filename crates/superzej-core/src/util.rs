@@ -85,16 +85,19 @@ pub fn age(then: i64) -> String {
 }
 
 pub fn have(cmd: &str) -> bool {
-    // `command -v` semantics: search PATH for an executable.
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let p = dir.join(cmd);
-            if p.is_file() {
-                return true;
-            }
+    which_path(cmd).is_some()
+}
+
+/// Return the absolute path of `cmd` found on `PATH`, or `None` if not found.
+pub fn which_path(cmd: &str) -> Option<String> {
+    let paths = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&paths) {
+        let p = dir.join(cmd);
+        if p.is_file() {
+            return Some(p.to_string_lossy().into_owned());
         }
     }
-    false
+    None
 }
 
 /// A `git -C <dir>` command with the parent's repo-targeting env scrubbed.

@@ -4761,9 +4761,12 @@ async fn event_loop<T: Terminal>(
             panel_ui.tests = crate::panel::TestPanelState::default();
             sync_tests_for_worktree(&mut panel_ui, &current_worktree, keymap.config());
             loaded_tests_worktree = current_worktree.to_string_lossy().into_owned();
-            // Immediate hydrate for the newly-focused worktree; the cached panel
-            // stays on screen until the fresh model lands (never blank). The
-            // old worktree's hunk previews are meaningless here: drop them and
+            // Immediate hydrate for the newly-focused worktree. Clear the stale
+            // panel data immediately so the panel shows the new worktree's branch
+            // name and empty changes rather than the previous worktree's data
+            // while the background hydration is in flight.
+            model.panel = crate::panel::PanelData::default();
+            // The old worktree's hunk previews are meaningless here: drop them and
             // raise the acceptance cutoff so in-flight fetches die on arrival.
             hydration_gen += 1;
             panel_ui.hunks.clear();
@@ -8708,9 +8711,34 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::NewTab => {
-                                // A fresh tab WITHIN the active worktree.
+                                // A fresh tab WITHIN the active worktree. Eagerly
+                                // spawn its shell so the new tab never reuses an
+                                // existing pane — Tab::new() uses Leaf(0) as a
+                                // placeholder, but pane-0 is the very first shell
+                                // ever spawned, so it already exists and gets
+                                // shared with the new tab if we don't override it.
+                                let cwd = active_cwd(&session);
                                 if let Some(g) = session.active_group_mut() {
                                     g.add_tab();
+                                }
+                                let cfg = keymap.config().clone();
+                                match spawn_worktree_shell_pane(
+                                    &mut panes,
+                                    &cfg,
+                                    cwd.as_deref(),
+                                    chrome.center,
+                                ) {
+                                    Ok(id) => {
+                                        if let Some(tab) =
+                                            session.active_group_mut().and_then(|g| g.active_tab_mut())
+                                        {
+                                            tab.center = crate::center::CenterTree::Leaf(id);
+                                            tab.focused_pane = id;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        model.status = format!("new tab spawn failed: {e:#}");
+                                    }
                                 }
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
