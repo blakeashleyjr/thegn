@@ -177,7 +177,14 @@ impl Session {
 
         // Also adopt worktrees recorded for this session that aren't in
         // tab_groups yet (state from sessions that predate layout persistence).
+        // The registry is the order authority: capture each worktree's
+        // persistent `position` so we can sort the final group list by it.
+        let mut positions: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
         if let Ok(wts) = db.worktrees() {
+            for wt in &wts {
+                positions.insert(wt.worktree.clone(), wt.position);
+            }
             for wt in wts {
                 // git is the source of truth: a local registry row whose dir
                 // vanished (worktree deleted outside superzej) is stale —
@@ -224,6 +231,14 @@ impl Session {
                 }
             }
         }
+
+        // Order registered worktrees by their persistent registry `position`
+        // (creation order by default, user-reorderable via Shift+Alt+↑/↓) so
+        // the tree never reshuffles across restart. Groups with no registry row
+        // — `home` (always floated first at display time) and legacy/unregistered
+        // branches — sink to the end; a stable sort keeps them in their prior
+        // (ordinal) order, so legacy layouts resurrect unchanged.
+        worktrees.sort_by_key(|g| positions.get(&g.path).copied().unwrap_or(i64::MAX));
 
         let active = db
             .active_tab(session)?

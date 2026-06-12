@@ -53,6 +53,10 @@ pub enum Action {
     NextWorktree,
     /// Move to the previous worktree group (Alt+Up).
     PrevWorktree,
+    /// Move the active worktree one slot up within its workspace (Shift+Alt+Up).
+    MoveWorktreeUp,
+    /// Move the active worktree one slot down within its workspace (Shift+Alt+Down).
+    MoveWorktreeDown,
     SplitDown,
     SplitRight,
     FocusLeft,
@@ -233,6 +237,20 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         label: "Next worktree",
         hint: "next worktree",
         default_chords: &["Alt Down"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "move-worktree-up",
+        label: "Move worktree up",
+        hint: "move wt↑",
+        default_chords: &["Shift Alt Up"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "move-worktree-down",
+        label: "Move worktree down",
+        hint: "move wt↓",
+        default_chords: &["Shift Alt Down"],
         palette: true,
     },
     ActionSpec {
@@ -489,6 +507,8 @@ impl Action {
             Action::PrevTab => "prev-tab",
             Action::NextWorktree => "next-worktree",
             Action::PrevWorktree => "prev-worktree",
+            Action::MoveWorktreeUp => "move-worktree-up",
+            Action::MoveWorktreeDown => "move-worktree-down",
             Action::SplitDown => "split-down",
             Action::SplitRight => "split-right",
             Action::FocusLeft => "focus-left",
@@ -543,6 +563,8 @@ impl Action {
             "prev-tab" => Action::PrevTab,
             "next-worktree" => Action::NextWorktree,
             "prev-worktree" => Action::PrevWorktree,
+            "move-worktree-up" => Action::MoveWorktreeUp,
+            "move-worktree-down" => Action::MoveWorktreeDown,
             "split-down" | "new-panel-native" => Action::SplitDown,
             "split-right" | "new-panel" => Action::SplitRight,
             "focus-left" => Action::FocusLeft,
@@ -826,6 +848,12 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Alt Right", Action::NextTab).unwrap();
     map.insert_all("Alt Up", Action::PrevWorktree).unwrap();
     map.insert_all("Alt Down", Action::NextWorktree).unwrap();
+    // Shift+Alt+↑/↓ moves the active worktree within its workspace (manual
+    // reorder), mirroring the plain-Alt navigation.
+    map.insert_all("Shift Alt Up", Action::MoveWorktreeUp)
+        .unwrap();
+    map.insert_all("Shift Alt Down", Action::MoveWorktreeDown)
+        .unwrap();
 
     map.insert_all("Shift PageUp", Action::ScrollUp).unwrap();
     map.insert_all("Shift PageDown", Action::ScrollDown)

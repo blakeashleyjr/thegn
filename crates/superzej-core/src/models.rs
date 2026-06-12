@@ -30,6 +30,9 @@ pub struct WorktreeRow {
     pub session_name: String,
     /// Remote-location descriptor (JSON) for a remote worktree; empty = local.
     pub location: String,
+    /// Persistent sort key for the sidebar (creation order by default,
+    /// user-reorderable via Shift+Alt+↑/↓). Lower sorts first.
+    pub position: i64,
 }
 
 /// A persisted worktree group (native host, schema v6): one worktree shown in
@@ -121,6 +124,7 @@ mod tests {
             tab_name: "r/x".into(),
             session_name: "default".into(),
             location: String::new(),
+            position: 0,
         };
         let _ = format!("{:?}", row.clone());
     }
