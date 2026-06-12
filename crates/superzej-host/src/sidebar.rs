@@ -52,9 +52,14 @@ pub struct GitGlyphs {
 /// Tree ordering for worktree groups within a workspace (item 23).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortMode {
+    /// User-controlled order: trusts the underlying sequence (the session's
+    /// group order when loaded, the persisted `position` order when not),
+    /// "home" first. Defaults to creation order and is what Shift+Alt+↑/↓
+    /// rearranges. The default — worktrees never reshuffle on their own.
+    #[default]
+    Manual,
     /// Case-insensitive label order, "home" first. Stable — a worktree keeps
     /// its slot when selected/opened (no jumping). The old plugin's default.
-    #[default]
     Name,
     /// Most-recently-touched first (by tab position as a recency proxy).
     Recent,
@@ -65,6 +70,7 @@ pub enum SortMode {
 impl SortMode {
     pub fn as_str(self) -> &'static str {
         match self {
+            SortMode::Manual => "manual",
             SortMode::Name => "name",
             SortMode::Recent => "recent",
             SortMode::Activity => "activity",
@@ -72,17 +78,20 @@ impl SortMode {
     }
     pub fn from_str(s: &str) -> Self {
         match s {
+            "name" => SortMode::Name,
             "recent" => SortMode::Recent,
             "activity" => SortMode::Activity,
-            _ => SortMode::Name,
+            // Unknown / "manual" → the manual (creation-order) default.
+            _ => SortMode::Manual,
         }
     }
     /// Cycle to the next mode (for a single keybind).
     pub fn next(self) -> Self {
         match self {
+            SortMode::Manual => SortMode::Name,
             SortMode::Name => SortMode::Recent,
             SortMode::Recent => SortMode::Activity,
-            SortMode::Activity => SortMode::Name,
+            SortMode::Activity => SortMode::Manual,
         }
     }
 }
@@ -346,6 +355,13 @@ pub fn build_rows(
 
 fn sort_groups(groups: &mut [Group], sort: SortMode) {
     match sort {
+        SortMode::Manual => {
+            // Trust the session order (gi); just float "home" to the top.
+            // `gi` is the worktree's slot in `session.worktrees`, which the
+            // host keeps in persisted `position` order — so this is the
+            // creation-order-by-default, manually-reorderable sequence.
+            groups.sort_by(|a, b| (a.label != "home", a.gi).cmp(&(b.label != "home", b.gi)));
+        }
         SortMode::Name => {
             // "home" first, then case-insensitive label, ties by position.
             groups.sort_by(|a, b| {
@@ -742,5 +758,86 @@ mod tests {
         let busy = rows.iter().position(|r| r.label == "busy").unwrap();
         let home = rows.iter().position(|r| r.label == "home").unwrap();
         assert!(busy < home, "active worktree should sort first");
+    }
+
+    #[test]
+    fn manual_sort_is_the_default_and_preserves_session_order() {
+        // Session order is zebra, then alpha — deliberately *not* alphabetical.
+        // The default (Manual) keeps that order (home first), so worktrees never
+        // reshuffle on their own; only an explicit Name sort alphabetizes.
+        let s = session(
+            vec![
+                tab("app/home", "/wt/home"),
+                tab("app/zebra", "/wt/zebra"),
+                tab("app/alpha", "/wt/alpha"),
+            ],
+            0,
+        );
+        let ws = vec![(
+            "app".to_string(),
+            "app".to_string(),
+            "repo".to_string(),
+            String::new(),
+        )];
+
+        // Default == Manual: home, then session order (zebra, alpha).
+        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &[]);
+        let labels: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.kind == RowKind::Worktree)
+            .map(|r| r.label.as_str())
+            .collect();
+        assert_eq!(labels, vec!["home", "zebra", "alpha"]);
+
+        // Name sort, by contrast, alphabetizes the non-home worktrees.
+        let view = ViewState {
+            sort: SortMode::Name,
+            ..Default::default()
+        };
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &[]);
+        let labels: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.kind == RowKind::Worktree)
+            .map(|r| r.label.as_str())
+            .collect();
+        assert_eq!(labels, vec!["home", "alpha", "zebra"]);
+    }
+
+    #[test]
+    fn unloaded_workspace_lists_db_worktrees_in_given_order() {
+        // A workspace with no live session groups renders home + its registered
+        // worktrees straight from the DB list, whose order the DB query fixes
+        // (persisted `position`). build_rows preserves that order verbatim.
+        let s = session(vec![], 0);
+        let ws = vec![(
+            "app".to_string(),
+            "app".to_string(),
+            "repo".to_string(),
+            "/repos/app".to_string(),
+        )];
+        let dbw = vec![
+            DbWorktree {
+                slug: "app".into(),
+                branch: "zebra".into(),
+                repo_path: "/repos/app".into(),
+                tab_name: "app/zebra".into(),
+                path: "/wt/zebra".into(),
+            },
+            DbWorktree {
+                slug: "app".into(),
+                branch: "alpha".into(),
+                repo_path: "/repos/app".into(),
+                tab_name: "app/alpha".into(),
+                path: "/wt/alpha".into(),
+            },
+        ];
+        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &dbw);
+        let labels: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.kind == RowKind::Worktree)
+            .map(|r| r.label.as_str())
+            .collect();
+        // home synthesized first, then the DB order (not alphabetized).
+        assert_eq!(labels, vec!["home", "zebra", "alpha"]);
     }
 }

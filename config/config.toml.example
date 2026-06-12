@@ -236,6 +236,11 @@ format = "text"           # text | json
 # new-worktree = "Ctrl w"
 # toggle-sidebar = "Alt s"
 # switch-font = "Alt f"  # opens the realtime font picker (alacritty profile)
+# Alt ↑/↓ navigate worktrees; Shift+Alt ↑/↓ *move* the active worktree within
+# its repo. Worktrees default to creation order ("manual" sort) and keep the
+# order you set; cycle sort modes with `s` while the sidebar is focused.
+# move-worktree-up = "Shift Alt Up"
+# move-worktree-down = "Shift Alt Down"
 
 # You can also scope rebinds to a specific mode:
 [keybinds.vim_normal]

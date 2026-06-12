@@ -848,6 +848,74 @@ impl SidebarState {
         }
     }
 
+    /// Move the active worktree one slot within its workspace (Shift+Alt+↑/↓).
+    /// Swaps it with the adjacent *same-workspace* branch sibling in both the
+    /// live session order and the persisted registry `position`, so the new
+    /// order survives restart. `home` is a fixed top anchor: a worktree can't
+    /// move above it, and home itself never moves. A move while a computed sort
+    /// is active first flips the workspace back to Manual so the move is visible
+    /// and sticks. Returns whether anything moved.
+    fn move_active_worktree(
+        &mut self,
+        model: &mut FrameModel,
+        session: &mut crate::session::Session,
+        up: bool,
+    ) -> bool {
+        use crate::session::GroupKind;
+        let a = session.active;
+        // Home never moves.
+        if session.worktrees.get(a).map(|g| g.kind) == Some(GroupKind::Home) {
+            return false;
+        }
+        // Walk the on-screen order so the motion matches what the user sees;
+        // same-workspace worktrees are contiguous there (one block per repo).
+        let order = sidebar_worktree_order(model);
+        let Some(p) = order.iter().position(|&g| g == a) else {
+            return false;
+        };
+        let neighbor = if up {
+            p.checked_sub(1)
+        } else {
+            (p + 1 < order.len()).then_some(p + 1)
+        };
+        let Some(np) = neighbor else { return false };
+        let b = order[np];
+        // Stay within the same workspace, and never cross above home.
+        let slug = |gi: usize| {
+            session
+                .worktrees
+                .get(gi)
+                .and_then(|g| crate::sidebar::split_tab(&g.name).map(|(s, _)| s))
+        };
+        if slug(a) != slug(b) {
+            return false;
+        }
+        if session.worktrees.get(b).map(|g| g.kind) == Some(GroupKind::Home) {
+            return false;
+        }
+
+        // Persist the new order: swap the durable `position` of the two paths…
+        if let Ok(db) = superzej_core::db::Db::open() {
+            let (pa, pb) = (
+                session.worktrees[a].path.clone(),
+                session.worktrees[b].path.clone(),
+            );
+            let _ = db.swap_worktree_positions(&pa, &pb);
+        }
+        // …and the live session order, keeping the moved group active.
+        session.worktrees.swap(a, b);
+        session.active = b;
+
+        // A manual move only makes sense under Manual order; flip + persist if a
+        // computed sort was active so the move is visible and survives restart.
+        if self.view.sort != crate::sidebar::SortMode::Manual {
+            self.view.sort = crate::sidebar::SortMode::Manual;
+            self.persist(&session.id, "sort_mode", self.view.sort.as_str());
+        }
+        self.rebuild(model, session);
+        true
+    }
+
     /// What the cursor row activates, if anything.
     fn cursor_target(&self, model: &FrameModel) -> Option<crate::sidebar::RowTarget> {
         self.selected_row(model).and_then(|r| r.tab_target.clone())
@@ -7858,6 +7926,17 @@ async fn event_loop<T: Terminal>(
                                     chrome.center,
                                 );
                             }
+                            Action::MoveWorktreeUp | Action::MoveWorktreeDown => {
+                                // Reorder the active worktree within its
+                                // workspace; the move method rebuilds the tree
+                                // and persists the new order itself. The active
+                                // group's content is unchanged, so only a redraw
+                                // is needed.
+                                let up = action == Action::MoveWorktreeUp;
+                                if sb.move_active_worktree(&mut model, &mut session, up) {
+                                    need_relayout = true;
+                                }
+                            }
                             Action::NewPane => {
                                 // Zellij-style: split the focused pane along
                                 // its longer dimension.
@@ -8684,6 +8763,67 @@ mod tests {
     }
 
     #[test]
+    fn resurrect_orders_worktrees_by_persisted_position() {
+        let root = std::env::temp_dir().join(format!(
+            "superzej-resurrect-order-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let repo = root.join("app");
+        let alpha = root.join("app-alpha");
+        let beta = root.join("app-beta");
+        for d in [&repo, &alpha, &beta] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let db = superzej_core::db::Db::open_at(&root.join("state/superzej.db")).unwrap();
+        let repo_s = repo.to_string_lossy().into_owned();
+        let alpha_s = alpha.to_string_lossy().into_owned();
+        let beta_s = beta.to_string_lossy().into_owned();
+
+        let session = Session {
+            id: repo_s.clone(),
+            worktrees: vec![
+                WorktreeGroup::new("app/home", GroupKind::Home, &repo_s),
+                WorktreeGroup::new("app/alpha", GroupKind::Branch, &alpha_s),
+                WorktreeGroup::new("app/beta", GroupKind::Branch, &beta_s),
+            ],
+            active: 0,
+        };
+        session.persist(&db, &repo_s, now_secs()).unwrap();
+        // Register both branches; positions are assigned in call order.
+        db.put_worktree("app/alpha", &repo_s, &alpha_s, "alpha", None)
+            .unwrap();
+        db.put_worktree("app/beta", &repo_s, &beta_s, "beta", None)
+            .unwrap();
+
+        // Registered branches come back in creation order (alpha before beta);
+        // home has no registry row, so it sorts last in the raw session vec
+        // (the sidebar floats it first at display time).
+        let r = Session::resurrect(&db, &repo_s).unwrap();
+        assert_eq!(
+            r.worktrees
+                .iter()
+                .map(|g| g.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["app/alpha", "app/beta", "app/home"]
+        );
+
+        // A manual reorder (swap positions) survives resurrect: beta now
+        // precedes alpha.
+        db.swap_worktree_positions(&alpha_s, &beta_s).unwrap();
+        let r = Session::resurrect(&db, &repo_s).unwrap();
+        assert_eq!(
+            r.worktrees
+                .iter()
+                .map(|g| g.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["app/beta", "app/alpha", "app/home"]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn new_workspace_action_starts_path_or_url_input() {
         let mut model = FrameModel::default();
         let mut host_input = None;
@@ -8944,6 +9084,80 @@ mod tests {
             press(&mut sb, '3', &mut model, &session),
             SidebarOutcome::NotHandled
         ));
+    }
+
+    fn three_worktree_session() -> Session {
+        Session {
+            id: "s1".into(),
+            worktrees: vec![
+                WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/app"),
+                WorktreeGroup::new("app/alpha", GroupKind::Branch, "/tmp/app-alpha"),
+                WorktreeGroup::new("app/beta", GroupKind::Branch, "/tmp/app-beta"),
+            ],
+            active: 2, // beta
+        }
+    }
+
+    #[test]
+    fn move_active_worktree_reorders_within_workspace_and_anchors_home() {
+        // Holds the env lock: move_active_worktree opens the user DB to persist
+        // the swap; point it at a throwaway scope (the swap no-ops on unknown
+        // paths — we assert the in-memory reorder, which is the user-visible bit).
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let state_home = std::env::temp_dir().join(format!(
+            "superzej-move-wt-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        // SAFETY: test holds ENV_LOCK; sets/clears an XDG var around the calls.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+
+        let mut session = three_worktree_session();
+        let mut model = build_initial_model(&session);
+        model.sidebar_workspaces = vec![("app".into(), "app".into(), "repo".into(), String::new())];
+        let mut sb = SidebarState::default();
+        sb.rebuild(&mut model, &session);
+
+        // Move beta up: it swaps with alpha and remains active.
+        assert!(sb.move_active_worktree(&mut model, &mut session, true));
+        let order: Vec<&str> = session.worktrees.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(order, vec!["app/home", "app/beta", "app/alpha"]);
+        assert_eq!(session.worktrees[session.active].name, "app/beta");
+
+        // Move beta up again: the slot above is home — blocked, nothing moves.
+        assert!(!sb.move_active_worktree(&mut model, &mut session, true));
+        let order: Vec<&str> = session.worktrees.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(order, vec!["app/home", "app/beta", "app/alpha"]);
+
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+        let _ = std::fs::remove_dir_all(&state_home);
+    }
+
+    #[test]
+    fn move_under_computed_sort_flips_to_manual() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let state_home = std::env::temp_dir().join(format!(
+            "superzej-move-flip-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        // SAFETY: test holds ENV_LOCK; sets/clears an XDG var around the calls.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+
+        let mut session = three_worktree_session();
+        let mut model = build_initial_model(&session);
+        model.sidebar_workspaces = vec![("app".into(), "app".into(), "repo".into(), String::new())];
+        let mut sb = SidebarState::default();
+        sb.view.sort = crate::sidebar::SortMode::Name;
+        sb.rebuild(&mut model, &session);
+
+        // Moving under a computed sort flips the workspace to Manual so the move
+        // is visible and persists.
+        assert!(sb.move_active_worktree(&mut model, &mut session, true));
+        assert_eq!(sb.view.sort, crate::sidebar::SortMode::Manual);
+
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+        let _ = std::fs::remove_dir_all(&state_home);
     }
 
     #[test]
