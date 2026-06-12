@@ -268,7 +268,7 @@ pub struct BranchRow {
 
 /// One row of the commits section (structured, parents included for the
 /// graph).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommitRow {
     pub sha: String,
     pub short: String,
@@ -319,8 +319,12 @@ pub struct PanelData {
     pub file_count: Option<u64>,
     /// Local branches with upstream/divergence + PR badges (branches section).
     pub branches: Vec<BranchRow>,
-    /// Structured recent commits (commits section + graph feed).
+    /// Structured recent commits (commits section + graph feed). Loaded from
+    /// cache synchronously; refreshed by a background `git log` worker.
     pub commits: Vec<CommitRow>,
+    /// True when the commits section is visible but the cache is missing/stale
+    /// and a background refresh has been kicked.
+    pub commits_loading: bool,
     /// Stash entries (stash section).
     pub stashes: Vec<StashRow>,
 }

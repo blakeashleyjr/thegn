@@ -32,6 +32,7 @@ mod panes;
 mod pins;
 mod queries;
 mod run;
+mod search;
 mod seg;
 mod sequence;
 mod session;

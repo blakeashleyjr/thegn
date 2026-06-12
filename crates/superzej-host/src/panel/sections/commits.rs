@@ -47,7 +47,12 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         rows.push(fr);
     }
     if data.commits.is_empty() {
-        rows.push(PanelRow::plain(Line::segs(vec![seg(g(), "no commits")])));
+        let msg = if data.commits_loading {
+            "loading commits…"
+        } else {
+            "no commits"
+        };
+        rows.push(PanelRow::plain(Line::segs(vec![seg(g(), msg)])));
         return rows;
     }
     let indices = super::filtered_indices(ui, GitView::Commits, data.commits.len(), |i| {

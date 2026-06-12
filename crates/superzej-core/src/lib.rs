@@ -11,6 +11,8 @@
 
 pub mod activity;
 pub mod config;
+pub mod history;
+pub mod search;
 pub mod custom_cmd;
 pub mod db;
 pub mod diff_highlight;

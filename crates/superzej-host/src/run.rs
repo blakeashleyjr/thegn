@@ -714,9 +714,12 @@ fn refresh_tab_model(
     sb: &mut SidebarState,
 ) {
     let (worktree, tabs, active_tab) = crate::hydrate::tab_strip(session);
+    let active_path = crate::hydrate::active_tab_path(session);
     model.worktree = worktree;
     model.tabs = tabs;
     model.active_tab = active_tab;
+    model.active_container_name =
+        superzej_core::sandbox::container_name(&active_path.to_string_lossy());
     // The workspace list can change when worktrees are added/closed or the
     // workspace switches: keep the DB-backed entries (refreshed by the next
     // hydration), re-derive the live fallbacks from the current session, and
@@ -2308,36 +2311,6 @@ fn handle_git_msg(
                 _ => {}
             }
         }
-        GitMsg::RangeDown | GitMsg::RangeUp => {
-            let down = msg == GitMsg::RangeDown;
-            match panel_ui.git.focus {
-                GitView::Staging | GitView::PatchBuilding => {
-                    let cur = panel_ui.git.staging.as_ref().map_or(0, |s| s.cursor);
-                    let next = active_line_doc(&panel_ui.git)
-                        .map(|d| gitui::step_cursor(&d.doc, cur, down));
-                    if let (Some(next), Some(s)) = (next, panel_ui.git.staging.as_mut()) {
-                        if s.anchor.is_none() {
-                            s.anchor = Some(s.cursor);
-                        }
-                        s.cursor = next;
-                    }
-                }
-                v => {
-                    let len = gitui::list_len(&panel_ui.git, v, &model.panel);
-                    let cur = panel_ui.git.cur.get(v);
-                    if panel_ui.git.sel_anchor.is_none() {
-                        panel_ui.git.sel_anchor = Some(cur);
-                    }
-                    let next = if down {
-                        (cur + 1).min(len.saturating_sub(1))
-                    } else {
-                        cur.saturating_sub(1)
-                    };
-                    panel_ui.git.cur.set(v, next);
-                    panel_ui.cursor = next;
-                }
-            }
-        }
         GitMsg::ToggleRangeMode => match panel_ui.git.focus {
             GitView::Staging | GitView::PatchBuilding => {
                 if let Some(s) = panel_ui.git.staging.as_mut() {
@@ -3483,24 +3456,70 @@ fn normalize_key(k: termwiz::input::KeyEvent) -> termwiz::input::KeyEvent {
     k
 }
 
+/// Generic repeat-drainer: starting from a count of 1 (the caller already
+/// consumed `first`), keep pulling from `next` as long as `is_repeat` returns
+/// `true` for the incoming event. Returns `(total_count, leftover)` where
+/// `leftover` is the first non-matching event to push back, or `None` if the
+/// queue was drained.
+///
+/// Both `drain_key_repeats` and `drain_wheel_ticks` are thin wrappers around
+/// this so the coalescing logic lives in one place.
+fn drain_event_repeats(
+    mut is_repeat: impl FnMut(&InputEvent) -> bool,
+    mut next: impl FnMut() -> Option<InputEvent>,
+) -> (usize, Option<InputEvent>) {
+    let mut count = 1usize;
+    loop {
+        match next() {
+            Some(ev) if is_repeat(&ev) => count += 1,
+            Some(other) => return (count, Some(other)),
+            None => return (count, None),
+        }
+    }
+}
+
 /// Count immediately-available repeats of `first` (same key + modifiers);
 /// the first NON-identical event is returned for requeueing. `next` yields
 /// `None` when the input queue is drained. Coalescing a held key's backlog
 /// into one application kills scroll inertia without dropping other events.
 fn drain_key_repeats(
     first: &termwiz::input::KeyEvent,
-    mut next: impl FnMut() -> Option<InputEvent>,
+    next: impl FnMut() -> Option<InputEvent>,
 ) -> (usize, Option<InputEvent>) {
-    let mut count = 1usize;
-    loop {
-        match next() {
-            Some(InputEvent::Key(k)) if k.key == first.key && k.modifiers == first.modifiers => {
-                count += 1;
-            }
-            Some(other) => return (count, Some(other)),
-            None => return (count, None),
-        }
-    }
+    drain_event_repeats(
+        |ev| {
+            matches!(
+                ev,
+                InputEvent::Key(k) if k.key == first.key && k.modifiers == first.modifiers
+            )
+        },
+        next,
+    )
+}
+
+/// Drain immediately-available wheel events that match `up` direction.
+/// Returns `(tick_count, leftover)` — the opposite-direction wheel or any
+/// non-wheel event is returned as leftover so the caller can requeueit.
+///
+/// Using `Duration::ZERO` for the `next` poll drains everything already
+/// queued even when the OS delivers events one-per-`poll_input` return,
+/// because the spin loop keeps pulling until the kernel returns nothing.
+fn drain_wheel_ticks(
+    up: bool,
+    next: impl FnMut() -> Option<InputEvent>,
+) -> (usize, Option<InputEvent>) {
+    use termwiz::input::MouseButtons;
+    drain_event_repeats(
+        move |ev| {
+            matches!(
+                ev,
+                InputEvent::Mouse(m)
+                    if m.mouse_buttons.contains(MouseButtons::VERT_WHEEL)
+                        && m.mouse_buttons.contains(MouseButtons::WHEEL_POSITIVE) == up
+            )
+        },
+        next,
+    )
 }
 
 /// Run the detected test command off-thread; results (parsed indicator
@@ -3929,7 +3948,7 @@ fn spawn_worktree_shell_pane(
         && dir.is_dir()
     {
         let wt = dir.to_string_lossy().into_owned();
-        let spec = crate::agent::launch_spec(cfg, &wt, None, "shell");
+        let spec = crate::agent::launch_spec(cfg, &wt, None, "shell")?;
         return panes.spawn_argv_env(
             &spec.argv,
             spec.cwd.as_deref().or(Some(dir)),
@@ -3951,7 +3970,7 @@ fn spawn_yazi_pane(
         && cfg.tool_command("yazi").is_some()
     {
         let wt = dir.to_string_lossy().into_owned();
-        let spec = crate::agent::launch_spec(cfg, &wt, None, "yazi");
+        let spec = crate::agent::launch_spec(cfg, &wt, None, "yazi").ok()?;
         let yenv = crate::panes::yazi_env(cfg);
         let argv = contain_yazi_argv(cfg, spec.argv, superzej_core::util::have("systemd-run"));
         return panes
@@ -4006,6 +4025,157 @@ fn hide_drawer_into_pool(
     }
 }
 
+// ── Search helpers ────────────────────────────────────────────────────────────
+
+/// Build the list of `(pane_id, label, &HistoryBuffer)` sources for the search
+/// engine. The `scope` determines which panes from `session` are included;
+/// only live panes present in `panes` contribute (closed panes are skipped).
+///
+/// For `Pane(id)` scope we return at most one entry. For broader scopes we
+/// walk the session tree in display order.
+fn build_search_sources<'a>(
+    scope: superzej_core::search::SearchScope,
+    session: &crate::session::Session,
+    panes: &'a Panes,
+    focused: u32,
+) -> Vec<(u32, String, &'a superzej_core::history::HistoryBuffer)> {
+    use superzej_core::search::SearchScope;
+    let mut out = Vec::new();
+
+    match scope {
+        SearchScope::Pane(id) => {
+            if let Some(p) = panes.table.get(&id) {
+                out.push((id, "pane".to_string(), &p.history));
+            }
+        }
+        SearchScope::Tab => {
+            // Collect panes in the active tab only.
+            if let Some(tab) = session.active_tab() {
+                for pid in tab.center.pane_ids() {
+                    if let Some(p) = panes.table.get(&pid) {
+                        let label = if pid == focused {
+                            "focused pane".to_string()
+                        } else {
+                            format!("pane {pid}")
+                        };
+                        out.push((pid, label, &p.history));
+                    }
+                }
+            }
+        }
+        SearchScope::Worktree => {
+            // All tabs in the active worktree.
+            if let Some(g) = session.active_group() {
+                for (ti, tab) in g.tabs.iter().enumerate() {
+                    let tab_label = format!("tab {}", ti + 1);
+                    for pid in tab.center.pane_ids() {
+                        if let Some(p) = panes.table.get(&pid) {
+                            out.push((pid, tab_label.clone(), &p.history));
+                        }
+                    }
+                }
+            }
+        }
+        SearchScope::Workspace => {
+            // All worktrees in the active session.
+            for g in &session.worktrees {
+                let wt_name = g.path.rsplit('/').next().unwrap_or(&g.name).to_string();
+                for (ti, tab) in g.tabs.iter().enumerate() {
+                    let label = format!("tab {} · {}", ti + 1, wt_name);
+                    for pid in tab.center.pane_ids() {
+                        if let Some(p) = panes.table.get(&pid) {
+                            out.push((pid, label.clone(), &p.history));
+                        }
+                    }
+                }
+            }
+        }
+        SearchScope::Profile => {
+            // Same as Workspace for now (profile == session in the current model;
+            // when profiles land this will walk across sessions).
+            for g in &session.worktrees {
+                let wt_name = g.path.rsplit('/').next().unwrap_or(&g.name).to_string();
+                for (ti, tab) in g.tabs.iter().enumerate() {
+                    let label = format!("tab {} · {}", ti + 1, wt_name);
+                    for pid in tab.center.pane_ids() {
+                        if let Some(p) = panes.table.get(&pid) {
+                            out.push((pid, label.clone(), &p.history));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Compute the overlay rect: centered horizontally, upper third of the center.
+fn search_overlay_rect(center: Rect) -> Rect {
+    center // run.rs passes center directly; open_layer handles sizing
+}
+
+/// Jump to the matched line: switch tab if needed, scroll the pane so the
+/// matched line is visible, focus the center terminal.
+fn apply_search_jump(
+    m: superzej_core::search::SearchMatch,
+    session: &mut crate::session::Session,
+    panes: &mut Panes,
+    focus: &mut crate::focus::FocusState,
+    model: &mut crate::chrome::FrameModel,
+    sb: &mut SidebarState,
+    need_relayout: &mut bool,
+) {
+    use crate::focus::Zone;
+
+    // Find which tab owns this pane and switch to it if not already active.
+    let mut switched = false;
+    'outer: for (gi, g) in session.worktrees.iter().enumerate() {
+        for (ti, tab) in g.tabs.iter().enumerate() {
+            if tab.center.pane_ids().contains(&m.pane_id) {
+                if gi != session.active {
+                    session.switch_to(gi);
+                    switched = true;
+                }
+                if gi == session.active {
+                    let g = &mut session.worktrees[gi];
+                    if g.active_tab != ti {
+                        g.active_tab = ti;
+                        switched = true;
+                    }
+                }
+                break 'outer;
+            }
+        }
+    }
+    if switched {
+        refresh_tab_model(model, session, sb);
+        *need_relayout = true;
+    }
+
+    // Focus the center terminal.
+    focus.zone = Zone::Center;
+    if let Some(tab) = session.active_tab_mut() {
+        tab.focused_pane = m.pane_id;
+    }
+
+    // Scroll the pane to bring the matched line into view.
+    // `line_idx` is the 0-based index in the history ring (oldest surviving = 0).
+    // The history ring may have evicted older lines; the distance from the tail
+    // is `history.len() - 1 - line_idx` lines up from the live tail.
+    if let Some(p) = panes.table.get_mut(&m.pane_id) {
+        let buf_len = p.history.len();
+        if buf_len > 0 && m.line_idx < buf_len {
+            let lines_from_tail = buf_len - 1 - m.line_idx;
+            // Reset first so we're always measuring from the tail.
+            // Scroll to tail first (huge down scroll clamps to 0).
+            p.scroll_down(usize::MAX / 2);
+            if lines_from_tail > 0 {
+                p.scroll_up(lines_from_tail);
+            }
+        }
+    }
+}
+
 fn drawer_cancel_key(key: &KeyCode, modifiers: Modifiers) -> bool {
     if modifiers.contains(Modifiers::CTRL) || modifiers.contains(Modifiers::ALT) {
         return false;
@@ -4050,6 +4220,7 @@ fn persist_session_layout(session: &crate::session::Session) {
 /// in "agent picker" mode: its selection launches the chosen agent into the
 /// group named `tab` rather than dispatching a command. Escaping defaults to a
 /// plain shell so the worktree is never left with no process.
+#[derive(Debug, Clone)]
 struct PendingAgent {
     /// The `{repo_slug}/{branch}` group name to launch into.
     tab: String,
@@ -4103,22 +4274,20 @@ fn create_local_worktree(
     Some(NewWorktree { tab, branch, path })
 }
 
-/// Launch `choice` into the worktree tab named `pending.tab`: compose the
-/// sandbox-wrapped argv + env (via [`crate::agent::launch_spec`]), spawn it as a
-/// fresh pane, and point that tab's center at the live pane so `materialize`
-/// won't also spawn a plain shell. No-op (returns false) if the tab is gone.
-fn launch_agent_into_tab(
-    cfg: &superzej_core::config::Config,
+/// Spawn an already-resolved launch spec into the worktree tab named
+/// `pending.tab`, then point that tab's center at the live pane so lazy
+/// materialization will not also spawn a plain shell. Resolving the spec can
+/// block on sandbox/container setup, so callers must do that off the event loop.
+fn launch_resolved_agent_into_tab(
     session: &mut crate::session::Session,
     panes: &mut Panes,
     pending: &PendingAgent,
-    choice: &str,
+    spec: &crate::agent::LaunchSpec,
     center: Rect,
 ) -> bool {
     let Some(gi) = session.worktrees.iter().position(|g| g.name == pending.tab) else {
         return false;
     };
-    let spec = crate::agent::launch_spec(cfg, &pending.worktree, Some(&pending.branch), choice);
     let cwd = spec.cwd.clone();
     match panes.spawn_argv_env(&spec.argv, cwd.as_deref(), &spec.env, center) {
         Ok(id) => {
@@ -4249,9 +4418,20 @@ async fn event_loop<T: Terminal>(
     // specs for a (worktree, tab)'s missing leaves, keeps the splash up, and
     // finishes the spawn (openpty+exec, fast) when they land. Stale results
     // (worktree/tab changed mid-flight) are dropped on arrival.
-    type SpecBatch = (String, usize, Vec<(u32, crate::agent::LaunchSpec)>);
+    type SpecBatch = (
+        String,
+        usize,
+        std::result::Result<Vec<(u32, crate::agent::LaunchSpec)>, String>,
+    );
     let (spec_tx, mut spec_rx) = tokio_mpsc::unbounded_channel::<SpecBatch>();
     let mut materialize_inflight: Option<(String, usize)> = None;
+    type AgentLaunchDone = (
+        PendingAgent,
+        String,
+        std::result::Result<crate::agent::LaunchSpec, String>,
+        Vec<superzej_core::sandbox::ContainerInfo>,
+    );
+    let (agent_tx, mut agent_rx) = tokio_mpsc::unbounded_channel::<AgentLaunchDone>();
     // Test-explorer results from the background runner/discoverer (capped,
     // single-flight). Two channels: run outcomes and discovery outcomes.
     let (test_run_tx, mut test_run_rx) =
@@ -4357,6 +4537,8 @@ async fn event_loop<T: Terminal>(
     let mut wire_renderer = crate::wire::WireRenderer::new();
     let use_termwiz_renderer = crate::wire::use_termwiz_renderer();
     let mut palette: Option<crate::palette::Palette> = None;
+    // Search overlay state: lives here so it survives across loop iterations.
+    let mut search: Option<crate::search::SearchOverlay> = None;
     // Panel document payloads (git calendar/log, the selected file's diff)
     // are fetched off-loop on section entry and tagged with `docs_gen`; a
     // worktree switch bumps the generation so stale results die on arrival.
@@ -4623,10 +4805,9 @@ async fn event_loop<T: Terminal>(
                 let tx = spec_tx.clone();
                 let wk = waker.clone();
                 task::spawn_blocking(move || {
-                    let specs: Vec<(u32, crate::agent::LaunchSpec)> = missing
-                        .into_iter()
-                        .map(|id| (id, crate::agent::launch_spec(&cfg, &wt, None, "shell")))
-                        .collect();
+                    let specs = crate::agent::launch_spec(&cfg, &wt, None, "shell")
+                        .map(|spec| missing.into_iter().map(|id| (id, spec.clone())).collect())
+                        .map_err(|e| e.to_string());
                     if tx.send((wt, ti, specs)).is_ok() {
                         let _ = wk.wake();
                     }
@@ -4733,10 +4914,9 @@ async fn event_loop<T: Terminal>(
                     let wk = waker.clone();
                     let wt = path.clone();
                     task::spawn_blocking(move || {
-                        let specs: Vec<(u32, crate::agent::LaunchSpec)> = missing
-                            .into_iter()
-                            .map(|id| (id, crate::agent::launch_spec(&cfg, &wt, None, "shell")))
-                            .collect();
+                        let specs = crate::agent::launch_spec(&cfg, &wt, None, "shell")
+                            .map(|spec| missing.into_iter().map(|id| (id, spec.clone())).collect())
+                            .map_err(|e| e.to_string());
                         if tx.send((wt, ti, specs)).is_ok() {
                             let _ = wk.wake();
                         }
@@ -5258,16 +5438,80 @@ async fn event_loop<T: Terminal>(
             if is_active && center_dormant {
                 continue; // splash still up: stay lazy
             }
+            let specs = match specs {
+                Ok(specs) => specs,
+                Err(e) => {
+                    model.status = format!("Pane launch blocked: {e}");
+                    if is_active {
+                        center_dormant = true;
+                        dirty = true;
+                    }
+                    continue;
+                }
+            };
+            let warnings = specs
+                .iter()
+                .filter_map(|(_, spec)| spec.warning_summary())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
             let Some(tab) = session.worktrees[gi].tabs.get_mut(ti) else {
                 continue;
             };
             if let Err(e) = panes.materialize_with_specs(tab, &wt, &specs, chrome.center) {
                 // Spawn failures are survivable: report, don't exit the loop.
                 model.status = format!("Pane spawn failed: {e}");
+            } else if is_active && !warnings.is_empty() {
+                model.status = format!("⚠ Sandbox fallback: {}", warnings.join("; "));
             }
             if is_active {
                 need_relayout = true;
             }
+            dirty = true;
+        }
+
+        while let Ok((pending, choice, spec, containers)) = agent_rx.try_recv() {
+            model.containers = containers;
+            match spec {
+                Ok(spec) => {
+                    let backend = spec.backend.clone();
+                    let warning = spec.warning_summary();
+                    if launch_resolved_agent_into_tab(
+                        &mut session,
+                        &mut panes,
+                        &pending,
+                        &spec,
+                        chrome.center,
+                    ) {
+                        model.status = if let Some(warning) = warning {
+                            format!(
+                                "⚠ Launched {choice} in {} ({backend}) — sandbox fallback: {warning}",
+                                pending.tab
+                            )
+                        } else {
+                            format!("Launched {choice} in {} ({backend})", pending.tab)
+                        };
+                        refresh_tab_model(&mut model, &session, &mut sb);
+                        need_relayout = true;
+                    } else {
+                        model.status = format!("Launch target vanished: {}", pending.tab);
+                    }
+                }
+                Err(e) => {
+                    model.status = format!("Launch blocked: {e}");
+                }
+            }
+            hydration_gen = hydration_gen.wrapping_add(1);
+            spawn_model_hydration(
+                model_tx.clone(),
+                hydration_gen,
+                session.clone(),
+                Some(waker.clone()),
+                crate::hydrate::HydrateHints {
+                    open: panel_ui.open,
+                    expanded: panel_ui.width.is_expanded(),
+                },
+            );
             dirty = true;
         }
 
@@ -5594,6 +5838,11 @@ async fn event_loop<T: Terminal>(
             if let Some(pal) = &palette {
                 pal.render(&mut scratch, screen);
             }
+            // Search overlay is composited above the center, below menus.
+            if let Some(ref ov) = search {
+                let rect = search_overlay_rect(chrome.center);
+                ov.render(&mut scratch, rect);
+            }
             if let Some(m) = &active_menu {
                 m.render(&mut scratch, screen);
             }
@@ -5806,11 +6055,25 @@ async fn event_loop<T: Terminal>(
                 if m.mouse_buttons.contains(MouseButtons::VERT_WHEEL) {
                     let up = m.mouse_buttons.contains(MouseButtons::WHEEL_POSITIVE);
                     if let Some((id, _)) = hit_pane {
+                        // Coalesce all same-direction wheel ticks that are
+                        // already queued: one render pass for the whole
+                        // gesture, never one render per tick.
+                        let (ticks, leftover) = drain_wheel_ticks(up, || {
+                            buf.terminal()
+                                .poll_input(Some(std::time::Duration::ZERO))
+                                .ok()
+                                .flatten()
+                        });
+                        if let Some(ev) = leftover {
+                            pending_input.push_back(ev);
+                        }
+                        // 5 rows per tick (was 3) — snappier single-tick response.
+                        let delta = ticks * 5;
                         if let Some(p) = panes.table.get_mut(&id) {
                             if up {
-                                p.scroll_up(3);
+                                p.scroll_up(delta);
                             } else {
-                                p.scroll_down(3);
+                                p.scroll_down(delta);
                             }
                             dirty = true;
                         }
@@ -6361,6 +6624,41 @@ async fn event_loop<T: Terminal>(
                         continue;
                     }
                 }
+                // Modal: when the search overlay is open it captures all keys.
+                if let Some(ref mut ov) = search {
+                    let srcs = build_search_sources(ov.scope(), &session, &panes, focused);
+                    // Convert to the borrow shape the engine expects.
+                    let srcs_ref: Vec<(u32, &str, &superzej_core::history::HistoryBuffer)> = srcs
+                        .iter()
+                        .map(|(id, label, buf)| (*id, label.as_str(), *buf))
+                        .collect();
+                    match ov.handle_key(&k.key, k.modifiers, &srcs_ref) {
+                        crate::search::SearchOutcome::Pending => {
+                            dirty = true;
+                            continue;
+                        }
+                        crate::search::SearchOutcome::Dismiss => {
+                            search = None;
+                            dirty = true;
+                            continue;
+                        }
+                        crate::search::SearchOutcome::Jump(m) => {
+                            search = None;
+                            apply_search_jump(
+                                m,
+                                &mut session,
+                                &mut panes,
+                                &mut focus,
+                                &mut model,
+                                &mut sb,
+                                &mut need_relayout,
+                            );
+                            dirty = true;
+                            continue;
+                        }
+                    }
+                }
+
                 // Modal: when the palette is open it captures all keys.
                 if let Some(p) = palette.as_mut() {
                     // Agent-picker mode: the palette is choosing what to run in a
@@ -6421,14 +6719,30 @@ async fn event_loop<T: Terminal>(
                                 if let Some(pending) = pending_agent.as_ref()
                                     && choice != "shell"
                                 {
-                                    launch_agent_into_tab(
-                                        keymap.config(),
-                                        &mut session,
-                                        &mut panes,
-                                        pending,
-                                        &choice,
-                                        chrome.center,
-                                    );
+                                    let pending = pending.clone();
+                                    let cfg = keymap.config().clone();
+                                    let choice_for_worker = choice.clone();
+                                    let tx = agent_tx.clone();
+                                    let wk = waker.clone();
+                                    model.status =
+                                        format!("Launching {choice} in {}…", pending.tab);
+                                    task::spawn_blocking(move || {
+                                        let spec = crate::agent::launch_spec(
+                                            &cfg,
+                                            &pending.worktree,
+                                            Some(&pending.branch),
+                                            &choice_for_worker,
+                                        )
+                                        .map_err(|e| e.to_string());
+                                        let containers =
+                                            superzej_core::sandbox::running_containers();
+                                        if tx
+                                            .send((pending, choice_for_worker, spec, containers))
+                                            .is_ok()
+                                        {
+                                            let _ = wk.wake();
+                                        }
+                                    });
                                 }
                                 pending_agent = None;
                                 palette = None;
@@ -7567,6 +7881,98 @@ async fn event_loop<T: Terminal>(
                             }
                             true
                         }
+                        (Section::Files, KeyCode::Char('O'))
+                        | (Section::Changes, KeyCode::Char('O')) => {
+                            let path = if panel_ui.open == Section::Files {
+                                changed_file_at(&model, panel_ui.cursor)
+                            } else {
+                                panel_ui
+                                    .chg_sel
+                                    .or(Some(panel_ui.cursor))
+                                    .and_then(|i| model.panel.changes.get(i))
+                                    .map(|c| c.path.clone())
+                            };
+                            if let Some(path) = path {
+                                let cmd = editor_open_command(keymap.config(), &path, None);
+                                let cwd = active_cwd(&session);
+                                open_command_pane(
+                                    &mut session,
+                                    &mut panes,
+                                    focused,
+                                    &cmd,
+                                    cwd.as_deref(),
+                                    chrome.center,
+                                );
+                                focus.zone = crate::focus::Zone::Center;
+                                refresh_tab_model(&mut model, &session, &mut sb);
+                                need_relayout = true;
+                            }
+                            true
+                        }
+                        (Section::Files, KeyCode::Char('\x0F'))
+                        | (Section::Changes, KeyCode::Char('\x0F')) => {
+                            // Ctrl-O: Open in external editor
+                            let path = if panel_ui.open == Section::Files {
+                                changed_file_at(&model, panel_ui.cursor)
+                            } else {
+                                panel_ui
+                                    .chg_sel
+                                    .or(Some(panel_ui.cursor))
+                                    .and_then(|i| model.panel.changes.get(i))
+                                    .map(|c| c.path.clone())
+                            };
+                            if let Some(path) = path {
+                                let wt = active_tab_path(&session);
+                                let abs_path = wt.join(path);
+                                let cmd = editor_open_command(
+                                    keymap.config(),
+                                    &abs_path.to_string_lossy(),
+                                    None,
+                                );
+                                let _ = std::process::Command::new("sh").arg("-c").arg(cmd).spawn();
+                            }
+                            true
+                        }
+                        (Section::Files, KeyCode::Char('\r'))
+                        | (Section::Changes, KeyCode::Char('\r'))
+                        | (Section::Files, KeyCode::Enter)
+                        | (Section::Changes, KeyCode::Enter) => {
+                            // Handled by PanelMsg::Select in accordion map!
+                            false
+                        }
+                        (Section::Files, KeyCode::Char('b'))
+                        | (Section::Changes, KeyCode::Char('b')) => {
+                            let path = if panel_ui.open == Section::Files {
+                                changed_file_at(&model, panel_ui.cursor)
+                            } else {
+                                panel_ui
+                                    .chg_sel
+                                    .or(Some(panel_ui.cursor))
+                                    .and_then(|i| model.panel.changes.get(i))
+                                    .map(|c| c.path.clone())
+                            };
+                            if let Some(path) = path {
+                                let bat = keymap
+                                    .config()
+                                    .tool_command("bat")
+                                    .unwrap_or("bat --paging=always")
+                                    .to_string();
+                                let cmd = format!("{bat} {}", test_shell_quote(&path));
+                                let cwd = active_cwd(&session);
+                                open_command_pane(
+                                    &mut session,
+                                    &mut panes,
+                                    focused,
+                                    &cmd,
+                                    cwd.as_deref(),
+                                    chrome.center,
+                                );
+                                focus.zone = crate::focus::Zone::Center;
+                                refresh_tab_model(&mut model, &session, &mut sb);
+                                need_relayout = true;
+                            }
+                            true
+                        }
                         // Esc in section mode returns to the terminal (row
                         // mode's Esc is claimed by the accordion map).
                         (_, key) if crate::input::is_escape_key(&key) => {
@@ -7801,6 +8207,9 @@ async fn event_loop<T: Terminal>(
                             }
                             Action::NextTab => {
                                 session.next_tab();
+                                // Tab switches always land focus on the center
+                                // terminal — the user switched to work there.
+                                focus.zone = crate::focus::Zone::Center;
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
                                 sync_drawer_persistence(
@@ -7815,6 +8224,9 @@ async fn event_loop<T: Terminal>(
                             }
                             Action::PrevTab => {
                                 session.prev_tab();
+                                // Tab switches always land focus on the center
+                                // terminal — the user switched to work there.
+                                focus.zone = crate::focus::Zone::Center;
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
                                 sync_drawer_persistence(
@@ -7846,6 +8258,9 @@ async fn event_loop<T: Terminal>(
                                     _ if action == Action::NextWorktree => session.next_worktree(),
                                     _ => session.prev_worktree(),
                                 }
+                                // Worktree switches always land focus on the
+                                // center terminal — the user switched to work there.
+                                focus.zone = crate::focus::Zone::Center;
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
                                 sync_drawer_persistence(
@@ -8219,6 +8634,9 @@ async fn event_loop<T: Terminal>(
                                     crate::session::CloseResult::Nothing => {}
                                 }
                                 persist_session_layout(&session);
+                                // Close always lands the user on the center
+                                // terminal of whichever tab is now active.
+                                focus.zone = crate::focus::Zone::Center;
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
                             }
@@ -8246,6 +8664,9 @@ async fn event_loop<T: Terminal>(
                                     forget_worktree_group(&db, &session.id, &g);
                                 }
                                 persist_session_layout(&session);
+                                // Close always lands the user on the center
+                                // terminal of whichever worktree is now active.
+                                focus.zone = crate::focus::Zone::Center;
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
                             }
@@ -8271,6 +8692,26 @@ async fn event_loop<T: Terminal>(
                                     let _ = out.write_all(&crate::copymode::osc52(&text));
                                     let _ = out.flush();
                                 }
+                            }
+                            Action::SearchPane => {
+                                // Open an incremental search overlay scoped to
+                                // the focused pane's history.
+                                let max = keymap.config().search.max_results;
+                                search = Some(crate::search::SearchOverlay::new(
+                                    superzej_core::search::SearchScope::Pane(focused),
+                                    focused,
+                                    max,
+                                ));
+                            }
+                            Action::SearchGlobal => {
+                                // Open the search overlay scoped to the whole
+                                // active worktree; user can Tab to widen scope.
+                                let max = keymap.config().search.max_results;
+                                search = Some(crate::search::SearchOverlay::new(
+                                    superzej_core::search::SearchScope::Worktree,
+                                    focused,
+                                    max,
+                                ));
                             }
                             Action::Lazygit | Action::Editor | Action::Diff => {
                                 // Tools open in a fresh center tab — a real
@@ -9272,23 +9713,40 @@ mod tests {
         assert_eq!(k.modifiers, kitty.modifiers);
     }
 
+    // ── drain helpers ────────────────────────────────────────────────────────
+
+    fn mk_key(code: KeyCode) -> InputEvent {
+        InputEvent::Key(termwiz::input::KeyEvent {
+            key: code,
+            modifiers: Modifiers::NONE,
+        })
+    }
+
+    fn mk_wheel(up: bool) -> InputEvent {
+        use termwiz::input::{MouseButtons, MouseEvent};
+        let mut buttons = MouseButtons::VERT_WHEEL;
+        if up {
+            buttons |= MouseButtons::WHEEL_POSITIVE;
+        }
+        InputEvent::Mouse(MouseEvent {
+            x: 1,
+            y: 1,
+            mouse_buttons: buttons,
+            modifiers: Modifiers::NONE,
+        })
+    }
+
     #[test]
     fn drain_key_repeats_coalesces_identical_keys() {
         let key = termwiz::input::KeyEvent {
             key: KeyCode::DownArrow,
             modifiers: Modifiers::NONE,
         };
-        let mk = |code| {
-            InputEvent::Key(termwiz::input::KeyEvent {
-                key: code,
-                modifiers: Modifiers::NONE,
-            })
-        };
         // Three identical repeats then a different key.
         let mut q: std::collections::VecDeque<InputEvent> = [
-            mk(KeyCode::DownArrow),
-            mk(KeyCode::DownArrow),
-            mk(KeyCode::Char('x')),
+            mk_key(KeyCode::DownArrow),
+            mk_key(KeyCode::DownArrow),
+            mk_key(KeyCode::Char('x')),
         ]
         .into();
         let (n, leftover) = drain_key_repeats(&key, || q.pop_front());
@@ -9297,10 +9755,127 @@ mod tests {
             leftover,
             Some(InputEvent::Key(k)) if k.key == KeyCode::Char('x')
         ));
-        // Empty queue → just the first.
+        // Empty queue → just the first (count = 1).
         let (n, leftover) = drain_key_repeats(&key, || None);
         assert_eq!(n, 1);
         assert!(leftover.is_none());
+    }
+
+    #[test]
+    fn drain_key_repeats_stops_on_different_modifiers() {
+        let key = termwiz::input::KeyEvent {
+            key: KeyCode::DownArrow,
+            modifiers: Modifiers::NONE,
+        };
+        // Same key but with Shift — must stop the drain.
+        let shifted = InputEvent::Key(termwiz::input::KeyEvent {
+            key: KeyCode::DownArrow,
+            modifiers: Modifiers::SHIFT,
+        });
+        let mut q: std::collections::VecDeque<InputEvent> =
+            [mk_key(KeyCode::DownArrow), shifted].into();
+        let (n, leftover) = drain_key_repeats(&key, || q.pop_front());
+        assert_eq!(n, 2); // first + one plain repeat
+        assert!(matches!(
+            leftover,
+            Some(InputEvent::Key(k)) if k.modifiers == Modifiers::SHIFT
+        ));
+    }
+
+    #[test]
+    fn drain_wheel_ticks_coalesces_same_direction() {
+        // 4 up ticks then a down tick.
+        let mut q: std::collections::VecDeque<InputEvent> = [
+            mk_wheel(true),
+            mk_wheel(true),
+            mk_wheel(true),
+            mk_wheel(false), // opposite direction — stops drain
+        ]
+        .into();
+        let (n, leftover) = drain_wheel_ticks(true, || q.pop_front());
+        assert_eq!(n, 4, "first tick + 3 repeats = 4 total");
+        assert!(
+            matches!(&leftover, Some(InputEvent::Mouse(m)) if !m.mouse_buttons.contains(termwiz::input::MouseButtons::WHEEL_POSITIVE)),
+            "leftover should be the down-wheel event"
+        );
+        // The leftover is back in the caller's hands; the queue should be empty now.
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn drain_wheel_ticks_stops_on_direction_reversal() {
+        // Only one tick in the queue before a reversal.
+        let mut q: std::collections::VecDeque<InputEvent> = [mk_wheel(false)].into();
+        let (n, leftover) = drain_wheel_ticks(true, || q.pop_front());
+        // count = 1 (the original event the caller already consumed), leftover = the down.
+        assert_eq!(n, 1);
+        assert!(leftover.is_some());
+    }
+
+    #[test]
+    fn drain_wheel_ticks_stops_on_non_wheel_event() {
+        // A keypress interrupts the wheel drain.
+        let mut q: std::collections::VecDeque<InputEvent> =
+            [mk_wheel(true), mk_key(KeyCode::Char('q'))].into();
+        let (n, leftover) = drain_wheel_ticks(true, || q.pop_front());
+        assert_eq!(n, 2, "first + one more wheel = 2");
+        assert!(matches!(leftover, Some(InputEvent::Key(_))));
+    }
+
+    #[test]
+    fn drain_wheel_ticks_empty_queue_returns_one() {
+        let (n, leftover) = drain_wheel_ticks(true, || None);
+        assert_eq!(n, 1);
+        assert!(leftover.is_none());
+    }
+
+    #[test]
+    fn drain_wheel_ticks_down_direction() {
+        // Symmetric: draining down-wheel events.
+        let mut q: std::collections::VecDeque<InputEvent> =
+            [mk_wheel(false), mk_wheel(false), mk_wheel(true)].into();
+        let (n, leftover) = drain_wheel_ticks(false, || q.pop_front());
+        assert_eq!(n, 3);
+        assert!(
+            matches!(&leftover, Some(InputEvent::Mouse(m)) if m.mouse_buttons.contains(termwiz::input::MouseButtons::WHEEL_POSITIVE))
+        );
+    }
+
+    #[test]
+    fn drain_event_repeats_stops_on_first_mismatch() {
+        // Exercise the generic core directly with an arbitrary predicate over
+        // InputEvent: accept only Char('a') keys; stop on Char('b').
+        let mut q: std::collections::VecDeque<InputEvent> = [
+            mk_key(KeyCode::Char('a')),
+            mk_key(KeyCode::Char('a')),
+            mk_key(KeyCode::Char('b')), // mismatch → leftover
+            mk_key(KeyCode::Char('a')), // unreachable in this drain
+        ]
+        .into();
+        let (n, leftover) = drain_event_repeats(
+            |ev| matches!(ev, InputEvent::Key(k) if k.key == KeyCode::Char('a')),
+            || q.pop_front(),
+        );
+        assert_eq!(n, 3); // first + 2 repeats
+        assert!(matches!(
+            leftover,
+            Some(InputEvent::Key(k)) if k.key == KeyCode::Char('b')
+        ));
+        // The 4th event is still in the queue (not consumed by the drain).
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn drain_event_repeats_all_matching_drains_to_empty() {
+        let mut q: std::collections::VecDeque<InputEvent> =
+            [mk_key(KeyCode::Char('a')), mk_key(KeyCode::Char('a'))].into();
+        let (n, leftover) = drain_event_repeats(
+            |ev| matches!(ev, InputEvent::Key(k) if k.key == KeyCode::Char('a')),
+            || q.pop_front(),
+        );
+        assert_eq!(n, 3); // first + 2 from queue
+        assert!(leftover.is_none());
+        assert!(q.is_empty());
     }
 
     #[test]

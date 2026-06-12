@@ -304,8 +304,6 @@ pub enum GitMsg {
     // navigation / selection
     CursorDown,
     CursorUp,
-    RangeDown,
-    RangeUp,
     ToggleRangeMode,
     /// Enter: drill into the row (file→staging, commit→files, …).
     Drill,
@@ -390,8 +388,6 @@ pub fn context_keys(view: GitView) -> Vec<CtxKey> {
             k("s", "stash", GitMsg::StashPush),
             k("D", "reset menu", GitMsg::ResetMenu),
             k("v", "range", GitMsg::ToggleRangeMode),
-            k("S-down", "range", GitMsg::RangeDown),
-            k("S-up", "range", GitMsg::RangeUp),
             k("x", "commands", GitMsg::OpenMenu(MenuKind::CustomCommands)),
             k("z", "undo", GitMsg::Undo),
             k("Z", "redo", GitMsg::Redo),
@@ -439,8 +435,6 @@ pub fn context_keys(view: GitView) -> Vec<CtxKey> {
             k("}", "move down", GitMsg::MoveDown),
             k("{", "move up", GitMsg::MoveUp),
             k("v", "range", GitMsg::ToggleRangeMode),
-            k("S-down", "range", GitMsg::RangeDown),
-            k("S-up", "range", GitMsg::RangeUp),
             k("x", "commands", GitMsg::OpenMenu(MenuKind::CustomCommands)),
             k("z", "undo", GitMsg::Undo),
             k("Z", "redo", GitMsg::Redo),
@@ -462,8 +456,6 @@ pub fn context_keys(view: GitView) -> Vec<CtxKey> {
             k("space", "stage line", GitMsg::StageLines),
             k("a", "hunk", GitMsg::SelectHunk),
             k("v", "range", GitMsg::ToggleRangeMode),
-            k("S-down", "range", GitMsg::RangeDown),
-            k("S-up", "range", GitMsg::RangeUp),
             k("d", "discard", GitMsg::DiscardLines),
             k("tab", "staged⇄unstaged", GitMsg::TogglePane),
             k("[", "prev hunk", GitMsg::PrevHunk),
@@ -546,12 +538,6 @@ pub fn list_labels(view: GitView, data: &crate::panel::PanelData) -> Option<Vec<
         GitView::Stash => Some(data.stashes.iter().map(|s| s.message.clone()).collect()),
         _ => None,
     }
-}
-
-/// The display length of a git list view (its source list, or its filtered
-/// row count when a non-empty filter is live on it).
-pub fn list_len(ui: &GitUi, view: GitView, data: &crate::panel::PanelData) -> usize {
-    display_map(ui, view, data).len()
 }
 
 /// Display-ordered source indices of `view` under the live filter — the
@@ -729,8 +715,6 @@ fn chord_matches(chord: &str, key: &KeyCode, mods: Modifiers) -> bool {
         "space" => !ctrl && matches!(key, KeyCode::Char(' ')),
         "enter" => !ctrl && matches!(key, KeyCode::Enter),
         "tab" => !ctrl && matches!(key, KeyCode::Tab),
-        "S-down" => shift && matches!(key, KeyCode::DownArrow),
-        "S-up" => shift && matches!(key, KeyCode::UpArrow),
         c if c.starts_with("C-") => {
             let target = c.chars().nth(2);
             ctrl && matches!(key, KeyCode::Char(ch) if Some(*ch) == target)
@@ -758,8 +742,6 @@ fn is_navigation(msg: &GitMsg) -> bool {
         msg,
         GitMsg::CursorDown
             | GitMsg::CursorUp
-            | GitMsg::RangeDown
-            | GitMsg::RangeUp
             | GitMsg::ToggleRangeMode
             | GitMsg::Drill
             | GitMsg::Back
@@ -1074,6 +1056,32 @@ mod tests {
         // Lists leave j/k to the accordion's flow navigation.
         let commits = ui_at(GitView::Commits, PanelWidth::Full);
         assert_eq!(git_key(&KeyCode::Char('j'), none, &commits), None);
+    }
+
+    #[test]
+    fn shift_arrows_are_reserved_for_accordion_section_jumps() {
+        for view in [
+            GitView::Files,
+            GitView::Branches,
+            GitView::Commits,
+            GitView::Stash,
+            GitView::Staging,
+            GitView::CommitFiles,
+            GitView::PatchBuilding,
+            GitView::RebaseTodo,
+        ] {
+            let ui = ui_at(view, PanelWidth::Full);
+            assert_eq!(
+                git_key(&KeyCode::DownArrow, Modifiers::SHIFT, &ui),
+                None,
+                "{view:?} should let Shift+Down fall through to accordion_key"
+            );
+            assert_eq!(
+                git_key(&KeyCode::UpArrow, Modifiers::SHIFT, &ui),
+                None,
+                "{view:?} should let Shift+Up fall through to accordion_key"
+            );
+        }
     }
 
     #[test]

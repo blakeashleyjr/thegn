@@ -319,6 +319,10 @@ pub struct FrameModel {
     pub accent: String,
     /// Pin chips for the tabbar (label + status glyph), in `Alt-N` order.
     pub pins: Vec<crate::pins::PinChip>,
+    /// Deterministic container name for the active worktree path. The sandbox
+    /// panel uses this to show the sandbox for the selected worktree instead of
+    /// the first superzej-owned container on the machine.
+    pub active_container_name: String,
     /// Running containers (superzej-owned first) for the SANDBOXES section.
     pub containers: Vec<superzej_core::sandbox::ContainerInfo>,
 }

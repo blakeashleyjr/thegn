@@ -1258,6 +1258,29 @@ impl StripConfig {
     }
 }
 
+/// `[search]` — incremental pane-history and global search.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct SearchConfig {
+    /// Lines of terminal output kept per pane for searching. A larger value
+    /// lets you search further back in history at the cost of a small amount of
+    /// heap per pane.
+    pub history_lines: usize,
+    /// Maximum number of fuzzy-matched results returned per search. Capped at
+    /// the UI renderer's visible row count; higher values are just sorted but
+    /// not all drawn.
+    pub max_results: usize,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        SearchConfig {
+            history_lines: 10_000,
+            max_results: 1_000,
+        }
+    }
+}
+
 /// `[panel]` — the right accordion panel.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -1314,6 +1337,7 @@ pub struct Config {
     pub drawer: DrawerConfig,
     pub strip: StripConfig,
     pub panel: PanelConfig,
+    pub search: SearchConfig,
     /// Rebind a built-in action by id, e.g. `new-worktree = "Ctrl w"`. The flat
     /// table is the global/default layer; nested mode tables are native-host only.
     pub keybinds: KeybindConfig,
@@ -1376,6 +1400,7 @@ impl Default for Config {
             drawer: DrawerConfig::default(),
             strip: StripConfig::default(),
             panel: PanelConfig::default(),
+            search: SearchConfig::default(),
             keybinds: KeybindConfig::default(),
             actions: Vec::new(),
             profile: String::new(),

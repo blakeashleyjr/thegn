@@ -24,3 +24,4 @@ syntect.workspace = true
 chrono.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+nucleo-matcher.workspace = true

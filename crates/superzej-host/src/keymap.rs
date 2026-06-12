@@ -74,6 +74,10 @@ pub enum Action {
     ScrollUp,
     ScrollDown,
     CopyPane,
+    /// Open an incremental fuzzy-search overlay over the focused pane's history.
+    SearchPane,
+    /// Open the search overlay scoped to the active worktree (Tab → cycle wider).
+    SearchGlobal,
     /// Toggle the Ctrl+g keybind lock: while locked every key except Ctrl+g
     /// passes through to the focused pane (compositor chords are suspended).
     ToggleKeyLock,
@@ -351,6 +355,20 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         palette: true,
     },
     ActionSpec {
+        id: "search-pane",
+        label: "Search pane history",
+        hint: "search",
+        default_chords: &["/"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "search-global",
+        label: "Search across all panes (worktree scope)",
+        hint: "search all",
+        default_chords: &["Ctrl /"],
+        palette: true,
+    },
+    ActionSpec {
         id: "toggle-key-lock",
         label: "Lock/unlock keybinds (pass through)",
         hint: "lock",
@@ -490,6 +508,8 @@ impl Action {
             Action::ScrollUp => "scroll-up",
             Action::ScrollDown => "scroll-down",
             Action::CopyPane => "copy-pane",
+            Action::SearchPane => "search-pane",
+            Action::SearchGlobal => "search-global",
             Action::ToggleKeyLock => "toggle-key-lock",
             Action::SwitchMode(Mode::Normal) => "mode-normal",
             Action::SwitchMode(Mode::VimNormal) => "mode-vim-normal",
@@ -542,6 +562,8 @@ impl Action {
             "scroll-up" => Action::ScrollUp,
             "scroll-down" => Action::ScrollDown,
             "copy-pane" => Action::CopyPane,
+            "search-pane" | "search" => Action::SearchPane,
+            "search-global" => Action::SearchGlobal,
             "toggle-key-lock" | "key-lock" | "lock" => Action::ToggleKeyLock,
             "quit" => Action::Quit,
             "mode-normal" => Action::SwitchMode(Mode::Normal),
@@ -808,6 +830,10 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Shift PageUp", Action::ScrollUp).unwrap();
     map.insert_all("Shift PageDown", Action::ScrollDown)
         .unwrap();
+
+    // Search: "/" for focused-pane history, "Ctrl /" for worktree-wide scope.
+    map.insert_all("/", Action::SearchPane).unwrap();
+    map.insert_all("Ctrl /", Action::SearchGlobal).unwrap();
 
     // Pins: Alt-1..9 launch-or-focus the configured pin in registration order;
     // strip visibility/sizing and promote/unpin hang off Ctrl-Alt chords.

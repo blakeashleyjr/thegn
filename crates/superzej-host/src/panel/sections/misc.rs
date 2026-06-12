@@ -220,8 +220,11 @@ pub(super) fn debug() -> Vec<PanelRow> {
 pub(super) fn sandbox(ctx: &SectionCtx) -> Vec<PanelRow> {
     let (model, deep, full) = (ctx.model, ctx.deep(), ctx.full());
     let mut rows: Vec<PanelRow> = Vec::new();
-    let ours: Vec<_> = model.containers.iter().filter(|c| c.ours).collect();
-    match ours.first() {
+    let active = model
+        .containers
+        .iter()
+        .find(|c| c.ours && c.name == model.active_container_name);
+    match active {
         Some(c) => {
             rows.push(PanelRow::plain(Line::split(
                 vec![
