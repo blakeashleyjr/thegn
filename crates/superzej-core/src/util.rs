@@ -97,15 +97,30 @@ pub fn have(cmd: &str) -> bool {
     false
 }
 
+/// A `git -C <dir>` command with the parent's repo-targeting env scrubbed.
+/// When superzej (or its test suite, via a pre-commit hook) runs inside a git
+/// hook, git exports GIT_DIR/GIT_INDEX_FILE/GIT_WORK_TREE — often as paths
+/// RELATIVE to the outer repo — which would mis-target these explicit `-C`
+/// invocations (`git worktree add` dies with "index file open failed").
+pub fn git_cmd(dir: &Path) -> Command {
+    let mut c = Command::new("git");
+    c.arg("-C").arg(dir);
+    for var in [
+        "GIT_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_WORK_TREE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    ] {
+        c.env_remove(var);
+    }
+    c
+}
+
 /// Run `git -C <dir> <args...>`, returning trimmed stdout on success (None on
 /// failure or empty output).
 pub fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .ok()?;
+    let out = git_cmd(dir).args(args).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -234,9 +249,7 @@ pub fn sh_join(argv: &[String]) -> String {
 
 /// Run `git -C <dir> <args...>`, returning success (stdout/stderr discarded).
 pub fn git_ok(dir: &Path, args: &[&str]) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
+    git_cmd(dir)
         .args(args)
         .output()
         .map(|o| o.status.success())

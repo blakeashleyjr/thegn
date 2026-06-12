@@ -42,6 +42,7 @@ mod task;
 mod telemetry;
 mod testkit;
 mod wire;
+mod wizard;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
