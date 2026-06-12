@@ -1,8 +1,8 @@
-//! Shared keybinding overlay renderer: the full **cheatsheet** (`Alt ?`) and the
-//! transient **which-key** popup shown after a pending prefix. Both draw a box
-//! into the back-buffer `Surface` using `chrome::{fill, draw_text, theme_color}`,
-//! mirroring the palette overlay. Rows are derived from the core keymap registry
-//! (`superzej_core::keymap::effective`) so labels stay in one place.
+//! Keybinding hint data + the transient **which-key** popup shown after a
+//! pending prefix. The full cheatsheet is the panel's Keys section (9), whose
+//! Full view renders [`cheatsheet_groups`] — rows stay derived from the core
+//! keymap registry (`superzej_core::keymap::effective`) so labels live in one
+//! place.
 
 use termwiz::cell::{AttributeChange, Intensity};
 use termwiz::color::ColorAttribute;
@@ -140,59 +140,6 @@ pub fn which_key_rows(continuations: &[(Key, crate::keymap::Action)]) -> Vec<Hin
         .collect()
 }
 
-/// Draw a centered cheatsheet box: a title, then each group's heading + rows.
-/// Clips to `screen`; long content is truncated at the box height.
-pub fn render_cheatsheet(surface: &mut Surface, screen: Rect, groups: &[HintGroup], accent: &str) {
-    let total_rows: usize = groups.iter().map(|g| g.rows.len() + 1).sum();
-    let box_cols = (screen.cols * 7 / 10).clamp(30, 90).min(screen.cols);
-    let box_rows = (total_rows + 3)
-        .clamp(5, screen.rows.saturating_sub(2))
-        .min(screen.rows);
-    let x = screen.x + (screen.cols.saturating_sub(box_cols)) / 2;
-    let y = screen.y + (screen.rows.saturating_sub(box_rows)) / 4;
-    let rect = Rect {
-        x,
-        y,
-        cols: box_cols,
-        rows: box_rows,
-    };
-    fill(surface, rect, theme_color(theme::PANEL));
-
-    draw_title(
-        surface,
-        x + 1,
-        y,
-        " KEYBINDINGS — Esc to close",
-        accent,
-        box_cols,
-    );
-
-    let mut row = y + 2;
-    let max_row = y + box_rows;
-    for group in groups {
-        if row >= max_row {
-            break;
-        }
-        draw_text(
-            surface,
-            x + 1,
-            row,
-            &group.title,
-            theme_color(accent),
-            theme_color(theme::PANEL),
-            box_cols.saturating_sub(2),
-        );
-        row += 1;
-        for r in &group.rows {
-            if row >= max_row {
-                break;
-            }
-            draw_row(surface, x, row, r, box_cols);
-            row += 1;
-        }
-    }
-}
-
 /// Draw the bottom-anchored which-key popup listing next-key candidates.
 pub fn render_which_key(
     surface: &mut Surface,
@@ -314,26 +261,6 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].chord, "p");
         assert_eq!(rows[1].chord, "s");
-    }
-
-    #[test]
-    fn render_cheatsheet_draws_into_surface() {
-        let cfg = superzej_core::config::Config::default();
-        let groups = cheatsheet_groups(&cfg);
-        let mut s = Surface::new(100, 40);
-        render_cheatsheet(
-            &mut s,
-            Rect {
-                x: 0,
-                y: 0,
-                cols: 100,
-                rows: 40,
-            },
-            &groups,
-            theme::TEAL,
-        );
-        let text = s.screen_chars_to_string();
-        assert!(text.contains("KEYBINDINGS"), "title rendered: {text:?}");
     }
 
     #[test]

@@ -186,6 +186,21 @@ impl GitLoc {
         }
     }
 
+    /// A `Command` running an arbitrary shell script with cwd = the worktree
+    /// (the custom-command seam) — `sh -c` locally, `cd … && …` over ssh.
+    pub fn sh_command(&self, script: &str) -> Command {
+        match self {
+            GitLoc::Local(p) => {
+                let mut c = Command::new("sh");
+                c.arg("-c").arg(script).current_dir(p);
+                c
+            }
+            GitLoc::Remote { ssh, path } => {
+                self.ssh_command(ssh, format!("cd {} && {script}", util::sh_quote(path)))
+            }
+        }
+    }
+
     fn ssh_command(&self, ssh: &SshTarget, remote_cmd: String) -> Command {
         let mut argv = ssh_base(ssh.port, ssh.forward_agent, true);
         argv.push(ssh.host.clone());
@@ -193,6 +208,113 @@ impl GitLoc {
         let mut c = Command::new(&argv[0]);
         c.args(&argv[1..]);
         c
+    }
+
+    /// Like [`git_command`](Self::git_command), with extra environment
+    /// variables. Locally they go on the `Command`; remotely they become an
+    /// `env K=V … git …` prefix inside the ssh shell string (values
+    /// sh-quoted), since ssh does not forward arbitrary client env.
+    pub fn git_command_env(&self, envs: &[(&str, &str)], args: &[&str]) -> Command {
+        match self {
+            GitLoc::Local(p) => {
+                let mut c = Command::new("git");
+                c.arg("-C").arg(p).args(args);
+                for (k, v) in envs {
+                    c.env(k, v);
+                }
+                c
+            }
+            GitLoc::Remote { ssh, path } => {
+                let mut parts = vec!["env".to_string()];
+                for (k, v) in envs {
+                    parts.push(format!("{k}={}", util::sh_quote(v)));
+                }
+                parts.push("git".into());
+                parts.push("-C".into());
+                parts.push(util::sh_quote(path));
+                parts.extend(args.iter().map(|s| util::sh_quote(s)));
+                self.ssh_command(ssh, parts.join(" "))
+            }
+        }
+    }
+
+    /// Run git with `stdin` piped in (e.g. `git apply -`, `git commit -F -`),
+    /// returning the full `Output`. Works over ssh (ssh forwards stdin).
+    pub fn git_with_stdin(
+        &self,
+        envs: &[(&str, &str)],
+        args: &[&str],
+        stdin: &[u8],
+    ) -> std::io::Result<std::process::Output> {
+        use std::io::Write;
+        let mut cmd = self.git_command_env(envs, args);
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn()?;
+        if let Some(mut sink) = child.stdin.take() {
+            // A dead child (bad args) closes the pipe; the wait below reports it.
+            let _ = sink.write_all(stdin);
+        }
+        child.wait_with_output()
+    }
+
+    /// Resolve a path inside the repo's private gitdir via
+    /// `git rev-parse --git-path` — never a literal `.git/…`, which breaks in
+    /// linked worktrees where `.git` is a redirect file.
+    fn resolve_git_path(&self, rel: &str) -> Option<String> {
+        let p = self.git_out(&["rev-parse", "--git-path", rel])?;
+        // rev-parse may answer relative to the worktree; anchor it.
+        if p.starts_with('/') {
+            Some(p)
+        } else {
+            Some(format!("{}/{p}", self.path()))
+        }
+    }
+
+    /// Read a file inside the gitdir (e.g. `rebase-merge/git-rebase-todo`,
+    /// `BISECT_LOG`). `None` when absent or unreadable.
+    pub fn read_git_path(&self, rel: &str) -> Option<Vec<u8>> {
+        let p = self.resolve_git_path(rel)?;
+        match self {
+            GitLoc::Local(_) => std::fs::read(p).ok(),
+            GitLoc::Remote { ssh, .. } => {
+                let out = self
+                    .ssh_command(ssh, format!("cat {}", util::sh_quote(&p)))
+                    .output()
+                    .ok()?;
+                out.status.success().then_some(out.stdout)
+            }
+        }
+    }
+
+    /// Write a file inside the gitdir (e.g. a prepared rebase todo).
+    pub fn write_git_path(&self, rel: &str, bytes: &[u8]) -> std::io::Result<()> {
+        let p = self
+            .resolve_git_path(rel)
+            .ok_or_else(|| std::io::Error::other(format!("cannot resolve git path {rel:?}")))?;
+        match self {
+            GitLoc::Local(_) => std::fs::write(p, bytes),
+            GitLoc::Remote { ssh, .. } => {
+                use std::io::Write;
+                let mut cmd = self.ssh_command(ssh, format!("cat > {}", util::sh_quote(&p)));
+                cmd.stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                let mut child = cmd.spawn()?;
+                if let Some(mut sink) = child.stdin.take() {
+                    sink.write_all(bytes)?;
+                }
+                let st = child.wait()?;
+                if st.success() {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other(format!(
+                        "remote write of {rel:?} failed"
+                    )))
+                }
+            }
+        }
     }
 
     /// Run a git command, returning trimmed stdout on success (None otherwise).
@@ -243,6 +365,47 @@ mod tests {
             argv.last()
                 .unwrap()
                 .contains("git -C /remote/wt status --short")
+        );
+    }
+
+    #[test]
+    fn env_command_prefixes_env_remotely_and_sets_it_locally() {
+        let s = GitLoc::remote_db_string("box", 22, false, "/r/wt");
+        let remote = GitLoc::from_db("/r/wt", Some(&s));
+        let cmd = remote.git_command_env(&[("GIT_EDITOR", ":"), ("X", "a b")], &["rebase", "-i"]);
+        let last = cmd
+            .get_args()
+            .last()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            last.starts_with("env GIT_EDITOR=: X='a b' git -C /r/wt rebase -i"),
+            "{last}"
+        );
+
+        let local = GitLoc::from_db("/wt/x", None);
+        let cmd = local.git_command_env(&[("GIT_EDITOR", ":")], &["rebase", "-i"]);
+        assert_eq!(cmd.get_program().to_string_lossy(), "git");
+        assert!(
+            cmd.get_envs()
+                .any(|(k, v)| k.to_string_lossy() == "GIT_EDITOR"
+                    && v.is_some_and(|v| v.to_string_lossy() == ":"))
+        );
+    }
+
+    #[test]
+    fn git_with_stdin_pipes_bytes_through() {
+        // `git hash-object --stdin` works without a repo and echoes a stable
+        // sha for known input — a hermetic stdin round-trip.
+        let loc = GitLoc::Local(std::env::temp_dir());
+        let out = loc
+            .git_with_stdin(&[], &["hash-object", "--stdin"], b"hello\n")
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "ce013625030ba8dba906f756967f9e9ca394464a"
         );
     }
 

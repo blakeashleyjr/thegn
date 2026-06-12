@@ -5,7 +5,6 @@
 //! `Surface` that diff-flushes to the outer terminal (the "no-flash" mechanism).
 
 mod agent;
-mod ansi;
 mod borders;
 mod center;
 mod chrome;
@@ -14,12 +13,16 @@ mod compositor;
 mod copymode;
 mod emulator;
 mod focus;
+mod font;
+mod gitmut;
 mod hydrate;
 mod input;
 mod keyhint;
 mod keymap;
+mod layer;
 mod layout;
 mod logotype;
+mod menu;
 mod metrics;
 mod mousefilter;
 mod palette;
@@ -29,12 +32,15 @@ mod panes;
 mod pins;
 mod queries;
 mod run;
+mod seg;
 mod sequence;
 mod session;
 mod sidebar;
 mod stats;
 mod task;
+mod telemetry;
 mod testkit;
+mod wire;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;

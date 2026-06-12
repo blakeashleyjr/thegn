@@ -23,16 +23,19 @@ use termwiz::terminal::{Terminal, TerminalWaker, new_terminal};
 
 use crate::chrome::{FrameModel, render_tab};
 use crate::compositor::Rect;
+use crate::gitmut::{GitOp, GitOpResult};
 use crate::hydrate::{
     RefreshKind, active_tab_path, build_initial_model, load_or_seed_session, retarget_diff_watcher,
     spawn_model_hydration, spawn_pr_cache_refresh, spawn_refresh_ticker, workspace_list,
 };
 use crate::input::key_bytes;
 use crate::layout;
+use crate::menu::{self, MenuChoice, MenuOverlay};
 use crate::palette::{build_agent_palette, build_palette, build_sandbox_palette};
 use crate::pane::PaneEvent;
+use crate::panel::gitui::{self, GitFlow, GitMsg, GitView, StagePane};
 use crate::panes::{
-    Panes, prewarm_neighbors, relayout, relayout_strip, replace_single_dead_center_pane,
+    Panes, prewarm_requests, relayout, relayout_strip, replace_single_dead_center_pane,
     tool_drawer_argv,
 };
 
@@ -84,34 +87,55 @@ fn keybind_conflict_summary(cfg: &superzej_core::config::Config) -> Option<Strin
     ))
 }
 
+/// Resolve `[theme] undercurl` to a capability: "on"/"off" are explicit, and
+/// "auto" sniffs $TERM/$TERM_PROGRAM/$VTE_VERSION.
+fn resolve_undercurl(cfg: &superzej_core::config::Config) -> bool {
+    use superzej_core::config::UndercurlMode;
+    match cfg.theme.undercurl {
+        UndercurlMode::On => true,
+        UndercurlMode::Off => false,
+        UndercurlMode::Auto => crate::wire::detect_undercurl(),
+    }
+}
+
 fn apply_mode_status(model: &mut FrameModel, mode: crate::keymap::Mode) {
     // The bottom bar carries the contextual keybind hints; the status slot
-    // only flags a non-default input mode.
+    // only flags a non-default input mode. The mode chip always shows.
     model.status = match mode {
         crate::keymap::Mode::Normal => String::new(),
         m => format!("{} mode", m.as_str()),
     };
+    model.mode_chip = match mode {
+        crate::keymap::Mode::Normal => "N",
+        crate::keymap::Mode::VimNormal => "V",
+        crate::keymap::Mode::VimInsert => "I",
+        crate::keymap::Mode::Emacs => "E",
+    }
+    .into();
 }
 
-/// The bottom bar's contextual keybind hints: what works right now, given the
-/// focused zone (and the panel's view when it owns the keyboard).
+/// The bottom bar's contextual keybind hints — (chord, label) pairs the
+/// statusbar renders as key chips + dim labels: what works right now, given
+/// the focused zone (and the panel's view when it owns the keyboard).
 fn context_hints(
     focus: &crate::focus::FocusState,
     panel_ui: &crate::panel::PanelUi,
     cfg: &superzej_core::config::Config,
-) -> String {
+) -> Vec<(String, String)> {
     let chord = |id: &str| -> Option<String> { crate::keymap::chord_hint_for(cfg, id) };
-    let hint = |label: &str, id: &str| chord(id).map(|c| format!("{c} {label}"));
+    let hint = |label: &str, id: &str| chord(id).map(|c| (c, label.to_string()));
+    let pair = |c: &str, label: &str| Some((c.to_string(), label.to_string()));
     if focus.locked {
-        return hint("unlock", "toggle-key-lock").unwrap_or_else(|| "Ctrl-g unlock".into());
+        return vec![
+            hint("unlock", "toggle-key-lock").unwrap_or_else(|| ("Ctrl-g".into(), "unlock".into())),
+        ];
     }
     match focus.zone {
         crate::focus::Zone::Center => [
-            hint("pane", "focus-left")
-                .or_else(|| chord("focus-right").map(|c| format!("{c} pane"))),
-            hint("tab", "prev-tab").or_else(|| chord("next-tab").map(|c| format!("{c} tab"))),
+            hint("pane", "focus-left").or_else(|| chord("focus-right").map(|c| (c, "pane".into()))),
+            hint("tab", "prev-tab").or_else(|| chord("next-tab").map(|c| (c, "tab".into()))),
             hint("worktree", "prev-worktree")
-                .or_else(|| chord("next-worktree").map(|c| format!("{c} worktree"))),
+                .or_else(|| chord("next-worktree").map(|c| (c, "worktree".into()))),
             hint("close tab", "close-tab"),
             hint("smart split", "new-pane"),
             hint("split↓", "split-down"),
@@ -121,38 +145,145 @@ fn context_hints(
         ]
         .into_iter()
         .flatten()
-        .collect::<Vec<_>>()
-        .join(" · "),
+        .collect(),
         crate::focus::Zone::Sidebar => [
-            Some("↑↓ move".into()),
-            Some("Enter open".into()),
-            Some("Space mark".into()),
-            Some("m menu".into()),
-            hint("tab", "prev-tab").or_else(|| chord("next-tab").map(|c| format!("{c} tab"))),
-            Some("Esc back".into()),
+            pair("↑↓", "move"),
+            pair("Enter", "open"),
+            pair("Space", "mark"),
+            pair("m", "menu"),
+            hint("tab", "prev-tab").or_else(|| chord("next-tab").map(|c| (c, "tab".into()))),
+            pair("Esc", "back"),
         ]
         .into_iter()
         .flatten()
-        .collect::<Vec<_>>()
-        .join(" · "),
+        .collect(),
         crate::focus::Zone::Panel => {
-            let nav = [
+            let mut hints: Vec<(String, String)> = [
                 hint("pane", "focus-left")
-                    .or_else(|| chord("focus-right").map(|c| format!("{c} pane"))),
-                hint("tab", "prev-tab").or_else(|| chord("next-tab").map(|c| format!("{c} tab"))),
-                Some("Esc back".into()),
+                    .or_else(|| chord("focus-right").map(|c| (c, "pane".into()))),
+                hint("tab", "prev-tab").or_else(|| chord("next-tab").map(|c| (c, "tab".into()))),
+                pair("Esc", "back"),
             ]
             .into_iter()
             .flatten()
-            .collect::<Vec<_>>()
-            .join(" · ");
-            let panel = crate::chrome::panel_help_hint(panel_ui.tab, panel_ui.diff_view);
-            if nav.is_empty() {
-                panel.into()
-            } else {
-                format!("{nav} · {panel}")
-            }
+            .collect();
+            hints.extend(crate::chrome::panel_help_pairs(panel_ui));
+            hints
         }
+        crate::focus::Zone::Masthead => vec![
+            hint("back", "focus-down").unwrap_or_else(|| ("Ctrl-Down".into(), "back".into())),
+            ("Esc".into(), "back".into()),
+        ],
+        crate::focus::Zone::Statusbar => vec![
+            hint("back", "focus-up").unwrap_or_else(|| ("Ctrl-Up".into(), "back".into())),
+            ("Esc".into(), "back".into()),
+        ],
+    }
+}
+
+/// Fetch the git section's heat/velocity/log payload off the loop (skipped
+/// while the per-worktree cache is warm). The result rides `tx` + a waker
+/// pulse; the body shows "loading…" until it lands.
+fn kick_git_docs_fetch(
+    generation: u64,
+    session: &crate::session::Session,
+    panel_ui: &crate::panel::PanelUi,
+    tx: &tokio_mpsc::UnboundedSender<(u64, crate::panel::docs::DocsPayload)>,
+    waker: &TerminalWaker,
+) {
+    use crate::panel::docs::{DocsPayload, GitDocs};
+    if panel_ui.docs.git.is_some() {
+        return;
+    }
+    const WEEKS: usize = 36;
+    let wt = active_tab_path(session);
+    let tx = tx.clone();
+    let wk = waker.clone();
+    task::spawn_blocking(move || {
+        use superzej_svc::git::GitBackend;
+        let loc = superzej_core::remote::GitLoc::for_worktree(&wt);
+        let git = superzej_svc::git::CliGit;
+        let now = superzej_core::util::now();
+        let epochs = git.commit_times(&loc, WEEKS).unwrap_or_default();
+        let data = GitDocs {
+            heat: superzej_core::gitviz::heat_grid(&epochs, now, WEEKS),
+            weekly: superzej_core::gitviz::weekly_counts(&epochs, now, WEEKS),
+            log: git.log_graph(&loc, 40).unwrap_or_default(),
+            total: epochs.len() as u32,
+            head_branch: git.current_branch(&loc).unwrap_or_default(),
+        };
+        if tx.send((generation, DocsPayload::Git(data))).is_ok() {
+            let _ = wk.wake();
+        }
+    });
+}
+
+/// Fetch the selected change's parsed side-by-side diff off the loop —
+/// refetched on every (re-)entry into the changes full view, the working
+/// tree moves constantly. Targets the panel's selected change, else the
+/// first; with a clean tree the doc is synthesized here (the body renders
+/// the empty state immediately — nothing to fetch).
+fn kick_diff_doc_fetch(
+    generation: u64,
+    session: &crate::session::Session,
+    panel_ui: &mut crate::panel::PanelUi,
+    model: &FrameModel,
+    tx: &tokio_mpsc::UnboundedSender<(u64, crate::panel::docs::DocsPayload)>,
+    waker: &TerminalWaker,
+) {
+    use crate::panel::docs::{DiffDoc, DocsPayload};
+    panel_ui.docs.diff = None;
+    let path = panel_ui
+        .chg_sel
+        .and_then(|i| model.panel.changes.get(i))
+        .or_else(|| model.panel.changes.first())
+        .map(|c| c.path.clone());
+    let Some(path) = path else {
+        panel_ui.docs.diff = Some(DiffDoc {
+            path: String::new(),
+            file: superzej_core::diff_sbs::SbsFile::default(),
+        });
+        return;
+    };
+    let wt = active_tab_path(session);
+    let tx = tx.clone();
+    let wk = waker.clone();
+    task::spawn_blocking(move || {
+        let loc = superzej_core::remote::GitLoc::for_worktree(&wt);
+        let text = loc
+            .git_command(&["diff", "--no-color", "HEAD", "--", &path])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let doc = DiffDoc {
+            path,
+            file: superzej_core::diff_sbs::parse_unified(&text),
+        };
+        if tx.send((generation, DocsPayload::Diff(doc))).is_ok() {
+            let _ = wk.wake();
+        }
+    });
+}
+
+/// Kick whatever document fetch the panel's (section, width) state needs.
+/// The single entry point for every transition (section open, width cycle,
+/// worktree switch) so data wiring can't drift per site.
+fn sync_panel_docs(
+    panel_ui: &mut crate::panel::PanelUi,
+    model: &FrameModel,
+    session: &crate::session::Session,
+    generation: u64,
+    tx: &tokio_mpsc::UnboundedSender<(u64, crate::panel::docs::DocsPayload)>,
+    waker: &TerminalWaker,
+) {
+    use crate::panel::Section;
+    if panel_ui.open == Section::Git && panel_ui.width.is_expanded() {
+        kick_git_docs_fetch(generation, session, panel_ui, tx, waker);
+    }
+    if panel_ui.open == Section::Changes && panel_ui.width == layout::PanelWidth::Full {
+        kick_diff_doc_fetch(generation, session, panel_ui, model, tx, waker);
     }
 }
 
@@ -239,6 +370,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // Resolve the configurable chrome palette ([theme] / [theme.colors]) before
     // the first frame; the config fs-watch re-resolves it live.
     crate::chrome::set_palette(cfg.palette());
+    crate::seg::set_undercurl_supported(resolve_undercurl(&cfg));
     crate::center::PANE_HPAD.store(
         cfg.theme.pane_padding as usize,
         std::sync::atomic::Ordering::Relaxed,
@@ -253,7 +385,13 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     model.bars = cfg.bars.clone();
     model.stats_icons = cfg.stats.clone();
     let (model_tx, model_rx) = tokio_mpsc::unbounded_channel::<(u64, FrameModel)>();
-    spawn_model_hydration(model_tx.clone(), 0, session.clone(), Some(waker.clone()));
+    spawn_model_hydration(
+        model_tx.clone(),
+        0,
+        session.clone(),
+        Some(waker.clone()),
+        crate::hydrate::HydrateHints::default(),
+    );
 
     // Config reload events ride a tokio channel so the loop drains them on wake;
     // the notify watcher thread `send`s + pulses the waker.
@@ -309,10 +447,14 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     let stats_interval_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
         (cfg.stats.refresh_secs.max(0.5) * 1000.0) as u64,
     ));
+    // Set while the telemetry overlay is open: the ticker samples stats at
+    // its 500ms half-tick instead of the user-cycled rate.
+    let stats_live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     spawn_refresh_ticker(
         refresh_tx.clone(),
         stats_tx,
         stats_interval_ms.clone(),
+        stats_live.clone(),
         waker.clone(),
     );
 
@@ -333,6 +475,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         stats_rx,
         metrics_rx,
         stats_interval_ms,
+        stats_live,
         waker,
         start,
     )
@@ -400,7 +543,7 @@ fn compute_chrome(
     want_sidebar: bool,
     want_panel: bool,
     panel_forced: bool,
-    panel_expanded: bool,
+    panel_width: layout::PanelWidth,
     sidebar_cols: usize,
     zoom: Option<crate::focus::Zone>,
     supervisor: &crate::pins::PinSupervisor,
@@ -416,7 +559,7 @@ fn compute_chrome(
             false,
             false,
             false,
-            false,
+            layout::PanelWidth::Normal,
             sidebar_cols,
             false,
             0.0,
@@ -430,7 +573,7 @@ fn compute_chrome(
                 true,
                 false,
                 false,
-                false,
+                layout::PanelWidth::Normal,
                 sidebar_cols,
                 false,
                 0.0,
@@ -454,7 +597,7 @@ fn compute_chrome(
                 false,
                 true,
                 true,
-                true,
+                layout::PanelWidth::Full,
                 sidebar_cols,
                 false,
                 0.0,
@@ -472,13 +615,16 @@ fn compute_chrome(
             l.strip = None;
             l
         }
-        None => layout::compute_full(
+        // The bars are single rows — zooming them makes no sense; fall back
+        // to the normal layout (zoom is never set to a bar zone; this arm
+        // exists for exhaustiveness).
+        Some(Zone::Masthead) | Some(Zone::Statusbar) | None => layout::compute_full(
             cols,
             rows,
             want_sidebar,
             want_panel,
             panel_forced,
-            panel_expanded,
+            panel_width,
             sidebar_cols,
             strip,
             supervisor.strip_ratio(),
@@ -1121,6 +1267,37 @@ fn switch_to_workspace_tab(
     Ok(true)
 }
 
+/// The panel's current geometry for content building, falling back to the
+/// resting width and a tall default when the panel rect is hidden.
+fn panel_geom(chrome: &layout::ChromeLayout) -> (usize, usize) {
+    chrome
+        .panel
+        .map(|r| (r.cols, r.rows))
+        .unwrap_or((layout::PANEL_COLS, 40))
+}
+
+/// The accordion immediately after `from` in the live order (no wrap) — the
+/// cursor flows into it when Down is pressed at the bottom of `from`. Every
+/// accordion is visited, including those with no actionable rows (you land on
+/// the header and the next Down flows onward). None at the last accordion.
+fn next_section_in_order(
+    from: crate::panel::Section,
+    ui: &crate::panel::PanelUi,
+) -> Option<crate::panel::Section> {
+    let idx = ui.order.iter().position(|&s| s == from)?;
+    ui.order.get(idx + 1).copied()
+}
+
+/// The accordion immediately before `from` in the live order (no wrap); the
+/// cursor flows into its LAST item when Up is pressed at the top of `from`.
+fn prev_section_in_order(
+    from: crate::panel::Section,
+    ui: &crate::panel::PanelUi,
+) -> Option<crate::panel::Section> {
+    let idx = ui.order.iter().position(|&s| s == from)?;
+    idx.checked_sub(1).and_then(|i| ui.order.get(i).copied())
+}
+
 /// A worktree group's working directory, falling back to the process cwd.
 fn group_cwd(g: &crate::session::WorktreeGroup) -> Option<std::path::PathBuf> {
     (!g.path.is_empty() && std::path::Path::new(&g.path).is_dir())
@@ -1164,6 +1341,7 @@ fn delete_groups(
 ) -> String {
     targets.sort_unstable_by(|a, b| b.cmp(a));
     targets.dedup();
+    let db = superzej_core::db::Db::open().ok();
     let (mut deleted, mut skipped) = (0usize, 0usize);
     for gi in targets {
         if gi >= session.worktrees.len() {
@@ -1178,7 +1356,12 @@ fn delete_groups(
             if let Some(root) = superzej_core::repo::main_worktree(Path::new(&path)) {
                 superzej_core::worktree::remove(&root, Path::new(&path), "", false);
             }
-            if let Ok(db) = superzej_core::db::Db::open() {
+            // git is the source of truth, but `git worktree remove` leaves the
+            // dir behind if it ever fails (locked, detached, prune races); a
+            // lingering dir is re-adopted on the next launch and looks like a
+            // failed delete. Make sure the directory is actually gone.
+            let _ = std::fs::remove_dir_all(&path);
+            if let Some(db) = &db {
                 let _ = db.del_worktree(&path);
             }
         }
@@ -1190,6 +1373,14 @@ fn delete_groups(
         session.switch_to(gi);
         session.close_active_group();
         deleted += 1;
+    }
+    // Persist the trimmed layout: without this the closed groups survive in the
+    // `tab_groups` table and `Session::resurrect` brings the "deleted" worktrees
+    // back on the next launch.
+    if deleted > 0
+        && let Some(db) = &db
+    {
+        let _ = session.persist(db, &session.id, now_secs());
     }
     let mut status = format!("Deleted {deleted} worktree(s) from disk");
     if skipped > 0 {
@@ -1234,231 +1425,1926 @@ fn session_pane_ids(session: &crate::session::Session) -> Vec<u32> {
         .collect()
 }
 
-/// Highlighted single-file diff vs HEAD — the same range the panel's file list
-/// is built from, so drilling in always matches the row. One fast,
-/// user-triggered subprocess (same as the worktree-creation actions); failures
-/// yield an empty body rather than an error.
-fn fetch_file_diff(worktree: &std::path::Path, path: &str) -> String {
-    let loc = superzej_core::remote::GitLoc::for_worktree(worktree);
-    loc.git_command(&["diff", "--no-color", "HEAD", "--", path])
-        .output()
-        .map(|o| {
-            superzej_core::diff_highlight::highlight_diff(&String::from_utf8_lossy(&o.stdout), path)
-        })
-        .unwrap_or_default()
-}
-
-/// Tracked + untracked (non-ignored) files for the Files tab, repo-relative.
-/// One fast, user-triggered subprocess (same class as [`fetch_file_diff`]).
-fn fetch_worktree_files(worktree: &std::path::Path) -> Vec<String> {
-    let loc = superzej_core::remote::GitLoc::for_worktree(worktree);
-    loc.git_command(&["ls-files", "--cached", "--others", "--exclude-standard"])
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(|s| s.to_string())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// The bat invocation for the in-panel preview: colored, numbered, unpaged,
-/// unwrapped (our renderer soft-wraps). `override_cmd` is `[tools] bat`'s
-/// first token when configured.
-fn bat_preview_argv(override_cmd: Option<&str>, abs: &std::path::Path) -> Vec<String> {
-    let bin = override_cmd
-        .and_then(|c| c.split_whitespace().next())
-        .unwrap_or("bat")
-        .to_string();
-    vec![
-        bin,
-        "--color=always".into(),
-        "--style=numbers,changes".into(),
-        "--paging=never".into(),
-        "--wrap=never".into(),
-        "--".into(),
-        abs.to_string_lossy().into_owned(),
-    ]
-}
-
-/// Read + highlight a file for the Files tab's in-panel preview: real `bat`
-/// output when available (the user's pager, faithfully), syntect fallback
-/// otherwise. Size-capped and binary-safe; errors degrade to a message line.
-fn fetch_file_preview(worktree: &std::path::Path, path: &str, bat: Option<&str>) -> String {
-    const MAX_BYTES: usize = 1_000_000;
-    let abs = worktree.join(path);
-    let bytes = match std::fs::read(&abs) {
-        Ok(b) if b.len() > MAX_BYTES => {
-            return format!("{path}: too large to preview ({} KiB)", b.len() / 1024);
-        }
-        Ok(b) => b,
-        Err(e) => return format!("{path}: {e}"),
-    };
-    let Ok(text) = String::from_utf8(bytes) else {
-        return format!("{path}: binary file");
-    };
-    let argv = bat_preview_argv(bat, &abs);
-    if let Ok(out) = std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .current_dir(worktree)
-        .output()
-        && out.status.success()
-        && !out.stdout.is_empty()
-    {
-        return String::from_utf8_lossy(&out.stdout).into_owned();
-    }
-    superzej_core::diff_highlight::highlight_file(&text, path)
-}
-
-/// Cache key for a drilled document (`'d'` diff / `'p'` preview).
-fn doc_key(kind: char, worktree: &std::path::Path, path: &str) -> String {
-    format!("{kind}:{}:{path}", worktree.display())
-}
-
-fn fetch_doc(kind: char, worktree: &std::path::Path, path: &str, bat: Option<&str>) -> String {
-    if kind == 'd' {
-        fetch_file_diff(worktree, path)
-    } else {
-        fetch_file_preview(worktree, path, bat)
+/// The editor invocation for a worktree-relative `path`, with the universal
+/// `+N` line jump when a location is known. Shared by every panel open path
+/// (changed files, review threads, failing tests).
+fn editor_open_command(
+    cfg: &superzej_core::config::Config,
+    path: &str,
+    line: Option<usize>,
+) -> String {
+    let editor = cfg
+        .tool_command("editor")
+        .unwrap_or("${EDITOR:-vi} .")
+        .trim();
+    let editor = editor.strip_suffix(" .").unwrap_or(editor);
+    let quoted = path.replace('\'', r"'\''");
+    match line {
+        Some(l) => format!("{editor} +{l} '{quoted}'"),
+        None => format!("{editor} '{quoted}'"),
     }
 }
 
-/// Preload neighbor documents off-thread into the doc cache so Shift+J/K
-/// lands instantly; pulses the waker so the loop banks the results.
-fn spawn_doc_preload(
-    tx: tokio_mpsc::UnboundedSender<(String, String)>,
-    waker: TerminalWaker,
-    worktree: std::path::PathBuf,
-    kind: char,
-    paths: Vec<String>,
-    bat: Option<String>,
+/// Parse a `path:line` failure location; bare messages yield `None`.
+fn parse_file_line(at: &str) -> Option<(String, usize)> {
+    let (path, line) = at.rsplit_once(':')?;
+    let line: usize = line.trim().parse().ok()?;
+    (!path.is_empty()).then(|| (path.to_string(), line))
+}
+
+/// The cursor-th FILE row of the files section's changed-files mini tree —
+/// mirrors `panel::sections::files` display order (dirs synthesized but not
+/// actionable), so the row-mode cursor and Enter always agree.
+fn changed_file_at(model: &FrameModel, cursor: usize) -> Option<String> {
+    let paths: Vec<String> = model.panel.changes.iter().map(|c| c.path.clone()).collect();
+    crate::panel::build_file_tree(&paths)
+        .into_iter()
+        .filter(|e| !e.is_dir)
+        .nth(cursor)
+        .map(|e| e.path)
+}
+
+/// Persist the accordion's open section + wide mode (mirrors the sidebar's
+/// inline `ui_state` writes — single-row upserts on a WAL handle, sub-ms).
+fn persist_panel_state(panel_ui: &crate::panel::PanelUi) {
+    if let Ok(db) = superzej_core::db::Db::open() {
+        let _ = db.set_ui_state("panel", "open", panel_ui.open.as_key());
+        let _ = db.set_ui_state("panel", "width", panel_ui.width.as_key());
+    }
+}
+
+/// The docs-fetch wiring a panel transition needs: generation + channel +
+/// the model the diff fetch targets. Bundled so `open_panel_section` /
+/// `toggle_panel_expand` call sites stay readable.
+struct PanelDocsWiring<'a> {
+    model: &'a FrameModel,
+    generation: u64,
+    tx: &'a tokio_mpsc::UnboundedSender<(u64, crate::panel::docs::DocsPayload)>,
+}
+
+/// Open accordion section `s`: reset row-mode state, persist the choice,
+/// kick a rehydrate so the model carries the section's deep data (git log,
+/// file count) — the cached panel stays on screen until the fresh one lands —
+/// and start whatever document fetch the new (section, width) state needs.
+fn open_panel_section(
+    s: crate::panel::Section,
+    panel_ui: &mut crate::panel::PanelUi,
+    hydration_gen: &mut u64,
+    model_tx: &tokio_mpsc::UnboundedSender<(u64, FrameModel)>,
+    session: &crate::session::Session,
+    waker: &TerminalWaker,
+    docs: PanelDocsWiring<'_>,
 ) {
+    panel_ui.open = s;
+    // Land at the top of the new section's items (row_mode tracks panel focus,
+    // not the section, so a focused panel keeps walking rows across switches).
+    panel_ui.cursor = 0;
+    panel_ui.chg_sel = None;
+    panel_ui.scroll = 0;
+    panel_ui.diff_hunk = 0;
+    persist_panel_state(panel_ui);
+    *hydration_gen += 1;
+    spawn_model_hydration(
+        model_tx.clone(),
+        *hydration_gen,
+        session.clone(),
+        Some(waker.clone()),
+        crate::hydrate::HydrateHints {
+            open: panel_ui.open,
+            expanded: panel_ui.width.is_expanded(),
+        },
+    );
+    sync_panel_docs(
+        panel_ui,
+        docs.model,
+        session,
+        docs.generation,
+        docs.tx,
+        waker,
+    );
+}
+
+/// Cycle the accordion's view (`e`): persist + rehydrate (section bodies
+/// change with the width) and start any document fetch the wider view needs.
+/// The pre-render expansion detector picks up the new state and recomputes
+/// the chrome.
+fn toggle_panel_expand(
+    panel_ui: &mut crate::panel::PanelUi,
+    hydration_gen: &mut u64,
+    model_tx: &tokio_mpsc::UnboundedSender<(u64, FrameModel)>,
+    session: &crate::session::Session,
+    waker: &TerminalWaker,
+    docs: PanelDocsWiring<'_>,
+) {
+    // Cycle the panel width Normal → Half → Full → Normal; every section
+    // renders a distinct body per width.
+    panel_ui.width = panel_ui.width.cycle();
+    panel_ui.scroll = 0;
+    panel_ui.diff_hunk = 0;
+    persist_panel_state(panel_ui);
+    *hydration_gen += 1;
+    spawn_model_hydration(
+        model_tx.clone(),
+        *hydration_gen,
+        session.clone(),
+        Some(waker.clone()),
+        crate::hydrate::HydrateHints {
+            open: panel_ui.open,
+            expanded: panel_ui.width.is_expanded(),
+        },
+    );
+    sync_panel_docs(
+        panel_ui,
+        docs.model,
+        session,
+        docs.generation,
+        docs.tx,
+        waker,
+    );
+}
+
+/// Fetch one changed file's inline hunk preview off the loop, deduped against
+/// the banked previews and the in-flight set; the result rides `hunk_tx` back
+/// with a waker pulse.
+#[allow(clippy::too_many_arguments)]
+fn spawn_hunk_fetch(
+    path: &str,
+    session: &crate::session::Session,
+    panel_ui: &crate::panel::PanelUi,
+    hunk_inflight: &mut std::collections::HashSet<String>,
+    hunk_tx: &tokio_mpsc::UnboundedSender<(u64, String, Vec<superzej_svc::git::Hunk>)>,
+    waker: &TerminalWaker,
+    generation: u64,
+) {
+    if panel_ui.hunks.contains_key(path) || !hunk_inflight.insert(path.to_string()) {
+        return;
+    }
+    let tx = hunk_tx.clone();
+    let waker = waker.clone();
+    let wt = active_tab_path(session);
+    let path = path.to_string();
     tokio::task::spawn_blocking(move || {
-        for path in paths {
-            let key = doc_key(kind, &worktree, &path);
-            let doc = fetch_doc(kind, &worktree, &path, bat.as_deref());
-            if tx.send((key, doc)).is_err() {
-                return;
-            }
+        use superzej_svc::git::GitBackend;
+        let loc = superzej_core::remote::GitLoc::for_worktree(&wt);
+        let hunks = superzej_svc::git::CliGit
+            .diff_hunks(&loc, "HEAD", &path, 16)
+            .unwrap_or_default();
+        if tx.send((generation, path, hunks)).is_ok() {
+            let _ = waker.wake();
         }
-        let _ = waker.wake();
     });
 }
 
-/// The next-two + previous-one indices around `cur` (for document preloads).
-fn neighbor_indices(len: usize, cur: usize) -> Vec<usize> {
-    let mut v = Vec::new();
-    for i in [cur + 1, cur + 2] {
-        if i < len {
-            v.push(i);
+/// Toggle the changes-section selection onto row `i` (re-selecting dismisses
+/// the preview), kicking the background hunk fetch for newly-selected paths.
+#[allow(clippy::too_many_arguments)]
+fn toggle_change_selection(
+    i: usize,
+    panel_ui: &mut crate::panel::PanelUi,
+    model: &FrameModel,
+    session: &crate::session::Session,
+    hunk_inflight: &mut std::collections::HashSet<String>,
+    hunk_tx: &tokio_mpsc::UnboundedSender<(u64, String, Vec<superzej_svc::git::Hunk>)>,
+    waker: &TerminalWaker,
+    generation: u64,
+) {
+    if panel_ui.chg_sel == Some(i) {
+        panel_ui.chg_sel = None;
+        return;
+    }
+    panel_ui.chg_sel = Some(i);
+    // Untracked rows have no diff: the preview renders a static note.
+    if let Some(row) = model
+        .panel
+        .changes
+        .get(i)
+        .filter(|c| c.stage != crate::panel::Stage::Untracked)
+    {
+        spawn_hunk_fetch(
+            &row.path,
+            session,
+            panel_ui,
+            hunk_inflight,
+            hunk_tx,
+            waker,
+            generation,
+        );
+    }
+}
+
+/// Kick a `gh` PR action off the loop; a PR-cache + model refresh follows so
+/// the git section reflects the outcome. Failures are logged (the next
+/// refresh's `pr_note` carries the visible state) rather than blocking.
+fn spawn_pr_action<F>(
+    session: &crate::session::Session,
+    refresh_tx: &tokio_mpsc::UnboundedSender<RefreshKind>,
+    waker: &TerminalWaker,
+    label: &'static str,
+    action: F,
+) where
+    F: FnOnce(&superzej_core::remote::GitLoc) -> Result<(), superzej_core::github::GhError>
+        + Send
+        + 'static,
+{
+    let wt = active_tab_path(session);
+    let tx = refresh_tx.clone();
+    let waker = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        let loc = superzej_core::remote::GitLoc::for_worktree(&wt);
+        if let Err(e) = action(&loc) {
+            superzej_core::msg::warn(&format!(
+                "{label} failed: {}",
+                superzej_core::github::describe(&e)
+            ));
+        }
+        // A PR refresh implies a model refresh in the loop's intake.
+        if tx.send(RefreshKind::Pr).is_ok() {
+            let _ = waker.wake();
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// The git mutation pipeline: every lazygit-style write flows through ONE
+// runner — `enqueue_git_op` rejects while one is in flight, runs the op on
+// `spawn_blocking`, and the result rides `gitop_tx` back with a waker pulse.
+// `handle_git_msg` turns the pure `GitMsg` intents from `gitui::git_key`
+// into ops / state changes; `dispatch_menu_choice` does the same for the
+// option/confirm menus. Both are plain functions so the event-loop match
+// stays readable.
+// ---------------------------------------------------------------------------
+
+/// Which flow a SUCCESSFUL op closes (computed at dispatch — results only
+/// carry the op's label).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlowEnd {
+    None,
+    Rebase,
+    Bisect,
+    Patch,
+}
+
+fn flow_end_of(op: &GitOp) -> FlowEnd {
+    match op {
+        GitOp::RebaseAbort
+        | GitOp::RebaseContinue
+        | GitOp::RebaseSkip
+        | GitOp::RebaseInteractive { .. }
+        | GitOp::RebaseBranch { .. }
+        | GitOp::RebaseOnto { .. }
+        | GitOp::Squash { .. }
+        | GitOp::Fixup { .. }
+        | GitOp::Drop { .. }
+        | GitOp::MoveCommit { .. }
+        | GitOp::AmendOldCommit { .. } => FlowEnd::Rebase,
+        GitOp::BisectReset => FlowEnd::Bisect,
+        GitOp::PatchApply { .. }
+        | GitOp::PatchRemoveFromCommit { .. }
+        | GitOp::PatchSplit { .. }
+        | GitOp::PatchToIndex { .. } => FlowEnd::Patch,
+        _ => FlowEnd::None,
+    }
+}
+
+/// One finished mutation, tagged with everything the intake needs.
+struct GitOpDone {
+    generation: u64,
+    label: &'static str,
+    touches_remote: bool,
+    flow_end: FlowEnd,
+    clear_clipboard: bool,
+    result: GitOpResult,
+}
+
+/// Run `op` off the loop (one at a time — a request while busy is rejected
+/// with a status note, lazygit-style; queueing compound git ops invites
+/// disaster). The result lands on `tx` with a waker pulse.
+fn enqueue_git_op(
+    op: GitOp,
+    git: &mut gitui::GitUi,
+    status: &mut String,
+    session: &crate::session::Session,
+    override_gpg: bool,
+    tx: &tokio_mpsc::UnboundedSender<GitOpDone>,
+    waker: &TerminalWaker,
+) {
+    if let Some(p) = &git.pending {
+        *status = format!("git busy: {}", p.label);
+        return;
+    }
+    let label = op.label();
+    let touches_remote = op.touches_remote();
+    let flow_end = flow_end_of(&op);
+    let clear_clipboard = matches!(op, GitOp::CherryPick { .. });
+    git.pending = Some(gitui::PendingOp {
+        label: label.to_string(),
+    });
+    *status = format!("{label}…");
+    let generation = git.op_gen;
+    let wt = active_tab_path(session);
+    let tx = tx.clone();
+    let wk = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        let loc = superzej_core::remote::GitLoc::for_worktree(&wt);
+        let result = crate::gitmut::execute(op, &loc, override_gpg);
+        if tx
+            .send(GitOpDone {
+                generation,
+                label,
+                touches_remote,
+                flow_end,
+                clear_clipboard,
+                result,
+            })
+            .is_ok()
+        {
+            let _ = wk.wake();
+        }
+    });
+}
+
+/// A fetched git document for the line-cursor views.
+enum GitDoc {
+    Stage(gitui::StageDocState),
+    CommitFiles(Vec<(String, u32, u32)>),
+    Patch(gitui::StageDocState),
+    /// A paused rebase's live state (`None` when the pause vanished before
+    /// the read landed).
+    Rebase(Option<superzej_svc::git::RebaseStatus>),
+}
+
+/// Fetch the staging view's diff (unstaged|staged per pane) off the loop and
+/// flatten it; generation-tagged like the hunk fetches.
+fn spawn_stage_doc_fetch(
+    generation: u64,
+    session: &crate::session::Session,
+    path: String,
+    pane: StagePane,
+    tx: &tokio_mpsc::UnboundedSender<(u64, GitDoc)>,
+    waker: &TerminalWaker,
+) {
+    let wt = active_tab_path(session);
+    let tx = tx.clone();
+    let wk = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        use superzej_svc::git::GitBackend;
+        let loc = superzej_core::remote::GitLoc::for_worktree(&wt);
+        let git = superzej_svc::git::CliGit;
+        let diff = match pane {
+            StagePane::Unstaged => git.unstaged_diff(&loc, &path),
+            StagePane::Staged => git.staged_diff(&loc, &path),
+        }
+        .unwrap_or_default();
+        let doc = crate::panel::staging::build(&path, &diff);
+        let state = gitui::StageDocState {
+            path,
+            pane,
+            doc,
+            diff,
+        };
+        if tx.send((generation, GitDoc::Stage(state))).is_ok() {
+            let _ = wk.wake();
+        }
+    });
+}
+
+/// Fetch a paused rebase's live state off the loop, so the TODO editor
+/// always works on `rebase-merge/git-rebase-todo` as it actually is (never
+/// the stale pre-rebase plan, never blind to external edits).
+fn spawn_rebase_status_fetch(
+    generation: u64,
+    session: &crate::session::Session,
+    tx: &tokio_mpsc::UnboundedSender<(u64, GitDoc)>,
+    waker: &TerminalWaker,
+) {
+    let wt = active_tab_path(session);
+    let tx = tx.clone();
+    let wk = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        use superzej_svc::git::RebaseOps;
+        let loc = superzej_core::remote::GitLoc::for_worktree(&wt);
+        let status = superzej_svc::git::CliGit.rebase_status(&loc).ok().flatten();
+        if tx.send((generation, GitDoc::Rebase(status))).is_ok() {
+            let _ = wk.wake();
+        }
+    });
+}
+
+/// Fetch a drilled commit's file list (numstat) off the loop.
+fn spawn_commit_files_fetch(
+    generation: u64,
+    session: &crate::session::Session,
+    sha: String,
+    tx: &tokio_mpsc::UnboundedSender<(u64, GitDoc)>,
+    waker: &TerminalWaker,
+) {
+    let wt = active_tab_path(session);
+    let tx = tx.clone();
+    let wk = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        use superzej_core::patch::LineKind;
+        use superzej_svc::git::GitBackend;
+        let loc = superzej_core::remote::GitLoc::for_worktree(&wt);
+        let git = superzej_svc::git::CliGit;
+        // `sha^..sha` covers ordinary commits; a root commit has no parent,
+        // so fall back to counting the commit diff's own +/- lines.
+        let files: Vec<(String, u32, u32)> = match git.diff_refs(&loc, &format!("{sha}^"), &sha) {
+            Ok(v) if !v.is_empty() => v
+                .into_iter()
+                .map(|d| (d.path, d.added, d.deleted))
+                .collect(),
+            _ => git
+                .commit_diff(&loc, &sha, None)
+                .map(|d| {
+                    superzej_core::patch::parse_patch(&d)
+                        .into_iter()
+                        .map(|f| {
+                            let (a, del) = f.hunks.iter().flat_map(|h| &h.lines).fold(
+                                (0u32, 0u32),
+                                |(a, d), l| match l.kind {
+                                    LineKind::Add => (a + 1, d),
+                                    LineKind::Del => (a, d + 1),
+                                    _ => (a, d),
+                                },
+                            );
+                            (f.new_path.clone(), a, del)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        if tx.send((generation, GitDoc::CommitFiles(files))).is_ok() {
+            let _ = wk.wake();
+        }
+    });
+}
+
+/// Fetch one file of a drilled commit's diff (the patch-building doc).
+fn spawn_patch_doc_fetch(
+    generation: u64,
+    session: &crate::session::Session,
+    sha: String,
+    path: String,
+    tx: &tokio_mpsc::UnboundedSender<(u64, GitDoc)>,
+    waker: &TerminalWaker,
+) {
+    let wt = active_tab_path(session);
+    let tx = tx.clone();
+    let wk = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        use superzej_svc::git::GitBackend;
+        let loc = superzej_core::remote::GitLoc::for_worktree(&wt);
+        let diff = superzej_svc::git::CliGit
+            .commit_diff(&loc, &sha, Some(&path))
+            .unwrap_or_default();
+        let doc = crate::panel::staging::build(&path, &diff);
+        let state = gitui::StageDocState {
+            path,
+            pane: StagePane::Unstaged,
+            doc,
+            diff,
+        };
+        if tx.send((generation, GitDoc::Patch(state))).is_ok() {
+            let _ = wk.wake();
+        }
+    });
+}
+
+/// The read-only wiring `handle_git_msg` / `dispatch_menu_choice` need.
+struct GitWires<'a> {
+    session: &'a crate::session::Session,
+    cfg: &'a superzej_core::config::Config,
+    op_tx: &'a tokio_mpsc::UnboundedSender<GitOpDone>,
+    doc_tx: &'a tokio_mpsc::UnboundedSender<(u64, GitDoc)>,
+    waker: &'a TerminalWaker,
+}
+
+/// The loop-owned overlay slots the git layer drives.
+struct GitOverlays<'a> {
+    menu: &'a mut Option<MenuOverlay>,
+    input: &'a mut Option<(menu::InputOverlay, GitInputKind)>,
+    /// A destructive op awaiting its `[y]` (the menu carries tag "git-op").
+    confirm_op: &'a mut Option<GitOp>,
+    /// `cfg.git_commands` indices behind the open custom-commands menu.
+    custom_cmds: &'a mut Vec<usize>,
+}
+
+/// What a submitted git input overlay means.
+enum GitInputKind {
+    Commit,
+    Reword {
+        sha: String,
+    },
+    StashPush,
+    PatchSplit {
+        sha: String,
+        patch: String,
+    },
+    BranchCreate,
+    BranchRename {
+        old: String,
+    },
+    /// One prompt of a custom command; `remaining` are `(key, title)` pairs.
+    CustomPrompt {
+        cmd: usize,
+        key: String,
+        collected: std::collections::BTreeMap<String, String>,
+        remaining: Vec<(String, String)>,
+    },
+}
+
+/// A follow-up only the loop body can perform (it owns session/panes).
+#[must_use]
+enum GitAfter {
+    None,
+    /// Run the `Action::NewWorktree` flow.
+    NewWorktree,
+    /// Spawn this command into a fresh center tab (custom-command
+    /// `output = "terminal"`).
+    Terminal(String),
+}
+
+fn short_sha(sha: &str) -> String {
+    sha.chars().take(7).collect()
+}
+
+fn sel_change(ui: &crate::panel::PanelUi, model: &FrameModel) -> Option<crate::panel::ChangeRow> {
+    gitui::source_at(&ui.git, GitView::Files, &model.panel)
+        .and_then(|i| model.panel.changes.get(i).cloned())
+}
+
+fn sel_commit(ui: &crate::panel::PanelUi, model: &FrameModel) -> Option<crate::panel::CommitRow> {
+    gitui::source_at(&ui.git, GitView::Commits, &model.panel)
+        .and_then(|i| model.panel.commits.get(i).cloned())
+}
+
+fn sel_branch(ui: &crate::panel::PanelUi, model: &FrameModel) -> Option<crate::panel::BranchRow> {
+    gitui::source_at(&ui.git, GitView::Branches, &model.panel)
+        .and_then(|i| model.panel.branches.get(i).cloned())
+}
+
+fn sel_stash(ui: &crate::panel::PanelUi, model: &FrameModel) -> Option<crate::panel::StashRow> {
+    gitui::source_at(&ui.git, GitView::Stash, &model.panel)
+        .and_then(|i| model.panel.stashes.get(i).cloned())
+}
+
+/// The line-cursor views' active document.
+fn active_line_doc(git: &gitui::GitUi) -> Option<&gitui::StageDocState> {
+    match git.focus {
+        GitView::Staging => git.stage_doc.as_ref(),
+        GitView::PatchBuilding => git.patch_doc.as_ref(),
+        _ => None,
+    }
+}
+
+/// Stash `op` behind a yes/no confirm menu (tag "git-op").
+fn confirm_git_op(
+    ov: &mut GitOverlays<'_>,
+    title: &str,
+    body: impl Into<String>,
+    danger: bool,
+    op: GitOp,
+) {
+    *ov.confirm_op = Some(op);
+    *ov.menu = Some(menu::confirm_menu(
+        title,
+        body,
+        "git-op",
+        String::new(),
+        danger,
+    ));
+}
+
+/// The custom-commands `context` label a git view filters on.
+fn custom_context_label(view: GitView) -> &'static str {
+    match view {
+        GitView::Files | GitView::Staging => "files",
+        GitView::Branches => "branches",
+        GitView::Commits | GitView::CommitFiles | GitView::PatchBuilding | GitView::RebaseTodo => {
+            "commits"
+        }
+        GitView::Stash => "stash",
+    }
+}
+
+/// The template context for custom commands, built from the CURRENT
+/// selection (expansion happens at pick/submit time, lazygit-style).
+fn git_template_ctx(
+    panel_ui: &crate::panel::PanelUi,
+    model: &FrameModel,
+    session: &crate::session::Session,
+    prompts: std::collections::BTreeMap<String, String>,
+) -> superzej_core::custom_cmd::TemplateCtx {
+    use superzej_core::custom_cmd::{BranchVars, CommitVars, StashVars, TemplateCtx};
+    TemplateCtx {
+        selected_commit: sel_commit(panel_ui, model).map(|c| CommitVars {
+            sha: c.sha,
+            short: c.short,
+            subject: c.subject,
+            author: c.author,
+        }),
+        selected_branch: sel_branch(panel_ui, model).map(|b| BranchVars {
+            name: b.name,
+            upstream: b.upstream,
+        }),
+        checked_out_branch: Some(BranchVars {
+            name: model.panel.branch.clone(),
+            upstream: None,
+        }),
+        selected_file: sel_change(panel_ui, model).map(|c| c.path),
+        selected_stash: sel_stash(panel_ui, model).map(|s| StashVars {
+            index: s.index,
+            message: s.message,
+        }),
+        worktree_path: Some(active_tab_path(session).to_string_lossy().into_owned()),
+        prompt_responses: prompts,
+    }
+}
+
+/// Expand + run custom command `idx` with the collected prompt responses.
+fn run_custom_command(
+    idx: usize,
+    prompts: std::collections::BTreeMap<String, String>,
+    panel_ui: &mut crate::panel::PanelUi,
+    model: &mut FrameModel,
+    wires: &GitWires<'_>,
+) -> GitAfter {
+    use superzej_core::config::GitCmdOutput;
+    let Some(cmd) = wires.cfg.git_commands.get(idx) else {
+        return GitAfter::None;
+    };
+    let ctx = git_template_ctx(panel_ui, model, wires.session, prompts);
+    match superzej_core::custom_cmd::expand(&cmd.command, &ctx) {
+        Ok(line) => match cmd.output {
+            GitCmdOutput::Terminal => GitAfter::Terminal(line),
+            out => {
+                enqueue_git_op(
+                    GitOp::Custom {
+                        command: line,
+                        capture: out == GitCmdOutput::Popup,
+                    },
+                    &mut panel_ui.git,
+                    &mut model.status,
+                    wires.session,
+                    wires.cfg.git.override_gpg,
+                    wires.op_tx,
+                    wires.waker,
+                );
+                GitAfter::None
+            }
+        },
+        Err(e) => {
+            model.status = e.to_string();
+            GitAfter::None
         }
     }
-    if let Some(p) = cur.checked_sub(1) {
-        v.push(p);
-    }
-    v
 }
 
-/// Show the diff document for the current Diff cursor (cache-first), enter
-/// the FileDiff view, and preload neighbors.
-fn show_diff_doc(
-    panel_ui: &mut crate::panel::PanelUi,
-    files: &[crate::panel::DiffFile],
-    wt: &std::path::Path,
-    cache: &mut std::collections::HashMap<String, String>,
-    tx: &tokio_mpsc::UnboundedSender<(String, String)>,
-    waker: &TerminalWaker,
-) {
-    let Some(f) = files.get(panel_ui.diff_cursor) else {
-        return;
+/// Render the custom patch from the marked lines across every fetched patch
+/// doc. `reverse=true` for the removal flows (remove/split/move-to-index) —
+/// see `svc::git::patch`; forward for plain applies.
+fn render_marked_patch(git: &gitui::GitUi, reverse: bool) -> Option<String> {
+    let GitFlow::Patch(p) = &git.flow else {
+        return None;
     };
-    let key = doc_key('d', wt, &f.path);
-    let doc = cache
-        .get(&key)
-        .cloned()
-        .unwrap_or_else(|| fetch_file_diff(wt, &f.path));
-    cache.insert(key, doc.clone());
-    panel_ui.file_diff = doc;
-    panel_ui.focused_path = f.path.clone();
-    panel_ui.diff_scroll = 0;
-    panel_ui.diff_view = crate::panel::DiffView::FileDiff;
-    let neighbors: Vec<String> = neighbor_indices(files.len(), panel_ui.diff_cursor)
-        .into_iter()
-        .map(|i| files[i].path.clone())
-        .filter(|p| !cache.contains_key(&doc_key('d', wt, p)))
-        .collect();
-    if !neighbors.is_empty() {
-        spawn_doc_preload(
-            tx.clone(),
-            waker.clone(),
-            wt.to_path_buf(),
-            'd',
-            neighbors,
-            None,
-        );
+    let mut out = String::new();
+    for (path, marks) in &p.marks {
+        if marks.is_empty() {
+            continue;
+        }
+        let Some(docst) = git.patch_docs.get(path) else {
+            continue;
+        };
+        let files = superzej_core::patch::parse_patch(&docst.diff);
+        let Some(file) = files.first() else {
+            continue;
+        };
+        let sel = crate::panel::staging::to_selection(&docst.doc, marks.iter().copied());
+        if let Some(piece) = superzej_core::patch::transform(file, &sel, reverse) {
+            out.push_str(&piece);
+        }
     }
+    (!out.is_empty()).then_some(out)
 }
 
-/// The visible-row positions of FILE entries (dirs skipped) in the Files tree.
-fn file_row_positions(panel_ui: &crate::panel::PanelUi) -> (Vec<usize>, Vec<usize>) {
-    let visible = crate::panel::visible_file_indices(&panel_ui.files, &panel_ui.files_collapsed);
-    let positions: Vec<usize> = visible
-        .iter()
-        .enumerate()
-        .filter(|(_, vi)| !panel_ui.files[**vi].is_dir)
-        .map(|(pos, _)| pos)
-        .collect();
-    (visible, positions)
+/// Open a PR url in the browser, detached (no `gh` needed).
+fn open_url_detached(url: &str) {
+    let _ = std::process::Command::new("xdg-open")
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
-/// Show the preview for the Files cursor's file (cache-first) and preload
-/// neighboring files in visible order.
-fn show_file_preview(
+/// Turn one decoded [`GitMsg`] into ops / state changes. Navigation mutates
+/// [`gitui::GitUi`] directly; effects flow through the mutation runner (with
+/// destructive ones parked behind a confirm menu first).
+#[allow(clippy::too_many_lines)]
+fn handle_git_msg(
+    msg: GitMsg,
     panel_ui: &mut crate::panel::PanelUi,
-    wt: &std::path::Path,
-    cache: &mut std::collections::HashMap<String, String>,
-    tx: &tokio_mpsc::UnboundedSender<(String, String)>,
-    waker: &TerminalWaker,
-    bat: Option<&str>,
-) {
-    let (visible, positions) = file_row_positions(panel_ui);
-    let Some(&vi) = visible.get(panel_ui.files_cursor) else {
-        return;
-    };
-    let entry = panel_ui.files[vi].clone();
-    if entry.is_dir {
-        return;
-    }
-    let key = doc_key('p', wt, &entry.path);
-    let doc = cache
-        .get(&key)
-        .cloned()
-        .unwrap_or_else(|| fetch_file_preview(wt, &entry.path, bat));
-    cache.insert(key, doc.clone());
-    panel_ui.file_diff = doc;
-    panel_ui.focused_path = entry.path;
-    panel_ui.diff_scroll = 0;
-    panel_ui.files_preview = true;
-    let cur_fp = positions
-        .iter()
-        .position(|&p| p == panel_ui.files_cursor)
-        .unwrap_or(0);
-    let neighbors: Vec<String> = neighbor_indices(positions.len(), cur_fp)
-        .into_iter()
-        .map(|fp| panel_ui.files[visible[positions[fp]]].path.clone())
-        .filter(|p| !cache.contains_key(&doc_key('p', wt, p)))
-        .collect();
-    if !neighbors.is_empty() {
-        spawn_doc_preload(
-            tx.clone(),
-            waker.clone(),
-            wt.to_path_buf(),
-            'p',
-            neighbors,
-            bat.map(str::to_string),
+    model: &mut FrameModel,
+    wires: &GitWires<'_>,
+    ov: &mut GitOverlays<'_>,
+) -> GitAfter {
+    let enqueue = |panel_ui: &mut crate::panel::PanelUi, model: &mut FrameModel, op: GitOp| {
+        enqueue_git_op(
+            op,
+            &mut panel_ui.git,
+            &mut model.status,
+            wires.session,
+            wires.cfg.git.override_gpg,
+            wires.op_tx,
+            wires.waker,
         );
+    };
+    match msg {
+        // ---- navigation -------------------------------------------------
+        GitMsg::CursorDown | GitMsg::CursorUp => {
+            let down = msg == GitMsg::CursorDown;
+            match panel_ui.git.focus {
+                GitView::RebaseTodo => {
+                    if let GitFlow::Rebase(r) = &mut panel_ui.git.flow {
+                        let max = r.todos.len().saturating_sub(1);
+                        r.cursor = if down {
+                            (r.cursor + 1).min(max)
+                        } else {
+                            r.cursor.saturating_sub(1)
+                        };
+                    }
+                }
+                GitView::Staging | GitView::PatchBuilding => {
+                    let cur = panel_ui.git.staging.as_ref().map_or(0, |s| s.cursor);
+                    let next = active_line_doc(&panel_ui.git)
+                        .map(|d| gitui::step_cursor(&d.doc, cur, down));
+                    if let (Some(next), Some(s)) = (next, panel_ui.git.staging.as_mut()) {
+                        s.cursor = next;
+                    }
+                }
+                _ => {}
+            }
+        }
+        GitMsg::RangeDown | GitMsg::RangeUp => {
+            let down = msg == GitMsg::RangeDown;
+            match panel_ui.git.focus {
+                GitView::Staging | GitView::PatchBuilding => {
+                    let cur = panel_ui.git.staging.as_ref().map_or(0, |s| s.cursor);
+                    let next = active_line_doc(&panel_ui.git)
+                        .map(|d| gitui::step_cursor(&d.doc, cur, down));
+                    if let (Some(next), Some(s)) = (next, panel_ui.git.staging.as_mut()) {
+                        if s.anchor.is_none() {
+                            s.anchor = Some(s.cursor);
+                        }
+                        s.cursor = next;
+                    }
+                }
+                v => {
+                    let len = gitui::list_len(&panel_ui.git, v, &model.panel);
+                    let cur = panel_ui.git.cur.get(v);
+                    if panel_ui.git.sel_anchor.is_none() {
+                        panel_ui.git.sel_anchor = Some(cur);
+                    }
+                    let next = if down {
+                        (cur + 1).min(len.saturating_sub(1))
+                    } else {
+                        cur.saturating_sub(1)
+                    };
+                    panel_ui.git.cur.set(v, next);
+                    panel_ui.cursor = next;
+                }
+            }
+        }
+        GitMsg::ToggleRangeMode => match panel_ui.git.focus {
+            GitView::Staging | GitView::PatchBuilding => {
+                if let Some(s) = panel_ui.git.staging.as_mut() {
+                    s.anchor = match s.anchor {
+                        Some(_) => None,
+                        None => Some(s.cursor),
+                    };
+                }
+            }
+            v => {
+                panel_ui.git.sel_anchor = match panel_ui.git.sel_anchor {
+                    Some(_) => None,
+                    None => Some(panel_ui.git.cur.get(v)),
+                };
+            }
+        },
+        GitMsg::TogglePane => {
+            if panel_ui.git.focus == GitView::Staging {
+                let kicked = panel_ui.git.staging.as_mut().map(|s| {
+                    s.pane = match s.pane {
+                        StagePane::Unstaged => StagePane::Staged,
+                        StagePane::Staged => StagePane::Unstaged,
+                    };
+                    s.cursor = 0;
+                    s.anchor = None;
+                    (s.path.clone(), s.pane)
+                });
+                if let Some((path, pane)) = kicked {
+                    spawn_stage_doc_fetch(
+                        panel_ui.git.op_gen,
+                        wires.session,
+                        path,
+                        pane,
+                        wires.doc_tx,
+                        wires.waker,
+                    );
+                }
+            }
+        }
+        GitMsg::NextHunk | GitMsg::PrevHunk => {
+            let cur = panel_ui.git.staging.as_ref().map_or(0, |s| s.cursor);
+            let next = active_line_doc(&panel_ui.git).and_then(|d| {
+                if msg == GitMsg::NextHunk {
+                    crate::panel::staging::next_hunk(&d.doc, cur)
+                } else {
+                    crate::panel::staging::prev_hunk(&d.doc, cur)
+                }
+            });
+            if let (Some(next), Some(s)) = (next, panel_ui.git.staging.as_mut()) {
+                s.cursor = next;
+                s.anchor = None;
+            }
+        }
+        GitMsg::Drill => match panel_ui.git.focus {
+            GitView::Files => {
+                if let Some(row) = sel_change(panel_ui, model) {
+                    // An untracked file has no diff to line-stage: record it
+                    // with intent-to-add first (`git add -N`), which turns
+                    // its whole content into stageable Add lines.
+                    if row.stage == crate::panel::Stage::Untracked {
+                        enqueue(
+                            panel_ui,
+                            model,
+                            GitOp::IntentToAdd {
+                                path: row.path.clone(),
+                            },
+                        );
+                    }
+                    let mut s = gitui::StagingUi::new(&row.path);
+                    if row.stage == crate::panel::Stage::Staged {
+                        s.pane = StagePane::Staged;
+                    }
+                    let pane = s.pane;
+                    panel_ui.git.stage_doc = None;
+                    panel_ui.git.staging = Some(s);
+                    panel_ui.git.focus = GitView::Staging;
+                    spawn_stage_doc_fetch(
+                        panel_ui.git.op_gen,
+                        wires.session,
+                        row.path,
+                        pane,
+                        wires.doc_tx,
+                        wires.waker,
+                    );
+                }
+            }
+            GitView::Commits => {
+                if let Some(c) = sel_commit(panel_ui, model) {
+                    panel_ui.git.drilled_commit = Some(c.sha.clone());
+                    panel_ui.git.commit_files.clear();
+                    panel_ui.git.cur.commit_files = 0;
+                    panel_ui.cursor = 0;
+                    panel_ui.git.focus = GitView::CommitFiles;
+                    spawn_commit_files_fetch(
+                        panel_ui.git.op_gen,
+                        wires.session,
+                        c.sha,
+                        wires.doc_tx,
+                        wires.waker,
+                    );
+                }
+            }
+            GitView::CommitFiles => {
+                let file = panel_ui
+                    .git
+                    .commit_files
+                    .get(panel_ui.git.cur.commit_files)
+                    .map(|(p, _, _)| p.clone());
+                if let (Some(path), Some(sha)) = (file, panel_ui.git.drilled_commit.clone()) {
+                    match &mut panel_ui.git.flow {
+                        GitFlow::Patch(p) => p.path = path.clone(),
+                        f => {
+                            *f = GitFlow::Patch(gitui::PatchUi {
+                                commit: sha.clone(),
+                                path: path.clone(),
+                                marks: Default::default(),
+                            })
+                        }
+                    }
+                    panel_ui.git.patch_doc = None;
+                    panel_ui.git.staging = Some(gitui::StagingUi::new(&path));
+                    panel_ui.git.focus = GitView::PatchBuilding;
+                    spawn_patch_doc_fetch(
+                        panel_ui.git.op_gen,
+                        wires.session,
+                        sha,
+                        path,
+                        wires.doc_tx,
+                        wires.waker,
+                    );
+                }
+            }
+            GitView::Branches => {
+                model.status = "branch log renders from the commits list".into();
+            }
+            GitView::Stash => {
+                model.status = "stash diff renders in the main region".into();
+            }
+            _ => {}
+        },
+        GitMsg::Back => {
+            let git = &mut panel_ui.git;
+            if git.filter.is_some() {
+                git.filter = None;
+            } else if git.staging.as_ref().is_some_and(|s| s.anchor.is_some()) {
+                if let Some(s) = git.staging.as_mut() {
+                    s.anchor = None;
+                }
+            } else if git.sel_anchor.is_some() {
+                git.sel_anchor = None;
+            } else {
+                match git.focus {
+                    GitView::Staging => {
+                        git.staging = None;
+                        git.stage_doc = None;
+                        git.focus = panel_ui.open.home_view().unwrap_or(GitView::Files);
+                    }
+                    GitView::PatchBuilding => {
+                        git.staging = None;
+                        git.focus = GitView::CommitFiles;
+                    }
+                    GitView::CommitFiles => {
+                        git.drilled_commit = None;
+                        git.commit_files.clear();
+                        git.focus = GitView::Commits;
+                    }
+                    GitView::RebaseTodo => {
+                        if !matches!(&git.flow, GitFlow::Rebase(r) if r.running) {
+                            git.flow = GitFlow::None;
+                        }
+                        git.focus = GitView::Commits;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // ---- staging / patch building ------------------------------------
+        GitMsg::StageLines => match panel_ui.git.focus {
+            GitView::Staging => {
+                let op = panel_ui
+                    .git
+                    .staging
+                    .as_ref()
+                    .zip(panel_ui.git.stage_doc.as_ref())
+                    .map(|(s, d)| {
+                        let indices = gitui::sel_pairs(&d.doc, s.selection());
+                        (indices, d.path.clone(), d.diff.clone(), d.pane)
+                    });
+                match op {
+                    Some((indices, _, _, _)) if indices.is_empty() => {
+                        model.status = "nothing stageable selected".into();
+                    }
+                    Some((indices, path, diff, pane)) => {
+                        if let Some(s) = panel_ui.git.staging.as_mut() {
+                            s.anchor = None;
+                        }
+                        let target = match pane {
+                            StagePane::Unstaged => crate::gitmut::StageTarget::Unstaged,
+                            StagePane::Staged => crate::gitmut::StageTarget::Staged,
+                        };
+                        enqueue(
+                            panel_ui,
+                            model,
+                            GitOp::StageLines {
+                                path,
+                                diff,
+                                indices,
+                                target,
+                            },
+                        );
+                    }
+                    None => {}
+                }
+            }
+            GitView::PatchBuilding => {
+                // Pure: toggle marks for the selected range.
+                let sel = panel_ui.git.staging.as_ref().map(|s| s.selection());
+                let toggles: Vec<usize> = sel
+                    .and_then(|sel| {
+                        panel_ui.git.patch_doc.as_ref().map(|d| {
+                            sel.filter(|&i| crate::panel::staging::selectable(&d.doc, i))
+                                .collect()
+                        })
+                    })
+                    .unwrap_or_default();
+                let path = panel_ui.git.staging.as_ref().map(|s| s.path.clone());
+                if let (Some(path), GitFlow::Patch(p)) = (path, &mut panel_ui.git.flow) {
+                    let marks = p.marks.entry(path).or_default();
+                    for i in toggles {
+                        if !marks.remove(&i) {
+                            marks.insert(i);
+                        }
+                    }
+                    model.status = format!("{} line(s) in patch", p.marked());
+                }
+                if let Some(s) = panel_ui.git.staging.as_mut() {
+                    s.anchor = None;
+                }
+            }
+            _ => {}
+        },
+        GitMsg::SelectHunk => {
+            let cur = panel_ui.git.staging.as_ref().map_or(0, |s| s.cursor);
+            let range = active_line_doc(&panel_ui.git).and_then(|d| {
+                let r = crate::panel::staging::hunk_range(&d.doc, cur)?;
+                // Rest the cursor on the hunk's last CURSORABLE line.
+                let end = (*r.start()..=*r.end())
+                    .rev()
+                    .find(|&i| crate::panel::staging::cursorable(&d.doc, i))?;
+                Some((*r.start(), end))
+            });
+            if let (Some((start, end)), Some(s)) = (range, panel_ui.git.staging.as_mut()) {
+                s.anchor = Some(start);
+                s.cursor = end;
+            }
+        }
+        GitMsg::DiscardLines => {
+            if panel_ui.git.focus == GitView::Staging {
+                let op = panel_ui
+                    .git
+                    .staging
+                    .as_ref()
+                    .zip(panel_ui.git.stage_doc.as_ref())
+                    .map(|(s, d)| {
+                        (
+                            gitui::sel_pairs(&d.doc, s.selection()),
+                            d.path.clone(),
+                            d.diff.clone(),
+                        )
+                    });
+                if let Some((indices, path, diff)) = op {
+                    if indices.is_empty() {
+                        model.status = "nothing selected to discard".into();
+                    } else {
+                        confirm_git_op(
+                            ov,
+                            "discard lines?",
+                            format!(
+                                "discards {} line(s) of {path} — unrecoverable",
+                                indices.len()
+                            ),
+                            true,
+                            GitOp::DiscardLines {
+                                path,
+                                diff,
+                                indices,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        GitMsg::StageAll => {
+            // Toggle, lazygit-style: when everything is already staged the
+            // same key empties the index instead.
+            let all_staged = !model.panel.changes.is_empty()
+                && model
+                    .panel
+                    .changes
+                    .iter()
+                    .all(|c| c.stage == crate::panel::Stage::Staged);
+            if all_staged {
+                confirm_git_op(
+                    ov,
+                    "unstage all?",
+                    "unstages every change",
+                    false,
+                    GitOp::UnstageAll,
+                );
+            } else {
+                confirm_git_op(
+                    ov,
+                    "stage all?",
+                    "stages every change",
+                    false,
+                    GitOp::StageAll,
+                );
+            }
+        }
+        // ---- files ---------------------------------------------------------
+        GitMsg::StageToggleFile => match panel_ui.git.focus {
+            GitView::RebaseTodo => {
+                if let GitFlow::Rebase(r) = &mut panel_ui.git.flow {
+                    gitui::todo_toggle_at(&mut r.todos, r.cursor);
+                }
+            }
+            _ => {
+                if let Some(row) = sel_change(panel_ui, model) {
+                    enqueue(
+                        panel_ui,
+                        model,
+                        GitOp::StageFile {
+                            path: row.path,
+                            unstage: row.stage == crate::panel::Stage::Staged,
+                        },
+                    );
+                }
+            }
+        },
+        GitMsg::DiscardFile => {
+            if let Some(row) = sel_change(panel_ui, model) {
+                confirm_git_op(
+                    ov,
+                    "discard?",
+                    format!("discards {} — unrecoverable", row.path),
+                    true,
+                    GitOp::DiscardFile {
+                        path: row.path,
+                        untracked: row.stage == crate::panel::Stage::Untracked,
+                    },
+                );
+            }
+        }
+        // ---- commits ---------------------------------------------------------
+        GitMsg::Commit => {
+            *ov.input = Some((
+                menu::InputOverlay::new("commit message", ""),
+                GitInputKind::Commit,
+            ));
+        }
+        GitMsg::Reword => {
+            if let Some(c) = sel_commit(panel_ui, model) {
+                *ov.input = Some((
+                    menu::InputOverlay::new(format!("reword {}", c.short), c.subject),
+                    GitInputKind::Reword { sha: c.sha },
+                ));
+            }
+        }
+        GitMsg::Squash | GitMsg::Fixup => {
+            if let Some((oldest, targets)) = gitui::commit_selection(&panel_ui.git, &model.panel) {
+                panel_ui.git.sel_anchor = None;
+                let op = if msg == GitMsg::Squash {
+                    GitOp::Squash { oldest, targets }
+                } else {
+                    GitOp::Fixup { oldest, targets }
+                };
+                enqueue(panel_ui, model, op);
+            }
+        }
+        GitMsg::Drop => {
+            if let Some((oldest, targets)) = gitui::commit_selection(&panel_ui.git, &model.panel) {
+                panel_ui.git.sel_anchor = None;
+                confirm_git_op(
+                    ov,
+                    "drop?",
+                    format!("drops {} commit(s) from history", targets.len()),
+                    true,
+                    GitOp::Drop { oldest, targets },
+                );
+            }
+        }
+        GitMsg::Edit => {
+            if let Some(c) = sel_commit(panel_ui, model) {
+                panel_ui.git.flow = GitFlow::Rebase(gitui::RebaseUi {
+                    running: true,
+                    ..Default::default()
+                });
+                enqueue(panel_ui, model, GitOp::EditStop { sha: c.sha });
+            }
+        }
+        GitMsg::MoveUp | GitMsg::MoveDown => {
+            let up = msg == GitMsg::MoveUp;
+            match panel_ui.git.focus {
+                GitView::RebaseTodo => {
+                    if let GitFlow::Rebase(r) = &mut panel_ui.git.flow {
+                        r.cursor = gitui::todo_move(&mut r.todos, r.cursor, up);
+                    }
+                }
+                _ => {
+                    if let Some(c) = sel_commit(panel_ui, model) {
+                        enqueue(panel_ui, model, GitOp::MoveCommit { sha: c.sha, up });
+                    }
+                }
+            }
+        }
+        GitMsg::AmendStaged => {
+            if let Some(c) = sel_commit(panel_ui, model) {
+                // Amending HEAD needs no rebase — a plain `--amend` is
+                // cheaper and conflict-free.
+                let is_head = model.panel.commits.first().map(|h| &h.sha) == Some(&c.sha);
+                let op = if is_head {
+                    GitOp::AmendHead
+                } else {
+                    GitOp::AmendOldCommit { target: c.sha }
+                };
+                confirm_git_op(
+                    ov,
+                    "amend?",
+                    format!("amends staged changes into {}", c.short),
+                    false,
+                    op,
+                );
+            }
+        }
+        GitMsg::Revert => {
+            if let Some(c) = sel_commit(panel_ui, model) {
+                confirm_git_op(
+                    ov,
+                    "revert?",
+                    format!("reverts {} with a new inverse commit", c.short),
+                    false,
+                    GitOp::Revert { sha: c.sha },
+                );
+            }
+        }
+        GitMsg::CopyCommits => {
+            let shas: Vec<String> = gitui::selected_sources(&panel_ui.git, &model.panel)
+                .into_iter()
+                .filter_map(|i| model.panel.commits.get(i).map(|c| c.sha.clone()))
+                .collect();
+            for sha in shas {
+                if !panel_ui.git.clipboard.contains(&sha) {
+                    panel_ui.git.clipboard.push(sha);
+                }
+            }
+            panel_ui.git.sel_anchor = None;
+            model.status = format!("{} copied", panel_ui.git.clipboard.len());
+        }
+        GitMsg::PasteCommits => {
+            if panel_ui.git.clipboard.is_empty() {
+                model.status = "nothing copied".into();
+            } else {
+                // The clipboard holds newest-first; the executor wants
+                // oldest-first.
+                let shas: Vec<String> = panel_ui.git.clipboard.iter().rev().cloned().collect();
+                confirm_git_op(
+                    ov,
+                    "cherry-pick?",
+                    format!("cherry-picks {} commit(s) onto HEAD", shas.len()),
+                    false,
+                    GitOp::CherryPick { shas },
+                );
+            }
+        }
+        GitMsg::EnterInteractive => {
+            // A rebase already in progress owns the editor — `i` jumps to
+            // it rather than clobbering the live flow with a fresh plan.
+            if matches!(&panel_ui.git.flow, GitFlow::Rebase(r) if r.running) {
+                panel_ui.git.focus = GitView::RebaseTodo;
+            } else if let Some((base, todos)) = gitui::todo_from_commits(&model.panel.commits) {
+                panel_ui.git.flow = GitFlow::Rebase(gitui::RebaseUi {
+                    base,
+                    todos,
+                    ..Default::default()
+                });
+                panel_ui.git.focus = GitView::RebaseTodo;
+            } else {
+                model.status = "no commits loaded".into();
+            }
+        }
+        GitMsg::ConfirmRebase => {
+            let op = match &mut panel_ui.git.flow {
+                GitFlow::Rebase(r) if !r.running => {
+                    r.running = true;
+                    Some(GitOp::RebaseInteractive {
+                        base: r.base.clone(),
+                        todo: r.todos.clone(),
+                    })
+                }
+                // A PAUSED rebase: confirm rewrites the still-pending
+                // entries in place (reorder/retag/drop mid-flight). The op
+                // carries the as-read baseline and the backend refuses to
+                // clobber a todo that changed on disk since; an unsynced
+                // editor (live read still out) can't rewrite at all.
+                GitFlow::Rebase(r) if r.running && r.todos_synced => {
+                    Some(GitOp::RewritePendingTodo {
+                        todo: r.todos.clone(),
+                        baseline: r.baseline.clone(),
+                    })
+                }
+                GitFlow::Rebase(_) => {
+                    model.status = "loading live rebase todo — retry in a moment".into();
+                    None
+                }
+                _ => None,
+            };
+            if let Some(op) = op {
+                enqueue(panel_ui, model, op);
+            }
+        }
+        GitMsg::TodoSetAction(action) => {
+            if let GitFlow::Rebase(r) = &mut panel_ui.git.flow {
+                gitui::todo_retag_at(&mut r.todos, r.cursor, action);
+            }
+        }
+        GitMsg::MarkBase => {
+            if let Some(c) = sel_commit(panel_ui, model) {
+                panel_ui.git.mark_base = match panel_ui.git.mark_base.take() {
+                    Some(m) if m == c.sha => None,
+                    _ => {
+                        model.status = format!("rebase base marked: {}", c.short);
+                        Some(c.sha)
+                    }
+                };
+            }
+        }
+        GitMsg::ToggleDiffMark => {
+            if let Some(c) = sel_commit(panel_ui, model) {
+                if matches!(&panel_ui.git.flow, GitFlow::Diffing(m) if *m == c.sha) {
+                    *ov.menu = Some(menu::diff_menu(&c.short));
+                } else {
+                    panel_ui.git.diff_mark = Some(c.sha.clone());
+                    panel_ui.git.flow = GitFlow::Diffing(c.sha);
+                    model.status = format!("diffing against {}", c.short);
+                }
+            }
+        }
+        GitMsg::CheckoutSel => match panel_ui.git.focus {
+            GitView::Branches => {
+                if let Some(b) = sel_branch(panel_ui, model) {
+                    if b.is_head {
+                        model.status = "already checked out".into();
+                    } else {
+                        enqueue(panel_ui, model, GitOp::Checkout { refname: b.name });
+                    }
+                }
+            }
+            _ => {
+                if let Some(c) = sel_commit(panel_ui, model) {
+                    confirm_git_op(
+                        ov,
+                        "checkout commit?",
+                        format!("checks out {} (detached HEAD)", c.short),
+                        false,
+                        GitOp::Checkout { refname: c.sha },
+                    );
+                }
+            }
+        },
+        GitMsg::ResetMenu => {
+            let (sha, short) = match panel_ui.git.focus {
+                GitView::Files => ("HEAD".to_string(), "HEAD".to_string()),
+                _ => match sel_commit(panel_ui, model) {
+                    Some(c) => (c.sha, c.short),
+                    None => return GitAfter::None,
+                },
+            };
+            *ov.menu = Some(menu::reset_menu(&sha, &short));
+        }
+        GitMsg::OpenMenu(kind) => match kind {
+            gitui::MenuKind::Rebase => {
+                // The continue family is chosen by the live conflict banner:
+                // `m` during a cherry-pick/merge conflict drives THOSE
+                // sequencers, not the rebase one.
+                let banner = model.panel.merge.as_ref().map(|m| m.label.clone());
+                *ov.menu = Some(match banner.as_deref() {
+                    Some("CHERRY-PICK") => menu::cherry_conflict_menu(),
+                    Some("MERGING") => menu::merge_conflict_menu(),
+                    Some("REVERTING") => menu::revert_conflict_menu(),
+                    other => {
+                        let conflicted = matches!(&panel_ui.git.flow, GitFlow::Rebase(r) if r.conflict)
+                            || other.is_some();
+                        menu::rebase_menu(conflicted)
+                    }
+                });
+            }
+            gitui::MenuKind::Patch => {
+                *ov.menu = Some(menu::patch_menu());
+            }
+            gitui::MenuKind::Bisect => {
+                *ov.menu = Some(menu::bisect_menu(matches!(
+                    panel_ui.git.flow,
+                    GitFlow::Bisect(_)
+                )));
+            }
+            gitui::MenuKind::BranchActions => {
+                if let Some(b) = sel_branch(panel_ui, model) {
+                    *ov.menu = Some(menu::branch_actions_menu(&b.name, b.is_head));
+                }
+            }
+            gitui::MenuKind::CustomCommands => {
+                let ctx_label = custom_context_label(panel_ui.git.focus);
+                let mut seen = std::collections::HashSet::new();
+                let mut pairs: Vec<(char, String)> = Vec::new();
+                ov.custom_cmds.clear();
+                for (i, c) in wires.cfg.git_commands.iter().enumerate() {
+                    if c.context != "global" && c.context != ctx_label {
+                        continue;
+                    }
+                    let key = c.key.chars().next().unwrap_or('?');
+                    if !seen.insert(key.to_ascii_lowercase()) {
+                        continue; // duplicate hotkey: first one wins
+                    }
+                    ov.custom_cmds.push(i);
+                    pairs.push((
+                        key,
+                        c.description.clone().unwrap_or_else(|| c.command.clone()),
+                    ));
+                }
+                if pairs.is_empty() {
+                    model.status = "no custom commands for this view ([[git_commands]])".into();
+                } else {
+                    *ov.menu = Some(menu::custom_commands_menu(&pairs));
+                }
+            }
+        },
+        // ---- branches ---------------------------------------------------
+        GitMsg::Pull => enqueue(panel_ui, model, GitOp::Pull),
+        GitMsg::Push => enqueue(
+            panel_ui,
+            model,
+            GitOp::Push {
+                force: superzej_svc::git::ForceMode::None,
+            },
+        ),
+        GitMsg::FastForward => {
+            if let Some(b) = sel_branch(panel_ui, model) {
+                enqueue(
+                    panel_ui,
+                    model,
+                    GitOp::FastForward {
+                        branch: b.name,
+                        current: b.is_head,
+                    },
+                );
+            }
+        }
+        GitMsg::RebaseOntoSel => {
+            if let Some(b) = sel_branch(panel_ui, model) {
+                if b.is_head {
+                    model.status = "cannot rebase a branch onto itself".into();
+                } else if let Some(marked_base) = panel_ui.git.mark_base.clone() {
+                    confirm_git_op(
+                        ov,
+                        "rebase onto?",
+                        format!(
+                            "rebases commits after {} onto {}",
+                            short_sha(&marked_base),
+                            b.name
+                        ),
+                        false,
+                        GitOp::RebaseOnto {
+                            target: b.name,
+                            marked_base,
+                        },
+                    );
+                } else {
+                    enqueue(panel_ui, model, GitOp::RebaseBranch { branch: b.name });
+                }
+            }
+        }
+        GitMsg::DeleteSel => {
+            if let Some(b) = sel_branch(panel_ui, model) {
+                if b.is_head {
+                    model.status = "cannot delete the checked-out branch".into();
+                } else {
+                    confirm_git_op(
+                        ov,
+                        "delete branch?",
+                        format!("deletes {}", b.name),
+                        true,
+                        GitOp::DeleteBranch {
+                            name: b.name,
+                            force: false,
+                        },
+                    );
+                }
+            }
+        }
+        GitMsg::CreateWorktree => return GitAfter::NewWorktree,
+        GitMsg::OpenPrInBrowser => {
+            match sel_branch(panel_ui, model).and_then(|b| b.pr.map(|p| p.url)) {
+                Some(url) => {
+                    open_url_detached(&url);
+                    model.status = "opened PR in the browser".into();
+                }
+                None => model.status = "no PR for this branch".into(),
+            }
+        }
+        // ---- stash --------------------------------------------------------
+        GitMsg::StashPush => {
+            *ov.input = Some((
+                menu::InputOverlay::new("stash message", ""),
+                GitInputKind::StashPush,
+            ));
+        }
+        GitMsg::StashApply => {
+            if let Some(s) = sel_stash(panel_ui, model) {
+                enqueue(panel_ui, model, GitOp::StashApply { index: s.index });
+            }
+        }
+        GitMsg::StashPop => {
+            if let Some(s) = sel_stash(panel_ui, model) {
+                enqueue(panel_ui, model, GitOp::StashPop { index: s.index });
+            }
+        }
+        GitMsg::StashDrop => {
+            if let Some(s) = sel_stash(panel_ui, model) {
+                confirm_git_op(
+                    ov,
+                    "drop stash?",
+                    format!("drops stash@{{{}}}: {}", s.index, s.message),
+                    true,
+                    GitOp::StashDrop { index: s.index },
+                );
+            }
+        }
+        // ---- global-ish ---------------------------------------------------
+        GitMsg::Undo => enqueue(panel_ui, model, GitOp::UndoPlan { redo: false }),
+        GitMsg::Redo => enqueue(panel_ui, model, GitOp::UndoPlan { redo: true }),
+        GitMsg::Cheatsheet => {
+            let view = panel_ui.git.focus;
+            let pairs: Vec<(String, String)> = gitui::context_keys(view)
+                .iter()
+                .map(|ck| (ck.chord.to_string(), ck.label.to_string()))
+                .collect();
+            *ov.menu = Some(menu::keybinds_menu(view.label(), &pairs));
+        }
+        GitMsg::FilterStart => {
+            let view = panel_ui.git.focus;
+            if gitui::list_labels(view, &model.panel).is_some() {
+                panel_ui.git.filter = Some(gitui::ListFilter {
+                    view,
+                    query: String::new(),
+                    editing: true,
+                    map: gitui::display_map(&panel_ui.git, view, &model.panel),
+                });
+            } else {
+                model.status = "filter is not available in this view".into();
+            }
+        }
     }
+    GitAfter::None
+}
+
+/// Resolve a picked menu choice into ops / state changes (the exhaustive
+/// counterpart of the constructors in `crate::menu`).
+#[allow(clippy::too_many_lines)]
+fn dispatch_menu_choice(
+    choice: MenuChoice,
+    panel_ui: &mut crate::panel::PanelUi,
+    model: &mut FrameModel,
+    wires: &GitWires<'_>,
+    ov: &mut GitOverlays<'_>,
+    pending_undo: &mut Option<(superzej_core::reflog::UndoPlan, bool)>,
+) -> GitAfter {
+    use superzej_svc::git::{ForceMode, ResetMode};
+    let enqueue = |panel_ui: &mut crate::panel::PanelUi, model: &mut FrameModel, op: GitOp| {
+        enqueue_git_op(
+            op,
+            &mut panel_ui.git,
+            &mut model.status,
+            wires.session,
+            wires.cfg.git.override_gpg,
+            wires.op_tx,
+            wires.waker,
+        );
+    };
+    match choice {
+        MenuChoice::RebaseContinue => enqueue(panel_ui, model, GitOp::RebaseContinue),
+        MenuChoice::RebaseAbort => enqueue(panel_ui, model, GitOp::RebaseAbort),
+        MenuChoice::RebaseSkip => enqueue(panel_ui, model, GitOp::RebaseSkip),
+        MenuChoice::ResetSoft(sha) => enqueue(
+            panel_ui,
+            model,
+            GitOp::ResetTo {
+                sha,
+                mode: ResetMode::Soft,
+            },
+        ),
+        MenuChoice::ResetMixed(sha) => enqueue(
+            panel_ui,
+            model,
+            GitOp::ResetTo {
+                sha,
+                mode: ResetMode::Mixed,
+            },
+        ),
+        MenuChoice::ResetHard(sha) => enqueue(
+            panel_ui,
+            model,
+            GitOp::ResetTo {
+                sha,
+                mode: ResetMode::Hard,
+            },
+        ),
+        MenuChoice::Nuke => enqueue(panel_ui, model, GitOp::Nuke),
+        MenuChoice::PatchApply | MenuChoice::PatchApplyReverse => {
+            match render_marked_patch(&panel_ui.git, false) {
+                Some(patch) => enqueue(
+                    panel_ui,
+                    model,
+                    GitOp::PatchApply {
+                        patch,
+                        reverse: choice == MenuChoice::PatchApplyReverse,
+                    },
+                ),
+                None => model.status = "no lines marked".into(),
+            }
+        }
+        MenuChoice::PatchToIndex => {
+            let sha = match &panel_ui.git.flow {
+                GitFlow::Patch(p) => Some(p.commit.clone()),
+                _ => None,
+            };
+            match (sha, render_marked_patch(&panel_ui.git, true)) {
+                (Some(sha), Some(patch)) => {
+                    enqueue(panel_ui, model, GitOp::PatchToIndex { sha, patch })
+                }
+                _ => model.status = "no lines marked".into(),
+            }
+        }
+        MenuChoice::PatchNewCommit => {
+            let sha = match &panel_ui.git.flow {
+                GitFlow::Patch(p) => Some(p.commit.clone()),
+                _ => None,
+            };
+            match (sha, render_marked_patch(&panel_ui.git, true)) {
+                (Some(sha), Some(patch)) => {
+                    *ov.input = Some((
+                        menu::InputOverlay::new("new commit message", ""),
+                        GitInputKind::PatchSplit { sha, patch },
+                    ));
+                }
+                _ => model.status = "no lines marked".into(),
+            }
+        }
+        MenuChoice::PatchRemoveFromCommit => {
+            let sha = match &panel_ui.git.flow {
+                GitFlow::Patch(p) => Some(p.commit.clone()),
+                _ => None,
+            };
+            match (sha, render_marked_patch(&panel_ui.git, true)) {
+                (Some(sha), Some(patch)) => {
+                    enqueue(panel_ui, model, GitOp::PatchRemoveFromCommit { sha, patch })
+                }
+                _ => model.status = "no lines marked".into(),
+            }
+        }
+        MenuChoice::PatchReset => {
+            if let GitFlow::Patch(p) = &mut panel_ui.git.flow {
+                p.marks.clear();
+                model.status = "patch reset".into();
+            }
+        }
+        MenuChoice::DiffSwap => {
+            model.status = "diff sides swap is not wired yet".into();
+        }
+        MenuChoice::DiffExit => {
+            panel_ui.git.flow = GitFlow::None;
+            panel_ui.git.diff_mark = None;
+            model.status = "diff mode off".into();
+        }
+        MenuChoice::BisectStart => {
+            panel_ui.git.flow = GitFlow::Bisect(gitui::BisectUi {
+                bad_term: "bad".into(),
+                good_term: "good".into(),
+                ..Default::default()
+            });
+            enqueue(
+                panel_ui,
+                model,
+                GitOp::BisectStart {
+                    bad: None,
+                    good: None,
+                },
+            );
+        }
+        MenuChoice::BisectMarkGood => enqueue(
+            panel_ui,
+            model,
+            GitOp::BisectMark {
+                term: "good".into(),
+            },
+        ),
+        MenuChoice::BisectMarkBad => {
+            enqueue(panel_ui, model, GitOp::BisectMark { term: "bad".into() })
+        }
+        MenuChoice::BisectSkip => enqueue(panel_ui, model, GitOp::BisectSkip),
+        MenuChoice::BisectReset => enqueue(panel_ui, model, GitOp::BisectReset),
+        MenuChoice::BranchDelete { name, force } => {
+            enqueue(panel_ui, model, GitOp::DeleteBranch { name, force })
+        }
+        MenuChoice::BranchForcePush => enqueue(
+            panel_ui,
+            model,
+            GitOp::Push {
+                force: ForceMode::WithLease,
+            },
+        ),
+        MenuChoice::BranchPush => enqueue(
+            panel_ui,
+            model,
+            GitOp::Push {
+                force: ForceMode::None,
+            },
+        ),
+        MenuChoice::BranchPull => enqueue(panel_ui, model, GitOp::Pull),
+        MenuChoice::BranchSetUpstream(name) => {
+            let q = superzej_core::util::sh_quote(&name);
+            enqueue(
+                panel_ui,
+                model,
+                GitOp::Custom {
+                    command: format!("git branch --set-upstream-to=origin/{q} {q}"),
+                    capture: false,
+                },
+            );
+        }
+        MenuChoice::BranchRename(name) => {
+            *ov.input = Some((
+                menu::InputOverlay::new(format!("rename {name}"), name.clone()),
+                GitInputKind::BranchRename { old: name },
+            ));
+        }
+        MenuChoice::BranchMerge(name) => enqueue(panel_ui, model, GitOp::Merge { branch: name }),
+        MenuChoice::BranchCreate => {
+            *ov.input = Some((
+                menu::InputOverlay::new("new branch name", ""),
+                GitInputKind::BranchCreate,
+            ));
+        }
+        MenuChoice::CherryContinue => enqueue(panel_ui, model, GitOp::CherryContinue),
+        MenuChoice::CherryAbort => enqueue(panel_ui, model, GitOp::CherryAbort),
+        MenuChoice::CherrySkip => enqueue(panel_ui, model, GitOp::CherrySkip),
+        MenuChoice::RevertContinue => enqueue(panel_ui, model, GitOp::RevertContinue),
+        MenuChoice::RevertAbort => enqueue(panel_ui, model, GitOp::RevertAbort),
+        MenuChoice::BranchFetch => enqueue(panel_ui, model, GitOp::Fetch),
+        MenuChoice::MergeContinue => enqueue(panel_ui, model, GitOp::MergeContinue),
+        MenuChoice::MergeAbort => enqueue(panel_ui, model, GitOp::MergeAbort),
+        MenuChoice::CustomCommand(i) => {
+            if let Some(&idx) = ov.custom_cmds.get(i) {
+                let prompts: Vec<(String, String)> = wires
+                    .cfg
+                    .git_commands
+                    .get(idx)
+                    .map(|c| {
+                        c.prompts
+                            .iter()
+                            .map(|p| {
+                                (
+                                    p.key.clone(),
+                                    p.title.clone().unwrap_or_else(|| p.key.clone()),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                match prompts.split_first() {
+                    None => {
+                        return run_custom_command(idx, Default::default(), panel_ui, model, wires);
+                    }
+                    Some(((key, title), rest)) => {
+                        *ov.input = Some((
+                            menu::InputOverlay::new(title.clone(), ""),
+                            GitInputKind::CustomPrompt {
+                                cmd: idx,
+                                key: key.clone(),
+                                collected: Default::default(),
+                                remaining: rest.to_vec(),
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+        MenuChoice::ConfirmUndo | MenuChoice::ConfirmRedo => {
+            if let Some((plan, _redo)) = pending_undo.take() {
+                // Always autostash: the plan may hard-reset over a dirty
+                // tree, and parking the dirt is strictly safer than failing.
+                enqueue(
+                    panel_ui,
+                    model,
+                    GitOp::UndoApply {
+                        plan,
+                        autostash: true,
+                    },
+                );
+            }
+        }
+        MenuChoice::Confirm { tag: "git-op", .. } => {
+            if let Some(op) = ov.confirm_op.take() {
+                enqueue(panel_ui, model, op);
+            }
+        }
+        MenuChoice::Confirm { .. } | MenuChoice::Dismiss => {
+            *ov.confirm_op = None;
+        }
+    }
+    GitAfter::None
+}
+
+/// Resolve a submitted git input overlay into its op (or the next prompt of
+/// a custom-command chain).
+fn handle_git_input_submit(
+    kind: GitInputKind,
+    text: String,
+    panel_ui: &mut crate::panel::PanelUi,
+    model: &mut FrameModel,
+    wires: &GitWires<'_>,
+    ov: &mut GitOverlays<'_>,
+) -> GitAfter {
+    let enqueue = |panel_ui: &mut crate::panel::PanelUi, model: &mut FrameModel, op: GitOp| {
+        enqueue_git_op(
+            op,
+            &mut panel_ui.git,
+            &mut model.status,
+            wires.session,
+            wires.cfg.git.override_gpg,
+            wires.op_tx,
+            wires.waker,
+        );
+    };
+    let trimmed = text.trim().to_string();
+    let require = |model: &mut FrameModel| {
+        if trimmed.is_empty() {
+            model.status = "empty input — cancelled".into();
+            true
+        } else {
+            false
+        }
+    };
+    match kind {
+        GitInputKind::Commit => {
+            if !require(model) {
+                enqueue(panel_ui, model, GitOp::Commit { message: text });
+            }
+        }
+        GitInputKind::Reword { sha } => {
+            if !require(model) {
+                enqueue(panel_ui, model, GitOp::Reword { sha, message: text });
+            }
+        }
+        GitInputKind::StashPush => {
+            if !require(model) {
+                enqueue(panel_ui, model, GitOp::StashPush { message: text });
+            }
+        }
+        GitInputKind::PatchSplit { sha, patch } => {
+            if !require(model) {
+                enqueue(
+                    panel_ui,
+                    model,
+                    GitOp::PatchSplit {
+                        sha,
+                        patch,
+                        message: text,
+                    },
+                );
+            }
+        }
+        GitInputKind::BranchCreate => {
+            if !require(model) {
+                enqueue(
+                    panel_ui,
+                    model,
+                    GitOp::CreateBranch {
+                        name: trimmed,
+                        base: "HEAD".into(),
+                    },
+                );
+            }
+        }
+        GitInputKind::BranchRename { old } => {
+            if !require(model) {
+                let from = superzej_core::util::sh_quote(&old);
+                let to = superzej_core::util::sh_quote(&trimmed);
+                enqueue(
+                    panel_ui,
+                    model,
+                    GitOp::Custom {
+                        command: format!("git branch -m {from} {to}"),
+                        capture: false,
+                    },
+                );
+            }
+        }
+        GitInputKind::CustomPrompt {
+            cmd,
+            key,
+            mut collected,
+            mut remaining,
+        } => {
+            collected.insert(key, text);
+            if remaining.is_empty() {
+                return run_custom_command(cmd, collected, panel_ui, model, wires);
+            }
+            let (next_key, title) = remaining.remove(0);
+            *ov.input = Some((
+                menu::InputOverlay::new(title, ""),
+                GitInputKind::CustomPrompt {
+                    cmd,
+                    key: next_key,
+                    collected,
+                    remaining,
+                },
+            ));
+        }
+    }
+    GitAfter::None
 }
 
 /// Normalize legacy control-key encodings so configured chords match on
@@ -1648,14 +3534,25 @@ fn locate_test_in_repo(worktree: &std::path::Path, test_id: &str) -> Option<(Str
     None
 }
 
-/// For `Rerun`/`RunFailed`, narrow the base task command to the selected/failed
+/// Which slice of the suite a tests-section run key targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestRun {
+    /// `r`: the selected test (whole suite when none is selected).
+    Selected,
+    /// `f`: the first failing test (falls back to the selection).
+    Failed,
+    /// `R`: everything.
+    All,
+}
+
+/// For `Selected`/`Failed`, narrow the base task command to the selected/failed
 /// test where the runner supports it; otherwise run the whole suite.
-fn test_task_for_nav(
+fn test_task_for_run(
     ui: &crate::panel::PanelUi,
-    nav: crate::panel::PanelNav,
+    kind: TestRun,
     base: crate::panel::TestTask,
 ) -> crate::panel::TestTask {
-    use crate::panel::{PanelNav, TestNodeKind, TestState};
+    use crate::panel::{TestNodeKind, TestState};
     let selected = ui
         .tests
         .selected_node()
@@ -1665,10 +3562,10 @@ fn test_task_for_nav(
         .nodes
         .iter()
         .find(|n| n.kind == TestNodeKind::Test && n.state == TestState::Fail);
-    let target = match nav {
-        PanelNav::Rerun => selected,
-        PanelNav::RunFailed => failed.or(selected),
-        _ => None,
+    let target = match kind {
+        TestRun::Selected => selected,
+        TestRun::Failed => failed.or(selected),
+        TestRun::All => None,
     };
     let Some(target) = target else {
         return base;
@@ -1744,171 +3641,6 @@ fn smart_split_dir(cols: usize, rows: usize) -> crate::center::Dir {
     }
 }
 
-/// Rows available to the panel's document/list body (below the switcher row
-/// and its blank spacer).
-fn panel_doc_rows(chrome: &layout::ChromeLayout) -> usize {
-    chrome
-        .panel
-        .map(|p| {
-            let (zone, _) = crate::chrome::panel_split(p);
-            zone.rows.saturating_sub(2).max(1)
-        })
-        .unwrap_or(20)
-}
-
-/// Scroll the panel's CURRENT view by `n`, clamped at both ends — a drilled
-/// document scrolls its lines (stopping at the last line), the Diff file
-/// list and Files tree move their cursors (stopping at the last row).
-fn scroll_panel(
-    panel_ui: &mut crate::panel::PanelUi,
-    model: &FrameModel,
-    up: bool,
-    n: usize,
-    body_rows: usize,
-) {
-    if panel_ui.drilled() {
-        let max = panel_ui.file_diff.lines().count().saturating_sub(body_rows);
-        panel_ui.diff_scroll = if up {
-            panel_ui.diff_scroll.saturating_sub(n)
-        } else {
-            (panel_ui.diff_scroll + n).min(max)
-        };
-        return;
-    }
-    match panel_ui.tab {
-        crate::panel::PanelTab::Diff => {
-            let max = model.panel.files.len().saturating_sub(1);
-            panel_ui.diff_cursor = if up {
-                panel_ui.diff_cursor.saturating_sub(n)
-            } else {
-                (panel_ui.diff_cursor + n).min(max)
-            };
-        }
-        crate::panel::PanelTab::Tests => {
-            // Move the selection cursor (drives select/open), keeping it in view.
-            let visible = panel_ui.tests.visible_indices().len();
-            let max = visible.saturating_sub(1);
-            panel_ui.tests.cursor = if up {
-                panel_ui.tests.cursor.saturating_sub(n)
-            } else {
-                (panel_ui.tests.cursor + n).min(max)
-            };
-            if panel_ui.tests.cursor < panel_ui.tests.scroll {
-                panel_ui.tests.scroll = panel_ui.tests.cursor;
-            } else if body_rows > 0 && panel_ui.tests.cursor >= panel_ui.tests.scroll + body_rows {
-                panel_ui.tests.scroll = panel_ui.tests.cursor + 1 - body_rows;
-            }
-        }
-        crate::panel::PanelTab::Files => {
-            let visible =
-                crate::panel::visible_file_indices(&panel_ui.files, &panel_ui.files_collapsed);
-            let max = visible.len().saturating_sub(1);
-            panel_ui.files_cursor = if up {
-                panel_ui.files_cursor.saturating_sub(n)
-            } else {
-                (panel_ui.files_cursor + n).min(max)
-            };
-            if panel_ui.files_cursor < panel_ui.files_scroll {
-                panel_ui.files_scroll = panel_ui.files_cursor;
-            } else if panel_ui.files_cursor >= panel_ui.files_scroll + body_rows {
-                panel_ui.files_scroll = panel_ui.files_cursor + 1 - body_rows;
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Background-load BOTH documents (diff + bat preview) for the hovered file
-/// and the one below it, deduped against the cache and the in-flight set so
-/// holding j/k never spawns a subprocess storm.
-#[allow(clippy::too_many_arguments)]
-fn preload_hover(
-    panel_ui: &crate::panel::PanelUi,
-    files: &[crate::panel::DiffFile],
-    wt: &std::path::Path,
-    cache: &std::collections::HashMap<String, String>,
-    inflight: &mut std::collections::HashSet<String>,
-    tx: &tokio_mpsc::UnboundedSender<(String, String)>,
-    waker: &TerminalWaker,
-    bat: Option<&str>,
-) {
-    // Hovered + next, in the active tab's ordering.
-    let hovered: Vec<String> = match panel_ui.tab {
-        crate::panel::PanelTab::Diff => {
-            let c = panel_ui.diff_cursor;
-            files
-                .iter()
-                .skip(c)
-                .take(2)
-                .map(|f| f.path.clone())
-                .collect()
-        }
-        crate::panel::PanelTab::Files => {
-            let (visible, positions) = file_row_positions(panel_ui);
-            let start = positions
-                .iter()
-                .position(|&p| p >= panel_ui.files_cursor)
-                .unwrap_or(0);
-            positions
-                .iter()
-                .skip(start)
-                .take(2)
-                .map(|&p| panel_ui.files[visible[p]].path.clone())
-                .collect()
-        }
-        _ => Vec::new(),
-    };
-    for kind in ['d', 'p'] {
-        let jobs: Vec<String> = hovered
-            .iter()
-            .filter(|p| {
-                let key = doc_key(kind, wt, p);
-                !cache.contains_key(&key) && inflight.insert(key)
-            })
-            .cloned()
-            .collect();
-        if !jobs.is_empty() {
-            spawn_doc_preload(
-                tx.clone(),
-                waker.clone(),
-                wt.to_path_buf(),
-                kind,
-                jobs,
-                bat.map(str::to_string),
-            );
-        }
-    }
-}
-
-/// Move the Files cursor to the next/prev FILE row (skipping directories).
-/// Returns false when there is nothing to move to.
-fn step_file_cursor(panel_ui: &mut crate::panel::PanelUi, fwd: bool) -> bool {
-    let (_, positions) = file_row_positions(panel_ui);
-    if positions.is_empty() {
-        return false;
-    }
-    let cur = positions
-        .iter()
-        .position(|&p| p >= panel_ui.files_cursor)
-        .unwrap_or(positions.len() - 1);
-    let new = if positions.get(cur) == Some(&panel_ui.files_cursor) {
-        if fwd {
-            (cur + 1).min(positions.len() - 1)
-        } else {
-            cur.saturating_sub(1)
-        }
-    } else {
-        // Cursor sat on a dir: snap to the nearest file in the direction.
-        if fwd {
-            cur.min(positions.len() - 1)
-        } else {
-            cur.saturating_sub(1)
-        }
-    };
-    panel_ui.files_cursor = positions[new];
-    true
-}
-
 /// Spawn `command` (via the login-shell exec wrapper) into a fresh tab of the
 /// active worktree and focus it.
 fn open_command_tab(
@@ -1953,27 +3685,6 @@ fn open_command_pane(
         return;
     }
     panes.table.remove(&id);
-}
-
-/// (Re)build the Files tab's tree for the active worktree. Top-level
-/// directories start collapsed so the tab opens as a tidy accordion; cached
-/// per worktree and rebuilt only when the worktree changes.
-fn refresh_files_tree(panel_ui: &mut crate::panel::PanelUi, session: &crate::session::Session) {
-    let wt = active_tab_path(session);
-    let key = wt.to_string_lossy().into_owned();
-    if panel_ui.files_worktree == key && !panel_ui.files.is_empty() {
-        return;
-    }
-    panel_ui.files = crate::panel::build_file_tree(&fetch_worktree_files(&wt));
-    panel_ui.files_collapsed = panel_ui
-        .files
-        .iter()
-        .filter(|e| e.is_dir && e.depth == 0)
-        .map(|e| e.path.clone())
-        .collect();
-    panel_ui.files_worktree = key;
-    panel_ui.files_cursor = 0;
-    panel_ui.files_scroll = 0;
 }
 
 /// Keep-alive yazi drawers, one per worktree dir: hiding STASHES the pane
@@ -2172,6 +3883,49 @@ fn hide_drawer_into_pool(
     }
 }
 
+fn drawer_cancel_key(key: &KeyCode, modifiers: Modifiers) -> bool {
+    if modifiers.contains(Modifiers::CTRL) || modifiers.contains(Modifiers::ALT) {
+        return false;
+    }
+    matches!(
+        key,
+        KeyCode::Escape | KeyCode::Char('q') | KeyCode::Char('Q')
+    )
+}
+
+fn palette_cancel_key(
+    palette: &crate::palette::Palette,
+    key: &KeyCode,
+    modifiers: Modifiers,
+) -> bool {
+    if matches!(key, KeyCode::Escape) {
+        return true;
+    }
+    if modifiers.contains(Modifiers::CTRL)
+        && matches!(
+            key,
+            KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Char('g') | KeyCode::Char('G')
+        )
+    {
+        return true;
+    }
+    if modifiers.contains(Modifiers::CTRL) || modifiers.contains(Modifiers::ALT) {
+        return false;
+    }
+    palette.query().is_empty()
+        && matches!(key, KeyCode::Char('q') | KeyCode::Char('Q'))
+        && palette
+            .matches()
+            .iter()
+            .all(|item| item.key.starts_with("font:"))
+}
+
+fn persist_session_layout(session: &crate::session::Session) {
+    if let Ok(db) = superzej_core::db::Db::open() {
+        let _ = session.persist(&db, &session.id, now_secs());
+    }
+}
+
 /// A worktree awaiting its agent choice. While set, the command palette is
 /// in "agent picker" mode: its selection launches the chosen agent into the
 /// group named `tab` rather than dispatching a command. Escaping defaults to a
@@ -2317,6 +4071,7 @@ async fn event_loop<T: Terminal>(
     mut stats_rx: tokio_mpsc::UnboundedReceiver<crate::stats::StatsSnapshot>,
     mut metrics_rx: tokio_mpsc::UnboundedReceiver<crate::metrics::MetricsState>,
     stats_interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    stats_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
     waker: TerminalWaker,
     start: std::time::Instant,
 ) -> Result<()> {
@@ -2338,17 +4093,44 @@ async fn event_loop<T: Terminal>(
     // An explicit un-hide on a small screen overrides the panel's auto-hide
     // threshold (readable width up to nearly full screen); cleared on hide.
     let mut panel_forced = false;
-    // True while a drilled-in document (single-file diff / file preview) is
-    // open: the panel widens to a reading width and retracts on exit. The
-    // loop-top detector keeps it in sync with `panel_ui`.
-    let mut panel_expanded = false;
+    // The accordion's width state (cycled by `e`: Normal → Half → Full). The
+    // pre-render detector keeps this in sync with `panel_ui.width` so every
+    // toggle path triggers a chrome recompute.
+    let mut panel_width = layout::PanelWidth::Normal;
     // Set while the panel was popped up by Ctrl+→ at the center edge; holds
     // the (want_panel, panel_forced) pair to restore when focus leaves it.
     let mut panel_auto_revealed: Option<(bool, bool)> = None;
-    // Drilled-document cache (highlighted diffs/previews) + the channel the
-    // background preloader feeds it through; Shift+J/K hits are instant.
-    let mut doc_cache: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let (doc_tx, mut doc_rx) = tokio_mpsc::unbounded_channel::<(String, String)>();
+    // Inline hunk previews arrive from background `git diff` fetches tagged
+    // with the hydration generation at request time; `hunk_inflight` dedupes
+    // re-selects while a fetch is still out.
+    let (hunk_tx, mut hunk_rx) =
+        tokio_mpsc::unbounded_channel::<(u64, String, Vec<superzej_svc::git::Hunk>)>();
+    // The git mutation runner + the line-cursor document fetches (staging
+    // diff, drilled-commit files, patch doc). Results are tagged with
+    // `panel_ui.git.op_gen` so a worktree switch kills strays on arrival.
+    let (gitop_tx, mut gitop_rx) = tokio_mpsc::unbounded_channel::<GitOpDone>();
+    let (gitdoc_tx, mut gitdoc_rx) = tokio_mpsc::unbounded_channel::<(u64, GitDoc)>();
+    // The open git option/confirm menu and text-input overlay — held like
+    // the palette (Option, keys first, painted last).
+    let mut active_menu: Option<MenuOverlay> = None;
+    let mut git_input: Option<(menu::InputOverlay, GitInputKind)> = None;
+    // A live rebase_status read is out (dedupes the safety-net re-kicks).
+    let mut rebase_sync_inflight = false;
+    // A computed undo/redo plan awaiting its confirm pick.
+    let mut pending_undo: Option<(superzej_core::reflog::UndoPlan, bool)> = None;
+    // A destructive git op parked behind the open confirm menu.
+    let mut pending_confirm_op: Option<GitOp> = None;
+    // `cfg.git_commands` indices behind the open custom-commands menu rows.
+    let mut custom_menu_cmds: Vec<usize> = Vec::new();
+    // Pane launch specs resolved off-thread: `launch_spec` walks the sandbox
+    // chain (podman ensure can pull an image — seconds to minutes on a cold
+    // or wedged runtime) and MUST NOT run on the loop. The loop requests
+    // specs for a (worktree, tab)'s missing leaves, keeps the splash up, and
+    // finishes the spawn (openpty+exec, fast) when they land. Stale results
+    // (worktree/tab changed mid-flight) are dropped on arrival.
+    type SpecBatch = (String, usize, Vec<(u32, crate::agent::LaunchSpec)>);
+    let (spec_tx, mut spec_rx) = tokio_mpsc::unbounded_channel::<SpecBatch>();
+    let mut materialize_inflight: Option<(String, usize)> = None;
     // Test-explorer results from the background runner/discoverer (capped,
     // single-flight). Two channels: run outcomes and discovery outcomes.
     let (test_run_tx, mut test_run_rx) =
@@ -2362,13 +4144,38 @@ async fn event_loop<T: Terminal>(
     let test_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(
         keymap.config().limits.test_max_parallel.max(1),
     ));
-    // Keys currently being fetched by the preloader (dedupes hover storms).
-    let mut doc_inflight: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // Sidebar interaction + persisted view state (collapse/sort/pins/width).
+    // Paths whose hunk fetch is still in flight (dedupes select storms).
+    let mut hunk_inflight: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Sidebar interaction + persisted view state (collapse/sort/pins/width),
+    // and the right panel's persisted accordion state (open section + wide
+    // mode survive restarts; row mode is intentionally transient).
     let mut sb = SidebarState::default();
+    let mut panel_ui = crate::panel::PanelUi::default();
     if let Ok(db) = superzej_core::db::Db::open() {
         sb.load(&db, &session.id);
+        for (key, value) in db.ui_state_in_scope("panel").unwrap_or_default() {
+            match key.as_str() {
+                "open" => {
+                    if let Some(s) = crate::panel::Section::from_key(&value) {
+                        panel_ui.open = s;
+                    }
+                }
+                // Back-compat: older builds stored a boolean "expanded".
+                "expanded" if value == "1" => {
+                    panel_ui.width = layout::PanelWidth::Half;
+                }
+                "width" => {
+                    panel_ui.width = layout::PanelWidth::from_key(&value);
+                }
+                _ => {}
+            }
+        }
     }
+    // `[panel] sections` reorders/hides accordions; a persisted open section
+    // the config hid snaps to the first visible one. The keys section renders
+    // the cheatsheet groups cached here (refreshed on config reload).
+    panel_ui.set_order(crate::panel::resolve_order(keymap.config()));
+    panel_ui.docs.cfg_keys = crate::keyhint::cheatsheet_groups(keymap.config());
     tracing::info!(
         target: "szhost::startup",
         since_start_ms = start.elapsed().as_millis() as u64,
@@ -2394,7 +4201,7 @@ async fn event_loop<T: Terminal>(
         want_sidebar,
         want_panel,
         panel_forced,
-        panel_expanded,
+        panel_width,
         sidebar_cols,
         zoom,
         &supervisor,
@@ -2404,8 +4211,6 @@ async fn event_loop<T: Terminal>(
     // One zone owns the keyboard at any time; Ctrl+g toggles the keybind lock.
     // `sb.focused` / `model.panel_focused` / `model.center_focused` mirror it.
     let mut focus = crate::focus::FocusState::default();
-    // The right panel's persistent UI state (tab, cursor, drill-in view).
-    let mut panel_ui = crate::panel::PanelUi::default();
     let mut prev_zone = focus.zone;
     // Mouse: SGR press/drag tracking + the live text selection — (pane id,
     // grid selection). Drags highlight within ONE pane only and auto-copy
@@ -2426,10 +4231,20 @@ async fn event_loop<T: Terminal>(
     // layout may survive. Tab/worktree switches reuse the same rects and must
     // NOT trigger this: a full repaint flashes the whole center.
     let mut full_repaint = true;
+    // Our own Change→escape serializer (undercurl + underline-color capable);
+    // `SUPERZEJ_RENDERER=termwiz` falls back to the stock renderer.
+    let mut wire_renderer = crate::wire::WireRenderer::new();
+    let use_termwiz_renderer = crate::wire::use_termwiz_renderer();
     let mut palette: Option<crate::palette::Palette> = None;
-    // Cheatsheet overlay (Alt-?) and the transient which-key popup (set while a
-    // multi-key prefix is pending). Both render via the shared `keyhint` module.
-    let mut cheatsheet = false;
+    // Panel document payloads (git calendar/log, the selected file's diff)
+    // are fetched off-loop on section entry and tagged with `docs_gen`; a
+    // worktree switch bumps the generation so stale results die on arrival.
+    // The git payload is cached per worktree (it's a calendar — cheap to
+    // keep); the diff doc refetches on every full-view entry.
+    let (docs_tx, mut docs_rx) =
+        tokio_mpsc::unbounded_channel::<(u64, crate::panel::docs::DocsPayload)>();
+    let mut docs_gen: u64 = 0;
+    // The transient which-key popup (set while a multi-key prefix is pending).
     let mut which_key: Vec<crate::keyhint::HintRow> = Vec::new();
     let mut which_key_prefix = String::new();
     // When set, the open palette is an agent picker for a just-created worktree
@@ -2538,7 +4353,7 @@ async fn event_loop<T: Terminal>(
                 want_sidebar,
                 want_panel,
                 panel_forced,
-                panel_expanded,
+                panel_width,
                 sidebar_cols,
                 zoom,
                 &supervisor,
@@ -2562,9 +4377,9 @@ async fn event_loop<T: Terminal>(
             keymap.reset();
             keymap_workspace = session.id.clone();
         }
-        // Leaving the panel fully resets it (drill closed, preview closed,
-        // scroll rewound — cursors kept). Central, so EVERY exit path (Esc,
-        // Ctrl+←, mouse, Alt+s, …) behaves identically.
+        // Leaving the panel drops back to section mode (row walk + change
+        // selection cleared — open section and cursor kept). Central, so
+        // EVERY exit path (Esc, Ctrl+←, mouse, Alt+s, …) behaves identically.
         if prev_zone == crate::focus::Zone::Panel && !focus.panel() {
             panel_ui.reset_on_leave();
             // A Ctrl+→ auto-revealed panel disappears again when navigated
@@ -2578,7 +4393,7 @@ async fn event_loop<T: Terminal>(
                     want_sidebar,
                     want_panel,
                     panel_forced,
-                    panel_expanded,
+                    panel_width,
                     sidebar_cols,
                     zoom,
                     &supervisor,
@@ -2586,6 +4401,16 @@ async fn event_loop<T: Terminal>(
                 need_relayout = true;
                 dirty = true;
             }
+        }
+        // Entering the panel lands directly on the open section's items: the
+        // cursor walks rows immediately (Down/j), with Shift+Down/j hopping
+        // between sections. No separate "press Enter to enter rows" step.
+        if prev_zone != crate::focus::Zone::Panel && focus.panel() {
+            panel_ui.row_mode = true;
+            let (pc, pr) = panel_geom(&chrome);
+            let max =
+                crate::panel::frame::actionable_rows(&model, &panel_ui, pc, pr).saturating_sub(1);
+            panel_ui.cursor = panel_ui.cursor.min(max);
         }
         if prev_zone != focus.zone
             && let Some(z) = zoom
@@ -2599,7 +4424,7 @@ async fn event_loop<T: Terminal>(
                 want_sidebar,
                 want_panel,
                 panel_forced,
-                panel_expanded,
+                panel_width,
                 sidebar_cols,
                 zoom,
                 &supervisor,
@@ -2623,13 +4448,44 @@ async fn event_loop<T: Terminal>(
             sync_tests_for_worktree(&mut panel_ui, &current_worktree, keymap.config());
             loaded_tests_worktree = current_worktree.to_string_lossy().into_owned();
             // Immediate hydrate for the newly-focused worktree; the cached panel
-            // stays on screen until the fresh model lands (never blank).
+            // stays on screen until the fresh model lands (never blank). The
+            // old worktree's hunk previews are meaningless here: drop them and
+            // raise the acceptance cutoff so in-flight fetches die on arrival.
             hydration_gen += 1;
+            panel_ui.hunks.clear();
+            hunk_inflight.clear();
+            materialize_inflight = None;
+            panel_ui.chg_sel = None;
+            panel_ui.hunks_gen = hydration_gen;
+            // Git interaction state is per-worktree: cursors, flows, marks
+            // and fetched docs all reset; `op_gen` bumps so in-flight op/doc
+            // results die on arrival. Overlays target the old worktree.
+            panel_ui.git.reset_for_worktree();
+            rebase_sync_inflight = false;
+            active_menu = None;
+            git_input = None;
+            pending_undo = None;
+            pending_confirm_op = None;
+            custom_menu_cmds.clear();
+            // Panel documents are per-worktree: drop the caches, raise the
+            // acceptance cutoff so in-flight fetches die on arrival, and
+            // refetch whatever the open (section, width) still needs (the
+            // body shows "loading…" until fresh data lands).
+            docs_gen += 1;
+            panel_ui.docs.git = None;
+            panel_ui.docs.diff = None;
+            panel_ui.scroll = 0;
+            panel_ui.diff_hunk = 0;
+            sync_panel_docs(&mut panel_ui, &model, &session, docs_gen, &docs_tx, &waker);
             spawn_model_hydration(
                 model_tx.clone(),
                 hydration_gen,
                 session.clone(),
                 Some(waker.clone()),
+                crate::hydrate::HydrateHints {
+                    open: panel_ui.open,
+                    expanded: panel_ui.width.is_expanded(),
+                },
             );
             spawn_pr_cache_refresh(session.clone(), Some(waker.clone()));
             retarget_diff_watcher(
@@ -2641,7 +4497,20 @@ async fn event_loop<T: Terminal>(
                 &waker,
             );
             // Pre-warm sibling tabs so first focus of a neighbor is instant.
-            prewarm_neighbors(&mut panes, &mut session, chrome.center, keymap.config());
+            for (wt, ti, missing) in prewarm_requests(&panes, &mut session) {
+                let cfg = keymap.config().clone();
+                let tx = spec_tx.clone();
+                let wk = waker.clone();
+                task::spawn_blocking(move || {
+                    let specs: Vec<(u32, crate::agent::LaunchSpec)> = missing
+                        .into_iter()
+                        .map(|id| (id, crate::agent::launch_spec(&cfg, &wt, None, "shell")))
+                        .collect();
+                    if tx.send((wt, ti, specs)).is_ok() {
+                        let _ = wk.wake();
+                    }
+                });
+            }
             // And the new worktree's hidden yazi drawer, so the first toggle
             // never waits on yazi's startup. Off by default ([drawer].prewarm)
             // so invisible yazi instances never accumulate unbidden.
@@ -2677,7 +4546,7 @@ async fn event_loop<T: Terminal>(
                 want_sidebar,
                 want_panel,
                 panel_forced,
-                panel_expanded,
+                panel_width,
                 sidebar_cols,
                 zoom,
                 &supervisor,
@@ -2729,31 +4598,45 @@ async fn event_loop<T: Terminal>(
                 need_relayout = true;
                 dirty = true;
                 // The landing group materializes on the next loop turn.
-            } else if let Err(e) = panes.materialize(
-                &mut session.worktrees[session.active].tabs[ti],
-                &path,
-                chrome.center,
-                keymap.config(),
-            ) {
-                // Spawn failures are survivable: report, don't exit the loop.
-                model.status = format!("Pane spawn failed: {e}");
-                dirty = true;
+            } else {
+                // Two-phase materialize: request launch specs off-thread (the
+                // sandbox ensure inside `launch_spec` can block on podman for
+                // seconds to minutes), spawn when they land. One request per
+                // (worktree, tab) at a time.
+                let missing = panes.missing_leaves(&session.worktrees[session.active].tabs[ti]);
+                let key = (path.clone(), ti);
+                if !missing.is_empty() && materialize_inflight.as_ref() != Some(&key) {
+                    materialize_inflight = Some(key);
+                    let cfg = keymap.config().clone();
+                    let tx = spec_tx.clone();
+                    let wk = waker.clone();
+                    let wt = path.clone();
+                    task::spawn_blocking(move || {
+                        let specs: Vec<(u32, crate::agent::LaunchSpec)> = missing
+                            .into_iter()
+                            .map(|id| (id, crate::agent::launch_spec(&cfg, &wt, None, "shell")))
+                            .collect();
+                        if tx.send((wt, ti, specs)).is_ok() {
+                            let _ = wk.wake();
+                        }
+                    });
+                }
             }
         }
-        // A drilled-in document (single-file diff / file preview) widens the
-        // panel to a reading width; closing it retracts. Keep this before the
-        // relayout gate so the resized center pane PTYs match the frame that is
-        // about to render; otherwise the event loop can block with a stale PTY
-        // width after the panel retracts.
-        if panel_ui.drilled() != panel_expanded {
-            panel_expanded = panel_ui.drilled();
+        // The accordion's width (Normal → Half → Full) drives the chrome
+        // geometry. Keep this before the relayout gate so the resized center
+        // pane PTYs match the frame that is about to render; otherwise the
+        // event loop can block with a stale PTY width after the panel
+        // retracts.
+        if panel_ui.width != panel_width {
+            panel_width = panel_ui.width;
             chrome = compute_chrome(
                 cols,
                 rows,
                 want_sidebar,
                 want_panel,
                 panel_forced,
-                panel_expanded,
+                panel_width,
                 sidebar_cols,
                 zoom,
                 &supervisor,
@@ -3000,6 +4883,16 @@ async fn event_loop<T: Terminal>(
                 panel_ui.tests.summary.error = outcome
                     .truncated
                     .then(|| "output truncated before parsing completed".to_string());
+                panel_ui
+                    .tests
+                    .push_history(crate::testkit::model::TestRunRec {
+                        at: superzej_core::util::now(),
+                        passed: panel_ui.tests.summary.passed,
+                        failed: panel_ui.tests.summary.failed,
+                        skipped: panel_ui.tests.summary.skipped,
+                        duration_ms: outcome.duration_ms as u64,
+                        branch: model.panel.branch.clone(),
+                    });
                 persist_tests_for_worktree(&panel_ui, &outcome.worktree);
                 model.status = format!(
                     "Tests finished in {:.1}s: {}",
@@ -3010,29 +4903,307 @@ async fn event_loop<T: Terminal>(
             }
         }
 
-        // Bank preloaded documents (capped — it's a small LRU-ish pool).
-        while let Ok((key, doc)) = doc_rx.try_recv() {
-            if doc_cache.len() > 64 {
-                doc_cache.clear();
+        // Bank background hunk previews. Strays from before a worktree switch
+        // are dropped (`hunks_gen` records the acceptance cutoff); a fetch
+        // outliving an ordinary refresh is fine — same worktree, same diff.
+        while let Ok((generation, path, hunks)) = hunk_rx.try_recv() {
+            hunk_inflight.remove(&path);
+            if generation >= panel_ui.hunks_gen {
+                panel_ui.hunks.insert(path, hunks);
+                dirty = true;
             }
-            doc_inflight.remove(&key);
-            doc_cache.insert(key, doc);
+        }
+
+        // Finished git mutations: clear the pending lock, surface the
+        // outcome, close ended flows, and rehydrate (even failures may have
+        // half-moved state). Stale generations died with their worktree.
+        while let Ok(done) = gitop_rx.try_recv() {
+            if done.generation != panel_ui.git.op_gen {
+                continue;
+            }
+            panel_ui.git.pending = None;
+            let mut rehydrate = true;
+            match done.result {
+                GitOpResult::Ok(note) => {
+                    model.status = note.unwrap_or_else(|| format!("{} ✓", done.label));
+                    match done.flow_end {
+                        FlowEnd::Rebase => {
+                            if matches!(panel_ui.git.flow, GitFlow::Rebase(_)) {
+                                panel_ui.git.flow = GitFlow::None;
+                                if panel_ui.git.focus == GitView::RebaseTodo {
+                                    panel_ui.git.focus = GitView::Commits;
+                                }
+                            }
+                        }
+                        FlowEnd::Bisect => {
+                            if matches!(panel_ui.git.flow, GitFlow::Bisect(_)) {
+                                panel_ui.git.flow = GitFlow::None;
+                            }
+                        }
+                        FlowEnd::Patch => {
+                            if matches!(panel_ui.git.flow, GitFlow::Patch(_)) {
+                                panel_ui.git.flow = GitFlow::None;
+                                if matches!(
+                                    panel_ui.git.focus,
+                                    GitView::PatchBuilding | GitView::CommitFiles
+                                ) {
+                                    panel_ui.git.focus = GitView::Commits;
+                                }
+                            }
+                        }
+                        FlowEnd::None => {}
+                    }
+                    if done.clear_clipboard {
+                        panel_ui.git.clipboard.clear();
+                    }
+                    // A landed stage/discard moves lines between panes:
+                    // refetch the staging doc the cursor is parked on.
+                    if let Some(s) = &panel_ui.git.staging {
+                        spawn_stage_doc_fetch(
+                            panel_ui.git.op_gen,
+                            &session,
+                            s.path.clone(),
+                            s.pane,
+                            &gitdoc_tx,
+                            &waker,
+                        );
+                    }
+                    // A landed live-todo rewrite changed the disk todo: the
+                    // editor's baseline is stale until the re-read lands.
+                    if done.label == "editing todo"
+                        && let GitFlow::Rebase(r) = &mut panel_ui.git.flow
+                    {
+                        r.todos_synced = false;
+                    }
+                }
+                GitOpResult::Stopped(out) => {
+                    let conflict = out == superzej_svc::git::RebaseOutcome::Conflict;
+                    model.status = if conflict {
+                        "conflict — resolve, then m → continue".into()
+                    } else {
+                        "rebase paused (edit) — m → continue".into()
+                    };
+                    match &mut panel_ui.git.flow {
+                        GitFlow::Rebase(r) => {
+                            r.running = true;
+                            r.conflict = conflict;
+                            // The sequencer consumed entries; whatever the
+                            // editor holds is no longer the live todo.
+                            r.todos_synced = false;
+                        }
+                        flow => {
+                            *flow = GitFlow::Rebase(gitui::RebaseUi {
+                                running: true,
+                                conflict,
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+                GitOpResult::Culprit(sha) => {
+                    model.status = format!("first bad commit: {}", short_sha(&sha));
+                    if let GitFlow::Bisect(b) = &mut panel_ui.git.flow {
+                        b.culprit = Some(sha);
+                    }
+                }
+                GitOpResult::Plan { plan, redo } => {
+                    rehydrate = false;
+                    let verb = if redo { "redo" } else { "undo" };
+                    match &plan {
+                        superzej_core::reflog::UndoPlan::Nothing => {
+                            model.status = format!("nothing to {verb}");
+                        }
+                        plan => {
+                            let body = match plan {
+                                superzej_core::reflog::UndoPlan::HardResetTo {
+                                    undoing, ..
+                                } => undoing.clone(),
+                                superzej_core::reflog::UndoPlan::Checkout { branch, undoing } => {
+                                    format!("{undoing} (back to {branch})")
+                                }
+                                superzej_core::reflog::UndoPlan::Nothing => unreachable!(),
+                            };
+                            pending_undo = Some((plan.clone(), redo));
+                            active_menu = Some(menu::undo_confirm_menu(body, redo));
+                        }
+                    }
+                }
+                GitOpResult::Output(text) => {
+                    if text.trim().is_empty() {
+                        model.status = format!("{} ✓ (no output)", done.label);
+                    } else {
+                        active_menu = Some(menu::output_menu("output", &text));
+                    }
+                }
+                GitOpResult::Err(msg) => {
+                    model.status = msg;
+                    // A refused rewrite (todo changed on disk) — or any
+                    // other failure mid-pause — warrants a fresh read so
+                    // the editor shows what's actually pending.
+                    if done.label == "editing todo"
+                        && let GitFlow::Rebase(r) = &mut panel_ui.git.flow
+                    {
+                        r.todos_synced = false;
+                    }
+                }
+            }
+            if rehydrate {
+                let _ = refresh_tx.send(if done.touches_remote {
+                    crate::hydrate::RefreshKind::Pr
+                } else {
+                    crate::hydrate::RefreshKind::Model
+                });
+            }
+            // Safety net: a running-but-unsynced TODO editor always gets a
+            // live read (deduped by the inflight flag, killed on worktree
+            // switch by the generation tag).
+            if matches!(&panel_ui.git.flow, GitFlow::Rebase(r) if r.running && !r.todos_synced)
+                && !rebase_sync_inflight
+            {
+                rebase_sync_inflight = true;
+                spawn_rebase_status_fetch(panel_ui.git.op_gen, &session, &gitdoc_tx, &waker);
+            }
+            dirty = true;
+        }
+
+        // Fetched git documents for the line-cursor views (generation-tagged
+        // like the hunk previews).
+        while let Ok((generation, doc)) = gitdoc_rx.try_recv() {
+            if generation != panel_ui.git.op_gen {
+                continue;
+            }
+            match doc {
+                GitDoc::Stage(state) => {
+                    if let Some(s) = panel_ui.git.staging.as_mut()
+                        && s.path == state.path
+                        && s.pane == state.pane
+                    {
+                        s.cursor = crate::panel::staging::clamp_cursor(&state.doc, s.cursor);
+                        if s.anchor.is_some_and(|a| a >= state.doc.lines.len()) {
+                            s.anchor = None;
+                        }
+                        panel_ui.git.stage_doc = Some(state);
+                    }
+                }
+                GitDoc::CommitFiles(files) => {
+                    panel_ui.git.commit_files = files;
+                    let max = panel_ui.git.commit_files.len().saturating_sub(1);
+                    let cur = panel_ui.git.cur.get(GitView::CommitFiles).min(max);
+                    panel_ui.git.cur.set(GitView::CommitFiles, cur);
+                }
+                GitDoc::Patch(state) => {
+                    panel_ui
+                        .git
+                        .patch_docs
+                        .insert(state.path.clone(), state.clone());
+                    panel_ui.git.patch_doc = Some(state);
+                }
+                GitDoc::Rebase(status) => {
+                    rebase_sync_inflight = false;
+                    if let GitFlow::Rebase(r) = &mut panel_ui.git.flow {
+                        match status {
+                            Some(st) if r.running => {
+                                r.todos = st.remaining.clone();
+                                r.baseline = st.remaining;
+                                r.todos_synced = true;
+                                r.done = st.done.len();
+                                r.stopped_sha = st.stopped_sha;
+                                r.conflict = st.paused == superzej_svc::git::PauseReason::Conflict;
+                                r.cursor = r.cursor.min(r.todos.len().saturating_sub(1));
+                            }
+                            // The pause vanished before the read landed (a
+                            // fast --continue elsewhere); hydration's banner
+                            // sync clears the flow — just drop the read.
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            dirty = true;
+        }
+
+        // Resolved launch specs: finish the deferred materialize (lazy focus
+        // path and pre-warm alike). Results for a worktree/tab that vanished
+        // mid-flight are dropped; `materialize_with_specs` itself skips
+        // leaves that came alive some other way in the meantime.
+        while let Ok((wt, ti, specs)) = spec_rx.try_recv() {
+            if materialize_inflight.as_ref() == Some(&(wt.clone(), ti)) {
+                materialize_inflight = None;
+            }
+            let Some(gi) = session.worktrees.iter().position(|g| g.path == wt) else {
+                continue;
+            };
+            let is_active = gi == session.active && session.worktrees[gi].active_tab == ti;
+            if is_active && center_dormant {
+                continue; // splash still up: stay lazy
+            }
+            let Some(tab) = session.worktrees[gi].tabs.get_mut(ti) else {
+                continue;
+            };
+            if let Err(e) = panes.materialize_with_specs(tab, &wt, &specs, chrome.center) {
+                // Spawn failures are survivable: report, don't exit the loop.
+                model.status = format!("Pane spawn failed: {e}");
+            }
+            if is_active {
+                need_relayout = true;
+            }
+            dirty = true;
         }
 
         while let Ok((generation, next_model)) = model_rx.try_recv() {
             if generation != hydration_gen {
                 continue;
             }
-            // Fresh git data invalidates cached documents (the 2s safety tick
-            // sends identical panels, so only real changes clear the cache).
+            // Fresh git data invalidates the inline hunk previews (the 2s
+            // safety tick sends identical panels, so only real changes
+            // clear); the selected row's preview is refetched immediately so
+            // an open preview never sticks on stale content.
             if next_model.panel != model.panel {
-                doc_cache.clear();
+                panel_ui.hunks.clear();
+                hunk_inflight.clear();
+                if let Some(path) = panel_ui
+                    .chg_sel
+                    .and_then(|i| next_model.panel.changes.get(i))
+                    .filter(|c| c.stage != crate::panel::Stage::Untracked)
+                    .map(|c| c.path.clone())
+                {
+                    spawn_hunk_fetch(
+                        &path,
+                        &session,
+                        &panel_ui,
+                        &mut hunk_inflight,
+                        &hunk_tx,
+                        &waker,
+                        hydration_gen,
+                    );
+                }
             }
             let stats = std::mem::take(&mut model.stats);
             let metrics = std::mem::take(&mut model.metrics);
             model = next_model;
             model.stats = stats;
             model.metrics = metrics;
+            // Mirror an externally-started (or externally-finished) rebase
+            // into the git flow state, so the TODO view and conflict chrome
+            // track `git rebase` runs from any terminal.
+            {
+                let banner = model
+                    .panel
+                    .merge
+                    .as_ref()
+                    .map(|m| (m.label.as_str(), m.unresolved));
+                if let Some(note) = gitui::sync_rebase_flow(&mut panel_ui.git, banner) {
+                    model.status = note.to_string();
+                }
+                // An externally-started rebase arrives here with an empty,
+                // unsynced editor: load the live pending todo for it.
+                if matches!(&panel_ui.git.flow, GitFlow::Rebase(r) if r.running && !r.todos_synced)
+                    && !rebase_sync_inflight
+                {
+                    rebase_sync_inflight = true;
+                    spawn_rebase_status_fetch(panel_ui.git.op_gen, &session, &gitdoc_tx, &waker);
+                }
+            }
             refresh_tab_model(&mut model, &session, &mut sb);
             apply_mode_status(&mut model, mode);
             model.accent = current_config.accent_rgb();
@@ -3043,9 +5214,16 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
 
-        // Fresh stats reading from the ticker thread (top-bar widgets).
+        // Fresh stats reading from the ticker thread (top-bar widgets + the
+        // telemetry section's history). While that section is on screen,
+        // every tick dirties the frame — its graphs advance even when the
+        // headline numbers are unchanged.
+        let telemetry_visible =
+            chrome.panel.is_some() && panel_ui.open == crate::panel::Section::Telemetry;
         while let Ok(snap) = stats_rx.try_recv() {
-            if model.stats != snap {
+            panel_ui.docs.telemetry.push(&snap);
+            panel_ui.docs.tick = panel_ui.docs.tick.wrapping_add(1);
+            if model.stats != snap || telemetry_visible {
                 model.stats = snap;
                 dirty = true;
             }
@@ -3057,6 +5235,19 @@ async fn event_loop<T: Terminal>(
                 model.metrics = state;
                 dirty = true;
             }
+        }
+
+        // Panel document payloads from the on-entry fetches; stale
+        // generations (pre-worktree-switch) are dropped.
+        while let Ok((generation, payload)) = docs_rx.try_recv() {
+            if generation != docs_gen {
+                continue;
+            }
+            match payload {
+                crate::panel::docs::DocsPayload::Git(d) => panel_ui.docs.git = Some(d),
+                crate::panel::docs::DocsPayload::Diff(d) => panel_ui.docs.diff = Some(d),
+            }
+            dirty = true;
         }
 
         // Adopt freshly-registered diff watchers; drop stale ones (the user
@@ -3075,6 +5266,7 @@ async fn event_loop<T: Terminal>(
                         .unwrap_or_else(|| "Config reloaded".into());
                     // Live theme reload: colors apply on the next repaint.
                     crate::chrome::set_palette(new_cfg.palette());
+                    crate::seg::set_undercurl_supported(resolve_undercurl(&new_cfg));
                     crate::center::PANE_HPAD.store(
                         new_cfg.theme.pane_padding as usize,
                         std::sync::atomic::Ordering::Relaxed,
@@ -3082,6 +5274,10 @@ async fn event_loop<T: Terminal>(
                     model.accent = new_cfg.accent_rgb();
                     model.bars = new_cfg.bars.clone();
                     model.stats_icons = new_cfg.stats.clone();
+                    // Live `[panel] sections` reload: reorder/hide accordions;
+                    // the keys section's cheatsheet follows the new keymap.
+                    panel_ui.set_order(crate::panel::resolve_order(&new_cfg));
+                    panel_ui.docs.cfg_keys = crate::keyhint::cheatsheet_groups(&new_cfg);
                     current_config = new_cfg;
                     need_relayout = true;
                 }
@@ -3114,6 +5310,10 @@ async fn event_loop<T: Terminal>(
                 hydration_gen,
                 session.clone(),
                 Some(waker.clone()),
+                crate::hydrate::HydrateHints {
+                    open: panel_ui.open,
+                    expanded: panel_ui.width.is_expanded(),
+                },
             );
         }
         if want_pr_refresh {
@@ -3138,9 +5338,17 @@ async fn event_loop<T: Terminal>(
         model.sidebar_focused = focus.sidebar();
         model.panel_focused = focus.panel();
         model.center_focused = focus.center();
+        model.masthead_focused = focus.masthead();
+        model.statusbar_focused = focus.statusbar();
         model.key_locked = focus.locked;
         model.zoomed = zoom.is_some();
         model.keyhints = context_hints(&focus, &panel_ui, keymap.config());
+        // The ticker samples at live (500ms) cadence while the telemetry
+        // section is on screen, so its graphs actually move.
+        stats_live.store(
+            chrome.panel.is_some() && panel_ui.open == crate::panel::Section::Telemetry,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // 2. Render if anything changed (diff-flush): all visible panes of the
         //    active tab + the chrome, with the hardware cursor in the focused pane.
@@ -3265,11 +5473,14 @@ async fn event_loop<T: Terminal>(
             if let Some(pal) = &palette {
                 pal.render(&mut scratch, screen);
             }
+            if let Some(m) = &active_menu {
+                m.render(&mut scratch, screen);
+            }
+            if let Some((inp, _)) = &git_input {
+                inp.render(&mut scratch, screen);
+            }
             let accent = current_config.accent_rgb();
-            if cheatsheet {
-                let groups = crate::keyhint::cheatsheet_groups(&current_config);
-                crate::keyhint::render_cheatsheet(&mut scratch, screen, &groups, &accent);
-            } else if !which_key.is_empty() {
+            if !which_key.is_empty() {
                 crate::keyhint::render_which_key(
                     &mut scratch,
                     screen,
@@ -3303,10 +5514,11 @@ async fn event_loop<T: Terminal>(
                 let seq = front.add_change(clear.clone());
                 front.flush_changes_older_than(seq);
                 wire.push(clear);
+                wire_renderer.invalidate();
                 full_repaint = false;
             }
             let mut pending = front.diff_screens(&scratch);
-            if palette.is_none() && !cheatsheet {
+            if palette.is_none() {
                 // The hardware cursor sits in the focused pane's CONTENT rect
                 // (inside its frame ring). With no live focused pane (launch
                 // splash), hide it so nothing blinks over the wordmark.
@@ -3337,8 +5549,17 @@ async fn event_loop<T: Terminal>(
             let seq = scratch.current_seqno();
             scratch.flush_changes_older_than(seq);
             wire.extend(pending);
-            buf.terminal().render(&wire).context("render")?;
-            buf.terminal().flush().context("terminal flush")?;
+            if use_termwiz_renderer {
+                buf.terminal().render(&wire).context("render")?;
+                buf.terminal().flush().context("terminal flush")?;
+            } else {
+                let mut bytes = String::new();
+                wire_renderer.render(&wire, &mut bytes);
+                use std::io::Write as _;
+                let mut out = std::io::stdout();
+                out.write_all(bytes.as_bytes()).context("render")?;
+                out.flush().context("terminal flush")?;
+            }
             dirty = false;
             tracing::debug!(
                 target: "szhost::frame",
@@ -3470,7 +5691,38 @@ async fn event_loop<T: Terminal>(
                             dirty = true;
                         }
                     } else if chrome.panel.is_some_and(|r| contains(r, mx, my)) {
-                        scroll_panel(&mut panel_ui, &model, up, 3, panel_doc_rows(&chrome));
+                        // Row mode walks the open section's rows; section mode
+                        // wheels through the accordion itself.
+                        if panel_ui.row_mode {
+                            let (pc, pr) = panel_geom(&chrome);
+                            let max =
+                                crate::panel::frame::actionable_rows(&model, &panel_ui, pc, pr)
+                                    .saturating_sub(1);
+                            panel_ui.cursor = if up {
+                                panel_ui.cursor.saturating_sub(1)
+                            } else {
+                                (panel_ui.cursor + 1).min(max)
+                            };
+                        } else {
+                            let next = if up {
+                                panel_ui.prev_section()
+                            } else {
+                                panel_ui.next_section()
+                            };
+                            open_panel_section(
+                                next,
+                                &mut panel_ui,
+                                &mut hydration_gen,
+                                &model_tx,
+                                &session,
+                                &waker,
+                                PanelDocsWiring {
+                                    model: &model,
+                                    generation: docs_gen,
+                                    tx: &docs_tx,
+                                },
+                            );
+                        }
                         dirty = true;
                     } else if chrome.sidebar.is_some_and(|r| contains(r, mx, my)) {
                         let visible = SidebarState::visible_len(&model);
@@ -3580,16 +5832,28 @@ async fn event_loop<T: Terminal>(
                         }
                     } else if let Some(r) = chrome.panel.filter(|r| contains(*r, mx, my)) {
                         focus.zone = crate::focus::Zone::Panel;
-                        if my == r.y {
-                            // Click a DIFF|FILES|PR|CHECKS segment to switch.
-                            if let Some(t) = crate::chrome::panel_tab_hit(r, mx) {
-                                panel_ui.tab = t;
-                                panel_ui.diff_view = crate::panel::DiffView::FileList;
-                                panel_ui.files_preview = false;
-                                if t == crate::panel::PanelTab::Files {
-                                    refresh_files_tree(&mut panel_ui, &session);
-                                }
-                                if t == crate::panel::PanelTab::Tests {
+                        // Resolve the click against the same frame the
+                        // renderer painted — placement can never drift.
+                        let hit = crate::chrome::panel_hits(&model, &panel_ui, r)
+                            .into_iter()
+                            .find(|(y, _)| *y == my)
+                            .map(|(_, h)| h);
+                        match hit {
+                            Some(crate::panel::PanelHit::OpenSection(s)) => {
+                                open_panel_section(
+                                    s,
+                                    &mut panel_ui,
+                                    &mut hydration_gen,
+                                    &model_tx,
+                                    &session,
+                                    &waker,
+                                    PanelDocsWiring {
+                                        model: &model,
+                                        generation: docs_gen,
+                                        tx: &docs_tx,
+                                    },
+                                );
+                                if s == crate::panel::Section::Tests {
                                     maybe_discover_tests(
                                         &mut panel_ui,
                                         &session,
@@ -3601,19 +5865,59 @@ async fn event_loop<T: Terminal>(
                                     );
                                 }
                             }
-                        } else if my > r.y + 1
-                            && my
-                                < crate::chrome::panel_split(r).0.y
-                                    + crate::chrome::panel_split(r).0.rows
-                            && panel_ui.tab == crate::panel::PanelTab::Diff
-                            && panel_ui.diff_view == crate::panel::DiffView::FileList
-                        {
-                            // Click a file row to move the cursor (body starts
-                            // below the title + blank rows; the SANDBOXES
-                            // section is not clickable rows).
-                            let idx = my - r.y - 2;
-                            if idx < model.panel.files.len() {
-                                panel_ui.diff_cursor = idx;
+                            Some(crate::panel::PanelHit::Expand) => {
+                                toggle_panel_expand(
+                                    &mut panel_ui,
+                                    &mut hydration_gen,
+                                    &model_tx,
+                                    &session,
+                                    &waker,
+                                    PanelDocsWiring {
+                                        model: &model,
+                                        generation: docs_gen,
+                                        tx: &docs_tx,
+                                    },
+                                );
+                                need_relayout = true;
+                            }
+                            Some(crate::panel::PanelHit::Row(sec, i)) => {
+                                panel_ui.row_mode = true;
+                                panel_ui.cursor = i;
+                                if sec == crate::panel::Section::Changes {
+                                    toggle_change_selection(
+                                        i,
+                                        &mut panel_ui,
+                                        &model,
+                                        &session,
+                                        &mut hunk_inflight,
+                                        &hunk_tx,
+                                        &waker,
+                                        hydration_gen,
+                                    );
+                                }
+                            }
+                            None => {
+                                // The Full view packs the section list onto a
+                                // single horizontal rail, so a row-granular hit
+                                // misses it — fall back to the x+y rail test.
+                                if panel_ui.width == crate::layout::PanelWidth::Full
+                                    && let Some(s) =
+                                        crate::chrome::panel_rail_hit(&model, &panel_ui, r, mx, my)
+                                {
+                                    open_panel_section(
+                                        s,
+                                        &mut panel_ui,
+                                        &mut hydration_gen,
+                                        &model_tx,
+                                        &session,
+                                        &waker,
+                                        PanelDocsWiring {
+                                            model: &model,
+                                            generation: docs_gen,
+                                            tx: &docs_tx,
+                                        },
+                                    );
+                                }
                             }
                         }
                     }
@@ -3677,16 +5981,6 @@ async fn event_loop<T: Terminal>(
                 if mouse_sel.take().is_some() {
                     dirty = true;
                 }
-                // Modal: the cheatsheet swallows all keys; Esc / Alt-? closes it.
-                if cheatsheet {
-                    let close = matches!(k.key, KeyCode::Escape)
-                        || (k.key == KeyCode::Char('?') && k.modifiers.contains(Modifiers::ALT));
-                    if close {
-                        cheatsheet = false;
-                        dirty = true;
-                    }
-                    continue;
-                }
                 // Modal: a pending destructive delete swallows the next key.
                 if let Some((_, targets)) = pending_delete.take() {
                     if matches!(k.key, KeyCode::Char('y') | KeyCode::Char('Y')) {
@@ -3710,6 +6004,169 @@ async fn event_loop<T: Terminal>(
                     continue;
                 }
                 let mut forced_palette_action: Option<crate::keymap::Action> = None;
+                // Modal: an open git option/confirm menu captures all keys.
+                if let Some(m) = active_menu.as_mut() {
+                    match m.handle_key(&k.key, k.modifiers) {
+                        menu::MenuOutcome::Pending => {}
+                        menu::MenuOutcome::Cancel => {
+                            active_menu = None;
+                            pending_confirm_op = None;
+                            pending_undo = None;
+                        }
+                        menu::MenuOutcome::Pick(choice) => {
+                            active_menu = None;
+                            let wires = GitWires {
+                                session: &session,
+                                cfg: keymap.config(),
+                                op_tx: &gitop_tx,
+                                doc_tx: &gitdoc_tx,
+                                waker: &waker,
+                            };
+                            let mut ov = GitOverlays {
+                                menu: &mut active_menu,
+                                input: &mut git_input,
+                                confirm_op: &mut pending_confirm_op,
+                                custom_cmds: &mut custom_menu_cmds,
+                            };
+                            match dispatch_menu_choice(
+                                choice,
+                                &mut panel_ui,
+                                &mut model,
+                                &wires,
+                                &mut ov,
+                                &mut pending_undo,
+                            ) {
+                                GitAfter::None => {}
+                                GitAfter::NewWorktree => {
+                                    forced_palette_action =
+                                        Some(crate::keymap::Action::NewWorktree);
+                                }
+                                GitAfter::Terminal(cmd) => {
+                                    let cwd = active_cwd(&session);
+                                    open_command_tab(
+                                        &mut session,
+                                        &mut panes,
+                                        &cmd,
+                                        cwd.as_deref(),
+                                        chrome.center,
+                                    );
+                                    focus.zone = crate::focus::Zone::Center;
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    need_relayout = true;
+                                }
+                            }
+                        }
+                    }
+                    dirty = true;
+                    if forced_palette_action.is_none() {
+                        continue;
+                    }
+                }
+                // Modal: a git text-input overlay (commit message, reword,
+                // prompts, …) captures all keys.
+                if git_input.is_some() {
+                    let outcome = git_input
+                        .as_mut()
+                        .map(|(inp, _)| inp.handle_key(&k.key, k.modifiers))
+                        .unwrap_or(menu::InputOutcome::Pending);
+                    match outcome {
+                        menu::InputOutcome::Pending => {}
+                        menu::InputOutcome::Cancel => {
+                            git_input = None;
+                            model.status = "cancelled".into();
+                        }
+                        menu::InputOutcome::Submit(text) => {
+                            if let Some((_, kind)) = git_input.take() {
+                                let wires = GitWires {
+                                    session: &session,
+                                    cfg: keymap.config(),
+                                    op_tx: &gitop_tx,
+                                    doc_tx: &gitdoc_tx,
+                                    waker: &waker,
+                                };
+                                let mut ov = GitOverlays {
+                                    menu: &mut active_menu,
+                                    input: &mut git_input,
+                                    confirm_op: &mut pending_confirm_op,
+                                    custom_cmds: &mut custom_menu_cmds,
+                                };
+                                match handle_git_input_submit(
+                                    kind,
+                                    text,
+                                    &mut panel_ui,
+                                    &mut model,
+                                    &wires,
+                                    &mut ov,
+                                ) {
+                                    GitAfter::None => {}
+                                    GitAfter::NewWorktree => {
+                                        forced_palette_action =
+                                            Some(crate::keymap::Action::NewWorktree);
+                                    }
+                                    GitAfter::Terminal(cmd) => {
+                                        let cwd = active_cwd(&session);
+                                        open_command_tab(
+                                            &mut session,
+                                            &mut panes,
+                                            &cmd,
+                                            cwd.as_deref(),
+                                            chrome.center,
+                                        );
+                                        focus.zone = crate::focus::Zone::Center;
+                                        refresh_tab_model(&mut model, &session, &mut sb);
+                                        need_relayout = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    dirty = true;
+                    if forced_palette_action.is_none() {
+                        continue;
+                    }
+                }
+                // The git filter line eats printable keys while editing.
+                if focus.panel() && panel_ui.git.filter.as_ref().is_some_and(|f| f.editing) {
+                    let mut consumed = true;
+                    match k.key {
+                        KeyCode::Enter => {
+                            if let Some(f) = panel_ui.git.filter.as_mut() {
+                                f.editing = false;
+                            }
+                        }
+                        KeyCode::Escape => {
+                            panel_ui.git.filter = None;
+                        }
+                        KeyCode::Backspace => {
+                            if let Some(f) = panel_ui.git.filter.as_mut() {
+                                f.query.pop();
+                            }
+                        }
+                        KeyCode::Char(c)
+                            if !k.modifiers.contains(Modifiers::CTRL)
+                                && !k.modifiers.contains(Modifiers::ALT) =>
+                        {
+                            if let Some(f) = panel_ui.git.filter.as_mut() {
+                                f.query.push(c);
+                            }
+                        }
+                        _ => consumed = false,
+                    }
+                    if consumed {
+                        // Recompute display space; stale cursors/anchors are
+                        // the classic filtered-list bug.
+                        let view = panel_ui.git.focus;
+                        let map = gitui::display_map(&panel_ui.git, view, &model.panel);
+                        let cur = panel_ui.git.cur.get(view).min(map.len().saturating_sub(1));
+                        panel_ui.git.cur.set(view, cur);
+                        panel_ui.git.sel_anchor = None;
+                        if let Some(f) = panel_ui.git.filter.as_mut() {
+                            f.map = map;
+                        }
+                        dirty = true;
+                        continue;
+                    }
+                }
                 // Modal: when the palette is open it captures all keys.
                 if let Some(p) = palette.as_mut() {
                     // Agent-picker mode: the palette is choosing what to run in a
@@ -3719,6 +6176,17 @@ async fn event_loop<T: Terminal>(
                     // real agent choice replaces the pane.
                     if pending_agent.is_some() {
                         match k.key {
+                            KeyCode::Char('c')
+                            | KeyCode::Char('C')
+                            | KeyCode::Char('g')
+                            | KeyCode::Char('G')
+                                if k.modifiers.contains(Modifiers::CTRL) =>
+                            {
+                                pending_agent = None;
+                                palette = None;
+                                refresh_tab_model(&mut model, &session, &mut sb);
+                                need_relayout = true;
+                            }
                             KeyCode::Escape => {
                                 if let Some(pending) = pending_agent.as_mut()
                                     && pending.choosing_sandbox
@@ -3784,6 +6252,11 @@ async fn event_loop<T: Terminal>(
                         dirty = true;
                         continue;
                     }
+                    if palette_cancel_key(p, &k.key, k.modifiers) {
+                        palette = None;
+                        dirty = true;
+                        continue;
+                    }
                     match k.key {
                         KeyCode::Escape => palette = None,
                         KeyCode::Enter => {
@@ -3793,10 +6266,22 @@ async fn event_loop<T: Terminal>(
                                 if let Ok(db) = superzej_core::db::Db::open() {
                                     let _ = db.bump_palette_usage(&key);
                                 }
-                                if key == "quit" {
+                                if let Some(family) = key.strip_prefix("font:") {
+                                    match crate::font::apply_font_family(family) {
+                                        Ok(path) => {
+                                            model.status =
+                                                format!("Font → {family} ({})", path.display());
+                                        }
+                                        Err(e) => model.status = format!("Font switch failed: {e}"),
+                                    }
+                                    palette = None;
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    need_relayout = true;
+                                    dirty = true;
+                                    continue;
+                                } else if key == "quit" {
                                     return Ok(());
-                                }
-                                if let Some(payload) = key.strip_prefix("wt:") {
+                                } else if let Some(payload) = key.strip_prefix("wt:") {
                                     let outgoing = session_pane_ids(&session);
                                     if let Some((repo_path, tab_name)) = payload.split_once('\t')
                                         && let Ok(db) = superzej_core::db::Db::open()
@@ -3893,7 +6378,7 @@ async fn event_loop<T: Terminal>(
                                         want_sidebar,
                                         want_panel,
                                         panel_forced,
-                                        panel_expanded,
+                                        panel_width,
                                         sidebar_cols,
                                         zoom,
                                         &supervisor,
@@ -3907,7 +6392,7 @@ async fn event_loop<T: Terminal>(
                                         want_sidebar,
                                         want_panel,
                                         panel_forced,
-                                        panel_expanded,
+                                        panel_width,
                                         sidebar_cols,
                                         zoom,
                                         &supervisor,
@@ -3961,6 +6446,39 @@ async fn event_loop<T: Terminal>(
                     }
                     continue;
                 }
+                if drawer.is_some() && drawer_cancel_key(&k.key, k.modifiers) {
+                    if let Some(cwd) = active_cwd(&session) {
+                        hide_drawer_into_pool(
+                            &mut drawer,
+                            &mut drawer_pool,
+                            &mut drawer_home,
+                            &cwd,
+                            keymap.config(),
+                            &mut panes,
+                        );
+                        let key = superzej_core::util::slugify(&cwd.to_string_lossy());
+                        let dir = superzej_core::util::superzej_dir().join("drawer");
+                        let _ = std::fs::create_dir_all(&dir);
+                        let _ = std::fs::write(dir.join(key), "false");
+                    } else if let Some(id) = drawer.take() {
+                        panes.table.remove(&id);
+                    }
+                    dirty = true;
+                    continue;
+                }
+                // Bar zones (masthead/statusbar): no widget interaction is
+                // wired yet — Esc returns to the center; everything else is
+                // swallowed (bars never forward to a pane).
+                if focus.bar()
+                    && !k.modifiers.contains(Modifiers::CTRL)
+                    && !k.modifiers.contains(Modifiers::ALT)
+                {
+                    if k.key == KeyCode::Escape {
+                        focus.zone = crate::focus::Zone::Center;
+                    }
+                    dirty = true;
+                    continue;
+                }
                 // Sidebar zone: unmodified keys drive the tree (j/k, Enter, /,
                 // …). Ctrl/Alt chords fall through to the keymap so the
                 // spatial focus moves and tab switches still work from here.
@@ -3991,7 +6509,7 @@ async fn event_loop<T: Terminal>(
                                 want_sidebar,
                                 want_panel,
                                 panel_forced,
-                                panel_expanded,
+                                panel_width,
                                 sidebar_cols,
                                 zoom,
                                 &supervisor,
@@ -4064,6 +6582,11 @@ async fn event_loop<T: Terminal>(
                         SidebarOutcome::CloseGroups(targets) => {
                             let (mut targets, skipped_home) =
                                 deletable_group_targets(&session, targets);
+
+                            // Capture the *name* of the active group before deletion,
+                            // because its index will shift as groups below it are removed.
+                            let active_group_name = session.active_group().map(|g| g.name.clone());
+
                             // Close from the highest index down so earlier
                             // indices stay valid as groups are removed.
                             targets.sort_unstable_by(|a, b| b.cmp(a));
@@ -4078,9 +6601,21 @@ async fn event_loop<T: Terminal>(
                                     session.close_active_group();
                                 }
                             }
+
+                            // Restore focus to the group that was active before bulk-delete
+                            // (if it survived). If it was deleted, `close_active_group()`
+                            // above already applied the fallback clamping.
+                            if let Some(target_name) = active_group_name
+                                && let Some(new_idx) =
+                                    session.worktrees.iter().position(|g| g.name == target_name)
+                            {
+                                session.switch_to(new_idx);
+                            }
+
                             if skipped_home > 0 {
                                 model.status = "Root workspace cannot be closed".into();
                             }
+                            persist_session_layout(&session);
                             sb.marked.clear();
                             refresh_tab_model(&mut model, &session, &mut sb);
                             need_relayout = true;
@@ -4098,69 +6633,120 @@ async fn event_loop<T: Terminal>(
                         }
                     }
                 }
-                // Panel zone: unmodified keys drive the Diff/PR/Checks widgets.
+                // Panel zone, git-family contexts: the table-driven git keys
+                // resolve BEFORE the accordion (space = stage-line in the
+                // staging view, stage-file in the files list, …). Ctrl is
+                // carved out only for the chords git explicitly claims
+                // (Ctrl+j/k move commits, Ctrl+p patch menu).
+                if forced_palette_action.is_none()
+                    && focus.panel()
+                    && !k.modifiers.contains(Modifiers::ALT)
+                    && (!k.modifiers.contains(Modifiers::CTRL)
+                        || gitui::git_claims_ctrl(&panel_ui, &k.key))
+                    && let Some(msg) = gitui::git_key(&k.key, k.modifiers, &panel_ui)
+                {
+                    let wires = GitWires {
+                        session: &session,
+                        cfg: keymap.config(),
+                        op_tx: &gitop_tx,
+                        doc_tx: &gitdoc_tx,
+                        waker: &waker,
+                    };
+                    let mut ov = GitOverlays {
+                        menu: &mut active_menu,
+                        input: &mut git_input,
+                        confirm_op: &mut pending_confirm_op,
+                        custom_cmds: &mut custom_menu_cmds,
+                    };
+                    match handle_git_msg(msg, &mut panel_ui, &mut model, &wires, &mut ov) {
+                        GitAfter::None => {}
+                        GitAfter::NewWorktree => {
+                            forced_palette_action = Some(crate::keymap::Action::NewWorktree);
+                        }
+                        GitAfter::Terminal(cmd) => {
+                            let cwd = active_cwd(&session);
+                            open_command_tab(
+                                &mut session,
+                                &mut panes,
+                                &cmd,
+                                cwd.as_deref(),
+                                chrome.center,
+                            );
+                            focus.zone = crate::focus::Zone::Center;
+                            refresh_tab_model(&mut model, &session, &mut sb);
+                            need_relayout = true;
+                        }
+                    }
+                    dirty = true;
+                    if forced_palette_action.is_none() {
+                        continue;
+                    }
+                }
+                // Panel zone: unmodified keys drive the accordion — the pure
+                // key→intent map first, per-section ACTION keys resolved on
+                // top of it (the loop's job, per the panel module contract).
                 if forced_palette_action.is_none()
                     && focus.panel()
                     && !k.modifiers.contains(Modifiers::CTRL)
                     && !k.modifiers.contains(Modifiers::ALT)
                 {
-                    use crate::panel::{DiffView, PanelNav, PanelTab, panel_nav_key};
-                    if let Some(nav) = panel_nav_key(&k.key, panel_ui.tab, panel_ui.diff_view) {
-                        // Files-tab helpers: the selected (visible) entry and
-                        // the drawer-open primitive shared by bat/editor/yazi.
-                        let selected_file_entry = |ui: &crate::panel::PanelUi| {
-                            crate::panel::visible_file_indices(&ui.files, &ui.files_collapsed)
-                                .get(ui.files_cursor)
-                                .map(|&vi| ui.files[vi].clone())
+                    use crate::panel::{PanelMsg, Section, accordion_key};
+                    if let Some(msg) = accordion_key(&k.key, k.modifiers, &panel_ui) {
+                        // Open/next/prev share one reset+persist+rehydrate path.
+                        let open_target = match msg {
+                            PanelMsg::Open(s) => Some(s),
+                            PanelMsg::NextSection => Some(panel_ui.next_section()),
+                            PanelMsg::PrevSection => Some(panel_ui.prev_section()),
+                            _ => None,
                         };
-                        let panel_body_rows = panel_doc_rows(&chrome);
-                        match nav {
-                            PanelNav::SelectTab(t) => {
-                                panel_ui.tab = t;
-                                panel_ui.diff_view = DiffView::FileList;
-                                panel_ui.files_preview = false;
-                                if t == PanelTab::Files {
-                                    refresh_files_tree(&mut panel_ui, &session);
-                                }
-                                if t == PanelTab::Tests {
-                                    maybe_discover_tests(
-                                        &mut panel_ui,
-                                        &session,
-                                        &mut test_generation,
-                                        test_discovery_tx.clone(),
-                                        waker.clone(),
-                                        keymap.config(),
-                                        test_sem.clone(),
-                                    );
+                        if let Some(s) = open_target {
+                            open_panel_section(
+                                s,
+                                &mut panel_ui,
+                                &mut hydration_gen,
+                                &model_tx,
+                                &session,
+                                &waker,
+                                PanelDocsWiring {
+                                    model: &model,
+                                    generation: docs_gen,
+                                    tx: &docs_tx,
+                                },
+                            );
+                            // Opening tests kicks the lazy (capped) discovery,
+                            // exactly as entering the old Tests tab did.
+                            if s == Section::Tests {
+                                maybe_discover_tests(
+                                    &mut panel_ui,
+                                    &session,
+                                    &mut test_generation,
+                                    test_discovery_tx.clone(),
+                                    waker.clone(),
+                                    keymap.config(),
+                                    test_sem.clone(),
+                                );
+                            }
+                            dirty = true;
+                            continue;
+                        }
+                        match msg {
+                            // Handled above; kept to keep the match exhaustive.
+                            PanelMsg::Open(_) | PanelMsg::NextSection | PanelMsg::PrevSection => {}
+                            PanelMsg::LeaveRows => {
+                                // Esc peels one layer: an expanded change
+                                // preview first, then the whole panel zone
+                                // (focus drops back to the center terminal).
+                                if panel_ui.chg_sel.is_some() {
+                                    panel_ui.chg_sel = None;
+                                } else {
+                                    focus.zone = crate::focus::Zone::Center;
                                 }
                             }
-                            PanelNav::CycleTab => {
-                                panel_ui.tab = panel_ui.tab.next();
-                                panel_ui.diff_view = DiffView::FileList;
-                                panel_ui.files_preview = false;
-                                if panel_ui.tab == PanelTab::Files {
-                                    refresh_files_tree(&mut panel_ui, &session);
-                                }
-                                if panel_ui.tab == PanelTab::Tests {
-                                    maybe_discover_tests(
-                                        &mut panel_ui,
-                                        &session,
-                                        &mut test_generation,
-                                        test_discovery_tx.clone(),
-                                        waker.clone(),
-                                        keymap.config(),
-                                        test_sem.clone(),
-                                    );
-                                }
-                            }
-                            PanelNav::Up | PanelNav::Down => {
-                                // One clamped scroll step per QUEUED key:
-                                // held-key repeats are drained and applied in
-                                // a single render pass, so releasing the key
-                                // stops the motion instantly (no backlog
-                                // inertia). Documents stop at the last line,
-                                // lists at the last row.
-                                let up = nav == PanelNav::Up;
+                            PanelMsg::CursorDown | PanelMsg::CursorUp => {
+                                // One clamped step per QUEUED key: held-key
+                                // repeats are drained and applied in a single
+                                // render pass (no backlog inertia).
+                                let up = msg == PanelMsg::CursorUp;
                                 let (repeat, leftover) = drain_key_repeats(&k, || {
                                     buf.terminal()
                                         .poll_input(Some(std::time::Duration::ZERO))
@@ -4170,380 +6756,606 @@ async fn event_loop<T: Terminal>(
                                 if let Some(ev) = leftover {
                                     pending_input.push_back(ev);
                                 }
-                                scroll_panel(&mut panel_ui, &model, up, repeat, panel_body_rows);
-                                // Hover preload: warm the diff + bat docs for
-                                // the file now under the cursor and the next
-                                // one, so Enter / Shift+J land instantly.
-                                if !panel_ui.drilled() {
-                                    preload_hover(
-                                        &panel_ui,
-                                        &model.panel.files,
-                                        &active_tab_path(&session),
-                                        &doc_cache,
-                                        &mut doc_inflight,
-                                        &doc_tx,
-                                        &waker,
-                                        keymap.config().tool_command("bat"),
-                                    );
-                                }
-                            }
-                            PanelNav::Back => {
-                                // One press: back to the terminal. The
-                                // panel-leave detector performs the full reset.
-                                focus.zone = crate::focus::Zone::Center;
-                            }
-                            PanelNav::Enter if panel_ui.tab == PanelTab::Files => {
-                                if let Some(entry) = selected_file_entry(&panel_ui) {
-                                    if entry.is_dir {
-                                        // Accordion: toggle the folder.
-                                        if !panel_ui.files_collapsed.remove(&entry.path) {
-                                            panel_ui.files_collapsed.insert(entry.path);
+                                // Full-view scroll documents (the side-by-side
+                                // diff, the git log, the cheatsheet): j/k move
+                                // the viewport, not a row cursor.
+                                if panel_ui.width == layout::PanelWidth::Full
+                                    && matches!(
+                                        panel_ui.open,
+                                        Section::Changes | Section::Git | Section::Keys
+                                    )
+                                {
+                                    let max = match panel_ui.open {
+                                        Section::Changes => panel_ui
+                                            .docs
+                                            .diff
+                                            .as_ref()
+                                            .map(|d| {
+                                                crate::panel::docs::diff_flat_len(&d.file)
+                                                    .saturating_sub(1)
+                                            })
+                                            .unwrap_or(0),
+                                        Section::Git => panel_ui
+                                            .docs
+                                            .git
+                                            .as_ref()
+                                            .map(|d| d.log.len().saturating_sub(1))
+                                            .unwrap_or(0),
+                                        // Two balanced columns → height ≈ half
+                                        // the total group lines (clamped again
+                                        // at render).
+                                        _ => {
+                                            let lines: usize = panel_ui
+                                                .docs
+                                                .cfg_keys
+                                                .iter()
+                                                .map(|g| g.rows.len() + 2)
+                                                .sum::<usize>()
+                                                + 8;
+                                            lines.div_ceil(2).saturating_sub(1)
                                         }
+                                    };
+                                    panel_ui.scroll = if up {
+                                        panel_ui.scroll.saturating_sub(repeat)
                                     } else {
-                                        // Open the file as an in-panel
-                                        // syntax-highlighted preview
-                                        // (cache-first; neighbors preload).
-                                        show_file_preview(
-                                            &mut panel_ui,
-                                            &active_tab_path(&session),
-                                            &mut doc_cache,
-                                            &doc_tx,
-                                            &waker,
-                                            keymap.config().tool_command("bat"),
+                                        (panel_ui.scroll + repeat).min(max)
+                                    };
+                                    if panel_ui.open == Section::Changes
+                                        && let Some(doc) = &panel_ui.docs.diff
+                                    {
+                                        let starts =
+                                            crate::panel::docs::diff_hunk_starts(&doc.file);
+                                        panel_ui.diff_hunk = crate::panel::docs::diff_hunk_at(
+                                            &starts,
+                                            panel_ui.scroll,
                                         );
                                     }
+                                    dirty = true;
+                                    continue;
+                                }
+                                let geom = panel_geom(&chrome);
+                                let count = crate::panel::frame::actionable_rows(
+                                    &model, &panel_ui, geom.0, geom.1,
+                                );
+                                let max = count.saturating_sub(1);
+                                if up {
+                                    if panel_ui.cursor > 0 {
+                                        panel_ui.cursor = panel_ui.cursor.saturating_sub(repeat);
+                                    } else if let Some(s) =
+                                        prev_section_in_order(panel_ui.open, &panel_ui)
+                                    {
+                                        // Top of the list: flow into the previous
+                                        // accordion, landing on its last row (or its
+                                        // header when it has no actionable rows).
+                                        let last = crate::panel::frame::section_rows(
+                                            s, &model, &panel_ui, geom.0, geom.1,
+                                        )
+                                        .saturating_sub(1);
+                                        open_panel_section(
+                                            s,
+                                            &mut panel_ui,
+                                            &mut hydration_gen,
+                                            &model_tx,
+                                            &session,
+                                            &waker,
+                                            PanelDocsWiring {
+                                                model: &model,
+                                                generation: docs_gen,
+                                                tx: &docs_tx,
+                                            },
+                                        );
+                                        panel_ui.cursor = last;
+                                    }
+                                } else if count > 0 && panel_ui.cursor < max {
+                                    panel_ui.cursor = (panel_ui.cursor + repeat).min(max);
+                                } else if let Some(s) =
+                                    next_section_in_order(panel_ui.open, &panel_ui)
+                                {
+                                    // Bottom of the list (or an accordion with no
+                                    // actionable rows): flow into the next accordion
+                                    // at its first row (its header when empty).
+                                    open_panel_section(
+                                        s,
+                                        &mut panel_ui,
+                                        &mut hydration_gen,
+                                        &model_tx,
+                                        &session,
+                                        &waker,
+                                        PanelDocsWiring {
+                                            model: &model,
+                                            generation: docs_gen,
+                                            tx: &docs_tx,
+                                        },
+                                    );
+                                    panel_ui.cursor = 0;
                                 }
                             }
-                            PanelNav::Enter => {
-                                // Drill into the selected file's diff
-                                // (cache-first; neighbors preload behind it).
-                                show_diff_doc(
+                            PanelMsg::Select => match panel_ui.open {
+                                Section::Changes => {
+                                    toggle_change_selection(
+                                        panel_ui.cursor,
+                                        &mut panel_ui,
+                                        &model,
+                                        &session,
+                                        &mut hunk_inflight,
+                                        &hunk_tx,
+                                        &waker,
+                                        hydration_gen,
+                                    );
+                                }
+                                Section::Git => {
+                                    // The cursor walks the DISPLAYED review
+                                    // threads — same filter/cap as the git
+                                    // section's content builder.
+                                    let deep = panel_ui.width.is_expanded();
+                                    let visible = if deep { 4 } else { 2 };
+                                    let target = model
+                                        .panel
+                                        .threads
+                                        .iter()
+                                        .filter(|t| !t.resolved || deep)
+                                        .take(visible)
+                                        .nth(panel_ui.cursor)
+                                        .map(|t| (t.path.clone(), t.line.map(|l| l as usize)));
+                                    if let Some((path, line)) = target {
+                                        let cmd = editor_open_command(keymap.config(), &path, line);
+                                        let cwd = active_cwd(&session);
+                                        open_command_tab(
+                                            &mut session,
+                                            &mut panes,
+                                            &cmd,
+                                            cwd.as_deref(),
+                                            chrome.center,
+                                        );
+                                        focus.zone = crate::focus::Zone::Center;
+                                        refresh_tab_model(&mut model, &session, &mut sb);
+                                        need_relayout = true;
+                                    }
+                                }
+                                Section::Tests => {
+                                    let target = model
+                                        .panel
+                                        .tests
+                                        .as_ref()
+                                        .and_then(|t| t.failures.get(panel_ui.cursor))
+                                        .and_then(|(_, at)| parse_file_line(at));
+                                    if let Some((path, line)) = target {
+                                        let cmd =
+                                            editor_open_command(keymap.config(), &path, Some(line));
+                                        let cwd = active_cwd(&session);
+                                        open_command_tab(
+                                            &mut session,
+                                            &mut panes,
+                                            &cmd,
+                                            cwd.as_deref(),
+                                            chrome.center,
+                                        );
+                                        focus.zone = crate::focus::Zone::Center;
+                                        refresh_tab_model(&mut model, &session, &mut sb);
+                                        need_relayout = true;
+                                    } else {
+                                        model.status = "No source location for this failure".into();
+                                    }
+                                }
+                                Section::Files => {
+                                    if let Some(path) = changed_file_at(&model, panel_ui.cursor) {
+                                        let cmd = editor_open_command(keymap.config(), &path, None);
+                                        let cwd = active_cwd(&session);
+                                        open_command_tab(
+                                            &mut session,
+                                            &mut panes,
+                                            &cmd,
+                                            cwd.as_deref(),
+                                            chrome.center,
+                                        );
+                                        focus.zone = crate::focus::Zone::Center;
+                                        refresh_tab_model(&mut model, &session, &mut sb);
+                                        need_relayout = true;
+                                    }
+                                }
+                                // Drill handling for the git-family lists
+                                // arrives with the GitMsg dispatch layer.
+                                Section::Commits | Section::Branches | Section::Stash => {}
+                                Section::Debug
+                                | Section::Sandbox
+                                | Section::Db
+                                | Section::Telemetry
+                                | Section::Keys => {}
+                            },
+                            PanelMsg::ToggleExpand => {
+                                toggle_panel_expand(
                                     &mut panel_ui,
-                                    &model.panel.files,
-                                    &active_tab_path(&session),
-                                    &mut doc_cache,
-                                    &doc_tx,
+                                    &mut hydration_gen,
+                                    &model_tx,
+                                    &session,
                                     &waker,
+                                    PanelDocsWiring {
+                                        model: &model,
+                                        generation: docs_gen,
+                                        tx: &docs_tx,
+                                    },
+                                );
+                                need_relayout = true;
+                            }
+                            PanelMsg::StageToggle => {
+                                // The highlighted change row (the cursor row
+                                // when nothing is highlighted); git runs off
+                                // the loop and a model refresh follows.
+                                let row = panel_ui
+                                    .chg_sel
+                                    .or(Some(panel_ui.cursor))
+                                    .and_then(|i| model.panel.changes.get(i))
+                                    .map(|c| (c.path.clone(), c.stage));
+                                if let Some((path, stage)) = row {
+                                    let unstage = stage == crate::panel::Stage::Staged;
+                                    model.status = format!(
+                                        "{} {path}",
+                                        if unstage { "Unstaging" } else { "Staging" }
+                                    );
+                                    let wt = active_tab_path(&session);
+                                    let tx = refresh_tx.clone();
+                                    let wk = waker.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        use superzej_svc::git::GitBackend;
+                                        let loc = superzej_core::remote::GitLoc::for_worktree(&wt);
+                                        let git = superzej_svc::git::GixGit::new();
+                                        let _ = if unstage {
+                                            git.unstage(&loc, &path)
+                                        } else {
+                                            git.stage(&loc, &path)
+                                        };
+                                        if tx.send(RefreshKind::Model).is_ok() {
+                                            let _ = wk.wake();
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                        dirty = true;
+                        continue;
+                    }
+                    // Per-section ACTION keys: plain chars the accordion map
+                    // left unclaimed, scoped to the open section.
+                    let handled = match (panel_ui.open, k.key) {
+                        // -- changes (full view): hunk snap + file hop -------
+                        (Section::Changes, KeyCode::Char(c @ (']' | '[')))
+                            if panel_ui.width == layout::PanelWidth::Full =>
+                        {
+                            if let Some(doc) = &panel_ui.docs.diff {
+                                let starts = crate::panel::docs::diff_hunk_starts(&doc.file);
+                                if !starts.is_empty() {
+                                    panel_ui.diff_hunk = if c == ']' {
+                                        (panel_ui.diff_hunk + 1).min(starts.len() - 1)
+                                    } else {
+                                        panel_ui.diff_hunk.saturating_sub(1)
+                                    };
+                                    panel_ui.scroll = starts[panel_ui.diff_hunk];
+                                }
+                            }
+                            true
+                        }
+                        (Section::Changes, KeyCode::Char(c @ ('n' | 'p')))
+                            if panel_ui.width == layout::PanelWidth::Full
+                                && !model.panel.changes.is_empty() =>
+                        {
+                            // Hop the diff target to the next/previous change
+                            // and refetch (the body shows "loading…").
+                            let len = model.panel.changes.len();
+                            let cur = panel_ui.chg_sel.unwrap_or(0);
+                            panel_ui.chg_sel = Some(if c == 'n' {
+                                (cur + 1) % len
+                            } else {
+                                (cur + len - 1) % len
+                            });
+                            panel_ui.scroll = 0;
+                            panel_ui.diff_hunk = 0;
+                            kick_diff_doc_fetch(
+                                docs_gen,
+                                &session,
+                                &mut panel_ui,
+                                &model,
+                                &docs_tx,
+                                &waker,
+                            );
+                            true
+                        }
+                        // -- git: copy the HEAD sha (wide views) -------------
+                        (Section::Git, KeyCode::Char('y')) if panel_ui.width.is_expanded() => {
+                            match panel_ui
+                                .docs
+                                .git
+                                .as_ref()
+                                .and_then(crate::panel::docs::copy_target_sha)
+                            {
+                                Some(sha) => {
+                                    use std::io::Write;
+                                    let mut out = std::io::stdout();
+                                    let _ = out.write_all(&crate::copymode::osc52(&sha));
+                                    let _ = out.flush();
+                                    model.status = format!("Copied {sha}");
+                                }
+                                None => model.status = "No commit data yet".into(),
+                            }
+                            true
+                        }
+                        // -- git: PR actions via `gh`, off the loop ----------
+                        (Section::Git, KeyCode::Char('M')) => {
+                            match &model.panel.pr {
+                                Some(pr) => {
+                                    model.status = format!("Merging PR #{} (squash)…", pr.number);
+                                    spawn_pr_action(
+                                        &session,
+                                        &refresh_tx,
+                                        &waker,
+                                        "pr merge",
+                                        |loc| {
+                                            superzej_core::github::merge_pr(
+                                                loc,
+                                                superzej_core::github::MergeMethod::Squash,
+                                                false,
+                                                false,
+                                            )
+                                        },
+                                    );
+                                }
+                                None => model.status = "No pull request to merge".into(),
+                            }
+                            true
+                        }
+                        (Section::Git, KeyCode::Char('A')) => {
+                            match &model.panel.pr {
+                                Some(pr) => {
+                                    model.status = format!("Approving PR #{}…", pr.number);
+                                    spawn_pr_action(
+                                        &session,
+                                        &refresh_tx,
+                                        &waker,
+                                        "pr approve",
+                                        |loc| superzej_core::github::approve_pr(loc, None),
+                                    );
+                                }
+                                None => model.status = "No pull request to approve".into(),
+                            }
+                            true
+                        }
+                        (Section::Git, KeyCode::Char('c')) => {
+                            if model.panel.pr.is_some() {
+                                model.status = "A pull request already exists".into();
+                            } else {
+                                model.status = "Creating PR from branch commits…".into();
+                                spawn_pr_action(
+                                    &session,
+                                    &refresh_tx,
+                                    &waker,
+                                    "pr create",
+                                    |loc| {
+                                        superzej_core::github::create_pr(
+                                            loc,
+                                            &superzej_core::github::CreateOpts {
+                                                title: None,
+                                                body: None,
+                                                base: None,
+                                                draft: false,
+                                                web: false,
+                                                fill: true,
+                                            },
+                                        )
+                                        .map(|_| ())
+                                    },
                                 );
                             }
-                            PanelNav::Open | PanelNav::OpenEditorPane
-                                if panel_ui.tab != PanelTab::Tests =>
-                            {
-                                // Open the selected file in the editor — `o`
-                                // in a fresh center tab, `e` in a split pane
-                                // (the bottom drawer is no longer used).
-                                let path = if panel_ui.tab == PanelTab::Files {
-                                    selected_file_entry(&panel_ui)
-                                        .filter(|e| !e.is_dir)
-                                        .map(|e| e.path)
-                                } else {
-                                    model
-                                        .panel
-                                        .files
-                                        .get(panel_ui.diff_cursor)
-                                        .map(|f| f.path.clone())
-                                };
-                                if let Some(path) = path {
-                                    let editor = keymap
-                                        .config()
-                                        .tool_command("editor")
-                                        .unwrap_or("${EDITOR:-vi} .")
-                                        .trim();
-                                    let editor = editor.strip_suffix(" .").unwrap_or(editor);
-                                    let quoted = path.replace('\'', r"'\''");
-                                    let cmd = format!("{editor} '{quoted}'");
-                                    let cwd = active_cwd(&session);
-                                    if nav == PanelNav::Open {
-                                        open_command_tab(
-                                            &mut session,
-                                            &mut panes,
-                                            &cmd,
-                                            cwd.as_deref(),
-                                            chrome.center,
-                                        );
-                                    } else {
-                                        open_command_pane(
-                                            &mut session,
-                                            &mut panes,
-                                            focused,
-                                            &cmd,
-                                            cwd.as_deref(),
-                                            chrome.center,
-                                        );
-                                    }
-                                    focus.zone = crate::focus::Zone::Center;
-                                    refresh_tab_model(&mut model, &session, &mut sb);
-                                    need_relayout = true;
-                                }
+                            true
+                        }
+                        (Section::Git, KeyCode::Char('r')) => {
+                            model.status = "Re-running failed checks…".into();
+                            spawn_pr_action(
+                                &session,
+                                &refresh_tx,
+                                &waker,
+                                "pr rerun-checks",
+                                |loc| superzej_core::github::rerun_failed_checks(loc).map(|_| ()),
+                            );
+                            true
+                        }
+                        (Section::Git, KeyCode::Char('o')) => {
+                            // The PR in the browser, detached (no gh needed).
+                            if let Some(pr) = &model.panel.pr {
+                                let _ = std::process::Command::new("xdg-open")
+                                    .arg(&pr.url)
+                                    .stdin(std::process::Stdio::null())
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null())
+                                    .spawn();
+                                model.status = format!("Opened PR #{} in the browser", pr.number);
+                            } else {
+                                model.status = "No pull request to open".into();
                             }
-                            PanelNav::NextDoc | PanelNav::PrevDoc => {
-                                let fwd = nav == PanelNav::NextDoc;
-                                let wt = active_tab_path(&session);
-                                match panel_ui.tab {
-                                    PanelTab::Diff => {
-                                        let len = model.panel.files.len();
-                                        if len > 0 {
-                                            let cur = panel_ui.diff_cursor.min(len - 1);
-                                            panel_ui.diff_cursor = if fwd {
-                                                (cur + 1).min(len - 1)
-                                            } else {
-                                                cur.saturating_sub(1)
-                                            };
-                                            show_diff_doc(
-                                                &mut panel_ui,
-                                                &model.panel.files,
-                                                &wt,
-                                                &mut doc_cache,
-                                                &doc_tx,
-                                                &waker,
-                                            );
-                                        }
-                                    }
-                                    PanelTab::Files => {
-                                        if !step_file_cursor(&mut panel_ui, fwd) {
-                                            // nothing to walk to
-                                        } else {
-                                            if panel_ui.files_cursor < panel_ui.files_scroll {
-                                                panel_ui.files_scroll = panel_ui.files_cursor;
-                                            } else if panel_ui.files_cursor
-                                                >= panel_ui.files_scroll + panel_body_rows
-                                            {
-                                                panel_ui.files_scroll =
-                                                    panel_ui.files_cursor + 1 - panel_body_rows;
-                                            }
-                                            show_file_preview(
-                                                &mut panel_ui,
-                                                &wt,
-                                                &mut doc_cache,
-                                                &doc_tx,
-                                                &waker,
-                                                keymap.config().tool_command("bat"),
-                                            );
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            PanelNav::OpenTab | PanelNav::OpenPane => {
-                                // Promote the current artifact into the
-                                // center: the file's diff (Diff tab) or its
-                                // bat view (Files tab), as a tab or a split.
-                                let shq = |p: &str| p.replace('\'', r"'\''");
-                                let command = match panel_ui.tab {
-                                    PanelTab::Diff => {
-                                        model.panel.files.get(panel_ui.diff_cursor).map(|f| {
-                                            format!(
-                                                "git -c color.ui=always diff HEAD -- '{}' \
-                                                 | ${{PAGER:-less -R}}",
-                                                shq(&f.path)
-                                            )
-                                        })
-                                    }
-                                    PanelTab::Files => selected_file_entry(&panel_ui)
-                                        .filter(|e| !e.is_dir)
-                                        .map(|e| {
-                                            let pager = keymap
-                                                .config()
-                                                .tool_command("bat")
-                                                .unwrap_or("bat --paging=always")
-                                                .trim()
-                                                .to_string();
-                                            format!("{pager} '{}'", shq(&e.path))
-                                        }),
-                                    _ => None,
-                                };
-                                if let Some(cmd) = command {
-                                    let cwd = active_cwd(&session);
-                                    if nav == PanelNav::OpenTab {
-                                        open_command_tab(
-                                            &mut session,
-                                            &mut panes,
-                                            &cmd,
-                                            cwd.as_deref(),
-                                            chrome.center,
-                                        );
-                                    } else {
-                                        open_command_pane(
-                                            &mut session,
-                                            &mut panes,
-                                            focused,
-                                            &cmd,
-                                            cwd.as_deref(),
-                                            chrome.center,
-                                        );
-                                    }
-                                    focus.zone = crate::focus::Zone::Center;
-                                    refresh_tab_model(&mut model, &session, &mut sb);
-                                    need_relayout = true;
-                                }
-                            }
-                            PanelNav::OpenExternal => {
-                                // Hand the file to the system opener, detached.
-                                if let Some(entry) =
-                                    selected_file_entry(&panel_ui).filter(|e| !e.is_dir)
-                                {
-                                    let abs = active_tab_path(&session).join(&entry.path);
-                                    let _ = std::process::Command::new("xdg-open")
-                                        .arg(abs)
-                                        .stdin(std::process::Stdio::null())
-                                        .stdout(std::process::Stdio::null())
-                                        .stderr(std::process::Stdio::null())
-                                        .spawn();
-                                    model.status = format!("Opened {} externally", entry.name);
-                                }
-                            }
-                            PanelNav::RevealDrawer => {
-                                // Yazi drawer anchored at the selection's dir.
-                                if let Some(entry) = selected_file_entry(&panel_ui) {
-                                    let wt = active_tab_path(&session);
-                                    let dir = if entry.is_dir {
-                                        wt.join(&entry.path)
-                                    } else {
-                                        wt.join(&entry.path)
-                                            .parent()
-                                            .map(|p| p.to_path_buf())
-                                            .unwrap_or(wt)
-                                    };
-                                    if let Some(cwd) = active_cwd(&session) {
-                                        hide_drawer_into_pool(
-                                            &mut drawer,
-                                            &mut drawer_pool,
-                                            &mut drawer_home,
-                                            &cwd,
-                                            keymap.config(),
-                                            &mut panes,
-                                        );
-                                    } else if let Some(id) = drawer.take() {
-                                        panes.table.remove(&id);
-                                    }
-                                    drawer = spawn_yazi_pane(
-                                        &mut panes,
-                                        keymap.config(),
-                                        Some(dir.as_path()),
-                                        chrome.center,
-                                    );
-                                    drawer_home = Some(dir.clone());
-                                }
-                            }
-                            PanelNav::Rerun | PanelNav::RunAll | PanelNav::RunFailed
-                                if panel_ui.tab == PanelTab::Tests =>
-                            {
-                                let wt = active_tab_path(&session);
-                                sync_tests_for_worktree(&mut panel_ui, &wt, keymap.config());
-                                if let Some(base) = panel_ui.tests.task.clone() {
-                                    if !panel_ui.tests.running {
-                                        let task_spec = test_task_for_nav(&panel_ui, nav, base);
-                                        test_generation += 1;
-                                        panel_ui.tests.running = true;
-                                        panel_ui.tests.summary.running = true;
-                                        panel_ui.tests.summary.error = None;
-                                        model.status = format!("Running tests: {}", task_spec.name);
-                                        spawn_test_run_task(
-                                            test_run_tx.clone(),
-                                            waker.clone(),
-                                            wt,
-                                            test_generation,
-                                            task_spec,
-                                            keymap.config().limits.clone(),
-                                            test_sem.clone(),
-                                        );
-                                    }
-                                } else {
-                                    model.status = "No test task detected".into();
-                                }
-                            }
-                            PanelNav::Refresh if panel_ui.tab == PanelTab::Tests => {
-                                let wt = active_tab_path(&session);
-                                sync_tests_for_worktree(&mut panel_ui, &wt, keymap.config());
-                                if let Some(task) = panel_ui.tests.task.clone() {
+                            true
+                        }
+                        // -- tests: run / discover (capped, single-flight) ---
+                        (Section::Tests, KeyCode::Char(c @ ('r' | 'R' | 'f'))) => {
+                            let kind = match c {
+                                'r' => TestRun::Selected,
+                                'R' => TestRun::All,
+                                _ => TestRun::Failed,
+                            };
+                            let wt = active_tab_path(&session);
+                            sync_tests_for_worktree(&mut panel_ui, &wt, keymap.config());
+                            if let Some(base) = panel_ui.tests.task.clone() {
+                                if !panel_ui.tests.running {
+                                    let task_spec = test_task_for_run(&panel_ui, kind, base);
                                     test_generation += 1;
-                                    panel_ui.tests.discovering = true;
+                                    panel_ui.tests.running = true;
+                                    panel_ui.tests.summary.running = true;
                                     panel_ui.tests.summary.error = None;
-                                    // Force re-discovery and record the current
-                                    // fingerprint so the auto-gate stays quiet after.
-                                    panel_ui.tests.fingerprint =
-                                        crate::task::manifest_fingerprint(&wt);
-                                    spawn_test_discovery(
-                                        test_discovery_tx.clone(),
+                                    model.status = format!("Running tests: {}", task_spec.name);
+                                    spawn_test_run_task(
+                                        test_run_tx.clone(),
                                         waker.clone(),
                                         wt,
                                         test_generation,
-                                        task,
+                                        task_spec,
                                         keymap.config().limits.clone(),
                                         test_sem.clone(),
                                     );
-                                } else {
-                                    model.status = "No test task detected".into();
                                 }
+                            } else {
+                                model.status = "No test task detected".into();
                             }
-                            PanelNav::Open if panel_ui.tab == PanelTab::Tests => {
-                                let wt = active_tab_path(&session);
-                                if let Some((path, line)) = resolve_open_target(&panel_ui, &wt) {
-                                    let editor = keymap
-                                        .config()
-                                        .tool_command("editor")
-                                        .unwrap_or("${EDITOR:-vi} .")
-                                        .trim();
-                                    let editor = editor.strip_suffix(" .").unwrap_or(editor);
-                                    let cmd =
-                                        format!("{editor} +{line} {}", test_shell_quote(&path));
-                                    let cwd = active_cwd(&session);
-                                    open_command_tab(
-                                        &mut session,
-                                        &mut panes,
-                                        &cmd,
-                                        cwd.as_deref(),
-                                        chrome.center,
-                                    );
-                                    focus.zone = crate::focus::Zone::Center;
-                                    refresh_tab_model(&mut model, &session, &mut sb);
-                                    need_relayout = true;
-                                } else {
-                                    model.status = "Could not locate the selected test".into();
-                                }
-                            }
-                            PanelNav::Peek if panel_ui.tab == PanelTab::Tests => {
-                                let wt = active_tab_path(&session);
-                                if let Some((path, line)) = resolve_open_target(&panel_ui, &wt) {
-                                    let bat = keymap
-                                        .config()
-                                        .tool_command("bat")
-                                        .unwrap_or("bat --paging=always")
-                                        .to_string();
-                                    let cmd = format!(
-                                        "{bat} --highlight-line {line} {}",
-                                        test_shell_quote(&path)
-                                    );
-                                    let cwd = active_cwd(&session);
-                                    open_command_pane(
-                                        &mut session,
-                                        &mut panes,
-                                        focused,
-                                        &cmd,
-                                        cwd.as_deref(),
-                                        chrome.center,
-                                    );
-                                    focus.zone = crate::focus::Zone::Center;
-                                    refresh_tab_model(&mut model, &session, &mut sb);
-                                    need_relayout = true;
-                                } else {
-                                    model.status = "Could not locate the selected test".into();
-                                }
-                            }
-                            PanelNav::Debug if panel_ui.tab == PanelTab::Tests => {
-                                if let (Some(node), Some(task)) =
-                                    (panel_ui.tests.selected_node(), &panel_ui.tests.task)
-                                {
-                                    model.status =
-                                        crate::task::dap_launch_descriptor(task, &node.id);
-                                } else {
-                                    model.status = "Select a test to prepare a debug launch".into();
-                                }
-                            }
-                            // PR-tab actions (merge/approve/create/rerun) land
-                            // with the gh wiring; navigation is the zone's job.
-                            _ => {}
+                            true
                         }
+                        (Section::Tests, KeyCode::Char('u')) => {
+                            let wt = active_tab_path(&session);
+                            sync_tests_for_worktree(&mut panel_ui, &wt, keymap.config());
+                            if let Some(task) = panel_ui.tests.task.clone() {
+                                test_generation += 1;
+                                panel_ui.tests.discovering = true;
+                                panel_ui.tests.summary.error = None;
+                                // Force re-discovery and record the current
+                                // fingerprint so the auto-gate stays quiet after.
+                                panel_ui.tests.fingerprint = crate::task::manifest_fingerprint(&wt);
+                                spawn_test_discovery(
+                                    test_discovery_tx.clone(),
+                                    waker.clone(),
+                                    wt,
+                                    test_generation,
+                                    task,
+                                    keymap.config().limits.clone(),
+                                    test_sem.clone(),
+                                );
+                            } else {
+                                model.status = "No test task detected".into();
+                            }
+                            true
+                        }
+                        (Section::Tests, KeyCode::Char('o')) => {
+                            // Open the explorer's selected test in the editor
+                            // (file:line when captured, name-located otherwise).
+                            let wt = active_tab_path(&session);
+                            if let Some((path, line)) = resolve_open_target(&panel_ui, &wt) {
+                                let cmd = editor_open_command(keymap.config(), &path, Some(line));
+                                let cwd = active_cwd(&session);
+                                open_command_tab(
+                                    &mut session,
+                                    &mut panes,
+                                    &cmd,
+                                    cwd.as_deref(),
+                                    chrome.center,
+                                );
+                                focus.zone = crate::focus::Zone::Center;
+                                refresh_tab_model(&mut model, &session, &mut sb);
+                                need_relayout = true;
+                            } else {
+                                model.status = "Could not locate the selected test".into();
+                            }
+                            true
+                        }
+                        (Section::Tests, KeyCode::Char('b')) => {
+                            // Peek the selected test in bat, in a split pane.
+                            let wt = active_tab_path(&session);
+                            if let Some((path, line)) = resolve_open_target(&panel_ui, &wt) {
+                                let bat = keymap
+                                    .config()
+                                    .tool_command("bat")
+                                    .unwrap_or("bat --paging=always")
+                                    .to_string();
+                                let cmd = format!(
+                                    "{bat} --highlight-line {line} {}",
+                                    test_shell_quote(&path)
+                                );
+                                let cwd = active_cwd(&session);
+                                open_command_pane(
+                                    &mut session,
+                                    &mut panes,
+                                    focused,
+                                    &cmd,
+                                    cwd.as_deref(),
+                                    chrome.center,
+                                );
+                                focus.zone = crate::focus::Zone::Center;
+                                refresh_tab_model(&mut model, &session, &mut sb);
+                                need_relayout = true;
+                            } else {
+                                model.status = "Could not locate the selected test".into();
+                            }
+                            true
+                        }
+                        // Row mode only: section mode's `d` summons the diff
+                        // layer through the accordion map above.
+                        (Section::Tests, KeyCode::Char('d')) => {
+                            if let (Some(node), Some(task)) =
+                                (panel_ui.tests.selected_node(), &panel_ui.tests.task)
+                            {
+                                model.status = crate::task::dap_launch_descriptor(task, &node.id);
+                            } else {
+                                model.status = "Select a test to prepare a debug launch".into();
+                            }
+                            true
+                        }
+                        // -- files / changes: yazi reveal + editor open ------
+                        (Section::Files, KeyCode::Char('y')) => {
+                            // Yazi drawer anchored at the selection's dir.
+                            let wt = active_tab_path(&session);
+                            let dir = changed_file_at(&model, panel_ui.cursor)
+                                .and_then(|p| wt.join(&p).parent().map(|d| d.to_path_buf()))
+                                .unwrap_or_else(|| wt.clone());
+                            if let Some(cwd) = active_cwd(&session) {
+                                hide_drawer_into_pool(
+                                    &mut drawer,
+                                    &mut drawer_pool,
+                                    &mut drawer_home,
+                                    &cwd,
+                                    keymap.config(),
+                                    &mut panes,
+                                );
+                            } else if let Some(id) = drawer.take() {
+                                panes.table.remove(&id);
+                            }
+                            drawer = spawn_yazi_pane(
+                                &mut panes,
+                                keymap.config(),
+                                Some(dir.as_path()),
+                                chrome.center,
+                            );
+                            drawer_home = Some(dir);
+                            true
+                        }
+                        (Section::Files, KeyCode::Char('o'))
+                        | (Section::Changes, KeyCode::Char('o')) => {
+                            let path = if panel_ui.open == Section::Files {
+                                changed_file_at(&model, panel_ui.cursor)
+                            } else {
+                                panel_ui
+                                    .chg_sel
+                                    .or(Some(panel_ui.cursor))
+                                    .and_then(|i| model.panel.changes.get(i))
+                                    .map(|c| c.path.clone())
+                            };
+                            if let Some(path) = path {
+                                let cmd = editor_open_command(keymap.config(), &path, None);
+                                let cwd = active_cwd(&session);
+                                open_command_tab(
+                                    &mut session,
+                                    &mut panes,
+                                    &cmd,
+                                    cwd.as_deref(),
+                                    chrome.center,
+                                );
+                                focus.zone = crate::focus::Zone::Center;
+                                refresh_tab_model(&mut model, &session, &mut sb);
+                                need_relayout = true;
+                            }
+                            true
+                        }
+                        // Esc in section mode returns to the terminal (row
+                        // mode's Esc is claimed by the accordion map).
+                        (_, KeyCode::Escape) => {
+                            focus.zone = crate::focus::Zone::Center;
+                            true
+                        }
+                        _ => false,
+                    };
+                    if handled {
                         dirty = true;
                         continue;
                     }
@@ -4578,9 +7390,6 @@ async fn event_loop<T: Terminal>(
                         // A completed chord clears any pending which-key popup.
                         which_key.clear();
                         match action {
-                            Action::Cheatsheet => {
-                                cheatsheet = true;
-                            }
                             Action::SwitchMode(next) => {
                                 mode = next;
                                 keymap.reset();
@@ -4610,6 +7419,17 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::Quit => return Ok(()),
+                            Action::SwitchFont => match crate::font::font_palette_items() {
+                                Ok(items) if items.is_empty() => {
+                                    model.status = "No fonts found via fc-list".into();
+                                }
+                                Ok(items) => {
+                                    palette = Some(crate::palette::Palette::new(items));
+                                }
+                                Err(e) => {
+                                    model.status = format!("Font list failed: {e}");
+                                }
+                            },
                             Action::OpenPalette => {
                                 if let Ok(db) = superzej_core::db::Db::open() {
                                     palette = Some(crate::palette::Palette::new(build_palette(
@@ -4674,7 +7494,7 @@ async fn event_loop<T: Terminal>(
                                     want_sidebar,
                                     want_panel,
                                     panel_forced,
-                                    panel_expanded,
+                                    panel_width,
                                     sidebar_cols,
                                     zoom,
                                     &supervisor,
@@ -4706,7 +7526,7 @@ async fn event_loop<T: Terminal>(
                                     want_sidebar,
                                     want_panel,
                                     panel_forced,
-                                    panel_expanded,
+                                    panel_width,
                                     sidebar_cols,
                                     zoom,
                                     &supervisor,
@@ -4725,7 +7545,7 @@ async fn event_loop<T: Terminal>(
                                         want_sidebar,
                                         want_panel,
                                         panel_forced,
-                                        panel_expanded,
+                                        panel_width,
                                         sidebar_cols,
                                         zoom,
                                         &supervisor,
@@ -4750,7 +7570,7 @@ async fn event_loop<T: Terminal>(
                                         want_sidebar,
                                         want_panel,
                                         panel_forced,
-                                        panel_expanded,
+                                        panel_width,
                                         sidebar_cols,
                                         zoom,
                                         &supervisor,
@@ -4869,10 +7689,12 @@ async fn event_loop<T: Terminal>(
                                     format!("Theme: {name} (set [theme] preset to keep)");
                             }
                             Action::ToggleZoom => {
-                                zoom = if zoom.is_some() {
-                                    None
-                                } else {
+                                // Toggle: zoom the focused zone, unless already
+                                // zoomed or focused on a single-row bar (can't zoom).
+                                zoom = if zoom.is_none() && !focus.bar() {
                                     Some(focus.zone)
+                                } else {
+                                    None
                                 };
                                 model.status = if zoom.is_some() {
                                     "Zoomed — Ctrl+Alt+z to restore".into()
@@ -4885,7 +7707,7 @@ async fn event_loop<T: Terminal>(
                                     want_sidebar,
                                     want_panel,
                                     panel_forced,
-                                    panel_expanded,
+                                    panel_width,
                                     sidebar_cols,
                                     zoom,
                                     &supervisor,
@@ -4972,13 +7794,39 @@ async fn event_loop<T: Terminal>(
                                             }
                                             sb.sync(&mut model);
                                         } else if focus.panel() {
-                                            if delta < 0 {
-                                                panel_ui.diff_cursor =
-                                                    panel_ui.diff_cursor.saturating_sub(1);
+                                            // Row mode walks the open section's
+                                            // rows; section mode steps the
+                                            // accordion itself.
+                                            if panel_ui.row_mode {
+                                                let (pc, pr) = panel_geom(&chrome);
+                                                let max = crate::panel::frame::actionable_rows(
+                                                    &model, &panel_ui, pc, pr,
+                                                )
+                                                .saturating_sub(1);
+                                                panel_ui.cursor = if delta < 0 {
+                                                    panel_ui.cursor.saturating_sub(1)
+                                                } else {
+                                                    (panel_ui.cursor + 1).min(max)
+                                                };
                                             } else {
-                                                let max = model.panel.files.len().saturating_sub(1);
-                                                panel_ui.diff_cursor =
-                                                    (panel_ui.diff_cursor + 1).min(max);
+                                                let next = if delta < 0 {
+                                                    panel_ui.prev_section()
+                                                } else {
+                                                    panel_ui.next_section()
+                                                };
+                                                open_panel_section(
+                                                    next,
+                                                    &mut panel_ui,
+                                                    &mut hydration_gen,
+                                                    &model_tx,
+                                                    &session,
+                                                    &waker,
+                                                    PanelDocsWiring {
+                                                        model: &model,
+                                                        generation: docs_gen,
+                                                        tx: &docs_tx,
+                                                    },
+                                                );
                                             }
                                         }
                                     }
@@ -5001,7 +7849,7 @@ async fn event_loop<T: Terminal>(
                                                 want_sidebar,
                                                 want_panel,
                                                 panel_forced,
-                                                panel_expanded,
+                                                panel_width,
                                                 sidebar_cols,
                                                 zoom,
                                                 &supervisor,
@@ -5144,6 +7992,7 @@ async fn event_loop<T: Terminal>(
                                     }
                                     crate::session::CloseResult::Nothing => {}
                                 }
+                                persist_session_layout(&session);
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
                             }
@@ -5166,6 +8015,7 @@ async fn event_loop<T: Terminal>(
                                     }
                                 }
                                 session.close_active_group();
+                                persist_session_layout(&session);
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
                             }
@@ -5255,7 +8105,7 @@ async fn event_loop<T: Terminal>(
                                     want_sidebar,
                                     want_panel,
                                     panel_forced,
-                                    panel_expanded,
+                                    panel_width,
                                     sidebar_cols,
                                     zoom,
                                     &supervisor,
@@ -5270,7 +8120,7 @@ async fn event_loop<T: Terminal>(
                                     want_sidebar,
                                     want_panel,
                                     panel_forced,
-                                    panel_expanded,
+                                    panel_width,
                                     sidebar_cols,
                                     zoom,
                                     &supervisor,
@@ -5290,7 +8140,7 @@ async fn event_loop<T: Terminal>(
                                     want_sidebar,
                                     want_panel,
                                     panel_forced,
-                                    panel_expanded,
+                                    panel_width,
                                     sidebar_cols,
                                     zoom,
                                     &supervisor,
@@ -5329,7 +8179,7 @@ async fn event_loop<T: Terminal>(
                                         want_sidebar,
                                         want_panel,
                                         panel_forced,
-                                        panel_expanded,
+                                        panel_width,
                                         sidebar_cols,
                                         zoom,
                                         &supervisor,
@@ -5365,7 +8215,7 @@ async fn event_loop<T: Terminal>(
                                         want_sidebar,
                                         want_panel,
                                         panel_forced,
-                                        panel_expanded,
+                                        panel_width,
                                         sidebar_cols,
                                         zoom,
                                         &supervisor,
@@ -5446,7 +8296,7 @@ async fn event_loop<T: Terminal>(
                     want_sidebar,
                     want_panel,
                     panel_forced,
-                    panel_expanded,
+                    panel_width,
                     sidebar_cols,
                     zoom,
                     &supervisor,
@@ -5562,10 +8412,11 @@ mod tests {
         let panel = crate::panel::PanelUi::default();
         let hints = context_hints(&focus, &panel, &cfg);
 
-        assert!(hints.contains("Alt-X close tab"), "hints were {hints}");
-        assert!(hints.contains("Alt-p smart split"), "hints were {hints}");
-        assert!(hints.contains("Alt-n split↓"), "hints were {hints}");
-        assert!(hints.contains("Alt-N split→"), "hints were {hints}");
+        let has = |c: &str, l: &str| hints.iter().any(|(hc, hl)| hc == c && hl == l);
+        assert!(has("Alt-x", "close tab"), "hints were {hints:?}");
+        assert!(has("Alt-p", "smart split"), "hints were {hints:?}");
+        assert!(has("Alt-n", "split↓"), "hints were {hints:?}");
+        assert!(has("Alt-N", "split→"), "hints were {hints:?}");
     }
 
     #[test]
@@ -5576,8 +8427,9 @@ mod tests {
         let panel = crate::panel::PanelUi::default();
         let hints = context_hints(&focus, &panel, &cfg);
 
-        assert!(hints.contains("Ctrl-Alt-x close tab"), "hints were {hints}");
-        assert!(!hints.contains("Alt-X close tab"), "hints were {hints}");
+        let has = |c: &str, l: &str| hints.iter().any(|(hc, hl)| hc == c && hl == l);
+        assert!(has("Ctrl-Alt-x", "close tab"), "hints were {hints:?}");
+        assert!(!has("Alt-x", "close tab"), "hints were {hints:?}");
     }
 
     #[test]
@@ -5649,6 +8501,45 @@ mod tests {
         pool.stash(a, 3, 2, &mut panes);
         assert!(pool.remove_id(3));
         assert!(!pool.remove_id(3));
+    }
+
+    #[test]
+    fn drawer_cancel_keys_hide_the_file_picker() {
+        assert!(drawer_cancel_key(&KeyCode::Escape, Modifiers::NONE));
+        assert!(drawer_cancel_key(&KeyCode::Char('q'), Modifiers::NONE));
+        assert!(drawer_cancel_key(&KeyCode::Char('Q'), Modifiers::SHIFT));
+        assert!(!drawer_cancel_key(&KeyCode::Char('q'), Modifiers::CTRL));
+        assert!(!drawer_cancel_key(&KeyCode::Char('j'), Modifiers::NONE));
+    }
+
+    #[test]
+    fn font_palette_has_escape_ctrl_c_and_empty_q_cancels() {
+        let mut p = crate::palette::Palette::new(vec![crate::palette::PaletteItem::new(
+            "font:JetBrainsMono Nerd Font",
+            "JetBrainsMono Nerd Font",
+        )]);
+        assert!(palette_cancel_key(&p, &KeyCode::Escape, Modifiers::NONE));
+        assert!(palette_cancel_key(&p, &KeyCode::Char('c'), Modifiers::CTRL));
+        assert!(palette_cancel_key(&p, &KeyCode::Char('q'), Modifiers::NONE));
+
+        p.push_char('j');
+        assert!(!palette_cancel_key(
+            &p,
+            &KeyCode::Char('q'),
+            Modifiers::NONE
+        ));
+    }
+
+    #[test]
+    fn generic_command_palette_does_not_treat_plain_q_as_cancel() {
+        let p =
+            crate::palette::Palette::new(vec![crate::palette::PaletteItem::new("quit", "Quit")]);
+        assert!(!palette_cancel_key(
+            &p,
+            &KeyCode::Char('q'),
+            Modifiers::NONE
+        ));
+        assert!(palette_cancel_key(&p, &KeyCode::Escape, Modifiers::NONE));
     }
 
     /// A SidebarState whose `persist` writes to a temp DB scope rather than the
@@ -5733,7 +8624,9 @@ mod tests {
         press(&mut sb, ' ', &mut model, &session);
         let out = sb.handle_key(&KeyCode::Char('X'), Modifiers::NONE, &mut model, &session);
         match out {
-            SidebarOutcome::CloseGroups(t) => assert_eq!(t.len(), 2),
+            SidebarOutcome::CloseGroups(t) => {
+                assert_eq!(t.len(), 2);
+            }
             _ => panic!("expected CloseGroups"),
         }
     }
@@ -5823,6 +8716,51 @@ mod tests {
     }
 
     #[test]
+    fn load_or_seed_session_ignores_launch_directory() {
+        // Directory-agnostic: launching from an unrelated cwd reopens the
+        // most-recently-active workspace, never a workspace keyed to the cwd.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let state_home =
+            std::env::temp_dir().join(format!("test_db_agnostic_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state_home);
+        let db_path = state_home.join("superzej/superzej.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+        let db = superzej_core::db::Db::open_at(&db_path).unwrap();
+        // A registered workspace unrelated to the launch cwd below.
+        let _ = db.put_workspace("/tmp/app", "app", "repo");
+        let wt_dir = state_home.join("app-feat");
+        std::fs::create_dir_all(&wt_dir).unwrap();
+        db.put_tab_group(
+            "/tmp/app",
+            &superzej_core::models::TabGroupRow {
+                name: "app/feat".into(),
+                kind: "branch".into(),
+                worktree: wt_dir.to_string_lossy().into_owned(),
+                ordinal: 0,
+                active_tab: 0,
+            },
+        )
+        .unwrap();
+
+        // SAFETY: test holds ENV_LOCK; sets/clears an XDG var around one call.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+        // Launch from a directory unrelated to either workspace.
+        let (session, _) = load_or_seed_session(std::path::Path::new("/tmp/somewhere-unrelated"));
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+        let _ = std::fs::remove_dir_all(&state_home);
+
+        assert_eq!(
+            session.id, "/tmp/app",
+            "should reopen the most-recently-active workspace, not the cwd"
+        );
+        assert!(
+            session.worktrees.iter().any(|g| g.name == "app/feat"),
+            "the recent workspace's worktree should be present"
+        );
+    }
+
+    #[test]
     fn load_or_seed_session_reports_fresh_seed() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let state_home =
@@ -5861,7 +8799,7 @@ mod tests {
         unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
 
         let (session, _) = load_or_seed_session(std::path::Path::new("/tmp/repo1"));
-        let model = build_model(&session, &db);
+        let model = build_model(&session, &db, crate::hydrate::HydrateHints::default());
 
         unsafe { std::env::remove_var("XDG_STATE_HOME") };
 

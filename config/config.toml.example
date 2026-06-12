@@ -40,29 +40,52 @@ confirm_delete = true
 # Visual tuning. The focus accent recolors every superzej surface (plugins,
 # pickers, dashboard). `focus_border` frames whatever owns focus — the focused
 # pane's border ring, the active tab chip, the active worktree row, and the
-# focused chrome edge. Unfocused frames use `colors.border` (light grey).
+# focused chrome edge. Unfocused frames use `colors.border`.
 [theme]
-# Named palette preset: "storm" (default), "light", "abyss", "ember", "aurora".
-# Cycle live with Ctrl+Alt+t; [theme.colors] overrides apply on top.
-preset = "storm"
-accent = "#76eede"
-focus_border = "#9bd1ff"
+# Named palette preset: "prism" (default), "storm", "light", "abyss", "ember",
+# "aurora". Cycle live with Ctrl+Alt+t; [theme.colors] / [theme.hues]
+# overrides apply on top.
+preset = "prism"
+accent = "#6ee7d8"
+focus_border = "#6ee7d8"
 # Horizontal breathing room (cells) between a pane's frame and its content.
 pane_padding = 0
+# Curly underlines (conflict squiggles): "auto" sniffs the terminal
+# ($TERM / $TERM_PROGRAM / $VTE_VERSION); "on" / "off" force it. Unsupported
+# terminals degrade to a single underline.
+undercurl = "auto"
 
 # Optional: override any chrome surface/text color (all "#rrggbb"; unset keys
-# keep the built-in storm-blue palette). Invalid hex warns and keeps default.
+# keep the preset's palette). Invalid hex warns and keeps the default.
 [theme.colors]
-# bg0 = "#14161f"     # deepest background (sidebar)
-# bg1 = "#1a1d29"     # bars / surfaces (tabbar, statusbar, panel)
-# panel = "#212432"   # panel lists
-# panel2 = "#282c3e"  # selection / hover
-# raise = "#2f3448"   # raised (context menus)
-# border = "#aab1c4"  # pane/edge frame lines
-# text = "#e0e4f0"    # primary text
-# dim = "#9aa0b4"     # secondary text
-# faint = "#656b80"   # tertiary / labels
-# ghost = "#484d60"   # connectors / disabled
+# bg0 = "#0b0e16"       # deepest background (sidebar)
+# bg1 = "#10141f"       # bars / surfaces (tabbar, statusbar, panel)
+# panel = "#151a28"     # panel lists
+# panel2 = "#1a2031"    # selection / hover
+# raise = "#222942"     # raised (context menus)
+# border = "#4e556e"    # pane/edge frame lines
+# text = "#edf0f8"      # primary text
+# dim = "#aab1c5"       # secondary text
+# faint = "#7a8197"     # tertiary / labels
+# ghost = "#4e556e"     # connectors / disabled
+# ghost2 = "#343a52"    # structural glyphs (below ghost)
+# ghost3 = "#232940"    # deepest structural fg (rules, bar tracks)
+# shadow_bg = "#05070c" # layer shadow cell background
+# shadow_fg = "#1c2233" # layer shadow cell foreground
+# chip_fg = "#0b0e16"   # text inside inverse chips (defaults to bg0)
+
+# Optional: override the eight semantic hues (identity + status colors).
+# Unset keys keep the preset's hues; legacy presets default to the prism set
+# ("light" ships darker, paper-legible hues).
+[theme.hues]
+# teal = "#6ee7d8"
+# magenta = "#ef8fc4"
+# purple = "#b69cf2"
+# green = "#7fdca0"
+# amber = "#e6c264"
+# red = "#ef6f6f"
+# blue = "#7fb4ec"
+# orange = "#f09d6a"
 
 # Resource managers opened from the top-bar stats widget: highlight a stat with
 # Super+Alt+Up, cycle CPU/MEM/Net/GPU with ←/→, press Enter to embed it as a pane.
@@ -93,7 +116,7 @@ refresh-secs = 2           # Polling interval in seconds
 # cpu-icon = "CPU"
 # mem-icon = "MEM"
 # net-icon = "NET"
-# gpu-icon = "GPU"              # default glyph is padded to match other stat icons
+# gpu-icon = "GPU"              # default is the MDI expansion-card glyph (override if your font renders it oddly)
 # battery-icon = "BAT"          # discharging icon
 # battery-charging-icon = "CHG" # shown while charging / on AC
 battery-warn = 25               # red at/below this percent
@@ -159,6 +182,31 @@ interval_secs = 4      # refresh cadence (SUPERZEJ_DASHBOARD_INTERVAL)
 [watch]
 pr_interval_secs = 20  # PR refresh cadence (SUPERZEJ_WATCH_PR_INTERVAL)
 
+# Git write-operation knobs for the panel's lazygit-style features
+# (line staging, interactive rebase, cherry-pick, bisect, undo, …).
+[git]
+override_gpg = false   # true => history rewrites pass -c commit.gpgSign=false
+                       # -c tag.gpgSign=false, so a gpg passphrase prompt can
+                       # never hang a background operation
+
+# User-defined git commands, surfaced in the git panel's custom-commands menu
+# (`x`). `command` is a template expanded against the current selection — see
+# the list below — then run via `sh -c`. The `| quote` filter shell-quotes a
+# value. Referencing an empty selection is an error, never a silent "".
+#   {{.SelectedCommit.Sha}} / .Short / .Subject / .Author
+#   {{.SelectedBranch.Name}} / .Upstream      (also .SelectedLocalBranch.*)
+#   {{.CheckedOutBranch.Name}} / .Upstream
+#   {{.SelectedFile}}   {{.SelectedStash.Index}} / .Message
+#   {{.WorktreePath}}   {{.Form.<Key>}}        (a prompt response)
+#
+# [[git_commands]]
+# key = "P"                    # hotkey inside the custom-commands menu
+# context = "branches"         # commits | branches | files | stash | global
+# command = "git push --force-with-lease origin {{.SelectedBranch.Name | quote}}"
+# description = "force-push selected branch"
+# output = "popup"             # none | popup | terminal
+# prompts = [{ type = "input", title = "Confirm branch", key = "Branch" }]
+
 # Diagnostics. stderr is always on (level-gated, branded, colored on a TTY); the
 # file sink is opt-in. SUPERZEJ_LOG is a tracing-style filter that refines the
 # level per-module, e.g. SUPERZEJ_LOG=debug,superzej::db=trace
@@ -187,6 +235,7 @@ format = "text"           # text | json
 [keybinds]
 # new-worktree = "Ctrl w"
 # toggle-sidebar = "Alt s"
+# switch-font = "Alt f"  # opens the realtime font picker (alacritty profile)
 
 # You can also scope rebinds to a specific mode:
 [keybinds.vim_normal]
@@ -207,7 +256,7 @@ format = "text"           # text | json
 # SUPERZEJ_PROFILE env var / --profile flag). Applied *under* [keybinds], so a
 # global rebind still wins. `default_mode` sets the host mode on launch. The
 # names `vim`/`emacs` also start in the matching mode without an explicit
-# default_mode. Press `Alt ?` in the shell for the full cheatsheet overlay.
+# default_mode. For the full keybinding cheatsheet, focus the panel and press 9.
 # profile = "vim"
 # [profiles.vim]
 # default_mode = "vim-normal"
@@ -356,6 +405,14 @@ command = "git diff"
 [strip]
 ratio = 0.2
 visible = true
+
+# The right accordion panel. `sections` sets the display order — the numbered
+# jump keys (1..) follow the list — and any section left out is hidden
+# entirely. An empty/absent list shows every section in the built-in order:
+#   changes · git · files · tests · debug · sandbox · db · telemetry · keys
+# Unknown keys are ignored; reloads apply live.
+[panel]
+# sections = ["changes", "git", "files", "tests", "telemetry", "keys"]
 
 # Pinned programs: summoned from anywhere with Alt-1..9 (in registration order)
 # or the tabbar's pin chips. Pins run on the host (no sandbox) and are managed by

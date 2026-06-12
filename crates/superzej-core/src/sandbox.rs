@@ -23,6 +23,47 @@ use crate::remote::GitLoc;
 use crate::{msg, util};
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{Duration, Instant};
+
+/// Ceiling for fast control-plane probes (`image exists`, `container
+/// inspect`, health checks). A wedged runtime (stuck podman machine, broken
+/// overlay storage) must FAIL the candidate quickly so the backend chain
+/// falls through to bwrap/host instead of freezing the caller — pane spawns
+/// run on the event loop's critical path.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Ceiling for container create (`run -d`): image is prefetched by then, so
+/// this is namespace/cgroup setup, not network.
+const RUN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Ceiling for image pulls (network, legitimately slow — but never forever).
+const PULL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Run `argv` for its exit status with a hard deadline, stdio discarded.
+/// `None` on spawn failure or timeout (the child is killed and reaped) — for
+/// callers, indistinguishable from "this backend doesn't work", which is
+/// exactly the degradation the chain wants.
+fn status_with_timeout(argv: &[String], timeout: Duration) -> Option<bool> {
+    use std::process::Stdio;
+    let mut child = Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status.success()),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(_) => return None,
+        }
+    }
+}
 
 /// Runtime backend (resolved from the config-facing [`SandboxBackend`]; this set
 /// has no `Auto` — auto resolution is what produces a concrete `Backend`).
@@ -600,16 +641,20 @@ pub fn prefetch_image(spec: &SandboxSpec) -> anyhow::Result<()> {
     }
     if let Some(img) = &spec.image {
         let rt = spec.backend.binary();
-        let exists = std::process::Command::new(rt)
-            .args(["image", "exists", img])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-
-        if !exists {
-            let _ = std::process::Command::new(rt)
-                .args(["pull", img])
-                .output()?;
+        let exists_argv: Vec<String> =
+            vec![rt.into(), "image".into(), "exists".into(), img.clone()];
+        match status_with_timeout(&exists_argv, PROBE_TIMEOUT) {
+            Some(true) => {}
+            Some(false) => {
+                let pull_argv: Vec<String> = vec![rt.into(), "pull".into(), img.clone()];
+                if status_with_timeout(&pull_argv, PULL_TIMEOUT) != Some(true) {
+                    anyhow::bail!("{rt} pull {img} failed or timed out");
+                }
+            }
+            // The probe itself wedged: the runtime is unhealthy (stuck
+            // machine, broken storage) — fail the candidate so the chain
+            // falls through instead of trusting a pull to behave.
+            None => anyhow::bail!("{rt} not responding (image probe timed out)"),
         }
     }
     Ok(())
@@ -620,11 +665,14 @@ pub fn health_check(spec: &SandboxSpec) -> bool {
         return true;
     }
     let rt = spec.backend.binary();
-    let out = std::process::Command::new(rt)
-        .args(["exec", &spec.name, "echo", "ok"])
-        .output()
-        .ok();
-    out.map(|o| o.status.success()).unwrap_or(false)
+    let argv: Vec<String> = vec![
+        rt.into(),
+        "exec".into(),
+        spec.name.clone(),
+        "echo".into(),
+        "ok".into(),
+    ];
+    status_with_timeout(&argv, PROBE_TIMEOUT).unwrap_or(false)
 }
 
 /// Ensure any persistent state exists (OCI: a keep-alive container we `exec`
@@ -646,7 +694,7 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
     let rt = spec.backend.binary();
     let mut inspect = backend_prefix(spec.backend);
     inspect.extend(["container".into(), "inspect".into(), spec.name.clone()]);
-    if run_control_owned(spec, &inspect).unwrap_or(false) {
+    if run_control_owned(spec, &inspect, PROBE_TIMEOUT).unwrap_or(false) {
         return Ok(()); // already running
     }
     let mut argv: Vec<String> = backend_prefix(spec.backend);
@@ -663,7 +711,7 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
             .unwrap_or_else(|| "docker.io/library/debian:stable".into()),
     );
     argv.extend(["sleep".into(), "infinity".into()]);
-    if run_control_owned(spec, &argv).unwrap_or(false) {
+    if run_control_owned(spec, &argv, RUN_TIMEOUT).unwrap_or(false) {
         Ok(())
     } else {
         anyhow::bail!("could not start {rt} container '{}'", spec.name)
@@ -687,7 +735,7 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
         if available(&transport, b) {
             let mut argv = backend_prefix(b);
             argv.extend(["rm".into(), "-f".into(), name.to_string()]);
-            let _ = run_control_t_owned(&transport, &argv);
+            let _ = run_control_t_owned(&transport, &argv, PROBE_TIMEOUT);
         }
     }
 }
@@ -936,11 +984,11 @@ fn run_local_output(prefix: &[String], args: &[&str]) -> Option<String> {
 
 /// Run a control-plane command (locally, or on the remote over ssh). Returns
 /// whether it succeeded.
-fn run_control_owned(spec: &SandboxSpec, argv: &[String]) -> Option<bool> {
-    run_control_t_owned(&spec.transport, argv)
+fn run_control_owned(spec: &SandboxSpec, argv: &[String], timeout: Duration) -> Option<bool> {
+    run_control_t_owned(&spec.transport, argv, timeout)
 }
 
-fn run_control_t_owned(transport: &Transport, argv: &[String]) -> Option<bool> {
+fn run_control_t_owned(transport: &Transport, argv: &[String], timeout: Duration) -> Option<bool> {
     let argv: Vec<String> = match transport {
         Transport::Local => argv.to_vec(),
         Transport::Remote(r) => {
@@ -951,11 +999,7 @@ fn run_control_t_owned(transport: &Transport, argv: &[String]) -> Option<bool> {
             v
         }
     };
-    Command::new(&argv[0])
-        .args(&argv[1..])
-        .output()
-        .ok()
-        .map(|o| o.status.success())
+    status_with_timeout(&argv, timeout)
 }
 
 /// Local uid/gid via `id` (no libc dep). None if `id` is unavailable.

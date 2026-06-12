@@ -24,12 +24,8 @@ tab_size = 2
 # previews still work; set [drawer].image_previews = true to remove this block
 # from the private generated config.
 [plugin]
-prepend_previewers = [
-  { mime = "image/*", run = "noop" },
-]
-prepend_preloaders = [
-  { mime = "image/*", run = "noop" },
-]
+prepend_previewers = [{ mime = "image/*", run = "noop" }]
+prepend_preloaders = [{ mime = "image/*", run = "noop" }]
 # END SUPERZEJ MANAGED IMAGE PREVIEW POLICY
 
 # Route "edit" (Enter/o on a text file) through superzej so it opens in
