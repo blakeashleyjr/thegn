@@ -428,15 +428,19 @@ impl Session {
             .unwrap_or(CloseResult::Nothing)
     }
 
-    /// Remove the active group entirely; focus the previous one.
+    /// Remove the active group entirely; focus the nearest remaining one.
     pub fn close_active_group(&mut self) -> Option<WorktreeGroup> {
         if self.worktrees.is_empty() {
             return None;
         }
         let removed = self.worktrees.remove(self.active);
+        // If we deleted the last group, clamp down
         if self.active >= self.worktrees.len() {
             self.active = self.worktrees.len().saturating_sub(1);
         }
+        // No explicit -1 needed: `remove(self.active)` naturally drops the *next*
+        // item into the `self.active` slot, so we automatically land on the
+        // group immediately below the one we just deleted.
         Some(removed)
     }
 }
@@ -564,6 +568,35 @@ mod tests {
         }
         assert_eq!(s.close_active_tab(), CloseResult::Nothing);
         assert!(s.active_group().is_none());
+    }
+
+    #[test]
+    fn close_active_group_clamps_focus_when_removing_last_group() {
+        let mut s = Session::default();
+        s.add_group(group("g1"));
+        s.add_group(group("g2"));
+        s.add_group(group("g3"));
+
+        // Focus middle group
+        s.active = 1;
+        assert_eq!(s.active_group().unwrap().name, "g2");
+
+        // Remove middle group -> the old index 1 now points to "g3"
+        s.close_active_group();
+        assert_eq!(s.worktrees.len(), 2);
+        assert_eq!(s.active_group().unwrap().name, "g3");
+        assert_eq!(s.active, 1);
+
+        // Remove the last group (now at index 1) -> should clamp focus to index 0 ("g1")
+        s.close_active_group();
+        assert_eq!(s.worktrees.len(), 1);
+        assert_eq!(s.active_group().unwrap().name, "g1");
+        assert_eq!(s.active, 0);
+
+        // Remove final group
+        s.close_active_group();
+        assert_eq!(s.worktrees.len(), 0);
+        assert_eq!(s.active, 0);
     }
 
     #[test]

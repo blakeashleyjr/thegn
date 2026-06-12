@@ -8,6 +8,9 @@
 pub struct StatsSnapshot {
     /// CPU utilization 0–100 (delta over the sample interval).
     pub cpu_pct: Option<u8>,
+    /// Per-core utilization 0–100, in `cpuN` order. Empty until two samples
+    /// exist (rates need a delta) or when `/proc/stat` is unavailable.
+    pub cpu_cores: Vec<u8>,
     /// Memory as (used GiB, total GiB).
     pub mem_gib: Option<(f32, f32)>,
     /// GPU utilization 0–100 (NVIDIA only; absent when undetected).
@@ -48,6 +51,9 @@ pub fn read_battery(base: &std::path::Path) -> Option<(u8, bool)> {
 /// rates. Lives on the ticker thread.
 pub struct StatsSampler {
     prev_cpu: Option<(u64, u64)>, // (total, idle) jiffies
+    /// Per-core (total, idle) jiffies from the previous sample; rates are
+    /// only emitted when the core count is stable across samples.
+    prev_cores: Vec<(u64, u64)>,
     prev_net: Option<(u64, u64, std::time::Instant)>,
     gpu: GpuProbe,
 }
@@ -89,6 +95,7 @@ impl StatsSampler {
     pub fn new() -> Self {
         StatsSampler {
             prev_cpu: None,
+            prev_cores: Vec::new(),
             prev_net: None,
             gpu: probe_gpu(),
         }
@@ -99,13 +106,24 @@ impl StatsSampler {
     pub fn sample(&mut self) -> StatsSnapshot {
         let mut snap = StatsSnapshot::default();
 
-        if let Ok(stat) = std::fs::read_to_string("/proc/stat")
-            && let Some((total, idle)) = parse_proc_stat(&stat)
-        {
-            if let Some((pt, pi)) = self.prev_cpu {
-                snap.cpu_pct = cpu_pct((pt, pi), (total, idle));
+        if let Ok(stat) = std::fs::read_to_string("/proc/stat") {
+            if let Some((total, idle)) = parse_proc_stat(&stat) {
+                if let Some((pt, pi)) = self.prev_cpu {
+                    snap.cpu_pct = cpu_pct((pt, pi), (total, idle));
+                }
+                self.prev_cpu = Some((total, idle));
             }
-            self.prev_cpu = Some((total, idle));
+            // Per-core rates ride the same single read (the telemetry
+            // overlay's c0..cN sparkrow). Hotplug (count change) resets.
+            let cores = parse_proc_stat_cores(&stat);
+            if cores.len() == self.prev_cores.len() {
+                snap.cpu_cores = cores
+                    .iter()
+                    .zip(&self.prev_cores)
+                    .map(|(cur, prev)| cpu_pct(*prev, *cur).unwrap_or(0))
+                    .collect();
+            }
+            self.prev_cores = cores;
         }
 
         if let Ok(mem) = std::fs::read_to_string("/proc/meminfo") {
@@ -166,6 +184,29 @@ pub fn parse_proc_stat(text: &str) -> Option<(u64, u64)> {
     let total: u64 = fields.iter().sum();
     let idle = fields[3] + fields.get(4).copied().unwrap_or(0);
     Some((total, idle))
+}
+
+/// `/proc/stat` per-core `cpuN` lines → (total, idle) jiffies, in core order.
+/// The aggregate `cpu ` line is excluded.
+pub fn parse_proc_stat_cores(text: &str) -> Vec<(u64, u64)> {
+    text.lines()
+        .filter(|l| {
+            l.strip_prefix("cpu")
+                .and_then(|r| r.chars().next())
+                .is_some_and(|c| c.is_ascii_digit())
+        })
+        .filter_map(|line| {
+            let fields: Vec<u64> = line
+                .split_whitespace()
+                .skip(1)
+                .filter_map(|f| f.parse().ok())
+                .collect();
+            if fields.len() < 5 {
+                return None;
+            }
+            Some((fields.iter().sum(), fields[3] + fields[4]))
+        })
+        .collect()
 }
 
 /// Utilization percentage between two `/proc/stat` readings.
@@ -244,6 +285,25 @@ mod tests {
         // No progress → None.
         assert_eq!(cpu_pct(pb, pb), None);
         assert_eq!(parse_proc_stat("intr 0 0\n"), None);
+    }
+
+    #[test]
+    fn proc_stat_per_core_lines_parse_in_order() {
+        let text = "\
+cpu  300 0 300 1400 200 0 0 0 0 0
+cpu0 100 0 100 700 100 0 0 0 0 0
+cpu1 200 0 200 700 100 0 0 0 0 0
+intr 0 0
+";
+        let cores = parse_proc_stat_cores(text);
+        assert_eq!(cores, vec![(1000, 800), (1200, 800)]);
+        // Aggregate-only input yields no cores; short lines are skipped.
+        assert_eq!(parse_proc_stat_cores("cpu  1 2 3 4 5\n"), vec![]);
+        assert_eq!(parse_proc_stat_cores("cpu0 1 2\n"), vec![]);
+        // Per-core deltas → percentages, exactly like the aggregate.
+        let a = parse_proc_stat_cores("cpu0 100 0 100 700 100 0 0 0 0 0\n");
+        let b = parse_proc_stat_cores("cpu0 150 0 150 750 150 0 0 0 0 0\n");
+        assert_eq!(cpu_pct(a[0], b[0]), Some(50));
     }
 
     #[test]

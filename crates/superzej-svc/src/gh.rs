@@ -6,7 +6,7 @@
 
 use serde_json::Value;
 use superzej_core::github::{
-    self, CheckRun, CreateOpts, GhError, MergeMethod, PanelState, PrPanel, PrStatus,
+    self, CheckRun, CreateOpts, GhError, MergeMethod, PanelState, PrHeader, PrPanel, PrStatus,
 };
 use superzej_core::remote::GitLoc;
 
@@ -25,6 +25,10 @@ pub trait GhBackend: Send + Sync {
     ) -> Result<(), GhError>;
     async fn approve(&self, loc: &GitLoc, body: Option<&str>) -> Result<(), GhError>;
     async fn rerun_failed(&self, loc: &GitLoc) -> Result<u32, GhError>;
+    /// The repo's open PRs, one header per branch — the branch-badge feed.
+    async fn pr_list(&self, loc: &GitLoc) -> Result<Vec<PrHeader>, GhError> {
+        github::pr_list(loc, 100)
+    }
 }
 
 /// The permanent fallback: every op via the `gh` CLI (through superzej-core's
@@ -78,6 +82,30 @@ fn token_from(
         .map(|t| t.trim().to_string())
 }
 
+/// All open PRs' headers in one round trip — the per-branch badge feed.
+pub const PR_LIST_QUERY: &str = r#"
+query($owner:String!,$repo:String!){
+  repository(owner:$owner,name:$repo){
+    pullRequests(first:100, states:[OPEN]){
+      nodes{ number headRefName state url isDraft }
+    }
+  }
+}"#;
+
+/// Parse a `PR_LIST_QUERY` response into headers. Pure, fixture-tested.
+pub fn parse_graphql_pr_list(resp: &Value) -> Vec<PrHeader> {
+    let data = resp.get("data").unwrap_or(resp);
+    data.pointer("/repository/pullRequests/nodes")
+        .and_then(Value::as_array)
+        .map(|nodes| {
+            nodes
+                .iter()
+                .filter_map(|n| serde_json::from_value(n.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The single GraphQL query that replaces the CLI's separate `gh pr view` +
 /// `gh run list`: PR state + checks + reviews in one round trip.
 pub const PR_QUERY: &str = r#"
@@ -90,7 +118,7 @@ query($owner:String!,$repo:String!,$head:String!){
         commits(last:1){ nodes{ commit{ statusCheckRollup{
           contexts(first:100){ nodes{
             __typename
-            ... on CheckRun   { name status conclusion detailsUrl }
+            ... on CheckRun   { name status conclusion detailsUrl startedAt completedAt }
             ... on StatusContext { context state targetUrl }
           }}}}}}
       }
@@ -110,6 +138,8 @@ fn check_from_ctx(ctx: &Value) -> CheckRun {
             state: s("state"),
             workflow_name: None,
             details_url: s("targetUrl"),
+            started_at: None,
+            completed_at: None,
         },
         _ => CheckRun {
             name: s("name").unwrap_or_default(),
@@ -118,6 +148,8 @@ fn check_from_ctx(ctx: &Value) -> CheckRun {
             state: None,
             workflow_name: None,
             details_url: s("detailsUrl"),
+            started_at: s("startedAt"),
+            completed_at: s("completedAt"),
         },
     }
 }
@@ -174,6 +206,8 @@ pub fn parse_graphql_pr(resp: &Value, worktree: &str, branch: &str, now: i64) ->
         worktree: worktree.to_string(),
         branch: branch.to_string(),
         fetched_at: now,
+        threads: Vec::new(),
+        issues: Vec::new(),
     }
 }
 
@@ -287,6 +321,29 @@ impl GhBackend for GhNative {
     async fn rerun_failed(&self, loc: &GitLoc) -> Result<u32, GhError> {
         self.fallback.rerun_failed(loc).await
     }
+
+    async fn pr_list(&self, loc: &GitLoc) -> Result<Vec<PrHeader>, GhError> {
+        if loc.is_remote() {
+            return self.fallback.pr_list(loc).await;
+        }
+        let (Some(token), Some((owner, repo))) = (resolve_token(), self.owner_repo(loc)) else {
+            return self.fallback.pr_list(loc).await;
+        };
+        let Ok(client) = octocrab::OctocrabBuilder::new()
+            .personal_token(token)
+            .build()
+        else {
+            return self.fallback.pr_list(loc).await;
+        };
+        let body = serde_json::json!({
+            "query": PR_LIST_QUERY,
+            "variables": { "owner": owner, "repo": repo },
+        });
+        match client.graphql::<Value>(&body).await {
+            Ok(resp) if resp.get("errors").is_none() => Ok(parse_graphql_pr_list(&resp)),
+            _ => self.fallback.pr_list(loc).await,
+        }
+    }
 }
 
 fn gh_auth_token() -> Option<String> {
@@ -354,6 +411,26 @@ mod tests {
             Some(("org".into(), "repo".into()))
         );
         assert_eq!(parse_owner_repo("not a url"), None);
+    }
+
+    #[test]
+    fn graphql_pr_list_parses_headers() {
+        let resp = serde_json::json!({
+          "data": { "repository": { "pullRequests": { "nodes": [
+            {"number": 7, "headRefName": "feat/x", "state": "OPEN",
+             "url": "https://github.com/o/r/pull/7", "isDraft": true},
+            {"number": 9, "headRefName": "fix/y", "state": "OPEN",
+             "url": "https://github.com/o/r/pull/9", "isDraft": false}
+          ]}}}
+        });
+        let prs = parse_graphql_pr_list(&resp);
+        assert_eq!(prs.len(), 2);
+        assert_eq!(prs[0].number, 7);
+        assert_eq!(prs[0].head_ref, "feat/x");
+        assert!(prs[0].is_draft);
+        assert_eq!(prs[1].url, "https://github.com/o/r/pull/9");
+        // Empty / malformed → empty.
+        assert!(parse_graphql_pr_list(&serde_json::json!({})).is_empty());
     }
 
     #[test]
