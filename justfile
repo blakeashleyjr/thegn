@@ -142,8 +142,9 @@ start-term name="dev": build
       "$PWD/{{bin}}"
 
 # Install/update the native superzej host onto your PATH (standalone, non-Nix):
-# builds release artifacts and symlinks `superzej`/`sj`/`szhost` to
-# target/release/szhost. Pass a bindir to override the default (~/.local/bin),
+# builds release artifacts, installs `sj` as the dedicated alacritty launcher,
+# `sj-tui` for the current terminal window, and direct `superzej`/`szhost`
+# native-host aliases. Pass a bindir to override the default (~/.local/bin),
 # e.g. `just install ~/bin`.
 install *bindir:
     ./install.sh {{bindir}}

@@ -95,26 +95,24 @@ programs.superzej = {
 };
 ```
 
-This installs the `superzej` command and deploys the three WASM plugins to
-`~/.local/share/superzej/{sidebar,panel,tabbar}.wasm`. The layouts and the
-zellij config are embedded in the binary and seeded into superzej's own
-namespace — `~/.superzej/layouts/` and `~/.superzej/zellij.kdl` — at launch, so
-superzej never touches your personal `~/.config/zellij`. superzej starts zellij
-with `--config ~/.superzej/zellij.kdl` for full control — edit that file to
-customize; it is **never overwritten** once it exists. (The layouts _are_
-re-seeded each launch, so they track the installed build.)
+This installs the native `szhost` compositor. There are no zellij/WASM plugins in
+the current native path: `sj` opens a dedicated Alacritty window using the bundled
+profile in `config/alacritty.toml`; `sj-tui` opens the same TUI in the current
+terminal window; `superzej` and `szhost` remain direct native-host entrypoints for
+CLI verbs and current-terminal use.
 
 ### Standalone
 
 ```sh
-./install.sh    # builds the binary + both WASM plugins, symlinks bin/sj, layouts, plugins
-sj
+./install.sh    # builds szhost, installs sj (Alacritty), sj-tui (current terminal), superzej, szhost
+sj              # dedicated Alacritty window with bundled superzej settings
+sj-tui          # same TUI in the current terminal window
 ```
 
-`./install.sh` needs the `wasm32-wasip1` rust target (it runs `rustup target add` for
-you). For Nix users, a fully-wrapped binary: `nix profile install .#default`, and
-plugins via `nix build .#superzej-sidebar .#superzej-panel .#superzej-tabbar`. superzej shells out to
-`git zellij fzf gh` (or `gum`); `lazygit yazi delta` are optional.
+`./install.sh` needs Rust/Cargo and an `alacritty` binary for the `sj` dedicated-window
+launcher. `sj-tui`, `superzej`, and `szhost` run directly in the current terminal.
+For Nix users, a fully-wrapped binary: `nix profile install .#default`.
+superzej shells out to `git fzf gh` (or `gum`); `lazygit yazi delta` are optional.
 
 ## How it works
 

@@ -241,7 +241,7 @@ pub fn filter_samples(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_parse_simple_gauge() {
         let input = r#"
@@ -258,7 +258,7 @@ process_resident_memory_bytes 82440192
         assert_eq!(samples[1].name, "process_resident_memory_bytes");
         assert_eq!(samples[1].value, 82440192.0);
     }
-    
+
     #[test]
     fn test_filter_by_name() {
         let samples = vec![
@@ -348,11 +348,11 @@ pub fn spawn_metrics_supervisor(
     if config.targets.is_empty() {
         return;
     }
-    
+
     tokio::spawn(async move {
         let interval = Duration::from_secs_f64(config.interval_secs.max(1.0));
         let timeout = Duration::from_millis(config.timeout_ms.max(100).min(30000));
-        
+
         // Initialize state with all targets
         let mut state = MetricsState {
             targets: config.targets.iter().map(|t| MetricTargetState {
@@ -364,16 +364,16 @@ pub fn spawn_metrics_supervisor(
                 error: Some("initializing".into()),
             }).collect(),
         };
-        
+
         // Send initial state
         let _ = tx.send(state.clone());
-        
+
         loop {
             let now = Instant::now();
-            
+
             for (i, target_cfg) in config.targets.iter().enumerate() {
                 let result = scrape_target(&target_cfg.url, timeout, config.max_body_bytes).await;
-                
+
                 let target_state = &mut state.targets[i];
                 target_state.samples = match result {
                     Ok(body) => {
@@ -402,11 +402,11 @@ pub fn spawn_metrics_supervisor(
                     }
                 };
             }
-            
+
             // Send update
             let _ = tx.send(state.clone());
             let _ = waker.wake();
-            
+
             sleep(interval).await;
         }
     });
@@ -418,20 +418,20 @@ async fn scrape_target(url: &str, timeout: Duration, max_bytes: usize) -> Result
         .timeout(timeout)
         .build()
         .map_err(|e| e.to_string())?;
-    
+
     let response = client
         .get(url)
         .header("Accept", "text/plain; version=0.0.4")
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    
+
     let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-    
+
     if bytes.len() > max_bytes {
         return Err(format!("response too large: {} > {}", bytes.len(), max_bytes));
     }
-    
+
     String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())
 }
 ```
@@ -597,7 +597,7 @@ fn draw_metrics_section(surface: &mut Surface, rect: Rect, model: &FrameModel) {
         col(S::Panel),
         rect.cols.saturating_sub(1),
     );
-    
+
     if model.metrics.targets.is_empty() {
         draw_text(
             surface,
@@ -610,10 +610,10 @@ fn draw_metrics_section(surface: &mut Surface, rect: Rect, model: &FrameModel) {
         );
         return;
     }
-    
+
     let mut y = rect.y + 1;
     let max_y = rect.y + rect.rows;
-    
+
     for target in &model.metrics.targets {
         if y >= max_y {
             break;
@@ -625,7 +625,7 @@ fn draw_metrics_section(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             crate::metrics::MetricHealth::Error => ("\u{25cb}", theme_color(theme::RED), "err"),
         };
         draw_text(surface, rect.x + 1, y, dot, dot_fg, col(S::Panel), 1);
-        
+
         // Target name
         draw_text(
             surface,
@@ -636,7 +636,7 @@ fn draw_metrics_section(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             col(S::Panel),
             rect.cols.saturating_sub(3),
         );
-        
+
         // Health status
         let health_col = rect.x + 3 + target.name.chars().count() + 2;
         if health_col < rect.x + rect.cols {
@@ -650,9 +650,9 @@ fn draw_metrics_section(surface: &mut Surface, rect: Rect, model: &FrameModel) {
                 (rect.x + rect.cols).saturating_sub(health_col),
             );
         }
-        
+
         y += 1;
-        
+
         // Show first few metric values (if up)
         if target.health == crate::metrics::MetricHealth::Up {
             for sample in target.samples.iter().take(3) {
@@ -762,17 +762,20 @@ git commit -m "docs(config): add [metrics] section example"
 ## Verification Steps
 
 1. **Config loads:**
+
    ```bash
    cargo run -p superzej-host --bin szhost --config /dev/null
    # Should not panic on missing [metrics] section
    ```
 
 2. **Parser tests:**
+
    ```bash
    cargo test -p superzej-core metrics
    ```
 
 3. **Full build:**
+
    ```bash
    cargo build --workspace
    ```
