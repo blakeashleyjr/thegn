@@ -31,13 +31,14 @@ use crate::hydrate::{
 use crate::input::key_bytes;
 use crate::layout;
 use crate::menu::{self, MenuChoice, MenuOverlay};
-use crate::palette::{build_agent_palette, build_palette, build_sandbox_palette};
+use crate::palette::build_palette;
 use crate::pane::PaneEvent;
 use crate::panel::gitui::{self, GitFlow, GitMsg, GitView, StagePane};
 use crate::panes::{
     Panes, prewarm_requests, relayout, relayout_strip, replace_single_dead_center_pane,
     tool_drawer_argv,
 };
+use crate::wizard;
 
 pub fn now_secs() -> i64 {
     std::time::SystemTime::now()
@@ -4284,76 +4285,19 @@ fn persist_session_layout(session: &crate::session::Session) {
     }
 }
 
-/// A worktree awaiting its agent choice. While set, the command palette is
-/// in "agent picker" mode: its selection launches the chosen agent into the
-/// group named `tab` rather than dispatching a command. Escaping defaults to a
-/// plain shell so the worktree is never left with no process.
-#[derive(Debug, Clone)]
-struct PendingAgent {
-    /// The `{repo_slug}/{branch}` group name to launch into.
-    tab: String,
-    worktree: String,
-    branch: String,
-    choosing_sandbox: bool,
-}
-
-/// A freshly-created worktree, ready to back a tab + agent launch.
-struct NewWorktree {
-    /// The `{repo_slug}/{branch}` tab name.
-    tab: String,
-    /// The branch created.
-    branch: String,
-    /// Absolute worktree path (local on disk; DB key for the agent launch).
-    path: String,
-}
-
-/// Create a local git worktree off `repo_root`, reusing core's worktree helpers
-/// (the same calls the legacy `new_worktree` command made, minus the zellij
-/// tab). Records it in the DB so the sidebar/dashboard/resurrect pick it up.
-/// Returns `None` (after a branded warning) when the base has no commits or the
-/// `git worktree add` fails.
-fn create_local_worktree(
-    cfg: &superzej_core::config::Config,
-    repo_root: &std::path::Path,
-) -> Option<NewWorktree> {
-    use superzej_core::{db::Db, repo, util, worktree};
-
-    let base = worktree::resolve_base(repo_root, cfg);
-    if util::git_out(repo_root, &["rev-parse", "--verify", "--quiet", &base]).is_none() {
-        superzej_core::msg::warn(&format!(
-            "'{base}' has no commits yet — make an initial commit before adding a worktree."
-        ));
-        return None;
-    }
-
-    let slug = repo::repo_slug(repo_root);
-    let branch = worktree::branch_name(repo_root, None, cfg);
-    let tab = repo::branch_tab(&slug, &branch);
-    let path = worktree::worktree_path(repo_root, &branch, cfg);
-    if !worktree::add(repo_root, &branch, &base, &path, cfg) {
-        superzej_core::msg::warn("could not create the worktree (see the git error above).");
-        return None;
-    }
-    let path = path.to_string_lossy().into_owned();
-
-    if let Ok(db) = Db::open() {
-        let _ = db.put_worktree(&tab, &repo_root.to_string_lossy(), &path, &branch, None);
-    }
-    Some(NewWorktree { tab, branch, path })
-}
-
-/// Spawn an already-resolved launch spec into the worktree tab named
-/// `pending.tab`, then point that tab's center at the live pane so lazy
-/// materialization will not also spawn a plain shell. Resolving the spec can
-/// block on sandbox/container setup, so callers must do that off the event loop.
-fn launch_resolved_agent_into_tab(
+/// Attach a freshly-created worktree's agent pane: spawn the pre-resolved
+/// launch spec (openpty+exec — fast, the blocking sandbox/compose work already
+/// ran on the wizard worker) into the tab named `tab_name` and point that
+/// tab's center at the live pane so `materialize` won't also spawn a plain
+/// shell. No-op (returns false) if the tab is gone.
+fn attach_agent_pane(
     session: &mut crate::session::Session,
     panes: &mut Panes,
-    pending: &PendingAgent,
+    tab_name: &str,
     spec: &crate::agent::LaunchSpec,
     center: Rect,
 ) -> bool {
-    let Some(gi) = session.worktrees.iter().position(|g| g.name == pending.tab) else {
+    let Some(gi) = session.worktrees.iter().position(|g| g.name == tab_name) else {
         return false;
     };
     let cwd = spec.cwd.clone();
@@ -4493,13 +4437,16 @@ async fn event_loop<T: Terminal>(
     );
     let (spec_tx, mut spec_rx) = tokio_mpsc::unbounded_channel::<SpecBatch>();
     let mut materialize_inflight: Option<(String, usize)> = None;
-    type AgentLaunchDone = (
-        PendingAgent,
-        String,
-        std::result::Result<crate::agent::LaunchSpec, String>,
-        Vec<superzej_core::sandbox::ContainerInfo>,
-    );
-    let (agent_tx, mut agent_rx) = tokio_mpsc::unbounded_channel::<AgentLaunchDone>();
+    // The new-worktree wizard (Alt+w) + its creation pipeline. The worker
+    // speculatively creates the worktree under the pregenerated name while
+    // the wizard is open; `wizard_cmd_tx` carries the wizard's decisions to
+    // it, `create_rx` carries progress events back. One creation at a time;
+    // `create_gen` kills a cancelled run's stragglers on arrival.
+    let (create_tx, mut create_rx) = tokio_mpsc::unbounded_channel::<wizard::CreateEvent>();
+    let mut wizard_ui: Option<wizard::NewWorktreeWizard> = None;
+    let mut wizard_cmd_tx: Option<std::sync::mpsc::Sender<wizard::WizardCmd>> = None;
+    let mut creating: Option<wizard::CreationProgress> = None;
+    let mut create_gen: u64 = 0;
     // Test-explorer results from the background runner/discoverer (capped,
     // single-flight). Two channels: run outcomes and discovery outcomes.
     let (test_run_tx, mut test_run_rx) =
@@ -4618,10 +4565,6 @@ async fn event_loop<T: Terminal>(
     // The transient which-key popup (set while a multi-key prefix is pending).
     let mut which_key: Vec<crate::keyhint::HintRow> = Vec::new();
     let mut which_key_prefix = String::new();
-    // When set, the open palette is an agent picker for a just-created worktree
-    // tab; its selection launches the agent rather than dispatching a command.
-    let mut pending_agent: Option<PendingAgent> = None;
-
     let (tx, mut rx) = tokio_mpsc::channel::<PaneEvent>(1024);
     let mut panes = Panes::with_waker(tx, waker.clone());
     let mut need_relayout = true;
@@ -5538,51 +5481,6 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
 
-        while let Ok((pending, choice, spec, containers)) = agent_rx.try_recv() {
-            model.containers = containers;
-            match spec {
-                Ok(spec) => {
-                    let backend = spec.backend.clone();
-                    let warning = spec.warning_summary();
-                    if launch_resolved_agent_into_tab(
-                        &mut session,
-                        &mut panes,
-                        &pending,
-                        &spec,
-                        chrome.center,
-                    ) {
-                        model.status = if let Some(warning) = warning {
-                            format!(
-                                "⚠ Launched {choice} in {} ({backend}) — sandbox fallback: {warning}",
-                                pending.tab
-                            )
-                        } else {
-                            format!("Launched {choice} in {} ({backend})", pending.tab)
-                        };
-                        refresh_tab_model(&mut model, &session, &mut sb);
-                        need_relayout = true;
-                    } else {
-                        model.status = format!("Launch target vanished: {}", pending.tab);
-                    }
-                }
-                Err(e) => {
-                    model.status = format!("Launch blocked: {e}");
-                }
-            }
-            hydration_gen = hydration_gen.wrapping_add(1);
-            spawn_model_hydration(
-                model_tx.clone(),
-                hydration_gen,
-                session.clone(),
-                Some(waker.clone()),
-                crate::hydrate::HydrateHints {
-                    open: panel_ui.open,
-                    expanded: panel_ui.width.is_expanded(),
-                },
-            );
-            dirty = true;
-        }
-
         while let Ok((generation, next_model)) = model_rx.try_recv() {
             if generation != hydration_gen {
                 continue;
@@ -5681,6 +5579,138 @@ async fn event_loop<T: Terminal>(
                 crate::panel::docs::DocsPayload::Diff(d) => panel_ui.docs.diff = Some(d),
             }
             dirty = true;
+        }
+
+        // Worktree-creation progress from the wizard worker; stale
+        // generations (a cancelled run's stragglers) are dropped.
+        while let Ok(ev) = create_rx.try_recv() {
+            match ev {
+                wizard::CreateEvent::Preflight {
+                    generation,
+                    suggested,
+                } => {
+                    if generation != create_gen {
+                        continue;
+                    }
+                    if let Some(w) = wizard_ui.as_mut() {
+                        w.apply_name_suggestion(&suggested);
+                    }
+                    if let Some(cp) = creating.as_mut() {
+                        cp.branch = suggested;
+                    }
+                    dirty = true;
+                }
+                wizard::CreateEvent::Step {
+                    generation,
+                    step,
+                    state,
+                    detail,
+                } => {
+                    if generation != create_gen {
+                        continue;
+                    }
+                    if let Some(cp) = creating.as_mut() {
+                        cp.apply(step, state, detail);
+                        if cp.revealed {
+                            dirty = true;
+                        }
+                    }
+                }
+                wizard::CreateEvent::Tick { generation } => {
+                    if generation != create_gen {
+                        continue;
+                    }
+                    if let Some(cp) = creating.as_mut() {
+                        cp.bump_tick();
+                        if cp.revealed {
+                            dirty = true;
+                        }
+                    }
+                }
+                wizard::CreateEvent::Failed {
+                    generation,
+                    step,
+                    error,
+                } => {
+                    if generation != create_gen {
+                        continue;
+                    }
+                    // The worker cleaned up and exited; surface the failure
+                    // immediately (even mid-wizard — nothing left to submit).
+                    wizard_ui = None;
+                    wizard_cmd_tx = None;
+                    if let Some(cp) = creating.as_mut() {
+                        cp.revealed = true;
+                        cp.stop_ticker();
+                    }
+                    model.status = format!("worktree creation failed ({}): {error}", step.label());
+                    dirty = true;
+                }
+                wizard::CreateEvent::Done {
+                    generation,
+                    payload,
+                } => {
+                    if generation != create_gen {
+                        continue;
+                    }
+                    let payload = *payload;
+                    if let Some(cp) = creating.as_mut() {
+                        cp.apply(
+                            wizard::CreateStep::LaunchAgent,
+                            wizard::StepState::Running,
+                            Some(payload.agent.clone()),
+                        );
+                    }
+                    session.add_group(crate::session::WorktreeGroup::new(
+                        payload.tab.clone(),
+                        crate::session::GroupKind::Branch,
+                        payload.path.clone(),
+                    ));
+                    refresh_tab_model(&mut model, &session, &mut sb);
+                    need_relayout = true;
+                    // Pane spawn (openpty+exec) is the only loop-side step;
+                    // on failure the tab's empty leaves fall through to the
+                    // materialize path, which backs it with a plain shell.
+                    if attach_agent_pane(
+                        &mut session,
+                        &mut panes,
+                        &payload.tab,
+                        &payload.spec,
+                        chrome.center,
+                    ) {
+                        focus.zone = crate::focus::Zone::Center;
+                        let backend = &payload.spec.backend;
+                        model.status = match payload.spec.warning_summary() {
+                            Some(warning) => format!(
+                                "⚠ worktree {} ready ({backend}) — sandbox fallback: {warning}",
+                                payload.branch
+                            ),
+                            None => format!("worktree {} ready ({backend})", payload.branch),
+                        };
+                    } else {
+                        model.status =
+                            format!("worktree {} created (agent launch failed)", payload.branch);
+                    }
+                    if let Some(cp) = creating.take() {
+                        cp.stop_ticker();
+                    }
+                    wizard_cmd_tx = None;
+                    // Fresh worktree + agent pane: re-hydrate so the sidebar
+                    // and panel reflect it immediately.
+                    hydration_gen = hydration_gen.wrapping_add(1);
+                    spawn_model_hydration(
+                        model_tx.clone(),
+                        hydration_gen,
+                        session.clone(),
+                        Some(waker.clone()),
+                        crate::hydrate::HydrateHints {
+                            open: panel_ui.open,
+                            expanded: panel_ui.width.is_expanded(),
+                        },
+                    );
+                    dirty = true;
+                }
+            }
         }
 
         // Adopt freshly-registered diff watchers; drop stale ones (the user
@@ -5920,6 +5950,14 @@ async fn event_loop<T: Terminal>(
             if let Some((inp, _)) = &host_input {
                 inp.render(&mut scratch, screen);
             }
+            if let Some(w) = &wizard_ui {
+                w.render(&mut scratch, screen);
+            }
+            if let Some(cp) = &creating
+                && cp.revealed
+            {
+                cp.render(&mut scratch, screen);
+            }
             let accent = current_config.accent_rgb();
             if !which_key.is_empty() {
                 crate::keyhint::render_which_key(
@@ -5959,7 +5997,10 @@ async fn event_loop<T: Terminal>(
                 full_repaint = false;
             }
             let mut pending = front.diff_screens(&scratch);
-            if palette.is_none() {
+            if palette.is_none()
+                && wizard_ui.is_none()
+                && !creating.as_ref().is_some_and(|cp| cp.revealed)
+            {
                 // The hardware cursor sits in the focused pane's CONTENT rect
                 // (inside its frame ring). With no live focused pane (launch
                 // splash), hide it so nothing blinks over the wordmark.
@@ -6460,6 +6501,78 @@ async fn event_loop<T: Terminal>(
                     continue;
                 }
                 let mut forced_palette_action: Option<crate::keymap::Action> = None;
+                // Modal: the revealed worktree-creation progress overlay
+                // swallows every key. Esc hides it while work continues (a
+                // mid-flight checkout isn't safely interruptible and the
+                // result is useful); on a failed run Esc/Enter dismisses.
+                if creating.as_ref().is_some_and(|cp| cp.revealed) {
+                    let failed = creating.as_ref().is_some_and(|cp| cp.failed);
+                    let dismiss = crate::input::is_escape_key(&k.key)
+                        || (failed && k.key == KeyCode::Enter)
+                        || (matches!(k.key, KeyCode::Char('c' | 'C' | 'g' | 'G'))
+                            && k.modifiers.contains(Modifiers::CTRL));
+                    if dismiss {
+                        if failed {
+                            creating = None;
+                            wizard_cmd_tx = None;
+                            create_gen += 1;
+                        } else if let Some(cp) = creating.as_mut() {
+                            cp.revealed = false;
+                            cp.stop_ticker();
+                            model.status = format!("creating {} in the background…", cp.branch);
+                        }
+                    }
+                    dirty = true;
+                    continue;
+                }
+                // Modal: the new-worktree wizard captures all keys; its
+                // decisions stream to the creation worker as they happen.
+                if let Some(w) = wizard_ui.as_mut() {
+                    match w.handle_key(&k.key, k.modifiers) {
+                        wizard::WizardOutcome::Pending => {}
+                        wizard::WizardOutcome::Cancel => {
+                            if let Some(tx) = wizard_cmd_tx.take() {
+                                let _ = tx.send(wizard::WizardCmd::Cancel);
+                            }
+                            wizard_ui = None;
+                            creating = None;
+                            create_gen += 1;
+                            model.status = "worktree creation cancelled".into();
+                        }
+                        wizard::WizardOutcome::SandboxChosen(backend) => {
+                            if let Some(tx) = wizard_cmd_tx.as_ref() {
+                                let _ = tx.send(wizard::WizardCmd::SandboxChosen(backend));
+                            }
+                        }
+                        wizard::WizardOutcome::Submit(choices) => {
+                            if let wizard::NameChoice::Human(tail) = &choices.name
+                                && let Some(cp) = creating.as_mut()
+                            {
+                                cp.branch = format!("{}{}", keymap.config().branch_prefix, tail);
+                            }
+                            if let Some(tx) = wizard_cmd_tx.as_ref() {
+                                let _ = tx.send(wizard::WizardCmd::Submit(choices));
+                            }
+                            wizard_ui = None;
+                            if let Some(cp) = creating.as_mut() {
+                                cp.revealed = true;
+                                wizard::spawn_ticker(
+                                    cp.generation,
+                                    cp.ticker_alive.clone(),
+                                    create_tx.clone(),
+                                    {
+                                        let wk = waker.clone();
+                                        move || {
+                                            let _ = wk.wake();
+                                        }
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    dirty = true;
+                    continue;
+                }
                 // Modal: host text input overlays (workspace creation, etc.)
                 // capture all keys before palettes/panels so the shortcut gives
                 // immediate visible feedback and a focused input target.
@@ -6734,100 +6847,6 @@ async fn event_loop<T: Terminal>(
                     // shell, so "shell" (and Escape) keep the live pane —
                     // respawning it would needlessly reload the terminal. Only a
                     // real agent choice replaces the pane.
-                    if pending_agent.is_some() {
-                        match k.key {
-                            KeyCode::Char('c')
-                            | KeyCode::Char('C')
-                            | KeyCode::Char('g')
-                            | KeyCode::Char('G')
-                                if k.modifiers.contains(Modifiers::CTRL) =>
-                            {
-                                pending_agent = None;
-                                palette = None;
-                                refresh_tab_model(&mut model, &session, &mut sb);
-                                need_relayout = true;
-                            }
-                            key if crate::input::is_escape_key(&key) => {
-                                if let Some(pending) = pending_agent.as_mut()
-                                    && pending.choosing_sandbox
-                                {
-                                    let backend = keymap.config().sandbox.default_backend.as_str();
-                                    if let Ok(db) = superzej_core::db::Db::open() {
-                                        let _ = db.set_worktree_sandbox(&pending.worktree, backend);
-                                    }
-                                    pending.choosing_sandbox = false;
-                                    palette = Some(crate::palette::Palette::new(
-                                        build_agent_palette(keymap.config()),
-                                    ));
-                                } else {
-                                    pending_agent = None;
-                                    palette = None;
-                                    refresh_tab_model(&mut model, &session, &mut sb);
-                                    need_relayout = true;
-                                }
-                            }
-                            KeyCode::Enter => {
-                                let choice = p
-                                    .selected_item()
-                                    .map(|i| i.key.clone())
-                                    .unwrap_or_else(|| "shell".to_string());
-                                if let Some(backend) = choice.strip_prefix("sandbox:")
-                                    && let Some(pending) = pending_agent.as_mut()
-                                {
-                                    if let Ok(db) = superzej_core::db::Db::open() {
-                                        let _ = db.set_worktree_sandbox(&pending.worktree, backend);
-                                    }
-                                    pending.choosing_sandbox = false;
-                                    palette = Some(crate::palette::Palette::new(
-                                        build_agent_palette(keymap.config()),
-                                    ));
-                                    dirty = true;
-                                    continue;
-                                }
-                                if let Some(pending) = pending_agent.as_ref()
-                                    && choice != "shell"
-                                {
-                                    let pending = pending.clone();
-                                    let cfg = keymap.config().clone();
-                                    let choice_for_worker = choice.clone();
-                                    let tx = agent_tx.clone();
-                                    let wk = waker.clone();
-                                    model.status =
-                                        format!("Launching {choice} in {}…", pending.tab);
-                                    task::spawn_blocking(move || {
-                                        let spec = crate::agent::launch_spec(
-                                            &cfg,
-                                            &pending.worktree,
-                                            Some(&pending.branch),
-                                            &choice_for_worker,
-                                        )
-                                        .map_err(|e| e.to_string());
-                                        let containers =
-                                            superzej_core::sandbox::running_containers();
-                                        if tx
-                                            .send((pending, choice_for_worker, spec, containers))
-                                            .is_ok()
-                                        {
-                                            let _ = wk.wake();
-                                        }
-                                    });
-                                }
-                                pending_agent = None;
-                                palette = None;
-                                refresh_tab_model(&mut model, &session, &mut sb);
-                                need_relayout = true;
-                            }
-                            KeyCode::UpArrow => p.move_up(),
-                            KeyCode::DownArrow => p.move_down(),
-                            KeyCode::Backspace => p.backspace(),
-                            KeyCode::Char(c) if !k.modifiers.contains(Modifiers::CTRL) => {
-                                p.push_char(c)
-                            }
-                            _ => {}
-                        }
-                        dirty = true;
-                        continue;
-                    }
                     if palette_cancel_key(p, &k.key, k.modifiers) {
                         palette = None;
                         dirty = true;
@@ -8646,24 +8665,41 @@ async fn event_loop<T: Terminal>(
                                             .and_then(|c| superzej_core::repo::main_worktree(&c))
                                     });
                                 if let Some(root) = repo_root {
-                                    if let Some(nw) = create_local_worktree(keymap.config(), &root)
-                                    {
-                                        session.add_group(crate::session::WorktreeGroup::new(
-                                            nw.tab.clone(),
-                                            crate::session::GroupKind::Branch,
-                                            nw.path.clone(),
-                                        ));
-                                        refresh_tab_model(&mut model, &session, &mut sb);
-                                        need_relayout = true;
-                                        pending_agent = Some(PendingAgent {
-                                            tab: nw.tab,
-                                            worktree: nw.path,
-                                            branch: nw.branch,
-                                            choosing_sandbox: true,
+                                    if wizard_ui.is_some() || creating.is_some() {
+                                        model.status =
+                                            "worktree creation already in progress".into();
+                                    } else {
+                                        // Open the wizard instantly (pure
+                                        // prefill) and start the worker, which
+                                        // speculatively creates the worktree
+                                        // under the candidate name while the
+                                        // user reads the form.
+                                        create_gen += 1;
+                                        let w = wizard::NewWorktreeWizard::new(
+                                            root.clone(),
+                                            keymap.config(),
+                                        );
+                                        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+                                        let ctx = wizard::WorkerCtx {
+                                            cfg: keymap.config().clone(),
+                                            repo_root: root,
+                                            candidate: w.candidate(),
+                                            generation: create_gen,
+                                            db_path: None,
+                                        };
+                                        let tx = create_tx.clone();
+                                        let wk = waker.clone();
+                                        task::spawn_blocking(move || {
+                                            wizard::run_worker(ctx, cmd_rx, tx, move || {
+                                                let _ = wk.wake();
+                                            });
                                         });
-                                        palette = Some(crate::palette::Palette::new(
-                                            build_sandbox_palette(keymap.config()),
+                                        creating = Some(wizard::CreationProgress::new(
+                                            create_gen,
+                                            w.candidate(),
                                         ));
+                                        wizard_cmd_tx = Some(cmd_tx);
+                                        wizard_ui = Some(w);
                                     }
                                 } else {
                                     superzej_core::msg::warn(
