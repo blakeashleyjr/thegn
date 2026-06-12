@@ -30,38 +30,83 @@ fn branch_exists(root: &Path, branch: &str) -> bool {
     )
 }
 
-fn worktree_uses_branch(root: &Path, branch: &str) -> bool {
-    util::git_out(root, &["worktree", "list", "--porcelain"])
-        .map(|s| {
-            s.lines()
-                .any(|l| l == format!("branch refs/heads/{branch}"))
-        })
-        .unwrap_or(false)
+/// Every branch name a new branch must avoid: local heads plus branches
+/// checked out in any worktree. Loaded with two git subprocesses total so
+/// collision checks are pure lookups (the old per-candidate probing ran two
+/// subprocesses per attempt).
+pub struct BranchSet {
+    taken: std::collections::HashSet<String>,
 }
 
-/// Generate a collision-free branch name. `human` is an optional friendly name.
-pub fn branch_name(root: &Path, human: Option<&str>, cfg: &Config) -> String {
-    let prefix = &cfg.branch_prefix;
-    let base = if let Some(h) = human {
-        format!("{prefix}{}", util::slugify(h))
-    } else if cfg.name_scheme == NameScheme::Numbered {
-        format!("{prefix}pane")
-    } else {
-        // Seed the random adjective-noun name with the pid + wall-clock so
-        // concurrent creates don't collide on the same candidate.
-        let seed = (std::process::id() as u64).wrapping_add(util::now() as u64);
-        let adj = ADJ[(seed % ADJ.len() as u64) as usize];
-        let noun = NOUN[((seed / 7 + 1) % NOUN.len() as u64) as usize];
-        format!("{prefix}{adj}-{noun}")
-    };
+impl BranchSet {
+    pub fn load(root: &Path) -> Self {
+        let mut taken = std::collections::HashSet::new();
+        if let Some(out) = util::git_out(
+            root,
+            &["for-each-ref", "refs/heads", "--format=%(refname:short)"],
+        ) {
+            taken.extend(out.lines().map(str::to_string).filter(|l| !l.is_empty()));
+        }
+        if let Some(out) = util::git_out(root, &["worktree", "list", "--porcelain"]) {
+            taken.extend(
+                out.lines()
+                    .filter_map(|l| l.strip_prefix("branch refs/heads/"))
+                    .map(str::to_string),
+            );
+        }
+        Self { taken }
+    }
 
-    let mut candidate = base.clone();
+    pub fn from_names<I: IntoIterator<Item = String>>(names: I) -> Self {
+        Self {
+            taken: names.into_iter().collect(),
+        }
+    }
+
+    pub fn taken(&self, branch: &str) -> bool {
+        self.taken.contains(branch)
+    }
+}
+
+/// The branch-name candidate for an unnamed worktree: `{prefix}{adj}-{noun}`
+/// (or `{prefix}pane` under the numbered scheme). Pure — no git, so a wizard
+/// prefill can be computed synchronously on the UI loop.
+pub fn candidate_name(cfg: &Config) -> String {
+    let prefix = &cfg.branch_prefix;
+    if cfg.name_scheme == NameScheme::Numbered {
+        return format!("{prefix}pane");
+    }
+    // Seed the random adjective-noun name with the pid + wall-clock so
+    // concurrent creates don't collide on the same candidate.
+    let seed = (std::process::id() as u64).wrapping_add(util::now() as u64);
+    let adj = ADJ[(seed % ADJ.len() as u64) as usize];
+    let noun = NOUN[((seed / 7 + 1) % NOUN.len() as u64) as usize];
+    format!("{prefix}{adj}-{noun}")
+}
+
+/// The branch-name base for a human-provided name: `{prefix}{slug}`.
+pub fn human_base(human: &str, cfg: &Config) -> String {
+    format!("{}{}", cfg.branch_prefix, util::slugify(human))
+}
+
+/// Suffix `base` with `-1`, `-2`, … until it avoids every taken name.
+pub fn dedupe(base: &str, taken: &BranchSet) -> String {
+    let mut candidate = base.to_string();
     let mut n = 0;
-    while branch_exists(root, &candidate) || worktree_uses_branch(root, &candidate) {
+    while taken.taken(&candidate) {
         n += 1;
         candidate = format!("{base}-{n}");
     }
     candidate
+}
+
+/// Generate a collision-free branch name. `human` is an optional friendly name.
+pub fn branch_name(root: &Path, human: Option<&str>, cfg: &Config) -> String {
+    let base = match human {
+        Some(h) => human_base(h, cfg),
+        None => candidate_name(cfg),
+    };
+    dedupe(&base, &BranchSet::load(root))
 }
 
 /// Best-effort default branch: origin/HEAD, else main, else master, else HEAD.
@@ -118,6 +163,22 @@ pub fn worktree_path(root: &Path, branch: &str, cfg: &Config) -> PathBuf {
 /// Create a worktree. Returns false on failure (caller decides how to recover)
 /// rather than killing the pane.
 pub fn add(root: &Path, branch: &str, base: &str, path: &Path, cfg: &Config) -> bool {
+    if let Err(e) = add_checked(root, branch, base, path, cfg) {
+        msg::warn(&e);
+        return false;
+    }
+    true
+}
+
+/// [`add`] with the failure reason returned instead of warned, for callers
+/// that surface errors in their own UI (the new-worktree progress overlay).
+pub fn add_checked(
+    root: &Path,
+    branch: &str,
+    base: &str,
+    path: &Path,
+    cfg: &Config,
+) -> Result<(), String> {
     if cfg.worktree_mode == WorktreeMode::InRepo {
         // Keep .worktrees out of git locally without touching tracked .gitignore.
         let excl = root.join(".git/info/exclude");
@@ -136,24 +197,20 @@ pub fn add(root: &Path, branch: &str, base: &str, path: &Path, cfg: &Config) -> 
     let out = Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["worktree", "add", "-b", branch])
+        .args(["worktree", "add", "--quiet", "-b", branch])
         .arg(path)
         .arg(base)
         .output();
     match out {
-        Ok(o) if o.status.success() => true,
+        Ok(o) if o.status.success() => Ok(()),
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
-            msg::warn(&format!(
+            Err(format!(
                 "git worktree add failed (branch={branch} base={base}): {}",
                 stderr.trim()
-            ));
-            false
+            ))
         }
-        Err(e) => {
-            msg::warn(&format!("could not run git worktree add: {e}"));
-            false
-        }
+        Err(e) => Err(format!("could not run git worktree add: {e}")),
     }
 }
 
@@ -172,5 +229,102 @@ pub fn remove(root: &Path, path: &Path, branch: &str, delete_branch: bool) {
     }
     if delete_branch && !branch.is_empty() && !util::git_ok(root, &["branch", "-D", branch]) {
         msg::warn(&format!("could not delete branch {branch}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    fn temp_repo(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sz-wt-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.email", "t@t.t"],
+            &["config", "user.name", "t"],
+            &["commit", "--allow-empty", "-q", "-m", "init"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&dir)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        dir
+    }
+
+    #[test]
+    fn candidate_name_uses_prefix_and_scheme() {
+        let mut cfg = Config {
+            branch_prefix: "x/".into(),
+            ..Default::default()
+        };
+        let name = candidate_name(&cfg);
+        let tail = name.strip_prefix("x/").expect("prefix");
+        let (adj, noun) = tail.split_once('-').expect("adj-noun");
+        assert!(ADJ.contains(&adj));
+        assert!(NOUN.contains(&noun));
+
+        cfg.name_scheme = NameScheme::Numbered;
+        assert_eq!(candidate_name(&cfg), "x/pane");
+    }
+
+    #[test]
+    fn human_base_slugifies() {
+        let cfg = Config::default();
+        assert_eq!(
+            human_base("My Fix!", &cfg),
+            format!("{}my-fix", cfg.branch_prefix)
+        );
+    }
+
+    #[test]
+    fn dedupe_suffixes_until_free() {
+        let taken = BranchSet::from_names(["a".into(), "a-1".into()]);
+        assert_eq!(dedupe("a", &taken), "a-2");
+        assert_eq!(dedupe("b", &taken), "b");
+    }
+
+    #[test]
+    fn branch_set_load_sees_heads_and_worktree_branches() {
+        let repo = temp_repo("set");
+        assert!(util::git_ok(&repo, &["branch", "feature"]));
+        let wt = repo.join(".wt-other");
+        assert!(util::git_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "other",
+                &wt.to_string_lossy(),
+                "main",
+            ]
+        ));
+        let set = BranchSet::load(&repo);
+        assert!(set.taken("main"));
+        assert!(set.taken("feature"));
+        assert!(set.taken("other"));
+        assert!(!set.taken("free"));
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn branch_name_dedupes_against_repo() {
+        let repo = temp_repo("name");
+        let cfg = Config::default();
+        let first = branch_name(&repo, Some("dup"), &cfg);
+        assert_eq!(first, format!("{}dup", cfg.branch_prefix));
+        assert!(util::git_ok(&repo, &["branch", &first]));
+        assert_eq!(branch_name(&repo, Some("dup"), &cfg), format!("{first}-1"));
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }
