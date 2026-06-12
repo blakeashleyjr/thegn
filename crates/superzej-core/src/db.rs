@@ -22,7 +22,7 @@ use std::path::PathBuf;
 /// purely additive. v6: tabs live *within* a worktree — the flat `tab_layout`
 /// (pages encoded as " ·N" name suffixes) becomes `tab_groups` + `group_tabs`;
 /// legacy rows are transformed in place and `tab_layout` is dropped.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 pub struct Db {
     conn: Connection,
@@ -248,6 +248,20 @@ impl Db {
         // non-git directory). Defaults keep every pre-existing workspace a repo.
         let _ = conn.execute(
             "ALTER TABLE workspaces ADD COLUMN kind TEXT DEFAULT 'repo'",
+            [],
+        );
+        // v8: a persistent per-worktree sort key — the single source of truth
+        // for sidebar order (loaded + unloaded). Additive; backfilled below.
+        let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN position INTEGER", []);
+        // Backfill any unset positions deterministically by creation order
+        // (path as the tie-breaker), giving pre-v8 worktrees a stable,
+        // collision-free order on first launch after upgrade. Runs once: after
+        // this every row has a position, and `put_worktree` assigns MAX+1.
+        let _ = conn.execute(
+            "UPDATE worktrees SET position = (
+                 SELECT COUNT(*) FROM worktrees AS w2
+                 WHERE (w2.created_at, w2.worktree) < (worktrees.created_at, worktrees.worktree)
+             ) WHERE position IS NULL",
             [],
         );
         // v6: transform any remaining flat v4/v5 `tab_layout` into worktree
@@ -606,9 +620,11 @@ impl Db {
         branch: &str,
         location: Option<&str>,
     ) -> Result<()> {
+        // New worktrees append at the bottom (MAX+1); an upsert leaves the
+        // existing `position` untouched so a re-register never reshuffles order.
         self.conn.execute(
-            r#"INSERT INTO worktrees(worktree,session_name,tab_name,repo_path,branch,agent,created_at,location)
-               VALUES(?1,?2,?3,?4,?5,'',?6,?7)
+            r#"INSERT INTO worktrees(worktree,session_name,tab_name,repo_path,branch,agent,created_at,location,position)
+               VALUES(?1,?2,?3,?4,?5,'',?6,?7,(SELECT COALESCE(MAX(position),-1)+1 FROM worktrees))
                ON CONFLICT(worktree) DO UPDATE SET branch=?5, tab_name=?3, repo_path=?4, session_name=?2, location=?7"#,
             params![wt, session(), tab, root, branch, util::now(), location],
         )?;
@@ -707,9 +723,13 @@ impl Db {
 
     /// All recorded worktrees (metadata only; git supplies live status).
     pub fn worktrees(&self) -> Result<Vec<WorktreeRow>> {
+        // `position` is the persistent sort key (creation order by default,
+        // user-reorderable). Order by it so every consumer — the sidebar's
+        // unloaded-workspace rows and the resurrect adopt loop — is stable;
+        // created_at/path are deterministic tie-breakers for any unset row.
         let mut stmt = self.conn.prepare(
-            "SELECT worktree, branch, agent, created_at, repo_path, tab_name, session_name, location
-             FROM worktrees",
+            "SELECT worktree, branch, agent, created_at, repo_path, tab_name, session_name, location, position
+             FROM worktrees ORDER BY position, created_at, worktree",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(WorktreeRow {
@@ -721,9 +741,48 @@ impl Db {
                 tab_name: r.get(5)?,
                 session_name: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
                 location: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                position: r.get::<_, Option<i64>>(8)?.unwrap_or(0),
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Swap the persisted sort positions of two worktrees (by path). Used by
+    /// the sidebar's manual reorder (Shift+Alt+↑/↓): the caller picks the two
+    /// adjacent siblings, this exchanges their `position` so the new order
+    /// survives restart. Positions are globally unique (migration + MAX+1
+    /// inserts), so a swap can never create a collision.
+    pub fn swap_worktree_positions(&self, a: &str, b: &str) -> Result<()> {
+        // Read both first, then write — a single CASE-UPDATE that reads the
+        // table it mutates can observe its own intermediate write and clobber
+        // the swap.
+        let pos = |wt: &str| -> Result<Option<i64>> {
+            Ok(self
+                .conn
+                .query_row(
+                    "SELECT position FROM worktrees WHERE worktree=?1",
+                    params![wt],
+                    |r| r.get::<_, Option<i64>>(0),
+                )
+                .optional()?
+                .flatten())
+        };
+        if let (Some(pa), Some(pb)) = (pos(a)?, pos(b)?) {
+            self.set_worktree_position(a, pb)?;
+            self.set_worktree_position(b, pa)?;
+        }
+        Ok(())
+    }
+
+    /// Set one worktree's persisted sort position (path key). The session-layout
+    /// persist path uses this to keep `position` in step with the live group
+    /// order after a manual move.
+    pub fn set_worktree_position(&self, wt: &str, position: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE worktrees SET position=?2 WHERE worktree=?1",
+            params![wt, position],
+        )?;
+        Ok(())
     }
 
     // --- v6 session/layout persistence (native-host resurrect) -------------
@@ -1480,6 +1539,74 @@ mod tests {
         // delete
         db.del_worktree("/wt/other").unwrap();
         assert!(db.worktrees().unwrap().is_empty());
+    }
+
+    #[test]
+    fn worktree_position_default_is_creation_order() {
+        let db = db();
+        // Inserted a, b, c — `worktrees()` returns them in that creation order
+        // regardless of branch name (no alphabetizing), and positions are the
+        // dense 0,1,2 the appending MAX+1 insert assigns.
+        db.put_worktree("app/c", "/x/app", "/wt/c", "sz/c", None)
+            .unwrap();
+        db.put_worktree("app/a", "/x/app", "/wt/a", "sz/a", None)
+            .unwrap();
+        db.put_worktree("app/b", "/x/app", "/wt/b", "sz/b", None)
+            .unwrap();
+        let order: Vec<_> = db
+            .worktrees()
+            .unwrap()
+            .into_iter()
+            .map(|w| (w.worktree, w.position))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("/wt/c".into(), 0),
+                ("/wt/a".into(), 1),
+                ("/wt/b".into(), 2),
+            ]
+        );
+
+        // Re-registering an existing worktree (upsert) keeps its position — a
+        // metadata refresh must never reshuffle the list.
+        db.put_worktree("app/c", "/x/app", "/wt/c", "sz/c-renamed", None)
+            .unwrap();
+        let pos_c = db
+            .worktrees()
+            .unwrap()
+            .into_iter()
+            .find(|w| w.worktree == "/wt/c")
+            .unwrap()
+            .position;
+        assert_eq!(pos_c, 0, "upsert must preserve position");
+    }
+
+    #[test]
+    fn swap_worktree_positions_reorders() {
+        let db = db();
+        db.put_worktree("app/a", "/x/app", "/wt/a", "sz/a", None)
+            .unwrap();
+        db.put_worktree("app/b", "/x/app", "/wt/b", "sz/b", None)
+            .unwrap();
+        db.put_worktree("app/c", "/x/app", "/wt/c", "sz/c", None)
+            .unwrap();
+
+        // Swap the first two: order becomes b, a, c.
+        db.swap_worktree_positions("/wt/a", "/wt/b").unwrap();
+        let order: Vec<String> = db
+            .worktrees()
+            .unwrap()
+            .into_iter()
+            .map(|w| w.worktree)
+            .collect();
+        assert_eq!(order, vec!["/wt/b", "/wt/a", "/wt/c"]);
+
+        // set_worktree_position is the persist-side primitive; moving c to the
+        // front (a fresh min) floats it above the rest.
+        db.set_worktree_position("/wt/c", -1).unwrap();
+        let first = db.worktrees().unwrap().into_iter().next().unwrap().worktree;
+        assert_eq!(first, "/wt/c");
     }
 
     #[test]
