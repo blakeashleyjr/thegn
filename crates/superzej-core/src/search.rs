@@ -5,7 +5,10 @@
 //! it holds query + ranked matches; the host layer owns the overlay UI and
 //! feeds the engine sources on each keystroke.
 
-use nucleo_matcher::{Config, Matcher, Utf32Str, pattern::{CaseMatching, Normalization, Pattern}};
+use nucleo_matcher::{
+    Config, Matcher, Utf32Str,
+    pattern::{CaseMatching, Normalization, Pattern},
+};
 
 use crate::history::HistoryBuffer;
 
@@ -347,7 +350,11 @@ mod tests {
         let mut eng = engine(SearchScope::Worktree);
         eng.set_query("build", &sources);
         assert_eq!(eng.matches().len(), 2);
-        let labels: Vec<_> = eng.matches().iter().map(|m| m.pane_label.as_str()).collect();
+        let labels: Vec<_> = eng
+            .matches()
+            .iter()
+            .map(|m| m.pane_label.as_str())
+            .collect();
         assert!(labels.contains(&"tab 1 · main"));
         assert!(labels.contains(&"tab 2 · feat"));
     }
@@ -419,7 +426,11 @@ mod tests {
         eng.push_char('a', &sources);
         eng.push_char('r', &sources);
         assert_eq!(eng.query(), "car");
-        assert!(eng.matches().iter().all(|m| m.line.to_lowercase().contains('c')));
+        assert!(
+            eng.matches()
+                .iter()
+                .all(|m| m.line.to_lowercase().contains('c'))
+        );
         eng.backspace(&sources);
         assert_eq!(eng.query(), "ca");
     }

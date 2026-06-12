@@ -8729,8 +8729,9 @@ async fn event_loop<T: Terminal>(
                                     chrome.center,
                                 ) {
                                     Ok(id) => {
-                                        if let Some(tab) =
-                                            session.active_group_mut().and_then(|g| g.active_tab_mut())
+                                        if let Some(tab) = session
+                                            .active_group_mut()
+                                            .and_then(|g| g.active_tab_mut())
                                         {
                                             tab.center = crate::center::CenterTree::Leaf(id);
                                             tab.focused_pane = id;
