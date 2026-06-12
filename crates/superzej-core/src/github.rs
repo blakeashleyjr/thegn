@@ -328,6 +328,48 @@ pub fn pr_status_full(loc: &GitLoc) -> PrPanel {
     panel
 }
 
+/// One open PR's identifying header — the per-branch PR-badge feed
+/// (`gh pr list`), cached as a JSON array in `pr_branch_cache`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrHeader {
+    pub number: u64,
+    #[serde(rename = "headRefName")]
+    pub head_ref: String,
+    pub state: String,
+    pub url: String,
+    #[serde(rename = "isDraft", default)]
+    pub is_draft: bool,
+}
+
+/// Parse the cached/CLI JSON array of PR headers (empty on any mismatch).
+pub fn parse_pr_headers(json: &str) -> Vec<PrHeader> {
+    serde_json::from_str(json).unwrap_or_default()
+}
+
+/// The repo's open PRs, one header per branch
+/// (`gh pr list --json … --limit <n>`).
+pub fn pr_list(loc: &GitLoc, limit: usize) -> Result<Vec<PrHeader>, GhError> {
+    let limit = limit.to_string();
+    let json = gh_out(
+        loc,
+        &[
+            "pr",
+            "list",
+            "--json",
+            "number,headRefName,state,url,isDraft",
+            "--limit",
+            &limit,
+        ],
+    )?;
+    Ok(parse_pr_headers(&json))
+}
+
+/// Open the PR belonging to `branch` in the browser
+/// (`gh pr view <branch> --web`) — the fallback when no cached URL exists.
+pub fn open_pr_for_branch(loc: &GitLoc, branch: &str) -> Result<(), GhError> {
+    gh_run(loc, &["pr", "view", branch, "--web"])
+}
+
 /// `(owner, repo)` from a GitHub PR/issue/repo URL
 /// (`https://github.com/OWNER/REPO[/...]`). Forge-host agnostic: any host
 /// with the same path shape parses.

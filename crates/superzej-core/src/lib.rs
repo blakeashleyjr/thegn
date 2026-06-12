@@ -11,19 +11,24 @@
 
 pub mod activity;
 pub mod config;
+pub mod custom_cmd;
 pub mod db;
 pub mod diff_highlight;
 pub mod diff_sbs;
 pub mod forge;
 pub mod github;
+pub mod gitrefs;
 pub mod gitviz;
 pub mod keymap;
 pub mod log;
 pub mod models;
 pub mod msg;
 pub mod out;
+pub mod patch;
 pub mod picker;
 pub mod plugin_api;
+pub mod rebase_todo;
+pub mod reflog;
 pub mod remote;
 pub mod repo;
 pub mod sandbox;

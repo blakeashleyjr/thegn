@@ -6,7 +6,46 @@
 
 use anyhow::{Context, Result};
 use std::path::Path;
+use superzej_core::gitrefs::{BranchInfo, Commit, StashEntry};
+use superzej_core::reflog::ReflogEntry;
 use superzej_core::remote::GitLoc;
+
+mod bisect;
+mod branch;
+mod cherry;
+mod commit;
+mod custom;
+mod patch;
+mod rebase;
+mod stage;
+mod stash;
+mod undo;
+
+pub use bisect::BisectOps;
+pub use branch::{BranchOps, ForceMode};
+pub use cherry::CherryOps;
+pub use commit::{CommitOps, ResetMode};
+pub use custom::CustomOps;
+pub use patch::PatchOps;
+pub use rebase::{PauseReason, RebaseOps, RebaseOpts, RebaseOutcome, RebaseStatus};
+pub use stage::StageOps;
+pub use stash::StashOps;
+pub use undo::UndoOps;
+
+/// Diff flags for any output that will later be fed to `git apply`: user
+/// config (`diff.noprefix`), external diff drivers, and rename headers all
+/// produce patches `git apply` rejects, so the panel's stageable diffs pin
+/// them off. `-c` must precede the subcommand, so this replaces the leading
+/// `"diff"` arg rather than following it.
+pub(crate) const SANITIZED_DIFF: &[&str] = &[
+    "-c",
+    "diff.noprefix=false",
+    "diff",
+    "--no-color",
+    "--no-ext-diff",
+    "--no-renames",
+    "-U3",
+];
 
 /// A changed file in `git status` terms (porcelain XY + path).
 #[derive(Debug, Clone)]
@@ -42,6 +81,7 @@ pub enum MergeKind {
     Merge,
     Rebase,
     CherryPick,
+    Revert,
 }
 
 impl MergeKind {
@@ -51,6 +91,7 @@ impl MergeKind {
             MergeKind::Merge => "MERGING",
             MergeKind::Rebase => "REBASING",
             MergeKind::CherryPick => "CHERRY-PICK",
+            MergeKind::Revert => "REVERTING",
         }
     }
 }
@@ -219,6 +260,8 @@ pub trait GitBackend: Send + Sync {
             Some((MergeKind::Rebase, "REBASE_HEAD"))
         } else if exists("CHERRY_PICK_HEAD") {
             Some((MergeKind::CherryPick, "CHERRY_PICK_HEAD"))
+        } else if exists("REVERT_HEAD") {
+            Some((MergeKind::Revert, "REVERT_HEAD"))
         } else {
             None
         };
@@ -268,6 +311,99 @@ pub trait GitBackend: Send + Sync {
         Ok(out.lines().filter(|l| !l.trim().is_empty()).count())
     }
 
+    /// The last `n` commits as structured records (parents included — the
+    /// commit-graph / commits-view feed).
+    fn log_commits(&self, loc: &GitLoc, n: usize) -> Result<Vec<Commit>> {
+        let n = n.to_string();
+        let out = run(
+            loc,
+            &[
+                "log",
+                "--format=%x1f%H%x1f%h%x1f%an%x1f%ae%x1f%ct%x1f%P%x1f%D%x1f%s",
+                "-n",
+                &n,
+            ],
+        )?;
+        Ok(superzej_core::gitrefs::parse_commits(&out))
+    }
+
+    /// All local branches with upstream/divergence detail, newest first.
+    fn branches_full(&self, loc: &GitLoc) -> Result<Vec<BranchInfo>> {
+        let out = run(
+            loc,
+            &[
+                "for-each-ref",
+                "refs/heads",
+                "--sort=-committerdate",
+                "--format=%(HEAD)%x1f%(refname:short)%x1f%(upstream:short)%x1f%(upstream:track)%x1f%(objectname)%x1f%(committerdate:unix)%x1f%(contents:subject)",
+            ],
+        )?;
+        Ok(superzej_core::gitrefs::parse_branches(&out))
+    }
+
+    /// The stash as structured entries (empty on a stash-less repo).
+    fn stash_list(&self, loc: &GitLoc) -> Result<Vec<StashEntry>> {
+        let out = match loc
+            .git_command(&["stash", "list", "--format=%gd\u{1f}%H\u{1f}%ct\u{1f}%gs"])
+            .output()
+        {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+            _ => return Ok(Vec::new()),
+        };
+        Ok(superzej_core::gitrefs::parse_stashes(&out))
+    }
+
+    /// The last `n` HEAD reflog entries (the undo planner's feed).
+    fn reflog(&self, loc: &GitLoc, n: usize) -> Result<Vec<ReflogEntry>> {
+        let n = n.to_string();
+        let out = run(
+            loc,
+            &["reflog", "--format=%H%x1f%gd%x1f%ct%x1f%gs", "-n", &n],
+        )?;
+        Ok(superzej_core::reflog::parse_reflog(&out))
+    }
+
+    /// Diffstat between two arbitrary refs (`diff_files` with an `A..B`
+    /// base) — named for discoverability.
+    fn diff_refs(&self, loc: &GitLoc, from: &str, to: &str) -> Result<Vec<DiffEntry>> {
+        self.diff_files(loc, &format!("{from}..{to}"))
+    }
+
+    /// One file's worktree-vs-index diff, sanitized for `git apply`
+    /// round-trips (see [`SANITIZED_DIFF`]). Empty string when unchanged.
+    fn unstaged_diff(&self, loc: &GitLoc, path: &str) -> Result<String> {
+        let mut args = SANITIZED_DIFF.to_vec();
+        args.extend(["--", path]);
+        run(loc, &args)
+    }
+
+    /// One file's index-vs-HEAD diff, sanitized for `git apply` round-trips.
+    fn staged_diff(&self, loc: &GitLoc, path: &str) -> Result<String> {
+        let mut args = SANITIZED_DIFF.to_vec();
+        args.extend(["--cached", "--", path]);
+        run(loc, &args)
+    }
+
+    /// A commit's patch (optionally narrowed to one path), sanitized for
+    /// `git apply` round-trips — the custom-patch builder's feed.
+    fn commit_diff(&self, loc: &GitLoc, sha: &str, path: Option<&str>) -> Result<String> {
+        let mut args = vec![
+            "-c",
+            "diff.noprefix=false",
+            "show",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-renames",
+            "-U3",
+            "--format=",
+            sha,
+        ];
+        if let Some(p) = path {
+            args.extend(["--", p]);
+        }
+        run(loc, &args)
+    }
+
     /// Stage one path (`git add -- <path>`).
     fn stage(&self, loc: &GitLoc, path: &str) -> Result<()> {
         run(loc, &["add", "--", path]).map(|_| ())
@@ -296,6 +432,59 @@ fn run(loc: &GitLoc, args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The write-op runner: like [`run`] but with extra env, a null stdin, and
+/// `GIT_TERMINAL_PROMPT=0` — a credential/gpg prompt must fail fast, never
+/// hang the background thread that mutations run on.
+pub(crate) fn run_w(loc: &GitLoc, envs: &[(&str, &str)], args: &[&str]) -> Result<String> {
+    let mut env: Vec<(&str, &str)> = vec![("GIT_TERMINAL_PROMPT", "0")];
+    env.extend_from_slice(envs);
+    let out = loc
+        .git_command_env(&env, args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .with_context(|| format!("git {}", args.join(" ")))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// [`run_w`] with bytes piped to stdin (`git apply -`, `git commit -F -`).
+pub(crate) fn run_stdin(
+    loc: &GitLoc,
+    envs: &[(&str, &str)],
+    args: &[&str],
+    stdin: &[u8],
+) -> Result<String> {
+    let mut env: Vec<(&str, &str)> = vec![("GIT_TERMINAL_PROMPT", "0")];
+    env.extend_from_slice(envs);
+    let out = loc
+        .git_with_stdin(&env, args, stdin)
+        .with_context(|| format!("git {}", args.join(" ")))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// `-c` flags disabling gpg signing for history rewrites when the user set
+/// `[git] override_gpg = true` (a passphrase prompt would stall the op).
+pub(crate) fn gpg_args(override_gpg: bool) -> &'static [&'static str] {
+    if override_gpg {
+        &["-c", "commit.gpgSign=false", "-c", "tag.gpgSign=false"]
+    } else {
+        &[]
+    }
 }
 
 fn run_root(root: &Path, args: &[&str]) -> Result<()> {
@@ -559,6 +748,123 @@ impl GitBackend for GixGit {
     }
     fn remove_worktree(&self, root: &Path, path: &Path, delete_branch: bool) -> Result<()> {
         self.fallback.remove_worktree(root, path, delete_branch)
+    }
+}
+
+/// Shared real-repo fixture helpers for the ops modules' integration tests.
+#[cfg(test)]
+pub(crate) mod testutil {
+    use std::path::{Path, PathBuf};
+
+    /// A throwaway repo under /tmp, removed on drop. `git init -b main` done.
+    pub(crate) struct TestRepo {
+        pub dir: PathBuf,
+    }
+
+    impl TestRepo {
+        pub fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "sz-git-{tag}-{}-{:x}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .subsec_nanos()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            git_in(&dir, &["init", "-q", "-b", "main"]);
+            TestRepo { dir }
+        }
+
+        pub fn loc(&self) -> superzej_core::remote::GitLoc {
+            superzej_core::remote::GitLoc::for_worktree(&self.dir)
+        }
+
+        /// Write a file and `git add` + commit it.
+        pub fn commit_file(&self, path: &str, content: &str, msg: &str) {
+            std::fs::write(self.dir.join(path), content).unwrap();
+            git_in(&self.dir, &["add", path]);
+            git_in(&self.dir, &["commit", "-q", "-m", msg]);
+        }
+
+        /// Trimmed stdout of a git command (panics on failure).
+        pub fn out(&self, args: &[&str]) -> String {
+            let out = git_cmd(&self.dir, args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        /// Commit subjects, newest first.
+        pub fn subjects(&self) -> Vec<String> {
+            self.out(&["log", "--format=%s"])
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        pub fn head(&self) -> String {
+            self.out(&["rev-parse", "HEAD"])
+        }
+
+        /// Sha of a commit by subject (panics if absent/ambiguous).
+        pub fn sha_of(&self, subject: &str) -> String {
+            let out = self.out(&["log", "--format=%H %s"]);
+            let mut hits = out.lines().filter(|l| {
+                l.split_once(' ')
+                    .map(|(_, s)| s == subject)
+                    .unwrap_or(false)
+            });
+            let sha = hits
+                .next()
+                .unwrap_or_else(|| panic!("no commit with subject {subject:?}"))
+                .split(' ')
+                .next()
+                .unwrap()
+                .to_string();
+            assert!(hits.next().is_none(), "ambiguous subject {subject:?}");
+            sha
+        }
+    }
+
+    impl Drop for TestRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn git_cmd(dir: &Path, args: &[&str]) -> std::process::Command {
+        let mut c = std::process::Command::new("git");
+        c.args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@e")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@e")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null");
+        c
+    }
+
+    /// Run `git` in `dir`, panicking on failure.
+    pub(crate) fn git_in(dir: &Path, args: &[&str]) {
+        let out = git_cmd(dir, args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "git {} failed in {}: {}",
+            args.join(" "),
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    pub(crate) fn commit_empty(dir: &Path, msg: &str) {
+        git_in(dir, &["commit", "--allow-empty", "-q", "-m", msg]);
     }
 }
 

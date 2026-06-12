@@ -338,6 +338,70 @@ pub struct CustomAction {
     pub close_on_exit: bool,
 }
 
+config_enum! {
+    /// Where a git custom command's output goes: discarded, shown in a
+    /// popup overlay, or run in a floating terminal pane.
+    pub enum GitCmdOutput: "git command output" {
+        None = "none", Popup = "popup", Terminal = "terminal",
+    } default = Popup;
+}
+
+/// An input collected before a git custom command runs; the response is
+/// referenced in the command template as `{{ .Form.<key> }}`.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct GitPrompt {
+    /// Template lookup key (`{{ .Form.<key> }}`).
+    pub key: String,
+    /// Prompt title shown to the user (defaults to `key`).
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Prompt kind; only `input` exists today.
+    #[serde(default = "default_prompt_kind", rename = "type")]
+    pub kind: String,
+}
+
+fn default_prompt_kind() -> String {
+    "input".into()
+}
+
+fn default_git_context() -> String {
+    "global".into()
+}
+
+/// A user-defined git custom command (`[[git_commands]]`), lazygit-style: a
+/// key reachable from the git panel's custom-commands menu, whose command
+/// line expands `{{ .SelectedCommit.Sha }}`-style template variables against
+/// the current selection (see `custom_cmd`).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct GitCommand {
+    /// Menu hotkey (single character) inside the custom-commands menu.
+    pub key: String,
+    /// Which git view offers it: `commits`, `branches`, `files`, `stash`,
+    /// or `global` (every git view).
+    #[serde(default = "default_git_context")]
+    pub context: String,
+    /// Shell command template, run via `sh -c` after expansion.
+    pub command: String,
+    /// Menu label (defaults to the command text).
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub output: GitCmdOutput,
+    #[serde(default)]
+    pub prompts: Vec<GitPrompt>,
+}
+
+/// Git behavior knobs for the panel's write operations (`[git]`).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct GitConfig {
+    /// Pass `-c commit.gpgSign=false -c tag.gpgSign=false` to
+    /// history-rewriting operations (rebase, amend, cherry-pick) so a gpg
+    /// passphrase prompt can never hang a background op. Off by default: a
+    /// working gpg-agent signs headlessly.
+    pub override_gpg: bool,
+}
+
 /// Host keybinding overrides. The flat `[keybinds]` table remains the
 /// default/global layer for backwards compatibility; nested tables such as
 /// `[keybinds.vim_normal]` override only the native host's named modes.
@@ -1188,8 +1252,10 @@ pub struct Config {
     pub pins: Vec<Pin>,
     pub tasks: Vec<Task>,
     pub actions: Vec<CustomAction>,
+    pub git_commands: Vec<GitCommand>,
     pub plugins: Vec<crate::plugin_api::PluginManifest>,
     // --- sub-tables ---
+    pub git: GitConfig,
     pub theme: ThemeConfig,
     pub monitor: MonitorConfig,
     pub stats: StatsConfig,
@@ -1248,7 +1314,9 @@ impl Default for Config {
             tools: Vec::new(),
             pins: Vec::new(),
             tasks: Vec::new(),
+            git_commands: Vec::new(),
             plugins: Vec::new(),
+            git: GitConfig::default(),
             theme: ThemeConfig::default(),
             monitor: MonitorConfig::default(),
             stats: StatsConfig::default(),
@@ -2400,6 +2468,50 @@ surface = "todoist.status"
         assert!(cfg.drawer.contain);
         assert_eq!(cfg.drawer.pool_limit, 1);
         assert!(!cfg.drawer.prewarm);
+    }
+
+    #[test]
+    fn git_section_and_custom_commands_parse() {
+        let cfg: Config = toml::from_str(
+            r#"
+[git]
+override_gpg = true
+
+[[git_commands]]
+key = "p"
+context = "branches"
+command = "git push {{.SelectedBranch.Name | quote}}"
+output = "terminal"
+description = "push selected branch"
+prompts = [{ type = "input", title = "Remote", key = "Remote" }]
+
+[[git_commands]]
+key = "n"
+command = "git notes add {{.SelectedCommit.Sha}}"
+"#,
+        )
+        .unwrap();
+        assert!(cfg.git.override_gpg);
+        assert_eq!(cfg.git_commands.len(), 2);
+        let c = &cfg.git_commands[0];
+        assert_eq!(c.key, "p");
+        assert_eq!(c.context, "branches");
+        assert_eq!(c.output, GitCmdOutput::Terminal);
+        assert_eq!(c.description.as_deref(), Some("push selected branch"));
+        assert_eq!(c.prompts.len(), 1);
+        assert_eq!(c.prompts[0].key, "Remote");
+        assert_eq!(c.prompts[0].kind, "input");
+        assert_eq!(c.prompts[0].title.as_deref(), Some("Remote"));
+        // Defaults: context global, popup output, no prompts.
+        let c = &cfg.git_commands[1];
+        assert_eq!(c.context, "global");
+        assert_eq!(c.output, GitCmdOutput::Popup);
+        assert!(c.prompts.is_empty());
+
+        // Absent section → defaults.
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(!cfg.git.override_gpg);
+        assert!(cfg.git_commands.is_empty());
     }
 
     #[test]
