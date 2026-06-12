@@ -658,6 +658,18 @@ impl Db {
         Ok(())
     }
 
+    /// Forget the registry row for a worktree group by its owning repo and tab
+    /// name. This is intentionally independent of the worktree path so close /
+    /// delete operations cannot be undone by a stale row whose path was moved or
+    /// normalized differently than the live session group.
+    pub fn del_worktree_for_tab(&self, repo_root: &str, tab: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM worktrees WHERE repo_path=?1 AND tab_name=?2",
+            params![repo_root, tab],
+        )?;
+        Ok(())
+    }
+
     pub fn set_worktree_sandbox(&self, wt: &str, backend: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE worktrees SET sandbox_backend=?2 WHERE worktree=?1",
@@ -1452,17 +1464,21 @@ mod tests {
         db.put_worktree(
             "app/feat",
             "/x/app",
-            "/wt/feat",
+            "/wt/feat-renamed-on-disk",
             "sz/feat",
             Some("{\"host\":\"box\"}"),
         )
         .unwrap();
-        assert_eq!(
-            db.location_for("/wt/feat").unwrap().as_deref(),
-            Some("{\"host\":\"box\"}")
+        db.del_worktree_for_tab("/x/app", "app/feat").unwrap();
+        assert!(
+            db.worktrees().unwrap().is_empty(),
+            "closing/deleting a worktree group must forget registry rows even if the path changed"
         );
+
+        db.put_worktree("app/other", "/x/app", "/wt/other", "sz/other", None)
+            .unwrap();
         // delete
-        db.del_worktree("/wt/feat").unwrap();
+        db.del_worktree("/wt/other").unwrap();
         assert!(db.worktrees().unwrap().is_empty());
     }
 

@@ -5,7 +5,17 @@ use termwiz::input::{KeyCode, Modifiers};
 
 use crate::emulator::MouseMode;
 
-/// Translate a termwiz key event into the bytes a terminal app expects on
+/// True when a termwiz key event represents the physical Escape key.
+///
+/// Most terminals decode Esc as [`KeyCode::Escape`], but CSI-u/fixterms
+/// terminals can report the same key as `KeyCode::Char('\x1b')` (termwiz's
+/// basic CSI-u map does this for `ESC [ 27 u`). Host overlays should treat both
+/// spellings as cancel/dismiss so Esc never gets appended to palette/input text.
+pub(crate) fn is_escape_key(key: &KeyCode) -> bool {
+    matches!(key, KeyCode::Escape | KeyCode::Char('\x1b'))
+}
+
+/// Translate a termwiz key event into the bytes a terminal application expects on
 /// stdin (normal cursor-key mode).
 pub(crate) fn key_bytes(key: &KeyCode, mods: Modifiers) -> Option<Vec<u8>> {
     key_bytes_mode(key, mods, false)
@@ -113,6 +123,13 @@ pub(crate) fn encode_mouse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escape_key_helper_accepts_termwiz_csi_u_escape_char() {
+        assert!(is_escape_key(&KeyCode::Escape));
+        assert!(is_escape_key(&KeyCode::Char('\x1b')));
+        assert!(!is_escape_key(&KeyCode::Char('q')));
+    }
 
     #[test]
     fn app_cursor_switches_arrows_to_ss3() {
