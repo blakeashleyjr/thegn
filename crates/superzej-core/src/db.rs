@@ -22,7 +22,7 @@ use std::path::PathBuf;
 /// purely additive. v6: tabs live *within* a worktree — the flat `tab_layout`
 /// (pages encoded as " ·N" name suffixes) becomes `tab_groups` + `group_tabs`;
 /// legacy rows are transformed in place and `tab_layout` is dropped.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 pub struct Db {
     conn: Connection,
@@ -218,6 +218,22 @@ impl Db {
             -- Switch/panel-resolve hot path: worktree lookup keyed by the tab.
             CREATE INDEX IF NOT EXISTS idx_worktrees_session_tab
               ON worktrees (session_name, tab_name);
+            -- v7: reflog undo bookkeeping — the reset targets WE wrote, so the
+            -- undo planner can tell its own resets from user actions (capped
+            -- per worktree on insert).
+            CREATE TABLE IF NOT EXISTS undo_marks (
+              worktree TEXT NOT NULL,
+              sha      TEXT NOT NULL,
+              ts       INTEGER NOT NULL,
+              PRIMARY KEY (worktree, sha)
+            );
+            -- v7: open-PRs-by-branch cache per repo (JSON array), so branch
+            -- rows can render PR badges without a network call.
+            CREATE TABLE IF NOT EXISTS pr_branch_cache (
+              repo_root  TEXT PRIMARY KEY,
+              json       TEXT,
+              fetched_at INTEGER
+            );
             COMMIT;
             "#,
         )?;
@@ -262,6 +278,57 @@ impl Db {
             params![worktree, branch, json, util::now()],
         )?;
         Ok(())
+    }
+
+    // --- per-repo open-PRs-by-branch cache (feeds branch-row PR badges) ----
+    pub fn get_pr_branch_cache(&self, repo_root: &str) -> Result<Option<(String, i64)>> {
+        let r = self
+            .conn
+            .query_row(
+                "SELECT json, fetched_at FROM pr_branch_cache WHERE repo_root=?1",
+                params![repo_root],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .ok();
+        Ok(r)
+    }
+
+    pub fn put_pr_branch_cache(&self, repo_root: &str, json: &str) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO pr_branch_cache(repo_root,json,fetched_at)
+               VALUES(?1,?2,?3)
+               ON CONFLICT(repo_root) DO UPDATE SET json=?2, fetched_at=?3"#,
+            params![repo_root, json, util::now()],
+        )?;
+        Ok(())
+    }
+
+    // --- reflog-undo bookkeeping (which resets are OURS, per worktree) ------
+    /// Record a reset target we are about to create, pruning each worktree's
+    /// mark set to the freshest 100 (the undo planner only reads ~100 reflog
+    /// entries anyway).
+    pub fn add_undo_mark(&self, worktree: &str, sha: &str) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO undo_marks(worktree,sha,ts) VALUES(?1,?2,?3)
+               ON CONFLICT(worktree,sha) DO UPDATE SET ts=?3"#,
+            params![worktree, sha, util::now()],
+        )?;
+        self.conn.execute(
+            r#"DELETE FROM undo_marks WHERE worktree=?1 AND sha NOT IN (
+                 SELECT sha FROM undo_marks WHERE worktree=?1
+                 ORDER BY ts DESC LIMIT 100)"#,
+            params![worktree],
+        )?;
+        Ok(())
+    }
+
+    /// All recorded undo-reset targets for a worktree (newest first).
+    pub fn undo_marks(&self, worktree: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT sha FROM undo_marks WHERE worktree=?1 ORDER BY ts DESC")?;
+        let rows = stmt.query_map(params![worktree], |r| r.get::<_, String>(0))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     // --- diff cache (per worktree; feeds panel-snapshot's instant paint) ----
@@ -1275,6 +1342,36 @@ mod tests {
         // Different repo, same basename → suffixed.
         assert_eq!(db.slug_for_repo("/y/app", "app").unwrap(), "app-2");
         assert_eq!(db.slug_for_repo("/z/app", "app").unwrap(), "app-3");
+    }
+
+    #[test]
+    fn pr_branch_cache_roundtrip_and_upsert() {
+        let db = db();
+        assert!(db.get_pr_branch_cache("/repo").unwrap().is_none());
+        db.put_pr_branch_cache("/repo", "[{\"number\":1}]").unwrap();
+        let (json, at) = db.get_pr_branch_cache("/repo").unwrap().unwrap();
+        assert_eq!(json, "[{\"number\":1}]");
+        assert!(at > 0);
+        db.put_pr_branch_cache("/repo", "[]").unwrap();
+        assert_eq!(db.get_pr_branch_cache("/repo").unwrap().unwrap().0, "[]");
+    }
+
+    #[test]
+    fn undo_marks_record_dedupe_and_cap() {
+        let db = db();
+        assert!(db.undo_marks("/wt").unwrap().is_empty());
+        db.add_undo_mark("/wt", "aaa").unwrap();
+        db.add_undo_mark("/wt", "bbb").unwrap();
+        db.add_undo_mark("/wt", "aaa").unwrap(); // refresh, not duplicate
+        let marks = db.undo_marks("/wt").unwrap();
+        assert_eq!(marks.len(), 2);
+        // Other worktrees are isolated.
+        assert!(db.undo_marks("/other").unwrap().is_empty());
+        // Cap: 110 inserts keep only the freshest 100.
+        for i in 0..110 {
+            db.add_undo_mark("/cap", &format!("sha{i:03}")).unwrap();
+        }
+        assert_eq!(db.undo_marks("/cap").unwrap().len(), 100);
     }
 
     #[test]
