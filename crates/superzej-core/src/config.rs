@@ -87,6 +87,14 @@ config_enum! {
     } default = Auto;
 }
 config_enum! {
+    /// Whether the outer terminal renders curly underlines (conflict
+    /// squiggles). "auto" sniffs $TERM/$TERM_PROGRAM; unsupported terminals
+    /// degrade to a single underline.
+    pub enum UndercurlMode: "undercurl mode" {
+        Auto = "auto", On = "on", Off = "off",
+    } default = Auto;
+}
+config_enum! {
     /// Where worktrees live on disk.
     pub enum WorktreeMode: "worktree_mode" {
         Global = "global", InRepo = "in_repo",
@@ -414,32 +422,46 @@ pub struct WorkspaceConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct ThemeConfig {
-    /// Named palette preset: "storm" (default), "light", "abyss", "ember",
-    /// "aurora". `[theme.colors]` overrides apply on top.
+    /// Named palette preset: "prism" (default), "storm", "light", "abyss",
+    /// "ember", "aurora". `[theme.colors]` / `[theme.hues]` overrides apply
+    /// on top.
     pub preset: String,
     /// Focus accent as "#rrggbb" (default the signature teal).
     pub accent: String,
     /// Frame/highlight color of the focused pane, tab, and chrome edge
-    /// (default light blue).
+    /// (default the accent teal).
     pub focus_border: String,
     /// Horizontal breathing room (cells) between a pane's frame and its
     /// content, each side.
     pub pane_padding: u16,
+    /// Curly-underline support: "auto" (sniff the terminal), "on", "off".
+    pub undercurl: UndercurlMode,
     /// Optional overrides for every chrome surface/text color.
     pub colors: ThemeColors,
+    /// Optional overrides for the eight semantic hues.
+    pub hues: ThemeHues,
 }
 
 impl Default for ThemeConfig {
     fn default() -> Self {
         ThemeConfig {
-            preset: "storm".into(),
-            accent: "#76eede".into(),
-            focus_border: "#9bd1ff".into(),
+            preset: "prism".into(),
+            accent: "#6ee7d8".into(),
+            focus_border: "#6ee7d8".into(),
             pane_padding: 0,
+            undercurl: UndercurlMode::Auto,
             colors: ThemeColors::default(),
+            hues: ThemeHues::default(),
         }
     }
 }
+
+/// Accent/focus values treated as "not customized" when deciding whether the
+/// user's `[theme]` should clobber a preset's own accent: the current default
+/// plus the pre-prism defaults (a config that pinned the old default keeps
+/// preset-cycling behavior).
+const DEFAULTISH_ACCENTS: &[&str] = &["#6ee7d8", "#76eede"];
+const DEFAULTISH_FOCUS: &[&str] = &["#6ee7d8", "#9bd1ff"];
 
 /// `[theme.colors]` — all optional "#rrggbb" overrides; unset keys keep the
 /// built-in storm-blue defaults (src/theme.rs).
@@ -467,6 +489,44 @@ pub struct ThemeColors {
     pub faint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ghost: Option<String>,
+    /// Foreground ramp step below ghost (structural glyphs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ghost2: Option<String>,
+    /// Deepest structural foreground (rules, fills, tracks).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ghost3: Option<String>,
+    /// Background of layer shadow cells.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow_bg: Option<String>,
+    /// Foreground of layer shadow cells.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow_fg: Option<String>,
+    /// Text inside inverse chips (defaults to bg0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chip_fg: Option<String>,
+}
+
+/// `[theme.hues]` — all optional "#rrggbb" overrides for the eight semantic
+/// hues (identity + status colors); unset keys keep the preset's hues.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct ThemeHues {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub teal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub magenta: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purple: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub green: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amber: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub red: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blue: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orange: Option<String>,
 }
 
 /// `[monitor]` — the resource managers opened from the top-bar stats widget
@@ -525,8 +585,11 @@ impl Default for StatsConfig {
             cpu_icon: "\u{f4bc}".into(),
             mem_icon: "\u{efc5}".into(),
             net_icon: "\u{f06f3}".into(),
-            // Same-width glyph family as the others (the old gpu glyph
-            // rendered narrower in the bundled Nerd Font).
+            // Material Design "expansion-card-variant" (the canonical GPU
+            // glyph), same MDI family as the net icon so it fills the cell
+            // like its neighbors. The old FA microchip (U+F2DB) rendered
+            // visibly smaller. Glyph metrics are font-specific — override via
+            // `[stats] gpu_icon` if yours still disagrees.
             gpu_icon: "\u{f0fb2}".into(),
             battery_icon: "\u{f0079}".into(),
             battery_charging_icon: "\u{f0084}".into(),
@@ -1087,6 +1150,17 @@ impl StripConfig {
     }
 }
 
+/// `[panel]` — the right accordion panel.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct PanelConfig {
+    /// Section display order, by key (`"changes"`, `"git"`, `"files"`,
+    /// `"tests"`, `"debug"`, `"sandbox"`, `"db"`, `"telemetry"`, `"keys"`).
+    /// Sections omitted from the list are hidden; an empty list (the default)
+    /// shows every section in its built-in order. Unknown keys are ignored.
+    pub sections: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct Config {
@@ -1128,6 +1202,7 @@ pub struct Config {
     pub limits: LimitsConfig,
     pub drawer: DrawerConfig,
     pub strip: StripConfig,
+    pub panel: PanelConfig,
     /// Rebind a built-in action by id, e.g. `new-worktree = "Ctrl w"`. The flat
     /// table is the global/default layer; nested mode tables are native-host only.
     pub keybinds: KeybindConfig,
@@ -1186,6 +1261,7 @@ impl Default for Config {
             limits: LimitsConfig::default(),
             drawer: DrawerConfig::default(),
             strip: StripConfig::default(),
+            panel: PanelConfig::default(),
             keybinds: KeybindConfig::default(),
             actions: Vec::new(),
             profile: String::new(),
@@ -1665,14 +1741,14 @@ impl Config {
     /// The accent as a truecolor "R;G;B" fragment; invalid hex falls back to
     /// the default teal.
     pub fn accent_rgb(&self) -> String {
-        parse_hex_rgb(&self.theme.accent).unwrap_or_else(|| crate::theme::TEAL.to_string())
+        parse_hex_rgb(&self.theme.accent).unwrap_or_else(|| crate::theme::HUE_TEAL.to_string())
     }
 
     /// The accent as "#rrggbb" (validated; falls back to the default teal).
     pub fn accent_hex(&self) -> String {
         match parse_hex_rgb(&self.theme.accent) {
             Some(_) => self.theme.accent.to_ascii_lowercase(),
-            None => "#76eede".into(),
+            None => "#6ee7d8".into(),
         }
     }
 
@@ -1682,8 +1758,10 @@ impl Config {
         self.palette_with_preset(&self.theme.preset)
     }
 
-    /// The palette for a named preset with this config's `[theme.colors]` +
-    /// accent/focus overrides applied — the live theme-cycle uses this.
+    /// The palette for a named preset with this config's `[theme.colors]` /
+    /// `[theme.hues]` + accent/focus overrides applied — the live theme-cycle
+    /// uses this. Extension tokens a legacy preset leaves empty are derived
+    /// last, so derivations follow any user-overridden base colors.
     pub fn palette_with_preset(&self, preset: &str) -> crate::theme::Palette {
         let mut p = crate::theme::preset(preset).unwrap_or_default();
         let set = |slot: &mut String, hex: &Option<String>| {
@@ -1702,15 +1780,30 @@ impl Config {
         set(&mut p.dim, &c.dim);
         set(&mut p.faint, &c.faint);
         set(&mut p.ghost, &c.ghost);
+        set(&mut p.ghost2, &c.ghost2);
+        set(&mut p.ghost3, &c.ghost3);
+        set(&mut p.shadow_bg, &c.shadow_bg);
+        set(&mut p.shadow_fg, &c.shadow_fg);
+        set(&mut p.chip_fg, &c.chip_fg);
+        let h = &self.theme.hues;
+        set(&mut p.hues.teal, &h.teal);
+        set(&mut p.hues.magenta, &h.magenta);
+        set(&mut p.hues.purple, &h.purple);
+        set(&mut p.hues.green, &h.green);
+        set(&mut p.hues.amber, &h.amber);
+        set(&mut p.hues.red, &h.red);
+        set(&mut p.hues.blue, &h.blue);
+        set(&mut p.hues.orange, &h.orange);
         // Only override the preset's focus/accent when the user actually
-        // customized them (the built-in defaults would clobber presets).
-        let default_theme = ThemeConfig::default();
-        if self.theme.focus_border != default_theme.focus_border {
+        // customized them (a default — current or pre-prism — would clobber
+        // presets).
+        if !DEFAULTISH_FOCUS.contains(&self.theme.focus_border.as_str()) {
             set(&mut p.focus, &Some(self.theme.focus_border.clone()));
         }
-        if self.theme.accent != default_theme.accent {
+        if !DEFAULTISH_ACCENTS.contains(&self.theme.accent.as_str()) {
             p.accent = self.accent_rgb();
         }
+        crate::theme::extend_palette(&mut p);
         p
     }
 
@@ -1733,6 +1826,7 @@ impl Config {
             "theme.accent" => self.theme.accent.clone(),
             "theme.focus_border" => self.theme.focus_border.clone(),
             "theme.pane_padding" => self.theme.pane_padding.to_string(),
+            "theme.undercurl" => self.theme.undercurl.to_string(),
             _ if key.starts_with("theme.colors.") => {
                 let c = &self.theme.colors;
                 let slot = match &key["theme.colors.".len()..] {
@@ -1746,6 +1840,26 @@ impl Config {
                     "dim" => &c.dim,
                     "faint" => &c.faint,
                     "ghost" => &c.ghost,
+                    "ghost2" => &c.ghost2,
+                    "ghost3" => &c.ghost3,
+                    "shadow_bg" => &c.shadow_bg,
+                    "shadow_fg" => &c.shadow_fg,
+                    "chip_fg" => &c.chip_fg,
+                    _ => return None,
+                };
+                slot.clone().unwrap_or_default()
+            }
+            _ if key.starts_with("theme.hues.") => {
+                let h = &self.theme.hues;
+                let slot = match &key["theme.hues.".len()..] {
+                    "teal" => &h.teal,
+                    "magenta" => &h.magenta,
+                    "purple" => &h.purple,
+                    "green" => &h.green,
+                    "amber" => &h.amber,
+                    "red" => &h.red,
+                    "blue" => &h.blue,
+                    "orange" => &h.orange,
                     _ => return None,
                 };
                 slot.clone().unwrap_or_default()
@@ -2070,17 +2184,59 @@ surface = "todoist.status"
             },
             ..Config::default()
         };
-        assert_eq!(bad.accent_hex(), "#76eede");
-        assert_eq!(bad.accent_rgb(), crate::theme::TEAL);
+        assert_eq!(bad.accent_hex(), "#6ee7d8");
+        assert_eq!(bad.accent_rgb(), crate::theme::HUE_TEAL);
     }
 
     #[test]
     fn palette_defaults_match_builtins() {
         let p = Config::default().palette();
         assert_eq!(p, crate::theme::Palette::default());
-        assert_eq!(p.focus, crate::theme::FOCUS); // #9bd1ff
-        assert_eq!(p.border, crate::theme::FRAME); // light grey default
-        assert_eq!(p.accent, crate::theme::TEAL);
+        assert_eq!(p.focus, crate::theme::HUE_TEAL);
+        assert_eq!(p.border, crate::theme::P_GHOST);
+        assert_eq!(p.accent, crate::theme::HUE_TEAL);
+    }
+
+    #[test]
+    fn legacy_presets_come_back_fully_extended() {
+        let cfg = Config::default();
+        for name in crate::theme::PRESETS {
+            let p = cfg.palette_with_preset(name);
+            assert!(!p.ghost2.is_empty(), "{name}: ghost2");
+            assert!(!p.shadow_bg.is_empty(), "{name}: shadow_bg");
+            assert!(!p.hues.orange.is_empty(), "{name}: hues");
+            assert!(p.heat.iter().all(|h| !h.is_empty()), "{name}: heat");
+        }
+    }
+
+    #[test]
+    fn derived_tokens_follow_overridden_bases_and_hue_overrides_apply() {
+        let mut cfg = Config::default();
+        cfg.theme.preset = "storm".into();
+        cfg.theme.colors.ghost = Some("#808080".into());
+        cfg.theme.hues.red = Some("#ff0000".into());
+        let p = cfg.palette();
+        // ghost2 derives from the *overridden* ghost, not storm's.
+        assert_eq!(
+            p.ghost2,
+            crate::theme::blend_over("128;128;128", &p.bg0, 0.62)
+        );
+        assert_eq!(p.hues.red, "255;0;0");
+        // Explicit extension override beats derivation.
+        cfg.theme.colors.ghost2 = Some("#010203".into());
+        assert_eq!(cfg.palette().ghost2, "1;2;3");
+    }
+
+    #[test]
+    fn old_default_accent_still_reads_as_uncustomized() {
+        // A config that pinned the pre-prism default accent keeps preset
+        // accents when cycling (treated as "not customized").
+        let mut cfg = Config::default();
+        cfg.theme.accent = "#76eede".into();
+        cfg.theme.focus_border = "#9bd1ff".into();
+        let p = cfg.palette_with_preset("ember");
+        assert_eq!(p.accent, "255;122;89"); // ember's own accent survives
+        assert_eq!(p.focus, "255;176;102"); // ember's own focus survives
     }
 
     #[test]
@@ -2094,7 +2250,7 @@ surface = "todoist.status"
         assert_eq!(p.focus, "16;32;48");
         assert_eq!(p.bg0, "0;0;0");
         assert_eq!(p.border, "255;255;255");
-        assert_eq!(p.text, crate::theme::TEXT);
+        assert_eq!(p.text, crate::theme::P_TEXT);
     }
 
     #[test]
@@ -2244,6 +2400,16 @@ surface = "todoist.status"
         assert!(cfg.drawer.contain);
         assert_eq!(cfg.drawer.pool_limit, 1);
         assert!(!cfg.drawer.prewarm);
+    }
+
+    #[test]
+    fn panel_sections_parse_and_default_empty() {
+        let cfg: Config =
+            toml::from_str("[panel]\nsections = [\"git\", \"changes\", \"telemetry\"]\n").unwrap();
+        assert_eq!(cfg.panel.sections, vec!["git", "changes", "telemetry"]);
+        // Absent table → empty list (the host shows every section).
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.panel.sections.is_empty());
     }
 
     #[test]
@@ -2701,12 +2867,12 @@ format = \"bad\"
     #[test]
     fn accent_and_log_dir_helpers() {
         let mut c = Config::default();
-        assert_eq!(c.accent_hex(), "#76eede");
+        assert_eq!(c.accent_hex(), "#6ee7d8");
         assert!(c.accent_rgb().contains(';'));
         c.theme.accent = "#fff".into();
         assert_eq!(c.accent_rgb(), "255;255;255"); // 3-digit hex expands
         c.theme.accent = "garbage".into();
-        assert_eq!(c.accent_hex(), "#76eede"); // invalid falls back
+        assert_eq!(c.accent_hex(), "#6ee7d8"); // invalid falls back
         assert!(c.accent_rgb().len() > 3);
         // log dir: default vs explicit.
         assert!(c.log.dir_path().ends_with("superzej/logs"));

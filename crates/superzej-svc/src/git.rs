@@ -36,6 +36,146 @@ pub struct WorktreeInfo {
     pub branch: Option<String>,
 }
 
+/// What kind of multi-step operation the repo is in the middle of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeKind {
+    Merge,
+    Rebase,
+    CherryPick,
+}
+
+impl MergeKind {
+    /// The statusbar/header chip label.
+    pub fn label(self) -> &'static str {
+        match self {
+            MergeKind::Merge => "MERGING",
+            MergeKind::Rebase => "REBASING",
+            MergeKind::CherryPick => "CHERRY-PICK",
+        }
+    }
+}
+
+/// A merge/rebase/cherry-pick in progress.
+#[derive(Debug, Clone)]
+pub struct MergeInfo {
+    pub kind: MergeKind,
+    /// Best-effort name of what is being merged/applied (e.g.
+    /// "origin/main"). Empty when unresolvable.
+    pub onto: String,
+}
+
+/// One `git log --graph` row: the graph glyph prefix plus (for commit rows)
+/// sha/subject/refs. Pure connector rows carry an empty sha.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogRow {
+    pub graph: String,
+    pub sha: String,
+    pub subject: String,
+    /// Decorations (`%D`), e.g. "HEAD -> main, origin/main".
+    pub refs: String,
+}
+
+impl LogRow {
+    pub fn is_head(&self) -> bool {
+        self.refs.split(',').any(|r| {
+            let r = r.trim();
+            r == "HEAD" || r.starts_with("HEAD ->")
+        })
+    }
+}
+
+/// One hunk of a unified diff, capped for inline preview rendering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hunk {
+    /// The `@@ -a,b +c,d @@` range header.
+    pub header: String,
+    /// The function context after the header (may be empty).
+    pub func: String,
+    /// `(origin, text)` rows: origin is '+', '-', or ' '.
+    pub lines: Vec<(char, String)>,
+    /// True when lines were dropped to fit the preview cap.
+    pub truncated: bool,
+}
+
+/// Count files in conflict (porcelain XY in the unmerged set: DD AU UD UA
+/// DU AA UU).
+pub fn conflict_count(status: &[FileStatus]) -> usize {
+    status.iter().filter(|f| is_conflict(f)).count()
+}
+
+/// Whether a porcelain entry is an unmerged (conflicted) path.
+pub fn is_conflict(f: &FileStatus) -> bool {
+    matches!(
+        (f.staged, f.unstaged),
+        ('D', 'D') | ('A', 'U') | ('U', 'D') | ('U', 'A') | ('D', 'U') | ('A', 'A') | ('U', 'U')
+    )
+}
+
+/// Parse `git log --graph --format=%x1f%h%x1f%s%x1f%D` output. Lines without
+/// the unit separator are pure graph connectors.
+pub fn parse_log_graph(out: &str) -> Vec<LogRow> {
+    out.lines()
+        .map(|line| match line.split_once('\u{1f}') {
+            Some((graph, rest)) => {
+                let mut it = rest.split('\u{1f}');
+                LogRow {
+                    graph: graph.trim_end().to_string(),
+                    sha: it.next().unwrap_or_default().to_string(),
+                    subject: it.next().unwrap_or_default().to_string(),
+                    refs: it
+                        .next()
+                        .unwrap_or_default()
+                        .trim()
+                        .trim_start_matches('(')
+                        .trim_end_matches(')')
+                        .to_string(),
+                }
+            }
+            None => LogRow {
+                graph: line.trim_end().to_string(),
+                sha: String::new(),
+                subject: String::new(),
+                refs: String::new(),
+            },
+        })
+        .collect()
+}
+
+/// Parse unified-diff output (`git diff -U3 -- <path>`) into hunks, capping
+/// each hunk's content at `max_lines` rows.
+pub fn parse_unified_hunks(diff: &str, max_lines: usize) -> Vec<Hunk> {
+    let mut hunks: Vec<Hunk> = Vec::new();
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("@@") {
+            // "@@ -a,b +c,d @@ func" — the header ends at the second "@@".
+            let (range, func) = match rest.split_once("@@") {
+                Some((r, f)) => (r.trim(), f.trim()),
+                None => (rest.trim(), ""),
+            };
+            hunks.push(Hunk {
+                header: format!("@@ {range} @@"),
+                func: func.to_string(),
+                lines: Vec::new(),
+                truncated: false,
+            });
+            continue;
+        }
+        let Some(h) = hunks.last_mut() else { continue };
+        let mut chars = line.chars();
+        // Only +/-/space rows are hunk content ("\ No newline at end of
+        // file" and friends fall through). File headers ("+++ b/…",
+        // "--- a/…") also start with +/- but only appear before the first @@.
+        if let Some(origin @ ('+' | '-' | ' ')) = chars.next() {
+            if h.lines.len() >= max_lines {
+                h.truncated = true;
+            } else {
+                h.lines.push((origin, chars.collect()));
+            }
+        }
+    }
+    hunks
+}
+
 /// Reads go native (gix) for local locs; writes and remote stay CLI.
 pub trait GitBackend: Send + Sync {
     fn status(&self, loc: &GitLoc) -> Result<Vec<FileStatus>>;
@@ -55,6 +195,88 @@ pub trait GitBackend: Send + Sync {
     fn worktrees(&self, root: &Path) -> Result<Vec<WorktreeInfo>>;
     fn add_worktree(&self, root: &Path, branch: &str, base: &str, path: &Path) -> Result<()>;
     fn remove_worktree(&self, root: &Path, path: &Path, delete_branch: bool) -> Result<()>;
+
+    /// A merge/rebase/cherry-pick in progress, or `None`. CLI everywhere —
+    /// probed via `rev-parse --verify` so it works for remote locs too.
+    fn merge_state(&self, loc: &GitLoc) -> Result<Option<MergeInfo>> {
+        let exists = |what: &str| -> bool {
+            loc.git_command(&["rev-parse", "-q", "--verify", what])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        let name_of = |what: &str| -> String {
+            loc.git_command(&["name-rev", "--name-only", "--always", what])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default()
+        };
+        let kind = if exists("MERGE_HEAD") {
+            Some((MergeKind::Merge, "MERGE_HEAD"))
+        } else if exists("REBASE_HEAD") {
+            Some((MergeKind::Rebase, "REBASE_HEAD"))
+        } else if exists("CHERRY_PICK_HEAD") {
+            Some((MergeKind::CherryPick, "CHERRY_PICK_HEAD"))
+        } else {
+            None
+        };
+        Ok(kind.map(|(kind, head)| MergeInfo {
+            kind,
+            onto: name_of(head),
+        }))
+    }
+
+    /// The last `n` commits as graph rows (glyph prefix + sha/subject/refs).
+    fn log_graph(&self, loc: &GitLoc, n: usize) -> Result<Vec<LogRow>> {
+        let n = n.to_string();
+        let out = run(
+            loc,
+            &["log", "--graph", "--format=%x1f%h%x1f%s%x1f%D", "-n", &n],
+        )?;
+        Ok(parse_log_graph(&out))
+    }
+
+    /// Commit timestamps (epoch seconds) for the last `weeks` weeks — the
+    /// commit-calendar feed. Cheap: one line per commit.
+    fn commit_times(&self, loc: &GitLoc, weeks: usize) -> Result<Vec<i64>> {
+        let since = format!("{weeks}.weeks");
+        let out = run(loc, &["log", "--since", &since, "--format=%ct"])?;
+        Ok(out.lines().filter_map(|l| l.trim().parse().ok()).collect())
+    }
+
+    /// The unified-diff hunks of one file against `base`, capped at
+    /// `max_lines` content rows per hunk (inline preview).
+    fn diff_hunks(
+        &self,
+        loc: &GitLoc,
+        base: &str,
+        path: &str,
+        max_lines: usize,
+    ) -> Result<Vec<Hunk>> {
+        let out = run(loc, &["diff", "--no-color", "-U3", base, "--", path])?;
+        Ok(parse_unified_hunks(&out, max_lines))
+    }
+
+    /// Stash entry count (0 when the stash is empty or absent).
+    fn stash_count(&self, loc: &GitLoc) -> Result<usize> {
+        let out = match loc.git_command(&["stash", "list", "--format=%h"]).output() {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+            _ => return Ok(0),
+        };
+        Ok(out.lines().filter(|l| !l.trim().is_empty()).count())
+    }
+
+    /// Stage one path (`git add -- <path>`).
+    fn stage(&self, loc: &GitLoc, path: &str) -> Result<()> {
+        run(loc, &["add", "--", path]).map(|_| ())
+    }
+
+    /// Unstage one path (`git reset -q HEAD -- <path>` — works on every git).
+    fn unstage(&self, loc: &GitLoc, path: &str) -> Result<()> {
+        run(loc, &["reset", "-q", "HEAD", "--", path]).map(|_| ())
+    }
 }
 
 /// The permanent fallback: every op via the `git` CLI (through `GitLoc`, so it
@@ -468,6 +690,203 @@ mod tests {
         assert!(cli.is_dirty(&loc).unwrap());
         assert!(gix.is_dirty(&loc).unwrap());
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn parse_log_graph_splits_commit_and_connector_rows() {
+        let out = "* \u{1f}a3f81c2\u{1f}merge origin/main\u{1f}HEAD -> main, origin/main\n\
+                   |\\  \n\
+                   | * \u{1f}9c2d11e\u{1f}panel: focus follows zoom\u{1f}\n\
+                   * | \u{1f}f44a09b\u{1f}tabs: dedup titles\u{1f}tag: v0.1\n\
+                   |/  \n\
+                   * \u{1f}77a1f2c\u{1f}host: panel split math\u{1f}\n";
+        let rows = parse_log_graph(out);
+        assert_eq!(rows.len(), 6);
+        assert_eq!(rows[0].graph, "*");
+        assert_eq!(rows[0].sha, "a3f81c2");
+        assert_eq!(rows[0].subject, "merge origin/main");
+        assert!(rows[0].is_head());
+        assert_eq!(rows[1].graph, "|\\");
+        assert!(rows[1].sha.is_empty(), "connector row");
+        assert_eq!(rows[2].graph, "| *");
+        assert!(!rows[2].is_head());
+        assert_eq!(rows[3].refs, "tag: v0.1");
+        assert_eq!(parse_log_graph(""), Vec::<LogRow>::new());
+    }
+
+    #[test]
+    fn is_head_matches_head_decorations_only() {
+        let row = |refs: &str| LogRow {
+            graph: String::new(),
+            sha: "x".into(),
+            subject: String::new(),
+            refs: refs.into(),
+        };
+        assert!(row("HEAD -> main, origin/main").is_head());
+        assert!(row("HEAD").is_head());
+        assert!(row("main, HEAD -> feat").is_head());
+        assert!(!row("origin/HEAD-ish, main").is_head());
+        assert!(!row("").is_head());
+    }
+
+    #[test]
+    fn parse_unified_hunks_extracts_headers_lines_and_caps() {
+        // Built line-by-line: `\`-continued string literals would strip the
+        // leading space that marks a context row.
+        let diff = [
+            "diff --git a/src/tabs.rs b/src/tabs.rs",
+            "index 1111111..2222222 100644",
+            "--- a/src/tabs.rs",
+            "+++ b/src/tabs.rs",
+            "@@ -180,6 +180,14 @@ fn handle_key()",
+            " context line",
+            "+let idx = self.order.iter()",
+            "+    .position(|t| t.id == id)?;",
+            "-self.tabs.swap(a, b);",
+            "@@ -512,3 +518,9 @@",
+            "+filtered",
+            "\\ No newline at end of file",
+        ]
+        .join("\n");
+        let diff = diff.as_str();
+        let hunks = parse_unified_hunks(diff, 100);
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].header, "@@ -180,6 +180,14 @@");
+        assert_eq!(hunks[0].func, "fn handle_key()");
+        assert_eq!(
+            hunks[0].lines,
+            vec![
+                (' ', "context line".to_string()),
+                ('+', "let idx = self.order.iter()".to_string()),
+                ('+', "    .position(|t| t.id == id)?;".to_string()),
+                ('-', "self.tabs.swap(a, b);".to_string()),
+            ]
+        );
+        assert!(!hunks[0].truncated);
+        assert_eq!(hunks[1].func, "");
+        assert_eq!(hunks[1].lines.len(), 1);
+
+        // The cap truncates and flags.
+        let capped = parse_unified_hunks(diff, 2);
+        assert_eq!(capped[0].lines.len(), 2);
+        assert!(capped[0].truncated);
+
+        // File headers before the first @@ never leak into hunks; garbage is
+        // tolerated.
+        assert!(parse_unified_hunks("not a diff\n+++ b/x\n--- a/x\n", 10).is_empty());
+    }
+
+    #[test]
+    fn conflict_count_matches_unmerged_xy_codes() {
+        let f = |s: char, u: char| FileStatus {
+            path: "x".into(),
+            staged: s,
+            unstaged: u,
+        };
+        let status = vec![
+            f('M', ' '),
+            f('U', 'U'),
+            f('A', 'A'),
+            f('D', 'D'),
+            f('A', 'U'),
+            f('U', 'D'),
+            f('U', 'A'),
+            f('D', 'U'),
+            f('?', '?'),
+            f('A', ' '),
+        ];
+        assert_eq!(conflict_count(&status), 7);
+        assert_eq!(conflict_count(&[]), 0);
+    }
+
+    #[test]
+    fn merge_state_detects_a_live_merge_and_clears_after_abort() {
+        let base = std::env::temp_dir().join(format!("sz-merge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        git_in(&base, &["init", "-q", "-b", "main"]);
+        std::fs::write(base.join("f.txt"), "base\n").unwrap();
+        git_in(&base, &["add", "f.txt"]);
+        git_in(&base, &["commit", "-q", "-m", "c0"]);
+        git_in(&base, &["checkout", "-q", "-b", "feat"]);
+        std::fs::write(base.join("f.txt"), "feat\n").unwrap();
+        git_in(&base, &["commit", "-q", "-am", "feat change"]);
+        git_in(&base, &["checkout", "-q", "main"]);
+        std::fs::write(base.join("f.txt"), "main\n").unwrap();
+        git_in(&base, &["commit", "-q", "-am", "main change"]);
+
+        let loc = GitLoc::for_worktree(&base);
+        assert!(CliGit.merge_state(&loc).unwrap().is_none());
+
+        // A conflicting merge leaves MERGE_HEAD behind (merge itself fails).
+        let _ = std::process::Command::new("git")
+            .args(["merge", "feat"])
+            .current_dir(&base)
+            .output();
+        let st = CliGit.merge_state(&loc).unwrap().expect("merge detected");
+        assert_eq!(st.kind, MergeKind::Merge);
+        assert_eq!(st.kind.label(), "MERGING");
+        assert!(st.onto.contains("feat"), "onto was {:?}", st.onto);
+        // The porcelain conflict set agrees.
+        let status = CliGit.status(&loc).unwrap();
+        assert_eq!(conflict_count(&status), 1);
+
+        git_in(&base, &["merge", "--abort"]);
+        assert!(CliGit.merge_state(&loc).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn log_graph_stash_and_stage_roundtrip_on_a_fixture_repo() {
+        let base = std::env::temp_dir().join(format!("sz-ops-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        git_in(&base, &["init", "-q", "-b", "main"]);
+        commit_empty(&base, "c0");
+        commit_empty(&base, "c1");
+
+        let loc = GitLoc::for_worktree(&base);
+        let rows = CliGit.log_graph(&loc, 6).unwrap();
+        let commits: Vec<&LogRow> = rows.iter().filter(|r| !r.sha.is_empty()).collect();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].subject, "c1");
+        assert!(commits[0].is_head());
+
+        // commit_times sees both commits (they are < 1 week old).
+        let times = CliGit.commit_times(&loc, 4).unwrap();
+        assert_eq!(times.len(), 2);
+        assert!(times.iter().all(|&t| t > 0));
+
+        // stash count: zero, then one.
+        assert_eq!(CliGit.stash_count(&loc).unwrap(), 0);
+        std::fs::write(base.join("w.txt"), "x").unwrap();
+        git_in(&base, &["add", "w.txt"]);
+        git_in(&base, &["stash", "-q"]);
+        assert_eq!(CliGit.stash_count(&loc).unwrap(), 1);
+        git_in(&base, &["stash", "drop", "-q"]);
+
+        // stage/unstage move a file between the porcelain columns.
+        std::fs::write(base.join("s.txt"), "y").unwrap();
+        let untracked = |st: &[FileStatus]| st.iter().any(|f| f.staged == '?' && f.path == "s.txt");
+        assert!(untracked(&CliGit.status(&loc).unwrap()));
+        CliGit.stage(&loc, "s.txt").unwrap();
+        let st = CliGit.status(&loc).unwrap();
+        assert!(
+            st.iter().any(|f| f.staged == 'A' && f.path == "s.txt"),
+            "{st:?}"
+        );
+        CliGit.unstage(&loc, "s.txt").unwrap();
+        assert!(untracked(&CliGit.status(&loc).unwrap()));
+
+        // diff_hunks on a tracked modification.
+        std::fs::write(base.join("h.txt"), "one\n").unwrap();
+        git_in(&base, &["add", "h.txt"]);
+        git_in(&base, &["commit", "-q", "-m", "h0"]);
+        std::fs::write(base.join("h.txt"), "two\n").unwrap();
+        let hunks = CliGit.diff_hunks(&loc, "HEAD", "h.txt", 16).unwrap();
+        assert_eq!(hunks.len(), 1);
+        assert!(hunks[0].lines.iter().any(|(o, t)| *o == '+' && t == "two"));
         let _ = std::fs::remove_dir_all(&base);
     }
 

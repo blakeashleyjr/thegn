@@ -213,21 +213,29 @@ impl Panes {
         Ok(id)
     }
 
-    /// Ensure every leaf in `tab.center` is backed by a live pane. On first focus
-    /// (or after resurrect, whose ids are stale) this spawns fresh panes and
-    /// remaps the tree's leaf ids + the focused id onto them. `worktree` is the
+    /// The leaves of `tab.center` not yet backed by live panes — the targets
+    /// a spec-resolution pass must cover before [`Self::materialize_with_specs`].
+    pub(crate) fn missing_leaves(&self, tab: &crate::session::Tab) -> Vec<u32> {
+        tab.center
+            .pane_ids()
+            .into_iter()
+            .filter(|id| !self.table.contains_key(id))
+            .collect()
+    }
+
+    /// Finish materialization with pre-resolved launch specs: spawn a pane per
+    /// missing leaf and remap the tree's leaf ids + focused id onto them. Spec
+    /// resolution (sandbox ensure, DB lookups — potentially SLOW: a wedged
+    /// podman pulls an image) happens off-thread via the loop's spec channel;
+    /// this half is openpty+exec only, safe on the loop. `worktree` is the
     /// owning group's dir (tabs spawn their shells there).
-    pub(crate) fn materialize(
+    pub(crate) fn materialize_with_specs(
         &mut self,
         tab: &mut crate::session::Tab,
         worktree: &str,
+        specs: &[(u32, crate::agent::LaunchSpec)],
         center: Rect,
-        cfg: &superzej_core::config::Config,
     ) -> Result<()> {
-        let leaves = tab.center.pane_ids();
-        if leaves.iter().all(|id| self.table.contains_key(id)) {
-            return Ok(()); // already live
-        }
         let cwd = (!worktree.is_empty() && std::path::Path::new(worktree).is_dir())
             .then(|| std::path::PathBuf::from(worktree))
             .or_else(|| std::env::current_dir().ok())
@@ -235,25 +243,25 @@ impl Panes {
 
         let spawn_t0 = std::time::Instant::now();
         let mut map = std::collections::HashMap::new();
-        for old in &leaves {
-            if !map.contains_key(old) {
-                let spec = crate::agent::launch_spec(cfg, worktree, None, "shell");
-                match self.spawn_argv_env(
-                    &spec.argv,
-                    spec.cwd.as_deref().or(cwd.as_deref()),
-                    &spec.env,
-                    center,
-                ) {
-                    Ok(fresh) => {
-                        map.insert(*old, fresh);
-                    }
-                    Err(e) => {
-                        let _ = std::fs::write(
-                            "/tmp/szhost-spawn-err.log",
-                            format!("Materialize spawn failed: {e:?}"),
-                        );
-                        return Err(e);
-                    }
+        for (old, spec) in specs {
+            if self.table.contains_key(old) || map.contains_key(old) {
+                continue; // raced a direct spawn; keep the live pane
+            }
+            match self.spawn_argv_env(
+                &spec.argv,
+                spec.cwd.as_deref().or(cwd.as_deref()),
+                &spec.env,
+                center,
+            ) {
+                Ok(fresh) => {
+                    map.insert(*old, fresh);
+                }
+                Err(e) => {
+                    let _ = std::fs::write(
+                        "/tmp/szhost-spawn-err.log",
+                        format!("Materialize spawn failed: {e:?}"),
+                    );
+                    return Err(e);
                 }
             }
         }
@@ -264,7 +272,8 @@ impl Panes {
             "pty panes spawned"
         );
         let old_focus = tab.focused_pane;
-        tab.center.remap(&mut |old| map[&old]);
+        tab.center
+            .remap(&mut |old| map.get(&old).copied().unwrap_or(old));
         tab.focused_pane = map
             .get(&old_focus)
             .copied()
@@ -289,35 +298,41 @@ fn prewarm_targets(active: usize, len: usize, radius: usize) -> Vec<usize> {
 /// per tab on a large session.
 const PREWARM_RADIUS: usize = 1;
 
-/// Pre-spawn PTY children for the tabs adjacent to the active one (within the
-/// active worktree) and for the neighboring worktrees' active tabs, so first
-/// focus of a neighbor is instant. Best-effort: `materialize` spawns + remaps a
-/// tab's leaf ids in place, so a later switch finds the panes already live and
-/// returns early. Errors are ignored (the lazy path will retry on real focus).
-pub(crate) fn prewarm_neighbors(
-    panes: &mut Panes,
+/// The (worktree, tab, missing leaf ids) triples a pre-warm pass should
+/// resolve specs for: the tabs adjacent to the active one (within the active
+/// worktree) and the neighboring worktrees' active tabs, so first focus of a
+/// neighbor is instant. Pure enumeration — the caller requests launch specs
+/// off-thread (sandbox ensure can block) and finishes the spawns when they
+/// land, exactly like the lazy materialize path.
+pub(crate) fn prewarm_requests(
+    panes: &Panes,
     session: &mut crate::session::Session,
-    center: Rect,
-    cfg: &superzej_core::config::Config,
-) {
+) -> Vec<(String, usize, Vec<u32>)> {
+    let mut out = Vec::new();
     if session.worktrees.is_empty() {
-        return;
+        return out;
     }
     // Sibling tabs within the active worktree.
-    let g = &mut session.worktrees[session.active];
-    let path = g.path.clone();
+    let g = &session.worktrees[session.active];
     for ti in prewarm_targets(g.active_tab, g.tabs.len(), PREWARM_RADIUS) {
-        let _ = panes.materialize(&mut g.tabs[ti], &path, center, cfg);
+        let missing = panes.missing_leaves(&g.tabs[ti]);
+        if !missing.is_empty() {
+            out.push((g.path.clone(), ti, missing));
+        }
     }
     // Neighboring worktrees: their remembered active tab.
     for gi in prewarm_targets(session.active, session.worktrees.len(), PREWARM_RADIUS) {
         let g = &mut session.worktrees[gi];
-        let path = g.path.clone();
         let at = g.active_tab.min(g.tabs.len().saturating_sub(1));
-        if let Some(tab) = g.tabs.get_mut(at) {
-            let _ = panes.materialize(tab, &path, center, cfg);
+        g.active_tab = at;
+        if let Some(tab) = g.tabs.get(at) {
+            let missing = panes.missing_leaves(tab);
+            if !missing.is_empty() {
+                out.push((g.path.clone(), at, missing));
+            }
         }
     }
+    out
 }
 
 /// Resize each pane in `tree` to its CONTENT rect within `center` (inside the
@@ -409,12 +424,19 @@ mod tests {
         let path = session.worktrees[0].path.clone();
         let mut cfg = superzej_core::config::Config::default();
         cfg.sandbox.enabled = false;
+        // Two-phase materialize: resolve a shell launch spec per missing leaf
+        // (the loop does this off-thread), then spawn + remap on the tree.
+        let specs: Vec<(u32, crate::agent::LaunchSpec)> = panes
+            .missing_leaves(&session.worktrees[0].tabs[0])
+            .into_iter()
+            .map(|id| (id, crate::agent::launch_spec(&cfg, &path, None, "shell")))
+            .collect();
         panes
-            .materialize(
+            .materialize_with_specs(
                 &mut session.worktrees[0].tabs[0],
                 &path,
+                &specs,
                 chrome.center,
-                &cfg,
             )
             .unwrap();
 

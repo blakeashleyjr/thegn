@@ -90,7 +90,7 @@ query($owner:String!,$repo:String!,$head:String!){
         commits(last:1){ nodes{ commit{ statusCheckRollup{
           contexts(first:100){ nodes{
             __typename
-            ... on CheckRun   { name status conclusion detailsUrl }
+            ... on CheckRun   { name status conclusion detailsUrl startedAt completedAt }
             ... on StatusContext { context state targetUrl }
           }}}}}}
       }
@@ -110,6 +110,8 @@ fn check_from_ctx(ctx: &Value) -> CheckRun {
             state: s("state"),
             workflow_name: None,
             details_url: s("targetUrl"),
+            started_at: None,
+            completed_at: None,
         },
         _ => CheckRun {
             name: s("name").unwrap_or_default(),
@@ -118,6 +120,8 @@ fn check_from_ctx(ctx: &Value) -> CheckRun {
             state: None,
             workflow_name: None,
             details_url: s("detailsUrl"),
+            started_at: s("startedAt"),
+            completed_at: s("completedAt"),
         },
     }
 }
@@ -174,6 +178,8 @@ pub fn parse_graphql_pr(resp: &Value, worktree: &str, branch: &str, now: i64) ->
         worktree: worktree.to_string(),
         branch: branch.to_string(),
         fetched_at: now,
+        threads: Vec::new(),
+        issues: Vec::new(),
     }
 }
 
