@@ -98,7 +98,7 @@ impl Backend {
 
     /// Map a config backend to its runtime form. `Auto` has no concrete runtime
     /// backend (it triggers the detection chain) and yields `None`.
-    fn from_config(b: SandboxBackend) -> Option<Backend> {
+    pub fn from_config(b: SandboxBackend) -> Option<Backend> {
         Some(match b {
             SandboxBackend::Auto => return None,
             SandboxBackend::Podman => Backend::Podman,
@@ -241,7 +241,11 @@ pub fn resolve(cfg: &SandboxConfig, loc: &GitLoc, name: &str) -> Option<SandboxS
 
     let image = {
         let t = cfg.image.trim();
-        (!t.is_empty()).then(|| t.to_string())
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
     };
     let worktree = PathBuf::from(loc.path());
     // Path-preserving git mounts: the worktree and the repo's git-common dir
@@ -635,27 +639,33 @@ fn available(transport: &Transport, backend: Backend) -> bool {
     }
 }
 
+pub const DEFAULT_OCI_IMAGE: &str = "docker.io/library/debian:stable";
+
+fn effective_image(spec: &SandboxSpec) -> String {
+    spec.image
+        .clone()
+        .unwrap_or_else(|| DEFAULT_OCI_IMAGE.to_string())
+}
+
 pub fn prefetch_image(spec: &SandboxSpec) -> anyhow::Result<()> {
     if !spec.backend.is_oci() {
         return Ok(());
     }
-    if let Some(img) = &spec.image {
-        let rt = spec.backend.binary();
-        let exists_argv: Vec<String> =
-            vec![rt.into(), "image".into(), "exists".into(), img.clone()];
-        match status_with_timeout(&exists_argv, PROBE_TIMEOUT) {
-            Some(true) => {}
-            Some(false) => {
-                let pull_argv: Vec<String> = vec![rt.into(), "pull".into(), img.clone()];
-                if status_with_timeout(&pull_argv, PULL_TIMEOUT) != Some(true) {
-                    anyhow::bail!("{rt} pull {img} failed or timed out");
-                }
+    let img = effective_image(spec);
+    let rt = spec.backend.binary();
+    let exists_argv: Vec<String> = vec![rt.into(), "image".into(), "exists".into(), img.clone()];
+    match status_with_timeout(&exists_argv, PROBE_TIMEOUT) {
+        Some(true) => {}
+        Some(false) => {
+            let pull_argv: Vec<String> = vec![rt.into(), "pull".into(), img.clone()];
+            if status_with_timeout(&pull_argv, PULL_TIMEOUT) != Some(true) {
+                anyhow::bail!("{rt} pull {img} failed or timed out");
             }
-            // The probe itself wedged: the runtime is unhealthy (stuck
-            // machine, broken storage) — fail the candidate so the chain
-            // falls through instead of trusting a pull to behave.
-            None => anyhow::bail!("{rt} not responding (image probe timed out)"),
         }
+        // The probe itself wedged: the runtime is unhealthy (stuck
+        // machine, broken storage) — fail the candidate so the chain
+        // falls through instead of trusting a pull to behave.
+        None => anyhow::bail!("{rt} not responding (image probe timed out)"),
     }
     Ok(())
 }
@@ -689,7 +699,7 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let _ = prefetch_image(spec);
+    prefetch_image(spec)?;
 
     let rt = spec.backend.binary();
     let mut inspect = backend_prefix(spec.backend);
@@ -705,17 +715,46 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
         spec.name.clone(),
     ]);
     argv.extend(oci_create_opts(spec));
-    argv.push(
-        spec.image
-            .clone()
-            .unwrap_or_else(|| "docker.io/library/debian:stable".into()),
-    );
+    argv.push(effective_image(spec));
     argv.extend(["sleep".into(), "infinity".into()]);
     if run_control_owned(spec, &argv, RUN_TIMEOUT).unwrap_or(false) {
-        Ok(())
-    } else {
-        anyhow::bail!("could not start {rt} container '{}'", spec.name)
+        return Ok(());
     }
+
+    // Some rootless Podman/crun combinations (seen on NixOS) fail every
+    // container started with `--userns keep-id` even though ordinary rootless
+    // containers work. Retry without keep-id so an explicit rootless Podman
+    // selection still produces a real container instead of forcing host use.
+    if spec.backend == Backend::Podman {
+        let _ = run_control_owned(
+            spec,
+            &[
+                spec.backend.binary().to_string(),
+                "rm".into(),
+                "-f".into(),
+                spec.name.clone(),
+            ],
+            PROBE_TIMEOUT,
+        );
+        let mut retry: Vec<String> = backend_prefix(spec.backend);
+        retry.extend([
+            "run".into(),
+            "-d".into(),
+            "--name".into(),
+            spec.name.clone(),
+        ]);
+        retry.extend(oci_create_opts_with_keep_id(spec, false));
+        retry.push(effective_image(spec));
+        retry.extend(["sleep".into(), "infinity".into()]);
+        if run_control_owned(spec, &retry, RUN_TIMEOUT).unwrap_or(false) {
+            msg::warn(
+                "podman --userns keep-id failed; continuing with rootless podman default user namespace",
+            );
+            return Ok(());
+        }
+    }
+
+    anyhow::bail!("could not start {rt} container '{}'", spec.name)
 }
 
 /// Remove a worktree's persistent container (OCI backends). Best-effort. Runs on
@@ -934,6 +973,54 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
         v.extend(["-p".into(), p.clone()]);
     }
     v
+}
+
+/// Like [`oci_create_opts`] but lets the caller suppress Podman's
+/// `--userns keep-id` flag for the rootless-fallback retry path.
+fn oci_create_opts_with_keep_id(spec: &SandboxSpec, keep_id: bool) -> Vec<String> {
+    let mut v = Vec::new();
+    match spec.backend {
+        Backend::Podman => {
+            if keep_id {
+                v.extend(["--userns".into(), "keep-id".into()]);
+            }
+        }
+        Backend::PodmanRootful => {
+            if let (Transport::Local, Some((uid, gid))) = (&spec.transport, local_uid_gid()) {
+                v.extend(["--user".into(), format!("{uid}:{gid}")]);
+            }
+        }
+        Backend::Docker => {
+            if let (Transport::Local, Some((uid, gid))) = (&spec.transport, local_uid_gid()) {
+                v.extend(["--user".into(), format!("{uid}:{gid}")]);
+            }
+        }
+        _ => {}
+    }
+    // All other opts (network, mounts, env, volumes, gpu, limits, ports) are
+    // identical to oci_create_opts — delegate by temporarily re-routing:
+    // build via oci_create_opts and strip the userns flag if present.
+    let mut full = oci_create_opts(spec);
+    if spec.backend == Backend::Podman && !keep_id {
+        // Drop "--userns" and "keep-id" (two consecutive entries).
+        let mut out = Vec::with_capacity(full.len());
+        let mut skip = false;
+        for item in full.drain(..) {
+            if item == "--userns" {
+                skip = true;
+                continue;
+            }
+            if skip && item == "keep-id" {
+                skip = false;
+                continue;
+            }
+            skip = false;
+            out.push(item);
+        }
+        out
+    } else {
+        full
+    }
 }
 
 /// Wrap a backend argv so it runs on the remote: mosh (interactive) or ssh.
@@ -1262,6 +1349,13 @@ mod tests {
         assert!(j.contains("-v /repo/.git:/repo/.git"));
         assert!(j.contains("-e GH_TOKEN=abc"));
         assert!(j.contains("-p 8080:8080"));
+    }
+
+    #[test]
+    fn empty_oci_image_uses_default_image() {
+        let mut s = spec(Backend::Podman);
+        s.image = None;
+        assert_eq!(effective_image(&s), DEFAULT_OCI_IMAGE);
     }
 
     #[test]

@@ -608,6 +608,65 @@ mod spec {
     }
 
     #[test]
+    fn commits_section_shows_loading_while_cache_is_empty() {
+        let mut m = model();
+        m.panel.commits.clear();
+        m.panel.commits_loading = true;
+        let u = ui(PanelWidth::Normal, Section::Commits);
+        let ctx = SectionCtx {
+            model: &m,
+            ui: &u,
+            cols: 39,
+            rows: 28,
+        };
+        let rendered = text(&content(Section::Commits, &ctx));
+        assert!(rendered.contains("loading commits…"), "{rendered}");
+    }
+
+    #[test]
+    fn sandbox_section_prefers_active_worktree_container() {
+        let mut m = model();
+        m.active_container_name = "superzej-active-worktree".into();
+        m.containers = vec![
+            superzej_core::sandbox::ContainerInfo {
+                name: "superzej-other-worktree".into(),
+                image: "rust:1".into(),
+                status: "Up 1h".into(),
+                ours: true,
+                backend: "podman".into(),
+                cpu: "9%".into(),
+                mem: "300MiB".into(),
+                net: "9kB".into(),
+                containment: "other-policy".into(),
+                mounts: String::new(),
+            },
+            superzej_core::sandbox::ContainerInfo {
+                name: "superzej-active-worktree".into(),
+                image: "rust:1".into(),
+                status: "Up 2m".into(),
+                ours: true,
+                backend: "podman".into(),
+                cpu: "2%".into(),
+                mem: "120MiB".into(),
+                net: "2kB".into(),
+                containment: "active-policy".into(),
+                mounts: String::new(),
+            },
+        ];
+        let u = ui(PanelWidth::Normal, Section::Sandbox);
+        let ctx = SectionCtx {
+            model: &m,
+            ui: &u,
+            cols: 39,
+            rows: 28,
+        };
+        let rendered = text(&content(Section::Sandbox, &ctx));
+        assert!(rendered.contains("superzej-active-worktree"), "{rendered}");
+        assert!(rendered.contains("active-policy"), "{rendered}");
+        assert!(!rendered.contains("superzej-other-worktree"), "{rendered}");
+    }
+
+    #[test]
     fn every_section_renders_three_distinct_views() {
         for section in crate::panel::SECTION_ORDER {
             let n = render(section, PanelWidth::Normal);

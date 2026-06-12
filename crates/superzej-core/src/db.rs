@@ -22,7 +22,7 @@ use std::path::PathBuf;
 /// purely additive. v6: tabs live *within* a worktree — the flat `tab_layout`
 /// (pages encoded as " ·N" name suffixes) becomes `tab_groups` + `group_tabs`;
 /// legacy rows are transformed in place and `tab_layout` is dropped.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 pub struct Db {
     conn: Connection,
@@ -146,6 +146,14 @@ impl Db {
             CREATE TABLE IF NOT EXISTS diff_cache (
               worktree   TEXT PRIMARY KEY,
               files      TEXT,
+              fetched_at INTEGER
+            );
+            -- Latest structured commit feed per worktree. The host paints the
+            -- commits panel from this cache immediately, then refreshes it on a
+            -- background worker so `git log` never gates opening the sidebar.
+            CREATE TABLE IF NOT EXISTS commit_cache (
+              worktree   TEXT PRIMARY KEY,
+              json       TEXT,
               fetched_at INTEGER
             );
             CREATE TABLE IF NOT EXISTS loc_cache (
@@ -350,6 +358,29 @@ impl Db {
                VALUES(?1,?2,?3)
                ON CONFLICT(worktree) DO UPDATE SET files=?2, fetched_at=?3"#,
             params![worktree, files, util::now()],
+        )?;
+        Ok(())
+    }
+
+    // --- commit cache (per worktree; feeds instant lazy commits panel) -----
+    pub fn get_commit_cache(&self, worktree: &str) -> Result<Option<(String, i64)>> {
+        let r = self
+            .conn
+            .query_row(
+                "SELECT json, fetched_at FROM commit_cache WHERE worktree=?1",
+                params![worktree],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .ok();
+        Ok(r)
+    }
+
+    pub fn put_commit_cache(&self, worktree: &str, json: &str) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO commit_cache(worktree,json,fetched_at)
+               VALUES(?1,?2,?3)
+               ON CONFLICT(worktree) DO UPDATE SET json=?2, fetched_at=?3"#,
+            params![worktree, json, util::now()],
         )?;
         Ok(())
     }
@@ -1095,6 +1126,17 @@ mod tests {
 
     fn db() -> Db {
         Db::open_memory().unwrap()
+    }
+
+    #[test]
+    fn commit_cache_roundtrips_json_and_timestamp() {
+        let db = db();
+        assert!(db.get_commit_cache("/wt").unwrap().is_none());
+        db.put_commit_cache("/wt", r#"[{"short":"abc1234"}]"#)
+            .unwrap();
+        let (json, fetched_at) = db.get_commit_cache("/wt").unwrap().unwrap();
+        assert_eq!(json, r#"[{"short":"abc1234"}]"#);
+        assert!(fetched_at > 0);
     }
 
     #[test]

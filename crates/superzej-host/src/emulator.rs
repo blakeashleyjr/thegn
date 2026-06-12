@@ -85,6 +85,14 @@ pub trait PaneEmulator: Send {
     fn mouse_mode(&self) -> (MouseMode, bool) {
         (MouseMode::None, false)
     }
+    /// Number of lines currently stored in the parallel history ring. Used by
+    /// `apply_search_jump` to compute the scroll offset needed to bring a
+    /// matched line into view. Returns `None` when the emulator has no attached
+    /// history ring (e.g. in unit tests that use a stub emulator).
+    #[allow(dead_code)] // used by search jump scroll-offset calculation
+    fn history_len(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Mouse reporting level an app can request (DECSET 9/1000/1002/1003),

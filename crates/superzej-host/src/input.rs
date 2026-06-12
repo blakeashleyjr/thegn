@@ -51,6 +51,7 @@ pub(crate) fn key_bytes_mode(key: &KeyCode, mods: Modifiers, app_cursor: bool) -
         }
         KeyCode::Enter => Some(vec![b'\r']),
         KeyCode::Backspace => Some(vec![0x7f]),
+        KeyCode::Tab if mods.contains(Modifiers::SHIFT) => Some(b"\x1b[Z".to_vec()),
         KeyCode::Tab => Some(vec![b'\t']),
         KeyCode::Escape => Some(vec![0x1b]),
         KeyCode::LeftArrow => Some(b"\x1b[D".to_vec()),
@@ -129,6 +130,15 @@ mod tests {
         assert!(is_escape_key(&KeyCode::Escape));
         assert!(is_escape_key(&KeyCode::Char('\x1b')));
         assert!(!is_escape_key(&KeyCode::Char('q')));
+    }
+
+    #[test]
+    fn shift_tab_forwards_reverse_tab_sequence() {
+        assert_eq!(
+            key_bytes_mode(&KeyCode::Tab, Modifiers::SHIFT, false).unwrap(),
+            b"\x1b[Z"
+        );
+        assert_eq!(key_bytes(&KeyCode::Tab, Modifiers::NONE).unwrap(), b"\t");
     }
 
     #[test]

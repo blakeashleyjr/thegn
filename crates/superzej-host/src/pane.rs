@@ -10,6 +10,8 @@ use std::io::Write;
 use termwiz::terminal::TerminalWaker;
 use tokio::sync::mpsc as tokio_mpsc;
 
+use superzej_core::history::{AnsiStripper, HistoryBuffer, feed_bytes_to_history};
+
 use crate::emulator::{PaneEmulator, Vt100Emulator};
 
 /// What a pane's reader thread emits (tagged with the pane id so one shared
@@ -33,6 +35,15 @@ pub struct PtyPane {
     /// shell). Used to key per-program keybind overlays + remaps. Best-effort
     /// from the spawn argv — not a live foreground-process probe.
     program: String,
+    /// Plain-text history ring (ANSI-stripped), parallel to the vt100 grid.
+    /// Read by the search engine; populated by `feed` on each PTY output chunk.
+    pub history: HistoryBuffer,
+    /// Bytes of the in-progress line not yet terminated by '\n'. Flushed into
+    /// `history` on newline or when it exceeds 4096 bytes.
+    history_partial: Vec<u8>,
+    /// Stateful ANSI stripper carried across PTY read chunks so sequences that
+    /// arrive split at a chunk boundary are handled correctly.
+    history_stripper: AnsiStripper,
 }
 
 /// Derive a pane's program name from its spawn argv. Handles the common
@@ -171,6 +182,9 @@ impl PtyPane {
             rows,
             cols,
             program: program_name(argv),
+            history: HistoryBuffer::new(10_000),
+            history_partial: Vec::new(),
+            history_stripper: AnsiStripper::default(),
         })
     }
 
@@ -179,10 +193,16 @@ impl PtyPane {
         &self.program
     }
 
-    /// Feed PTY output into the emulator grid (drain-without-render is just this
-    /// without a subsequent compose).
+    /// Feed PTY output into the emulator grid and the plain-text history ring.
+    /// Drain-without-render is just this without a subsequent compose.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.emulator.advance(bytes);
+        feed_bytes_to_history(
+            bytes,
+            &mut self.history,
+            &mut self.history_partial,
+            &mut self.history_stripper,
+        );
     }
 
     /// Forward user input bytes to the child. Typing snaps the viewport back to

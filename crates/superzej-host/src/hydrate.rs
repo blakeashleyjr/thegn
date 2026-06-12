@@ -443,11 +443,13 @@ pub(crate) fn build_initial_model(session: &crate::session::Session) -> FrameMod
         .active_group()
         .map(|g| g.name.clone())
         .unwrap_or_else(|| "workspace/home".into());
+    let cwd = active_tab_path(session);
     let (worktree, tabs, active_tab) = tab_strip(session);
     FrameModel {
         worktree,
         tabs,
         active_tab,
+        active_container_name: superzej_core::sandbox::container_name(&cwd.to_string_lossy()),
         panel: crate::panel::PanelData {
             branch: active_name,
             ..Default::default()
@@ -468,6 +470,56 @@ pub(crate) fn build_initial_model(session: &crate::session::Session) -> FrameMod
 pub(crate) struct HydrateHints {
     pub open: crate::panel::Section,
     pub expanded: bool,
+}
+
+impl HydrateHints {
+    fn wants_commits(self) -> bool {
+        self.open == crate::panel::Section::Commits || (self.expanded && self.open.is_git_family())
+    }
+
+    fn visible_commit_limit(self) -> usize {
+        if self.expanded { 80 } else { 20 }
+    }
+}
+
+const COMMIT_CACHE_TTL_SECS: i64 = 30;
+
+fn commit_cache_needs_refresh(cache: Option<&(String, i64)>) -> bool {
+    let Some((json, fetched_at)) = cache else {
+        return true;
+    };
+    serde_json::from_str::<Vec<crate::panel::CommitRow>>(json).is_err()
+        || superzej_core::util::now().saturating_sub(*fetched_at) >= COMMIT_CACHE_TTL_SECS
+}
+
+fn refresh_commit_cache(db: &superzej_core::db::Db, session: &crate::session::Session) -> bool {
+    use superzej_core::remote::GitLoc;
+    use superzej_svc::git::{CliGit, GitBackend};
+
+    let cwd = active_tab_path(session);
+    if !cwd.is_dir() {
+        return false;
+    }
+    let loc = GitLoc::for_worktree(&cwd);
+    let Ok(rows) = CliGit.log_commits(&loc, 80) else {
+        return false;
+    };
+    let rows: Vec<crate::panel::CommitRow> = rows
+        .into_iter()
+        .map(|c| crate::panel::CommitRow {
+            sha: c.sha,
+            short: c.short,
+            subject: c.subject,
+            author: c.author,
+            date: c.date,
+            refs: c.refs,
+            parents: c.parents,
+        })
+        .collect();
+    serde_json::to_string(&rows)
+        .ok()
+        .and_then(|json| db.put_commit_cache(&loc.path(), &json).ok())
+        .is_some()
 }
 
 /// Map the typed PR cache into the panel's pr/checks/threads/issues fields.
@@ -613,22 +665,15 @@ pub(crate) fn build_model(
     // pays only for what's visible. The Full git frame shows every list, so
     // any open git-family section at Full hydrates them all.
     let git_family_full = hints.expanded && hints.open.is_git_family();
-    if hints.open == crate::panel::Section::Commits || git_family_full {
-        let n = if hints.expanded { 80 } else { 20 };
-        panel.commits = git
-            .log_commits(&loc, n)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|c| crate::panel::CommitRow {
-                sha: c.sha,
-                short: c.short,
-                subject: c.subject,
-                author: c.author,
-                date: c.date,
-                refs: c.refs,
-                parents: c.parents,
-            })
-            .collect();
+    if hints.wants_commits() {
+        let cached = db.get_commit_cache(&loc.path()).ok().flatten();
+        if let Some((json, _)) = cached.as_ref()
+            && let Ok(mut rows) = serde_json::from_str::<Vec<crate::panel::CommitRow>>(json)
+        {
+            rows.truncate(hints.visible_commit_limit());
+            panel.commits = rows;
+        }
+        panel.commits_loading = commit_cache_needs_refresh(cached.as_ref());
     }
     if hints.open == crate::panel::Section::Branches || git_family_full {
         // The per-repo open-PR cache joins onto branch rows by head ref.
@@ -713,6 +758,7 @@ pub(crate) fn build_model(
         sidebar_db_worktrees,
         sidebar_status,
         loc: loc_count,
+        active_container_name: superzej_core::sandbox::container_name(&loc.path()),
         containers: superzej_core::sandbox::running_containers(),
         panel,
         panel_focused: false,
@@ -736,7 +782,23 @@ pub(crate) fn spawn_model_hydration(
     hints: HydrateHints,
 ) {
     task::spawn_blocking(move || {
-        if let Ok(db) = superzej_core::db::Db::open()
+        let Ok(db) = superzej_core::db::Db::open() else {
+            return;
+        };
+        let first = build_model(&session, &db, hints);
+        let refresh_commits = first.panel.commits_loading;
+        if tx.send((generation, first)).is_ok()
+            && let Some(w) = &waker
+        {
+            let _ = w.wake();
+        }
+
+        // `git log` can be expensive on large repos. Run it only after the
+        // cache-backed model has already landed, then send a second model from
+        // the refreshed cache. Generation tagging in the event loop drops this
+        // safely if the user switched worktrees meanwhile.
+        if refresh_commits
+            && refresh_commit_cache(&db, &session)
             && tx
                 .send((generation, build_model(&session, &db, hints)))
                 .is_ok()

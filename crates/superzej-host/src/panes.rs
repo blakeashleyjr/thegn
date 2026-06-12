@@ -429,7 +429,12 @@ mod tests {
         let specs: Vec<(u32, crate::agent::LaunchSpec)> = panes
             .missing_leaves(&session.worktrees[0].tabs[0])
             .into_iter()
-            .map(|id| (id, crate::agent::launch_spec(&cfg, &path, None, "shell")))
+            .map(|id| {
+                (
+                    id,
+                    crate::agent::launch_spec(&cfg, &path, None, "shell").unwrap(),
+                )
+            })
             .collect();
         panes
             .materialize_with_specs(

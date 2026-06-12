@@ -58,6 +58,16 @@ pub struct LaunchSpec {
     pub argv: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub env: Vec<(String, String)>,
+    /// The effective containment backend used for this launch (`host` after fallback).
+    pub backend: String,
+    /// Human-visible notes when auto sandbox resolution fell through to another backend.
+    pub warnings: Vec<String>,
+}
+
+impl LaunchSpec {
+    pub fn warning_summary(&self) -> Option<String> {
+        (!self.warnings.is_empty()).then(|| self.warnings.join("; "))
+    }
 }
 
 /// Compose the [`LaunchSpec`] for running `choice` in `worktree`. Records the
@@ -66,7 +76,12 @@ pub struct LaunchSpec {
 ///
 /// `branch` is the worktree's branch (for the pane env + title); `None` falls
 /// back to the worktree basename.
-pub fn launch_spec(cfg: &Config, worktree: &str, branch: Option<&str>, choice: &str) -> LaunchSpec {
+pub fn launch_spec(
+    cfg: &Config,
+    worktree: &str,
+    branch: Option<&str>,
+    choice: &str,
+) -> anyhow::Result<LaunchSpec> {
     let loc = GitLoc::for_worktree(Path::new(worktree));
     let cmd = resolve_command(cfg, choice);
 
@@ -100,52 +115,104 @@ pub fn launch_spec(cfg: &Config, worktree: &str, branch: Option<&str>, choice: &
     // Wrap the chosen program in the worktree's sandbox/container (and/or the
     // mosh/ssh transport for a remote worktree). Auto walks the configured chain;
     // a persisted worktree choice (from the new-worktree picker) narrows the
-    // candidates. Host is an explicit last fallback, labeled in the DB.
+    // candidates. Explicit sandbox selections must not silently fall back to host.
     let mut sb = cfg.repo_sandbox(&repo_root);
+    let mut explicit_backend =
+        sandbox::Backend::from_config(sb.backend).filter(|b| *b != sandbox::Backend::None);
     if let Ok(db) = Db::open()
         && let Ok(Some(saved)) = db.worktree_sandbox(worktree)
-        && !saved.trim().is_empty()
-        && saved.trim() != "auto"
-        && let Ok(b) = superzej_core::config::SandboxBackend::from_str_validated(&saved)
     {
-        sb.backend = b;
+        let saved = saved.trim();
+        if !saved.is_empty()
+            && saved != "auto"
+            && let Ok(b) = superzej_core::config::SandboxBackend::from_str_validated(saved)
+        {
+            explicit_backend =
+                sandbox::Backend::from_config(b).filter(|b| *b != sandbox::Backend::None);
+            sb.backend = b;
+        }
     }
+    let explicit_choice = explicit_backend.is_some();
+    let auto_choice = sb.backend == superzej_core::config::SandboxBackend::Auto;
+    let mut warnings = Vec::new();
     let cname = sandbox::container_name(worktree);
     for candidate in sandbox_candidates(&sb) {
         if let Some(spec) = sandbox::resolve(&candidate, &loc, &cname) {
             if spec.backend == sandbox::Backend::None {
                 break;
             }
+            if let Some(expected) = explicit_backend
+                && spec.backend != expected
+            {
+                anyhow::bail!(
+                    "explicit sandbox backend '{}' resolved to '{}' for {worktree}; refusing fallback",
+                    sb.backend,
+                    spec.backend.label()
+                );
+            }
             match sandbox::ensure(&spec) {
                 Ok(()) => {
                     if let Ok(db) = Db::open() {
                         let _ = db.set_worktree_sandbox(worktree, spec.backend.label());
                     }
-                    return LaunchSpec {
+                    return Ok(LaunchSpec {
                         argv: sandbox::enter_argv(&spec, &cmd),
                         cwd,
                         env,
-                    };
+                        backend: spec.backend.label().to_string(),
+                        warnings,
+                    });
                 }
-                Err(e) => superzej_core::msg::warn(&format!(
-                    "sandbox {} failed for {worktree}: {e}; trying next backend",
-                    spec.backend.label()
-                )),
+                Err(e) if explicit_choice => {
+                    anyhow::bail!(
+                        "sandbox {} failed for {worktree}: {e}",
+                        spec.backend.label()
+                    );
+                }
+                Err(e) => {
+                    let note = format!("sandbox {} failed: {e}", spec.backend.label());
+                    warnings.push(note.clone());
+                    superzej_core::msg::warn(&format!(
+                        "sandbox {} failed for {worktree}: {e}; trying next backend",
+                        spec.backend.label()
+                    ));
+                }
             }
         } else if candidate.backend == superzej_core::config::SandboxBackend::None {
             break;
+        } else if explicit_choice {
+            anyhow::bail!(
+                "sandbox backend '{}' could not be resolved for {worktree}",
+                candidate.backend
+            );
+        } else if candidate.backend != superzej_core::config::SandboxBackend::Auto {
+            warnings.push(format!("sandbox {} unavailable", candidate.backend));
         }
     }
 
+    if explicit_choice {
+        anyhow::bail!(
+            "explicit sandbox backend '{}' did not produce a runnable sandbox for {worktree}",
+            sb.backend
+        );
+    }
+
+    if auto_choice && warnings.is_empty() {
+        warnings.push("sandbox auto selected host".to_string());
+    } else if auto_choice {
+        warnings.push("running on host after sandbox fallback".to_string());
+    }
     if let Ok(db) = Db::open() {
         let _ = db.set_worktree_sandbox(worktree, "host");
     }
     // Host fallback: run the command through a login shell so PATH/env expand.
-    LaunchSpec {
+    Ok(LaunchSpec {
         argv: vec![superzej_core::util::shell(), "-lc".to_string(), cmd],
         cwd,
         env,
-    }
+        backend: "host".to_string(),
+        warnings,
+    })
 }
 
 fn sandbox_candidates(
@@ -209,5 +276,83 @@ mod tests {
         assert_eq!(resolve_command(&cfg, "shell"), shell_inner());
         // Unknown label degrades to a shell.
         assert_eq!(resolve_command(&cfg, "nope"), shell_inner());
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_temp_state<T>(name: &str, f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("sz-agent-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::env::var_os("XDG_STATE_HOME");
+        // SAFETY: guarded by ENV_LOCK; this module's DB-touching tests run inside this critical section.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
+        let out = f();
+        match old {
+            Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    }
+
+    #[test]
+    fn explicit_unavailable_sandbox_does_not_fall_back_to_host() {
+        with_temp_state("explicit-no-host", || {
+            let mut cfg = cfg_with(&[], &[]);
+            cfg.sandbox.backend = superzej_core::config::SandboxBackend::Wsl;
+            cfg.sandbox.backend_chain = vec!["host".to_string()];
+            let worktree =
+                std::env::temp_dir().join(format!("sz-agent-wsl-missing-{}", std::process::id()));
+            let err = launch_spec(&cfg, &worktree.to_string_lossy(), None, "shell")
+                .expect_err("explicit WSL sandbox must not degrade to host");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("explicit sandbox backend")
+                    || msg.contains("refusing fallback")
+                    || msg.contains("could not be resolved"),
+                "{msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn auto_backend_chain_can_fall_back_to_host() {
+        with_temp_state("auto-host", || {
+            let mut cfg = cfg_with(&[], &[]);
+            cfg.sandbox.backend = superzej_core::config::SandboxBackend::Auto;
+            cfg.sandbox.backend_chain = vec!["host".to_string()];
+            let worktree =
+                std::env::temp_dir().join(format!("sz-agent-auto-host-{}", std::process::id()));
+            let spec = launch_spec(&cfg, &worktree.to_string_lossy(), None, "shell").unwrap();
+            assert_eq!(spec.backend, "host");
+            assert!(spec.argv.join(" ").contains("sh"));
+            assert_eq!(
+                spec.warning_summary().as_deref(),
+                Some("sandbox auto selected host")
+            );
+        });
+    }
+
+    #[test]
+    fn auto_backend_fallthrough_carries_visible_warning() {
+        with_temp_state("auto-fallthrough-warning", || {
+            let mut cfg = cfg_with(&[], &[]);
+            cfg.sandbox.backend = superzej_core::config::SandboxBackend::Auto;
+            cfg.sandbox.backend_chain = vec!["wsl".to_string(), "host".to_string()];
+            let worktree = std::env::temp_dir()
+                .join(format!("sz-agent-auto-fallthrough-{}", std::process::id()));
+            let spec = launch_spec(&cfg, &worktree.to_string_lossy(), None, "shell").unwrap();
+            assert_eq!(spec.backend, "host");
+            let warning = spec
+                .warning_summary()
+                .expect("host fallback should be visible");
+            assert!(warning.contains("sandbox wsl unavailable"), "{warning}");
+            assert!(
+                warning.contains("running on host after sandbox fallback"),
+                "{warning}"
+            );
+        });
     }
 }
