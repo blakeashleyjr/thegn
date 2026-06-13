@@ -4484,6 +4484,7 @@ dependencies = [
  "serde_json",
  "superzej-core",
  "superzej-svc",
+ "sw-core",
  "sw-rpc",
  "sw-tui",
  "sz-kit",
@@ -4491,6 +4492,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "ulid",
  "vt100",
 ]
 
