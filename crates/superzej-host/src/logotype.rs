@@ -245,11 +245,13 @@ pub fn splash_variant(cols: usize, rows: usize) -> SplashVariant {
 /// keybind hints, centered in `rect` on the deep background. Pure function of
 /// `rect` + the live palette — resize re-centers it for free.
 pub fn draw_splash(surface: &mut Surface, rect: Rect, model: &crate::chrome::FrameModel) {
+    use crate::chrome::{LoadStep, StepState};
     chrome::fill(surface, rect, col(S::Bg0));
     let accent = chrome::theme_color(model.accent_or_default());
     let bg = col(S::Bg0);
     let version = concat!("v", env!("CARGO_PKG_VERSION"));
     let tagline = " · git worktree IDE";
+    let loading = !model.load_steps.is_empty();
 
     // Center one line made of (text, fg) parts.
     let centered_parts = |surface: &mut Surface, y: usize, parts: &[(&str, ColorAttribute)]| {
@@ -263,82 +265,67 @@ pub fn draw_splash(surface: &mut Surface, rect: Rect, model: &crate::chrome::Fra
 
     match splash_variant(rect.cols, rect.rows) {
         SplashVariant::Large => {
-            // wordmark(3) + gap + version + gap + hints(3) = 9 rows.
-            let y0 = rect.y + rect.rows.saturating_sub(9) / 2;
+            // Loading: wordmark(3) + gap(1) + version(1) + gap(1) + steps(N).
+            // Idle:    wordmark(3) + gap(1) + version(1) + gap(1) + hints(3) = 9 rows total.
+            let content_rows = if loading { model.load_steps.len() } else { 3 };
+            let total_rows = 9.max(3 + 3 + content_rows); // always at least 9 for stable centering
+            let y0 = rect.y + rect.rows.saturating_sub(total_rows) / 2;
             let (w, _) = measure(Face::Large, WORDMARK);
             let x = rect.x + rect.cols.saturating_sub(w) / 2;
-            draw(
-                surface,
-                x,
-                y0,
-                WORDMARK,
-                Face::Large,
-                accent,
-                bg,
-                rect.cols,
-                3,
-            );
+            draw(surface, x, y0, WORDMARK, Face::Large, accent, bg, rect.cols, 3);
             centered_parts(
                 surface,
                 y0 + 4,
                 &[(version, col(S::Dim)), (tagline, col(S::Faint))],
             );
-            // A left-aligned hint block, centered as a whole on its widest line.
-            let hints = [
-                ("Ctrl-Space", "command palette"),
-                ("Alt-↑↓", "prev/next worktree"),
-                ("Ctrl-g", "lock keys to pane"),
-            ];
-            let key_w = 10; // "Ctrl-Space"
-            let block_w = key_w + 2 + 18; // widest label
-            let hx = rect.x + rect.cols.saturating_sub(block_w) / 2;
-            for (i, (key, label)) in hints.iter().enumerate() {
-                let y = y0 + 6 + i;
-                chrome::draw_text(surface, hx, y, key, col(S::Dim), bg, rect.cols);
-                let lx = hx + key_w + 2;
-                chrome::draw_text(
-                    surface,
-                    lx,
-                    y,
-                    label,
-                    col(S::Faint),
-                    bg,
-                    (rect.x + rect.cols).saturating_sub(lx),
-                );
+            if loading {
+                draw_steps(surface, rect, &model.load_steps, y0 + 6, bg, accent);
+            } else {
+                let hints = [
+                    ("Ctrl-Space", "command palette"),
+                    ("Alt-↑↓",     "prev/next worktree"),
+                    ("Ctrl-g",     "lock keys to pane"),
+                ];
+                let key_w = 10;
+                let block_w = key_w + 2 + 18;
+                let hx = rect.x + rect.cols.saturating_sub(block_w) / 2;
+                for (i, (key, label)) in hints.iter().enumerate() {
+                    let y = y0 + 6 + i;
+                    chrome::draw_text(surface, hx, y, key, col(S::Dim), bg, rect.cols);
+                    let lx = hx + key_w + 2;
+                    chrome::draw_text(surface, lx, y, label, col(S::Faint), bg,
+                        (rect.x + rect.cols).saturating_sub(lx));
+                }
             }
         }
         SplashVariant::Small => {
-            // wordmark(2) + gap + version + gap + hints(1) = 6 rows.
             let y0 = rect.y + rect.rows.saturating_sub(6) / 2;
             let (w, _) = measure(Face::Small, WORDMARK);
             let x = rect.x + rect.cols.saturating_sub(w) / 2;
-            draw(
-                surface,
-                x,
-                y0,
-                WORDMARK,
-                Face::Small,
-                accent,
-                bg,
-                rect.cols,
-                2,
-            );
+            draw(surface, x, y0, WORDMARK, Face::Small, accent, bg, rect.cols, 2);
             centered_parts(
                 surface,
                 y0 + 3,
                 &[(version, col(S::Dim)), (tagline, col(S::Faint))],
             );
-            centered_parts(
-                surface,
-                y0 + 5,
-                &[
+            if loading {
+                // Compact: show only the active step on y0+5.
+                if let Some(step) = model.load_steps.iter().find(|s| s.state == StepState::Active)
+                    .or_else(|| model.load_steps.last())
+                {
+                    let (glyph, fg) = step_glyph(step, accent);
+                    let text = format!("{glyph} {}", step.label);
+                    centered_parts(surface, y0 + 5, &[(&text, fg)]);
+                }
+            } else {
+                centered_parts(surface, y0 + 5, &[
                     ("Ctrl-Space", col(S::Dim)),
                     (" palette ", col(S::Faint)),
                     ("·", col(S::Ghost)),
                     (" Ctrl-g", col(S::Dim)),
                     (" lock", col(S::Faint)),
-                ],
-            );
+                ]);
+            }
         }
         SplashVariant::Text => {
             let y = rect.y + rect.rows.saturating_sub(1) / 2;
@@ -346,24 +333,52 @@ pub fn draw_splash(surface: &mut Surface, rect: Rect, model: &crate::chrome::Fra
         }
         SplashVariant::None => {}
     }
+}
 
-    // Loading status line: shown while the first pane is spawning. Rendered
-    // two rows above the bottom of the splash rect so it doesn't overlap the
-    // hint block and is always visible even on very short terminals.
-    if !model.center_status.is_empty() && rect.rows >= 3 {
-        let s = &model.center_status;
-        // Truncate to fit with a leading spinner glyph.
-        let max_w = rect.cols.saturating_sub(2);
-        let display: String = if s.chars().count() > max_w {
-            s.chars().take(max_w.saturating_sub(1)).collect::<String>() + "…"
-        } else {
-            s.clone()
+/// Returns the glyph and color for a step based on its state.
+fn step_glyph(step: &crate::chrome::LoadStep, accent: ColorAttribute)
+    -> (&'static str, ColorAttribute)
+{
+    use crate::chrome::StepState;
+    match step.state {
+        StepState::Done    => ("✓", col(S::Dim)),
+        StepState::Active  => ("◆", accent),
+        StepState::Pending => ("◇", col(S::Ghost)),
+        StepState::Failed  => ("✗", col(S::Ghost)),
+    }
+}
+
+/// Render a step list centered as a block below `y_start`.
+fn draw_steps(
+    surface: &mut Surface,
+    rect: Rect,
+    steps: &[crate::chrome::LoadStep],
+    y_start: usize,
+    bg: ColorAttribute,
+    accent: ColorAttribute,
+) {
+    use crate::chrome::StepState;
+    // Find the width of the widest label to left-align the block as a whole.
+    let max_label = steps.iter().map(|s| s.label.chars().count()).max().unwrap_or(0);
+    // glyph(1) + space(1) + label
+    let block_w = 2 + max_label;
+    let bx = rect.x + rect.cols.saturating_sub(block_w) / 2;
+
+    for (i, step) in steps.iter().enumerate() {
+        let y = y_start + i;
+        if y >= rect.y + rect.rows {
+            break;
+        }
+        let (glyph, glyph_fg) = step_glyph(step, accent);
+        chrome::draw_text(surface, bx, y, glyph, glyph_fg, bg, 1);
+        let label_fg = match step.state {
+            StepState::Done    => col(S::Dim),
+            StepState::Active  => col(S::Text),
+            StepState::Pending => col(S::Ghost),
+            StepState::Failed  => col(S::Ghost),
         };
-        let full = format!("⟳ {display}");
-        let w = full.chars().count();
-        let x = rect.x + rect.cols.saturating_sub(w) / 2;
-        let y = rect.y + rect.rows - 2;
-        chrome::draw_text(surface, x, y, &full, col(S::Dim), col(S::Bg0), rect.cols);
+        chrome::draw_text(surface, bx + 2, y, &step.label, label_fg, bg,
+            (rect.x + rect.cols).saturating_sub(bx + 2));
     }
 }
 
