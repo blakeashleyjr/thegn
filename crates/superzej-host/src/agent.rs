@@ -51,30 +51,47 @@ pub fn resolve_command(cfg: &Config, choice: &str) -> String {
 ///
 /// `in_oci` must be `true` when the inner command will run inside an OCI
 /// container (podman/docker).  In that case the host's absolute `$SHELL` path
-/// (e.g. `/run/current-system/sw/bin/zsh`) is meaningless inside the container
-/// filesystem; we use only the basename so the container's own PATH resolves
-/// it, falling through `zsh → bash → sh` until we find something sensible.
+/// (e.g. `/run/current-system/sw/bin/zsh`) is meaningless — and even using the
+/// basename fails if the container image doesn't have that shell installed (e.g.
+/// a bare Debian image has bash but not zsh).  We emit a POSIX sh snippet that
+/// walks a preference chain at runtime inside the container and execs the first
+/// one that exists; `/bin/sh` is always the last resort.
 ///
 /// On the host fallback path `in_oci = false` keeps the existing behaviour:
 /// use `$SHELL` verbatim so NixOS users get the right store-path shell.
 fn shell_inner(in_oci: bool) -> String {
-    let host_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-    let shell = if in_oci {
-        // For OCI containers strip the absolute path: use only the basename
-        // (e.g. "zsh") so the container's PATH resolves it.  Fall back through
-        // a safe chain if the host shell is unusual.
-        let name = std::path::Path::new(&host_shell)
+    if in_oci {
+        // Preference order: honour the host shell name if it's a known shell,
+        // then try zsh/bash/fish/sh in that order.  The outer /bin/sh -lc
+        // already provides a POSIX execution context, so this snippet is safe.
+        let host_shell = std::env::var("SHELL").unwrap_or_default();
+        let preferred = std::path::Path::new(&host_shell)
             .file_name()
             .and_then(|s| s.to_str())
-            .unwrap_or("sh");
-        match name {
-            "zsh" | "bash" | "fish" | "dash" | "sh" | "ksh" | "mksh" => name.to_string(),
-            _ => "sh".to_string(),
+            .unwrap_or("");
+        // Build a chain that tries the host-preferred shell first (if it's a
+        // known name) then falls through to bash → sh.
+        let mut chain: Vec<&str> = Vec::new();
+        if matches!(preferred, "zsh" | "bash" | "fish" | "dash" | "ksh" | "mksh") {
+            chain.push(preferred);
         }
+        for s in &["zsh", "bash", "sh"] {
+            if !chain.contains(s) {
+                chain.push(s);
+            }
+        }
+        // Emit: for s in zsh bash sh; do command -v "$s" >/dev/null 2>&1 && exec "$s" -l; done
+        let checks: String = chain
+            .iter()
+            .map(|s| format!("command -v {s} >/dev/null 2>&1 && exec {s} -l; "))
+            .collect();
+        // The trailing /bin/sh -l is the unconditional fallback — it exists in
+        // every POSIX container.
+        format!("{checks}exec /bin/sh -l")
     } else {
-        host_shell
-    };
-    format!("{shell} -l")
+        let host_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        format!("{host_shell} -l")
+    }
 }
 
 /// Like [`shell_inner`] but uses an explicit override from the sandbox config.
@@ -481,30 +498,22 @@ mod tests {
         );
     }
 
-    /// OCI shell panes must use only the basename of $SHELL, not the absolute
-    /// host path, because e.g. /run/current-system/sw/bin/zsh does not exist
-    /// inside a Debian/Ubuntu/etc container.
+    /// OCI shell panes emit a runtime probe chain so containers that don't have
+    /// the host shell (e.g. a bare Debian image has bash but not zsh) still get
+    /// a working login shell instead of "exec: zsh: not found".
     #[test]
-    fn shell_inner_oci_uses_basename_not_host_abs_path() {
-        // Simulate a NixOS host where $SHELL is a Nix store path.
-        let nix_zsh = "/run/current-system/sw/bin/zsh";
-        // Non-OCI: the full path must be preserved.
-        let host_cmd = shell_inner(false);
-        // We can't control $SHELL in the test env, but we can test the logic
-        // directly via the function.  The key invariant: in_oci=true strips to
-        // just the basename.
-        let known_shells = ["zsh", "bash", "fish", "sh", "dash"];
-        // Manually invoke the logic: basename of nix_zsh is "zsh", which is in
-        // the known list, so the result must be "zsh -l".
-        let base = std::path::Path::new(nix_zsh)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("sh");
-        assert!(known_shells.contains(&base), "basename should be a known shell name");
-        assert_eq!(format!("{base} -l"), "zsh -l");
-        // in_oci=false must preserve whatever shell_inner returns as-is.
-        assert!(!host_cmd.starts_with('/') || host_cmd.contains('/'),
-            "host form should keep the resolved path");
+    fn shell_inner_oci_emits_runtime_probe_chain() {
+        let oci = shell_inner(true);
+        // Must contain a POSIX command -v probe for each candidate shell.
+        assert!(oci.contains("command -v"), "should probe for shell availability");
+        // Must have an unconditional /bin/sh -l fallback at the end.
+        assert!(oci.ends_with("exec /bin/sh -l"), "must end with /bin/sh fallback");
+        // bash must always appear in the chain (present in every Debian image).
+        assert!(oci.contains("bash"), "bash must be in the probe chain");
+        // Non-OCI: must be a simple "<shell> -l" with the host path, not a chain.
+        let host = shell_inner(false);
+        assert!(!host.contains("command -v"), "host form must not emit a probe chain");
+        assert!(host.ends_with(" -l"), "host form must end with -l");
     }
 
     #[test]
