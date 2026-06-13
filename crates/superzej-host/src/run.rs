@@ -382,7 +382,12 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         cfg.theme.pane_padding as usize,
         std::sync::atomic::Ordering::Relaxed,
     );
-    let mut model = build_initial_model(&session);
+    // Open the DB once here so the first frame has the full workspace list
+    // (instead of only live-session entries). The DB open is fast (<1ms on
+    // WAL) and we already touched it in load_or_seed_session — this is a
+    // second handle, not a new migration. None falls back gracefully.
+    let startup_db = superzej_core::db::Db::open().ok();
+    let mut model = build_initial_model(&session, startup_db.as_ref());
     model.accent = cfg.accent_rgb();
     apply_mode_status(&mut model, mode);
     // Surface keybind conflicts at launch (non-fatal — the shell always opens).
@@ -5016,6 +5021,8 @@ async fn event_loop<T: Terminal>(
                     && !materialize_failed.contains(&key)
                 {
                     materialize_inflight = Some(key);
+                    model.center_status = "preparing sandbox…".into();
+                    dirty = true;
                     let cfg = keymap.config().clone();
                     let tx = spec_tx.clone();
                     let wk = waker.clone();
@@ -5548,10 +5555,22 @@ async fn event_loop<T: Terminal>(
                 continue; // splash still up: stay lazy
             }
             let specs = match specs {
-                Ok(specs) => specs,
+                Ok(specs) => {
+                    // Show which backend was resolved so the user can see
+                    // "podman" / "bwrap" / "host" while the shell starts.
+                    if is_active {
+                        if let Some((_, spec)) = specs.first() {
+                            model.center_status =
+                                format!("opening {} shell…", spec.backend);
+                            dirty = true;
+                        }
+                    }
+                    specs
+                }
                 Err(e) => {
                     model.status = format!("Pane launch blocked: {e}");
                     if is_active {
+                        model.center_status = String::new();
                         center_dormant = true;
                         // Park the active tab too — without this the loop
                         // re-probes on every iteration and pegs the CPU.
@@ -5573,11 +5592,23 @@ async fn event_loop<T: Terminal>(
             let Some(tab) = session.worktrees[gi].tabs.get_mut(ti) else {
                 continue;
             };
+            if is_active {
+                model.center_status = "spawning shell…".into();
+                dirty = true;
+            }
             if let Err(e) = panes.materialize_with_specs(tab, &wt, &specs, chrome.center) {
                 // Spawn failures are survivable: report, don't exit the loop.
                 model.status = format!("Pane spawn failed: {e}");
-            } else if is_active && !warnings.is_empty() {
-                model.status = format!("⚠ Sandbox fallback: {}", warnings.join("; "));
+                if is_active {
+                    model.center_status = String::new();
+                }
+            } else {
+                if is_active {
+                    model.center_status = String::new();
+                }
+                if is_active && !warnings.is_empty() {
+                    model.status = format!("⚠ Sandbox fallback: {}", warnings.join("; "));
+                }
             }
             if is_active {
                 need_relayout = true;
@@ -9859,7 +9890,7 @@ mod tests {
     #[test]
     fn sidebar_filter_hides_nonmatching_rows() {
         let session = two_worktree_session();
-        let mut model = build_initial_model(&session);
+        let mut model = build_initial_model(&session, None);
         model.sidebar_workspaces = vec![("app".into(), "app".into(), "repo".into(), String::new())];
         let mut sb = focused_state(&mut model, &session);
 
@@ -9880,7 +9911,7 @@ mod tests {
     #[test]
     fn sidebar_enter_activates_cursor_row() {
         let session = two_worktree_session();
-        let mut model = build_initial_model(&session);
+        let mut model = build_initial_model(&session, None);
         model.sidebar_workspaces = vec![("app".into(), "app".into(), "repo".into(), String::new())];
         let mut sb = focused_state(&mut model, &session);
         // Rows: app(ws), home, feat. Move to feat and Enter → activate it.
@@ -9928,7 +9959,7 @@ mod tests {
         unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
 
         let mut session = three_worktree_session();
-        let mut model = build_initial_model(&session);
+        let mut model = build_initial_model(&session, None);
         model.sidebar_workspaces = vec![("app".into(), "app".into(), "repo".into(), String::new())];
         let mut sb = SidebarState::default();
         sb.rebuild(&mut model, &session);
@@ -9960,7 +9991,7 @@ mod tests {
         unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
 
         let mut session = three_worktree_session();
-        let mut model = build_initial_model(&session);
+        let mut model = build_initial_model(&session, None);
         model.sidebar_workspaces = vec![("app".into(), "app".into(), "repo".into(), String::new())];
         let mut sb = SidebarState::default();
         sb.view.sort = crate::sidebar::SortMode::Name;
@@ -9978,7 +10009,7 @@ mod tests {
     #[test]
     fn sidebar_multiselect_marks_and_bulk_close_targets_marked() {
         let session = two_worktree_session();
-        let mut model = build_initial_model(&session);
+        let mut model = build_initial_model(&session, None);
         model.sidebar_workspaces = vec![("app".into(), "app".into(), "repo".into(), String::new())];
         let mut sb = focused_state(&mut model, &session);
         // Move to the home worktree row (index 1) and mark it.
@@ -10000,7 +10031,7 @@ mod tests {
     #[test]
     fn sidebar_destructive_actions_reanchor_cursor_to_active_row() {
         let mut session = two_worktree_session();
-        let mut model = build_initial_model(&session);
+        let mut model = build_initial_model(&session, None);
         model.sidebar_workspaces = vec![("app".into(), "app".into(), "repo".into(), String::new())];
         let mut sb = focused_state(&mut model, &session);
         sb.cursor = 0; // stale cursor on the workspace header after a delete/re-sort
@@ -10026,7 +10057,7 @@ mod tests {
         unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
 
         let session = one_tab_session();
-        let mut model = build_initial_model(&session);
+        let mut model = build_initial_model(&session, None);
         let mut sb = focused_state(&mut model, &session);
         // Narrow past the minimum: clamps at SIDEBAR_MIN_WIDTH.
         for _ in 0..20 {
@@ -10044,7 +10075,7 @@ mod tests {
     #[test]
     fn sidebar_escape_defocuses() {
         let session = one_tab_session();
-        let mut model = build_initial_model(&session);
+        let mut model = build_initial_model(&session, None);
         let mut sb = focused_state(&mut model, &session);
         let out = sb.handle_key(&KeyCode::Escape, Modifiers::NONE, &mut model, &session);
         assert!(matches!(out, SidebarOutcome::Defocus));
@@ -10253,7 +10284,7 @@ mod tests {
     #[test]
     fn refresh_tab_model_updates_sidebar_tree_when_tabs_change() {
         let mut session = one_tab_session();
-        let mut model = build_initial_model(&session);
+        let mut model = build_initial_model(&session, None);
         let mut sb = SidebarState::default();
 
         refresh_tab_model(&mut model, &session, &mut sb);
@@ -10513,7 +10544,7 @@ mod tests {
             )],
             active: 0,
         };
-        let mut model = build_initial_model(&session);
+        let mut model = build_initial_model(&session, None);
         model.sidebar_workspaces = vec![
             (
                 "superzej".into(),
@@ -10559,7 +10590,7 @@ mod tests {
     #[test]
     fn new_tab_stays_within_the_worktree_and_tabbar_scopes_to_it() {
         let mut session = two_worktree_session();
-        let mut model = build_initial_model(&session);
+        let mut model = build_initial_model(&session, None);
         let mut sb = SidebarState::default();
 
         // A new tab in the active worktree (Alt+t): the tabbar shows ONLY this
@@ -10593,7 +10624,7 @@ mod tests {
             GroupKind::Branch,
             "/tmp/app-feat",
         ));
-        let mut model = build_initial_model(&session);
+        let mut model = build_initial_model(&session, None);
         let mut sb = SidebarState::default();
         let chrome = layout::compute(160, 40, true, true);
         let before = chrome.clone();

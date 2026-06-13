@@ -330,6 +330,10 @@ pub struct FrameModel {
     pub app_tabs: Vec<String>,
     /// Index of the active app tab in [`Self::app_tabs`] (0 = `work`).
     pub active_app: usize,
+    /// Progress message shown in the splash screen while the first pane is
+    /// loading (sandbox probe, container start, exec, etc.). Cleared once a
+    /// live pane exists. Empty string = no status line shown.
+    pub center_status: String,
 }
 
 impl FrameModel {

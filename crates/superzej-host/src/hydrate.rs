@@ -439,17 +439,23 @@ fn worktree_loc(db: &superzej_core::db::Db, path: &std::path::Path) -> Option<u6
 /// user immediate chrome/status while the expensive model hydrates in the
 /// background. Sidebar workspaces are populated from the already-loaded session
 /// (no DB, no git) so the tree is non-blank on frame 1.
-pub(crate) fn build_initial_model(session: &crate::session::Session) -> FrameModel {
+/// Build the cheap first frame. Pass the already-open `db` from
+/// `load_or_seed_session` so the sidebar workspace list is populated from
+/// the DB on the very first frame — no waiting for the hydration worker.
+pub(crate) fn build_initial_model(
+    session: &crate::session::Session,
+    db: Option<&superzej_core::db::Db>,
+) -> FrameModel {
     let active_name = session
         .active_group()
         .map(|g| g.name.clone())
         .unwrap_or_else(|| "workspace/home".into());
     let cwd = active_tab_path(session);
     let (worktree, tabs, active_tab) = tab_strip(session);
-    // Fast: no DB open, no git — derives workspace slugs from the session in
-    // memory. Git status / agent glyphs are left empty and fill in on
-    // hydration, same as before.
-    let sidebar_workspaces = workspace_list(session, None);
+    // Use the DB if available (it's already open from load_or_seed_session)
+    // so the sidebar shows all registered workspaces on the very first frame
+    // instead of only the live session entries.
+    let sidebar_workspaces = workspace_list(session, db);
     FrameModel {
         worktree,
         tabs,
@@ -465,6 +471,7 @@ pub(crate) fn build_initial_model(session: &crate::session::Session) -> FrameMod
             "Starting szhost (build: {})… panes usable while git status hydrates",
             env!("SZHOST_BUILD_TIME")
         ),
+        center_status: "starting…".into(),
         accent: superzej_core::theme::TEAL.to_string(),
         ..Default::default()
     }
@@ -962,7 +969,7 @@ mod tests {
     #[test]
     fn initial_model_is_cheap_and_marks_hydration_pending() {
         let session = one_tab_session();
-        let model = build_initial_model(&session);
+        let model = build_initial_model(&session, None);
         assert_eq!(model.worktree, "app/home");
         assert_eq!(model.tabs, vec!["1".to_string()]);
         assert_eq!(model.active_tab, 0);
