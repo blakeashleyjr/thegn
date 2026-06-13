@@ -149,6 +149,10 @@ pub(crate) struct Panes {
     /// `poll_input(None)` wakes to drain PTY output. `None` in unit tests that
     /// construct `Panes` without a live terminal.
     waker: Option<TerminalWaker>,
+    /// Wall-clock time each pane was spawned. Used by the crash debounce: if a
+    /// pane exits within the threshold it's counted as a crash even if it wrote
+    /// output (bwrap prints an error message before dying).
+    spawn_times: std::collections::HashMap<u32, std::time::Instant>,
 }
 
 impl Panes {
@@ -159,6 +163,7 @@ impl Panes {
             next_id: 1,
             tx,
             waker: None,
+            spawn_times: std::collections::HashMap::new(),
         }
     }
 
@@ -168,6 +173,7 @@ impl Panes {
             next_id: 1,
             tx,
             waker: Some(waker),
+            spawn_times: std::collections::HashMap::new(),
         }
     }
 
@@ -210,7 +216,19 @@ impl Panes {
             self.waker.clone(),
         )?;
         self.table.insert(id, pane);
+        self.spawn_times.insert(id, std::time::Instant::now());
         Ok(id)
+    }
+
+    /// How long the pane has been alive. `None` if the id is unknown.
+    /// Used by the crash debounce: exits within 5s of spawn are fast-crashes.
+    pub(crate) fn pane_age(&self, id: u32) -> Option<std::time::Duration> {
+        self.spawn_times.get(&id).map(|t| t.elapsed())
+    }
+
+    /// Remove the spawn-time entry for a pane that has exited.
+    pub(crate) fn forget_spawn_time(&mut self, id: u32) {
+        self.spawn_times.remove(&id);
     }
 
     /// The leaves of `tab.center` not yet backed by live panes — the targets
