@@ -4500,18 +4500,30 @@ async fn event_loop<T: Terminal>(
     let mut materialize_inflight: Option<(String, usize)> = None;
     // Active-tab keys whose sandbox probe failed: skip re-probing on the next
     // tick for the same reason as prewarm_failed. Cleared on worktree switch.
-    let mut materialize_failed: std::collections::HashSet<(String, usize)> = std::collections::HashSet::new();
+    let mut materialize_failed: std::collections::HashSet<(String, usize)> =
+        std::collections::HashSet::new();
     // Pre-warm requests that are already in-flight: keyed by (worktree, tab)
     // so we never fire a second spawn_blocking for the same neighbor tab while
     // one is already resolving — especially important when the sandbox chain
     // keeps failing (all backends unavailable) and every loop tick would
     // otherwise spawn a new slow probe that pegs the CPU at 100%.
-    let mut prewarm_inflight: std::collections::HashSet<(String, usize)> = std::collections::HashSet::new();
+    let mut prewarm_inflight: std::collections::HashSet<(String, usize)> =
+        std::collections::HashSet::new();
     // Keys whose sandbox probe failed: suppressed from future pre-warm probes
     // so a permanently-unavailable backend (no podman/bwrap installed) cannot
     // keep spawning new threads on every event loop iteration. The active-tab
     // materialize path retries independently when the tab is actually focused.
-    let mut prewarm_failed: std::collections::HashSet<(String, usize)> = std::collections::HashSet::new();
+    let mut prewarm_failed: std::collections::HashSet<(String, usize)> =
+        std::collections::HashSet::new();
+    // Panes that have produced at least one byte of output. Used to distinguish
+    // "user typed exit" (output seen → normal, respawn) from "shell crashed on
+    // start" (no output → crash; stop the tight respawn loop after 3 strikes).
+    let mut panes_with_output: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    // Consecutive silent-crash count per (group, tab). Reset when the pane
+    // produces output (i.e. stays alive long enough for the user to see it).
+    // After 3 crashes, respawn is suppressed until the user intervenes.
+    let mut respawn_crash_count: std::collections::HashMap<(usize, usize), u32> =
+        std::collections::HashMap::new();
     // The new-worktree wizard (Alt+w) + its creation pipeline. The worker
     // speculatively creates the worktree under the pregenerated name while
     // the wizard is open; `wizard_cmd_tx` carries the wizard's decisions to
@@ -4862,6 +4874,7 @@ async fn event_loop<T: Terminal>(
             materialize_inflight = None;
             materialize_failed.clear();
             prewarm_failed.clear();
+            respawn_crash_count.clear();
             panel_ui.chg_sel = None;
             panel_ui.hunks_gen = hydration_gen;
             // Git interaction state is per-worktree: cursors, flows, marks
@@ -5117,6 +5130,7 @@ async fn event_loop<T: Terminal>(
                                 if !model.load_steps.is_empty() && visible.contains(&id) {
                                     model.load_steps.clear();
                                 }
+                                panes_with_output.insert(id);
                                 p.feed(&b);
                                 // Answer terminal queries (DA/DSR/OSC color,
                                 // kitty probes) the app just sent — without a
@@ -5219,28 +5233,63 @@ async fn event_loop<T: Terminal>(
                             if let Some((gi, ti, sole)) = owner {
                                 let is_active_tab =
                                     gi == session.active && ti == session.worktrees[gi].active_tab;
+                                // A pane that exits without producing any output
+                                // crashed on startup (bwrap/sandbox failure, bad shell
+                                // binary, etc.).  Count consecutive silent crashes to
+                                // stop the tight respawn loop; a pane that produced
+                                // output before exiting resets the counter.
+                                let had_output = panes_with_output.remove(&id);
+                                let crash_key = (gi, ti);
+                                if had_output {
+                                    respawn_crash_count.remove(&crash_key);
+                                } else {
+                                    *respawn_crash_count.entry(crash_key).or_insert(0) += 1;
+                                }
+                                let crashes =
+                                    respawn_crash_count.get(&crash_key).copied().unwrap_or(0);
                                 if sole {
                                     if is_active_tab {
-                                        // Worktree dir first, then current_dir, then $HOME.
-                                        let cwd = group_cwd(&session.worktrees[gi]).or_else(|| {
-                                            std::env::var("HOME").ok().map(std::path::PathBuf::from)
-                                        });
-                                        match spawn_worktree_shell_pane(
-                                            &mut panes,
-                                            keymap.config(),
-                                            cwd.as_deref(),
-                                            chrome.center,
-                                        ) {
-                                            Ok(fresh) => {
-                                                if let Some(tab) = session.tab_mut(gi, ti) {
-                                                    replace_single_dead_center_pane(tab, id, fresh);
+                                        if crashes >= 3 {
+                                            // Shell is crashing on every startup — stop
+                                            // the loop and surface the problem. The user
+                                            // can try a different backend or fix their
+                                            // shell config, then switch worktrees to retry.
+                                            model.load_steps.clear();
+                                            center_dormant = true;
+                                            model.status =
+                                                "Shell keeps crashing on startup — not respawning. \
+                                                 Check your sandbox backend and shell config, \
+                                                 then switch worktrees to retry.".into();
+                                        } else {
+                                            // Worktree dir first, then current_dir, then $HOME.
+                                            let cwd =
+                                                group_cwd(&session.worktrees[gi]).or_else(|| {
+                                                    std::env::var("HOME")
+                                                        .ok()
+                                                        .map(std::path::PathBuf::from)
+                                                });
+                                            match spawn_worktree_shell_pane(
+                                                &mut panes,
+                                                keymap.config(),
+                                                cwd.as_deref(),
+                                                chrome.center,
+                                            ) {
+                                                Ok(fresh) => {
+                                                    if let Some(tab) = session.tab_mut(gi, ti) {
+                                                        replace_single_dead_center_pane(
+                                                            tab, id, fresh,
+                                                        );
+                                                    }
+                                                    model.status =
+                                                        "Pane exited; spawned a fresh shell".into();
+                                                    need_relayout = true;
                                                 }
-                                                model.status =
-                                                    "Pane exited; spawned a fresh shell".into();
-                                                need_relayout = true;
-                                            }
-                                            Err(err) => {
-                                                model.status = format!("Respawn failed: {err:#}");
+                                                Err(err) => {
+                                                    model.load_steps.clear();
+                                                    center_dormant = true;
+                                                    model.status =
+                                                        format!("Respawn failed: {err:#}");
+                                                }
                                             }
                                         }
                                     }
@@ -5569,7 +5618,8 @@ async fn event_loop<T: Terminal>(
                 Ok(specs) => {
                     if is_active {
                         // sandbox done → container active; label shows backend
-                        let backend = specs.first()
+                        let backend = specs
+                            .first()
                             .map(|(_, s)| s.backend.clone())
                             .unwrap_or_else(|| "host".into());
                         model.load_steps = vec![
@@ -5584,9 +5634,7 @@ async fn event_loop<T: Terminal>(
                 Err(e) => {
                     model.status = format!("Pane launch blocked: {e}");
                     if is_active {
-                        model.load_steps = vec![
-                            LoadStep::failed("sandbox"),
-                        ];
+                        model.load_steps = vec![LoadStep::failed("sandbox")];
                         center_dormant = true;
                         materialize_failed.insert(tab_key);
                     } else {
@@ -5607,7 +5655,8 @@ async fn event_loop<T: Terminal>(
             };
             if is_active {
                 // container done → shell active
-                let backend = specs.first()
+                let backend = specs
+                    .first()
                     .map(|(_, s)| s.backend.clone())
                     .unwrap_or_else(|| "host".into());
                 model.load_steps = vec![
