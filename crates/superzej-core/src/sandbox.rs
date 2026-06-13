@@ -708,6 +708,43 @@ pub fn health_check(spec: &SandboxSpec) -> bool {
     status_with_timeout(&argv, PROBE_TIMEOUT).unwrap_or(false)
 }
 
+/// Returns `true` when the named container exists and is running.
+fn container_running(spec: &SandboxSpec) -> bool {
+    let mut argv = backend_prefix(spec.backend);
+    argv.extend(["container".into(), "inspect".into(), spec.name.clone()]);
+    run_control_owned(spec, &argv, PROBE_TIMEOUT).unwrap_or(false)
+}
+
+/// Returns `true` when every bind-mount source in `spec` is already present
+/// in the running container's mount list. Mounts the container doesn't have
+/// yet (new auto-cache or toolchain paths added by an upgrade) return `false`,
+/// triggering a recreate. Uses `--format` over the JSON output for speed.
+fn container_mounts_match(spec: &SandboxSpec) -> bool {
+    // Ask the runtime for the bind-mount sources currently active.
+    let mut argv = backend_prefix(spec.backend);
+    argv.extend([
+        "container".into(),
+        "inspect".into(),
+        "--format".into(),
+        // Emit one source path per line for bind mounts only.
+        "{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}\n{{end}}{{end}}".into(),
+        spec.name.clone(),
+    ]);
+    let out = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .output();
+    let active: std::collections::HashSet<String> = match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string())
+            .collect(),
+        _ => return false, // can't inspect → treat as stale
+    };
+    // Every source the spec requires must be present.
+    spec.mounts.iter().all(|m| active.contains(&m.host))
+}
+
 /// Ensure any persistent state exists (OCI: a keep-alive container we `exec`
 /// into). No-op for host-toolchain backends and `none`.
 pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
@@ -725,10 +762,25 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
     prefetch_image(spec)?;
 
     let rt = spec.backend.binary();
-    let mut inspect = backend_prefix(spec.backend);
-    inspect.extend(["container".into(), "inspect".into(), spec.name.clone()]);
-    if run_control_owned(spec, &inspect, PROBE_TIMEOUT).unwrap_or(false) {
-        return Ok(()); // already running
+
+    // Check whether the container already exists AND has the right bind-mounts.
+    // If the mount set changed (e.g. host_toolchain_mounts() added /nix/store
+    // after an upgrade) we force-remove and recreate so the user's shell picks
+    // up the new environment without manual intervention.
+    if container_running(spec) {
+        if container_mounts_match(spec) {
+            return Ok(()); // already running with the correct mounts
+        }
+        // Stale mounts — remove and fall through to recreate.
+        msg::warn(&format!(
+            "sandbox: container '{}' has stale mounts (config changed); recreating",
+            spec.name
+        ));
+        let _ = run_control_owned(
+            spec,
+            &[rt.to_string(), "rm".into(), "-f".into(), spec.name.clone()],
+            PROBE_TIMEOUT,
+        );
     }
     let mut argv: Vec<String> = backend_prefix(spec.backend);
     argv.extend([
