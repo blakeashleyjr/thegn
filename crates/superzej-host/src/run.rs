@@ -4493,6 +4493,11 @@ async fn event_loop<T: Terminal>(
     // keeps failing (all backends unavailable) and every loop tick would
     // otherwise spawn a new slow probe that pegs the CPU at 100%.
     let mut prewarm_inflight: std::collections::HashSet<(String, usize)> = std::collections::HashSet::new();
+    // Keys whose sandbox probe failed: suppressed from future pre-warm probes
+    // so a permanently-unavailable backend (no podman/bwrap installed) cannot
+    // keep spawning new threads on every event loop iteration. The active-tab
+    // materialize path retries independently when the tab is actually focused.
+    let mut prewarm_failed: std::collections::HashSet<(String, usize)> = std::collections::HashSet::new();
     // The new-worktree wizard (Alt+w) + its creation pipeline. The worker
     // speculatively creates the worktree under the pregenerated name while
     // the wizard is open; `wizard_cmd_tx` carries the wizard's decisions to
@@ -4841,6 +4846,9 @@ async fn event_loop<T: Terminal>(
             panel_ui.hunks.clear();
             hunk_inflight.clear();
             materialize_inflight = None;
+            // Allow neighbor tabs of the new active worktree a fresh pre-warm
+            // attempt in case a backend became available since last failure.
+            prewarm_failed.clear();
             panel_ui.chg_sel = None;
             panel_ui.hunks_gen = hydration_gen;
             // Git interaction state is per-worktree: cursors, flows, marks
@@ -4885,8 +4893,8 @@ async fn event_loop<T: Terminal>(
             // Pre-warm sibling tabs so first focus of a neighbor is instant.
             for (wt, ti, missing) in prewarm_requests(&panes, &mut session) {
                 let key = (wt.clone(), ti);
-                if prewarm_inflight.contains(&key) {
-                    continue; // already resolving; don't spawn another probe
+                if prewarm_inflight.contains(&key) || prewarm_failed.contains(&key) {
+                    continue; // in-flight or previously failed — skip
                 }
                 prewarm_inflight.insert(key);
                 let cfg = keymap.config().clone();
@@ -5519,9 +5527,8 @@ async fn event_loop<T: Terminal>(
             if materialize_inflight.as_ref() == Some(&(wt.clone(), ti)) {
                 materialize_inflight = None;
             }
-            // Clear the pre-warm inflight guard so a retry is allowed later
-            // (e.g. after the sandbox becomes available).
-            prewarm_inflight.remove(&(wt.clone(), ti));
+            let tab_key = (wt.clone(), ti);
+            prewarm_inflight.remove(&tab_key);
             let Some(gi) = session.worktrees.iter().position(|g| g.path == wt) else {
                 continue;
             };
@@ -5535,8 +5542,13 @@ async fn event_loop<T: Terminal>(
                     model.status = format!("Pane launch blocked: {e}");
                     if is_active {
                         center_dormant = true;
-                        dirty = true;
+                    } else {
+                        // Pre-warm failed for a neighbor tab — park it so the
+                        // loop doesn't re-probe on every iteration. The active-
+                        // tab materialize path retries when the tab is focused.
+                        prewarm_failed.insert(tab_key);
                     }
+                    dirty = true;
                     continue;
                 }
             };
