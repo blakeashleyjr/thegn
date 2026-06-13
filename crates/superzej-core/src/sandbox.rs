@@ -308,6 +308,10 @@ pub fn resolve(cfg: &SandboxConfig, loc: &GitLoc, name: &str) -> Option<SandboxS
     // systemd/host: full host filesystem, no extra mounts needed.
     let inject_host_toolchain =
         (backend.is_oci() || backend == Backend::Bwrap) && cfg.auto_caches;
+    // OCI: mount home ro (running as root in a foreign image, must not write).
+    // bwrap: mount home rw (running as the real user; zsh history, zoxide,
+    //   keychain etc. need to write to $HOME — ro causes blank/broken prompts).
+    let home_ro = backend.is_oci();
 
     match cfg.file_access {
         FileAccess::All | FileAccess::Host => {
@@ -321,7 +325,7 @@ pub fn resolve(cfg: &SandboxConfig, loc: &GitLoc, name: &str) -> Option<SandboxS
         FileAccess::Worktree => {
             add_worktree_mounts(&mut mounts);
             if inject_host_toolchain {
-                mounts.extend(host_toolchain_mounts());
+                mounts.extend(host_toolchain_mounts_ro_home(home_ro));
             }
         }
         FileAccess::WorktreePlusCaches => {
@@ -330,7 +334,7 @@ pub fn resolve(cfg: &SandboxConfig, loc: &GitLoc, name: &str) -> Option<SandboxS
                 mounts.extend(auto_cache_mounts());
             }
             if inject_host_toolchain {
-                mounts.extend(host_toolchain_mounts());
+                mounts.extend(host_toolchain_mounts_ro_home(home_ro));
             }
         }
         FileAccess::Custom => add_worktree_mounts(&mut mounts),
@@ -1250,7 +1254,13 @@ fn local_uid_gid() -> Option<(u32, u32)> {
 /// the list is always a subset of what's actually present, never a wish list.
 /// All mounts are **read-only** (the container should not modify host system
 /// files).
+/// `ro_home`: mount `$HOME` read-only (OCI) or read-write (bwrap).
+/// See the comment on the home-directory section below.
 pub fn host_toolchain_mounts() -> Vec<Mount> {
+    host_toolchain_mounts_ro_home(true) // public API defaults to safe (ro)
+}
+
+fn host_toolchain_mounts_ro_home(ro_home: bool) -> Vec<Mount> {
     let mut mounts = Vec::new();
     let home = std::env::var("HOME").unwrap_or_default();
 
@@ -1331,22 +1341,28 @@ pub fn host_toolchain_mounts() -> Vec<Mount> {
     }
 
     // ── User home directory (dotfiles) ───────────────────────────────────────
-    // Mount $HOME read-only so ~/.zshrc, ~/.config/starship.toml, ~/.gitconfig
-    // and similar dotfiles are visible. On NixOS these are typically symlinks
-    // into /nix/store, so this mount is complementary (symlink) + /nix/store
-    // (target). Without home the symlinks dangle inside the container.
-    // We use the same dest so absolute paths in dotfiles work unchanged.
+    // Mount $HOME so ~/.zshrc, ~/.config/starship.toml, ~/.gitconfig and similar
+    // dotfiles are visible. On NixOS these are symlinks into /nix/store, so this
+    // mount is complementary: symlink + /nix/store (target).
+    //
+    // ro_home controls read-only vs read-write:
+    //   OCI (podman/docker) — ro: the container runs as root in a foreign image;
+    //     we expose dotfiles for reading but must not let root write to the host.
+    //   bwrap — rw: the process runs as the real user on the host filesystem;
+    //     zsh history, zoxide DB, keychain, and many other tools need to write
+    //     to $HOME and will silently fail or produce a blank prompt with ro.
     if !home.is_empty() && exists(&home) {
         mounts.push(Mount {
             host: home.clone(),
             dest: home,
-            ro: true,
+            ro: ro_home,
             cache: false,
         });
     }
 
     mounts
 }
+
 
 fn auto_cache_mounts() -> Vec<Mount> {
     let home = std::env::var("HOME").unwrap_or_default();
