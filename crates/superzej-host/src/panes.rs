@@ -551,4 +551,37 @@ mod tests {
         assert_eq!(argv[1], "-lc");
         assert_eq!(argv[2], "exec ${EDITOR:-vi} .");
     }
+
+    #[test]
+    fn spawn_records_time_and_forget_clears_it() {
+        // SAFETY: single-threaded test.
+        unsafe { std::env::set_var("SHELL", "/bin/sh") };
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
+        let mut panes = Panes::new(tx);
+        let chrome = layout::compute(80, 24, false, false);
+
+        let id = panes.spawn(None, chrome.center).expect("spawn");
+
+        // pane_age returns Some(duration) right after spawn.
+        let age = panes.pane_age(id);
+        assert!(age.is_some(), "pane_age should be Some after spawn");
+        assert!(
+            age.unwrap() < std::time::Duration::from_secs(1),
+            "age should be near-zero just after spawn"
+        );
+
+        // forget_spawn_time removes the entry.
+        panes.forget_spawn_time(id);
+        assert!(
+            panes.pane_age(id).is_none(),
+            "pane_age should be None after forget_spawn_time"
+        );
+    }
+
+    #[test]
+    fn pane_age_unknown_id_returns_none() {
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
+        let panes = Panes::new(tx);
+        assert!(panes.pane_age(999).is_none());
+    }
 }
