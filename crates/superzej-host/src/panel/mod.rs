@@ -317,6 +317,10 @@ pub struct PanelData {
     pub tests: Option<TestsLite>,
     /// Total tracked-file count for the files summary ("214 · 29.5k loc").
     pub file_count: Option<u64>,
+    /// All tracked files from `git ls-files` — populated while Files is open.
+    /// The Files section renders this as a collapsible tree with changed-file
+    /// highlights drawn from [`changes`].
+    pub all_files: Vec<String>,
     /// Local branches with upstream/divergence + PR badges (branches section).
     pub branches: Vec<BranchRow>,
     /// Structured recent commits (commits section + graph feed). Loaded from
@@ -382,6 +386,34 @@ pub fn build_file_tree(paths: &[String]) -> Vec<FileEntry> {
     out
 }
 
+/// Filter a full file tree to only the rows visible given the collapsed set.
+/// A row is hidden when any ancestor directory path is in `collapsed`.
+/// Returns pairs of `(original_index, entry_ref)` in display order.
+pub fn file_tree_visible<'a>(
+    tree: &'a [FileEntry],
+    collapsed: &std::collections::HashSet<String>,
+) -> Vec<(usize, &'a FileEntry)> {
+    tree.iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            // An entry is visible iff none of its ancestor dir paths are collapsed.
+            let parts: Vec<&str> = e.path.split('/').collect();
+            // Check every prefix up to (but not including) the entry itself.
+            let ancestor_count = if e.is_dir {
+                parts.len().saturating_sub(1)
+            } else {
+                parts.len().saturating_sub(1)
+            };
+            for d in 1..=ancestor_count {
+                if collapsed.contains(&parts[..d].join("/")) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect()
+}
+
 /// The panel's interactive state, owned by the event loop.
 #[derive(Debug, Clone)]
 pub struct PanelUi {
@@ -417,6 +449,10 @@ pub struct PanelUi {
     pub docs: docs::PanelDocs,
     /// The git-family interaction state (lazygit contexts, marks, flows).
     pub git: gitui::GitUi,
+    /// Repo-relative dir paths that are collapsed in the Files accordion tree.
+    /// Persisted to the DB (`ui_state` table, prefix `panel.files.col/`) so the
+    /// tree survives restarts.
+    pub files_collapsed: std::collections::HashSet<String>,
 }
 
 impl Default for PanelUi {
@@ -435,6 +471,7 @@ impl Default for PanelUi {
             diff_hunk: 0,
             docs: docs::PanelDocs::default(),
             git: gitui::GitUi::default(),
+            files_collapsed: std::collections::HashSet::new(),
         }
     }
 }
@@ -907,6 +944,41 @@ mod tests {
                 ("src/main.rs".into(), 1, false),
             ]
         );
+    }
+
+    #[test]
+    fn file_tree_visible_respects_collapsed_dirs() {
+        let paths = vec![
+            "src/main.rs".to_string(),
+            "README.md".to_string(),
+            "src/cmd/pr.rs".to_string(),
+            "src/cmd/diff.rs".to_string(),
+        ];
+        let tree = build_file_tree(&paths);
+
+        // No collapsed dirs: all 6 rows visible.
+        let collapsed = std::collections::HashSet::new();
+        let vis = file_tree_visible(&tree, &collapsed);
+        assert_eq!(vis.len(), 6);
+
+        // Collapse "src": only README.md and "src" row visible (3 hidden).
+        let mut collapsed = std::collections::HashSet::new();
+        collapsed.insert("src".to_string());
+        let vis = file_tree_visible(&tree, &collapsed);
+        assert_eq!(vis.len(), 2);
+        assert_eq!(vis[0].1.path, "README.md");
+        assert_eq!(vis[1].1.path, "src");
+
+        // Collapse only "src/cmd": src + src/main.rs + README.md visible (3),
+        // src/cmd is visible but its children are not.
+        let mut collapsed = std::collections::HashSet::new();
+        collapsed.insert("src/cmd".to_string());
+        let vis = file_tree_visible(&tree, &collapsed);
+        assert_eq!(vis.len(), 4); // README.md, src, src/cmd, src/main.rs
+        let paths_vis: Vec<&str> = vis.iter().map(|(_, e)| e.path.as_str()).collect();
+        assert!(paths_vis.contains(&"src/cmd"));
+        assert!(!paths_vis.contains(&"src/cmd/pr.rs"));
+        assert!(!paths_vis.contains(&"src/cmd/diff.rs"));
     }
 
     #[test]

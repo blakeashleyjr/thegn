@@ -1541,9 +1541,26 @@ fn parse_file_line(at: &str) -> Option<(String, usize)> {
     (!path.is_empty()).then(|| (path.to_string(), line))
 }
 
-/// The cursor-th FILE row of the files section's changed-files mini tree —
-/// mirrors `panel::sections::files` display order (dirs synthesized but not
-/// actionable), so the row-mode cursor and Enter always agree.
+/// The cursor-th row of the files accordion tree (dir or file), matching the
+/// renderer's visible-row order exactly (collapsed subtrees excluded).
+fn file_entry_at(
+    model: &FrameModel,
+    collapsed: &std::collections::HashSet<String>,
+    cursor: usize,
+) -> Option<crate::panel::FileEntry> {
+    let source: Vec<String> = if !model.panel.all_files.is_empty() {
+        model.panel.all_files.clone()
+    } else {
+        model.panel.changes.iter().map(|c| c.path.clone()).collect()
+    };
+    let tree = crate::panel::build_file_tree(&source);
+    crate::panel::file_tree_visible(&tree, collapsed)
+        .into_iter()
+        .nth(cursor)
+        .map(|(_, e)| e.clone())
+}
+
+/// Back-compat shim for sites that only need a changed file path (Changes section).
 fn changed_file_at(model: &FrameModel, cursor: usize) -> Option<String> {
     let paths: Vec<String> = model.panel.changes.iter().map(|c| c.path.clone()).collect();
     crate::panel::build_file_tree(&paths)
@@ -1551,6 +1568,22 @@ fn changed_file_at(model: &FrameModel, cursor: usize) -> Option<String> {
         .filter(|e| !e.is_dir)
         .nth(cursor)
         .map(|e| e.path)
+}
+
+/// Toggle a directory's collapsed state in `panel_ui.files_collapsed` and
+/// persist to the DB.
+fn toggle_files_collapse(panel_ui: &mut crate::panel::PanelUi, dir: &str) {
+    if panel_ui.files_collapsed.contains(dir) {
+        panel_ui.files_collapsed.remove(dir);
+        if let Ok(db) = superzej_core::db::Db::open() {
+            let _ = db.del_ui_state("panel.files.col", dir);
+        }
+    } else {
+        panel_ui.files_collapsed.insert(dir.to_string());
+        if let Ok(db) = superzej_core::db::Db::open() {
+            let _ = db.set_ui_state("panel.files.col", dir, "1");
+        }
+    }
 }
 
 /// Persist the accordion's open section + wide mode (mirrors the sidebar's
@@ -4512,6 +4545,10 @@ async fn event_loop<T: Terminal>(
                 _ => {}
             }
         }
+        // Restore collapsed directories in the Files tree.
+        for (key, _) in db.ui_state_in_scope("panel.files.col").unwrap_or_default() {
+            panel_ui.files_collapsed.insert(key);
+        }
     }
     // `[panel] sections` reorders/hides accordions; a persisted open section
     // the config hid snaps to the first visible one. The keys section renders
@@ -6044,7 +6081,9 @@ async fn event_loop<T: Terminal>(
             if let Some(cp) = &creating
                 && cp.revealed
             {
-                cp.render(&mut scratch, screen);
+                // Center within the pane content area, not the full terminal
+                // (which would put it behind the sidebar).
+                cp.render(&mut scratch, chrome.center);
             }
             let accent = current_config.accent_rgb();
             if !which_key.is_empty() {
@@ -7718,19 +7757,40 @@ async fn event_loop<T: Terminal>(
                                     }
                                 }
                                 Section::Files => {
-                                    if let Some(path) = changed_file_at(&model, panel_ui.cursor) {
-                                        let cmd = editor_open_command(keymap.config(), &path, None);
-                                        let cwd = active_cwd(&session);
-                                        open_command_tab(
-                                            &mut session,
-                                            &mut panes,
-                                            &cmd,
-                                            cwd.as_deref(),
-                                            chrome.center,
-                                        );
-                                        focus.zone = crate::focus::Zone::Center;
-                                        refresh_tab_model(&mut model, &session, &mut sb);
-                                        need_relayout = true;
+                                    // Enter/Space: dirs toggle collapse, files open in bat.
+                                    if let Some(entry) = file_entry_at(
+                                        &model,
+                                        &panel_ui.files_collapsed,
+                                        panel_ui.cursor,
+                                    ) {
+                                        if entry.is_dir {
+                                            toggle_files_collapse(&mut panel_ui, &entry.path);
+                                        } else {
+                                            // Open file in bat (split pane).
+                                            let bat = keymap
+                                                .config()
+                                                .tool_command("bat")
+                                                .unwrap_or("bat --paging=always")
+                                                .to_string();
+                                            let wt = active_tab_path(&session);
+                                            let abs = wt.join(&entry.path);
+                                            let cmd = format!(
+                                                "{bat} {}",
+                                                test_shell_quote(&abs.to_string_lossy())
+                                            );
+                                            let cwd = active_cwd(&session);
+                                            open_command_pane(
+                                                &mut session,
+                                                &mut panes,
+                                                focused,
+                                                &cmd,
+                                                cwd.as_deref(),
+                                                chrome.center,
+                                            );
+                                            focus.zone = crate::focus::Zone::Center;
+                                            refresh_tab_model(&mut model, &session, &mut sb);
+                                            need_relayout = true;
+                                        }
                                     }
                                 }
                                 // Drill handling for the git-family lists
@@ -8076,9 +8136,19 @@ async fn event_loop<T: Terminal>(
                         (Section::Files, KeyCode::Char('y')) => {
                             // Yazi drawer anchored at the selection's dir.
                             let wt = active_tab_path(&session);
-                            let dir = changed_file_at(&model, panel_ui.cursor)
-                                .and_then(|p| wt.join(&p).parent().map(|d| d.to_path_buf()))
-                                .unwrap_or_else(|| wt.clone());
+                            let dir =
+                                file_entry_at(&model, &panel_ui.files_collapsed, panel_ui.cursor)
+                                    .map(|e| {
+                                        if e.is_dir {
+                                            wt.join(&e.path)
+                                        } else {
+                                            wt.join(&e.path)
+                                                .parent()
+                                                .map(|d| d.to_path_buf())
+                                                .unwrap_or_else(|| wt.clone())
+                                        }
+                                    })
+                                    .unwrap_or_else(|| wt.clone());
                             if let Some(cwd) = active_cwd(&session) {
                                 hide_drawer_into_pool(
                                     &mut drawer,
@@ -8100,17 +8170,43 @@ async fn event_loop<T: Terminal>(
                             drawer_home = Some(dir);
                             true
                         }
-                        (Section::Files, KeyCode::Char('o'))
-                        | (Section::Changes, KeyCode::Char('o')) => {
-                            let path = if panel_ui.open == Section::Files {
-                                changed_file_at(&model, panel_ui.cursor)
-                            } else {
-                                panel_ui
-                                    .chg_sel
-                                    .or(Some(panel_ui.cursor))
-                                    .and_then(|i| model.panel.changes.get(i))
-                                    .map(|c| c.path.clone())
-                            };
+                        (Section::Files, KeyCode::Char('o')) => {
+                            // Files `o`: open in bat (split pane), same as Enter for files.
+                            let entry =
+                                file_entry_at(&model, &panel_ui.files_collapsed, panel_ui.cursor);
+                            if let Some(entry) = entry
+                                && !entry.is_dir
+                            {
+                                let bat = keymap
+                                    .config()
+                                    .tool_command("bat")
+                                    .unwrap_or("bat --paging=always")
+                                    .to_string();
+                                let wt = active_tab_path(&session);
+                                let abs = wt.join(&entry.path);
+                                let cmd =
+                                    format!("{bat} {}", test_shell_quote(&abs.to_string_lossy()));
+                                let cwd = active_cwd(&session);
+                                open_command_pane(
+                                    &mut session,
+                                    &mut panes,
+                                    focused,
+                                    &cmd,
+                                    cwd.as_deref(),
+                                    chrome.center,
+                                );
+                                focus.zone = crate::focus::Zone::Center;
+                                refresh_tab_model(&mut model, &session, &mut sb);
+                                need_relayout = true;
+                            }
+                            true
+                        }
+                        (Section::Changes, KeyCode::Char('o')) => {
+                            let path = panel_ui
+                                .chg_sel
+                                .or(Some(panel_ui.cursor))
+                                .and_then(|i| model.panel.changes.get(i))
+                                .map(|c| c.path.clone());
                             if let Some(path) = path {
                                 let cmd = editor_open_command(keymap.config(), &path, None);
                                 let cwd = active_cwd(&session);
@@ -8127,17 +8223,34 @@ async fn event_loop<T: Terminal>(
                             }
                             true
                         }
-                        (Section::Files, KeyCode::Char('O'))
-                        | (Section::Changes, KeyCode::Char('O')) => {
-                            let path = if panel_ui.open == Section::Files {
-                                changed_file_at(&model, panel_ui.cursor)
-                            } else {
-                                panel_ui
-                                    .chg_sel
-                                    .or(Some(panel_ui.cursor))
-                                    .and_then(|i| model.panel.changes.get(i))
-                                    .map(|c| c.path.clone())
-                            };
+                        (Section::Files, KeyCode::Char('O')) => {
+                            // Files `Shift+O`: open file in terminal editor (new tab).
+                            let entry =
+                                file_entry_at(&model, &panel_ui.files_collapsed, panel_ui.cursor);
+                            if let Some(entry) = entry
+                                && !entry.is_dir
+                            {
+                                let cmd = editor_open_command(keymap.config(), &entry.path, None);
+                                let cwd = active_cwd(&session);
+                                open_command_tab(
+                                    &mut session,
+                                    &mut panes,
+                                    &cmd,
+                                    cwd.as_deref(),
+                                    chrome.center,
+                                );
+                                focus.zone = crate::focus::Zone::Center;
+                                refresh_tab_model(&mut model, &session, &mut sb);
+                                need_relayout = true;
+                            }
+                            true
+                        }
+                        (Section::Changes, KeyCode::Char('O')) => {
+                            let path = panel_ui
+                                .chg_sel
+                                .or(Some(panel_ui.cursor))
+                                .and_then(|i| model.panel.changes.get(i))
+                                .map(|c| c.path.clone());
                             if let Some(path) = path {
                                 let cmd = editor_open_command(keymap.config(), &path, None);
                                 let cwd = active_cwd(&session);
@@ -8157,9 +8270,11 @@ async fn event_loop<T: Terminal>(
                         }
                         (Section::Files, KeyCode::Char('\x0F'))
                         | (Section::Changes, KeyCode::Char('\x0F')) => {
-                            // Ctrl-O: Open in external editor
+                            // Ctrl-O: Open in external editor (detached process)
                             let path = if panel_ui.open == Section::Files {
-                                changed_file_at(&model, panel_ui.cursor)
+                                file_entry_at(&model, &panel_ui.files_collapsed, panel_ui.cursor)
+                                    .filter(|e| !e.is_dir)
+                                    .map(|e| e.path)
                             } else {
                                 panel_ui
                                     .chg_sel

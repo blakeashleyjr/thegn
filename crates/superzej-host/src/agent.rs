@@ -46,8 +46,17 @@ pub fn resolve_command(cfg: &Config, choice: &str) -> String {
 }
 
 /// The `inner` program string for a plain shell pane (what `enter_argv` wraps).
+/// Resolved at call time from the host's `$SHELL` so OCI containers — which
+/// don't inherit the host environment — get the right shell without relying on
+/// `${SHELL}` being set inside the container.
 fn shell_inner() -> String {
-    "${SHELL:-/bin/sh} -l".to_string()
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    format!("{shell} -l")
+}
+
+/// Like [`shell_inner`] but uses an explicit override from the sandbox config.
+fn shell_inner_override(shell_override: &str) -> String {
+    format!("{shell_override} -l")
 }
 
 /// A fully-resolved launch: the argv to spawn (sandbox/transport-wrapped when a
@@ -190,7 +199,18 @@ pub fn compose_spec(
     loc: &GitLoc,
     sb: &SandboxOutcome,
 ) -> LaunchSpec {
-    let cmd = resolve_command(cfg, choice);
+    // If the sandbox config has an explicit shell override, use it for shell
+    // panes. Empty string = resolve from host $SHELL (the default).
+    let sb_shell = cfg
+        .repo_sandbox(Path::new(worktree))
+        .shell
+        .trim()
+        .to_string();
+    let cmd = if choice == "shell" && !sb_shell.is_empty() {
+        shell_inner_override(&sb_shell)
+    } else {
+        resolve_command(cfg, choice)
+    };
     // Local worktrees run in their own dir; remote worktrees have no local dir
     // (the transport cd's on the remote), so the pane cwd stays unset.
     let cwd = (!loc.is_remote()).then(|| PathBuf::from(worktree));

@@ -958,6 +958,16 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
         let suffix = if m.ro { ":ro" } else { "" };
         v.extend(["-v".into(), format!("{}:{}{suffix}", m.host, m.dest)]);
     }
+    // When devenv lives in the Nix store, bind-mount /nix read-only so the
+    // container can exec the resolved absolute path. Consistent with bwrap
+    // which already does `--ro-bind /nix/store /nix/store`.
+    if spec.devenv {
+        if let Some(p) = &spec.devenv_path {
+            if p.starts_with("/nix") && std::path::Path::new("/nix").exists() {
+                v.extend(["-v".into(), "/nix:/nix:ro".into()]);
+            }
+        }
+    }
     for (k, val) in &spec.env {
         v.extend(["-e".into(), format!("{k}={val}")]);
     }
