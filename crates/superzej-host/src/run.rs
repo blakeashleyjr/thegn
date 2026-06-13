@@ -4487,6 +4487,9 @@ async fn event_loop<T: Terminal>(
     );
     let (spec_tx, mut spec_rx) = tokio_mpsc::unbounded_channel::<SpecBatch>();
     let mut materialize_inflight: Option<(String, usize)> = None;
+    // Active-tab keys whose sandbox probe failed: skip re-probing on the next
+    // tick for the same reason as prewarm_failed. Cleared on worktree switch.
+    let mut materialize_failed: std::collections::HashSet<(String, usize)> = std::collections::HashSet::new();
     // Pre-warm requests that are already in-flight: keyed by (worktree, tab)
     // so we never fire a second spawn_blocking for the same neighbor tab while
     // one is already resolving — especially important when the sandbox chain
@@ -4846,8 +4849,7 @@ async fn event_loop<T: Terminal>(
             panel_ui.hunks.clear();
             hunk_inflight.clear();
             materialize_inflight = None;
-            // Allow neighbor tabs of the new active worktree a fresh pre-warm
-            // attempt in case a backend became available since last failure.
+            materialize_failed.clear();
             prewarm_failed.clear();
             panel_ui.chg_sel = None;
             panel_ui.hunks_gen = hydration_gen;
@@ -5003,7 +5005,10 @@ async fn event_loop<T: Terminal>(
                 // (worktree, tab) at a time.
                 let missing = panes.missing_leaves(&session.worktrees[session.active].tabs[ti]);
                 let key = (path.clone(), ti);
-                if !missing.is_empty() && materialize_inflight.as_ref() != Some(&key) {
+                if !missing.is_empty()
+                    && materialize_inflight.as_ref() != Some(&key)
+                    && !materialize_failed.contains(&key)
+                {
                     materialize_inflight = Some(key);
                     let cfg = keymap.config().clone();
                     let tx = spec_tx.clone();
@@ -5542,10 +5547,11 @@ async fn event_loop<T: Terminal>(
                     model.status = format!("Pane launch blocked: {e}");
                     if is_active {
                         center_dormant = true;
+                        // Park the active tab too — without this the loop
+                        // re-probes on every iteration and pegs the CPU.
+                        materialize_failed.insert(tab_key);
                     } else {
-                        // Pre-warm failed for a neighbor tab — park it so the
-                        // loop doesn't re-probe on every iteration. The active-
-                        // tab materialize path retries when the tab is focused.
+                        // Pre-warm failed for a neighbor tab — park it.
                         prewarm_failed.insert(tab_key);
                     }
                     dirty = true;
