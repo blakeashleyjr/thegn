@@ -454,49 +454,169 @@ visible = true
 
 # ── Sandbox / containers ──────────────────────────────────────────────────────
 # Run each worktree's interactive process (agent/shell/tools) inside a
-# container/sandbox. The git worktree stays on the host and is bind-mounted in at
-# its real path, so the sidebar/panel/PR (which read git host-side) keep working,
-# while the agent only sees the worktree and its git metadata.
-# Per-repo overrides go in a repo-root `.superzej.{toml,yaml,yml,json}` under a
-# `[sandbox]` table (only the keys you set override these).
+# container/sandbox. The git worktree stays on the host and is bind-mounted in
+# at its real path, so the sidebar/panel/PR (which read git host-side) keep
+# working while the agent/shell only sees the worktree and its git metadata.
+#
+# Backend comparison (for NixOS / host-toolchain users):
+#   bwrap           — bubblewrap: no daemon, no image, sub-millisecond spawn.
+#                     Exposes the host filesystem selectively; your Nix-store
+#                     shell and tools are available without any extra mounts.
+#                     Best default for NixOS users who just want containment.
+#   podman-rootless — OCI image (Debian, Ubuntu, custom). Reproducible env,
+#                     persistent named container, but ~50-200 ms per spawn and
+#                     the host shell path (/run/current-system/sw/bin/zsh)
+#                     doesn't exist inside the image — superzej probes for
+#                     zsh/bash/sh at runtime and uses the first one found.
+#   host            — no sandbox; process runs directly in the worktree dir.
+#
+# Per-repo overrides go in `.superzej.{toml,yaml,yml,json}` at the repo root
+# under a `[sandbox]` table — only the keys you set override these globals.
 [sandbox]
 enabled = true
-# auto | podman-rootless | podman-rootful | docker | bwrap | systemd | apple | wsl | host
+
+# ── Backend selection ────────────────────────────────────────────────────────
+# Which containment backend to use. "auto" walks backend_chain until one works.
+#   auto | podman-rootless | podman-rootful | docker | bwrap | bubblewrap |
+#   systemd | systemd-run | apple | container | wsl | none | host
+# NixOS tip: set "bwrap" here to skip the podman probes and get instant panes.
 backend = "auto"
-# Default selection in the new-worktree sandbox picker.
+
+# Pre-selected backend in the new-worktree picker ("auto" = use backend_chain).
 default_backend = "auto"
-# Detection order for "auto"; "host" = uncontained host fallback (last by default).
+
+# Probe order for "auto". First backend that is installed and usable wins.
+# "none"/"host" anywhere in the list = uncontained fallback from that point on.
+# NixOS users: move "bwrap" first if podman isn't installed.
 backend_chain = ["podman-rootless", "podman-rootful", "docker", "bwrap", "host"]
-# Empty => use the built-in OCI default image for podman/docker, or host-toolchain
-# mode for bwrap/systemd. Set an OCI image to get a reproducible env.
+
+# ── OCI image (podman / docker only) ────────────────────────────────────────
+# Empty  = superzej's built-in default (debian:stable).
+# Named  = pulled on first use (e.g. "ghcr.io/org/devenv:latest").
+# bwrap / systemd ignore this — they use the host filesystem directly.
 image = ""
-# nat (egress, no inbound) | host | none. Coding agents need egress, so "none"
-# will break API-backed agents.
+
+# Docker Compose file to bring up before the first pane in a workspace.
+# The named container is expected to be running when panes are spawned.
+# compose = "docker-compose.yml"
+
+# ── Network ──────────────────────────────────────────────────────────────────
+# nat  — egress only, no inbound ports. Required for API-backed agents.
+# host — share the host network stack (no isolation; fastest for local services).
+# none — no network (offline/air-gapped agents).
 network = "nat"
-# File access: worktree | worktree_plus_caches | custom | all | host | none.
-# worktree_plus_caches mounts common build caches by default without exposing HOME.
+
+# Host ports to publish from the container: ["host_port:container_port", ...].
+# E.g. expose a dev server started by the agent on port 3000:
+# ports = ["3000:3000", "8080:8080"]
+ports = []
+
+# ── Filesystem ───────────────────────────────────────────────────────────────
+# How much of the host filesystem the sandbox can see:
+#   worktree            — only the worktree dir (most isolated).
+#   worktree_plus_caches — worktree + auto-detected language build caches
+#                          (~/.cargo, ~/.npm, ~/.cache/pip, etc.). Default.
+#   all / host          — entire host filesystem (read-write, least isolated).
+#   none                — no filesystem access beyond the container root.
+#   custom              — only the explicit mounts list below.
 file_access = "worktree_plus_caches"
+
+# Mount common language build caches from the host when file_access is
+# worktree_plus_caches. Disable to get a fully cold cache on every pane.
 auto_caches = true
-# Host env vars forwarded into the sandbox (agent/git auth lives here).
-env_passthrough = ["SSH_AUTH_SOCK", "GH_TOKEN", "GITHUB_TOKEN", "ANTHROPIC_API_KEY", "TERM", "COLORTERM"]
-# Extra bind mounts: "host", "host:ro", "host:dest", "host:dest:ro", or
-# "host:dest:cache" (read-write cache, grouped in the sandbox summary).
+
+# Extra bind mounts beyond what file_access provides.
+# Formats: "host_path"              → rw at same path inside container
+#          "host_path:ro"           → read-only at same path
+#          "host_path:dest"         → rw at dest inside container
+#          "host_path:dest:ro"      → read-only at dest
+#          "host_path:dest:cache"   → read-write cache (shown in sandbox summary)
+# ~ is expanded to $HOME.
 mounts = ["~/.gitconfig:ro"]
-# Shell run inside before the agent/shell (e.g. tool setup).
+
+# ── GPU passthrough (OCI only) ───────────────────────────────────────────────
+# Expose a GPU device to the container. Values depend on the runtime:
+#   "all"             — all GPUs (--gpus all / --device nvidia.com/gpu=all)
+#   "/dev/dri/card0"  — specific device path
+# Leave commented to disable GPU passthrough.
+# gpu = "all"
+
+# ── Environment ──────────────────────────────────────────────────────────────
+# Host env vars forwarded into the sandbox. Extend this list if your agent
+# needs additional credentials or toolchain vars.
+env_passthrough = [
+  "SSH_AUTH_SOCK",      # SSH key forwarding (needed for git push inside OCI)
+  "GH_TOKEN",           # GitHub CLI auth
+  "GITHUB_TOKEN",       # GitHub Actions / API compat alias
+  "ANTHROPIC_API_KEY",
+  "TERM",
+  "COLORTERM",
+]
+
+# ── Shell ─────────────────────────────────────────────────────────────────────
+# Shell for plain "shell" panes inside the sandbox.
+# ""   = auto: for OCI containers superzej probes zsh → bash → sh at runtime
+#        so it works even when the image doesn't have the host shell installed
+#        (e.g. a Debian image has bash but not /run/current-system/sw/bin/zsh).
+#        For bwrap / host the host's $SHELL path is used directly.
+# Set an explicit name ("bash") or absolute path ("/usr/bin/zsh") to pin one.
+shell = ""
+
+# ── Init script ───────────────────────────────────────────────────────────────
+# POSIX sh snippet run inside the sandbox before each agent/shell starts.
+# Useful for first-run tool installation, env setup, or container git config.
+# init_script = "mise install 2>/dev/null || true"
 init_script = ""
-# Wrap the inner command in `devenv shell --` (auto-on if devenv.nix is present
-# and `devenv` is installed).
+
+# Wrap the inner command in `devenv shell --`. Auto-enabled if devenv.nix is
+# present in the worktree root and the `devenv` binary is on PATH.
 devenv = false
-# warn | prompt | fail when no backend is available.
+
+# ── Missing backend behaviour ─────────────────────────────────────────────────
+# What to do when no backend in backend_chain is available:
+#   warn   — open the pane on the host and show a banner (default).
+#   prompt — ask before falling back to host.
+#   fail   — refuse to open the pane.
 on_missing = "warn"
 
-# Run worktrees on a remote machine. Leave host empty for local (default).
-# Control plane (git reads, container lifecycle) uses ssh; the interactive pane
-# uses mosh when transport = "mosh".
+# ── Resource limits (OCI only) ────────────────────────────────────────────────
+# Cap CPU and memory for the container (Docker/Podman units).
+#   cpu    — fractional cores: "0.5" = half a core, "2" = two cores.
+#   memory — bytes with suffix: "512m", "2g".
+# Both default to unlimited when unset.
+[sandbox.limits]
+# cpu    = "2"
+# memory = "4g"
+
+# ── Named volumes (OCI only) ──────────────────────────────────────────────────
+# Persistent volumes that survive container recreations.
+# Key = volume name (created by podman/docker if absent), value = mount point
+# inside the container. Useful for package caches that shouldn't cold-start
+# on every `just build`.
+# [sandbox.volumes]
+# cargo-registry = "/root/.cargo/registry"
+# node-modules   = "/root/.npm"
+# pip-cache      = "/root/.cache/pip"
+
+# ── Remote worktrees ──────────────────────────────────────────────────────────
+# Run worktrees on a remote machine over SSH. Leave host empty for local use.
+# Control-plane operations (git reads, container lifecycle) always use ssh;
+# the interactive pane uses mosh (resilient to network changes) by default.
 [sandbox.remote]
-host = ""              # e.g. "user@devbox"
+# Remote host. Accepts "user@host", bare hostname (uses $USER), or an SSH
+# alias from ~/.ssh/config. Empty = local only (default).
+host = ""
 port = 22
-transport = "mosh"    # mosh | ssh
-mode = "remote"       # remote | local_exec | sshfs
+# mosh — UDP tunnel; survives IP changes and flaky connections. Requires the
+#         mosh package on both the local machine and the remote host.
+# ssh  — plain SSH pty; works everywhere but drops on network interruption.
+transport = "mosh"
+# remote     — worktrees live on the remote host under remote_dir (default).
+# sshfs      — worktrees are sshfs-mounted locally; slower but local toolchain.
+# local_exec — experimental: agent runs locally against the remote filesystem.
+mode = "remote"
+# Where worktrees are stored on the remote host.
 remote_dir = "~/superzej-worktrees"
+# Forward the local SSH agent (ssh -A) so git push uses your local keys.
+# Disable if the remote host has its own deploy key.
 forward_agent = true
