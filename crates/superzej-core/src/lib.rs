@@ -35,6 +35,7 @@ pub mod remote;
 pub mod repo;
 pub mod sandbox;
 pub mod search;
+pub mod startup;
 pub mod theme;
 pub mod util;
 pub mod viz;
