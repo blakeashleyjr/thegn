@@ -5,6 +5,8 @@
 [submodule "apps/termite-chat"]
 	path = apps/termite-chat
 	url = git@github.com:blakeashleyjr/termite-chat.git
+	branch = sz-kit-integration
 [submodule "apps/termite-agent"]
 	path = apps/termite-agent
 	url = git@github.com:blakeashleyjr/termite-agent.git
+	branch = sz-kit-integration

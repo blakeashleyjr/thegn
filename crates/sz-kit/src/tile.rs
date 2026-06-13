@@ -19,7 +19,13 @@ use crate::input::{InputEvent, InputResult};
 pub type ChangeHook = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 /// A full TUI application embeddable as a superzej app tab.
-pub trait AppTile: Send {
+///
+/// Not `Send`: the host drives tiles on its single event-loop thread (the loop
+/// future is `block_on`'d, never `spawn`ed) and the standalone harness drives
+/// them on its main thread, so tiles never cross threads — and some ratatui
+/// 0.30 widgets a tile may hold (e.g. a `Block` with a shadow `Effect`) are
+/// themselves `!Send`. Async work is offloaded via the `ChangeHook` instead.
+pub trait AppTile {
     /// Stable identifier — the tab id and config key (`"comms"`, `"chat"`, …).
     fn id(&self) -> &'static str;
 
