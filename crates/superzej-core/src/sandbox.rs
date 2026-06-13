@@ -737,8 +737,10 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
     let required: std::collections::HashSet<&str> =
         spec.mounts.iter().map(|m| m.host.as_str()).collect();
 
-    // Emit "OK" first, then one bind-mount source per line.
-    let fmt = "OK\n{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}\n{{end}}{{end}}";
+    // Emit "RUNNING" if actually running (not "created"/"exited"), then one
+    // bind-mount source per line. A container in "created" state passes inspect
+    // but cannot accept exec sessions — we must not treat it as healthy.
+    let fmt = "{{if .State.Running}}RUNNING{{end}}\n{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}\n{{end}}{{end}}";
     let mut argv = backend_prefix(spec.backend);
     // For remote worktrees the transport wraps the argv; for local we call
     // podman/docker directly. run_control_t_owned gives us the timeout but
@@ -760,7 +762,8 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
             return (false, false); // container doesn't exist
         }
         let mut lines = stdout.lines();
-        if lines.next() != Some("OK") {
+        // First line must be "RUNNING" — "CREATED" / "EXITED" / missing → not usable.
+        if lines.next() != Some("RUNNING") {
             return (false, false);
         }
         let active: std::collections::HashSet<&str> =
@@ -823,7 +826,11 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
     argv.extend(oci_create_opts(spec));
     argv.push(effective_image(spec));
     argv.extend(["sleep".into(), "infinity".into()]);
-    if run_control_owned(spec, &argv, RUN_TIMEOUT).unwrap_or(false) {
+    run_control_owned(spec, &argv, RUN_TIMEOUT);
+    // Don't trust the exit code of `podman run -d`: on NixOS with broken
+    // --userns keep-id, crun exits 0 but leaves the container in "created"
+    // state. Verify it is actually running before declaring success.
+    if container_status(spec).0 {
         return Ok(());
     }
 
@@ -852,7 +859,8 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
         retry.extend(oci_create_opts_with_keep_id(spec, false));
         retry.push(effective_image(spec));
         retry.extend(["sleep".into(), "infinity".into()]);
-        if run_control_owned(spec, &retry, RUN_TIMEOUT).unwrap_or(false) {
+        run_control_owned(spec, &retry, RUN_TIMEOUT);
+        if container_status(spec).0 {
             msg::warn(
                 "podman --userns keep-id failed; continuing with rootless podman default user namespace",
             );
