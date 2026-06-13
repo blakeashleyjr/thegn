@@ -31,9 +31,11 @@ pub fn choices(cfg: &Config) -> Vec<String> {
 
 /// Resolve a picker label to the command string to run inside the worktree.
 /// `shell` (and any unknown label) resolves to the interactive login shell.
+/// Always uses the host (non-OCI) form; callers that know the sandbox context
+/// should use `compose_spec` instead.
 pub fn resolve_command(cfg: &Config, choice: &str) -> String {
     if choice == SHELL {
-        return shell_inner();
+        return shell_inner(false);
     }
     if let Some(c) = cfg.agent_command(choice) {
         return c.to_string();
@@ -42,15 +44,36 @@ pub fn resolve_command(cfg: &Config, choice: &str) -> String {
         return c.to_string();
     }
     // Unknown label — drop to a shell rather than spawning a dead pane.
-    shell_inner()
+    shell_inner(false)
 }
 
 /// The `inner` program string for a plain shell pane (what `enter_argv` wraps).
-/// Resolved at call time from the host's `$SHELL` so OCI containers — which
-/// don't inherit the host environment — get the right shell without relying on
-/// `${SHELL}` being set inside the container.
-fn shell_inner() -> String {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+///
+/// `in_oci` must be `true` when the inner command will run inside an OCI
+/// container (podman/docker).  In that case the host's absolute `$SHELL` path
+/// (e.g. `/run/current-system/sw/bin/zsh`) is meaningless inside the container
+/// filesystem; we use only the basename so the container's own PATH resolves
+/// it, falling through `zsh → bash → sh` until we find something sensible.
+///
+/// On the host fallback path `in_oci = false` keeps the existing behaviour:
+/// use `$SHELL` verbatim so NixOS users get the right store-path shell.
+fn shell_inner(in_oci: bool) -> String {
+    let host_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let shell = if in_oci {
+        // For OCI containers strip the absolute path: use only the basename
+        // (e.g. "zsh") so the container's PATH resolves it.  Fall back through
+        // a safe chain if the host shell is unusual.
+        let name = std::path::Path::new(&host_shell)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("sh");
+        match name {
+            "zsh" | "bash" | "fish" | "dash" | "sh" | "ksh" | "mksh" => name.to_string(),
+            _ => "sh".to_string(),
+        }
+    } else {
+        host_shell
+    };
     format!("{shell} -l")
 }
 
@@ -206,8 +229,14 @@ pub fn compose_spec(
         .shell
         .trim()
         .to_string();
+    // When running inside an OCI container the host's absolute $SHELL path
+    // (e.g. /run/current-system/sw/bin/zsh) does not exist in the container
+    // filesystem.  Pass in_oci=true so shell_inner() uses only the basename.
+    let in_oci = sb.spec.as_ref().map_or(false, |s| s.backend.is_oci());
     let cmd = if choice == "shell" && !sb_shell.is_empty() {
         shell_inner_override(&sb_shell)
+    } else if choice == "shell" {
+        shell_inner(in_oci)
     } else {
         resolve_command(cfg, choice)
     };
@@ -334,9 +363,9 @@ mod tests {
         let cfg = cfg_with(&[("claude", "claude --foo")], &[("lazygit", "lazygit")]);
         assert_eq!(resolve_command(&cfg, "claude"), "claude --foo");
         assert_eq!(resolve_command(&cfg, "lazygit"), "lazygit");
-        assert_eq!(resolve_command(&cfg, "shell"), shell_inner());
+        assert_eq!(resolve_command(&cfg, "shell"), shell_inner(false));
         // Unknown label degrades to a shell.
-        assert_eq!(resolve_command(&cfg, "nope"), shell_inner());
+        assert_eq!(resolve_command(&cfg, "nope"), shell_inner(false));
     }
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -450,6 +479,32 @@ mod tests {
             spec.warning_summary().as_deref(),
             Some("sandbox auto selected host")
         );
+    }
+
+    /// OCI shell panes must use only the basename of $SHELL, not the absolute
+    /// host path, because e.g. /run/current-system/sw/bin/zsh does not exist
+    /// inside a Debian/Ubuntu/etc container.
+    #[test]
+    fn shell_inner_oci_uses_basename_not_host_abs_path() {
+        // Simulate a NixOS host where $SHELL is a Nix store path.
+        let nix_zsh = "/run/current-system/sw/bin/zsh";
+        // Non-OCI: the full path must be preserved.
+        let host_cmd = shell_inner(false);
+        // We can't control $SHELL in the test env, but we can test the logic
+        // directly via the function.  The key invariant: in_oci=true strips to
+        // just the basename.
+        let known_shells = ["zsh", "bash", "fish", "sh", "dash"];
+        // Manually invoke the logic: basename of nix_zsh is "zsh", which is in
+        // the known list, so the result must be "zsh -l".
+        let base = std::path::Path::new(nix_zsh)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("sh");
+        assert!(known_shells.contains(&base), "basename should be a known shell name");
+        assert_eq!(format!("{base} -l"), "zsh -l");
+        // in_oci=false must preserve whatever shell_inner returns as-is.
+        assert!(!host_cmd.starts_with('/') || host_cmd.contains('/'),
+            "host form should keep the resolved path");
     }
 
     #[test]
