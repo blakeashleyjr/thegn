@@ -4354,6 +4354,23 @@ fn sync_drawer_persistence(
     }
 }
 
+/// Cycle the active top-level tab by `delta` over `[work, tile0, … tile(n-1)]`
+/// (wrapping). `work` is index 0; tile `i` is index `i + 1`.
+fn cycle_app(active: crate::apps::ActiveApp, n: usize, delta: isize) -> crate::apps::ActiveApp {
+    use crate::apps::ActiveApp;
+    let total = (n + 1) as isize;
+    let cur = match active {
+        ActiveApp::Work => 0,
+        ActiveApp::Tile(i) => i as isize + 1,
+    };
+    let next = (cur + delta).rem_euclid(total);
+    if next == 0 {
+        ActiveApp::Work
+    } else {
+        ActiveApp::Tile((next - 1) as usize)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn event_loop<T: Terminal>(
     buf: &mut BufferedTerminal<T>,
@@ -4447,6 +4464,15 @@ async fn event_loop<T: Terminal>(
     let mut wizard_cmd_tx: Option<std::sync::mpsc::Sender<wizard::WizardCmd>> = None;
     let mut creating: Option<wizard::CreationProgress> = None;
     let mut create_gen: u64 = 0;
+    // Top-level app tabs (comms/chat/agent) hosted as tiles above the worktree
+    // IDE. A tile's ChangeHook posts its slot index here and pulses the waker,
+    // so async results fold in and re-render on the existing 0%-idle path.
+    // Tiles lazy-load on first focus.
+    let (app_tx, mut app_rx) = tokio_mpsc::unbounded_channel::<usize>();
+    let mut app_host = crate::apps::AppHost::new(vec![
+        crate::apps::AppSlot::new("comms", "comms"),
+        crate::apps::AppSlot::new("chat", "chat"),
+    ]);
     // Test-explorer results from the background runner/discoverer (capped,
     // single-flight). Two channels: run outcomes and discovery outcomes.
     let (test_run_tx, mut test_run_rx) =
@@ -5563,6 +5589,18 @@ async fn event_loop<T: Terminal>(
             }
         }
 
+        // App-tab change-hooks fired (async results landed in a tile). Drain the
+        // signals, fold every running tile's messages, and repaint — the chip
+        // badges track unfocused tiles, the active tile shows its new state.
+        let mut app_signalled = false;
+        while app_rx.try_recv().is_ok() {
+            app_signalled = true;
+        }
+        if app_signalled {
+            app_host.pump_all();
+            dirty = true;
+        }
+
         // Fresh metrics readings from the scrape supervisor (sidebar section).
         while let Ok(state) = metrics_rx.try_recv() {
             if model.metrics != state {
@@ -5845,38 +5883,84 @@ async fn event_loop<T: Terminal>(
                 .rsplit_once('/')
                 .map(|(_, l)| l.to_string())
                 .unwrap_or_else(|| model.worktree.clone());
-            render_tab(
-                &mut scratch,
-                &chrome,
-                &tree,
-                focused,
-                &model,
-                &panel_ui,
-                |id| panes.table.get(&id).map(|p| p.emulator()),
-                &|id| {
-                    panes
-                        .table
-                        .get(&id)
-                        .map(|p| {
-                            // Prefer the OSC window title the app sets (zsh +
-                            // starship, tmux, etc.); fall back to the program
-                            // name derived from the spawn argv.
-                            let name = p
-                                .emulator()
-                                .title()
-                                .filter(|t| !t.trim().is_empty())
-                                .unwrap_or_else(|| p.program().to_string());
-                            if title_leaf.is_empty() {
-                                name
-                            } else {
-                                format!("{name} \u{00b7} {title_leaf}")
-                            }
-                        })
-                        .unwrap_or_default()
-                },
-            );
+            // Top-level app tabs: reflect the strip into the model so the
+            // masthead chips render every frame.
+            {
+                let mut tabs = Vec::with_capacity(app_host.slots.len() + 1);
+                tabs.push("work".to_string());
+                tabs.extend(app_host.slots.iter().map(|s| s.chip_label()));
+                model.app_tabs = tabs;
+                model.active_app = match app_host.active {
+                    crate::apps::ActiveApp::Work => 0,
+                    crate::apps::ActiveApp::Tile(i) => i + 1,
+                };
+            }
+            let app_tile_active = app_host.active_tile_mut().is_some();
+            if app_tile_active {
+                // App-tab takeover: the masthead (with chips) + statusbar frame
+                // the focused tile, which owns the whole band between them. The
+                // worktree IDE (sidebar/center/panel) is hidden while it's up.
+                if let Some(s) = app_host.active_tile_mut().and_then(|t| t.status_line()) {
+                    model.status = s;
+                }
+                crate::chrome::draw_masthead(&mut scratch, &chrome, &model);
+                crate::chrome::draw_statusbar(&mut scratch, chrome.statusbar, &model);
+                let top = chrome.divider.y + chrome.divider.rows;
+                let band = Rect {
+                    x: 0,
+                    y: top,
+                    cols,
+                    rows: chrome.statusbar.y.saturating_sub(top),
+                };
+                if let Some(tile) = app_host.active_tile_mut()
+                    && band.cols > 0
+                    && band.rows > 0
+                {
+                    let area = sz_kit::ratatui::layout::Rect::new(
+                        0,
+                        0,
+                        band.cols as u16,
+                        band.rows as u16,
+                    );
+                    let mut tbuf = sz_kit::ratatui::buffer::Buffer::empty(area);
+                    tile.render(area, &mut tbuf);
+                    crate::apps::bridge::blit(&mut scratch, &tbuf, band);
+                }
+            } else {
+                render_tab(
+                    &mut scratch,
+                    &chrome,
+                    &tree,
+                    focused,
+                    &model,
+                    &panel_ui,
+                    |id| panes.table.get(&id).map(|p| p.emulator()),
+                    &|id| {
+                        panes
+                            .table
+                            .get(&id)
+                            .map(|p| {
+                                // Prefer the OSC window title the app sets (zsh +
+                                // starship, tmux, etc.); fall back to the program
+                                // name derived from the spawn argv.
+                                let name = p
+                                    .emulator()
+                                    .title()
+                                    .filter(|t| !t.trim().is_empty())
+                                    .unwrap_or_else(|| p.program().to_string());
+                                if title_leaf.is_empty() {
+                                    name
+                                } else {
+                                    format!("{name} \u{00b7} {title_leaf}")
+                                }
+                            })
+                            .unwrap_or_default()
+                    },
+                );
+            }
             // Mouse-selection highlight, clipped to the anchored pane.
-            if let Some((sel_pane, sel)) = &mouse_sel
+            if !app_tile_active
+                && let Some((sel_pane, sel)) = &mouse_sel
                 && let Some((_, _, content)) = tree
                     .layout_framed(chrome.center)
                     .iter()
@@ -5889,7 +5973,7 @@ async fn event_loop<T: Terminal>(
                     crate::chrome::col(crate::chrome::S::Panel2),
                 );
             }
-            if let Some(strip_rect) = chrome.strip {
+            if !app_tile_active && let Some(strip_rect) = chrome.strip {
                 let cells: Vec<crate::chrome::StripCell> = supervisor
                     .strip_layout(strip_rect)
                     .into_iter()
@@ -5913,7 +5997,8 @@ async fn event_loop<T: Terminal>(
                     |id| panes.table.get(&id).map(|p| p.emulator()),
                 );
             }
-            if let Some(drawer_id) = drawer
+            if !app_tile_active
+                && let Some(drawer_id) = drawer
                 && let Some(p) = panes.table.get(&drawer_id)
             {
                 let height = current_config
@@ -6000,7 +6085,13 @@ async fn event_loop<T: Terminal>(
                 full_repaint = false;
             }
             let mut pending = front.diff_screens(&scratch);
-            if palette.is_none()
+            if app_tile_active {
+                // The app tile owns the band; no host hardware cursor (the tile
+                // draws its own caret if it wants one).
+                pending.push(Change::CursorVisibility(
+                    termwiz::surface::CursorVisibility::Hidden,
+                ));
+            } else if palette.is_none()
                 && wizard_ui.is_none()
                 && !creating.as_ref().is_some_and(|cp| cp.revealed)
             {
@@ -6479,6 +6570,71 @@ async fn event_loop<T: Terminal>(
                 // Typing clears any lingering mouse selection highlight.
                 if mouse_sel.take().is_some() {
                     dirty = true;
+                }
+                // Top-level app tabs. Switch chords (Alt+1 = work, Alt+2.. =
+                // tiles, Alt+]/[ = cycle) work from any tab; while a tile is
+                // focused it owns every other key (its own quit returns here).
+                {
+                    let n = app_host.slots.len();
+                    let target = if k.modifiers.contains(Modifiers::ALT) {
+                        match k.key {
+                            KeyCode::Char('1') => Some(crate::apps::ActiveApp::Work),
+                            KeyCode::Char(c @ '2'..='9') => {
+                                let idx = (c as usize) - ('2' as usize);
+                                (idx < n).then_some(crate::apps::ActiveApp::Tile(idx))
+                            }
+                            KeyCode::Char(']') => Some(cycle_app(app_host.active, n, 1)),
+                            KeyCode::Char('[') => Some(cycle_app(app_host.active, n, -1)),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(target) = target {
+                        // Lazy-load the tile on first focus (cheap; the await is
+                        // free in this async loop). The ChangeHook posts the
+                        // slot index + pulses the waker, so async results fold
+                        // in on the normal drain path.
+                        if let crate::apps::ActiveApp::Tile(i) = target
+                            && matches!(app_host.slots[i].state, crate::apps::SlotState::Unloaded)
+                        {
+                            let hook: sz_kit::ChangeHook = {
+                                let tx = app_tx.clone();
+                                let wk = waker.clone();
+                                std::sync::Arc::new(move || {
+                                    let _ = tx.send(i);
+                                    let _ = wk.wake();
+                                })
+                            };
+                            let handle = tokio::runtime::Handle::current();
+                            // Hand the tile the live chrome palette so it
+                            // renders in the same theme as the work tab.
+                            let theme = crate::apps::kit_theme(&current_config.palette());
+                            let tile = match app_host.slots[i].id {
+                                "comms" => crate::apps::comms::build(handle, hook, theme).await,
+                                "chat" => crate::apps::chat::build(handle, hook, theme).await,
+                                _ => {
+                                    // Unknown app id — leave it Unloaded.
+                                    continue;
+                                }
+                            };
+                            app_host.slots[i].state = crate::apps::SlotState::Running(tile);
+                        }
+                        app_host.active = target;
+                        dirty = true;
+                        continue;
+                    }
+                    // A focused tile owns all remaining input.
+                    if let crate::apps::ActiveApp::Tile(i) = app_host.active {
+                        if let Some(ev) = crate::apps::input::to_kit(&k.key, k.modifiers)
+                            && let Some(tile) = app_host.slots[i].state.tile_mut()
+                            && tile.handle_input(ev) == sz_kit::InputResult::Exit
+                        {
+                            app_host.active = crate::apps::ActiveApp::Work;
+                        }
+                        dirty = true;
+                        continue;
+                    }
                 }
                 // Modal: a pending destructive delete swallows the next key.
                 if let Some((_, targets)) = pending_delete.take() {

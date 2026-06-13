@@ -4,7 +4,22 @@ members = [
   "crates/superzej-core",
   "crates/superzej-svc",
   "crates/superzej-host",
+  "crates/sz-kit",
 ]
+# Integrated app repos live under apps/ as git submodules, each with its OWN
+# cargo workspace; keep these out of superzej's workspace so commands run from
+# an arbitrary cwd don't try to absorb them. (superzej-host reaches their
+# crates via explicit path deps — that resolves against each submodule's own
+# [workspace], not this one.)
+exclude = ["apps", "vendor"]
+
+# The app submodules consume sz-kit as a git dependency on THIS repo (so they
+# also build standalone). When building embedded, redirect that git source to
+# the in-tree crate, so one sz-kit/ratatui version compiles across host + apps
+# and no network fetch happens. Standalone app builds (cloned alone) resolve
+# the real git tag instead.
+[patch."ssh://git@github.com/blakeashleyjr/superzej.git"]
+sz-kit = { path = "crates/sz-kit" }
 
 [workspace.package]
 version = "0.1.0"
@@ -14,7 +29,7 @@ license = "MIT"
 [workspace.dependencies]
 # --- shared domain/runtime deps ---
 clap = { version = "4.5", features = ["derive", "env"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
