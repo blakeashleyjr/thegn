@@ -165,12 +165,11 @@ impl NewWorktreeWizard {
         if mods.contains(Modifiers::ALT) || mods.contains(Modifiers::SUPER) {
             return WizardOutcome::Pending;
         }
-        let esc = crate::input::is_escape_key(key);
+        if crate::input::is_escape_key(key) {
+            return WizardOutcome::Cancel;
+        }
         match self.step {
             WizardStep::Name => {
-                if esc {
-                    return WizardOutcome::Cancel;
-                }
                 match key {
                     KeyCode::Enter if !self.tail.trim().is_empty() => {
                         self.step = WizardStep::Sandbox;
@@ -188,61 +187,52 @@ impl NewWorktreeWizard {
                 }
                 WizardOutcome::Pending
             }
-            WizardStep::Sandbox | WizardStep::Agent => {
-                if esc {
-                    self.step = match self.step {
-                        WizardStep::Agent => WizardStep::Sandbox,
-                        _ => WizardStep::Name,
-                    };
-                    return WizardOutcome::Pending;
+            WizardStep::Sandbox | WizardStep::Agent => match key {
+                KeyCode::DownArrow | KeyCode::Char('j') => {
+                    let max = self.rows().len().saturating_sub(1);
+                    let sel = self.sel();
+                    *sel = (*sel + 1).min(max);
+                    WizardOutcome::Pending
                 }
-                match key {
-                    KeyCode::DownArrow | KeyCode::Char('j') => {
-                        let max = self.rows().len().saturating_sub(1);
-                        let sel = self.sel();
-                        *sel = (*sel + 1).min(max);
-                        WizardOutcome::Pending
-                    }
-                    KeyCode::UpArrow | KeyCode::Char('k') => {
-                        let sel = self.sel();
-                        *sel = sel.saturating_sub(1);
-                        WizardOutcome::Pending
-                    }
-                    KeyCode::Enter => {
-                        if self.step == WizardStep::Sandbox {
-                            let backend = self
-                                .sandbox_rows
-                                .get(self.sandbox_sel)
-                                .map(|(k, _)| k.clone())
-                                .unwrap_or_else(|| "auto".into());
-                            self.step = WizardStep::Agent;
-                            WizardOutcome::SandboxChosen(backend)
+                KeyCode::UpArrow | KeyCode::Char('k') => {
+                    let sel = self.sel();
+                    *sel = sel.saturating_sub(1);
+                    WizardOutcome::Pending
+                }
+                KeyCode::Enter => {
+                    if self.step == WizardStep::Sandbox {
+                        let backend = self
+                            .sandbox_rows
+                            .get(self.sandbox_sel)
+                            .map(|(k, _)| k.clone())
+                            .unwrap_or_else(|| "auto".into());
+                        self.step = WizardStep::Agent;
+                        WizardOutcome::SandboxChosen(backend)
+                    } else {
+                        let sandbox = self
+                            .sandbox_rows
+                            .get(self.sandbox_sel)
+                            .map(|(k, _)| k.clone())
+                            .unwrap_or_else(|| "auto".into());
+                        let agent = self
+                            .agent_rows
+                            .get(self.agent_sel)
+                            .map(|(k, _)| k.clone())
+                            .unwrap_or_else(|| "shell".into());
+                        let name = if self.name_edited {
+                            NameChoice::Human(self.tail.clone())
                         } else {
-                            let sandbox = self
-                                .sandbox_rows
-                                .get(self.sandbox_sel)
-                                .map(|(k, _)| k.clone())
-                                .unwrap_or_else(|| "auto".into());
-                            let agent = self
-                                .agent_rows
-                                .get(self.agent_sel)
-                                .map(|(k, _)| k.clone())
-                                .unwrap_or_else(|| "shell".into());
-                            let name = if self.name_edited {
-                                NameChoice::Human(self.tail.clone())
-                            } else {
-                                NameChoice::Generated
-                            };
-                            WizardOutcome::Submit(WizardChoices {
-                                name,
-                                sandbox,
-                                agent,
-                            })
-                        }
+                            NameChoice::Generated
+                        };
+                        WizardOutcome::Submit(WizardChoices {
+                            name,
+                            sandbox,
+                            agent,
+                        })
                     }
-                    _ => WizardOutcome::Pending,
                 }
-            }
+                _ => WizardOutcome::Pending,
+            },
         }
     }
 
@@ -286,7 +276,12 @@ impl NewWorktreeWizard {
                     seg(Tok::Slot(S::Faint), label.to_string()),
                 )
             };
-            vec![chip, sp(1), text, seg(Tok::Slot(S::Faint), "  ›  ".to_string())]
+            vec![
+                chip,
+                sp(1),
+                text,
+                seg(Tok::Slot(S::Faint), "  ›  ".to_string()),
+            ]
         };
         let mut crumbs: Vec<Seg> = Vec::new();
         crumbs.extend(crumb(WizardStep::Name, "1", "name"));
@@ -1066,15 +1061,24 @@ mod tests {
     }
 
     #[test]
-    fn esc_backtracks_then_cancels_and_ctrl_c_cancels_anywhere() {
+    fn esc_cancels_from_any_step_and_ctrl_c_cancels_anywhere() {
         let cfg = test_cfg();
+        // Escape cancels immediately from the name step.
+        let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
+        assert_eq!(key(&mut w, KeyCode::Escape), WizardOutcome::Cancel);
+
+        // Escape cancels immediately from the sandbox step.
+        let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
+        key(&mut w, KeyCode::Enter); // name → sandbox
+        assert_eq!(key(&mut w, KeyCode::Escape), WizardOutcome::Cancel);
+
+        // Escape cancels immediately from the agent step.
         let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
         key(&mut w, KeyCode::Enter); // name → sandbox
         key(&mut w, KeyCode::Enter); // sandbox → agent
-        assert_eq!(key(&mut w, KeyCode::Escape), WizardOutcome::Pending); // agent → sandbox
-        assert_eq!(key(&mut w, KeyCode::Escape), WizardOutcome::Pending); // sandbox → name
         assert_eq!(key(&mut w, KeyCode::Escape), WizardOutcome::Cancel);
 
+        // Ctrl+c cancels from any step.
         let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
         key(&mut w, KeyCode::Enter);
         assert_eq!(
