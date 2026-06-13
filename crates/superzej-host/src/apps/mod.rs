@@ -19,6 +19,7 @@
 #![allow(dead_code)] // wired into run.rs incrementally (Phase 2)
 
 pub mod bridge;
+pub mod comms;
 pub mod input;
 
 use superzej_core::theme::Palette;
