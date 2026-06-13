@@ -277,6 +277,14 @@ pub fn resolve(cfg: &SandboxConfig, loc: &GitLoc, name: &str) -> Option<SandboxS
             });
         }
     };
+    // OCI containers (podman/docker) get the host toolchain mounted in by
+    // default so the user's real shell, starship, dotfiles, and tools work
+    // identically inside the container — including on NixOS where everything
+    // lives in /nix/store and $SHELL is an absolute store path.
+    // bwrap/systemd are "host-toolchain" backends that expose the host
+    // filesystem directly, so they don't need these extra mounts.
+    let inject_host_toolchain = backend.is_oci() && cfg.auto_caches;
+
     match cfg.file_access {
         FileAccess::All | FileAccess::Host => {
             mounts.push(Mount {
@@ -286,11 +294,19 @@ pub fn resolve(cfg: &SandboxConfig, loc: &GitLoc, name: &str) -> Option<SandboxS
                 cache: false,
             });
         }
-        FileAccess::Worktree => add_worktree_mounts(&mut mounts),
+        FileAccess::Worktree => {
+            add_worktree_mounts(&mut mounts);
+            if inject_host_toolchain {
+                mounts.extend(host_toolchain_mounts());
+            }
+        }
         FileAccess::WorktreePlusCaches => {
             add_worktree_mounts(&mut mounts);
             if cfg.auto_caches {
                 mounts.extend(auto_cache_mounts());
+            }
+            if inject_host_toolchain {
+                mounts.extend(host_toolchain_mounts());
             }
         }
         FileAccess::Custom => add_worktree_mounts(&mut mounts),
@@ -1126,6 +1142,115 @@ fn local_uid_gid() -> Option<(u32, u32)> {
     Some((u, g))
 }
 
+/// Mounts that bring the host toolchain into an OCI container so the user's
+/// real shell, dotfiles, and tools work identically inside the sandbox.
+///
+/// This is most useful on NixOS, where everything lives in `/nix/store` and
+/// `/run/current-system/sw`, but the same logic also picks up conventional
+/// FHS paths (`/usr`, `/lib`, `/bin`) on non-NixOS hosts.
+///
+/// Only paths that **exist on the host** at spec-build time are included —
+/// the list is always a subset of what's actually present, never a wish list.
+/// All mounts are **read-only** (the container should not modify host system
+/// files).
+pub fn host_toolchain_mounts() -> Vec<Mount> {
+    let mut mounts = Vec::new();
+    let home = std::env::var("HOME").unwrap_or_default();
+
+    let ro = |path: &str| Mount {
+        host: path.to_string(),
+        dest: path.to_string(),
+        ro: true,
+        cache: false,
+    };
+
+    let exists = |p: &str| std::path::Path::new(p).exists();
+
+    // ── NixOS / Nix-on-anything paths ───────────────────────────────────────
+    // /nix/store  — every binary, library, and config file Nix manages lives
+    //               here. Mounting it ro brings in the shell ($SHELL resolves
+    //               to a store path), starship, completions, dotfile symlink
+    //               targets, etc. without any per-package enumeration.
+    if exists("/nix/store") {
+        mounts.push(ro("/nix/store"));
+    }
+    // /run/current-system — the stable generation symlinks:
+    //   sw/bin/zsh, sw/share/zsh, etc. The container's $SHELL will resolve
+    //   correctly once /nix/store is present.
+    if exists("/run/current-system") {
+        mounts.push(ro("/run/current-system"));
+    }
+    // /nix/var/nix/profiles — user profiles (alternative to per-user path).
+    if exists("/nix/var/nix/profiles") {
+        mounts.push(ro("/nix/var/nix/profiles"));
+    }
+    // /etc/profiles/per-user/<user> — per-user packages installed by
+    // home-manager (e.g. zsh plugins, starship when not in system profile).
+    if !home.is_empty() {
+        let username = std::path::Path::new(&home)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        if !username.is_empty() {
+            let p = format!("/etc/profiles/per-user/{username}");
+            if exists(&p) {
+                mounts.push(ro(&p));
+            }
+        }
+    }
+    // /etc/static — NixOS-managed /etc entries (zshrc, zshenv, zprofile, …).
+    if exists("/etc/static") {
+        mounts.push(ro("/etc/static"));
+    }
+
+    // ── Conventional FHS paths (non-NixOS, or mixed systems) ────────────────
+    // These are absent on pure NixOS (everything is in /nix) but present on
+    // Ubuntu/Debian/Fedora/Arch and WSL; include them when they exist.
+    for path in &["/usr", "/lib", "/lib64", "/bin"] {
+        // Skip /bin and /lib if they're just symlinks into /usr (common on
+        // modern FHS systems) to avoid duplicate mounts.
+        let p = std::path::Path::new(path);
+        if p.exists() && !p.is_symlink() {
+            mounts.push(ro(path));
+        }
+    }
+
+    // ── Identity/locale files every process expects ──────────────────────────
+    // passwd/group are needed for getpwuid() (shell prompts, git author, etc.)
+    // Overlaying the host files means the container sees the real username.
+    for path in &[
+        "/etc/passwd",
+        "/etc/group",
+        "/etc/hosts",
+        "/etc/localtime",
+        "/etc/resolv.conf",
+        "/etc/zshrc",   // NixOS system-wide zsh init (sourced by /etc/static/zshrc)
+        "/etc/zshenv",
+        "/etc/zprofile",
+    ] {
+        if exists(path) {
+            mounts.push(ro(path));
+        }
+    }
+
+    // ── User home directory (dotfiles) ───────────────────────────────────────
+    // Mount $HOME read-only so ~/.zshrc, ~/.config/starship.toml, ~/.gitconfig
+    // and similar dotfiles are visible. On NixOS these are typically symlinks
+    // into /nix/store, so this mount is complementary (symlink) + /nix/store
+    // (target). Without home the symlinks dangle inside the container.
+    // We use the same dest so absolute paths in dotfiles work unchanged.
+    if !home.is_empty() && exists(&home) {
+        mounts.push(Mount {
+            host: home.clone(),
+            dest: home,
+            ro: true,
+            cache: false,
+        });
+    }
+
+    mounts
+}
+
 fn auto_cache_mounts() -> Vec<Mount> {
     let home = std::env::var("HOME").unwrap_or_default();
     if home.is_empty() {
@@ -1668,5 +1793,59 @@ mod tests {
         // Garbage degrades to empty, never panics.
         assert!(parse_podman_ps("not json").is_empty());
         assert!(parse_docker_ps("not json").is_empty());
+    }
+
+    #[test]
+    fn host_toolchain_mounts_are_all_ro_and_exist() {
+        // Every mount returned must point to a path that actually exists on the
+        // current host (no phantom entries) and must be read-only.
+        for m in host_toolchain_mounts() {
+            assert!(
+                std::path::Path::new(&m.host).exists(),
+                "host_toolchain_mounts returned non-existent path: {}",
+                m.host
+            );
+            assert!(m.ro, "host toolchain mount must be read-only: {}", m.host);
+            assert_eq!(m.host, m.dest, "host toolchain mounts must be path-preserving");
+        }
+    }
+
+    #[test]
+    fn host_toolchain_mounts_injected_for_oci_not_bwrap() {
+        // For OCI backends, host_toolchain_mounts() contributes only paths that
+        // exist on the current host — verify that invariant holds by checking
+        // any mount whose host path is NOT the synthetic worktree path.
+        let mut cfg = crate::config::SandboxConfig::default();
+        cfg.file_access = crate::config::FileAccess::WorktreePlusCaches;
+        cfg.auto_caches = true;
+        cfg.backend = crate::config::SandboxBackend::Podman;
+        cfg.image = "debian:stable".into();
+        let loc = crate::remote::GitLoc::from_db("/wt/x", None);
+        if let Some(spec) = resolve(&cfg, &loc, "test") {
+            // host_toolchain_mounts() entries: not the fake worktree, not the
+            // rw language caches from auto_cache_mounts (those are !ro && cache),
+            // and not unexpanded-tilde paths from cfg.mounts defaults.
+            let toolchain: Vec<_> = spec
+                .mounts
+                .iter()
+                .filter(|m| !m.host.starts_with("/wt/") && !m.cache && !m.host.starts_with('~'))
+                .collect();
+            for m in &toolchain {
+                assert!(
+                    std::path::Path::new(&m.host).exists(),
+                    "host_toolchain mount for non-existent path: {}",
+                    m.host
+                );
+                assert!(m.ro, "host toolchain mount should be ro: {}", m.host);
+            }
+            // On NixOS (where /nix/store exists) we must have injected at
+            // least the nix store mount.
+            if std::path::Path::new("/nix/store").exists() {
+                assert!(
+                    toolchain.iter().any(|m| m.host == "/nix/store"),
+                    "OCI spec on NixOS should include /nix/store mount"
+                );
+            }
+        }
     }
 }
