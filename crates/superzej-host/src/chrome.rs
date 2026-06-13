@@ -330,10 +330,44 @@ pub struct FrameModel {
     pub app_tabs: Vec<String>,
     /// Index of the active app tab in [`Self::app_tabs`] (0 = `work`).
     pub active_app: usize,
-    /// Progress message shown in the splash screen while the first pane is
-    /// loading (sandbox probe, container start, exec, etc.). Cleared once a
-    /// live pane exists. Empty string = no status line shown.
-    pub center_status: String,
+    /// Ordered launch steps shown in the loading screen while the first pane
+    /// is spawning. Empty = no loading screen. Cleared once a live pane exists.
+    pub load_steps: Vec<LoadStep>,
+}
+
+/// One step in the pane-launch progress display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadStep {
+    pub label: String,
+    pub state: StepState,
+}
+
+/// Visual state of a [`LoadStep`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepState {
+    /// Not started yet.
+    Pending,
+    /// Currently running.
+    Active,
+    /// Completed successfully.
+    Done,
+    /// Failed.
+    Failed,
+}
+
+impl LoadStep {
+    pub fn pending(label: impl Into<String>) -> Self {
+        Self { label: label.into(), state: StepState::Pending }
+    }
+    pub fn active(label: impl Into<String>) -> Self {
+        Self { label: label.into(), state: StepState::Active }
+    }
+    pub fn done(label: impl Into<String>) -> Self {
+        Self { label: label.into(), state: StepState::Done }
+    }
+    pub fn failed(label: impl Into<String>) -> Self {
+        Self { label: label.into(), state: StepState::Failed }
+    }
 }
 
 impl FrameModel {
@@ -1646,7 +1680,11 @@ pub fn render_tab<'a>(
     // splash replaces what used to render as a black hole, and disappears on
     // the exact frame a pane shows up.
     let any_live = frames.iter().any(|(id, _, _)| lookup(*id).is_some());
-    if any_live {
+    // Show the loading splash whenever pane-launch steps are in progress,
+    // even on a resurrected session (any_live may be false before the PTY
+    // forks, and we want the progress display visible immediately).
+    let show_splash = !any_live || !model.load_steps.is_empty();
+    if !show_splash {
         // The pane card owns the full center band. Paint the outside/ring
         // background before composing terminal content so no default black halo
         // can remain around the blue/white focus divider.

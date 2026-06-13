@@ -21,7 +21,7 @@ use termwiz::surface::{Change, Position, Surface};
 use termwiz::terminal::buffered::BufferedTerminal;
 use termwiz::terminal::{Terminal, TerminalWaker, new_terminal};
 
-use crate::chrome::{FrameModel, render_tab};
+use crate::chrome::{FrameModel, LoadStep, StepState, render_tab};
 use crate::compositor::Rect;
 use crate::gitmut::{GitOp, GitOpResult};
 use crate::hydrate::{
@@ -5021,7 +5021,11 @@ async fn event_loop<T: Terminal>(
                     && !materialize_failed.contains(&key)
                 {
                     materialize_inflight = Some(key);
-                    model.center_status = "preparing sandbox…".into();
+                    model.load_steps = vec![
+                        LoadStep::active("sandbox"),
+                        LoadStep::pending("container"),
+                        LoadStep::pending("shell"),
+                    ];
                     dirty = true;
                     let cfg = keymap.config().clone();
                     let tx = spec_tx.clone();
@@ -5556,27 +5560,29 @@ async fn event_loop<T: Terminal>(
             }
             let specs = match specs {
                 Ok(specs) => {
-                    // Show which backend was resolved so the user can see
-                    // "podman" / "bwrap" / "host" while the shell starts.
                     if is_active {
-                        if let Some((_, spec)) = specs.first() {
-                            model.center_status =
-                                format!("opening {} shell…", spec.backend);
-                            dirty = true;
-                        }
+                        // sandbox done → container active; label shows backend
+                        let backend = specs.first()
+                            .map(|(_, s)| s.backend.clone())
+                            .unwrap_or_else(|| "host".into());
+                        model.load_steps = vec![
+                            LoadStep::done("sandbox"),
+                            LoadStep::active(format!("container  ({backend})")),
+                            LoadStep::pending("shell"),
+                        ];
+                        dirty = true;
                     }
                     specs
                 }
                 Err(e) => {
                     model.status = format!("Pane launch blocked: {e}");
                     if is_active {
-                        model.center_status = String::new();
+                        model.load_steps = vec![
+                            LoadStep::failed("sandbox"),
+                        ];
                         center_dormant = true;
-                        // Park the active tab too — without this the loop
-                        // re-probes on every iteration and pegs the CPU.
                         materialize_failed.insert(tab_key);
                     } else {
-                        // Pre-warm failed for a neighbor tab — park it.
                         prewarm_failed.insert(tab_key);
                     }
                     dirty = true;
@@ -5593,18 +5599,29 @@ async fn event_loop<T: Terminal>(
                 continue;
             };
             if is_active {
-                model.center_status = "spawning shell…".into();
+                // container done → shell active
+                let backend = specs.first()
+                    .map(|(_, s)| s.backend.clone())
+                    .unwrap_or_else(|| "host".into());
+                model.load_steps = vec![
+                    LoadStep::done("sandbox"),
+                    LoadStep::done(format!("container  ({backend})")),
+                    LoadStep::active("shell"),
+                ];
                 dirty = true;
             }
             if let Err(e) = panes.materialize_with_specs(tab, &wt, &specs, chrome.center) {
-                // Spawn failures are survivable: report, don't exit the loop.
                 model.status = format!("Pane spawn failed: {e}");
                 if is_active {
-                    model.center_status = String::new();
+                    model.load_steps = vec![
+                        LoadStep::done("sandbox"),
+                        LoadStep::done("container"),
+                        LoadStep::failed("shell"),
+                    ];
                 }
             } else {
                 if is_active {
-                    model.center_status = String::new();
+                    model.load_steps.clear(); // pane live — dismiss loading screen
                 }
                 if is_active && !warnings.is_empty() {
                     model.status = format!("⚠ Sandbox fallback: {}", warnings.join("; "));

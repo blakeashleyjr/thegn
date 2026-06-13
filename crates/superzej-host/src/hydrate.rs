@@ -12,7 +12,7 @@ use tokio::task;
 
 use termwiz::terminal::TerminalWaker;
 
-use crate::chrome::FrameModel;
+use crate::chrome::{FrameModel, LoadStep};
 use crate::run::now_secs;
 
 const MODEL_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
@@ -471,7 +471,11 @@ pub(crate) fn build_initial_model(
             "Starting szhost (build: {})… panes usable while git status hydrates",
             env!("SZHOST_BUILD_TIME")
         ),
-        center_status: "starting…".into(),
+        load_steps: vec![
+            LoadStep::pending("sandbox"),
+            LoadStep::pending("container"),
+            LoadStep::pending("shell"),
+        ],
         accent: superzej_core::theme::TEAL.to_string(),
         ..Default::default()
     }
