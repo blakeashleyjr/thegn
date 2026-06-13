@@ -4469,7 +4469,11 @@ async fn event_loop<T: Terminal>(
     // so async results fold in and re-render on the existing 0%-idle path.
     // Tiles lazy-load on first focus.
     let (app_tx, mut app_rx) = tokio_mpsc::unbounded_channel::<usize>();
-    let mut app_host = crate::apps::AppHost::new(vec![crate::apps::AppSlot::new("comms", "comms")]);
+    let mut app_host = crate::apps::AppHost::new(vec![
+        crate::apps::AppSlot::new("comms", "comms"),
+        crate::apps::AppSlot::new("chat", "chat"),
+        crate::apps::AppSlot::new("agent", "agent"),
+    ]);
     // Test-explorer results from the background runner/discoverer (capped,
     // single-flight). Two channels: run outcomes and discovery outcomes.
     let (test_run_tx, mut test_run_rx) =
@@ -6606,6 +6610,8 @@ async fn event_loop<T: Terminal>(
                             let handle = tokio::runtime::Handle::current();
                             let tile = match app_host.slots[i].id {
                                 "comms" => crate::apps::comms::build(handle, hook).await,
+                                "chat" => crate::apps::chat::build(handle, hook).await,
+                                "agent" => crate::apps::agent::build(handle, hook).await,
                                 _ => {
                                     // Unknown app id — leave it Unloaded.
                                     continue;

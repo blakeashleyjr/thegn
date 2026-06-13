@@ -429,7 +429,8 @@ impl Db {
             .query_row(
                 "SELECT loc FROM loc_cache WHERE worktree=?1",
                 params![worktree],
-                |r| r.get::<_, usize>(0),
+                // rusqlite 0.40 dropped the usize SQL impls; store/read as i64.
+                |r| r.get::<_, i64>(0).map(|n| n as usize),
             )
             .ok();
         Ok(r)
@@ -442,7 +443,7 @@ impl Db {
             .query_row(
                 "SELECT loc, fetched_at FROM loc_cache WHERE worktree=?1",
                 params![worktree],
-                |r| Ok((r.get::<_, usize>(0)?, r.get::<_, i64>(1)?)),
+                |r| Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)?)),
             )
             .ok();
         Ok(r)
@@ -453,7 +454,7 @@ impl Db {
             r#"INSERT INTO loc_cache(worktree,loc,fetched_at)
                VALUES(?1,?2,?3)
                ON CONFLICT(worktree) DO UPDATE SET loc=?2, fetched_at=?3"#,
-            params![worktree, loc, util::now()],
+            params![worktree, loc as i64, util::now()],
         )?;
         Ok(())
     }
