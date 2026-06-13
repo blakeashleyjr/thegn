@@ -4487,6 +4487,12 @@ async fn event_loop<T: Terminal>(
     );
     let (spec_tx, mut spec_rx) = tokio_mpsc::unbounded_channel::<SpecBatch>();
     let mut materialize_inflight: Option<(String, usize)> = None;
+    // Pre-warm requests that are already in-flight: keyed by (worktree, tab)
+    // so we never fire a second spawn_blocking for the same neighbor tab while
+    // one is already resolving — especially important when the sandbox chain
+    // keeps failing (all backends unavailable) and every loop tick would
+    // otherwise spawn a new slow probe that pegs the CPU at 100%.
+    let mut prewarm_inflight: std::collections::HashSet<(String, usize)> = std::collections::HashSet::new();
     // The new-worktree wizard (Alt+w) + its creation pipeline. The worker
     // speculatively creates the worktree under the pregenerated name while
     // the wizard is open; `wizard_cmd_tx` carries the wizard's decisions to
@@ -4878,6 +4884,11 @@ async fn event_loop<T: Terminal>(
             );
             // Pre-warm sibling tabs so first focus of a neighbor is instant.
             for (wt, ti, missing) in prewarm_requests(&panes, &mut session) {
+                let key = (wt.clone(), ti);
+                if prewarm_inflight.contains(&key) {
+                    continue; // already resolving; don't spawn another probe
+                }
+                prewarm_inflight.insert(key);
                 let cfg = keymap.config().clone();
                 let tx = spec_tx.clone();
                 let wk = waker.clone();
@@ -5508,6 +5519,9 @@ async fn event_loop<T: Terminal>(
             if materialize_inflight.as_ref() == Some(&(wt.clone(), ti)) {
                 materialize_inflight = None;
             }
+            // Clear the pre-warm inflight guard so a retry is allowed later
+            // (e.g. after the sandbox becomes available).
+            prewarm_inflight.remove(&(wt.clone(), ti));
             let Some(gi) = session.worktrees.iter().position(|g| g.path == wt) else {
                 continue;
             };
