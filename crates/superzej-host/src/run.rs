@@ -4515,13 +4515,12 @@ async fn event_loop<T: Terminal>(
     // materialize path retries independently when the tab is actually focused.
     let mut prewarm_failed: std::collections::HashSet<(String, usize)> =
         std::collections::HashSet::new();
-    // Panes that have produced at least one byte of output. Used to distinguish
-    // "user typed exit" (output seen → normal, respawn) from "shell crashed on
-    // start" (no output → crash; stop the tight respawn loop after 3 strikes).
-    let mut panes_with_output: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    // Consecutive silent-crash count per (group, tab). Reset when the pane
-    // produces output (i.e. stays alive long enough for the user to see it).
-    // After 3 crashes, respawn is suppressed until the user intervenes.
+    // Consecutive fast-crash count per (group, tab). A "fast crash" is any
+    // pane that exits within CRASH_THRESHOLD of being spawned — this catches
+    // bwrap failures that print an error to the PTY before dying (output-based
+    // detection would mis-classify those as normal exits). Reset when a pane
+    // survives longer than the threshold. After 3 fast crashes, respawn stops.
+    const CRASH_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(5);
     let mut respawn_crash_count: std::collections::HashMap<(usize, usize), u32> =
         std::collections::HashMap::new();
     // The new-worktree wizard (Alt+w) + its creation pipeline. The worker
@@ -5130,7 +5129,6 @@ async fn event_loop<T: Terminal>(
                                 if !model.load_steps.is_empty() && visible.contains(&id) {
                                     model.load_steps.clear();
                                 }
-                                panes_with_output.insert(id);
                                 p.feed(&b);
                                 // Answer terminal queries (DA/DSR/OSC color,
                                 // kitty probes) the app just sent — without a
@@ -5233,14 +5231,16 @@ async fn event_loop<T: Terminal>(
                             if let Some((gi, ti, sole)) = owner {
                                 let is_active_tab =
                                     gi == session.active && ti == session.worktrees[gi].active_tab;
-                                // A pane that exits without producing any output
-                                // crashed on startup (bwrap/sandbox failure, bad shell
-                                // binary, etc.).  Count consecutive silent crashes to
-                                // stop the tight respawn loop; a pane that produced
-                                // output before exiting resets the counter.
-                                let had_output = panes_with_output.remove(&id);
+                                // A pane that exits within CRASH_THRESHOLD of being
+                                // spawned is a "fast crash" — bwrap/sandbox failures
+                                // write their error to the PTY before dying, so
+                                // output-based detection would mis-classify them as
+                                // normal exits. Count consecutive fast crashes; reset
+                                // when a pane lives long enough (normal exit).
+                                let age = panes.pane_age(id).unwrap_or_default();
+                                panes.forget_spawn_time(id);
                                 let crash_key = (gi, ti);
-                                if had_output {
+                                if age >= CRASH_THRESHOLD {
                                     respawn_crash_count.remove(&crash_key);
                                 } else {
                                     *respawn_crash_count.entry(crash_key).or_insert(0) += 1;
