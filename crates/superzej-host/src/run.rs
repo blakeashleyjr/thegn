@@ -4520,7 +4520,11 @@ async fn event_loop<T: Terminal>(
     // bwrap failures that print an error to the PTY before dying (output-based
     // detection would mis-classify those as normal exits). Reset when a pane
     // survives longer than the threshold. After 3 fast crashes, respawn stops.
-    const CRASH_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(5);
+    //
+    // 2 seconds: bwrap/exec failures land in < 100ms; interactive shells need
+    // at least ~300ms to show a prompt + the user must type "exit" + Enter,
+    // making deliberate quick exits practically impossible below 2s.
+    const CRASH_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(2);
     let mut respawn_crash_count: std::collections::HashMap<(usize, usize), u32> =
         std::collections::HashMap::new();
     // The new-worktree wizard (Alt+w) + its creation pipeline. The worker
@@ -4874,6 +4878,10 @@ async fn event_loop<T: Terminal>(
             materialize_failed.clear();
             prewarm_failed.clear();
             respawn_crash_count.clear();
+            // A crash-dormant screen from the previous worktree must not bleed
+            // into the new one — clear it so the new worktree's shell can
+            // materialise immediately without requiring a key-press to dismiss.
+            center_dormant = false;
             panel_ui.chg_sel = None;
             panel_ui.hunks_gen = hydration_gen;
             // Git interaction state is per-worktree: cursors, flows, marks
@@ -5240,13 +5248,12 @@ async fn event_loop<T: Terminal>(
                                 let age = panes.pane_age(id).unwrap_or_default();
                                 panes.forget_spawn_time(id);
                                 let crash_key = (gi, ti);
-                                if age >= CRASH_THRESHOLD {
-                                    respawn_crash_count.remove(&crash_key);
-                                } else {
-                                    *respawn_crash_count.entry(crash_key).or_insert(0) += 1;
-                                }
-                                let crashes =
-                                    respawn_crash_count.get(&crash_key).copied().unwrap_or(0);
+                                let crashes = update_crash_count(
+                                    &mut respawn_crash_count,
+                                    crash_key,
+                                    age,
+                                    CRASH_THRESHOLD,
+                                );
                                 if sole {
                                     if is_active_tab {
                                         if crashes >= 3 {
@@ -9580,6 +9587,29 @@ fn render_before_pty_drain(dirty: bool) -> bool {
 }
 
 #[allow(dead_code)]
+/// Update the per-(group, tab) fast-crash counter.
+///
+/// A "fast crash" is any pane exit where `age < threshold` — this threshold
+/// distinguishes sandbox/exec failures (< 100ms) from deliberate quick exits
+/// (which require at least prompt-render-time + keystroke, typically > 2s).
+///
+/// Returns the new crash count after the update.
+fn update_crash_count(
+    crash_counts: &mut std::collections::HashMap<(usize, usize), u32>,
+    crash_key: (usize, usize),
+    age: std::time::Duration,
+    threshold: std::time::Duration,
+) -> u32 {
+    if age >= threshold {
+        crash_counts.remove(&crash_key);
+        0
+    } else {
+        let entry = crash_counts.entry(crash_key).or_insert(0);
+        *entry += 1;
+        *entry
+    }
+}
+
 fn remap_warmed_tab_ids(tab: &mut crate::session::Tab, focus: u32, pairs: &[(u32, u32)]) -> bool {
     let leaves = tab.center.pane_ids();
     if pairs.len() != leaves.len() {
@@ -10754,5 +10784,111 @@ mod tests {
 
         assert!(!remap_warmed_tab_ids(&mut tab, 4, &[(3, 20), (4, 21)]));
         assert_eq!(tab, before);
+    }
+
+    #[test]
+    fn crash_count_fast_exits_increment_and_reach_limit() {
+        let mut counts = std::collections::HashMap::new();
+        let key = (0usize, 0usize);
+        let threshold = std::time::Duration::from_secs(2);
+
+        // Three consecutive fast crashes (< 2s) hit the limit.
+        assert_eq!(
+            update_crash_count(
+                &mut counts,
+                key,
+                std::time::Duration::from_millis(50),
+                threshold
+            ),
+            1
+        );
+        assert_eq!(
+            update_crash_count(
+                &mut counts,
+                key,
+                std::time::Duration::from_millis(50),
+                threshold
+            ),
+            2
+        );
+        assert_eq!(
+            update_crash_count(
+                &mut counts,
+                key,
+                std::time::Duration::from_millis(50),
+                threshold
+            ),
+            3
+        );
+        assert_eq!(counts[&key], 3);
+    }
+
+    #[test]
+    fn crash_count_slow_exit_resets_after_fast_crashes() {
+        let mut counts = std::collections::HashMap::new();
+        let key = (0usize, 0usize);
+        let threshold = std::time::Duration::from_secs(2);
+
+        // Two fast crashes build up the count.
+        update_crash_count(
+            &mut counts,
+            key,
+            std::time::Duration::from_millis(50),
+            threshold,
+        );
+        update_crash_count(
+            &mut counts,
+            key,
+            std::time::Duration::from_millis(50),
+            threshold,
+        );
+        assert_eq!(counts[&key], 2);
+
+        // A slow exit (user typed `exit` normally) resets the counter.
+        let remaining = update_crash_count(
+            &mut counts,
+            key,
+            std::time::Duration::from_secs(10),
+            threshold,
+        );
+        assert_eq!(remaining, 0);
+        assert!(!counts.contains_key(&key));
+    }
+
+    #[test]
+    fn crash_count_zero_age_treated_as_fast_crash() {
+        // pane_age() returns None → unwrap_or_default() → Duration::ZERO.
+        // A pane with no recorded spawn time exiting should count as a crash.
+        let mut counts = std::collections::HashMap::new();
+        let key = (1usize, 2usize);
+        let threshold = std::time::Duration::from_secs(2);
+        let result = update_crash_count(&mut counts, key, std::time::Duration::ZERO, threshold);
+        assert_eq!(result, 1);
+    }
+
+    #[test]
+    fn crash_count_keys_are_independent() {
+        let mut counts = std::collections::HashMap::new();
+        let threshold = std::time::Duration::from_secs(2);
+        let fast = std::time::Duration::from_millis(50);
+        let key_a = (0usize, 0usize);
+        let key_b = (0usize, 1usize);
+
+        update_crash_count(&mut counts, key_a, fast, threshold);
+        update_crash_count(&mut counts, key_a, fast, threshold);
+        update_crash_count(&mut counts, key_b, fast, threshold);
+
+        assert_eq!(counts[&key_a], 2);
+        assert_eq!(counts[&key_b], 1);
+
+        // A slow exit on key_b doesn't affect key_a.
+        update_crash_count(
+            &mut counts,
+            key_b,
+            std::time::Duration::from_secs(10),
+            threshold,
+        );
+        assert_eq!(counts[&key_a], 2);
+        assert!(!counts.contains_key(&key_b));
     }
 }
