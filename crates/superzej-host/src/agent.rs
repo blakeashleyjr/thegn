@@ -150,14 +150,21 @@ pub fn prepare_sandbox(
     let mut sb = cfg.repo_sandbox(repo_root);
     let mut explicit_backend =
         sandbox::Backend::from_config(sb.backend).filter(|b| *b != sandbox::Backend::None);
-    if let Some(saved) = backend_choice.map(str::trim)
-        && !saved.is_empty()
-        && saved != "auto"
-        && let Ok(b) = superzej_core::config::SandboxBackend::from_str_validated(saved)
-    {
-        explicit_backend =
-            sandbox::Backend::from_config(b).filter(|b| *b != sandbox::Backend::None);
-        sb.backend = b;
+    // Only let the DB-saved per-worktree backend override when config is "auto".
+    // An explicit config backend (e.g. `backend = "bwrap"`) always wins so that
+    // changing the config actually takes effect instead of being silently trumped
+    // by a stale DB entry from a previous backend that no longer works.
+    let config_is_auto = sb.backend == superzej_core::config::SandboxBackend::Auto;
+    if config_is_auto {
+        if let Some(saved) = backend_choice.map(str::trim)
+            && !saved.is_empty()
+            && saved != "auto"
+            && let Ok(b) = superzej_core::config::SandboxBackend::from_str_validated(saved)
+        {
+            explicit_backend =
+                sandbox::Backend::from_config(b).filter(|b| *b != sandbox::Backend::None);
+            sb.backend = b;
+        }
     }
     let explicit_choice = explicit_backend.is_some();
     let auto_choice = sb.backend == superzej_core::config::SandboxBackend::Auto;
@@ -505,14 +512,23 @@ mod tests {
     fn shell_inner_oci_emits_runtime_probe_chain() {
         let oci = shell_inner(true);
         // Must contain a POSIX command -v probe for each candidate shell.
-        assert!(oci.contains("command -v"), "should probe for shell availability");
+        assert!(
+            oci.contains("command -v"),
+            "should probe for shell availability"
+        );
         // Must have an unconditional /bin/sh -l fallback at the end.
-        assert!(oci.ends_with("exec /bin/sh -l"), "must end with /bin/sh fallback");
+        assert!(
+            oci.ends_with("exec /bin/sh -l"),
+            "must end with /bin/sh fallback"
+        );
         // bash must always appear in the chain (present in every Debian image).
         assert!(oci.contains("bash"), "bash must be in the probe chain");
         // Non-OCI: must be a simple "<shell> -l" with the host path, not a chain.
         let host = shell_inner(false);
-        assert!(!host.contains("command -v"), "host form must not emit a probe chain");
+        assert!(
+            !host.contains("command -v"),
+            "host form must not emit a probe chain"
+        );
         assert!(host.ends_with(" -l"), "host form must end with -l");
     }
 
