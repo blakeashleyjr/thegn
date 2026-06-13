@@ -816,6 +816,13 @@ fn wrap_script(spec: &SandboxSpec, inner: &str) -> String {
         // their default PATH.
         let devenv = spec.devenv_path.as_deref().unwrap_or("devenv");
         s.push_str(&format!("exec {devenv} shell -- {inner}"));
+    } else if inner.contains("&&") || inner.contains(';') {
+        // Compound expressions (e.g. a shell probe chain like
+        // `command -v zsh && exec zsh -l; exec bash -l`) must NOT be
+        // prefixed with `exec` — `exec` only accepts a single command.
+        // The individual `exec` calls inside the chain handle process
+        // replacement; running the expression directly is correct.
+        s.push_str(inner);
     } else {
         s.push_str(&format!("exec {inner}"));
     }
