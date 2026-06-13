@@ -295,13 +295,19 @@ pub fn resolve(cfg: &SandboxConfig, loc: &GitLoc, name: &str) -> Option<SandboxS
             });
         }
     };
-    // OCI containers (podman/docker) get the host toolchain mounted in by
-    // default so the user's real shell, starship, dotfiles, and tools work
-    // identically inside the container — including on NixOS where everything
-    // lives in /nix/store and $SHELL is an absolute store path.
-    // bwrap/systemd are "host-toolchain" backends that expose the host
-    // filesystem directly, so they don't need these extra mounts.
-    let inject_host_toolchain = backend.is_oci() && cfg.auto_caches;
+    // Inject host toolchain paths (dotfiles, $HOME, /nix/store, etc.) so the
+    // user's real shell, starship, and configs work identically in the sandbox.
+    //
+    // OCI (podman/docker): container image has none of the host paths — we must
+    //   mount everything in explicitly.
+    // bwrap: hardcodes /nix/store, /usr, /etc in backend_enter_argv, but does
+    //   NOT include $HOME, so dotfiles (.zshrc, .config/starship.toml) are
+    //   absent and zsh runs zsh-newuser-install instead of the real config.
+    //   host_toolchain_mounts() fills in $HOME and other user-specific paths;
+    //   bwrap picks them up via spec.mounts → --ro-bind flags.
+    // systemd/host: full host filesystem, no extra mounts needed.
+    let inject_host_toolchain =
+        (backend.is_oci() || backend == Backend::Bwrap) && cfg.auto_caches;
 
     match cfg.file_access {
         FileAccess::All | FileAccess::Host => {

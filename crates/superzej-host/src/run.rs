@@ -5110,6 +5110,13 @@ async fn event_loop<T: Terminal>(
                     match ev {
                         PaneEvent::Output(id, b) => {
                             if let Some(p) = panes.table.get_mut(&id) {
+                                // First real output from the active pane: the
+                                // shell is live. Dismiss the loading screen now
+                                // so it disappears on the same frame as content,
+                                // never leaving a blank flash between the two.
+                                if !model.load_steps.is_empty() && visible.contains(&id) {
+                                    model.load_steps.clear();
+                                }
                                 p.feed(&b);
                                 // Answer terminal queries (DA/DSR/OSC color,
                                 // kitty probes) the app just sent — without a
@@ -5620,9 +5627,10 @@ async fn event_loop<T: Terminal>(
                     ];
                 }
             } else {
-                if is_active {
-                    model.load_steps.clear(); // pane live — dismiss loading screen
-                }
+                // Keep load_steps until first PTY output arrives (cleared in
+                // the PaneEvent::Output handler above) so the loading screen
+                // stays visible until the shell actually produces content —
+                // no blank flash between fork and first render.
                 if is_active && !warnings.is_empty() {
                     model.status = format!("⚠ Sandbox fallback: {}", warnings.join("; "));
                 }
