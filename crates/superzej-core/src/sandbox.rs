@@ -42,18 +42,36 @@ const PULL_TIMEOUT: Duration = Duration::from_secs(120);
 /// callers, indistinguishable from "this backend doesn't work", which is
 /// exactly the degradation the chain wants.
 fn status_with_timeout(argv: &[String], timeout: Duration) -> Option<bool> {
+    output_with_timeout(argv, timeout).map(|(ok, _)| ok)
+}
+
+/// Like [`status_with_timeout`] but also captures stdout. Returns
+/// `(success, stdout)` or `None` on spawn failure or timeout.
+fn output_with_timeout(argv: &[String], timeout: Duration) -> Option<(bool, String)> {
     use std::process::Stdio;
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return Some(status.success()),
+            Ok(Some(status)) => {
+                // stdout is available once the process has exited.
+                let stdout = child
+                    .stdout
+                    .take()
+                    .and_then(|mut r| {
+                        use std::io::Read;
+                        let mut s = String::new();
+                        r.read_to_string(&mut s).ok().map(|_| s)
+                    })
+                    .unwrap_or_default();
+                return Some((status.success(), stdout));
+            }
             Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -708,41 +726,55 @@ pub fn health_check(spec: &SandboxSpec) -> bool {
     status_with_timeout(&argv, PROBE_TIMEOUT).unwrap_or(false)
 }
 
-/// Returns `true` when the named container exists and is running.
-fn container_running(spec: &SandboxSpec) -> bool {
-    let mut argv = backend_prefix(spec.backend);
-    argv.extend(["container".into(), "inspect".into(), spec.name.clone()]);
-    run_control_owned(spec, &argv, PROBE_TIMEOUT).unwrap_or(false)
-}
+/// Check whether the named container is running AND has all the bind-mounts
+/// the spec requires. Returns `(running, mounts_ok)`.
+///
+/// Uses a single `inspect --format` call (one subprocess, `PROBE_TIMEOUT`
+/// bound) for both questions. The format emits an `OK` sentinel first line so
+/// we can distinguish "container missing / inspect failed" (no sentinel) from
+/// "running but mounts differ".
+fn container_status(spec: &SandboxSpec) -> (bool, bool) {
+    let required: std::collections::HashSet<&str> =
+        spec.mounts.iter().map(|m| m.host.as_str()).collect();
 
-/// Returns `true` when every bind-mount source in `spec` is already present
-/// in the running container's mount list. Mounts the container doesn't have
-/// yet (new auto-cache or toolchain paths added by an upgrade) return `false`,
-/// triggering a recreate. Uses `--format` over the JSON output for speed.
-fn container_mounts_match(spec: &SandboxSpec) -> bool {
-    // Ask the runtime for the bind-mount sources currently active.
+    // Emit "OK" first, then one bind-mount source per line.
+    let fmt = "OK\n{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}\n{{end}}{{end}}";
     let mut argv = backend_prefix(spec.backend);
-    argv.extend([
-        "container".into(),
-        "inspect".into(),
-        "--format".into(),
-        // Emit one source path per line for bind mounts only.
-        "{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}\n{{end}}{{end}}".into(),
-        spec.name.clone(),
-    ]);
-    let out = std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .output();
-    let active: std::collections::HashSet<String> = match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(|l| l.to_string())
-            .collect(),
-        _ => return false, // can't inspect → treat as stale
-    };
-    // Every source the spec requires must be present.
-    spec.mounts.iter().all(|m| active.contains(&m.host))
+    // For remote worktrees the transport wraps the argv; for local we call
+    // podman/docker directly. run_control_t_owned gives us the timeout but
+    // discards stdout, so we use output_with_timeout for local transport and
+    // fall back to run_control_owned (exit-code only → assume stale) for remote.
+    if matches!(spec.transport, Transport::Local) {
+        argv.extend([
+            "container".into(),
+            "inspect".into(),
+            "--format".into(),
+            fmt.to_string(),
+            spec.name.clone(),
+        ]);
+        let (ok, stdout) = match output_with_timeout(&argv, PROBE_TIMEOUT) {
+            Some(r) => r,
+            None => return (false, false), // timed out
+        };
+        if !ok && stdout.is_empty() {
+            return (false, false); // container doesn't exist
+        }
+        let mut lines = stdout.lines();
+        if lines.next() != Some("OK") {
+            return (false, false);
+        }
+        let active: std::collections::HashSet<&str> =
+            lines.filter(|l| !l.is_empty()).collect();
+        let mounts_ok = required.iter().all(|r| active.contains(r));
+        (true, mounts_ok)
+    } else {
+        // Remote: just check existence; skip mount comparison (remote mounts
+        // are managed differently and don't carry host paths).
+        let mut check = backend_prefix(spec.backend);
+        check.extend(["container".into(), "inspect".into(), spec.name.clone()]);
+        let running = run_control_owned(spec, &check, PROBE_TIMEOUT).unwrap_or(false);
+        (running, true) // assume mounts are fine on remote
+    }
 }
 
 /// Ensure any persistent state exists (OCI: a keep-alive container we `exec`
@@ -763,15 +795,14 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
 
     let rt = spec.backend.binary();
 
-    // Check whether the container already exists AND has the right bind-mounts.
-    // If the mount set changed (e.g. host_toolchain_mounts() added /nix/store
-    // after an upgrade) we force-remove and recreate so the user's shell picks
-    // up the new environment without manual intervention.
-    if container_running(spec) {
-        if container_mounts_match(spec) {
+    // Single inspect call: are we running, and do the mounts match?
+    let (running, mounts_ok) = container_status(spec);
+    if running {
+        if mounts_ok {
             return Ok(()); // already running with the correct mounts
         }
-        // Stale mounts — remove and fall through to recreate.
+        // Stale mounts (e.g. host_toolchain_mounts() added /nix/store after
+        // an upgrade) — force-remove and fall through to recreate.
         msg::warn(&format!(
             "sandbox: container '{}' has stale mounts (config changed); recreating",
             spec.name
