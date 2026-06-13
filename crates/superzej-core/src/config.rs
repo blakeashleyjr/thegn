@@ -981,6 +981,10 @@ pub struct SandboxConfig {
     pub mounts: Vec<String>, // extra binds ("host:dest[:ro|rw|cache]" or "host"); suffix allowed
     pub init_script: String, // runs inside before the agent/shell
     pub devenv: bool,        // wrap inner cmd with `devenv shell --`
+    /// Shell to use inside the sandbox. `""` = resolve from the host's `$SHELL`
+    /// at pane-spawn time. Set to an absolute path or name (e.g. `"zsh"`) to
+    /// override per workspace via `.superzej.toml`.
+    pub shell: String,
     pub on_missing: OnMissing,
     pub remote: RemoteConfig,
 }
@@ -1024,6 +1028,7 @@ impl Default for SandboxConfig {
             mounts: vec!["~/.gitconfig:ro".into()],
             init_script: String::new(),
             devenv: false,
+            shell: String::new(),
             on_missing: OnMissing::Warn,
             remote: RemoteConfig::default(),
         }
@@ -1053,6 +1058,7 @@ pub struct SandboxOverlay {
     pub mounts: Option<Vec<String>>,
     pub init_script: Option<String>,
     pub devenv: Option<bool>,
+    pub shell: Option<String>,
     pub on_missing: Option<OnMissing>,
     pub remote: Option<RemoteOverlay>,
 }
@@ -1121,6 +1127,9 @@ impl SandboxOverlay {
         if let Some(v) = self.devenv {
             base.devenv = v;
         }
+        if let Some(v) = self.shell {
+            base.shell = v;
+        }
         if let Some(v) = self.on_missing {
             base.on_missing = v;
         }
@@ -1141,6 +1150,7 @@ impl SandboxOverlay {
             && self.mounts.is_none()
             && self.init_script.is_none()
             && self.devenv.is_none()
+            && self.shell.is_none()
             && self.on_missing.is_none()
             && self.remote.is_none()
     }

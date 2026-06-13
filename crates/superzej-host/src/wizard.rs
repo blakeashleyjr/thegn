@@ -266,22 +266,32 @@ impl NewWorktreeWizard {
         let panel = Tok::Slot(S::Panel);
 
         // Breadcrumb: done steps green, current accent-bold, rest faint.
-        let crumb = |step: WizardStep, label: &str| -> Vec<Seg> {
+        // Numbers rendered as padded chip boxes matching the tab-bar style.
+        let crumb = |step: WizardStep, n: &str, label: &str| -> Vec<Seg> {
             let done = (self.step == WizardStep::Sandbox && step == WizardStep::Name)
                 || (self.step == WizardStep::Agent && step != WizardStep::Agent);
-            let s = if done {
-                seg(Tok::Hue(Hue::Green), label.to_string())
+            let (chip, text) = if done {
+                (
+                    Seg::chip(Tok::Hue(Hue::Green), format!(" {n} ")),
+                    seg(Tok::Hue(Hue::Green), label.to_string()),
+                )
             } else if self.step == step {
-                seg(Tok::Slot(S::Accent), label.to_string()).bold()
+                (
+                    Seg::chip(Tok::Slot(S::Accent), format!(" {n} ")),
+                    seg(Tok::Slot(S::Accent), label.to_string()).bold(),
+                )
             } else {
-                seg(Tok::Slot(S::Faint), label.to_string())
+                (
+                    Seg::chip(Tok::Slot(S::Faint), format!(" {n} ")),
+                    seg(Tok::Slot(S::Faint), label.to_string()),
+                )
             };
-            vec![s, seg(Tok::Slot(S::Faint), "  ›  ".to_string())]
+            vec![chip, sp(1), text, seg(Tok::Slot(S::Faint), "  ›  ".to_string())]
         };
         let mut crumbs: Vec<Seg> = Vec::new();
-        crumbs.extend(crumb(WizardStep::Name, "① name"));
-        crumbs.extend(crumb(WizardStep::Sandbox, "② sandbox"));
-        crumbs.extend(crumb(WizardStep::Agent, "③ agent"));
+        crumbs.extend(crumb(WizardStep::Name, "1", "name"));
+        crumbs.extend(crumb(WizardStep::Sandbox, "2", "sandbox"));
+        crumbs.extend(crumb(WizardStep::Agent, "3", "agent"));
         crumbs.pop(); // trailing separator
         seg::draw_line(
             surface,
@@ -1225,7 +1235,10 @@ mod tests {
         w.render(&mut s, screen);
         let frame = text(&mut s);
         assert!(frame.contains("new worktree"));
-        assert!(frame.contains("① name"));
+        // Step numbers now render as padded chip boxes; the text and number
+        // are separate segments so assert them individually.
+        assert!(frame.contains(" 1 "));
+        assert!(frame.contains("name"));
         assert!(frame.contains("branch ❯"));
         assert!(frame.contains("esc cancel"));
 

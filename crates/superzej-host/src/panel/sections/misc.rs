@@ -17,50 +17,78 @@ pub(super) fn files(ctx: &SectionCtx) -> Vec<PanelRow> {
     let (model, deep, full) = (ctx.model, ctx.deep(), ctx.full());
     let data = &model.panel;
     let mut rows: Vec<PanelRow> = Vec::new();
-    if data.changes.is_empty() {
-        rows.push(PanelRow::plain(Line::segs(vec![seg(
-            g(),
-            "no changed files",
-        )])));
+
+    // Source: all tracked files when available; fall back to changed files only
+    // (while the first hydration is still in flight).
+    let source_paths: Vec<String> = if !data.all_files.is_empty() {
+        data.all_files.clone()
+    } else if !data.changes.is_empty() {
+        data.changes.iter().map(|c| c.path.clone()).collect()
+    } else {
+        rows.push(PanelRow::plain(Line::segs(vec![seg(g(), "no files")])));
         return rows;
-    }
-    // Mini tree of the changed paths with status letters.
-    let paths: Vec<String> = data.changes.iter().map(|c| c.path.clone()).collect();
+    };
+
+    // Build an index from repo-relative path → change row for status glyphs.
     let by_path: std::collections::HashMap<&str, &super::ChangeRow> =
         data.changes.iter().map(|c| (c.path.as_str(), c)).collect();
-    let tree = crate::panel::build_file_tree(&paths);
-    // Hit indices count FILES only (dirs are not actionable), so they line up
-    // with the loop's row-mode cursor over `actionable_rows`.
+
+    let tree = crate::panel::build_file_tree(&source_paths);
+    let visible = crate::panel::file_tree_visible(&tree, &ctx.ui.files_collapsed);
+
+    // Hit indices count every visible row (dirs AND files are actionable).
+    // Dirs toggle collapse; files open in bat.
     let mut fi = 0usize;
-    for e in tree.iter() {
+    for (_, e) in &visible {
         let indent = 2 * e.depth as usize;
         let line = if e.is_dir {
+            let collapsed = ctx.ui.files_collapsed.contains(&e.path);
+            let chevron = if collapsed { "▸ " } else { "▾ " };
+            // Count changed files under this dir for an inline badge.
+            let changed_under = data
+                .changes
+                .iter()
+                .filter(|c| {
+                    c.path.starts_with(&format!("{}/", e.path))
+                })
+                .count();
+            let dir_fg = if changed_under > 0 { d() } else { f() };
             let mut l = vec![
                 sp(indent),
-                seg(g2(), "▾ "),
-                seg(f(), format!("{}/", e.name)),
+                seg(g2(), chevron.to_string()),
+                seg(dir_fg, format!("{}/", e.name)),
             ];
-            if full {
-                // Per-directory rollup: Σ added/deleted under this prefix.
+            if changed_under > 0 && deep {
+                l.push(seg(g(), format!("  {changed_under}✎")));
+            }
+            if full && !collapsed {
                 let (a, del) = data
                     .changes
                     .iter()
                     .filter(|c| c.path.starts_with(&format!("{}/", e.path)))
                     .fold((0u32, 0u32), |(a, d), c| (a + c.added, d + c.deleted));
-                l.push(seg(g(), "  Σ "));
-                l.push(seg(hue(Hue::Green), format!("+{a}")));
-                l.push(seg(g(), " "));
-                l.push(seg(hue(Hue::Red), format!("−{del}")));
+                if a > 0 || del > 0 {
+                    l.push(seg(g(), "  Σ "));
+                    l.push(seg(hue(Hue::Green), format!("+{a}")));
+                    l.push(seg(g(), " "));
+                    l.push(seg(hue(Hue::Red), format!("−{del}")));
+                }
             }
             Line::segs(l)
         } else {
             let c = by_path.get(e.path.as_str()).copied();
-            let st = c.map(|c| c.status.as_str()).unwrap_or("");
-            let st_tok = match st {
-                "A" => hue(Hue::Green),
-                "D" | "!U" => hue(Hue::Red),
-                "?" => g(),
-                _ => hue(Hue::Amber),
+            let (file_fg, st, st_tok) = if let Some(c) = c {
+                let st = c.status.as_str();
+                let tok = match st {
+                    "A" => hue(Hue::Green),
+                    "D" | "!U" => hue(Hue::Red),
+                    "?" => g(),
+                    _ => hue(Hue::Amber),
+                };
+                (d(), st.to_string(), tok)
+            } else {
+                // Unmodified tracked file
+                (f(), String::new(), g())
             };
             let mut r = Vec::new();
             if deep && let Some(c) = c {
@@ -71,16 +99,17 @@ pub(super) fn files(ctx: &SectionCtx) -> Vec<PanelRow> {
                 r.extend(split_bar(c.added, c.deleted, 10));
                 r.push(sp(1));
             }
-            r.push(seg(st_tok, st.to_string()));
-            Line::split(vec![sp(indent + 2), seg(d(), e.name.clone())], r)
+            if !st.is_empty() {
+                r.push(seg(st_tok, st));
+            }
+            Line::split(vec![sp(indent + 2), seg(file_fg, e.name.clone())], r)
         };
         let mut row = PanelRow::plain(line);
-        if !e.is_dir {
-            row = row.with_hit(PanelHit::Row(Section::Files, fi));
-            fi += 1;
-        }
+        row = row.with_hit(PanelHit::Row(Section::Files, fi));
+        fi += 1;
         rows.push(row);
     }
+
     if deep {
         rows.push(PanelRow::blank());
         let loc = model.loc.map(compact_count).unwrap_or_else(|| "—".into());
@@ -90,7 +119,7 @@ pub(super) fn files(ctx: &SectionCtx) -> Vec<PanelRow> {
             .unwrap_or_else(|| "—".into());
         rows.push(PanelRow::plain(Line::split(
             vec![seg(g(), format!("{count} files · {loc} loc"))],
-            vec![seg(g2(), "y yazi")],
+            vec![seg(g2(), "o bat · O editor · y yazi")],
         )));
     }
     rows

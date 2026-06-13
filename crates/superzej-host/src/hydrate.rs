@@ -437,7 +437,8 @@ fn worktree_loc(db: &superzej_core::db::Db, path: &std::path::Path) -> Option<u6
 
 /// A cheap first-frame model: no git, no diff, no DB recents. It gives the
 /// user immediate chrome/status while the expensive model hydrates in the
-/// background.
+/// background. Sidebar workspaces are populated from the already-loaded session
+/// (no DB, no git) so the tree is non-blank on frame 1.
 pub(crate) fn build_initial_model(session: &crate::session::Session) -> FrameModel {
     let active_name = session
         .active_group()
@@ -445,10 +446,15 @@ pub(crate) fn build_initial_model(session: &crate::session::Session) -> FrameMod
         .unwrap_or_else(|| "workspace/home".into());
     let cwd = active_tab_path(session);
     let (worktree, tabs, active_tab) = tab_strip(session);
+    // Fast: no DB open, no git — derives workspace slugs from the session in
+    // memory. Git status / agent glyphs are left empty and fill in on
+    // hydration, same as before.
+    let sidebar_workspaces = workspace_list(session, None);
     FrameModel {
         worktree,
         tabs,
         active_tab,
+        sidebar_workspaces,
         active_container_name: superzej_core::sandbox::container_name(&cwd.to_string_lossy()),
         panel: crate::panel::PanelData {
             branch: active_name,
@@ -732,13 +738,19 @@ pub(crate) fn build_model(
         panel.tests = Some(crate::panel::tests_lite(&cache));
     }
 
-    // Tracked-file count for the files summary — only while files is open
+    // Tracked-file list for the Files accordion — only while Files is open
     // (`git ls-files` is cheap but not free on big repos every 2s).
     if hints.open == crate::panel::Section::Files
         && let Ok(out) = loc.git_command(&["ls-files"]).output()
         && out.status.success()
     {
-        panel.file_count = Some(out.stdout.iter().filter(|&&b| b == b'\n').count() as u64);
+        let files: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string())
+            .collect();
+        panel.file_count = Some(files.len() as u64);
+        panel.all_files = files;
     }
 
     tracing::debug!(
