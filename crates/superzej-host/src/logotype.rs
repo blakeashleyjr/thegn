@@ -346,6 +346,25 @@ pub fn draw_splash(surface: &mut Surface, rect: Rect, model: &crate::chrome::Fra
         }
         SplashVariant::None => {}
     }
+
+    // Loading status line: shown while the first pane is spawning. Rendered
+    // two rows above the bottom of the splash rect so it doesn't overlap the
+    // hint block and is always visible even on very short terminals.
+    if !model.center_status.is_empty() && rect.rows >= 3 {
+        let s = &model.center_status;
+        // Truncate to fit with a leading spinner glyph.
+        let max_w = rect.cols.saturating_sub(2);
+        let display: String = if s.chars().count() > max_w {
+            s.chars().take(max_w.saturating_sub(1)).collect::<String>() + "…"
+        } else {
+            s.clone()
+        };
+        let full = format!("⟳ {display}");
+        let w = full.chars().count();
+        let x = rect.x + rect.cols.saturating_sub(w) / 2;
+        let y = rect.y + rect.rows - 2;
+        chrome::draw_text(surface, x, y, &full, col(S::Dim), col(S::Bg0), rect.cols);
+    }
 }
 
 #[cfg(test)]
