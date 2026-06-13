@@ -31,14 +31,17 @@ it**, never a direct `ratatui` dep at a different version. The shared
 repos consume it as a git dependency on the superzej repo, pinned by tag:
 
 ```toml
-sz-kit = { git = "https://github.com/blakeashleyjr/superzej.git", package = "sz-kit", tag = "sz-kit-v0.1.0" }
+sz-kit = { git = "ssh://git@github.com/blakeashleyjr/superzej.git", package = "sz-kit", tag = "sz-kit-v0.1.0" }
 ```
+
+(superzej is private, so the ssh URL is used — cargo resolves it via the git
+CLI / SSH key. `.cargo/config.toml` sets `net.git-fetch-with-cli = true`.)
 
 When building superzej itself, the workspace `[patch]` redirects that git dep
 back to the in-tree path, so one version compiles everywhere:
 
 ```toml
-[patch."https://github.com/blakeashleyjr/superzej.git"]
+[patch."ssh://git@github.com/blakeashleyjr/superzej.git"]
 sz-kit = { path = "crates/sz-kit" }
 ```
 

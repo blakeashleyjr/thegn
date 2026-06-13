@@ -18,7 +18,7 @@ exclude = ["apps", "vendor"]
 # the in-tree crate, so one sz-kit/ratatui version compiles across host + apps
 # and no network fetch happens. Standalone app builds (cloned alone) resolve
 # the real git tag instead.
-[patch."https://github.com/blakeashleyjr/superzej.git"]
+[patch."ssh://git@github.com/blakeashleyjr/superzej.git"]
 sz-kit = { path = "crates/sz-kit" }
 
 [workspace.package]
