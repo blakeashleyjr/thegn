@@ -290,6 +290,12 @@ fn sync_panel_docs(
 
 pub async fn main(cli: crate::Cli) -> Result<()> {
     let start = std::time::Instant::now();
+
+    // Repair broken home-directory paths (e.g. ~/.gitconfig left as an empty
+    // directory by AI coding-tool sandboxes) before the first git operation.
+    // See `superzej_core::startup` for the full rationale.
+    superzej_core::startup::run_checks();
+
     // File-sink logging is opt-in via `SUPERZEJ_LOG` (an env-filter string).
     // When unset no subscriber is installed at all, so every tracing callsite
     // collapses to one atomic load — instrumentation is free in the idle case.
