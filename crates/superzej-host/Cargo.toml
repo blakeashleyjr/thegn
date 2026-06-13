@@ -36,3 +36,11 @@ reqwest = { version = "0.12", default-features = false, features = [
   "blocking",
   "rustls-tls",
 ] }
+# The app-tab embedding contract (AppTile, shared theme, the pinned ratatui
+# re-export). The host renders embedded apps' ratatui buffers through
+# `sz_kit::ratatui` so the Buffer type is identical to what the apps produce.
+sz-kit = { path = "../sz-kit" }
+# Embedded app crates (git submodules under apps/, each its own workspace) are
+# wired in after sz-kit-v0.1.0 is tagged, so their sz-kit git-dep resolves:
+#   sw-tui = { path = "../../apps/switchboard/crates/sw-tui" }
+#   sw-rpc = { path = "../../apps/switchboard/crates/sw-rpc" }

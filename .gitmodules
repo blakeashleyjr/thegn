@@ -1,0 +1,9 @@
+[submodule "apps/switchboard"]
+	path = apps/switchboard
+	url = git@github.com:blakeashleyjr/switchboard.git
+[submodule "apps/termite-chat"]
+	path = apps/termite-chat
+	url = git@github.com:blakeashleyjr/termite-chat.git
+[submodule "apps/termite-agent"]
+	path = apps/termite-agent
+	url = git@github.com:blakeashleyjr/termite-agent.git

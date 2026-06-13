@@ -5,6 +5,7 @@
 //! `Surface` that diff-flushes to the outer terminal (the "no-flash" mechanism).
 
 mod agent;
+mod apps;
 mod borders;
 mod center;
 mod chrome;
