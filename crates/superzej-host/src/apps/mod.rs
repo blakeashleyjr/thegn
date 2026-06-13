@@ -18,7 +18,6 @@
 //! [`ChangeHook`]: sz_kit::ChangeHook
 #![allow(dead_code)] // wired into run.rs incrementally (Phase 2)
 
-pub mod agent;
 pub mod bridge;
 pub mod chat;
 pub mod comms;

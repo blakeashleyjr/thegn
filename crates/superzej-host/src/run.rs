@@ -4472,7 +4472,6 @@ async fn event_loop<T: Terminal>(
     let mut app_host = crate::apps::AppHost::new(vec![
         crate::apps::AppSlot::new("comms", "comms"),
         crate::apps::AppSlot::new("chat", "chat"),
-        crate::apps::AppSlot::new("agent", "agent"),
     ]);
     // Test-explorer results from the background runner/discoverer (capped,
     // single-flight). Two channels: run outcomes and discovery outcomes.
@@ -6608,10 +6607,12 @@ async fn event_loop<T: Terminal>(
                                 })
                             };
                             let handle = tokio::runtime::Handle::current();
+                            // Hand the tile the live chrome palette so it
+                            // renders in the same theme as the work tab.
+                            let theme = crate::apps::kit_theme(&current_config.palette());
                             let tile = match app_host.slots[i].id {
-                                "comms" => crate::apps::comms::build(handle, hook).await,
-                                "chat" => crate::apps::chat::build(handle, hook).await,
-                                "agent" => crate::apps::agent::build(handle, hook).await,
+                                "comms" => crate::apps::comms::build(handle, hook, theme).await,
+                                "chat" => crate::apps::chat::build(handle, hook, theme).await,
                                 _ => {
                                     // Unknown app id — leave it Unloaded.
                                     continue;
