@@ -10,13 +10,17 @@ use std::sync::Arc;
 
 use sw_rpc::{CommsClient, MockClient};
 use sw_tui::CommsUi;
-use sz_kit::{AppTile, ChangeHook};
+use sz_kit::{AppTile, ChangeHook, Theme};
 
 /// Construct the comms tile. Async because seeding the mock awaits; called from
 /// the host loop on first focus (lazy-load), so the await is free.
-pub async fn build(rt: tokio::runtime::Handle, on_change: ChangeHook) -> Box<dyn AppTile> {
+pub async fn build(
+    rt: tokio::runtime::Handle,
+    on_change: ChangeHook,
+    theme: Theme,
+) -> Box<dyn AppTile> {
     let client: Arc<dyn CommsClient> = seeded_mock().await;
-    Box::new(CommsUi::new(client, rt, Some(on_change)))
+    Box::new(CommsUi::new(client, rt, Some(on_change), theme))
 }
 
 /// A few conversations so the tab renders populated. Mirrors the standalone

@@ -50,7 +50,5 @@ sw-rpc = { path = "../../apps/switchboard/crates/sw-rpc" }
 # mock client until the daemon path is wired.
 sw-core = { path = "../../apps/switchboard/crates/sw-core", default-features = false }
 ulid = "1"
-# termite-agent's embeddable TUI (the `agent` tab). Pulls termite-core/store.
-termite-cli = { path = "../../apps/termite-agent/crates/termite-cli" }
 # termite-chat's embeddable TUI (the `chat` tab).
 termite-chat = { path = "../../apps/termite-chat" }

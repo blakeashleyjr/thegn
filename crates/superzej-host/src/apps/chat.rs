@@ -5,17 +5,28 @@
 //! come from the env (`TERMITE_*`); with no API key a submit surfaces the
 //! error in-transcript — correct end-to-end behavior.
 
-use sz_kit::{AppTile, ChangeHook};
+use sz_kit::{AppTile, ChangeHook, Theme};
 use termite_chat::config::Config;
 use termite_chat::session::{
     SessionRepository, SqliteSessionRepository, StoreConfig, open_repository,
 };
 use termite_chat::tile::ChatUi;
 
-pub async fn build(rt: tokio::runtime::Handle, on_change: ChangeHook) -> Box<dyn AppTile> {
+pub async fn build(
+    rt: tokio::runtime::Handle,
+    on_change: ChangeHook,
+    theme: Theme,
+) -> Box<dyn AppTile> {
     let cfg = Config::from_env();
     let client = reqwest::Client::new();
-    Box::new(ChatUi::new(cfg, client, session_repo(), rt, on_change))
+    Box::new(ChatUi::new(
+        cfg,
+        client,
+        session_repo(),
+        rt,
+        on_change,
+        theme,
+    ))
 }
 
 /// The configured session store, falling back to an in-memory one so the tab

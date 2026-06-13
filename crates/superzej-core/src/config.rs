@@ -1743,6 +1743,11 @@ impl Config {
                     hints: vec![],
                 },
                 NamedCommand {
+                    name: "termite".into(),
+                    command: "termite tui".into(),
+                    hints: vec![],
+                },
+                NamedCommand {
                     name: "shell".into(),
                     command: "__shell__".into(),
                     hints: vec![],
