@@ -325,6 +325,11 @@ pub struct FrameModel {
     pub active_container_name: String,
     /// Running containers (superzej-owned first) for the SANDBOXES section.
     pub containers: Vec<superzej_core::sandbox::ContainerInfo>,
+    /// Top-level app-tab chip labels in masthead order: `work` first, then the
+    /// embedded apps (`comms`, …). Empty hides the strip entirely.
+    pub app_tabs: Vec<String>,
+    /// Index of the active app tab in [`Self::app_tabs`] (0 = `work`).
+    pub active_app: usize,
 }
 
 impl FrameModel {
@@ -518,7 +523,54 @@ pub fn draw_masthead(
         brand_cols,
         bg,
     );
-    draw_masthead_left(surface, layout.masthead_stats_row(), model, brand_cols);
+    // Top-level app tabs sit right after the brand; the masthead-left widgets
+    // (breadcrumb/clock/…) start after them.
+    let stats_row = layout.masthead_stats_row();
+    let chips_start = stats_row.x + brand_cols.max(1);
+    let chips_w = draw_app_chips(surface, stats_row, model, chips_start);
+    draw_masthead_left(surface, stats_row, model, brand_cols + chips_w);
+}
+
+/// The top-level app-tab chips (`work`, `comms`, …) in the masthead, just after
+/// the brand. Active chip in the focus color on a focus-tinted pill; the rest
+/// quiet on the bar. Returns the columns consumed (0 when there are no tabs),
+/// so the caller can place the remaining masthead-left widgets after them.
+fn draw_app_chips(surface: &mut Surface, rect: Rect, model: &FrameModel, start_x: usize) -> usize {
+    if model.app_tabs.is_empty() || rect.rows == 0 {
+        return 0;
+    }
+    let bar_bg = if model.masthead_focused {
+        S::Raise
+    } else {
+        S::Panel
+    };
+    let focus = col(S::Focus);
+    let dim = col(S::Dim);
+    let pill = theme_color(&theme::blend_over(&focus_rgb(), &panel_rgb(), 0.28));
+    let end = rect.x + rect.cols;
+    let mut x = start_x;
+    for (i, label) in model.app_tabs.iter().enumerate() {
+        if x >= end {
+            break;
+        }
+        let chip = format!(" {label} ");
+        let (fg, chip_bg) = if i == model.active_app {
+            (focus, pill)
+        } else {
+            (dim, col(bar_bg))
+        };
+        draw_text(
+            surface,
+            x,
+            rect.y,
+            &chip,
+            fg,
+            chip_bg,
+            end.saturating_sub(x),
+        );
+        x += chip.chars().count() + 1; // trailing gap between chips
+    }
+    x.min(end).saturating_sub(start_x)
 }
 
 /// The center column's tab bar, directly below the divider: the worktree

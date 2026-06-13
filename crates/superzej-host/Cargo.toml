@@ -36,3 +36,19 @@ reqwest = { version = "0.12", default-features = false, features = [
   "blocking",
   "rustls-tls",
 ] }
+# The app-tab embedding contract (AppTile, shared theme, the pinned ratatui
+# re-export). The host renders embedded apps' ratatui buffers through
+# `sz_kit::ratatui` so the Buffer type is identical to what the apps produce.
+sz-kit = { path = "../sz-kit" }
+# Embedded app crates (git submodules under apps/, each its own workspace).
+# Path deps resolve the package directly against the submodule's own
+# [workspace]; superzej's `exclude` keeps these out of this workspace. Their
+# sz-kit git-dep is redirected to the in-tree crate by the root [patch].
+sw-tui = { path = "../../apps/switchboard/crates/sw-tui" }
+sw-rpc = { path = "../../apps/switchboard/crates/sw-rpc" }
+# sw-core (no libsql in the client link) + ulid: just for seeding the comms
+# mock client until the daemon path is wired.
+sw-core = { path = "../../apps/switchboard/crates/sw-core", default-features = false }
+ulid = "1"
+# termite-chat's embeddable TUI (the `chat` tab).
+termite-chat = { path = "../../apps/termite-chat" }
