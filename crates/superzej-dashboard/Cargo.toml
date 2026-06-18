@@ -19,6 +19,13 @@ sz-kit = { path = "../sz-kit" }
 sysinfo.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest = { version = "0.12", default-features = false, features = [
+  "blocking",
+  "json",
+  "rustls-tls",
+] }
 
 [features]
 default = []
