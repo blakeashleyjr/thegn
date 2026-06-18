@@ -387,9 +387,14 @@ pub fn resolve(cfg: &SandboxConfig, loc: &GitLoc, name: &str) -> Option<SandboxS
             .collect(),
         compose: cfg.compose.clone(),
         init_script: (!cfg.init_script.trim().is_empty()).then(|| cfg.init_script.clone()),
-        // Explicit opt-in, or a *local* repo with devenv.nix when `devenv` is on PATH.
+        // Explicit opt-in, or an OCI-backed local repo with devenv.nix when
+        // `devenv` is on PATH.  Auto-detection is OCI-only: for bwrap/systemd
+        // the host toolchain is already mounted and the user's login shell
+        // already activates the devenv env — running `devenv shell` inside
+        // bwrap would fail because the Nix daemon socket is not mounted there.
         devenv: cfg.devenv
-            || (!loc.is_remote()
+            || (backend.is_oci()
+                && !loc.is_remote()
                 && PathBuf::from(loc.path()).join("devenv.nix").is_file()
                 && util::have("devenv")),
         // Resolve the absolute devenv path at spec-build time so OCI containers
@@ -988,8 +993,15 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
         }
         Backend::Bwrap => {
             let mut v = vec!["bwrap".to_string()];
+            // Paths hardcoded into the bwrap argv — anything already covered here
+            // must be skipped when processing spec.mounts to avoid duplicate /
+            // conflicting bind mounts. bwrap cannot create sub-mount-points inside
+            // a read-only bind (e.g. /etc/profiles/per-user/blake inside --ro-bind
+            // /etc /etc) and returns "Unable to mount source on destination".
+            let mut hardcoded_parents: Vec<&str> = Vec::new();
             if matches!(spec.file_access, FileAccess::All | FileAccess::Host) {
                 v.extend(["--dev-bind".into(), "/".into(), "/".into()]);
+                hardcoded_parents.push("/");
             } else {
                 // Do not expose host / wholesale. Bind the runtime substrate read-only,
                 // then add the explicit worktree/cache mounts below.
@@ -1004,6 +1016,7 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
                 ] {
                     if std::path::Path::new(path).exists() {
                         v.extend(["--ro-bind".into(), path.into(), path.into()]);
+                        hardcoded_parents.push(path);
                     }
                 }
                 v.extend([
@@ -1019,6 +1032,19 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
                 v.extend(["--chdir".into(), wt]);
             }
             for m in &spec.mounts {
+                // Skip mounts already covered by a hardcoded parent — bwrap
+                // cannot create a mount-point inside a read-only bind.
+                let covered = hardcoded_parents
+                    .iter()
+                    .any(|p| std::path::Path::new(&m.dest).starts_with(p) && m.dest != *p);
+                if covered {
+                    continue;
+                }
+                // Also skip exact duplicates of already-hardcoded paths.
+                let duplicate = hardcoded_parents.iter().any(|p| m.dest == *p);
+                if duplicate {
+                    continue;
+                }
                 let flag = if m.ro { "--ro-bind" } else { "--bind" };
                 v.extend([flag.into(), m.host.clone(), m.dest.clone()]);
             }
