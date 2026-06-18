@@ -11,6 +11,17 @@
     # independent of the user's system and of the main `nixpkgs`. Bump it
     # deliberately with `nix flake update nixpkgs-yazi`.
     nixpkgs-yazi.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    # Embedded app crates are git submodules. Local flake `self` sources contain
+    # only gitlinks for submodules, so package builds need them as explicit
+    # non-flake inputs and then copy them into Cargo's expected path-dep dirs.
+    switchboard = {
+      url = "github:blakeashleyjr/switchboard/9ec679706e9f0a4d40319e235f35a67ddf14db0c";
+      flake = false;
+    };
+    termiteChat = {
+      url = "github:blakeashleyjr/termite-chat/26b0aebfb8284cf7d1dfd76dcbb786c96eeface2";
+      flake = false;
+    };
   };
 
   outputs = {
@@ -19,6 +30,8 @@
     flake-utils,
     rust-overlay,
     nixpkgs-yazi,
+    switchboard,
+    termiteChat,
   }:
     flake-utils.lib.eachDefaultSystem (system: let
       pkgs = import nixpkgs {
@@ -66,7 +79,33 @@
           imagemagick
         ])
         ++ [yaziPkgs.poppler-utils];
+      rootSrc = pkgs.lib.cleanSourceWith {
+        src = ./.;
+        # Drop build artifacts so the store path is stable across rebuilds.
+        filter = path: _type: let
+          rel = pkgs.lib.removePrefix (toString ./. + "/") (toString path);
+        in
+          !(pkgs.lib.hasPrefix "target" rel
+            || pkgs.lib.hasPrefix "result" rel
+            || pkgs.lib.hasPrefix ".direnv" rel
+            || pkgs.lib.hasPrefix ".git/" rel);
+      };
+      # Local flake sources do not materialize git submodule contents in `self`,
+      # but Cargo path dependencies need these embedded app crates at package
+      # build time. Compose an explicit source tree with the submodule sources
+      # copied into the paths declared by crates/superzej-host/Cargo.toml.
+      superzejSrc = pkgs.runCommand "superzej-source" {} ''
+        mkdir -p $out
+        cp -R ${rootSrc}/. $out/
+        chmod -R u+w $out
+
+        rm -rf $out/apps/switchboard $out/apps/termite-chat
+        mkdir -p $out/apps
+        cp -R ${switchboard} $out/apps/switchboard
+        cp -R ${termiteChat} $out/apps/termite-chat
+      '';
       superzej = pkgs.callPackage ./nix/package.nix {
+        src = superzejSrc;
         yazi = yaziPinned;
         inherit yaziDeps;
       };

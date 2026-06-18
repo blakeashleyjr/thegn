@@ -370,7 +370,7 @@ pub trait GitBackend: Send + Sync {
     }
 
     /// One file's worktree-vs-index diff, sanitized for `git apply`
-    /// round-trips (see [`SANITIZED_DIFF`]). Empty string when unchanged.
+    /// round-trips (see `SANITIZED_DIFF`). Empty string when unchanged.
     fn unstaged_diff(&self, loc: &GitLoc, path: &str) -> Result<String> {
         let mut args = SANITIZED_DIFF.to_vec();
         args.extend(["--", path]);

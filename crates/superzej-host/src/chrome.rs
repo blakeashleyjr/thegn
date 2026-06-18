@@ -159,7 +159,8 @@ pub fn draw_text(
     surface.add_change(Change::Text(clipped));
 }
 
-/// Draw a transport-neutral plugin [`View`] into a host-owned surface rect.
+/// Draw a transport-neutral plugin [`View`](superzej_core::plugin_api::View)
+/// into a host-owned surface rect.
 /// Plugins supply semantic roles only; this function resolves them against the
 /// current superzej theme/accent and clips to the host-owned slot.
 ///

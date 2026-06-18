@@ -50,7 +50,7 @@ flake-check:
     nix flake check
 
 # The full gate.
-ci: fmt-check lint build test coverage smoke nix-build
+ci: fmt-check lint build test doc-check coverage smoke nix-build
     @echo "ci: all green"
 
 # (e2e/stress/perf harnesses drove the old zellij CLI's worktree-creation
@@ -84,9 +84,13 @@ coverage-html:
 # Comprehensive linting: rust (clippy), bash (shellcheck), yaml (yamllint), toml (taplo).
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
-    shellcheck -x install.sh test/smoke.sh test/install-plan.sh test/dev-tui-plan.sh
+    shellcheck -x install.sh test/smoke.sh test/pty-smoke.sh test/install-plan.sh test/dev-tui-plan.sh
     yamllint .
     taplo lint
+
+# Rustdoc must stay warning-clean; public API docs are part of the release gate.
+doc-check:
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 # Format everything via treefmt (rust, nix, bash, toml, yaml, markdown).
 fmt:
@@ -105,6 +109,7 @@ smoke: build
     ./test/install-plan.sh
     ./test/dev-tui-plan.sh
     ./test/smoke.sh {{bin}}
+    ./test/pty-smoke.sh {{bin}}
 
 # Same, but against the built Nix package (verifies the wrapper + injected deps).
 smoke-pkg:

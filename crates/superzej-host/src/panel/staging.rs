@@ -2,7 +2,7 @@
 //! parsed unified diff ([`superzej_core::patch`]) into addressable display
 //! lines, renders them as panel rows with a line cursor / range highlight /
 //! patch marks, and converts UI selections back into a core
-//! [`Selection`](superzej_core::patch::Selection) for the apply path.
+//! [`Selection`] for the apply path.
 //!
 //! The flattened index space is shared with [`StagingUi`](
 //! crate::panel::gitui::StagingUi) cursors and [`PatchUi`](

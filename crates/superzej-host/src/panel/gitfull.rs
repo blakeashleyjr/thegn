@@ -5,7 +5,7 @@
 //! spinner), a side column of the four git lists (FILES · BRANCHES · COMMITS
 //! · STASH, the focused one getting the lion's share of rows), a
 //! focus-dependent main region across a vertical `│` seam, and a context help
-//! bar fed by the same [`gitui::context_keys`] tables that drive dispatch.
+//! bar fed by the same `gitui::context_keys` tables that drive dispatch.
 //!
 //! Pure view-model: fixed `PanelData` + `GitUi` in, `PanelFrame` out. Side
 //! list rows carry [`PanelHit::Row`] with their home [`Section`] so the

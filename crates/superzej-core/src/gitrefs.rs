@@ -252,7 +252,7 @@ pub fn parse_bisect(refs_out: &str, terms: Option<&str>, head: &str) -> BisectSt
     state
 }
 
-/// Scan bisect command stdout for "<full-sha> is the first bad commit",
+/// Scan bisect command stdout for `"<full-sha> is the first bad commit"`,
 /// anchored to the start of a line with a 40-hex sha (so a commit subject
 /// quoting the phrase mid-line can't fool it).
 pub fn find_culprit(stdout: &str) -> Option<String> {

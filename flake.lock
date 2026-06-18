@@ -55,7 +55,9 @@
         "flake-utils": "flake-utils",
         "nixpkgs": "nixpkgs",
         "nixpkgs-yazi": "nixpkgs-yazi",
-        "rust-overlay": "rust-overlay"
+        "rust-overlay": "rust-overlay",
+        "switchboard": "switchboard",
+        "termiteChat": "termiteChat"
       }
     },
     "rust-overlay": {
@@ -78,6 +80,23 @@
         "type": "github"
       }
     },
+    "switchboard": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1781329543,
+        "narHash": "sha256-NVWajxVjmDru8Sblztnj57ZUmqxvB1nyNgHvFzDZ7ho=",
+        "owner": "blakeashleyjr",
+        "repo": "switchboard",
+        "rev": "9ec679706e9f0a4d40319e235f35a67ddf14db0c",
+        "type": "github"
+      },
+      "original": {
+        "owner": "blakeashleyjr",
+        "repo": "switchboard",
+        "rev": "9ec679706e9f0a4d40319e235f35a67ddf14db0c",
+        "type": "github"
+      }
+    },
     "systems": {
       "locked": {
         "lastModified": 1681028828,
@@ -90,6 +109,23 @@
       "original": {
         "owner": "nix-systems",
         "repo": "default",
+        "type": "github"
+      }
+    },
+    "termiteChat": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1781329554,
+        "narHash": "sha256-VD6pd9ZEON2qczXkRc4G7dUpbi2iwvABd3L4dhRG0ac=",
+        "owner": "blakeashleyjr",
+        "repo": "termite-chat",
+        "rev": "26b0aebfb8284cf7d1dfd76dcbb786c96eeface2",
+        "type": "github"
+      },
+      "original": {
+        "owner": "blakeashleyjr",
+        "repo": "termite-chat",
+        "rev": "26b0aebfb8284cf7d1dfd76dcbb786c96eeface2",
         "type": "github"
       }
     }

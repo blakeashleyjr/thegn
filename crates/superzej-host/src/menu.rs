@@ -193,7 +193,13 @@ impl MenuOverlay {
     /// hotkey picks its item immediately (case-insensitive); Esc/q cancels;
     /// everything else is Pending.
     pub fn handle_key(&mut self, key: &KeyCode, mods: Modifiers) -> MenuOutcome {
-        if mods.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER) {
+        if mods.contains(Modifiers::CTRL) {
+            return match key {
+                KeyCode::Char('c' | 'C' | 'g' | 'G') => MenuOutcome::Cancel,
+                _ => MenuOutcome::Pending,
+            };
+        }
+        if mods.intersects(Modifiers::ALT | Modifiers::SUPER) {
             return MenuOutcome::Pending;
         }
         if crate::input::is_escape_key(key) {
@@ -763,6 +769,19 @@ mod tests {
             "CSI-u/fixterms Esc decodes as a literal ESC char"
         );
         assert_eq!(m.handle_key(&KeyCode::Char('q'), NONE), MenuOutcome::Cancel);
+    }
+
+    #[test]
+    fn ctrl_c_and_ctrl_g_cancel_menu() {
+        let mut m = three();
+        assert_eq!(
+            m.handle_key(&KeyCode::Char('c'), Modifiers::CTRL),
+            MenuOutcome::Cancel
+        );
+        assert_eq!(
+            m.handle_key(&KeyCode::Char('G'), Modifiers::CTRL),
+            MenuOutcome::Cancel
+        );
     }
 
     #[test]
