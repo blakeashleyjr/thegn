@@ -9257,43 +9257,30 @@ async fn event_loop<T: Terminal>(
                                 need_relayout = true;
                             }
                             Action::CloseTab => {
-                                // Close the active tab; if it was the home group's last tab,
-                                // refuse so the root workspace cannot disappear.
+                                // Close the active tab only. The final tab is
+                                // the durable surface for its worktree; closing
+                                // a worktree is a separate explicit action
+                                // (CloseWorktree) so CloseTab can never erase a
+                                // home checkout or branch worktree by accident.
                                 if session
                                     .active_group()
-                                    .map(|g| {
-                                        g.kind == crate::session::GroupKind::Home
-                                            && g.tabs.len() <= 1
-                                    })
+                                    .map(|g| g.tabs.len() <= 1)
                                     .unwrap_or(false)
                                 {
-                                    model.status = "Root workspace cannot be closed".into();
-                                    dirty = true;
-                                    continue;
-                                }
-                                // Closing the last tab of a non-home group removes the whole
-                                // group from the session — confirm before proceeding.
-                                if session
-                                    .active_group()
-                                    .map(|g| {
-                                        g.kind != crate::session::GroupKind::Home
-                                            && g.tabs.len() == 1
-                                    })
-                                    .unwrap_or(false)
-                                {
-                                    let name = session
+                                    model.status = session
                                         .active_group()
-                                        .map(|g| g.name.clone())
-                                        .unwrap_or_else(|| "worktree".into());
-                                    active_menu = Some(menu::confirm_menu(
-                                        "Close worktree?",
-                                        format!(
-                                            "Closing the last tab removes '{name}' from this session."
-                                        ),
-                                        "close-worktree",
-                                        name,
-                                        true,
-                                    ));
+                                        .map(|g| {
+                                            if g.kind == crate::session::GroupKind::Home {
+                                                "Cannot close the last tab in the home worktree"
+                                                    .to_string()
+                                            } else {
+                                                format!(
+                                                    "Cannot close the last tab in '{}'; use Close worktree to remove it",
+                                                    g.name
+                                                )
+                                            }
+                                        })
+                                        .unwrap_or_else(|| "No tab to close".into());
                                     dirty = true;
                                     continue;
                                 }
@@ -9301,16 +9288,6 @@ async fn event_loop<T: Terminal>(
                                     crate::session::CloseResult::Tab(tab) => {
                                         for id in tab.center.pane_ids() {
                                             panes.table.remove(&id);
-                                        }
-                                    }
-                                    crate::session::CloseResult::Group(g) => {
-                                        for tab in &g.tabs {
-                                            for id in tab.center.pane_ids() {
-                                                panes.table.remove(&id);
-                                            }
-                                        }
-                                        if let Ok(db) = superzej_core::db::Db::open() {
-                                            forget_worktree_group(&db, &session.id, &g);
                                         }
                                     }
                                     crate::session::CloseResult::Nothing => {}

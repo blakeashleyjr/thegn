@@ -41,8 +41,8 @@ pub enum Action {
     CycleTheme,
     /// Pick a font family from fontconfig and patch the live alacritty profile.
     SwitchFont,
-    /// Close the active tab within the worktree (closing the last tab closes
-    /// the whole worktree group).
+    /// Close the active tab within the worktree. The final tab is kept; use
+    /// CloseWorktree for the explicit worktree-removal action.
     CloseTab,
     CloseWorktree,
     SwitchWorkspace,
