@@ -782,6 +782,11 @@ pub(crate) fn build_model(
         sidebar_status,
         loc: loc_count,
         active_container_name: superzej_core::sandbox::container_name(&loc.path()),
+        active_sandbox_backend: db
+            .worktree_sandbox(&loc.path())
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
         containers: superzej_core::sandbox::running_containers(),
         panel,
         panel_focused: false,

@@ -323,6 +323,10 @@ pub struct FrameModel {
     /// panel uses this to show the sandbox for the selected worktree instead of
     /// the first superzej-owned container on the machine.
     pub active_container_name: String,
+    /// DB-stored sandbox backend label for the active worktree (e.g. "bwrap",
+    /// "podman-rootless", "host"). Used to show non-OCI sandboxes (bwrap,
+    /// systemd) as green even though they have no container entry.
+    pub active_sandbox_backend: String,
     /// Running containers (superzej-owned first) for the SANDBOXES section.
     pub containers: Vec<superzej_core::sandbox::ContainerInfo>,
     /// Top-level app-tab chip labels in masthead order: `work` first, then the
