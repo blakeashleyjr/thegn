@@ -10,7 +10,7 @@ use crate::chrome::{FrameModel, S};
 use crate::seg::{Line, Seg, Tok, seg, sp};
 
 use super::sections::{self, PanelRow, SectionCtx};
-use super::{PanelHit, PanelUi, budget};
+use super::{PanelHit, PanelTab, PanelUi, budget};
 
 /// The fully-assembled panel: one entry per visible row, plus the full
 /// view's rail hit spans (empty in Normal/Half).
@@ -18,6 +18,10 @@ use super::{PanelHit, PanelUi, budget};
 pub struct PanelFrame {
     pub rows: Vec<PanelRow>,
     pub rail: Vec<RailSpan>,
+    /// X-spans for the tab bar (always row 0): `(col_range, tab)`.
+    /// Used by `chrome::panel_tab_hit` for x-based click resolution.
+    /// Empty for the git-family full view which omits the tab bar.
+    pub tab_spans: Vec<(std::ops::Range<usize>, PanelTab)>,
 }
 
 /// One section's clickable span in the full view's horizontal rail:
@@ -164,6 +168,33 @@ fn flow_chips(ui: &PanelUi) -> Vec<Seg> {
             chips.push(sp(1));
         }
         GitFlow::Rebase(_) | GitFlow::None => {}
+        GitFlow::Merge(s) => {
+            let label = if s.conflict {
+                " MERGING ⚑ "
+            } else {
+                " MERGING "
+            };
+            chips.push(Seg::chip(hue(Hue::Amber), label));
+            chips.push(sp(1));
+        }
+        GitFlow::CherryPick(s) => {
+            let label = if s.conflict {
+                " CHERRY-PICK ⚑ "
+            } else {
+                " CHERRY-PICK "
+            };
+            chips.push(Seg::chip(hue(Hue::Purple), label));
+            chips.push(sp(1));
+        }
+        GitFlow::Revert(s) => {
+            let label = if s.conflict {
+                " REVERTING ⚑ "
+            } else {
+                " REVERTING "
+            };
+            chips.push(Seg::chip(hue(Hue::Purple), label));
+            chips.push(sp(1));
+        }
     }
     chips
 }
@@ -204,6 +235,38 @@ fn indent(line: Line) -> Line {
     }
 }
 
+/// One-row tab bar: `git  work  system` with the active tab accented.
+fn tab_bar_row(ui: &PanelUi, focused: bool) -> (PanelRow, Vec<(std::ops::Range<usize>, PanelTab)>) {
+    use crate::seg::{seg, sp};
+    let tabs = [PanelTab::Git, PanelTab::Work, PanelTab::System];
+    let mut segs = vec![sp(1)];
+    let mut spans: Vec<(std::ops::Range<usize>, PanelTab)> = Vec::new();
+    let mut col = 1usize; // column after the leading sp(1)
+    for (i, &tab) in tabs.iter().enumerate() {
+        if i > 0 {
+            segs.push(seg(Tok::Slot(S::Ghost3), "  "));
+            col += 2;
+        }
+        let on = tab == ui.tab;
+        let tok = if on && focused {
+            Tok::Slot(S::Accent)
+        } else if on {
+            Tok::Slot(S::Text)
+        } else {
+            Tok::Slot(S::Ghost2)
+        };
+        let label = tab.label();
+        let mut s = seg(tok, label);
+        if on {
+            s = s.bold();
+        }
+        segs.push(s);
+        spans.push((col..col + label.len(), tab));
+        col += label.len();
+    }
+    (PanelRow::plain(crate::seg::Line::Segs(segs)), spans)
+}
+
 /// The content geometry handed to section builders: the panel width minus
 /// the 2-cell indent + 1-cell right pad, and a post-skeleton row estimate.
 fn section_ctx<'a>(
@@ -217,7 +280,7 @@ fn section_ctx<'a>(
         model,
         ui,
         cols: cols.saturating_sub(3),
-        rows: rows.saturating_sub(header_len + ui.order.len() + 2),
+        rows: rows.saturating_sub(header_len + ui.visible_section_count() + 2),
     }
 }
 
@@ -237,15 +300,32 @@ pub fn build_panel(
         }
         return build_full(model, ui, cols, rows, focused);
     }
+
+    // Reserve 1 row for the tab bar at the top; account for it in the budget.
+    let (tab_row, tab_spans) = tab_bar_row(ui, focused);
+    let rows_for_body = rows.saturating_sub(1);
+
     let header = with_flow_chips(header_rows(model, focused), ui);
-    let ctx = section_ctx(model, ui, cols, rows, header.len());
+    let ctx = section_ctx(model, ui, cols, rows_for_body, header.len());
     let content_raw = sections::content(ui.open, &ctx);
-    let plan = budget::allocate(rows, header.len(), content_raw.len(), ui.order.len());
+    let visible_secs: Vec<_> = ui
+        .order
+        .iter()
+        .copied()
+        .filter(|s| s.tab() == ui.tab)
+        .collect();
+    let plan = budget::allocate(
+        rows_for_body,
+        header.len(),
+        content_raw.len(),
+        visible_secs.len(),
+    );
 
     let mut out: Vec<PanelRow> = Vec::new();
+    out.push(tab_row);
     out.extend(header.into_iter().take(plan.header_rows));
 
-    for (i, section) in ui.order.iter().copied().enumerate() {
+    for (i, section) in visible_secs.iter().copied().enumerate() {
         let on = section == ui.open;
         let label_tok = if on {
             Tok::Slot(S::Accent)
@@ -256,7 +336,7 @@ pub fn build_panel(
         if on {
             label = label.bold();
         }
-        // Each accordion is numbered; the number is its open shortcut.
+        // Each accordion is numbered; the number is its open shortcut within the tab.
         let num = seg(
             Tok::Slot(if on { S::Accent } else { S::Ghost2 }),
             format!("{}", i + 1),
@@ -318,18 +398,26 @@ pub fn build_panel(
     PanelFrame {
         rows: out,
         rail: Vec::new(),
+        tab_spans,
     }
 }
 
 /// The full view's horizontal rail: `1 changes · 2 git · …` wrapped to
 /// `cols`, the open section accented. Returns the rows plus the rail-relative
 /// hit spans (`build_full` absolutizes the row indices).
+/// Only sections belonging to the active tab are shown.
 fn rail_rows_and_spans(ui: &PanelUi, cols: usize) -> (Vec<PanelRow>, Vec<RailSpan>) {
     let mut rows: Vec<PanelRow> = Vec::new();
     let mut spans: Vec<RailSpan> = Vec::new();
     let mut cur: Vec<Seg> = vec![sp(1)];
     let mut x = 1usize;
-    for (i, section) in ui.order.iter().copied().enumerate() {
+    let visible: Vec<_> = ui
+        .order
+        .iter()
+        .copied()
+        .filter(|s| s.tab() == ui.tab)
+        .collect();
+    for (i, section) in visible.iter().copied().enumerate() {
         let on = section == ui.open;
         let num = format!("{}", i + 1);
         let label = section.label();
@@ -377,9 +465,10 @@ fn cursor_tint(mut row: PanelRow, focused: bool, ui: &PanelUi) -> PanelRow {
     row
 }
 
-/// The full-width layout: header, the horizontal rail, a rule seam, then the
-/// open section's body filling every remaining row (bodies that scroll read
-/// `ui.scroll` themselves; overflowing list bodies truncate to a "+N more").
+/// The full-width layout: tab bar, header, the horizontal rail, a rule seam,
+/// then the open section's body filling every remaining row (bodies that
+/// scroll read `ui.scroll` themselves; overflowing list bodies truncate to a
+/// "+N more").
 fn build_full(
     model: &FrameModel,
     ui: &PanelUi,
@@ -387,11 +476,16 @@ fn build_full(
     rows: usize,
     focused: bool,
 ) -> PanelFrame {
+    // Reserve 1 row for the tab bar.
+    let (tab_row, tab_spans) = tab_bar_row(ui, focused);
+    let rows_for_body = rows.saturating_sub(1);
+
     let header = with_flow_chips(header_rows(model, focused), ui);
     let (rail, mut spans) = rail_rows_and_spans(ui, cols);
-    let plan = budget::allocate_full(rows, header.len(), rail.len());
+    let plan = budget::allocate_full(rows_for_body, header.len(), rail.len());
 
     let mut out: Vec<PanelRow> = Vec::new();
+    out.push(tab_row);
     out.extend(header.into_iter().take(plan.header_rows));
     let rail_y0 = out.len();
     let kept = plan.rail_rows.min(rail.len());
@@ -455,6 +549,7 @@ fn build_full(
     PanelFrame {
         rows: out,
         rail: spans,
+        tab_spans,
     }
 }
 
@@ -468,7 +563,8 @@ pub fn section_rows(
     cols: usize,
     rows: usize,
 ) -> usize {
-    let ctx = section_ctx(model, ui, cols, rows, 4);
+    // Subtract 1 for the tab bar row in the row estimate.
+    let ctx = section_ctx(model, ui, cols, rows.saturating_sub(1), 4);
     sections::content(section, &ctx)
         .iter()
         .filter(|r| matches!(r.hit, Some(PanelHit::Row(_, _))))
@@ -525,31 +621,40 @@ mod tests {
             changes: vec![change("src/a.rs", Stage::Staged)],
             ..Default::default()
         });
-        let ui = PanelUi::default(); // open = Changes
+        let ui = PanelUi::default(); // open = Changes, tab = Git
         let frame = build_panel(&model, &ui, 44, 50, true);
         let texts: Vec<String> = frame.rows.iter().map(|r| text_of(&r.line)).collect();
         let all = texts.join("\n");
-        for s in crate::panel::SECTION_ORDER {
+        // Only Git-tab sections appear (Changes, Commits, Branches, Stash, Files).
+        let git_secs = ui.tab_sections();
+        for s in &git_secs {
             assert!(all.contains(s.label()), "{} missing:\n{all}", s.label());
         }
+        // Work/System sections are not in the Git tab accordion.
+        assert!(!all.contains("notifications"), "{all}");
+        assert!(!all.contains("logs"), "{all}");
         // The open section's content (the change row) renders indented.
         assert!(all.contains("a.rs"), "{all}");
         // The footer is gone — no "more, one keystroke away" strip.
         assert!(!all.contains("MORE, ONE KEYSTROKE AWAY"), "{all}");
-        // Every accordion is numbered (the number is its open shortcut).
-        for n in 1..=ui.order.len() {
+        // Tab bar row is present.
+        assert!(all.contains("git"), "{all}");
+        assert!(all.contains("work"), "{all}");
+        assert!(all.contains("system"), "{all}");
+        // Every accordion within the tab is numbered (the number is its jump shortcut).
+        for n in 1..=git_secs.len() {
             assert!(
                 all.contains(&format!("{n}")),
-                "missing accordion number {n}"
+                "missing accordion number {n}: {all}"
             );
         }
-        // Section rows carry their hits.
+        // Section rows carry their hits (one per tab-visible section).
         let hits: Vec<&PanelHit> = frame.rows.iter().filter_map(|r| r.hit.as_ref()).collect();
-        assert!(
+        assert_eq!(
             hits.iter()
                 .filter(|h| matches!(h, PanelHit::OpenSection(_)))
-                .count()
-                == crate::panel::SECTION_ORDER.len()
+                .count(),
+            git_secs.len()
         );
         assert!(frame.rows.len() <= 50);
     }
@@ -561,9 +666,11 @@ mod tests {
             changes: vec![change("src/a.rs", Stage::Staged)],
             ..Default::default()
         });
+        // Git tab with only Changes visible; Pr is Work tab so it's invisible
+        // in the Git accordion even if it's in order.
         let ui = PanelUi {
-            order: vec![Section::Git, Section::Changes],
-            ..Default::default()
+            order: vec![Section::Pr, Section::Changes],
+            ..Default::default() // tab = Git
         };
         let frame = build_panel(&model, &ui, 44, 40, false);
         let sections: Vec<Section> = frame
@@ -574,8 +681,8 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // Hidden sections never render; the order is the config's.
-        assert_eq!(sections, vec![Section::Git, Section::Changes]);
+        // Only Changes appears in the Git tab (Pr is Work tab).
+        assert_eq!(sections, vec![Section::Changes]);
         let all: String = frame
             .rows
             .iter()
@@ -663,7 +770,7 @@ mod tests {
         let ui = PanelUi {
             chg_sel: Some(0),
             row_mode: true,
-            ..Default::default()
+            ..Default::default() // tab = Git, open = Changes
         };
         let frame = build_panel(&model, &ui, 44, 50, true);
         // The open section row carries the tint bg.

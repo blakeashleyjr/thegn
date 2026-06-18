@@ -410,6 +410,23 @@ fn worktree_parts(model: &FrameModel) -> Option<(String, String)> {
     }
 }
 
+/// Returns `(display_text, is_active)` for the sandbox indicator.
+/// `is_active` = true → green; false → red ("None").
+fn sandbox_indicator(model: &FrameModel) -> (&str, bool) {
+    let b = model.active_sandbox_backend.as_str();
+    if b.is_empty() || b == "none" || b == "host" {
+        ("None", false)
+    } else {
+        (b, true)
+    }
+}
+
+/// Character width of the sandbox indicator (prefix + value, no trailing gap).
+fn sandbox_indicator_width(model: &FrameModel) -> usize {
+    let (val, _) = sandbox_indicator(model);
+    " · Sandbox: ".chars().count() + val.chars().count()
+}
+
 /// Where the right-aligned pin chips begin in the tab strip (the tab chips
 /// must stop before this column).
 fn pin_chips_start(model: &FrameModel, strip: Rect) -> usize {
@@ -439,7 +456,7 @@ fn strip_chip_spans(model: &FrameModel, strip: Rect) -> Vec<(usize, usize, usize
         if !ws.is_empty() {
             x += ws.chars().count() + 3; // "WS ▸ "
         }
-        x += leaf.chars().count() + 2; // "leaf" + gap
+        x += leaf.chars().count() + sandbox_indicator_width(model) + 2; // "leaf" + sandbox + gap
     }
     for (i, title) in model.tabs.iter().enumerate() {
         let w = title.chars().count() + 2; // " {title} "
@@ -687,6 +704,45 @@ fn draw_center_tabs(surface: &mut Surface, strip: Rect, model: &FrameModel) {
             bg,
             chips_end.saturating_sub(x),
         );
+        x += leaf.chars().count();
+        // Issue badge: show the first linked issue's status + number next to
+        // the active worktree name when at least one issue is linked.
+        if let Some(issue_id) = model.panel.tracker_links.first() {
+            if let Some(issue) = model
+                .panel
+                .tracker_issues
+                .iter()
+                .find(|i| &i.id == issue_id)
+            {
+                let badge = format!(" ◈{}", issue.number);
+                let avail = chips_end.saturating_sub(x);
+                if avail >= badge.chars().count() {
+                    draw_text(surface, x, strip.y, &badge, col(S::Accent), bg, avail);
+                    x += badge.chars().count();
+                }
+            }
+        }
+        let (sb_val, sb_active) = sandbox_indicator(model);
+        let sb_prefix = " · Sandbox: ";
+        let avail = chips_end.saturating_sub(x);
+        if avail >= sb_prefix.chars().count() + sb_val.chars().count() {
+            draw_text(surface, x, strip.y, sb_prefix, dim, bg, avail);
+            let vx = x + sb_prefix.chars().count();
+            let sb_color = if sb_active {
+                theme_color(theme::GREEN)
+            } else {
+                theme_color(theme::RED)
+            };
+            draw_text(
+                surface,
+                vx,
+                strip.y,
+                sb_val,
+                sb_color,
+                bg,
+                chips_end.saturating_sub(vx),
+            );
+        }
     }
 
     // The chips render as padded pills: the active tab in the focus color on
@@ -828,8 +884,8 @@ fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> {
                 format!(
                     "{} \u{2193}{} \u{2191}{}",
                     ic.net_icon,
-                    crate::stats::fmt_rate(rx).trim(),
-                    crate::stats::fmt_rate(tx).trim()
+                    crate::stats::fmt_rate(rx),
+                    crate::stats::fmt_rate(tx)
                 ),
                 col(S::Dim),
             )
@@ -1051,6 +1107,13 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             r.push(seg(Tok::Slot(S::Ghost3), " \u{2502} "));
         }
         r.push(seg(Tok::Attr(p.fg), p.text));
+    }
+    if model.panel.unread_notifications > 0 {
+        r.push(seg(Tok::Slot(S::Text), " "));
+        r.push(Seg::chip(
+            Tok::Hue(superzej_core::theme::Hue::Red),
+            format!(" \u{2691} {} ", model.panel.unread_notifications),
+        ));
     }
     if model.zoomed {
         r.push(seg(Tok::Slot(S::Text), " "));
@@ -1490,6 +1553,33 @@ pub fn panel_rail_hit(
         .map(|s| s.section)
 }
 
+/// Resolve a click on the tab bar row (row 0 of the panel in Normal/Half/Full
+/// modes). The tab bar row fits on a single terminal line but carries three
+/// labeled pills; the x position determines which tab was hit.
+///
+/// Returns `None` when the click is not on row 0, when the frame has no tab
+/// bar (git-family full view), or when the x position falls between pills.
+pub fn panel_tab_hit(
+    model: &FrameModel,
+    ui: &crate::panel::PanelUi,
+    rect: Rect,
+    x: usize,
+    y: usize,
+) -> Option<crate::panel::PanelTab> {
+    // Tab bar is always row 0 of the panel frame.
+    if y != rect.y {
+        return None;
+    }
+    let frame =
+        crate::panel::frame::build_panel(model, ui, rect.cols, rect.rows, model.panel_focused);
+    let rel_x = x.checked_sub(rect.x)?;
+    frame
+        .tab_spans
+        .iter()
+        .find(|(cols, _)| cols.contains(&rel_x))
+        .map(|(_, tab)| *tab)
+}
+
 /// The context-sensitive help-bar hints for the accordion's current state, as
 /// (chord, label) pairs for the statusbar's chip renderer: section-walking
 /// keys while the cursor is on the section list, the open section's row
@@ -1497,11 +1587,12 @@ pub fn panel_rail_hit(
 pub(crate) fn panel_help_pairs(ui: &crate::panel::PanelUi) -> Vec<(String, String)> {
     use crate::panel::Section;
     if !ui.row_mode {
-        let jumps = format!("1-{}", ui.order.len());
+        let jumps = format!("1-{}", ui.visible_section_count());
         return [
             ("j/k", "section"),
             (jumps.as_str(), "jump"),
-            ("↵", "rows"),
+            ("↵", "open"),
+            ("alt+1-3", "tab"),
             ("e", "expand"),
         ]
         .iter()
@@ -1510,19 +1601,36 @@ pub(crate) fn panel_help_pairs(ui: &crate::panel::PanelUi) -> Vec<(String, Strin
     }
     // The git-family lists draw their hints from the focused context's key
     // table (the same data that drives dispatch and the `?` cheatsheet, so
-    // the help bar can never drift). The Git section keeps its PR actions.
-    if ui.open.is_git_family() && ui.open != Section::Git {
-        return crate::panel::gitui::context_keys(ui.git.focus)
-            .iter()
-            .take(6)
-            .map(|ck| (ck.chord.to_string(), ck.label.to_string()))
-            .collect();
+    // the help bar can never drift). The Pr section keeps its PR actions.
+    if ui.open.is_git_family() && ui.open != Section::Pr {
+        let ctx_keys = crate::panel::gitui::context_keys(ui.git.focus);
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        // Sequencer flow hint leads: it replaces the generic "m flow menu" in
+        // the table so the label reflects what `m` will actually do right now.
+        if let Some((chord, label)) = crate::panel::gitui::flow_hint(&ui.git.flow) {
+            pairs.push((chord.to_string(), label.to_string()));
+            pairs.extend(
+                ctx_keys
+                    .iter()
+                    .filter(|ck| ck.chord != chord)
+                    .take(6usize.saturating_sub(1))
+                    .map(|ck| (ck.chord.to_string(), ck.label.to_string())),
+            );
+        } else {
+            pairs.extend(
+                ctx_keys
+                    .iter()
+                    .take(6)
+                    .map(|ck| (ck.chord.to_string(), ck.label.to_string())),
+            );
+        }
+        return pairs;
     }
     let pairs: &[(&str, &str)] = match ui.open {
         Section::Changes | Section::Commits | Section::Branches | Section::Stash => {
             unreachable!("git-family sections returned above")
         }
-        Section::Git => &[
+        Section::Pr => &[
             ("j/k", "row"),
             ("M", "merge"),
             ("A", "approve"),
@@ -1531,14 +1639,43 @@ pub(crate) fn panel_help_pairs(ui: &crate::panel::PanelUi) -> Vec<(String, Strin
         ],
         Section::Tests => &[("r", "run"), ("R", "all"), ("f", "failed"), ("↵", "open")],
         Section::Files => &[("↵", "open"), ("y", "yazi")],
+        Section::Issues => &[
+            ("j/k", "row"),
+            ("↵", "link"),
+            ("o", "open"),
+            ("n", "new"),
+            ("e", "edit"),
+        ],
+        Section::Notifications => &[
+            ("j/k", "row"),
+            ("↵", "go to"),
+            ("/ ", "search"),
+            ("r", "read"),
+            ("d", "dismiss"),
+            ("A", "show all"),
+        ],
+        Section::Jobs => &[
+            ("↵", "run"),
+            ("r", "re-run"),
+            ("s", "stop"),
+            ("o", "output"),
+            ("j/k", "select"),
+        ],
+        Section::Logs => &[
+            ("j/k", "row"),
+            ("/ ", "filter"),
+            ("l", "level"),
+            ("y", "copy"),
+            ("e", "export"),
+        ],
         Section::Debug | Section::Sandbox | Section::Db | Section::Telemetry | Section::Keys => {
-            &[("j/k", "row"), ("esc", "back")]
+            &[("j/k", "row")]
         }
     };
-    pairs
-        .iter()
-        .map(|(c, l)| (c.to_string(), l.to_string()))
-        .collect()
+    // "esc back" leads every row-mode hint list so the exit path is always visible.
+    let mut result: Vec<(String, String)> = vec![("esc".to_string(), "back".to_string())];
+    result.extend(pairs.iter().map(|(c, l)| (c.to_string(), l.to_string())));
+    result
 }
 
 /// One pin's slot in the top strip: where it sits and how to label it. The
@@ -2301,9 +2438,10 @@ mod tests {
 
         let mut s = Surface::new(cols, rows);
         let center = crate::center::CenterTree::Leaf(1);
-        // Git section open so the #42 PR summary is on screen.
+        // Pr section open (Work tab) so the #42 PR summary is on screen.
         let panel_ui = crate::panel::PanelUi {
-            open: crate::panel::Section::Git,
+            tab: crate::panel::PanelTab::Work,
+            open: crate::panel::Section::Pr,
             ..Default::default()
         };
         render_tab(
@@ -2338,8 +2476,14 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        // Default tab = Work (Pr section open with #42 PR data); tab bar is visible.
         assert!(
-            panel_col.contains("changes") && panel_col.contains("sandbox"),
+            panel_col.contains("git") && panel_col.contains("work") && panel_col.contains("system"),
+            "tab bar in panel column: {panel_col:?}"
+        );
+        // Work tab sections are visible.
+        assert!(
+            panel_col.contains("pr") && panel_col.contains("issues"),
             "accordion sections fill the panel column: {panel_col:?}"
         );
         assert!(l[rows - 1].contains("Cmd-K"), "status: {:?}", l[rows - 1]);
@@ -2374,7 +2518,7 @@ mod tests {
 
     #[test]
     fn panel_renders_accordion_sections_and_open_content() {
-        use crate::panel::{PanelUi, SECTION_ORDER};
+        use crate::panel::PanelUi;
         let rect = Rect {
             x: 0,
             y: 0,
@@ -2382,26 +2526,31 @@ mod tests {
             rows: 30,
         };
         let model = panel_model();
+        let ui = PanelUi::default(); // tab = Git
         let mut s = Surface::new(44, 30);
-        draw_panel(&mut s, rect, &model, &PanelUi::default());
+        draw_panel(&mut s, rect, &model, &ui);
         let text = s.screen_chars_to_string();
-        // Every section label is on screen, plus the open (Changes)
-        // section's content row and the branch header.
-        for sec in SECTION_ORDER {
+        // Active-tab sections (Git: changes, commits, branches, stash, files)
+        // are on screen; other-tab sections are hidden.
+        for sec in ui.tab_sections() {
             assert!(
                 text.contains(sec.label()),
                 "{} missing: {text:?}",
                 sec.label()
             );
         }
+        // Tab bar labels are always visible.
+        assert!(text.contains("git"), "tab bar: {text:?}");
+        assert!(text.contains("work"), "tab bar: {text:?}");
+        assert!(text.contains("system"), "tab bar: {text:?}");
         assert!(text.contains("feat"), "branch header: {text:?}");
         assert!(text.contains("main.rs"), "open section content: {text:?}");
-        // Help hints moved to the bottom bar: section mode offers the rows
-        // affordance, row mode the open section's actions.
+        // Help hints moved to the bottom bar: section mode offers the open
+        // affordance (Enter to drill into rows), row mode the section's actions.
         assert!(
             panel_help_pairs(&PanelUi::default())
                 .iter()
-                .any(|(_, l)| l == "rows")
+                .any(|(_, l)| l == "open")
         );
         let row_mode = PanelUi {
             row_mode: true,
@@ -2412,6 +2561,27 @@ mod tests {
                 .iter()
                 .any(|(_, l)| l == "stage")
         );
+        // During an active merge conflict the flow hint leads and replaces the
+        // generic "m flow menu" entry in the table.
+        let merge_flow = PanelUi {
+            row_mode: true,
+            git: {
+                let mut g = crate::panel::gitui::GitUi::default();
+                g.flow = crate::panel::gitui::GitFlow::Merge(crate::panel::gitui::SequencerUi {
+                    onto: "main".to_string(),
+                    conflict: true,
+                });
+                g
+            },
+            ..Default::default()
+        };
+        let mf_pairs = panel_help_pairs(&merge_flow);
+        assert_eq!(
+            mf_pairs[0],
+            ("m".to_string(), "merge continue/abort".to_string())
+        );
+        // The generic "m flow menu" entry is suppressed (deduplicated by chord).
+        assert!(!mf_pairs.iter().any(|(_, l)| l == "flow menu"));
         // Degenerate rects never panic or paint.
         let mut tiny = Surface::new(44, 30);
         draw_panel(
@@ -2443,9 +2613,11 @@ mod tests {
             .filter(|(_, h)| matches!(h, PanelHit::OpenSection(_)))
             .map(|(y, _)| *y)
             .collect();
+        // Default tab = Git → 5 sections shown (Changes, Commits, Branches, Stash, Files).
+        let default_ui = PanelUi::default();
         assert_eq!(
             section_rows.len(),
-            crate::panel::SECTION_ORDER.len(),
+            default_ui.tab_sections().len(),
             "hits: {hits:?}"
         );
         let mut dedup = section_rows.clone();
@@ -2489,7 +2661,8 @@ mod tests {
             },
         ];
         let ui = PanelUi {
-            open: Section::Git,
+            tab: crate::panel::PanelTab::Work,
+            open: Section::Pr,
             ..Default::default()
         };
         let mut s = Surface::new(44, 30);

@@ -22,7 +22,13 @@ use std::path::PathBuf;
 /// purely additive. v6: tabs live *within* a worktree — the flat `tab_layout`
 /// (pages encoded as " ·N" name suffixes) becomes `tab_groups` + `group_tabs`;
 /// legacy rows are transformed in place and `tab_layout` is dropped.
-const SCHEMA_VERSION: i64 = 8;
+/// v9: adds `issue_cache` (TTL'd per-repo provider cache) and `issue_links`
+/// (worktree↔issue associations for badge/palette surfacing).
+/// v10: adds `issue_relations` (blocking/blocked-by/duplicate/relates DAG) and
+/// `issue_projects` (sprint/milestone/epic cache per repo+provider).
+/// v11: adds `notifications` inbox (kind, issue ref, message, read flag).
+/// v12: adds `agent_dispatches` (AI agent assignments: issue→worktree→agent).
+const SCHEMA_VERSION: i64 = 12;
 
 pub struct Db {
     conn: Connection,
@@ -242,6 +248,63 @@ impl Db {
               json       TEXT,
               fetched_at INTEGER
             );
+            -- v9: cached issue list per (repo, provider). The JSON column holds
+            -- a `Vec<Issue>` array; the host panel reads from this cache
+            -- immediately on open (zero network latency) and a background worker
+            -- refreshes it on a 60s interval.
+            CREATE TABLE IF NOT EXISTS issue_cache (
+              repo_root  TEXT    NOT NULL,
+              provider   TEXT    NOT NULL,
+              json       TEXT    NOT NULL,
+              fetched_at INTEGER NOT NULL,
+              PRIMARY KEY (repo_root, provider)
+            );
+            -- v9: which issues the user has explicitly linked to a worktree,
+            -- surfaced as tabbar badges and palette quick-links.
+            CREATE TABLE IF NOT EXISTS issue_links (
+              worktree_path TEXT    NOT NULL,
+              issue_id      TEXT    NOT NULL,
+              linked_at     INTEGER NOT NULL,
+              PRIMARY KEY (worktree_path, issue_id)
+            );
+            -- v10: directional blocking relationships between issues.
+            CREATE TABLE IF NOT EXISTS issue_relations (
+              issue_id   TEXT    NOT NULL,
+              related_id TEXT    NOT NULL,
+              kind       TEXT    NOT NULL,
+              provider   TEXT    NOT NULL,
+              fetched_at INTEGER NOT NULL,
+              PRIMARY KEY (issue_id, related_id, kind)
+            );
+            -- v10: project/sprint/milestone cache per repo+provider.
+            CREATE TABLE IF NOT EXISTS issue_projects (
+              repo_root  TEXT    NOT NULL,
+              provider   TEXT    NOT NULL,
+              json       TEXT    NOT NULL,
+              fetched_at INTEGER NOT NULL,
+              PRIMARY KEY (repo_root, provider)
+            );
+            -- v11: notification inbox. Rows accumulate from the diff engine;
+            -- the panel inbox marks them read.
+            CREATE TABLE IF NOT EXISTS notifications (
+              id             INTEGER PRIMARY KEY AUTOINCREMENT,
+              kind           TEXT    NOT NULL,
+              issue_id       TEXT    NOT NULL,
+              message        TEXT    NOT NULL,
+              created_at_ms  INTEGER NOT NULL,
+              read           INTEGER NOT NULL DEFAULT 0,
+              worktree_path  TEXT    NOT NULL DEFAULT ''
+            );
+            -- v12: agent dispatch registry.  Each row tracks one AI coding
+            -- agent assigned to work on one issue in a dedicated worktree.
+            CREATE TABLE IF NOT EXISTS agent_dispatches (
+              id               INTEGER PRIMARY KEY AUTOINCREMENT,
+              issue_id         TEXT    NOT NULL,
+              worktree_path    TEXT    NOT NULL,
+              agent_name       TEXT    NOT NULL,
+              dispatched_at_ms INTEGER NOT NULL,
+              status           TEXT    NOT NULL DEFAULT 'queued'
+            );
             COMMIT;
             "#,
         )?;
@@ -322,6 +385,213 @@ impl Db {
                ON CONFLICT(repo_root) DO UPDATE SET json=?2, fetched_at=?3"#,
             params![repo_root, json, util::now()],
         )?;
+        Ok(())
+    }
+
+    // --- issue tracker cache (TTL'd, per repo+provider) ---------------------
+    pub fn get_issue_cache(
+        &self,
+        repo_root: &str,
+        provider: &str,
+    ) -> Result<Option<(String, i64)>> {
+        let r = self
+            .conn
+            .query_row(
+                "SELECT json, fetched_at FROM issue_cache WHERE repo_root=?1 AND provider=?2",
+                params![repo_root, provider],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .ok();
+        Ok(r)
+    }
+
+    pub fn put_issue_cache(&self, repo_root: &str, provider: &str, json: &str) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO issue_cache(repo_root,provider,json,fetched_at)
+               VALUES(?1,?2,?3,?4)
+               ON CONFLICT(repo_root,provider) DO UPDATE SET json=?3, fetched_at=?4"#,
+            params![repo_root, provider, json, util::now()],
+        )?;
+        Ok(())
+    }
+
+    // --- worktree↔issue links (badge + palette surfacing) -------------------
+    /// Associate `issue_id` (in `"<provider>:<key>"` form) with a worktree path.
+    pub fn link_issue(&self, worktree_path: &str, issue_id: &str) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO issue_links(worktree_path,issue_id,linked_at)
+               VALUES(?1,?2,?3)
+               ON CONFLICT(worktree_path,issue_id) DO UPDATE SET linked_at=?3"#,
+            params![worktree_path, issue_id, util::now()],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a worktree↔issue association.
+    pub fn unlink_issue(&self, worktree_path: &str, issue_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM issue_links WHERE worktree_path=?1 AND issue_id=?2",
+            params![worktree_path, issue_id],
+        )?;
+        Ok(())
+    }
+
+    /// All issue ids linked to a worktree, newest first.
+    pub fn linked_issues(&self, worktree_path: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT issue_id FROM issue_links WHERE worktree_path=?1 ORDER BY linked_at DESC",
+        )?;
+        let rows = stmt.query_map(params![worktree_path], |r| r.get::<_, String>(0))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    // --- notifications inbox -------------------------------------------------
+
+    /// Append a notification.  Returns the new row id.
+    pub fn put_notification(
+        &self,
+        kind: &str,
+        issue_id: &str,
+        message: &str,
+        worktree_path: &str,
+    ) -> Result<i64> {
+        self.conn.execute(
+            r#"INSERT INTO notifications(kind,issue_id,message,created_at_ms,read,worktree_path)
+               VALUES(?1,?2,?3,?4,0,?5)"#,
+            params![kind, issue_id, message, util::now(), worktree_path],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// All unread notifications, newest first.
+    pub fn get_unread_notifications(&self) -> Result<Vec<crate::notification::Notification>> {
+        self.notifications_query(
+            "SELECT id,kind,issue_id,message,created_at_ms,read,worktree_path \
+             FROM notifications WHERE read=0 ORDER BY created_at_ms DESC",
+            rusqlite::params![],
+            usize::MAX,
+        )
+    }
+
+    /// All notifications (read and unread), newest first, capped at `limit`.
+    pub fn get_all_notifications(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::notification::Notification>> {
+        self.notifications_query(
+            "SELECT id,kind,issue_id,message,created_at_ms,read,worktree_path \
+             FROM notifications ORDER BY created_at_ms DESC",
+            rusqlite::params![],
+            limit,
+        )
+    }
+
+    fn notifications_query(
+        &self,
+        sql: &str,
+        _params: &[&dyn rusqlite::ToSql],
+        limit: usize,
+    ) -> Result<Vec<crate::notification::Notification>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, String>(6)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows.filter_map(|r| r.ok()) {
+            if out.len() >= limit {
+                break;
+            }
+            let kind: crate::notification::NotificationKind =
+                serde_json::from_str(&format!("\"{}\"", row.1))
+                    .unwrap_or(crate::notification::NotificationKind::StatusChanged);
+            out.push(crate::notification::Notification {
+                id: row.0,
+                kind,
+                source_ref: row.2,
+                message: row.3,
+                created_at_ms: row.4,
+                read: row.5 != 0,
+                worktree_path: row.6,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Mark a single notification as read.
+    pub fn mark_notification_read(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("UPDATE notifications SET read=1 WHERE id=?1", params![id])?;
+        Ok(())
+    }
+
+    /// Mark all notifications as read.
+    pub fn mark_all_notifications_read(&self) -> Result<()> {
+        self.conn.execute("UPDATE notifications SET read=1", [])?;
+        Ok(())
+    }
+
+    // --- agent dispatch registry ---------------------------------------------
+
+    /// Record a new agent dispatch.  Returns the new row id.
+    pub fn put_agent_dispatch(
+        &self,
+        issue_id: &str,
+        worktree_path: &str,
+        agent_name: &str,
+    ) -> Result<i64> {
+        self.conn.execute(
+            r#"INSERT INTO agent_dispatches(issue_id,worktree_path,agent_name,dispatched_at_ms,status)
+               VALUES(?1,?2,?3,?4,'queued')"#,
+            params![issue_id, worktree_path, agent_name, util::now()],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Update the status of a dispatch.
+    pub fn update_dispatch_status(&self, id: i64, status: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE agent_dispatches SET status=?1 WHERE id=?2",
+            params![status, id],
+        )?;
+        Ok(())
+    }
+
+    /// Find the dispatch id for a worktree path (most recent, if any).
+    pub fn dispatch_for_worktree(&self, worktree_path: &str) -> Result<Option<i64>> {
+        Ok(self.conn
+            .query_row(
+                "SELECT id FROM agent_dispatches WHERE worktree_path=?1 ORDER BY dispatched_at_ms DESC, id DESC LIMIT 1",
+                params![worktree_path],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?)
+    }
+
+    /// Find the dispatch id and originating issue id for a worktree path.
+    pub fn dispatch_info_for_worktree(&self, worktree_path: &str) -> Result<Option<(i64, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, issue_id FROM agent_dispatches WHERE worktree_path=?1 \
+                 ORDER BY dispatched_at_ms DESC, id DESC LIMIT 1",
+                params![worktree_path],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Delete a single notification row (dismiss).
+    pub fn delete_notification(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM notifications WHERE id=?1", params![id])?;
         Ok(())
     }
 
@@ -1740,5 +2010,159 @@ mod tests {
             db.get_ui_state("s1", "sort_mode").unwrap(),
             Some("recent".to_string())
         );
+    }
+
+    #[test]
+    fn issue_cache_roundtrips_and_updates() {
+        let db = db();
+        // Cold cache returns None.
+        assert!(db.get_issue_cache("/repo", "linear").unwrap().is_none());
+        // Write and read back.
+        db.put_issue_cache("/repo", "linear", r#"[{"id":"linear:A-1"}]"#)
+            .unwrap();
+        let (json, ts) = db.get_issue_cache("/repo", "linear").unwrap().unwrap();
+        assert_eq!(json, r#"[{"id":"linear:A-1"}]"#);
+        assert!(ts > 0);
+        // Different provider is independent.
+        assert!(db.get_issue_cache("/repo", "github").unwrap().is_none());
+        // Upsert overwrites.
+        db.put_issue_cache("/repo", "linear", r#"[{"id":"linear:A-2"}]"#)
+            .unwrap();
+        let (json2, _) = db.get_issue_cache("/repo", "linear").unwrap().unwrap();
+        assert_eq!(json2, r#"[{"id":"linear:A-2"}]"#);
+    }
+
+    #[test]
+    fn issue_links_crud() {
+        let db = db();
+        // No links initially.
+        assert!(db.linked_issues("/wt/a").unwrap().is_empty());
+        // Link two issues.
+        db.link_issue("/wt/a", "linear:A-1").unwrap();
+        db.link_issue("/wt/a", "github:42").unwrap();
+        let links = db.linked_issues("/wt/a").unwrap();
+        assert_eq!(links.len(), 2);
+        assert!(links.contains(&"linear:A-1".to_string()));
+        assert!(links.contains(&"github:42".to_string()));
+        // Another worktree is isolated.
+        assert!(db.linked_issues("/wt/b").unwrap().is_empty());
+        // Unlink removes exactly one.
+        db.unlink_issue("/wt/a", "linear:A-1").unwrap();
+        let links = db.linked_issues("/wt/a").unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0], "github:42");
+        // Linking twice is idempotent (no duplicate).
+        db.link_issue("/wt/a", "github:42").unwrap();
+        assert_eq!(db.linked_issues("/wt/a").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn notifications_put_and_read_and_mark_read() {
+        let db = db();
+        // No notifications initially.
+        assert!(db.get_unread_notifications().unwrap().is_empty());
+        // Add two notifications.
+        db.put_notification("status_changed", "linear:A-1", "A-1 moved to Done", "/wt/x")
+            .unwrap();
+        db.put_notification("assigned", "linear:A-2", "A-2 assigned to you", "/wt/x")
+            .unwrap();
+        let unread = db.get_unread_notifications().unwrap();
+        assert_eq!(unread.len(), 2);
+        // Mark one read by id.
+        let first_id = unread[0].id;
+        db.mark_notification_read(first_id).unwrap();
+        assert_eq!(db.get_unread_notifications().unwrap().len(), 1);
+        // Mark all read clears the rest.
+        db.mark_all_notifications_read().unwrap();
+        assert!(db.get_unread_notifications().unwrap().is_empty());
+    }
+
+    #[test]
+    fn agent_dispatch_roundtrip() {
+        let db = db();
+        // No dispatch for unknown path.
+        assert!(db.dispatch_for_worktree("/wt/issue").unwrap().is_none());
+        // Insert a dispatch.
+        let id = db
+            .put_agent_dispatch("linear:A-1", "/wt/issue", "claude")
+            .unwrap();
+        assert!(id > 0);
+        // Retrieve by worktree path.
+        let found = db.dispatch_for_worktree("/wt/issue").unwrap();
+        assert_eq!(found, Some(id));
+        // Update status.
+        db.update_dispatch_status(id, "running").unwrap();
+        // A different worktree is isolated.
+        assert!(db.dispatch_for_worktree("/wt/other").unwrap().is_none());
+    }
+
+    #[test]
+    fn dispatch_info_for_worktree_returns_id_and_issue_id() {
+        let db = db();
+        // No result for unknown path.
+        assert!(db.dispatch_info_for_worktree("/wt/x").unwrap().is_none());
+        // Insert dispatch.
+        let id = db
+            .put_agent_dispatch("linear:B-7", "/wt/x", "claude")
+            .unwrap();
+        // Info returns both id and issue id.
+        let info = db.dispatch_info_for_worktree("/wt/x").unwrap();
+        assert_eq!(info, Some((id, "linear:B-7".to_string())));
+        // Multiple dispatches: most recent wins.
+        let id2 = db
+            .put_agent_dispatch("linear:B-8", "/wt/x", "claude")
+            .unwrap();
+        let info2 = db.dispatch_info_for_worktree("/wt/x").unwrap();
+        assert_eq!(info2, Some((id2, "linear:B-8".to_string())));
+    }
+
+    #[test]
+    fn get_all_notifications_returns_read_and_unread() {
+        let db = db();
+        // 2 read + 1 unread.
+        let id1 = db
+            .put_notification("assigned", "linear:A-1", "msg1", "/wt")
+            .unwrap();
+        let id2 = db
+            .put_notification("status_changed", "linear:A-2", "msg2", "/wt")
+            .unwrap();
+        db.put_notification("test_failed", "/wt", "msg3", "/wt")
+            .unwrap();
+        db.mark_notification_read(id1).unwrap();
+        db.mark_notification_read(id2).unwrap();
+        // get_all_notifications returns all 3.
+        let all = db.get_all_notifications(100).unwrap();
+        assert_eq!(all.len(), 3);
+        // get_unread_notifications returns only 1.
+        let unread = db.get_unread_notifications().unwrap();
+        assert_eq!(unread.len(), 1);
+    }
+
+    #[test]
+    fn get_all_notifications_respects_limit() {
+        let db = db();
+        for i in 0..60 {
+            db.put_notification("assigned", &format!("ref:{i}"), "msg", "/wt")
+                .unwrap();
+        }
+        let capped = db.get_all_notifications(50).unwrap();
+        assert_eq!(capped.len(), 50);
+        let all = db.get_all_notifications(100).unwrap();
+        assert_eq!(all.len(), 60);
+    }
+
+    #[test]
+    fn delete_notification_removes_single_row() {
+        let db = db();
+        let id = db
+            .put_notification("agent_done", "linear:A-1", "done", "/wt")
+            .unwrap();
+        db.put_notification("agent_done", "linear:A-2", "done", "/wt")
+            .unwrap();
+        assert_eq!(db.get_all_notifications(10).unwrap().len(), 2);
+        db.delete_notification(id).unwrap();
+        let remaining = db.get_all_notifications(10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_ne!(remaining[0].id, id);
     }
 }

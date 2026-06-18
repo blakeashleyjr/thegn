@@ -132,6 +132,11 @@ fn repair_gitconfig(gitconfig: &Path, home: &Path) {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
+
+    /// Serialises tests that mutate `HOME` so that sandbox tests reading
+    /// `HOME` in parallel don't see a temp path that's about to be deleted.
+    static HOME_LOCK: Mutex<()> = Mutex::new(());
 
     /// Create a unique temp directory for each test — avoids cross-test
     /// interference without requiring the `tempfile` crate.
@@ -250,22 +255,30 @@ mod tests {
         let gitconfig = home.join(".gitconfig");
         fs::create_dir(&gitconfig).unwrap();
 
-        // Override HOME for the duration of this check.
+        // Hold the lock for the entire HOME-mutation window so that the
+        // sandbox test, which reads HOME to build toolchain mounts, never
+        // sees a temp path that's about to be deleted.
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
         let original_home = std::env::var("HOME").ok();
-        // SAFETY: test-only mutation, single-threaded at this point.
+        // SAFETY: test-only mutation, protected by HOME_LOCK above.
         unsafe { std::env::set_var("HOME", &home) };
 
         run_checks();
 
+        // Assert before cleanup: the symlink must exist while the temp home dir
+        // is still on disk.
+        let meta = fs::symlink_metadata(&gitconfig).unwrap();
+        assert!(meta.file_type().is_symlink());
+
+        // Restore HOME and remove temp dir while still holding the lock so no
+        // concurrent reader can observe a HOME pointing at a deleted path.
         if let Some(h) = original_home {
             unsafe { std::env::set_var("HOME", h) };
         } else {
             unsafe { std::env::remove_var("HOME") };
         }
-
-        // ~/.gitconfig should now be a symlink.
-        let meta = fs::symlink_metadata(&gitconfig).unwrap();
-        assert!(meta.file_type().is_symlink());
         let _ = fs::remove_dir_all(&home);
+        drop(_guard); // HOME is restored and temp dir is gone
     }
 }

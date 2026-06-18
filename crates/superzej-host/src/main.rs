@@ -114,6 +114,16 @@ pub enum Command {
         /// Path to the worktree (defaults to the current directory).
         worktree: Option<String>,
     },
+    /// Push, list, dismiss, or read notifications (plugin/script API).
+    Notify {
+        #[command(subcommand)]
+        action: cmd::notify::Action,
+    },
+    /// Tail or query the szhost log file (plugin/script API).
+    Logs {
+        #[command(subcommand)]
+        action: cmd::logs::Action,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -163,6 +173,8 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Repos => cmd::repos::repos(&cfg),
         Command::Recent { count } => cmd::repos::recent(count),
         Command::Config { action } => cmd::config::run(&cfg, action, config_path),
+        Command::Notify { action } => cmd::notify::run(action),
+        Command::Logs { action } => cmd::logs::run(&cfg, action),
         Command::SandboxArgv { worktree } => {
             let wt = worktree
                 .or_else(|| std::env::current_dir().ok()?.to_str().map(str::to_string))

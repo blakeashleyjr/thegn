@@ -147,6 +147,10 @@ pub enum GitOp {
     Push {
         force: ForceMode,
     },
+    PushSetUpstream {
+        remote: String,
+        branch: String,
+    },
     Pull,
     Fetch,
     Nuke,
@@ -254,6 +258,7 @@ impl GitOp {
             GitOp::RebaseBranch { .. } | GitOp::RebaseOnto { .. } => "rebasing",
             GitOp::FastForward { .. } => "fast-forwarding",
             GitOp::Push { .. } => "pushing",
+            GitOp::PushSetUpstream { .. } => "pushing (set upstream)",
             GitOp::Pull => "pulling",
             GitOp::Fetch => "fetching",
             GitOp::Nuke => "nuking working tree",
@@ -302,7 +307,11 @@ impl GitOp {
     pub fn touches_remote(&self) -> bool {
         matches!(
             self,
-            GitOp::Push { .. } | GitOp::Pull | GitOp::Fetch | GitOp::FastForward { .. }
+            GitOp::Push { .. }
+                | GitOp::PushSetUpstream { .. }
+                | GitOp::Pull
+                | GitOp::Fetch
+                | GitOp::FastForward { .. }
         )
     }
 }
@@ -325,6 +334,11 @@ pub enum GitOpResult {
     /// Captured custom-command output for the popup.
     Output(String),
     Err(String),
+    /// Push failed because the branch has no upstream. The caller can offer
+    /// to run `push -u origin <branch>`.
+    NoUpstream {
+        branch: String,
+    },
 }
 
 fn selection_of(indices: &[(usize, usize)]) -> superzej_core::patch::Selection {
@@ -459,7 +473,30 @@ pub fn execute(op: GitOp, loc: &GitLoc, override_gpg: bool) -> GitOpResult {
         GitOp::FastForward { branch, current } => {
             done(g.fast_forward(loc, &branch, current, "origin"))
         }
-        GitOp::Push { force } => done(g.push(loc, force)),
+        GitOp::PushSetUpstream { remote, branch } => {
+            done(g.push_set_upstream(loc, &remote, &branch))
+        }
+        GitOp::Push { force } => {
+            match g.push(loc, force) {
+                Ok(()) => GitOpResult::Ok(None),
+                Err(e) => {
+                    let msg = format!("{e}");
+                    // `git push` with no upstream prints "has no upstream branch"
+                    // or "no configured push destination". Offer to set it.
+                    if msg.contains("has no upstream branch")
+                        || msg.contains("no configured push destination")
+                        || msg.contains("set-upstream")
+                    {
+                        let branch = loc
+                            .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
+                            .unwrap_or_default();
+                        GitOpResult::NoUpstream { branch }
+                    } else {
+                        GitOpResult::Err(first_line_str(&msg))
+                    }
+                }
+            }
+        }
         GitOp::Pull => done(g.pull(loc)),
         GitOp::Fetch => done(g.fetch(loc)),
         GitOp::Nuke => done(g.nuke_working_tree(loc)),
@@ -533,7 +570,10 @@ pub fn execute(op: GitOp, loc: &GitLoc, override_gpg: bool) -> GitOpResult {
 }
 
 fn first_line(e: &anyhow::Error) -> String {
-    let s = e.to_string();
+    first_line_str(&e.to_string())
+}
+
+fn first_line_str(s: &str) -> String {
     s.lines().next().unwrap_or("git error").to_string()
 }
 

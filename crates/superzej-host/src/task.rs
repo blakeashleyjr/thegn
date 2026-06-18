@@ -327,7 +327,7 @@ pub fn configured_test_tasks(cfg: &Config) -> Vec<TestTask> {
         .collect()
 }
 
-fn test_task_from_config(t: &Task) -> TestTask {
+pub fn test_task_from_config(t: &Task) -> TestTask {
     let mut command = t.command.clone();
     if !t.args.is_empty() {
         command.push(' ');

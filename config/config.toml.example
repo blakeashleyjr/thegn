@@ -419,13 +419,17 @@ command = "git diff"
 ratio = 0.2
 visible = true
 
-# The right accordion panel. `sections` sets the display order — the numbered
-# jump keys (1..) follow the list — and any section left out is hidden
-# entirely. An empty/absent list shows every section in the built-in order:
-#   changes · git · files · tests · debug · sandbox · db · telemetry · keys
+# The right accordion panel. Three top-level tabs (git/work/system) group
+# sections by concern; `[` / `]` cycle tabs, Alt+1/2/3 jump directly.
+# `sections` reorders sections across all tabs — any section left out is hidden;
+# an empty/absent list shows every section in the built-in order:
+#   Git tab:    changes · commits · branches · stash · files
+#   Work tab:   pr · issues · jobs · tests
+#   System tab: notifications · logs · sandbox · telemetry · keys
+# The old "prs" and "tasks" keys still work as aliases for "pr" and "jobs".
 # Unknown keys are ignored; reloads apply live.
 [panel]
-# sections = ["changes", "git", "files", "tests", "telemetry", "keys"]
+# sections = ["changes", "pr", "files", "tests", "telemetry", "keys"]
 
 # Pinned programs: summoned from anywhere with Alt-1..9 (in registration order)
 # or the tabbar's pin chips. Pins run on the host (no sandbox) and are managed by

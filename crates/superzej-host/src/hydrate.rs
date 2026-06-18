@@ -17,15 +17,18 @@ use crate::run::now_secs;
 
 const MODEL_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const PR_REFRESH_INTERVAL: Duration = Duration::from_secs(20);
+const ISSUE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A refresh request delivered to the event loop. `Model` rehydrates the
 /// sidebar/panel/diff (cheap, gix-backed, off-thread); `Pr` additionally kicks
-/// the GitHub PR-cache refresh. Both arrive event-driven (worktree fs-watch,
-/// tab switch) and on a low-frequency safety-net interval.
+/// the GitHub PR-cache refresh; `Issues` kicks the issue-tracker cache refresh.
+/// All arrive event-driven (worktree fs-watch, tab switch) and on low-frequency
+/// safety-net intervals.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RefreshKind {
     Model,
     Pr,
+    Issues,
 }
 
 /// Background ticker: emits a `Model` refresh every `MODEL_REFRESH_INTERVAL` and
@@ -51,6 +54,7 @@ pub(crate) fn spawn_refresh_ticker(
         let tick = Duration::from_millis(500);
         let model_every = MODEL_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let pr_every = PR_REFRESH_INTERVAL.as_millis() as u64 / 500;
+        let issue_every = ISSUE_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let mut ticks: u64 = 0;
         // System stats for the top bar ride the same thread/cadence — the
         // /proc reads never touch the event loop.
@@ -69,6 +73,12 @@ pub(crate) fn spawn_refresh_ticker(
                 };
                 if tx.send(kind).is_err() {
                     break; // loop gone
+                }
+                wake = true;
+            }
+            if ticks.is_multiple_of(issue_every) {
+                if tx.send(RefreshKind::Issues).is_err() {
+                    break;
                 }
                 wake = true;
             }
@@ -483,18 +493,20 @@ pub(crate) fn build_initial_model(
 
 /// What the open panel needs from this hydration pass — lets `build_model`
 /// skip work for closed sections (the git log, the file count).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct HydrateHints {
     pub open: crate::panel::Section,
     pub expanded: bool,
+    /// The configured issue provider id (`"none"` when disabled, `""` treated as "none").
+    pub issues_provider: String,
 }
 
 impl HydrateHints {
-    fn wants_commits(self) -> bool {
+    fn wants_commits(&self) -> bool {
         self.open == crate::panel::Section::Commits || (self.expanded && self.open.is_git_family())
     }
 
-    fn visible_commit_limit(self) -> usize {
+    fn visible_commit_limit(&self) -> usize {
         if self.expanded { 80 } else { 20 }
     }
 }
@@ -673,7 +685,7 @@ pub(crate) fn build_model(
     panel.stash_count = git.stash_count(&loc).unwrap_or(0);
 
     // The git section's LOG block — only fetched while that section is open.
-    if hints.open == crate::panel::Section::Git {
+    if hints.open == crate::panel::Section::Pr {
         let n = if hints.expanded { 12 } else { 6 };
         panel.log = git.log_graph(&loc, n).unwrap_or_default();
     }
@@ -764,12 +776,87 @@ pub(crate) fn build_model(
         panel.all_files = files;
     }
 
+    // Issue tracker cache — reads directly from the DB (no network;
+    // the background `spawn_issue_cache_refresh` keeps the cache warm).
+    let provider = hints.issues_provider.as_str();
+    if !provider.is_empty() && provider != "none" {
+        if let Ok(Some((json, _))) = db.get_issue_cache(&loc.path(), provider)
+            && let Ok(issues) = serde_json::from_str::<Vec<superzej_core::issue::Issue>>(&json)
+        {
+            panel.tracker_issues = issues;
+        }
+        if let Ok(links) = db.linked_issues(&cwd.to_string_lossy()) {
+            panel.tracker_links = links;
+        }
+    }
+    // Full notification list for the inbox panel; badge count is derived from it.
+    if let Ok(notifications) = db.get_all_notifications(50) {
+        panel.unread_notifications = notifications.iter().filter(|n| !n.read).count();
+        panel.notifications = notifications;
+    }
+    // Tasks section: populate task specs from config.
+    // Only non-test tasks go here; the Tests section handles TestKind tasks.
+    if let Ok(task_cfg) = superzej_core::config::Config::try_load_layered(
+        &superzej_core::config::ProcessEnv,
+        &[],
+        None,
+    ) {
+        panel.task_specs = task_cfg
+            .tasks
+            .iter()
+            .filter(|t| t.kind != superzej_core::config::TaskKind::Test)
+            .cloned()
+            .collect();
+    }
+
+    // Logs section: tail the szhost log file.
+    // Always scan for new ERRORs to surface as notifications; full tail only
+    // when the section is open (to avoid reading 5 MB on every tick).
+    let log_path = superzej_core::util::xdg_state_home().join("superzej/logs/szhost.log");
+    if log_path.exists() {
+        if let Ok(bytes) = std::fs::read(&log_path) {
+            let content = String::from_utf8_lossy(bytes.as_ref());
+            let all_lines: Vec<_> = content
+                .lines()
+                .filter_map(superzej_core::log_view::parse_log_line)
+                .collect();
+
+            // Surface new ERROR lines as a notification (at most once per 5 min).
+            let now_ms = superzej_core::util::now();
+            let five_min_ms: i64 = 5 * 60 * 1_000;
+            let has_recent_log_error = panel
+                .notifications
+                .iter()
+                .any(|n| n.source_ref == "log:szhost" && now_ms - n.created_at_ms < five_min_ms);
+            if !has_recent_log_error {
+                let error_count = all_lines
+                    .iter()
+                    .filter(|l| l.level == superzej_core::log_view::LogLevel::Error)
+                    .count();
+                if error_count > 0 {
+                    let msg = format!(
+                        "{} error{} in szhost.log",
+                        error_count,
+                        if error_count == 1 { "" } else { "s" }
+                    );
+                    let _ = db.put_notification("log_error", "log:szhost", &msg, "");
+                }
+            }
+
+            if hints.open == crate::panel::Section::Logs {
+                let start = all_lines.len().saturating_sub(500);
+                panel.log_lines = all_lines[start..].to_vec();
+            }
+        }
+    }
+
     tracing::debug!(
         target: "szhost::hydrate",
         build_model_ms = t0.elapsed().as_millis() as u64,
         diff_files = panel.files.len(),
         changes = panel.changes.len(),
         merging = panel.merge.is_some(),
+        tracker_issues = panel.tracker_issues.len(),
         "model hydrated"
     );
     let (worktree, tabs, active_tab) = tab_strip(session);
@@ -813,7 +900,7 @@ pub(crate) fn spawn_model_hydration(
         let Ok(db) = superzej_core::db::Db::open() else {
             return;
         };
-        let first = build_model(&session, &db, hints);
+        let first = build_model(&session, &db, hints.clone());
         let refresh_commits = first.panel.commits_loading;
         if tx.send((generation, first)).is_ok()
             && let Some(w) = &waker
@@ -849,15 +936,45 @@ pub(crate) fn spawn_pr_cache_refresh(
             return;
         }
         let loc = superzej_core::remote::GitLoc::for_worktree(&cwd);
+        let Ok(db) = superzej_core::db::Db::open() else {
+            return;
+        };
+
+        // Snapshot the old PR state BEFORE overwriting the cache.
+        let old_pr_state: Option<String> = db
+            .get_pr_cache(&loc.path())
+            .ok()
+            .flatten()
+            .and_then(|(json, _)| {
+                serde_json::from_str::<superzej_core::github::PrPanel>(&json).ok()
+            })
+            .and_then(|p| match p.state {
+                superzej_core::github::PanelState::Pr(pr) => Some(pr.state),
+                _ => None,
+            });
+
         // The full feed: PR + checks + review threads + issues (extras are
         // best-effort and never fail the panel).
         let panel = superzej_core::github::pr_status_full(&loc);
         let Ok(json) = serde_json::to_string(&panel) else {
             return;
         };
-        if let Ok(db) = superzej_core::db::Db::open() {
-            let _ = db.put_pr_cache(&loc.path(), &panel.branch, &json);
+        let _ = db.put_pr_cache(&loc.path(), &panel.branch, &json);
+
+        // Emit a notification when the PR transitions between states
+        // (e.g. OPEN → MERGED). Only fires when there was a prior known state
+        // to diff against — avoids spurious notifications on first fetch.
+        if let superzej_core::github::PanelState::Pr(ref pr) = panel.state {
+            if let Some(old) = &old_pr_state {
+                if old != &pr.state {
+                    let pr_ref = format!("pr:{}", pr.number);
+                    let msg = format!("PR #{} {} → {}", pr.number, old, pr.state);
+                    let wt = cwd.to_string_lossy();
+                    let _ = db.put_notification("pr_state_changed", &pr_ref, &msg, &wt);
+                }
+            }
         }
+
         // PR cache landing should surface via a model rehydrate; pulse the waker
         // so an idle loop repaints promptly.
         if let Some(w) = &waker {
@@ -894,6 +1011,86 @@ pub(crate) fn spawn_pr_cache_refresh(
             if let Some(w) = &branch_waker {
                 let _ = w.wake();
             }
+        }
+    });
+}
+
+/// Refresh the issue-tracker cache for the active worktree's repo.  Runs
+/// entirely off-thread (no event-loop contact); writes the fresh JSON into
+/// `issue_cache` and pulses the waker so the loop rehydrates promptly.
+pub(crate) fn spawn_issue_cache_refresh(
+    session: crate::session::Session,
+    cfg: superzej_core::config::IssuesConfig,
+    waker: Option<TerminalWaker>,
+) {
+    task::spawn_blocking(move || {
+        use superzej_core::issue::IssueFilter;
+        use superzej_svc::issue::IssueRouter;
+
+        let cwd = active_tab_path(&session);
+        if !cwd.is_dir() {
+            return;
+        }
+        let router = IssueRouter::from_config(&cfg);
+        if !router.is_configured() {
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        let filter = IssueFilter {
+            assignee_me: cfg.filter_assignee_me,
+            limit: cfg.max_issues,
+            ..Default::default()
+        };
+        let Ok(issues) = rt.block_on(router.list_issues(&filter)) else {
+            return;
+        };
+        let Ok(json) = serde_json::to_string(&issues) else {
+            return;
+        };
+        if let Ok(db) = superzej_core::db::Db::open() {
+            // Diff old vs new to emit notifications before overwriting.
+            let old_issues: Vec<superzej_core::issue::Issue> = db
+                .get_issue_cache(&cwd.to_string_lossy(), router.provider_id())
+                .ok()
+                .flatten()
+                .and_then(|(j, _)| serde_json::from_str(&j).ok())
+                .unwrap_or_default();
+            let old_map: std::collections::HashMap<&str, &superzej_core::issue::IssueStatus> =
+                old_issues
+                    .iter()
+                    .map(|i| (i.id.as_str(), &i.status))
+                    .collect();
+            let linked: std::collections::HashSet<String> = db
+                .linked_issues(&cwd.to_string_lossy())
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            for issue in &issues {
+                if let Some(&old_status) = old_map.get(issue.id.as_str()) {
+                    if *old_status != issue.status && linked.contains(&issue.id) {
+                        let msg = format!(
+                            "{} status changed to {}",
+                            issue.number,
+                            issue.status.label()
+                        );
+                        let _ = db.put_notification(
+                            "status_changed",
+                            &issue.id,
+                            &msg,
+                            &cwd.to_string_lossy(),
+                        );
+                    }
+                }
+            }
+            let _ = db.put_issue_cache(&cwd.to_string_lossy(), router.provider_id(), &json);
+        }
+        if let Some(w) = &waker {
+            let _ = w.wake();
         }
     });
 }

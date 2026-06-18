@@ -1,15 +1,18 @@
-//! The right panel: the accordion sidebar over the focused worktree — a
-//! branch-header zone, numbered one-line sections (changes · git · files ·
-//! tests · debug · sandbox · db · telemetry · keys) with live summaries and
-//! the open section's content beneath it. `[panel] sections` in the config
-//! reorders the accordion and hides sections entirely.
+//! The right panel: a tabbed accordion sidebar over the focused worktree.
+//! Three top-level tabs group the sections by concern:
+//! - **Git** — Changes, Commits, Branches, Stash, Files
+//! - **Work** — PR, Issues, Jobs, Tests
+//! - **System** — Notifications, Logs, Sandbox, Telemetry, Keys
+//!
+//! Each tab shows its own accordion; `[panel] sections` reorders/hides sections
+//! within the full list, and tabs filter that list to their assigned sections.
 //!
 //! Split into two halves:
 //! - [`PanelData`] — the git/GitHub payload, rebuilt by the host's background
 //!   model hydration and carried on the `FrameModel`. Cheap to clone, `Send`.
-//! - [`PanelUi`] — the interactive state (open section, panel width, row
-//!   cursor, the banked hunk previews). Owned by the event loop so it
-//!   survives data refreshes.
+//! - [`PanelUi`] — the interactive state (active tab, open section, panel
+//!   width, row cursor, the banked hunk previews). Owned by the event loop so
+//!   it survives data refreshes.
 //!
 //! Rendering lives in `chrome.rs` next to the other `draw_*` surfaces; this
 //! module owns the data model + the pure key→intent navigation logic.
@@ -26,6 +29,57 @@ pub mod staging;
 
 use termwiz::input::{KeyCode, Modifiers};
 
+/// The three top-level panel tabs that group sections by concern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PanelTab {
+    /// Git operations: Changes, Commits, Branches, Stash, Files.
+    #[default]
+    Git,
+    /// Work-item context: PR, Issues, Jobs, Tests.
+    Work,
+    /// System & monitoring: Notifications, Logs, Sandbox, Telemetry, Keys.
+    System,
+}
+
+impl PanelTab {
+    pub fn label(self) -> &'static str {
+        match self {
+            PanelTab::Git => "git",
+            PanelTab::Work => "work",
+            PanelTab::System => "system",
+        }
+    }
+
+    pub fn as_key(self) -> &'static str {
+        self.label()
+    }
+
+    pub fn from_key(key: &str) -> Option<PanelTab> {
+        match key {
+            "git" => Some(PanelTab::Git),
+            "work" => Some(PanelTab::Work),
+            "system" => Some(PanelTab::System),
+            _ => None,
+        }
+    }
+
+    pub fn next(self) -> PanelTab {
+        match self {
+            PanelTab::Git => PanelTab::Work,
+            PanelTab::Work => PanelTab::System,
+            PanelTab::System => PanelTab::Git,
+        }
+    }
+
+    pub fn prev(self) -> PanelTab {
+        match self {
+            PanelTab::Git => PanelTab::System,
+            PanelTab::Work => PanelTab::Git,
+            PanelTab::System => PanelTab::Work,
+        }
+    }
+}
+
 /// A mouse/row target inside the rendered panel. The frame builder attaches
 /// these to rows; the loop resolves clicks and row-mode Enter against them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +90,8 @@ pub enum PanelHit {
     Expand,
     /// The i-th actionable row of a section's content.
     Row(Section, usize),
+    /// A click on the tab bar: resolved by x-position via `panel_tab_hit`.
+    Tab(PanelTab),
 }
 
 /// One of the accordion sections, in built-in display order.
@@ -46,30 +102,49 @@ pub enum Section {
     Commits,
     Branches,
     Stash,
-    Git,
+    /// Pull-request state, CI checks, review threads. (Renamed from "git".)
+    Pr,
+    Issues,
     Files,
+    /// Configured shell jobs (build, test, run). (Renamed from "tasks".)
+    Jobs,
     Tests,
-    Debug,
+    Notifications,
+    Logs,
     Sandbox,
-    Db,
     Telemetry,
     Keys,
+    // Placeholder sections — kept as dead variants for future use.
+    #[allow(dead_code)]
+    Debug,
+    #[allow(dead_code)]
+    Db,
 }
 
 /// The accordion's built-in display order — the default when `[panel]
-/// sections` is unset. The live order (config-reordered, possibly trimmed)
-/// rides on [`PanelUi::order`]; the numbered jump keys index THAT.
-pub const SECTION_ORDER: [Section; 12] = [
+/// sections` is unset. Grouped by tab:
+/// - Git (5): Changes, Commits, Branches, Stash, Files
+/// - Work (4): Pr, Issues, Jobs, Tests
+/// - System (5): Notifications, Logs, Sandbox, Telemetry, Keys
+///
+/// The live order (config-reordered, possibly trimmed) rides on
+/// [`PanelUi::order`]; numbered jump keys index the ACTIVE TAB's slice.
+pub const SECTION_ORDER: [Section; 14] = [
+    // Git tab
     Section::Changes,
     Section::Commits,
     Section::Branches,
     Section::Stash,
-    Section::Git,
     Section::Files,
+    // Work tab
+    Section::Pr,
+    Section::Issues,
+    Section::Jobs,
     Section::Tests,
-    Section::Debug,
+    // System tab
+    Section::Notifications,
+    Section::Logs,
     Section::Sandbox,
-    Section::Db,
     Section::Telemetry,
     Section::Keys,
 ];
@@ -82,14 +157,37 @@ impl Section {
             Section::Commits => "commits",
             Section::Branches => "branches",
             Section::Stash => "stash",
-            Section::Git => "git",
+            Section::Pr => "pr",
             Section::Files => "files",
+            Section::Jobs => "jobs",
             Section::Tests => "tests",
             Section::Debug => "debug",
             Section::Sandbox => "sandbox",
             Section::Db => "db",
             Section::Telemetry => "telemetry",
             Section::Keys => "keys",
+            Section::Issues => "issues",
+            Section::Notifications => "notifications",
+            Section::Logs => "logs",
+        }
+    }
+
+    /// Which top-level tab this section belongs to.
+    pub fn tab(self) -> PanelTab {
+        match self {
+            Section::Changes
+            | Section::Commits
+            | Section::Branches
+            | Section::Stash
+            | Section::Files => PanelTab::Git,
+            Section::Pr | Section::Issues | Section::Jobs | Section::Tests => PanelTab::Work,
+            Section::Notifications
+            | Section::Logs
+            | Section::Sandbox
+            | Section::Telemetry
+            | Section::Keys
+            | Section::Debug
+            | Section::Db => PanelTab::System,
         }
     }
 
@@ -98,7 +196,7 @@ impl Section {
     pub fn is_git_family(self) -> bool {
         matches!(
             self,
-            Section::Changes | Section::Commits | Section::Branches | Section::Stash | Section::Git
+            Section::Changes | Section::Commits | Section::Branches | Section::Stash | Section::Pr
         )
     }
 
@@ -119,6 +217,12 @@ impl Section {
     }
 
     pub fn from_key(key: &str) -> Option<Section> {
+        // Back-compat aliases for renamed sections (old configs use these keys).
+        let key = match key {
+            "prs" | "git" => "pr",
+            "tasks" => "jobs",
+            k => k,
+        };
         SECTION_ORDER.iter().copied().find(|s| s.as_key() == key)
     }
 }
@@ -180,6 +284,21 @@ pub struct MergeBanner {
     /// First-seen unresolved count this merge ("resolved X/Y" bar);
     /// `None` hides the progress bar.
     pub total: Option<usize>,
+}
+
+/// Lightweight record of a completed (or running) generic task run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskRunRecord {
+    /// Matches `Task::name`.
+    pub name: String,
+    pub exit_code: i32,
+    pub duration_ms: u64,
+    /// Unix milliseconds when the run finished (0 when running).
+    pub finished_at: i64,
+    /// Last few lines of captured stdout+stderr (display only).
+    pub output_tail: String,
+    /// True while the task process is still running.
+    pub running: bool,
 }
 
 /// A trimmed test snapshot for the tests section (read from `test_cache`
@@ -279,6 +398,71 @@ pub struct CommitRow {
     pub parents: Vec<String>,
 }
 
+/// One annotated line from `git blame --porcelain`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlameRow {
+    /// 7-character short SHA of the commit that introduced this line.
+    pub sha: String,
+    pub author: String,
+    /// Unix timestamp of the authoring commit.
+    pub date: i64,
+    /// 1-based final line number in the file.
+    pub lineno: usize,
+    /// Raw source line (without the leading tab from porcelain format).
+    pub content: String,
+}
+
+/// Parse `git blame --porcelain` stdout into a `Vec<BlameRow>`. Lines are
+/// returned in file order (ascending `lineno`). Malformed groups are silently
+/// skipped — the view degrades gracefully to whatever porcelain returns.
+pub fn parse_blame_porcelain(text: &str) -> Vec<BlameRow> {
+    let mut rows: Vec<BlameRow> = Vec::new();
+    let mut lines = text.lines().peekable();
+    while let Some(header) = lines.next() {
+        // Each group starts with "<40-sha> <orig> <final> [<num-lines>]".
+        let parts: Vec<&str> = header.split_whitespace().collect();
+        if parts.len() < 3 || parts[0].len() < 7 {
+            continue;
+        }
+        let sha = parts[0][..7].to_string();
+        let lineno: usize = parts[2].parse().unwrap_or(0);
+        let mut author = String::new();
+        let mut date: i64 = 0;
+        // Consume metadata lines until we reach the content line (starts with TAB).
+        loop {
+            match lines.peek() {
+                Some(line) if line.starts_with('\t') => {
+                    let content = lines.next().unwrap()[1..].to_string();
+                    if lineno > 0 {
+                        rows.push(BlameRow {
+                            sha,
+                            author,
+                            date,
+                            lineno,
+                            content,
+                        });
+                    }
+                    break;
+                }
+                Some(line) if line.starts_with("author ") && !line.starts_with("author-") => {
+                    author = lines.next().unwrap()["author ".len()..].to_string();
+                }
+                Some(line) if line.starts_with("author-time ") => {
+                    date = lines.next().unwrap()["author-time ".len()..]
+                        .trim()
+                        .parse()
+                        .unwrap_or(0);
+                }
+                Some(_) => {
+                    lines.next();
+                }
+                None => break,
+            }
+        }
+    }
+    rows
+}
+
 /// One row of the stash section.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StashRow {
@@ -331,6 +515,21 @@ pub struct PanelData {
     pub commits_loading: bool,
     /// Stash entries (stash section).
     pub stashes: Vec<StashRow>,
+    /// Issues from the configured tracker (Linear/GitHub/Jira), loaded from
+    /// the `issue_cache` DB table. Empty when no provider is configured.
+    pub tracker_issues: Vec<superzej_core::issue::Issue>,
+    /// Issue ids (in `"<provider>:<key>"` form) linked to the current worktree.
+    pub tracker_links: Vec<String>,
+    /// Unread notification count for the status bar badge.
+    pub unread_notifications: usize,
+    /// Full notification list (newest first, capped at 50) for the inbox section.
+    pub notifications: Vec<superzej_core::notification::Notification>,
+    /// Last 500 lines of szhost.log, parsed. Empty when SUPERZEJ_LOG is unset.
+    pub log_lines: Vec<superzej_core::log_view::LogLine>,
+    /// Configured + auto-discovered task specs for the Tasks section.
+    pub task_specs: Vec<superzej_core::config::Task>,
+    /// Last-run record per task name (keyed by `Task::name`).
+    pub task_last_runs: std::collections::HashMap<String, TaskRunRecord>,
 }
 
 /// One row of the Files tab's accordion tree, in display order.
@@ -416,10 +615,13 @@ pub struct PanelUi {
     /// The full test-explorer state (detected task, per-test status map,
     /// display tree, cursor/scroll/filter) backing the tests section's runs.
     pub tests: TestPanelState,
-    /// The live accordion order (config-resolved, possibly trimmed); the
-    /// numbered jump keys (`1..=order.len()`) index this. Never empty.
+    /// The live accordion order (config-resolved, possibly trimmed) across ALL
+    /// tabs. Sections are filtered to the active tab before display.
+    /// The numbered jump keys index the ACTIVE TAB's slice. Never empty.
     pub order: Vec<Section>,
-    /// Which accordion section is open (exactly one).
+    /// The active top-level tab (Git / Work / System).
+    pub tab: PanelTab,
+    /// Which accordion section is open (exactly one; must belong to `tab`).
     pub open: Section,
     /// The view selector, cycled by `e` (Normal → Half → Full): every section
     /// renders a distinct body per width — compact, deep, and full-screen.
@@ -449,6 +651,32 @@ pub struct PanelUi {
     /// Persisted to the DB (`ui_state` table, prefix `panel.files.col/`) so the
     /// tree survives restarts.
     pub files_collapsed: std::collections::HashSet<String>,
+    /// Row cursor within the Tasks section's list.
+    pub tasks_cursor: usize,
+    /// Row cursor within the Issues section's list (persisted across section switches).
+    pub issues_cursor: usize,
+    /// Active free-text filter query for the Issues section (`/` mode).
+    pub issues_filter: String,
+    /// Optional project/sprint ID filter for the Issues section (`f` key cycles).
+    pub issues_project_filter: Option<String>,
+    /// Row cursor within the Notifications section's list.
+    pub notifications_cursor: usize,
+    /// When true, the Notifications section shows already-read items too (`A` toggle).
+    pub notifications_show_read: bool,
+    /// Active free-text filter query for the Notifications section (`/` mode).
+    pub notifications_filter: String,
+    /// True while the Notifications section's filter field is being edited.
+    pub notifications_filter_editing: bool,
+    /// Row cursor within the Logs section's list.
+    pub logs_cursor: usize,
+    /// Active free-text filter query for the Logs section (`/` mode).
+    pub logs_filter: String,
+    /// True while the Logs section's filter field is being edited.
+    pub logs_filter_editing: bool,
+    /// Level gate: `None` = all levels; `Some(L)` shows lines at L and above.
+    pub logs_level: Option<superzej_core::log_view::LogLevel>,
+    /// When true, the cursor auto-jumps to the newest line on each hydration.
+    pub logs_tail: bool,
 }
 
 impl Default for PanelUi {
@@ -456,6 +684,7 @@ impl Default for PanelUi {
         PanelUi {
             tests: TestPanelState::default(),
             order: SECTION_ORDER.to_vec(),
+            tab: PanelTab::default(),
             open: Section::default(),
             width: crate::layout::PanelWidth::default(),
             row_mode: false,
@@ -468,6 +697,19 @@ impl Default for PanelUi {
             docs: docs::PanelDocs::default(),
             git: gitui::GitUi::default(),
             files_collapsed: std::collections::HashSet::new(),
+            tasks_cursor: 0,
+            issues_cursor: 0,
+            issues_filter: String::new(),
+            issues_project_filter: None,
+            notifications_cursor: 0,
+            notifications_show_read: false,
+            notifications_filter: String::new(),
+            notifications_filter_editing: false,
+            logs_cursor: 0,
+            logs_filter: String::new(),
+            logs_filter_editing: false,
+            logs_level: None,
+            logs_tail: true,
         }
     }
 }
@@ -482,30 +724,74 @@ impl PanelUi {
     }
 
     /// Adopt a config-resolved order; the open section snaps to the first
-    /// visible one when the config hid it.
+    /// section in the current tab when the config hid it.
     pub fn set_order(&mut self, order: Vec<Section>) {
         debug_assert!(!order.is_empty());
-        if !order.contains(&self.open)
-            && let Some(&first) = order.first()
-        {
-            self.open = first;
-        }
         self.order = order;
+        self.ensure_open_valid();
     }
 
-    /// The position of the open section in the live order (0 when stale).
+    /// Switch to a different top-level tab; snaps `open` to the first section
+    /// of that tab that appears in the live order.
+    pub fn switch_tab(&mut self, tab: PanelTab) {
+        self.tab = tab;
+        self.row_mode = false;
+        self.cursor = 0;
+        self.ensure_open_valid();
+    }
+
+    /// Ensure `open` is a section that belongs to the current tab and exists
+    /// in the live order. If not, snap to the first valid section.
+    fn ensure_open_valid(&mut self) {
+        if self.open.tab() == self.tab && self.order.contains(&self.open) {
+            return;
+        }
+        // Try to find a section for the current tab.
+        if let Some(&s) = self.order.iter().find(|s| s.tab() == self.tab) {
+            self.open = s;
+        } else if let Some(&s) = self.order.first() {
+            self.open = s;
+        }
+    }
+
+    /// Sections in the live order that belong to the active tab.
+    pub fn tab_sections(&self) -> Vec<Section> {
+        self.order
+            .iter()
+            .copied()
+            .filter(|s| s.tab() == self.tab)
+            .collect()
+    }
+
+    /// Count of sections in the active tab (used for budget math).
+    pub fn visible_section_count(&self) -> usize {
+        self.order.iter().filter(|s| s.tab() == self.tab).count()
+    }
+
+    /// The position of the open section within the active tab's slice (0 when stale).
     fn open_index(&self) -> usize {
-        self.order.iter().position(|s| *s == self.open).unwrap_or(0)
+        self.tab_sections()
+            .iter()
+            .position(|s| *s == self.open)
+            .unwrap_or(0)
     }
 
-    /// The section after the open one, wrapping within the live order.
+    /// The section after the open one, wrapping within the active tab.
     pub fn next_section(&self) -> Section {
-        self.order[(self.open_index() + 1) % self.order.len()]
+        let secs = self.tab_sections();
+        if secs.is_empty() {
+            return self.open;
+        }
+        secs[(self.open_index() + 1) % secs.len()]
     }
 
-    /// The section before the open one, wrapping within the live order.
+    /// The section before the open one, wrapping within the active tab.
     pub fn prev_section(&self) -> Section {
-        self.order[(self.open_index() + self.order.len() - 1) % self.order.len()]
+        let secs = self.tab_sections();
+        if secs.is_empty() {
+            return self.open;
+        }
+        secs[(self.open_index() + secs.len() - 1) % secs.len()]
     }
 }
 
@@ -620,13 +906,15 @@ pub enum PanelMsg {
     /// Down/j (Up/k): step the cursor through the open section's items.
     CursorDown,
     CursorUp,
-    /// Enter on a row (changes: toggle the hunk preview; git: jump to a
+    /// Enter on a row (changes: toggle the hunk preview; pr: jump to a
     /// thread; files: open/fold; tests: open the failing test).
     Select,
     /// `e`: cycle the view width (Normal → Half → Full).
     ToggleExpand,
     /// Space in the changes section: stage/unstage the selected file.
     StageToggle,
+    /// `[`/`]` or Alt+1/2/3: switch the active top-level tab.
+    SwitchTab(PanelTab),
 }
 
 /// Map a raw key (plus modifiers) to an accordion intent. Pure; per-section
@@ -638,27 +926,50 @@ pub enum PanelMsg {
 /// adjacent accordion (every accordion is visited — one with no items is just
 /// passed through). Shift+Down/j (Shift+Up/k) skip straight to the next/
 /// previous accordion header. Enter activates the highlighted row; Esc leaves.
+///
+/// `Alt+1/2/3` switch the active tab directly (Git/Work/System). These are
+/// intercepted by the event loop before reaching this function (the loop
+/// handles them with panel priority so they shadow the global pin-summon
+/// shortcuts). Within a tab, `1..=N` jump to that tab's N-th section.
 pub fn accordion_key(key: &KeyCode, mods: Modifiers, ui: &PanelUi) -> Option<PanelMsg> {
     let shift = mods.contains(Modifiers::SHIFT);
+    let alt = mods.contains(Modifiers::ALT);
+
     // Always-available jumps (the view cycle, numbered section jumps) read
-    // the same wherever the panel is.
+    // the same wherever the panel is. Digits index the ACTIVE TAB's sections.
     match key {
         KeyCode::Char('e') => return Some(PanelMsg::ToggleExpand),
-        KeyCode::Char(c @ '1'..='9') => {
+        KeyCode::Char(c @ '1'..='9') if !alt => {
             let idx = (*c as usize) - ('1' as usize);
-            if let Some(&s) = ui.order.get(idx) {
+            let tab_secs = ui.tab_sections();
+            if let Some(&s) = tab_secs.get(idx) {
                 return Some(PanelMsg::Open(s));
             }
         }
         _ => {}
     }
     match key {
-        // Shift hops between sections; plain steps through the open one's rows.
+        // Shift always hops between section headers regardless of mode.
         KeyCode::DownArrow | KeyCode::Char('j' | 'J') if shift => Some(PanelMsg::NextSection),
         KeyCode::UpArrow | KeyCode::Char('k' | 'K') if shift => Some(PanelMsg::PrevSection),
-        KeyCode::DownArrow | KeyCode::Char('j') => Some(PanelMsg::CursorDown),
-        KeyCode::UpArrow | KeyCode::Char('k') => Some(PanelMsg::CursorUp),
+        // In section mode j/k navigate section headers; in row mode they walk
+        // the open section's items (with flow into the adjacent section at the
+        // boundary).
+        KeyCode::DownArrow | KeyCode::Char('j') => Some(if ui.row_mode {
+            PanelMsg::CursorDown
+        } else {
+            PanelMsg::NextSection
+        }),
+        KeyCode::UpArrow | KeyCode::Char('k') => Some(if ui.row_mode {
+            PanelMsg::CursorUp
+        } else {
+            PanelMsg::PrevSection
+        }),
+        // Enter: drill into the open section (section mode → row mode) or
+        // activate the highlighted row (row mode).
         KeyCode::Enter => Some(PanelMsg::Select),
+        // Esc peels back one level: row mode → section mode, section mode →
+        // leave the panel zone.
         KeyCode::Escape => Some(PanelMsg::LeaveRows),
         KeyCode::Char(' ') if ui.open == Section::Changes => Some(PanelMsg::StageToggle),
         _ => None,
@@ -671,19 +982,25 @@ mod tests {
 
     #[test]
     fn section_order_jump_and_cycle() {
-        assert_eq!(SECTION_ORDER.len(), 12);
-        let ui = PanelUi::default(); // open = Changes, built-in order
-        assert_eq!(ui.next_section(), Section::Commits);
-        assert_eq!(ui.prev_section(), Section::Keys); // wraps
-        let keys = PanelUi {
-            open: Section::Keys,
+        assert_eq!(SECTION_ORDER.len(), 14);
+        // Default tab = Git; Changes is in Git tab.
+        let ui = PanelUi::default(); // open = Changes, tab = Git
+        assert_eq!(ui.next_section(), Section::Commits); // next in Git tab
+        assert_eq!(ui.prev_section(), Section::Files); // wraps within Git tab
+        // Files is last in Git tab; next wraps to Changes.
+        let files = PanelUi {
+            open: Section::Files,
             ..Default::default()
         };
-        assert_eq!(keys.next_section(), Section::Changes); // wraps
+        assert_eq!(files.next_section(), Section::Changes); // wraps within Git tab
         for s in SECTION_ORDER {
             assert_eq!(Section::from_key(s.as_key()), Some(s));
             assert!(!s.label().is_empty());
         }
+        // Back-compat aliases still resolve.
+        assert_eq!(Section::from_key("prs"), Some(Section::Pr));
+        assert_eq!(Section::from_key("git"), Some(Section::Pr));
+        assert_eq!(Section::from_key("tasks"), Some(Section::Jobs));
         assert_eq!(Section::from_key("nope"), None);
     }
 
@@ -693,18 +1010,12 @@ mod tests {
         // Empty (the default) → the built-in order, all sections visible.
         assert_eq!(resolve_order(&cfg), SECTION_ORDER.to_vec());
         // A custom list reorders; omitted sections are hidden; unknown keys
-        // and duplicates are ignored.
-        cfg.panel.sections = vec![
-            "git".into(),
-            "telemetry".into(),
-            "nope".into(),
-            "changes".into(),
-            "git".into(),
-        ];
-        assert_eq!(
-            resolve_order(&cfg),
-            vec![Section::Git, Section::Telemetry, Section::Changes]
-        );
+        // and duplicates are ignored. Old "prs" alias still resolves.
+        cfg.panel.sections = vec!["prs".into(), "nope".into(), "changes".into(), "prs".into()];
+        assert_eq!(resolve_order(&cfg), vec![Section::Pr, Section::Changes]);
+        // New key "pr" also works.
+        cfg.panel.sections = vec!["pr".into(), "changes".into()];
+        assert_eq!(resolve_order(&cfg), vec![Section::Pr, Section::Changes]);
         // All-junk lists fall back to the built-in order (never empty).
         cfg.panel.sections = vec!["bogus".into()];
         assert_eq!(resolve_order(&cfg), SECTION_ORDER.to_vec());
@@ -712,19 +1023,23 @@ mod tests {
 
     #[test]
     fn set_order_snaps_a_hidden_open_section_to_first_visible() {
+        // Tests is a Work-tab section; default tab is Git.
+        // set_order with only Pr+Changes → open snaps to Pr (first Work section).
         let mut ui = PanelUi {
+            tab: PanelTab::Work,
             open: Section::Tests,
             ..Default::default()
         };
-        ui.set_order(vec![Section::Git, Section::Changes]);
-        assert_eq!(ui.open, Section::Git);
-        // Cycling walks the trimmed order, wrapping.
-        assert_eq!(ui.next_section(), Section::Changes);
-        assert_eq!(ui.prev_section(), Section::Changes);
+        ui.set_order(vec![Section::Pr, Section::Changes]);
+        // Tests is not in order → snaps to Pr (first Work section visible).
+        assert_eq!(ui.open, Section::Pr);
+        // Cycling walks only the Work tab's sections (only Pr here).
+        assert_eq!(ui.next_section(), Section::Pr); // wraps to itself
+        assert_eq!(ui.prev_section(), Section::Pr);
         // A still-visible open section is kept.
-        ui.open = Section::Changes;
-        ui.set_order(vec![Section::Changes, Section::Db]);
-        assert_eq!(ui.open, Section::Changes);
+        ui.open = Section::Pr;
+        ui.set_order(vec![Section::Pr, Section::Changes]);
+        assert_eq!(ui.open, Section::Pr);
     }
 
     fn fstat(staged: char, unstaged: char, path: &str) -> superzej_svc::git::FileStatus {
@@ -835,24 +1150,41 @@ mod tests {
 
     #[test]
     fn accordion_keys_unified_navigation() {
-        let ui = PanelUi::default(); // open = Changes
+        let ui = PanelUi::default(); // open = Changes, tab = Git, row_mode = false
         let none = Modifiers::NONE;
         let shift = Modifiers::SHIFT;
-        // Plain Down/j (Up/k) step item-by-item through the open section.
+        let alt = Modifiers::ALT;
+        // In section mode (row_mode = false) j/k navigate section headers.
         assert_eq!(
             accordion_key(&KeyCode::Char('j'), none, &ui),
-            Some(PanelMsg::CursorDown)
+            Some(PanelMsg::NextSection)
         );
         assert_eq!(
             accordion_key(&KeyCode::DownArrow, none, &ui),
-            Some(PanelMsg::CursorDown)
+            Some(PanelMsg::NextSection)
         );
         assert_eq!(
             accordion_key(&KeyCode::UpArrow, none, &ui),
+            Some(PanelMsg::PrevSection)
+        );
+        // In row mode j/k walk rows within the open section.
+        let row_ui = PanelUi {
+            row_mode: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            accordion_key(&KeyCode::Char('j'), none, &row_ui),
+            Some(PanelMsg::CursorDown)
+        );
+        assert_eq!(
+            accordion_key(&KeyCode::DownArrow, none, &row_ui),
+            Some(PanelMsg::CursorDown)
+        );
+        assert_eq!(
+            accordion_key(&KeyCode::UpArrow, none, &row_ui),
             Some(PanelMsg::CursorUp)
         );
-        // Shift hops between sections (arrows and J/K both work — termwiz
-        // uppercases shifted letters but keeps the modifier).
+        // Shift always hops between sections regardless of row_mode.
         assert_eq!(
             accordion_key(&KeyCode::DownArrow, shift, &ui),
             Some(PanelMsg::NextSection)
@@ -874,33 +1206,61 @@ mod tests {
             accordion_key(&KeyCode::Escape, none, &ui),
             Some(PanelMsg::LeaveRows)
         );
-        // Digits jump (indexing the LIVE order) and `e` cycles the view.
+        // Digits jump within the ACTIVE TAB's sections (Git tab: Changes, Commits,
+        // Branches, Stash, Files — indices 1..=5).
+        assert_eq!(
+            accordion_key(&KeyCode::Char('1'), none, &ui),
+            Some(PanelMsg::Open(Section::Changes))
+        );
         assert_eq!(
             accordion_key(&KeyCode::Char('3'), none, &ui),
             Some(PanelMsg::Open(Section::Branches))
         );
         assert_eq!(
-            accordion_key(&KeyCode::Char('8'), none, &ui),
-            Some(PanelMsg::Open(Section::Debug))
+            accordion_key(&KeyCode::Char('5'), none, &ui),
+            Some(PanelMsg::Open(Section::Files))
         );
-        assert_eq!(
-            accordion_key(&KeyCode::Char('9'), none, &ui),
-            Some(PanelMsg::Open(Section::Sandbox))
-        );
-        // A digit past the visible count is not an accordion intent.
-        let trimmed = PanelUi {
-            order: vec![Section::Changes, Section::Git],
+        // A digit past the tab's section count is not an accordion intent.
+        assert_eq!(accordion_key(&KeyCode::Char('6'), none, &ui), None);
+        // In Work tab, digits index Work sections (Pr, Issues, Jobs, Tests).
+        let work_ui = PanelUi {
+            tab: PanelTab::Work,
+            open: Section::Pr,
             ..Default::default()
         };
         assert_eq!(
-            accordion_key(&KeyCode::Char('2'), none, &trimmed),
-            Some(PanelMsg::Open(Section::Git))
+            accordion_key(&KeyCode::Char('1'), none, &work_ui),
+            Some(PanelMsg::Open(Section::Pr))
         );
-        assert_eq!(accordion_key(&KeyCode::Char('3'), none, &trimmed), None);
+        assert_eq!(
+            accordion_key(&KeyCode::Char('3'), none, &work_ui),
+            Some(PanelMsg::Open(Section::Jobs))
+        );
+        // A custom order filters to the tab's sections.
+        let trimmed = PanelUi {
+            order: vec![Section::Changes, Section::Pr],
+            ..Default::default() // tab = Git
+        };
+        // Git tab has only Changes (Pr is Work tab).
+        assert_eq!(
+            accordion_key(&KeyCode::Char('1'), none, &trimmed),
+            Some(PanelMsg::Open(Section::Changes))
+        );
+        assert_eq!(accordion_key(&KeyCode::Char('2'), none, &trimmed), None);
         assert_eq!(
             accordion_key(&KeyCode::Char('e'), none, &ui),
             Some(PanelMsg::ToggleExpand)
         );
+        // Alt+1/2/3 tab switching is handled by the event loop before
+        // accordion_key (they shadow global pin-summon; see run.rs).
+        // accordion_key itself does NOT produce SwitchTab for these chords.
+        assert_eq!(accordion_key(&KeyCode::Char('1'), alt, &ui), None);
+        assert_eq!(accordion_key(&KeyCode::Char('2'), alt, &ui), None);
+        assert_eq!(accordion_key(&KeyCode::Char('3'), alt, &ui), None);
+        // [ / ] are no longer tab-switching keys; they fall through to
+        // per-section handlers (hunk navigation in Changes full view, etc.).
+        assert_eq!(accordion_key(&KeyCode::Char('['), none, &ui), None);
+        assert_eq!(accordion_key(&KeyCode::Char(']'), none, &ui), None);
         // The retired overlay keys fall through (forwarded to panes).
         assert_eq!(accordion_key(&KeyCode::Char('t'), none, &ui), None);
         assert_eq!(accordion_key(&KeyCode::Char('?'), none, &ui), None);
@@ -909,11 +1269,12 @@ mod tests {
             accordion_key(&KeyCode::Char(' '), none, &ui),
             Some(PanelMsg::StageToggle)
         );
-        let git = PanelUi {
-            open: Section::Git,
+        let pr = PanelUi {
+            tab: PanelTab::Work,
+            open: Section::Pr,
             ..Default::default()
         };
-        assert_eq!(accordion_key(&KeyCode::Char(' '), none, &git), None);
+        assert_eq!(accordion_key(&KeyCode::Char(' '), none, &pr), None);
     }
 
     #[test]
@@ -980,7 +1341,8 @@ mod tests {
     #[test]
     fn reset_on_leave_clears_drill_state_but_keeps_cursors() {
         let mut ui = PanelUi {
-            open: Section::Git,
+            tab: PanelTab::Work,
+            open: Section::Pr,
             width: crate::layout::PanelWidth::Half,
             row_mode: true,
             cursor: 3,
@@ -993,8 +1355,68 @@ mod tests {
         assert_eq!(ui.chg_sel, None);
         // …while the open section, width, and row cursor survive so
         // returning lands where the user left off.
-        assert_eq!(ui.open, Section::Git);
+        assert_eq!(ui.open, Section::Pr);
         assert_eq!(ui.width, crate::layout::PanelWidth::Half);
         assert_eq!(ui.cursor, 3);
+    }
+
+    #[test]
+    fn parse_blame_porcelain_extracts_rows_in_order() {
+        let input = "\
+abc1234abc1234abc1234abc1234abc1234abc1234 1 1 1\n\
+author Alice\n\
+author-mail <alice@example.com>\n\
+author-time 1700000000\n\
+author-tz +0000\n\
+committer Alice\n\
+committer-mail <alice@example.com>\n\
+committer-time 1700000000\n\
+committer-tz +0000\n\
+summary first commit\n\
+filename src/main.rs\n\
+\tfirst line\n\
+def5678def5678def5678def5678def5678def5678 2 2 1\n\
+author Bob\n\
+author-mail <bob@example.com>\n\
+author-time 1710000000\n\
+author-tz +0000\n\
+committer Bob\n\
+committer-mail <bob@example.com>\n\
+committer-time 1710000000\n\
+committer-tz +0000\n\
+summary second commit\n\
+filename src/main.rs\n\
+\tsecond line\n\
+";
+        let rows = parse_blame_porcelain(input);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].sha, "abc1234");
+        assert_eq!(rows[0].author, "Alice");
+        assert_eq!(rows[0].date, 1700000000);
+        assert_eq!(rows[0].lineno, 1);
+        assert_eq!(rows[0].content, "first line");
+        assert_eq!(rows[1].sha, "def5678");
+        assert_eq!(rows[1].author, "Bob");
+        assert_eq!(rows[1].lineno, 2);
+        assert_eq!(rows[1].content, "second line");
+    }
+
+    #[test]
+    fn parse_blame_porcelain_skips_malformed_groups() {
+        // A header with too-short SHA is skipped; a valid group after it still parses.
+        let input = "\
+short 1 1 1\n\
+author X\n\
+author-time 0\n\
+\tsome content\n\
+abc1234abc1234abc1234abc1234abc1234abc1234 3 3 1\n\
+author Valid\n\
+author-time 1000\n\
+\tvalid line\n\
+";
+        let rows = parse_blame_porcelain(input);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].author, "Valid");
+        assert_eq!(rows[0].lineno, 3);
     }
 }

@@ -164,16 +164,14 @@ fn context_hints(
         .flatten()
         .collect(),
         crate::focus::Zone::Panel => {
-            let mut hints: Vec<(String, String)> = [
-                hint("pane", "focus-left")
-                    .or_else(|| chord("focus-right").map(|c| (c, "pane".into()))),
-                hint("tab", "prev-tab").or_else(|| chord("next-tab").map(|c| (c, "tab".into()))),
-                pair("Esc", "back"),
-            ]
+            let mut hints = crate::chrome::panel_help_pairs(panel_ui);
+            // Zone-exit hints trail the section/row-specific ones.
+            let exit: Vec<(String, String)> = [hint("pane", "focus-left")
+                .or_else(|| chord("focus-right").map(|c| (c, "pane".into())))]
             .into_iter()
             .flatten()
             .collect();
-            hints.extend(crate::chrome::panel_help_pairs(panel_ui));
+            hints.extend(exit);
             hints
         }
         crate::focus::Zone::Masthead => vec![
@@ -285,7 +283,7 @@ fn sync_panel_docs(
     waker: &TerminalWaker,
 ) {
     use crate::panel::Section;
-    if panel_ui.open == Section::Git && panel_ui.width.is_expanded() {
+    if panel_ui.open == Section::Pr && panel_ui.width.is_expanded() {
         kick_git_docs_fetch(generation, session, panel_ui, tx, waker);
     }
     if panel_ui.open == Section::Changes && panel_ui.width == layout::PanelWidth::Full {
@@ -379,6 +377,21 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     );
     let keymap = rebuild_keymap(&cfg, &session);
     let mode = crate::keymap::startup_mode(&cfg);
+    // Validate that no keybinding scope has ambiguous duplicates. Cross-scope
+    // overlaps (panel shadows global) are intentional and logged at debug.
+    {
+        let conflicts = crate::keymap::check_binding_conflicts(
+            crate::keymap::PANEL_SCOPE_BINDINGS,
+            crate::keymap::ACTION_SPECS,
+        );
+        debug_assert!(
+            conflicts.is_empty(),
+            "keybind conflicts detected at startup: {conflicts:?}"
+        );
+        for c in &conflicts {
+            tracing::warn!("keybind conflict: {c}");
+        }
+    }
     // Resolve the configurable chrome palette ([theme] / [theme.colors]) before
     // the first frame; the config fs-watch re-resolves it live.
     crate::chrome::set_palette(cfg.palette());
@@ -1316,6 +1329,16 @@ fn activate_row_target(
             }
         }
     }
+    // When activating a tab via the sidebar, focus the leftmost visible pane
+    // if the tab has more than one pane open.
+    if let Some(tab) = session.active_tab_mut() {
+        let layout = tab.center.layout(center);
+        if layout.len() > 1 {
+            if let Some((id, _)) = layout.iter().min_by_key(|(_, r)| r.x) {
+                tab.focused_pane = *id;
+            }
+        }
+    }
     refresh_tab_model(model, session, sb);
     sync_drawer_persistence(session, panes, drawer, pool, home, cfg, center);
 }
@@ -1602,12 +1625,14 @@ fn toggle_files_collapse(panel_ui: &mut crate::panel::PanelUi, dir: &str) {
     }
 }
 
-/// Persist the accordion's open section + wide mode (mirrors the sidebar's
-/// inline `ui_state` writes — single-row upserts on a WAL handle, sub-ms).
+/// Persist the accordion's open section + wide mode + active tab (mirrors the
+/// sidebar's inline `ui_state` writes — single-row upserts on a WAL handle,
+/// sub-ms).
 fn persist_panel_state(panel_ui: &crate::panel::PanelUi) {
     if let Ok(db) = superzej_core::db::Db::open() {
         let _ = db.set_ui_state("panel", "open", panel_ui.open.as_key());
         let _ = db.set_ui_state("panel", "width", panel_ui.width.as_key());
+        let _ = db.set_ui_state("panel", "tab", panel_ui.tab.as_key());
     }
 }
 
@@ -1650,6 +1675,7 @@ fn open_panel_section(
         crate::hydrate::HydrateHints {
             open: panel_ui.open,
             expanded: panel_ui.width.is_expanded(),
+            ..Default::default()
         },
     );
     sync_panel_docs(
@@ -1689,6 +1715,7 @@ fn toggle_panel_expand(
         crate::hydrate::HydrateHints {
             open: panel_ui.open,
             expanded: panel_ui.width.is_expanded(),
+            ..Default::default()
         },
     );
     sync_panel_docs(
@@ -1909,6 +1936,8 @@ enum GitDoc {
     /// A paused rebase's live state (`None` when the pause vanished before
     /// the read landed).
     Rebase(Option<superzej_svc::git::RebaseStatus>),
+    /// `git blame --porcelain` output parsed into per-line rows.
+    Blame(Vec<crate::panel::BlameRow>),
 }
 
 /// Fetch the staging view's diff (unstaged|staged per pane) off the loop and
@@ -2043,6 +2072,47 @@ fn spawn_patch_doc_fetch(
             diff,
         };
         if tx.send((generation, GitDoc::Patch(state))).is_ok() {
+            let _ = wk.wake();
+        }
+    });
+}
+
+/// Run `git blame --porcelain` off the loop and deliver parsed rows.
+fn spawn_blame_fetch(
+    generation: u64,
+    session: &crate::session::Session,
+    path: String,
+    // Commit to blame; empty string or "HEAD" means the working-tree state.
+    rev: String,
+    tx: &tokio_mpsc::UnboundedSender<(u64, GitDoc)>,
+    waker: &TerminalWaker,
+) {
+    let wt = active_tab_path(session);
+    let tx = tx.clone();
+    let wk = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut args = vec![
+            "-C".to_string(),
+            wt.to_str().unwrap_or(".").to_string(),
+            "blame".to_string(),
+            "--porcelain".to_string(),
+        ];
+        if !rev.is_empty() && rev != "HEAD" {
+            args.push(rev);
+        }
+        args.push("--".to_string());
+        args.push(path.clone());
+        let output = std::process::Command::new("git")
+            .args(&args)
+            .output()
+            .unwrap_or_else(|_| std::process::Output {
+                status: std::process::ExitStatus::default(),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            });
+        let text = String::from_utf8_lossy(&output.stdout);
+        let rows = crate::panel::parse_blame_porcelain(&text);
+        if tx.send((generation, GitDoc::Blame(rows))).is_ok() {
             let _ = wk.wake();
         }
     });
@@ -2208,6 +2278,10 @@ enum GitAfter {
     Terminal(String),
     /// Execute the confirmed worktree-group close.
     CloseWorktreeGroup,
+    /// Open a file in the configured editor in a new center tab (used for
+    /// conflict-file resolution — the user resolves markers, saves, then
+    /// stages the file normally).
+    OpenEditor(String),
 }
 
 fn short_sha(sha: &str) -> String {
@@ -2270,6 +2344,7 @@ fn custom_context_label(view: GitView) -> &'static str {
             "commits"
         }
         GitView::Stash => "stash",
+        GitView::Blame => "files",
     }
 }
 
@@ -2428,6 +2503,14 @@ fn handle_git_msg(
                         s.cursor = next;
                     }
                 }
+                GitView::Blame => {
+                    let max = panel_ui.git.blame_rows.len().saturating_sub(1);
+                    panel_ui.git.blame_cursor = if down {
+                        (panel_ui.git.blame_cursor + 1).min(max)
+                    } else {
+                        panel_ui.git.blame_cursor.saturating_sub(1)
+                    };
+                }
                 _ => {}
             }
         }
@@ -2487,6 +2570,11 @@ fn handle_git_msg(
         GitMsg::Drill => match panel_ui.git.focus {
             GitView::Files => {
                 if let Some(row) = sel_change(panel_ui, model) {
+                    // Conflict files: open in the editor so the user can
+                    // resolve the markers, then stage the file normally.
+                    if row.stage == crate::panel::Stage::Conflict {
+                        return GitAfter::OpenEditor(row.path);
+                    }
                     // An untracked file has no diff to line-stage: record it
                     // with intent-to-add first (`git add -N`), which turns
                     // its whole content into stageable Add lines.
@@ -2563,6 +2651,26 @@ fn handle_git_msg(
                     );
                 }
             }
+            GitView::Blame => {
+                // Enter on a blame row → drill into that commit's file list.
+                let row = panel_ui
+                    .git
+                    .blame_rows
+                    .get(panel_ui.git.blame_cursor)
+                    .cloned();
+                if let Some(r) = row {
+                    panel_ui.git.drilled_commit = Some(r.sha.clone());
+                    panel_ui.git.commit_files.clear();
+                    panel_ui.git.focus = GitView::CommitFiles;
+                    spawn_commit_files_fetch(
+                        panel_ui.git.op_gen,
+                        wires.session,
+                        r.sha,
+                        wires.doc_tx,
+                        wires.waker,
+                    );
+                }
+            }
             GitView::Branches => {
                 model.status = "branch log renders from the commits list".into();
             }
@@ -2571,6 +2679,48 @@ fn handle_git_msg(
             }
             _ => {}
         },
+        GitMsg::BlameFile => {
+            // `b` in Files → blame HEAD version; `b` in CommitFiles → blame that commit's version.
+            let (path, sha) = match panel_ui.git.focus {
+                GitView::Files => {
+                    let path = model
+                        .panel
+                        .changes
+                        .get(panel_ui.git.cur.files)
+                        .map(|c| c.path.clone());
+                    (path, "HEAD".to_string())
+                }
+                GitView::CommitFiles => {
+                    let path = panel_ui
+                        .git
+                        .commit_files
+                        .get(panel_ui.git.cur.commit_files)
+                        .map(|(p, _, _)| p.clone());
+                    let sha = panel_ui
+                        .git
+                        .drilled_commit
+                        .clone()
+                        .unwrap_or_else(|| "HEAD".to_string());
+                    (path, sha)
+                }
+                _ => (None, String::new()),
+            };
+            if let Some(p) = path {
+                panel_ui.git.blame_path = Some(p.clone());
+                panel_ui.git.blame_rows.clear();
+                panel_ui.git.blame_cursor = 0;
+                panel_ui.git.blame_scroll = 0;
+                panel_ui.git.focus = GitView::Blame;
+                spawn_blame_fetch(
+                    panel_ui.git.op_gen,
+                    wires.session,
+                    p,
+                    sha,
+                    wires.doc_tx,
+                    wires.waker,
+                );
+            }
+        }
         GitMsg::Back => {
             let git = &mut panel_ui.git;
             if git.filter.is_some() {
@@ -2602,6 +2752,16 @@ fn handle_git_msg(
                             git.flow = GitFlow::None;
                         }
                         git.focus = GitView::Commits;
+                    }
+                    GitView::Blame => {
+                        git.blame_rows.clear();
+                        git.blame_path = None;
+                        // Return to whichever view launched blame.
+                        git.focus = if git.drilled_commit.is_some() {
+                            GitView::CommitFiles
+                        } else {
+                            panel_ui.open.home_view().unwrap_or(GitView::Files)
+                        };
                     }
                     _ => {}
                 }
@@ -4575,6 +4735,9 @@ async fn event_loop<T: Terminal>(
     // Tiles lazy-load on first focus.
     let (app_tx, mut app_rx) = tokio_mpsc::unbounded_channel::<usize>();
     let mut app_host = crate::apps::AppHost::from_config(keymap.config());
+    // Named task (Tasks section) run outcomes — separate from the test runner.
+    let (named_task_run_tx, mut named_task_run_rx) =
+        tokio_mpsc::unbounded_channel::<crate::task::TaskOutcome>();
     // Test-explorer results from the background runner/discoverer (capped,
     // single-flight). Two channels: run outcomes and discovery outcomes.
     let (test_run_tx, mut test_run_rx) =
@@ -4610,6 +4773,11 @@ async fn event_loop<T: Terminal>(
                 }
                 "width" => {
                     panel_ui.width = layout::PanelWidth::from_key(&value);
+                }
+                "tab" => {
+                    if let Some(t) = crate::panel::PanelTab::from_key(&value) {
+                        panel_ui.tab = t;
+                    }
                 }
                 _ => {}
             }
@@ -4852,11 +5020,10 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
             }
         }
-        // Entering the panel lands directly on the open section's items: the
-        // cursor walks rows immediately (Down/j), with Shift+Down/j hopping
-        // between sections. No separate "press Enter to enter rows" step.
+        // On entering the panel, clamp the cursor to the current section's
+        // bounds but stay in section-navigation mode — Enter drills into rows.
         if prev_zone != crate::focus::Zone::Panel && focus.panel() {
-            panel_ui.row_mode = true;
+            panel_ui.row_mode = false;
             let (pc, pr) = panel_geom(&chrome);
             let max =
                 crate::panel::frame::actionable_rows(&model, &panel_ui, pc, pr).saturating_sub(1);
@@ -4945,9 +5112,15 @@ async fn event_loop<T: Terminal>(
                 crate::hydrate::HydrateHints {
                     open: panel_ui.open,
                     expanded: panel_ui.width.is_expanded(),
+                    ..Default::default()
                 },
             );
             spawn_pr_cache_refresh(session.clone(), Some(waker.clone()));
+            crate::hydrate::spawn_issue_cache_refresh(
+                session.clone(),
+                current_config.issues.clone(),
+                Some(waker.clone()),
+            );
             retarget_diff_watcher(
                 &session,
                 &mut watched_worktree,
@@ -5287,6 +5460,37 @@ async fn event_loop<T: Terminal>(
                                     age,
                                     CRASH_THRESHOLD,
                                 );
+                                {
+                                    let wt = session.worktrees[gi].path.clone();
+                                    if !wt.is_empty() {
+                                        let crashed = crashes > 0;
+                                        tokio::task::spawn_blocking(move || {
+                                            let Ok(db) = superzej_core::db::Db::open() else {
+                                                return;
+                                            };
+                                            let Ok(Some((dispatch_id, issue_id))) =
+                                                db.dispatch_info_for_worktree(&wt)
+                                            else {
+                                                return;
+                                            };
+                                            let kind = if crashed {
+                                                "agent_failed"
+                                            } else {
+                                                "agent_done"
+                                            };
+                                            let base = wt.rsplit('/').next().unwrap_or(&wt);
+                                            let msg = format!(
+                                                "agent {} in {base}",
+                                                if crashed { "crashed" } else { "finished" }
+                                            );
+                                            let _ = db.put_notification(kind, &issue_id, &msg, &wt);
+                                            let _ = db.update_dispatch_status(
+                                                dispatch_id,
+                                                if crashed { "failed" } else { "done" },
+                                            );
+                                        });
+                                    }
+                                }
                                 if sole {
                                     if is_active_tab {
                                         if crashes >= 3 {
@@ -5383,6 +5587,32 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
             }
         }
+        // Named task (Tasks section) run outcomes.
+        while let Ok(outcome) = named_task_run_rx.try_recv() {
+            let elapsed_s = outcome.duration_ms as f64 / 1000.0;
+            let exit = outcome.exit_code.unwrap_or(-1);
+            let rec = crate::panel::TaskRunRecord {
+                name: outcome.task.name.clone(),
+                exit_code: exit,
+                duration_ms: outcome.duration_ms as u64,
+                finished_at: superzej_core::util::now(),
+                output_tail: outcome.stdout_stderr.clone(),
+                running: false,
+            };
+            model
+                .panel
+                .task_last_runs
+                .insert(outcome.task.name.clone(), rec);
+            model.status = if exit == 0 {
+                format!("Task '{}' done in {:.1}s", outcome.task.name, elapsed_s)
+            } else {
+                format!(
+                    "Task '{}' failed (exit {}) in {:.1}s",
+                    outcome.task.name, exit, elapsed_s
+                )
+            };
+            dirty = true;
+        }
         // Run results: the latest run upserts each reported test's status while
         // leaving other tests' most-recent status intact.
         while let Ok(outcome) = test_run_rx.try_recv() {
@@ -5409,6 +5639,21 @@ async fn event_loop<T: Terminal>(
                         branch: model.panel.branch.clone(),
                     });
                 persist_tests_for_worktree(&panel_ui, &outcome.worktree);
+                if outcome.exit_code != Some(0) {
+                    let wt = outcome.worktree.clone();
+                    let failed = panel_ui.tests.summary.failed;
+                    tokio::task::spawn_blocking(move || {
+                        let Ok(db) = superzej_core::db::Db::open() else {
+                            return;
+                        };
+                        let msg = format!(
+                            "tests: {} failure{}",
+                            failed,
+                            if failed == 1 { "" } else { "s" }
+                        );
+                        let _ = db.put_notification("test_failed", &wt, &msg, &wt);
+                    });
+                }
                 model.status = format!(
                     "Tests finished in {:.1}s: {}",
                     outcome.duration_ms as f64 / 1000.0,
@@ -5561,6 +5806,23 @@ async fn event_loop<T: Terminal>(
                         r.todos_synced = false;
                     }
                 }
+                GitOpResult::NoUpstream { branch } => {
+                    rehydrate = false;
+                    // Push failed: no upstream. Offer to push -u so the
+                    // branch tracks origin/<branch> from now on.
+                    let remote_branch = format!("origin/{branch}");
+                    active_menu = Some(menu::confirm_menu(
+                        "no upstream branch",
+                        format!("push and track {remote_branch}?"),
+                        "git-op",
+                        String::new(),
+                        false,
+                    ));
+                    pending_confirm_op = Some(GitOp::PushSetUpstream {
+                        remote: "origin".to_owned(),
+                        branch,
+                    });
+                }
             }
             if rehydrate {
                 let _ = refresh_tx.send(if done.touches_remote {
@@ -5631,6 +5893,13 @@ async fn event_loop<T: Terminal>(
                             // sync clears the flow — just drop the read.
                             _ => {}
                         }
+                    }
+                }
+                GitDoc::Blame(rows) => {
+                    if panel_ui.git.focus == GitView::Blame {
+                        panel_ui.git.blame_cursor =
+                            panel_ui.git.blame_cursor.min(rows.len().saturating_sub(1));
+                        panel_ui.git.blame_rows = rows;
                     }
                 }
             }
@@ -5780,6 +6049,19 @@ async fn event_loop<T: Terminal>(
                 if let Some(note) = gitui::sync_rebase_flow(&mut panel_ui.git, banner) {
                     model.status = note.to_string();
                 }
+                // Mirror merge / cherry-pick / revert flow state.
+                {
+                    let (label, onto, unresolved) = match model.panel.merge.as_ref() {
+                        Some(m) => (Some(m.label.as_str()), m.onto.as_str(), m.unresolved),
+                        None => (None, "", 0),
+                    };
+                    gitui::sync_sequencer_flow(&mut panel_ui.git, label, onto, unresolved);
+                    // Back-fill the MergeBanner total from the captured initial count
+                    // so the "X/Y resolved" progress bar renders correctly.
+                    if let Some(m) = model.panel.merge.as_mut() {
+                        m.total = panel_ui.git.merge_conflict_total;
+                    }
+                }
                 // An externally-started rebase arrives here with an empty,
                 // unsynced editor: load the live pending todo for it.
                 if matches!(&panel_ui.git.flow, GitFlow::Rebase(r) if r.running && !r.todos_synced)
@@ -5796,6 +6078,21 @@ async fn event_loop<T: Terminal>(
             model.stats_icons = current_config.stats.clone();
             let ws = (!session.id.is_empty()).then_some(session.id.as_str());
             model.pins = supervisor.chips(&current_config, ws);
+            // Tail mode: auto-jump to the newest visible log line.
+            if panel_ui.open == crate::panel::Section::Logs && panel_ui.logs_tail {
+                let filter = panel_ui.logs_filter.to_lowercase();
+                let count = model
+                    .panel
+                    .log_lines
+                    .iter()
+                    .filter(|l| {
+                        panel_ui.logs_level.map_or(true, |lvl| l.level <= lvl)
+                            && (filter.is_empty() || l.raw.to_lowercase().contains(&filter))
+                    })
+                    .count();
+                panel_ui.logs_cursor = count.saturating_sub(1);
+                panel_ui.cursor = panel_ui.logs_cursor;
+            }
             dirty = true;
         }
 
@@ -5957,6 +6254,21 @@ async fn event_loop<T: Terminal>(
                         model.status =
                             format!("worktree {} created (agent launch failed)", payload.branch);
                     }
+                    {
+                        let branch = payload.branch.clone();
+                        let path = payload.path.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let Ok(db) = superzej_core::db::Db::open() else {
+                                return;
+                            };
+                            let _ = db.put_notification(
+                                "worktree_created",
+                                &path,
+                                &format!("worktree {} ready", branch),
+                                &path,
+                            );
+                        });
+                    }
                     if let Some(cp) = creating.take() {
                         cp.stop_ticker();
                     }
@@ -5972,6 +6284,7 @@ async fn event_loop<T: Terminal>(
                         crate::hydrate::HydrateHints {
                             open: panel_ui.open,
                             expanded: panel_ui.width.is_expanded(),
+                            ..Default::default()
                         },
                     );
                     dirty = true;
@@ -6023,11 +6336,16 @@ async fn event_loop<T: Terminal>(
         // refresh. Both run off-thread and pulse the waker when results land.
         let mut want_model_refresh = false;
         let mut want_pr_refresh = false;
+        let mut want_issue_refresh = false;
         while let Ok(kind) = refresh_rx.try_recv() {
             match kind {
                 RefreshKind::Model => want_model_refresh = true,
                 RefreshKind::Pr => {
                     want_pr_refresh = true;
+                    want_model_refresh = true;
+                }
+                RefreshKind::Issues => {
+                    want_issue_refresh = true;
                     want_model_refresh = true;
                 }
             }
@@ -6042,11 +6360,19 @@ async fn event_loop<T: Terminal>(
                 crate::hydrate::HydrateHints {
                     open: panel_ui.open,
                     expanded: panel_ui.width.is_expanded(),
+                    ..Default::default()
                 },
             );
         }
         if want_pr_refresh {
             spawn_pr_cache_refresh(session.clone(), Some(waker.clone()));
+        }
+        if want_issue_refresh {
+            crate::hydrate::spawn_issue_cache_refresh(
+                session.clone(),
+                current_config.issues.clone(),
+                Some(waker.clone()),
+            );
         }
 
         // Ack the focused worktree's activity so its "look at me" dot clears
@@ -6728,7 +7054,17 @@ async fn event_loop<T: Terminal>(
                                             tx: &docs_tx,
                                         },
                                     );
+                                } else if let Some(t) =
+                                    crate::chrome::panel_tab_hit(&model, &panel_ui, r, mx, my)
+                                {
+                                    // Click on a tab bar pill: switch panel tab.
+                                    panel_ui.switch_tab(t);
+                                    persist_panel_state(&panel_ui);
                                 }
+                            }
+                            Some(crate::panel::PanelHit::Tab(t)) => {
+                                panel_ui.switch_tab(t);
+                                persist_panel_state(&panel_ui);
                             }
                         }
                     }
@@ -6738,6 +7074,19 @@ async fn event_loop<T: Terminal>(
                     if let Some((id, sel)) = mouse_sel.as_mut()
                         && let Some((_, _, content)) = frames.iter().find(|(fid, _, _)| fid == id)
                     {
+                        // Autoscroll when the cursor is dragged past the top or bottom edge.
+                        let pane_id = *id;
+                        if my < content.y {
+                            let delta = (content.y - my).min(3);
+                            if let Some(p) = panes.table.get_mut(&pane_id) {
+                                p.scroll_up(delta);
+                            }
+                        } else if my >= content.y + content.rows {
+                            let delta = (my - (content.y + content.rows - 1)).min(3);
+                            if let Some(p) = panes.table.get_mut(&pane_id) {
+                                p.scroll_down(delta);
+                            }
+                        }
                         let row = my.clamp(content.y, content.y + content.rows.saturating_sub(1))
                             - content.y;
                         let col = mx.clamp(content.x, content.x + content.cols.saturating_sub(1))
@@ -7038,6 +7387,20 @@ async fn event_loop<T: Terminal>(
                                     forced_palette_action =
                                         Some(crate::keymap::Action::NewWorktree);
                                 }
+                                GitAfter::OpenEditor(path) => {
+                                    let cmd = editor_open_command(keymap.config(), &path, None);
+                                    let cwd = active_cwd(&session);
+                                    open_command_tab(
+                                        &mut session,
+                                        &mut panes,
+                                        &cmd,
+                                        cwd.as_deref(),
+                                        chrome.center,
+                                    );
+                                    focus.zone = crate::focus::Zone::Center;
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    need_relayout = true;
+                                }
                                 GitAfter::Terminal(cmd) => {
                                     let cwd = active_cwd(&session);
                                     open_command_tab(
@@ -7118,6 +7481,20 @@ async fn event_loop<T: Terminal>(
                                         forced_palette_action =
                                             Some(crate::keymap::Action::NewWorktree);
                                     }
+                                    GitAfter::OpenEditor(path) => {
+                                        let cmd = editor_open_command(keymap.config(), &path, None);
+                                        let cwd = active_cwd(&session);
+                                        open_command_tab(
+                                            &mut session,
+                                            &mut panes,
+                                            &cmd,
+                                            cwd.as_deref(),
+                                            chrome.center,
+                                        );
+                                        focus.zone = crate::focus::Zone::Center;
+                                        refresh_tab_model(&mut model, &session, &mut sb);
+                                        need_relayout = true;
+                                    }
                                     GitAfter::Terminal(cmd) => {
                                         let cwd = active_cwd(&session);
                                         open_command_tab(
@@ -7178,6 +7555,69 @@ async fn event_loop<T: Terminal>(
                         if let Some(f) = panel_ui.git.filter.as_mut() {
                             f.map = map;
                         }
+                        dirty = true;
+                        continue;
+                    }
+                }
+                // Notifications filter editing.
+                if focus.panel()
+                    && panel_ui.open == crate::panel::Section::Notifications
+                    && panel_ui.notifications_filter_editing
+                {
+                    let mut consumed = true;
+                    match k.key {
+                        KeyCode::Enter => {
+                            panel_ui.notifications_filter_editing = false;
+                        }
+                        key if crate::input::is_escape_key(&key) => {
+                            panel_ui.notifications_filter_editing = false;
+                            panel_ui.notifications_filter.clear();
+                        }
+                        KeyCode::Backspace => {
+                            panel_ui.notifications_filter.pop();
+                        }
+                        KeyCode::Char(c)
+                            if !k.modifiers.contains(Modifiers::CTRL)
+                                && !k.modifiers.contains(Modifiers::ALT) =>
+                        {
+                            panel_ui.notifications_filter.push(c);
+                            panel_ui.notifications_cursor = 0;
+                            panel_ui.cursor = 0;
+                        }
+                        _ => consumed = false,
+                    }
+                    if consumed {
+                        dirty = true;
+                        continue;
+                    }
+                }
+                // Logs filter editing: intercept printable keys and routing.
+                if focus.panel()
+                    && panel_ui.open == crate::panel::Section::Logs
+                    && panel_ui.logs_filter_editing
+                {
+                    let mut consumed = true;
+                    match k.key {
+                        KeyCode::Enter => {
+                            panel_ui.logs_filter_editing = false;
+                        }
+                        key if crate::input::is_escape_key(&key) => {
+                            panel_ui.logs_filter_editing = false;
+                        }
+                        KeyCode::Backspace => {
+                            panel_ui.logs_filter.pop();
+                        }
+                        KeyCode::Char(c)
+                            if !k.modifiers.contains(Modifiers::CTRL)
+                                && !k.modifiers.contains(Modifiers::ALT) =>
+                        {
+                            panel_ui.logs_filter.push(c);
+                            panel_ui.logs_cursor = 0;
+                            panel_ui.cursor = 0;
+                        }
+                        _ => consumed = false,
+                    }
+                    if consumed {
                         dirty = true;
                         continue;
                     }
@@ -7356,6 +7796,28 @@ async fn event_loop<T: Terminal>(
                                         &supervisor,
                                     );
                                     need_relayout = true;
+                                } else if let Some(issue_id) = key.strip_prefix("issue:") {
+                                    // Link the issue to the current worktree and
+                                    // jump to the Issues panel section.
+                                    let wt = active_tab_path(&session);
+                                    let wt_str = wt.to_string_lossy().to_string();
+                                    if let Ok(db) = superzej_core::db::Db::open() {
+                                        let _ = db.link_issue(&wt_str, issue_id);
+                                    }
+                                    panel_ui.open = crate::panel::Section::Issues;
+                                    hydration_gen += 1;
+                                    spawn_model_hydration(
+                                        model_tx.clone(),
+                                        hydration_gen,
+                                        session.clone(),
+                                        Some(waker.clone()),
+                                        crate::hydrate::HydrateHints {
+                                            open: panel_ui.open,
+                                            expanded: panel_ui.width.is_expanded(),
+                                            ..Default::default()
+                                        },
+                                    );
+                                    model.status = format!("Linked {issue_id} to this worktree");
                                 } else if key == "toggle-strip" {
                                     supervisor.toggle_strip();
                                     chrome = compute_chrome(
@@ -7631,6 +8093,25 @@ async fn event_loop<T: Terminal>(
                         }
                     }
                 }
+                // Panel zone: Alt+1/2/3 switch panel tabs. These intentionally
+                // shadow the global Alt+1/2/3 pin-summon shortcuts when the
+                // panel has focus — handled here before the global keymap.
+                if forced_palette_action.is_none() && focus.panel() && k.modifiers == Modifiers::ALT
+                {
+                    use crate::panel::PanelTab;
+                    let tab = match k.key {
+                        KeyCode::Char('1') => Some(PanelTab::Git),
+                        KeyCode::Char('2') => Some(PanelTab::Work),
+                        KeyCode::Char('3') => Some(PanelTab::System),
+                        _ => None,
+                    };
+                    if let Some(t) = tab {
+                        panel_ui.switch_tab(t);
+                        persist_panel_state(&panel_ui);
+                        dirty = true;
+                        continue;
+                    }
+                }
                 // Panel zone, git-family contexts: the table-driven git keys
                 // resolve BEFORE the accordion (space = stage-line in the
                 // staging view, stage-file in the files list, …). Ctrl is
@@ -7662,6 +8143,20 @@ async fn event_loop<T: Terminal>(
                             forced_palette_action = Some(crate::keymap::Action::NewWorktree);
                         }
                         GitAfter::Terminal(cmd) => {
+                            let cwd = active_cwd(&session);
+                            open_command_tab(
+                                &mut session,
+                                &mut panes,
+                                &cmd,
+                                cwd.as_deref(),
+                                chrome.center,
+                            );
+                            focus.zone = crate::focus::Zone::Center;
+                            refresh_tab_model(&mut model, &session, &mut sb);
+                            need_relayout = true;
+                        }
+                        GitAfter::OpenEditor(path) => {
+                            let cmd = editor_open_command(keymap.config(), &path, None);
                             let cwd = active_cwd(&session);
                             open_command_tab(
                                 &mut session,
@@ -7731,11 +8226,13 @@ async fn event_loop<T: Terminal>(
                             // Handled above; kept to keep the match exhaustive.
                             PanelMsg::Open(_) | PanelMsg::NextSection | PanelMsg::PrevSection => {}
                             PanelMsg::LeaveRows => {
-                                // Esc peels one layer: an expanded change
-                                // preview first, then the whole panel zone
-                                // (focus drops back to the center terminal).
+                                // Esc peels one layer at a time: expanded
+                                // change preview → row mode → section mode →
+                                // leave the panel zone.
                                 if panel_ui.chg_sel.is_some() {
                                     panel_ui.chg_sel = None;
+                                } else if panel_ui.row_mode {
+                                    panel_ui.row_mode = false;
                                 } else {
                                     focus.zone = crate::focus::Zone::Center;
                                 }
@@ -7760,7 +8257,7 @@ async fn event_loop<T: Terminal>(
                                 if panel_ui.width == layout::PanelWidth::Full
                                     && matches!(
                                         panel_ui.open,
-                                        Section::Changes | Section::Git | Section::Keys
+                                        Section::Changes | Section::Pr | Section::Keys
                                     )
                                 {
                                     let max = match panel_ui.open {
@@ -7773,7 +8270,7 @@ async fn event_loop<T: Terminal>(
                                                     .saturating_sub(1)
                                             })
                                             .unwrap_or(0),
-                                        Section::Git => panel_ui
+                                        Section::Pr => panel_ui
                                             .docs
                                             .git
                                             .as_ref()
@@ -7867,120 +8364,348 @@ async fn event_loop<T: Terminal>(
                                     );
                                     panel_ui.cursor = 0;
                                 }
+                                if let Some(v) = panel_ui.open.home_view() {
+                                    panel_ui.git.cur.set(v, panel_ui.cursor);
+                                }
+                                if panel_ui.open == crate::panel::Section::Notifications {
+                                    panel_ui.notifications_cursor = panel_ui.cursor;
+                                }
+                                if panel_ui.open == crate::panel::Section::Logs {
+                                    panel_ui.logs_cursor = panel_ui.cursor;
+                                }
+                                if panel_ui.open == crate::panel::Section::Jobs {
+                                    panel_ui.tasks_cursor = panel_ui.cursor;
+                                }
                             }
-                            PanelMsg::Select => match panel_ui.open {
-                                Section::Changes => {
-                                    toggle_change_selection(
-                                        panel_ui.cursor,
-                                        &mut panel_ui,
-                                        &model,
-                                        &session,
-                                        &mut hunk_inflight,
-                                        &hunk_tx,
-                                        &waker,
-                                        hydration_gen,
-                                    );
-                                }
-                                Section::Git => {
-                                    // The cursor walks the DISPLAYED review
-                                    // threads — same filter/cap as the git
-                                    // section's content builder.
-                                    let deep = panel_ui.width.is_expanded();
-                                    let visible = if deep { 4 } else { 2 };
-                                    let target = model
-                                        .panel
-                                        .threads
-                                        .iter()
-                                        .filter(|t| !t.resolved || deep)
-                                        .take(visible)
-                                        .nth(panel_ui.cursor)
-                                        .map(|t| (t.path.clone(), t.line.map(|l| l as usize)));
-                                    if let Some((path, line)) = target {
-                                        let cmd = editor_open_command(keymap.config(), &path, line);
-                                        let cwd = active_cwd(&session);
-                                        open_command_tab(
-                                            &mut session,
-                                            &mut panes,
-                                            &cmd,
-                                            cwd.as_deref(),
-                                            chrome.center,
-                                        );
-                                        focus.zone = crate::focus::Zone::Center;
-                                        refresh_tab_model(&mut model, &session, &mut sb);
-                                        need_relayout = true;
-                                    }
-                                }
-                                Section::Tests => {
-                                    let target = model
-                                        .panel
-                                        .tests
-                                        .as_ref()
-                                        .and_then(|t| t.failures.get(panel_ui.cursor))
-                                        .and_then(|(_, at)| parse_file_line(at));
-                                    if let Some((path, line)) = target {
-                                        let cmd =
-                                            editor_open_command(keymap.config(), &path, Some(line));
-                                        let cwd = active_cwd(&session);
-                                        open_command_tab(
-                                            &mut session,
-                                            &mut panes,
-                                            &cmd,
-                                            cwd.as_deref(),
-                                            chrome.center,
-                                        );
-                                        focus.zone = crate::focus::Zone::Center;
-                                        refresh_tab_model(&mut model, &session, &mut sb);
-                                        need_relayout = true;
-                                    } else {
-                                        model.status = "No source location for this failure".into();
-                                    }
-                                }
-                                Section::Files => {
-                                    // Enter/Space: dirs toggle collapse, files open in bat.
-                                    if let Some(entry) = file_entry_at(
-                                        &model,
-                                        &panel_ui.files_collapsed,
-                                        panel_ui.cursor,
-                                    ) {
-                                        if entry.is_dir {
-                                            toggle_files_collapse(&mut panel_ui, &entry.path);
-                                        } else {
-                                            // Open file in bat (split pane).
-                                            let bat = keymap
-                                                .config()
-                                                .tool_command("bat")
-                                                .unwrap_or("bat --paging=always")
-                                                .to_string();
-                                            let wt = active_tab_path(&session);
-                                            let abs = wt.join(&entry.path);
-                                            let cmd = format!(
-                                                "{bat} {}",
-                                                test_shell_quote(&abs.to_string_lossy())
-                                            );
-                                            let cwd = active_cwd(&session);
-                                            open_command_pane(
-                                                &mut session,
-                                                &mut panes,
-                                                focused,
-                                                &cmd,
-                                                cwd.as_deref(),
-                                                chrome.center,
-                                            );
-                                            focus.zone = crate::focus::Zone::Center;
-                                            refresh_tab_model(&mut model, &session, &mut sb);
-                                            need_relayout = true;
+                            PanelMsg::Select => {
+                                if !panel_ui.row_mode {
+                                    // Drill from section browsing into the
+                                    // section's row list.
+                                    panel_ui.row_mode = true;
+                                    panel_ui.cursor = 0;
+                                } else {
+                                    match panel_ui.open {
+                                        Section::Changes => {
+                                            // Conflict files open in the editor for
+                                            // resolution; all others expand the diff preview.
+                                            let is_conflict = model
+                                                .panel
+                                                .changes
+                                                .get(panel_ui.cursor)
+                                                .is_some_and(|c| {
+                                                    c.stage == crate::panel::Stage::Conflict
+                                                });
+                                            if is_conflict {
+                                                if let Some(path) = model
+                                                    .panel
+                                                    .changes
+                                                    .get(panel_ui.cursor)
+                                                    .map(|c| c.path.clone())
+                                                {
+                                                    let cmd = editor_open_command(
+                                                        keymap.config(),
+                                                        &path,
+                                                        None,
+                                                    );
+                                                    let cwd = active_cwd(&session);
+                                                    open_command_tab(
+                                                        &mut session,
+                                                        &mut panes,
+                                                        &cmd,
+                                                        cwd.as_deref(),
+                                                        chrome.center,
+                                                    );
+                                                    focus.zone = crate::focus::Zone::Center;
+                                                    refresh_tab_model(
+                                                        &mut model, &session, &mut sb,
+                                                    );
+                                                    need_relayout = true;
+                                                }
+                                            } else {
+                                                toggle_change_selection(
+                                                    panel_ui.cursor,
+                                                    &mut panel_ui,
+                                                    &model,
+                                                    &session,
+                                                    &mut hunk_inflight,
+                                                    &hunk_tx,
+                                                    &waker,
+                                                    hydration_gen,
+                                                );
+                                            }
                                         }
+                                        Section::Pr => {
+                                            // The cursor walks the DISPLAYED review
+                                            // threads — same filter/cap as the git
+                                            // section's content builder.
+                                            let deep = panel_ui.width.is_expanded();
+                                            let visible = if deep { 4 } else { 2 };
+                                            let target = model
+                                                .panel
+                                                .threads
+                                                .iter()
+                                                .filter(|t| !t.resolved || deep)
+                                                .take(visible)
+                                                .nth(panel_ui.cursor)
+                                                .map(|t| {
+                                                    (t.path.clone(), t.line.map(|l| l as usize))
+                                                });
+                                            if let Some((path, line)) = target {
+                                                let cmd = editor_open_command(
+                                                    keymap.config(),
+                                                    &path,
+                                                    line,
+                                                );
+                                                let cwd = active_cwd(&session);
+                                                open_command_tab(
+                                                    &mut session,
+                                                    &mut panes,
+                                                    &cmd,
+                                                    cwd.as_deref(),
+                                                    chrome.center,
+                                                );
+                                                focus.zone = crate::focus::Zone::Center;
+                                                refresh_tab_model(&mut model, &session, &mut sb);
+                                                need_relayout = true;
+                                            }
+                                        }
+                                        Section::Tests => {
+                                            let target = model
+                                                .panel
+                                                .tests
+                                                .as_ref()
+                                                .and_then(|t| t.failures.get(panel_ui.cursor))
+                                                .and_then(|(_, at)| parse_file_line(at));
+                                            if let Some((path, line)) = target {
+                                                let cmd = editor_open_command(
+                                                    keymap.config(),
+                                                    &path,
+                                                    Some(line),
+                                                );
+                                                let cwd = active_cwd(&session);
+                                                open_command_tab(
+                                                    &mut session,
+                                                    &mut panes,
+                                                    &cmd,
+                                                    cwd.as_deref(),
+                                                    chrome.center,
+                                                );
+                                                focus.zone = crate::focus::Zone::Center;
+                                                refresh_tab_model(&mut model, &session, &mut sb);
+                                                need_relayout = true;
+                                            } else {
+                                                model.status =
+                                                    "No source location for this failure".into();
+                                            }
+                                        }
+                                        Section::Files => {
+                                            // Enter/Space: dirs toggle collapse, files open in bat.
+                                            if let Some(entry) = file_entry_at(
+                                                &model,
+                                                &panel_ui.files_collapsed,
+                                                panel_ui.cursor,
+                                            ) {
+                                                if entry.is_dir {
+                                                    toggle_files_collapse(
+                                                        &mut panel_ui,
+                                                        &entry.path,
+                                                    );
+                                                } else {
+                                                    // Open file in bat (split pane).
+                                                    let bat = keymap
+                                                        .config()
+                                                        .tool_command("bat")
+                                                        .unwrap_or("bat --paging=always")
+                                                        .to_string();
+                                                    let wt = active_tab_path(&session);
+                                                    let abs = wt.join(&entry.path);
+                                                    let cmd = format!(
+                                                        "{bat} {}",
+                                                        test_shell_quote(&abs.to_string_lossy())
+                                                    );
+                                                    let cwd = active_cwd(&session);
+                                                    open_command_pane(
+                                                        &mut session,
+                                                        &mut panes,
+                                                        focused,
+                                                        &cmd,
+                                                        cwd.as_deref(),
+                                                        chrome.center,
+                                                    );
+                                                    focus.zone = crate::focus::Zone::Center;
+                                                    refresh_tab_model(
+                                                        &mut model, &session, &mut sb,
+                                                    );
+                                                    need_relayout = true;
+                                                }
+                                            }
+                                        }
+                                        // Drill handling for the git-family lists
+                                        // arrives with the GitMsg dispatch layer.
+                                        Section::Commits | Section::Branches | Section::Stash => {}
+                                        Section::Issues => {
+                                            // Enter toggles the worktree↔issue link for
+                                            // the cursor row.
+                                            let wt = active_tab_path(&session);
+                                            let wt_str = wt.to_string_lossy().to_string();
+                                            if let Some(issue) = model
+                                                .panel
+                                                .tracker_issues
+                                                .get(panel_ui.issues_cursor)
+                                            {
+                                                let id = issue.id.clone();
+                                                let already_linked =
+                                                    model.panel.tracker_links.contains(&id);
+                                                if let Ok(db) = superzej_core::db::Db::open() {
+                                                    if already_linked {
+                                                        let _ = db.unlink_issue(&wt_str, &id);
+                                                        model.status = format!("Unlinked {id}");
+                                                    } else {
+                                                        let _ = db.link_issue(&wt_str, &id);
+                                                        model.status = format!("Linked {id}");
+                                                    }
+                                                }
+                                                // Refresh model so the badge updates.
+                                                hydration_gen += 1;
+                                                crate::hydrate::spawn_model_hydration(
+                                                    model_tx.clone(),
+                                                    hydration_gen,
+                                                    session.clone(),
+                                                    Some(waker.clone()),
+                                                    crate::hydrate::HydrateHints {
+                                                        open: panel_ui.open,
+                                                        expanded: panel_ui.width.is_expanded(),
+                                                        ..Default::default()
+                                                    },
+                                                );
+                                            }
+                                        }
+                                        Section::Notifications => {
+                                            let notif = model
+                                                .panel
+                                                .notifications
+                                                .iter()
+                                                .filter(|n| {
+                                                    (panel_ui.notifications_show_read || !n.read)
+                                                        && (panel_ui
+                                                            .notifications_filter
+                                                            .is_empty()
+                                                            || n.message.to_lowercase().contains(
+                                                                &panel_ui
+                                                                    .notifications_filter
+                                                                    .to_lowercase(),
+                                                            )
+                                                            || n.source_ref
+                                                                .to_lowercase()
+                                                                .contains(
+                                                                    &panel_ui
+                                                                        .notifications_filter
+                                                                        .to_lowercase(),
+                                                                ))
+                                                })
+                                                .nth(panel_ui.notifications_cursor)
+                                                .cloned();
+                                            if let Some(n) = notif {
+                                                let id = n.id;
+                                                let kind = n.kind;
+                                                let wt_path = n.worktree_path.clone();
+                                                tokio::task::spawn_blocking(move || {
+                                                    let Ok(db) = superzej_core::db::Db::open()
+                                                    else {
+                                                        return;
+                                                    };
+                                                    let _ = db.mark_notification_read(id);
+                                                });
+                                                use superzej_core::notification::NotificationKind as NK;
+                                                match kind {
+                                                    NK::PrStateChanged => {
+                                                        panel_ui.open = crate::panel::Section::Pr;
+                                                    }
+                                                    NK::TestFailed => {
+                                                        panel_ui.open =
+                                                            crate::panel::Section::Tests;
+                                                    }
+                                                    NK::WorktreeCreated => {
+                                                        if let Some(idx) = session
+                                                            .worktrees
+                                                            .iter()
+                                                            .position(|g| g.path == wt_path)
+                                                        {
+                                                            session.switch_to(idx);
+                                                            refresh_tab_model(
+                                                                &mut model, &session, &mut sb,
+                                                            );
+                                                            need_relayout = true;
+                                                        }
+                                                        panel_ui.open =
+                                                            crate::panel::Section::Changes;
+                                                    }
+                                                    _ => {
+                                                        panel_ui.open =
+                                                            crate::panel::Section::Issues;
+                                                    }
+                                                }
+                                                panel_ui.cursor = 0;
+                                                hydration_gen += 1;
+                                                crate::hydrate::spawn_model_hydration(
+                                                    model_tx.clone(),
+                                                    hydration_gen,
+                                                    session.clone(),
+                                                    Some(waker.clone()),
+                                                    crate::hydrate::HydrateHints {
+                                                        open: panel_ui.open,
+                                                        expanded: panel_ui.width.is_expanded(),
+                                                        ..Default::default()
+                                                    },
+                                                );
+                                            }
+                                        }
+                                        Section::Jobs => {
+                                            // Enter on a task row runs the selected task.
+                                            let task = model
+                                                .panel
+                                                .task_specs
+                                                .get(panel_ui.tasks_cursor)
+                                                .cloned();
+                                            if let Some(task) = task {
+                                                let run_rec = crate::panel::TaskRunRecord {
+                                                    name: task.name.clone(),
+                                                    running: true,
+                                                    ..Default::default()
+                                                };
+                                                model
+                                                    .panel
+                                                    .task_last_runs
+                                                    .insert(task.name.clone(), run_rec);
+                                                model.status = format!("Running: {}", task.name);
+                                                let test_task =
+                                                    crate::task::test_task_from_config(&task);
+                                                let wt = crate::hydrate::active_tab_path(&session);
+                                                let tx2 = named_task_run_tx.clone();
+                                                let wk2 = waker.clone();
+                                                let limits2 = keymap.config().limits.clone();
+                                                tokio::task::spawn_blocking(move || {
+                                                    let outcome = crate::task::run_task(
+                                                        wt, 0, test_task, &limits2,
+                                                    );
+                                                    let _ = tx2.send(outcome);
+                                                    let _ = wk2.wake();
+                                                });
+                                            }
+                                        }
+                                        Section::Debug
+                                        | Section::Sandbox
+                                        | Section::Db
+                                        | Section::Telemetry
+                                        | Section::Keys
+                                        | Section::Logs => {}
                                     }
-                                }
-                                // Drill handling for the git-family lists
-                                // arrives with the GitMsg dispatch layer.
-                                Section::Commits | Section::Branches | Section::Stash => {}
-                                Section::Debug
-                                | Section::Sandbox
-                                | Section::Db
-                                | Section::Telemetry
-                                | Section::Keys => {}
-                            },
+                                } // match panel_ui.open + else
+                            }
+                            PanelMsg::SwitchTab(t) => {
+                                panel_ui.switch_tab(t);
+                                persist_panel_state(&panel_ui);
+                            }
                             PanelMsg::ToggleExpand => {
                                 toggle_panel_expand(
                                     &mut panel_ui,
@@ -8079,7 +8804,7 @@ async fn event_loop<T: Terminal>(
                             true
                         }
                         // -- git: copy the HEAD sha (wide views) -------------
-                        (Section::Git, KeyCode::Char('y')) if panel_ui.width.is_expanded() => {
+                        (Section::Pr, KeyCode::Char('y')) if panel_ui.width.is_expanded() => {
                             match panel_ui
                                 .docs
                                 .git
@@ -8098,7 +8823,7 @@ async fn event_loop<T: Terminal>(
                             true
                         }
                         // -- git: PR actions via `gh`, off the loop ----------
-                        (Section::Git, KeyCode::Char('M')) => {
+                        (Section::Pr, KeyCode::Char('M')) => {
                             match &model.panel.pr {
                                 Some(pr) => {
                                     model.status = format!("Merging PR #{} (squash)…", pr.number);
@@ -8121,7 +8846,7 @@ async fn event_loop<T: Terminal>(
                             }
                             true
                         }
-                        (Section::Git, KeyCode::Char('A')) => {
+                        (Section::Pr, KeyCode::Char('A')) => {
                             match &model.panel.pr {
                                 Some(pr) => {
                                     model.status = format!("Approving PR #{}…", pr.number);
@@ -8137,7 +8862,7 @@ async fn event_loop<T: Terminal>(
                             }
                             true
                         }
-                        (Section::Git, KeyCode::Char('c')) => {
+                        (Section::Pr, KeyCode::Char('c')) => {
                             if model.panel.pr.is_some() {
                                 model.status = "A pull request already exists".into();
                             } else {
@@ -8165,7 +8890,7 @@ async fn event_loop<T: Terminal>(
                             }
                             true
                         }
-                        (Section::Git, KeyCode::Char('r')) => {
+                        (Section::Pr, KeyCode::Char('r')) => {
                             model.status = "Re-running failed checks…".into();
                             spawn_pr_action(
                                 &session,
@@ -8176,7 +8901,7 @@ async fn event_loop<T: Terminal>(
                             );
                             true
                         }
-                        (Section::Git, KeyCode::Char('o')) => {
+                        (Section::Pr, KeyCode::Char('o')) => {
                             // The PR in the browser, detached (no gh needed).
                             if let Some(pr) = &model.panel.pr {
                                 let _ = std::process::Command::new("xdg-open")
@@ -8308,6 +9033,34 @@ async fn event_loop<T: Terminal>(
                                 model.status = crate::task::dap_launch_descriptor(task, &node.id);
                             } else {
                                 model.status = "Select a test to prepare a debug launch".into();
+                            }
+                            true
+                        }
+                        // -- tasks: run / re-run / stop ----------------------
+                        (Section::Jobs, KeyCode::Char('r')) => {
+                            // Re-run: same as Enter but without moving cursor.
+                            let task = model.panel.task_specs.get(panel_ui.tasks_cursor).cloned();
+                            if let Some(task) = task {
+                                let run_rec = crate::panel::TaskRunRecord {
+                                    name: task.name.clone(),
+                                    running: true,
+                                    ..Default::default()
+                                };
+                                model
+                                    .panel
+                                    .task_last_runs
+                                    .insert(task.name.clone(), run_rec);
+                                model.status = format!("Re-running: {}", task.name);
+                                let test_task = crate::task::test_task_from_config(&task);
+                                let wt = crate::hydrate::active_tab_path(&session);
+                                let tx2 = named_task_run_tx.clone();
+                                let wk2 = waker.clone();
+                                let limits2 = keymap.config().limits.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let outcome = crate::task::run_task(wt, 0, test_task, &limits2);
+                                    let _ = tx2.send(outcome);
+                                    let _ = wk2.wake();
+                                });
                             }
                             true
                         }
@@ -8513,6 +9266,403 @@ async fn event_loop<T: Terminal>(
                             }
                             true
                         }
+                        // -- issues: open URL, refresh, self-assign ----------
+                        (Section::Issues, KeyCode::Char('o')) => {
+                            if let Some(issue) =
+                                model.panel.tracker_issues.get(panel_ui.issues_cursor)
+                            {
+                                open_url_detached(&issue.url.clone());
+                                model.status = format!("Opened {} in browser", issue.number);
+                            }
+                            true
+                        }
+                        (Section::Issues, KeyCode::Char('r')) => {
+                            crate::hydrate::spawn_issue_cache_refresh(
+                                session.clone(),
+                                current_config.issues.clone(),
+                                Some(waker.clone()),
+                            );
+                            model.status = "Refreshing issues…".into();
+                            true
+                        }
+                        (Section::Issues, KeyCode::Char('a')) => {
+                            // Self-assign the cursor issue.
+                            if let Some(issue) = model
+                                .panel
+                                .tracker_issues
+                                .get(panel_ui.issues_cursor)
+                                .cloned()
+                            {
+                                let cfg = current_config.issues.clone();
+                                let waker2 = waker.clone();
+                                let session2 = session.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    use superzej_core::issue::IssuePatch;
+                                    use superzej_svc::issue::IssueRouter;
+                                    let router = IssueRouter::from_config(&cfg);
+                                    if !router.is_configured() {
+                                        return;
+                                    }
+                                    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                                        .enable_all()
+                                        .build()
+                                    else {
+                                        return;
+                                    };
+                                    let patch = IssuePatch {
+                                        assignee_me: Some(true),
+                                        ..Default::default()
+                                    };
+                                    let _ = rt.block_on(router.update_issue(&issue.id, &patch));
+                                    crate::hydrate::spawn_issue_cache_refresh(
+                                        session2,
+                                        cfg,
+                                        Some(waker2),
+                                    );
+                                });
+                                model.status = format!("Assigning {} to you…", issue.number);
+                            }
+                            true
+                        }
+                        (Section::Issues, KeyCode::Char('D')) => {
+                            // Dispatch a Claude Code agent to a new worktree for
+                            // the selected issue.  Reuses the wizard's Done path.
+                            if let Some(issue) = model
+                                .panel
+                                .tracker_issues
+                                .get(panel_ui.issues_cursor)
+                                .cloned()
+                            {
+                                // Cancel any in-progress wizard so the Done event
+                                // we send below is the newest generation.
+                                wizard_cmd_tx = None;
+                                creating = None;
+                                wizard_ui = None;
+                                create_gen += 1;
+                                let dispatch_gen = create_gen;
+
+                                let cfg2 = keymap.config().clone();
+                                let tx2 = create_tx.clone();
+                                let wk2 = waker.clone();
+                                let src_path = session
+                                    .active_group()
+                                    .map(|g| g.path.clone())
+                                    .unwrap_or_default();
+                                let issue_id = issue.id.clone();
+                                let issue_number = issue.number.clone();
+                                let issue_title = issue.title.clone();
+                                let issue_body = issue.body.clone().unwrap_or_default();
+                                let issue_url = issue.url.clone();
+
+                                tokio::task::spawn_blocking(move || {
+                                    use superzej_core::{repo, worktree as wt};
+
+                                    // Find the repo root from the active worktree path.
+                                    let root_opt = (!src_path.is_empty())
+                                        .then(|| {
+                                            repo::main_worktree(std::path::Path::new(&src_path))
+                                        })
+                                        .flatten()
+                                        .or_else(|| {
+                                            std::env::current_dir()
+                                                .ok()
+                                                .and_then(|c| repo::main_worktree(&c))
+                                        });
+                                    let Some(root) = root_opt else {
+                                        return;
+                                    };
+
+                                    let base = wt::resolve_base(&root, &cfg2);
+                                    let taken = wt::BranchSet::load(&root);
+                                    let raw_branch = issue
+                                        .branch_hint
+                                        .as_deref()
+                                        .map(str::to_owned)
+                                        .unwrap_or_else(|| {
+                                            superzej_core::util::slugify(&issue_number)
+                                        });
+                                    let branch = wt::dedupe(&raw_branch, &taken);
+                                    let path = wt::worktree_path(&root, &branch, &cfg2);
+
+                                    if let Err(e) =
+                                        wt::add_checked(&root, &branch, &base, &path, &cfg2)
+                                    {
+                                        superzej_core::msg::warn(&format!("agent dispatch: {e}"));
+                                        return;
+                                    }
+
+                                    let wt_str = path.to_string_lossy().into_owned();
+                                    let Ok(mut spec) = crate::agent::launch_spec(
+                                        &cfg2,
+                                        &wt_str,
+                                        Some(&branch),
+                                        "claude",
+                                    ) else {
+                                        return;
+                                    };
+
+                                    // Inject issue context for the agent.
+                                    spec.env
+                                        .push(("SUPERZEJ_ISSUE_ID".into(), issue_id.clone()));
+                                    spec.env
+                                        .push(("SUPERZEJ_ISSUE_TITLE".into(), issue_title.clone()));
+                                    spec.env.push(("SUPERZEJ_ISSUE_BODY".into(), issue_body));
+                                    spec.env.push(("SUPERZEJ_ISSUE_URL".into(), issue_url));
+
+                                    let slug = repo::repo_slug(&root);
+                                    let tab = repo::branch_tab(&slug, &branch);
+
+                                    // Register the dispatch in the DB.
+                                    if let Ok(db) = superzej_core::db::Db::open() {
+                                        let root_s = root.to_string_lossy();
+                                        let _ =
+                                            db.put_worktree(&tab, &root_s, &wt_str, &branch, None);
+                                        let _ = db.put_agent_dispatch(&issue_id, &wt_str, "claude");
+                                        let _ = db.link_issue(&wt_str, &issue_id);
+                                    }
+                                    let payload = crate::wizard::CreatedWorktree {
+                                        tab: tab.clone(),
+                                        branch: branch.clone(),
+                                        path: wt_str,
+                                        agent: "claude".into(),
+                                        spec,
+                                    };
+                                    let _ = tx2.send(crate::wizard::CreateEvent::Done {
+                                        generation: dispatch_gen,
+                                        payload: Box::new(payload),
+                                    });
+                                    let _ = wk2.wake();
+                                });
+                                model.status = format!("Dispatching agent to {}…", issue.number);
+                            }
+                            true
+                        }
+                        (Section::Notifications, KeyCode::Char('r')) => {
+                            let notif_id = model
+                                .panel
+                                .notifications
+                                .iter()
+                                .filter(|n| {
+                                    (panel_ui.notifications_show_read || !n.read)
+                                        && (panel_ui.notifications_filter.is_empty()
+                                            || n.message.to_lowercase().contains(
+                                                &panel_ui.notifications_filter.to_lowercase(),
+                                            )
+                                            || n.source_ref.to_lowercase().contains(
+                                                &panel_ui.notifications_filter.to_lowercase(),
+                                            ))
+                                })
+                                .nth(panel_ui.notifications_cursor)
+                                .map(|n| n.id);
+                            if let Some(id) = notif_id {
+                                tokio::task::spawn_blocking(move || {
+                                    let Ok(db) = superzej_core::db::Db::open() else {
+                                        return;
+                                    };
+                                    let _ = db.mark_notification_read(id);
+                                });
+                                hydration_gen += 1;
+                                crate::hydrate::spawn_model_hydration(
+                                    model_tx.clone(),
+                                    hydration_gen,
+                                    session.clone(),
+                                    Some(waker.clone()),
+                                    crate::hydrate::HydrateHints {
+                                        open: panel_ui.open,
+                                        expanded: panel_ui.width.is_expanded(),
+                                        ..Default::default()
+                                    },
+                                );
+                            }
+                            true
+                        }
+                        (Section::Notifications, KeyCode::Char('R')) => {
+                            tokio::task::spawn_blocking(|| {
+                                let Ok(db) = superzej_core::db::Db::open() else {
+                                    return;
+                                };
+                                let _ = db.mark_all_notifications_read();
+                            });
+                            hydration_gen += 1;
+                            crate::hydrate::spawn_model_hydration(
+                                model_tx.clone(),
+                                hydration_gen,
+                                session.clone(),
+                                Some(waker.clone()),
+                                crate::hydrate::HydrateHints {
+                                    open: panel_ui.open,
+                                    expanded: panel_ui.width.is_expanded(),
+                                    ..Default::default()
+                                },
+                            );
+                            true
+                        }
+                        (Section::Notifications, KeyCode::Char('d')) => {
+                            let notif_id = model
+                                .panel
+                                .notifications
+                                .iter()
+                                .filter(|n| {
+                                    (panel_ui.notifications_show_read || !n.read)
+                                        && (panel_ui.notifications_filter.is_empty()
+                                            || n.message.to_lowercase().contains(
+                                                &panel_ui.notifications_filter.to_lowercase(),
+                                            )
+                                            || n.source_ref.to_lowercase().contains(
+                                                &panel_ui.notifications_filter.to_lowercase(),
+                                            ))
+                                })
+                                .nth(panel_ui.notifications_cursor)
+                                .map(|n| n.id);
+                            if let Some(id) = notif_id {
+                                tokio::task::spawn_blocking(move || {
+                                    let Ok(db) = superzej_core::db::Db::open() else {
+                                        return;
+                                    };
+                                    let _ = db.delete_notification(id);
+                                });
+                                panel_ui.notifications_cursor =
+                                    panel_ui.notifications_cursor.saturating_sub(1);
+                                panel_ui.cursor = panel_ui.notifications_cursor;
+                                hydration_gen += 1;
+                                crate::hydrate::spawn_model_hydration(
+                                    model_tx.clone(),
+                                    hydration_gen,
+                                    session.clone(),
+                                    Some(waker.clone()),
+                                    crate::hydrate::HydrateHints {
+                                        open: panel_ui.open,
+                                        expanded: panel_ui.width.is_expanded(),
+                                        ..Default::default()
+                                    },
+                                );
+                            }
+                            true
+                        }
+                        (Section::Notifications, KeyCode::Char('A')) => {
+                            panel_ui.notifications_show_read = !panel_ui.notifications_show_read;
+                            panel_ui.notifications_cursor = 0;
+                            panel_ui.cursor = 0;
+                            true
+                        }
+                        (Section::Notifications, KeyCode::Char('/')) => {
+                            panel_ui.notifications_filter_editing = true;
+                            if panel_ui.notifications_filter.is_empty() {
+                                panel_ui.notifications_cursor = 0;
+                                panel_ui.cursor = 0;
+                            }
+                            true
+                        }
+                        // -- Logs: filter, level, tail, copy, export -----------
+                        (Section::Logs, KeyCode::Char('/')) => {
+                            panel_ui.logs_filter_editing = true;
+                            if panel_ui.logs_filter.is_empty() {
+                                panel_ui.logs_cursor = 0;
+                                panel_ui.cursor = 0;
+                            }
+                            true
+                        }
+                        (Section::Logs, KeyCode::Char('l')) => {
+                            use superzej_core::log_view::LogLevel;
+                            panel_ui.logs_level = match panel_ui.logs_level {
+                                None => Some(LogLevel::Error),
+                                Some(l) => l.next_cycle(),
+                            };
+                            panel_ui.logs_cursor = 0;
+                            panel_ui.cursor = 0;
+                            model.status = match panel_ui.logs_level {
+                                None => "Logs: all levels".into(),
+                                Some(l) => format!("Logs: {} and above", l.label()),
+                            };
+                            true
+                        }
+                        (Section::Logs, KeyCode::Char('a')) => {
+                            panel_ui.logs_tail = !panel_ui.logs_tail;
+                            model.status = if panel_ui.logs_tail {
+                                "Logs: tail mode on".into()
+                            } else {
+                                "Logs: tail mode off".into()
+                            };
+                            true
+                        }
+                        (Section::Logs, KeyCode::Char('y')) => {
+                            let filter = panel_ui.logs_filter.to_lowercase();
+                            let line = model
+                                .panel
+                                .log_lines
+                                .iter()
+                                .filter(|l| {
+                                    panel_ui.logs_level.map_or(true, |lvl| l.level <= lvl)
+                                        && (filter.is_empty()
+                                            || l.raw.to_lowercase().contains(&filter))
+                                })
+                                .nth(panel_ui.logs_cursor)
+                                .map(|l| l.raw.clone());
+                            if let Some(text) = line {
+                                use std::io::Write as _;
+                                let mut out = std::io::stdout();
+                                let _ = out.write_all(&crate::copymode::osc52(&text));
+                                let _ = out.flush();
+                                model.status = "Log line copied".into();
+                            }
+                            true
+                        }
+                        (Section::Logs, KeyCode::Char('Y')) => {
+                            let filter = panel_ui.logs_filter.to_lowercase();
+                            let lines: Vec<String> = model
+                                .panel
+                                .log_lines
+                                .iter()
+                                .filter(|l| {
+                                    panel_ui.logs_level.map_or(true, |lvl| l.level <= lvl)
+                                        && (filter.is_empty()
+                                            || l.raw.to_lowercase().contains(&filter))
+                                })
+                                .map(|l| l.raw.clone())
+                                .collect();
+                            if !lines.is_empty() {
+                                let text = lines.join("\n");
+                                use std::io::Write as _;
+                                let mut out = std::io::stdout();
+                                let _ = out.write_all(&crate::copymode::osc52(&text));
+                                let _ = out.flush();
+                                model.status = format!("Copied {} log lines", lines.len());
+                            }
+                            true
+                        }
+                        (Section::Logs, KeyCode::Char('e')) => {
+                            let filter = panel_ui.logs_filter.to_lowercase();
+                            let lines: Vec<String> = model
+                                .panel
+                                .log_lines
+                                .iter()
+                                .filter(|l| {
+                                    panel_ui.logs_level.map_or(true, |lvl| l.level <= lvl)
+                                        && (filter.is_empty()
+                                            || l.raw.to_lowercase().contains(&filter))
+                                })
+                                .map(|l| l.raw.clone())
+                                .collect();
+                            if !lines.is_empty() {
+                                let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+                                let export_path = superzej_core::util::xdg_state_home()
+                                    .join(format!("superzej/logs/export-{ts}.log"));
+                                let content = lines.join("\n");
+                                match std::fs::write(&export_path, &content) {
+                                    Ok(()) => {
+                                        model.status = format!(
+                                            "Exported {} lines to {}",
+                                            lines.len(),
+                                            export_path.display()
+                                        );
+                                    }
+                                    Err(e) => {
+                                        model.status = format!("Export failed: {e}");
+                                    }
+                                }
+                            }
+                            true
+                        }
                         // Esc in section mode returns to the terminal (row
                         // mode's Esc is claimed by the accordion map).
                         (_, key) if crate::input::is_escape_key(&key) => {
@@ -8602,6 +9752,7 @@ async fn event_loop<T: Terminal>(
                                         &session,
                                         &db,
                                         &current_config,
+                                        &model.panel.tracker_issues,
                                     )));
                                 }
                             }

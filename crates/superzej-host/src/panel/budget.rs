@@ -146,26 +146,26 @@ mod tests {
 
     #[test]
     fn overflow_reserves_the_more_row() {
-        // fixed = 4 + 12 + 2 = 18; rows 23 → budget 5; content 20 → 5 rows
-        // granted (4 real + the "+N more" row), hidden = 20 - 4 = 16.
-        let p = allocate(23, 4, 20, SECTIONS);
-        assert_eq!(p.content_rows, 5);
-        assert_eq!(p.overflow, Some(16));
+        // fixed = 4 + 14 + 2 = 20; rows 24 → budget 4; content 20 → 4 rows
+        // granted (3 real + the "+N more" row), hidden = 20 - 3 = 17.
+        let p = allocate(24, 4, 20, SECTIONS);
+        assert_eq!(p.content_rows, 4);
+        assert_eq!(p.overflow, Some(17));
         assert!(!p.airy);
     }
 
     #[test]
     fn exact_fit_has_no_overflow() {
-        let p = allocate(27, 4, 6, SECTIONS);
+        let p = allocate(28, 4, 6, SECTIONS);
         assert_eq!(p.content_rows, 6);
         assert_eq!(p.overflow, None);
     }
 
     #[test]
     fn short_panel_sheds_header_detail_but_keeps_branch_row() {
-        // rows 15: fixed(4)=18 > 15 → header shrinks to 1 (fixed = 15), zero
+        // rows 16: fixed(1)=17 > 16 → degenerate path, header=min(1,2)=1, zero
         // content budget.
-        let p = allocate(15, 4, 10, SECTIONS);
+        let p = allocate(16, 4, 10, SECTIONS);
         assert_eq!(p.header_rows, 1);
         assert_eq!(p.content_rows, 0);
         assert_eq!(p.overflow, None);
@@ -192,7 +192,7 @@ mod tests {
     fn budget_of_zero_with_content_shows_nothing_not_a_bare_more_row() {
         // rows exactly the skeleton: no content row at all (a lone "+N more"
         // row without context would be noise).
-        let rows = 4 + SECTIONS + 2; // 15
+        let rows = 4 + SECTIONS + 2; // 19
         let p = allocate(rows, 4, 9, SECTIONS);
         assert_eq!(p.content_rows, 0);
         assert_eq!(p.overflow, None);

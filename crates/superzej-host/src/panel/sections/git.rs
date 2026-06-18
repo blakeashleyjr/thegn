@@ -136,7 +136,7 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
                             seg(g(), format!(" · {at} · ")),
                             seg(d(), format!("“{}”", th.snippet)),
                         ]))
-                        .with_hit(PanelHit::Row(Section::Git, i)),
+                        .with_hit(PanelHit::Row(Section::Pr, i)),
                     );
                 }
                 rows.push(PanelRow::blank());

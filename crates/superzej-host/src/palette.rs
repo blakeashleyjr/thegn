@@ -285,6 +285,7 @@ pub(crate) fn build_palette(
     session: &crate::session::Session,
     db: &superzej_core::db::Db,
     cfg: &superzej_core::config::Config,
+    issues: &[superzej_core::issue::Issue],
 ) -> Vec<crate::palette::PaletteItem> {
     use crate::palette::PaletteItem;
     let mut items = build_command_palette_items(cfg);
@@ -341,6 +342,13 @@ pub(crate) fn build_palette(
                 ));
             }
         }
+    }
+
+    // Tracked issues: `issue:<id>` prefix, searchable by number + title.
+    for issue in issues {
+        let status_glyph = issue.status.glyph();
+        let label = format!("{status_glyph} {} {}", issue.number, issue.title);
+        items.push(PaletteItem::new(format!("issue:{}", issue.id), label));
     }
 
     let usage = db.palette_usage().unwrap_or_default();

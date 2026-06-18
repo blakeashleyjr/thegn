@@ -32,6 +32,8 @@ pub enum GitView {
     PatchBuilding,
     /// The interactive-rebase TODO editor.
     RebaseTodo,
+    /// Annotated blame for a specific file.
+    Blame,
 }
 
 impl GitView {
@@ -46,6 +48,7 @@ impl GitView {
             GitView::CommitFiles => "commit files",
             GitView::PatchBuilding => "patch",
             GitView::RebaseTodo => "rebase",
+            GitView::Blame => "blame",
         }
     }
 }
@@ -151,6 +154,16 @@ impl PatchUi {
     }
 }
 
+/// State for an active merge/cherry-pick/revert mid-conflict.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SequencerUi {
+    /// What is being merged/applied in (branch name, commit short, …).
+    pub onto: String,
+    /// Conflict marker is set while MERGE_HEAD / CHERRY_PICK_HEAD / REVERT_HEAD
+    /// is present and at least one file is unresolved.
+    pub conflict: bool,
+}
+
 /// A modal git flow in progress (rendered as a header chip + main region).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum GitFlow {
@@ -161,6 +174,12 @@ pub enum GitFlow {
     Patch(PatchUi),
     /// Diff-two-refs mode: everything diffs against this marked ref.
     Diffing(String),
+    /// An in-progress `git merge` (possibly conflicted).
+    Merge(SequencerUi),
+    /// An in-progress `git cherry-pick` (possibly conflicted).
+    CherryPick(SequencerUi),
+    /// An in-progress `git revert` (possibly conflicted).
+    Revert(SequencerUi),
 }
 
 /// A per-list fuzzy filter (`/`). Cursor and selection operate in FILTERED
@@ -276,6 +295,18 @@ pub struct GitUi {
     /// Acceptance cutoff for arriving git-op results (same idiom as
     /// `hunks_gen`).
     pub op_gen: u64,
+    /// Initial unresolved-conflict count for the current merge/cherry/revert
+    /// flow — captured on first detection so `MergeBanner.total` can render
+    /// the "X/Y resolved" bar across successive hydrations.
+    pub merge_conflict_total: Option<usize>,
+    /// Path of the file currently open in blame view.
+    pub blame_path: Option<String>,
+    /// Fetched blame rows (empty while the async fetch is in-flight).
+    pub blame_rows: Vec<crate::panel::BlameRow>,
+    /// Cursor into `blame_rows`.
+    pub blame_cursor: usize,
+    /// Vertical scroll offset for the blame region.
+    pub blame_scroll: usize,
 }
 
 impl GitUi {
@@ -360,6 +391,8 @@ pub enum GitMsg {
     Redo,
     FilterStart,
     Cheatsheet,
+    /// Open the blame view for the selected file (Files / CommitFiles).
+    BlameFile,
 }
 
 /// One context key: chord text (display + parse), help label, message.
@@ -382,6 +415,8 @@ pub fn context_keys(view: GitView) -> Vec<CtxKey> {
         GitView::Files => vec![
             k("space", "stage", GitMsg::StageToggleFile),
             k("enter", "diff", GitMsg::Drill),
+            k("b", "blame", GitMsg::BlameFile),
+            k("m", "flow menu", GitMsg::OpenMenu(MenuKind::Rebase)),
             k("c", "commit", GitMsg::Commit),
             k("d", "discard", GitMsg::DiscardFile),
             k("a", "stage all", GitMsg::StageAll),
@@ -466,8 +501,13 @@ pub fn context_keys(view: GitView) -> Vec<CtxKey> {
         ],
         GitView::CommitFiles => vec![
             k("enter", "patch lines", GitMsg::Drill),
+            k("b", "blame", GitMsg::BlameFile),
             k("z", "undo", GitMsg::Undo),
             k("/", "filter", GitMsg::FilterStart),
+            k("?", "keys", GitMsg::Cheatsheet),
+        ],
+        GitView::Blame => vec![
+            k("enter", "open commit", GitMsg::Drill),
             k("?", "keys", GitMsg::Cheatsheet),
         ],
         GitView::PatchBuilding => vec![
@@ -520,6 +560,21 @@ pub fn fuzzy_filter(labels: &[String], query: &str) -> Vec<usize> {
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     scored.into_iter().map(|(_, i)| i).collect()
+}
+
+/// A flow-specific hint pair `(chord, label)` to prepend to the help bar when
+/// an active sequencer flow overrides what `m` does. Returns `None` when no
+/// sequencer is in progress (rebase is tracked separately in `RebaseTodo`).
+pub fn flow_hint(flow: &GitFlow) -> Option<(&'static str, &'static str)> {
+    match flow {
+        GitFlow::Merge(s) if s.conflict => Some(("m", "merge continue/abort")),
+        GitFlow::Merge(_) => Some(("m", "merge menu")),
+        GitFlow::CherryPick(s) if s.conflict => Some(("m", "cherry continue/abort")),
+        GitFlow::CherryPick(_) => Some(("m", "cherry menu")),
+        GitFlow::Revert(s) if s.conflict => Some(("m", "revert continue/abort")),
+        GitFlow::Revert(_) => Some(("m", "revert menu")),
+        _ => None,
+    }
 }
 
 /// The filter labels of a git list view — MUST match what the section
@@ -707,6 +762,80 @@ pub fn sync_rebase_flow(git: &mut GitUi, banner: Option<(&str, usize)>) -> Optio
     }
 }
 
+/// Mirror an externally-driven merge / cherry-pick / revert into `git.flow`,
+/// tracking the initial conflict count for the progress bar. Clears stale
+/// flows when the banner disappears. Call alongside `sync_rebase_flow`.
+pub fn sync_sequencer_flow(git: &mut GitUi, label: Option<&str>, onto: &str, unresolved: usize) {
+    match label {
+        Some("MERGING") => {
+            // Capture the initial total on first detection.
+            if git.merge_conflict_total.is_none() {
+                git.merge_conflict_total = Some(unresolved);
+            }
+            match &mut git.flow {
+                GitFlow::Merge(s) => {
+                    s.conflict = unresolved > 0;
+                    s.onto = onto.to_owned();
+                }
+                GitFlow::None => {
+                    git.flow = GitFlow::Merge(SequencerUi {
+                        onto: onto.to_owned(),
+                        conflict: unresolved > 0,
+                    });
+                }
+                _ => {}
+            }
+        }
+        Some("CHERRY-PICK") => {
+            if git.merge_conflict_total.is_none() {
+                git.merge_conflict_total = Some(unresolved);
+            }
+            match &mut git.flow {
+                GitFlow::CherryPick(s) => {
+                    s.conflict = unresolved > 0;
+                    s.onto = onto.to_owned();
+                }
+                GitFlow::None => {
+                    git.flow = GitFlow::CherryPick(SequencerUi {
+                        onto: onto.to_owned(),
+                        conflict: unresolved > 0,
+                    });
+                }
+                _ => {}
+            }
+        }
+        Some("REVERTING") => {
+            if git.merge_conflict_total.is_none() {
+                git.merge_conflict_total = Some(unresolved);
+            }
+            match &mut git.flow {
+                GitFlow::Revert(s) => {
+                    s.conflict = unresolved > 0;
+                    s.onto = onto.to_owned();
+                }
+                GitFlow::None => {
+                    git.flow = GitFlow::Revert(SequencerUi {
+                        onto: onto.to_owned(),
+                        conflict: unresolved > 0,
+                    });
+                }
+                _ => {}
+            }
+        }
+        None => {
+            // Clear any sequencer flow that has now finished.
+            if matches!(
+                &git.flow,
+                GitFlow::Merge(_) | GitFlow::CherryPick(_) | GitFlow::Revert(_)
+            ) {
+                git.flow = GitFlow::None;
+                git.merge_conflict_total = None;
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Whether a chord string matches a raw key event.
 fn chord_matches(chord: &str, key: &KeyCode, mods: Modifiers) -> bool {
     let ctrl = mods.contains(Modifiers::CTRL);
@@ -813,7 +942,7 @@ pub fn git_key(key: &KeyCode, mods: Modifiers, ui: &crate::panel::PanelUi) -> Op
     // flow-through navigation); the line-cursor views claim them.
     if matches!(
         view,
-        GitView::Staging | GitView::PatchBuilding | GitView::RebaseTodo
+        GitView::Staging | GitView::PatchBuilding | GitView::RebaseTodo | GitView::Blame
     ) && !mods.contains(Modifiers::SHIFT)
         && !mods.contains(Modifiers::CTRL)
     {
@@ -872,6 +1001,7 @@ mod tests {
             GitView::CommitFiles,
             GitView::PatchBuilding,
             GitView::RebaseTodo,
+            GitView::Blame,
         ] {
             let mut seen = std::collections::HashSet::new();
             for ck in context_keys(view) {
@@ -1069,6 +1199,7 @@ mod tests {
             GitView::CommitFiles,
             GitView::PatchBuilding,
             GitView::RebaseTodo,
+            GitView::Blame,
         ] {
             let ui = ui_at(view, PanelWidth::Full);
             assert_eq!(
@@ -1255,6 +1386,79 @@ mod tests {
         git.flow = GitFlow::None;
         sync_rebase_flow(&mut git, Some(("MERGING", 1)));
         assert_eq!(git.flow, GitFlow::None);
+    }
+
+    #[test]
+    fn sync_sequencer_flow_mirrors_merge_cherry_revert_state() {
+        let mut git = GitUi::default();
+
+        // MERGING banner creates a Merge flow and captures total.
+        sync_sequencer_flow(&mut git, Some("MERGING"), "main", 3);
+        assert!(matches!(&git.flow, GitFlow::Merge(s) if s.conflict && s.onto == "main"));
+        assert_eq!(git.merge_conflict_total, Some(3));
+
+        // Subsequent calls update conflict flag but do not reset total.
+        sync_sequencer_flow(&mut git, Some("MERGING"), "main", 0);
+        assert!(matches!(&git.flow, GitFlow::Merge(s) if !s.conflict));
+        assert_eq!(git.merge_conflict_total, Some(3), "total must not be reset");
+
+        // None clears a finished merge.
+        sync_sequencer_flow(&mut git, None, "", 0);
+        assert_eq!(git.flow, GitFlow::None);
+        assert_eq!(git.merge_conflict_total, None);
+
+        // CHERRY-PICK banner.
+        sync_sequencer_flow(&mut git, Some("CHERRY-PICK"), "abc1234", 1);
+        assert!(matches!(&git.flow, GitFlow::CherryPick(s) if s.conflict));
+        assert_eq!(git.merge_conflict_total, Some(1));
+
+        // REVERTING banner.
+        git.flow = GitFlow::None;
+        git.merge_conflict_total = None;
+        sync_sequencer_flow(&mut git, Some("REVERTING"), "abc1234", 2);
+        assert!(matches!(&git.flow, GitFlow::Revert(s) if s.conflict && s.onto == "abc1234"));
+
+        // Unrecognised banners leave the flow unchanged.
+        let before = git.flow.clone();
+        sync_sequencer_flow(&mut git, Some("BISECTING"), "", 0);
+        assert_eq!(git.flow, before);
+    }
+
+    #[test]
+    fn flow_hint_returns_correct_label_per_sequencer_state() {
+        let none = flow_hint(&GitFlow::None);
+        assert!(none.is_none());
+
+        let merge_conflict = GitFlow::Merge(SequencerUi {
+            onto: "main".into(),
+            conflict: true,
+        });
+        let (chord, label) = flow_hint(&merge_conflict).unwrap();
+        assert_eq!(chord, "m");
+        assert!(
+            label.contains("continue"),
+            "expected continue/abort hint, got {label}"
+        );
+
+        let cherry_no_conflict = GitFlow::CherryPick(SequencerUi {
+            onto: "abc".into(),
+            conflict: false,
+        });
+        let (_, label2) = flow_hint(&cherry_no_conflict).unwrap();
+        assert!(
+            label2.contains("cherry"),
+            "expected cherry label, got {label2}"
+        );
+    }
+
+    #[test]
+    fn files_context_has_m_for_flow_menu() {
+        let ui = ui_at(GitView::Files, PanelWidth::Full);
+        assert_eq!(
+            git_key(&KeyCode::Char('m'), Modifiers::NONE, &ui),
+            Some(GitMsg::OpenMenu(MenuKind::Rebase)),
+            "m in Files must open the flow/rebase menu"
+        );
     }
 
     #[test]
