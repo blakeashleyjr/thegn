@@ -295,10 +295,22 @@ pub(super) fn sandbox(ctx: &SectionCtx) -> Vec<PanelRow> {
             }
         }
         None => {
-            rows.push(PanelRow::plain(Line::segs(vec![seg(
-                g2(),
-                "○ not sandboxed",
-            )])));
+            // Non-OCI sandboxes (bwrap, systemd) don't create containers but
+            // ARE active — show green if the DB confirms a non-host backend.
+            let backend = model.active_sandbox_backend.as_str();
+            let is_host_toolchain =
+                matches!(backend, "bwrap" | "systemd") || backend.starts_with("bwrap");
+            if is_host_toolchain {
+                rows.push(PanelRow::plain(Line::segs(vec![
+                    seg(hue(Hue::Green), "● active"),
+                    seg(g(), format!("  {backend}")),
+                ])));
+            } else {
+                rows.push(PanelRow::plain(Line::segs(vec![seg(
+                    g2(),
+                    "○ not sandboxed",
+                )])));
+            }
             if !model.containers.is_empty() {
                 rows.push(PanelRow::plain(Line::segs(vec![seg(
                     g(),
