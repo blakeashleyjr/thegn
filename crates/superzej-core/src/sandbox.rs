@@ -306,8 +306,7 @@ pub fn resolve(cfg: &SandboxConfig, loc: &GitLoc, name: &str) -> Option<SandboxS
     //   host_toolchain_mounts() fills in $HOME and other user-specific paths;
     //   bwrap picks them up via spec.mounts → --ro-bind flags.
     // systemd/host: full host filesystem, no extra mounts needed.
-    let inject_host_toolchain =
-        (backend.is_oci() || backend == Backend::Bwrap) && cfg.auto_caches;
+    let inject_host_toolchain = (backend.is_oci() || backend == Backend::Bwrap) && cfg.auto_caches;
     // OCI: mount home ro (running as root in a foreign image, must not write).
     // bwrap: mount home rw (running as the real user; zsh history, zoxide,
     //   keychain etc. need to write to $HOME — ro causes blank/broken prompts).
@@ -342,7 +341,13 @@ pub fn resolve(cfg: &SandboxConfig, loc: &GitLoc, name: &str) -> Option<SandboxS
     }
 
     for m in &cfg.mounts {
-        mounts.push(parse_mount(m));
+        let parsed = parse_mount(m);
+        // Skip mounts whose source doesn't exist — silently, since config
+        // defaults like ~/.gitconfig may not be present on every machine and
+        // the whole home directory is already bind-mounted for bwrap/OCI.
+        if std::path::Path::new(&parsed.host).exists() {
+            mounts.push(parsed);
+        }
     }
 
     let env = cfg
@@ -776,8 +781,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
         if lines.next() != Some("RUNNING") {
             return (false, false);
         }
-        let active: std::collections::HashSet<&str> =
-            lines.filter(|l| !l.is_empty()).collect();
+        let active: std::collections::HashSet<&str> = lines.filter(|l| !l.is_empty()).collect();
         let mounts_ok = required.iter().all(|r| active.contains(r));
         (true, mounts_ok)
     } else {
@@ -1331,7 +1335,7 @@ fn host_toolchain_mounts_ro_home(ro_home: bool) -> Vec<Mount> {
         "/etc/hosts",
         "/etc/localtime",
         "/etc/resolv.conf",
-        "/etc/zshrc",   // NixOS system-wide zsh init (sourced by /etc/static/zshrc)
+        "/etc/zshrc", // NixOS system-wide zsh init (sourced by /etc/static/zshrc)
         "/etc/zshenv",
         "/etc/zprofile",
     ] {
@@ -1362,7 +1366,6 @@ fn host_toolchain_mounts_ro_home(ro_home: bool) -> Vec<Mount> {
 
     mounts
 }
-
 
 fn auto_cache_mounts() -> Vec<Mount> {
     let home = std::env::var("HOME").unwrap_or_default();
@@ -1402,47 +1405,50 @@ fn auto_cache_mounts() -> Vec<Mount> {
 
 fn parse_mount(spec: &str) -> Mount {
     // "host", "host:ro", or "host:dest" / "host:dest:ro".
+    // Paths starting with "~/" are expanded to the real home directory so the
+    // mount spec is valid as a filesystem path (bwrap does not do shell expansion).
+    let expand = |p: &str| crate::util::expand_tilde(p);
     let parts: Vec<&str> = spec.split(':').collect();
     match parts.as_slice() {
         [host] => Mount {
-            host: (*host).into(),
-            dest: (*host).into(),
+            host: expand(host),
+            dest: expand(host),
             ro: false,
             cache: false,
         },
         [host, "ro"] => Mount {
-            host: (*host).into(),
-            dest: (*host).into(),
+            host: expand(host),
+            dest: expand(host),
             ro: true,
             cache: false,
         },
         [host, "cache"] => Mount {
-            host: (*host).into(),
-            dest: (*host).into(),
+            host: expand(host),
+            dest: expand(host),
             ro: false,
             cache: true,
         },
         [host, dest] => Mount {
-            host: (*host).into(),
-            dest: (*dest).into(),
+            host: expand(host),
+            dest: expand(dest),
             ro: false,
             cache: false,
         },
         [host, dest, "ro"] => Mount {
-            host: (*host).into(),
-            dest: (*dest).into(),
+            host: expand(host),
+            dest: expand(dest),
             ro: true,
             cache: false,
         },
         [host, dest, "cache"] => Mount {
-            host: (*host).into(),
-            dest: (*dest).into(),
+            host: expand(host),
+            dest: expand(dest),
             ro: false,
             cache: true,
         },
         _ => Mount {
-            host: spec.into(),
-            dest: spec.into(),
+            host: expand(spec),
+            dest: expand(spec),
             ro: false,
             cache: false,
         },
@@ -1865,11 +1871,12 @@ mod tests {
 
     #[test]
     fn mount_parsing() {
+        let home = std::env::var("HOME").unwrap_or_default();
         assert_eq!(
             parse_mount("~/.gitconfig:ro"),
             Mount {
-                host: "~/.gitconfig".into(),
-                dest: "~/.gitconfig".into(),
+                host: format!("{home}/.gitconfig"),
+                dest: format!("{home}/.gitconfig"),
                 ro: true,
                 cache: false,
             }
@@ -1919,7 +1926,10 @@ mod tests {
                 m.host
             );
             assert!(m.ro, "host toolchain mount must be read-only: {}", m.host);
-            assert_eq!(m.host, m.dest, "host toolchain mounts must be path-preserving");
+            assert_eq!(
+                m.host, m.dest,
+                "host toolchain mounts must be path-preserving"
+            );
         }
     }
 
@@ -1933,15 +1943,18 @@ mod tests {
         cfg.auto_caches = true;
         cfg.backend = crate::config::SandboxBackend::Podman;
         cfg.image = "debian:stable".into();
+        // Clear user-configured mounts so only host_toolchain + auto_cache mounts
+        // are present; avoids depending on whether $HOME/.gitconfig exists in the
+        // test environment.
+        cfg.mounts = vec![];
         let loc = crate::remote::GitLoc::from_db("/wt/x", None);
         if let Some(spec) = resolve(&cfg, &loc, "test") {
             // host_toolchain_mounts() entries: not the fake worktree, not the
-            // rw language caches from auto_cache_mounts (those are !ro && cache),
-            // and not unexpanded-tilde paths from cfg.mounts defaults.
+            // rw language caches from auto_cache_mounts (those are !ro && cache).
             let toolchain: Vec<_> = spec
                 .mounts
                 .iter()
-                .filter(|m| !m.host.starts_with("/wt/") && !m.cache && !m.host.starts_with('~'))
+                .filter(|m| !m.host.starts_with("/wt/") && !m.cache)
                 .collect();
             for m in &toolchain {
                 assert!(
