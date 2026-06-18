@@ -5727,9 +5727,15 @@ async fn event_loop<T: Terminal>(
             }
             let stats = std::mem::take(&mut model.stats);
             let metrics = std::mem::take(&mut model.metrics);
+            // Preserve transient status messages (crash alerts, user feedback)
+            // so a periodic hydration tick doesn't silently clear them.
+            let prev_status = std::mem::take(&mut model.status);
             model = next_model;
             model.stats = stats;
             model.metrics = metrics;
+            if model.status.is_empty() {
+                model.status = prev_status;
+            }
             // Mirror an externally-started (or externally-finished) rebase
             // into the git flow state, so the TODO view and conflict chrome
             // track `git rebase` runs from any terminal.
