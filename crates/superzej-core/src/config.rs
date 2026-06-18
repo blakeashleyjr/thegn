@@ -776,17 +776,81 @@ impl Default for PrConfig {
     }
 }
 
-/// `[dashboard]` — the worktree switcher's live refresh.
+/// `[apps]` — top-level sub-app tab ordering and startup focus.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct AppsConfig {
+    /// Tab focused on startup. Valid ids: "dashboard", "work", "comms", "chat".
+    pub default_tab: String,
+    /// Ordered top-level tab ids. Unknown ids are ignored; missing built-ins are appended.
+    pub tab_order: Vec<String>,
+}
+
+impl Default for AppsConfig {
+    fn default() -> Self {
+        AppsConfig {
+            default_tab: "dashboard".into(),
+            tab_order: vec![
+                "dashboard".into(),
+                "work".into(),
+                "comms".into(),
+                "chat".into(),
+            ],
+        }
+    }
+}
+
+impl AppsConfig {
+    pub const BUILTIN_TABS: [&'static str; 4] = ["dashboard", "work", "comms", "chat"];
+
+    pub fn effective_tab_order(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for id in &self.tab_order {
+            let id = id.trim();
+            if Self::BUILTIN_TABS.contains(&id) && !out.iter().any(|existing| existing == id) {
+                out.push(id.to_string());
+            }
+        }
+        for id in Self::BUILTIN_TABS {
+            if !out.iter().any(|existing| existing == id) {
+                out.push(id.to_string());
+            }
+        }
+        out
+    }
+
+    pub fn normalized_default_tab(&self) -> String {
+        let default = self.default_tab.trim();
+        if self.effective_tab_order().iter().any(|id| id == default) {
+            default.to_string()
+        } else {
+            self.effective_tab_order()
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| "dashboard".into())
+        }
+    }
+}
+
+/// `[dashboard]` — the dashboard app's live refresh and widgets.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct DashboardConfig {
-    /// Seconds between refreshes of the `--watch` dashboard pane.
+    /// Seconds between refreshes of the dashboard app.
     pub interval_secs: u64,
+    /// Poll Hacker News top stories for the dashboard widget.
+    pub hacker_news: bool,
+    /// Number of Hacker News stories to show/fetch.
+    pub hacker_news_limit: usize,
 }
 
 impl Default for DashboardConfig {
     fn default() -> Self {
-        DashboardConfig { interval_secs: 4 }
+        DashboardConfig {
+            interval_secs: 4,
+            hacker_news: true,
+            hacker_news_limit: 5,
+        }
     }
 }
 
@@ -1337,6 +1401,7 @@ pub struct Config {
     pub monitor: MonitorConfig,
     pub stats: StatsConfig,
     pub metrics: MetricsConfig,
+    pub apps: AppsConfig,
     pub bars: BarsConfig,
     pub pr: PrConfig,
     pub dashboard: DashboardConfig,
@@ -1400,6 +1465,7 @@ impl Default for Config {
             monitor: MonitorConfig::default(),
             stats: StatsConfig::default(),
             metrics: MetricsConfig::default(),
+            apps: AppsConfig::default(),
             bars: BarsConfig::default(),
             pr: PrConfig::default(),
             dashboard: DashboardConfig::default(),
@@ -1471,6 +1537,8 @@ pub struct ConfigOverlay {
     pub metrics_interval_secs: Option<f64>,
     pub metrics_timeout_ms: Option<u64>,
     pub metrics_max_body_bytes: Option<usize>,
+    pub apps_default_tab: Option<String>,
+    pub apps_tab_order: Option<Vec<String>>,
     pub log_level: Option<LogLevel>,
     pub log_file: Option<bool>,
     pub log_dir: Option<String>,
@@ -1510,6 +1578,8 @@ impl ConfigOverlay {
         set!(base.metrics.interval_secs, self.metrics_interval_secs);
         set!(base.metrics.timeout_ms, self.metrics_timeout_ms);
         set!(base.metrics.max_body_bytes, self.metrics_max_body_bytes);
+        set!(base.apps.default_tab, self.apps_default_tab);
+        set!(base.apps.tab_order, self.apps_tab_order);
         set!(base.log.level, self.log_level);
         set!(base.log.file, self.log_file);
         set!(base.log.dir, self.log_dir);
@@ -1546,6 +1616,13 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
                 None
             }
         }
+    };
+    let parse_list = |raw: String| -> Vec<String> {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
     };
 
     o.worktrees_dir = env.get("SUPERZEJ_WORKTREES_DIR");
@@ -1600,6 +1677,12 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     if let Some(v) = env.get("SUPERZEJ_METRICS_MAX_BODY_BYTES") {
         o.metrics_max_body_bytes =
             parse_num(v, "SUPERZEJ_METRICS_MAX_BODY_BYTES").map(|n| n as usize);
+    }
+
+    // [apps]
+    o.apps_default_tab = env.get("SUPERZEJ_APPS_DEFAULT_TAB");
+    if let Some(v) = env.get("SUPERZEJ_APPS_TAB_ORDER") {
+        o.apps_tab_order = Some(parse_list(v));
     }
 
     // [log]
@@ -1710,6 +1793,16 @@ impl Config {
     }
 
     fn apply_override_str(cfg: &mut Config, key: &str, val: &str) -> Result<(), String> {
+        if key == "apps.tab_order" {
+            cfg.apps.tab_order = val
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            return Ok(());
+        }
+
         let mut tree = serde_json::to_value(&cfg).map_err(|e| e.to_string())?;
 
         let parts: Vec<&str> = key.split('.').collect();
@@ -1807,6 +1900,8 @@ impl Config {
         self.metrics.interval_secs = self.metrics.interval_secs.max(1.0);
         self.metrics.timeout_ms = self.metrics.timeout_ms.clamp(100, 30_000);
         self.metrics.max_body_bytes = self.metrics.max_body_bytes.max(1);
+        self.dashboard.interval_secs = self.dashboard.interval_secs.max(1);
+        self.dashboard.hacker_news_limit = self.dashboard.hacker_news_limit.clamp(1, 20);
     }
 
     pub fn agent_command(&self, name: &str) -> Option<&str> {
@@ -2201,6 +2296,35 @@ fn parse_hex_rgb(hex: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_tab_config_defaults_to_dashboard_first_and_default() {
+        let cfg = Config::default();
+        assert_eq!(cfg.apps.default_tab, "dashboard");
+        assert_eq!(
+            cfg.apps.effective_tab_order(),
+            vec!["dashboard", "work", "comms", "chat"]
+        );
+    }
+
+    #[test]
+    fn app_tab_config_honors_file_env_and_cli_order() {
+        let mut env = MapEnv::default();
+        env.0.insert(
+            "SUPERZEJ_APPS_TAB_ORDER".into(),
+            "chat,work,dashboard,comms".into(),
+        );
+        env.0
+            .insert("SUPERZEJ_APPS_DEFAULT_TAB".into(), "chat".into());
+        let flags = vec!["apps.default_tab=work".to_string()];
+        let cfg = Config::load_layered(&env, &flags, None);
+
+        assert_eq!(cfg.apps.default_tab, "work");
+        assert_eq!(
+            cfg.apps.effective_tab_order(),
+            vec!["chat", "work", "dashboard", "comms"]
+        );
+    }
 
     #[test]
     fn try_load_layered_handles_overrides_and_invalid_overrides() {

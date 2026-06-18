@@ -174,9 +174,17 @@ prewarm = false
 [pr]
 ttl_secs = 30          # cache TTL before a live `gh` re-fetch (SUPERZEJ_PR_TTL)
 
-# The --watch worktree dashboard.
+# Top-level app tab strip. Defaults make the dashboard the first and focused tab.
+# Valid ids: "dashboard", "work", "comms", "chat".
+[apps]
+default_tab = "dashboard" # initial tab (SUPERZEJ_APPS_DEFAULT_TAB)
+tab_order = ["dashboard", "work", "comms", "chat"]
+
+# The terminal-native dashboard app.
 [dashboard]
-interval_secs = 4      # refresh cadence (SUPERZEJ_DASHBOARD_INTERVAL)
+interval_secs = 4        # refresh cadence (SUPERZEJ_DASHBOARD_INTERVAL)
+hacker_news = true       # poll Hacker News top stories for the HN widget
+hacker_news_limit = 5    # stories fetched/rendered (clamped 1..20)
 
 # The per-session daemon that pushes live diff/PR updates to the panel.
 [watch]

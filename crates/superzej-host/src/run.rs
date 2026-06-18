@@ -4406,21 +4406,40 @@ fn sync_drawer_persistence(
     }
 }
 
-/// Cycle the active top-level tab by `delta` over `[work, tile0, … tile(n-1)]`
-/// (wrapping). `work` is index 0; tile `i` is index `i + 1`.
-fn cycle_app(active: crate::apps::ActiveApp, n: usize, delta: isize) -> crate::apps::ActiveApp {
-    use crate::apps::ActiveApp;
-    let total = (n + 1) as isize;
-    let cur = match active {
-        ActiveApp::Work => 0,
-        ActiveApp::Tile(i) => i as isize + 1,
+async fn ensure_app_loaded(
+    app_host: &mut crate::apps::AppHost,
+    target: crate::apps::ActiveApp,
+    app_tx: &tokio_mpsc::UnboundedSender<usize>,
+    waker: &TerminalWaker,
+    current_config: &superzej_core::config::Config,
+) -> bool {
+    let crate::apps::ActiveApp::Tile(i) = target else {
+        return true;
     };
-    let next = (cur + delta).rem_euclid(total);
-    if next == 0 {
-        ActiveApp::Work
-    } else {
-        ActiveApp::Tile((next - 1) as usize)
+    if !matches!(app_host.slots[i].state, crate::apps::SlotState::Unloaded) {
+        return true;
     }
+    let hook: sz_kit::ChangeHook = {
+        let tx = app_tx.clone();
+        let wk = waker.clone();
+        std::sync::Arc::new(move || {
+            let _ = tx.send(i);
+            let _ = wk.wake();
+        })
+    };
+    let handle = tokio::runtime::Handle::current();
+    let theme = crate::apps::kit_theme(&current_config.palette());
+    let id = app_host.slots[i].id;
+    let tile = match id {
+        "comms" => crate::apps::comms::build(handle, hook, theme).await,
+        "chat" => crate::apps::chat::build(handle, hook, theme).await,
+        "dashboard" => {
+            crate::apps::dashboard::build(handle, hook, theme, &current_config.dashboard).await
+        }
+        _ => return false,
+    };
+    app_host.slots[i].state = crate::apps::SlotState::Running(tile);
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4550,11 +4569,7 @@ async fn event_loop<T: Terminal>(
     // so async results fold in and re-render on the existing 0%-idle path.
     // Tiles lazy-load on first focus.
     let (app_tx, mut app_rx) = tokio_mpsc::unbounded_channel::<usize>();
-    let mut app_host = crate::apps::AppHost::new(vec![
-        crate::apps::AppSlot::new("comms", "comms"),
-        crate::apps::AppSlot::new("chat", "chat"),
-        crate::apps::AppSlot::new("dashboard", "dashboard"),
-    ]);
+    let mut app_host = crate::apps::AppHost::from_config(keymap.config());
     // Test-explorer results from the background runner/discoverer (capped,
     // single-flight). Two channels: run outcomes and discovery outcomes.
     let (test_run_tx, mut test_run_rx) =
@@ -4727,6 +4742,10 @@ async fn event_loop<T: Terminal>(
     );
 
     let mut current_config = keymap.config().clone();
+    let initial_app = app_host.active;
+    if ensure_app_loaded(&mut app_host, initial_app, &app_tx, &waker, &current_config).await {
+        dirty = true;
+    }
     // The workspace the keymap was last built for; when the focused workspace
     // changes we rebuild so per-workspace/repo-root keybind layers follow it.
     let mut keymap_workspace = session.id.clone();
@@ -6087,14 +6106,8 @@ async fn event_loop<T: Terminal>(
             // Top-level app tabs: reflect the strip into the model so the
             // masthead chips render every frame.
             {
-                let mut tabs = Vec::with_capacity(app_host.slots.len() + 1);
-                tabs.push("work".to_string());
-                tabs.extend(app_host.slots.iter().map(|s| s.chip_label()));
-                model.app_tabs = tabs;
-                model.active_app = match app_host.active {
-                    crate::apps::ActiveApp::Work => 0,
-                    crate::apps::ActiveApp::Tile(i) => i + 1,
-                };
+                model.app_tabs = app_host.tab_labels();
+                model.active_app = app_host.active_tab_index();
             }
             let app_tile_active = app_host.active_tile_mut().is_some();
             if app_tile_active {
@@ -6778,56 +6791,32 @@ async fn event_loop<T: Terminal>(
                 // tiles, Alt+]/[ = cycle) work from any tab; while a tile is
                 // focused it owns every other key (its own quit returns here).
                 {
-                    let n = app_host.slots.len();
                     let target = if k.modifiers.contains(Modifiers::ALT) {
                         match k.key {
-                            KeyCode::Char('1') => Some(crate::apps::ActiveApp::Work),
-                            KeyCode::Char(c @ '2'..='9') => {
-                                let idx = (c as usize) - ('2' as usize);
-                                (idx < n).then_some(crate::apps::ActiveApp::Tile(idx))
+                            KeyCode::Char(c @ '1'..='9') => {
+                                let idx = (c as usize) - ('1' as usize);
+                                app_host.tab_target(idx)
                             }
-                            KeyCode::Char(']') => Some(cycle_app(app_host.active, n, 1)),
-                            KeyCode::Char('[') => Some(cycle_app(app_host.active, n, -1)),
+                            KeyCode::Char(']') => Some(app_host.cycle(app_host.active, 1)),
+                            KeyCode::Char('[') => Some(app_host.cycle(app_host.active, -1)),
                             _ => None,
                         }
                     } else {
                         None
                     };
                     if let Some(target) = target {
-                        // Lazy-load the tile on first focus (cheap; the await is
-                        // free in this async loop). The ChangeHook posts the
-                        // slot index + pulses the waker, so async results fold
-                        // in on the normal drain path.
-                        if let crate::apps::ActiveApp::Tile(i) = target
-                            && matches!(app_host.slots[i].state, crate::apps::SlotState::Unloaded)
+                        if ensure_app_loaded(
+                            &mut app_host,
+                            target,
+                            &app_tx,
+                            &waker,
+                            &current_config,
+                        )
+                        .await
                         {
-                            let hook: sz_kit::ChangeHook = {
-                                let tx = app_tx.clone();
-                                let wk = waker.clone();
-                                std::sync::Arc::new(move || {
-                                    let _ = tx.send(i);
-                                    let _ = wk.wake();
-                                })
-                            };
-                            let handle = tokio::runtime::Handle::current();
-                            // Hand the tile the live chrome palette so it
-                            // renders in the same theme as the work tab.
-                            let theme = crate::apps::kit_theme(&current_config.palette());
-                            let tile = match app_host.slots[i].id {
-                                "comms" => crate::apps::comms::build(handle, hook, theme).await,
-                                "chat" => crate::apps::chat::build(handle, hook, theme).await,
-                                "dashboard" => {
-                                    crate::apps::dashboard::build(handle, hook, theme).await
-                                }
-                                _ => {
-                                    // Unknown app id — leave it Unloaded.
-                                    continue;
-                                }
-                            };
-                            app_host.slots[i].state = crate::apps::SlotState::Running(tile);
+                            app_host.active = target;
+                            dirty = true;
                         }
-                        app_host.active = target;
-                        dirty = true;
                         continue;
                     }
                     // A focused tile owns all remaining input.
@@ -9080,34 +9069,19 @@ async fn event_loop<T: Terminal>(
                                 begin_new_workspace_prompt(&mut host_input, &mut model);
                             }
                             Action::Dashboard => {
-                                let dash_idx =
-                                    app_host.slots.iter().position(|s| s.id == "dashboard");
-                                if let Some(i) = dash_idx {
-                                    if app_host.active == crate::apps::ActiveApp::Tile(i) {
+                                if let Some(target) = app_host.dashboard_target() {
+                                    if app_host.active == target {
                                         app_host.active = crate::apps::ActiveApp::Work;
-                                    } else {
-                                        if matches!(
-                                            app_host.slots[i].state,
-                                            crate::apps::SlotState::Unloaded
-                                        ) {
-                                            let hook: sz_kit::ChangeHook = {
-                                                let tx = app_tx.clone();
-                                                let wk = waker.clone();
-                                                std::sync::Arc::new(move || {
-                                                    let _ = tx.send(i);
-                                                    let _ = wk.wake();
-                                                })
-                                            };
-                                            let handle = tokio::runtime::Handle::current();
-                                            let theme =
-                                                crate::apps::kit_theme(&current_config.palette());
-                                            let tile =
-                                                crate::apps::dashboard::build(handle, hook, theme)
-                                                    .await;
-                                            app_host.slots[i].state =
-                                                crate::apps::SlotState::Running(tile);
-                                        }
-                                        app_host.active = crate::apps::ActiveApp::Tile(i);
+                                    } else if ensure_app_loaded(
+                                        &mut app_host,
+                                        target,
+                                        &app_tx,
+                                        &waker,
+                                        &current_config,
+                                    )
+                                    .await
+                                    {
+                                        app_host.active = target;
                                     }
                                 }
                             }

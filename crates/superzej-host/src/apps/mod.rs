@@ -96,14 +96,110 @@ impl AppSlot {
 pub struct AppHost {
     pub slots: Vec<AppSlot>,
     pub active: ActiveApp,
+    tab_order: Vec<ActiveApp>,
 }
 
 impl AppHost {
     pub fn new(slots: Vec<AppSlot>) -> AppHost {
+        let tab_order = std::iter::once(ActiveApp::Work)
+            .chain((0..slots.len()).map(ActiveApp::Tile))
+            .collect();
         AppHost {
             slots,
             active: ActiveApp::Work,
+            tab_order,
         }
+    }
+
+    pub fn from_config(cfg: &superzej_core::config::Config) -> AppHost {
+        let tab_ids = cfg.apps.effective_tab_order();
+        let mut slots = Vec::new();
+        for id in tab_ids.iter().filter(|id| id.as_str() != "work") {
+            let label = id.as_str();
+            slots.push(AppSlot::new(
+                match label {
+                    "dashboard" => "dashboard",
+                    "comms" => "comms",
+                    "chat" => "chat",
+                    _ => continue,
+                },
+                label,
+            ));
+        }
+
+        let mut tab_order = Vec::new();
+        for id in tab_ids {
+            if id == "work" {
+                tab_order.push(ActiveApp::Work);
+            } else if let Some(idx) = slots.iter().position(|slot| slot.id == id) {
+                tab_order.push(ActiveApp::Tile(idx));
+            }
+        }
+        if tab_order.is_empty() {
+            tab_order.push(ActiveApp::Work);
+        }
+
+        let default_id = cfg.apps.normalized_default_tab();
+        let active = if default_id == "work" {
+            ActiveApp::Work
+        } else {
+            slots
+                .iter()
+                .position(|slot| slot.id == default_id)
+                .map(ActiveApp::Tile)
+                .unwrap_or(tab_order[0])
+        };
+
+        AppHost {
+            slots,
+            active,
+            tab_order,
+        }
+    }
+
+    pub fn tab_labels(&self) -> Vec<String> {
+        self.tab_order
+            .iter()
+            .map(|target| match *target {
+                ActiveApp::Work => "work".to_string(),
+                ActiveApp::Tile(i) => self
+                    .slots
+                    .get(i)
+                    .map(AppSlot::chip_label)
+                    .unwrap_or_else(|| "?".into()),
+            })
+            .collect()
+    }
+
+    pub fn active_tab_index(&self) -> usize {
+        self.tab_order
+            .iter()
+            .position(|target| *target == self.active)
+            .unwrap_or(0)
+    }
+
+    pub fn tab_target(&self, index: usize) -> Option<ActiveApp> {
+        self.tab_order.get(index).copied()
+    }
+
+    pub fn cycle(&self, active: ActiveApp, delta: isize) -> ActiveApp {
+        if self.tab_order.is_empty() {
+            return ActiveApp::Work;
+        }
+        let cur = self
+            .tab_order
+            .iter()
+            .position(|target| *target == active)
+            .unwrap_or(0) as isize;
+        let next = (cur + delta).rem_euclid(self.tab_order.len() as isize) as usize;
+        self.tab_order[next]
+    }
+
+    pub fn dashboard_target(&self) -> Option<ActiveApp> {
+        self.slots
+            .iter()
+            .position(|slot| slot.id == "dashboard")
+            .map(ActiveApp::Tile)
     }
 
     /// The active tile, if an app tab (not `work`) is focused and running.
@@ -202,5 +298,25 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(kit_theme(&p).accent, (1, 2, 3));
+    }
+
+    #[test]
+    fn app_host_uses_configured_tab_order_and_default_tab() {
+        let mut cfg = superzej_core::config::Config::default();
+        cfg.apps.tab_order = vec!["chat".into(), "work".into(), "dashboard".into()];
+        cfg.apps.default_tab = "dashboard".into();
+
+        let host = AppHost::from_config(&cfg);
+
+        assert_eq!(
+            host.tab_labels(),
+            vec!["chat", "work", "dashboard", "comms"]
+        );
+        assert_eq!(host.active, ActiveApp::Tile(1));
+        assert_eq!(host.active_tab_index(), 2);
+        assert_eq!(host.tab_target(0), Some(ActiveApp::Tile(0)));
+        assert_eq!(host.tab_target(1), Some(ActiveApp::Work));
+        assert_eq!(host.dashboard_target(), Some(ActiveApp::Tile(1)));
+        assert_eq!(host.cycle(ActiveApp::Tile(1), 1), ActiveApp::Tile(2));
     }
 }
