@@ -319,7 +319,7 @@ pub struct PanelData {
     pub file_count: Option<u64>,
     /// All tracked files from `git ls-files` — populated while Files is open.
     /// The Files section renders this as a collapsible tree with changed-file
-    /// highlights drawn from [`changes`].
+    /// highlights drawn from `changes`.
     pub all_files: Vec<String>,
     /// Local branches with upstream/divergence + PR badges (branches section).
     pub branches: Vec<BranchRow>,

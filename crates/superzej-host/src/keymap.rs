@@ -951,7 +951,8 @@ pub fn default_keymap_with_config(cfg: &superzej_core::config::Config) -> KeyMap
 }
 
 /// Build the host keymap for a focused context: the built-in defaults, custom
-/// `[[actions]]`, then each keybind layer from [`Config::effective_keybinds`]
+/// `[[actions]]`, then each keybind layer from
+/// [`Config::effective_keybinds`](superzej_core::config::Config::effective_keybinds)
 /// applied lowest-precedence-first (profile → global → workspace → repo-root).
 /// `repo_root`/`slug` are `None` outside a workspace (e.g. the home tab).
 pub fn default_keymap_for(
@@ -1031,7 +1032,7 @@ fn single_key(chord: &str) -> Result<Key, String> {
     }
 }
 
-/// Apply one keybind layer (a [`KeybindConfig`]) onto `map`: the flat table
+/// Apply one keybind layer (a [`KeybindConfig`](superzej_core::config::KeybindConfig)) onto `map`: the flat table
 /// rebinds across all modes, the nested tables rebind their named mode only.
 fn apply_keybind_layer(map: &mut KeyMap, layer: &superzej_core::config::KeybindConfig) {
     for (id, chord) in layer.iter() {

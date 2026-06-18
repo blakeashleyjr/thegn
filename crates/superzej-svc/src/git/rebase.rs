@@ -162,7 +162,7 @@ fn todo_for(loc: &GitLoc, base: &str) -> Result<Vec<TodoEntry>> {
 
 pub trait RebaseOps: GitBackend {
     /// The pick-everything todo for `<sha>^..HEAD` — the seed the
-    /// interactive-rebase view edits before [`rebase_interactive`].
+    /// interactive-rebase view edits before `rebase_interactive`.
     fn rebase_todo_for(&self, loc: &GitLoc, oldest_sha: &str) -> Result<Vec<TodoEntry>> {
         todo_for(loc, &base_for(loc, oldest_sha)?)
     }

@@ -206,17 +206,18 @@ pub fn compute_full(
         cols,
         rows: MASTHEAD_ROWS.min(rows),
     };
-    let status_y = rows.saturating_sub(STATUSBAR_ROWS);
+    let status_rows = rows.saturating_sub(masthead.rows).min(STATUSBAR_ROWS);
+    let status_y = rows.saturating_sub(status_rows);
     let statusbar = Rect {
         x: 0,
         y: status_y,
         cols,
-        rows: rows.min(STATUSBAR_ROWS),
+        rows: status_rows,
     };
 
     // A 1-row horizontal divider caps the columns directly below the masthead
     // (skipped on terminals too short to spare a row).
-    let divider_rows = rows.saturating_sub(masthead.rows + STATUSBAR_ROWS).min(1);
+    let divider_rows = rows.saturating_sub(masthead.rows + statusbar.rows).min(1);
     let divider = Rect {
         x: 0,
         y: masthead.rows,
@@ -227,7 +228,7 @@ pub fn compute_full(
     // The band below the divider: sidebar, panel, strip, and center all live
     // here, with the column tops aligned at `band_y`.
     let band_y = masthead.rows + divider_rows;
-    let band_rows = rows.saturating_sub(band_y + STATUSBAR_ROWS);
+    let band_rows = rows.saturating_sub(band_y + statusbar.rows);
 
     // Clamp the surface widths so the center keeps ≥ 1 column after the
     // 1-col separators between sidebar|center and center|panel are reserved.
@@ -469,18 +470,60 @@ mod tests {
 
     #[test]
     fn masthead_clamps_on_tiny_heights() {
-        // rows=1: the masthead takes the only row; no divider/tab-bar rows.
+        // rows=1: the masthead takes the only row; the statusbar must not
+        // overlap it or the first frame flashes the wrong content on tiny PTYs.
         let l = compute(160, 1, true, true);
         assert_eq!(l.masthead.rows, 1);
+        assert_eq!(l.statusbar.rows, 0);
         assert_eq!(l.divider.rows, 0);
         assert_eq!(l.center_tabs.rows, 0);
+        assert_eq!(l.center.rows, 0);
 
         // rows=2: masthead + statusbar; the band (and center) is empty but
         // never negative.
         let l = compute(160, 2, true, true);
         assert_eq!(l.masthead.rows, 1);
+        assert_eq!(l.statusbar.rows, 1);
+        assert_eq!(l.statusbar.y, 1);
         assert_eq!(l.divider.rows, 0);
         assert_eq!(l.center.rows, 0);
+    }
+
+    #[test]
+    fn tiny_layout_rects_do_not_overlap_when_they_have_area() {
+        fn overlaps(a: Rect, b: Rect) -> bool {
+            a.cols > 0
+                && a.rows > 0
+                && b.cols > 0
+                && b.rows > 0
+                && a.x < b.x + b.cols
+                && b.x < a.x + a.cols
+                && a.y < b.y + b.rows
+                && b.y < a.y + a.rows
+        }
+
+        for rows in 0..=4 {
+            let l = compute(24, rows, true, true);
+            let named = [
+                ("masthead", Some(l.masthead)),
+                ("divider", Some(l.divider)),
+                ("statusbar", Some(l.statusbar)),
+                ("tabs", Some(l.center_tabs)),
+                ("center", Some(l.center)),
+                ("sidebar", l.sidebar),
+                ("panel", l.panel),
+            ];
+            for (i, (an, a)) in named.iter().enumerate() {
+                for (bn, b) in named.iter().skip(i + 1) {
+                    if let (Some(a), Some(b)) = (a, b) {
+                        assert!(
+                            !overlaps(*a, *b),
+                            "{an} overlaps {bn} at rows={rows}: {l:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

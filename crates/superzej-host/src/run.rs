@@ -40,6 +40,11 @@ use crate::panes::{
 };
 use crate::wizard;
 
+/// Bounded PTY event queue depth. Reader threads use `blocking_send`, so this
+/// is the backpressure valve for chatty panes: large enough for bursts, small
+/// enough that a frozen compositor cannot buffer unbounded output.
+const PANE_EVENT_CHANNEL_CAPACITY: usize = 256;
+
 pub fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4692,7 +4697,7 @@ async fn event_loop<T: Terminal>(
     // The transient which-key popup (set while a multi-key prefix is pending).
     let mut which_key: Vec<crate::keyhint::HintRow> = Vec::new();
     let mut which_key_prefix = String::new();
-    let (tx, mut rx) = tokio_mpsc::channel::<PaneEvent>(1024);
+    let (tx, mut rx) = tokio_mpsc::channel::<PaneEvent>(PANE_EVENT_CHANNEL_CAPACITY);
     let mut panes = Panes::with_waker(tx, waker.clone());
     let mut need_relayout = true;
     let mut drawer: Option<u32> = None;
@@ -9953,8 +9958,32 @@ mod tests {
     }
 
     #[test]
+    fn pane_event_channel_capacity_is_small_for_backpressure() {
+        assert_eq!(PANE_EVENT_CHANNEL_CAPACITY, 256);
+    }
+
+    #[test]
+    fn pane_event_channel_is_actually_bounded() {
+        let (tx, mut rx) = tokio_mpsc::channel::<PaneEvent>(PANE_EVENT_CHANNEL_CAPACITY);
+        for _ in 0..PANE_EVENT_CHANNEL_CAPACITY {
+            tx.try_send(PaneEvent::Output(1, Vec::new()))
+                .expect("within capacity should enqueue");
+        }
+        assert!(
+            matches!(
+                tx.try_send(PaneEvent::Output(1, Vec::new())),
+                Err(tokio_mpsc::error::TrySendError::Full(_))
+            ),
+            "PTY readers must hit backpressure instead of buffering unbounded output"
+        );
+        assert!(rx.try_recv().is_ok(), "draining releases capacity");
+        tx.try_send(PaneEvent::Output(1, Vec::new()))
+            .expect("one drained slot should be reusable");
+    }
+
+    #[test]
     fn drawer_pool_respects_zero_limit_and_evicts_oldest() {
-        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(PANE_EVENT_CHANNEL_CAPACITY);
         let mut panes = Panes::new(tx);
         let mut pool = DrawerPool::default();
         let a = std::path::Path::new("/tmp/a");

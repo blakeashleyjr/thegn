@@ -15,14 +15,8 @@
   # yazi's preview/runtime tools (passed pinned from the flake); injected onto
   # PATH so previews work inside the file-manager drawer.
   yaziDeps ? [],
-}: let
-  runtimeDeps = [git fzf gum lazygit yazi delta gh coreutils] ++ yaziDeps;
-in
-  rustPlatform.buildRustPackage {
-    pname = "superzej";
-    version = "0.1.0";
-
-    src = lib.cleanSourceWith {
+  src ?
+    lib.cleanSourceWith {
       src = ../.;
       # Drop build artifacts so the store path is stable across rebuilds.
       filter = path: _type: let
@@ -32,7 +26,15 @@ in
           || lib.hasPrefix "result" rel
           || lib.hasPrefix ".direnv" rel
           || lib.hasPrefix ".git/" rel);
-    };
+    },
+}: let
+  runtimeDeps = [git fzf gum lazygit yazi delta gh coreutils] ++ yaziDeps;
+in
+  rustPlatform.buildRustPackage {
+    pname = "superzej";
+    version = "0.1.0";
+
+    inherit src;
 
     cargoLock.lockFile = ../Cargo.lock;
 
