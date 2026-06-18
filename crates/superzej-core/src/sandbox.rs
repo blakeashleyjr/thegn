@@ -343,9 +343,18 @@ pub fn resolve(cfg: &SandboxConfig, loc: &GitLoc, name: &str) -> Option<SandboxS
     for m in &cfg.mounts {
         let parsed = parse_mount(m);
         // Skip mounts whose source doesn't exist — silently, since config
-        // defaults like ~/.gitconfig may not be present on every machine and
-        // the whole home directory is already bind-mounted for bwrap/OCI.
-        if std::path::Path::new(&parsed.host).exists() {
+        // defaults like ~/.gitconfig may not be present on every machine.
+        if !std::path::Path::new(&parsed.host).exists() {
+            continue;
+        }
+        // Skip mounts already covered by a parent directory that's already in
+        // the list (e.g. ~/.gitconfig when $HOME is already bind-mounted): bwrap
+        // cannot create a file mount-point inside an already-bound directory and
+        // returns "Can't create file". Exact-path duplicates are also redundant.
+        let covered = mounts
+            .iter()
+            .any(|e| std::path::Path::new(&parsed.host).starts_with(&e.host));
+        if !covered {
             mounts.push(parsed);
         }
     }
@@ -1929,6 +1938,34 @@ mod tests {
             assert_eq!(
                 m.host, m.dest,
                 "host toolchain mounts must be path-preserving"
+            );
+        }
+    }
+
+    #[test]
+    fn cfg_mounts_covered_by_parent_are_skipped() {
+        // When $HOME is already bind-mounted (via host_toolchain_mounts for bwrap),
+        // a cfg.mounts entry for a child path (e.g. ~/.gitconfig) must be dropped.
+        // Keeping it causes bwrap "Can't create file" because bwrap cannot create a
+        // file mount-point inside an already-mounted parent directory.
+        let home = std::env::var("HOME").unwrap_or_default();
+        if home.is_empty() {
+            return; // can't test without $HOME
+        }
+        let mut cfg = crate::config::SandboxConfig::default();
+        cfg.file_access = crate::config::FileAccess::WorktreePlusCaches;
+        cfg.auto_caches = false;
+        cfg.backend = crate::config::SandboxBackend::Bwrap;
+        // Use a file inside $HOME — it may or may not exist, the coverage check
+        // must fire regardless (covered by the parent home bind).
+        cfg.mounts = vec![format!("{}/.gitconfig:ro", home)];
+        let loc = crate::remote::GitLoc::from_db("/wt/x", None);
+        if let Some(spec) = resolve(&cfg, &loc, "test") {
+            let gitconfig = format!("{home}/.gitconfig");
+            let has_gitconfig_mount = spec.mounts.iter().any(|m| m.host == gitconfig);
+            assert!(
+                !has_gitconfig_mount,
+                "~/.gitconfig should be excluded — $HOME is already bind-mounted"
             );
         }
     }
