@@ -423,9 +423,10 @@ impl Session {
         }
     }
 
-    /// Close the active tab. When it was the group's last tab, the whole group
-    /// leaves the session (the worktree on disk is untouched) and the removed
-    /// group is returned so the caller can clean up panes/DB.
+    /// Close the active tab. The final tab in a worktree is intentionally not
+    /// removed here: callers must use `close_active_group` / CloseWorktree for
+    /// that explicit destructive transition so CloseTab cannot accidentally
+    /// erase a worktree group.
     pub fn close_active_tab(&mut self) -> CloseResult {
         let Some(g) = self.active_group_mut() else {
             return CloseResult::Nothing;
@@ -438,9 +439,7 @@ impl Session {
             g.renumber();
             return CloseResult::Tab(removed);
         }
-        self.close_active_group()
-            .map(CloseResult::Group)
-            .unwrap_or(CloseResult::Nothing)
+        CloseResult::Nothing
     }
 
     /// Remove the active group entirely; focus the nearest remaining one.
@@ -465,8 +464,7 @@ impl Session {
 pub enum CloseResult {
     /// A tab closed; the group lives on.
     Tab(Tab),
-    /// The group's last tab closed, removing the whole group.
-    Group(WorktreeGroup),
+    /// There was no non-final tab to close.
     Nothing,
 }
 
@@ -557,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn close_tab_then_group_semantics() {
+    fn close_tab_never_removes_last_tab_or_group() {
         let mut s = Session::default();
         s.add_group(group("a"));
         s.add_group(group("b"));
@@ -569,20 +567,18 @@ mod tests {
         assert_eq!(g.tabs.len(), 1);
         assert_eq!(g.tabs[0].title, "1");
 
-        // Closing the last tab removes the whole group.
-        match s.close_active_tab() {
-            CloseResult::Group(g) => assert_eq!(g.name, "b"),
-            other => panic!("expected group close, got {other:?}"),
-        }
-        assert_eq!(s.worktrees.len(), 1);
-        assert_eq!(s.active_group().unwrap().name, "a");
-
-        match s.close_active_tab() {
-            CloseResult::Group(g) => assert_eq!(g.name, "a"),
-            other => panic!("expected group close, got {other:?}"),
-        }
+        // Closing the final tab is a no-op: CloseWorktree is the only action
+        // that removes a worktree group from the session.
         assert_eq!(s.close_active_tab(), CloseResult::Nothing);
-        assert!(s.active_group().is_none());
+        assert_eq!(s.worktrees.len(), 2);
+        assert_eq!(s.active_group().unwrap().name, "b");
+        assert_eq!(s.active_group().unwrap().tabs.len(), 1);
+
+        s.switch_to(0);
+        assert_eq!(s.close_active_tab(), CloseResult::Nothing);
+        assert_eq!(s.worktrees.len(), 2);
+        assert_eq!(s.active_group().unwrap().name, "a");
+        assert_eq!(s.active_group().unwrap().tabs.len(), 1);
     }
 
     #[test]

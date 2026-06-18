@@ -430,7 +430,7 @@ pub const BUILTINS: &[Action] = &[
     Action {
         id: "close-tab",
         chords: &["Alt X"],
-        menu_label: "Close tab (last one closes the worktree)",
+        menu_label: "Close tab",
         hint: "tabs",
         invocation: Invocation::Native { body: "CloseTab;" },
         scope: Scope::Shared,
