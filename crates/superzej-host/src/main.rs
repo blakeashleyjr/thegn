@@ -109,6 +109,11 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::config::Action,
     },
+    /// Print the exact sandbox argv for a worktree (for debugging).
+    SandboxArgv {
+        /// Path to the worktree (defaults to the current directory).
+        worktree: Option<String>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -158,5 +163,20 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Repos => cmd::repos::repos(&cfg),
         Command::Recent { count } => cmd::repos::recent(count),
         Command::Config { action } => cmd::config::run(&cfg, action, config_path),
+        Command::SandboxArgv { worktree } => {
+            let wt = worktree
+                .or_else(|| std::env::current_dir().ok()?.to_str().map(str::to_string))
+                .unwrap_or_default();
+            match crate::agent::launch_spec(&cfg, &wt, None, "shell") {
+                Ok(spec) => {
+                    println!("{}", spec.argv.join(" "));
+                }
+                Err(e) => {
+                    eprintln!("launch_spec failed: {e:#}");
+                    std::process::exit(1);
+                }
+            }
+            Ok(())
+        }
     }
 }
