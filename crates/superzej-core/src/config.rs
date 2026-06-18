@@ -24,6 +24,25 @@ pub fn config_warn(msg: &str) {
     crate::msg::warn(&format!("config: {msg}"));
 }
 
+/// Expand a config value that may be an environment-variable reference.
+///
+/// A string of the form `"env:VAR_NAME"` is replaced by the value of the
+/// environment variable `VAR_NAME`. Any other non-empty string is returned
+/// as-is. An empty string or a missing environment variable both return `None`.
+pub fn expand_env_ref(value: &str) -> Option<String> {
+    let v = value.trim();
+    if v.is_empty() {
+        return None;
+    }
+    if let Some(var_name) = v.strip_prefix("env:") {
+        std::env::var(var_name)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+    } else {
+        Some(v.to_string())
+    }
+}
+
 /// Declare a string-backed, validated, TOML-friendly enum.
 ///
 /// Generates `Default`, `Display`, `as_str`, `from_str_validated` (strict, for
@@ -288,7 +307,7 @@ pub enum TaskKind {
 
 /// A `[[tasks]]` entry — a named command that can be run from the host and whose
 /// output can be parsed by feature-specific consumers (Tests, Problems, Timeline).
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Task {
     pub name: String,
     pub command: String,
@@ -776,6 +795,110 @@ impl Default for PrConfig {
     }
 }
 
+/// `[issues]` — issue tracker integration (Linear, GitHub Issues, Jira).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct IssuesConfig {
+    /// Active provider. `"none"` disables the integration.
+    pub provider: IssueProviderKind,
+    /// Cache TTL (seconds) before a background re-fetch.
+    pub ttl_secs: u64,
+    /// Maximum issues to fetch and display.
+    pub max_issues: usize,
+    /// Pre-filter to issues assigned to the authenticated user.
+    pub filter_assignee_me: bool,
+    pub linear: LinearConfig,
+    pub github_issues: GitHubIssuesConfig,
+    pub jira: JiraConfig,
+}
+
+impl Default for IssuesConfig {
+    fn default() -> Self {
+        IssuesConfig {
+            provider: IssueProviderKind::None,
+            ttl_secs: 60,
+            max_issues: 100,
+            filter_assignee_me: true,
+            linear: LinearConfig::default(),
+            github_issues: GitHubIssuesConfig::default(),
+            jira: JiraConfig::default(),
+        }
+    }
+}
+
+config_enum! {
+    /// Which issue tracker backend is active.
+    pub enum IssueProviderKind : "issue provider" {
+        None    = "none",
+        Linear  = "linear",
+        Github  = "github",
+        Jira    = "jira",
+    } default = None;
+}
+
+/// `[issues.linear]` — Linear.app configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct LinearConfig {
+    /// API key. Use `"env:LINEAR_API_KEY"` to read from the environment.
+    pub api_key: String,
+    /// Restrict to a single team id. `""` = all teams.
+    pub team_id: String,
+    /// Optional workspace slug (used for URLs; inferred if empty).
+    pub workspace_slug: String,
+}
+
+impl Default for LinearConfig {
+    fn default() -> Self {
+        LinearConfig {
+            api_key: "env:LINEAR_API_KEY".into(),
+            team_id: String::new(),
+            workspace_slug: String::new(),
+        }
+    }
+}
+
+/// `[issues.github_issues]` — GitHub Issues configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct GitHubIssuesConfig {
+    /// Additional `gh issue list` flags, e.g. `--assignee @me --label bug`.
+    pub extra_flags: Vec<String>,
+}
+
+impl Default for GitHubIssuesConfig {
+    fn default() -> Self {
+        GitHubIssuesConfig {
+            extra_flags: Vec::new(),
+        }
+    }
+}
+
+/// `[issues.jira]` — Jira Cloud/Server configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct JiraConfig {
+    /// Jira instance base URL, e.g. `"https://myorg.atlassian.net"`.
+    pub base_url: String,
+    /// Jira user email.
+    pub email: String,
+    /// API token. Use `"env:JIRA_API_TOKEN"` to read from the environment.
+    pub api_token: String,
+    /// Restrict to a single project key, e.g. `"PROJ"`. `""` = all projects.
+    pub project_key: String,
+}
+
+impl Default for JiraConfig {
+    fn default() -> Self {
+        JiraConfig {
+            base_url: String::new(),
+            email: String::new(),
+            api_token: "env:JIRA_API_TOKEN".into(),
+            project_key: String::new(),
+        }
+    }
+}
+
 /// `[apps]` — top-level sub-app tab ordering and startup focus.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -1084,12 +1207,19 @@ impl Default for SandboxConfig {
                 "ANTHROPIC_API_KEY",
                 "TERM",
                 "COLORTERM",
+                "GPG_AGENT_INFO",
+                "GNUPGHOME",
+                "GPG_TTY",
             ]
             .iter()
             .map(|s| s.to_string())
             .collect(),
             auto_caches: true,
-            mounts: vec!["~/.gitconfig:ro".into()],
+            mounts: vec![
+                "~/.gitconfig:ro".into(),
+                "~/.gnupg:rw".into(),
+                "/run/user".into(),
+            ],
             init_script: String::new(),
             devenv: false,
             shell: String::new(),
@@ -1404,6 +1534,7 @@ pub struct Config {
     pub apps: AppsConfig,
     pub bars: BarsConfig,
     pub pr: PrConfig,
+    pub issues: IssuesConfig,
     pub dashboard: DashboardConfig,
     pub watch: WatchConfig,
     pub log: LogConfig,
@@ -1468,6 +1599,7 @@ impl Default for Config {
             apps: AppsConfig::default(),
             bars: BarsConfig::default(),
             pr: PrConfig::default(),
+            issues: IssuesConfig::default(),
             dashboard: DashboardConfig::default(),
             watch: WatchConfig::default(),
             log: LogConfig::default(),
@@ -2760,8 +2892,8 @@ command = "git notes add {{.SelectedCommit.Sha}}"
     #[test]
     fn panel_sections_parse_and_default_empty() {
         let cfg: Config =
-            toml::from_str("[panel]\nsections = [\"git\", \"changes\", \"telemetry\"]\n").unwrap();
-        assert_eq!(cfg.panel.sections, vec!["git", "changes", "telemetry"]);
+            toml::from_str("[panel]\nsections = [\"pr\", \"changes\", \"telemetry\"]\n").unwrap();
+        assert_eq!(cfg.panel.sections, vec!["pr", "changes", "telemetry"]);
         // Absent table → empty list (the host shows every section).
         let cfg: Config = toml::from_str("").unwrap();
         assert!(cfg.panel.sections.is_empty());
@@ -3600,5 +3732,48 @@ forward_agent = false
         assert_eq!(global_only[0].name, "aerc");
         let in_repo = cfg.pins_for_workspace(Some("/repo"));
         assert_eq!(in_repo.len(), 2);
+    }
+
+    #[test]
+    fn expand_env_ref_resolves_env_prefix() {
+        unsafe { std::env::set_var("SUPERZEJ_TEST_EXPAND_TOKEN", "secret") };
+        assert_eq!(
+            expand_env_ref("env:SUPERZEJ_TEST_EXPAND_TOKEN"),
+            Some("secret".into())
+        );
+        unsafe { std::env::remove_var("SUPERZEJ_TEST_EXPAND_TOKEN") };
+        // Missing var returns None.
+        assert_eq!(expand_env_ref("env:SUPERZEJ_TEST_EXPAND_TOKEN"), None);
+    }
+
+    #[test]
+    fn expand_env_ref_returns_literal_for_plain_value() {
+        assert_eq!(expand_env_ref("lin_abc123"), Some("lin_abc123".into()));
+    }
+
+    #[test]
+    fn expand_env_ref_returns_none_for_empty() {
+        assert_eq!(expand_env_ref(""), None);
+        assert_eq!(expand_env_ref("   "), None);
+    }
+
+    #[test]
+    fn issue_provider_kind_infallible_deserialize() {
+        let k: IssueProviderKind = serde_json::from_str(r#""linear""#).unwrap();
+        assert_eq!(k, IssueProviderKind::Linear);
+        // Unknown value falls back to default (None) without panic.
+        let k: IssueProviderKind = serde_json::from_str(r#""unknown_provider""#).unwrap();
+        assert_eq!(k, IssueProviderKind::None);
+    }
+
+    #[test]
+    fn issues_config_defaults() {
+        let cfg = Config::default();
+        assert_eq!(cfg.issues.provider, IssueProviderKind::None);
+        assert_eq!(cfg.issues.ttl_secs, 60);
+        assert_eq!(cfg.issues.max_issues, 100);
+        assert!(cfg.issues.filter_assignee_me);
+        assert_eq!(cfg.issues.linear.api_key, "env:LINEAR_API_KEY");
+        assert_eq!(cfg.issues.jira.api_token, "env:JIRA_API_TOKEN");
     }
 }

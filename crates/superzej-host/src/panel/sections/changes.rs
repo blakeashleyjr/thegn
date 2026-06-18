@@ -8,6 +8,8 @@ use superzej_core::theme::Hue;
 use crate::panel::docs::{diff_hunk_at, diff_hunk_starts};
 use crate::seg::{Line, Seg, seg, sp};
 
+use crate::seg::seg_width;
+
 use super::{
     ChangeRow, PanelHit, PanelRow, PanelUi, Section, SectionCtx, Stage, d, diffstat, f, g, g2, g3,
     hint_row, hue, rule, spinner_row, split_bar, t,
@@ -34,7 +36,7 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
     for (i, c) in data.changes.iter().enumerate() {
         let on = ui.chg_sel == Some(i);
-        rows.push(change_row(c, i, on, deep));
+        rows.push(change_row(c, i, on, deep, ctx.cols));
         if on {
             rows.extend(hunk_preview(c, ui, deep));
             rows.push(PanelRow::blank());
@@ -49,7 +51,7 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
     rows
 }
 
-fn change_row(c: &ChangeRow, i: usize, on: bool, deep: bool) -> PanelRow {
+fn change_row(c: &ChangeRow, i: usize, on: bool, deep: bool, cols: usize) -> PanelRow {
     let (glyph, glyph_tok) = match c.stage {
         Stage::Staged => ("●", hue(Hue::Green)),
         Stage::Conflict => ("!", hue(Hue::Red)),
@@ -68,13 +70,7 @@ fn change_row(c: &ChangeRow, i: usize, on: bool, deep: bool) -> PanelRow {
         }
         _ => seg(d(), c.name.clone()),
     };
-    let l = vec![
-        seg(glyph_tok, glyph),
-        sp(1),
-        seg(status_tok, format!("{:<2}", c.status)).bold(),
-        seg(g2(), c.dir.clone()),
-        name,
-    ];
+    // Build right side first so its width is known before computing the path budget.
     let r: Vec<Seg> = match c.stage {
         Stage::Conflict if !on => vec![seg(hue(Hue::Red), "resolve ").bold(), seg(g2(), "↵")],
         Stage::Untracked => vec![seg(g2(), "new")],
@@ -85,11 +81,54 @@ fn change_row(c: &ChangeRow, i: usize, on: bool, deep: bool) -> PanelRow {
             v
         }
     };
+    // Prefix width: glyph(1) + sp(1) + status(2) = 4.
+    // indent() adds sp(2) to l and sp(1) to r; draw_line adds 1-cell gap between l and r.
+    // Net path budget = cols - 4(prefix) - r_w - 5(indent+gap overhead).
+    let path_budget = cols.saturating_sub(4 + seg_width(&r) + 5);
+    let dir_display = clip_dir_left(&c.dir, c.name.chars().count(), path_budget);
+    let l = vec![
+        seg(glyph_tok, glyph),
+        sp(1),
+        seg(status_tok, format!("{:<2}", c.status)).bold(),
+        seg(g2(), dir_display),
+        name,
+    ];
     let mut row = PanelRow::plain(Line::split(l, r)).with_hit(PanelHit::Row(Section::Changes, i));
     if on {
         row = row.with_bg(crate::seg::Tok::SelAccent);
     }
     row
+}
+
+/// Left-clip `dir` so that `name_w` chars are guaranteed to fit within `budget`.
+///
+/// Returns the portion of `dir` to display. Clips from the left (preserving the
+/// tail of the path nearest the filename), snapping to a `/` boundary so it
+/// reads as `…parent/` rather than `…arent/`. Returns an empty string when the
+/// budget is too tight to show any directory context.
+fn clip_dir_left(dir: &str, name_w: usize, budget: usize) -> String {
+    let dir_chars: Vec<char> = dir.chars().collect();
+    let dir_w = dir_chars.len();
+    if dir_w + name_w <= budget {
+        return dir.to_string();
+    }
+    let dir_budget = budget.saturating_sub(name_w);
+    if dir_budget <= 1 {
+        return String::new();
+    }
+    // Reserve 1 char for the leading "…", the rest goes to the dir suffix.
+    let take = dir_budget.saturating_sub(1);
+    let from = dir_w.saturating_sub(take);
+    // Advance to the next '/' so we start cleanly on a component boundary.
+    let snap = dir_chars[from..]
+        .iter()
+        .position(|&c| c == '/')
+        .map(|p| from + p + 1)
+        .unwrap_or(from);
+    if snap >= dir_w {
+        return String::new();
+    }
+    format!("…{}", dir_chars[snap..].iter().collect::<String>())
 }
 
 /// The inline hunk preview under a highlighted change row. The Half view
@@ -259,4 +298,43 @@ fn side_by_side(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
     rows.push(footer);
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clip_dir_left_passes_through_short_paths() {
+        assert_eq!(clip_dir_left("src/", 6, 20), "src/");
+        assert_eq!(clip_dir_left("", 6, 20), "");
+    }
+
+    #[test]
+    fn clip_dir_left_snaps_to_slash_boundary() {
+        // "crates/superzej-host/src/" (25 chars) + "chrome.rs" (9) = 34
+        // budget = 20 → dir_budget = 11, take = 10, from = 15 → snap after "host/"
+        let d = clip_dir_left("crates/superzej-host/src/", 9, 20);
+        assert!(d.starts_with('…'), "got: {d}");
+        assert!(d.ends_with('/'), "should end with /: {d}");
+        assert!(!d.contains("crates"), "leading dir should be clipped: {d}");
+    }
+
+    #[test]
+    fn clip_dir_left_drops_dir_when_budget_too_tight() {
+        // budget barely fits the name (10) — no room for any dir
+        assert_eq!(clip_dir_left("src/long/path/", 10, 10), "");
+        // budget = 0 or 1 → empty
+        assert_eq!(clip_dir_left("src/", 3, 1), "");
+        assert_eq!(clip_dir_left("src/", 3, 0), "");
+    }
+
+    #[test]
+    fn clip_dir_left_shows_name_only_when_no_slash_in_range() {
+        // dir = "longname/" (9 chars), name = 5, budget = 8 → dir_budget = 3, take = 2
+        // chars["longname/"][from=7..] = "e/" — no previous slash to snap to
+        let d = clip_dir_left("longname/", 5, 8);
+        // Either shows "…e/" or falls back to empty — either is acceptable
+        assert!(d.is_empty() || d.starts_with('…'));
+    }
 }

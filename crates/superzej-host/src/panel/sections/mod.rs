@@ -15,9 +15,13 @@ mod branches;
 mod changes;
 pub(crate) mod commits;
 mod git;
+mod issues;
 mod keys;
+mod logs;
 mod misc;
+mod notifications;
 mod stash;
+mod tasks;
 mod telemetry;
 
 // Token shorthands (the mockup's class vocabulary), shared by the builders.
@@ -118,15 +122,18 @@ fn split_bar(added: u32, deleted: u32, w: usize) -> Vec<Seg> {
     ]
 }
 
-/// `+N` / `−N` diffstat segs, right-padded like the mockup.
+/// `+N` / `−N` diffstat segs. The minus is omitted when there are no deletions
+/// so the phantom padding doesn't eat into the path display budget.
 fn diffstat(added: u32, deleted: u32) -> Vec<Seg> {
-    let plus = format!("{:>4}", format!("+{added}"));
-    let minus = if deleted > 0 {
-        format!("{:>4}", format!("−{deleted}"))
+    let plus = seg(hue(Hue::Green), format!("{:>4}", format!("+{added}")));
+    if deleted > 0 {
+        vec![
+            plus,
+            seg(hue(Hue::Red), format!("{:>4}", format!("−{deleted}"))),
+        ]
     } else {
-        "    ".into()
-    };
-    vec![seg(hue(Hue::Green), plus), seg(hue(Hue::Red), minus)]
+        vec![plus]
+    }
 }
 
 /// Compact seconds ("41s", "2m41s", "1h12m").
@@ -276,7 +283,7 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
                 vec![seg(g(), data.stashes.len().to_string())]
             }
         }
-        Section::Git => match &data.pr {
+        Section::Pr => match &data.pr {
             Some(pr) => {
                 let (mut pass, mut fail, mut pend) = (0u32, 0u32, 0u32);
                 for c in &data.checks {
@@ -322,6 +329,32 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
                 _ => vec![seg(g(), format!("{} changed", data.changes.len()))],
             }
         }
+        Section::Jobs => {
+            let specs = &data.task_specs;
+            let runs = &data.task_last_runs;
+            if specs.is_empty() {
+                vec![seg(g2(), "none")]
+            } else {
+                let running = runs.values().filter(|r| r.running).count();
+                let failed = runs
+                    .values()
+                    .filter(|r| !r.running && r.exit_code != 0)
+                    .count();
+                if running > 0 {
+                    vec![
+                        seg(hue(Hue::Amber), format!("… {running}")),
+                        seg(g(), format!("/{}", specs.len())),
+                    ]
+                } else if failed > 0 {
+                    vec![
+                        seg(hue(Hue::Red), format!("✗ {failed}")),
+                        seg(g(), format!("/{}", specs.len())),
+                    ]
+                } else {
+                    vec![seg(g(), specs.len().to_string())]
+                }
+            }
+        }
         Section::Tests => match &data.tests {
             Some(t) if t.passed + t.failed + t.skipped > 0 => {
                 let mut v = vec![seg(hue(Hue::Green), format!("✓ {}", t.passed))];
@@ -360,6 +393,53 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
             }
         }
         Section::Keys => vec![seg(g2(), "?")],
+        Section::Issues => {
+            let n = model.panel.tracker_issues.len();
+            let open = model
+                .panel
+                .tracker_issues
+                .iter()
+                .filter(|i| i.status.is_active())
+                .count();
+            let linked = model.panel.tracker_links.len();
+            if n == 0 {
+                vec![seg(g2(), "off")]
+            } else if linked > 0 {
+                vec![
+                    seg(hue(Hue::Amber), format!("◈{linked} ")),
+                    seg(g(), format!("{open}/{n}")),
+                ]
+            } else {
+                vec![seg(g(), format!("{open} open"))]
+            }
+        }
+        Section::Notifications => {
+            let u = model.panel.unread_notifications;
+            if u == 0 {
+                vec![seg(g2(), "inbox zero")]
+            } else {
+                vec![seg(hue(Hue::Red), format!("⚑ {u}"))]
+            }
+        }
+        Section::Logs => {
+            let n = model.panel.log_lines.len();
+            let errors = model
+                .panel
+                .log_lines
+                .iter()
+                .filter(|l| l.level == superzej_core::log_view::LogLevel::Error)
+                .count();
+            if n == 0 {
+                vec![seg(g2(), "off")]
+            } else if errors > 0 {
+                vec![
+                    seg(hue(Hue::Red), format!("✗ {errors}")),
+                    seg(g(), format!(" · {n}")),
+                ]
+            } else {
+                vec![seg(g(), format!("{n} lines"))]
+            }
+        }
     }
 }
 
@@ -402,14 +482,18 @@ pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
         Section::Commits => commits::content(ctx),
         Section::Branches => branches::content(ctx),
         Section::Stash => stash::content(ctx),
-        Section::Git => git::content(ctx),
+        Section::Pr => git::content(ctx),
         Section::Files => misc::files(ctx),
+        Section::Jobs => tasks::content(ctx),
         Section::Tests => misc::tests(ctx),
         Section::Debug => misc::debug(),
         Section::Sandbox => misc::sandbox(ctx),
         Section::Db => misc::db(),
         Section::Telemetry => telemetry::content(ctx),
         Section::Keys => keys::content(ctx),
+        Section::Issues => issues::content(ctx),
+        Section::Notifications => notifications::content(ctx),
+        Section::Logs => logs::content(ctx),
     }
 }
 
@@ -538,6 +622,51 @@ mod spec {
             date: 1,
             message: "WIP on main: tinkering".into(),
         }];
+        m.panel.notifications = vec![superzej_core::notification::Notification {
+            id: 1,
+            kind: superzej_core::notification::NotificationKind::AgentDone,
+            source_ref: "linear:ABC-42".into(),
+            message: "agent finished in feat/views".into(),
+            created_at_ms: 1_700_000_000_000,
+            read: false,
+            worktree_path: "/repo/feat-views".into(),
+        }];
+        m.panel.task_specs = vec![superzej_core::config::Task {
+            name: "build".into(),
+            command: "cargo build".into(),
+            args: vec![],
+            cwd: None,
+            env: Default::default(),
+            kind: superzej_core::config::TaskKind::Build,
+            matcher: None,
+            scope: None,
+        }];
+        m.panel.task_last_runs = {
+            let mut h = std::collections::HashMap::new();
+            h.insert(
+                "build".into(),
+                crate::panel::TaskRunRecord {
+                    name: "build".into(),
+                    exit_code: 0,
+                    duration_ms: 2_340,
+                    finished_at: 1_700_000_000_000,
+                    output_tail: "Compiling superzej v0.1.0\nFinished dev profile".into(),
+                    running: false,
+                },
+            );
+            h
+        };
+        m.panel.unread_notifications = 1;
+        m.panel.log_lines = vec![
+            superzej_core::log_view::parse_log_line(
+                "2026-06-05T12:00:00  INFO  superzej::db  connection opened",
+            )
+            .unwrap(),
+            superzej_core::log_view::parse_log_line(
+                "2026-06-05T12:00:01  ERROR superzej::host  fatal error",
+            )
+            .unwrap(),
+        ];
         m
     }
 
@@ -675,7 +804,7 @@ mod spec {
             assert!(!n.is_empty(), "{section:?} normal");
             assert!(!h.is_empty(), "{section:?} half");
             assert!(!f.is_empty(), "{section:?} full");
-            // Debug/Db are placeholder sections — distinctness is waived.
+            // Debug/Db are dead-code placeholder sections — distinctness is waived.
             if matches!(section, Section::Debug | Section::Db) {
                 continue;
             }
@@ -692,7 +821,7 @@ mod spec {
             "{f}"
         );
         assert!(f.contains("c0") && f.contains("c1"), "core sparkrow: {f}");
-        let f = render(Section::Git, PanelWidth::Full);
+        let f = render(Section::Pr, PanelWidth::Full);
         assert!(
             f.contains("COMMITS") && f.contains("VELOCITY") && f.contains("LOG"),
             "{f}"
@@ -712,7 +841,7 @@ mod spec {
     #[test]
     fn full_bodies_load_gracefully_without_docs() {
         let m = model();
-        let mut u = ui(PanelWidth::Full, Section::Git);
+        let mut u = ui(PanelWidth::Full, Section::Pr);
         u.docs.git = None;
         u.docs.diff = None;
         let ctx = SectionCtx {
@@ -721,7 +850,7 @@ mod spec {
             cols: 150,
             rows: 38,
         };
-        assert!(text(&content(Section::Git, &ctx)).contains("loading"));
+        assert!(text(&content(Section::Pr, &ctx)).contains("loading"));
         let mut u = ui(PanelWidth::Full, Section::Changes);
         u.docs.diff = None;
         let ctx = SectionCtx {

@@ -469,6 +469,95 @@ pub fn action_specs() -> &'static [ActionSpec] {
     ACTION_SPECS
 }
 
+/// The scope in which a keybinding applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BindingScope {
+    /// Fires in any focus zone.
+    Global,
+    /// Fires only while the right panel has keyboard focus.
+    PanelFocused,
+    /// Fires only while the workspace sidebar has keyboard focus.
+    SidebarFocused,
+}
+
+/// A keybinding registered at a specific scope. Used for conflict detection
+/// and for documenting intentional global→scoped overrides.
+#[derive(Debug, Clone, Copy)]
+pub struct ScopedBinding {
+    /// The chord string in the same format as `ActionSpec::default_chords`
+    /// (e.g. `"Alt 1"`).
+    pub chord: &'static str,
+    pub scope: BindingScope,
+    /// Human description for diagnostics ("panel tab → git").
+    pub label: &'static str,
+}
+
+/// Panel-scoped bindings that intentionally shadow global defaults. Documented
+/// here so conflict detection can distinguish deliberate overrides from bugs,
+/// and so future plugin keybind registration can validate against them.
+pub const PANEL_SCOPE_BINDINGS: &[ScopedBinding] = &[
+    ScopedBinding {
+        chord: "Alt 1",
+        scope: BindingScope::PanelFocused,
+        label: "panel tab → git",
+    },
+    ScopedBinding {
+        chord: "Alt 2",
+        scope: BindingScope::PanelFocused,
+        label: "panel tab → work",
+    },
+    ScopedBinding {
+        chord: "Alt 3",
+        scope: BindingScope::PanelFocused,
+        label: "panel tab → system",
+    },
+];
+
+/// Check for keybinding conflicts.
+///
+/// **True conflict** (returned as `Err` strings): two bindings at the *same*
+/// scope claim the same chord — the result would be ambiguous.
+///
+/// **Intentional override** (logged at debug, not returned): a `PanelFocused`
+/// binding shadows a `Global` one. This is expected and by design; the narrower
+/// scope wins. Callers can pass `PANEL_SCOPE_BINDINGS` + `ACTION_SPECS` to
+/// surface these as diagnostics without treating them as errors.
+pub fn check_binding_conflicts(
+    scoped: &[ScopedBinding],
+    global_specs: &[ActionSpec],
+) -> Vec<String> {
+    let mut errors: Vec<String> = Vec::new();
+
+    // Within-scope duplicates are always errors.
+    let mut seen: std::collections::HashMap<(&str, BindingScope), &str> =
+        std::collections::HashMap::new();
+    for b in scoped {
+        if let Some(prev) = seen.insert((b.chord, b.scope), b.label) {
+            errors.push(format!(
+                "chord {:?} is bound twice within scope {:?}: {:?} vs {:?}",
+                b.chord, b.scope, prev, b.label
+            ));
+        }
+    }
+
+    // Cross-scope (Global vs PanelFocused) overlaps are intentional overrides.
+    // Log them at debug so they're visible during development but not noisy.
+    for b in scoped.iter().filter(|b| b.scope != BindingScope::Global) {
+        for spec in global_specs {
+            if spec.default_chords.iter().any(|c| *c == b.chord) {
+                tracing::debug!(
+                    chord = b.chord,
+                    panel_binding = b.label,
+                    global_action = spec.id,
+                    "panel binding intentionally shadows global action"
+                );
+            }
+        }
+    }
+
+    errors
+}
+
 pub fn action_spec(id: &str) -> Option<&'static ActionSpec> {
     ACTION_SPECS.iter().find(|s| s.id == id)
 }

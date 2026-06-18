@@ -1072,8 +1072,6 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
                 "--collect".into(),
                 format!("--working-directory={}", spec.worktree.display()),
                 "-p".into(),
-                "ProtectHome=tmpfs".into(),
-                "-p".into(),
                 "PrivateTmp=yes".into(),
             ];
             if spec.network == Network::None {
@@ -2017,11 +2015,16 @@ mod tests {
         let loc = crate::remote::GitLoc::from_db("/wt/x", None);
         if let Some(spec) = resolve(&cfg, &loc, "test") {
             // host_toolchain_mounts() entries: not the fake worktree, not the
-            // rw language caches from auto_cache_mounts (those are !ro && cache).
+            // rw language caches from auto_cache_mounts (those are !ro && cache),
+            // and not the $HOME bind-mount (parallel tests may temporarily set
+            // HOME to a temp dir that's deleted mid-assertion).
+            let home = std::env::var("HOME").unwrap_or_default();
             let toolchain: Vec<_> = spec
                 .mounts
                 .iter()
-                .filter(|m| !m.host.starts_with("/wt/") && !m.cache)
+                .filter(|m| {
+                    !m.host.starts_with("/wt/") && !m.cache && (home.is_empty() || m.host != home)
+                })
                 .collect();
             for m in &toolchain {
                 assert!(

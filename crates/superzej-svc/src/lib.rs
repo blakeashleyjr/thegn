@@ -9,4 +9,5 @@
 
 pub mod gh;
 pub mod git;
+pub mod issue;
 pub mod ssh;

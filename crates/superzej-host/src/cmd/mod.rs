@@ -13,6 +13,8 @@ pub mod config;
 pub mod diff;
 pub mod issue;
 pub mod list;
+pub mod logs;
+pub mod notify;
 pub mod pr;
 pub mod repos;
 

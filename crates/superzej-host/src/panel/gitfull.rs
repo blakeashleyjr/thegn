@@ -137,12 +137,36 @@ fn commit_mark(sha: &str, ui: &PanelUi) -> Seg {
 
 // ---- status region ----------------------------------------------------------
 
-/// Flow chips for the status row: `REBASING`, `BISECT g/c`, `DIFF vs x`,
-/// `PATCH n lines`.
+/// Flow chips for the status row: `REBASING`, `MERGING`, `CHERRY-PICK`,
+/// `REVERTING`, `BISECT g/c`, `DIFF vs x`, `PATCH n lines`.
 fn flow_chips(flow: &GitFlow) -> Vec<Seg> {
     match flow {
         GitFlow::None => Vec::new(),
         GitFlow::Rebase(_) => vec![sp(1), Seg::chip(hue(Hue::Amber), " REBASING ")],
+        GitFlow::Merge(s) => {
+            let label = if s.conflict {
+                " MERGING ⚑ "
+            } else {
+                " MERGING "
+            };
+            vec![sp(1), Seg::chip(hue(Hue::Amber), label)]
+        }
+        GitFlow::CherryPick(s) => {
+            let label = if s.conflict {
+                " CHERRY-PICK ⚑ "
+            } else {
+                " CHERRY-PICK "
+            };
+            vec![sp(1), Seg::chip(hue(Hue::Purple), label)]
+        }
+        GitFlow::Revert(s) => {
+            let label = if s.conflict {
+                " REVERTING ⚑ "
+            } else {
+                " REVERTING "
+            };
+            vec![sp(1), Seg::chip(hue(Hue::Purple), label)]
+        }
         GitFlow::Bisect(b) => vec![
             sp(1),
             Seg::chip(
@@ -742,8 +766,76 @@ fn main_rows(
             g2(),
             "no rebase in progress",
         )]))],
+        GitView::Blame => blame_region(ui, focused, avail),
     }
 }
+
+/// Annotated blame: one row per source line, coloured by author, with age and
+/// SHA prefix on the left. The cursor row gets the accent tint.
+fn blame_region(ui: &PanelUi, focused: bool, avail: usize) -> Vec<PanelRow> {
+    if ui.git.blame_rows.is_empty() {
+        return if ui.git.blame_path.is_some() {
+            vec![spinner(0, "blame")]
+        } else {
+            vec![PanelRow::plain(Line::segs(vec![seg(
+                g2(),
+                "no file selected",
+            )]))]
+        };
+    }
+    let rows = &ui.git.blame_rows;
+    let cur = ui.git.blame_cursor.min(rows.len().saturating_sub(1));
+    let win = window(rows.len(), avail, cur);
+    let win_start = win.start;
+    rows[win.clone()]
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let src_i = win_start + i;
+            let is_cur = focused && src_i == cur;
+            // FNV1a hash of the author name → deterministic colour per author.
+            let author_hue = {
+                let mut h: u32 = 0x811c9dc5;
+                for b in r.author.bytes() {
+                    h ^= u32::from(b);
+                    h = h.wrapping_mul(0x01000193);
+                }
+                BLAME_HUES[(h as usize) % BLAME_HUES.len()]
+            };
+            let short_sha = if r.sha.len() >= 7 {
+                &r.sha[..7]
+            } else {
+                &r.sha
+            };
+            let lineno_s = format!("{:>5}", r.lineno);
+            let age_s = age(r.date);
+            let segs = vec![
+                seg(
+                    if is_cur { ac() } else { hue(author_hue) },
+                    short_sha.to_string(),
+                ),
+                sp(1),
+                seg(g2(), age_s),
+                sp(1),
+                seg(d(), lineno_s),
+                sp(1),
+                seg(if is_cur { t() } else { d() }, r.content.clone()),
+            ];
+            let mut row = PanelRow::plain(Line::segs(segs));
+            if is_cur {
+                row = row.with_bg(if focused {
+                    Tok::SelAccent
+                } else {
+                    range_tint()
+                });
+            }
+            row
+        })
+        .collect()
+}
+
+/// Hue palette for blame author colouring. Cycles across authors by name hash.
+const BLAME_HUES: [Hue; 8] = Hue::ALL;
 
 // ---- composition ------------------------------------------------------------
 
@@ -856,6 +948,7 @@ pub(super) fn build_git_full(
     PanelFrame {
         rows: out,
         rail: Vec::new(),
+        tab_spans: Vec::new(),
     }
 }
 
