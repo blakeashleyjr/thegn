@@ -357,16 +357,28 @@ pub enum StepState {
 
 impl LoadStep {
     pub fn pending(label: impl Into<String>) -> Self {
-        Self { label: label.into(), state: StepState::Pending }
+        Self {
+            label: label.into(),
+            state: StepState::Pending,
+        }
     }
     pub fn active(label: impl Into<String>) -> Self {
-        Self { label: label.into(), state: StepState::Active }
+        Self {
+            label: label.into(),
+            state: StepState::Active,
+        }
     }
     pub fn done(label: impl Into<String>) -> Self {
-        Self { label: label.into(), state: StepState::Done }
+        Self {
+            label: label.into(),
+            state: StepState::Done,
+        }
     }
     pub fn failed(label: impl Into<String>) -> Self {
-        Self { label: label.into(), state: StepState::Failed }
+        Self {
+            label: label.into(),
+            state: StepState::Failed,
+        }
     }
 }
 

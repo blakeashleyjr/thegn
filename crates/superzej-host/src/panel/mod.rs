@@ -399,11 +399,7 @@ pub fn file_tree_visible<'a>(
             // An entry is visible iff none of its ancestor dir paths are collapsed.
             let parts: Vec<&str> = e.path.split('/').collect();
             // Check every prefix up to (but not including) the entry itself.
-            let ancestor_count = if e.is_dir {
-                parts.len().saturating_sub(1)
-            } else {
-                parts.len().saturating_sub(1)
-            };
+            let ancestor_count = parts.len().saturating_sub(1);
             for d in 1..=ancestor_count {
                 if collapsed.contains(&parts[..d].join("/")) {
                     return false;

@@ -4,6 +4,7 @@ members = [
   "crates/superzej-core",
   "crates/superzej-svc",
   "crates/superzej-host",
+  "crates/superzej-dashboard",
   "crates/sz-kit",
 ]
 # Integrated app repos live under apps/ as git submodules, each with its OWN

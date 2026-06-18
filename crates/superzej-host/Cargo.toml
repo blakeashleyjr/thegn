@@ -15,6 +15,7 @@ path = "src/main.rs"
 clap = { workspace = true, features = ["derive"] }
 superzej-core.workspace = true
 superzej-svc.workspace = true
+superzej-dashboard = { path = "../superzej-dashboard" }
 anyhow.workspace = true
 tracing.workspace = true
 serde.workspace = true

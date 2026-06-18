@@ -38,8 +38,7 @@ pub(super) fn files(ctx: &SectionCtx) -> Vec<PanelRow> {
 
     // Hit indices count every visible row (dirs AND files are actionable).
     // Dirs toggle collapse; files open in bat.
-    let mut fi = 0usize;
-    for (_, e) in &visible {
+    for (fi, (_, e)) in visible.iter().enumerate() {
         let indent = 2 * e.depth as usize;
         let line = if e.is_dir {
             let collapsed = ctx.ui.files_collapsed.contains(&e.path);
@@ -48,9 +47,7 @@ pub(super) fn files(ctx: &SectionCtx) -> Vec<PanelRow> {
             let changed_under = data
                 .changes
                 .iter()
-                .filter(|c| {
-                    c.path.starts_with(&format!("{}/", e.path))
-                })
+                .filter(|c| c.path.starts_with(&format!("{}/", e.path)))
                 .count();
             let dir_fg = if changed_under > 0 { d() } else { f() };
             let mut l = vec![
@@ -106,7 +103,6 @@ pub(super) fn files(ctx: &SectionCtx) -> Vec<PanelRow> {
         };
         let mut row = PanelRow::plain(line);
         row = row.with_hit(PanelHit::Row(Section::Files, fi));
-        fi += 1;
         rows.push(row);
     }
 

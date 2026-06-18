@@ -360,7 +360,7 @@ fn sort_groups(groups: &mut [Group], sort: SortMode) {
             // `gi` is the worktree's slot in `session.worktrees`, which the
             // host keeps in persisted `position` order — so this is the
             // creation-order-by-default, manually-reorderable sequence.
-            groups.sort_by(|a, b| (a.label != "home", a.gi).cmp(&(b.label != "home", b.gi)));
+            groups.sort_by_key(|a| (a.label != "home", a.gi));
         }
         SortMode::Name => {
             // "home" first, then case-insensitive label, ties by position.
