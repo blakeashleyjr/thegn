@@ -245,7 +245,7 @@ pub fn splash_variant(cols: usize, rows: usize) -> SplashVariant {
 /// keybind hints, centered in `rect` on the deep background. Pure function of
 /// `rect` + the live palette — resize re-centers it for free.
 pub fn draw_splash(surface: &mut Surface, rect: Rect, model: &crate::chrome::FrameModel) {
-    use crate::chrome::{LoadStep, StepState};
+    use crate::chrome::StepState;
     chrome::fill(surface, rect, col(S::Bg0));
     let accent = chrome::theme_color(model.accent_or_default());
     let bg = col(S::Bg0);
@@ -272,7 +272,17 @@ pub fn draw_splash(surface: &mut Surface, rect: Rect, model: &crate::chrome::Fra
             let y0 = rect.y + rect.rows.saturating_sub(total_rows) / 2;
             let (w, _) = measure(Face::Large, WORDMARK);
             let x = rect.x + rect.cols.saturating_sub(w) / 2;
-            draw(surface, x, y0, WORDMARK, Face::Large, accent, bg, rect.cols, 3);
+            draw(
+                surface,
+                x,
+                y0,
+                WORDMARK,
+                Face::Large,
+                accent,
+                bg,
+                rect.cols,
+                3,
+            );
             centered_parts(
                 surface,
                 y0 + 4,
@@ -283,8 +293,8 @@ pub fn draw_splash(surface: &mut Surface, rect: Rect, model: &crate::chrome::Fra
             } else {
                 let hints = [
                     ("Ctrl-Space", "command palette"),
-                    ("Alt-↑↓",     "prev/next worktree"),
-                    ("Ctrl-g",     "lock keys to pane"),
+                    ("Alt-↑↓", "prev/next worktree"),
+                    ("Ctrl-g", "lock keys to pane"),
                 ];
                 let key_w = 10;
                 let block_w = key_w + 2 + 18;
@@ -293,8 +303,15 @@ pub fn draw_splash(surface: &mut Surface, rect: Rect, model: &crate::chrome::Fra
                     let y = y0 + 6 + i;
                     chrome::draw_text(surface, hx, y, key, col(S::Dim), bg, rect.cols);
                     let lx = hx + key_w + 2;
-                    chrome::draw_text(surface, lx, y, label, col(S::Faint), bg,
-                        (rect.x + rect.cols).saturating_sub(lx));
+                    chrome::draw_text(
+                        surface,
+                        lx,
+                        y,
+                        label,
+                        col(S::Faint),
+                        bg,
+                        (rect.x + rect.cols).saturating_sub(lx),
+                    );
                 }
             }
         }
@@ -302,7 +319,17 @@ pub fn draw_splash(surface: &mut Surface, rect: Rect, model: &crate::chrome::Fra
             let y0 = rect.y + rect.rows.saturating_sub(6) / 2;
             let (w, _) = measure(Face::Small, WORDMARK);
             let x = rect.x + rect.cols.saturating_sub(w) / 2;
-            draw(surface, x, y0, WORDMARK, Face::Small, accent, bg, rect.cols, 2);
+            draw(
+                surface,
+                x,
+                y0,
+                WORDMARK,
+                Face::Small,
+                accent,
+                bg,
+                rect.cols,
+                2,
+            );
             centered_parts(
                 surface,
                 y0 + 3,
@@ -310,7 +337,10 @@ pub fn draw_splash(surface: &mut Surface, rect: Rect, model: &crate::chrome::Fra
             );
             if loading {
                 // Compact: show only the active step on y0+5.
-                if let Some(step) = model.load_steps.iter().find(|s| s.state == StepState::Active)
+                if let Some(step) = model
+                    .load_steps
+                    .iter()
+                    .find(|s| s.state == StepState::Active)
                     .or_else(|| model.load_steps.last())
                 {
                     let (glyph, fg) = step_glyph(step, accent);
@@ -318,13 +348,17 @@ pub fn draw_splash(surface: &mut Surface, rect: Rect, model: &crate::chrome::Fra
                     centered_parts(surface, y0 + 5, &[(&text, fg)]);
                 }
             } else {
-                centered_parts(surface, y0 + 5, &[
-                    ("Ctrl-Space", col(S::Dim)),
-                    (" palette ", col(S::Faint)),
-                    ("·", col(S::Ghost)),
-                    (" Ctrl-g", col(S::Dim)),
-                    (" lock", col(S::Faint)),
-                ]);
+                centered_parts(
+                    surface,
+                    y0 + 5,
+                    &[
+                        ("Ctrl-Space", col(S::Dim)),
+                        (" palette ", col(S::Faint)),
+                        ("·", col(S::Ghost)),
+                        (" Ctrl-g", col(S::Dim)),
+                        (" lock", col(S::Faint)),
+                    ],
+                );
             }
         }
         SplashVariant::Text => {
@@ -336,15 +370,16 @@ pub fn draw_splash(surface: &mut Surface, rect: Rect, model: &crate::chrome::Fra
 }
 
 /// Returns the glyph and color for a step based on its state.
-fn step_glyph(step: &crate::chrome::LoadStep, accent: ColorAttribute)
-    -> (&'static str, ColorAttribute)
-{
+fn step_glyph(
+    step: &crate::chrome::LoadStep,
+    accent: ColorAttribute,
+) -> (&'static str, ColorAttribute) {
     use crate::chrome::StepState;
     match step.state {
-        StepState::Done    => ("✓", col(S::Dim)),
-        StepState::Active  => ("◆", accent),
+        StepState::Done => ("✓", col(S::Dim)),
+        StepState::Active => ("◆", accent),
         StepState::Pending => ("◇", col(S::Ghost)),
-        StepState::Failed  => ("✗", col(S::Ghost)),
+        StepState::Failed => ("✗", col(S::Ghost)),
     }
 }
 
@@ -359,7 +394,11 @@ fn draw_steps(
 ) {
     use crate::chrome::StepState;
     // Find the width of the widest label to left-align the block as a whole.
-    let max_label = steps.iter().map(|s| s.label.chars().count()).max().unwrap_or(0);
+    let max_label = steps
+        .iter()
+        .map(|s| s.label.chars().count())
+        .max()
+        .unwrap_or(0);
     // glyph(1) + space(1) + label
     let block_w = 2 + max_label;
     let bx = rect.x + rect.cols.saturating_sub(block_w) / 2;
@@ -372,13 +411,20 @@ fn draw_steps(
         let (glyph, glyph_fg) = step_glyph(step, accent);
         chrome::draw_text(surface, bx, y, glyph, glyph_fg, bg, 1);
         let label_fg = match step.state {
-            StepState::Done    => col(S::Dim),
-            StepState::Active  => col(S::Text),
+            StepState::Done => col(S::Dim),
+            StepState::Active => col(S::Text),
             StepState::Pending => col(S::Ghost),
-            StepState::Failed  => col(S::Ghost),
+            StepState::Failed => col(S::Ghost),
         };
-        chrome::draw_text(surface, bx + 2, y, &step.label, label_fg, bg,
-            (rect.x + rect.cols).saturating_sub(bx + 2));
+        chrome::draw_text(
+            surface,
+            bx + 2,
+            y,
+            &step.label,
+            label_fg,
+            bg,
+            (rect.x + rect.cols).saturating_sub(bx + 2),
+        );
     }
 }
 

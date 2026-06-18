@@ -21,7 +21,7 @@ use termwiz::surface::{Change, Position, Surface};
 use termwiz::terminal::buffered::BufferedTerminal;
 use termwiz::terminal::{Terminal, TerminalWaker, new_terminal};
 
-use crate::chrome::{FrameModel, LoadStep, StepState, render_tab};
+use crate::chrome::{FrameModel, LoadStep, render_tab};
 use crate::compositor::Rect;
 use crate::gitmut::{GitOp, GitOpResult};
 use crate::hydrate::{
@@ -4545,6 +4545,7 @@ async fn event_loop<T: Terminal>(
     let mut app_host = crate::apps::AppHost::new(vec![
         crate::apps::AppSlot::new("comms", "comms"),
         crate::apps::AppSlot::new("chat", "chat"),
+        crate::apps::AppSlot::new("dashboard", "dashboard"),
     ]);
     // Test-explorer results from the background runner/discoverer (capped,
     // single-flight). Two channels: run outcomes and discovery outcomes.
@@ -5671,7 +5672,6 @@ async fn event_loop<T: Terminal>(
                     LoadStep::done(format!("container  ({backend})")),
                     LoadStep::active("shell"),
                 ];
-                dirty = true;
             }
             if let Err(e) = panes.materialize_with_specs(tab, &wt, &specs, chrome.center) {
                 model.status = format!("Pane spawn failed: {e}");
@@ -6808,6 +6808,9 @@ async fn event_loop<T: Terminal>(
                             let tile = match app_host.slots[i].id {
                                 "comms" => crate::apps::comms::build(handle, hook, theme).await,
                                 "chat" => crate::apps::chat::build(handle, hook, theme).await,
+                                "dashboard" => {
+                                    crate::apps::dashboard::build(handle, hook, theme).await
+                                }
                                 _ => {
                                     // Unknown app id — leave it Unloaded.
                                     continue;
@@ -9026,6 +9029,38 @@ async fn event_loop<T: Terminal>(
                             Action::NewWorkspace => {
                                 begin_new_workspace_prompt(&mut host_input, &mut model);
                             }
+                            Action::Dashboard => {
+                                let dash_idx =
+                                    app_host.slots.iter().position(|s| s.id == "dashboard");
+                                if let Some(i) = dash_idx {
+                                    if app_host.active == crate::apps::ActiveApp::Tile(i) {
+                                        app_host.active = crate::apps::ActiveApp::Work;
+                                    } else {
+                                        if matches!(
+                                            app_host.slots[i].state,
+                                            crate::apps::SlotState::Unloaded
+                                        ) {
+                                            let hook: sz_kit::ChangeHook = {
+                                                let tx = app_tx.clone();
+                                                let wk = waker.clone();
+                                                std::sync::Arc::new(move || {
+                                                    let _ = tx.send(i);
+                                                    let _ = wk.wake();
+                                                })
+                                            };
+                                            let handle = tokio::runtime::Handle::current();
+                                            let theme =
+                                                crate::apps::kit_theme(&current_config.palette());
+                                            let tile =
+                                                crate::apps::dashboard::build(handle, hook, theme)
+                                                    .await;
+                                            app_host.slots[i].state =
+                                                crate::apps::SlotState::Running(tile);
+                                        }
+                                        app_host.active = crate::apps::ActiveApp::Tile(i);
+                                    }
+                                }
+                            }
                             Action::SwitchWorkspace => {
                                 if let Ok(db) = superzej_core::db::Db::open()
                                     && let Some(target) = palette
@@ -9467,10 +9502,6 @@ async fn event_loop<T: Terminal>(
                                     model.status = "Unpin: no live pin".into();
                                 }
                             }
-                            // New/switch worktree+workspace and tool floats: recognized
-                            // and consumed; they land with the sandbox::enter_argv spawn
-                            // + branch/repo picker wiring.
-                            _ => {}
                         }
                         dirty = true;
                         continue;
@@ -9616,6 +9647,7 @@ fn update_crash_count(
     }
 }
 
+#[allow(dead_code)]
 fn remap_warmed_tab_ids(tab: &mut crate::session::Tab, focus: u32, pairs: &[(u32, u32)]) -> bool {
     let leaves = tab.center.pane_ids();
     if pairs.len() != leaves.len() {

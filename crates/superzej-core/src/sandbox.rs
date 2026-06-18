@@ -1124,12 +1124,12 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
     // When devenv lives in the Nix store, bind-mount /nix read-only so the
     // container can exec the resolved absolute path. Consistent with bwrap
     // which already does `--ro-bind /nix/store /nix/store`.
-    if spec.devenv {
-        if let Some(p) = &spec.devenv_path {
-            if p.starts_with("/nix") && std::path::Path::new("/nix").exists() {
-                v.extend(["-v".into(), "/nix:/nix:ro".into()]);
-            }
-        }
+    if spec.devenv
+        && let Some(p) = &spec.devenv_path
+        && p.starts_with("/nix")
+        && std::path::Path::new("/nix").exists()
+    {
+        v.extend(["-v".into(), "/nix:/nix:ro".into()]);
     }
     for (k, val) in &spec.env {
         v.extend(["-e".into(), format!("{k}={val}")]);
@@ -1978,13 +1978,15 @@ mod tests {
         if home.is_empty() {
             return; // can't test without $HOME
         }
-        let mut cfg = crate::config::SandboxConfig::default();
-        cfg.file_access = crate::config::FileAccess::WorktreePlusCaches;
-        cfg.auto_caches = false;
-        cfg.backend = crate::config::SandboxBackend::Bwrap;
-        // Use a file inside $HOME — it may or may not exist, the coverage check
-        // must fire regardless (covered by the parent home bind).
-        cfg.mounts = vec![format!("{}/.gitconfig:ro", home)];
+        let cfg = crate::config::SandboxConfig {
+            file_access: crate::config::FileAccess::WorktreePlusCaches,
+            auto_caches: true,
+            backend: crate::config::SandboxBackend::Bwrap,
+            // Use a file inside $HOME — it may or may not exist, the coverage check
+            // must fire regardless (covered by the parent home bind).
+            mounts: vec![format!("{}/.gitconfig:ro", home)],
+            ..Default::default()
+        };
         let loc = crate::remote::GitLoc::from_db("/wt/x", None);
         if let Some(spec) = resolve(&cfg, &loc, "test") {
             let gitconfig = format!("{home}/.gitconfig");
@@ -2001,15 +2003,17 @@ mod tests {
         // For OCI backends, host_toolchain_mounts() contributes only paths that
         // exist on the current host — verify that invariant holds by checking
         // any mount whose host path is NOT the synthetic worktree path.
-        let mut cfg = crate::config::SandboxConfig::default();
-        cfg.file_access = crate::config::FileAccess::WorktreePlusCaches;
-        cfg.auto_caches = true;
-        cfg.backend = crate::config::SandboxBackend::Podman;
-        cfg.image = "debian:stable".into();
-        // Clear user-configured mounts so only host_toolchain + auto_cache mounts
-        // are present; avoids depending on whether $HOME/.gitconfig exists in the
-        // test environment.
-        cfg.mounts = vec![];
+        let cfg = crate::config::SandboxConfig {
+            file_access: crate::config::FileAccess::WorktreePlusCaches,
+            auto_caches: true,
+            backend: crate::config::SandboxBackend::Podman,
+            image: "debian:stable".into(),
+            // Clear user-configured mounts so only host_toolchain + auto_cache mounts
+            // are present; avoids depending on whether $HOME/.gitconfig exists in the
+            // test environment.
+            mounts: vec![],
+            ..Default::default()
+        };
         let loc = crate::remote::GitLoc::from_db("/wt/x", None);
         if let Some(spec) = resolve(&cfg, &loc, "test") {
             // host_toolchain_mounts() entries: not the fake worktree, not the

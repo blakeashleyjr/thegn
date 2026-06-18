@@ -222,7 +222,7 @@ impl SearchEngine {
         // Sort by score descending; for equal scores, prefer earlier matches
         // (lower line_idx = older, but same pane). Stable sort preserves
         // source order within equal scores.
-        self.matches.sort_by(|a, b| b.score.cmp(&a.score));
+        self.matches.sort_by_key(|m| std::cmp::Reverse(m.score));
         self.matches.truncate(self.max_results);
     }
 }

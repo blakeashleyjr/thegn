@@ -155,16 +155,15 @@ pub fn prepare_sandbox(
     // changing the config actually takes effect instead of being silently trumped
     // by a stale DB entry from a previous backend that no longer works.
     let config_is_auto = sb.backend == superzej_core::config::SandboxBackend::Auto;
-    if config_is_auto {
-        if let Some(saved) = backend_choice.map(str::trim)
-            && !saved.is_empty()
-            && saved != "auto"
-            && let Ok(b) = superzej_core::config::SandboxBackend::from_str_validated(saved)
-        {
-            explicit_backend =
-                sandbox::Backend::from_config(b).filter(|b| *b != sandbox::Backend::None);
-            sb.backend = b;
-        }
+    if config_is_auto
+        && let Some(saved) = backend_choice.map(str::trim)
+        && !saved.is_empty()
+        && saved != "auto"
+        && let Ok(b) = superzej_core::config::SandboxBackend::from_str_validated(saved)
+    {
+        explicit_backend =
+            sandbox::Backend::from_config(b).filter(|b| *b != sandbox::Backend::None);
+        sb.backend = b;
     }
     let explicit_choice = explicit_backend.is_some();
     let auto_choice = sb.backend == superzej_core::config::SandboxBackend::Auto;
@@ -256,7 +255,7 @@ pub fn compose_spec(
     // When running inside an OCI container the host's absolute $SHELL path
     // (e.g. /run/current-system/sw/bin/zsh) does not exist in the container
     // filesystem.  Pass in_oci=true so shell_inner() uses only the basename.
-    let in_oci = sb.spec.as_ref().map_or(false, |s| s.backend.is_oci());
+    let in_oci = sb.spec.as_ref().is_some_and(|s| s.backend.is_oci());
     let cmd = if choice == "shell" && !sb_shell.is_empty() {
         shell_inner_override(&sb_shell)
     } else if choice == "shell" {

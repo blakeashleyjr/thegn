@@ -1,0 +1,25 @@
+[package]
+name = "superzej-dashboard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "superzej WTF-style terminal dashboard app tile"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "superzej-dashboard"
+path = "src/main.rs"
+required-features = ["standalone"]
+
+[dependencies]
+superzej-core.workspace = true
+sz-kit = { path = "../sz-kit" }
+sysinfo.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+
+[features]
+default = []
+standalone = ["sz-kit/standalone"]

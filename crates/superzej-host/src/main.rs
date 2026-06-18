@@ -169,11 +169,10 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
                 .unwrap_or_default();
             match crate::agent::launch_spec(&cfg, &wt, None, "shell") {
                 Ok(spec) => {
-                    println!("{}", spec.argv.join(" "));
+                    superzej_core::outln!("{}", spec.argv.join(" "));
                 }
                 Err(e) => {
-                    eprintln!("launch_spec failed: {e:#}");
-                    std::process::exit(1);
+                    superzej_core::msg::die(&format!("launch_spec failed: {e:#}"));
                 }
             }
             Ok(())

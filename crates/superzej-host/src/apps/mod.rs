@@ -21,6 +21,7 @@
 pub mod bridge;
 pub mod chat;
 pub mod comms;
+pub mod dashboard;
 pub mod input;
 
 use superzej_core::theme::Palette;
@@ -196,8 +197,10 @@ mod tests {
 
     #[test]
     fn user_palette_overrides_flow_through() {
-        let mut p = Palette::default();
-        p.accent = "1;2;3".into();
+        let p = Palette {
+            accent: "1;2;3".into(),
+            ..Default::default()
+        };
         assert_eq!(kit_theme(&p).accent, (1, 2, 3));
     }
 }

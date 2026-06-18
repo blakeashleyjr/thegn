@@ -25,11 +25,7 @@ use std::path::{Path, PathBuf};
 
 /// The canonical list of home-directory paths that sandbox tools may replace
 /// with empty directories. Checked in order; each entry is relative to `$HOME`.
-const MASKED_PATHS: &[&str] = &[
-    ".gitconfig",
-    ".bash_profile",
-    ".bashrc",
-];
+const MASKED_PATHS: &[&str] = &[".gitconfig", ".bash_profile", ".bashrc"];
 
 /// Run all startup environment checks. Call once, early in `main()`, before
 /// the first git subprocess or config read. Non-fatal: a failed repair logs a
@@ -79,9 +75,7 @@ fn repair_mask(path: &Path, home: &Path, rel: &str) {
     ));
 
     if let Err(e) = std::fs::remove_dir(path) {
-        crate::msg::warn(&format!(
-            "startup: could not remove {rel} directory: {e}"
-        ));
+        crate::msg::warn(&format!("startup: could not remove {rel} directory: {e}"));
         return;
     }
 
@@ -107,9 +101,7 @@ fn repair_gitconfig(gitconfig: &Path, home: &Path) {
         // XDG location is canonical; point ~/.gitconfig at it.
         match std::os::unix::fs::symlink(&xdg_git_config, gitconfig) {
             Ok(()) => {
-                crate::msg::warn(
-                    "startup: restored ~/.gitconfig → ~/.config/git/config symlink",
-                );
+                crate::msg::warn("startup: restored ~/.gitconfig → ~/.config/git/config symlink");
             }
             Err(e) => {
                 crate::msg::warn(&format!(
@@ -144,8 +136,10 @@ mod tests {
     /// Create a unique temp directory for each test — avoids cross-test
     /// interference without requiring the `tempfile` crate.
     fn tmp_home(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("szhost-startup-test-{label}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "szhost-startup-test-{label}-{}",
+            std::process::id()
+        ));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -205,7 +199,10 @@ mod tests {
 
         // Should now be a symlink pointing at the XDG config.
         let meta = fs::symlink_metadata(&gitconfig).unwrap();
-        assert!(meta.file_type().is_symlink(), ".gitconfig should be a symlink");
+        assert!(
+            meta.file_type().is_symlink(),
+            ".gitconfig should be a symlink"
+        );
         assert_eq!(fs::read_link(&gitconfig).unwrap(), xdg_cfg);
         let _ = fs::remove_dir_all(&home);
     }
@@ -222,7 +219,10 @@ mod tests {
 
         // Should now be a regular file with placeholder content.
         let content = fs::read_to_string(&gitconfig).unwrap();
-        assert!(content.contains("[core]"), "placeholder should contain [core]");
+        assert!(
+            content.contains("[core]"),
+            "placeholder should contain [core]"
+        );
         let _ = fs::remove_dir_all(&home);
     }
 

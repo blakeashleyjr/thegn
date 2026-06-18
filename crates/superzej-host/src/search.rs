@@ -426,7 +426,7 @@ mod tests {
     #[test]
     fn render_does_not_panic_on_empty_history() {
         let buf = HistoryBuffer::new(100);
-        let srcs: Vec<SearchSource<'_>> = vec![(1, "pane", &buf)];
+        let _srcs: Vec<SearchSource<'_>> = vec![(1, "pane", &buf)];
         let ov = SearchOverlay::new(SearchScope::Pane(1), 1, 100);
         let mut surface = Surface::new(80, 24);
         let rect = Rect {
