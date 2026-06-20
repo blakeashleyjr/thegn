@@ -65,6 +65,12 @@ impl BranchSet {
     pub fn taken(&self, branch: &str) -> bool {
         self.taken.contains(branch)
     }
+
+    /// Drop a name from the set — used when renaming a worktree so its own
+    /// current branch doesn't count as a collision against the new name.
+    pub fn remove(&mut self, branch: &str) {
+        self.taken.remove(branch);
+    }
 }
 
 /// The branch-name candidate for an unnamed worktree: `{prefix}{adj}-{noun}`
@@ -229,6 +235,54 @@ pub fn remove(root: &Path, path: &Path, branch: &str, delete_branch: bool) {
     }
 }
 
+/// Rename a worktree's branch (`git branch -m`) and move its checkout to the
+/// path implied by the new branch name (`git worktree move`). Returns the new
+/// on-disk path on success, or the reason it failed (the caller keeps the old
+/// name and surfaces the message). Both steps must succeed; a failed move after
+/// a successful branch rename leaves the branch renamed but the checkout in
+/// place — reported so the caller can warn.
+///
+/// Shared by the new-worktree wizard's finalize-name step and the sidebar's
+/// post-creation "rename worktree" action.
+pub fn rename(
+    root: &Path,
+    old_path: &Path,
+    old_branch: &str,
+    new_branch: &str,
+    cfg: &Config,
+) -> Result<PathBuf, String> {
+    if new_branch.is_empty() {
+        return Err("new branch name is empty".into());
+    }
+    if new_branch == old_branch {
+        return Ok(old_path.to_path_buf());
+    }
+    let new_path = worktree_path(root, new_branch, cfg);
+    if let Some(parent) = new_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if !util::git_ok(root, &["branch", "-m", old_branch, new_branch]) {
+        return Err(format!(
+            "could not rename branch {old_branch} → {new_branch}"
+        ));
+    }
+    if !util::git_ok(
+        root,
+        &[
+            "worktree",
+            "move",
+            &old_path.to_string_lossy(),
+            &new_path.to_string_lossy(),
+        ],
+    ) {
+        return Err(format!(
+            "branch renamed to {new_branch}, but moving the worktree to {} failed",
+            new_path.display()
+        ));
+    }
+    Ok(new_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +367,39 @@ mod tests {
         assert_eq!(first, format!("{}dup", cfg.branch_prefix));
         assert!(util::git_ok(&repo, &["branch", &first]));
         assert_eq!(branch_name(&repo, Some("dup"), &cfg), format!("{first}-1"));
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn rename_moves_branch_and_checkout() {
+        let repo = temp_repo("rename");
+        let cfg = Config::default();
+        let old_branch = "old-feat";
+        let path = worktree_path(&repo, old_branch, &cfg);
+        add_checked(&repo, old_branch, "main", &path, &cfg).unwrap();
+        assert!(path.is_dir());
+
+        let new_branch = "new-feat";
+        let new_path = rename(&repo, &path, old_branch, new_branch, &cfg).unwrap();
+        // New checkout exists; the branch was renamed (old gone, new present).
+        assert!(new_path.is_dir(), "moved checkout exists");
+        assert_ne!(new_path, path, "path changed with the branch name");
+        let set = BranchSet::load(&repo);
+        assert!(set.taken(new_branch), "new branch present");
+        assert!(!set.taken(old_branch), "old branch gone");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn rename_to_same_name_is_a_noop() {
+        let repo = temp_repo("rename-noop");
+        let cfg = Config::default();
+        let path = worktree_path(&repo, "keep", &cfg);
+        add_checked(&repo, "keep", "main", &path, &cfg).unwrap();
+        let same = rename(&repo, &path, "keep", "keep", &cfg).unwrap();
+        assert_eq!(same, path);
+        // Empty new name is rejected.
+        assert!(rename(&repo, &path, "keep", "", &cfg).is_err());
         let _ = std::fs::remove_dir_all(&repo);
     }
 }
