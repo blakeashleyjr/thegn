@@ -862,6 +862,184 @@ mod spec {
         assert!(text(&content(Section::Changes, &ctx)).contains("loading"));
     }
 
+    // ── Suite B: sandbox section rendering ────────────────────────────────
+
+    fn sandbox_rows(m: &FrameModel, width: PanelWidth) -> String {
+        let u = ui(width, Section::Sandbox);
+        let ctx = SectionCtx {
+            model: m,
+            ui: &u,
+            cols: match width {
+                PanelWidth::Normal => 39,
+                PanelWidth::Half => 75,
+                PanelWidth::Full => 150,
+            },
+            rows: 28,
+        };
+        text(&content(Section::Sandbox, &ctx))
+    }
+
+    fn container_info(name: &str, status: &str) -> superzej_core::sandbox::ContainerInfo {
+        superzej_core::sandbox::ContainerInfo {
+            name: name.into(),
+            image: "alpine:latest".into(),
+            status: status.into(),
+            ours: true,
+            backend: "podman".into(),
+            cpu: String::new(),
+            mem: String::new(),
+            net: String::new(),
+            containment: String::new(),
+            mounts: String::new(),
+        }
+    }
+
+    #[test]
+    fn b1_healthy_container_renders_green_bullet() {
+        let mut m = model();
+        m.active_container_name = "superzej-wt-feat".into();
+        m.container_health = crate::chrome::ContainerHealth::Healthy;
+        m.containers = vec![container_info("superzej-wt-feat", "Up 3 hours")];
+        let rendered = sandbox_rows(&m, PanelWidth::Normal);
+        assert!(
+            rendered.contains("● running"),
+            "expected running bullet: {rendered}"
+        );
+        assert!(!rendered.contains('⚠'), "unexpected warning: {rendered}");
+    }
+
+    #[test]
+    fn b2_degraded_container_renders_amber_warning() {
+        let mut m = model();
+        m.active_container_name = "superzej-wt-feat".into();
+        m.container_health =
+            crate::chrome::ContainerHealth::Degraded("stale mount: /wt/feat".into());
+        m.containers = vec![container_info("superzej-wt-feat", "Up 1 hour (degraded)")];
+        let rendered = sandbox_rows(&m, PanelWidth::Normal);
+        assert!(rendered.contains("⚠ degraded"), "expected ⚠: {rendered}");
+        assert!(
+            rendered.contains("stale mount: /wt/feat"),
+            "expected degradation reason: {rendered}"
+        );
+    }
+
+    #[test]
+    fn b3_no_container_shows_not_sandboxed() {
+        let mut m = model();
+        m.active_container_name = "superzej-wt-feat".into();
+        m.container_health = crate::chrome::ContainerHealth::Unknown;
+        m.containers = vec![];
+        m.active_sandbox_backend = String::new();
+        let rendered = sandbox_rows(&m, PanelWidth::Normal);
+        assert!(
+            rendered.contains("○ not sandboxed"),
+            "expected not-sandboxed: {rendered}"
+        );
+    }
+
+    #[test]
+    fn b4_bwrap_backend_shows_active() {
+        let mut m = model();
+        m.active_container_name = String::new();
+        m.containers = vec![];
+        m.active_sandbox_backend = "bwrap".into();
+        let rendered = sandbox_rows(&m, PanelWidth::Normal);
+        assert!(
+            rendered.contains("● active"),
+            "expected active bullet: {rendered}"
+        );
+        assert!(
+            rendered.contains("bwrap"),
+            "expected backend name: {rendered}"
+        );
+    }
+
+    #[test]
+    fn b5_startup_orphans_notice() {
+        let mut m = model();
+        m.active_container_name = String::new();
+        m.containers = vec![];
+        m.active_sandbox_backend = String::new();
+        m.startup_orphans_removed = vec!["superzej-old-wt".into(), "superzej-stale".into()];
+        let rendered = sandbox_rows(&m, PanelWidth::Normal);
+        assert!(rendered.contains('⚠'), "expected warning: {rendered}");
+        assert!(
+            rendered.contains("removed 2 orphan container(s) at startup"),
+            "expected orphan notice: {rendered}"
+        );
+        assert!(
+            rendered.contains("superzej-old-wt"),
+            "expected first name: {rendered}"
+        );
+        assert!(
+            rendered.contains("superzej-stale"),
+            "expected second name: {rendered}"
+        );
+    }
+
+    #[test]
+    fn b6_audit_log_section_in_deep_view() {
+        let mut m = model();
+        m.active_container_name = "superzej-wt-feat".into();
+        m.containers = vec![container_info("superzej-wt-feat", "Up 5m")];
+        m.container_events = vec![
+            superzej_core::models::ContainerEvent {
+                id: 1,
+                worktree: "/wt/feat".into(),
+                ts: 1000,
+                kind: "exec".into(),
+                detail: Some("cargo build".into()),
+                exit_code: None,
+            },
+            superzej_core::models::ContainerEvent {
+                id: 2,
+                worktree: "/wt/feat".into(),
+                ts: 2000,
+                kind: "network".into(),
+                detail: Some("eth0".into()),
+                exit_code: None,
+            },
+            superzej_core::models::ContainerEvent {
+                id: 3,
+                worktree: "/wt/feat".into(),
+                ts: 3000,
+                kind: "die".into(),
+                detail: None,
+                exit_code: Some(0),
+            },
+        ];
+        // Half width → deep() == true
+        let rendered = sandbox_rows(&m, PanelWidth::Half);
+        assert!(
+            rendered.contains("AUDIT LOG"),
+            "expected AUDIT LOG: {rendered}"
+        );
+        assert!(rendered.contains("exec"), "expected exec event: {rendered}");
+        assert!(
+            rendered.contains("network"),
+            "expected network event: {rendered}"
+        );
+        assert!(rendered.contains("die"), "expected die event: {rendered}");
+    }
+
+    #[test]
+    fn b7_mounts_section_in_deep_view() {
+        let mut m = model();
+        m.active_container_name = "superzej-wt-feat".into();
+        let mut ci = container_info("superzej-wt-feat", "Up 5m");
+        ci.mounts = "/wt/feat:/wt/feat:z /repo/.git:/repo/.git:z".into();
+        m.containers = vec![ci];
+        let rendered = sandbox_rows(&m, PanelWidth::Half);
+        assert!(
+            rendered.contains("MOUNTS"),
+            "expected MOUNTS section: {rendered}"
+        );
+        assert!(
+            rendered.contains("/wt/feat"),
+            "expected mount path: {rendered}"
+        );
+    }
+
     #[test]
     fn two_col_pads_clips_and_zips() {
         let left = vec![

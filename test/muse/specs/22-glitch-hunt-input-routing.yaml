@@ -1,0 +1,91 @@
+name: glitch_hunt_input_routing
+case_tmp_env: XDG_STATE_HOME
+matrix:
+  profiles: [xterm]
+  sizes: ["100x30"]
+spawn: ["szhost"]
+env:
+  XDG_STATE_HOME: "{case_tmp}"
+  SUPERZEJ_LOG: warn
+  MUSE_READY: "1"
+  TERM: xterm-256color
+sync:
+  quiet_window_ms: 2000
+snapshot_defaults:
+  kind: styled
+steps:
+  - begin_step: "startup"
+  - expect_visible: {regex: "szhost|superzej|\\$|>", timeout_ms: 8000}
+  # Exit the dashboard tile to access the Work tab.
+  - key: {key: q}
+  - sleep_ms: 200
+  # ── Verify host keys do not bleed into the pane ──────────────────────────────
+  # After pressing a host chord (Alt+S), the pane shell should NOT have
+  # received those bytes. We check by looking at what the pane echoes back.
+  - begin_step: "host key does not reach pane"
+  # Wake the dormant pane if needed by pressing enter
+  - key: {key: enter}
+  - sleep_ms: 100
+  - key: {key: s, mods: [ctrl, alt]}
+  - sleep_ms: 80
+  - key: {key: s, mods: [ctrl, alt]}
+  - sleep_ms: 80
+  - key: {key: p, mods: [ctrl, alt]}
+  - sleep_ms: 100
+  - key: {key: p, mods: [ctrl, alt]}
+  - sleep_ms: 80
+  - snapshot: {name: pane_after_host_keys}
+  # ── Mouse click routing ───────────────────────────────────────────────────────
+  - begin_step: "mouse click in center pane"
+  - mouse: {row: 15, col: 50}
+  - sleep_ms: 80
+  - snapshot: {name: after_pane_click}
+  # Click sidebar area
+  - begin_step: "mouse click sidebar"
+  - mouse: {row: 5, col: 2}
+  - sleep_ms: 80
+  - snapshot: {name: after_sidebar_click}
+  # Sidebar should now be focused
+  - key: {key: escape}
+  - sleep_ms: 80
+  # Click panel toggle area (if visible in statusbar)
+  - begin_step: "mouse click statusbar"
+  - mouse: {row: 29, col: 50}
+  - sleep_ms: 100
+  - snapshot: {name: after_statusbar_click}
+  # ── Paste does not corrupt chrome ─────────────────────────────────────────────
+  - begin_step: "bracketed paste does not corrupt chrome"
+  - paste: "this is a pasted string with special chars: <>[]{}()"
+  - sleep_ms: 100
+  - snapshot: {name: after_paste}
+  - key: {key: u, mods: [ctrl]}
+  - sleep_ms: 50
+  # ── Rapid write does not corrupt ─────────────────────────────────────────────
+  - begin_step: "rapid character input"
+  - write: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  - sleep_ms: 50
+  - write: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  - sleep_ms: 50
+  - snapshot: {name: after_rapid_write}
+  - key: {key: u, mods: [ctrl]}
+  - sleep_ms: 50
+  # ── Multi-pane input isolation ────────────────────────────────────────────────
+  - begin_step: "multi-pane input isolation"
+  # Alt+N = SplitDown (top/bottom); new bottom pane is focused after split
+  - key: {key: n, mods: [alt]}
+  - sleep_ms: 200
+  # Bottom pane is focused — write the right-pane marker here
+  - write_line: "rpmark"
+  - sleep_ms: 80
+  # Move up to the top pane
+  - key: {key: up, mods: [ctrl]}
+  - sleep_ms: 80
+  - write_line: "lpmark"
+  - sleep_ms: 80
+  - snapshot: {name: two_pane_input_isolation}
+  - expect_visible: {text: "lpmark", timeout_ms: 2000}
+  - expect_visible: {text: "rpmark", timeout_ms: 2000}
+  - begin_step: "verify no errors"
+  - check_file:
+      path: "{case_tmp}/superzej/logs/szhost.log"
+      reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt|subtract with overflow|index out of bounds"

@@ -50,8 +50,28 @@ flake-check:
     nix flake check
 
 # The full gate.
-ci: fmt-check lint build test doc-check coverage smoke nix-build
+ci: fmt-check lint build test doc-check coverage smoke sandbox-e2e-dns sandbox-e2e-db e2e nix-build
     @echo "ci: all green"
+
+# Visual regression suite: run all muse specs against a live szhost binary.
+# Baselines live in test/muse/snapshots/ and are committed to git.
+# Workers default to 4; glitch-hunt specs run serial (--workers 1) to avoid
+# UI-state races between concurrently running szhost processes.
+# szhost is put on PATH so specs can use spawn: ["szhost"] portably.
+e2e: build
+    PATH="$(pwd)/target/debug:$PATH" muse run test/muse/specs/ \
+        --reporter pretty --workers 4 --deadline-ms 12000
+
+# Run only the glitch-hunt specs (18–28) — slower, more thorough.
+e2e-glitch: build
+    PATH="$(pwd)/target/debug:$PATH" muse run \
+        test/muse/specs/1[89]-*.yaml test/muse/specs/2[0-9]-*.yaml \
+        --reporter pretty --workers 2 --deadline-ms 12000
+
+# Update snapshot baselines (run after intentional rendering changes).
+e2e-update: build
+    PATH="$(pwd)/target/debug:$PATH" muse run test/muse/specs/ \
+        --update-snapshots --workers 4 --deadline-ms 12000
 
 # (e2e/stress/perf harnesses drove the old zellij CLI's worktree-creation
 # commands headlessly; worktree/workspace/pin creation is now an interactive
@@ -84,7 +104,7 @@ coverage-html:
 # Comprehensive linting: rust (clippy), bash (shellcheck), yaml (yamllint), toml (taplo).
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
-    shellcheck -x install.sh test/smoke.sh test/pty-smoke.sh test/install-plan.sh test/dev-tui-plan.sh
+    shellcheck -x install.sh test/smoke.sh test/pty-smoke.sh test/install-plan.sh test/dev-tui-plan.sh test/sandbox-network.sh
     yamllint .
     taplo lint
 
@@ -110,6 +130,44 @@ smoke: build
     ./test/dev-tui-plan.sh
     ./test/smoke.sh {{bin}}
     ./test/pty-smoke.sh {{bin}}
+
+# Sandbox integration tests: require podman (or docker) to be available.
+# Set PODMAN_E2E_FORCE=1 to assert it must pass (CI with podman).
+# Without the env var the recipe just reports "podman not found, skipping."
+sandbox-e2e: build
+    @if command -v podman >/dev/null 2>&1; then \
+      echo "sandbox-e2e: podman found, running integration tests"; \
+      PODMAN_E2E_FORCE=1 cargo test -p superzej-core -- sandbox; \
+    elif [ "$$PODMAN_E2E_FORCE" = "1" ]; then \
+      echo "sandbox-e2e: PODMAN_E2E_FORCE=1 but podman not found"; exit 1; \
+    else \
+      echo "sandbox-e2e: podman not found, skipping (set PODMAN_E2E_FORCE=1 to fail on missing)"; \
+    fi
+
+# DNS filter E2E — Tier 1, no podman needed; always runs in CI.
+sandbox-e2e-dns:
+    cargo test -p superzej-core --test sandbox_dns_e2e
+
+# DB audit trail — Tier 1, no podman; always runs in CI.
+sandbox-e2e-db:
+    cargo test -p superzej-core --lib -- db::tests::container_events
+
+# Full podman-backed suite (Tier 2). Discovers podman and exits cleanly if absent.
+sandbox-e2e-full: build
+    @if command -v podman >/dev/null 2>&1; then \
+      echo "sandbox-e2e-full: podman found, running Tier 2 tests"; \
+      PODMAN_E2E_FORCE=1 cargo test -p superzej-core \
+        --test sandbox_lifecycle \
+        --test sandbox_credentials \
+        --test sandbox_health \
+        --test sandbox_network_policy \
+        --test sandbox_audit \
+        --test sandbox_profile; \
+    elif [ "$$PODMAN_E2E_FORCE" = "1" ]; then \
+      echo "sandbox-e2e-full: PODMAN_E2E_FORCE=1 but podman not found"; exit 1; \
+    else \
+      echo "sandbox-e2e-full: podman not found — skipping Tier 2 tests"; \
+    fi
 
 # Same, but against the built Nix package (verifies the wrapper + injected deps).
 smoke-pkg:

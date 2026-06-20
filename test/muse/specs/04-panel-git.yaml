@@ -1,0 +1,50 @@
+name: panel_git
+case_tmp_env: XDG_STATE_HOME
+matrix:
+  profiles: [xterm]
+  sizes: ["100x30", "160x40"]
+spawn: ["szhost"]
+env:
+  XDG_STATE_HOME: "{case_tmp}"
+  SUPERZEJ_LOG: warn
+  MUSE_READY: "1"
+  TERM: xterm-256color
+sync:
+  quiet_window_ms: 2000
+  max_settle_ms: 10000
+steps:
+  - expect_visible: {regex: "szhost|superzej|\\$|>", timeout_ms: 8000}
+  # Exit the dashboard tile to access the Work tab.
+  - key: {key: q}
+  - sleep_ms: 200
+  # Open the panel
+  - key: {key: p, mods: [ctrl, alt]}
+  - sleep_ms: 200
+  - snapshot: {name: panel_git_open, kind: styled}
+  # Navigate down through sections
+  - key: {key: j}
+  - key: {key: j}
+  - sleep_ms: 100
+  - snapshot: {name: panel_git_nav, kind: styled}
+  # Navigate back up
+  - key: {key: k}
+  - key: {key: k}
+  # Jump to Git tab (already default, ensure we're on tab 1)
+  - key: {key: "1", mods: [alt]}
+  - sleep_ms: 100
+  - snapshot: {name: panel_tab_git, kind: styled}
+  # Jump to Work tab
+  - key: {key: "2", mods: [alt]}
+  - sleep_ms: 100
+  - snapshot: {name: panel_tab_work, kind: styled}
+  # Jump to System tab
+  - key: {key: "3", mods: [alt]}
+  - sleep_ms: 100
+  - snapshot: {name: panel_tab_system, kind: styled}
+  # Close panel
+  - key: {key: p, mods: [ctrl, alt]}
+  - sleep_ms: 100
+  - snapshot: {name: panel_closed, kind: styled}
+  - check_file:
+      path: "{case_tmp}/superzej/logs/szhost.log"
+      reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt"

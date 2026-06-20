@@ -486,6 +486,12 @@ pub struct ProfileConfig {
     /// Keybind overrides applied as this profile's layer.
     #[serde(skip_serializing_if = "KeybindConfig::is_empty")]
     pub keybinds: KeybindConfig,
+    /// Sandbox policy overrides for this profile (network_allow, network_block,
+    /// network_audit, env_passthrough, etc.). Applied after the global [sandbox]
+    /// and before the repo-root overlay, so per-profile restrictions take effect
+    /// without touching per-repo config.
+    #[serde(skip_serializing_if = "SandboxOverlay::is_empty")]
+    pub sandbox: SandboxOverlay,
 }
 
 /// Per-workspace config (`[workspace.<slug>.keybinds]`), keyed by repo slug.
@@ -1174,6 +1180,15 @@ pub struct SandboxConfig {
     pub shell: String,
     pub on_missing: OnMissing,
     pub remote: RemoteConfig,
+    /// Allow-only these hostnames for outbound connections (empty = allow all).
+    /// Enforced via a per-container DNS interceptor. Block-list is checked first
+    /// when both lists are non-empty.
+    pub network_allow: Vec<String>,
+    /// Block outbound connections to these hostnames. Takes priority over
+    /// network_allow when a hostname matches both.
+    pub network_block: Vec<String>,
+    /// Log all outbound DNS queries and connection attempts to the audit table.
+    pub network_audit: bool,
 }
 
 impl Default for SandboxConfig {
@@ -1225,6 +1240,9 @@ impl Default for SandboxConfig {
             shell: String::new(),
             on_missing: OnMissing::Warn,
             remote: RemoteConfig::default(),
+            network_allow: Vec::new(),
+            network_block: Vec::new(),
+            network_audit: false,
         }
     }
 }
@@ -1232,7 +1250,7 @@ impl Default for SandboxConfig {
 /// Partial overlay deserialized from a repo-root `.superzej.{toml,yaml,yml,json}`
 /// — only the keys present override the global `[sandbox]`. Also reused for the
 /// `SUPERZEJ_SANDBOX_*` env layer.
-#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct SandboxOverlay {
     pub enabled: Option<bool>,
@@ -1255,9 +1273,12 @@ pub struct SandboxOverlay {
     pub shell: Option<String>,
     pub on_missing: Option<OnMissing>,
     pub remote: Option<RemoteOverlay>,
+    pub network_allow: Option<Vec<String>>,
+    pub network_block: Option<Vec<String>>,
+    pub network_audit: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RemoteOverlay {
     pub host: Option<String>,
@@ -1330,6 +1351,15 @@ impl SandboxOverlay {
         if let Some(r) = self.remote {
             r.apply(&mut base.remote);
         }
+        if let Some(v) = self.network_allow {
+            base.network_allow = v;
+        }
+        if let Some(v) = self.network_block {
+            base.network_block = v;
+        }
+        if let Some(v) = self.network_audit {
+            base.network_audit = v;
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -1347,6 +1377,9 @@ impl SandboxOverlay {
             && self.shell.is_none()
             && self.on_missing.is_none()
             && self.remote.is_none()
+            && self.network_allow.is_none()
+            && self.network_block.is_none()
+            && self.network_audit.is_none()
     }
 }
 
@@ -2133,6 +2166,10 @@ impl Config {
     /// Tilde-expands path-bearing fields (mounts, remote_dir).
     pub fn repo_sandbox(&self, repo_root: &std::path::Path) -> SandboxConfig {
         let mut sb = self.sandbox.clone();
+        // Profile sandbox overlay (network policy isolation per profile).
+        if let Some(profile) = self.active_profile() {
+            profile.sandbox.clone().apply(&mut sb);
+        }
         if let Some(overlay) = load_repo_overlay(repo_root) {
             overlay.sandbox.apply(&mut sb);
         }
@@ -2980,6 +3017,40 @@ command = "git notes add {{.SelectedCommit.Sha}}"
         let with = cfg.effective_keybinds(None, Some("myrepo"));
         assert_eq!(with.len(), 2);
         assert_eq!(with[1].get("focus-down").map(String::as_str), Some("Alt j"));
+    }
+
+    // G2: Profile sandbox overlay applied by repo_sandbox().
+    #[test]
+    fn profile_sandbox_overlay_applies_network_block() {
+        let cfg: Config = toml::from_str(
+            "profile = \"work\"\n\
+             [profiles.work.sandbox]\n\
+             network_block = [\"social.example.com\"]\n",
+        )
+        .unwrap();
+        // repo_sandbox on any path should now inherit the profile block-list.
+        let sb = cfg.repo_sandbox(std::path::Path::new("/nonexistent"));
+        assert!(
+            sb.network_block.contains(&"social.example.com".to_string()),
+            "profile network_block should flow into repo_sandbox: {:?}",
+            sb.network_block
+        );
+    }
+
+    #[test]
+    fn profile_sandbox_overlay_does_not_apply_when_inactive() {
+        let cfg: Config = toml::from_str(
+            "profile = \"\"\n\
+             [profiles.work.sandbox]\n\
+             network_block = [\"social.example.com\"]\n",
+        )
+        .unwrap();
+        let sb = cfg.repo_sandbox(std::path::Path::new("/nonexistent"));
+        assert!(
+            sb.network_block.is_empty(),
+            "inactive profile must not inject block list: {:?}",
+            sb.network_block
+        );
     }
 
     #[test]

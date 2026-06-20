@@ -330,6 +330,12 @@ pub struct FrameModel {
     pub active_sandbox_backend: String,
     /// Running containers (superzej-owned first) for the SANDBOXES section.
     pub containers: Vec<superzej_core::sandbox::ContainerInfo>,
+    /// Health of the active worktree's container (updated on the container refresh tick).
+    pub container_health: ContainerHealth,
+    /// Recent audit events for the active worktree's container (last 10, newest first).
+    pub container_events: Vec<superzej_core::models::ContainerEvent>,
+    /// Names of orphan containers removed at startup GC (shown once in System panel).
+    pub startup_orphans_removed: Vec<String>,
     /// Top-level app-tab chip labels in masthead order: `work` first, then the
     /// embedded apps (`comms`, …). Empty hides the strip entirely.
     pub app_tabs: Vec<String>,
@@ -338,6 +344,18 @@ pub struct FrameModel {
     /// Ordered launch steps shown in the loading screen while the first pane
     /// is spawning. Empty = no loading screen. Cleared once a live pane exists.
     pub load_steps: Vec<LoadStep>,
+}
+
+/// Health of the active worktree's container.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ContainerHealth {
+    /// No OCI backend in use, or health not yet checked.
+    #[default]
+    Unknown,
+    /// Container is running and all bind-mounts are present.
+    Healthy,
+    /// Container exists but mounts are stale or the container is paused.
+    Degraded(String),
 }
 
 /// One step in the pane-launch progress display.

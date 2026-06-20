@@ -1,0 +1,34 @@
+name: chrome_regions
+case_tmp_env: XDG_STATE_HOME
+matrix:
+  profiles: [xterm]
+  sizes: ["100x30", "80x24", "160x40", "40x12"]
+spawn: ["szhost"]
+env:
+  XDG_STATE_HOME: "{case_tmp}"
+  SUPERZEJ_LOG: warn
+  MUSE_READY: "1"
+  TERM: xterm-256color
+sync:
+  quiet_window_ms: 2000
+  max_settle_ms: 10000
+steps:
+  - expect_visible: {regex: "szhost|superzej|dashboard|work|\\$|>", timeout_ms: 8000}
+  # Full frame at each size
+  - snapshot: {name: full_frame, kind: text}
+  - snapshot: {name: full_frame_styled, kind: styled}
+  # Top row: masthead / tabbar area
+  - snapshot:
+      name: masthead_row
+      kind: styled
+      masks:
+        - rect: [1, 0, 200, 29]
+  # Bottom row: statusbar
+  - snapshot:
+      name: statusbar_row
+      kind: styled
+      masks:
+        - rect: [0, 0, 200, 28]
+  - check_file:
+      path: "{case_tmp}/superzej/logs/szhost.log"
+      reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt"

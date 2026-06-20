@@ -78,7 +78,12 @@ futures = "0.3"
 # `#[tokio::main]` macro, and mpsc channels. svc's octocrab brings its own
 # reqwest/hyper runtime needs. No `time`/net/fs/process here — the refresh ticker
 # is a plain OS thread and subprocess + git I/O go through `spawn_blocking`.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "sync",
+  "signal",
+] }
 portable-pty = "0.9"
 termwiz = "0.23"
 vt100 = "0.16"

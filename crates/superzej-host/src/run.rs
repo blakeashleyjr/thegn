@@ -423,6 +423,36 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         crate::hydrate::HydrateHints::default(),
     );
 
+    // Startup orphan GC: remove any superzej containers whose worktrees no
+    // longer exist in the DB. Best-effort; runs off-thread so launch is instant.
+    let (orphan_tx, mut orphan_rx) = tokio_mpsc::unbounded_channel::<Vec<String>>();
+    {
+        let gc_waker = waker.clone();
+        tokio::task::spawn_blocking(move || {
+            let Ok(db) = superzej_core::db::Db::open() else {
+                return;
+            };
+            let db_worktrees: Vec<String> = db
+                .worktrees()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| r.worktree)
+                .collect();
+            let removed = superzej_core::sandbox::run_gc(&db_worktrees);
+            if !removed.is_empty() {
+                superzej_core::msg::info(&format!(
+                    "sandbox: removed {} orphan container(s): {}",
+                    removed.len(),
+                    removed.join(", ")
+                ));
+                let _ = orphan_tx.send(removed);
+                let _ = gc_waker.wake();
+            }
+        });
+    }
+    // orphan_rx drained in the event loop to surface the notice in the System panel.
+    let _ = orphan_rx; // placeholder until wired into event_loop
+
     // Config reload events ride a tokio channel so the loop drains them on wake;
     // the notify watcher thread `send`s + pulses the waker.
     let (config_tx, config_rx) =
@@ -470,6 +500,8 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // refresh; this thread just pulses a tick + waker on the interval.
     let (refresh_tx, refresh_rx) = tokio_mpsc::unbounded_channel::<RefreshKind>();
     let (stats_tx, stats_rx) = tokio_mpsc::unbounded_channel::<crate::stats::StatsSnapshot>();
+    let (container_tx, container_rx) =
+        tokio_mpsc::unbounded_channel::<Vec<superzej_core::sandbox::ContainerInfo>>();
     let (metrics_tx, metrics_rx) = tokio_mpsc::unbounded_channel::<crate::metrics::MetricsState>();
     crate::metrics::spawn_metrics_supervisor(cfg.metrics.clone(), metrics_tx, waker.clone());
     // The stats cadence is user-cyclable at runtime (click the top-right
@@ -483,10 +515,47 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     spawn_refresh_ticker(
         refresh_tx.clone(),
         stats_tx,
+        container_tx,
         stats_interval_ms.clone(),
         stats_live.clone(),
         waker.clone(),
     );
+
+    // Podman exec/network event subscriber — writes to the container_events DB
+    // table so the audit panel has live data. Silently no-ops when podman is
+    // not installed.
+    let (sandbox_event_tx, mut sandbox_event_rx) =
+        tokio_mpsc::unbounded_channel::<crate::sandbox_events::SandboxEventBatch>();
+    crate::sandbox_events::spawn(cfg.sandbox.network_audit, sandbox_event_tx);
+    // Drain sandbox_event_rx in the event loop below: model goes dirty so the
+    // panel audit log re-renders.
+    let _ = sandbox_event_rx; // placeholder until wired into event_loop
+
+    // Graceful shutdown on SIGTERM / SIGHUP: set a flag and pulse the waker so
+    // the blocking poll_input returns and the loop exits at the top of its next
+    // iteration, persisting session state before returning.
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let flag = shutdown.clone();
+        let sig_waker = waker.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut term = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let mut hup = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = hup.recv() => {}
+            }
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = sig_waker.wake();
+        });
+    }
 
     let result = event_loop(
         &mut buf,
@@ -503,11 +572,13 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         refresh_tx,
         refresh_rx,
         stats_rx,
+        container_rx,
         metrics_rx,
         stats_interval_ms,
         stats_live,
         waker,
         start,
+        shutdown,
     )
     .await;
 
@@ -1460,6 +1531,15 @@ fn forget_worktree_group(
     }
     let _ = db.del_worktree_for_tab(session_id, &group.name);
     let _ = db.delete_tab_group(session_id, &group.name);
+    // Tear down any sandbox container for this worktree in the background
+    // (best-effort: we fire-and-forget on a dedicated thread so the event loop
+    // is never blocked by a slow container runtime).
+    if !group.path.is_empty() {
+        let path = group.path.clone();
+        std::thread::spawn(move || {
+            superzej_core::sandbox::teardown_by_path(&path);
+        });
+    }
 }
 
 fn delete_groups(
@@ -4623,11 +4703,13 @@ async fn event_loop<T: Terminal>(
     refresh_tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     mut refresh_rx: tokio_mpsc::UnboundedReceiver<RefreshKind>,
     mut stats_rx: tokio_mpsc::UnboundedReceiver<crate::stats::StatsSnapshot>,
+    mut container_rx: tokio_mpsc::UnboundedReceiver<Vec<superzej_core::sandbox::ContainerInfo>>,
     mut metrics_rx: tokio_mpsc::UnboundedReceiver<crate::metrics::MetricsState>,
     stats_interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stats_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
     waker: TerminalWaker,
     start: std::time::Instant,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     let mut scratch = Surface::new(cols, rows);
     // What the terminal currently shows; the render path diffs scratch
@@ -4635,10 +4717,12 @@ async fn event_loop<T: Terminal>(
     let mut front = Surface::new(cols, rows);
     // Freshly-seeded sessions launch dormant: no PTY is forked and the center
     // shows the logo splash until the first keypress / center click (dashboard
-    // style). Resurrected sessions never see it. The bench guard keeps
-    // `just bench` measuring launch → first SHELL frame, unchanged.
+    // style). Resurrected sessions never see it. The bench guard and the muse
+    // test harness (MUSE_READY=1) both need real first-frame content, so both
+    // suppress dormant mode.
+    let muse_ready = std::env::var_os("MUSE_READY").is_some();
     let mut center_dormant =
-        seeded && std::env::var_os("SUPERZEJ_BENCH_FIRST_FRAME_EXIT").is_none();
+        seeded && std::env::var_os("SUPERZEJ_BENCH_FIRST_FRAME_EXIT").is_none() && !muse_ready;
     tracing::debug!(target: "szhost::frame", seeded, center_dormant, "dormant init");
     // One-shot startup milestone: logged after the first diff-flush below.
     let mut first_frame_logged = false;
@@ -4989,6 +5073,10 @@ async fn event_loop<T: Terminal>(
         if session.worktrees.is_empty() {
             return Ok(()); // last worktree closed
         }
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            persist_session_layout(&session);
+            return Ok(());
+        }
         // Per-workspace keybinds: rebuild when the focused workspace changed.
         if session.id != keymap_workspace {
             keymap = rebuild_keymap(&current_config, &session);
@@ -5112,6 +5200,7 @@ async fn event_loop<T: Terminal>(
                 crate::hydrate::HydrateHints {
                     open: panel_ui.open,
                     expanded: panel_ui.width.is_expanded(),
+                    profile: current_config.profile.clone(),
                     ..Default::default()
                 },
             );
@@ -6111,6 +6200,34 @@ async fn event_loop<T: Terminal>(
             }
         }
 
+        // Container list from the 5s ticker — replaces the old inline call
+        // inside model hydration so `podman ps` never blocks the hydrate path.
+        while let Ok(containers) = container_rx.try_recv() {
+            if model.containers != containers {
+                // Derive container health for the active worktree from the
+                // snapshot: if the named container is present and running →
+                // Healthy; present but not running → Degraded; absent →
+                // Unknown (non-OCI backends also land here).
+                let health = if model.active_container_name.is_empty() {
+                    crate::chrome::ContainerHealth::Unknown
+                } else {
+                    match containers
+                        .iter()
+                        .find(|c| c.name == model.active_container_name)
+                    {
+                        None => crate::chrome::ContainerHealth::Unknown,
+                        Some(c) if c.status.to_lowercase().starts_with("up") => {
+                            crate::chrome::ContainerHealth::Healthy
+                        }
+                        Some(c) => crate::chrome::ContainerHealth::Degraded(c.status.clone()),
+                    }
+                };
+                model.container_health = health;
+                model.containers = containers;
+                dirty = true;
+            }
+        }
+
         // App-tab change-hooks fired (async results landed in a tile). Drain the
         // signals, fold every running tile's messages, and repaint — the chip
         // badges track unfocused tiles, the active tile shows its new state.
@@ -6360,6 +6477,7 @@ async fn event_loop<T: Terminal>(
                 crate::hydrate::HydrateHints {
                     open: panel_ui.open,
                     expanded: panel_ui.width.is_expanded(),
+                    profile: current_config.profile.clone(),
                     ..Default::default()
                 },
             );
@@ -6684,6 +6802,57 @@ async fn event_loop<T: Terminal>(
                 out.flush().context("terminal flush")?;
             }
             dirty = false;
+            if muse_ready {
+                // Only emit the ready marker when the event queue is
+                // completely drained.  If szhost still has buffered input (e.g.
+                // 51 'a' chars arrive at once, each causing its own render),
+                // emitting after the first render would fire a premature stable
+                // in the muse sync state machine, capturing only the partial
+                // state.  By deferring until both the in-memory queue and the
+                // terminal's own read buffer are empty we guarantee the marker
+                // corresponds to the final rendered state of the batch.
+                // Only KEY/MOUSE/PASTE events defer the marker — Wake/Resize
+                // events (background ticks, hydration) must never block it or
+                // startup will spin indefinitely waiting for an empty queue.
+                let has_pty_pending = {
+                    let in_queue = pending_input.iter().any(|e| {
+                        matches!(
+                            e,
+                            InputEvent::Key(_) | InputEvent::Mouse(_) | InputEvent::Paste(_)
+                        )
+                    });
+                    if in_queue {
+                        true
+                    } else {
+                        let mut found = false;
+                        loop {
+                            match buf.terminal().poll_input(Some(std::time::Duration::ZERO)) {
+                                Ok(Some(ev)) => {
+                                    let is_pty = matches!(
+                                        ev,
+                                        InputEvent::Key(_)
+                                            | InputEvent::Mouse(_)
+                                            | InputEvent::Paste(_)
+                                    );
+                                    pending_input.push_back(ev);
+                                    if is_pty {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                _ => break,
+                            }
+                        }
+                        found
+                    }
+                };
+                if !has_pty_pending {
+                    use std::io::Write as _;
+                    let _ = std::io::stdout()
+                        .write_all(b"\x1b]5379;muse:ready\x07")
+                        .and_then(|_| std::io::stdout().flush());
+                }
+            }
             tracing::debug!(
                 target: "szhost::frame",
                 render_ms = frame_t0.elapsed().as_millis() as u64,
@@ -8093,24 +8262,26 @@ async fn event_loop<T: Terminal>(
                         }
                     }
                 }
-                // Panel zone: Alt+1/2/3 switch panel tabs. These intentionally
-                // shadow the global Alt+1/2/3 pin-summon shortcuts when the
-                // panel has focus — handled here before the global keymap.
-                if forced_palette_action.is_none() && focus.panel() && k.modifiers == Modifiers::ALT
+                // Panel zone: Tab/Shift+Tab cycle panel tabs (Git → Work → System).
+                if forced_palette_action.is_none()
+                    && focus.panel()
+                    && k.modifiers.is_empty()
+                    && k.key == KeyCode::Tab
                 {
-                    use crate::panel::PanelTab;
-                    let tab = match k.key {
-                        KeyCode::Char('1') => Some(PanelTab::Git),
-                        KeyCode::Char('2') => Some(PanelTab::Work),
-                        KeyCode::Char('3') => Some(PanelTab::System),
-                        _ => None,
-                    };
-                    if let Some(t) = tab {
-                        panel_ui.switch_tab(t);
-                        persist_panel_state(&panel_ui);
-                        dirty = true;
-                        continue;
-                    }
+                    panel_ui.switch_tab(panel_ui.tab.next());
+                    persist_panel_state(&panel_ui);
+                    dirty = true;
+                    continue;
+                }
+                if forced_palette_action.is_none()
+                    && focus.panel()
+                    && k.modifiers == Modifiers::SHIFT
+                    && k.key == KeyCode::Tab
+                {
+                    panel_ui.switch_tab(panel_ui.tab.prev());
+                    persist_panel_state(&panel_ui);
+                    dirty = true;
+                    continue;
                 }
                 // Panel zone, git-family contexts: the table-driven git keys
                 // resolve BEFORE the accordion (space = stage-line in the
@@ -9734,7 +9905,10 @@ async fn event_loop<T: Terminal>(
                                     }
                                 }
                             }
-                            Action::Quit => return Ok(()),
+                            Action::Quit => {
+                                persist_session_layout(&session);
+                                return Ok(());
+                            }
                             Action::SwitchFont => match crate::font::font_palette_items() {
                                 Ok(items) if items.is_empty() => {
                                     model.status = "No fonts found via fc-list".into();

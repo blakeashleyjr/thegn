@@ -9,7 +9,7 @@
 //! list-sessions` for sessions; this is a cache + history layer. rusqlite is
 //! bundled, so there's no system sqlite dependency.
 
-use crate::models::{WorkspaceRow, WorktreeRow};
+use crate::models::{ContainerEvent, WorkspaceRow, WorktreeRow};
 use crate::util;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -305,6 +305,19 @@ impl Db {
               dispatched_at_ms INTEGER NOT NULL,
               status           TEXT    NOT NULL DEFAULT 'queued'
             );
+            -- v13: sandbox audit trail.  Exec events (commands run inside
+            -- containers), network events (outbound connections), and GC events
+            -- (orphan teardown) from the sandbox subsystem.
+            CREATE TABLE IF NOT EXISTS container_events (
+              id        INTEGER PRIMARY KEY AUTOINCREMENT,
+              worktree  TEXT    NOT NULL,
+              ts        INTEGER NOT NULL,
+              kind      TEXT    NOT NULL,
+              detail    TEXT,
+              exit_code INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_container_events_wt
+              ON container_events (worktree, ts DESC);
             COMMIT;
             "#,
         )?;
@@ -1007,6 +1020,59 @@ impl Db {
         } else {
             Ok(None)
         }
+    }
+
+    // --- container_events (sandbox audit trail) ------------------------------
+
+    /// Record a sandbox event (exec, network, dns, orphan_gc) in the audit log.
+    pub fn insert_container_event(
+        &self,
+        worktree: &str,
+        ts: i64,
+        kind: &str,
+        detail: Option<&str>,
+        exit_code: Option<i64>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO container_events (worktree, ts, kind, detail, exit_code)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![worktree, ts, kind, detail, exit_code],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve the most recent `limit` container events for a worktree,
+    /// newest first.
+    pub fn container_events(&self, worktree: &str, limit: usize) -> Result<Vec<ContainerEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, worktree, ts, kind, detail, exit_code
+             FROM container_events
+             WHERE worktree = ?1
+             ORDER BY ts DESC, id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![worktree, limit as i64], |r| {
+            Ok(ContainerEvent {
+                id: r.get(0)?,
+                worktree: r.get(1)?,
+                ts: r.get(2)?,
+                kind: r.get(3)?,
+                detail: r.get(4)?,
+                exit_code: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Delete container events older than `older_than_secs` seconds. Called on
+    /// startup to keep the audit table from growing unbounded.
+    pub fn prune_container_events(&self, older_than_secs: i64) -> Result<usize> {
+        let cutoff = crate::util::now() - older_than_secs;
+        let n = self.conn.execute(
+            "DELETE FROM container_events WHERE ts < ?1",
+            params![cutoff],
+        )?;
+        Ok(n)
     }
 
     /// The worktree path for a (session, tab) pair — how the panel plugin maps
@@ -2164,5 +2230,58 @@ mod tests {
         let remaining = db.get_all_notifications(10).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_ne!(remaining[0].id, id);
+    }
+
+    // ── Suite C: container_events audit trail ──────────────────────────────
+
+    #[test]
+    fn container_events_round_trip() {
+        let db = db();
+        db.insert_container_event("/wt/feat", 1000, "exec", Some("cargo build"), None)
+            .unwrap();
+        db.insert_container_event("/wt/feat", 2000, "exec", Some("git status"), Some(0))
+            .unwrap();
+        db.insert_container_event("/wt/other", 3000, "die", None, Some(1))
+            .unwrap();
+
+        let events = db.container_events("/wt/feat", 10).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].ts, 2000, "newest first");
+        assert_eq!(events[1].kind, "exec");
+        assert_eq!(events[1].detail.as_deref(), Some("cargo build"));
+
+        let other = db.container_events("/wt/other", 10).unwrap();
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].exit_code, Some(1));
+    }
+
+    #[test]
+    fn container_events_prune_removes_old() {
+        let db = db();
+        let now = crate::util::now();
+        db.insert_container_event("/wt/feat", now - 86400, "exec", Some("old"), None)
+            .unwrap();
+        db.insert_container_event("/wt/feat", now - 100, "exec", Some("recent"), None)
+            .unwrap();
+        db.insert_container_event("/wt/feat", now, "exec", Some("now"), None)
+            .unwrap();
+        db.prune_container_events(3600).unwrap();
+        let remaining = db.container_events("/wt/feat", 10).unwrap();
+        assert_eq!(remaining.len(), 2, "only the 24h-old row should be pruned");
+        assert!(
+            remaining.iter().all(|e| e.detail.as_deref() != Some("old")),
+            "old event must not appear in results"
+        );
+    }
+
+    #[test]
+    fn container_events_limit_honoured() {
+        let db = db();
+        for i in 0..15i64 {
+            db.insert_container_event("/wt/feat", i, "exec", None, None)
+                .unwrap();
+        }
+        let ten = db.container_events("/wt/feat", 10).unwrap();
+        assert_eq!(ten.len(), 10);
     }
 }

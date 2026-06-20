@@ -31,10 +31,15 @@ pub(crate) enum RefreshKind {
     Issues,
 }
 
+const CONTAINER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Background ticker: emits a `Model` refresh every `MODEL_REFRESH_INTERVAL` and
 /// a `Pr` refresh every `PR_REFRESH_INTERVAL`, pulsing the waker so an idle loop
 /// wakes to service it. This is the staleness backstop; fs-watch + on-switch
 /// refresh handle the common, latency-sensitive cases.
+///
+/// Also refreshes the container list on a 5s cadence (sent on `container_tx`),
+/// keeping the sandbox panel live without blocking the hydration path.
 ///
 /// Runs on a dedicated OS thread (not `tokio::spawn`) so it can never be starved
 /// by the main loop blocking a runtime worker in `poll_input(None)` — true even
@@ -45,6 +50,7 @@ pub(crate) enum RefreshKind {
 pub(crate) fn spawn_refresh_ticker(
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     stats_tx: tokio_mpsc::UnboundedSender<crate::stats::StatsSnapshot>,
+    container_tx: tokio_mpsc::UnboundedSender<Vec<superzej_core::sandbox::ContainerInfo>>,
     stats_interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stats_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
     waker: TerminalWaker,
@@ -55,6 +61,7 @@ pub(crate) fn spawn_refresh_ticker(
         let model_every = MODEL_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let pr_every = PR_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let issue_every = ISSUE_REFRESH_INTERVAL.as_millis() as u64 / 500;
+        let container_every = CONTAINER_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let mut ticks: u64 = 0;
         // System stats for the top bar ride the same thread/cadence — the
         // /proc reads never touch the event loop.
@@ -89,6 +96,15 @@ pub(crate) fn spawn_refresh_ticker(
             if stats_live.load(Ordering::Relaxed) || last_stats.elapsed() >= interval {
                 last_stats = Instant::now();
                 if stats_tx.send(sampler.sample()).is_err() {
+                    break;
+                }
+                wake = true;
+            }
+            // Container list refresh: runs OCI `ps` subprocesses, so keep it on
+            // its own cadence (5s) rather than tying it to the fast stats tick.
+            if ticks.is_multiple_of(container_every) {
+                let containers = superzej_core::sandbox::running_containers();
+                if container_tx.send(containers).is_err() {
                     break;
                 }
                 wake = true;
@@ -499,6 +515,8 @@ pub(crate) struct HydrateHints {
     pub expanded: bool,
     /// The configured issue provider id (`"none"` when disabled, `""` treated as "none").
     pub issues_provider: String,
+    /// Active profile slug for per-profile container naming (empty = default).
+    pub profile: String,
 }
 
 impl HydrateHints {
@@ -868,13 +886,24 @@ pub(crate) fn build_model(
         sidebar_db_worktrees,
         sidebar_status,
         loc: loc_count,
-        active_container_name: superzej_core::sandbox::container_name(&loc.path()),
+        active_container_name: superzej_core::sandbox::container_name_with_profile(
+            &loc.path(),
+            if hints.profile.is_empty() {
+                None
+            } else {
+                Some(&hints.profile)
+            },
+        ),
         active_sandbox_backend: db
             .worktree_sandbox(&loc.path())
             .ok()
             .flatten()
             .unwrap_or_default(),
-        containers: superzej_core::sandbox::running_containers(),
+        // containers is populated by the dedicated container refresh ticker
+        // (run.rs) rather than inline here, to avoid blocking model hydration
+        // on `podman ps` subprocess calls.
+        containers: vec![],
+        container_events: db.container_events(&loc.path(), 10).unwrap_or_default(),
         panel,
         panel_focused: false,
         status: format!(
