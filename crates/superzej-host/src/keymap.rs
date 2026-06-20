@@ -1242,6 +1242,38 @@ mod tests {
     }
 
     #[test]
+    fn config_defined_multikey_sequence_routes() {
+        // A user binds a two-key leader sequence; the host registers it as a
+        // real sequence (Pending on the prefix, Matched on completion).
+        let mut cfg = superzej_core::config::Config::default();
+        cfg.keybinds.insert("new-worktree".into(), "Space w".into());
+        let mut map = default_keymap_for(&cfg, None, None);
+        let space = Key::char(' ');
+        let w = Key::char('w');
+        assert!(
+            matches!(
+                map.dispatch(Mode::Normal, space.clone()),
+                MatchResult::Pending
+            ),
+            "the leader key is a pending prefix"
+        );
+        assert_eq!(
+            map.dispatch(Mode::Normal, w),
+            MatchResult::Matched(Action::NewWorktree),
+            "completing the sequence fires the action"
+        );
+        // which-key has a continuation to show after the prefix.
+        map.reset();
+        let _ = map.dispatch(Mode::Normal, space);
+        assert!(
+            map.pending_continuations(Mode::Normal)
+                .iter()
+                .any(|(_, a)| *a == Action::NewWorktree),
+            "the which-key popup lists the sequence continuation"
+        );
+    }
+
+    #[test]
     fn ctrl_and_ctrl_alt_distinguished() {
         assert_eq!(k(' ', Modifiers::CTRL), Some(Action::OpenPalette));
         assert_eq!(k('g', Modifiers::CTRL), Some(Action::ToggleKeyLock));
