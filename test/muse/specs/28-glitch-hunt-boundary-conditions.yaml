@@ -1,0 +1,144 @@
+name: glitch_hunt_boundary_conditions
+case_tmp_env: XDG_STATE_HOME
+matrix:
+  profiles: [xterm]
+  sizes: ["100x30"]
+spawn: ["szhost"]
+env:
+  XDG_STATE_HOME: "{case_tmp}"
+  SUPERZEJ_LOG: warn
+  MUSE_READY: "1"
+  TERM: xterm-256color
+sync:
+  quiet_window_ms: 2000
+snapshot_defaults:
+  kind: styled
+steps:
+  - begin_step: "startup"
+  - expect_visible: {regex: "szhost|superzej|\\$|>", timeout_ms: 8000}
+  # Exit the dashboard tile to access the Work tab.
+  - key: {key: q}
+  - sleep_ms: 200
+  # ── Interleaved panel + sidebar + splits: maximum chrome simultaneously ───────
+  - begin_step: "all chrome at once"
+  - key: {key: n, mods: [alt]}
+  - sleep_ms: 150
+  - key: {key: p, mods: [ctrl, alt]}
+  - sleep_ms: 120
+  - key: {key: s, mods: [alt]}
+  - sleep_ms: 80
+  - snapshot: {name: all_chrome_at_once}
+  # Navigate within the sidebar while panel and split are open
+  - key: {key: j}
+  - key: {key: j}
+  - sleep_ms: 80
+  - snapshot: {name: sidebar_nav_with_full_chrome}
+  - key: {key: escape}
+  - sleep_ms: 80
+  - key: {key: p, mods: [ctrl, alt]}
+  - sleep_ms: 80
+  # ── Very long path/filename in sidebar ───────────────────────────────────────
+  - begin_step: "sidebar with long content"
+  - key: {key: s, mods: [alt]}
+  - sleep_ms: 80
+  - snapshot: {name: sidebar_long_content}
+  # Filter mode with long query
+  - key: {key: /}
+  - sleep_ms: 30
+  - write: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  - sleep_ms: 100
+  - snapshot: {name: sidebar_long_filter_query}
+  - key: {key: escape}
+  - sleep_ms: 80
+  - key: {key: escape}
+  - sleep_ms: 80
+  # ── Empty state: no results in sidebar filter ────────────────────────────────
+  - begin_step: "sidebar filter no results"
+  - key: {key: s, mods: [alt]}
+  - sleep_ms: 80
+  - key: {key: /}
+  - sleep_ms: 30
+  - write: "xzxzxzxzxzxzxzxz_no_match_xzxzxz"
+  - sleep_ms: 100
+  - snapshot: {name: sidebar_no_results}
+  # Must still show "no results" or empty list — not crash or render garbage
+  - key: {key: escape}
+  - sleep_ms: 80
+  - key: {key: escape}
+  - sleep_ms: 80
+  # ── Palette with long query ───────────────────────────────────────────────────
+  - begin_step: "palette long query"
+  - key: {key: " ", mods: [ctrl]}
+  - sleep_ms: 150
+  - write: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  - sleep_ms: 100
+  - snapshot: {name: palette_long_query}
+  - key: {key: escape}
+  - sleep_ms: 80
+  # ── Palette with no match ─────────────────────────────────────────────────────
+  - begin_step: "palette no match"
+  - key: {key: " ", mods: [ctrl]}
+  - sleep_ms: 150
+  - write: "xzxzxzxzxzxzxzxz_no_match_xzxzxz"
+  - sleep_ms: 100
+  - snapshot: {name: palette_no_match}
+  - key: {key: escape}
+  - sleep_ms: 80
+  # ── Rapid context-switch while writing in pane ───────────────────────────────
+  - begin_step: "context switch mid-write"
+  - write: "partial_command"
+  - sleep_ms: 50
+  - key: {key: p, mods: [ctrl, alt]}
+  - sleep_ms: 80
+  - key: {key: p, mods: [ctrl, alt]}
+  - sleep_ms: 80
+  - snapshot: {name: after_context_switch_mid_write}
+  # The partial command should still be in the pane (not lost)
+  - expect_visible: {text: "partial_command", timeout_ms: 2000}
+  - key: {key: u, mods: [ctrl]}
+  - sleep_ms: 50
+  # ── Scroll at top of scrollback ───────────────────────────────────────────────
+  - begin_step: "scrollback boundary"
+  - key: {key: f, mods: [ctrl, alt]}
+  - sleep_ms: 150
+  # Scroll up past the beginning of scrollback
+  - key: {key: up}
+  - key: {key: up}
+  - key: {key: up}
+  - key: {key: up}
+  - key: {key: up}
+  - key: {key: up}
+  - key: {key: up}
+  - key: {key: up}
+  - key: {key: up}
+  - key: {key: up}
+  - sleep_ms: 100
+  - snapshot: {name: scrollback_top}
+  # Scroll down past the end
+  - key: {key: down}
+  - key: {key: down}
+  - key: {key: down}
+  - key: {key: down}
+  - key: {key: down}
+  - key: {key: down}
+  - key: {key: down}
+  - key: {key: down}
+  - key: {key: down}
+  - key: {key: down}
+  - sleep_ms: 100
+  - snapshot: {name: scrollback_bottom}
+  - key: {key: escape}
+  - sleep_ms: 80
+  # ── Simultaneous timer events: trigger refresh timer during user input ────────
+  - begin_step: "refresh timer + user input race"
+  # Sleep long enough to trigger the 2s refresh timer while actively inputting
+  - sleep_ms: 2100
+  - write: "hello"
+  - sleep_ms: 100
+  - snapshot: {name: after_timer_race}
+  - key: {key: u, mods: [ctrl]}
+  - sleep_ms: 50
+  - begin_step: "verify no errors"
+  - check_file:
+      path: "{case_tmp}/superzej/logs/szhost.log"
+      reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt|subtract with overflow|index out of bounds"

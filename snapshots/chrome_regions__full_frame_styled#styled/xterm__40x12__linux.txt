@@ -1,0 +1,57 @@
+L0|  dashboard 4 work   comms 1 chat 02:15
+R0 0 1 fg=default bg=#151a28 attrs=
+R0 1 11 fg=#6ee7d8 bg=#2e5359 attrs=
+R0 12 27 fg=#aab1c5 bg=#151a28 attrs=
+R0 39 1 fg=default bg=#151a28 attrs=
+L1|
+L2|┌ System ────┐┌ Hacker News ───────────┐
+R2 0 40 fg=#4e556e bg=default attrs=
+L3|│OS:         │└────────────────────────┘
+R3 0 1 fg=#4e556e bg=default attrs=
+R3 1 4 fg=#aab1c5 bg=default attrs=
+R3 5 8 fg=default bg=default attrs=
+R3 13 27 fg=#4e556e bg=default attrs=
+L4|│Uptime: 0s  │┌ Recent Repos ──────────┐
+R4 0 1 fg=#4e556e bg=default attrs=
+R4 1 8 fg=#aab1c5 bg=default attrs=
+R4 9 2 fg=#edf0f8 bg=default attrs=
+R4 11 2 fg=default bg=default attrs=
+R4 13 27 fg=#4e556e bg=default attrs=
+L5|│Memory: 0.00│┌ Workspaces ────────────┐
+R5 0 1 fg=#4e556e bg=default attrs=
+R5 1 8 fg=#aab1c5 bg=default attrs=
+R5 9 4 fg=#edf0f8 bg=default attrs=
+R5 13 27 fg=#4e556e bg=default attrs=
+L6|└────────────┘└────────────────────────┘
+R6 0 40 fg=#4e556e bg=default attrs=
+L7|┌ Resources ─┐┌ Superzej Dashboard ────┐
+R7 0 40 fg=#4e556e bg=default attrs=
+L8|│CPU: 0.0%   ││Last updated: 0  |  Refr│
+R8 0 1 fg=#4e556e bg=default attrs=
+R8 1 5 fg=#aab1c5 bg=default attrs=
+R8 6 4 fg=#7fdca0 bg=default attrs=
+R8 10 3 fg=default bg=default attrs=
+R8 13 2 fg=#4e556e bg=default attrs=
+R8 15 24 fg=#aab1c5 bg=default attrs=
+R8 39 1 fg=#4e556e bg=default attrs=
+L9|│Mem: 0.0% (0││                        │
+R9 0 1 fg=#4e556e bg=default attrs=
+R9 1 5 fg=#aab1c5 bg=default attrs=
+R9 6 7 fg=#6ee7d8 bg=default attrs=
+R9 13 2 fg=#4e556e bg=default attrs=
+R9 15 24 fg=#aab1c5 bg=default attrs=
+R9 39 1 fg=#4e556e bg=default attrs=
+L10|└────────────┘└────────────────────────┘
+R10 0 40 fg=#4e556e bg=default attrs=
+L11|  N   Ctrl-Left pane   Alt-Left tab  …
+R11 0 1 fg=#edf0f8 bg=#151a28 attrs=
+R11 1 3 fg=#0b0e16 bg=#6ee7d8 attrs=BOLD
+R11 4 2 fg=#edf0f8 bg=#151a28 attrs=
+R11 6 9 fg=#7a8197 bg=#151a28 attrs=
+R11 15 5 fg=#4e556e bg=#151a28 attrs=
+R11 20 3 fg=#edf0f8 bg=#151a28 attrs=
+R11 23 8 fg=#7a8197 bg=#151a28 attrs=
+R11 31 4 fg=#4e556e bg=#151a28 attrs=
+R11 35 2 fg=#edf0f8 bg=#151a28 attrs=
+R11 37 1 fg=#4e556e bg=#151a28 attrs=
+R11 38 2 fg=#edf0f8 bg=#151a28 attrs=

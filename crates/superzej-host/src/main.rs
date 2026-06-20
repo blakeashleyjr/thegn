@@ -33,6 +33,7 @@ mod panes;
 mod pins;
 mod queries;
 mod run;
+mod sandbox_events;
 mod search;
 mod seg;
 mod sequence;
@@ -145,7 +146,15 @@ fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let result = rt.block_on(run::main(cli));
     rt.shutdown_background();
-    result
+    // termwiz opens /dev/tty without O_CLOEXEC; child pane shells inherit that
+    // FD and keep the outer PTY open after szhost exits, preventing the parent
+    // from seeing EOF. process::exit is the correct terminal-emulator exit: it
+    // kills the whole process group atomically, matching what alacritty/kitty do.
+    let code: i32 = match &result {
+        Ok(()) => 0,
+        Err(_) => 1,
+    };
+    std::process::exit(code);
 }
 
 /// Dispatch a non-interactive verb. Loads the layered config (the verbs that

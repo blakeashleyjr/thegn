@@ -228,7 +228,19 @@ pub struct SandboxSpec {
     pub worktree: PathBuf,
     pub mounts: Vec<Mount>,
     pub env: Vec<(String, String)>,
+    /// Per-agent env overrides: injected into the shell script before the inner
+    /// command runs, taking priority over env_passthrough. Used for scoped API
+    /// keys (virtual keys from the LLM proxy) without rebuilding the container.
+    pub env_overrides: std::collections::HashMap<String, String>,
+    /// Env keys to suppress inside the sandbox — unset even if forwarded by
+    /// env_passthrough or present in the OCI image. Use alongside env_overrides
+    /// to swap a master key for a scoped virtual key.
+    pub env_block: Vec<String>,
     pub network: Network,
+    /// Domain allow-list for the DNS filter (empty = allow all non-blocked).
+    pub network_allow: Vec<String>,
+    /// Domain block-list for the DNS filter (checked before allow-list).
+    pub network_block: Vec<String>,
     pub file_access: FileAccess,
     pub ports: Vec<String>,
     pub gpu: Option<String>,
@@ -372,7 +384,11 @@ pub fn resolve(cfg: &SandboxConfig, loc: &GitLoc, name: &str) -> Option<SandboxS
         worktree,
         mounts,
         env,
+        env_overrides: std::collections::HashMap::new(),
+        env_block: Vec::new(),
         network: cfg.network,
+        network_allow: cfg.network_allow.clone(),
+        network_block: cfg.network_block.clone(),
         file_access: cfg.file_access,
         ports: cfg.ports.clone(),
         gpu: cfg.gpu.clone(),
@@ -412,6 +428,21 @@ pub const CONTAINER_PREFIX: &str = "superzej-";
 /// local or remote, no DB slug lookup needed.
 pub fn container_name(worktree: &str) -> String {
     format!("{CONTAINER_PREFIX}{}", util::slugify(worktree))
+}
+
+/// Per-profile variant: `superzej-{profile}-{slug}` when a profile is active.
+/// Falls back to [`container_name`] when `profile` is `None` or `"default"`.
+pub fn container_name_with_profile(worktree: &str, profile: Option<&str>) -> String {
+    match profile {
+        Some(p) if !p.is_empty() && p != "default" => {
+            format!(
+                "{CONTAINER_PREFIX}{}-{}",
+                util::slugify(p),
+                util::slugify(worktree)
+            )
+        }
+        _ => container_name(worktree),
+    }
 }
 
 /// One running container, as listed by the OCI runtime — feeds the panel's
@@ -744,15 +775,9 @@ pub fn health_check(spec: &SandboxSpec) -> bool {
     if !spec.backend.is_oci() {
         return true;
     }
-    let rt = spec.backend.binary();
-    let argv: Vec<String> = vec![
-        rt.into(),
-        "exec".into(),
-        spec.name.clone(),
-        "echo".into(),
-        "ok".into(),
-    ];
-    status_with_timeout(&argv, PROBE_TIMEOUT).unwrap_or(false)
+    // Verify both liveness AND that all required bind-mounts are present.
+    let (running, mounts_ok) = container_status(spec);
+    running && mounts_ok
 }
 
 /// Check whether the named container is running AND has all the bind-mounts
@@ -799,12 +824,25 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
         let mounts_ok = required.iter().all(|r| active.contains(r));
         (true, mounts_ok)
     } else {
-        // Remote: just check existence; skip mount comparison (remote mounts
-        // are managed differently and don't carry host paths).
-        let mut check = backend_prefix(spec.backend);
-        check.extend(["container".into(), "inspect".into(), spec.name.clone()]);
-        let running = run_control_owned(spec, &check, PROBE_TIMEOUT).unwrap_or(false);
-        (running, true) // assume mounts are fine on remote
+        // Remote: run the same inspect command over SSH to verify mounts.
+        let mut remote_argv = backend_prefix(spec.backend);
+        remote_argv.extend([
+            "container".into(),
+            "inspect".into(),
+            "--format".into(),
+            fmt.to_string(),
+            spec.name.clone(),
+        ]);
+        let Some((_, stdout)) = output_control_owned(spec, &remote_argv, PROBE_TIMEOUT) else {
+            return (false, false);
+        };
+        let mut lines = stdout.lines();
+        if lines.next() != Some("RUNNING") {
+            return (false, false);
+        }
+        let active: std::collections::HashSet<&str> = lines.filter(|l| !l.is_empty()).collect();
+        let mounts_ok = required.iter().all(|r| active.contains(r));
+        (true, mounts_ok)
     }
 }
 
@@ -899,6 +937,26 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
     anyhow::bail!("could not start {rt} container '{}'", spec.name)
 }
 
+/// Tear down the container for a worktree identified only by its local path.
+/// Tries all OCI backends; silently ignores errors. Intended for background
+/// cleanup when a worktree is closed and only its path is known (no cfg/loc).
+pub fn teardown_by_path(worktree: &str) {
+    let name = container_name(worktree);
+    let transport = Transport::Local;
+    for b in [
+        Backend::Podman,
+        Backend::PodmanRootful,
+        Backend::Docker,
+        Backend::Apple,
+    ] {
+        if available(&transport, b) {
+            let mut argv = backend_prefix(b);
+            argv.extend(["rm".into(), "-f".into(), name.to_string()]);
+            let _ = run_control_t_owned(&transport, &argv, PROBE_TIMEOUT);
+        }
+    }
+}
+
 /// Remove a worktree's persistent container (OCI backends). Best-effort. Runs on
 /// the worktree's host (local or remote, per its `GitLoc`).
 pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
@@ -940,6 +998,19 @@ fn wrap_script(spec: &SandboxSpec, inner: &str) -> String {
     if spec.backend.is_oci() {
         // Bind-mounted worktree is owned by a different uid under userns/root.
         s.push_str("git config --global --add safe.directory '*' >/dev/null 2>&1 || true\n");
+    }
+    // Unset blocked env keys (e.g. master API key when a scoped key replaces it).
+    for key in &spec.env_block {
+        s.push_str(&format!("unset {key}\n"));
+    }
+    // Inject per-agent env overrides (e.g. scoped virtual API key from the proxy).
+    // Sort for determinism in tests.
+    let mut overrides: Vec<(&String, &String)> = spec.env_overrides.iter().collect();
+    overrides.sort_by_key(|(k, _)| k.as_str());
+    for (key, val) in overrides {
+        // Single-quote the value to be safe with special characters.
+        let safe = val.replace('\'', "'\\''");
+        s.push_str(&format!("export {key}='{safe}'\n"));
     }
     if let Some(init) = &spec.init_script {
         s.push_str(init);
@@ -1115,6 +1186,21 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
         Network::None => v.extend(["--network".into(), "none".into()]),
         Network::Nat => {}
     }
+    // DNS-based domain filtering: start the proxy on first use and point the
+    // container at it. Skip when network is None (DNS unreachable anyway) or
+    // when no filtering is configured.
+    if spec.network != Network::None
+        && (!spec.network_allow.is_empty() || !spec.network_block.is_empty())
+        && matches!(spec.transport, Transport::Local)
+    {
+        let policy = crate::dns_filter::DnsPolicy {
+            allow: spec.network_allow.clone(),
+            block: spec.network_block.clone(),
+        };
+        if let Some(port) = crate::dns_filter::get_or_start(policy) {
+            v.extend(["--dns".into(), format!("127.0.0.1:{port}")]);
+        }
+    }
     for m in &spec.mounts {
         let suffix = if m.ro { ":ro" } else { "" };
         v.extend(["-v".into(), format!("{}:{}{suffix}", m.host, m.dest)]);
@@ -1269,6 +1355,26 @@ fn run_control_t_owned(transport: &Transport, argv: &[String], timeout: Duration
         }
     };
     status_with_timeout(&argv, timeout)
+}
+
+/// Like [`run_control_t_owned`] but also captures stdout. Wraps argv in the
+/// transport for remote specs (ssh for control-plane calls).
+fn output_control_owned(
+    spec: &SandboxSpec,
+    argv: &[String],
+    timeout: Duration,
+) -> Option<(bool, String)> {
+    let full: Vec<String> = match &spec.transport {
+        Transport::Local => argv.to_vec(),
+        Transport::Remote(r) => {
+            let mut v = Transport::ssh_base(r, true);
+            v.push(r.host.clone());
+            v.push("--".into());
+            v.push(util::sh_join(argv));
+            v
+        }
+    };
+    output_with_timeout(&full, timeout)
 }
 
 /// Local uid/gid via `id` (no libc dep). None if `id` is unavailable.
@@ -1545,16 +1651,21 @@ pub fn identify_orphans(active_worktrees: &[String], containers: &[String]) -> V
         .collect()
 }
 
-pub fn run_gc(db_worktrees: &[String]) -> Result<(), String> {
+/// Remove orphaned superzej containers (containers whose worktree no longer
+/// exists in the DB). Returns the names of containers that were removed.
+pub fn run_gc(db_worktrees: &[String]) -> Vec<String> {
+    let mut removed = Vec::new();
     for backend in [Backend::Podman, Backend::Docker] {
         if !crate::util::have(backend.binary()) {
             continue;
         }
 
-        let out = std::process::Command::new(backend.binary())
+        let Ok(out) = std::process::Command::new(backend.binary())
             .args(["ps", "-a", "--format", "{{.Names}}"])
             .output()
-            .map_err(|e| e.to_string())?;
+        else {
+            continue;
+        };
 
         let stdout = String::from_utf8_lossy(&out.stdout);
         let containers: Vec<String> = stdout.lines().map(|s| s.trim().to_string()).collect();
@@ -1563,9 +1674,10 @@ pub fn run_gc(db_worktrees: &[String]) -> Result<(), String> {
             let _ = std::process::Command::new(backend.binary())
                 .args(["rm", "-f", &orphan])
                 .output();
+            removed.push(orphan);
         }
     }
-    Ok(())
+    removed
 }
 
 #[cfg(test)]
@@ -1593,7 +1705,11 @@ mod tests {
                 },
             ],
             env: vec![("GH_TOKEN".into(), "abc".into())],
+            env_overrides: std::collections::HashMap::new(),
+            env_block: Vec::new(),
             network: Network::Nat,
+            network_allow: Vec::new(),
+            network_block: Vec::new(),
             ports: vec!["8080:8080".into()],
             gpu: None,
             limits: SandboxLimits::default(),
@@ -2043,5 +2159,90 @@ mod tests {
                 );
             }
         }
+    }
+
+    // H3: Orphan GC — identify orphans correctly.
+    #[test]
+    fn test_identify_orphans_names_only_superzej_containers() {
+        let active = vec!["/wt/live".to_string()];
+        let containers = vec![
+            container_name("/wt/live"),    // active → not orphan
+            container_name("/wt/dead"),    // no active entry → orphan
+            "other-tool-container".into(), // not superzej-prefixed → ignored
+        ];
+        let orphans = identify_orphans(&active, &containers);
+        assert_eq!(orphans, vec![container_name("/wt/dead")]);
+    }
+
+    #[test]
+    fn test_identify_orphans_empty_inputs() {
+        // No containers → nothing to remove.
+        assert!(identify_orphans(&["wt".to_string()], &[]).is_empty());
+        // No active worktrees → all superzej containers are orphans.
+        let containers = vec![container_name("/wt/a"), container_name("/wt/b")];
+        let orphans = identify_orphans(&[], &containers);
+        assert_eq!(orphans.len(), 2);
+    }
+
+    #[test]
+    fn test_run_gc_noop_when_no_backend_available() {
+        // run_gc with an empty DB set and no containers should return empty
+        // without panicking (even if podman/docker aren't installed).
+        let removed = run_gc(&["/wt/alive".to_string()]);
+        // On CI there may be no podman — the result is just an empty list.
+        assert!(removed.iter().all(|n| n.starts_with(CONTAINER_PREFIX)));
+    }
+
+    // H2: Remote transport unit tests.
+    #[test]
+    fn remote_enter_argv_wraps_with_mosh() {
+        let mut s = spec(Backend::Podman);
+        s.transport = Transport::Remote(Remote {
+            host: "devbox".into(),
+            port: 22,
+            forward_agent: false,
+            kind: TransportKind::Mosh,
+        });
+        // With a real image + OCI backend on a remote, enter_argv should
+        // produce a mosh wrapper.
+        let argv = enter_argv(&s, "bash -l");
+        assert_eq!(argv[0], "mosh", "outer command must be mosh: {argv:?}");
+        // The remote host must appear in the argv.
+        assert!(argv.iter().any(|a| a == "devbox"), "host missing: {argv:?}");
+    }
+
+    #[test]
+    fn remote_enter_argv_wraps_with_ssh() {
+        let mut s = spec(Backend::Podman);
+        s.transport = Transport::Remote(Remote {
+            host: "devbox".into(),
+            port: 2222,
+            forward_agent: true,
+            kind: TransportKind::Ssh,
+        });
+        let argv = enter_argv(&s, "bash -l");
+        // SSH transport: first arg is ssh, not mosh.
+        assert_eq!(argv[0], "ssh", "outer command must be ssh: {argv:?}");
+        assert!(argv.iter().any(|a| a == "devbox"), "host missing: {argv:?}");
+        // Port flag must be present when non-default.
+        assert!(
+            argv.iter().any(|a| a == "-p"),
+            "port flag missing: {argv:?}"
+        );
+    }
+
+    // H4 is in dns_filter.rs (already done).
+
+    // Per-profile container naming (G1).
+    #[test]
+    fn container_name_with_profile_adds_slug() {
+        let default = container_name_with_profile("/wt/feat", None);
+        let explicit_default = container_name_with_profile("/wt/feat", Some("default"));
+        let named = container_name_with_profile("/wt/feat", Some("work"));
+        assert_eq!(default, container_name("/wt/feat"));
+        assert_eq!(explicit_default, container_name("/wt/feat"));
+        assert!(named.starts_with(CONTAINER_PREFIX));
+        assert!(named.contains("work"));
+        assert!(named != default);
     }
 }

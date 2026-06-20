@@ -2,6 +2,17 @@
 
 use serde::Serialize;
 
+/// A sandbox audit event from the `container_events` table.
+#[derive(Debug, Clone)]
+pub struct ContainerEvent {
+    pub id: i64,
+    pub worktree: String,
+    pub ts: i64,
+    pub kind: String,
+    pub detail: Option<String>,
+    pub exit_code: Option<i64>,
+}
+
 /// A registered workspace, as recorded in the DB. Identified by its path — a
 /// git repo's main worktree, or a plain directory for a non-repo workspace.
 #[derive(Debug, Clone, Serialize)]

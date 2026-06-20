@@ -251,14 +251,26 @@ pub(super) fn sandbox(ctx: &SectionCtx) -> Vec<PanelRow> {
         .find(|c| c.ours && c.name == model.active_container_name);
     match active {
         Some(c) => {
+            let (bullet, bullet_label) = match &model.container_health {
+                crate::chrome::ContainerHealth::Degraded(reason) => {
+                    (seg(hue(Hue::Amber), "⚠ degraded"), Some(reason.clone()))
+                }
+                _ => (seg(hue(Hue::Green), "● running"), None),
+            };
             rows.push(PanelRow::plain(Line::split(
                 vec![
-                    seg(hue(Hue::Green), "● running"),
+                    bullet,
                     seg(g(), format!(" · {} · ", c.backend)),
                     seg(d(), c.name.clone()),
                 ],
                 vec![seg(g(), c.status.clone())],
             )));
+            if let Some(reason) = bullet_label {
+                rows.push(PanelRow::plain(Line::segs(vec![
+                    sp(2),
+                    seg(hue(Hue::Amber), reason),
+                ])));
+            }
             if !c.cpu.is_empty() || !c.mem.is_empty() {
                 rows.push(PanelRow::plain(Line::segs(vec![
                     seg(g(), "cpu "),
@@ -275,14 +287,6 @@ pub(super) fn sandbox(ctx: &SectionCtx) -> Vec<PanelRow> {
                     seg(d(), c.containment.clone()),
                 ])));
             }
-            rows.push(PanelRow::blank());
-            rows.push(PanelRow::plain(Line::segs(vec![
-                seg(g2(), "DENIALS").bold(),
-            ])));
-            rows.push(PanelRow::plain(Line::segs(vec![
-                sp(2),
-                seg(g2(), "none recorded"),
-            ])));
             if deep && !c.mounts.is_empty() {
                 rows.push(PanelRow::blank());
                 rows.push(PanelRow::plain(Line::segs(vec![
@@ -292,6 +296,25 @@ pub(super) fn sandbox(ctx: &SectionCtx) -> Vec<PanelRow> {
                     sp(2),
                     seg(f(), c.mounts.clone()),
                 ])));
+            }
+            if deep && !model.container_events.is_empty() {
+                rows.push(PanelRow::blank());
+                rows.push(PanelRow::plain(Line::segs(vec![
+                    seg(g2(), "AUDIT LOG").bold(),
+                ])));
+                for ev in &model.container_events {
+                    let kind_col = match ev.kind.as_str() {
+                        "network" => hue(Hue::Amber),
+                        "die" => hue(Hue::Red),
+                        _ => g(),
+                    };
+                    let detail = ev.detail.as_deref().unwrap_or("—");
+                    rows.push(PanelRow::plain(Line::segs(vec![
+                        sp(2),
+                        seg(kind_col, format!("{:<8}", ev.kind)),
+                        seg(d(), detail.to_string()),
+                    ])));
+                }
             }
         }
         None => {
@@ -317,6 +340,26 @@ pub(super) fn sandbox(ctx: &SectionCtx) -> Vec<PanelRow> {
                     format!("{} other container(s) running", model.containers.len()),
                 )])));
             }
+        }
+    }
+    // Startup orphan GC notice (shown until the next model hydration clears it).
+    if !model.startup_orphans_removed.is_empty() {
+        rows.push(PanelRow::blank());
+        rows.push(PanelRow::plain(Line::segs(vec![
+            seg(hue(Hue::Amber), "⚠"),
+            seg(
+                g(),
+                format!(
+                    " removed {} orphan container(s) at startup",
+                    model.startup_orphans_removed.len()
+                ),
+            ),
+        ])));
+        for name in &model.startup_orphans_removed {
+            rows.push(PanelRow::plain(Line::segs(vec![
+                sp(2),
+                seg(d(), name.clone()),
+            ])));
         }
     }
     // Full: every container on the machine, one table row each.

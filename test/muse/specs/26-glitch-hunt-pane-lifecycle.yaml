@@ -1,0 +1,89 @@
+name: glitch_hunt_pane_lifecycle
+case_tmp_env: XDG_STATE_HOME
+matrix:
+  profiles: [xterm]
+  sizes: ["100x30"]
+spawn: ["szhost"]
+env:
+  XDG_STATE_HOME: "{case_tmp}"
+  SUPERZEJ_LOG: warn
+  MUSE_READY: "1"
+  TERM: xterm-256color
+sync:
+  quiet_window_ms: 2000
+snapshot_defaults:
+  kind: styled
+steps:
+  - begin_step: "startup"
+  - expect_visible: {regex: "szhost|superzej|\\$|>", timeout_ms: 8000}
+  # Exit the dashboard tile to access the Work tab.
+  - key: {key: q}
+  - sleep_ms: 200
+  # ── Pane limit: at the configured maximum, further splits must be blocked ──────
+  - begin_step: "reach pane limit"
+  - key: {key: n, mods: [alt]}
+  - sleep_ms: 150
+  - key: {key: n, mods: [alt]}
+  - sleep_ms: 150
+  - key: {key: n, mods: [alt]}
+  - sleep_ms: 150
+  - key: {key: n, mods: [alt]}
+  - sleep_ms: 150
+  - snapshot: {name: near_pane_limit}
+  # Try to create more (should show a "limit reached" message or silently ignore)
+  - key: {key: n, mods: [alt]}
+  - sleep_ms: 150
+  - key: {key: n, mods: [alt]}
+  - sleep_ms: 150
+  - snapshot: {name: at_or_past_pane_limit}
+  # ── Zoom with many panes ──────────────────────────────────────────────────────
+  - begin_step: "zoom with many panes"
+  - key: {key: z, mods: [ctrl, alt]}
+  - sleep_ms: 80
+  - snapshot: {name: zoomed_many_panes}
+  - key: {key: z, mods: [ctrl, alt]}
+  - sleep_ms: 80
+  - snapshot: {name: unzoomed_many_panes}
+  # ── Rapid split/close cycle ───────────────────────────────────────────────────
+  - begin_step: "rapid split/close cycle"
+  - key: {key: n, mods: [alt]}
+  - sleep_ms: 100
+  - key: {key: x, mods: [ctrl, alt]}
+  - sleep_ms: 100
+  - key: {key: n, mods: [alt]}
+  - sleep_ms: 100
+  - key: {key: x, mods: [ctrl, alt]}
+  - sleep_ms: 100
+  - key: {key: n, mods: [alt]}
+  - sleep_ms: 100
+  - key: {key: x, mods: [ctrl, alt]}
+  - sleep_ms: 100
+  - snapshot: {name: after_rapid_split_close}
+  # ── Closing the last pane: must not crash (should block or warn) ──────────────
+  - begin_step: "protect against closing last pane"
+  # Close until one remains
+  - key: {key: x, mods: [ctrl, alt]}
+  - sleep_ms: 100
+  - key: {key: x, mods: [ctrl, alt]}
+  - sleep_ms: 100
+  - key: {key: x, mods: [ctrl, alt]}
+  - sleep_ms: 100
+  - key: {key: x, mods: [ctrl, alt]}
+  - sleep_ms: 100
+  - key: {key: x, mods: [ctrl, alt]}
+  - sleep_ms: 100
+  - snapshot: {name: single_pane_protected}
+  # ── Resize the last pane all the way ─────────────────────────────────────────
+  - begin_step: "resize last pane extremes"
+  - resize: "40x8"
+  - sleep_ms: 80
+  - snapshot: {name: min_viable_with_one_pane}
+  - resize: "200x60"
+  - sleep_ms: 80
+  - snapshot: {name: max_size_with_one_pane}
+  - resize: "100x30"
+  - sleep_ms: 80
+  - begin_step: "verify no errors"
+  - check_file:
+      path: "{case_tmp}/superzej/logs/szhost.log"
+      reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt|subtract with overflow|index out of bounds"

@@ -1484,6 +1484,7 @@ mod tests {
             superzej_core::config::ProfileConfig {
                 default_mode: "emacs".into(),
                 keybinds: Default::default(),
+                sandbox: Default::default(),
             },
         );
         let cfg = superzej_core::config::Config {

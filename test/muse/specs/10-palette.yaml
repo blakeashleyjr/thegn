@@ -1,0 +1,39 @@
+name: palette
+case_tmp_env: XDG_STATE_HOME
+matrix:
+  profiles: [xterm]
+  sizes: ["100x30"]
+spawn: ["szhost"]
+env:
+  XDG_STATE_HOME: "{case_tmp}"
+  SUPERZEJ_LOG: warn
+  MUSE_READY: "1"
+  TERM: xterm-256color
+sync:
+  quiet_window_ms: 2000
+  max_settle_ms: 10000
+steps:
+  - expect_visible: {regex: "szhost|superzej|\\$|>", timeout_ms: 8000}
+  # Exit the dashboard tile to access the Work tab.
+  - key: {key: q}
+  - sleep_ms: 200
+  # Open palette (Super+K or Ctrl+Space)
+  - key: {key: " ", mods: [ctrl]}
+  - sleep_ms: 300
+  - snapshot: {name: palette_open, kind: styled}
+  # Type a query
+  - write: "toggle sidebar"
+  - sleep_ms: 200
+  - snapshot: {name: palette_filtered, kind: styled}
+  # Clear and type another query
+  - key: {key: a, mods: [ctrl]}
+  - write: "theme"
+  - sleep_ms: 200
+  - snapshot: {name: palette_theme_query, kind: styled}
+  # Close palette with Escape
+  - key: {key: escape}
+  - sleep_ms: 100
+  - snapshot: {name: palette_closed, kind: styled}
+  - check_file:
+      path: "{case_tmp}/superzej/logs/szhost.log"
+      reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt"

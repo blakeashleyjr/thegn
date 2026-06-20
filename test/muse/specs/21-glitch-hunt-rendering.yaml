@@ -1,0 +1,94 @@
+name: glitch_hunt_rendering
+case_tmp_env: XDG_STATE_HOME
+matrix:
+  profiles: [xterm, vt220, screen]
+  sizes: ["100x30", "80x24"]
+spawn: ["szhost"]
+env:
+  XDG_STATE_HOME: "{case_tmp}"
+  SUPERZEJ_LOG: warn
+  MUSE_READY: "1"
+  TERM: xterm-256color
+sync:
+  quiet_window_ms: 2000
+snapshot_defaults:
+  kind: styled
+steps:
+  - begin_step: "startup"
+  - expect_visible: {regex: "szhost|superzej|\\$|>", timeout_ms: 8000}
+  # Exit the dashboard tile to access the Work tab.
+  - key: {key: q}
+  - sleep_ms: 200
+  - snapshot: {name: clean_initial}
+  # ── Ghost characters: resize should not leave artifacts ───────────────────────
+  - begin_step: "ghost check after wide→narrow"
+  - resize: "160x40"
+  - sleep_ms: 80
+  - resize: "80x24"
+  - sleep_ms: 100
+  - snapshot: {name: after_wide_to_narrow}
+  # Text snapshot catches ghost chars that styled doesn't (they'd be default-styled)
+  - snapshot: {name: after_wide_to_narrow_text, kind: text}
+  - begin_step: "ghost check after tall→short"
+  - resize: "100x50"
+  - sleep_ms: 80
+  - resize: "100x20"
+  - sleep_ms: 100
+  - snapshot: {name: after_tall_to_short}
+  - resize: "100x30"
+  - sleep_ms: 80
+  # ── Panel rendering across resize ────────────────────────────────────────────
+  - begin_step: "panel open, resize, close"
+  - key: {key: p, mods: [ctrl, alt]}
+  - sleep_ms: 120
+  - snapshot: {name: panel_at_normal}
+  - resize: "160x40"
+  - sleep_ms: 80
+  - snapshot: {name: panel_at_wide}
+  - resize: "80x24"
+  - sleep_ms: 80
+  - snapshot: {name: panel_at_narrow}
+  - resize: "100x30"
+  - sleep_ms: 80
+  - key: {key: p, mods: [ctrl, alt]}
+  - sleep_ms: 80
+  # ── Sidebar rendering integrity ───────────────────────────────────────────────
+  - begin_step: "sidebar resize integrity"
+  - key: {key: s, mods: [alt]}
+  - sleep_ms: 80
+  - resize: "120x35"
+  - sleep_ms: 80
+  - snapshot: {name: sidebar_at_120x35}
+  - resize: "100x30"
+  - sleep_ms: 80
+  - key: {key: escape}
+  - sleep_ms: 80
+  # ── Multi-split rendering ─────────────────────────────────────────────────────
+  - begin_step: "multi-split rendering"
+  - key: {key: n, mods: [alt]}
+  - sleep_ms: 150
+  - key: {key: n, mods: [alt, shift]}
+  - sleep_ms: 150
+  - snapshot: {name: three_pane_render}
+  - resize: "80x24"
+  - sleep_ms: 80
+  - snapshot: {name: three_pane_narrow}
+  - resize: "100x30"
+  - sleep_ms: 80
+  - snapshot: {name: three_pane_restored}
+  # ── Statusbar: must always be present at bottom row ──────────────────────────
+  - begin_step: "statusbar persistence"
+  - snapshot:
+      name: statusbar_check
+      kind: text
+      # Mask the pane content — only check bottom row for statusbar presence
+      masks:
+        - {rect: [0, 0, 200, 28]}
+  - snapshot:
+      name: statusbar_check_styled
+      masks:
+        - {rect: [0, 0, 200, 28]}
+  - begin_step: "verify no errors"
+  - check_file:
+      path: "{case_tmp}/superzej/logs/szhost.log"
+      reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt|subtract with overflow|index out of bounds"

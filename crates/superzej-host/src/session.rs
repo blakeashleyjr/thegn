@@ -56,8 +56,9 @@ impl Tab {
     /// Reconstruct a tab from its persisted row. A malformed `pane_tree` falls
     /// back to a single pane rather than failing the whole resurrect.
     pub fn from_row(row: &GroupTabRow) -> Tab {
-        let center =
-            serde_json::from_str::<CenterTree>(&row.pane_tree).unwrap_or(CenterTree::Leaf(0));
+        let center = serde_json::from_str::<CenterTree>(&row.pane_tree)
+            .inspect_err(|e| tracing::warn!("malformed pane_tree in tab '{}': {e}", row.group_name))
+            .unwrap_or(CenterTree::Leaf(0));
         Tab {
             title: if row.title.is_empty() {
                 (row.ordinal + 1).to_string()
