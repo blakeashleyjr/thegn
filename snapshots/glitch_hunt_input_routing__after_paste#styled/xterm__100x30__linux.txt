@@ -1,19 +1,13 @@
-L0| ◆ superzej v0.1.0   dashboard   work   comms   chat 32.9/94G · 󰾲  1% · 󰂄 100% · Fri Jun 19 · 02:15
+L0| ◆ superzej v0.1.0   dashboard  work 9 comms 3 chat  ↓  195K ↑  244K · 󰂄 100% · Fri Jun 19 · 22:56
 R0 0 1 fg=default bg=#151a28 attrs=
 R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
 R0 3 8 fg=#edf0f8 bg=#151a28 attrs=
 R0 11 1 fg=default bg=#151a28 attrs=
 R0 12 6 fg=#4e556e bg=#151a28 attrs=
 R0 18 2 fg=default bg=#151a28 attrs=
-R0 20 11 fg=#aab1c5 bg=#151a28 attrs=
-R0 31 1 fg=default bg=#151a28 attrs=
+R0 20 12 fg=#aab1c5 bg=#151a28 attrs=
 R0 32 6 fg=#6ee7d8 bg=#2e5359 attrs=
-R0 38 1 fg=default bg=#151a28 attrs=
-R0 39 7 fg=#aab1c5 bg=#151a28 attrs=
-R0 46 1 fg=default bg=#151a28 attrs=
-R0 47 14 fg=#aab1c5 bg=#151a28 attrs=
-R0 61 3 fg=#4e556e bg=#151a28 attrs=
-R0 64 5 fg=#aab1c5 bg=#151a28 attrs=
+R0 38 31 fg=#aab1c5 bg=#151a28 attrs=
 R0 69 3 fg=#4e556e bg=#151a28 attrs=
 R0 72 6 fg=#aab1c5 bg=#151a28 attrs=
 R0 78 3 fg=#4e556e bg=#151a28 attrs=
@@ -48,7 +42,7 @@ R3 55 1 fg=default bg=#0b0e16 attrs=
 R3 56 1 fg=#edf0f8 bg=#151a28 attrs=
 R3 57 1 fg=#edf0f8 bg=#151a28 attrs=BOLD
 R3 58 42 fg=#edf0f8 bg=#151a28 attrs=
-L4| ▾ regclaude         │blake@ws-3:~/ >                 │ ────────────────────────────────────────────
+L4| ▾ regclaude         │                                │ ────────────────────────────────────────────
 R4 0 1 fg=default bg=#151a28 attrs=
 R4 1 11 fg=#aab1c5 bg=#151a28 attrs=
 R4 12 8 fg=default bg=#151a28 attrs=
@@ -58,7 +52,7 @@ R4 22 32 fg=default bg=#151a28 attrs=
 R4 54 1 fg=#6ee7d8 bg=#151a28 attrs=
 R4 55 1 fg=default bg=#0b0e16 attrs=
 R4 56 44 fg=#232940 bg=#151a28 attrs=
-L5|   ● home            │blake@ws-3:~/ > [200~this is a p│  1 changes                            clean
+L5|   ● home            │blake@ws-3:~/ >                 │  1 changes                            clean
 R5 0 1 fg=default bg=#1a2031 attrs=
 R5 1 8 fg=#6ee7d8 bg=#1a2031 attrs=
 R5 9 11 fg=default bg=#1a2031 attrs=
@@ -74,7 +68,7 @@ R5 59 7 fg=#6ee7d8 bg=#10141f attrs=BOLD
 R5 66 28 fg=#edf0f8 bg=#10141f attrs=
 R5 94 5 fg=#4e556e bg=#10141f attrs=
 R5 99 1 fg=#edf0f8 bg=#10141f attrs=
-L6|                     │asted string with special chars:│
+L6|                     │blake@ws-3:~/ > [200~this is a p│
 R6 0 20 fg=default bg=#151a28 attrs=
 R6 20 1 fg=default bg=#0b0e16 attrs=
 R6 21 1 fg=#6ee7d8 bg=#151a28 attrs=
@@ -82,7 +76,7 @@ R6 22 32 fg=default bg=#151a28 attrs=
 R6 54 1 fg=#6ee7d8 bg=#151a28 attrs=
 R6 55 1 fg=default bg=#0b0e16 attrs=
 R6 56 44 fg=#edf0f8 bg=#151a28 attrs=
-L7|                     │ <>[]{}()~                      │   working tree clean
+L7|                     │asted string with special chars:│   working tree clean
 R7 0 20 fg=default bg=#151a28 attrs=
 R7 20 1 fg=default bg=#0b0e16 attrs=
 R7 21 1 fg=#6ee7d8 bg=#151a28 attrs=
@@ -92,7 +86,7 @@ R7 55 1 fg=default bg=#0b0e16 attrs=
 R7 56 2 fg=#edf0f8 bg=#151a28 attrs=
 R7 58 18 fg=#4e556e bg=#151a28 attrs=
 R7 76 24 fg=#edf0f8 bg=#151a28 attrs=
-L8|                     │                                │
+L8|                     │ <>[]{}()~                      │
 R8 0 20 fg=default bg=#151a28 attrs=
 R8 20 1 fg=default bg=#0b0e16 attrs=
 R8 21 1 fg=#6ee7d8 bg=#151a28 attrs=

@@ -12,6 +12,12 @@ env:
 sync:
   quiet_window_ms: 2000
   max_settle_ms: 10000
+snapshot_defaults:
+  masks:
+    - {rect: [0, 0, 200, 1]}
+  normalize:
+    - {re: "L0\\|.*", replace: "L0|<masthead>"}
+    - {re: "R0 \\d+ \\d+ .*", replace: "R0 <masked>"}
 steps:
   - expect_visible: {regex: "szhost|superzej|\\$|>", timeout_ms: 8000}
   # Exit the dashboard tile to access the Work tab.

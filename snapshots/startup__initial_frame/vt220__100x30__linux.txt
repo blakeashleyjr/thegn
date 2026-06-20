@@ -1,4 +1,4 @@
- ◆ superzej v0.1.0   dashboard   work   comms   chat 35.0/94G · 󰾲  1% · 󰂄 100% · Fri Jun 19 · 02:15
+ ◆ superzej v0.1.0   dashboard   work   comms   chat 35.3/94G · 󰾲 16% · 󰂄 100% · Fri Jun 19 · 22:56
 
 ┌ System ─────────────────────────┐┌ Hacker News ──────────────────────────────────────────────────┐
 │OS:                              ││No HN stories yet (offline or loading).                        │

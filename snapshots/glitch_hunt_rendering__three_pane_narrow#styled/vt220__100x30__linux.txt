@@ -1,4 +1,4 @@
-L0| ◆ superzej   dashboard   work  comms 4 chat  1% · 󰂄 100% · Fri Jun 19 · 02:15
+L0| ◆ superzej   dashboard   work  comms 4 chat 20% · 󰂄 100% · Fri Jun 19 · 22:56
 R0 0 1 fg=default bg=idx00 attrs=
 R0 1 2 fg=idx06 bg=idx00 attrs=
 R0 3 8 fg=idx07 bg=idx00 attrs=
@@ -33,58 +33,57 @@ R3 20 1 fg=default bg=default attrs=
 R3 21 2 fg=idx08 bg=idx00 attrs=
 R3 23 14 fg=idx07 bg=idx00 attrs=
 R3 37 43 fg=idx08 bg=idx00 attrs=
-L4| ▾ regclaude         │%                                                        │
+L4| ▾ regclaude         │blake@ws-3:~/ >                                          │
 R4 0 1 fg=default bg=idx00 attrs=
 R4 1 11 fg=idx07 bg=idx00 attrs=
 R4 12 8 fg=default bg=idx00 attrs=
 R4 20 1 fg=default bg=default attrs=
 R4 21 1 fg=idx08 bg=idx00 attrs=
-R4 22 1 fg=default bg=default attrs=BOLD
-R4 23 56 fg=default bg=default attrs=
+R4 22 57 fg=default bg=idx00 attrs=
 R4 79 1 fg=idx08 bg=idx00 attrs=
-L5|   ● home            │blake@ws-3:~/ >                                          │
+L5|   ● home            │                                                         │
 R5 0 1 fg=default bg=idx00 attrs=
 R5 1 8 fg=idx06 bg=idx00 attrs=
 R5 9 11 fg=default bg=idx00 attrs=
 R5 20 1 fg=default bg=default attrs=
 R5 21 1 fg=idx08 bg=idx00 attrs=
-R5 22 57 fg=default bg=default attrs=
+R5 22 57 fg=default bg=idx00 attrs=
 R5 79 1 fg=idx08 bg=idx00 attrs=
 L6|                     │                                                         │
 R6 0 20 fg=default bg=idx00 attrs=
 R6 20 1 fg=default bg=default attrs=
 R6 21 1 fg=idx08 bg=idx00 attrs=
-R6 22 57 fg=default bg=default attrs=
+R6 22 57 fg=default bg=idx00 attrs=
 R6 79 1 fg=idx08 bg=idx00 attrs=
 L7|                     │                                                         │
 R7 0 20 fg=default bg=idx00 attrs=
 R7 20 1 fg=default bg=default attrs=
 R7 21 1 fg=idx08 bg=idx00 attrs=
-R7 22 57 fg=default bg=default attrs=
+R7 22 57 fg=default bg=idx00 attrs=
 R7 79 1 fg=idx08 bg=idx00 attrs=
 L8|                     │                                                         │
 R8 0 20 fg=default bg=idx00 attrs=
 R8 20 1 fg=default bg=default attrs=
 R8 21 1 fg=idx08 bg=idx00 attrs=
-R8 22 57 fg=default bg=default attrs=
+R8 22 57 fg=default bg=idx00 attrs=
 R8 79 1 fg=idx08 bg=idx00 attrs=
 L9|                     │                                                         │
 R9 0 20 fg=default bg=idx00 attrs=
 R9 20 1 fg=default bg=default attrs=
 R9 21 1 fg=idx08 bg=idx00 attrs=
-R9 22 57 fg=default bg=default attrs=
+R9 22 57 fg=default bg=idx00 attrs=
 R9 79 1 fg=idx08 bg=idx00 attrs=
 L10|                     │                                                         │
 R10 0 20 fg=default bg=idx00 attrs=
 R10 20 1 fg=default bg=default attrs=
 R10 21 1 fg=idx08 bg=idx00 attrs=
-R10 22 57 fg=default bg=default attrs=
+R10 22 57 fg=default bg=idx00 attrs=
 R10 79 1 fg=idx08 bg=idx00 attrs=
 L11|                     │                                                         │
 R11 0 20 fg=default bg=idx00 attrs=
 R11 20 1 fg=default bg=default attrs=
 R11 21 1 fg=idx08 bg=idx00 attrs=
-R11 22 57 fg=default bg=default attrs=
+R11 22 57 fg=default bg=idx00 attrs=
 R11 79 1 fg=idx08 bg=idx00 attrs=
 L12|                     ╰─────────────────────────────────────────────────────────╯
 R12 0 20 fg=default bg=idx00 attrs=

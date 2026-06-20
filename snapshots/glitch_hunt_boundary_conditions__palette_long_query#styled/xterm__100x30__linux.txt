@@ -1,4 +1,4 @@
-L0| ◆ superzej v0.1.0   dashboard  work 9 comms   chat  ↓  264K ↑  129K · 󰂄 100% · Fri Jun 19 · 02:15
+L0| ◆ superzej v0.1.0   dashboard  work 9 comms 2 chat  ↓  243K ↑  461K · 󰂄 100% · Fri Jun 19 · 22:56
 R0 0 1 fg=#343a52 bg=#0f131e attrs=
 R0 1 2 fg=#2d5959 bg=#0f131e attrs=
 R0 3 8 fg=#5a5d65 bg=#0f131e attrs=
@@ -42,9 +42,9 @@ R3 37 18 fg=#222634 bg=#0f131e attrs=
 R3 55 1 fg=#343a52 bg=#0b0e16 attrs=
 R3 56 44 fg=#5a5d65 bg=#0f131e attrs=
 L4| ▾ regclaude         │blake@ws-3:~/ >                 │ ────────────────────────────────────────────
-R4 0 1 fg=#343a52 bg=#111622 attrs=
-R4 1 11 fg=#5a5d65 bg=#111622 attrs=
-R4 12 8 fg=#343a52 bg=#111622 attrs=
+R4 0 1 fg=#343a52 bg=#0f131e attrs=
+R4 1 11 fg=#424753 bg=#0f131e attrs=
+R4 12 8 fg=#343a52 bg=#0f131e attrs=
 R4 20 1 fg=#343a52 bg=#0b0e16 attrs=
 R4 21 1 fg=#222634 bg=#0f131e attrs=
 R4 22 32 fg=#343a52 bg=#0f131e attrs=
@@ -52,9 +52,9 @@ R4 54 1 fg=#222634 bg=#0f131e attrs=
 R4 55 1 fg=#343a52 bg=#0b0e16 attrs=
 R4 56 44 fg=#131724 bg=#0f131e attrs=
 L5|   ● home            │                                │  1 changes                            clean
-R5 0 1 fg=#343a52 bg=#15222a attrs=
-R5 1 8 fg=#2d5959 bg=#15222a attrs=
-R5 9 11 fg=#343a52 bg=#15222a attrs=
+R5 0 1 fg=#343a52 bg=#111622 attrs=
+R5 1 8 fg=#2d5959 bg=#111622 attrs=
+R5 9 11 fg=#343a52 bg=#111622 attrs=
 R5 20 1 fg=#343a52 bg=#0b0e16 attrs=
 R5 21 1 fg=#222634 bg=#0f131e attrs=
 R5 22 32 fg=#343a52 bg=#0f131e attrs=

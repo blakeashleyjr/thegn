@@ -14,6 +14,11 @@ sync:
   max_settle_ms: 10000
 snapshot_defaults:
   kind: styled
+  masks:
+    - {rect: [0, 0, 200, 1]}
+  normalize:
+    - {re: "L0\\|.*", replace: "L0|<masthead>"}
+    - {re: "R0 \\d+ \\d+ .*", replace: "R0 <masked>"}
 steps:
   - begin_step: "wait for first frame"
   # szhost starts; the logo splash or first pane is visible

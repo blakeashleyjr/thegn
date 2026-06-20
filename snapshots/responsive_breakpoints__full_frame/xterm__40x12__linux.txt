@@ -1,4 +1,4 @@
-  dashboard 4 work   comms 1 chat 02:15
+  dashboard 4 work 1 comms 1 chat 22:56
 
 ┌ System ────┐┌ Hacker News ───────────┐
 │OS:         │└────────────────────────┘

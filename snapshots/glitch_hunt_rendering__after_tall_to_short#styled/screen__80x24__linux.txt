@@ -1,4 +1,4 @@
-L0| ◆ superzej v0.1.0   dashboard   work   comms   chat 32.8/94G · 󰾲  1% · 󰂄 100% · Fri Jun 19 · 02:15
+L0| ◆ superzej v0.1.0   dashboard   work   comms   chat 34.1/94G · 󰾲 34% · 󰂄 100% · Fri Jun 19 · 22:56
 R0 0 1 fg=default bg=idxea attrs=
 R0 1 2 fg=idx50 bg=idxea attrs=
 R0 3 8 fg=idxff bg=idxea attrs=

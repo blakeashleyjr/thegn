@@ -1,4 +1,4 @@
-L0| ◆ superzej v0.1.0   dashboard  work 9 comms   chat  ↓  157K ↑   63K · 󰂄 100% · Fri Jun 19 · 02:15
+L0| ◆ superzej v0.1.0   dashboard  work 9 comms 3 chat  ↓  388K ↑  384K · 󰂄 100% · Fri Jun 19 · 22:56
 R0 0 1 fg=default bg=#151a28 attrs=
 R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
 R0 3 8 fg=#edf0f8 bg=#151a28 attrs=
@@ -42,7 +42,7 @@ R3 55 1 fg=default bg=#0b0e16 attrs=
 R3 56 1 fg=#edf0f8 bg=#151a28 attrs=
 R3 57 1 fg=#edf0f8 bg=#151a28 attrs=BOLD
 R3 58 42 fg=#edf0f8 bg=#151a28 attrs=
-L4| ▾ regclaude         │blake@ws-3:~/ >                 │ ────────────────────────────────────────────
+L4| ▾ regclaude         │                                │ ────────────────────────────────────────────
 R4 0 1 fg=default bg=#151a28 attrs=
 R4 1 11 fg=#aab1c5 bg=#151a28 attrs=
 R4 12 8 fg=default bg=#151a28 attrs=
@@ -52,7 +52,7 @@ R4 22 32 fg=default bg=#151a28 attrs=
 R4 54 1 fg=#6ee7d8 bg=#151a28 attrs=
 R4 55 1 fg=default bg=#0b0e16 attrs=
 R4 56 44 fg=#232940 bg=#151a28 attrs=
-L5|   ● home            │blake@ws-3:~/ > lpmark          │  1 changes                            clean
+L5|   ● home            │blake@ws-3:~/ >                 │  1 changes                            clean
 R5 0 1 fg=default bg=#1a2031 attrs=
 R5 1 8 fg=#6ee7d8 bg=#1a2031 attrs=
 R5 9 11 fg=default bg=#1a2031 attrs=
@@ -68,7 +68,7 @@ R5 59 7 fg=#6ee7d8 bg=#10141f attrs=BOLD
 R5 66 28 fg=#edf0f8 bg=#10141f attrs=
 R5 94 5 fg=#4e556e bg=#10141f attrs=
 R5 99 1 fg=#edf0f8 bg=#10141f attrs=
-L6|                     │                                │
+L6|                     │blake@ws-3:~/ > lpmark          │
 R6 0 20 fg=default bg=#151a28 attrs=
 R6 20 1 fg=default bg=#0b0e16 attrs=
 R6 21 1 fg=#6ee7d8 bg=#151a28 attrs=

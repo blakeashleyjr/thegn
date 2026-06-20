@@ -1,4 +1,4 @@
-L0| ◆ superzej v0.1.0   dashboard   work   comms   chat                                                            34.6/94G · 󰾲  0% · 󰂄 100% · Fri Jun 19 · 02:15
+L0| ◆ superzej v0.1.0   dashboard   work   comms   chat                                                            35.1/94G · 󰾲 17% · 󰂄 100% · Fri Jun 19 · 22:56
 R0 0 1 fg=default bg=#151a28 attrs=
 R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
 R0 3 8 fg=#edf0f8 bg=#151a28 attrs=
@@ -62,10 +62,10 @@ R4 22 92 fg=default bg=#151a28 attrs=
 R4 114 1 fg=#6ee7d8 bg=#151a28 attrs=
 R4 115 1 fg=default bg=#0b0e16 attrs=
 R4 116 44 fg=#232940 bg=#151a28 attrs=
-L5|   home              │zsh-newuser-install.                                                                        │  1 changes                            clean
+L5|   ● home            │zsh-newuser-install.                                                                        │  1 changes                            clean
 R5 0 1 fg=default bg=#1a2031 attrs=
-R5 1 6 fg=#6ee7d8 bg=#1a2031 attrs=
-R5 7 13 fg=default bg=#1a2031 attrs=
+R5 1 8 fg=#6ee7d8 bg=#1a2031 attrs=
+R5 9 11 fg=default bg=#1a2031 attrs=
 R5 20 1 fg=default bg=#0b0e16 attrs=
 R5 21 1 fg=#6ee7d8 bg=#151a28 attrs=
 R5 22 92 fg=default bg=#151a28 attrs=

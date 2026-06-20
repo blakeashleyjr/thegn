@@ -1,4 +1,4 @@
- ◆ superzej v0.1.0   dashboard   work   comms   chat 33.1/94G · 󰾲  1% · 󰂄 100% · Fri Jun 19 · 02:15
+ ◆ superzej v0.1.0   dashboard   work   comms   chat 34.3/94G · 󰾲 30% · 󰂄 100% · Fri Jun 19 · 22:56
 ────────────────────────────────────────────────────────────────────────────────────────────────────
  WORKSPACES           REGCLAUDE ▸ home · Sandbox: None   git  work  system
                      ╭─ bwrap · home ─────────────────╮  —

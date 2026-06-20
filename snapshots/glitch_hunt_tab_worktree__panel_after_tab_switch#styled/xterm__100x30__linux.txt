@@ -1,4 +1,4 @@
-L0| ◆ superzej v0.1.0   dashboard  work 9 comms   chat  ↓  304K ↑  102K · 󰂄 100% · Fri Jun 19 · 02:15
+L0| ◆ superzej v0.1.0   dashboard  work 9 comms 3 chat  ↓  398K ↑  446K · 󰂄 100% · Fri Jun 19 · 22:56
 R0 0 1 fg=default bg=#151a28 attrs=
 R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
 R0 3 8 fg=#edf0f8 bg=#151a28 attrs=
@@ -33,153 +33,154 @@ L3|                     ╭─ bwrap · home ───────────�
 R3 0 20 fg=default bg=#151a28 attrs=
 R3 20 1 fg=default bg=default attrs=
 R3 21 79 fg=#6ee7d8 bg=#151a28 attrs=
-L4| ▾ regclaude         │blake@ws-3:~/ >                                                              │
+L4| ▾ regclaude         │%                                                                            │
 R4 0 1 fg=default bg=#151a28 attrs=
 R4 1 11 fg=#aab1c5 bg=#151a28 attrs=
 R4 12 8 fg=default bg=#151a28 attrs=
 R4 20 1 fg=default bg=default attrs=
 R4 21 1 fg=#6ee7d8 bg=#151a28 attrs=
-R4 22 77 fg=default bg=#151a28 attrs=
+R4 22 1 fg=default bg=default attrs=BOLD
+R4 23 76 fg=default bg=default attrs=
 R4 99 1 fg=#6ee7d8 bg=#151a28 attrs=
-L5|   ● home            │                                                                             │
+L5|   ● home            │blake@ws-3:~/ >                                                              │
 R5 0 1 fg=default bg=#1a2031 attrs=
 R5 1 8 fg=#6ee7d8 bg=#1a2031 attrs=
 R5 9 11 fg=default bg=#1a2031 attrs=
 R5 20 1 fg=default bg=default attrs=
 R5 21 1 fg=#6ee7d8 bg=#151a28 attrs=
-R5 22 77 fg=default bg=#151a28 attrs=
+R5 22 77 fg=default bg=default attrs=
 R5 99 1 fg=#6ee7d8 bg=#151a28 attrs=
 L6|                     │                                                                             │
 R6 0 20 fg=default bg=#151a28 attrs=
 R6 20 1 fg=default bg=default attrs=
 R6 21 1 fg=#6ee7d8 bg=#151a28 attrs=
-R6 22 77 fg=default bg=#151a28 attrs=
+R6 22 77 fg=default bg=default attrs=
 R6 99 1 fg=#6ee7d8 bg=#151a28 attrs=
 L7|                     │                                                                             │
 R7 0 20 fg=default bg=#151a28 attrs=
 R7 20 1 fg=default bg=default attrs=
 R7 21 1 fg=#6ee7d8 bg=#151a28 attrs=
-R7 22 77 fg=default bg=#151a28 attrs=
+R7 22 77 fg=default bg=default attrs=
 R7 99 1 fg=#6ee7d8 bg=#151a28 attrs=
 L8|                     │                                                                             │
 R8 0 20 fg=default bg=#151a28 attrs=
 R8 20 1 fg=default bg=default attrs=
 R8 21 1 fg=#6ee7d8 bg=#151a28 attrs=
-R8 22 77 fg=default bg=#151a28 attrs=
+R8 22 77 fg=default bg=default attrs=
 R8 99 1 fg=#6ee7d8 bg=#151a28 attrs=
 L9|                     │                                                                             │
 R9 0 20 fg=default bg=#151a28 attrs=
 R9 20 1 fg=default bg=default attrs=
 R9 21 1 fg=#6ee7d8 bg=#151a28 attrs=
-R9 22 77 fg=default bg=#151a28 attrs=
+R9 22 77 fg=default bg=default attrs=
 R9 99 1 fg=#6ee7d8 bg=#151a28 attrs=
 L10|                     │                                                                             │
 R10 0 20 fg=default bg=#151a28 attrs=
 R10 20 1 fg=default bg=default attrs=
 R10 21 1 fg=#6ee7d8 bg=#151a28 attrs=
-R10 22 77 fg=default bg=#151a28 attrs=
+R10 22 77 fg=default bg=default attrs=
 R10 99 1 fg=#6ee7d8 bg=#151a28 attrs=
 L11|                     │                                                                             │
 R11 0 20 fg=default bg=#151a28 attrs=
 R11 20 1 fg=default bg=default attrs=
 R11 21 1 fg=#6ee7d8 bg=#151a28 attrs=
-R11 22 77 fg=default bg=#151a28 attrs=
+R11 22 77 fg=default bg=default attrs=
 R11 99 1 fg=#6ee7d8 bg=#151a28 attrs=
 L12|                     │                                                                             │
 R12 0 20 fg=default bg=#151a28 attrs=
 R12 20 1 fg=default bg=default attrs=
 R12 21 1 fg=#6ee7d8 bg=#151a28 attrs=
-R12 22 77 fg=default bg=#151a28 attrs=
+R12 22 77 fg=default bg=default attrs=
 R12 99 1 fg=#6ee7d8 bg=#151a28 attrs=
 L13|                     │                                                                             │
 R13 0 20 fg=default bg=#151a28 attrs=
 R13 20 1 fg=default bg=default attrs=
 R13 21 1 fg=#6ee7d8 bg=#151a28 attrs=
-R13 22 77 fg=default bg=#151a28 attrs=
+R13 22 77 fg=default bg=default attrs=
 R13 99 1 fg=#6ee7d8 bg=#151a28 attrs=
 L14|                     │                                                                             │
 R14 0 20 fg=default bg=#151a28 attrs=
 R14 20 1 fg=default bg=default attrs=
 R14 21 1 fg=#6ee7d8 bg=#151a28 attrs=
-R14 22 77 fg=default bg=#151a28 attrs=
+R14 22 77 fg=default bg=default attrs=
 R14 99 1 fg=#6ee7d8 bg=#151a28 attrs=
 L15|                     │                                                                             │
 R15 0 20 fg=default bg=#151a28 attrs=
 R15 20 1 fg=default bg=default attrs=
 R15 21 1 fg=#6ee7d8 bg=#151a28 attrs=
-R15 22 77 fg=default bg=#151a28 attrs=
+R15 22 77 fg=default bg=default attrs=
 R15 99 1 fg=#6ee7d8 bg=#151a28 attrs=
 L16|                     │                                                                             │
 R16 0 20 fg=default bg=#151a28 attrs=
 R16 20 1 fg=default bg=default attrs=
 R16 21 1 fg=#6ee7d8 bg=#151a28 attrs=
-R16 22 77 fg=default bg=#151a28 attrs=
+R16 22 77 fg=default bg=default attrs=
 R16 99 1 fg=#6ee7d8 bg=#151a28 attrs=
 L17|                     │                                                                             │
 R17 0 20 fg=default bg=#151a28 attrs=
 R17 20 1 fg=default bg=default attrs=
 R17 21 1 fg=#6ee7d8 bg=#151a28 attrs=
-R17 22 77 fg=default bg=#151a28 attrs=
+R17 22 77 fg=default bg=default attrs=
 R17 99 1 fg=#6ee7d8 bg=#151a28 attrs=
 L18|                     │                                                                             │
 R18 0 20 fg=default bg=#151a28 attrs=
 R18 20 1 fg=default bg=default attrs=
 R18 21 1 fg=#6ee7d8 bg=#151a28 attrs=
-R18 22 77 fg=default bg=#151a28 attrs=
+R18 22 77 fg=default bg=default attrs=
 R18 99 1 fg=#6ee7d8 bg=#151a28 attrs=
 L19|                     │                                                                             │
 R19 0 20 fg=default bg=#151a28 attrs=
 R19 20 1 fg=default bg=default attrs=
 R19 21 1 fg=#6ee7d8 bg=#151a28 attrs=
-R19 22 77 fg=default bg=#151a28 attrs=
+R19 22 77 fg=default bg=default attrs=
 R19 99 1 fg=#6ee7d8 bg=#151a28 attrs=
 L20|                     │                                                                             │
 R20 0 20 fg=default bg=#151a28 attrs=
 R20 20 1 fg=default bg=default attrs=
 R20 21 1 fg=#6ee7d8 bg=#151a28 attrs=
-R20 22 77 fg=default bg=#151a28 attrs=
+R20 22 77 fg=default bg=default attrs=
 R20 99 1 fg=#6ee7d8 bg=#151a28 attrs=
 L21|                     │                                                                             │
 R21 0 20 fg=default bg=#151a28 attrs=
 R21 20 1 fg=default bg=default attrs=
 R21 21 1 fg=#6ee7d8 bg=#151a28 attrs=
-R21 22 77 fg=default bg=#151a28 attrs=
+R21 22 77 fg=default bg=default attrs=
 R21 99 1 fg=#6ee7d8 bg=#151a28 attrs=
 L22|                     │                                                                             │
 R22 0 20 fg=default bg=#151a28 attrs=
 R22 20 1 fg=default bg=default attrs=
 R22 21 1 fg=#6ee7d8 bg=#151a28 attrs=
-R22 22 77 fg=default bg=#151a28 attrs=
+R22 22 77 fg=default bg=default attrs=
 R22 99 1 fg=#6ee7d8 bg=#151a28 attrs=
 L23|                     │                                                                             │
 R23 0 20 fg=default bg=#151a28 attrs=
 R23 20 1 fg=default bg=default attrs=
 R23 21 1 fg=#6ee7d8 bg=#151a28 attrs=
-R23 22 77 fg=default bg=#151a28 attrs=
+R23 22 77 fg=default bg=default attrs=
 R23 99 1 fg=#6ee7d8 bg=#151a28 attrs=
 L24|                     │                                                                             │
 R24 0 20 fg=default bg=#151a28 attrs=
 R24 20 1 fg=default bg=default attrs=
 R24 21 1 fg=#6ee7d8 bg=#151a28 attrs=
-R24 22 77 fg=default bg=#151a28 attrs=
+R24 22 77 fg=default bg=default attrs=
 R24 99 1 fg=#6ee7d8 bg=#151a28 attrs=
 L25|                     │                                                                             │
 R25 0 20 fg=default bg=#151a28 attrs=
 R25 20 1 fg=default bg=default attrs=
 R25 21 1 fg=#6ee7d8 bg=#151a28 attrs=
-R25 22 77 fg=default bg=#151a28 attrs=
+R25 22 77 fg=default bg=default attrs=
 R25 99 1 fg=#6ee7d8 bg=#151a28 attrs=
 L26|                     │                                                                             │
 R26 0 20 fg=default bg=#151a28 attrs=
 R26 20 1 fg=default bg=default attrs=
 R26 21 1 fg=#6ee7d8 bg=#151a28 attrs=
-R26 22 77 fg=default bg=#151a28 attrs=
+R26 22 77 fg=default bg=default attrs=
 R26 99 1 fg=#6ee7d8 bg=#151a28 attrs=
 L27|                     │                                                                             │
 R27 0 20 fg=default bg=#151a28 attrs=
 R27 20 1 fg=default bg=default attrs=
 R27 21 1 fg=#6ee7d8 bg=#151a28 attrs=
-R27 22 77 fg=default bg=#151a28 attrs=
+R27 22 77 fg=default bg=default attrs=
 R27 99 1 fg=#6ee7d8 bg=#151a28 attrs=
 L28|                     ╰─────────────────────────────────────────────────────────────────────────────╯
 R28 0 20 fg=default bg=#151a28 attrs=

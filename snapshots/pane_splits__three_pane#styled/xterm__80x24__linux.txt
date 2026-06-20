@@ -1,4 +1,4 @@
-L0| ◆ superzej   dashboard   work  comms 4 chat  1% · 󰂄 100% · Fri Jun 19 · 02:15
+L0| ◆ superzej   dashboard   work  comms 4 chat 19% · 󰂄 100% · Fri Jun 19 · 22:56
 R0 0 1 fg=default bg=#151a28 attrs=
 R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
 R0 3 8 fg=#edf0f8 bg=#151a28 attrs=
@@ -94,7 +94,7 @@ L13|                     ╭─ bwrap · home ───────────�
 R13 0 20 fg=default bg=#151a28 attrs=
 R13 20 1 fg=default bg=#0b0e16 attrs=
 R13 21 59 fg=#6ee7d8 bg=#151a28 attrs=
-L14|                     │blake@ws-3:~/ > n                                        │
+L14|                     │blake@ws-3:~/ >                                          │
 R14 0 20 fg=default bg=#151a28 attrs=
 R14 20 1 fg=default bg=#0b0e16 attrs=
 R14 21 1 fg=#6ee7d8 bg=#151a28 attrs=

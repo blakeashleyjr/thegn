@@ -1,4 +1,4 @@
-L0| ◆ superzej v0.1.0   dashboard   work   comms   chat 34.0/94G · 󰾲  1% · 󰂄 100% · Fri Jun 19 · 02:15
+L0| ◆ superzej v0.1.0   dashboard   work   comms   chat 33.7/94G · 󰾲 14% · 󰂄 100% · Fri Jun 19 · 22:56
 R0 0 1 fg=default bg=#151a28 attrs=
 R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
 R0 3 8 fg=#edf0f8 bg=#151a28 attrs=
@@ -186,7 +186,7 @@ R16 20 1 fg=default bg=#0b0e16 attrs=
 R16 21 34 fg=#6ee7d8 bg=#151a28 attrs=
 R16 55 1 fg=default bg=#0b0e16 attrs=
 R16 56 44 fg=#edf0f8 bg=#151a28 attrs=
-L17|                     │blake@ws-3:~/ > n               │
+L17|                     │n                               │
 R17 0 20 fg=default bg=#151a28 attrs=
 R17 20 1 fg=default bg=#0b0e16 attrs=
 R17 21 1 fg=#6ee7d8 bg=#151a28 attrs=
