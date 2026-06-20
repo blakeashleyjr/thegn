@@ -300,6 +300,8 @@ pub struct FrameModel {
     pub key_locked: bool,
     /// True while a zone is zoomed fullscreen (statusbar indicator).
     pub zoomed: bool,
+    /// True while sync-panes broadcast is active (statusbar indicator, item 96).
+    pub sync_panes: bool,
     /// Transient message (errors, "Config reloaded", copy confirmations).
     pub status: String,
     /// Context-dependent keybind hints for the bottom bar as (chord, label)
@@ -1144,6 +1146,13 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
         r.push(Seg::chip(
             Tok::Hue(superzej_core::theme::Hue::Amber),
             " \u{2301} LOCKED ",
+        ));
+    }
+    if model.sync_panes {
+        r.push(seg(Tok::Slot(S::Text), " "));
+        r.push(Seg::chip(
+            Tok::Hue(superzej_core::theme::Hue::Red),
+            " \u{29c9} SYNC ",
         ));
     }
     r.push(seg(Tok::Slot(S::Text), " "));

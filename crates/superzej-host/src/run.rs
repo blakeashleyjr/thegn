@@ -5110,6 +5110,9 @@ async fn event_loop<T: Terminal>(
     // Fullscreen zoom: the zone that owns the whole screen, if any. Toggled
     // by Ctrl+Alt+z for the CURRENT zone; any zone change clears it.
     let mut zoom: Option<crate::focus::Zone> = None;
+    // Sync-panes (item 96): when true, typed input is broadcast to every pane in
+    // the focused tab (tmux `synchronize-panes`).
+    let mut sync_panes = false;
     let mut chrome = compute_chrome(
         cols,
         rows,
@@ -6896,6 +6899,7 @@ async fn event_loop<T: Terminal>(
         model.statusbar_focused = focus.statusbar();
         model.key_locked = focus.locked;
         model.zoomed = zoom.is_some();
+        model.sync_panes = sync_panes;
         model.keyhints = context_hints(&focus, &panel_ui, keymap.config());
         // The ticker samples at live (500ms) cadence while the telemetry
         // section is on screen, so its graphs actually move.
@@ -10908,6 +10912,16 @@ async fn event_loop<T: Terminal>(
                                 );
                                 need_relayout = true;
                             }
+                            Action::ToggleSyncPanes => {
+                                sync_panes = !sync_panes;
+                                model.status = if sync_panes {
+                                    "Sync-panes ON — input broadcasts to all panes in this tab \
+                                     (Ctrl+Alt+y to stop)"
+                                        .into()
+                                } else {
+                                    "Sync-panes off".into()
+                                };
+                            }
                             Action::SplitDown | Action::SplitRight => {
                                 const MAX_PANES: usize = 16;
                                 if session
@@ -11575,10 +11589,24 @@ async fn event_loop<T: Terminal>(
                     .unwrap_or(false);
                 let bytes = remapped
                     .or_else(|| crate::input::key_bytes_mode(&k.key, k.modifiers, app_cursor));
-                if let Some(bytes) = bytes
-                    && let Some(p) = panes.table.get_mut(&target_pane)
-                {
-                    p.write_input(&bytes)?;
+                if let Some(bytes) = bytes {
+                    // Sync-panes (item 96): broadcast to every pane in the active
+                    // tab. The drawer is excluded (it's a transient overlay, not
+                    // part of the tab layout); broadcasting only happens when
+                    // typing into the center, not the drawer.
+                    if sync_panes && drawer.is_none() {
+                        let ids: Vec<u32> = session
+                            .active_tab()
+                            .map(|t| t.center.pane_ids())
+                            .unwrap_or_default();
+                        for id in ids {
+                            if let Some(p) = panes.table.get_mut(&id) {
+                                let _ = p.write_input(&bytes);
+                            }
+                        }
+                    } else if let Some(p) = panes.table.get_mut(&target_pane) {
+                        p.write_input(&bytes)?;
+                    }
                     keymap.reset();
                     // Typing into the terminal clears selections elsewhere
                     // (sidebar multi-select marks).
