@@ -102,7 +102,6 @@ impl Palette {
             .and_then(|&i| self.items.get(i))
     }
 
-    #[allow(dead_code)] // used by tests; the live loop types via push_char/backspace
     pub fn set_query(&mut self, q: impl Into<String>) {
         self.query = q.into();
         self.selected = 0;
@@ -351,7 +350,22 @@ pub(crate) fn build_palette(
         items.push(PaletteItem::new(format!("issue:{}", issue.id), label));
     }
 
+    // Recent files surfaced in All mode via frecency. Keys: "open-file:{path}:1".
+    // We surface up to 10 recently opened files so they appear immediately.
     let usage = db.palette_usage().unwrap_or_default();
+    for (key, _count, _last) in &usage {
+        if let Some(payload) = key.strip_prefix("open-file:") {
+            // payload = "{rel_path}:{line_no}"
+            if let Some((rel_path, _)) = payload.rsplit_once(':') {
+                // Avoid duplicates (the key itself is unique, but the path label might overlap).
+                let full_key = key.clone();
+                if !items.iter().any(|i| i.key == full_key) {
+                    items.push(PaletteItem::new(full_key, format!("📄 {rel_path}")));
+                }
+            }
+        }
+    }
+
     crate::palette::order_by_frecency(items, &usage)
 }
 

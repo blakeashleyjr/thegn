@@ -431,6 +431,16 @@ visible = true
 [panel]
 # sections = ["changes", "pr", "files", "tests", "telemetry", "keys"]
 
+# Search Everywhere palette (Ctrl+Space). Mode prefixes:
+#   (none) = All (actions + recent files)   > = Files   / = Content
+#   @      = Git refs/commits/stashes       # = Symbols
+# Tab cycles modes; Esc closes.
+[palette]
+# content_max_results = 500    # max grep matches before streaming stops
+# file_max_results    = 200    # max file-path fuzzy results
+# symbol_max_results  = 100    # max symbol grep results
+# content_search_hidden = false  # include dotfiles / .gitignored paths
+
 # Pinned programs: summoned from anywhere with Alt-1..9 (in registration order)
 # or the tabbar's pin chips. Pins run on the host (no sandbox) and are managed by
 # a supervisor (eager start, restart policy, health, survive workspace switches).
