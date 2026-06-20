@@ -32,6 +32,10 @@ libc.workspace = true
 chrono.workspace = true
 vt100.workspace = true
 nucleo-matcher.workspace = true
+ignore.workspace = true
+grep-searcher.workspace = true
+grep-regex.workspace = true
+grep-matcher.workspace = true
 notify = "6"
 reqwest = { version = "0.12", default-features = false, features = [
   "blocking",

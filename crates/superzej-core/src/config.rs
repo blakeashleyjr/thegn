@@ -1518,6 +1518,31 @@ impl Default for SearchConfig {
     }
 }
 
+/// `[palette]` — Search Everywhere palette behavior and result caps.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct PaletteConfig {
+    /// Maximum content search matches across all files (streamed, capped at this).
+    pub content_max_results: usize,
+    /// Maximum file-path results returned after fuzzy ranking.
+    pub file_max_results: usize,
+    /// Maximum symbol matches returned.
+    pub symbol_max_results: usize,
+    /// Include hidden files (dotfiles, .gitignored paths) in the file index.
+    pub content_search_hidden: bool,
+}
+
+impl Default for PaletteConfig {
+    fn default() -> Self {
+        PaletteConfig {
+            content_max_results: 500,
+            file_max_results: 200,
+            symbol_max_results: 100,
+            content_search_hidden: false,
+        }
+    }
+}
+
 /// `[panel]` — the right accordion panel.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -1577,6 +1602,7 @@ pub struct Config {
     pub strip: StripConfig,
     pub panel: PanelConfig,
     pub search: SearchConfig,
+    pub palette: PaletteConfig,
     /// Rebind a built-in action by id, e.g. `new-worktree = "Ctrl w"`. The flat
     /// table is the global/default layer; nested mode tables are native-host only.
     pub keybinds: KeybindConfig,
@@ -1642,6 +1668,7 @@ impl Default for Config {
             strip: StripConfig::default(),
             panel: PanelConfig::default(),
             search: SearchConfig::default(),
+            palette: PaletteConfig::default(),
             keybinds: KeybindConfig::default(),
             actions: Vec::new(),
             profile: String::new(),

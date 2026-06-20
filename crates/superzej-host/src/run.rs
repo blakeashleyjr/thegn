@@ -4576,6 +4576,101 @@ fn palette_cancel_key(
             .all(|item| item.key.starts_with("font:"))
 }
 
+fn session_cancel_key(
+    session: &crate::search_everywhere::PaletteSession,
+    key: &KeyCode,
+    modifiers: Modifiers,
+) -> bool {
+    palette_cancel_key(&session.palette, key, modifiers)
+}
+
+/// Dispatch a search query to the right async worker based on the current
+/// palette mode. All-mode is synchronous (nucleo on pre-built items); the
+/// others spawn a `spawn_blocking` worker and wake the loop on completion.
+fn kick_palette_search(
+    session: &mut crate::search_everywhere::PaletteSession,
+    mode: crate::search_everywhere::PaletteMode,
+    file_index: &Option<crate::search_everywhere::FileIndex>,
+    worktree_root: std::path::PathBuf,
+    cfg: &superzej_core::config::Config,
+    waker: &termwiz::terminal::TerminalWaker,
+) {
+    use crate::search_everywhere::PaletteMode;
+    let (_, inner_query) = PaletteMode::parse(&session.raw_query);
+    let query = inner_query.to_string();
+    let sg = session.search_gen;
+    let tx = session.result_tx.clone();
+    let max_content = cfg.palette.content_max_results;
+    let max_file = cfg.palette.file_max_results;
+    let max_sym = cfg.palette.symbol_max_results;
+    let hidden = cfg.palette.content_search_hidden;
+
+    match mode {
+        PaletteMode::All => {
+            // Already updated synchronously in apply_query; nothing to do.
+        }
+        PaletteMode::Files => {
+            if query.is_empty() {
+                return;
+            }
+            match file_index {
+                Some(idx) => {
+                    crate::search_everywhere::spawn_file_search(
+                        idx.paths.clone(),
+                        query,
+                        sg,
+                        max_file,
+                        tx,
+                        waker.clone(),
+                    );
+                }
+                None => {
+                    // Index not built yet; start build.
+                    crate::search_everywhere::spawn_file_index_build(
+                        worktree_root,
+                        sg,
+                        tx,
+                        waker.clone(),
+                        hidden,
+                    );
+                }
+            }
+        }
+        PaletteMode::Content => {
+            if query.is_empty() {
+                return;
+            }
+            session.async_results.content.clear();
+            session.async_results.content_done = false;
+            crate::search_everywhere::spawn_content_search(
+                worktree_root,
+                query,
+                sg,
+                max_content,
+                hidden,
+                tx,
+                waker.clone(),
+            );
+        }
+        PaletteMode::Git => {
+            crate::search_everywhere::spawn_git_search(worktree_root, query, sg, tx, waker.clone());
+        }
+        PaletteMode::Symbols => {
+            if query.is_empty() {
+                return;
+            }
+            crate::search_everywhere::spawn_symbol_search(
+                worktree_root,
+                query,
+                sg,
+                max_sym,
+                tx,
+                waker.clone(),
+            );
+        }
+    }
+}
+
 fn persist_session_layout(session: &crate::session::Session) {
     if let Ok(db) = superzej_core::db::Db::open() {
         let _ = session.persist(&db, &session.id, now_secs());
@@ -4935,7 +5030,11 @@ async fn event_loop<T: Terminal>(
     // `SUPERZEJ_RENDERER=termwiz` falls back to the stock renderer.
     let mut wire_renderer = crate::wire::WireRenderer::new();
     let use_termwiz_renderer = crate::wire::use_termwiz_renderer();
-    let mut palette: Option<crate::palette::Palette> = None;
+    let mut palette: Option<crate::search_everywhere::PaletteSession> = None;
+    // Per-worktree file index for the `>` search mode. Invalidated by the
+    // FS watcher's create/remove events.
+    let mut file_index: Option<crate::search_everywhere::FileIndex> = None;
+    let mut file_index_gen: u64 = 0;
     // Search overlay state: lives here so it survives across loop iterations.
     let mut search: Option<crate::search::SearchOverlay> = None;
     // Panel document payloads (git calendar/log, the selected file's diff)
@@ -6085,6 +6184,60 @@ async fn event_loop<T: Terminal>(
                 need_relayout = true;
             }
             dirty = true;
+        }
+
+        // Drain palette async results (file/content/git/symbol search workers).
+        // FileIndexReady is special: it propagates back to `file_index` for
+        // future searches rather than updating displayed results.
+        if let Some(ps) = palette.as_mut() {
+            // Drain the channel; FileIndexReady is peeled out first.
+            loop {
+                match ps.result_rx.try_recv() {
+                    Ok(crate::search_everywhere::AsyncSearchResult::FileIndexReady {
+                        sg,
+                        index,
+                        root,
+                    }) => {
+                        file_index = Some(crate::search_everywhere::FileIndex {
+                            paths: index.clone(),
+                            root: root.clone(),
+                            generation: sg,
+                        });
+                        // Now that we have an index, kick the search for the
+                        // current query (it was pending the index build).
+                        let raw_q = ps.raw_query.clone();
+                        let (mode, _) = crate::search_everywhere::PaletteMode::parse(&raw_q);
+                        if mode == crate::search_everywhere::PaletteMode::Files {
+                            let raw = ps.raw_query.clone();
+                            let query = {
+                                let (_, q) = crate::search_everywhere::PaletteMode::parse(&raw);
+                                q.to_string()
+                            };
+                            if !query.is_empty() {
+                                let gen2 = ps.search_gen;
+                                crate::search_everywhere::spawn_file_search(
+                                    index,
+                                    query,
+                                    gen2,
+                                    current_config.palette.file_max_results,
+                                    ps.result_tx.clone(),
+                                    waker.clone(),
+                                );
+                            }
+                        }
+                        dirty = true;
+                    }
+                    Ok(result) => {
+                        // Re-queue for drain_results which handles gen filtering.
+                        let _ = ps.result_tx.send(result);
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if ps.drain_results() {
+                dirty = true;
+            }
         }
 
         while let Ok((generation, next_model)) = model_rx.try_recv() {
@@ -7833,20 +7986,93 @@ async fn event_loop<T: Terminal>(
                     // shell, so "shell" (and Escape) keep the live pane —
                     // respawning it would needlessly reload the terminal. Only a
                     // real agent choice replaces the pane.
-                    if palette_cancel_key(p, &k.key, k.modifiers) {
+                    if session_cancel_key(p, &k.key, k.modifiers) {
                         palette = None;
                         dirty = true;
                         continue;
                     }
                     match k.key {
                         KeyCode::Escape => palette = None,
+                        KeyCode::Tab => {
+                            let (mode, query) = p.cycle_mode();
+                            drop(query);
+                            kick_palette_search(
+                                p,
+                                mode,
+                                &file_index,
+                                active_tab_path(&session),
+                                &current_config,
+                                &waker,
+                            );
+                        }
                         KeyCode::Enter => {
-                            if let Some(item) = p.selected_item() {
-                                let key = item.key.clone();
+                            if let Some(key) = p.selected_key() {
                                 // Record frecency so the choice floats up next time.
                                 if let Ok(db) = superzej_core::db::Db::open() {
                                     let _ = db.bump_palette_usage(&key);
                                 }
+                                // --- new: file/git/symbol dispatch prefixes ---
+                                if let Some(payload) = key.strip_prefix("open-file:") {
+                                    // "open-file:{rel_path}:{line_no}"
+                                    let worktree_root = active_tab_path(&session);
+                                    if let Some((rel_path, line_str)) = payload.rsplit_once(':') {
+                                        let line_no: u64 = line_str.parse().unwrap_or(1).max(1);
+                                        let abs_path = worktree_root.join(rel_path);
+                                        let editor = std::env::var("EDITOR")
+                                            .or_else(|_| std::env::var("VISUAL"))
+                                            .unwrap_or_else(|_| "vi".into());
+                                        let line_arg = format!("+{line_no}");
+                                        if let Some(focused_pane) = panes.table.get_mut(&focused) {
+                                            let cmd = format!(
+                                                "{editor} {line_arg} {}\n",
+                                                abs_path.display()
+                                            );
+                                            let _ = focused_pane.write_input(cmd.as_bytes());
+                                        }
+                                        model.status = format!("Opening {}:{line_no}", rel_path);
+                                    }
+                                    palette = None;
+                                    dirty = true;
+                                    continue;
+                                } else if let Some(branch) = key.strip_prefix("git-branch:") {
+                                    let wt_path = active_tab_path(&session);
+                                    if let Some(focused_pane) = panes.table.get_mut(&focused) {
+                                        let cmd = format!(
+                                            "git -C {} checkout {branch}\n",
+                                            wt_path.display()
+                                        );
+                                        let _ = focused_pane.write_input(cmd.as_bytes());
+                                    }
+                                    model.status = format!("Switched to branch {branch}");
+                                    palette = None;
+                                    dirty = true;
+                                    continue;
+                                } else if let Some(tag) = key.strip_prefix("git-tag:") {
+                                    model.status = format!("At tag {tag}");
+                                    palette = None;
+                                    dirty = true;
+                                    continue;
+                                } else if let Some(idx_str) = key.strip_prefix("git-stash:") {
+                                    let wt_path = active_tab_path(&session);
+                                    if let Some(focused_pane) = panes.table.get_mut(&focused) {
+                                        let cmd = format!(
+                                            "git -C {} stash pop --index {idx_str}\n",
+                                            wt_path.display()
+                                        );
+                                        let _ = focused_pane.write_input(cmd.as_bytes());
+                                    }
+                                    model.status = format!("Popped stash {idx_str}");
+                                    palette = None;
+                                    dirty = true;
+                                    continue;
+                                } else if let Some(sha) = key.strip_prefix("git-commit:") {
+                                    let short = &sha[..sha.len().min(7)];
+                                    model.status = format!("Commit {short}");
+                                    palette = None;
+                                    dirty = true;
+                                    continue;
+                                }
+                                // --- end new dispatch ---
                                 if let Some(family) = key.strip_prefix("font:") {
                                     match crate::font::apply_font_family(family) {
                                         Ok(path) => {
@@ -8019,9 +8245,27 @@ async fn event_loop<T: Terminal>(
                         }
                         KeyCode::UpArrow => p.move_up(),
                         KeyCode::DownArrow => p.move_down(),
-                        KeyCode::Backspace => p.backspace(),
+                        KeyCode::Backspace => {
+                            let (mode, _query) = p.backspace();
+                            kick_palette_search(
+                                p,
+                                mode,
+                                &file_index,
+                                active_tab_path(&session),
+                                &current_config,
+                                &waker,
+                            );
+                        }
                         KeyCode::Char(c) if !k.modifiers.contains(Modifiers::CTRL) => {
-                            p.push_char(c)
+                            let (mode, _query) = p.push_char(c);
+                            kick_palette_search(
+                                p,
+                                mode,
+                                &file_index,
+                                active_tab_path(&session),
+                                &current_config,
+                                &waker,
+                            );
                         }
                         _ => {}
                     }
@@ -9914,7 +10158,8 @@ async fn event_loop<T: Terminal>(
                                     model.status = "No fonts found via fc-list".into();
                                 }
                                 Ok(items) => {
-                                    palette = Some(crate::palette::Palette::new(items));
+                                    palette =
+                                        Some(crate::search_everywhere::PaletteSession::new(items));
                                 }
                                 Err(e) => {
                                     model.status = format!("Font list failed: {e}");
@@ -9922,12 +10167,14 @@ async fn event_loop<T: Terminal>(
                             },
                             Action::OpenPalette => {
                                 if let Ok(db) = superzej_core::db::Db::open() {
-                                    palette = Some(crate::palette::Palette::new(build_palette(
-                                        &session,
-                                        &db,
-                                        &current_config,
-                                        &model.panel.tracker_issues,
-                                    )));
+                                    palette = Some(crate::search_everywhere::PaletteSession::new(
+                                        build_palette(
+                                            &session,
+                                            &db,
+                                            &current_config,
+                                            &model.panel.tracker_issues,
+                                        ),
+                                    ));
                                 }
                             }
                             Action::ToggleDrawer => {
@@ -10417,10 +10664,8 @@ async fn event_loop<T: Terminal>(
                             }
                             Action::SwitchWorkspace => {
                                 if let Ok(db) = superzej_core::db::Db::open()
-                                    && let Some(target) = palette
-                                        .as_ref()
-                                        .and_then(|p| p.selected_item())
-                                        .map(|i| i.key.clone())
+                                    && let Some(target) =
+                                        palette.as_ref().and_then(|p| p.selected_key())
                                 {
                                     let repo_path =
                                         target.strip_prefix("repo:").unwrap_or(&target).to_string();
