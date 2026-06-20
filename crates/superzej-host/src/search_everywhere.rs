@@ -93,7 +93,9 @@ impl PaletteMode {
 #[derive(Clone)]
 pub struct FileIndex {
     pub paths: Arc<Vec<Arc<str>>>,
+    #[allow(dead_code)]
     pub root: PathBuf,
+    #[allow(dead_code)]
     pub generation: u64,
 }
 
@@ -110,11 +112,11 @@ impl FileIndex {
             .follow_links(false)
             .max_depth(None);
         for entry in builder.build().flatten() {
-            if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                if let Ok(rel) = entry.path().strip_prefix(root) {
-                    let s: Arc<str> = rel.to_string_lossy().into();
-                    paths.push(s);
-                }
+            if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false)
+                && let Ok(rel) = entry.path().strip_prefix(root)
+            {
+                let s: Arc<str> = rel.to_string_lossy().into();
+                paths.push(s);
             }
         }
         FileIndex {
@@ -128,6 +130,7 @@ impl FileIndex {
 // ── Async result types ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct FileMatch {
     pub path: Arc<str>,
     pub score: u32,
@@ -736,7 +739,7 @@ pub fn spawn_file_search(
                     .map(|s| (p.clone(), s))
             })
             .collect();
-        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        scored.sort_by_key(|b| std::cmp::Reverse(b.1));
         scored.truncate(max_results);
         let matches = scored
             .into_iter()
@@ -815,7 +818,7 @@ pub fn spawn_content_search(
                         line_text: line.trim_end_matches('\n').to_string(),
                     });
                     if batch.len() >= BATCH {
-                        let drained: Vec<_> = batch.drain(..).collect();
+                        let drained: Vec<_> = std::mem::take(&mut batch);
                         all.extend(drained.clone());
                         let _ = tx2.send(AsyncSearchResult::ContentMatches {
                             sg,
@@ -930,7 +933,11 @@ pub fn spawn_git_search(
                     continue;
                 }
                 // line format: "stash@{0}: ..."
-                let name = line.splitn(2, ": ").nth(1).unwrap_or(line).to_string();
+                let name = line
+                    .split_once(": ")
+                    .map(|x| x.1)
+                    .unwrap_or(line)
+                    .to_string();
                 matches.push(GitRefMatch {
                     kind: GitRefKind::Stash,
                     name,

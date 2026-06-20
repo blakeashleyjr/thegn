@@ -479,6 +479,7 @@ pub fn action_specs() -> &'static [ActionSpec] {
 
 /// The scope in which a keybinding applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
 pub enum BindingScope {
     /// Fires in any focus zone.
     Global,
@@ -552,7 +553,7 @@ pub fn check_binding_conflicts(
     // Log them at debug so they're visible during development but not noisy.
     for b in scoped.iter().filter(|b| b.scope != BindingScope::Global) {
         for spec in global_specs {
-            if spec.default_chords.iter().any(|c| *c == b.chord) {
+            if spec.default_chords.contains(&b.chord) {
                 tracing::debug!(
                     chord = b.chord,
                     panel_binding = b.label,

@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 use superzej_core::config::{FileAccess, Network};
 use superzej_core::sandbox::{
-    Backend, Mount, SandboxLimits, SandboxSpec, Transport, container_name, ensure, health_check,
-    identify_orphans, run_gc, teardown_by_path,
+    Backend, SandboxLimits, SandboxSpec, Transport, container_name, ensure, health_check, run_gc,
+    teardown_by_path,
 };
 
 fn container_running(name: &str) -> bool {

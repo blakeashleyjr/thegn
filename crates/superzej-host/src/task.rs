@@ -2023,15 +2023,13 @@ fn discover_cargo_toml(worktree: &Path) -> Vec<Task> {
         if trimmed.starts_with('[') {
             in_alias = false;
         }
-        if in_alias {
-            if let Some(eq) = trimmed.find('=') {
-                let name = trimmed[..eq].trim().trim_matches('"');
-                let val = trimmed[eq + 1..].trim().trim_matches(['"', '\'']);
-                if !name.is_empty() {
-                    let cmd = format!("cargo {name}");
-                    let kind = infer_kind(val);
-                    tasks.push(make_task(format!("cargo {name}"), cmd, kind));
-                }
+        if in_alias && let Some(eq) = trimmed.find('=') {
+            let name = trimmed[..eq].trim().trim_matches('"');
+            let val = trimmed[eq + 1..].trim().trim_matches(['"', '\'']);
+            if !name.is_empty() {
+                let cmd = format!("cargo {name}");
+                let kind = infer_kind(val);
+                tasks.push(make_task(format!("cargo {name}"), cmd, kind));
             }
         }
     }
@@ -2069,14 +2067,12 @@ fn discover_pyproject(worktree: &Path) -> Vec<Task> {
         if trimmed.starts_with('[') {
             in_taskipy = false;
         }
-        if in_taskipy {
-            if let Some(eq) = trimmed.find('=') {
-                let name = trimmed[..eq].trim().trim_matches('"');
-                if !name.is_empty() {
-                    let cmd = format!("task {name}");
-                    let kind = infer_kind(name);
-                    tasks.push(make_task(name.to_string(), cmd, kind));
-                }
+        if in_taskipy && let Some(eq) = trimmed.find('=') {
+            let name = trimmed[..eq].trim().trim_matches('"');
+            if !name.is_empty() {
+                let cmd = format!("task {name}");
+                let kind = infer_kind(name);
+                tasks.push(make_task(name.to_string(), cmd, kind));
             }
         }
     }
@@ -2329,7 +2325,6 @@ fn parse_pytest_line(line: &str, source: &str) -> Option<ExtractedDiag> {
 #[cfg(test)]
 mod discovery_tests {
     use super::*;
-    use std::io::Write;
 
     fn temp_dir2(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("sz-disc-{tag}"));

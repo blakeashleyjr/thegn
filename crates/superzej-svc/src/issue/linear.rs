@@ -65,10 +65,10 @@ impl LinearBackend {
             )));
         }
         let gql: GqlResponse<R> = resp.json().await?;
-        if let Some(errs) = gql.errors {
-            if !errs.is_empty() {
-                return Err(IssueError::Api(errs[0].message.clone()));
-            }
+        if let Some(errs) = gql.errors
+            && !errs.is_empty()
+        {
+            return Err(IssueError::Api(errs[0].message.clone()));
         }
         gql.data
             .ok_or_else(|| IssueError::Parse("no data in response".into()))
@@ -90,6 +90,7 @@ struct IssueConnection {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LinearIssue {
+    #[allow(dead_code)]
     id: String,
     identifier: String,
     title: String,

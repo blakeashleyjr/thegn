@@ -2,6 +2,8 @@
 //!
 //! Reads szhost.log directly from disk; does not require a running host.
 
+#![allow(clippy::disallowed_macros)]
+
 use clap::Subcommand;
 use superzej_core::log_view::{LogLevel, parse_log_line};
 
@@ -66,10 +68,10 @@ pub fn run(cfg: &superzej_core::config::Config, action: Action) -> anyhow::Resul
                 .lines()
                 .filter_map(parse_log_line)
                 .filter(|l| {
-                    threshold.map_or(true, |thr| l.level <= thr)
+                    threshold.is_none_or(|thr| l.level <= thr)
                         && filter_lc
                             .as_deref()
-                            .map_or(true, |f| l.raw.to_lowercase().contains(f))
+                            .is_none_or(|f| l.raw.to_lowercase().contains(f))
                 })
                 .collect();
 
@@ -103,10 +105,10 @@ pub fn run(cfg: &superzej_core::config::Config, action: Action) -> anyhow::Resul
                 .lines()
                 .filter_map(parse_log_line)
                 .filter(|l| {
-                    threshold.map_or(true, |thr| l.level <= thr)
+                    threshold.is_none_or(|thr| l.level <= thr)
                         && filter_lc
                             .as_deref()
-                            .map_or(true, |f| l.raw.to_lowercase().contains(f))
+                            .is_none_or(|f| l.raw.to_lowercase().contains(f))
                 })
                 .count();
             println!("{count}");
@@ -118,7 +120,7 @@ pub fn run(cfg: &superzej_core::config::Config, action: Action) -> anyhow::Resul
 fn parse_level(s: Option<&str>) -> anyhow::Result<Option<LogLevel>> {
     match s {
         None => Ok(None),
-        Some(s) => LogLevel::from_str(s).map(Some).ok_or_else(|| {
+        Some(s) => LogLevel::parse(s).map(Some).ok_or_else(|| {
             anyhow::anyhow!(
                 "unknown log level {:?} — use error/warn/info/debug/trace",
                 s

@@ -725,19 +725,18 @@ fn draw_center_tabs(surface: &mut Surface, strip: Rect, model: &FrameModel) {
         x += leaf.chars().count();
         // Issue badge: show the first linked issue's status + number next to
         // the active worktree name when at least one issue is linked.
-        if let Some(issue_id) = model.panel.tracker_links.first() {
-            if let Some(issue) = model
+        if let Some(issue_id) = model.panel.tracker_links.first()
+            && let Some(issue) = model
                 .panel
                 .tracker_issues
                 .iter()
                 .find(|i| &i.id == issue_id)
-            {
-                let badge = format!(" ◈{}", issue.number);
-                let avail = chips_end.saturating_sub(x);
-                if avail >= badge.chars().count() {
-                    draw_text(surface, x, strip.y, &badge, col(S::Accent), bg, avail);
-                    x += badge.chars().count();
-                }
+        {
+            let badge = format!(" ◈{}", issue.number);
+            let avail = chips_end.saturating_sub(x);
+            if avail >= badge.chars().count() {
+                draw_text(surface, x, strip.y, &badge, col(S::Accent), bg, avail);
+                x += badge.chars().count();
             }
         }
         let (sb_val, sb_active) = sandbox_indicator(model);
@@ -1260,20 +1259,40 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             rect.cols.saturating_sub(1),
         );
         // Overpaint the status segment (git/agent/activity) in its own colors,
-        // right after the label, when there's room.
-        if let Some(seg) = composed.status {
-            let sx = rect.x + 1 + composed.status_col;
+        // right after the label, when there's room. Track the running column so
+        // badges paint after the status tail.
+        let mut col_off = composed.status_col;
+        if let Some(seg) = &composed.status {
+            let sx = rect.x + 1 + col_off;
             if sx < rect.x + rect.cols {
                 draw_text(
                     surface,
                     sx,
                     y,
-                    &seg,
+                    seg,
                     status_seg_color(row),
                     bg,
                     (rect.x + rect.cols).saturating_sub(sx),
                 );
             }
+            col_off += seg.chars().count();
+        }
+        // Badges (item 28): PR / unread / alert counts, each in its own color.
+        for badge in &composed.badges {
+            let sx = rect.x + 1 + col_off;
+            if sx >= rect.x + rect.cols {
+                break;
+            }
+            draw_text(
+                surface,
+                sx,
+                y,
+                &badge.text,
+                badge.color,
+                bg,
+                (rect.x + rect.cols).saturating_sub(sx),
+            );
+            col_off += badge.text.chars().count();
         }
     }
 
@@ -1392,6 +1411,15 @@ struct ComposedRow {
     text: String,
     status: Option<String>,
     status_col: usize,
+    /// Badge segments (item 28): PR / unread / alert counts, each with its own
+    /// color, drawn after the git status tail.
+    badges: Vec<Badge>,
+}
+
+/// A single sidebar badge segment with its own color.
+struct Badge {
+    text: String,
+    color: ColorAttribute,
 }
 
 fn compose_sidebar_row(row: &crate::sidebar::SidebarRow) -> ComposedRow {
@@ -1443,11 +1471,42 @@ fn compose_sidebar_row(row: &crate::sidebar::SidebarRow) -> ComposedRow {
     });
     let status = status.filter(|s| !s.is_empty());
     let status_col = text.chars().count();
+    let badges = compose_badges(row);
     ComposedRow {
         text,
         status,
         status_col,
+        badges,
     }
+}
+
+/// Build the per-row badge segments (item 28): open PRs, unread notifications,
+/// and alerts. Only non-zero counts render. Each badge is a glyph + count and
+/// carries its own color so the renderer can paint them distinctly.
+fn compose_badges(row: &crate::sidebar::SidebarRow) -> Vec<Badge> {
+    let mut badges = Vec::new();
+    // PR badge: open PRs for this worktree's branch (green = good state).
+    if let Some(pr) = row.pr_count.filter(|&c| c > 0) {
+        badges.push(Badge {
+            text: format!(" \u{2b21}{pr}"), // ⬡N
+            color: theme_color(theme::GREEN),
+        });
+    }
+    // Unread badge: unread notifications (blue = informational).
+    if row.unread_count > 0 {
+        badges.push(Badge {
+            text: format!(" \u{2709}{}", row.unread_count), // ✉N
+            color: theme_color(theme::BLUE),
+        });
+    }
+    // Alert badge: test failures, agent failures, log errors (red = action).
+    if row.alert_count > 0 {
+        badges.push(Badge {
+            text: format!(" \u{26a0}{}", row.alert_count), // ⚠N
+            color: theme_color(theme::RED),
+        });
+    }
+    badges
 }
 
 /// The activity dot prefix for a worktree row (item 20). Active rows pulse via
@@ -1929,6 +1988,9 @@ mod tests {
             visible: true,
             collapsed: false,
             dir: false,
+            pr_count: None,
+            unread_count: 0,
+            alert_count: 0,
         }
     }
 
@@ -2002,6 +2064,72 @@ mod tests {
         assert!(text.contains('\u{2191}'), "ahead glyph ↑: {text:?}");
         assert!(text.contains('\u{2193}'), "behind glyph ↓: {text:?}");
         assert!(text.contains('C'), "agent glyph for claude: {text:?}");
+    }
+
+    #[test]
+    fn sidebar_renders_badges_for_pr_unread_and_alert() {
+        use crate::sidebar::RowKind;
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 40,
+            rows: 6,
+        };
+        let mut ws = row(RowKind::Workspace, "app");
+        ws.collapsed = false;
+        let mut wt = row(RowKind::Worktree, "feat");
+        wt.pr_count = Some(2);
+        wt.unread_count = 3;
+        wt.alert_count = 1;
+        let model = FrameModel {
+            sidebar_rows: vec![ws, wt],
+            ..Default::default()
+        };
+        let mut s = Surface::new(40, 6);
+        draw_sidebar(&mut s, rect, &model);
+        let text = s.screen_chars_to_string();
+        assert!(text.contains('\u{2b21}'), "PR badge glyph ⬡: {text:?}");
+        assert!(text.contains('\u{2709}'), "unread badge glyph ✉: {text:?}");
+        assert!(text.contains('\u{26a0}'), "alert badge glyph ⚠: {text:?}");
+        // Counts render alongside the glyphs.
+        assert!(text.contains('2') && text.contains('3') && text.contains('1'));
+    }
+
+    #[test]
+    fn sidebar_omits_zero_badges() {
+        use crate::sidebar::RowKind;
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 40,
+            rows: 6,
+        };
+        let mut ws = row(RowKind::Workspace, "app");
+        ws.collapsed = false;
+        let mut wt = row(RowKind::Worktree, "feat");
+        // All zero/none: no badges should render.
+        wt.pr_count = Some(0);
+        wt.unread_count = 0;
+        wt.alert_count = 0;
+        let model = FrameModel {
+            sidebar_rows: vec![ws, wt],
+            ..Default::default()
+        };
+        let mut s = Surface::new(40, 6);
+        draw_sidebar(&mut s, rect, &model);
+        let text = s.screen_chars_to_string();
+        assert!(
+            !text.contains('\u{2b21}'),
+            "no PR badge when zero: {text:?}"
+        );
+        assert!(
+            !text.contains('\u{2709}'),
+            "no unread badge when zero: {text:?}"
+        );
+        assert!(
+            !text.contains('\u{26a0}'),
+            "no alert badge when zero: {text:?}"
+        );
     }
 
     #[test]
@@ -2584,13 +2712,12 @@ mod tests {
         // generic "m flow menu" entry in the table.
         let merge_flow = PanelUi {
             row_mode: true,
-            git: {
-                let mut g = crate::panel::gitui::GitUi::default();
-                g.flow = crate::panel::gitui::GitFlow::Merge(crate::panel::gitui::SequencerUi {
+            git: crate::panel::gitui::GitUi {
+                flow: crate::panel::gitui::GitFlow::Merge(crate::panel::gitui::SequencerUi {
                     onto: "main".to_string(),
                     conflict: true,
-                });
-                g
+                }),
+                ..Default::default()
             },
             ..Default::default()
         };

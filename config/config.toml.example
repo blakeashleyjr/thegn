@@ -412,6 +412,16 @@ command = "git diff"
 # isolated_target_dir = true # run superzej's cargo under <worktree>/target/superzej
 #                            #   so discovery/tests never block on the user's build lock
 
+# Aggregated notification bus. Events (PR state, agent done/failed, test
+# failures, log errors, worktree created) surface as sidebar badges + the
+# in-app inbox, and optionally as OS desktop notifications.
+#   desktop             — deliver OS toasts (Linux: notify-send, macOS: osascript)
+#   desktop_min_urgency — "low" | "normal" | "critical"; events below this
+#                         urgency stay in the inbox but never pop a toast
+[notifications]
+desktop = true
+desktop_min_urgency = "normal"
+
 # Top pinned-program strip: a horizontal band above the center that renders
 # `location = "strip"` pins side by side (toggle Ctrl+Alt+t; grow/shrink at
 # runtime). `ratio` is the fraction of the center band it occupies.

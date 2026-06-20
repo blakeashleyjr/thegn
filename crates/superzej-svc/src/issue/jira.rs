@@ -118,6 +118,7 @@ struct SearchResult {
 
 #[derive(Deserialize)]
 struct JiraIssue {
+    #[allow(dead_code)]
     id: String,
     key: String,
     #[serde(rename = "self")]
@@ -142,6 +143,7 @@ struct JiraFields {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct JiraStatus {
+    #[allow(dead_code)]
     name: String,
     status_category: Option<JiraStatusCategory>,
 }
@@ -190,7 +192,9 @@ struct JiraTransition {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct JiraTransitionState {
+    #[allow(dead_code)]
     status_category: Option<JiraStatusCategory>,
+    #[allow(dead_code)]
     name: String,
 }
 
@@ -494,6 +498,7 @@ impl IssueBackend for JiraBackend {
             struct TransitionId {
                 id: String,
             }
+            #[allow(dead_code)]
             #[derive(Deserialize)]
             struct Empty {}
             let _: serde_json::Value = self

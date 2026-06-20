@@ -402,6 +402,10 @@ fn collect_sidebar_status(
         .map(|(tab, st)| (tab, crate::sidebar::ActivityState::from_str(&st)))
         .collect();
 
+    // Badge counts (item 28): unread + alert notifications grouped by worktree.
+    status.unread_counts = db.get_unread_counts_by_worktree().unwrap_or_default();
+    status.alert_counts = db.get_alert_counts_by_worktree().unwrap_or_default();
+
     // git glyphs + agent per distinct worktree path.
     let mut seen = std::collections::HashSet::new();
     for g in &session.worktrees {
@@ -425,6 +429,15 @@ fn collect_sidebar_status(
         );
         if let Ok(Some(agent)) = db.worktree_agent(&g.path) {
             status.agent.insert(g.path.clone(), agent);
+        }
+        // PR badge: open PRs for this worktree's current branch, joined from the
+        // `pr_branch_cache` (keyed by worktree path, matching the branches view).
+        if let Ok(branch) = git.current_branch(&loc)
+            && let Ok(counts) = db.get_open_pr_counts_by_branch(&g.path)
+            && let Some(&n) = counts.get(&branch)
+            && n > 0
+        {
+            status.pr_counts.insert(g.path.clone(), n);
         }
     }
     tracing::debug!(
@@ -828,40 +841,40 @@ pub(crate) fn build_model(
     // Always scan for new ERRORs to surface as notifications; full tail only
     // when the section is open (to avoid reading 5 MB on every tick).
     let log_path = superzej_core::util::xdg_state_home().join("superzej/logs/szhost.log");
-    if log_path.exists() {
-        if let Ok(bytes) = std::fs::read(&log_path) {
-            let content = String::from_utf8_lossy(bytes.as_ref());
-            let all_lines: Vec<_> = content
-                .lines()
-                .filter_map(superzej_core::log_view::parse_log_line)
-                .collect();
+    if log_path.exists()
+        && let Ok(bytes) = std::fs::read(&log_path)
+    {
+        let content = String::from_utf8_lossy(bytes.as_ref());
+        let all_lines: Vec<_> = content
+            .lines()
+            .filter_map(superzej_core::log_view::parse_log_line)
+            .collect();
 
-            // Surface new ERROR lines as a notification (at most once per 5 min).
-            let now_ms = superzej_core::util::now();
-            let five_min_ms: i64 = 5 * 60 * 1_000;
-            let has_recent_log_error = panel
-                .notifications
+        // Surface new ERROR lines as a notification (at most once per 5 min).
+        let now_ms = superzej_core::util::now();
+        let five_min_ms: i64 = 5 * 60 * 1_000;
+        let has_recent_log_error = panel
+            .notifications
+            .iter()
+            .any(|n| n.source_ref == "log:szhost" && now_ms - n.created_at_ms < five_min_ms);
+        if !has_recent_log_error {
+            let error_count = all_lines
                 .iter()
-                .any(|n| n.source_ref == "log:szhost" && now_ms - n.created_at_ms < five_min_ms);
-            if !has_recent_log_error {
-                let error_count = all_lines
-                    .iter()
-                    .filter(|l| l.level == superzej_core::log_view::LogLevel::Error)
-                    .count();
-                if error_count > 0 {
-                    let msg = format!(
-                        "{} error{} in szhost.log",
-                        error_count,
-                        if error_count == 1 { "" } else { "s" }
-                    );
-                    let _ = db.put_notification("log_error", "log:szhost", &msg, "");
-                }
+                .filter(|l| l.level == superzej_core::log_view::LogLevel::Error)
+                .count();
+            if error_count > 0 {
+                let msg = format!(
+                    "{} error{} in szhost.log",
+                    error_count,
+                    if error_count == 1 { "" } else { "s" }
+                );
+                let _ = db.put_notification("log_error", "log:szhost", &msg, "");
             }
+        }
 
-            if hints.open == crate::panel::Section::Logs {
-                let start = all_lines.len().saturating_sub(500);
-                panel.log_lines = all_lines[start..].to_vec();
-            }
+        if hints.open == crate::panel::Section::Logs {
+            let start = all_lines.len().saturating_sub(500);
+            panel.log_lines = all_lines[start..].to_vec();
         }
     }
 
@@ -990,15 +1003,14 @@ pub(crate) fn spawn_pr_cache_refresh(
         // Emit a notification when the PR transitions between states
         // (e.g. OPEN → MERGED). Only fires when there was a prior known state
         // to diff against — avoids spurious notifications on first fetch.
-        if let superzej_core::github::PanelState::Pr(ref pr) = panel.state {
-            if let Some(old) = &old_pr_state {
-                if old != &pr.state {
-                    let pr_ref = format!("pr:{}", pr.number);
-                    let msg = format!("PR #{} {} → {}", pr.number, old, pr.state);
-                    let wt = cwd.to_string_lossy();
-                    let _ = db.put_notification("pr_state_changed", &pr_ref, &msg, &wt);
-                }
-            }
+        if let superzej_core::github::PanelState::Pr(ref pr) = panel.state
+            && let Some(old) = &old_pr_state
+            && old != &pr.state
+        {
+            let pr_ref = format!("pr:{}", pr.number);
+            let msg = format!("PR #{} {} → {}", pr.number, old, pr.state);
+            let wt = cwd.to_string_lossy();
+            let _ = db.put_notification("pr_state_changed", &pr_ref, &msg, &wt);
         }
 
         // PR cache landing should surface via a model rehydrate; pulse the waker
@@ -1097,20 +1109,21 @@ pub(crate) fn spawn_issue_cache_refresh(
                 .into_iter()
                 .collect();
             for issue in &issues {
-                if let Some(&old_status) = old_map.get(issue.id.as_str()) {
-                    if *old_status != issue.status && linked.contains(&issue.id) {
-                        let msg = format!(
-                            "{} status changed to {}",
-                            issue.number,
-                            issue.status.label()
-                        );
-                        let _ = db.put_notification(
-                            "status_changed",
-                            &issue.id,
-                            &msg,
-                            &cwd.to_string_lossy(),
-                        );
-                    }
+                if let Some(&old_status) = old_map.get(issue.id.as_str())
+                    && *old_status != issue.status
+                    && linked.contains(&issue.id)
+                {
+                    let msg = format!(
+                        "{} status changed to {}",
+                        issue.number,
+                        issue.status.label()
+                    );
+                    let _ = db.put_notification(
+                        "status_changed",
+                        &issue.id,
+                        &msg,
+                        &cwd.to_string_lossy(),
+                    );
                 }
             }
             let _ = db.put_issue_cache(&cwd.to_string_lossy(), router.provider_id(), &json);

@@ -42,7 +42,7 @@ fn visible_lines<'a>(ctx: &'a SectionCtx) -> Vec<&'a LogLine> {
         .log_lines
         .iter()
         .filter(|l| {
-            ctx.ui.logs_level.map_or(true, |lvl| l.level <= lvl)
+            ctx.ui.logs_level.is_none_or(|lvl| l.level <= lvl)
                 && (filter.is_empty() || l.raw.to_lowercase().contains(&filter))
         })
         .collect()

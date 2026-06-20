@@ -16,7 +16,7 @@ pub enum LogLevel {
 }
 
 impl LogLevel {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_uppercase().as_str() {
             "ERROR" => Some(Self::Error),
             "WARN" => Some(Self::Warn),
@@ -81,7 +81,7 @@ pub fn parse_log_line(line: &str) -> Option<LogLine> {
     let (ts, rest) = line.split_once("  ")?;
     // Step 2: level is the first whitespace-separated token.
     let (level_str, rest) = rest.split_once(' ')?;
-    let level = LogLevel::from_str(level_str.trim())?;
+    let level = LogLevel::parse(level_str.trim())?;
     // Step 3: skip any padding space between level and target, then find
     // the double-space delimiter that separates target from message.
     let (target, message) = rest.trim_start().split_once("  ")?;

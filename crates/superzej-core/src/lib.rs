@@ -16,6 +16,7 @@ pub mod db;
 pub mod diff_highlight;
 pub mod diff_sbs;
 pub mod dns_filter;
+pub mod event_bus;
 pub mod forge;
 pub mod github;
 pub mod gitrefs;

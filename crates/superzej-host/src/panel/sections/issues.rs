@@ -72,10 +72,10 @@ fn sorted_issues<'a>(ctx: &'a SectionCtx) -> Vec<&'a Issue> {
                     return false;
                 }
             }
-            if let Some(pid) = project {
-                if !i.project_ids.iter().any(|p| p == pid) {
-                    return false;
-                }
+            if let Some(pid) = project
+                && !i.project_ids.iter().any(|p| p == pid)
+            {
+                return false;
             }
             true
         })

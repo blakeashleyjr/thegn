@@ -125,6 +125,7 @@ impl Palette {
         self.recompute();
     }
 
+    #[allow(dead_code)] // used in tests
     pub fn push_char(&mut self, c: char) {
         self.query.push(c);
         self.selected = 0;
@@ -132,6 +133,7 @@ impl Palette {
         self.recompute();
     }
 
+    #[allow(dead_code)] // used in tests
     pub fn backspace(&mut self) {
         self.query.pop();
         self.selected = 0;
@@ -189,6 +191,7 @@ impl Palette {
     /// Draw the palette as the boxed "jump" layer (dim backdrop + shadow,
     /// upper-third anchor). The badge reads " menu " — the honest name for
     /// the Ctrl+Space binding (the mockup's ⌘K chip).
+    #[allow(dead_code)] // used in tests
     pub fn render(&self, surface: &mut Surface, screen: Rect) {
         const COLS: usize = 66;
         let shown = self.matches.len().min(MAX_ITEMS);

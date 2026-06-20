@@ -347,12 +347,12 @@ fn task_detail_segs(
     }
 
     // Output tail
-    if let Some(r) = run {
-        if !r.output_tail.is_empty() {
-            out.push(vec![seg(g3(), "─── output ───────────────────────────")]);
-            for line in r.output_tail.lines().take(8) {
-                out.push(vec![seg(g2(), truncate(line, w))]);
-            }
+    if let Some(r) = run
+        && !r.output_tail.is_empty()
+    {
+        out.push(vec![seg(g3(), "─── output ───────────────────────────")]);
+        for line in r.output_tail.lines().take(8) {
+            out.push(vec![seg(g2(), truncate(line, w))]);
         }
     }
 
