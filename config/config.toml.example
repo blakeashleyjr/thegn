@@ -402,6 +402,22 @@ command = "git diff"
 # command = "bats --formatter tap ."
 # matcher = "tap"
 
+# Worktree templates: reusable presets applied when creating a worktree (run
+# "New worktree from template…" from the command palette). A template can set
+# the base branch, branch prefix, sandbox backend, and agent (pre-selected in
+# the wizard), start a set of pins, and lay out the initial panes. The pane
+# layout is either a saved named layout (see "Save layout as…") via `layout`,
+# or the `commands` shorthand (an even row-split running each command; "" = a
+# plain shell). Pins are matched by name against [[pins]].
+# [[worktree_templates]]
+# name = "rust-feature"
+# base = "main"
+# branch_prefix = "feat/"
+# sandbox = "podman"
+# agent = "claude"
+# pins = ["logs"]
+# commands = ["nvim", "cargo watch -x test"]
+
 # Resource ceilings. superzej NEVER auto-runs tests; these only cap an *explicit*
 # run/discovery so a heavy suite can't pin the machine. When `systemd-run` is
 # available, runs go in a transient `--user --scope` with these caps; otherwise

@@ -145,6 +145,25 @@ impl LayoutSpec {
         }
     }
 
+    /// A shorthand layout: an even row-split running one pane per command (an
+    /// empty command string → a plain shell). Backs the `commands = [...]`
+    /// field of a worktree template (item 54).
+    pub fn even_split(commands: &[String]) -> LayoutSpec {
+        let children = commands
+            .iter()
+            .map(|c| LayoutBranch {
+                weight: 1.0,
+                child: LayoutSpec::Leaf {
+                    command: (!c.trim().is_empty()).then(|| c.clone()),
+                },
+            })
+            .collect();
+        LayoutSpec::Split {
+            dir: Dir::Row,
+            children,
+        }
+    }
+
     /// Serialize to a pretty JSON string (for file export, item 99).
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
@@ -249,6 +268,25 @@ mod tests {
         };
         let json = spec.to_json().unwrap();
         assert_eq!(LayoutSpec::from_json(&json).unwrap(), spec);
+    }
+
+    #[test]
+    fn even_split_maps_commands_and_blanks() {
+        let spec = LayoutSpec::even_split(&["nvim".into(), "".into(), "cargo watch".into()]);
+        match spec {
+            LayoutSpec::Split { dir, children } => {
+                assert_eq!(dir, Dir::Row);
+                assert_eq!(children.len(), 3);
+                assert_eq!(
+                    children[0].child,
+                    LayoutSpec::Leaf {
+                        command: Some("nvim".into())
+                    }
+                );
+                assert_eq!(children[1].child, LayoutSpec::Leaf { command: None });
+            }
+            other => panic!("expected split, got {other:?}"),
+        }
     }
 
     #[test]

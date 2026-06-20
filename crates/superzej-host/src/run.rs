@@ -2324,6 +2324,11 @@ enum HostInputKind {
     ExportLayout,
     /// Import a layout JSON file (typed path) into the active tab.
     ImportLayout,
+    /// Create a worktree from the `[[worktree_templates]]` preset named by the
+    /// typed value (item 54). Carries the resolved repo root.
+    NewWorktreeFromTemplate {
+        repo_root: String,
+    },
 }
 
 /// Launch the new-worktree wizard + speculative-create worker against `root`.
@@ -2334,6 +2339,7 @@ enum HostInputKind {
 fn begin_worktree_wizard(
     root: std::path::PathBuf,
     base_override: Option<String>,
+    template: Option<&superzej_core::config::WorktreeTemplate>,
     cfg: &superzej_core::config::Config,
     create_gen: &mut u64,
     create_tx: &tokio_mpsc::UnboundedSender<wizard::CreateEvent>,
@@ -2351,7 +2357,12 @@ fn begin_worktree_wizard(
     // speculatively creates the worktree under the candidate name while the
     // user reads the form.
     *create_gen += 1;
-    let w = wizard::NewWorktreeWizard::new(root.clone(), cfg);
+    let mut w = wizard::NewWorktreeWizard::new(root.clone(), cfg);
+    // A template (item 54) seeds the prefix + sandbox/agent selection; its base
+    // branch flows through `base_override` below.
+    if let Some(tmpl) = template {
+        w.apply_template(tmpl);
+    }
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
     let ctx = wizard::WorkerCtx {
         cfg: cfg.clone(),
@@ -5091,6 +5102,9 @@ async fn event_loop<T: Terminal>(
     let mut wizard_ui: Option<wizard::NewWorktreeWizard> = None;
     let mut wizard_cmd_tx: Option<std::sync::mpsc::Sender<wizard::WizardCmd>> = None;
     let mut creating: Option<wizard::CreationProgress> = None;
+    // When a worktree is created from a template (item 54), the template is held
+    // here until the worktree-ready event applies its layout + starts its pins.
+    let mut pending_template: Option<superzej_core::config::WorktreeTemplate> = None;
     let mut create_gen: u64 = 0;
     // Top-level app tabs (comms/chat/agent) hosted as tiles above the worktree
     // IDE. A tile's ChangeHook posts its slot index here and pulses the waker,
@@ -6838,6 +6852,63 @@ async fn event_loop<T: Terminal>(
                         cp.stop_ticker();
                     }
                     wizard_cmd_tx = None;
+                    // Worktree template (item 54): apply the initial layout
+                    // (named snapshot, else `commands` even-split) and start the
+                    // template's pins. The layout replaces the default agent pane;
+                    // pins are orthogonal strip/float daemons.
+                    if let Some(tmpl) = pending_template.take() {
+                        if let Some(gi) =
+                            session.worktrees.iter().position(|g| g.name == payload.tab)
+                        {
+                            session.switch_to(gi);
+                        }
+                        let spec = tmpl
+                            .layout
+                            .as_ref()
+                            .filter(|n| !n.is_empty())
+                            .and_then(|n| {
+                                superzej_core::db::Db::open()
+                                    .ok()
+                                    .and_then(|db| db.get_layout(n).ok().flatten())
+                            })
+                            .and_then(|json| crate::layout_spec::LayoutSpec::from_json(&json).ok())
+                            .or_else(|| {
+                                (!tmpl.commands.is_empty()).then(|| {
+                                    crate::layout_spec::LayoutSpec::even_split(&tmpl.commands)
+                                })
+                            });
+                        if let Some(spec) = spec {
+                            apply_layout_to_active_tab(
+                                &spec,
+                                &mut session,
+                                &mut panes,
+                                keymap.config(),
+                                chrome.center,
+                            );
+                            need_relayout = true;
+                        }
+                        // Start the template's pins by name.
+                        let ws = (!session.id.is_empty()).then_some(session.id.as_str());
+                        let resolved = crate::pins::PinSupervisor::resolve(keymap.config(), ws);
+                        let active_dir = active_cwd(&session);
+                        for pin_name in &tmpl.pins {
+                            if let Some(pin) = resolved.iter().find(|p| &p.name == pin_name) {
+                                if pin.singleton && supervisor.live_instance(&pin.name).is_some() {
+                                    continue;
+                                }
+                                let pin = (*pin).clone();
+                                spawn_pin(
+                                    &pin,
+                                    &mut panes,
+                                    &mut supervisor,
+                                    active_dir.clone(),
+                                    chrome.center,
+                                );
+                            }
+                        }
+                        refresh_tab_model(&mut model, &session, &mut sb);
+                        persist_session_layout(&session);
+                    }
                     // Fresh worktree + agent pane: re-hydrate so the sidebar
                     // and panel reflect it immediately.
                     hydration_gen = hydration_gen.wrapping_add(1);
@@ -8126,6 +8197,39 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                     }
+                                    HostInputKind::NewWorktreeFromTemplate { repo_root } => {
+                                        let name = text.trim();
+                                        match current_config
+                                            .worktree_templates
+                                            .iter()
+                                            .find(|t| t.name == name)
+                                            .cloned()
+                                        {
+                                            Some(tmpl) => {
+                                                let base =
+                                                    tmpl.base.clone().filter(|b| !b.is_empty());
+                                                // Held for the post-create layout + pins apply.
+                                                pending_template = Some(tmpl.clone());
+                                                begin_worktree_wizard(
+                                                    std::path::PathBuf::from(&repo_root),
+                                                    base,
+                                                    Some(&tmpl),
+                                                    keymap.config(),
+                                                    &mut create_gen,
+                                                    &create_tx,
+                                                    &waker,
+                                                    &mut creating,
+                                                    &mut wizard_cmd_tx,
+                                                    &mut wizard_ui,
+                                                    &mut model,
+                                                );
+                                            }
+                                            None => {
+                                                model.status =
+                                                    format!("No template named \"{name}\"");
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -9008,6 +9112,7 @@ async fn event_loop<T: Terminal>(
                             begin_worktree_wizard(
                                 std::path::PathBuf::from(repo_root),
                                 Some(base_branch),
+                                None,
                                 keymap.config(),
                                 &mut create_gen,
                                 &create_tx,
@@ -11135,6 +11240,61 @@ async fn event_loop<T: Terminal>(
                                 model.status =
                                     "Import layout: enter a file path (Esc cancels)".into();
                             }
+                            Action::NewWorktreeFromTemplate => {
+                                let names: Vec<String> = current_config
+                                    .worktree_templates
+                                    .iter()
+                                    .map(|t| t.name.clone())
+                                    .filter(|n| !n.is_empty())
+                                    .collect();
+                                // Resolve the repo root the same way NewWorktree does:
+                                // the sidebar-selected workspace, else the active group.
+                                let src_wt = focus
+                                    .sidebar()
+                                    .then(|| sb.selected_row(&model))
+                                    .flatten()
+                                    .map(|r| r.workspace_slug.clone())
+                                    .and_then(|slug| {
+                                        model
+                                            .sidebar_workspaces
+                                            .iter()
+                                            .find(|(s, _, _, _)| *s == slug)
+                                            .map(|(_, _, _, p)| p.clone())
+                                    })
+                                    .filter(|p| !p.is_empty())
+                                    .unwrap_or_else(|| {
+                                        session
+                                            .active_group()
+                                            .map(|g| g.path.clone())
+                                            .unwrap_or_default()
+                                    });
+                                let repo_root = (!src_wt.is_empty())
+                                    .then(|| superzej_core::repo::main_worktree(Path::new(&src_wt)))
+                                    .flatten()
+                                    .map(|p| p.to_string_lossy().into_owned());
+                                match (names.is_empty(), repo_root) {
+                                    (true, _) => {
+                                        model.status =
+                                            "No [[worktree_templates]] configured".into();
+                                    }
+                                    (false, None) => {
+                                        model.status =
+                                            "New worktree: not inside a git repository".into();
+                                    }
+                                    (false, Some(root)) => {
+                                        host_input = Some((
+                                            menu::InputOverlay::new("worktree template (name)", ""),
+                                            HostInputKind::NewWorktreeFromTemplate {
+                                                repo_root: root,
+                                            },
+                                        ));
+                                        model.status = format!(
+                                            "New worktree from template — {}",
+                                            names.join(", ")
+                                        );
+                                    }
+                                }
+                            }
                             Action::SplitDown | Action::SplitRight => {
                                 const MAX_PANES: usize = 16;
                                 if session
@@ -11382,6 +11542,7 @@ async fn event_loop<T: Terminal>(
                                 if let Some(root) = repo_root {
                                     begin_worktree_wizard(
                                         root,
+                                        None,
                                         None,
                                         keymap.config(),
                                         &mut create_gen,

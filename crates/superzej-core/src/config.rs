@@ -331,6 +331,32 @@ pub struct Task {
     pub scope: Option<String>,
 }
 
+/// A `[[worktree_templates]]` entry — a reusable preset applied when creating a
+/// worktree (item 54): base branch + branch prefix + sandbox/agent defaults,
+/// plus an optional initial pane layout and pins to start.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema, Default)]
+#[serde(default)]
+pub struct WorktreeTemplate {
+    /// Template name (shown in the new-worktree wizard's template picker).
+    pub name: String,
+    /// Base-branch override (empty = the configured/auto-resolved base).
+    pub base: Option<String>,
+    /// Branch-prefix override for worktrees created from this template.
+    pub branch_prefix: Option<String>,
+    /// Sandbox backend to pre-select (`podman`/`docker`/`bwrap`/`none`).
+    pub sandbox: Option<String>,
+    /// Agent to pre-select (e.g. `claude`, or `shell` for none).
+    pub agent: Option<String>,
+    /// Pin names (from `[[pins]]`) to start in the new worktree.
+    pub pins: Vec<String>,
+    /// A saved named layout (item 115) to apply as the initial pane layout.
+    /// Takes precedence over `commands`.
+    pub layout: Option<String>,
+    /// Shorthand initial layout: an even split running each command (a `None`
+    /// command — empty string — is a plain shell). Ignored when `layout` is set.
+    pub commands: Vec<String>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1602,6 +1628,7 @@ pub struct Config {
     pub tools: Vec<NamedCommand>,
     pub pins: Vec<Pin>,
     pub tasks: Vec<Task>,
+    pub worktree_templates: Vec<WorktreeTemplate>,
     pub actions: Vec<CustomAction>,
     pub git_commands: Vec<GitCommand>,
     pub plugins: Vec<crate::plugin_api::PluginManifest>,
@@ -1671,6 +1698,7 @@ impl Default for Config {
             tools: Vec::new(),
             pins: Vec::new(),
             tasks: Vec::new(),
+            worktree_templates: Vec::new(),
             git_commands: Vec::new(),
             plugins: Vec::new(),
             git: GitConfig::default(),
@@ -2615,6 +2643,42 @@ surface = "todoist.status"
             cfg.plugins[0].contributions[0].extension_point,
             crate::plugin_api::ExtensionPoint::StatusBarSegment
         );
+    }
+
+    #[test]
+    fn worktree_templates_parse_with_defaults() {
+        let cfg: Config = toml::from_str(
+            r#"
+[[worktree_templates]]
+name = "rust-feature"
+base = "main"
+branch_prefix = "feat/"
+sandbox = "podman"
+agent = "claude"
+pins = ["logs", "test-watch"]
+commands = ["nvim", "", "cargo watch -x test"]
+
+[[worktree_templates]]
+name = "minimal"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.worktree_templates.len(), 2);
+        let t = &cfg.worktree_templates[0];
+        assert_eq!(t.name, "rust-feature");
+        assert_eq!(t.base.as_deref(), Some("main"));
+        assert_eq!(t.branch_prefix.as_deref(), Some("feat/"));
+        assert_eq!(t.sandbox.as_deref(), Some("podman"));
+        assert_eq!(t.agent.as_deref(), Some("claude"));
+        assert_eq!(t.pins, vec!["logs", "test-watch"]);
+        assert_eq!(t.commands.len(), 3);
+        // A bare template defaults every optional field.
+        let m = &cfg.worktree_templates[1];
+        assert_eq!(m.name, "minimal");
+        assert!(m.base.is_none() && m.agent.is_none() && m.layout.is_none());
+        assert!(m.pins.is_empty() && m.commands.is_empty());
+        // Default config has no templates.
+        assert!(Config::default().worktree_templates.is_empty());
     }
 
     #[test]

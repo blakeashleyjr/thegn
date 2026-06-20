@@ -129,6 +129,26 @@ impl NewWorktreeWizard {
         format!("{}{}", self.prefix, self.tail)
     }
 
+    /// Seed the wizard from a worktree template (item 54): override the branch
+    /// prefix and pre-select the template's sandbox backend + agent so the
+    /// common path is "accept and go". Unknown sandbox/agent values leave the
+    /// default selection.
+    pub fn apply_template(&mut self, tmpl: &superzej_core::config::WorktreeTemplate) {
+        if let Some(prefix) = tmpl.branch_prefix.as_ref().filter(|p| !p.is_empty()) {
+            self.prefix = prefix.clone();
+        }
+        if let Some(sb) = tmpl.sandbox.as_deref()
+            && let Some(i) = self.sandbox_rows.iter().position(|(k, _)| k == sb)
+        {
+            self.sandbox_sel = i;
+        }
+        if let Some(agent) = tmpl.agent.as_deref()
+            && let Some(i) = self.agent_rows.iter().position(|(k, _)| k == agent)
+        {
+            self.agent_sel = i;
+        }
+    }
+
     /// Adopt the worker's collision-free suggestion — only while the field is
     /// pristine (a typed name is never clobbered).
     pub fn apply_name_suggestion(&mut self, suggested: &str) {
