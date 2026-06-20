@@ -168,6 +168,89 @@ impl Chord {
         Ok(Chord(out))
     }
 
+    /// Parse a chord that may be a **multi-key sequence** (e.g. `"Space w"`,
+    /// `"Ctrl x Ctrl c"`). Each key-group (optional modifiers + one key) is
+    /// canonicalized via [`Chord::parse`] and the groups are space-joined. A
+    /// single-group value is identical to [`Chord::parse`]. Used by `[keybinds]`
+    /// / `[[actions]]` so user-defined leader sequences are first-class in the
+    /// cheatsheet (the native host routes them via its own sequence matcher).
+    pub fn parse_loose(s: &str) -> Result<Chord, String> {
+        const MODS: &[&str] = &[
+            "ctrl", "control", "alt", "opt", "option", "super", "cmd", "mod", "win", "shift",
+        ];
+        // A token that legitimately ends a key-group: a single character, the
+        // leader/space alias, or a recognized named key. Anything else (e.g. a
+        // typo'd modifier like "Wat") is NOT a group boundary, so the value
+        // falls back to strict single-chord parsing, which reports the error.
+        fn is_key_token(tok: &str) -> bool {
+            if tok.chars().count() == 1 {
+                return true;
+            }
+            matches!(
+                tok.to_ascii_lowercase().as_str(),
+                "space"
+                    | "leader"
+                    | "enter"
+                    | "return"
+                    | "escape"
+                    | "esc"
+                    | "backspace"
+                    | "bs"
+                    | "tab"
+                    | "left"
+                    | "leftarrow"
+                    | "right"
+                    | "rightarrow"
+                    | "up"
+                    | "uparrow"
+                    | "down"
+                    | "downarrow"
+                    | "delete"
+                    | "del"
+                    | "pageup"
+                    | "pgup"
+                    | "pagedown"
+                    | "pgdn"
+                    | "home"
+                    | "end"
+            )
+        }
+        let toks: Vec<&str> = s.split_whitespace().collect();
+        if toks.is_empty() {
+            return Err("empty key chord".into());
+        }
+        // Split into key-groups, closing each on a recognized key token. An
+        // unclassifiable token bails to strict parsing (preserving typo errors).
+        let mut groups: Vec<String> = Vec::new();
+        let mut cur: Vec<&str> = Vec::new();
+        for tok in &toks {
+            let lower = tok.to_ascii_lowercase();
+            if MODS.contains(&lower.as_str()) {
+                cur.push(tok);
+            } else if is_key_token(tok) {
+                cur.push(tok);
+                groups.push(cur.join(" "));
+                cur.clear();
+            } else {
+                // Not a modifier and not a recognizable key → let the strict
+                // single-chord parser classify (and reject) the whole value.
+                return Chord::parse(s);
+            }
+        }
+        if !cur.is_empty() {
+            return Err(format!("dangling modifier(s) in {s:?}"));
+        }
+        if groups.len() == 1 {
+            return Chord::parse(&groups[0]);
+        }
+        // Multi-key sequence: canonicalize each group and space-join.
+        let canon: Result<Vec<String>, String> = groups
+            .iter()
+            .map(|g| Chord::parse(g).map(|c| c.0))
+            .collect();
+        Ok(Chord(canon?.join(" ")))
+    }
+
     /// The canonical zellij chord string (for KDL + `keys get`).
     pub fn to_kdl(&self) -> &str {
         &self.0
@@ -652,7 +735,7 @@ pub fn effective(cfg: &Config) -> Vec<Resolved> {
     // [keybinds] — rebind a builtin by id (whole chord set replaced).
     for (id, chord) in &cfg.keybinds {
         match out.iter_mut().find(|r| &r.id == id) {
-            Some(r) => match Chord::parse(chord) {
+            Some(r) => match Chord::parse_loose(chord) {
                 Ok(c) => r.chords = vec![c],
                 Err(e) => crate::msg::warn(&format!("[keybinds] {id}: {e}; keeping default")),
             },
@@ -662,7 +745,7 @@ pub fn effective(cfg: &Config) -> Vec<Resolved> {
 
     // [[actions]] — user-defined shell actions (rendered as `Run sh -c`).
     for a in &cfg.actions {
-        let chords = match Chord::parse(&a.key) {
+        let chords = match Chord::parse_loose(&a.key) {
             Ok(c) => vec![c],
             Err(e) => {
                 crate::msg::warn(&format!("[[actions]] {}: {e}; skipped", a.name));
@@ -948,6 +1031,38 @@ mod tests {
         assert_eq!(Chord::parse("Alt w").unwrap().to_hint(), "Alt-w");
         assert!(Chord::parse("Bogus w").is_err());
         assert!(Chord::parse("").is_err());
+    }
+
+    #[test]
+    fn parse_loose_accepts_single_chords_and_sequences() {
+        // A single chord behaves exactly like Chord::parse (and canonicalizes).
+        assert_eq!(Chord::parse_loose("alt w").unwrap().to_kdl(), "Alt w");
+        assert_eq!(Chord::parse_loose("shift alt x").unwrap().to_kdl(), "Alt X");
+
+        // Multi-key leader sequences split into canonical key-groups.
+        assert_eq!(Chord::parse_loose("Space w").unwrap().to_kdl(), "Space w");
+        assert_eq!(
+            Chord::parse_loose("ctrl x ctrl c").unwrap().to_kdl(),
+            "Ctrl x Ctrl c"
+        );
+        // The hint dashes the whole sequence.
+        assert_eq!(Chord::parse_loose("Space w").unwrap().to_hint(), "Space-w");
+
+        // A dangling trailing modifier is rejected; an unknown key too.
+        assert!(Chord::parse_loose("Space ctrl").is_err());
+        assert!(Chord::parse_loose("Space boguskey").is_err());
+        assert!(Chord::parse_loose("").is_err());
+    }
+
+    #[test]
+    fn effective_accepts_a_sequence_rebind_without_warning() {
+        let mut cfg = Config::default();
+        cfg.keybinds.insert("new-worktree".into(), "Space w".into());
+        let resolved = effective(&cfg);
+        let nw = resolved.iter().find(|r| r.id == "new-worktree").unwrap();
+        // The rebind replaced the default chord with the canonical sequence.
+        assert_eq!(nw.chords.len(), 1);
+        assert_eq!(nw.chords[0].to_kdl(), "Space w");
     }
 
     #[test]

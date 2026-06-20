@@ -244,6 +244,13 @@ format = "text"           # text | json
 # new-worktree = "Ctrl w"
 # toggle-sidebar = "Alt s"
 # switch-font = "Alt f"  # opens the realtime font picker (alacritty profile)
+# Multi-key sequences (a leader chord) are supported: bind a space-separated
+# sequence and a which-key popup lists the next keys after you press the prefix.
+# Use "Space"/"leader" for the space key. Sequences are safest in the modal
+# vim/emacs modes (in the default mode a bare-key prefix would be intercepted
+# before reaching the focused pane), e.g.:
+# [keybinds.vim_normal]
+# new-worktree = "Space g w"   # press Space, then g, then w
 # Alt ↑/↓ navigate worktrees; Shift+Alt ↑/↓ *move* the active worktree within
 # its repo. Worktrees default to creation order ("manual" sort) and keep the
 # order you set; cycle sort modes with `s` while the sidebar is focused.
