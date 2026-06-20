@@ -20,6 +20,7 @@ mod keys;
 mod logs;
 mod misc;
 mod notifications;
+mod problems;
 mod stash;
 mod tasks;
 mod telemetry;
@@ -440,6 +441,35 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
                 vec![seg(g(), format!("{n} lines"))]
             }
         }
+        Section::Problems => {
+            let n = model.panel.diagnostics.len();
+            let errors = model
+                .panel
+                .diagnostics
+                .iter()
+                .filter(|d| d.severity == super::Severity::Error)
+                .count();
+            let warnings = model
+                .panel
+                .diagnostics
+                .iter()
+                .filter(|d| d.severity == super::Severity::Warning)
+                .count();
+            if n == 0 {
+                vec![seg(g2(), "clean")]
+            } else if errors > 0 {
+                vec![
+                    seg(hue(Hue::Red), format!("✗ {errors}")),
+                    if warnings > 0 {
+                        seg(g(), format!("  ⚠ {warnings}"))
+                    } else {
+                        seg(g(), String::new())
+                    },
+                ]
+            } else {
+                vec![seg(hue(Hue::Amber), format!("⚠ {warnings}"))]
+            }
+        }
     }
 }
 
@@ -484,6 +514,7 @@ pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
         Section::Stash => stash::content(ctx),
         Section::Pr => git::content(ctx),
         Section::Files => misc::files(ctx),
+        Section::Problems => problems::content(ctx),
         Section::Jobs => tasks::content(ctx),
         Section::Tests => misc::tests(ctx),
         Section::Debug => misc::debug(),

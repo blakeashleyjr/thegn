@@ -60,11 +60,16 @@ pub fn order_by_frecency(
     idx.into_iter().map(|i| items[i].clone()).collect()
 }
 
+/// Maximum visible rows in the palette list at one time.
+const MAX_ITEMS: usize = 10;
+
 pub struct Palette {
     items: Vec<PaletteItem>,
     matcher: Matcher,
     query: String,
     selected: usize,
+    /// Scroll offset: index of the first visible match row.
+    scroll_offset: usize,
     /// Indices into `items`, best match first (or original order when empty).
     matches: Vec<usize>,
 }
@@ -76,6 +81,7 @@ impl Palette {
             matcher: Matcher::new(Config::DEFAULT),
             query: String::new(),
             selected: 0,
+            scroll_offset: 0,
             matches: Vec::new(),
         };
         p.recompute();
@@ -102,32 +108,58 @@ impl Palette {
             .and_then(|&i| self.items.get(i))
     }
 
+    /// The raw selected index (used to sync `PaletteSession.selected`).
+    pub fn selected_idx(&self) -> usize {
+        self.selected
+    }
+
+    /// The current scroll offset (used by `PaletteSession::render`).
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll_offset
+    }
+
     pub fn set_query(&mut self, q: impl Into<String>) {
         self.query = q.into();
         self.selected = 0;
+        self.scroll_offset = 0;
         self.recompute();
     }
 
     pub fn push_char(&mut self, c: char) {
         self.query.push(c);
         self.selected = 0;
+        self.scroll_offset = 0;
         self.recompute();
     }
 
     pub fn backspace(&mut self) {
         self.query.pop();
         self.selected = 0;
+        self.scroll_offset = 0;
         self.recompute();
     }
 
     pub fn move_down(&mut self) {
         if !self.matches.is_empty() {
             self.selected = (self.selected + 1).min(self.matches.len() - 1);
+            // Keep the cursor visible: scroll down when it passes the bottom.
+            self.clamp_scroll(MAX_ITEMS);
         }
     }
 
     pub fn move_up(&mut self) {
         self.selected = self.selected.saturating_sub(1);
+        // Keep the cursor visible: scroll up when it passes the top.
+        self.clamp_scroll(MAX_ITEMS);
+    }
+
+    /// Adjust scroll_offset so `selected` stays within [offset, offset+visible).
+    fn clamp_scroll(&mut self, visible: usize) {
+        if self.selected < self.scroll_offset {
+            self.scroll_offset = self.selected;
+        } else if self.selected >= self.scroll_offset + visible {
+            self.scroll_offset = self.selected + 1 - visible;
+        }
     }
 
     fn recompute(&mut self) {
@@ -159,7 +191,6 @@ impl Palette {
     /// the Ctrl+Space binding (the mockup's ⌘K chip).
     pub fn render(&self, surface: &mut Surface, screen: Rect) {
         const COLS: usize = 66;
-        const MAX_ITEMS: usize = 10;
         let shown = self.matches.len().min(MAX_ITEMS);
         let spec = LayerSpec {
             title: "jump".into(),
@@ -198,13 +229,19 @@ impl Palette {
         }
         seg::draw_line(surface, inner.x, inner.y + 1, inner.cols, &rule, panel);
 
-        // Item rows; the selected row carries the accent selection tint.
+        // Item rows: render the window [scroll_offset, scroll_offset+rows_avail).
+        // The selected row carries the accent selection tint.
         let rows_avail = inner.rows.saturating_sub(4);
-        for (row, &item_idx) in self.matches.iter().take(rows_avail).enumerate() {
+        let offset = self.scroll_offset;
+        for row in 0..rows_avail {
+            let match_idx = offset + row;
+            let Some(&item_idx) = self.matches.get(match_idx) else {
+                break;
+            };
             let Some(item) = self.items.get(item_idx) else {
                 continue;
             };
-            let selected = row == self.selected;
+            let selected = match_idx == self.selected;
             let pad = if selected { Tok::SelAccent } else { panel };
             let name = if selected {
                 seg(Tok::Slot(S::Text), item.label.clone()).bold()
@@ -221,10 +258,17 @@ impl Palette {
             );
         }
 
-        // Footer: navigation hints + the live match count.
+        // Footer: navigation hints + the live match count + scroll indicator.
         if inner.rows >= 4 {
             let fy = inner.y + inner.rows - 2;
             seg::draw_line(surface, inner.x, fy, inner.cols, &rule, panel);
+            let total = self.matches.len();
+            let count_str = if total > MAX_ITEMS {
+                let end = (self.scroll_offset + MAX_ITEMS).min(total);
+                format!("{}-{}/{}", self.scroll_offset + 1, end, total)
+            } else {
+                format!("{total} matches")
+            };
             let footer = Line::split(
                 vec![
                     seg(Tok::Slot(S::Ghost2), "↑↓"),
@@ -234,10 +278,7 @@ impl Palette {
                     seg(Tok::Slot(S::Ghost2), "esc"),
                     seg(Tok::Slot(S::Ghost), " dismiss"),
                 ],
-                vec![seg(
-                    Tok::Slot(S::Ghost3),
-                    format!("{} matches", self.matches.len()),
-                )],
+                vec![seg(Tok::Slot(S::Ghost3), count_str)],
             );
             seg::draw_line(surface, inner.x, fy + 1, inner.cols, &footer, panel);
         }

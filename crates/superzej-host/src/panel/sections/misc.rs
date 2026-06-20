@@ -126,6 +126,12 @@ pub(super) fn files(ctx: &SectionCtx) -> Vec<PanelRow> {
 pub(super) fn tests(ctx: &SectionCtx) -> Vec<PanelRow> {
     let (data, deep, full) = (&ctx.model.panel, ctx.deep(), ctx.full());
     let mut rows: Vec<PanelRow> = Vec::new();
+
+    // Full-width mode: render the live per-test node tree from TestPanelState.
+    if full {
+        return tests_full_tree(ctx);
+    }
+
     match &data.tests {
         Some(t) if t.passed + t.failed + t.skipped > 0 => {
             let dur = t
@@ -219,6 +225,181 @@ pub(super) fn tests(ctx: &SectionCtx) -> Vec<PanelRow> {
         ("r", "run"),
         ("R", "all"),
         ("f", "failed only"),
+    ]));
+    rows
+}
+
+// ---- tests full tree ---------------------------------------------------------
+
+fn tests_full_tree(ctx: &SectionCtx) -> Vec<PanelRow> {
+    use crate::seg::Tok;
+    use crate::testkit::model::{TestNodeKind, TestState};
+
+    let ts = &ctx.ui.tests;
+    let mut rows: Vec<PanelRow> = Vec::new();
+
+    // Header: summary counts + running indicator.
+    let s = &ts.summary;
+    let mut header: Vec<crate::seg::Seg> = Vec::new();
+    if s.running {
+        header.push(seg(hue(Hue::Amber), "… running  "));
+    }
+    if s.passed > 0 {
+        header.push(seg(hue(Hue::Green), format!("✓ {}  ", s.passed)));
+    }
+    if s.failed > 0 {
+        header.push(seg(hue(Hue::Red), format!("✗ {}  ", s.failed)));
+    }
+    if s.skipped > 0 {
+        header.push(seg(g2(), format!("○ {} skip", s.skipped)));
+    }
+    if header.is_empty() {
+        header.push(seg(g2(), "no tests discovered"));
+    }
+    if s.stale {
+        header.push(seg(hue(Hue::Amber), "  stale"));
+    }
+    rows.push(PanelRow::plain(Line::segs(header)));
+
+    if ts.nodes.is_empty() {
+        rows.push(PanelRow::plain(Line::segs(vec![seg(
+            g2(),
+            "run tests to populate the tree",
+        )])));
+        rows.push(super::hint_row(&[
+            ("r", "run"),
+            ("R", "all"),
+            ("f", "failed only"),
+        ]));
+        return rows;
+    }
+
+    let visible = ts.visible_indices();
+
+    // Two-column layout: left=tree list, right=detail for selected node.
+    let list_w = (ctx.cols / 2).max(24).min(50);
+    let detail_w = ctx.cols.saturating_sub(list_w + 2);
+    let cursor_visible_pos = visible.iter().position(|&i| i == ts.cursor);
+
+    // Build left column rows.
+    let list_rows: Vec<Vec<crate::seg::Seg>> = visible
+        .iter()
+        .map(|&node_idx| {
+            let node = &ts.nodes[node_idx];
+            let selected = node_idx == ts.cursor;
+            match node.kind {
+                TestNodeKind::Group => {
+                    let arrow = if selected { "▶ " } else { "  " };
+                    vec![
+                        seg(if selected { super::t() } else { g2() }, arrow),
+                        seg(
+                            if selected { super::t() } else { super::d() },
+                            node.label.clone(),
+                        )
+                        .bold(),
+                    ]
+                }
+                TestNodeKind::Test | TestNodeKind::Failure => {
+                    let (glyph, glyph_col) = match node.state {
+                        TestState::Pass => ("✓", hue(Hue::Green)),
+                        TestState::Fail => ("✗", hue(Hue::Red)),
+                        TestState::Running => ("…", hue(Hue::Amber)),
+                        TestState::Skip => ("○", g2()),
+                        TestState::Unknown => ("·", g2()),
+                    };
+                    let indent = if node.depth > 0 { 2 } else { 0 };
+                    let name_w = list_w.saturating_sub(indent + glyph.len() + 1);
+                    let label: String = node.label.chars().take(name_w).collect();
+                    let mut segs = Vec::new();
+                    if indent > 0 {
+                        segs.push(sp(indent));
+                    }
+                    segs.push(seg(glyph_col, glyph));
+                    segs.push(seg(g2(), " "));
+                    segs.push(seg(if selected { super::t() } else { super::d() }, label));
+                    segs
+                }
+            }
+        })
+        .collect();
+
+    // Build right column: detail for the cursor's node.
+    let detail_rows: Vec<Vec<crate::seg::Seg>> = if let Some(node) = ts.selected_node() {
+        let mut d_rows: Vec<Vec<crate::seg::Seg>> = Vec::new();
+        match node.kind {
+            TestNodeKind::Group => {
+                let group_tests: Vec<&crate::testkit::model::TestNode> = ts
+                    .nodes
+                    .iter()
+                    .filter(|n| {
+                        n.kind == TestNodeKind::Test
+                            && crate::testkit::model::test_name_of(&n.id) != &n.label
+                            || {
+                                // simple: check group prefix
+                                n.kind != TestNodeKind::Group && n.id.starts_with(&node.label)
+                            }
+                    })
+                    .collect();
+                let p = group_tests
+                    .iter()
+                    .filter(|n| n.state == TestState::Pass)
+                    .count();
+                let f = group_tests
+                    .iter()
+                    .filter(|n| n.state == TestState::Fail)
+                    .count();
+                d_rows.push(vec![
+                    seg(hue(Hue::Green), format!("✓ {p}  ")),
+                    seg(hue(Hue::Red), format!("✗ {f}")),
+                ]);
+            }
+            TestNodeKind::Test | TestNodeKind::Failure => {
+                let (glyph, glyph_col) = match node.state {
+                    TestState::Pass => ("✓ PASS", hue(Hue::Green)),
+                    TestState::Fail => ("✗ FAIL", hue(Hue::Red)),
+                    TestState::Running => ("… running", hue(Hue::Amber)),
+                    TestState::Skip => ("○ skip", g2()),
+                    TestState::Unknown => ("· unknown", g2()),
+                };
+                d_rows.push(vec![seg(glyph_col, glyph)]);
+                d_rows.push(vec![seg(super::t(), node.id.clone())]);
+                if let Some(loc) = &node.location {
+                    let loc_str = format!("{}:{}", loc.path, loc.line);
+                    let loc_str: String = loc_str.chars().take(detail_w).collect();
+                    d_rows.push(vec![seg(g2(), "at  "), seg(super::d(), loc_str)]);
+                }
+                if let Some(msg) = &node.message {
+                    d_rows.push(vec![]);
+                    for chunk in msg.chars().collect::<Vec<_>>().chunks(detail_w.max(1)) {
+                        let s: String = chunk.iter().collect();
+                        d_rows.push(vec![seg(hue(Hue::Red), s)]);
+                    }
+                }
+            }
+        }
+        d_rows
+    } else {
+        vec![vec![seg(g2(), "select a test")]]
+    };
+
+    // Merge list + detail into two-column rows.
+    let combined = super::two_col(&list_rows, &detail_rows, list_w, 2);
+    rows.extend(combined.into_iter().enumerate().map(|(i, l)| {
+        let node_idx = visible.get(i).copied().unwrap_or(usize::MAX);
+        let selected = node_idx == ts.cursor;
+        let row = PanelRow::plain(l).with_hit(PanelHit::Row(Section::Tests, node_idx));
+        if selected {
+            row.with_bg(Tok::SelAccent)
+        } else {
+            row
+        }
+    }));
+
+    let _ = cursor_visible_pos; // used for scroll tracking in future
+    rows.push(super::hint_row(&[
+        ("r", "run"),
+        ("↵", "open"),
+        ("j/k", "select"),
     ]));
     rows
 }

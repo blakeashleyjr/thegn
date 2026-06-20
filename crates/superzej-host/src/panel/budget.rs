@@ -146,11 +146,11 @@ mod tests {
 
     #[test]
     fn overflow_reserves_the_more_row() {
-        // fixed = 4 + 14 + 2 = 20; rows 24 → budget 4; content 20 → 4 rows
-        // granted (3 real + the "+N more" row), hidden = 20 - 3 = 17.
+        // fixed = 4 + 15 + 2 = 21; rows 24 → budget 3; content 20 → 3 rows
+        // granted (2 real + the "+N more" row), hidden = 20 - 2 = 18.
         let p = allocate(24, 4, 20, SECTIONS);
-        assert_eq!(p.content_rows, 4);
-        assert_eq!(p.overflow, Some(17));
+        assert_eq!(p.content_rows, 3);
+        assert_eq!(p.overflow, Some(18));
         assert!(!p.airy);
     }
 

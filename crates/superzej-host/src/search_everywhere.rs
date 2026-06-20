@@ -18,6 +18,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Maximum visible rows for async-mode result lists (Files/Content/Git/Symbols).
+const MAX_ASYNC_ITEMS: usize = 8;
+
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as NucleoConfig, Matcher, Utf32Str};
 use termwiz::surface::Surface;
@@ -217,6 +220,9 @@ pub struct PaletteSession {
     pub palette: crate::palette::Palette,
     pub async_results: AsyncResults,
     pub selected: usize,
+    /// Scroll offset for async-mode result lists (All-mode uses the inner
+    /// Palette's own scroll_offset).
+    pub scroll_offset: usize,
     pub result_rx: UnboundedReceiver<AsyncSearchResult>,
     pub result_tx: UnboundedSender<AsyncSearchResult>,
     pub search_gen: u64,
@@ -232,6 +238,7 @@ impl PaletteSession {
             palette: crate::palette::Palette::new(items),
             async_results: AsyncResults::default(),
             selected: 0,
+            scroll_offset: 0,
             result_rx: rx,
             result_tx: tx,
             search_gen: 0,
@@ -268,6 +275,7 @@ impl PaletteSession {
             self.async_results.clear();
         }
         self.selected = 0;
+        self.scroll_offset = 0;
         self.search_gen += 1;
         self.searching = true;
         if mode == PaletteMode::All {
@@ -278,13 +286,35 @@ impl PaletteSession {
     }
 
     pub fn move_up(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
+        if self.mode == PaletteMode::All {
+            // Delegate to inner palette so selected_item() stays in sync.
+            self.palette.move_up();
+            self.selected = self.palette.selected_idx();
+        } else {
+            self.selected = self.selected.saturating_sub(1);
+            self.clamp_scroll(MAX_ASYNC_ITEMS);
+        }
     }
 
     pub fn move_down(&mut self) {
-        let total = self.visible_count();
-        if total > 0 {
-            self.selected = (self.selected + 1).min(total - 1);
+        if self.mode == PaletteMode::All {
+            // Delegate to inner palette so selected_item() stays in sync.
+            self.palette.move_down();
+            self.selected = self.palette.selected_idx();
+        } else {
+            let total = self.visible_count();
+            if total > 0 {
+                self.selected = (self.selected + 1).min(total - 1);
+                self.clamp_scroll(MAX_ASYNC_ITEMS);
+            }
+        }
+    }
+
+    fn clamp_scroll(&mut self, visible: usize) {
+        if self.selected < self.scroll_offset {
+            self.scroll_offset = self.selected;
+        } else if self.selected >= self.scroll_offset + visible {
+            self.scroll_offset = self.selected + 1 - visible;
         }
     }
 
@@ -448,8 +478,15 @@ impl PaletteSession {
 
         match self.mode {
             PaletteMode::All => {
-                for (row, item) in self.palette.matches().iter().take(rows_avail).enumerate() {
-                    let selected = row == self.selected;
+                // All-mode: inner Palette manages its own scroll_offset and selected.
+                let offset = self.palette.scroll_offset();
+                let all_matches = self.palette.matches();
+                for row in 0..rows_avail {
+                    let match_idx = offset + row;
+                    let Some(item) = all_matches.get(match_idx) else {
+                        break;
+                    };
+                    let selected = match_idx == self.palette.selected_idx();
                     draw_single_line_item(
                         surface,
                         inner.x,
@@ -462,7 +499,15 @@ impl PaletteSession {
                 }
             }
             PaletteMode::Files => {
-                for (row, m) in self.async_results.files.iter().take(rows_avail).enumerate() {
+                let offset = self.scroll_offset;
+                for (row, m) in self
+                    .async_results
+                    .files
+                    .iter()
+                    .enumerate()
+                    .skip(offset)
+                    .take(rows_avail)
+                {
                     let selected = row == self.selected;
                     draw_single_line_item(surface, inner.x, row_y, inner.cols, &m.path, selected);
                     row_y += 1;
@@ -481,12 +526,14 @@ impl PaletteSession {
             }
             PaletteMode::Content => {
                 let items_avail = rows_avail / 2;
+                let offset = self.scroll_offset;
                 for (row, m) in self
                     .async_results
                     .content
                     .iter()
-                    .take(items_avail)
                     .enumerate()
+                    .skip(offset)
+                    .take(items_avail)
                 {
                     let selected = row == self.selected;
                     let primary = format!("{}:{}", m.path, m.line_no);
@@ -509,11 +556,18 @@ impl PaletteSession {
                 }
             }
             PaletteMode::Git => {
-                for (row, m) in self.async_results.git.iter().take(rows_avail).enumerate() {
+                let offset = self.scroll_offset;
+                for (row, m) in self
+                    .async_results
+                    .git
+                    .iter()
+                    .enumerate()
+                    .skip(offset)
+                    .take(rows_avail)
+                {
                     let selected = row == self.selected;
                     let glyph = match m.kind {
-                        GitRefKind::Branch => "⎇ ",
-                        GitRefKind::RemoteBranch => "⎇ ",
+                        GitRefKind::Branch | GitRefKind::RemoteBranch => "⎇ ",
                         GitRefKind::Tag => "⌖ ",
                         GitRefKind::Commit => "● ",
                         GitRefKind::Stash => "⟳ ",
@@ -536,12 +590,14 @@ impl PaletteSession {
             }
             PaletteMode::Symbols => {
                 let items_avail = rows_avail / 2;
+                let offset = self.scroll_offset;
                 for (row, m) in self
                     .async_results
                     .symbols
                     .iter()
-                    .take(items_avail)
                     .enumerate()
+                    .skip(offset)
+                    .take(items_avail)
                 {
                     let selected = row == self.selected;
                     let primary = format!("fn {}", m.symbol);
@@ -565,16 +621,23 @@ impl PaletteSession {
             }
         }
 
-        // Footer: navigation hints + match count.
+        // Footer: navigation hints + match count with scroll position.
         if inner.rows >= 4 {
             let fy = inner.y + inner.rows - 2;
             seg::draw_line(surface, inner.x, fy, inner.cols, &rule, panel);
-            let count = self.visible_count();
-            let count_str = if self.mode == PaletteMode::Content && !self.async_results.content_done
-            {
-                format!("{}+ matches", count)
+            let total = self.visible_count();
+            let count_str = if total > MAX_ASYNC_ITEMS {
+                let offset = if self.mode == PaletteMode::All {
+                    self.palette.scroll_offset()
+                } else {
+                    self.scroll_offset
+                };
+                let end = (offset + MAX_ASYNC_ITEMS).min(total);
+                format!("{}-{}/{}", offset + 1, end, total)
+            } else if self.mode == PaletteMode::Content && !self.async_results.content_done {
+                format!("{total}+ matches")
             } else {
-                format!("{count} matches")
+                format!("{total} matches")
             };
             let footer = Line::split(
                 vec![
