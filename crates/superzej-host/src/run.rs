@@ -425,7 +425,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
 
     // Startup orphan GC: remove any superzej containers whose worktrees no
     // longer exist in the DB. Best-effort; runs off-thread so launch is instant.
-    let (orphan_tx, mut orphan_rx) = tokio_mpsc::unbounded_channel::<Vec<String>>();
+    let (orphan_tx, orphan_rx) = tokio_mpsc::unbounded_channel::<Vec<String>>();
     {
         let gc_waker = waker.clone();
         tokio::task::spawn_blocking(move || {
@@ -524,12 +524,24 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // Podman exec/network event subscriber — writes to the container_events DB
     // table so the audit panel has live data. Silently no-ops when podman is
     // not installed.
-    let (sandbox_event_tx, mut sandbox_event_rx) =
+    let (sandbox_event_tx, sandbox_event_rx) =
         tokio_mpsc::unbounded_channel::<crate::sandbox_events::SandboxEventBatch>();
     crate::sandbox_events::spawn(cfg.sandbox.network_audit, sandbox_event_tx);
     // Drain sandbox_event_rx in the event loop below: model goes dirty so the
     // panel audit log re-renders.
     let _ = sandbox_event_rx; // placeholder until wired into event_loop
+
+    // Notification event bus (items 420/421/430): aggregates git/agent/test/log
+    // events and feeds desktop notifications + the in-app inbox + sidebar badges.
+    // The desktop dispatcher reads the bus' desktop channel on its own thread.
+    let event_bus = superzej_core::event_bus::EventBus::new();
+    crate::desktop_notify::spawn(
+        event_bus.desktop_receiver(),
+        cfg.notifications.desktop,
+        superzej_core::event_bus::NotificationUrgency::parse(
+            &cfg.notifications.desktop_min_urgency,
+        ),
+    );
 
     // Graceful shutdown on SIGTERM / SIGHUP: set a flag and pulse the waker so
     // the blocking poll_input returns and the loop exits at the top of its next
@@ -579,6 +591,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         waker,
         start,
         shutdown,
+        event_bus,
     )
     .await;
 
@@ -1404,10 +1417,10 @@ fn activate_row_target(
     // if the tab has more than one pane open.
     if let Some(tab) = session.active_tab_mut() {
         let layout = tab.center.layout(center);
-        if layout.len() > 1 {
-            if let Some((id, _)) = layout.iter().min_by_key(|(_, r)| r.x) {
-                tab.focused_pane = *id;
-            }
+        if layout.len() > 1
+            && let Some((id, _)) = layout.iter().min_by_key(|(_, r)| r.x)
+        {
+            tab.focused_pane = *id;
         }
     }
     refresh_tab_model(model, session, sb);
@@ -4805,6 +4818,7 @@ async fn event_loop<T: Terminal>(
     waker: TerminalWaker,
     start: std::time::Instant,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    event_bus: superzej_core::event_bus::EventBus,
 ) -> Result<()> {
     let mut scratch = Surface::new(cols, rows);
     // What the terminal currently shows; the render path diffs scratch
@@ -5034,7 +5048,7 @@ async fn event_loop<T: Terminal>(
     // Per-worktree file index for the `>` search mode. Invalidated by the
     // FS watcher's create/remove events.
     let mut file_index: Option<crate::search_everywhere::FileIndex> = None;
-    let mut file_index_gen: u64 = 0;
+    let _file_index_gen: u64 = 0;
     // Search overlay state: lives here so it survives across loop iterations.
     let mut search: Option<crate::search::SearchOverlay> = None;
     // Panel document payloads (git calendar/log, the selected file's diff)
@@ -5856,6 +5870,14 @@ async fn event_loop<T: Terminal>(
                 if outcome.exit_code != Some(0) {
                     let wt = outcome.worktree.clone();
                     let failed = panel_ui.tests.summary.failed;
+                    // Surface the failure on the event bus → desktop toast +
+                    // sidebar alert badge (item 28/430).
+                    event_bus.publish_with_notification(
+                        &superzej_core::event_bus::Event::TestsFailed {
+                            worktree: wt.clone(),
+                            count: failed,
+                        },
+                    );
                     tokio::task::spawn_blocking(move || {
                         let Ok(db) = superzej_core::db::Db::open() else {
                             return;
@@ -6354,7 +6376,7 @@ async fn event_loop<T: Terminal>(
                     .log_lines
                     .iter()
                     .filter(|l| {
-                        panel_ui.logs_level.map_or(true, |lvl| l.level <= lvl)
+                        panel_ui.logs_level.is_none_or(|lvl| l.level <= lvl)
                             && (filter.is_empty() || l.raw.to_lowercase().contains(&filter))
                     })
                     .count();
@@ -6553,6 +6575,13 @@ async fn event_loop<T: Terminal>(
                     {
                         let branch = payload.branch.clone();
                         let path = payload.path.clone();
+                        // Announce on the event bus (low-urgency desktop toast).
+                        event_bus.publish_with_notification(
+                            &superzej_core::event_bus::Event::WorktreeCreated {
+                                path: path.clone(),
+                                branch: branch.clone(),
+                            },
+                        );
                         tokio::task::spawn_blocking(move || {
                             let Ok(db) = superzej_core::db::Db::open() else {
                                 return;
@@ -7004,6 +7033,7 @@ async fn event_loop<T: Terminal>(
                         true
                     } else {
                         let mut found = false;
+                        #[allow(clippy::while_let_loop)]
                         loop {
                             match buf.terminal().poll_input(Some(std::time::Duration::ZERO)) {
                                 Ok(Some(ev)) => {
@@ -10117,7 +10147,7 @@ async fn event_loop<T: Terminal>(
                                 .log_lines
                                 .iter()
                                 .filter(|l| {
-                                    panel_ui.logs_level.map_or(true, |lvl| l.level <= lvl)
+                                    panel_ui.logs_level.is_none_or(|lvl| l.level <= lvl)
                                         && (filter.is_empty()
                                             || l.raw.to_lowercase().contains(&filter))
                                 })
@@ -10139,7 +10169,7 @@ async fn event_loop<T: Terminal>(
                                 .log_lines
                                 .iter()
                                 .filter(|l| {
-                                    panel_ui.logs_level.map_or(true, |lvl| l.level <= lvl)
+                                    panel_ui.logs_level.is_none_or(|lvl| l.level <= lvl)
                                         && (filter.is_empty()
                                             || l.raw.to_lowercase().contains(&filter))
                                 })
@@ -10162,7 +10192,7 @@ async fn event_loop<T: Terminal>(
                                 .log_lines
                                 .iter()
                                 .filter(|l| {
-                                    panel_ui.logs_level.map_or(true, |lvl| l.level <= lvl)
+                                    panel_ui.logs_level.is_none_or(|lvl| l.level <= lvl)
                                         && (filter.is_empty()
                                             || l.raw.to_lowercase().contains(&filter))
                                 })

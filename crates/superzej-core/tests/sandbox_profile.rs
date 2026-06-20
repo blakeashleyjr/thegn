@@ -64,20 +64,24 @@ fn h2_profile_overlay_sets_network_block() {
     use std::collections::BTreeMap;
     use superzej_core::config::{Config, ProfileConfig, SandboxOverlay};
 
-    let mut cfg = Config::default();
-    cfg.profile = "work".into();
-    let mut profiles: BTreeMap<String, ProfileConfig> = BTreeMap::new();
-    profiles.insert(
-        "work".into(),
-        ProfileConfig {
-            sandbox: SandboxOverlay {
-                network_block: Some(vec!["social.example.com".into()]),
-                ..Default::default()
-            },
-            ..Default::default()
+    let cfg = Config {
+        profile: "work".into(),
+        profiles: {
+            let mut profiles: BTreeMap<String, ProfileConfig> = BTreeMap::new();
+            profiles.insert(
+                "work".into(),
+                ProfileConfig {
+                    sandbox: SandboxOverlay {
+                        network_block: Some(vec!["social.example.com".into()]),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            profiles
         },
-    );
-    cfg.profiles = profiles;
+        ..Default::default()
+    };
 
     let sb = cfg.repo_sandbox(std::path::Path::new("/tmp/sz-h2-repo"));
     assert!(

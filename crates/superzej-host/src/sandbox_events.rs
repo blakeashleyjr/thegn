@@ -22,6 +22,7 @@ use superzej_core::sandbox::CONTAINER_PREFIX;
 
 /// Update type sent to the event loop: tells it to refresh the audit panel.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct SandboxEventBatch {
     /// Number of new events written to the DB.
     pub count: usize,
@@ -66,7 +67,7 @@ fn subscribe_exec(tx: Arc<tokio_mpsc::UnboundedSender<SandboxEventBatch>>) {
             "--format",
             "json",
             "--filter",
-            &format!("label=io.superzej=true"),
+            "label=io.superzej=true",
             "--filter",
             "event=exec",
             "--filter",
@@ -122,7 +123,7 @@ fn subscribe_network(tx: Arc<tokio_mpsc::UnboundedSender<SandboxEventBatch>>) {
             "--format",
             "json",
             "--filter",
-            &format!("label=io.superzej=true"),
+            "label=io.superzej=true",
             "--filter",
             "event=network",
         ])

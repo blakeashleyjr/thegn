@@ -14,7 +14,6 @@ use crate::panel::Severity;
 use superzej_core::theme::Hue;
 
 fn severity_glyph(s: Severity) -> (&'static str, Tok) {
-    use crate::seg::Tok;
     match s {
         Severity::Error => ("✗", hue(Hue::Red)),
         Severity::Warning => ("⚠", hue(Hue::Amber)),
@@ -283,8 +282,8 @@ use crate::seg::Tok;
 mod tests {
     use super::*;
     use crate::chrome::FrameModel;
-    use crate::layout::PanelWidth;
-    use crate::panel::{DiagnosticItem, PanelData, PanelUi, Severity};
+
+    use crate::panel::{DiagnosticItem, PanelUi, Severity};
 
     fn make_ctx<'a>(
         model: &'a FrameModel,
@@ -342,8 +341,10 @@ mod tests {
             make_diag(Severity::Error, "err", "a.rs"),
             make_diag(Severity::Warning, "warn", "b.rs"),
         ];
-        let mut ui = PanelUi::default();
-        ui.problems_cursor = 1;
+        let ui = PanelUi {
+            problems_cursor: 1,
+            ..Default::default()
+        };
         let ctx = make_ctx(&model, &ui, 40, 20);
         let rows = content(&ctx);
         // Row at index 1 (cursor=1) should have SelAccent background.

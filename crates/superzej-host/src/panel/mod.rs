@@ -38,6 +38,7 @@ pub enum PanelTab {
     /// Work-item context: PR, Issues, Jobs, Tests.
     Work,
     /// System & monitoring: Notifications, Logs, Sandbox, Telemetry, Keys.
+    #[allow(dead_code)]
     System,
 }
 
@@ -91,6 +92,7 @@ pub enum PanelHit {
     /// The i-th actionable row of a section's content.
     Row(Section, usize),
     /// A click on the tab bar: resolved by x-position via `panel_tab_hit`.
+    #[allow(dead_code)]
     Tab(PanelTab),
 }
 
@@ -949,6 +951,7 @@ pub enum PanelMsg {
     /// Space in the changes section: stage/unstage the selected file.
     StageToggle,
     /// `[`/`]` or Alt+1/2/3: switch the active top-level tab.
+    #[allow(dead_code)]
     SwitchTab(PanelTab),
 }
 

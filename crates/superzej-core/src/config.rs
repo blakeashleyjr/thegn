@@ -865,19 +865,11 @@ impl Default for LinearConfig {
 }
 
 /// `[issues.github_issues]` — GitHub Issues configuration.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema, Default)]
 #[serde(default)]
 pub struct GitHubIssuesConfig {
     /// Additional `gh issue list` flags, e.g. `--assignee @me --label bug`.
     pub extra_flags: Vec<String>,
-}
-
-impl Default for GitHubIssuesConfig {
-    fn default() -> Self {
-        GitHubIssuesConfig {
-            extra_flags: Vec::new(),
-        }
-    }
 }
 
 /// `[issues.jira]` — Jira Cloud/Server configuration.
@@ -1467,6 +1459,30 @@ impl Default for DrawerConfig {
     }
 }
 
+/// `[notifications]` — the aggregated event bus and desktop notification
+/// delivery (items 420/421/430). Events from git/agents/tests/logs are
+/// surfaced as sidebar badges and (optionally) OS desktop notifications.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct NotificationsConfig {
+    /// Whether to deliver OS desktop notifications (via `notify-send` on Linux).
+    /// When false, events still flow to the in-app inbox + sidebar badges.
+    pub desktop: bool,
+    /// Minimum urgency that triggers a desktop notification: `"low"`,
+    /// `"normal"`, or `"critical"`. Lower-urgency events are recorded in the
+    /// inbox but never pop a desktop toast.
+    pub desktop_min_urgency: String,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        NotificationsConfig {
+            desktop: true,
+            desktop_min_urgency: "normal".into(),
+        }
+    }
+}
+
 /// `[strip]` — the top pinned-program strip (a horizontal band above the center
 /// rendering live `location = "strip"` pins side by side). Hidden when empty;
 /// toggled with Ctrl+Alt+t and resized at runtime.
@@ -1599,6 +1615,7 @@ pub struct Config {
     pub sandbox: SandboxConfig,
     pub limits: LimitsConfig,
     pub drawer: DrawerConfig,
+    pub notifications: NotificationsConfig,
     pub strip: StripConfig,
     pub panel: PanelConfig,
     pub search: SearchConfig,
@@ -1665,6 +1682,7 @@ impl Default for Config {
             sandbox: SandboxConfig::default(),
             limits: LimitsConfig::default(),
             drawer: DrawerConfig::default(),
+            notifications: NotificationsConfig::default(),
             strip: StripConfig::default(),
             panel: PanelConfig::default(),
             search: SearchConfig::default(),

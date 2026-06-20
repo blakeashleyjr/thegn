@@ -401,6 +401,27 @@ impl Db {
         Ok(())
     }
 
+    /// Open PR counts grouped by branch (`head_ref`) for a repo, parsed from the
+    /// per-repo `pr_branch_cache`. Used to surface PR badges on sidebar rows
+    /// (item 28): the host maps each worktree's branch to its count. Only PRs in
+    /// the `OPEN` state are counted. Returns an empty map when the cache is
+    /// absent or unparseable.
+    pub fn get_open_pr_counts_by_branch(
+        &self,
+        repo_root: &str,
+    ) -> Result<std::collections::BTreeMap<String, usize>> {
+        let mut counts = std::collections::BTreeMap::new();
+        let Some((json, _)) = self.get_pr_branch_cache(repo_root)? else {
+            return Ok(counts);
+        };
+        for pr in crate::github::parse_pr_headers(&json) {
+            if pr.state.eq_ignore_ascii_case("open") {
+                *counts.entry(pr.head_ref).or_insert(0) += 1;
+            }
+        }
+        Ok(counts)
+    }
+
     // --- issue tracker cache (TTL'd, per repo+provider) ---------------------
     pub fn get_issue_cache(
         &self,
@@ -549,6 +570,42 @@ impl Db {
     pub fn mark_all_notifications_read(&self) -> Result<()> {
         self.conn.execute("UPDATE notifications SET read=1", [])?;
         Ok(())
+    }
+
+    /// Get unread notification counts grouped by worktree_path.
+    /// Returns a map from worktree_path to count of unread notifications.
+    pub fn get_unread_counts_by_worktree(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, usize>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT worktree_path, COUNT(*) FROM notifications \
+             WHERE read=0 AND worktree_path != '' \
+             GROUP BY worktree_path",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut counts = std::collections::BTreeMap::new();
+        for row in rows.filter_map(|r| r.ok()) {
+            counts.insert(row.0, row.1 as usize);
+        }
+        Ok(counts)
+    }
+
+    /// Get alert counts (test_failed, agent_failed, log_error notifications) grouped by worktree_path.
+    /// Returns a map from worktree_path to alert count.
+    pub fn get_alert_counts_by_worktree(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, usize>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT worktree_path, COUNT(*) FROM notifications \
+             WHERE read=0 AND kind IN ('test_failed', 'agent_failed', 'log_error') \
+             GROUP BY worktree_path",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut counts = std::collections::BTreeMap::new();
+        for row in rows.filter_map(|r| r.ok()) {
+            counts.insert(row.0, row.1 as usize);
+        }
+        Ok(counts)
     }
 
     // --- agent dispatch registry ---------------------------------------------
@@ -1807,6 +1864,33 @@ mod tests {
     }
 
     #[test]
+    fn open_pr_counts_by_branch_counts_only_open_prs() {
+        let db = db();
+        // No cache yet → empty map.
+        assert!(db.get_open_pr_counts_by_branch("/repo").unwrap().is_empty());
+
+        // Two open PRs on `feat`, one merged on `feat`, one open on `fix`.
+        let json = r#"[
+            {"number":1,"headRefName":"feat","state":"OPEN","url":"u1","isDraft":false},
+            {"number":2,"headRefName":"feat","state":"OPEN","url":"u2","isDraft":false},
+            {"number":3,"headRefName":"feat","state":"MERGED","url":"u3","isDraft":false},
+            {"number":4,"headRefName":"fix","state":"OPEN","url":"u4","isDraft":false}
+        ]"#;
+        db.put_pr_branch_cache("/repo", json).unwrap();
+        let counts = db.get_open_pr_counts_by_branch("/repo").unwrap();
+        assert_eq!(counts.get("feat"), Some(&2), "two OPEN PRs on feat");
+        assert_eq!(counts.get("fix"), Some(&1), "one OPEN PR on fix");
+        assert_eq!(counts.len(), 2, "merged/closed PRs are excluded");
+    }
+
+    #[test]
+    fn open_pr_counts_by_branch_handles_garbled_cache() {
+        let db = db();
+        db.put_pr_branch_cache("/repo", "not json").unwrap();
+        assert!(db.get_open_pr_counts_by_branch("/repo").unwrap().is_empty());
+    }
+
+    #[test]
     fn undo_marks_record_dedupe_and_cap() {
         let db = db();
         assert!(db.undo_marks("/wt").unwrap().is_empty());
@@ -2230,6 +2314,49 @@ mod tests {
         let remaining = db.get_all_notifications(10).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_ne!(remaining[0].id, id);
+    }
+
+    #[test]
+    fn get_unread_counts_by_worktree_groups_by_path() {
+        let db = db();
+        // Create notifications for different worktrees
+        db.put_notification("assigned", "ref:1", "msg", "/wt/app")
+            .unwrap();
+        db.put_notification("mentioned", "ref:2", "msg", "/wt/app")
+            .unwrap();
+        db.put_notification("status_changed", "ref:3", "msg", "/wt/other")
+            .unwrap();
+        // Read one to make it not count as unread
+        let unread = db.get_unread_notifications().unwrap();
+        assert_eq!(unread.len(), 3);
+        db.mark_notification_read(unread[0].id).unwrap();
+
+        let counts = db.get_unread_counts_by_worktree().unwrap();
+        // /wt/app has 1 unread, /wt/other has 1 unread
+        assert_eq!(counts.get("/wt/app"), Some(&1));
+        assert_eq!(counts.get("/wt/other"), Some(&1));
+    }
+
+    #[test]
+    fn get_alert_counts_by_worktree_filters_by_kind() {
+        let db = db();
+        // Create various notification types
+        db.put_notification("assigned", "ref:1", "msg", "/wt/app")
+            .unwrap(); // not an alert
+        db.put_notification("test_failed", "ref:2", "tests failed", "/wt/app")
+            .unwrap();
+        db.put_notification("agent_failed", "ref:3", "agent died", "/wt/app")
+            .unwrap();
+        db.put_notification("log_error", "ref:4", "error log", "/wt/other")
+            .unwrap();
+        db.put_notification("assigned", "ref:5", "msg", "/wt/other")
+            .unwrap(); // not an alert
+
+        let counts = db.get_alert_counts_by_worktree().unwrap();
+        // /wt/app has 2 alerts (test_failed + agent_failed)
+        // /wt/other has 1 alert (log_error)
+        assert_eq!(counts.get("/wt/app"), Some(&2));
+        assert_eq!(counts.get("/wt/other"), Some(&1));
     }
 
     // ── Suite C: container_events audit trail ──────────────────────────────

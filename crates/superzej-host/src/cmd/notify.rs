@@ -3,6 +3,8 @@
 //! These subcommands write to the shared SQLite DB, which the running
 //! superzej host picks up on its next 2s hydration tick.
 
+#![allow(clippy::disallowed_macros)]
+
 use clap::Subcommand;
 
 #[derive(Subcommand, Clone)]

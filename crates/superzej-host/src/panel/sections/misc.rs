@@ -277,7 +277,7 @@ fn tests_full_tree(ctx: &SectionCtx) -> Vec<PanelRow> {
     let visible = ts.visible_indices();
 
     // Two-column layout: left=tree list, right=detail for selected node.
-    let list_w = (ctx.cols / 2).max(24).min(50);
+    let list_w = (ctx.cols / 2).clamp(24, 50);
     let detail_w = ctx.cols.saturating_sub(list_w + 2);
     let cursor_visible_pos = visible.iter().position(|&i| i == ts.cursor);
 
@@ -333,7 +333,7 @@ fn tests_full_tree(ctx: &SectionCtx) -> Vec<PanelRow> {
                     .iter()
                     .filter(|n| {
                         n.kind == TestNodeKind::Test
-                            && crate::testkit::model::test_name_of(&n.id) != &n.label
+                            && crate::testkit::model::test_name_of(&n.id) != n.label
                             || {
                                 // simple: check group prefix
                                 n.kind != TestNodeKind::Group && n.id.starts_with(&node.label)

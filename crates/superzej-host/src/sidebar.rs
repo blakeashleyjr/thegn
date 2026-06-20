@@ -49,6 +49,18 @@ pub struct GitGlyphs {
     pub behind: usize,
 }
 
+/// Badge kinds displayed on sidebar rows (item 28).
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub enum BadgeKind {
+    /// Open PRs for this worktree's branch.
+    Pr,
+    /// Unread notifications relevant to this worktree.
+    Unread,
+    /// Alerts: test failures, agent failures, log errors.
+    Alert,
+}
+
 /// Tree ordering for worktree groups within a workspace (item 23).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortMode {
@@ -131,6 +143,15 @@ pub struct SidebarRow {
     pub collapsed: bool,
     /// For Workspace rows: a non-git "dir" workspace (drives a distinct glyph).
     pub dir: bool,
+    /// Badge: open PR count for this worktree's branch (item 28).
+    #[allow(dead_code)]
+    pub pr_count: Option<usize>,
+    /// Badge: unread notification count for this worktree (item 28).
+    #[allow(dead_code)]
+    pub unread_count: usize,
+    /// Badge: alert count (test failures, agent failures, log errors) for this worktree (item 28).
+    #[allow(dead_code)]
+    pub alert_count: usize,
 }
 
 /// Per-worktree status sourced from the (possibly slow) git/activity scan on
@@ -142,6 +163,12 @@ pub struct SidebarStatus {
     pub git: std::collections::BTreeMap<String, GitGlyphs>,
     pub agent: std::collections::BTreeMap<String, String>,
     pub activity: std::collections::BTreeMap<String, ActivityState>,
+    /// Badge: open PR count per worktree (item 28).
+    pub pr_counts: std::collections::BTreeMap<String, usize>,
+    /// Badge: unread notification count per worktree (item 28).
+    pub unread_counts: std::collections::BTreeMap<String, usize>,
+    /// Badge: alert count per worktree (item 28).
+    pub alert_counts: std::collections::BTreeMap<String, usize>,
 }
 
 /// Persisted + transient view state that shapes the tree (collapse/sort/pins/
@@ -235,6 +262,9 @@ pub fn build_rows(
             visible: true,
             collapsed,
             dir: kind == "dir",
+            pr_count: None,
+            unread_count: 0,
+            alert_count: 0,
         });
 
         // This repo's worktree groups, straight from the session model.
@@ -266,6 +296,20 @@ pub fn build_rows(
                 .as_deref()
                 .and_then(|p| status.agent.get(p))
                 .cloned();
+            let pr_count = wt_path
+                .as_deref()
+                .and_then(|p| status.pr_counts.get(p))
+                .copied();
+            let unread_count = wt_path
+                .as_deref()
+                .and_then(|p| status.unread_counts.get(p))
+                .copied()
+                .unwrap_or(0);
+            let alert_count = wt_path
+                .as_deref()
+                .and_then(|p| status.alert_counts.get(p))
+                .copied()
+                .unwrap_or(0);
             rows.push(SidebarRow {
                 kind: RowKind::Worktree,
                 depth: 1,
@@ -282,31 +326,53 @@ pub fn build_rows(
                 visible: !collapsed,
                 collapsed: false,
                 dir: false,
+                pr_count,
+                unread_count,
+                alert_count,
             });
         }
 
         // A workspace with no live session groups still shows its home and
         // registered worktrees; activating one switches workspace.
         if !live && !repo_path.is_empty() {
-            let mk = |label: &str, group: Option<String>, path: Option<String>| SidebarRow {
-                kind: RowKind::Worktree,
-                depth: 1,
-                label: label.to_string(),
-                workspace_slug: repo_slug.clone(),
-                tab_target: Some(RowTarget::Workspace {
-                    repo_path: repo_path.clone(),
-                    group,
-                }),
-                active: false,
-                worktree_path: path.clone(),
-                pin_key: format!("{repo_slug}/{label}"),
-                branch: Some(label.to_string()),
-                git: path.as_deref().and_then(|p| status.git.get(p)).copied(),
-                agent: path.as_deref().and_then(|p| status.agent.get(p)).cloned(),
-                activity: ActivityState::None,
-                visible: !collapsed,
-                collapsed: false,
-                dir: false,
+            let mk = |label: &str, group: Option<String>, path: Option<String>| {
+                let pr_count = path
+                    .as_deref()
+                    .and_then(|p| status.pr_counts.get(p))
+                    .copied();
+                let unread_count = path
+                    .as_deref()
+                    .and_then(|p| status.unread_counts.get(p))
+                    .copied()
+                    .unwrap_or(0);
+                let alert_count = path
+                    .as_deref()
+                    .and_then(|p| status.alert_counts.get(p))
+                    .copied()
+                    .unwrap_or(0);
+                SidebarRow {
+                    kind: RowKind::Worktree,
+                    depth: 1,
+                    label: label.to_string(),
+                    workspace_slug: repo_slug.clone(),
+                    tab_target: Some(RowTarget::Workspace {
+                        repo_path: repo_path.clone(),
+                        group,
+                    }),
+                    active: false,
+                    worktree_path: path.clone(),
+                    pin_key: format!("{repo_slug}/{label}"),
+                    branch: Some(label.to_string()),
+                    git: path.as_deref().and_then(|p| status.git.get(p)).copied(),
+                    agent: path.as_deref().and_then(|p| status.agent.get(p)).cloned(),
+                    activity: ActivityState::None,
+                    visible: !collapsed,
+                    collapsed: false,
+                    dir: false,
+                    pr_count,
+                    unread_count,
+                    alert_count,
+                }
             };
             rows.push(mk(
                 "home",
@@ -345,6 +411,9 @@ pub fn build_rows(
             visible: true,
             collapsed: false,
             dir: false,
+            pr_count: None,
+            unread_count: 0,
+            alert_count: 0,
         });
     }
 
