@@ -23,6 +23,7 @@ mod keyhint;
 mod keymap;
 mod layer;
 mod layout;
+mod layout_spec;
 mod logotype;
 mod menu;
 mod metrics;

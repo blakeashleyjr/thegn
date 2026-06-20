@@ -2316,6 +2316,14 @@ enum HostInputKind {
         old_path: String,
         old_branch: String,
     },
+    /// Save the active tab's layout under the typed name (item 115).
+    SaveLayout,
+    /// Apply the saved layout named by the typed value to the active tab.
+    ApplyLayout,
+    /// Export the active tab's layout to the typed file path (item 99).
+    ExportLayout,
+    /// Import a layout JSON file (typed path) into the active tab.
+    ImportLayout,
 }
 
 /// Launch the new-worktree wizard + speculative-create worker against `root`.
@@ -4442,6 +4450,62 @@ fn spawn_worktree_shell_pane(
         );
     }
     panes.spawn(dir, center)
+}
+
+/// Capture the active tab's pane layout as an abstract [`LayoutSpec`] (items
+/// 99/115). Each leaf records its program (a plain shell → `None`).
+fn active_tab_layout_spec(
+    session: &crate::session::Session,
+    panes: &Panes,
+) -> Option<crate::layout_spec::LayoutSpec> {
+    let tab = session.active_tab()?;
+    let program_of = |id: crate::center::PaneId| -> Option<String> {
+        panes
+            .table
+            .get(&id)
+            .map(|p| p.program().to_string())
+            .filter(|prog| !prog.is_empty() && !crate::pane::is_interactive_shell(prog))
+    };
+    Some(crate::layout_spec::LayoutSpec::from_tab(
+        &tab.center,
+        &program_of,
+    ))
+}
+
+/// Apply a [`LayoutSpec`] to the active tab: spawn a pane per leaf in `dir`,
+/// swap the tab's `center` to the new tree, drop the old panes, and refocus.
+/// Returns the new focused pane id, or `None` if nothing spawned.
+fn apply_layout_to_active_tab(
+    spec: &crate::layout_spec::LayoutSpec,
+    session: &mut crate::session::Session,
+    panes: &mut Panes,
+    cfg: &superzej_core::config::Config,
+    center: Rect,
+) -> Option<u32> {
+    let dir = active_cwd(session);
+    let old: Vec<u32> = session
+        .active_tab()
+        .map(|t| t.center.pane_ids())
+        .unwrap_or_default();
+    // Spawn a shell per leaf; a leaf carrying a command runs it in that shell.
+    let mut spawn = |cmd: Option<&str>| -> Option<u32> {
+        let id = spawn_worktree_shell_pane(panes, cfg, dir.as_deref(), center).ok()?;
+        if let Some(c) = cmd
+            && let Some(p) = panes.table.get_mut(&id)
+        {
+            let _ = p.write_input(format!("{c}\n").as_bytes());
+        }
+        Some(id)
+    };
+    let (tree, focus) = spec.apply(&mut spawn)?;
+    if let Some(tab) = session.active_tab_mut() {
+        tab.center = tree;
+        tab.focused_pane = focus;
+    }
+    for id in old {
+        panes.table.remove(&id);
+    }
+    Some(focus)
 }
 
 fn spawn_yazi_pane(
@@ -7954,6 +8018,114 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                     }
+                                    HostInputKind::SaveLayout => {
+                                        let name = text.trim().to_string();
+                                        if name.is_empty() {
+                                            model.status = "Save layout: empty name".into();
+                                        } else if let Some(spec) =
+                                            active_tab_layout_spec(&session, &panes)
+                                        {
+                                            match (spec.to_json(), superzej_core::db::Db::open()) {
+                                                (Ok(json), Ok(db)) => {
+                                                    let _ = db.put_layout(&name, &json);
+                                                    model.status =
+                                                        format!("Saved layout \"{name}\"");
+                                                }
+                                                _ => {
+                                                    model.status = "Save layout failed".into();
+                                                }
+                                            }
+                                        }
+                                    }
+                                    HostInputKind::ApplyLayout => {
+                                        let name = text.trim().to_string();
+                                        let spec = superzej_core::db::Db::open()
+                                            .ok()
+                                            .and_then(|db| db.get_layout(&name).ok().flatten())
+                                            .and_then(|json| {
+                                                crate::layout_spec::LayoutSpec::from_json(&json)
+                                                    .ok()
+                                            });
+                                        match spec {
+                                            Some(spec) => {
+                                                if apply_layout_to_active_tab(
+                                                    &spec,
+                                                    &mut session,
+                                                    &mut panes,
+                                                    keymap.config(),
+                                                    chrome.center,
+                                                )
+                                                .is_some()
+                                                {
+                                                    persist_session_layout(&session);
+                                                    need_relayout = true;
+                                                    model.status =
+                                                        format!("Applied layout \"{name}\"");
+                                                } else {
+                                                    model.status =
+                                                        "Apply layout: nothing spawned".into();
+                                                }
+                                            }
+                                            None => {
+                                                model.status =
+                                                    format!("No saved layout named \"{name}\"");
+                                            }
+                                        }
+                                    }
+                                    HostInputKind::ExportLayout => {
+                                        let path = text.trim().to_string();
+                                        match (
+                                            active_tab_layout_spec(&session, &panes)
+                                                .and_then(|s| s.to_json().ok()),
+                                            path.is_empty(),
+                                        ) {
+                                            (Some(json), false) => {
+                                                match std::fs::write(&path, json) {
+                                                    Ok(()) => {
+                                                        model.status =
+                                                            format!("Exported layout to {path}")
+                                                    }
+                                                    Err(e) => {
+                                                        model.status = format!("Export failed: {e}")
+                                                    }
+                                                }
+                                            }
+                                            _ => model.status = "Export layout failed".into(),
+                                        }
+                                    }
+                                    HostInputKind::ImportLayout => {
+                                        let path = text.trim().to_string();
+                                        let spec =
+                                            std::fs::read_to_string(&path).ok().and_then(|json| {
+                                                crate::layout_spec::LayoutSpec::from_json(&json)
+                                                    .ok()
+                                            });
+                                        match spec {
+                                            Some(spec) => {
+                                                if apply_layout_to_active_tab(
+                                                    &spec,
+                                                    &mut session,
+                                                    &mut panes,
+                                                    keymap.config(),
+                                                    chrome.center,
+                                                )
+                                                .is_some()
+                                                {
+                                                    persist_session_layout(&session);
+                                                    need_relayout = true;
+                                                    model.status =
+                                                        format!("Imported layout from {path}");
+                                                } else {
+                                                    model.status =
+                                                        "Import layout: nothing spawned".into();
+                                                }
+                                            }
+                                            None => {
+                                                model.status =
+                                                    format!("Could not read a layout from {path}");
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -10921,6 +11093,47 @@ async fn event_loop<T: Terminal>(
                                 } else {
                                     "Sync-panes off".into()
                                 };
+                            }
+                            Action::SaveLayout => {
+                                host_input = Some((
+                                    menu::InputOverlay::new("save layout as", ""),
+                                    HostInputKind::SaveLayout,
+                                ));
+                                model.status = "Save layout: enter a name (Esc cancels)".into();
+                            }
+                            Action::ApplyLayout => {
+                                let names = superzej_core::db::Db::open()
+                                    .ok()
+                                    .and_then(|db| db.list_layouts().ok())
+                                    .unwrap_or_default();
+                                if names.is_empty() {
+                                    model.status =
+                                        "No saved layouts yet — use \"Save layout as…\" first"
+                                            .into();
+                                } else {
+                                    host_input = Some((
+                                        menu::InputOverlay::new("apply layout (name)", ""),
+                                        HostInputKind::ApplyLayout,
+                                    ));
+                                    model.status =
+                                        format!("Apply layout — saved: {}", names.join(", "));
+                                }
+                            }
+                            Action::ExportLayout => {
+                                host_input = Some((
+                                    menu::InputOverlay::new("export layout to file", ""),
+                                    HostInputKind::ExportLayout,
+                                ));
+                                model.status =
+                                    "Export layout: enter a file path (Esc cancels)".into();
+                            }
+                            Action::ImportLayout => {
+                                host_input = Some((
+                                    menu::InputOverlay::new("import layout from file", ""),
+                                    HostInputKind::ImportLayout,
+                                ));
+                                model.status =
+                                    "Import layout: enter a file path (Esc cancels)".into();
                             }
                             Action::SplitDown | Action::SplitRight => {
                                 const MAX_PANES: usize = 16;
