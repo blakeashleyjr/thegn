@@ -58,6 +58,10 @@ pub enum NotificationKind {
     WorktreeCreated,
     /// One or more ERROR lines were detected in the szhost log.
     LogError,
+    /// A non-agent pane's process exited cleanly (a task-like command finished).
+    ProcessExited,
+    /// A non-agent pane's process crashed or exited non-zero.
+    ProcessFailed,
 }
 
 impl NotificationKind {
@@ -75,6 +79,8 @@ impl NotificationKind {
             Self::TestFailed => "✗",
             Self::WorktreeCreated => "+",
             Self::LogError => "✗",
+            Self::ProcessExited => "◇",
+            Self::ProcessFailed => "✗",
         }
     }
 
@@ -92,6 +98,8 @@ impl NotificationKind {
             Self::TestFailed => "tests failed",
             Self::WorktreeCreated => "worktree created",
             Self::LogError => "log error",
+            Self::ProcessExited => "process exited",
+            Self::ProcessFailed => "process failed",
         }
     }
 }
@@ -115,6 +123,8 @@ mod tests {
             NotificationKind::TestFailed,
             NotificationKind::WorktreeCreated,
             NotificationKind::LogError,
+            NotificationKind::ProcessExited,
+            NotificationKind::ProcessFailed,
         ] {
             let json = serde_json::to_string(&kind).unwrap();
             let back: NotificationKind = serde_json::from_str(&json).unwrap();
@@ -137,6 +147,8 @@ mod tests {
             NotificationKind::TestFailed,
             NotificationKind::WorktreeCreated,
             NotificationKind::LogError,
+            NotificationKind::ProcessExited,
+            NotificationKind::ProcessFailed,
         ] {
             assert!(!kind.glyph().is_empty(), "{kind:?} glyph is empty");
             assert!(!kind.label().is_empty(), "{kind:?} label is empty");

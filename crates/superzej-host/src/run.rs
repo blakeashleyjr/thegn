@@ -5572,7 +5572,11 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                         }
-                        PaneEvent::Exit(id) => {
+                        PaneEvent::Exit(id, exit_code) => {
+                            // Program name is needed for attention routing after
+                            // the pane leaves the table (item 524).
+                            let exited_program =
+                                panes.table.get(&id).map(|p| p.program().to_string());
                             panes.table.remove(&id);
                             // The visible yazi drawer died on its own (e.g. its
                             // contained scope hit the memory limit). Clear it,
@@ -5599,11 +5603,13 @@ async fn event_loop<T: Terminal>(
                                 continue;
                             }
                             // Pin panes are supervised separately from tab panes: the
-                            // supervisor applies the restart policy. (PTY EOF carries no
-                            // exit status, so treat death as a failure for policy purposes.)
+                            // supervisor applies the restart policy. A clean exit
+                            // (code 0) is reported as such so `restart = on-failure`
+                            // pins stay down on a normal stop; an unknown code
+                            // (None) is treated as a failure.
                             if let Some(inst) = supervisor.instance_of_pane(id) {
                                 let name = inst.name.clone();
-                                match supervisor.on_exit(id, false) {
+                                match supervisor.on_exit(id, exit_code == Some(0)) {
                                     crate::pins::RestartDecision::Respawn => {
                                         let active_dir = active_cwd(&session);
                                         let pin = current_config
@@ -5665,30 +5671,91 @@ async fn event_loop<T: Terminal>(
                                 {
                                     let wt = session.worktrees[gi].path.clone();
                                     if !wt.is_empty() {
-                                        let crashed = crashes > 0;
+                                        // Prefer the real exit code; fall back to
+                                        // the fast-crash heuristic when the child
+                                        // status couldn't be reaped.
+                                        let failed = match exit_code {
+                                            Some(c) => c != 0,
+                                            None => crashes > 0,
+                                        };
+                                        let program = exited_program.clone().unwrap_or_default();
+                                        let is_shell = crate::pane::is_interactive_shell(&program);
+                                        let policy =
+                                            superzej_core::event_bus::ProcessExitPolicy::parse(
+                                                &current_config.notifications.process_exit,
+                                            );
+                                        let outcome =
+                                            superzej_core::event_bus::classify_process_exit(
+                                                exit_code, is_shell, policy,
+                                            );
+                                        let bus = event_bus.clone();
                                         tokio::task::spawn_blocking(move || {
                                             let Ok(db) = superzej_core::db::Db::open() else {
                                                 return;
                                             };
-                                            let Ok(Some((dispatch_id, issue_id))) =
+                                            // Agent panes (worktree has a dispatch)
+                                            // keep their dedicated agent_done/failed
+                                            // path; everything else routes through
+                                            // item-524 process attention.
+                                            if let Ok(Some((dispatch_id, issue_id))) =
                                                 db.dispatch_info_for_worktree(&wt)
-                                            else {
+                                            {
+                                                let kind = if failed {
+                                                    "agent_failed"
+                                                } else {
+                                                    "agent_done"
+                                                };
+                                                let base = wt.rsplit('/').next().unwrap_or(&wt);
+                                                let msg = format!(
+                                                    "agent {} in {base}",
+                                                    if failed { "crashed" } else { "finished" }
+                                                );
+                                                let _ =
+                                                    db.put_notification(kind, &issue_id, &msg, &wt);
+                                                let _ = db.update_dispatch_status(
+                                                    dispatch_id,
+                                                    if failed { "failed" } else { "done" },
+                                                );
+                                                return;
+                                            }
+                                            // Non-agent pane: route per policy.
+                                            let Some(outcome) = outcome else {
                                                 return;
                                             };
-                                            let kind = if crashed {
-                                                "agent_failed"
-                                            } else {
-                                                "agent_done"
+                                            use superzej_core::event_bus::ProcessOutcome;
+                                            let kind = match outcome {
+                                                ProcessOutcome::Failed => "process_failed",
+                                                ProcessOutcome::TaskDone => "process_exited",
                                             };
-                                            let base = wt.rsplit('/').next().unwrap_or(&wt);
-                                            let msg = format!(
-                                                "agent {} in {base}",
-                                                if crashed { "crashed" } else { "finished" }
-                                            );
-                                            let _ = db.put_notification(kind, &issue_id, &msg, &wt);
-                                            let _ = db.update_dispatch_status(
-                                                dispatch_id,
-                                                if crashed { "failed" } else { "done" },
+                                            let label = if program.is_empty() {
+                                                "process"
+                                            } else {
+                                                &program
+                                            };
+                                            let msg = match (outcome, exit_code) {
+                                                (ProcessOutcome::Failed, Some(c)) => {
+                                                    format!("{label} failed (exit {c})")
+                                                }
+                                                (ProcessOutcome::Failed, None) => {
+                                                    format!("{label} crashed")
+                                                }
+                                                (ProcessOutcome::TaskDone, _) => {
+                                                    format!("{label} finished")
+                                                }
+                                            };
+                                            let _ = db.put_notification(kind, &program, &msg, &wt);
+                                            // Desktop toast (urgency gating decides
+                                            // whether it actually pops).
+                                            bus.publish_with_notification(
+                                                &superzej_core::event_bus::Event::ProcessExited {
+                                                    worktree: wt.clone(),
+                                                    program: program.clone(),
+                                                    exit_code,
+                                                    failed: matches!(
+                                                        outcome,
+                                                        ProcessOutcome::Failed
+                                                    ),
+                                                },
                                             );
                                         });
                                     }

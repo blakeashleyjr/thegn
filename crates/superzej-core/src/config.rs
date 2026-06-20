@@ -1472,6 +1472,11 @@ pub struct NotificationsConfig {
     /// `"normal"`, or `"critical"`. Lower-urgency events are recorded in the
     /// inbox but never pop a desktop toast.
     pub desktop_min_urgency: String,
+    /// How non-agent pane exits route into the attention model (item 524):
+    /// `"failures_and_tasks"` (default — crashes + non-shell task completions),
+    /// `"failures"` (only non-zero exits), `"all"` (every exit incl. clean
+    /// shells), or `"off"`.
+    pub process_exit: String,
 }
 
 impl Default for NotificationsConfig {
@@ -1479,6 +1484,7 @@ impl Default for NotificationsConfig {
         NotificationsConfig {
             desktop: true,
             desktop_min_urgency: "normal".into(),
+            process_exit: "failures_and_tasks".into(),
         }
     }
 }

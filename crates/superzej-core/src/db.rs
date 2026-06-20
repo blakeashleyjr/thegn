@@ -590,14 +590,15 @@ impl Db {
         Ok(counts)
     }
 
-    /// Get alert counts (test_failed, agent_failed, log_error notifications) grouped by worktree_path.
-    /// Returns a map from worktree_path to alert count.
+    /// Get alert counts (test_failed, agent_failed, log_error, process_failed
+    /// notifications) grouped by worktree_path. Returns a map from
+    /// worktree_path to alert count.
     pub fn get_alert_counts_by_worktree(
         &self,
     ) -> Result<std::collections::BTreeMap<String, usize>> {
         let mut stmt = self.conn.prepare(
             "SELECT worktree_path, COUNT(*) FROM notifications \
-             WHERE read=0 AND kind IN ('test_failed', 'agent_failed', 'log_error') \
+             WHERE read=0 AND kind IN ('test_failed', 'agent_failed', 'log_error', 'process_failed') \
              GROUP BY worktree_path",
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
@@ -2357,6 +2358,32 @@ mod tests {
         // /wt/other has 1 alert (log_error)
         assert_eq!(counts.get("/wt/app"), Some(&2));
         assert_eq!(counts.get("/wt/other"), Some(&1));
+    }
+
+    #[test]
+    fn process_failed_is_an_alert_process_exited_is_only_unread() {
+        let db = db();
+        // A clean task completion: unread, but NOT an alert.
+        db.put_notification("process_exited", "make", "make finished", "/wt/app")
+            .unwrap();
+        // A failure: both unread and an alert (red badge).
+        db.put_notification(
+            "process_failed",
+            "cargo",
+            "cargo failed (exit 101)",
+            "/wt/app",
+        )
+        .unwrap();
+
+        let unread = db.get_unread_counts_by_worktree().unwrap();
+        assert_eq!(unread.get("/wt/app"), Some(&2), "both count toward unread");
+
+        let alerts = db.get_alert_counts_by_worktree().unwrap();
+        assert_eq!(
+            alerts.get("/wt/app"),
+            Some(&1),
+            "only process_failed is an alert"
+        );
     }
 
     // ── Suite C: container_events audit trail ──────────────────────────────
