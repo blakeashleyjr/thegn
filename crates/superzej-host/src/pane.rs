@@ -4,7 +4,7 @@
 //! reader per pane, never a `select!` over N masters in the event loop).
 
 use anyhow::{Context, Result};
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use std::io::Write;
 
 use termwiz::terminal::TerminalWaker;
@@ -20,13 +20,14 @@ pub enum PaneEvent {
     /// PTY output bytes for pane `id`.
     Output(u32, Vec<u8>),
     /// Pane `id`'s child exited (or the PTY closed); its reader thread is done.
-    Exit(u32),
+    /// Carries the child's exit code when it could be reaped (`None` if the
+    /// status was unavailable — e.g. a PTY read error), so the event loop can
+    /// distinguish a clean exit from a crash (item 524).
+    Exit(u32, Option<i32>),
 }
 
 pub struct PtyPane {
     master: Box<dyn MasterPty + Send>,
-    #[allow(dead_code)]
-    child: Box<dyn Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
     emulator: Box<dyn PaneEmulator>,
     rows: u16,
@@ -62,8 +63,7 @@ pub fn program_name(argv: &[String]) -> String {
     };
     let base = stem(first);
     // A shell running an inline command: `sh -c "exec yazi"` → "yazi".
-    let is_shell = matches!(base.as_str(), "sh" | "bash" | "zsh" | "dash" | "fish");
-    if is_shell
+    if is_interactive_shell(&base)
         && let Some(cmd) = argv
             .iter()
             .skip(1)
@@ -83,6 +83,13 @@ pub fn program_name(argv: &[String]) -> String {
         }
     }
     base
+}
+
+/// Whether `program` (a short program name from [`program_name`]) is an
+/// interactive shell. Used by attention routing (item 524) to keep routine
+/// shell closes from generating notifications.
+pub fn is_interactive_shell(program: &str) -> bool {
+    matches!(program, "sh" | "bash" | "zsh" | "dash" | "fish")
 }
 
 impl PtyPane {
@@ -128,7 +135,7 @@ impl PtyPane {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        let child = pair.slave.spawn_command(cmd).context("spawn child")?;
+        let mut child = pair.slave.spawn_command(cmd).context("spawn child")?;
         // Drop the slave so the master sees EOF when the child exits.
         drop(pair.slave);
 
@@ -136,18 +143,16 @@ impl PtyPane {
         let mut reader = pair.master.try_clone_reader().context("clone_reader")?;
 
         // Use std::thread::spawn for the reader - it doesn't require a Tokio runtime
-        // but can still use blocking_send on the tokio channel
+        // but can still use blocking_send on the tokio channel. The child handle
+        // moves in here so that, once the read loop ends on PTY EOF, we can
+        // `wait()` for the child's exit status and report its code (item 524).
+        // Blocking the *reader* thread on `wait()` is safe — it's about to end
+        // anyway and never touches the event loop.
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
                 match reader.read(&mut buf) {
-                    Ok(0) => {
-                        let _ = tx.blocking_send(PaneEvent::Exit(id));
-                        if let Some(w) = &waker {
-                            let _ = w.wake();
-                        }
-                        break;
-                    }
+                    Ok(0) => break, // EOF: child exited or PTY closed
                     Ok(n) => {
                         // One exact-sized Vec per chunk: ownership must cross
                         // the channel, and the 8K stack buffer is reused, so
@@ -157,26 +162,27 @@ impl PtyPane {
                             .blocking_send(PaneEvent::Output(id, buf[..n].to_vec()))
                             .is_err()
                         {
-                            break; // consumer gone
+                            return; // consumer gone — don't bother reaping
                         }
                         if let Some(w) = &waker {
                             let _ = w.wake();
                         }
                     }
-                    Err(_) => {
-                        let _ = tx.blocking_send(PaneEvent::Exit(id));
-                        if let Some(w) = &waker {
-                            let _ = w.wake();
-                        }
-                        break;
-                    }
+                    Err(_) => break, // read error: treat as exit, status unknown
                 }
+            }
+            // Reap the child so the exit carries its real code (None if the
+            // status can't be retrieved). u32 → i32 keeps the conventional
+            // exit-code range; 0 == success.
+            let code = child.wait().ok().map(|s| s.exit_code() as i32);
+            let _ = tx.blocking_send(PaneEvent::Exit(id, code));
+            if let Some(w) = &waker {
+                let _ = w.wake();
             }
         });
 
         Ok(Self {
             master: pair.master,
-            child,
             writer,
             emulator: Box::new(Vt100Emulator::new(rows, cols, 10_000)),
             rows,
@@ -269,7 +275,7 @@ pub fn drain_until_exit(
         // Use blocking recv in a loop with timeout
         match rx.blocking_recv() {
             Some(PaneEvent::Output(_, b)) => pane.feed(&b),
-            Some(PaneEvent::Exit(_)) => return true,
+            Some(PaneEvent::Exit(..)) => return true,
             None => return false,
         }
         if start.elapsed().as_millis() as u64 >= deadline_ms {
@@ -291,6 +297,16 @@ mod tests {
         assert_eq!(program_name(&["/usr/bin/lazygit".into()]), "lazygit");
         assert_eq!(program_name(&["nvim".into(), "file".into()]), "nvim");
         assert_eq!(program_name(&[]), "");
+    }
+
+    #[test]
+    fn is_interactive_shell_matches_known_shells() {
+        for s in ["sh", "bash", "zsh", "dash", "fish"] {
+            assert!(is_interactive_shell(s), "{s} should be a shell");
+        }
+        for s in ["cargo", "make", "nvim", "lazygit", ""] {
+            assert!(!is_interactive_shell(s), "{s} should not be a shell");
+        }
     }
 
     #[test]

@@ -67,7 +67,84 @@ impl NotificationUrgency {
             Event::LogError { .. } => Self::Critical,
             Event::WorktreeCreated { .. } => Self::Low,
             Event::NotificationReceived { .. } => Self::Normal,
+            // A failed non-agent process is worth a toast (Normal); a clean
+            // task completion only updates the inbox/badge (Low, below the
+            // default desktop threshold).
+            Event::ProcessExited { failed, .. } => {
+                if *failed {
+                    Self::Normal
+                } else {
+                    Self::Low
+                }
+            }
         }
+    }
+}
+
+/// How aggressively non-agent pane exits route into the attention model
+/// (item 524). Parsed from `[notifications] process_exit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessExitPolicy {
+    /// Never route non-agent pane exits.
+    Off,
+    /// Route only crashes / non-zero exits.
+    FailuresOnly,
+    /// Route failures, plus clean exits of non-shell ("task-like") panes.
+    /// The default — best signal-to-noise.
+    FailuresAndTasks,
+    /// Route every non-agent pane exit, including clean interactive shells.
+    All,
+}
+
+impl ProcessExitPolicy {
+    /// Parse the config string; unknown values fall back to the default
+    /// `FailuresAndTasks`.
+    pub fn parse(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "off" => Self::Off,
+            "failures" | "failures_only" => Self::FailuresOnly,
+            "all" => Self::All,
+            _ => Self::FailuresAndTasks,
+        }
+    }
+}
+
+/// What a classified non-agent pane exit should surface as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessOutcome {
+    /// A crash / non-zero exit — drives the red alert badge + a desktop toast.
+    Failed,
+    /// A clean exit of a task-like pane — inbox + unread badge only.
+    TaskDone,
+}
+
+/// Decide whether (and how) a non-agent pane exit joins the attention model.
+/// `exit_code` is `None` when the child status couldn't be reaped (treated as a
+/// crash); `is_shell` marks routine interactive shells whose clean exits are
+/// noise. Returns `None` to suppress.
+pub fn classify_process_exit(
+    exit_code: Option<i32>,
+    is_shell: bool,
+    policy: ProcessExitPolicy,
+) -> Option<ProcessOutcome> {
+    let failed = exit_code != Some(0);
+    match policy {
+        ProcessExitPolicy::Off => None,
+        ProcessExitPolicy::FailuresOnly => failed.then_some(ProcessOutcome::Failed),
+        ProcessExitPolicy::FailuresAndTasks => {
+            if failed {
+                Some(ProcessOutcome::Failed)
+            } else if is_shell {
+                None
+            } else {
+                Some(ProcessOutcome::TaskDone)
+            }
+        }
+        ProcessExitPolicy::All => Some(if failed {
+            ProcessOutcome::Failed
+        } else {
+            ProcessOutcome::TaskDone
+        }),
     }
 }
 
@@ -178,6 +255,28 @@ impl DesktopNotification {
                 urgency: NotificationUrgency::Normal,
                 worktree: notification.worktree_path.clone(),
             }),
+            Event::ProcessExited {
+                program,
+                exit_code,
+                failed,
+                worktree,
+            } => Some(Self {
+                title: if *failed {
+                    "Process Failed".into()
+                } else {
+                    "Process Exited".into()
+                },
+                body: match exit_code {
+                    Some(c) => format!("{program} exited ({c})"),
+                    None => format!("{program} exited"),
+                },
+                urgency: if *failed {
+                    NotificationUrgency::Normal
+                } else {
+                    NotificationUrgency::Low
+                },
+                worktree: worktree.clone(),
+            }),
         }
     }
 }
@@ -222,6 +321,15 @@ pub enum Event {
     NotificationReceived {
         notification: crate::notification::Notification,
     },
+    /// A non-agent pane's process exited (item 524). `failed` is true for a
+    /// crash / non-zero exit (or an unreapable status); `program` is the pane's
+    /// short program name.
+    ProcessExited {
+        worktree: String,
+        program: String,
+        exit_code: Option<i32>,
+        failed: bool,
+    },
 }
 
 impl Event {
@@ -243,6 +351,7 @@ impl Event {
                     Some(&notification.worktree_path)
                 }
             }
+            Event::ProcessExited { worktree, .. } => Some(worktree),
         }
     }
 }
@@ -543,6 +652,18 @@ mod tests {
                     worktree_path: "/wt".into(),
                 },
             },
+            Event::ProcessExited {
+                worktree: "/wt".into(),
+                program: "cargo".into(),
+                exit_code: Some(1),
+                failed: true,
+            },
+            Event::ProcessExited {
+                worktree: "/wt".into(),
+                program: "make".into(),
+                exit_code: Some(0),
+                failed: false,
+            },
         ]
     }
 
@@ -655,5 +776,118 @@ mod tests {
     fn urgency_ranks_are_ordered() {
         assert!(NotificationUrgency::Low.rank() < NotificationUrgency::Normal.rank());
         assert!(NotificationUrgency::Normal.rank() < NotificationUrgency::Critical.rank());
+    }
+
+    #[test]
+    fn process_exit_policy_parse() {
+        assert_eq!(ProcessExitPolicy::parse("off"), ProcessExitPolicy::Off);
+        assert_eq!(
+            ProcessExitPolicy::parse("failures"),
+            ProcessExitPolicy::FailuresOnly
+        );
+        assert_eq!(
+            ProcessExitPolicy::parse("failures_only"),
+            ProcessExitPolicy::FailuresOnly
+        );
+        assert_eq!(ProcessExitPolicy::parse("ALL"), ProcessExitPolicy::All);
+        // Default + unknown.
+        assert_eq!(
+            ProcessExitPolicy::parse("failures_and_tasks"),
+            ProcessExitPolicy::FailuresAndTasks
+        );
+        assert_eq!(
+            ProcessExitPolicy::parse("bogus"),
+            ProcessExitPolicy::FailuresAndTasks
+        );
+    }
+
+    #[test]
+    fn classify_process_exit_truth_table() {
+        use ProcessExitPolicy::*;
+        use ProcessOutcome::*;
+
+        // Off: always suppress.
+        for code in [Some(0), Some(1), None] {
+            for shell in [true, false] {
+                assert_eq!(classify_process_exit(code, shell, Off), None);
+            }
+        }
+
+        // FailuresOnly: only non-zero / unknown, regardless of shell.
+        assert_eq!(classify_process_exit(Some(0), false, FailuresOnly), None);
+        assert_eq!(classify_process_exit(Some(0), true, FailuresOnly), None);
+        assert_eq!(
+            classify_process_exit(Some(2), false, FailuresOnly),
+            Some(Failed)
+        );
+        assert_eq!(
+            classify_process_exit(None, true, FailuresOnly),
+            Some(Failed)
+        );
+
+        // FailuresAndTasks (the default): failures always; clean non-shell =
+        // TaskDone; clean shell = suppressed.
+        assert_eq!(
+            classify_process_exit(Some(1), true, FailuresAndTasks),
+            Some(Failed)
+        );
+        assert_eq!(
+            classify_process_exit(None, false, FailuresAndTasks),
+            Some(Failed)
+        );
+        assert_eq!(
+            classify_process_exit(Some(0), false, FailuresAndTasks),
+            Some(TaskDone)
+        );
+        assert_eq!(classify_process_exit(Some(0), true, FailuresAndTasks), None);
+
+        // All: every exit routes; clean → TaskDone, else Failed (even shells).
+        assert_eq!(classify_process_exit(Some(0), true, All), Some(TaskDone));
+        assert_eq!(classify_process_exit(Some(0), false, All), Some(TaskDone));
+        assert_eq!(classify_process_exit(Some(5), true, All), Some(Failed));
+        assert_eq!(classify_process_exit(None, false, All), Some(Failed));
+    }
+
+    #[test]
+    fn process_exited_event_urgency_and_desktop() {
+        let failed = Event::ProcessExited {
+            worktree: "/wt/app".into(),
+            program: "cargo".into(),
+            exit_code: Some(101),
+            failed: true,
+        };
+        assert_eq!(failed.worktree(), Some("/wt/app"));
+        assert_eq!(
+            NotificationUrgency::from_event(&failed),
+            NotificationUrgency::Normal
+        );
+        let n = DesktopNotification::from_event(&failed).unwrap();
+        assert_eq!(n.title, "Process Failed");
+        assert!(n.body.contains("cargo") && n.body.contains("101"));
+
+        let done = Event::ProcessExited {
+            worktree: "/wt/app".into(),
+            program: "make".into(),
+            exit_code: Some(0),
+            failed: false,
+        };
+        assert_eq!(
+            NotificationUrgency::from_event(&done),
+            NotificationUrgency::Low
+        );
+        let n = DesktopNotification::from_event(&done).unwrap();
+        assert_eq!(n.title, "Process Exited");
+        // A clean exit (Low) stays below the default Normal desktop threshold.
+        assert!(!n.urgency.meets(NotificationUrgency::Normal));
+
+        // Unknown exit code still renders a body.
+        let unknown = Event::ProcessExited {
+            worktree: String::new(),
+            program: "srv".into(),
+            exit_code: None,
+            failed: true,
+        };
+        let n = DesktopNotification::from_event(&unknown).unwrap();
+        assert!(n.body.contains("srv"));
     }
 }

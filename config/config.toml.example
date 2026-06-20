@@ -421,6 +421,12 @@ command = "git diff"
 [notifications]
 desktop = true
 desktop_min_urgency = "normal"
+# How non-agent pane exits join the attention model (item 524):
+#   "failures_and_tasks" — crashes/non-zero exits + clean non-shell task panes (default)
+#   "failures"           — only non-zero exits
+#   "all"                — every non-agent exit, including clean interactive shells
+#   "off"                — never route pane exits
+process_exit = "failures_and_tasks"
 
 # Top pinned-program strip: a horizontal band above the center that renders
 # `location = "strip"` pins side by side (toggle Ctrl+Alt+t; grow/shrink at
