@@ -47,6 +47,8 @@ pub enum Action {
     ExportLayout,
     /// Import a layout from a JSON file into the focused tab (item 99).
     ImportLayout,
+    /// Create a worktree from a saved `[[worktree_templates]]` preset (item 54).
+    NewWorktreeFromTemplate,
     /// Cycle through the named theme presets (storm → light → abyss → …).
     CycleTheme,
     /// Pick a font family from fontconfig and patch the live alacritty profile.
@@ -219,6 +221,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         id: "import-layout",
         label: "Import layout from file…",
         hint: "import layout",
+        default_chords: &[],
+        palette: true,
+    },
+    ActionSpec {
+        id: "new-worktree-from-template",
+        label: "New worktree from template…",
+        hint: "template",
         default_chords: &[],
         palette: true,
     },
@@ -645,6 +654,7 @@ impl Action {
             Action::ApplyLayout => "apply-layout",
             Action::ExportLayout => "export-layout",
             Action::ImportLayout => "import-layout",
+            Action::NewWorktreeFromTemplate => "new-worktree-from-template",
             Action::CycleTheme => "cycle-theme",
             Action::SwitchFont => "switch-font",
             Action::CloseTab => "close-tab",
@@ -707,6 +717,7 @@ impl Action {
             "apply-layout" => Action::ApplyLayout,
             "export-layout" => Action::ExportLayout,
             "import-layout" => Action::ImportLayout,
+            "new-worktree-from-template" | "worktree-template" => Action::NewWorktreeFromTemplate,
             "cycle-theme" | "theme" => Action::CycleTheme,
             "switch-font" | "font" => Action::SwitchFont,
             "close-tab" => Action::CloseTab,
