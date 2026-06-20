@@ -39,6 +39,14 @@ pub enum Action {
     ToggleZoom,
     /// Broadcast typed input to every pane in the focused tab (item 96); toggles off.
     ToggleSyncPanes,
+    /// Save the focused tab's pane layout as a named snapshot (item 115).
+    SaveLayout,
+    /// Apply a saved named layout to the focused tab (item 115).
+    ApplyLayout,
+    /// Export the focused tab's layout to a JSON file (item 99).
+    ExportLayout,
+    /// Import a layout from a JSON file into the focused tab (item 99).
+    ImportLayout,
     /// Cycle through the named theme presets (storm → light → abyss → …).
     CycleTheme,
     /// Pick a font family from fontconfig and patch the live alacritty profile.
@@ -184,6 +192,34 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         label: "Toggle sync-panes (broadcast input)",
         hint: "sync",
         default_chords: &["Ctrl Alt y"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "save-layout",
+        label: "Save layout as…",
+        hint: "save layout",
+        default_chords: &[],
+        palette: true,
+    },
+    ActionSpec {
+        id: "apply-layout",
+        label: "Apply saved layout…",
+        hint: "apply layout",
+        default_chords: &[],
+        palette: true,
+    },
+    ActionSpec {
+        id: "export-layout",
+        label: "Export layout to file…",
+        hint: "export layout",
+        default_chords: &[],
+        palette: true,
+    },
+    ActionSpec {
+        id: "import-layout",
+        label: "Import layout from file…",
+        hint: "import layout",
+        default_chords: &[],
         palette: true,
     },
     ActionSpec {
@@ -605,6 +641,10 @@ impl Action {
             Action::NewPane => "new-pane",
             Action::ToggleZoom => "zoom",
             Action::ToggleSyncPanes => "sync-panes",
+            Action::SaveLayout => "save-layout",
+            Action::ApplyLayout => "apply-layout",
+            Action::ExportLayout => "export-layout",
+            Action::ImportLayout => "import-layout",
             Action::CycleTheme => "cycle-theme",
             Action::SwitchFont => "switch-font",
             Action::CloseTab => "close-tab",
@@ -663,6 +703,10 @@ impl Action {
             "new-pane" => Action::NewPane,
             "zoom" | "toggle-zoom" | "fullscreen" => Action::ToggleZoom,
             "sync-panes" | "toggle-sync-panes" | "broadcast" => Action::ToggleSyncPanes,
+            "save-layout" => Action::SaveLayout,
+            "apply-layout" => Action::ApplyLayout,
+            "export-layout" => Action::ExportLayout,
+            "import-layout" => Action::ImportLayout,
             "cycle-theme" | "theme" => Action::CycleTheme,
             "switch-font" | "font" => Action::SwitchFont,
             "close-tab" => Action::CloseTab,

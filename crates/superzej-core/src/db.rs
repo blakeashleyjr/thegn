@@ -318,6 +318,14 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_container_events_wt
               ON container_events (worktree, ts DESC);
+            -- Named, reusable pane-layout snapshots (items 99/115): an abstract
+            -- LayoutSpec (splits + per-leaf programs) serialized to JSON, recalled
+            -- by name from the palette or applied as a worktree-template layout.
+            CREATE TABLE IF NOT EXISTS layouts (
+              name       TEXT PRIMARY KEY,
+              spec       TEXT NOT NULL,
+              created_at INTEGER NOT NULL
+            );
             COMMIT;
             "#,
         )?;
@@ -1044,6 +1052,48 @@ impl Db {
     pub fn del_worktree(&self, wt: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM worktrees WHERE worktree=?1", params![wt])?;
+        Ok(())
+    }
+
+    // --- named pane-layout snapshots (items 99/115) -------------------------
+
+    /// Save (or replace) a named layout snapshot. `spec` is a serialized
+    /// `LayoutSpec` JSON string.
+    pub fn put_layout(&self, name: &str, spec: &str) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO layouts(name, spec, created_at) VALUES(?1, ?2, ?3)
+               ON CONFLICT(name) DO UPDATE SET spec=?2, created_at=?3"#,
+            params![name, spec, util::now()],
+        )?;
+        Ok(())
+    }
+
+    /// The serialized spec for a named layout, if present.
+    pub fn get_layout(&self, name: &str) -> Result<Option<String>> {
+        let r = self
+            .conn
+            .query_row(
+                "SELECT spec FROM layouts WHERE name=?1",
+                params![name],
+                |r| r.get::<_, String>(0),
+            )
+            .ok();
+        Ok(r)
+    }
+
+    /// All saved layout names, alphabetical.
+    pub fn list_layouts(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name FROM layouts ORDER BY name")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Delete a named layout (no-op if absent).
+    pub fn delete_layout(&self, name: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM layouts WHERE name=?1", params![name])?;
         Ok(())
     }
 
@@ -2021,6 +2071,28 @@ mod tests {
         // delete
         db.del_worktree("/wt/other").unwrap();
         assert!(db.worktrees().unwrap().is_empty());
+    }
+
+    #[test]
+    fn layouts_crud_roundtrip() {
+        let db = db();
+        assert!(db.list_layouts().unwrap().is_empty());
+        assert!(db.get_layout("dev").unwrap().is_none());
+
+        db.put_layout("dev", "{\"k\":1}").unwrap();
+        db.put_layout("review", "{\"k\":2}").unwrap();
+        assert_eq!(db.get_layout("dev").unwrap().as_deref(), Some("{\"k\":1}"));
+        // Alphabetical listing.
+        assert_eq!(db.list_layouts().unwrap(), vec!["dev", "review"]);
+
+        // Upsert replaces the spec in place.
+        db.put_layout("dev", "{\"k\":9}").unwrap();
+        assert_eq!(db.get_layout("dev").unwrap().as_deref(), Some("{\"k\":9}"));
+        assert_eq!(db.list_layouts().unwrap().len(), 2);
+
+        db.delete_layout("dev").unwrap();
+        assert_eq!(db.list_layouts().unwrap(), vec!["review"]);
+        db.delete_layout("missing").unwrap(); // no-op
     }
 
     #[test]
