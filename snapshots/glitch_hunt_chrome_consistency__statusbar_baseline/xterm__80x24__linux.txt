@@ -1,24 +1,24 @@
- ◆ superzej   dashboard   work  comms 4 chat  0% · 󰂄 100% · Fri Jun 19 · 02:15
+ ◆ superzej   dashboard   work  comms 4 chat 27% · 󰂄 100% · Fri Jun 19 · 22:56
 ────────────────────────────────────────────────────────────────────────────────
  WORKSPACES           REGCLAUDE ▸ home · Sandbox: None   1
-
- ▾ regclaude
-   ● home
-
-
-                           ▄▀▀▀▀ █   █ █▀▀▀▄ █▀▀▀▀ █▀▀▀▄ ▀▀▀█▀ █▀▀▀▀   ▀█▀
-                            ▀▀▀▄ █   █ █▄▄▄▀ █▀▀▀  █▄▄▄▀  ▄▀   █▀▀▀     █
-                           ▄▄▄▄▀ ▀▄▄▄▀ █     █▄▄▄▄ █  ▀▄ █▄▄▄▄ █▄▄▄▄ ▀▄▄▀
-
-                                      v0.1.0 · git worktree IDE
-
-                                   Ctrl-Space  command palette
-                                   Alt-↑↓      prev/next worktree
-                                   Ctrl-g      lock keys to pane
-
-
-
-
-
-
+                     ╭─ bwrap · home ──────────────────────────────────────────╮
+ ▾ regclaude         │                                                         │
+   ● home            │                                                         │
+                     │                                                         │
+                     │                                                         │
+                     │                                                         │
+                     │                                                         │
+                     │                                                         │
+                     │                                                         │
+                     │                                                         │
+                     │                                                         │
+                     │                                                         │
+                     │                                                         │
+                     │                                                         │
+                     │                                                         │
+                     │                                                         │
+                     │                                                         │
+                     │                                                         │
+                     │                                                         │
+                     ╰─────────────────────────────────────────────────────────╯
   N   Ctrl-Left pane   Alt-Left tab   Alt-Up worktree   Alt-x close tab … 0 LOC

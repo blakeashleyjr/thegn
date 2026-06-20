@@ -1,4 +1,4 @@
-L0| ◆ superzej v0.1.0   dashboard   work   comms   chat 32.4/94G · 󰾲  0% · 󰂄 100% · Fri Jun 19 · 02:15
+L0| ◆ superzej v0.1.0   dashboard   work   comms   chat 33.9/94G · 󰾲 34% · 󰂄 100% · Fri Jun 19 · 22:56
 R0 0 1 fg=default bg=#151a28 attrs=
 R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
 R0 3 8 fg=#edf0f8 bg=#151a28 attrs=
@@ -26,30 +26,20 @@ R1 0 100 fg=default bg=#0b0e16 attrs=
 L2|┌Rooms─────────────┐┌ Chat ────────────────────────────────────────────────────────────────────────┐
 R2 0 20 fg=default bg=#0b0e16 attrs=
 R2 20 80 fg=#4e556e bg=#0b0e16 attrs=BOLD
-L3|│● irc             │┌Messages──────────────────────────────────────────────────────────────────────┐
-R3 0 1 fg=default bg=#0b0e16 attrs=
-R3 1 18 fg=#6ee7d8 bg=#0b0e16 attrs=
-R3 19 1 fg=default bg=#0b0e16 attrs=
+L3|│                  │┌Messages──────────────────────────────────────────────────────────────────────┐
+R3 0 20 fg=default bg=#0b0e16 attrs=
 R3 20 80 fg=#aab1c5 bg=#0b0e16 attrs=
-L4|│  # general       ││No messages                                                                   │
-R4 0 1 fg=default bg=#0b0e16 attrs=
-R4 1 18 fg=#aab1c5 bg=#0b0e16 attrs=
-R4 19 1 fg=default bg=#0b0e16 attrs=
+L4|│                  ││No messages                                                                   │
+R4 0 20 fg=default bg=#0b0e16 attrs=
 R4 20 80 fg=#aab1c5 bg=#0b0e16 attrs=
-L5|│  # engineering   ││                                                                              │
-R5 0 1 fg=default bg=#0b0e16 attrs=
-R5 1 18 fg=#aab1c5 bg=#0b0e16 attrs=
-R5 19 1 fg=default bg=#0b0e16 attrs=
+L5|│                  ││                                                                              │
+R5 0 20 fg=default bg=#0b0e16 attrs=
 R5 20 80 fg=#aab1c5 bg=#0b0e16 attrs=
-L6|│● teams           ││                                                                              │
-R6 0 1 fg=default bg=#0b0e16 attrs=
-R6 1 18 fg=#edf0f8 bg=#0b0e16 attrs=
-R6 19 1 fg=default bg=#0b0e16 attrs=
+L6|│                  ││                                                                              │
+R6 0 20 fg=default bg=#0b0e16 attrs=
 R6 20 80 fg=#aab1c5 bg=#0b0e16 attrs=
-L7|│  # standup       ││                                                                              │
-R7 0 1 fg=default bg=#0b0e16 attrs=
-R7 1 18 fg=#aab1c5 bg=#0b0e16 attrs=
-R7 19 1 fg=default bg=#0b0e16 attrs=
+L7|│                  ││                                                                              │
+R7 0 20 fg=default bg=#0b0e16 attrs=
 R7 20 80 fg=#aab1c5 bg=#0b0e16 attrs=
 L8|│                  ││                                                                              │
 R8 0 20 fg=default bg=#0b0e16 attrs=

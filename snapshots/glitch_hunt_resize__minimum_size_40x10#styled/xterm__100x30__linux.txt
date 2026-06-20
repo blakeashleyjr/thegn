@@ -1,4 +1,4 @@
-L0|  dashboard 4 work   comms 1 chat 02:15
+L0|  dashboard 4 work 1 comms 1 chat 22:56
 R0 0 1 fg=default bg=#151a28 attrs=
 R0 1 12 fg=#aab1c5 bg=#151a28 attrs=
 R0 13 6 fg=#6ee7d8 bg=#2e5359 attrs=

@@ -1,4 +1,4 @@
-L0| ◆ superzej v0.1.0   dashboard   work   comms   chat                    34.0/94G · 󰾲  1% · 󰂄 100% ·
+L0| ◆ superzej v0.1.0   dashboard   work   comms   chat                    33.7/94G · 󰾲 14% · 󰂄 100% ·
 R0 0 1 fg=default bg=#151a28 attrs=
 R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
 R0 3 8 fg=#edf0f8 bg=#151a28 attrs=
