@@ -37,6 +37,8 @@ pub enum Action {
     NewPane,
     /// Fullscreen the focused zone (pane / sidebar / panel); toggles off.
     ToggleZoom,
+    /// Broadcast typed input to every pane in the focused tab (item 96); toggles off.
+    ToggleSyncPanes,
     /// Cycle through the named theme presets (storm → light → abyss → …).
     CycleTheme,
     /// Pick a font family from fontconfig and patch the live alacritty profile.
@@ -175,6 +177,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         label: "Toggle zoom",
         hint: "zoom",
         default_chords: &["Ctrl Alt z"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "sync-panes",
+        label: "Toggle sync-panes (broadcast input)",
+        hint: "sync",
+        default_chords: &["Ctrl Alt y"],
         palette: true,
     },
     ActionSpec {
@@ -595,6 +604,7 @@ impl Action {
             Action::NewTab => "new-tab",
             Action::NewPane => "new-pane",
             Action::ToggleZoom => "zoom",
+            Action::ToggleSyncPanes => "sync-panes",
             Action::CycleTheme => "cycle-theme",
             Action::SwitchFont => "switch-font",
             Action::CloseTab => "close-tab",
@@ -652,6 +662,7 @@ impl Action {
             "new-tab" => Action::NewTab,
             "new-pane" => Action::NewPane,
             "zoom" | "toggle-zoom" | "fullscreen" => Action::ToggleZoom,
+            "sync-panes" | "toggle-sync-panes" | "broadcast" => Action::ToggleSyncPanes,
             "cycle-theme" | "theme" => Action::CycleTheme,
             "switch-font" | "font" => Action::SwitchFont,
             "close-tab" => Action::CloseTab,
@@ -915,6 +926,8 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Alt t", Action::NewTab).unwrap();
     map.insert_all("Alt p", Action::NewPane).unwrap();
     map.insert_all("Ctrl Alt z", Action::ToggleZoom).unwrap();
+    map.insert_all("Ctrl Alt y", Action::ToggleSyncPanes)
+        .unwrap();
     map.insert_all("Ctrl Alt t", Action::CycleTheme).unwrap();
     map.insert_all("Alt f", Action::SwitchFont).unwrap();
     map.insert_all("Alt F", Action::SwitchFont).unwrap();
@@ -1292,6 +1305,16 @@ mod tests {
         );
         // Plain Ctrl-S is NOT a sidebar toggle (that's Ctrl-Alt-S).
         assert_eq!(k('s', Modifiers::CTRL), None);
+        // Sync-panes broadcast (item 96) on Ctrl-Alt-Y, distinct from zoom.
+        assert_eq!(
+            k('y', Modifiers::CTRL | Modifiers::ALT),
+            Some(Action::ToggleSyncPanes)
+        );
+        assert_eq!(
+            k('z', Modifiers::CTRL | Modifiers::ALT),
+            Some(Action::ToggleZoom)
+        );
+        assert_eq!(Action::from_key("broadcast"), Some(Action::ToggleSyncPanes));
     }
 
     #[test]
