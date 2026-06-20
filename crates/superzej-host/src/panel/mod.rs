@@ -106,6 +106,8 @@ pub enum Section {
     Pr,
     Issues,
     Files,
+    /// Compiler / linter / test diagnostics.
+    Problems,
     /// Configured shell jobs (build, test, run). (Renamed from "tasks".)
     Jobs,
     Tests,
@@ -124,12 +126,12 @@ pub enum Section {
 /// The accordion's built-in display order — the default when `[panel]
 /// sections` is unset. Grouped by tab:
 /// - Git (5): Changes, Commits, Branches, Stash, Files
-/// - Work (4): Pr, Issues, Jobs, Tests
+/// - Work (5): Pr, Issues, Problems, Jobs, Tests
 /// - System (5): Notifications, Logs, Sandbox, Telemetry, Keys
 ///
 /// The live order (config-reordered, possibly trimmed) rides on
 /// [`PanelUi::order`]; numbered jump keys index the ACTIVE TAB's slice.
-pub const SECTION_ORDER: [Section; 14] = [
+pub const SECTION_ORDER: [Section; 15] = [
     // Git tab
     Section::Changes,
     Section::Commits,
@@ -139,6 +141,7 @@ pub const SECTION_ORDER: [Section; 14] = [
     // Work tab
     Section::Pr,
     Section::Issues,
+    Section::Problems,
     Section::Jobs,
     Section::Tests,
     // System tab
@@ -159,6 +162,7 @@ impl Section {
             Section::Stash => "stash",
             Section::Pr => "pr",
             Section::Files => "files",
+            Section::Problems => "problems",
             Section::Jobs => "jobs",
             Section::Tests => "tests",
             Section::Debug => "debug",
@@ -180,7 +184,9 @@ impl Section {
             | Section::Branches
             | Section::Stash
             | Section::Files => PanelTab::Git,
-            Section::Pr | Section::Issues | Section::Jobs | Section::Tests => PanelTab::Work,
+            Section::Pr | Section::Issues | Section::Problems | Section::Jobs | Section::Tests => {
+                PanelTab::Work
+            }
             Section::Notifications
             | Section::Logs
             | Section::Sandbox
@@ -530,6 +536,32 @@ pub struct PanelData {
     pub task_specs: Vec<superzej_core::config::Task>,
     /// Last-run record per task name (keyed by `Task::name`).
     pub task_last_runs: std::collections::HashMap<String, TaskRunRecord>,
+    /// Compiler/linter/test diagnostics collected from task output (Problems section).
+    pub diagnostics: Vec<DiagnosticItem>,
+}
+
+/// Severity level for a compiler/linter diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum Severity {
+    #[default]
+    Error = 0,
+    Warning = 1,
+    Info = 2,
+    Hint = 3,
+}
+
+/// One structured diagnostic item for the Problems panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticItem {
+    /// Repo-relative file path.
+    pub file: String,
+    pub line: u64,
+    pub col: Option<u64>,
+    pub severity: Severity,
+    pub message: String,
+    /// Which task produced this (e.g. "cargo clippy", "pytest").
+    pub source: String,
+    pub code: Option<String>,
 }
 
 /// One row of the Files tab's accordion tree, in display order.
@@ -651,6 +683,8 @@ pub struct PanelUi {
     /// Persisted to the DB (`ui_state` table, prefix `panel.files.col/`) so the
     /// tree survives restarts.
     pub files_collapsed: std::collections::HashSet<String>,
+    /// Row cursor within the Problems section's list.
+    pub problems_cursor: usize,
     /// Row cursor within the Tasks section's list.
     pub tasks_cursor: usize,
     /// Row cursor within the Issues section's list (persisted across section switches).
@@ -697,6 +731,7 @@ impl Default for PanelUi {
             docs: docs::PanelDocs::default(),
             git: gitui::GitUi::default(),
             files_collapsed: std::collections::HashSet::new(),
+            problems_cursor: 0,
             tasks_cursor: 0,
             issues_cursor: 0,
             issues_filter: String::new(),
@@ -949,27 +984,17 @@ pub fn accordion_key(key: &KeyCode, mods: Modifiers, ui: &PanelUi) -> Option<Pan
         _ => {}
     }
     match key {
-        // Shift always hops between section headers regardless of mode.
+        // Shift always hops between section headers regardless of row position.
         KeyCode::DownArrow | KeyCode::Char('j' | 'J') if shift => Some(PanelMsg::NextSection),
         KeyCode::UpArrow | KeyCode::Char('k' | 'K') if shift => Some(PanelMsg::PrevSection),
-        // In section mode j/k navigate section headers; in row mode they walk
-        // the open section's items (with flow into the adjacent section at the
-        // boundary).
-        KeyCode::DownArrow | KeyCode::Char('j') => Some(if ui.row_mode {
-            PanelMsg::CursorDown
-        } else {
-            PanelMsg::NextSection
-        }),
-        KeyCode::UpArrow | KeyCode::Char('k') => Some(if ui.row_mode {
-            PanelMsg::CursorUp
-        } else {
-            PanelMsg::PrevSection
-        }),
-        // Enter: drill into the open section (section mode → row mode) or
-        // activate the highlighted row (row mode).
+        // j/k/arrows always navigate items within the open section first.
+        // At the boundary (top or bottom of the list) they flow into the
+        // adjacent section — the event loop handles boundary detection.
+        KeyCode::DownArrow | KeyCode::Char('j') => Some(PanelMsg::CursorDown),
+        KeyCode::UpArrow | KeyCode::Char('k') => Some(PanelMsg::CursorUp),
+        // Enter activates the highlighted row.
         KeyCode::Enter => Some(PanelMsg::Select),
-        // Esc peels back one level: row mode → section mode, section mode →
-        // leave the panel zone.
+        // Esc peels back one level: expanded change preview → leave panel zone.
         KeyCode::Escape => Some(PanelMsg::LeaveRows),
         KeyCode::Char(' ') if ui.open == Section::Changes => Some(PanelMsg::StageToggle),
         _ => None,
@@ -982,7 +1007,7 @@ mod tests {
 
     #[test]
     fn section_order_jump_and_cycle() {
-        assert_eq!(SECTION_ORDER.len(), 14);
+        assert_eq!(SECTION_ORDER.len(), 15);
         // Default tab = Git; Changes is in Git tab.
         let ui = PanelUi::default(); // open = Changes, tab = Git
         assert_eq!(ui.next_section(), Section::Commits); // next in Git tab
@@ -1154,20 +1179,22 @@ mod tests {
         let none = Modifiers::NONE;
         let shift = Modifiers::SHIFT;
         let alt = Modifiers::ALT;
-        // In section mode (row_mode = false) j/k navigate section headers.
+        // j/k always navigate items (CursorDown/CursorUp); the event loop
+        // handles boundary flow into adjacent sections. row_mode no longer
+        // gates cursor navigation — the item-first model is always active.
         assert_eq!(
             accordion_key(&KeyCode::Char('j'), none, &ui),
-            Some(PanelMsg::NextSection)
+            Some(PanelMsg::CursorDown)
         );
         assert_eq!(
             accordion_key(&KeyCode::DownArrow, none, &ui),
-            Some(PanelMsg::NextSection)
+            Some(PanelMsg::CursorDown)
         );
         assert_eq!(
             accordion_key(&KeyCode::UpArrow, none, &ui),
-            Some(PanelMsg::PrevSection)
+            Some(PanelMsg::CursorUp)
         );
-        // In row mode j/k walk rows within the open section.
+        // row_mode=true still works (no regression): same CursorDown/Up.
         let row_ui = PanelUi {
             row_mode: true,
             ..Default::default()
@@ -1222,7 +1249,7 @@ mod tests {
         );
         // A digit past the tab's section count is not an accordion intent.
         assert_eq!(accordion_key(&KeyCode::Char('6'), none, &ui), None);
-        // In Work tab, digits index Work sections (Pr, Issues, Jobs, Tests).
+        // In Work tab, digits index Work sections (Pr, Issues, Problems, Jobs, Tests).
         let work_ui = PanelUi {
             tab: PanelTab::Work,
             open: Section::Pr,
@@ -1234,7 +1261,7 @@ mod tests {
         );
         assert_eq!(
             accordion_key(&KeyCode::Char('3'), none, &work_ui),
-            Some(PanelMsg::Open(Section::Jobs))
+            Some(PanelMsg::Open(Section::Problems))
         );
         // A custom order filters to the tab's sections.
         let trimmed = PanelUi {

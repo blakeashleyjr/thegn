@@ -5799,6 +5799,32 @@ async fn event_loop<T: Terminal>(
                     outcome.task.name, exit, elapsed_s
                 )
             };
+            // Extract diagnostics and populate the Problems panel.
+            let new_diags =
+                crate::task::extract_diagnostics(&outcome.stdout_stderr, &outcome.task.name);
+            if !new_diags.is_empty() {
+                model
+                    .panel
+                    .diagnostics
+                    .retain(|d| d.source != outcome.task.name);
+                for d in new_diags {
+                    model.panel.diagnostics.push(crate::panel::DiagnosticItem {
+                        file: d.file,
+                        line: d.line,
+                        col: d.col,
+                        severity: match d.severity {
+                            crate::task::DiagSeverity::Error => crate::panel::Severity::Error,
+                            crate::task::DiagSeverity::Warning => crate::panel::Severity::Warning,
+                            crate::task::DiagSeverity::Info => crate::panel::Severity::Info,
+                            crate::task::DiagSeverity::Hint => crate::panel::Severity::Hint,
+                        },
+                        message: d.message,
+                        source: d.source,
+                        code: d.code,
+                    });
+                }
+                model.panel.diagnostics.sort_by_key(|d| d.severity as u8);
+            }
             dirty = true;
         }
         // Run results: the latest run upserts each reported test's status while
@@ -8653,6 +8679,9 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             PanelMsg::CursorDown | PanelMsg::CursorUp => {
+                                // j/k always navigate items; entering row mode
+                                // on the first keypress activates selection highlighting.
+                                panel_ui.row_mode = true;
                                 // One clamped step per QUEUED key: held-key
                                 // repeats are drained and applied in a single
                                 // render pass (no backlog inertia).
@@ -8793,12 +8822,10 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             PanelMsg::Select => {
-                                if !panel_ui.row_mode {
-                                    // Drill from section browsing into the
-                                    // section's row list.
-                                    panel_ui.row_mode = true;
-                                    panel_ui.cursor = 0;
-                                } else {
+                                // Enter always executes the item at cursor.
+                                // (row_mode is set by j/k on first navigation.)
+                                panel_ui.row_mode = true;
+                                {
                                     match panel_ui.open {
                                         Section::Changes => {
                                             // Conflict files open in the editor for
@@ -9106,6 +9133,32 @@ async fn event_loop<T: Terminal>(
                                                     let _ = tx2.send(outcome);
                                                     let _ = wk2.wake();
                                                 });
+                                            }
+                                        }
+                                        Section::Problems => {
+                                            // Open the selected diagnostic in the editor at file:line.
+                                            if let Some(d) = model
+                                                .panel
+                                                .diagnostics
+                                                .get(panel_ui.problems_cursor)
+                                                .cloned()
+                                            {
+                                                let cmd = editor_open_command(
+                                                    keymap.config(),
+                                                    &d.file,
+                                                    Some(d.line as usize),
+                                                );
+                                                let cwd = active_cwd(&session);
+                                                open_command_tab(
+                                                    &mut session,
+                                                    &mut panes,
+                                                    &cmd,
+                                                    cwd.as_deref(),
+                                                    chrome.center,
+                                                );
+                                                focus.zone = crate::focus::Zone::Center;
+                                                refresh_tab_model(&mut model, &session, &mut sb);
+                                                need_relayout = true;
                                             }
                                         }
                                         Section::Debug
@@ -9451,6 +9504,16 @@ async fn event_loop<T: Terminal>(
                             }
                             true
                         }
+                        // -- problems: cursor navigation ----------------------
+                        (Section::Problems, KeyCode::Char('j') | KeyCode::DownArrow) => {
+                            let max = model.panel.diagnostics.len().saturating_sub(1);
+                            panel_ui.problems_cursor = (panel_ui.problems_cursor + 1).min(max);
+                            true
+                        }
+                        (Section::Problems, KeyCode::Char('k') | KeyCode::UpArrow) => {
+                            panel_ui.problems_cursor = panel_ui.problems_cursor.saturating_sub(1);
+                            true
+                        }
                         // -- tasks: run / re-run / stop ----------------------
                         (Section::Jobs, KeyCode::Char('r')) => {
                             // Re-run: same as Enter but without moving cursor.
@@ -9476,6 +9539,53 @@ async fn event_loop<T: Terminal>(
                                     let _ = tx2.send(outcome);
                                     let _ = wk2.wake();
                                 });
+                            }
+                            true
+                        }
+                        (Section::Jobs, KeyCode::Char('s')) => {
+                            // Stop the selected running task.
+                            let task = model.panel.task_specs.get(panel_ui.tasks_cursor).cloned();
+                            if let Some(task) = task {
+                                let wt = crate::hydrate::active_tab_path(&session);
+                                crate::task::cancel_slot(&format!("{}:run", wt.display()));
+                                if let Some(rec) = model.panel.task_last_runs.get_mut(&task.name) {
+                                    rec.running = false;
+                                }
+                                model.status = format!("Stopped: {}", task.name);
+                            }
+                            true
+                        }
+                        (Section::Jobs, KeyCode::Char('o')) => {
+                            // Open the selected task's captured output in bat.
+                            let task = model.panel.task_specs.get(panel_ui.tasks_cursor).cloned();
+                            if let Some(task) = task
+                                && let Some(rec) =
+                                    model.panel.task_last_runs.get(&task.name).cloned()
+                                && !rec.output_tail.is_empty()
+                            {
+                                let tmp =
+                                    std::env::temp_dir().join(format!("sz-task-{}.txt", task.name));
+                                let _ = std::fs::write(&tmp, &rec.output_tail);
+                                let bat = keymap
+                                    .config()
+                                    .tool_command("bat")
+                                    .unwrap_or("bat --paging=always")
+                                    .to_string();
+                                let cmd = format!("{bat} {}", tmp.display());
+                                let cwd_o = active_cwd(&session);
+                                open_command_pane(
+                                    &mut session,
+                                    &mut panes,
+                                    focused,
+                                    &cmd,
+                                    cwd_o.as_deref(),
+                                    chrome.center,
+                                );
+                                focus.zone = crate::focus::Zone::Center;
+                                refresh_tab_model(&mut model, &session, &mut sb);
+                                need_relayout = true;
+                            } else {
+                                model.status = "No output captured yet".into();
                             }
                             true
                         }
@@ -10804,6 +10914,38 @@ async fn event_loop<T: Terminal>(
                                 }
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
+                            }
+                            Action::CloseSplitPane => {
+                                // Close the currently focused split pane. If
+                                // this is the only pane in the tab, do nothing
+                                // (can't close the last pane without closing
+                                // the tab/worktree).
+                                let pane_count = session
+                                    .active_tab()
+                                    .map(|t| t.center.pane_ids().len())
+                                    .unwrap_or(0);
+                                if pane_count <= 1 {
+                                    model.status =
+                                        "Only one pane — use Close tab to close the tab".into();
+                                } else {
+                                    let removed = session
+                                        .active_tab_mut()
+                                        .map(|t| t.center.remove(focused))
+                                        .unwrap_or(false);
+                                    if removed {
+                                        panes.table.remove(&focused);
+                                        // Focus whatever is now the first pane.
+                                        if let Some(tab) = session.active_tab_mut()
+                                            && let Some(first) =
+                                                tab.center.pane_ids().first().copied()
+                                        {
+                                            tab.focused_pane = first;
+                                        }
+                                        need_relayout = true;
+                                        persist_session_layout(&session);
+                                    }
+                                }
+                                refresh_tab_model(&mut model, &session, &mut sb);
                             }
                             Action::CloseTab => {
                                 // Close the active tab only. The final tab is

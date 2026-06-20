@@ -1813,3 +1813,637 @@ mod tests {
         let _ = std::fs::remove_dir_all(wt);
     }
 }
+
+// ── Task auto-discovery ───────────────────────────────────────────────────────
+
+/// Merge configured tasks (win by name) with auto-discovered tasks (fill gaps).
+/// The final list is: all configured tasks first, then discovered tasks whose
+/// names (case-insensitive) don't collide with any configured task.
+pub fn merge_tasks(configured: Vec<Task>, discovered: Vec<Task>) -> Vec<Task> {
+    let configured_names: std::collections::HashSet<String> = configured
+        .iter()
+        .map(|t| t.name.to_ascii_lowercase())
+        .collect();
+    let mut out = configured;
+    for t in discovered {
+        if !configured_names.contains(&t.name.to_ascii_lowercase()) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// Infer `TaskKind` from a command string. Pure; no subprocess.
+fn infer_kind(command: &str) -> TaskKind {
+    let c = command.to_ascii_lowercase();
+    if c.contains("test") || c.contains("spec") || c.contains("check --") {
+        TaskKind::Test
+    } else if c.contains("build") || c.contains("compile") || c.contains("make ") || c == "make" {
+        TaskKind::Build
+    } else if c.contains("lint")
+        || c.contains("fmt")
+        || c.contains("format")
+        || c.contains("clippy")
+        || c.contains("check")
+    {
+        TaskKind::Lint
+    } else if c.contains("dev")
+        || c.contains("serve")
+        || c.contains("start")
+        || c.contains("watch")
+        || c.starts_with("run ")
+        || c == "run"
+    {
+        TaskKind::Run
+    } else {
+        TaskKind::Custom
+    }
+}
+
+fn make_task(name: impl Into<String>, command: impl Into<String>, kind: TaskKind) -> Task {
+    Task {
+        name: name.into(),
+        command: command.into(),
+        args: Vec::new(),
+        cwd: None,
+        env: Default::default(),
+        kind,
+        matcher: None,
+        scope: None,
+    }
+}
+
+fn discover_justfile(worktree: &Path) -> Vec<Task> {
+    for name in &["justfile", "Justfile", ".justfile"] {
+        let Ok(text) = std::fs::read_to_string(worktree.join(name)) else {
+            continue;
+        };
+        let mut tasks = Vec::new();
+        for line in text.lines() {
+            let trimmed = line.trim();
+            // Recipe header: starts with an identifier immediately followed by ':' or ' '
+            // (not indented, not a comment, not a setting).
+            if trimmed.starts_with('#') || trimmed.starts_with('@') || !trimmed.contains(':') {
+                continue;
+            }
+            let recipe = trimmed.split([':', ' ', '(']).next().unwrap_or("");
+            if recipe.is_empty()
+                || recipe.starts_with('_')
+                || recipe
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(false)
+            {
+                continue;
+            }
+            // Skip variables (UPPER_SNAKE or key := value)
+            if recipe.chars().all(|c| c.is_ascii_uppercase() || c == '_') {
+                continue;
+            }
+            let cmd = format!("just {recipe}");
+            let kind = infer_kind(recipe);
+            tasks.push(make_task(recipe.to_string(), cmd, kind));
+        }
+        return tasks;
+    }
+    Vec::new()
+}
+
+fn discover_makefile(worktree: &Path) -> Vec<Task> {
+    let Ok(text) = std::fs::read_to_string(worktree.join("Makefile")) else {
+        return Vec::new();
+    };
+    let mut phony: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix(".PHONY:") {
+            for t in rest.split_whitespace() {
+                phony.insert(t);
+            }
+        }
+    }
+    let mut tasks = Vec::new();
+    for line in text.lines() {
+        // Target lines: "targetname:" not indented and not a variable assignment.
+        if line.starts_with('\t') || line.starts_with(' ') || line.starts_with('#') {
+            continue;
+        }
+        let Some(colon_pos) = line.find(':') else {
+            continue;
+        };
+        let target = line[..colon_pos].trim();
+        if target.is_empty()
+            || target.starts_with('.')
+            || target.contains('$')
+            || target.contains('/')
+        {
+            continue;
+        }
+        // Include explicit .PHONY targets and common well-known targets.
+        let well_known = matches!(
+            target,
+            "all" | "build" | "test" | "clean" | "install" | "run" | "fmt" | "lint" | "check"
+        );
+        if phony.contains(target) || well_known {
+            let cmd = format!("make {target}");
+            let kind = infer_kind(target);
+            tasks.push(make_task(target.to_string(), cmd, kind));
+        }
+    }
+    tasks
+}
+
+fn discover_package_json(worktree: &Path) -> Vec<Task> {
+    let Ok(text) = std::fs::read_to_string(worktree.join("package.json")) else {
+        return Vec::new();
+    };
+    // Minimal JSON parser: find "scripts": { "name": "cmd", ... }
+    let Some(scripts_start) = text.find("\"scripts\"") else {
+        return Vec::new();
+    };
+    let after_scripts = &text[scripts_start..];
+    let Some(brace_open) = after_scripts.find('{') else {
+        return Vec::new();
+    };
+    let inner = &after_scripts[brace_open + 1..];
+    let Some(brace_close) = inner.find('}') else {
+        return Vec::new();
+    };
+    let scripts_block = &inner[..brace_close];
+
+    let mut tasks = Vec::new();
+    // Each entry looks like: "name": "command"
+    let mut rest = scripts_block;
+    while let Some(q1) = rest.find('"') {
+        rest = &rest[q1 + 1..];
+        let Some(q2) = rest.find('"') else { break };
+        let name = &rest[..q2];
+        rest = &rest[q2 + 1..];
+        let Some(colon) = rest.find(':') else { break };
+        rest = &rest[colon + 1..];
+        let rest_trim = rest.trim_start();
+        if !rest_trim.starts_with('"') {
+            continue;
+        }
+        rest = &rest_trim[1..];
+        let Some(q3) = rest.find('"') else { break };
+        let cmd_value = &rest[..q3];
+        rest = &rest[q3 + 1..];
+
+        if name.is_empty() || name.starts_with('_') {
+            continue;
+        }
+        let cmd = format!("npm run {name}");
+        let kind = infer_kind(name);
+        tasks.push(make_task(name.to_string(), cmd, kind));
+        let _ = cmd_value; // available if we need it later
+    }
+    tasks
+}
+
+fn discover_cargo_toml(worktree: &Path) -> Vec<Task> {
+    let Ok(text) = std::fs::read_to_string(worktree.join("Cargo.toml")) else {
+        return Vec::new();
+    };
+    let mut tasks = vec![
+        make_task("cargo build", "cargo build", TaskKind::Build),
+        make_task("cargo test", "cargo test --workspace", TaskKind::Test),
+        make_task("cargo clippy", "cargo clippy --workspace", TaskKind::Lint),
+        make_task("cargo fmt", "cargo fmt --all", TaskKind::Lint),
+        make_task("cargo check", "cargo check --workspace", TaskKind::Lint),
+    ];
+    // Parse [alias] section
+    let mut in_alias = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[alias]" {
+            in_alias = true;
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            in_alias = false;
+        }
+        if in_alias {
+            if let Some(eq) = trimmed.find('=') {
+                let name = trimmed[..eq].trim().trim_matches('"');
+                let val = trimmed[eq + 1..].trim().trim_matches(['"', '\'']);
+                if !name.is_empty() {
+                    let cmd = format!("cargo {name}");
+                    let kind = infer_kind(val);
+                    tasks.push(make_task(format!("cargo {name}"), cmd, kind));
+                }
+            }
+        }
+    }
+    tasks
+}
+
+fn discover_go_mod(worktree: &Path) -> Vec<Task> {
+    if !worktree.join("go.mod").exists() {
+        return Vec::new();
+    }
+    vec![
+        make_task("go build", "go build ./...", TaskKind::Build),
+        make_task("go test", "go test ./...", TaskKind::Test),
+        make_task("go vet", "go vet ./...", TaskKind::Lint),
+        make_task("gofmt", "gofmt -w .", TaskKind::Lint),
+    ]
+}
+
+fn discover_pyproject(worktree: &Path) -> Vec<Task> {
+    let text = std::fs::read_to_string(worktree.join("pyproject.toml"))
+        .or_else(|_| std::fs::read_to_string(worktree.join("tox.ini")))
+        .unwrap_or_default();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut tasks = Vec::new();
+    // taskipy tasks: [tool.taskipy.tasks] or just [tasks]
+    let mut in_taskipy = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[tool.taskipy.tasks]" || trimmed == "[tasks]" {
+            in_taskipy = true;
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            in_taskipy = false;
+        }
+        if in_taskipy {
+            if let Some(eq) = trimmed.find('=') {
+                let name = trimmed[..eq].trim().trim_matches('"');
+                if !name.is_empty() {
+                    let cmd = format!("task {name}");
+                    let kind = infer_kind(name);
+                    tasks.push(make_task(name.to_string(), cmd, kind));
+                }
+            }
+        }
+    }
+    // tox envs: [testenv:name]
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("[testenv:") {
+            let env_name = rest.trim_end_matches(']');
+            if !env_name.is_empty() {
+                tasks.push(make_task(
+                    format!("tox:{env_name}"),
+                    format!("tox -e {env_name}"),
+                    infer_kind(env_name),
+                ));
+            }
+        }
+    }
+    tasks
+}
+
+fn discover_docker_compose(worktree: &Path) -> Vec<Task> {
+    let text = [
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "compose.yml",
+        "compose.yaml",
+    ]
+    .iter()
+    .find_map(|f| std::fs::read_to_string(worktree.join(f)).ok())
+    .unwrap_or_default();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut tasks = Vec::new();
+    let mut in_services = false;
+    for line in text.lines() {
+        if line.trim() == "services:" {
+            in_services = true;
+            continue;
+        }
+        if in_services {
+            // Service names are at exactly 2 spaces of indentation
+            if line.starts_with("  ") && !line.starts_with("   ") {
+                let svc = line.trim().trim_end_matches(':');
+                if !svc.is_empty() && !svc.starts_with('#') {
+                    tasks.push(make_task(
+                        format!("compose:{svc}"),
+                        format!("docker compose up {svc}"),
+                        TaskKind::Run,
+                    ));
+                }
+            }
+            // Stop at the next top-level section
+            if !line.starts_with(' ') && line.contains(':') {
+                in_services = false;
+            }
+        }
+    }
+    tasks
+}
+
+fn discover_procfile(worktree: &Path) -> Vec<Task> {
+    let Ok(text) = std::fs::read_to_string(worktree.join("Procfile")) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let (name, _cmd) = line.split_once(':')?;
+            let name = name.trim();
+            if name.is_empty() || name.starts_with('#') {
+                return None;
+            }
+            Some(make_task(
+                name.to_string(),
+                format!("foreman start {name}"),
+                TaskKind::Run,
+            ))
+        })
+        .collect()
+}
+
+/// Auto-discover tasks from well-known manifests in `worktree`. Does NOT run
+/// any subprocesses — reads manifest files only. Results are merged with
+/// configured tasks by the caller via [`merge_tasks`].
+pub fn discover_all_tasks(worktree: &Path) -> Vec<Task> {
+    let mut tasks = Vec::new();
+    tasks.extend(discover_justfile(worktree));
+    tasks.extend(discover_makefile(worktree));
+    tasks.extend(discover_package_json(worktree));
+    tasks.extend(discover_cargo_toml(worktree));
+    tasks.extend(discover_go_mod(worktree));
+    tasks.extend(discover_pyproject(worktree));
+    tasks.extend(discover_docker_compose(worktree));
+    tasks.extend(discover_procfile(worktree));
+    tasks
+}
+
+// ── Diagnostic extraction ─────────────────────────────────────────────────────
+
+/// Severity level for a compiler/linter/test diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DiagSeverity {
+    Error = 0,
+    Warning = 1,
+    Info = 2,
+    Hint = 3,
+}
+
+/// One structured diagnostic extracted from task output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedDiag {
+    pub file: String,
+    pub line: u64,
+    pub col: Option<u64>,
+    pub severity: DiagSeverity,
+    pub message: String,
+    pub source: String,
+    pub code: Option<String>,
+}
+
+fn diag_severity(word: &str) -> Option<DiagSeverity> {
+    match word.to_ascii_lowercase().as_str() {
+        "error" | "err" => Some(DiagSeverity::Error),
+        "warning" | "warn" => Some(DiagSeverity::Warning),
+        "note" | "info" | "help" => Some(DiagSeverity::Info),
+        "hint" => Some(DiagSeverity::Hint),
+        _ => None,
+    }
+}
+
+/// Extract structured diagnostics from task output. Pattern matches GCC/clang/
+/// rustc, Go, Python/pytest, and a generic fallback. Results are capped at 500
+/// and deduplicated by (file, line, message).
+pub fn extract_diagnostics(output: &str, source: &str) -> Vec<ExtractedDiag> {
+    let mut out: Vec<ExtractedDiag> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, u64, String)> =
+        std::collections::HashSet::new();
+
+    for line in output.lines() {
+        if out.len() >= 500 {
+            break;
+        }
+        // GCC/clang/rustc/cargo: file:line:col: severity: message
+        // Also handles: file:line: severity: message (no col)
+        if let Some(d) = parse_gcc_line(line, source) {
+            let key = (d.file.clone(), d.line, d.message.clone());
+            if seen.insert(key) {
+                out.push(d);
+            }
+            continue;
+        }
+        // Python/pytest: "FAILED path/test.py::TestClass::test_name"
+        if let Some(d) = parse_pytest_line(line, source) {
+            let key = (d.file.clone(), d.line, d.message.clone());
+            if seen.insert(key) {
+                out.push(d);
+            }
+        }
+    }
+
+    out.sort_by_key(|d| d.severity as u8);
+    out
+}
+
+fn parse_gcc_line(line: &str, source: &str) -> Option<ExtractedDiag> {
+    // Pattern: <path>:<line>[:<col>]: <severity>: <message>
+    // The path segment must not start with whitespace and must not be a URL.
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    // Split on ": " to find severity keyword.
+    let mut parts = line.splitn(3, ": ");
+    let location = parts.next()?;
+    let severity_word = parts.next()?;
+    let message = parts.next().unwrap_or("").trim();
+
+    let severity = diag_severity(severity_word)?;
+
+    // Parse location: path:line[:col]
+    let loc_parts: Vec<&str> = location.rsplitn(3, ':').collect();
+    // loc_parts is reversed: [col_or_line, line_or_path, path...]
+    let (file, line_no, col) = match loc_parts.len() {
+        3 => {
+            // path:line:col
+            let col: u64 = loc_parts[0].parse().ok()?;
+            let ln: u64 = loc_parts[1].parse().ok()?;
+            let path = &location[..location.len() - loc_parts[0].len() - loc_parts[1].len() - 2];
+            (path, ln, Some(col))
+        }
+        2 => {
+            // path:line
+            let ln: u64 = loc_parts[0].parse().ok()?;
+            let path = &location[..location.len() - loc_parts[0].len() - 1];
+            (path, ln, None)
+        }
+        _ => return None,
+    };
+
+    if file.is_empty() || file.contains("://") || file.starts_with("    ") {
+        return None;
+    }
+    // Reject paths that don't look like file paths (contain spaces but no slash).
+    if file.contains(' ') && !file.contains('/') && !file.contains('\\') {
+        return None;
+    }
+
+    Some(ExtractedDiag {
+        file: file.to_string(),
+        line: line_no,
+        col,
+        severity,
+        message: message.to_string(),
+        source: source.to_string(),
+        code: None,
+    })
+}
+
+fn parse_pytest_line(line: &str, source: &str) -> Option<ExtractedDiag> {
+    let line = line.trim();
+    // "FAILED tests/test_foo.py::TestClass::test_name - AssertionError"
+    if let Some(rest) = line.strip_prefix("FAILED ") {
+        let (path_part, msg) = rest.split_once(" - ").unwrap_or((rest, "test failed"));
+        let file = path_part.split("::").next().unwrap_or(path_part);
+        return Some(ExtractedDiag {
+            file: file.to_string(),
+            line: 1,
+            col: None,
+            severity: DiagSeverity::Error,
+            message: msg.to_string(),
+            source: source.to_string(),
+            code: None,
+        });
+    }
+    // "ERROR tests/test_foo.py::TestClass::test_name"
+    if let Some(rest) = line.strip_prefix("ERROR ") {
+        let file = rest.split("::").next().unwrap_or(rest).trim();
+        return Some(ExtractedDiag {
+            file: file.to_string(),
+            line: 1,
+            col: None,
+            severity: DiagSeverity::Error,
+            message: "test error".to_string(),
+            source: source.to_string(),
+            code: None,
+        });
+    }
+    None
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn temp_dir2(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("sz-disc-{tag}"));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn merge_tasks_configured_wins() {
+        let configured = vec![make_task("test", "my test runner", TaskKind::Test)];
+        let discovered = vec![
+            make_task("test", "cargo test", TaskKind::Test),
+            make_task("build", "cargo build", TaskKind::Build),
+        ];
+        let merged = merge_tasks(configured, discovered);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].command, "my test runner");
+        assert_eq!(merged[1].name, "build");
+    }
+
+    #[test]
+    fn discover_justfile_recipes() {
+        let dir = temp_dir2("just");
+        std::fs::write(
+            dir.join("Justfile"),
+            "build:\n    cargo build\n\ntest:\n    cargo test\n\n_hidden:\n    echo hidden\n",
+        )
+        .unwrap();
+        let tasks = discover_justfile(&dir);
+        let names: Vec<&str> = tasks.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"build"), "{names:?}");
+        assert!(names.contains(&"test"), "{names:?}");
+        assert!(
+            !names.contains(&"_hidden"),
+            "hidden recipes excluded: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn discover_package_json_scripts() {
+        let dir = temp_dir2("npm");
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"demo","scripts":{"build":"tsc","test":"jest","lint":"eslint ."}}"#,
+        )
+        .unwrap();
+        let tasks = discover_package_json(&dir);
+        let names: Vec<&str> = tasks.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"build"), "{names:?}");
+        assert!(names.contains(&"test"), "{names:?}");
+        assert!(names.contains(&"lint"), "{names:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn discover_cargo_toml_canonical_tasks() {
+        let dir = temp_dir2("cargo");
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname=\"demo\"\n").unwrap();
+        let tasks = discover_cargo_toml(&dir);
+        let names: Vec<&str> = tasks.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"cargo build"), "{names:?}");
+        assert!(names.contains(&"cargo test"), "{names:?}");
+        assert!(names.contains(&"cargo clippy"), "{names:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn extract_diagnostics_gcc_style() {
+        let output = "src/main.rs:10:5: error: unused variable `x`\n\
+                      src/lib.rs:20:3: warning: deprecated function\n\
+                      not a diagnostic line\n";
+        let diags = extract_diagnostics(output, "cargo");
+        assert_eq!(diags.len(), 2, "{diags:?}");
+        assert_eq!(diags[0].severity, DiagSeverity::Error);
+        assert_eq!(diags[0].file, "src/main.rs");
+        assert_eq!(diags[0].line, 10);
+        assert_eq!(diags[1].severity, DiagSeverity::Warning);
+    }
+
+    #[test]
+    fn extract_diagnostics_pytest_style() {
+        let output = "FAILED tests/test_foo.py::TestBar::test_something - AssertionError: 1 != 2\n\
+                      ERROR tests/test_baz.py::TestQux::test_other\n";
+        let diags = extract_diagnostics(output, "pytest");
+        assert_eq!(diags.len(), 2, "{diags:?}");
+        assert!(diags.iter().all(|d| d.severity == DiagSeverity::Error));
+        assert!(
+            diags.iter().any(|d| d.file == "tests/test_foo.py"),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn extract_diagnostics_deduplicates() {
+        let line = "src/main.rs:5:1: error: duplicate symbol\n";
+        let output = line.repeat(5);
+        let diags = extract_diagnostics(&output, "cargo");
+        assert_eq!(diags.len(), 1, "should deduplicate: {diags:?}");
+    }
+
+    #[test]
+    fn discover_makefile_phony_targets() {
+        let dir = temp_dir2("make");
+        std::fs::write(
+            dir.join("Makefile"),
+            ".PHONY: build test clean\nbuild:\n\tcargo build\ntest:\n\tcargo test\nclean:\n\trm -rf target\n",
+        ).unwrap();
+        let tasks = discover_makefile(&dir);
+        let names: Vec<&str> = tasks.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"build"), "{names:?}");
+        assert!(names.contains(&"test"), "{names:?}");
+        assert!(names.contains(&"clean"), "{names:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

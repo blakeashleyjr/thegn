@@ -812,19 +812,16 @@ pub(crate) fn build_model(
         panel.unread_notifications = notifications.iter().filter(|n| !n.read).count();
         panel.notifications = notifications;
     }
-    // Tasks section: populate task specs from config.
-    // Only non-test tasks go here; the Tests section handles TestKind tasks.
+    // Tasks section: populate task specs from config + auto-discovery.
+    // Configured tasks win by name; discovered tasks from manifests fill gaps.
     if let Ok(task_cfg) = superzej_core::config::Config::try_load_layered(
         &superzej_core::config::ProcessEnv,
         &[],
         None,
     ) {
-        panel.task_specs = task_cfg
-            .tasks
-            .iter()
-            .filter(|t| t.kind != superzej_core::config::TaskKind::Test)
-            .cloned()
-            .collect();
+        let configured = task_cfg.tasks.clone();
+        let discovered = crate::task::discover_all_tasks(&cwd);
+        panel.task_specs = crate::task::merge_tasks(configured, discovered);
     }
 
     // Logs section: tail the szhost log file.

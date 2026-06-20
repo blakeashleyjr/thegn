@@ -59,6 +59,7 @@ pub enum Action {
     MoveWorktreeDown,
     SplitDown,
     SplitRight,
+    CloseSplitPane,
     FocusLeft,
     FocusRight,
     FocusUp,
@@ -160,6 +161,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         label: "Split pane right",
         hint: "split→",
         default_chords: &["Alt N"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "close-pane",
+        label: "Close pane",
+        hint: "close pane",
+        default_chords: &["Ctrl w"],
         palette: true,
     },
     ActionSpec {
@@ -600,6 +608,7 @@ impl Action {
             Action::MoveWorktreeDown => "move-worktree-down",
             Action::SplitDown => "split-down",
             Action::SplitRight => "split-right",
+            Action::CloseSplitPane => "close-pane",
             Action::FocusLeft => "focus-left",
             Action::FocusRight => "focus-right",
             Action::FocusUp => "focus-up",
@@ -656,6 +665,7 @@ impl Action {
             "move-worktree-down" => Action::MoveWorktreeDown,
             "split-down" | "new-panel-native" => Action::SplitDown,
             "split-right" | "new-panel" => Action::SplitRight,
+            "close-pane" => Action::CloseSplitPane,
             "focus-left" => Action::FocusLeft,
             "focus-right" => Action::FocusRight,
             "focus-up" => Action::FocusUp,
@@ -913,6 +923,7 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Alt d", Action::Dashboard).unwrap();
     map.insert_all("Alt n", Action::SplitDown).unwrap();
     map.insert_all("Alt N", Action::SplitRight).unwrap();
+    map.insert_all("Ctrl w", Action::CloseSplitPane).unwrap();
     map.insert_all("Alt g", Action::Lazygit).unwrap();
     map.insert_all("Alt y", Action::Yazi).unwrap();
     map.insert_all("Alt e", Action::Editor).unwrap();

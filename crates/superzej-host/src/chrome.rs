@@ -1686,6 +1686,7 @@ pub(crate) fn panel_help_pairs(ui: &crate::panel::PanelUi) -> Vec<(String, Strin
             ("y", "copy"),
             ("e", "export"),
         ],
+        Section::Problems => &[("↵", "open"), ("j/k", "select")],
         Section::Debug | Section::Sandbox | Section::Db | Section::Telemetry | Section::Keys => {
             &[("j/k", "row")]
         }
