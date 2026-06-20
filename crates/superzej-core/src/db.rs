@@ -1047,6 +1047,24 @@ impl Db {
         Ok(())
     }
 
+    /// Re-key a worktree registry row after a rename (`git branch -m` +
+    /// `git worktree move`): the primary key `worktree` (path) moves to
+    /// `new_path`, and the `tab_name`/`branch` follow the new branch. `position`,
+    /// `agent`, and `sandbox_backend` are preserved. No-op if the old row is gone.
+    pub fn rename_worktree(
+        &self,
+        old_path: &str,
+        new_path: &str,
+        new_tab: &str,
+        new_branch: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE worktrees SET worktree=?2, tab_name=?3, branch=?4 WHERE worktree=?1",
+            params![old_path, new_path, new_tab, new_branch],
+        )?;
+        Ok(())
+    }
+
     /// Forget the registry row for a worktree group by its owning repo and tab
     /// name. This is intentionally independent of the worktree path so close /
     /// delete operations cannot be undone by a stale row whose path was moved or
@@ -2003,6 +2021,27 @@ mod tests {
         // delete
         db.del_worktree("/wt/other").unwrap();
         assert!(db.worktrees().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rename_worktree_rekeys_path_tab_and_branch() {
+        let db = db();
+        db.put_worktree("app/old", "/x/app", "/wt/old", "old", None)
+            .unwrap();
+        db.set_worktree_position("/wt/old", 7).unwrap();
+        db.rename_worktree("/wt/old", "/wt/new", "app/new", "new")
+            .unwrap();
+        let rows = db.worktrees().unwrap();
+        assert_eq!(rows.len(), 1);
+        let w = &rows[0];
+        assert_eq!(w.worktree, "/wt/new");
+        assert_eq!(w.tab_name, "app/new");
+        assert_eq!(w.branch, "new");
+        assert_eq!(w.position, 7, "position is preserved across rename");
+        // Renaming a missing row is a no-op (no panic, no insert).
+        db.rename_worktree("/wt/missing", "/wt/x", "app/x", "x")
+            .unwrap();
+        assert_eq!(db.worktrees().unwrap().len(), 1);
     }
 
     #[test]

@@ -955,6 +955,17 @@ enum SidebarOutcome {
     /// DELETE these worktree groups from disk (`git worktree remove`) and
     /// close them — destructive; the loop may interpose a confirmation.
     DeleteGroups(Vec<usize>),
+    /// Copy this text (a worktree path) to the system clipboard via OSC-52.
+    CopyText(String),
+    /// Prompt to rename the worktree group at this session index (its current
+    /// branch seeds the input). Item 53.
+    PromptRename { gi: usize, branch: String },
+    /// Fork a new worktree branching from this source branch (item 52). The
+    /// loop launches the new-worktree wizard with the base overridden.
+    Fork {
+        base_branch: String,
+        repo_root: String,
+    },
 }
 
 impl SidebarState {
@@ -1055,12 +1066,18 @@ impl SidebarState {
         }
         entries.push(("pin", "Pin / unpin"));
         if row.kind == RowKind::Worktree {
+            // Copy path / fork apply to any worktree with a real checkout.
+            if row.worktree_path.is_some() {
+                entries.push(("copy-path", "Copy path"));
+                entries.push(("fork", "Fork worktree"));
+            }
             let is_home = matches!(
                 row.tab_target,
                 Some(crate::sidebar::RowTarget::Tab(gi, _))
                     if session.worktrees.get(gi).map(|g| g.kind) == Some(crate::session::GroupKind::Home)
             );
             if !is_home {
+                entries.push(("rename", "Rename worktree"));
                 entries.push(("close", "Close worktree"));
                 entries.push(("delete", "Delete worktree (disk)"));
             }
@@ -1352,6 +1369,39 @@ impl SidebarState {
                 let targets = self.action_targets(model);
                 if !targets.is_empty() {
                     return SidebarOutcome::DeleteGroups(targets);
+                }
+            }
+            "copy-path" => {
+                if let Some(p) = self
+                    .selected_row(model)
+                    .and_then(|r| r.worktree_path.clone())
+                {
+                    return SidebarOutcome::CopyText(p);
+                }
+            }
+            "fork" => {
+                let row = self.selected_row(model);
+                if let Some(branch) = row.and_then(|r| r.branch.clone()).filter(|b| !b.is_empty())
+                    && let Some(path) = self
+                        .selected_row(model)
+                        .and_then(|r| r.worktree_path.clone())
+                {
+                    let repo_root = superzej_core::repo::main_worktree(std::path::Path::new(&path))
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or(path);
+                    return SidebarOutcome::Fork {
+                        base_branch: branch,
+                        repo_root,
+                    };
+                }
+            }
+            "rename" => {
+                // Resolve the live group index + current branch for the cursor row.
+                if let Some(crate::sidebar::RowTarget::Tab(gi, _)) =
+                    self.selected_row(model).and_then(|r| r.tab_target.clone())
+                    && let Some(branch) = self.selected_row(model).and_then(|r| r.branch.clone())
+                {
+                    return SidebarOutcome::PromptRename { gi, branch };
                 }
             }
             _ => {}
@@ -2254,9 +2304,65 @@ enum GitInputKind {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum HostInputKind {
     NewWorkspace,
+    /// Rename the worktree group at this session index from its old branch
+    /// (item 53). Carries the repo root + old path/branch so the off-thread
+    /// rename has everything it needs.
+    RenameWorktree {
+        gi: usize,
+        repo_root: String,
+        old_path: String,
+        old_branch: String,
+    },
+}
+
+/// Launch the new-worktree wizard + speculative-create worker against `root`.
+/// `base_override` forks from a chosen branch (item 52); `None` uses the
+/// configured/auto-resolved base. Shared by the `NewWorktree` action and the
+/// sidebar "fork worktree" outcome so both go through one launch path.
+#[allow(clippy::too_many_arguments)]
+fn begin_worktree_wizard(
+    root: std::path::PathBuf,
+    base_override: Option<String>,
+    cfg: &superzej_core::config::Config,
+    create_gen: &mut u64,
+    create_tx: &tokio_mpsc::UnboundedSender<wizard::CreateEvent>,
+    waker: &TerminalWaker,
+    creating: &mut Option<wizard::CreationProgress>,
+    wizard_cmd_tx: &mut Option<std::sync::mpsc::Sender<wizard::WizardCmd>>,
+    wizard_ui: &mut Option<wizard::NewWorktreeWizard>,
+    model: &mut FrameModel,
+) {
+    if wizard_ui.is_some() || creating.is_some() {
+        model.status = "worktree creation already in progress".into();
+        return;
+    }
+    // Open the wizard instantly (pure prefill) and start the worker, which
+    // speculatively creates the worktree under the candidate name while the
+    // user reads the form.
+    *create_gen += 1;
+    let w = wizard::NewWorktreeWizard::new(root.clone(), cfg);
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    let ctx = wizard::WorkerCtx {
+        cfg: cfg.clone(),
+        repo_root: root,
+        candidate: w.candidate(),
+        generation: *create_gen,
+        db_path: None,
+        base_override,
+    };
+    let tx = create_tx.clone();
+    let wk = waker.clone();
+    task::spawn_blocking(move || {
+        wizard::run_worker(ctx, cmd_rx, tx, move || {
+            let _ = wk.wake();
+        });
+    });
+    *creating = Some(wizard::CreationProgress::new(*create_gen, w.candidate()));
+    *wizard_cmd_tx = Some(cmd_tx);
+    *wizard_ui = Some(w);
 }
 
 fn begin_new_workspace_prompt(
@@ -7788,6 +7894,62 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                     }
+                                    HostInputKind::RenameWorktree {
+                                        gi,
+                                        repo_root,
+                                        old_path,
+                                        old_branch,
+                                    } => {
+                                        let root = Path::new(&repo_root);
+                                        // Dedupe the typed name against existing
+                                        // branches (excluding the one being renamed).
+                                        let mut taken =
+                                            superzej_core::worktree::BranchSet::load(root);
+                                        taken.remove(&old_branch);
+                                        let want =
+                                            superzej_core::worktree::dedupe(text.trim(), &taken);
+                                        match superzej_core::worktree::rename(
+                                            root,
+                                            Path::new(&old_path),
+                                            &old_branch,
+                                            &want,
+                                            &current_config,
+                                        ) {
+                                            Ok(new_path) => {
+                                                let new_path_s =
+                                                    new_path.to_string_lossy().into_owned();
+                                                // Re-key the live session group: name
+                                                // (slug/branch) + path follow the rename.
+                                                if let Some(g) = session.worktrees.get_mut(gi) {
+                                                    let slug = crate::sidebar::split_tab(&g.name)
+                                                        .map(|(s, _)| s)
+                                                        .unwrap_or_default();
+                                                    g.name = format!("{slug}/{want}");
+                                                    g.path = new_path_s.clone();
+                                                }
+                                                if let Ok(db) = superzej_core::db::Db::open() {
+                                                    let tab = session
+                                                        .worktrees
+                                                        .get(gi)
+                                                        .map(|g| g.name.clone())
+                                                        .unwrap_or_default();
+                                                    let _ = db.rename_worktree(
+                                                        &old_path,
+                                                        &new_path_s,
+                                                        &tab,
+                                                        &want,
+                                                    );
+                                                }
+                                                persist_session_layout(&session);
+                                                refresh_tab_model(&mut model, &session, &mut sb);
+                                                sb.focus_active_row(&mut model);
+                                                model.status = format!("Renamed to {want}");
+                                            }
+                                            Err(why) => {
+                                                model.status = format!("rename failed: {why}");
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -8623,6 +8785,61 @@ async fn event_loop<T: Terminal>(
                                 &mut drawer_home,
                                 keymap.config(),
                                 chrome.center,
+                            );
+                            dirty = true;
+                            continue;
+                        }
+                        SidebarOutcome::CopyText(text) => {
+                            // OSC-52 to the outer terminal's clipboard (item 27).
+                            use std::io::Write as _;
+                            let seq = crate::copymode::osc52(&text);
+                            let mut out = std::io::stdout();
+                            let _ = out.write_all(&seq).and_then(|_| out.flush());
+                            model.status = format!("Copied: {text}");
+                            dirty = true;
+                            continue;
+                        }
+                        SidebarOutcome::PromptRename { gi, branch } => {
+                            if let Some(g) = session.worktrees.get(gi) {
+                                let repo_root =
+                                    superzej_core::repo::main_worktree(Path::new(&g.path))
+                                        .map(|p| p.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| g.path.clone());
+                                host_input = Some((
+                                    menu::InputOverlay::new(
+                                        format!("rename {branch}"),
+                                        branch.clone(),
+                                    ),
+                                    HostInputKind::RenameWorktree {
+                                        gi,
+                                        repo_root,
+                                        old_path: g.path.clone(),
+                                        old_branch: branch,
+                                    },
+                                ));
+                                model.status =
+                                    "Rename worktree: edit the branch name (Esc cancels)".into();
+                            }
+                            dirty = true;
+                            continue;
+                        }
+                        SidebarOutcome::Fork {
+                            base_branch,
+                            repo_root,
+                        } => {
+                            // Reuse the new-worktree flow with the base overridden
+                            // to the selected branch (item 52).
+                            begin_worktree_wizard(
+                                std::path::PathBuf::from(repo_root),
+                                Some(base_branch),
+                                keymap.config(),
+                                &mut create_gen,
+                                &create_tx,
+                                &waker,
+                                &mut creating,
+                                &mut wizard_cmd_tx,
+                                &mut wizard_ui,
+                                &mut model,
                             );
                             dirty = true;
                             continue;
@@ -10936,42 +11153,18 @@ async fn event_loop<T: Terminal>(
                                             .and_then(|c| superzej_core::repo::main_worktree(&c))
                                     });
                                 if let Some(root) = repo_root {
-                                    if wizard_ui.is_some() || creating.is_some() {
-                                        model.status =
-                                            "worktree creation already in progress".into();
-                                    } else {
-                                        // Open the wizard instantly (pure
-                                        // prefill) and start the worker, which
-                                        // speculatively creates the worktree
-                                        // under the candidate name while the
-                                        // user reads the form.
-                                        create_gen += 1;
-                                        let w = wizard::NewWorktreeWizard::new(
-                                            root.clone(),
-                                            keymap.config(),
-                                        );
-                                        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
-                                        let ctx = wizard::WorkerCtx {
-                                            cfg: keymap.config().clone(),
-                                            repo_root: root,
-                                            candidate: w.candidate(),
-                                            generation: create_gen,
-                                            db_path: None,
-                                        };
-                                        let tx = create_tx.clone();
-                                        let wk = waker.clone();
-                                        task::spawn_blocking(move || {
-                                            wizard::run_worker(ctx, cmd_rx, tx, move || {
-                                                let _ = wk.wake();
-                                            });
-                                        });
-                                        creating = Some(wizard::CreationProgress::new(
-                                            create_gen,
-                                            w.candidate(),
-                                        ));
-                                        wizard_cmd_tx = Some(cmd_tx);
-                                        wizard_ui = Some(w);
-                                    }
+                                    begin_worktree_wizard(
+                                        root,
+                                        None,
+                                        keymap.config(),
+                                        &mut create_gen,
+                                        &create_tx,
+                                        &waker,
+                                        &mut creating,
+                                        &mut wizard_cmd_tx,
+                                        &mut wizard_ui,
+                                        &mut model,
+                                    );
                                 } else {
                                     superzej_core::msg::warn(
                                         "new-worktree: not inside a git repository",

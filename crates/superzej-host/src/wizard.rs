@@ -654,6 +654,10 @@ pub struct WorkerCtx {
     /// Test seam: `Some(path)` opens the DB there instead of the default
     /// state dir (this shell often runs inside a live superzej).
     pub db_path: Option<PathBuf>,
+    /// Fork source: when `Some(branch)`, the new worktree branches from this
+    /// ref instead of the configured/auto-resolved base (sidebar "fork
+    /// worktree", item 52). Empty/None falls back to `resolve_base`.
+    pub base_override: Option<String>,
 }
 
 /// The blocking half of worktree creation, run on a `spawn_blocking` thread:
@@ -702,7 +706,12 @@ pub fn run_worker(
     // --- preflight: taken names + base, then the collision-free suggestion.
     step(CreateStep::ResolveBase, StepState::Running, None);
     let taken = worktree::BranchSet::load(root);
-    let base = worktree::resolve_base(root, cfg);
+    // Fork (item 52) branches from the chosen source ref; otherwise the
+    // configured/auto-resolved base.
+    let base = match ctx.base_override.as_deref() {
+        Some(b) if !b.is_empty() => b.to_string(),
+        _ => worktree::resolve_base(root, cfg),
+    };
     if util::git_out(root, &["rev-parse", "--verify", "--quiet", &base]).is_none() {
         fail(
             CreateStep::ResolveBase,
@@ -800,59 +809,48 @@ pub fn run_worker(
                 step(CreateStep::FinalizeName, StepState::Skipped, None);
             } else {
                 step(CreateStep::FinalizeName, StepState::Running, None);
-                let new_path = worktree::worktree_path(root, &want, cfg);
-                if let Some(parent) = new_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let renamed = util::git_ok(root, &["branch", "-m", &branch, &want])
-                    && util::git_ok(
-                        root,
-                        &[
-                            "worktree",
-                            "move",
-                            &path.to_string_lossy(),
-                            &new_path.to_string_lossy(),
-                        ],
-                    );
-                if renamed {
-                    branch = want;
-                    path = new_path;
-                    // A sandbox container is keyed by the worktree path —
-                    // re-ensure for the moved path (cheap next to a checkout).
-                    if let Some((backend, outcome)) = prepped.as_mut()
-                        && outcome.spec.is_some()
-                    {
-                        let backend = backend.clone();
-                        step(CreateStep::SandboxPrep, StepState::Running, None);
-                        match prep(&backend, &path) {
-                            Ok(redo) => {
-                                step(
-                                    CreateStep::SandboxPrep,
-                                    StepState::Done,
-                                    Some(sandbox_detail(&redo)),
-                                );
-                                *outcome = redo;
-                            }
-                            Err(e) => {
-                                worktree::remove(root, &path, &branch, true);
-                                fail(CreateStep::SandboxPrep, e.to_string());
-                                return;
+                match worktree::rename(root, &path, &branch, &want, cfg) {
+                    Ok(new_path) => {
+                        branch = want;
+                        path = new_path;
+                        // A sandbox container is keyed by the worktree path —
+                        // re-ensure for the moved path (cheap next to a checkout).
+                        if let Some((backend, outcome)) = prepped.as_mut()
+                            && outcome.spec.is_some()
+                        {
+                            let backend = backend.clone();
+                            step(CreateStep::SandboxPrep, StepState::Running, None);
+                            match prep(&backend, &path) {
+                                Ok(redo) => {
+                                    step(
+                                        CreateStep::SandboxPrep,
+                                        StepState::Done,
+                                        Some(sandbox_detail(&redo)),
+                                    );
+                                    *outcome = redo;
+                                }
+                                Err(e) => {
+                                    worktree::remove(root, &path, &branch, true);
+                                    fail(CreateStep::SandboxPrep, e.to_string());
+                                    return;
+                                }
                             }
                         }
+                        step(
+                            CreateStep::FinalizeName,
+                            StepState::Done,
+                            Some(branch.clone()),
+                        );
                     }
-                    step(
-                        CreateStep::FinalizeName,
-                        StepState::Done,
-                        Some(branch.clone()),
-                    );
-                } else {
-                    // Keep the generated name rather than failing a finished
-                    // checkout; the overlay shows what happened.
-                    step(
-                        CreateStep::FinalizeName,
-                        StepState::Done,
-                        Some(format!("rename failed — kept {branch}")),
-                    );
+                    Err(why) => {
+                        // Keep the generated name rather than failing a finished
+                        // checkout; the overlay shows what happened.
+                        step(
+                            CreateStep::FinalizeName,
+                            StepState::Done,
+                            Some(format!("rename failed — kept {branch} ({why})")),
+                        );
+                    }
                 }
             }
         }
@@ -983,6 +981,7 @@ mod tests {
                 candidate: candidate.into(),
                 generation: 7,
                 db_path: Some(db_path.to_path_buf()),
+                base_override: None,
             },
             cmd_rx,
             ev_tx,
