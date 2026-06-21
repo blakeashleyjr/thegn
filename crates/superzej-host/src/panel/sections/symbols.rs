@@ -44,7 +44,12 @@ fn empty_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     if ctx.full() && !file.is_empty() {
         rows.push(PanelRow::plain(Line::segs(vec![seg(g3(), file.clone())])));
     }
-    rows.push(hint_row(&[("↵", "go to def"), ("j/k", "select")]));
+    rows.push(hint_row(&[
+        ("↵", "go to def"),
+        ("r", "refs"),
+        ("o", "outline"),
+        ("j/k", "select"),
+    ]));
     rows
 }
 
@@ -90,7 +95,12 @@ fn list_view(ctx: &SectionCtx, half: bool) -> Vec<PanelRow> {
         }
     }
 
-    rows.push(hint_row(&[("↵", "go to def"), ("j/k", "select")]));
+    rows.push(hint_row(&[
+        ("↵", "go to def"),
+        ("r", "refs"),
+        ("o", "outline"),
+        ("j/k", "select"),
+    ]));
     rows
 }
 
@@ -126,6 +136,7 @@ mod tests {
             name: name.into(),
             file: "src/a.rs".into(),
             line,
+            col: 0,
             depth,
         }
     }

@@ -568,6 +568,7 @@ mod spec {
                 name: "Views".into(),
                 file: "src/lib.rs".into(),
                 line: 1,
+                col: 7,
                 depth: 0,
             },
             crate::panel::SymbolRow {
@@ -575,6 +576,7 @@ mod spec {
                 name: "render".into(),
                 file: "src/lib.rs".into(),
                 line: 12,
+                col: 7,
                 depth: 1,
             },
         ];
