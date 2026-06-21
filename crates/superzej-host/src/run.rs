@@ -1881,6 +1881,57 @@ fn spawn_refs_fetch(
     });
 }
 
+/// Fetch hover docs + signature help + code actions for the symbol at
+/// `(file, line, col)` off the loop, assembling the preview popup. Requires a
+/// language server. Sends the built `HoverPopup` and pulses the waker.
+#[allow(clippy::too_many_arguments)]
+fn spawn_hover_fetch(
+    file: String,
+    line: u64,
+    col: u32,
+    label: String,
+    root: std::path::PathBuf,
+    lsp: std::sync::Arc<crate::lsp::LspInner>,
+    tx: tokio_mpsc::UnboundedSender<crate::hover::HoverPopup>,
+    waker: TerminalWaker,
+) {
+    use superzej_core::semantic::Lang;
+    tokio::task::spawn_blocking(move || {
+        let mut hover_md: Option<String> = None;
+        let mut signatures: Vec<String> = Vec::new();
+        let mut actions: Vec<String> = Vec::new();
+        if let Some(lang) = Lang::from_path(&file)
+            && let Ok(client) = lsp.client(&root, lang)
+        {
+            let uri = superzej_svc::lsp::path_to_uri(&root.join(&file).to_string_lossy());
+            if let Ok(text) = std::fs::read_to_string(root.join(&file)) {
+                let _ = client.did_open(&uri, lang, &text);
+            }
+            let pos = superzej_svc::lsp::Position {
+                line: line.saturating_sub(1) as u32,
+                character: col,
+            };
+            if let Ok(Some(h)) = client.hover(&uri, pos) {
+                hover_md = Some(h.markdown);
+            }
+            if let Ok(sigs) = client.signature_help(&uri, pos) {
+                signatures = sigs.into_iter().map(|s| s.label).collect();
+            }
+            let range = superzej_svc::lsp::Range {
+                start: pos,
+                end: pos,
+            };
+            if let Ok(acts) = client.code_actions(&uri, range) {
+                actions = acts.into_iter().map(|a| a.title).collect();
+            }
+        }
+        let popup =
+            crate::hover::HoverPopup::build(&label, hover_md.as_deref(), &signatures, &actions);
+        let _ = tx.send(popup);
+        let _ = waker.wake();
+    });
+}
+
 /// Build outline rows: LSP `documentSymbol` when a server answers, else the
 /// tree-sitter entities. All rows carry the (repo-relative) `file` as target.
 fn outline_rows(
@@ -5358,6 +5409,10 @@ async fn event_loop<T: Terminal>(
     let mut refs_label = String::new();
     let mut refs_rows: Vec<crate::panel::SymbolRow> = Vec::new();
     let mut refs_inflight = false;
+    // The hover/signature/code-action preview overlay (item 532): built off-loop
+    // from the language server, dismissed by any key.
+    let (hover_tx, mut hover_rx) = tokio_mpsc::unbounded_channel::<crate::hover::HoverPopup>();
+    let mut hover_popup: Option<crate::hover::HoverPopup> = None;
     // Live theme-cycle position within `theme::PRESETS` (Ctrl+Alt+t).
     let mut theme_idx: usize = superzej_core::theme::PRESETS
         .iter()
@@ -7259,6 +7314,11 @@ async fn event_loop<T: Terminal>(
             }
             dirty = true;
         }
+        // Hover preview: a completed fetch pops the overlay open.
+        while let Ok(popup) = hover_rx.try_recv() {
+            hover_popup = Some(popup);
+            dirty = true;
+        }
         // Derive the displayed list each frame from the active view, (re)fetching
         // the outline when its target file is stale.
         if panel_ui.open == crate::panel::Section::Symbols {
@@ -7487,6 +7547,10 @@ async fn event_loop<T: Terminal>(
                 // Center within the pane content area, not the full terminal
                 // (which would put it behind the sidebar).
                 cp.render(&mut scratch, chrome.center);
+            }
+            // The hover preview floats above the panel, below modal input.
+            if let Some(hp) = &hover_popup {
+                hp.render(&mut scratch, screen);
             }
             let accent = current_config.accent_rgb();
             if !which_key.is_empty() {
@@ -8073,6 +8137,12 @@ async fn event_loop<T: Terminal>(
                     continue;
                 }
                 let k = normalize_key(k);
+                // The hover preview is modal-lite: any key dismisses it and is
+                // consumed (so it never also acts on the panel beneath).
+                if hover_popup.take().is_some() {
+                    dirty = true;
+                    continue;
+                }
                 // Any real keypress dismisses the launch splash (chrome chords
                 // still dispatch below; a plain pane-bound key is swallowed
                 // once — the shell materializes on the next loop turn).
@@ -11104,6 +11174,25 @@ async fn event_loop<T: Terminal>(
                             panel_ui.symbols_show_refs = false;
                             panel_ui.symbols_cursor = 0;
                             panel_ui.cursor = 0;
+                            true
+                        }
+                        (Section::Symbols, KeyCode::Char('h')) => {
+                            if current_config.lsp.hover
+                                && let Some(s) =
+                                    model.panel.symbols.get(panel_ui.symbols_cursor).cloned()
+                            {
+                                model.status = format!("Hover: {}…", s.name);
+                                spawn_hover_fetch(
+                                    s.file,
+                                    s.line,
+                                    s.col,
+                                    s.name,
+                                    active_tab_path(&session),
+                                    lsp_supervisor.handle(),
+                                    hover_tx.clone(),
+                                    waker.clone(),
+                                );
+                            }
                             true
                         }
                         (Section::Symbols, key)

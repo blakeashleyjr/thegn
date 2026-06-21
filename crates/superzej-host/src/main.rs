@@ -17,6 +17,7 @@ mod emulator;
 mod focus;
 mod font;
 mod gitmut;
+mod hover;
 mod hydrate;
 mod input;
 mod keyhint;
