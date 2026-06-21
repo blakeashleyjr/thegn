@@ -3162,8 +3162,17 @@ fn handle_git_msg(
         }
         // ---- commits ---------------------------------------------------------
         GitMsg::Commit => {
+            // Prefill with the entity-derived structural message (item 317),
+            // computed off-thread on the panel model. Editable; empty when there
+            // are no entity-level changes.
+            let prefill = model
+                .panel
+                .entities
+                .as_ref()
+                .map(|e| superzej_core::semantic::derive_commit_message(&e.per_file))
+                .unwrap_or_default();
             *ov.input = Some((
-                menu::InputOverlay::new("commit message", ""),
+                menu::InputOverlay::new("commit message", prefill),
                 GitInputKind::Commit,
             ));
         }

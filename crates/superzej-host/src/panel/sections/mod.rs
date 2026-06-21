@@ -768,6 +768,33 @@ mod spec {
     }
 
     #[test]
+    fn changes_section_shows_entity_impact_and_headers() {
+        use superzej_core::semantic::{EntityChange, EntityKind, EntitySummary, Touch};
+        let mut m = model(); // includes a change row at src/lib.rs
+        m.panel.entities = Some(EntitySummary::new(vec![(
+            "src/lib.rs".into(),
+            vec![EntityChange {
+                kind: EntityKind::Function,
+                name: "go".into(),
+                added: 3,
+                deleted: 1,
+                touch: Touch::Modified,
+            }],
+        )]));
+        let mut u = ui(PanelWidth::Normal, Section::Changes);
+        u.chg_sel = Some(0); // select the row so its entity header renders
+        let ctx = SectionCtx {
+            model: &m,
+            ui: &u,
+            cols: 39,
+            rows: 28,
+        };
+        let rendered = text(&content(Section::Changes, &ctx));
+        assert!(rendered.contains('◈'), "impact line: {rendered}");
+        assert!(rendered.contains("fn go"), "entity header: {rendered}");
+    }
+
+    #[test]
     fn commits_section_shows_loading_while_cache_is_empty() {
         let mut m = model();
         m.panel.commits.clear();

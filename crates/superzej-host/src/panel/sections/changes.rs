@@ -34,10 +34,33 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
         )])));
         return rows;
     }
+    // Semantic impact line (item 313): a one-line entity summary of the change.
+    if let Some(impact) = data.entities.as_ref().and_then(|e| e.impact.as_ref()) {
+        rows.push(PanelRow::plain(Line::segs(vec![
+            seg(hue(Hue::Purple), "◈ "),
+            seg(g(), impact.summary.clone()),
+        ])));
+        rows.push(PanelRow::blank());
+    }
     for (i, c) in data.changes.iter().enumerate() {
         let on = ui.chg_sel == Some(i);
         rows.push(change_row(c, i, on, deep, ctx.cols));
         if on {
+            // Entities this file touches (item 311), above its hunk preview.
+            if let Some((_, changes)) = data
+                .entities
+                .as_ref()
+                .and_then(|e| e.per_file.iter().find(|(p, _)| *p == c.path))
+            {
+                let mut segs = vec![seg(hue(Hue::Purple), "  ▸ ")];
+                for (n, ch) in changes.iter().take(6).enumerate() {
+                    if n > 0 {
+                        segs.push(seg(g2(), ", "));
+                    }
+                    segs.push(seg(g(), format!("{} {}", ch.kind.label(), ch.name)));
+                }
+                rows.push(PanelRow::plain(Line::segs(segs)));
+            }
             rows.extend(hunk_preview(c, ui, deep));
             rows.push(PanelRow::blank());
         }

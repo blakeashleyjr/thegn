@@ -462,6 +462,11 @@ pub struct PanelData {
     pub commits_loading: bool,
     /// Stash entries (stash section).
     pub stashes: Vec<StashRow>,
+    /// Entity-level view of pending changes (semantic git layer, items 311/313/
+    /// 317): per-file entity churn + impact. Built off-thread from `git diff
+    /// HEAD`; feeds the changes-section impact line and the commit-message
+    /// prefill. `None` until first computed / when there are no entity changes.
+    pub entities: Option<superzej_core::semantic::EntitySummary>,
     /// Issues from the configured tracker (Linear/GitHub/Jira), loaded from
     /// the `issue_cache` DB table. Empty when no provider is configured.
     pub tracker_issues: Vec<superzej_core::issue::Issue>,
