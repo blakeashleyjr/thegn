@@ -1258,6 +1258,56 @@ mod tests {
         }
     }
 
+    /// End-to-end over the I/O seam: a real temp git repo with an edited
+    /// entity-bearing file → `compute_entity_summary` parses the diff + source
+    /// and attributes churn to the function.
+    #[test]
+    fn compute_entity_summary_over_a_real_repo() {
+        use superzej_core::util::{git_cmd, git_out};
+        let dir = std::env::temp_dir().join(format!("sz-sem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| {
+            assert!(
+                git_cmd(&dir).args(args).status().unwrap().success(),
+                "git {args:?}"
+            );
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t.t"]);
+        run(&["config", "user.name", "t"]);
+        let file = dir.join("lib.rs");
+        std::fs::write(&file, "fn greet() -> u8 {\n    1\n}\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+        // Edit the function body → a real `git diff HEAD`.
+        std::fs::write(&file, "fn greet() -> u8 {\n    42\n}\n").unwrap();
+
+        let loc = superzej_core::remote::GitLoc::for_worktree(&dir);
+        // A non-empty diff_entries list (only its length gates the call).
+        let entries = vec![superzej_svc::git::DiffEntry {
+            path: "lib.rs".into(),
+            added: 1,
+            deleted: 1,
+        }];
+        let summary = compute_entity_summary(&loc, &entries).expect("entity summary");
+        assert_eq!(summary.per_file.len(), 1, "{summary:?}");
+        let (path, changes) = &summary.per_file[0];
+        assert_eq!(path, "lib.rs");
+        assert_eq!(changes[0].name, "greet");
+        assert!(changes[0].added > 0 && changes[0].deleted > 0);
+        let impact = summary.impact.expect("impact");
+        assert_eq!(impact.entities, 1);
+
+        // A clean repo (no diff vs HEAD) yields None. `git_out` returns None on
+        // empty output, so a clean tree shows no changed names.
+        run(&["checkout", "--", "lib.rs"]);
+        assert!(git_out(&dir, &["diff", "--name-only", "HEAD"]).is_none());
+        assert!(compute_entity_summary(&loc, &entries).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn initial_model_is_cheap_and_marks_hydration_pending() {
         let session = one_tab_session();
