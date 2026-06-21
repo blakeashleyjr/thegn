@@ -1790,14 +1790,27 @@ struct PanelDocsWiring<'a> {
 /// kick a rehydrate so the model carries the section's deep data (git log,
 /// file count) — the cached panel stays on screen until the fresh one lands —
 /// and start whatever document fetch the new (section, width) state needs.
+/// A completed Symbols-section fetch (outline for a file, or references to a
+/// symbol), delivered to the loop on the outline channel.
+enum SymbolsFetch {
+    Outline {
+        file: String,
+        rows: Vec<crate::panel::SymbolRow>,
+    },
+    Refs {
+        label: String,
+        rows: Vec<crate::panel::SymbolRow>,
+    },
+}
+
 /// Fetch the document-symbol outline for `file` (repo-relative) off the loop:
 /// the language server when one is available, the tree-sitter entity parser
-/// otherwise. Sends `(file, rows)` and pulses the waker.
+/// otherwise. Sends a `SymbolsFetch::Outline` and pulses the waker.
 fn spawn_outline_fetch(
     file: String,
     root: std::path::PathBuf,
     lsp: std::sync::Arc<crate::lsp::LspInner>,
-    tx: tokio_mpsc::UnboundedSender<(String, Vec<crate::panel::SymbolRow>)>,
+    tx: tokio_mpsc::UnboundedSender<SymbolsFetch>,
     waker: TerminalWaker,
 ) {
     use superzej_core::semantic::Lang;
@@ -1809,7 +1822,61 @@ fn spawn_outline_fetch(
             },
             None => Vec::new(),
         };
-        let _ = tx.send((file, rows));
+        let _ = tx.send(SymbolsFetch::Outline { file, rows });
+        let _ = waker.wake();
+    });
+}
+
+/// Fetch references to the symbol at `(file, line, col)` off the loop. References
+/// require a language server (tree-sitter can't resolve them); the result is a
+/// list of reference sites. Sends a `SymbolsFetch::Refs` and pulses the waker.
+#[allow(clippy::too_many_arguments)]
+fn spawn_refs_fetch(
+    file: String,
+    line: u64,
+    col: u32,
+    label: String,
+    root: std::path::PathBuf,
+    lsp: std::sync::Arc<crate::lsp::LspInner>,
+    tx: tokio_mpsc::UnboundedSender<SymbolsFetch>,
+    waker: TerminalWaker,
+) {
+    use superzej_core::semantic::Lang;
+    tokio::task::spawn_blocking(move || {
+        let mut rows = Vec::new();
+        if let Some(lang) = Lang::from_path(&file)
+            && let Ok(client) = lsp.client(&root, lang)
+        {
+            let uri = superzej_svc::lsp::path_to_uri(&root.join(&file).to_string_lossy());
+            if let Ok(text) = std::fs::read_to_string(root.join(&file)) {
+                let _ = client.did_open(&uri, lang, &text);
+            }
+            let pos = superzej_svc::lsp::Position {
+                line: line.saturating_sub(1) as u32,
+                character: col,
+            };
+            if let Ok(locs) = client.references(&uri, pos) {
+                rows = locs
+                    .into_iter()
+                    .map(|l| {
+                        let rel = std::path::Path::new(&l.path)
+                            .strip_prefix(&root)
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_else(|_| l.path.clone());
+                        let line = l.line_1based() as u64;
+                        crate::panel::SymbolRow {
+                            kind: "→".to_string(),
+                            name: format!("{rel}:{line}"),
+                            file: rel,
+                            line,
+                            col: 0,
+                            depth: 0,
+                        }
+                    })
+                    .collect();
+            }
+        }
+        let _ = tx.send(SymbolsFetch::Refs { label, rows });
         let _ = waker.wake();
     });
 }
@@ -1836,6 +1903,7 @@ fn outline_rows(
                     name: s.name,
                     file: file.to_string(),
                     line: s.location.line_1based() as u64,
+                    col: s.location.range.start.character,
                     depth: u16::from(s.container.is_some()),
                 })
                 .collect();
@@ -1848,6 +1916,7 @@ fn outline_rows(
             name: e.name,
             file: file.to_string(),
             line: e.start_line as u64,
+            col: 0,
             depth: 0,
         })
         .collect()
@@ -1866,6 +1935,7 @@ fn open_panel_section(
     // Land at the top of the new section's items (row_mode tracks panel focus,
     // not the section, so a focused panel keeps walking rows across switches).
     panel_ui.cursor = 0;
+    panel_ui.symbols_show_refs = false;
     panel_ui.chg_sel = None;
     panel_ui.scroll = 0;
     panel_ui.diff_hunk = 0;
@@ -5278,14 +5348,16 @@ async fn event_loop<T: Terminal>(
             }
         });
     }
-    // Symbols outline: the fetched outline for the current file, cached host-side
-    // so it survives model-hydration swaps; (re)fetched when the open section +
-    // selected file imply it is stale.
-    let (outline_tx, mut outline_rx) =
-        tokio_mpsc::unbounded_channel::<(String, Vec<crate::panel::SymbolRow>)>();
+    // Symbols section: the fetched outline / references, cached host-side so they
+    // survive model-hydration swaps. The displayed list is derived each frame
+    // from the active view (outline vs references) — see the pre-render block.
+    let (outline_tx, mut outline_rx) = tokio_mpsc::unbounded_channel::<SymbolsFetch>();
     let mut outline_file = String::new();
     let mut outline_syms: Vec<crate::panel::SymbolRow> = Vec::new();
     let mut outline_inflight: Option<String> = None;
+    let mut refs_label = String::new();
+    let mut refs_rows: Vec<crate::panel::SymbolRow> = Vec::new();
+    let mut refs_inflight = false;
     // Live theme-cycle position within `theme::PRESETS` (Ctrl+Alt+t).
     let mut theme_idx: usize = superzej_core::theme::PRESETS
         .iter()
@@ -6706,9 +6778,7 @@ async fn event_loop<T: Terminal>(
             if !lsp_diags.is_empty() {
                 lsp_diags.merge_into(&mut model.panel.diagnostics);
             }
-            // A fresh model has an empty outline; restore the cached one.
-            model.panel.symbols_file = outline_file.clone();
-            model.panel.symbols = outline_syms.clone();
+            // The Symbols list (outline/refs) is re-derived in the pre-render block.
             // Mirror an externally-started (or externally-finished) rebase
             // into the git flow state, so the TODO view and conflict chrome
             // track `git rebase` runs from any terminal.
@@ -7171,46 +7241,62 @@ async fn event_loop<T: Terminal>(
             std::sync::atomic::Ordering::Relaxed,
         );
 
-        // Symbols outline: drain completed fetches into the model + cache, then
-        // (re)fetch when the Symbols section is open and its target file is stale.
-        while let Ok((file, syms)) = outline_rx.try_recv() {
-            outline_file = file;
-            outline_syms = syms;
-            model.panel.symbols_file = outline_file.clone();
-            model.panel.symbols = outline_syms.clone();
-            if outline_inflight.as_deref() == Some(outline_file.as_str()) {
-                outline_inflight = None;
+        // Symbols section: drain completed outline/refs fetches into their caches.
+        while let Ok(msg) = outline_rx.try_recv() {
+            match msg {
+                SymbolsFetch::Outline { file, rows } => {
+                    if outline_inflight.as_deref() == Some(file.as_str()) {
+                        outline_inflight = None;
+                    }
+                    outline_file = file;
+                    outline_syms = rows;
+                }
+                SymbolsFetch::Refs { label, rows } => {
+                    refs_inflight = false;
+                    refs_label = label;
+                    refs_rows = rows;
+                }
             }
             dirty = true;
         }
+        // Derive the displayed list each frame from the active view, (re)fetching
+        // the outline when its target file is stale.
         if panel_ui.open == crate::panel::Section::Symbols {
-            let target = panel_ui
-                .chg_sel
-                .and_then(|i| model.panel.changes.get(i))
-                .or_else(|| model.panel.changes.first())
-                .map(|c| c.path.clone());
-            match target {
-                Some(target)
-                    if target != outline_file
-                        && outline_inflight.as_deref() != Some(target.as_str()) =>
+            if panel_ui.symbols_show_refs {
+                let header = format!("refs: {refs_label}");
+                if model.panel.symbols != refs_rows || model.panel.symbols_file != header {
+                    model.panel.symbols = refs_rows.clone();
+                    model.panel.symbols_file = header;
+                    dirty = true;
+                }
+            } else {
+                let target = panel_ui
+                    .chg_sel
+                    .and_then(|i| model.panel.changes.get(i))
+                    .or_else(|| model.panel.changes.first())
+                    .map(|c| c.path.clone());
+                if let Some(target) = &target
+                    && *target != outline_file
+                    && outline_inflight.as_deref() != Some(target.as_str())
                 {
                     outline_inflight = Some(target.clone());
                     spawn_outline_fetch(
-                        target,
+                        target.clone(),
                         active_tab_path(&session),
                         lsp_supervisor.handle(),
                         outline_tx.clone(),
                         waker.clone(),
                     );
                 }
-                None if !outline_file.is_empty() => {
+                if target.is_none() && !outline_file.is_empty() {
                     outline_file.clear();
                     outline_syms.clear();
-                    model.panel.symbols_file.clear();
-                    model.panel.symbols.clear();
+                }
+                if model.panel.symbols != outline_syms || model.panel.symbols_file != outline_file {
+                    model.panel.symbols = outline_syms.clone();
+                    model.panel.symbols_file = outline_file.clone();
                     dirty = true;
                 }
-                _ => {}
             }
         }
 
@@ -10985,6 +11071,48 @@ async fn event_loop<T: Terminal>(
                                     }
                                 }
                             }
+                            true
+                        }
+                        // -- Symbols: find-references / back-to-outline --------
+                        (Section::Symbols, KeyCode::Char('r')) => {
+                            if !panel_ui.symbols_show_refs
+                                && let Some(s) =
+                                    model.panel.symbols.get(panel_ui.symbols_cursor).cloned()
+                                && !refs_inflight
+                            {
+                                refs_inflight = true;
+                                refs_label = s.name.clone();
+                                refs_rows.clear();
+                                panel_ui.symbols_show_refs = true;
+                                panel_ui.symbols_cursor = 0;
+                                panel_ui.cursor = 0;
+                                model.status = format!("Finding references to {}…", s.name);
+                                spawn_refs_fetch(
+                                    s.file,
+                                    s.line,
+                                    s.col,
+                                    s.name,
+                                    active_tab_path(&session),
+                                    lsp_supervisor.handle(),
+                                    outline_tx.clone(),
+                                    waker.clone(),
+                                );
+                            }
+                            true
+                        }
+                        (Section::Symbols, KeyCode::Char('o')) => {
+                            panel_ui.symbols_show_refs = false;
+                            panel_ui.symbols_cursor = 0;
+                            panel_ui.cursor = 0;
+                            true
+                        }
+                        (Section::Symbols, key)
+                            if crate::input::is_escape_key(&key) && panel_ui.symbols_show_refs =>
+                        {
+                            // First Esc in references mode returns to the outline.
+                            panel_ui.symbols_show_refs = false;
+                            panel_ui.symbols_cursor = 0;
+                            panel_ui.cursor = 0;
                             true
                         }
                         // Esc in section mode returns to the terminal (row

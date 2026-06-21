@@ -497,16 +497,18 @@ pub struct PanelData {
     pub symbols: Vec<SymbolRow>,
 }
 
-/// One row of the Symbols outline: a named entity at a 1-based line, with a
-/// short kind label and nesting depth (for indentation).
+/// One row of the Symbols outline (or, in references mode, a reference site): a
+/// named entity at a 1-based line, with a short kind label and nesting depth.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolRow {
-    /// Short kind label ("fn", "struct", …).
+    /// Short kind label ("fn", "struct", …; "→" for a reference site).
     pub kind: String,
     pub name: String,
     /// Repo-relative file path (the navigation target).
     pub file: String,
     pub line: u64,
+    /// 0-based column of the symbol name (the position used for find-references).
+    pub col: u32,
     /// Nesting depth for indentation (top-level = 0).
     pub depth: u16,
 }
@@ -658,6 +660,9 @@ pub struct PanelUi {
     pub problems_cursor: usize,
     /// Row cursor within the Symbols outline list.
     pub symbols_cursor: usize,
+    /// When true, the Symbols section shows find-references results for the last
+    /// selected symbol instead of the file outline (`r` toggles on, `o`/esc off).
+    pub symbols_show_refs: bool,
     /// Row cursor within the Tasks section's list.
     pub tasks_cursor: usize,
     /// Row cursor within the Issues section's list (persisted across section switches).
@@ -706,6 +711,7 @@ impl Default for PanelUi {
             files_collapsed: std::collections::HashSet::new(),
             problems_cursor: 0,
             symbols_cursor: 0,
+            symbols_show_refs: false,
             tasks_cursor: 0,
             issues_cursor: 0,
             issues_filter: String::new(),
