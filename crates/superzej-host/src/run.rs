@@ -1135,9 +1135,7 @@ impl SidebarState {
                     menu.cursor = menu.cursor.saturating_sub(1);
                 }
                 KeyCode::DownArrow | KeyCode::Char('j') => {
-                    if menu.cursor + 1 < menu.entries.len() {
-                        menu.cursor += 1;
-                    }
+                    menu.cursor = (menu.cursor + 1).min(menu.entries.len().saturating_sub(1));
                 }
                 KeyCode::Enter => {
                     let id = menu.entries.get(menu.cursor).map(|e| e.id.clone());

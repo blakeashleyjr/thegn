@@ -1248,11 +1248,10 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
 fn oci_create_opts_with_keep_id(spec: &SandboxSpec, keep_id: bool) -> Vec<String> {
     let mut v = Vec::new();
     match spec.backend {
-        Backend::Podman => {
-            if keep_id {
-                v.extend(["--userns".into(), "keep-id".into()]);
-            }
+        Backend::Podman if keep_id => {
+            v.extend(["--userns".into(), "keep-id".into()]);
         }
+        Backend::Podman => {}
         Backend::PodmanRootful => {
             if let (Transport::Local, Some((uid, gid))) = (&spec.transport, local_uid_gid()) {
                 v.extend(["--user".into(), format!("{uid}:{gid}")]);

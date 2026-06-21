@@ -195,9 +195,9 @@ impl NewWorktreeWizard {
                         self.step = WizardStep::Sandbox;
                     }
                     KeyCode::Backspace => {
-                        if self.tail.pop().is_some() {
-                            self.name_edited = true;
-                        }
+                        // Popping marks the field edited; `|=` keeps an earlier
+                        // edit flag set and avoids a nested `if`.
+                        self.name_edited |= self.tail.pop().is_some();
                     }
                     KeyCode::Char(c) => {
                         self.tail.push(*c);
