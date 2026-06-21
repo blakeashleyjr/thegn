@@ -22,6 +22,13 @@
       url = "github:blakeashleyjr/termite-chat/26b0aebfb8284cf7d1dfd76dcbb786c96eeface2";
       flake = false;
     };
+    # The muse visual-regression e2e harness (`just e2e`). Pinned as a non-flake
+    # source and built with the same rust toolchain so `nix develop` and CI run
+    # an identical, reproducible muse. Bump deliberately with `nix flake update muse`.
+    muse = {
+      url = "github:blakeashleyjr/muse/65672ef7e3a8c03809da8b47deeb616c2ea54d68";
+      flake = false;
+    };
   };
 
   outputs = {
@@ -32,6 +39,7 @@
     nixpkgs-yazi,
     switchboard,
     termiteChat,
+    muse,
   }:
     flake-utils.lib.eachDefaultSystem (system: let
       pkgs = import nixpkgs {
@@ -115,11 +123,29 @@
         # llvm-tools for `cargo llvm-cov` (just coverage).
         extensions = ["llvm-tools-preview"];
       };
+      # The muse e2e harness, built from the pinned source with the same stable
+      # toolchain. Pure-Rust (no system libs / git deps), so a vendored
+      # `cargoLock.lockFile` build needs no cargoHash.
+      musePlatform = pkgs.makeRustPlatform {
+        cargo = rustToolchain;
+        rustc = rustToolchain;
+      };
+      musePkg = musePlatform.buildRustPackage {
+        pname = "muse";
+        version = "0.1.0";
+        src = muse;
+        cargoLock.lockFile = "${muse}/Cargo.lock";
+        cargoBuildFlags = ["-p" "muse-cli"];
+        # The harness's own conformance tests aren't relevant to building the bin.
+        doCheck = false;
+      };
     in {
       packages.default = superzej;
       packages.superzej = superzej;
       # The pinned yazi superzej drives for the file-manager drawer.
       packages.yazi = yaziPinned;
+      # The muse e2e harness (`nix run .#muse`, also on the dev-shell PATH).
+      packages.muse = musePkg;
 
       # `nix fmt` formats every tracked file via treefmt.toml.
       formatter = treefmtWrapper;
@@ -174,6 +200,8 @@
             lazygit
             delta
             gh
+            # visual-regression e2e harness (`just e2e`)
+            musePkg
           ]
           # The same pinned yazi as the package, so the drawer's preview tools
           # resolve on PATH and `just host` runs the version superzej ships.
