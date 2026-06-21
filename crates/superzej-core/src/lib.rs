@@ -35,6 +35,7 @@ pub mod out;
 pub mod patch;
 pub mod picker;
 pub mod plugin_api;
+pub mod proxy;
 pub mod rebase_todo;
 pub mod reflog;
 pub mod remote;
