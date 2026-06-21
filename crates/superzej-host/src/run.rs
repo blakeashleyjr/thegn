@@ -1790,6 +1790,69 @@ struct PanelDocsWiring<'a> {
 /// kick a rehydrate so the model carries the section's deep data (git log,
 /// file count) — the cached panel stays on screen until the fresh one lands —
 /// and start whatever document fetch the new (section, width) state needs.
+/// Fetch the document-symbol outline for `file` (repo-relative) off the loop:
+/// the language server when one is available, the tree-sitter entity parser
+/// otherwise. Sends `(file, rows)` and pulses the waker.
+fn spawn_outline_fetch(
+    file: String,
+    root: std::path::PathBuf,
+    lsp: std::sync::Arc<crate::lsp::LspInner>,
+    tx: tokio_mpsc::UnboundedSender<(String, Vec<crate::panel::SymbolRow>)>,
+    waker: TerminalWaker,
+) {
+    use superzej_core::semantic::Lang;
+    tokio::task::spawn_blocking(move || {
+        let rows = match Lang::from_path(&file) {
+            Some(lang) => match std::fs::read_to_string(root.join(&file)) {
+                Ok(text) => outline_rows(&lsp, &root, &file, lang, &text),
+                Err(_) => Vec::new(),
+            },
+            None => Vec::new(),
+        };
+        let _ = tx.send((file, rows));
+        let _ = waker.wake();
+    });
+}
+
+/// Build outline rows: LSP `documentSymbol` when a server answers, else the
+/// tree-sitter entities. All rows carry the (repo-relative) `file` as target.
+fn outline_rows(
+    lsp: &crate::lsp::LspInner,
+    root: &std::path::Path,
+    file: &str,
+    lang: superzej_core::semantic::Lang,
+    text: &str,
+) -> Vec<crate::panel::SymbolRow> {
+    if let Ok(client) = lsp.client(root, lang) {
+        let uri = superzej_svc::lsp::path_to_uri(&root.join(file).to_string_lossy());
+        let _ = client.did_open(&uri, lang, text);
+        if let Ok(syms) = client.document_symbols(&uri)
+            && !syms.is_empty()
+        {
+            return syms
+                .into_iter()
+                .map(|s| crate::panel::SymbolRow {
+                    kind: s.kind.label().to_string(),
+                    name: s.name,
+                    file: file.to_string(),
+                    line: s.location.line_1based() as u64,
+                    depth: u16::from(s.container.is_some()),
+                })
+                .collect();
+        }
+    }
+    superzej_core::semantic::parse_entities(text, lang)
+        .into_iter()
+        .map(|e| crate::panel::SymbolRow {
+            kind: e.kind.label().to_string(),
+            name: e.name,
+            file: file.to_string(),
+            line: e.start_line as u64,
+            depth: 0,
+        })
+        .collect()
+}
+
 fn open_panel_section(
     s: crate::panel::Section,
     panel_ui: &mut crate::panel::PanelUi,
@@ -5215,6 +5278,14 @@ async fn event_loop<T: Terminal>(
             }
         });
     }
+    // Symbols outline: the fetched outline for the current file, cached host-side
+    // so it survives model-hydration swaps; (re)fetched when the open section +
+    // selected file imply it is stale.
+    let (outline_tx, mut outline_rx) =
+        tokio_mpsc::unbounded_channel::<(String, Vec<crate::panel::SymbolRow>)>();
+    let mut outline_file = String::new();
+    let mut outline_syms: Vec<crate::panel::SymbolRow> = Vec::new();
+    let mut outline_inflight: Option<String> = None;
     // Live theme-cycle position within `theme::PRESETS` (Ctrl+Alt+t).
     let mut theme_idx: usize = superzej_core::theme::PRESETS
         .iter()
@@ -6635,6 +6706,9 @@ async fn event_loop<T: Terminal>(
             if !lsp_diags.is_empty() {
                 lsp_diags.merge_into(&mut model.panel.diagnostics);
             }
+            // A fresh model has an empty outline; restore the cached one.
+            model.panel.symbols_file = outline_file.clone();
+            model.panel.symbols = outline_syms.clone();
             // Mirror an externally-started (or externally-finished) rebase
             // into the git flow state, so the TODO view and conflict chrome
             // track `git rebase` runs from any terminal.
@@ -7096,6 +7170,49 @@ async fn event_loop<T: Terminal>(
             chrome.panel.is_some() && panel_ui.open == crate::panel::Section::Telemetry,
             std::sync::atomic::Ordering::Relaxed,
         );
+
+        // Symbols outline: drain completed fetches into the model + cache, then
+        // (re)fetch when the Symbols section is open and its target file is stale.
+        while let Ok((file, syms)) = outline_rx.try_recv() {
+            outline_file = file;
+            outline_syms = syms;
+            model.panel.symbols_file = outline_file.clone();
+            model.panel.symbols = outline_syms.clone();
+            if outline_inflight.as_deref() == Some(outline_file.as_str()) {
+                outline_inflight = None;
+            }
+            dirty = true;
+        }
+        if panel_ui.open == crate::panel::Section::Symbols {
+            let target = panel_ui
+                .chg_sel
+                .and_then(|i| model.panel.changes.get(i))
+                .or_else(|| model.panel.changes.first())
+                .map(|c| c.path.clone());
+            match target {
+                Some(target)
+                    if target != outline_file
+                        && outline_inflight.as_deref() != Some(target.as_str()) =>
+                {
+                    outline_inflight = Some(target.clone());
+                    spawn_outline_fetch(
+                        target,
+                        active_tab_path(&session),
+                        lsp_supervisor.handle(),
+                        outline_tx.clone(),
+                        waker.clone(),
+                    );
+                }
+                None if !outline_file.is_empty() => {
+                    outline_file.clear();
+                    outline_syms.clear();
+                    model.panel.symbols_file.clear();
+                    model.panel.symbols.clear();
+                    dirty = true;
+                }
+                _ => {}
+            }
+        }
 
         // 2. Render if anything changed (diff-flush): all visible panes of the
         //    active tab + the chrome, with the hardware cursor in the focused pane.
@@ -9472,6 +9589,9 @@ async fn event_loop<T: Terminal>(
                                 if panel_ui.open == crate::panel::Section::Jobs {
                                     panel_ui.tasks_cursor = panel_ui.cursor;
                                 }
+                                if panel_ui.open == crate::panel::Section::Symbols {
+                                    panel_ui.symbols_cursor = panel_ui.cursor;
+                                }
                             }
                             PanelMsg::Select => {
                                 // Enter always executes the item at cursor.
@@ -9799,6 +9919,33 @@ async fn event_loop<T: Terminal>(
                                                     keymap.config(),
                                                     &d.file,
                                                     Some(d.line as usize),
+                                                );
+                                                let cwd = active_cwd(&session);
+                                                open_command_tab(
+                                                    &mut session,
+                                                    &mut panes,
+                                                    &cmd,
+                                                    cwd.as_deref(),
+                                                    chrome.center,
+                                                );
+                                                focus.zone = crate::focus::Zone::Center;
+                                                refresh_tab_model(&mut model, &session, &mut sb);
+                                                need_relayout = true;
+                                            }
+                                        }
+                                        Section::Symbols => {
+                                            // Go to definition: open the selected
+                                            // symbol in the editor at file:line.
+                                            if let Some(s) = model
+                                                .panel
+                                                .symbols
+                                                .get(panel_ui.symbols_cursor)
+                                                .cloned()
+                                            {
+                                                let cmd = editor_open_command(
+                                                    keymap.config(),
+                                                    &s.file,
+                                                    Some(s.line as usize),
                                                 );
                                                 let cwd = active_cwd(&session);
                                                 open_command_tab(

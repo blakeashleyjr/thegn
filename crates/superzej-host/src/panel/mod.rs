@@ -113,6 +113,8 @@ pub enum Section {
     /// Configured shell jobs (build, test, run). (Renamed from "tasks".)
     Jobs,
     Tests,
+    /// LSP / tree-sitter document-symbol outline for the selected file.
+    Symbols,
     Notifications,
     Logs,
     Sandbox,
@@ -128,12 +130,12 @@ pub enum Section {
 /// The accordion's built-in display order — the default when `[panel]
 /// sections` is unset. Grouped by tab:
 /// - Git (5): Changes, Commits, Branches, Stash, Files
-/// - Work (5): Pr, Issues, Problems, Jobs, Tests
+/// - Work (6): Pr, Issues, Problems, Jobs, Tests, Symbols
 /// - System (5): Notifications, Logs, Sandbox, Telemetry, Keys
 ///
 /// The live order (config-reordered, possibly trimmed) rides on
 /// [`PanelUi::order`]; numbered jump keys index the ACTIVE TAB's slice.
-pub const SECTION_ORDER: [Section; 15] = [
+pub const SECTION_ORDER: [Section; 16] = [
     // Git tab
     Section::Changes,
     Section::Commits,
@@ -146,6 +148,7 @@ pub const SECTION_ORDER: [Section; 15] = [
     Section::Problems,
     Section::Jobs,
     Section::Tests,
+    Section::Symbols,
     // System tab
     Section::Notifications,
     Section::Logs,
@@ -167,6 +170,7 @@ impl Section {
             Section::Problems => "problems",
             Section::Jobs => "jobs",
             Section::Tests => "tests",
+            Section::Symbols => "symbols",
             Section::Debug => "debug",
             Section::Sandbox => "sandbox",
             Section::Db => "db",
@@ -186,9 +190,12 @@ impl Section {
             | Section::Branches
             | Section::Stash
             | Section::Files => PanelTab::Git,
-            Section::Pr | Section::Issues | Section::Problems | Section::Jobs | Section::Tests => {
-                PanelTab::Work
-            }
+            Section::Pr
+            | Section::Issues
+            | Section::Problems
+            | Section::Jobs
+            | Section::Tests
+            | Section::Symbols => PanelTab::Work,
             Section::Notifications
             | Section::Logs
             | Section::Sandbox
@@ -484,6 +491,24 @@ pub struct PanelData {
     pub task_last_runs: std::collections::HashMap<String, TaskRunRecord>,
     /// Compiler/linter/test diagnostics collected from task output (Problems section).
     pub diagnostics: Vec<DiagnosticItem>,
+    /// Document-symbol outline for the selected file (Symbols section). The
+    /// `file` is the repo-relative path the outline was computed for ("" = none).
+    pub symbols_file: String,
+    pub symbols: Vec<SymbolRow>,
+}
+
+/// One row of the Symbols outline: a named entity at a 1-based line, with a
+/// short kind label and nesting depth (for indentation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolRow {
+    /// Short kind label ("fn", "struct", …).
+    pub kind: String,
+    pub name: String,
+    /// Repo-relative file path (the navigation target).
+    pub file: String,
+    pub line: u64,
+    /// Nesting depth for indentation (top-level = 0).
+    pub depth: u16,
 }
 
 /// Severity level for a compiler/linter diagnostic.
@@ -631,6 +656,8 @@ pub struct PanelUi {
     pub files_collapsed: std::collections::HashSet<String>,
     /// Row cursor within the Problems section's list.
     pub problems_cursor: usize,
+    /// Row cursor within the Symbols outline list.
+    pub symbols_cursor: usize,
     /// Row cursor within the Tasks section's list.
     pub tasks_cursor: usize,
     /// Row cursor within the Issues section's list (persisted across section switches).
@@ -678,6 +705,7 @@ impl Default for PanelUi {
             git: gitui::GitUi::default(),
             files_collapsed: std::collections::HashSet::new(),
             problems_cursor: 0,
+            symbols_cursor: 0,
             tasks_cursor: 0,
             issues_cursor: 0,
             issues_filter: String::new(),
@@ -954,7 +982,7 @@ mod tests {
 
     #[test]
     fn section_order_jump_and_cycle() {
-        assert_eq!(SECTION_ORDER.len(), 15);
+        assert_eq!(SECTION_ORDER.len(), 16);
         // Default tab = Git; Changes is in Git tab.
         let ui = PanelUi::default(); // open = Changes, tab = Git
         assert_eq!(ui.next_section(), Section::Commits); // next in Git tab

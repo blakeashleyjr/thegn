@@ -22,6 +22,7 @@ mod misc;
 mod notifications;
 mod problems;
 mod stash;
+mod symbols;
 mod tasks;
 mod telemetry;
 
@@ -470,6 +471,14 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
                 vec![seg(hue(Hue::Amber), format!("⚠ {warnings}"))]
             }
         }
+        Section::Symbols => {
+            let n = model.panel.symbols.len();
+            if n == 0 {
+                vec![seg(g2(), "—")]
+            } else {
+                vec![seg(g(), n.to_string())]
+            }
+        }
     }
 }
 
@@ -517,6 +526,7 @@ pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
         Section::Problems => problems::content(ctx),
         Section::Jobs => tasks::content(ctx),
         Section::Tests => misc::tests(ctx),
+        Section::Symbols => symbols::content(ctx),
         Section::Debug => misc::debug(),
         Section::Sandbox => misc::sandbox(ctx),
         Section::Db => misc::db(),
@@ -551,6 +561,23 @@ mod spec {
     fn model() -> FrameModel {
         let mut m = FrameModel::default();
         m.panel.branch = "feat/views".into();
+        m.panel.symbols_file = "src/lib.rs".into();
+        m.panel.symbols = vec![
+            crate::panel::SymbolRow {
+                kind: "struct".into(),
+                name: "Views".into(),
+                file: "src/lib.rs".into(),
+                line: 1,
+                depth: 0,
+            },
+            crate::panel::SymbolRow {
+                kind: "fn".into(),
+                name: "render".into(),
+                file: "src/lib.rs".into(),
+                line: 12,
+                depth: 1,
+            },
+        ];
         m.panel.changes = vec![ChangeRow {
             status: "M".into(),
             stage: Stage::Unstaged,
