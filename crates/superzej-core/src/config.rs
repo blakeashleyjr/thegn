@@ -195,6 +195,68 @@ config_enum! {
     } default = Global;
 }
 
+config_enum! {
+    /// How the LLM proxy chooses among a route's backends. Milestone 1 implements
+    /// `sequential` (ordered failover); the others are reserved for the AR
+    /// intelligent-routing work (cost-aware tiering, speculative cascade).
+    pub enum RoutingStrategy: "routing strategy" {
+        Sequential = "sequential" | "failover" | "ordered",
+        LoadBalanced = "load_balanced" | "balanced",
+        Speculative = "speculative" | "cascade",
+    } default = Sequential;
+}
+
+/// `[llm_proxy]` — the AI-traffic chokepoint daemon (`szproxy`). The shell never
+/// hard-depends on this; AI is strictly additive, so the default is disabled.
+/// When `enabled`, the host launches `szproxy` as a pinned daemon and agents
+/// point their `OPENAI_BASE_URL`/`ANTHROPIC_BASE_URL` at `listen`.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct LlmProxyConfig {
+    /// Whether the host should launch + manage the proxy daemon.
+    pub enabled: bool,
+    /// Address the daemon binds (and agents target).
+    pub listen: String,
+    /// Backend selection strategy.
+    pub routing: RoutingStrategy,
+    /// On a budget-cap breach, refuse the request (`true`) or downgrade to a
+    /// cheaper tier (`false`). The kill-switch always refuses.
+    pub refuse_on_breach: bool,
+    /// Path to the proxy's routes document (JSON), passed to `szproxy` as
+    /// `SZPROXY_CONFIG`. Empty means no backends are configured yet.
+    pub config_path: String,
+}
+
+impl Default for LlmProxyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: "127.0.0.1:8383".to_string(),
+            routing: RoutingStrategy::default(),
+            refuse_on_breach: true,
+            config_path: String::new(),
+        }
+    }
+}
+
+impl LlmProxyConfig {
+    /// The launch spec for the `szproxy` daemon — `(program, args, env)` — or
+    /// `None` when the proxy is disabled. The host feeds this to its process
+    /// supervisor (e.g. as a `restart = "always"` pinned daemon). `SZPROXY_LISTEN`
+    /// and `SZPROXY_CONFIG` mirror the standalone env knobs the daemon reads.
+    pub fn launch_spec(&self) -> Option<(String, Vec<String>, BTreeMap<String, String>)> {
+        if !self.enabled {
+            return None;
+        }
+        let mut env = BTreeMap::new();
+        env.insert("SZPROXY_LISTEN".to_string(), self.listen.clone());
+        if !self.config_path.is_empty() {
+            env.insert("SZPROXY_CONFIG".to_string(), self.config_path.clone());
+        }
+        Some(("szproxy".to_string(), Vec::new(), env))
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct NamedCommand {
     pub name: String,
@@ -1694,6 +1756,8 @@ pub struct Config {
     pub search: SearchConfig,
     pub palette: PaletteConfig,
     pub lsp: LspConfig,
+    /// The LLM proxy daemon (`[llm_proxy]`). Disabled by default — AI is additive.
+    pub llm_proxy: LlmProxyConfig,
     /// Rebind a built-in action by id, e.g. `new-worktree = "Ctrl w"`. The flat
     /// table is the global/default layer; nested mode tables are native-host only.
     pub keybinds: KeybindConfig,
@@ -1763,6 +1827,7 @@ impl Default for Config {
             search: SearchConfig::default(),
             palette: PaletteConfig::default(),
             lsp: LspConfig::default(),
+            llm_proxy: LlmProxyConfig::default(),
             keybinds: KeybindConfig::default(),
             actions: Vec::new(),
             profile: String::new(),
@@ -4003,5 +4068,47 @@ forward_agent = false
         assert!(cfg.issues.filter_assignee_me);
         assert_eq!(cfg.issues.linear.api_key, "env:LINEAR_API_KEY");
         assert_eq!(cfg.issues.jira.api_token, "env:JIRA_API_TOKEN");
+    }
+
+    #[test]
+    fn llm_proxy_disabled_by_default_no_launch() {
+        let cfg = Config::default();
+        assert!(!cfg.llm_proxy.enabled);
+        assert_eq!(cfg.llm_proxy.listen, "127.0.0.1:8383");
+        assert_eq!(cfg.llm_proxy.routing, RoutingStrategy::Sequential);
+        assert!(cfg.llm_proxy.launch_spec().is_none());
+    }
+
+    #[test]
+    fn llm_proxy_launch_spec_when_enabled() {
+        let mut cfg = LlmProxyConfig {
+            enabled: true,
+            config_path: "/etc/szproxy.json".into(),
+            ..Default::default()
+        };
+        let (prog, args, env) = cfg.launch_spec().unwrap();
+        assert_eq!(prog, "szproxy");
+        assert!(args.is_empty());
+        assert_eq!(env.get("SZPROXY_LISTEN").unwrap(), "127.0.0.1:8383");
+        assert_eq!(env.get("SZPROXY_CONFIG").unwrap(), "/etc/szproxy.json");
+        // No config path → no SZPROXY_CONFIG env entry.
+        cfg.config_path = String::new();
+        let (_, _, env) = cfg.launch_spec().unwrap();
+        assert!(!env.contains_key("SZPROXY_CONFIG"));
+    }
+
+    #[test]
+    fn routing_strategy_aliases_and_fallback() {
+        assert_eq!(
+            RoutingStrategy::from_str_validated("failover").unwrap(),
+            RoutingStrategy::Sequential
+        );
+        assert_eq!(
+            RoutingStrategy::from_str_validated("cascade").unwrap(),
+            RoutingStrategy::Speculative
+        );
+        // Unknown deserializes to the default without panic.
+        let s: RoutingStrategy = serde_json::from_str(r#""nonsense""#).unwrap();
+        assert_eq!(s, RoutingStrategy::Sequential);
     }
 }

@@ -697,3 +697,22 @@ remote_dir = "~/superzej-worktrees"
 # Forward the local SSH agent (ssh -A) so git push uses your local keys.
 # Disable if the remote host has its own deploy key.
 forward_agent = true
+# ── LLM proxy (group U/V) ──────────────────────────────────────────────────
+# The AI-traffic chokepoint daemon (binary `szproxy`). The shell never hard-
+# depends on this — AI is strictly additive — so it is OFF by default. When
+# enabled, the host launches szproxy and agents point OPENAI_BASE_URL /
+# ANTHROPIC_BASE_URL at `listen`.
+[llm_proxy]
+enabled = false
+# Address the daemon binds (and agents target).
+listen = "127.0.0.1:8383"
+# Backend selection: "sequential" (ordered failover, the M1 behavior),
+# "load_balanced", or "speculative" (cascade — reserved for the AR work).
+routing = "sequential"
+# On a budget-cap breach: refuse the request (true) or downgrade to a cheaper
+# tier (false). The kill-switch always refuses regardless of this setting.
+refuse_on_breach = true
+# Path to the proxy's routes document (JSON: { "routes": [ { "name", "backends":
+# [ { "name", "base_url", "model", "api_key_env", "anthropic", "rpm", "burst",
+# "context_limit", "defaults" } ] } ] }). Passed to szproxy as SZPROXY_CONFIG.
+config_path = ""

@@ -28,10 +28,66 @@ use std::path::PathBuf;
 /// `issue_projects` (sprint/milestone/epic cache per repo+provider).
 /// v11: adds `notifications` inbox (kind, issue ref, message, read flag).
 /// v12: adds `agent_dispatches` (AI agent assignments: issue→worktree→agent).
-const SCHEMA_VERSION: i64 = 12;
+/// v13: adds the LLM-proxy state tables — `proxy_health` (exhaustion markers,
+/// replacing the Go proxy's `health.json`), `proxy_requests` (per-request
+/// audit/query log; never stores prompt/completion bodies), `proxy_virtual_keys`
+/// (per-agent keys → upstream binding + scope), and `proxy_budgets` (per-scope
+/// spend + caps). Also formalizes the already-present `container_events` /
+/// `layouts` tables under this version.
+const SCHEMA_VERSION: i64 = 13;
 
 pub struct Db {
     conn: Connection,
+}
+
+/// A persisted LLM-proxy exhaustion marker (one per backend+model).
+#[derive(Debug, Clone)]
+pub struct ProxyHealthRow {
+    pub backend: String,
+    pub model: String,
+    pub kind: String,
+    pub reason: String,
+    pub since_ms: i64,
+    pub next_probe_ms: i64,
+    pub is_stale: bool,
+    pub consecutive_failures: i64,
+    pub cred_file: Option<String>,
+    pub cred_mtime_ms: Option<i64>,
+}
+
+/// A per-request audit row for the proxy. Carries only routing/usage/cost
+/// metadata — never prompt or completion bodies.
+#[derive(Debug, Clone, Default)]
+pub struct ProxyRequestRow {
+    pub ts_ms: i64,
+    pub protocol: String,
+    pub route: String,
+    pub virtual_key: Option<String>,
+    pub agent: Option<String>,
+    pub worktree: Option<String>,
+    pub workspace: Option<String>,
+    pub client_model: String,
+    pub backend: String,
+    pub backend_model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cost_usd: f64,
+    pub cost_source: String,
+    pub outcome: String,
+    pub error_code: Option<String>,
+}
+
+/// A per-scope spend/budget row.
+#[derive(Debug, Clone)]
+pub struct ProxyBudgetRow {
+    pub scope: String,
+    pub period: String,
+    pub spent_tokens: i64,
+    pub spent_cost: f64,
+    pub limit_tokens: Option<i64>,
+    pub limit_cost: Option<f64>,
+    pub reset_ms: i64,
+    pub killed: bool,
 }
 
 fn db_path() -> PathBuf {
@@ -325,6 +381,78 @@ impl Db {
               name       TEXT PRIMARY KEY,
               spec       TEXT NOT NULL,
               created_at INTEGER NOT NULL
+            );
+            -- v13: LLM-proxy state. The proxy daemon is the single chokepoint all
+            -- agent model traffic crosses; these tables replace the Go proxy's
+            -- flat files (health.json, queries.jsonl) and add per-agent identity
+            -- + budget machinery the Go version never had.
+            --
+            -- proxy_health: one exhaustion marker per (backend, model). Survives
+            -- restarts so a cooled-down backend isn't re-hammered immediately.
+            CREATE TABLE IF NOT EXISTS proxy_health (
+              backend              TEXT    NOT NULL,
+              model                TEXT    NOT NULL,
+              kind                 TEXT    NOT NULL,
+              reason               TEXT    NOT NULL DEFAULT '',
+              since_ms             INTEGER NOT NULL,
+              next_probe_ms        INTEGER NOT NULL,
+              is_stale             INTEGER NOT NULL DEFAULT 0,
+              consecutive_failures INTEGER NOT NULL DEFAULT 0,
+              cred_file            TEXT,
+              cred_mtime_ms        INTEGER,
+              PRIMARY KEY (backend, model)
+            );
+            -- proxy_requests: per-request audit/query log. NEVER stores prompt or
+            -- completion bodies — only routing/usage/cost metadata (preserves the
+            -- Go proxy's privacy invariant). virtual_key/agent/worktree/workspace
+            -- carry the resolved caller identity for spend attribution.
+            CREATE TABLE IF NOT EXISTS proxy_requests (
+              id            INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts_ms         INTEGER NOT NULL,
+              protocol      TEXT    NOT NULL DEFAULT 'openai',
+              route         TEXT    NOT NULL DEFAULT '',
+              virtual_key   TEXT,
+              agent         TEXT,
+              worktree      TEXT,
+              workspace     TEXT,
+              client_model  TEXT    NOT NULL DEFAULT '',
+              backend       TEXT    NOT NULL DEFAULT '',
+              backend_model TEXT    NOT NULL DEFAULT '',
+              input_tokens  INTEGER NOT NULL DEFAULT 0,
+              output_tokens INTEGER NOT NULL DEFAULT 0,
+              cost_usd      REAL    NOT NULL DEFAULT 0,
+              cost_source   TEXT    NOT NULL DEFAULT 'unknown',
+              outcome       TEXT    NOT NULL DEFAULT '',
+              error_code    TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_proxy_requests_ts
+              ON proxy_requests (ts_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_proxy_requests_scope
+              ON proxy_requests (agent, worktree, ts_ms DESC);
+            -- proxy_virtual_keys: per-agent tokens. The proxy holds the real
+            -- upstream credentials; agents authenticate with a virtual key that
+            -- resolves to a caller identity (scope) + upstream binding (V 287).
+            CREATE TABLE IF NOT EXISTS proxy_virtual_keys (
+              key_id       TEXT PRIMARY KEY,
+              token_hash   TEXT NOT NULL,
+              label        TEXT NOT NULL DEFAULT '',
+              scope        TEXT NOT NULL DEFAULT 'global',
+              upstream     TEXT,
+              created_at   INTEGER NOT NULL,
+              revoked_at   INTEGER
+            );
+            -- proxy_budgets: per-scope spend + caps (V 292/295). scope is one of
+            -- 'global', 'worktree:<path>', 'agent:<name>'. A null limit means no
+            -- cap; reset_ms anchors the rolling daily/weekly/monthly window.
+            CREATE TABLE IF NOT EXISTS proxy_budgets (
+              scope          TEXT PRIMARY KEY,
+              period         TEXT NOT NULL DEFAULT 'monthly',
+              spent_tokens   INTEGER NOT NULL DEFAULT 0,
+              spent_cost     REAL    NOT NULL DEFAULT 0,
+              limit_tokens   INTEGER,
+              limit_cost     REAL,
+              reset_ms       INTEGER NOT NULL DEFAULT 0,
+              killed         INTEGER NOT NULL DEFAULT 0
             );
             COMMIT;
             "#,
@@ -665,6 +793,260 @@ impl Db {
                 |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
             )
             .optional()?)
+    }
+
+    // --- LLM proxy state (v13) -----------------------------------------------
+    //
+    // These back the `superzej-proxy` daemon. Timestamps are passed in as
+    // explicit epoch-millis (`now_ms`) so core stays free of wall-clock coupling
+    // — the proxy supplies real values from chrono.
+
+    /// Upsert an exhaustion marker for `(backend, model)`. `kind` is the
+    /// [`crate::proxy::ExhaustionKind`] rendered as a short string. Replaces the
+    /// Go proxy's `health.json` persistence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn put_proxy_health(
+        &self,
+        backend: &str,
+        model: &str,
+        kind: &str,
+        reason: &str,
+        since_ms: i64,
+        next_probe_ms: i64,
+        is_stale: bool,
+        consecutive_failures: i64,
+        cred_file: Option<&str>,
+        cred_mtime_ms: Option<i64>,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO proxy_health
+                 (backend,model,kind,reason,since_ms,next_probe_ms,is_stale,
+                  consecutive_failures,cred_file,cred_mtime_ms)
+               VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+               ON CONFLICT(backend,model) DO UPDATE SET
+                 kind=?3, reason=?4, since_ms=?5, next_probe_ms=?6, is_stale=?7,
+                 consecutive_failures=?8, cred_file=?9, cred_mtime_ms=?10"#,
+            params![
+                backend,
+                model,
+                kind,
+                reason,
+                since_ms,
+                next_probe_ms,
+                is_stale as i64,
+                consecutive_failures,
+                cred_file,
+                cred_mtime_ms
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Clear an exhaustion marker (backend recovered).
+    pub fn clear_proxy_health(&self, backend: &str, model: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM proxy_health WHERE backend=?1 AND model=?2",
+            params![backend, model],
+        )?;
+        Ok(())
+    }
+
+    /// Load all live exhaustion markers (those whose `next_probe_ms` is still in
+    /// the future), for hydrating the in-memory health map on startup. Each row
+    /// is `(backend, model, kind, reason, since_ms, next_probe_ms, is_stale,
+    /// consecutive_failures, cred_file, cred_mtime_ms)`.
+    #[allow(clippy::type_complexity)]
+    pub fn load_proxy_health(&self, now_ms: i64) -> Result<Vec<ProxyHealthRow>> {
+        let mut stmt = self.conn.prepare(
+            r#"SELECT backend,model,kind,reason,since_ms,next_probe_ms,is_stale,
+                      consecutive_failures,cred_file,cred_mtime_ms
+               FROM proxy_health WHERE next_probe_ms > ?1"#,
+        )?;
+        let rows = stmt
+            .query_map(params![now_ms], |r| {
+                Ok(ProxyHealthRow {
+                    backend: r.get(0)?,
+                    model: r.get(1)?,
+                    kind: r.get(2)?,
+                    reason: r.get(3)?,
+                    since_ms: r.get(4)?,
+                    next_probe_ms: r.get(5)?,
+                    is_stale: r.get::<_, i64>(6)? != 0,
+                    consecutive_failures: r.get(7)?,
+                    cred_file: r.get(8)?,
+                    cred_mtime_ms: r.get(9)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Append a request audit row. NEVER pass prompt/completion bodies — this is
+    /// metadata only. Returns the new row id. Rolls cost into the relevant
+    /// budgets via [`add_proxy_spend`](Self::add_proxy_spend) at the call site.
+    pub fn put_proxy_request(&self, r: &ProxyRequestRow) -> Result<i64> {
+        self.conn.execute(
+            r#"INSERT INTO proxy_requests
+                 (ts_ms,protocol,route,virtual_key,agent,worktree,workspace,
+                  client_model,backend,backend_model,input_tokens,output_tokens,
+                  cost_usd,cost_source,outcome,error_code)
+               VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)"#,
+            params![
+                r.ts_ms,
+                r.protocol,
+                r.route,
+                r.virtual_key,
+                r.agent,
+                r.worktree,
+                r.workspace,
+                r.client_model,
+                r.backend,
+                r.backend_model,
+                r.input_tokens,
+                r.output_tokens,
+                r.cost_usd,
+                r.cost_source,
+                r.outcome,
+                r.error_code,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Look up a virtual key by its id, returning `(scope, upstream)` when the
+    /// key exists and is not revoked.
+    pub fn proxy_virtual_key(&self, key_id: &str) -> Result<Option<(String, Option<String>)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT scope, upstream FROM proxy_virtual_keys \
+                 WHERE key_id=?1 AND revoked_at IS NULL",
+                params![key_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Register a virtual key (token already hashed by the caller).
+    pub fn put_proxy_virtual_key(
+        &self,
+        key_id: &str,
+        token_hash: &str,
+        label: &str,
+        scope: &str,
+        upstream: Option<&str>,
+        now_ms: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO proxy_virtual_keys
+                 (key_id,token_hash,label,scope,upstream,created_at)
+               VALUES(?1,?2,?3,?4,?5,?6)
+               ON CONFLICT(key_id) DO UPDATE SET
+                 token_hash=?2, label=?3, scope=?4, upstream=?5, revoked_at=NULL"#,
+            params![key_id, token_hash, label, scope, upstream, now_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Revoke a virtual key.
+    pub fn revoke_proxy_virtual_key(&self, key_id: &str, now_ms: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE proxy_virtual_keys SET revoked_at=?2 WHERE key_id=?1",
+            params![key_id, now_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Add spend (tokens + cost) to a budget scope, creating the row if absent.
+    /// Resets the accumulators first when the rolling window (`reset_ms`) has
+    /// elapsed. Returns the post-update `(spent_tokens, spent_cost, killed)`.
+    pub fn add_proxy_spend(
+        &self,
+        scope: &str,
+        tokens: i64,
+        cost: f64,
+        now_ms: i64,
+    ) -> Result<(i64, f64, bool)> {
+        self.conn.execute(
+            "INSERT INTO proxy_budgets(scope) VALUES(?1) ON CONFLICT(scope) DO NOTHING",
+            params![scope],
+        )?;
+        // Roll the window over if due.
+        self.conn.execute(
+            "UPDATE proxy_budgets SET spent_tokens=0, spent_cost=0 \
+             WHERE scope=?1 AND reset_ms>0 AND reset_ms<=?2",
+            params![scope, now_ms],
+        )?;
+        self.conn.execute(
+            "UPDATE proxy_budgets SET spent_tokens=spent_tokens+?2, spent_cost=spent_cost+?3 \
+             WHERE scope=?1",
+            params![scope, tokens, cost],
+        )?;
+        Ok(self.conn.query_row(
+            "SELECT spent_tokens, spent_cost, killed FROM proxy_budgets WHERE scope=?1",
+            params![scope],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, f64>(1)?,
+                    r.get::<_, i64>(2)? != 0,
+                ))
+            },
+        )?)
+    }
+
+    /// Fetch a budget row for enforcement checks, if one exists.
+    pub fn proxy_budget(&self, scope: &str) -> Result<Option<ProxyBudgetRow>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT scope,period,spent_tokens,spent_cost,limit_tokens,limit_cost,reset_ms,killed \
+                 FROM proxy_budgets WHERE scope=?1",
+                params![scope],
+                |r| {
+                    Ok(ProxyBudgetRow {
+                        scope: r.get(0)?,
+                        period: r.get(1)?,
+                        spent_tokens: r.get(2)?,
+                        spent_cost: r.get(3)?,
+                        limit_tokens: r.get(4)?,
+                        limit_cost: r.get(5)?,
+                        reset_ms: r.get(6)?,
+                        killed: r.get::<_, i64>(7)? != 0,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Set the caps + rolling window for a budget scope (creating the row if
+    /// absent), without touching accumulated spend. A `None` limit means no cap.
+    pub fn set_proxy_budget_limits(
+        &self,
+        scope: &str,
+        period: &str,
+        limit_tokens: Option<i64>,
+        limit_cost: Option<f64>,
+        reset_ms: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO proxy_budgets(scope,period,limit_tokens,limit_cost,reset_ms)
+               VALUES(?1,?2,?3,?4,?5)
+               ON CONFLICT(scope) DO UPDATE SET
+                 period=?2, limit_tokens=?3, limit_cost=?4, reset_ms=?5"#,
+            params![scope, period, limit_tokens, limit_cost, reset_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Set or clear the kill-switch on a budget scope (V 296).
+    pub fn set_proxy_kill_switch(&self, scope: &str, killed: bool) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO proxy_budgets(scope,killed) VALUES(?1,?2) \
+             ON CONFLICT(scope) DO UPDATE SET killed=?2",
+            params![scope, killed as i64],
+        )?;
+        Ok(())
     }
 
     /// Delete a single notification row (dismiss).
@@ -2548,5 +2930,129 @@ mod tests {
         }
         let ten = db.container_events("/wt/feat", 10).unwrap();
         assert_eq!(ten.len(), 10);
+    }
+
+    #[test]
+    fn proxy_health_roundtrip_and_window() {
+        let db = db();
+        // A live marker (probe in the future) loads; a stale one (past) does not.
+        db.put_proxy_health(
+            "openrouter",
+            "ds-pro",
+            "rate_limit",
+            "HTTP 429",
+            1000,
+            9_999_999,
+            false,
+            2,
+            None,
+            None,
+        )
+        .unwrap();
+        db.put_proxy_health(
+            "kilo", "ds-pro", "payment", "HTTP 402", 1000, 500, true, 1, None, None,
+        )
+        .unwrap();
+        let live = db.load_proxy_health(1_000_000).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].backend, "openrouter");
+        assert_eq!(live[0].consecutive_failures, 2);
+        // Upsert overwrites in place.
+        db.put_proxy_health(
+            "openrouter",
+            "ds-pro",
+            "rate_limit",
+            "HTTP 429",
+            1000,
+            9_999_999,
+            false,
+            5,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            db.load_proxy_health(1_000_000).unwrap()[0].consecutive_failures,
+            5
+        );
+        db.clear_proxy_health("openrouter", "ds-pro").unwrap();
+        assert!(db.load_proxy_health(1_000_000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn proxy_budget_spend_caps_and_window() {
+        let db = db();
+        let (tokens, cost, killed) = db
+            .add_proxy_spend("agent:reviewer", 100, 0.5, 1000)
+            .unwrap();
+        assert_eq!(tokens, 100);
+        assert!((cost - 0.5).abs() < 1e-9);
+        assert!(!killed);
+        // A second add accumulates.
+        let (tokens, _, _) = db
+            .add_proxy_spend("agent:reviewer", 50, 0.25, 1000)
+            .unwrap();
+        assert_eq!(tokens, 150);
+        // Kill switch flips and is visible on the budget row.
+        db.set_proxy_kill_switch("agent:reviewer", true).unwrap();
+        assert!(db.proxy_budget("agent:reviewer").unwrap().unwrap().killed);
+    }
+
+    #[test]
+    fn proxy_spend_window_resets_when_due() {
+        let db = db();
+        db.add_proxy_spend("global", 100, 1.0, 1000).unwrap();
+        // Arm a rolling window that has already elapsed by `now_ms`.
+        db.conn
+            .execute(
+                "UPDATE proxy_budgets SET reset_ms=2000 WHERE scope='global'",
+                [],
+            )
+            .unwrap();
+        // now_ms past reset → accumulators reset before the add.
+        let (tokens, _, _) = db.add_proxy_spend("global", 10, 0.1, 3000).unwrap();
+        assert_eq!(tokens, 10);
+    }
+
+    #[test]
+    fn proxy_virtual_key_lookup_and_revoke() {
+        let db = db();
+        db.put_proxy_virtual_key(
+            "vk_1",
+            "hash",
+            "reviewer",
+            "agent:reviewer",
+            Some("anthropic"),
+            1000,
+        )
+        .unwrap();
+        let got = db.proxy_virtual_key("vk_1").unwrap().unwrap();
+        assert_eq!(got.0, "agent:reviewer");
+        assert_eq!(got.1.as_deref(), Some("anthropic"));
+        db.revoke_proxy_virtual_key("vk_1", 2000).unwrap();
+        assert!(db.proxy_virtual_key("vk_1").unwrap().is_none());
+    }
+
+    #[test]
+    fn proxy_request_audit_insert() {
+        let db = db();
+        let row = ProxyRequestRow {
+            ts_ms: 1234,
+            protocol: "openai".into(),
+            route: "standard".into(),
+            agent: Some("reviewer".into()),
+            worktree: Some("/wt/feat".into()),
+            client_model: "model-proxy/standard".into(),
+            backend: "openrouter".into(),
+            backend_model: "ds-pro".into(),
+            input_tokens: 100,
+            output_tokens: 50,
+            cost_usd: 0.01,
+            cost_source: "estimate".into(),
+            outcome: "ok".into(),
+            ..Default::default()
+        };
+        let id = db.put_proxy_request(&row).unwrap();
+        assert!(id > 0);
     }
 }

@@ -5,6 +5,7 @@ members = [
   "crates/superzej-svc",
   "crates/superzej-host",
   "crates/superzej-dashboard",
+  "crates/superzej-proxy",
   "crates/sz-kit",
 ]
 # Integrated app repos live under apps/ as git submodules, each with its OWN
@@ -95,6 +96,11 @@ reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls",
 ] }
 russh = "0.61"
+# --- LLM proxy (group U/V): the one new HTTP-server dependency. tokio/reqwest
+# are widened with extra features inside the superzej-proxy crate's own manifest
+# (cargo merges them with the workspace base). ---
+axum = "0.8"
+regex = "1"
 gix = "0.84"
 tokei = "12"
 # Semantic git layer (item 309+): tree-sitter entity parsing across languages.
