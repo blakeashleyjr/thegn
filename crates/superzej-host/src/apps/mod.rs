@@ -60,7 +60,7 @@ impl SlotState {
 
 /// One app tab.
 pub struct AppSlot {
-    /// Stable id / config key (`"comms"`, `"chat"`, `"agent"`).
+    /// Stable id / config key (e.g. `"dashboard"`, `"chat"`).
     pub id: &'static str,
     /// Chip label fallback before the tile is running (the running tile's
     /// `title()` takes over, badges included).
