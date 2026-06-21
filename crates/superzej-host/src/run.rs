@@ -2678,6 +2678,17 @@ fn open_url_detached(url: &str) {
 /// [`gitui::GitUi`] directly; effects flow through the mutation runner (with
 /// destructive ones parked behind a confirm menu first).
 #[allow(clippy::too_many_lines)]
+/// The entity-derived prefill for the commit-message box (item 317): the
+/// structural message from the panel's `EntitySummary`, or empty when there are
+/// no entity-level changes (the user types their own).
+fn commit_message_prefill(panel: &crate::panel::PanelData) -> String {
+    panel
+        .entities
+        .as_ref()
+        .map(|e| superzej_core::semantic::derive_commit_message(&e.per_file))
+        .unwrap_or_default()
+}
+
 fn handle_git_msg(
     msg: GitMsg,
     panel_ui: &mut crate::panel::PanelUi,
@@ -3165,12 +3176,7 @@ fn handle_git_msg(
             // Prefill with the entity-derived structural message (item 317),
             // computed off-thread on the panel model. Editable; empty when there
             // are no entity-level changes.
-            let prefill = model
-                .panel
-                .entities
-                .as_ref()
-                .map(|e| superzej_core::semantic::derive_commit_message(&e.per_file))
-                .unwrap_or_default();
+            let prefill = commit_message_prefill(&model.panel);
             *ov.input = Some((
                 menu::InputOverlay::new("commit message", prefill),
                 GitInputKind::Commit,
@@ -12115,6 +12121,29 @@ mod tests {
     use crate::center::CenterTree;
     use crate::hydrate::build_model;
     use crate::session::{GroupKind, Session, WorktreeGroup};
+
+    #[test]
+    fn commit_message_prefill_from_entities() {
+        use superzej_core::semantic::{EntityChange, EntityKind, EntitySummary, Touch};
+        // No entity summary → empty prefill (user types their own).
+        let mut panel = crate::panel::PanelData::default();
+        assert_eq!(commit_message_prefill(&panel), "");
+
+        // With an entity summary → the structural message.
+        panel.entities = Some(EntitySummary::new(vec![(
+            "src/lib.rs".into(),
+            vec![EntityChange {
+                kind: EntityKind::Function,
+                name: "go".into(),
+                added: 4,
+                deleted: 0,
+                touch: Touch::Added,
+            }],
+        )]));
+        let msg = commit_message_prefill(&panel);
+        assert!(msg.starts_with("add `go`"), "{msg}");
+        assert!(msg.contains("src/lib.rs:"), "{msg}");
+    }
 
     /// Tests that set `XDG_STATE_HOME` race each other (the env is process
     /// global); serialize them. Poisoning is fine to ignore — the env is
