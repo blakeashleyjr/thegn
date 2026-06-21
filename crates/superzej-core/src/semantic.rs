@@ -397,6 +397,56 @@ pub fn impact_summary(per_file: &[(String, Vec<EntityChange>)]) -> ImpactSummary
     }
 }
 
+// ─── Entity-derived commit messages (item 317) ──────────────────────────────
+
+/// Compose a structural commit message from per-file entity changes — NO AI.
+/// The subject states the dominant action over the top entities ("add `Bar`,
+/// update `foo`"); the body lists each file and its entity changes. Returns an
+/// empty string when there are no entity-level changes (caller leaves the
+/// commit box blank for the user to fill).
+pub fn derive_commit_message(per_file: &[(String, Vec<EntityChange>)]) -> String {
+    let verb = |t: Touch| match t {
+        Touch::Added => "add",
+        Touch::Removed => "remove",
+        Touch::Modified => "update",
+    };
+    // Flatten for the subject, ranked by churn (added+deleted) descending.
+    let mut flat: Vec<&EntityChange> = per_file.iter().flat_map(|(_, c)| c.iter()).collect();
+    if flat.is_empty() {
+        return String::new();
+    }
+    flat.sort_by_key(|c| std::cmp::Reverse(c.added + c.deleted));
+    let subject_parts: Vec<String> = flat
+        .iter()
+        .take(3)
+        .map(|c| format!("{} `{}`", verb(c.touch), c.name))
+        .collect();
+    let mut subject = subject_parts.join(", ");
+    if flat.len() > 3 {
+        subject.push_str(&format!(", +{} more", flat.len() - 3));
+    }
+
+    // Body: one section per file with entity bullets.
+    let mut body = String::new();
+    for (file, changes) in per_file {
+        if changes.is_empty() {
+            continue;
+        }
+        body.push_str(&format!("\n\n{file}:"));
+        for c in changes {
+            body.push_str(&format!(
+                "\n  - {} {} `{}` (+{} -{})",
+                verb(c.touch),
+                c.kind.label(),
+                c.name,
+                c.added,
+                c.deleted
+            ));
+        }
+    }
+    format!("{subject}{body}")
+}
+
 // ─── Entity-level blame (item 312) ──────────────────────────────────────────
 
 /// Blame rolled up to an entity: its most-recent touching commit + how many
@@ -697,6 +747,59 @@ diff --git a/x.rs b/x.rs
     #[test]
     fn impact_summary_empty() {
         assert_eq!(impact_summary(&[]).summary, "no entity-level changes");
+    }
+
+    #[test]
+    fn derive_commit_message_structures_subject_and_body() {
+        let per_file = vec![
+            (
+                "src/a.rs".to_string(),
+                vec![EntityChange {
+                    kind: EntityKind::Struct,
+                    name: "Bar".into(),
+                    added: 10,
+                    deleted: 0,
+                    touch: Touch::Added,
+                }],
+            ),
+            (
+                "src/b.rs".to_string(),
+                vec![EntityChange {
+                    kind: EntityKind::Function,
+                    name: "foo".into(),
+                    added: 1,
+                    deleted: 1,
+                    touch: Touch::Modified,
+                }],
+            ),
+        ];
+        let msg = derive_commit_message(&per_file);
+        let subject = msg.lines().next().unwrap();
+        // Highest churn (Bar, +10) leads the subject.
+        assert!(subject.starts_with("add `Bar`"), "{subject}");
+        assert!(subject.contains("update `foo`"), "{subject}");
+        // Body lists files + entity bullets.
+        assert!(msg.contains("src/a.rs:"));
+        assert!(msg.contains("- add struct `Bar` (+10 -0)"));
+        assert!(msg.contains("- update fn `foo` (+1 -1)"));
+        // Empty input → empty message.
+        assert_eq!(derive_commit_message(&[]), "");
+    }
+
+    #[test]
+    fn derive_commit_message_truncates_long_subjects() {
+        let changes: Vec<EntityChange> = (0..5)
+            .map(|i| EntityChange {
+                kind: EntityKind::Function,
+                name: format!("f{i}"),
+                added: 5 - i,
+                deleted: 0,
+                touch: Touch::Added,
+            })
+            .collect();
+        let msg = derive_commit_message(&[("x.rs".into(), changes)]);
+        let subject = msg.lines().next().unwrap();
+        assert!(subject.contains("+2 more"), "{subject}");
     }
 
     #[test]
