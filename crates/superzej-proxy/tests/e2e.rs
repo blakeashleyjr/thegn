@@ -32,6 +32,32 @@ async fn spawn_mock(status: u16, body: Value) -> String {
     format!("http://{addr}")
 }
 
+/// Spawns a mock upstream that streams a fixed OpenAI SSE body for
+/// `/chat/completions`. Returns its base URL.
+async fn spawn_mock_sse(body: &'static str) -> String {
+    async fn handler(State(body): State<&'static str>) -> impl axum::response::IntoResponse {
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            body,
+        )
+    }
+    let app = Router::new()
+        .route("/chat/completions", post(handler))
+        .with_state(body);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+const OPENAI_SSE: &str = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n\
+data: {\"choices\":[{\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":13}}\n\n\
+data: [DONE]\n\n";
+
 fn backend(name: &str, base_url: &str) -> Backend {
     Backend {
         name: name.to_string(),
@@ -56,6 +82,7 @@ async fn spawn_proxy(routes: Vec<Route>, db: SharedDb) -> String {
     let config = ProxyConfig {
         listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         routes,
+        relay: superzej_proxy::relay::RelayConfig::default(),
     };
     // Bind first so we know the port, then hand the listener to axum::serve.
     let listener = tokio::net::TcpListener::bind(config.listen).await.unwrap();
@@ -185,6 +212,115 @@ async fn all_backends_failed_returns_503() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 503);
+}
+
+/// Polls the global budget's spent tokens until it reaches `want` or times out.
+async fn wait_for_global_tokens(db: &SharedDb, want: i64) -> i64 {
+    for _ in 0..50 {
+        let got = db
+            .lock()
+            .unwrap()
+            .proxy_budget("global")
+            .unwrap()
+            .map(|b| b.spent_tokens)
+            .unwrap_or(0);
+        if got >= want {
+            return got;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    0
+}
+
+#[tokio::test]
+async fn openai_surface_streams_and_reconciles_usage() {
+    let up = spawn_mock_sse(OPENAI_SSE).await;
+    let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+    let routes = vec![Route {
+        name: "standard".into(),
+        priority: vec![backend("primary", &up)],
+    }];
+    let proxy = spawn_proxy(routes, db.clone()).await;
+
+    let body = serde_json::json!({"model": "model-proxy/standard", "stream": true, "messages": [{"role": "user", "content": "hi"}]});
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    // Passthrough: the upstream SSE content reaches the client.
+    assert!(text.contains("\"content\":\"Hello\""));
+    assert!(text.contains("[DONE]"));
+    // Usage was reconciled from the trailing usage chunk (prompt 10 + completion 3).
+    assert_eq!(wait_for_global_tokens(&db, 13).await, 13);
+}
+
+#[tokio::test]
+async fn anthropic_surface_translates_stream_to_events() {
+    let up = spawn_mock_sse(OPENAI_SSE).await;
+    let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+    let routes = vec![Route {
+        name: "standard".into(),
+        priority: vec![backend("primary", &up)],
+    }];
+    let proxy = spawn_proxy(routes, db).await;
+
+    let body = serde_json::json!({"model": "model-proxy/standard", "stream": true, "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]});
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy}/v1/messages"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    // Well-formed Anthropic event sequence translated from the OpenAI stream.
+    assert!(text.contains("event: message_start"));
+    assert!(text.contains("event: content_block_start"));
+    assert!(text.contains("\"text_delta\""));
+    assert!(text.contains("Hello"));
+    assert!(text.contains("event: message_delta"));
+    assert!(text.contains("event: message_stop"));
+}
+
+#[tokio::test]
+async fn empty_stream_peek_falls_through() {
+    // The first backend streams only [DONE] (no usable output): the peek must
+    // reject it and fall through to the second, whose content reaches the client.
+    let empty = spawn_mock_sse("data: [DONE]\n\n").await;
+    let good = spawn_mock_sse(OPENAI_SSE).await;
+    let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+    let routes = vec![Route {
+        name: "standard".into(),
+        priority: vec![backend("empty", &empty), backend("secondary", &good)],
+    }];
+    let proxy = spawn_proxy(routes, db).await;
+
+    let body = serde_json::json!({"model": "model-proxy/standard", "stream": true, "messages": [{"role": "user", "content": "hi"}]});
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("Hello"),
+        "expected second backend's content, got: {text}"
+    );
+
+    // /resolved should report the secondary as the server.
+    let resolved: Value = reqwest::get(format!("{proxy}/resolved"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resolved["standard"], "secondary");
 }
 
 #[tokio::test]

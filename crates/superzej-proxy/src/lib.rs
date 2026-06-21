@@ -8,11 +8,13 @@
 //! extended with the V budget machinery; the Claude-Max OAuth subscription path
 //! and the AR gateway layer are out of milestone-1 scope.
 
+pub mod anthropic_stream;
 pub mod budget;
 pub mod config;
 pub mod health;
 pub mod metrics;
 pub mod model;
+pub mod relay;
 pub mod reset;
 pub mod router;
 pub mod server;

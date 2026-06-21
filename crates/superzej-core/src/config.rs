@@ -225,6 +225,14 @@ pub struct LlmProxyConfig {
     /// Path to the proxy's routes document (JSON), passed to `szproxy` as
     /// `SZPROXY_CONFIG`. Empty means no backends are configured yet.
     pub config_path: String,
+    /// Streaming: seconds to wait for a backend's first usable output before
+    /// falling through (TTFB / empty-completion peek window).
+    pub first_byte_timeout_secs: u64,
+    /// Streaming: seconds of upstream silence after which a committed stream is
+    /// terminated.
+    pub idle_timeout_secs: u64,
+    /// Streaming: keep-alive cadence (seconds) emitted during upstream silence.
+    pub heartbeat_secs: u64,
 }
 
 impl Default for LlmProxyConfig {
@@ -235,6 +243,9 @@ impl Default for LlmProxyConfig {
             routing: RoutingStrategy::default(),
             refuse_on_breach: true,
             config_path: String::new(),
+            first_byte_timeout_secs: 45,
+            idle_timeout_secs: 120,
+            heartbeat_secs: 10,
         }
     }
 }
@@ -253,6 +264,18 @@ impl LlmProxyConfig {
         if !self.config_path.is_empty() {
             env.insert("SZPROXY_CONFIG".to_string(), self.config_path.clone());
         }
+        env.insert(
+            "SZPROXY_FIRST_BYTE_TIMEOUT".to_string(),
+            self.first_byte_timeout_secs.to_string(),
+        );
+        env.insert(
+            "SZPROXY_STREAM_IDLE_TIMEOUT".to_string(),
+            self.idle_timeout_secs.to_string(),
+        );
+        env.insert(
+            "SZPROXY_STREAM_HEARTBEAT_INTERVAL".to_string(),
+            self.heartbeat_secs.to_string(),
+        );
         Some(("szproxy".to_string(), Vec::new(), env))
     }
 }

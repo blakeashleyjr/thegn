@@ -716,3 +716,9 @@ refuse_on_breach = true
 # [ { "name", "base_url", "model", "api_key_env", "anthropic", "rpm", "burst",
 # "context_limit", "defaults" } ] } ] }). Passed to szproxy as SZPROXY_CONFIG.
 config_path = ""
+# Streaming tunables (seconds). first_byte_timeout: wait for a backend's first
+# usable token before falling through; idle_timeout: kill a stream gone silent
+# this long; heartbeat: keep-alive cadence during upstream silence.
+first_byte_timeout_secs = 45
+idle_timeout_secs = 120
+heartbeat_secs = 10

@@ -9,6 +9,7 @@ use superzej_core::proxy::ratelimit::{InflightTracker, RateLimiter};
 use crate::health::Health;
 use crate::metrics::Metrics;
 use crate::model::ProxyConfig;
+use crate::relay::RelayConfig;
 use crate::shared::SharedDb;
 
 /// Process-wide proxy state. Cheap to clone (everything is `Arc`/shared).
@@ -21,6 +22,8 @@ pub struct AppState {
     pub client: reqwest::Client,
     pub price_table: PriceTable,
     pub db: SharedDb,
+    /// Streaming relay tunables (copied from config for cheap access).
+    pub relay_config: RelayConfig,
     /// Route name → identity of the backend that last served it (`/resolved`).
     resolved: Mutex<HashMap<String, String>>,
     /// Whether a budget breach refuses (true) or downgrades (false).
@@ -33,9 +36,11 @@ pub type SharedState = Arc<AppState>;
 impl AppState {
     pub fn new(config: ProxyConfig, db: SharedDb, now_ms: i64) -> Arc<Self> {
         let health = Arc::new(Health::new(db.clone(), now_ms));
+        let relay_config = config.relay;
         Arc::new(Self {
             config,
             health,
+            relay_config,
             limiter: Arc::new(RateLimiter::new()),
             inflight: Arc::new(InflightTracker::new()),
             metrics: Arc::new(Metrics::new()),

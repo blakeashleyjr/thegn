@@ -375,6 +375,13 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         since_start_ms = start.elapsed().as_millis() as u64,
         "config loaded"
     );
+    // Auto-launch the LLM-proxy daemon when enabled (disabled by default — AI is
+    // additive). Held for the lifetime of `main`; the supervisor thread keeps it
+    // alive and `Drop` stops it on graceful return (process-group exit otherwise).
+    let _proxy_daemon = cfg
+        .llm_proxy
+        .launch_spec()
+        .and_then(crate::proxy_daemon::launch);
     let keymap = rebuild_keymap(&cfg, &session);
     let mode = crate::keymap::startup_mode(&cfg);
     // Validate that no keybinding scope has ambiguous duplicates. Cross-scope
