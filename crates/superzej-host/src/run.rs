@@ -7330,6 +7330,10 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                 }
             } else {
+                // Target the selected (or first) changed file. A momentarily
+                // empty `changes` (a hydration tick in flight) must NOT clear a
+                // populated outline — keep the last one until a new file is
+                // actually selected, so the outline doesn't flicker.
                 let target = panel_ui
                     .chg_sel
                     .and_then(|i| model.panel.changes.get(i))
@@ -7347,10 +7351,6 @@ async fn event_loop<T: Terminal>(
                         outline_tx.clone(),
                         waker.clone(),
                     );
-                }
-                if target.is_none() && !outline_file.is_empty() {
-                    outline_file.clear();
-                    outline_syms.clear();
                 }
                 if model.panel.symbols != outline_syms || model.panel.symbols_file != outline_file {
                     model.panel.symbols = outline_syms.clone();

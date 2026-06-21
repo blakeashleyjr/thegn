@@ -49,7 +49,7 @@ fn requests_return_mapped_results() {
 
     let symbols = client.document_symbols(uri).expect("documentSymbol");
     assert_eq!(symbols.len(), 1);
-    assert_eq!(symbols[0].name, "greet");
+    assert_eq!(symbols[0].name, "lspProbe");
     assert_eq!(symbols[0].kind, SymbolKind::Function);
     assert_eq!(symbols[0].location.line_1based(), 1);
 

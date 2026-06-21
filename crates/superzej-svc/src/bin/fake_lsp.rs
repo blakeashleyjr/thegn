@@ -1,16 +1,26 @@
 //! A minimal fake language server for tests: speaks just enough LSP base
-//! protocol over stdio to exercise `LspClient` end-to-end with no real server
-//! installed. It answers `initialize` (and immediately pushes one
-//! `publishDiagnostics`), and returns canned results for the request methods
-//! the client wraps. Selected by the integration test via `CARGO_BIN_EXE_fake_lsp`.
+//! protocol over stdio to exercise `LspClient` (and the host's live wiring)
+//! end-to-end with no real server installed. It answers `initialize` (and
+//! immediately pushes one `publishDiagnostics`), and returns canned results for
+//! the request methods the client wraps.
+//!
+//! Deliberately self-contained — it depends only on `serde_json`, not the
+//! `superzej-svc` lib, so the binary stays tiny and spawns fast (a heavyweight
+//! debug binary made the e2e cold-start flaky). The framing is re-implemented
+//! inline; `superzej_svc::lsp::framing` has the canonical, unit-tested copy.
 
 use std::io::{Read, Write, stdin, stdout};
 
 use serde_json::{Value, json};
-use superzej_svc::lsp::framing::{FrameDecoder, encode};
+
+fn frame(body: &str) -> Vec<u8> {
+    let mut out = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+    out.extend_from_slice(body.as_bytes());
+    out
+}
 
 fn send(out: &mut impl Write, body: &Value) {
-    let _ = out.write_all(&encode(&body.to_string()));
+    let _ = out.write_all(&frame(&body.to_string()));
     let _ = out.flush();
 }
 
@@ -21,8 +31,28 @@ fn reply(out: &mut impl Write, id: &Value, result: Value) {
     );
 }
 
+/// Pull the next complete message body out of `buf`, draining it.
+fn next_message(buf: &mut Vec<u8>) -> Option<String> {
+    let sep = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let header = std::str::from_utf8(&buf[..sep]).ok()?;
+    let len: usize = header.split("\r\n").find_map(|line| {
+        let (k, v) = line.split_once(':')?;
+        k.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| v.trim().parse().ok())
+            .flatten()
+    })?;
+    let start = sep + 4;
+    if buf.len() < start + len {
+        return None;
+    }
+    let body = String::from_utf8_lossy(&buf[start..start + len]).into_owned();
+    buf.drain(..start + len);
+    Some(body)
+}
+
 fn main() {
-    let mut decoder = FrameDecoder::new();
+    let mut buf: Vec<u8> = Vec::new();
     let mut input = stdin().lock();
     let mut out = stdout().lock();
     let mut chunk = [0u8; 4096];
@@ -32,9 +62,9 @@ fn main() {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
-        decoder.push(&chunk[..n]);
+        buf.extend_from_slice(&chunk[..n]);
 
-        while let Some(body) = decoder.next_message() {
+        while let Some(body) = next_message(&mut buf) {
             let Ok(msg) = serde_json::from_str::<Value>(&body) else {
                 continue;
             };
@@ -71,8 +101,10 @@ fn main() {
                 "textDocument/documentSymbol" => reply(
                     &mut out,
                     &id.unwrap_or(Value::Null),
+                    // A name no tree-sitter parse of the fixture would produce, so
+                    // a test seeing it knows the result came from the server.
                     json!([{
-                        "name": "greet", "kind": 12,
+                        "name": "lspProbe", "kind": 12,
                         "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 2, "character": 0 } },
                         "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 8 } }
                     }]),
@@ -81,7 +113,7 @@ fn main() {
                     &mut out,
                     &id.unwrap_or(Value::Null),
                     json!([{
-                        "name": "greet", "kind": 12,
+                        "name": "lspProbe", "kind": 12,
                         "location": { "uri": "file:///proj/src/lib.rs",
                             "range": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 8 } } }
                     }]),

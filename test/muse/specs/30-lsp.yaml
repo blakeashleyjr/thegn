@@ -1,0 +1,78 @@
+name: lsp
+# LSP integration (items 529/531/530): with a language server configured,
+# opening the Symbols section lazily starts it (via the outline fetch) and lists
+# the server's `documentSymbol` result. This drives the live pipeline with a
+# hermetic fake server (the svc `fake_lsp` test bin) — no real language server
+# installed — so it's deterministic and CI-reproducible.
+#
+# The fixture: a git repo with a dirty Rust file, plus an XDG_CONFIG_HOME whose
+# config.toml points the Rust server at the fake_lsp binary (absolute path, so
+# it resolves regardless of the login shell's PATH).
+#
+# The fake returns a symbol named `lspProbe` — a name no tree-sitter parse of the
+# fixture would produce — so seeing it in the outline proves the result came from
+# the language server (not the fallback parser). Assertion-based (no full-frame
+# snapshot); see the masthead-volatility note in spec 29.
+case_tmp_env: XDG_STATE_HOME
+matrix:
+  profiles: [xterm]
+  sizes: ["120x36"]
+spawn:
+  # The server command is the bare `fake_lsp` — `just e2e` puts target/debug on
+  # PATH, which szhost inherits, so it resolves regardless of the spawn cwd.
+  - sh
+  - -c
+  - |
+    # Derive XDG_CONFIG_HOME from the (real, case-isolated) XDG_STATE_HOME and
+    # export it so the exec'd szhost reads the same config dir we write here.
+    export XDG_CONFIG_HOME="$XDG_STATE_HOME/cfg"
+    repo="$XDG_STATE_HOME/wt"
+    mkdir -p "$repo" "$XDG_CONFIG_HOME/superzej"
+    printf '[[lsp.servers]]\n' > "$XDG_CONFIG_HOME/superzej/config.toml"
+    printf 'lang = "rust"\n' >> "$XDG_CONFIG_HOME/superzej/config.toml"
+    printf 'command = "fake_lsp"\n' >> "$XDG_CONFIG_HOME/superzej/config.toml"
+    printf 'args = []\n' >> "$XDG_CONFIG_HOME/superzej/config.toml"
+    cd "$repo"
+    git init -q -b main
+    git config user.email t@t.t
+    git config user.name t
+    printf 'fn greet() -> u8 {\n    1\n}\n' > lib.rs
+    git add .
+    git commit -qm init
+    printf 'fn greet() -> u8 {\n    42\n}\n' > lib.rs
+    exec szhost
+env:
+  XDG_STATE_HOME: "{case_tmp}"
+  SUPERZEJ_LOG: warn
+  MUSE_READY: "1"
+  TERM: xterm-256color
+sync:
+  quiet_window_ms: 2000
+  max_settle_ms: 12000
+steps:
+  - expect_visible: {regex: "szhost|superzej|\\$|>", timeout_ms: 8000}
+  # Exit the dashboard, open + focus the right panel.
+  - key: {key: q}
+  - sleep_ms: 300
+  - key: {key: p, mods: [ctrl, alt]}
+  - sleep_ms: 800
+  - key: {key: right, mods: [ctrl]}
+  - sleep_ms: 300
+  # Tab cycles the panel tab (Git → Work); '6' opens the Symbols section, whose
+  # outline fetch lazily starts the (fake) server. The first start spawns + does
+  # the initialize handshake, so allow generous time before asserting.
+  - key: {key: tab}
+  - sleep_ms: 500
+  # Open the Symbols section (6th): its outline fetch lazily starts the server.
+  - key: {key: "6"}
+  - sleep_ms: 3000
+  # Starting the server makes it push diagnostics; the Problems section (3rd)
+  # shows the unique "fake error" — proving the full pipeline end-to-end (config
+  # → lazy server start → publishDiagnostics → Problems panel). The diagnostic is
+  # stored host-side and persists, so this is robust to render timing.
+  - key: {key: "3"}
+  - sleep_ms: 1000
+  - expect_visible: {regex: "fake error", timeout_ms: 15000}
+  - check_file:
+      path: "{case_tmp}/superzej/logs/szhost.log"
+      reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt"
