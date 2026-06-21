@@ -361,6 +361,28 @@ pub struct ImpactSummary {
     pub summary: String,
 }
 
+/// The entity-level view of a worktree's pending changes, carried on the panel
+/// model: per-file entity churn + the aggregate impact. Built off-thread by the
+/// host hydration from `git diff HEAD`; read instantly to render the impact line
+/// and to prefill the commit message.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EntitySummary {
+    pub per_file: Vec<(String, Vec<EntityChange>)>,
+    pub impact: Option<ImpactSummary>,
+}
+
+impl EntitySummary {
+    /// Build from per-file entity changes (drops files with no entity churn).
+    pub fn new(per_file: Vec<(String, Vec<EntityChange>)>) -> Self {
+        let per_file: Vec<_> = per_file
+            .into_iter()
+            .filter(|(_, c)| !c.is_empty())
+            .collect();
+        let impact = (!per_file.is_empty()).then(|| impact_summary(&per_file));
+        EntitySummary { per_file, impact }
+    }
+}
+
 /// Aggregate per-file entity changes into an impact summary.
 pub fn impact_summary(per_file: &[(String, Vec<EntityChange>)]) -> ImpactSummary {
     let files = per_file.iter().filter(|(_, c)| !c.is_empty()).count();

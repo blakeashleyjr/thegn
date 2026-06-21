@@ -375,6 +375,49 @@ pub(crate) fn db_worktree_list(db: &superzej_core::db::Db) -> Vec<crate::sidebar
 /// Gather per-worktree git/agent/activity status for every tab in the session.
 /// Runs on the hydration thread (git can be slow); the event loop merges this
 /// into the tree at render time. Also advances the activity FSM in-process.
+/// Compute the entity-level summary of a worktree's pending changes from
+/// `git diff HEAD` (semantic git layer). Runs on the hydration thread: one diff
+/// subprocess + a tree-sitter parse per changed file. Capped at 50 files so a
+/// sprawling change never balloons hydration; `None` when there's nothing to
+/// show or git/parse yields no entities.
+fn compute_entity_summary(
+    loc: &superzej_core::remote::GitLoc,
+    diff_entries: &[superzej_svc::git::DiffEntry],
+) -> Option<superzej_core::semantic::EntitySummary> {
+    use superzej_core::semantic::{EntitySummary, Lang, entities_for_diff};
+    if diff_entries.is_empty() || diff_entries.len() > 50 {
+        return None;
+    }
+    // Same sanitized flags the git backend uses (see svc SANITIZED_DIFF) so the
+    // patch parses cleanly: no color/ext-diff/renames, 3 lines of context.
+    let diff = loc.git_out(&[
+        "-c",
+        "diff.noprefix=false",
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-renames",
+        "-U3",
+        "HEAD",
+    ])?;
+    let root = loc.path();
+    let mut per_file = Vec::new();
+    for f in superzej_core::patch::parse_patch(&diff) {
+        let Some(lang) = Lang::from_path(&f.new_path) else {
+            continue;
+        };
+        let Ok(src) = std::fs::read_to_string(std::path::Path::new(&root).join(&f.new_path)) else {
+            continue;
+        };
+        let changes = entities_for_diff(&src, lang, &f.hunks);
+        if !changes.is_empty() {
+            per_file.push((f.new_path.clone(), changes));
+        }
+    }
+    let summary = EntitySummary::new(per_file);
+    (!summary.per_file.is_empty()).then_some(summary)
+}
+
 fn collect_sidebar_status(
     session: &crate::session::Session,
     db: &superzej_core::db::Db,
@@ -701,6 +744,10 @@ pub(crate) fn build_model(
     // Changes section: porcelain status joined with the diffstat.
     let status = git.status(&loc).unwrap_or_default();
     panel.changes = crate::panel::build_change_rows(&status, &diff_entries);
+
+    // Semantic git layer (items 311/313/317): entity-level view of the pending
+    // changes, computed here on the hydration thread (parses each changed file).
+    panel.entities = compute_entity_summary(&loc, &diff_entries);
 
     // Header zone: upstream divergence + merge-in-progress banner.
     panel.ahead_behind = git.ahead_behind(&loc).ok().flatten();
