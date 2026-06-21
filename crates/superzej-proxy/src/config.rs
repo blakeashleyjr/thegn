@@ -7,6 +7,7 @@
 //! JSON shape here is the same data those layers will produce.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -14,6 +15,7 @@ use serde_json::{Map, Value};
 use superzej_core::proxy::ratelimit::RatePolicy;
 
 use crate::model::{Backend, ProxyConfig, Route};
+use crate::relay::RelayConfig;
 
 #[derive(Debug, Deserialize)]
 struct ConfigDoc {
@@ -57,12 +59,55 @@ fn default_listen() -> SocketAddr {
     "127.0.0.1:8383".parse().unwrap()
 }
 
-/// Reads `SZPROXY_LISTEN` (or `META_ROUTER_PORT`) and the routes document.
+/// Reads `SZPROXY_LISTEN` (or `META_ROUTER_PORT`), the routes document, and the
+/// streaming relay tunables.
 pub fn from_env() -> Result<ProxyConfig> {
     let listen = resolve_listen()?;
     let doc = load_doc()?;
     let routes = doc.map(build_routes).transpose()?.unwrap_or_default();
-    Ok(ProxyConfig { listen, routes })
+    Ok(ProxyConfig {
+        listen,
+        routes,
+        relay: relay_from_env(),
+    })
+}
+
+/// Resolves the relay tunables from env, honoring the Go-compatible
+/// `MODEL_PROXY_*` names (and `SZPROXY_*` aliases) with the Go defaults.
+fn relay_from_env() -> RelayConfig {
+    let secs = |keys: &[&str], default: u64| -> Duration {
+        for k in keys {
+            if let Ok(v) = std::env::var(k)
+                && let Ok(n) = v.trim().parse::<u64>()
+            {
+                return Duration::from_secs(n);
+            }
+        }
+        Duration::from_secs(default)
+    };
+    RelayConfig {
+        first_byte: secs(
+            &[
+                "SZPROXY_FIRST_BYTE_TIMEOUT",
+                "MODEL_PROXY_FIRST_BYTE_TIMEOUT",
+            ],
+            45,
+        ),
+        idle: secs(
+            &[
+                "SZPROXY_STREAM_IDLE_TIMEOUT",
+                "MODEL_PROXY_STREAM_IDLE_TIMEOUT",
+            ],
+            120,
+        ),
+        heartbeat: secs(
+            &[
+                "SZPROXY_STREAM_HEARTBEAT_INTERVAL",
+                "MODEL_PROXY_STREAM_HEARTBEAT_INTERVAL",
+            ],
+            10,
+        ),
+    }
 }
 
 fn resolve_listen() -> Result<SocketAddr> {
@@ -97,6 +142,7 @@ pub fn parse_config(raw: &str) -> Result<ProxyConfig> {
     Ok(ProxyConfig {
         listen: default_listen(),
         routes: build_routes(doc)?,
+        relay: RelayConfig::default(),
     })
 }
 

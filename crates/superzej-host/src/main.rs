@@ -35,6 +35,7 @@ mod pane;
 mod panel;
 mod panes;
 mod pins;
+mod proxy_daemon;
 mod queries;
 mod run;
 mod sandbox_events;

@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use superzej_core::proxy::bridge;
 
 use crate::budget::{BudgetVerdict, check_budget, resolve_identity};
-use crate::router::{StreamOutcome, route_nonstreaming, route_streaming};
+use crate::router::{StreamOutcome, Surface, route_nonstreaming, route_streaming};
 use crate::shared::now_unix;
 use crate::state::SharedState;
 
@@ -99,11 +99,18 @@ async fn chat_completions(
     };
 
     if wants_stream(&body) {
-        match route_streaming(&state, &identity, "openai", &route, &body).await {
-            StreamOutcome::Passthrough(resp) => {
-                sse_response(Body::from_stream(resp.bytes_stream()))
-            }
-            StreamOutcome::Synthesized(bytes) => sse_response(Body::from(bytes)),
+        let model = model_of(&body);
+        match route_streaming(
+            state.clone(),
+            identity,
+            Surface::OpenAi,
+            &route,
+            &model,
+            &body,
+        )
+        .await
+        {
+            StreamOutcome::Body(b) => sse_response(b),
             StreamOutcome::Failed => error_json(503, "all backends failed", "proxy_error"),
         }
     } else {
@@ -141,6 +148,24 @@ async fn anthropic_messages(
         return anthropic_error(400, "no route for model");
     };
     let openai_body = serde_json::to_vec(&openai_req).unwrap_or_default();
+
+    // Streaming: translate the upstream OpenAI SSE into live Anthropic events.
+    if wants_stream(&body) {
+        return match route_streaming(
+            state.clone(),
+            identity,
+            Surface::Anthropic,
+            &route,
+            &model,
+            &openai_body,
+        )
+        .await
+        {
+            StreamOutcome::Body(b) => sse_response(b),
+            StreamOutcome::Failed => anthropic_error(503, "all backends failed"),
+        };
+    }
+
     let r = route_nonstreaming(&state, &identity, "anthropic", &route, &openai_body).await;
     if !(200..300).contains(&r.status) {
         return anthropic_error(r.status, "all backends failed");

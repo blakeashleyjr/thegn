@@ -69,6 +69,8 @@ pub struct Route {
 pub struct ProxyConfig {
     pub listen: SocketAddr,
     pub routes: Vec<Route>,
+    /// Streaming relay tunables (TTFB / idle / heartbeat).
+    pub relay: crate::relay::RelayConfig,
 }
 
 impl ProxyConfig {
