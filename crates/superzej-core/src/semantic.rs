@@ -15,6 +15,7 @@ use std::sync::LazyLock;
 
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
 
+use crate::blame::BlameRow;
 use crate::patch::{LineKind, PatchHunk};
 
 /// A source language we can parse entities for.
@@ -396,6 +397,47 @@ pub fn impact_summary(per_file: &[(String, Vec<EntityChange>)]) -> ImpactSummary
     }
 }
 
+// ─── Entity-level blame (item 312) ──────────────────────────────────────────
+
+/// Blame rolled up to an entity: its most-recent touching commit + how many
+/// distinct commits its lines come from (churn/ownership signal).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntityBlame {
+    pub kind: EntityKind,
+    pub name: String,
+    pub last_sha: String,
+    pub last_author: String,
+    pub last_date: i64,
+    pub commit_count: usize,
+}
+
+/// Group blame rows by the entity whose span their `lineno` falls in. Per
+/// entity: the most-recent commit (max `date`) and the count of distinct
+/// commits across its lines. Entities with no blame lines are omitted.
+pub fn blame_entities(entities: &[Entity], blame: &[BlameRow]) -> Vec<EntityBlame> {
+    entities
+        .iter()
+        .filter_map(|e| {
+            let rows: Vec<&BlameRow> = blame
+                .iter()
+                .filter(|b| e.contains(b.lineno as u32))
+                .collect();
+            let last = rows.iter().max_by_key(|b| b.date)?;
+            let mut shas: Vec<&str> = rows.iter().map(|b| b.sha.as_str()).collect();
+            shas.sort_unstable();
+            shas.dedup();
+            Some(EntityBlame {
+                kind: e.kind,
+                name: e.name.clone(),
+                last_sha: last.sha.clone(),
+                last_author: last.author.clone(),
+                last_date: last.date,
+                commit_count: shas.len(),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,5 +697,55 @@ diff --git a/x.rs b/x.rs
     #[test]
     fn impact_summary_empty() {
         assert_eq!(impact_summary(&[]).summary, "no entity-level changes");
+    }
+
+    #[test]
+    fn blame_entities_groups_by_span() {
+        let entities = vec![
+            Entity {
+                kind: EntityKind::Function,
+                name: "a".into(),
+                start_line: 1,
+                end_line: 3,
+            },
+            Entity {
+                kind: EntityKind::Function,
+                name: "b".into(),
+                start_line: 5,
+                end_line: 8,
+            },
+        ];
+        let row = |sha: &str, date: i64, lineno: usize| BlameRow {
+            sha: sha.into(),
+            author: format!("auth-{sha}"),
+            date,
+            lineno,
+            content: String::new(),
+        };
+        let blame = vec![
+            row("aaa1111", 100, 1),
+            row("aaa1111", 100, 2),
+            row("bbb2222", 300, 6), // newer, in b
+            row("ccc3333", 200, 7), // older, in b
+        ];
+        let out = blame_entities(&entities, &blame);
+        let a = out.iter().find(|e| e.name == "a").unwrap();
+        assert_eq!(a.last_sha, "aaa1111");
+        assert_eq!(a.commit_count, 1);
+        let b = out.iter().find(|e| e.name == "b").unwrap();
+        assert_eq!(b.last_sha, "bbb2222", "newest commit wins");
+        assert_eq!(b.last_date, 300);
+        assert_eq!(b.commit_count, 2, "two distinct commits in b");
+        // An entity with no blame lines is omitted.
+        let none = blame_entities(
+            &[Entity {
+                kind: EntityKind::Struct,
+                name: "Z".into(),
+                start_line: 50,
+                end_line: 60,
+            }],
+            &blame,
+        );
+        assert!(none.is_empty());
     }
 }

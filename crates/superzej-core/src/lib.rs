@@ -10,6 +10,7 @@
 //! owns terminal chord→Action routing.
 
 pub mod activity;
+pub mod blame;
 pub mod config;
 pub mod custom_cmd;
 pub mod db;
