@@ -19,7 +19,7 @@ use crate::blame::BlameRow;
 use crate::patch::{LineKind, PatchHunk};
 
 /// A source language we can parse entities for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Lang {
     Rust,
     TypeScript,

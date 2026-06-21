@@ -4794,12 +4794,14 @@ fn session_cancel_key(
 /// Dispatch a search query to the right async worker based on the current
 /// palette mode. All-mode is synchronous (nucleo on pre-built items); the
 /// others spawn a `spawn_blocking` worker and wake the loop on completion.
+#[allow(clippy::too_many_arguments)]
 fn kick_palette_search(
     session: &mut crate::search_everywhere::PaletteSession,
     mode: crate::search_everywhere::PaletteMode,
     file_index: &Option<crate::search_everywhere::FileIndex>,
     worktree_root: std::path::PathBuf,
     cfg: &superzej_core::config::Config,
+    lsp: std::sync::Arc<crate::lsp::LspInner>,
     waker: &termwiz::terminal::TerminalWaker,
 ) {
     use crate::search_everywhere::PaletteMode;
@@ -4871,6 +4873,7 @@ fn kick_palette_search(
                 query,
                 sg,
                 max_sym,
+                lsp,
                 tx,
                 waker.clone(),
             );
@@ -5193,6 +5196,25 @@ async fn event_loop<T: Terminal>(
 
     // The pin supervisor owns daemon panes independent of tabs/visibility.
     let mut supervisor = crate::pins::PinSupervisor::from_config(keymap.config());
+
+    // LSP: lazy, warm language servers per worktree. Clients push diagnostics on
+    // a std channel; a bridge thread forwards them onto a loop channel and pulses
+    // the waker (svc has no waker). `lsp_diags` persists them across model swaps.
+    let mut lsp_supervisor = crate::lsp::LspSupervisor::from_config(keymap.config());
+    let mut lsp_diags = crate::lsp::LspDiagnostics::new();
+    let (lsp_diag_tx, mut lsp_diag_rx) =
+        tokio_mpsc::unbounded_channel::<superzej_svc::lsp::PublishedDiagnostics>();
+    if let Some(raw_rx) = lsp_supervisor.take_diagnostics_rx() {
+        let bridge_waker = waker.clone();
+        std::thread::spawn(move || {
+            while let Ok(pd) = raw_rx.recv() {
+                if lsp_diag_tx.send(pd).is_err() {
+                    break;
+                }
+                let _ = bridge_waker.wake();
+            }
+        });
+    }
     // Live theme-cycle position within `theme::PRESETS` (Ctrl+Alt+t).
     let mut theme_idx: usize = superzej_core::theme::PRESETS
         .iter()
@@ -6108,6 +6130,21 @@ async fn event_loop<T: Terminal>(
             }
             dirty = true;
         }
+        // LSP-pushed diagnostics → Problems panel (a second source alongside
+        // tasks). The store persists across hydration swaps; re-merged here.
+        {
+            let root = active_tab_path(&session);
+            let root = root.is_dir().then_some(root.as_path());
+            let mut got = false;
+            while let Ok(pd) = lsp_diag_rx.try_recv() {
+                lsp_diags.apply(pd, root);
+                got = true;
+            }
+            if got {
+                lsp_diags.merge_into(&mut model.panel.diagnostics);
+                dirty = true;
+            }
+        }
         // Run results: the latest run upserts each reported test's status while
         // leaving other tests' most-recent status intact.
         while let Ok(outcome) = test_run_rx.try_recv() {
@@ -6593,6 +6630,10 @@ async fn event_loop<T: Terminal>(
             model.metrics = metrics;
             if model.status.is_empty() {
                 model.status = prev_status;
+            }
+            // A fresh model carries only git/db diagnostics; re-apply LSP ones.
+            if !lsp_diags.is_empty() {
+                lsp_diags.merge_into(&mut model.panel.diagnostics);
             }
             // Mirror an externally-started (or externally-finished) rebase
             // into the git flow state, so the TODO view and conflict chrome
@@ -8580,6 +8621,7 @@ async fn event_loop<T: Terminal>(
                                 &file_index,
                                 active_tab_path(&session),
                                 &current_config,
+                                lsp_supervisor.handle(),
                                 &waker,
                             );
                         }
@@ -8831,6 +8873,7 @@ async fn event_loop<T: Terminal>(
                                 &file_index,
                                 active_tab_path(&session),
                                 &current_config,
+                                lsp_supervisor.handle(),
                                 &waker,
                             );
                         }
@@ -8842,6 +8885,7 @@ async fn event_loop<T: Terminal>(
                                 &file_index,
                                 active_tab_path(&session),
                                 &current_config,
+                                lsp_supervisor.handle(),
                                 &waker,
                             );
                         }

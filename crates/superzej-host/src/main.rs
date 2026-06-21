@@ -25,6 +25,7 @@ mod layer;
 mod layout;
 mod layout_spec;
 mod logotype;
+mod lsp;
 mod menu;
 mod metrics;
 mod mousefilter;
