@@ -164,6 +164,9 @@ pub struct SymbolMatch {
     pub path: String,
     pub line_no: u64,
     pub symbol: String,
+    /// Short kind label ("fn", "struct", …) — from LSP when available, else the
+    /// matched keyword. `None` falls back to "fn" in the UI.
+    pub kind: Option<String>,
 }
 
 pub enum AsyncSearchResult {
@@ -603,7 +606,7 @@ impl PaletteSession {
                     .take(items_avail)
                 {
                     let selected = row == self.selected;
-                    let primary = format!("fn {}", m.symbol);
+                    let primary = format!("{} {}", m.kind.as_deref().unwrap_or("fn"), m.symbol);
                     let context = format!("{}:{}", m.path, m.line_no);
                     draw_two_line_item(
                         surface, inner.x, row_y, inner.cols, &primary, &context, selected,
@@ -956,98 +959,199 @@ pub fn spawn_symbol_search(
     query: String,
     sg: u64,
     max_results: usize,
+    lsp: std::sync::Arc<crate::lsp::LspInner>,
     tx: UnboundedSender<AsyncSearchResult>,
     waker: termwiz::terminal::TerminalWaker,
 ) {
     tokio::task::spawn_blocking(move || {
-        use grep_matcher::Matcher;
-        use grep_regex::RegexMatcher;
-        use grep_searcher::SearcherBuilder;
-        use grep_searcher::sinks::UTF8;
-        use ignore::WalkBuilder;
+        // 1. Fast path: a tree-sitter-free regex sweep. Always runs (it's the
+        //    fallback when no LSP server is available) and is sent immediately so
+        //    the palette shows results without waiting on a language server.
+        let (regex_hits, langs) = regex_symbol_sweep(&root, &query, max_results);
+        let _ = tx.send(AsyncSearchResult::SymbolMatches {
+            sg,
+            matches: regex_hits.clone(),
+        });
+        let _ = waker.wake();
 
-        // Multi-language symbol pattern: fn/def/class/func/function/struct/impl/type
-        let sym_pat = r"(?m)^\s*(pub\s+)?(async\s+)?(?:fn|def|class|func|function|struct|impl|type|interface|enum)\s+(\w+)";
-        let matcher = match RegexMatcher::new(sym_pat) {
-            Ok(m) => m,
-            Err(_) => return,
-        };
-        let q_lower = query.to_ascii_lowercase();
-
-        let code_exts = &[
-            "rs", "py", "ts", "tsx", "js", "jsx", "go", "c", "cpp", "h", "java", "kt", "swift",
-            "rb", "php", "cs", "zig", "ex", "exs",
-        ];
-
-        let mut searcher = SearcherBuilder::new()
-            .binary_detection(grep_searcher::BinaryDetection::quit(0))
-            .build();
-
-        let mut all: Vec<SymbolMatch> = Vec::new();
-
-        let mut walk = WalkBuilder::new(&root);
-        walk.hidden(false).git_ignore(true);
-
-        for entry in walk.build().flatten() {
-            if all.len() >= max_results {
-                break;
+        // 2. Upgrade: query each present language's server (lazily starting it)
+        //    for workspace symbols, and re-send LSP-first results when richer.
+        let lsp_hits = lsp_workspace_symbols(&lsp, &root, &query, &langs);
+        if !lsp_hits.is_empty() {
+            let mut seen: std::collections::HashSet<(String, u64)> = lsp_hits
+                .iter()
+                .map(|m| (m.path.clone(), m.line_no))
+                .collect();
+            let mut merged = lsp_hits;
+            for m in regex_hits {
+                if seen.insert((m.path.clone(), m.line_no)) {
+                    merged.push(m);
+                }
             }
-            if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                continue;
-            }
-            let path = entry.path().to_owned();
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if !code_exts.contains(&ext.as_str()) {
-                continue;
-            }
-            let rel = path
-                .strip_prefix(&root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .into_owned();
+            merged.truncate(max_results);
+            let _ = tx.send(AsyncSearchResult::SymbolMatches {
+                sg,
+                matches: merged,
+            });
+            let _ = waker.wake();
+        }
+    });
+}
 
-            let q_lower2 = q_lower.clone();
-            let rel2 = rel.clone();
-            let mut local: Vec<SymbolMatch> = Vec::new();
-            let _ = searcher.search_path(
-                &matcher,
-                &path,
-                UTF8(|line_no, line| {
-                    // Extract the captured symbol name
-                    if let Ok(Some(m)) = matcher.find(line.as_bytes()) {
-                        let hit = &line[m];
-                        // The symbol name is the last word in the match
-                        let symbol = hit
-                            .split_whitespace()
-                            .last()
-                            .unwrap_or("")
-                            .trim_matches('{')
-                            .to_string();
-                        if !symbol.is_empty() {
-                            let sym_lower = symbol.to_ascii_lowercase();
-                            if q_lower2.is_empty() || sym_lower.contains(&q_lower2) {
-                                local.push(SymbolMatch {
-                                    path: rel2.clone(),
-                                    line_no,
-                                    symbol,
-                                });
-                            }
-                        }
-                    }
-                    Ok(true)
-                }),
-            );
-            all.extend(local);
+/// A regex symbol sweep over the worktree's code files. Returns the matches plus
+/// the set of LSP-supported languages encountered (to drive the LSP upgrade).
+fn regex_symbol_sweep(
+    root: &std::path::Path,
+    query: &str,
+    max_results: usize,
+) -> (
+    Vec<SymbolMatch>,
+    std::collections::HashSet<superzej_core::semantic::Lang>,
+) {
+    use grep_matcher::Matcher;
+    use grep_regex::RegexMatcher;
+    use grep_searcher::SearcherBuilder;
+    use grep_searcher::sinks::UTF8;
+    use ignore::WalkBuilder;
+    use superzej_core::semantic::Lang;
+
+    let sym_pat = r"(?m)^\s*(pub\s+)?(async\s+)?(?:fn|def|class|func|function|struct|impl|type|interface|enum)\s+(\w+)";
+    let Ok(matcher) = RegexMatcher::new(sym_pat) else {
+        return (Vec::new(), std::collections::HashSet::new());
+    };
+    let q_lower = query.to_ascii_lowercase();
+    let code_exts = &[
+        "rs", "py", "ts", "tsx", "js", "jsx", "go", "c", "cpp", "h", "java", "kt", "swift", "rb",
+        "php", "cs", "zig", "ex", "exs",
+    ];
+    let mut searcher = SearcherBuilder::new()
+        .binary_detection(grep_searcher::BinaryDetection::quit(0))
+        .build();
+    let mut all: Vec<SymbolMatch> = Vec::new();
+    let mut langs = std::collections::HashSet::new();
+
+    let mut walk = WalkBuilder::new(root);
+    walk.hidden(false).git_ignore(true);
+    for entry in walk.build().flatten() {
+        if all.len() >= max_results {
+            break;
+        }
+        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let path = entry.path().to_owned();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !code_exts.contains(&ext.as_str()) {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
+        if let Some(l) = Lang::from_path(&rel) {
+            langs.insert(l);
         }
 
-        all.truncate(max_results);
-        let _ = tx.send(AsyncSearchResult::SymbolMatches { sg, matches: all });
-        let _ = waker.wake();
-    });
+        let q_lower2 = q_lower.clone();
+        let rel2 = rel.clone();
+        let mut local: Vec<SymbolMatch> = Vec::new();
+        let _ = searcher.search_path(
+            &matcher,
+            &path,
+            UTF8(|line_no, line| {
+                if let Ok(Some(m)) = matcher.find(line.as_bytes()) {
+                    let hit = &line[m];
+                    let symbol = hit
+                        .split_whitespace()
+                        .last()
+                        .unwrap_or("")
+                        .trim_matches('{')
+                        .to_string();
+                    if !symbol.is_empty() {
+                        let sym_lower = symbol.to_ascii_lowercase();
+                        if q_lower2.is_empty() || sym_lower.contains(&q_lower2) {
+                            local.push(SymbolMatch {
+                                path: rel2.clone(),
+                                line_no,
+                                symbol,
+                                kind: keyword_kind(hit),
+                            });
+                        }
+                    }
+                }
+                Ok(true)
+            }),
+        );
+        all.extend(local);
+    }
+    all.truncate(max_results);
+    (all, langs)
+}
+
+/// Map the matched declaration keyword to a short kind label.
+fn keyword_kind(hit: &str) -> Option<String> {
+    let kw = hit.split_whitespace().find(|w| {
+        matches!(
+            *w,
+            "fn" | "def"
+                | "class"
+                | "func"
+                | "function"
+                | "struct"
+                | "impl"
+                | "type"
+                | "interface"
+                | "enum"
+        )
+    })?;
+    Some(
+        match kw {
+            "struct" => "struct",
+            "class" => "class",
+            "impl" => "impl",
+            "type" => "type",
+            "interface" => "interface",
+            "enum" => "enum",
+            _ => "fn",
+        }
+        .to_string(),
+    )
+}
+
+/// Query each present language's server (lazily started) for workspace symbols.
+fn lsp_workspace_symbols(
+    lsp: &crate::lsp::LspInner,
+    root: &std::path::Path,
+    query: &str,
+    langs: &std::collections::HashSet<superzej_core::semantic::Lang>,
+) -> Vec<SymbolMatch> {
+    let mut hits = Vec::new();
+    for &lang in langs {
+        let Ok(client) = lsp.client(root, lang) else {
+            continue;
+        };
+        let Ok(syms) = client.workspace_symbols(query) else {
+            continue;
+        };
+        for s in syms {
+            let path = std::path::Path::new(&s.location.path)
+                .strip_prefix(root)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| s.location.path.clone());
+            hits.push(SymbolMatch {
+                path,
+                line_no: s.location.line_1based() as u64,
+                symbol: s.name,
+                kind: Some(s.kind.label().to_string()),
+            });
+        }
+    }
+    hits
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

@@ -480,6 +480,22 @@ visible = true
 # symbol_max_results  = 100    # max symbol grep results
 # content_search_hidden = false  # include dotfiles / .gitignored paths
 
+# Language-server integration: symbol search, go-to-definition, hover, and
+# diagnostics. Servers start lazily on first use and stay warm per worktree.
+# Built-in defaults (used only when found on PATH): rust-analyzer,
+# typescript-language-server, pyright-langserver, gopls. Falls back to the
+# tree-sitter / regex providers when no server is available.
+[lsp]
+# enabled = true               # master switch
+# hover   = true               # show hover / signature previews
+#
+# Per-language server overrides. `lang` is one of rust / typescript / tsx /
+# javascript / python / go. `command = ""` disables that language.
+# [[lsp.servers]]
+# lang    = "rust"
+# command = "rust-analyzer"
+# args    = []
+
 # Pinned programs: summoned from anywhere with Alt-1..9 (in registration order)
 # or the tabbar's pin chips. Pins run on the host (no sandbox) and are managed by
 # a supervisor (eager start, restart policy, health, survive workspace switches).

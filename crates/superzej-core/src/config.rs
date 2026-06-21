@@ -1566,6 +1566,46 @@ impl Default for SearchConfig {
     }
 }
 
+/// `[lsp]` — language-server integration (symbols, navigation, hover,
+/// diagnostics). Servers start lazily on first use and stay warm per worktree.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct LspConfig {
+    /// Master switch. When `false`, no servers start and LSP features fall back
+    /// to the tree-sitter / regex providers.
+    pub enabled: bool,
+    /// Show hover/signature previews (the floating popup).
+    pub hover: bool,
+    /// Per-language server command overrides. An entry's `command = ""` disables
+    /// that language; omitted languages use the built-in default (`rust-analyzer`,
+    /// `typescript-language-server`, `pyright-langserver`, `gopls`), used only
+    /// when found on `PATH`.
+    pub servers: Vec<LspServerConfig>,
+}
+
+impl Default for LspConfig {
+    fn default() -> Self {
+        LspConfig {
+            enabled: true,
+            hover: true,
+            servers: Vec::new(),
+        }
+    }
+}
+
+/// One `[[lsp.servers]]` override.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema, Default)]
+#[serde(default)]
+pub struct LspServerConfig {
+    /// Language key: `"rust"`, `"typescript"`, `"tsx"`, `"javascript"`,
+    /// `"python"`, or `"go"`.
+    pub lang: String,
+    /// Server executable (looked up on `PATH` if it has no `/`). `""` disables.
+    pub command: String,
+    /// Arguments passed to the server (e.g. `["--stdio"]`).
+    pub args: Vec<String>,
+}
+
 /// `[palette]` — Search Everywhere palette behavior and result caps.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -1653,6 +1693,7 @@ pub struct Config {
     pub panel: PanelConfig,
     pub search: SearchConfig,
     pub palette: PaletteConfig,
+    pub lsp: LspConfig,
     /// Rebind a built-in action by id, e.g. `new-worktree = "Ctrl w"`. The flat
     /// table is the global/default layer; nested mode tables are native-host only.
     pub keybinds: KeybindConfig,
@@ -1721,6 +1762,7 @@ impl Default for Config {
             panel: PanelConfig::default(),
             search: SearchConfig::default(),
             palette: PaletteConfig::default(),
+            lsp: LspConfig::default(),
             keybinds: KeybindConfig::default(),
             actions: Vec::new(),
             profile: String::new(),
