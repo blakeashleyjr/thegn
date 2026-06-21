@@ -18,6 +18,23 @@
         "type": "github"
       }
     },
+    "muse": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1782006387,
+        "narHash": "sha256-13fZU1kbEucw5v0Oo6bBDbSG+WVvkK3Gg8fqNo1nzuE=",
+        "owner": "blakeashleyjr",
+        "repo": "muse",
+        "rev": "65672ef7e3a8c03809da8b47deeb616c2ea54d68",
+        "type": "github"
+      },
+      "original": {
+        "owner": "blakeashleyjr",
+        "repo": "muse",
+        "rev": "65672ef7e3a8c03809da8b47deeb616c2ea54d68",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1780336545,
@@ -53,6 +70,7 @@
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
+        "muse": "muse",
         "nixpkgs": "nixpkgs",
         "nixpkgs-yazi": "nixpkgs-yazi",
         "rust-overlay": "rust-overlay",
