@@ -4,6 +4,19 @@
 # The native compositor host (crate `superzej-host`); the shipped `superzej`.
 bin := "target/debug/szhost"
 
+# Hermetic-environment preamble for the e2e recipes: redirect HOME, the XDG dirs,
+# and git config into a throwaway temp dir (cleaned on exit) so the visual suite
+# can neither read the developer's real config/gitconfig nor leak test state into
+# the daily DB. Specs further isolate XDG_STATE_HOME per case via case_tmp_env.
+_e2e_env := '''
+set -euo pipefail
+_tmp="$(mktemp -d)"; trap 'rm -rf "$_tmp"' EXIT
+export HOME="$_tmp/home" XDG_CONFIG_HOME="$_tmp/config" XDG_STATE_HOME="$_tmp/state"
+export GIT_CONFIG_GLOBAL="$_tmp/gitconfig" GIT_CONFIG_SYSTEM=/dev/null
+mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"
+printf '[user]\nname = e2e\nemail = e2e@example.invalid\n' > "$_tmp/gitconfig"
+'''
+
 # Show available recipes (default).
 default:
     @just --list
@@ -58,18 +71,29 @@ ci: fmt-check lint build test doc-check coverage smoke sandbox-e2e-dns sandbox-e
 # Workers default to 4; glitch-hunt specs run serial (--workers 1) to avoid
 # UI-state races between concurrently running szhost processes.
 # szhost is put on PATH so specs can use spawn: ["szhost"] portably.
+#
+# The suite is hermetic w.r.t. the developer's environment: `_e2e_env` isolates
+# HOME, the XDG dirs, and git config into a throwaway temp dir (cleaned on exit),
+# so warm/shared envs can neither change behavior nor leak test state. Each spec
+# additionally isolates XDG_STATE_HOME per case via `case_tmp_env`.
 e2e: build
+    #!/usr/bin/env bash
+    {{_e2e_env}}
     PATH="$(pwd)/target/debug:$PATH" muse run test/muse/specs/ \
         --reporter pretty --workers 4 --deadline-ms 12000
 
 # Run only the glitch-hunt specs (18–28) — slower, more thorough.
 e2e-glitch: build
+    #!/usr/bin/env bash
+    {{_e2e_env}}
     PATH="$(pwd)/target/debug:$PATH" muse run \
         test/muse/specs/1[89]-*.yaml test/muse/specs/2[0-9]-*.yaml \
         --reporter pretty --workers 2 --deadline-ms 12000
 
 # Update snapshot baselines (run after intentional rendering changes).
 e2e-update: build
+    #!/usr/bin/env bash
+    {{_e2e_env}}
     PATH="$(pwd)/target/debug:$PATH" muse run test/muse/specs/ \
         --update-snapshots --workers 4 --deadline-ms 12000
 
