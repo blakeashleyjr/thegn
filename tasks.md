@@ -1,10 +1,15 @@
 # superzej — roadmap & progress
 
-533 features across 43 groups (A–AQ). The list is really **two tracks joined by
+579 features across 44 groups (A–AR). The list is really **two tracks joined by
 one keystone**: an AI-free _shell_ track and an AI track, bridged by the **proxy**.
-That shape drives the phasing below. Original numbering is preserved; gaps are
-deliberate cuts (499, 500, 502, 505, 506, 507, 510 dropped from the moonshot set;
-web dashboard 510 and voice 499 already cut).
+That shape drives the phasing below. The proxy is not just a router — it is the
+**AI control plane**: the single interception point every agent's model traffic
+crosses, so any cross-cutting concern is configured **once and inherited by every
+harness**. The proxy track (**U/V/W**) graduates into a full **AI gateway / context
+fabric** in **AR (541–586)**. Original numbering is preserved; gaps are deliberate
+cuts (499, 500, 502, 505, 506, 507, 510 dropped from the moonshot set; web
+dashboard 510 and voice 499 already cut). The dropped eval harness (505/506)
+resurfaces, scoped, as the gateway's eval hooks (**AR 581**).
 
 **Status legend:** `[x]` done · `[~]` in progress / partial · `[ ]` not started.
 Per-feature statuses below are verified against the current codebase. See
@@ -68,8 +73,9 @@ L0  Foundation (daemon, zellij, event bus, state, config)
         │       (sandbox, net, observ.)
         │                          │
         └──► L4  Proxy ────────────┤◄── the KEYSTONE for everything AI
-                + cost/limits      │
-                + brokerage        ▼
+                + cost/limits      │    (graduates into the AI gateway /
+                + brokerage        │     context fabric — AR. configure once,
+                + gateway (AR)     ▼     every harness inherits it)
                             L5  Agent layer (orchestration → ACP/adapters
                                  → observability → review/merge)
                                       │
@@ -137,6 +143,12 @@ orchestrator.
 - **The proxy: U (271–288)** — the keystone. Then cost/limits **V (289–300)** and the
   brokerage subset of **AJ (431, 433, 434, 437, 438, 441)** (virtual keys = 287/433).
   Token reduction **W (301–308)** rides along.
+- **AI gateway / context fabric AR (541–586)** layers onto the proxy and spans phases:
+  the routing, caching, token-economy, and transform/interop items (552–572, 577–586)
+  ride here with U/V/W; **capability-injection (541–551) presupposes the MCP server
+  (AL, Phase 4)** and house tools/skills; **guardrail items (573–576) presuppose the
+  egress/opsec layer (AJ)**; and the **eval hooks (581) gate any risky transform** so
+  the repo's own evals — not assumption — decide whether a transformation is net-positive.
 - **Milestone:** sandboxed envs + a metered, failover-capable proxy usable with
   off-the-shelf agents. AI-free users gain sandboxes too.
 
@@ -179,6 +191,18 @@ The "magical" layer; mostly composition of what's built.
 - **The proxy (271–288) is the single chokepoint of the AI half** — cost, limits,
   brokerage, offline, per-profile budgets all hang off it. Build/validate standalone
   early; #287 virtual keys is the brokerage primitive that later unlocks team mode.
+- **"Configure once, every agent inherits it" (AR) is the proxy's biggest payoff** —
+  one interception point turns N-harness setup (wire an MCP server / skill / system
+  rule into Claude Code _and_ Codex _and_ OpenCode) into 1, translated per harness
+  (#570 tool-format translation is what makes #541 "one MCP server, every harness"
+  real). Two honest tensions to engineer around: **(1) injection fights caching** —
+  every injected tool/skill/system block can shift the prompt prefix and bust prompt
+  caching, so injection must be cache-aware (stable prefix ordering, breakpoints after
+  injected blocks) or compression savings get eaten by cache misses; **(2) transforms
+  can degrade quality** — aggressive compaction/summarization/injection can make agents
+  worse or confuse harnesses that manage their own context (Claude Code does), so
+  defaults are conservative, every transform is opt-in by policy with a per-harness
+  **transparent-passthrough vs managed** mode, and the eval hooks (#581) decide net value.
 - **ACP-first (229)** collapses "support the top 10 harnesses" into one integration +
   registry — do it before hand-writing native adapters.
 - **Most dependencies are existing Rust crates** (bollard, iroh, sem/weave, rtk,
@@ -625,6 +649,11 @@ as the agent-specific side of the broader attention queue._
 - [ ] 307. Configurable aggressiveness
 - [ ] 308. Custom rtk filters per project
 
+_→ The proxy track (U/V/W) graduates into the **AI gateway / context fabric** — see
+**AR (541–586)** below, appended at the end with the other late groups but belonging
+here thematically: in-flight tool-output compression (552) and prompt-cache
+optimization (553) extend this group across every harness, not just rtk-hooked bash._
+
 ### X. Semantic git layer
 
 - [ ] 309. sem-core integration (entity parsing)
@@ -914,6 +943,92 @@ their original groups._
 - [ ] 533. Per-worktree local timeline — git/files/tasks/tests/agents/checks activity history
 - [ ] 534. Restore/compare from local timeline — inspect or recover local snapshots where available
 - [ ] 535. Unified layout+task template — native `CenterTree` layout + tasks + pins + sandbox preset
+
+### AR. AI gateway / context fabric
+
+_The proxy track (**U/V/W**) graduating into an **AI gateway / context fabric**: the
+proxy becomes the **AI control plane** — one interception point all model traffic
+crosses, so any cross-cutting concern is **configured once and inherited by every
+harness**, translated to each harness's format. Appended at the end with the other
+late groups, but it belongs thematically right after U/V/W. Dependency tags: `[AL]`
+presupposes the **MCP server** (Phase 4), `[AJ]` presupposes the **egress/opsec
+guardrail layer**, `[581]` is gated by the **eval hooks**. Two engineering invariants
+for the whole group: **injection must be cache-aware** (stable prefix ordering +
+breakpoints after injected blocks, or it busts prompt caching), and **transforms are
+conservative + opt-in by policy** with a per-harness transparent-passthrough vs managed
+mode, proven net-positive by #581 rather than assumed (Claude Code manages its own
+context — don't fight it)._
+
+**Capability injection — register once, all agents inherit it:**
+
+- [ ] 541. Central MCP registry — register an MCP server once; proxy advertises its tools to every agent, translated per-harness `[AL]`
+- [ ] 542. MCP lifecycle management — proxy spawns/supervises/health-checks/connection-pools MCP servers; one instance shared across agents `[AL]`
+- [ ] 543. MCP credential brokerage — proxy holds the MCP server's secrets; agents get the tools, never the keys `[AL]` _(extends AJ 431)_
+- [ ] 544. Skill injection — register SKILL.md-style skills once; inject the relevant ones by task/context
+- [ ] 545. House-tool injection — auto-add built-ins (rtk, sem, weave, guardrails) to every agent's toolset
+- [ ] 546. Tool filtering/override — hide dangerous tools, override descriptions, enforce a per-policy toolset
+- [ ] 547. System-prompt layering — inject house rules, coding standards, repo context (AGENTS.md/CLAUDE.md) uniformly across harnesses
+- [ ] 548. Prompt/template library — shared, versioned prompt snippets injected on demand
+- [ ] 549. Context/resource auto-attach — pull in repo docs, schemas, style guides relevant to the task
+- [ ] 550. Cross-session memory injection — persistent per-project/agent notes injected as context
+- [ ] 551. Role/persona presets — inject sub-agent personas centrally
+
+**Context & token economy — rides W, applied to every harness:**
+
+- [ ] 552. In-flight `tool_result` compression — rtk-style, applied to result blocks regardless of how the command ran _(extends W 301/305)_
+- [ ] 553. Prompt-cache optimization — structure requests for max cache hits, insert breakpoints, track savings _(extends U 284, V 297; the biggest cost lever)_
+- [ ] 554. Context-window management — auto-summarize/compact near the limit; sliding window; context GC `[581]`
+- [ ] 555. Semantic dedup — strip files/outputs already present in context; never re-send the same file twice
+- [ ] 556. Diff-aware context — send only changed regions of files instead of whole files
+- [ ] 557. History trimming — strip verbose thinking / old turns before resending `[581]`
+- [ ] 558. Attachment optimization — downscale/compress images and PDFs before they cost tokens
+- [ ] 559. Budget shaping — allocate the context window across system/tools/history/docs deliberately
+
+**Intelligent routing — extends U:**
+
+- [ ] 560. Semantic/task-type routing — classify the prompt → cheap model for simple turns, strong for hard
+- [ ] 561. Cost-aware tiering — cheapest model that clears a quality bar
+- [ ] 562. Cascade/speculative — try cheap first, escalate on low confidence or failure
+- [ ] 563. Best-of-N / ensembling at the proxy — fan one request to several models, pick or merge _(see Q 225; feeds eval 581)_
+- [ ] 564. Tool-strength routing — tool-heavy requests → tool-reliable models
+- [ ] 565. Local-first routing — prefer a local model when adequate _(powers 509 offline mode)_
+
+**Cross-agent caching & memory:**
+
+- [ ] 566. Exact + semantic response cache — two agents asking the same thing hit cache
+- [ ] 567. Tool-result cache — don't re-run the same `grep`/`ls` for two agents
+- [ ] 568. Embedding/rerank cache + a proxy-fronted embeddings + rerank endpoint
+- [ ] 569. Shared fleet knowledge cache — the blackboard, at the inference layer _(see AL 463)_
+
+**Transformation & interop:**
+
+- [ ] 570. Tool-format translation — what makes "one MCP server, every harness" actually work `[AL]` _(underpins 541)_
+- [ ] 571. Capability shimming — emulate JSON-mode / structured output / tool-use for models that lack them
+- [ ] 572. Output validation/repair — schema conformance, JSON repair, reject hallucinated tool calls _(protocol translation itself = U 271)_
+
+**Safety, guardrails & egress (opsec):**
+
+- [ ] 573. Prompt-injection scanning on tool results — scan fetched pages/files before they re-enter context; quarantine `[AJ]` _(pairs with AD 384)_
+- [ ] 574. Secret detection in prompts — block an API key/credential from being sent to a model `[AJ]` _(extends AJ 442)_
+- [ ] 575. PII/redaction on egress — scrub before prompts leave the box `[AJ]` _(extends AJ 442)_
+- [ ] 576. Per-policy content filtering — optional, off by default `[AJ]`
+       _(loop/runaway detection + kill-switch already S 251 / V 296 — now enforced at the one chokepoint all traffic crosses)_
+
+**Observability, cost & eval:**
+
+- [ ] 577. Per-request/agent/tool token + cost accounting _(extends V 289/290)_
+- [ ] 578. Compression-savings + cache-hit-ratio tracking _(extends V 297, W 306)_
+- [ ] 579. Tool-call analytics — which tools agents actually use, latency, failure rates
+- [ ] 580. Context-utilization tracking — how full the window runs per agent _(extends S 246)_
+- [ ] 581. Quality/eval hooks — score responses; A/B transformations to prove they help (the eval harness, ex-505/506; gates 554/557/risky transforms)
+- [ ] 582. Full request/response audit + replay — exact context inspection, time-travel _(extends AN 482)_
+
+**Dev/ops affordances:**
+
+- [ ] 583. Replay with a different model — debugging and migration
+- [ ] 584. Request inspector — see the exact context that was sent
+- [ ] 585. Record/mock mode — run agents against recorded responses offline, for testing
+- [ ] 586. Cost dry-run — "what would this conversation cost on model X"
 
 ### AI-free mode (audience-widener)
 
