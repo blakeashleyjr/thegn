@@ -1758,6 +1758,7 @@ pub(crate) fn panel_help_pairs(ui: &crate::panel::PanelUi) -> Vec<(String, Strin
         Section::Symbols => &[
             ("↵", "go to def"),
             ("r", "refs"),
+            ("h", "hover"),
             ("o", "outline"),
             ("j/k", "select"),
         ],
