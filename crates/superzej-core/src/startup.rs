@@ -132,11 +132,10 @@ fn repair_gitconfig(gitconfig: &Path, home: &Path) {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::Mutex;
 
-    /// Serialises tests that mutate `HOME` so that sandbox tests reading
-    /// `HOME` in parallel don't see a temp path that's about to be deleted.
-    static HOME_LOCK: Mutex<()> = Mutex::new(());
+    // Serialises HOME mutation against sandbox tests that read HOME — shared
+    // crate-wide so readers in other modules lock the SAME mutex.
+    use crate::HOME_LOCK;
 
     /// Create a unique temp directory for each test — avoids cross-test
     /// interference without requiring the `tempfile` crate.
@@ -280,5 +279,89 @@ mod tests {
         }
         let _ = fs::remove_dir_all(&home);
         drop(_guard); // HOME is restored and temp dir is gone
+    }
+
+    #[test]
+    fn repair_symlinks_when_xdg_dir_exists_without_config_file() {
+        let home = tmp_home("xdg-dir-only");
+        // The XDG git directory exists but has no `config` file yet.
+        let xdg_dir = home.join(".config/git");
+        fs::create_dir_all(&xdg_dir).unwrap();
+        let xdg_cfg = xdg_dir.join("config");
+        assert!(!xdg_cfg.exists());
+
+        let gitconfig = home.join(".gitconfig");
+        fs::create_dir(&gitconfig).unwrap();
+        assert!(is_sandbox_mask(&gitconfig));
+
+        repair_mask(&gitconfig, &home, ".gitconfig");
+
+        // Should be a symlink even though the target file does not exist yet —
+        // git will create it there on demand.
+        let meta = fs::symlink_metadata(&gitconfig).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            ".gitconfig should be symlink"
+        );
+        assert_eq!(fs::read_link(&gitconfig).unwrap(), xdg_cfg);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn repair_non_gitconfig_mask_leaves_path_absent() {
+        // A non-.gitconfig masked path (e.g. .bashrc) is just removed, not
+        // recreated.
+        let home = tmp_home("bashrc");
+        let bashrc = home.join(".bashrc");
+        fs::create_dir(&bashrc).unwrap();
+        assert!(is_sandbox_mask(&bashrc));
+
+        repair_mask(&bashrc, &home, ".bashrc");
+
+        // Removed and not recreated.
+        assert!(!bashrc.exists());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn run_checks_is_noop_when_home_empty() {
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let original_home = std::env::var("HOME").ok();
+        // An empty HOME triggers the early return; no panic, no work done.
+        // SAFETY: test-only mutation, protected by HOME_LOCK.
+        unsafe { std::env::set_var("HOME", "") };
+        run_checks();
+        // Also exercise the fully-unset path.
+        unsafe { std::env::remove_var("HOME") };
+        run_checks();
+        if let Some(h) = original_home {
+            unsafe { std::env::set_var("HOME", h) };
+        }
+        drop(_guard);
+    }
+
+    #[test]
+    fn run_checks_skips_when_no_mask_present() {
+        // HOME points at a dir where ~/.gitconfig is a real file (not a mask):
+        // run_checks must leave it untouched.
+        let home = tmp_home("no-mask");
+        let gitconfig = home.join(".gitconfig");
+        fs::write(&gitconfig, b"[user]\n\tname = Real\n").unwrap();
+
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let original_home = std::env::var("HOME").ok();
+        // SAFETY: test-only mutation, protected by HOME_LOCK.
+        unsafe { std::env::set_var("HOME", &home) };
+        run_checks();
+        // Still a regular file with its original contents.
+        let content = fs::read_to_string(&gitconfig).unwrap();
+        assert!(content.contains("Real"));
+        if let Some(h) = original_home {
+            unsafe { std::env::set_var("HOME", h) };
+        } else {
+            unsafe { std::env::remove_var("HOME") };
+        }
+        let _ = fs::remove_dir_all(&home);
+        drop(_guard);
     }
 }

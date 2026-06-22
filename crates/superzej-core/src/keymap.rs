@@ -1212,4 +1212,186 @@ mod tests {
         assert_eq!(close, s.len() - 1);
         assert!(match_brace("{ unbalanced").is_none());
     }
+
+    #[test]
+    fn plugin_wasm_and_url_for_all_variants() {
+        for (p, wasm) in [
+            (Plugin::Statusbar, "statusbar.wasm"),
+            (Plugin::Tabbar, "tabbar.wasm"),
+            (Plugin::Sidebar, "sidebar.wasm"),
+            (Plugin::Panel, "panel.wasm"),
+        ] {
+            assert_eq!(p.wasm(), wasm);
+            assert_eq!(p.url(), format!("file:~/.local/share/superzej/{wasm}"));
+        }
+    }
+
+    #[test]
+    fn chord_parse_modifier_aliases_and_errors() {
+        // Every modifier alias maps to its canonical name.
+        assert_eq!(Chord::parse("control x").unwrap().to_kdl(), "Ctrl x");
+        assert_eq!(Chord::parse("opt x").unwrap().to_kdl(), "Alt x");
+        assert_eq!(Chord::parse("option x").unwrap().to_kdl(), "Alt x");
+        assert_eq!(Chord::parse("win x").unwrap().to_kdl(), "Super x");
+        assert_eq!(Chord::parse("mod x").unwrap().to_kdl(), "Super x");
+        // Shift on a non-letter key keeps an explicit Shift modifier.
+        assert_eq!(Chord::parse("shift Left").unwrap().to_kdl(), "Shift Left");
+        // Shift on a multi-char key keeps explicit Shift too.
+        assert_eq!(Chord::parse("shift Enter").unwrap().to_kdl(), "Shift Enter");
+        // Full canonical order: Ctrl Super Alt Shift <key>.
+        assert_eq!(
+            Chord::parse("shift alt super ctrl Left").unwrap().to_kdl(),
+            "Ctrl Super Alt Shift Left"
+        );
+    }
+
+    #[test]
+    fn parse_loose_dangling_modifier_and_single_group() {
+        // A trailing modifier with nothing after it → dangling error.
+        assert!(Chord::parse_loose("ctrl alt").is_err());
+        // A single key-group routes through Chord::parse (canonicalizes).
+        assert_eq!(Chord::parse_loose("ctrl k").unwrap().to_kdl(), "Ctrl k");
+        // A named key alias as a standalone group.
+        assert_eq!(Chord::parse_loose("Enter").unwrap().to_kdl(), "Enter");
+    }
+
+    #[test]
+    fn effective_warns_and_ignores_unknown_keybind_id() {
+        let mut cfg = Config::default();
+        cfg.keybinds
+            .insert("not-a-real-action".into(), "Alt z".into());
+        // Resolution proceeds; the unknown id is simply dropped (warning only).
+        let acts = effective(&cfg);
+        assert!(acts.iter().all(|a| a.id != "not-a-real-action"));
+    }
+
+    #[test]
+    fn effective_keeps_default_on_bad_rebind_chord() {
+        let mut cfg = Config::default();
+        cfg.keybinds.insert("new-worktree".into(), "Bogus q".into());
+        let acts = effective(&cfg);
+        let nw = acts.iter().find(|a| a.id == "new-worktree").unwrap();
+        // The bad rebind is rejected; the builtin default chord is kept.
+        assert_eq!(nw.chords[0].to_kdl(), "Alt w");
+    }
+
+    #[test]
+    fn render_bind_message_plugin_with_payload() {
+        // focus-sidebar/focus-panel are MessagePlugin actions with empty payload;
+        // add a custom MessagePlugin path via a non-empty payload by constructing
+        // a Resolved directly and rendering it.
+        let resolved = vec![Resolved {
+            id: "x".into(),
+            chords: vec![Chord::parse("Alt q").unwrap()],
+            menu_label: "x".into(),
+            hint: "x".into(),
+            invocation: Invocation::MessagePlugin {
+                target: Plugin::Panel,
+                name: "do_thing",
+                payload: "the-payload",
+            },
+            scope: Scope::Shared,
+            context: Context::Always,
+            menu: false,
+            custom: false,
+        }];
+        let kdl = render_keybinds_kdl(&resolved);
+        assert!(kdl.contains("name \"do_thing\""), "{kdl}");
+        assert!(kdl.contains("payload \"the-payload\""), "{kdl}");
+    }
+
+    #[test]
+    fn render_bind_bare_run_and_native_and_tab_scope() {
+        // A non-floating Run with no options renders single-line.
+        // A Tab-scoped binding lands in the `tab {}` block.
+        let resolved = vec![
+            Resolved {
+                id: "bare".into(),
+                chords: vec![Chord::parse("Alt b").unwrap()],
+                menu_label: "bare".into(),
+                hint: "b".into(),
+                invocation: Invocation::Run {
+                    args: &["dashboard"],
+                    floating: false,
+                    close_on_exit: false,
+                    direction: None,
+                },
+                scope: Scope::Tab,
+                context: Context::Always,
+                menu: false,
+                custom: false,
+            },
+            Resolved {
+                id: "n".into(),
+                chords: vec![Chord::parse("Alt z").unwrap()],
+                menu_label: "n".into(),
+                hint: "n".into(),
+                invocation: Invocation::Native { body: "Quit;" },
+                scope: Scope::Shared,
+                context: Context::Always,
+                menu: false,
+                custom: false,
+            },
+        ];
+        let kdl = render_keybinds_kdl(&resolved);
+        // Bare single-line Run.
+        assert!(
+            kdl.contains("        bind \"Alt b\" { Run \"superzej\" \"dashboard\"; }\n"),
+            "{kdl}"
+        );
+        // Native single-line.
+        assert!(kdl.contains("        bind \"Alt z\" { Quit; }\n"), "{kdl}");
+    }
+
+    #[test]
+    fn render_falls_back_to_default_new_tab_when_absent() {
+        // An action set without `new-tab` still produces the tab-mode `n`
+        // override using the default tabbar pipe.
+        let resolved = vec![Resolved {
+            id: "only".into(),
+            chords: vec![Chord::parse("Alt o").unwrap()],
+            menu_label: "only".into(),
+            hint: "only".into(),
+            invocation: Invocation::Native { body: "Quit;" },
+            scope: Scope::Shared,
+            context: Context::Always,
+            menu: false,
+            custom: false,
+        }];
+        let kdl = render_keybinds_kdl(&resolved);
+        assert!(kdl.contains("superzej_new_tab"), "{kdl}");
+        assert!(kdl.contains("tabbar.wasm"), "{kdl}");
+    }
+
+    #[test]
+    fn non_floating_shell_action_renders_single_line() {
+        let mut cfg = Config::default();
+        cfg.actions.push(crate::config::CustomAction {
+            name: "plain".into(),
+            key: "Alt P".into(),
+            run: "ls".into(),
+            menu: false,
+            hint: None,
+            floating: false,
+            close_on_exit: false,
+        });
+        let kdl = render_keybinds_kdl(&effective(&cfg));
+        assert!(
+            kdl.contains("        bind \"Alt P\" { Run \"sh\" \"-c\" \"ls\"; }\n"),
+            "{kdl}"
+        );
+    }
+
+    #[test]
+    fn splice_replaces_marked_region_and_preserves_tail() {
+        let gen1 = render_keybinds_kdl(&effective(&Config::default()));
+        // A file that already has the managed markers plus a trailing comment.
+        let existing = format!("// top\n{gen1}// bottom comment\n");
+        let out = splice_managed_region(&existing, &gen1);
+        assert!(out.starts_with("// top\n"));
+        assert!(out.contains("// bottom comment"));
+        assert!(out.contains(BEGIN) && out.contains(END));
+        // Idempotent.
+        assert_eq!(splice_managed_region(&out, &gen1), out);
+    }
 }

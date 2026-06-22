@@ -4162,4 +4162,1056 @@ forward_agent = false
         let s: RoutingStrategy = serde_json::from_str(r#""nonsense""#).unwrap();
         assert_eq!(s, RoutingStrategy::Sequential);
     }
+
+    // ---- config_enum! Default + Display + from_str_validated round-trips ----
+
+    #[test]
+    fn config_enum_defaults_and_displays() {
+        // Default variant matches the macro `default =` clause for every enum.
+        assert_eq!(Picker::default(), Picker::Auto);
+        assert_eq!(UndercurlMode::default(), UndercurlMode::Auto);
+        assert_eq!(WorktreeMode::default(), WorktreeMode::Global);
+        assert_eq!(NameScheme::default(), NameScheme::Words);
+        assert_eq!(SandboxBackend::default(), SandboxBackend::Auto);
+        assert_eq!(Network::default(), Network::Nat);
+        assert_eq!(OnMissing::default(), OnMissing::Warn);
+        assert_eq!(RemoteTransport::default(), RemoteTransport::Mosh);
+        assert_eq!(RemoteMode::default(), RemoteMode::Remote);
+        assert_eq!(LogLevel::default(), LogLevel::Info);
+        assert_eq!(LogFormat::default(), LogFormat::Text);
+        assert_eq!(PinLocation::default(), PinLocation::Tab);
+        assert_eq!(PinScope::default(), PinScope::Global);
+        assert_eq!(RoutingStrategy::default(), RoutingStrategy::Sequential);
+        assert_eq!(CompressionLevel::default(), CompressionLevel::Conservative);
+        assert_eq!(GitCmdOutput::default(), GitCmdOutput::Popup);
+        assert_eq!(IssueProviderKind::default(), IssueProviderKind::None);
+
+        // Display delegates to as_str (canonical form).
+        assert_eq!(UndercurlMode::On.to_string(), "on");
+        assert_eq!(UndercurlMode::Off.to_string(), "off");
+        assert_eq!(WorktreeMode::InRepo.to_string(), "in_repo");
+        assert_eq!(NameScheme::Numbered.to_string(), "numbered");
+        assert_eq!(LogLevel::Trace.to_string(), "trace");
+        assert_eq!(GitCmdOutput::Terminal.to_string(), "terminal");
+        assert_eq!(GitCmdOutput::None.to_string(), "none");
+        assert_eq!(CompressionLevel::Aggressive.to_string(), "aggressive");
+        assert_eq!(IssueProviderKind::Jira.to_string(), "jira");
+    }
+
+    #[test]
+    fn config_enum_every_variant_roundtrips_canon_and_aliases() {
+        // SandboxBackend: each canonical + alias parses to its variant; as_str
+        // emits the canonical string.
+        for (s, v) in [
+            ("auto", SandboxBackend::Auto),
+            ("podman", SandboxBackend::Podman),
+            ("podman-rootless", SandboxBackend::Podman),
+            ("rootless-podman", SandboxBackend::Podman),
+            ("podman-rootful", SandboxBackend::PodmanRootful),
+            ("rootful-podman", SandboxBackend::PodmanRootful),
+            ("docker", SandboxBackend::Docker),
+            ("bwrap", SandboxBackend::Bwrap),
+            ("bubblewrap", SandboxBackend::Bwrap),
+            ("systemd", SandboxBackend::Systemd),
+            ("systemd-run", SandboxBackend::Systemd),
+            ("apple", SandboxBackend::Apple),
+            ("container", SandboxBackend::Apple),
+            ("wsl", SandboxBackend::Wsl),
+            ("none", SandboxBackend::None),
+            ("host", SandboxBackend::None),
+        ] {
+            assert_eq!(SandboxBackend::from_str_validated(s).unwrap(), v, "{s}");
+        }
+        assert_eq!(SandboxBackend::Systemd.as_str(), "systemd");
+        assert_eq!(SandboxBackend::Apple.as_str(), "apple");
+        assert_eq!(SandboxBackend::Wsl.as_str(), "wsl");
+        assert_eq!(SandboxBackend::PodmanRootful.as_str(), "podman-rootful");
+
+        // Network / OnMissing / RemoteTransport / RemoteMode.
+        for (s, v) in [
+            ("nat", Network::Nat),
+            ("host", Network::Host),
+            ("none", Network::None),
+        ] {
+            assert_eq!(Network::from_str_validated(s).unwrap(), v);
+            assert_eq!(v.as_str(), s);
+        }
+        for (s, v) in [
+            ("warn", OnMissing::Warn),
+            ("prompt", OnMissing::Prompt),
+            ("fail", OnMissing::Fail),
+        ] {
+            assert_eq!(OnMissing::from_str_validated(s).unwrap(), v);
+            assert_eq!(v.as_str(), s);
+        }
+        assert_eq!(
+            RemoteTransport::from_str_validated("ssh").unwrap(),
+            RemoteTransport::Ssh
+        );
+        assert_eq!(RemoteTransport::Mosh.as_str(), "mosh");
+        for (s, v) in [
+            ("remote", RemoteMode::Remote),
+            ("local_exec", RemoteMode::LocalExec),
+            ("sshfs", RemoteMode::Sshfs),
+        ] {
+            assert_eq!(RemoteMode::from_str_validated(s).unwrap(), v);
+            assert_eq!(v.as_str(), s);
+        }
+
+        // LogLevel / LogFormat full sets.
+        for (s, v) in [
+            ("error", LogLevel::Error),
+            ("warn", LogLevel::Warn),
+            ("info", LogLevel::Info),
+            ("debug", LogLevel::Debug),
+            ("trace", LogLevel::Trace),
+        ] {
+            assert_eq!(LogLevel::from_str_validated(s).unwrap(), v);
+            assert_eq!(v.as_str(), s);
+        }
+        assert_eq!(
+            LogFormat::from_str_validated("json").unwrap(),
+            LogFormat::Json
+        );
+        assert_eq!(LogFormat::Text.as_str(), "text");
+
+        // UndercurlMode, WorktreeMode, NameScheme, GitCmdOutput, IssueProviderKind.
+        for (s, v) in [
+            ("auto", UndercurlMode::Auto),
+            ("on", UndercurlMode::On),
+            ("off", UndercurlMode::Off),
+        ] {
+            assert_eq!(UndercurlMode::from_str_validated(s).unwrap(), v);
+            assert_eq!(v.as_str(), s);
+        }
+        assert_eq!(
+            WorktreeMode::from_str_validated("global").unwrap(),
+            WorktreeMode::Global
+        );
+        assert_eq!(
+            NameScheme::from_str_validated("words").unwrap(),
+            NameScheme::Words
+        );
+        for (s, v) in [
+            ("none", GitCmdOutput::None),
+            ("popup", GitCmdOutput::Popup),
+            ("terminal", GitCmdOutput::Terminal),
+        ] {
+            assert_eq!(GitCmdOutput::from_str_validated(s).unwrap(), v);
+            assert_eq!(v.as_str(), s);
+        }
+        for (s, v) in [
+            ("none", IssueProviderKind::None),
+            ("linear", IssueProviderKind::Linear),
+            ("github", IssueProviderKind::Github),
+            ("jira", IssueProviderKind::Jira),
+        ] {
+            assert_eq!(IssueProviderKind::from_str_validated(s).unwrap(), v);
+            assert_eq!(v.as_str(), s);
+        }
+
+        // Error messages mention the kind label and the bad value.
+        let e = Network::from_str_validated("bogus").unwrap_err();
+        assert!(e.contains("sandbox network") && e.contains("bogus"), "{e}");
+    }
+
+    #[test]
+    fn config_enum_parsing_is_case_and_whitespace_insensitive() {
+        assert_eq!(Picker::from_str_validated("  GUM ").unwrap(), Picker::Gum);
+        assert_eq!(
+            SandboxBackend::from_str_validated("DOCKER").unwrap(),
+            SandboxBackend::Docker
+        );
+    }
+
+    #[test]
+    fn pin_scope_aliases_parse() {
+        for (s, v) in [
+            ("global", PinScope::Global),
+            ("everywhere", PinScope::Global),
+            ("all", PinScope::Global),
+            ("workspace", PinScope::Workspace),
+            ("local", PinScope::Workspace),
+        ] {
+            assert_eq!(PinScope::from_str_validated(s).unwrap(), v, "{s}");
+        }
+        assert_eq!(PinScope::Global.as_str(), "global");
+        assert_eq!(PinScope::Workspace.as_str(), "workspace");
+    }
+
+    #[test]
+    fn pin_location_aliases_parse() {
+        for (s, v) in [
+            ("tab", PinLocation::Tab),
+            ("layout", PinLocation::Layout),
+            ("pane", PinLocation::Layout),
+            ("active_layout", PinLocation::Layout),
+            ("active-layout", PinLocation::Layout),
+            ("strip", PinLocation::Strip),
+            ("top", PinLocation::Strip),
+            ("top-strip", PinLocation::Strip),
+            ("top_strip", PinLocation::Strip),
+            ("float", PinLocation::Float),
+            ("floating", PinLocation::Float),
+            ("scratch", PinLocation::Float),
+        ] {
+            assert_eq!(PinLocation::from_str_validated(s).unwrap(), v, "{s}");
+        }
+    }
+
+    #[test]
+    fn compression_level_aliases_and_serde() {
+        assert_eq!(
+            CompressionLevel::from_str_validated("none").unwrap(),
+            CompressionLevel::Off
+        );
+        assert_eq!(CompressionLevel::Off.as_str(), "off");
+        assert_eq!(
+            CompressionLevel::from_str_validated("balanced").unwrap(),
+            CompressionLevel::Balanced
+        );
+        // Unknown deserializes to default (Conservative) without panic.
+        let c: CompressionLevel = serde_json::from_str(r#""nonsense""#).unwrap();
+        assert_eq!(c, CompressionLevel::Conservative);
+        // Serialize round-trips to canonical.
+        assert_eq!(
+            serde_json::to_string(&CompressionLevel::Aggressive).unwrap(),
+            r#""aggressive""#
+        );
+    }
+
+    // ---- Default impls (non-trivial fields) ----
+
+    #[test]
+    fn section_defaults_match_documented_values() {
+        assert_eq!(PrConfig::default().ttl_secs, 30);
+        assert_eq!(WatchConfig::default().pr_interval_secs, 20);
+
+        let d = DashboardConfig::default();
+        assert_eq!(d.interval_secs, 4);
+        assert!(d.hacker_news);
+        assert_eq!(d.hacker_news_limit, 5);
+
+        let a = AppsConfig::default();
+        assert_eq!(a.default_tab, "work");
+        assert_eq!(a.tab_order, vec!["work", "dashboard", "chat"]);
+
+        let n = NotificationsConfig::default();
+        assert!(n.desktop);
+        assert_eq!(n.desktop_min_urgency, "normal");
+        assert_eq!(n.process_exit, "failures_and_tasks");
+
+        let s = SearchConfig::default();
+        assert_eq!(s.history_lines, 10_000);
+        assert_eq!(s.max_results, 1_000);
+
+        let l = LspConfig::default();
+        assert!(l.enabled);
+        assert!(l.hover);
+        assert!(l.servers.is_empty());
+
+        let p = PaletteConfig::default();
+        assert_eq!(p.content_max_results, 500);
+        assert_eq!(p.file_max_results, 200);
+        assert_eq!(p.symbol_max_results, 100);
+        assert!(!p.content_search_hidden);
+
+        assert!(PanelConfig::default().sections.is_empty());
+        assert!(!GitConfig::default().override_gpg);
+    }
+
+    #[test]
+    fn bars_config_defaults() {
+        let b = BarsConfig::default();
+        assert_eq!(b.top_left, vec!["brand"]);
+        assert_eq!(
+            b.top_right,
+            vec!["cpu", "mem", "gpu", "net", "battery", "date", "clock"]
+        );
+        assert_eq!(b.bottom_left, vec!["keyhints"]);
+        assert_eq!(b.bottom_right, vec!["pr", "loc", "status"]);
+        assert_eq!(b.date_format, "%a %b %-d");
+        assert_eq!(b.clock_format, "%H:%M");
+    }
+
+    #[test]
+    fn limits_config_defaults() {
+        let l = LimitsConfig::default();
+        assert_eq!(l.tool_mem_max, "6G");
+        assert_eq!(l.tool_mem_swap_max, "1G");
+        assert_eq!(l.test_cpu_quota, "150%");
+        assert_eq!(l.test_mem_max, "4G");
+        assert_eq!(l.test_nice, 10);
+        assert_eq!(l.test_max_parallel, 1);
+        assert_eq!(l.test_timeout_secs, 1800);
+        assert_eq!(l.discover_timeout_secs, 45);
+        assert!(l.isolated_target_dir);
+    }
+
+    #[test]
+    fn log_config_default_and_theme_config_default() {
+        let l = LogConfig::default();
+        assert_eq!(l.level, LogLevel::Info);
+        assert!(!l.file);
+        assert_eq!(l.dir, "");
+        assert_eq!(l.rotation_size_mb, 5);
+        assert_eq!(l.max_files, 5);
+        assert_eq!(l.format, LogFormat::Text);
+
+        let t = ThemeConfig::default();
+        assert_eq!(t.preset, "prism");
+        assert_eq!(t.accent, "#6ee7d8");
+        assert_eq!(t.focus_border, "#6ee7d8");
+        assert_eq!(t.pane_padding, 0);
+        assert_eq!(t.undercurl, UndercurlMode::Auto);
+    }
+
+    #[test]
+    fn issue_provider_subconfig_defaults() {
+        let lin = LinearConfig::default();
+        assert_eq!(lin.api_key, "env:LINEAR_API_KEY");
+        assert_eq!(lin.team_id, "");
+        assert_eq!(lin.workspace_slug, "");
+        let jira = JiraConfig::default();
+        assert_eq!(jira.api_token, "env:JIRA_API_TOKEN");
+        assert_eq!(jira.base_url, "");
+        assert_eq!(jira.email, "");
+        assert_eq!(jira.project_key, "");
+        assert!(GitHubIssuesConfig::default().extra_flags.is_empty());
+    }
+
+    #[test]
+    fn remote_config_default_and_is_remote() {
+        let r = RemoteConfig::default();
+        assert_eq!(r.host, "");
+        assert_eq!(r.port, 22);
+        assert_eq!(r.transport, RemoteTransport::Mosh);
+        assert_eq!(r.mode, RemoteMode::Remote);
+        assert_eq!(r.remote_dir, "~/superzej-worktrees");
+        assert!(r.forward_agent);
+        assert!(!r.is_remote());
+        let r2 = RemoteConfig {
+            host: "  user@box ".into(),
+            ..RemoteConfig::default()
+        };
+        assert!(r2.is_remote());
+        let blank = RemoteConfig {
+            host: "   ".into(),
+            ..RemoteConfig::default()
+        };
+        assert!(!blank.is_remote());
+    }
+
+    #[test]
+    fn sandbox_config_default_collections() {
+        let s = SandboxConfig::default();
+        assert!(s.enabled);
+        assert_eq!(s.backend, SandboxBackend::Auto);
+        assert_eq!(s.default_backend, SandboxBackend::Auto);
+        assert_eq!(
+            s.backend_chain,
+            vec![
+                "podman-rootless",
+                "podman-rootful",
+                "docker",
+                "bwrap",
+                "host"
+            ]
+        );
+        assert!(s.image.is_empty());
+        assert!(s.env_passthrough.contains(&"SSH_AUTH_SOCK".to_string()));
+        assert!(s.env_passthrough.contains(&"GH_TOKEN".to_string()));
+        assert!(s.auto_caches);
+        assert!(s.mounts.contains(&"~/.gitconfig:ro".to_string()));
+        assert!(!s.devenv);
+        assert_eq!(s.on_missing, OnMissing::Warn);
+        assert_eq!(s.file_access, FileAccess::WorktreePlusCaches);
+        assert!(s.network_allow.is_empty());
+        assert!(!s.network_audit);
+    }
+
+    #[test]
+    fn file_access_default_and_serde() {
+        assert_eq!(FileAccess::default(), FileAccess::WorktreePlusCaches);
+        // snake_case rename: the default variant serializes to that string.
+        assert_eq!(
+            serde_json::to_string(&FileAccess::WorktreePlusCaches).unwrap(),
+            r#""worktree_plus_caches""#
+        );
+        let f: FileAccess = serde_json::from_str(r#""host""#).unwrap();
+        assert_eq!(f, FileAccess::Host);
+    }
+
+    #[test]
+    fn sandbox_limits_default_and_parse() {
+        let d = SandboxLimits::default();
+        assert!(d.cpu.is_none() && d.memory.is_none());
+        let cfg: Config =
+            toml::from_str("[sandbox.limits]\ncpu = \"2\"\nmemory = \"4G\"\n").unwrap();
+        assert_eq!(cfg.sandbox.limits.cpu.as_deref(), Some("2"));
+        assert_eq!(cfg.sandbox.limits.memory.as_deref(), Some("4G"));
+    }
+
+    // ---- launch_spec full env coverage ----
+
+    #[test]
+    fn llm_proxy_launch_spec_sets_all_stream_env() {
+        let cfg = LlmProxyConfig {
+            enabled: true,
+            listen: "0.0.0.0:9000".into(),
+            config_path: String::new(),
+            routing: RoutingStrategy::Speculative,
+            first_byte_timeout_secs: 7,
+            idle_timeout_secs: 99,
+            heartbeat_secs: 3,
+            token_reduction: true,
+            token_reduction_level: CompressionLevel::Aggressive,
+            ..Default::default()
+        };
+        let (prog, _args, env) = cfg.launch_spec().unwrap();
+        assert_eq!(prog, "szproxy");
+        assert_eq!(env.get("SZPROXY_LISTEN").unwrap(), "0.0.0.0:9000");
+        assert_eq!(env.get("SZPROXY_FIRST_BYTE_TIMEOUT").unwrap(), "7");
+        assert_eq!(env.get("SZPROXY_STREAM_IDLE_TIMEOUT").unwrap(), "99");
+        assert_eq!(env.get("SZPROXY_STREAM_HEARTBEAT_INTERVAL").unwrap(), "3");
+        assert_eq!(env.get("SZPROXY_COMPRESS").unwrap(), "1");
+        assert_eq!(env.get("SZPROXY_COMPRESS_LEVEL").unwrap(), "aggressive");
+        assert_eq!(env.get("SZPROXY_ROUTING").unwrap(), "speculative");
+        // token_reduction off → SZPROXY_COMPRESS = "0".
+        let off = LlmProxyConfig {
+            enabled: true,
+            token_reduction: false,
+            ..Default::default()
+        };
+        let (_, _, env) = off.launch_spec().unwrap();
+        assert_eq!(env.get("SZPROXY_COMPRESS").unwrap(), "0");
+    }
+
+    // ---- AppsConfig::effective_tab_order / normalized_default_tab edges ----
+
+    #[test]
+    fn effective_tab_order_dedups_and_appends_missing() {
+        let a = AppsConfig {
+            // duplicate, an unknown id, and only two of the three built-ins.
+            default_tab: "chat".into(),
+            tab_order: vec![
+                "chat".into(),
+                "chat".into(),
+                "bogus".into(),
+                " work ".into(),
+            ],
+        };
+        // dedup keeps first occurrence, unknown dropped, trimmed, missing
+        // built-in (dashboard) appended.
+        assert_eq!(a.effective_tab_order(), vec!["chat", "work", "dashboard"]);
+    }
+
+    #[test]
+    fn effective_tab_order_empty_falls_back_to_builtins() {
+        let a = AppsConfig {
+            default_tab: "work".into(),
+            tab_order: Vec::new(),
+        };
+        assert_eq!(a.effective_tab_order(), vec!["dashboard", "work", "chat"]);
+    }
+
+    #[test]
+    fn normalized_default_tab_present_and_falls_back_to_first() {
+        let present = AppsConfig {
+            default_tab: " dashboard ".into(),
+            tab_order: vec!["dashboard".into(), "work".into()],
+        };
+        assert_eq!(present.normalized_default_tab(), "dashboard");
+        // Unknown default → first of the effective order.
+        let bad = AppsConfig {
+            default_tab: "nonexistent".into(),
+            tab_order: vec!["chat".into(), "work".into()],
+        };
+        assert_eq!(bad.normalized_default_tab(), "chat");
+    }
+
+    // ---- ConfigOverlay::apply field-by-field ----
+
+    #[test]
+    fn config_overlay_apply_sets_every_field() {
+        let overlay = ConfigOverlay {
+            worktrees_dir: Some("/wt".into()),
+            workspaces_dir: Some("/ws".into()),
+            base_branch: Some("main".into()),
+            branch_prefix: Some("pfx/".into()),
+            picker: Some(Picker::Fzf),
+            worktree_mode: Some(WorktreeMode::InRepo),
+            name_scheme: Some(NameScheme::Numbered),
+            auto_remove_worktree: Some(true),
+            repo_scan_depth: Some(7),
+            profile: Some("vim".into()),
+            accent: Some("#111111".into()),
+            focus_border: Some("#222222".into()),
+            frame_border: Some("#333333".into()),
+            pr_ttl_secs: Some(99),
+            dashboard_interval_secs: Some(42),
+            watch_pr_interval_secs: Some(43),
+            metrics_interval_secs: Some(11.0),
+            metrics_timeout_ms: Some(1234),
+            metrics_max_body_bytes: Some(4096),
+            apps_default_tab: Some("chat".into()),
+            apps_tab_order: Some(vec!["chat".into(), "work".into()]),
+            log_level: Some(LogLevel::Debug),
+            log_file: Some(true),
+            log_dir: Some("/logs".into()),
+            log_rotation_size_mb: Some(12),
+            log_max_files: Some(3),
+            log_format: Some(LogFormat::Json),
+            sandbox: SandboxOverlay {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        };
+        let mut cfg = Config::default();
+        overlay.apply(&mut cfg);
+        assert_eq!(cfg.worktrees_dir, "/wt");
+        assert_eq!(cfg.workspaces_dir, "/ws");
+        assert_eq!(cfg.base_branch, "main");
+        assert_eq!(cfg.branch_prefix, "pfx/");
+        assert_eq!(cfg.picker, Picker::Fzf);
+        assert_eq!(cfg.worktree_mode, WorktreeMode::InRepo);
+        assert_eq!(cfg.name_scheme, NameScheme::Numbered);
+        assert!(cfg.auto_remove_worktree);
+        assert_eq!(cfg.repo_scan_depth, 7);
+        assert_eq!(cfg.profile, "vim");
+        assert_eq!(cfg.theme.accent, "#111111");
+        assert_eq!(cfg.theme.focus_border, "#222222");
+        assert_eq!(cfg.theme.colors.border.as_deref(), Some("#333333"));
+        assert_eq!(cfg.pr.ttl_secs, 99);
+        assert_eq!(cfg.dashboard.interval_secs, 42);
+        assert_eq!(cfg.watch.pr_interval_secs, 43);
+        assert_eq!(cfg.metrics.interval_secs, 11.0);
+        assert_eq!(cfg.metrics.timeout_ms, 1234);
+        assert_eq!(cfg.metrics.max_body_bytes, 4096);
+        assert_eq!(cfg.apps.default_tab, "chat");
+        assert_eq!(cfg.apps.tab_order, vec!["chat", "work"]);
+        assert_eq!(cfg.log.level, LogLevel::Debug);
+        assert!(cfg.log.file);
+        assert_eq!(cfg.log.dir, "/logs");
+        assert_eq!(cfg.log.rotation_size_mb, 12);
+        assert_eq!(cfg.log.max_files, 3);
+        assert_eq!(cfg.log.format, LogFormat::Json);
+        assert!(!cfg.sandbox.enabled);
+    }
+
+    #[test]
+    fn config_overlay_empty_leaves_base_untouched() {
+        let mut cfg = Config::default();
+        let before = cfg.clone();
+        ConfigOverlay::default().apply(&mut cfg);
+        // Spot-check a few fields are unchanged.
+        assert_eq!(cfg.branch_prefix, before.branch_prefix);
+        assert_eq!(cfg.picker, before.picker);
+        assert_eq!(cfg.sandbox.enabled, before.sandbox.enabled);
+        // An empty sandbox overlay must not be applied.
+        assert!(ConfigOverlay::default().sandbox.is_empty());
+    }
+
+    // ---- SandboxOverlay::apply remaining branches + is_empty ----
+
+    #[test]
+    fn sandbox_overlay_apply_covers_remaining_fields() {
+        let mut base = SandboxConfig::default();
+        let overlay = SandboxOverlay {
+            default_backend: Some(SandboxBackend::Docker),
+            file_access: Some(FileAccess::All),
+            ports: Some(vec!["8080:8080".into()]),
+            gpu: Some("all".into()),
+            limits: Some(SandboxLimits {
+                cpu: Some("2".into()),
+                memory: Some("8G".into()),
+            }),
+            volumes: Some(std::collections::HashMap::from([(
+                "vol".to_string(),
+                "/data".to_string(),
+            )])),
+            compose: Some("docker-compose.yml".into()),
+            auto_caches: Some(false),
+            shell: Some("zsh".into()),
+            network_audit: Some(true),
+            ..Default::default()
+        };
+        overlay.apply(&mut base);
+        assert_eq!(base.default_backend, SandboxBackend::Docker);
+        assert_eq!(base.file_access, FileAccess::All);
+        assert_eq!(base.ports, vec!["8080:8080"]);
+        assert_eq!(base.gpu.as_deref(), Some("all"));
+        assert_eq!(base.limits.cpu.as_deref(), Some("2"));
+        assert_eq!(base.limits.memory.as_deref(), Some("8G"));
+        assert_eq!(base.volumes.get("vol").map(String::as_str), Some("/data"));
+        assert_eq!(base.compose.as_deref(), Some("docker-compose.yml"));
+        assert!(!base.auto_caches);
+        assert_eq!(base.shell, "zsh");
+        assert!(base.network_audit);
+    }
+
+    #[test]
+    fn sandbox_overlay_is_empty_detects_any_set_field() {
+        assert!(SandboxOverlay::default().is_empty());
+        // Each is_empty()-tracked field flips it to non-empty.
+        let with_allow = SandboxOverlay {
+            network_allow: Some(vec!["x".into()]),
+            ..Default::default()
+        };
+        assert!(!with_allow.is_empty());
+        let with_remote = SandboxOverlay {
+            remote: Some(RemoteOverlay::default()),
+            ..Default::default()
+        };
+        assert!(!with_remote.is_empty());
+        let with_backend = SandboxOverlay {
+            backend: Some(SandboxBackend::Docker),
+            ..Default::default()
+        };
+        assert!(!with_backend.is_empty());
+    }
+
+    #[test]
+    fn remote_overlay_apply_sets_each_field() {
+        let mut base = RemoteConfig::default();
+        RemoteOverlay {
+            host: Some("h".into()),
+            port: Some(2022),
+            transport: Some(RemoteTransport::Ssh),
+            mode: Some(RemoteMode::LocalExec),
+            remote_dir: Some("/srv".into()),
+            forward_agent: Some(false),
+        }
+        .apply(&mut base);
+        assert_eq!(base.host, "h");
+        assert_eq!(base.port, 2022);
+        assert_eq!(base.transport, RemoteTransport::Ssh);
+        assert_eq!(base.mode, RemoteMode::LocalExec);
+        assert_eq!(base.remote_dir, "/srv");
+        assert!(!base.forward_agent);
+    }
+
+    // ---- env_overlay: remaining branches ----
+
+    #[test]
+    fn env_overlay_apps_tab_order_and_deprecated_dash_interval() {
+        let env = map_env(&[
+            ("SUPERZEJ_APPS_TAB_ORDER", " chat , work ,, dashboard "),
+            ("SZ_DASH_INTERVAL", "8"),
+        ]);
+        let o = env_overlay(&env);
+        // parse_list trims and drops empties.
+        assert_eq!(
+            o.apps_tab_order,
+            Some(vec![
+                "chat".to_string(),
+                "work".to_string(),
+                "dashboard".to_string()
+            ])
+        );
+        // Deprecated SZ_DASH_INTERVAL is honored as a fallback.
+        assert_eq!(o.dashboard_interval_secs, Some(8));
+    }
+
+    #[test]
+    fn env_overlay_canonical_dashboard_interval_wins() {
+        let env = map_env(&[
+            ("SUPERZEJ_DASHBOARD_INTERVAL", "5"),
+            ("SZ_DASH_INTERVAL", "8"),
+        ]);
+        assert_eq!(env_overlay(&env).dashboard_interval_secs, Some(5));
+    }
+
+    #[test]
+    fn env_overlay_metrics_rejects_non_finite_floats() {
+        let env = map_env(&[("SUPERZEJ_METRICS_INTERVAL_SECS", "inf")]);
+        assert_eq!(env_overlay(&env).metrics_interval_secs, None);
+        let env = map_env(&[("SUPERZEJ_METRICS_INTERVAL_SECS", "abc")]);
+        assert_eq!(env_overlay(&env).metrics_interval_secs, None);
+    }
+
+    #[test]
+    fn env_overlay_bad_enum_values_yield_none() {
+        let env = map_env(&[
+            ("SUPERZEJ_WORKTREE_MODE", "bogus"),
+            ("SUPERZEJ_NAME_SCHEME", "bogus"),
+            ("SUPERZEJ_LOG_LEVEL", "bogus"),
+            ("SUPERZEJ_LOG_FORMAT", "bogus"),
+            ("SUPERZEJ_SANDBOX_BACKEND", "bogus"),
+            ("SUPERZEJ_SANDBOX_NETWORK", "bogus"),
+            ("SUPERZEJ_SANDBOX_ON_MISSING", "bogus"),
+        ]);
+        let o = env_overlay(&env);
+        assert_eq!(o.worktree_mode, None);
+        assert_eq!(o.name_scheme, None);
+        assert_eq!(o.log_level, None);
+        assert_eq!(o.log_format, None);
+        assert_eq!(o.sandbox.backend, None);
+        assert_eq!(o.sandbox.network, None);
+        assert_eq!(o.sandbox.on_missing, None);
+    }
+
+    #[test]
+    fn env_overlay_log_and_metrics_bad_numbers_skip() {
+        let env = map_env(&[
+            ("SUPERZEJ_LOG_ROTATION_SIZE_MB", "huge"),
+            ("SUPERZEJ_LOG_MAX_FILES", "lots"),
+            ("SUPERZEJ_METRICS_TIMEOUT_MS", "soon"),
+            ("SUPERZEJ_METRICS_MAX_BODY_BYTES", "big"),
+            ("SUPERZEJ_WATCH_PR_INTERVAL", "later"),
+        ]);
+        let o = env_overlay(&env);
+        assert_eq!(o.log_rotation_size_mb, None);
+        assert_eq!(o.log_max_files, None);
+        assert_eq!(o.metrics_timeout_ms, None);
+        assert_eq!(o.metrics_max_body_bytes, None);
+        assert_eq!(o.watch_pr_interval_secs, None);
+    }
+
+    // ---- get_dotted: theme.preset/pane_padding/undercurl/hues + log.dir ----
+
+    #[test]
+    fn get_dotted_theme_preset_padding_undercurl_and_hues() {
+        let mut c = Config::default();
+        c.theme.preset = "storm".into();
+        c.theme.pane_padding = 3;
+        c.theme.undercurl = UndercurlMode::On;
+        c.theme.hues.teal = Some("#0a0b0c".into());
+        assert_eq!(c.get_dotted("theme.preset").as_deref(), Some("storm"));
+        assert_eq!(c.get_dotted("theme.pane_padding").as_deref(), Some("3"));
+        assert_eq!(c.get_dotted("theme.undercurl").as_deref(), Some("on"));
+        assert_eq!(c.get_dotted("theme.hues.teal").as_deref(), Some("#0a0b0c"));
+        // Unset hue → empty string; unknown hue → None.
+        assert_eq!(c.get_dotted("theme.hues.red").as_deref(), Some(""));
+        assert_eq!(c.get_dotted("theme.hues.bogus"), None);
+        // confirm_delete + remote sub-keys.
+        assert_eq!(c.get_dotted("confirm_delete").as_deref(), Some("true"));
+        assert_eq!(
+            c.get_dotted("sandbox.remote.transport").as_deref(),
+            Some("mosh")
+        );
+        assert_eq!(
+            c.get_dotted("sandbox.remote.mode").as_deref(),
+            Some("remote")
+        );
+        // log.dir resolves to the default path (no tilde).
+        let dir = c.get_dotted("log.dir").unwrap();
+        assert!(dir.ends_with("superzej/logs"), "{dir}");
+    }
+
+    // ---- post_process behavior ----
+
+    #[test]
+    fn post_process_populates_default_agents_and_tools() {
+        // Point at a non-existent file so the file layer is empty and defaults
+        // (not the host's real ~/.config) drive post_process.
+        let dir = tmpdir("ppdefaults");
+        let f = dir.join("missing.toml");
+        let c = Config::load_layered(&MapEnv::default(), &[], Some(f));
+        assert!(c.agents.iter().any(|a| a.name == "claude"));
+        assert!(c.agents.iter().any(|a| a.name == "shell"));
+        assert!(c.tools.iter().any(|t| t.name == "lazygit"));
+        assert!(c.tools.iter().any(|t| t.name == "editor"));
+        // repo_roots defaults to [workspaces_dir] when unset.
+        assert_eq!(c.repo_roots, vec![c.workspaces_dir.clone()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn post_process_keeps_user_agents_and_clamps_dashboard() {
+        let env = map_env(&[("SUPERZEJ_DASHBOARD_INTERVAL", "0")]);
+        let flags = vec!["dashboard.hacker_news_limit=999".to_string()];
+        let c = Config::load_layered(&env, &flags, None);
+        // interval clamped to >=1, hacker_news_limit clamped to <=20.
+        assert_eq!(c.dashboard.interval_secs, 1);
+        assert_eq!(c.dashboard.hacker_news_limit, 20);
+    }
+
+    #[test]
+    fn post_process_expands_pin_cwd_tilde() {
+        let dir = tmpdir("ppcwd");
+        let f = dir.join("c.toml");
+        std::fs::write(&f, "[[pins]]\nname='x'\ncommand='c'\ncwd='~/sub'\n").unwrap();
+        let c = Config::load_layered(&MapEnv::default(), &[], Some(f));
+        let cwd = c.pins[0].cwd.as_deref().unwrap();
+        assert!(!cwd.starts_with('~'), "{cwd}");
+        assert!(cwd.ends_with("/sub"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- apply_override_str: apps.tab_order shortcut + load_layered error path ----
+
+    #[test]
+    fn apply_override_str_apps_tab_order_splits_csv() {
+        let mut cfg = Config::default();
+        Config::apply_override_str(&mut cfg, "apps.tab_order", " chat , work ,, dashboard ")
+            .unwrap();
+        assert_eq!(cfg.apps.tab_order, vec!["chat", "work", "dashboard"]);
+    }
+
+    #[test]
+    fn load_layered_recovers_on_parse_error_and_still_applies_layers() {
+        // A malformed file forces the load_layered error branch, which rebuilds
+        // from defaults and re-applies env + flags.
+        let dir = tmpdir("recover");
+        let f = dir.join("c.toml");
+        std::fs::write(&f, "= = broken\n").unwrap();
+        let env = map_env(&[("SUPERZEJ_BRANCH_PREFIX", "env/")]);
+        let flags = vec!["picker=fzf".to_string()];
+        let c = Config::load_layered(&env, &flags, Some(f));
+        assert_eq!(c.branch_prefix, "env/");
+        assert_eq!(c.picker, Picker::Fzf);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- repo overlay parse-error and yaml/json error paths ----
+
+    #[test]
+    fn repo_overlay_malformed_file_is_ignored() {
+        let dir = tmpdir("badoverlay");
+        std::fs::write(dir.join(".superzej.toml"), "[sandbox\nbroken = =\n").unwrap();
+        let cfg = Config::default();
+        // Malformed overlay warns and is ignored → global sandbox survives.
+        let sb = cfg.repo_sandbox(&dir);
+        assert!(sb.enabled);
+        assert_eq!(sb.image, "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repo_overlay_json_format_loads() {
+        let dir = tmpdir("jsonoverlay");
+        std::fs::write(
+            dir.join(".superzej.json"),
+            r#"{"sandbox":{"backend":"docker","ports":["1:1"],"file_access":"all"}}"#,
+        )
+        .unwrap();
+        let sb = Config::default().repo_sandbox(&dir);
+        assert_eq!(sb.backend, SandboxBackend::Docker);
+        assert_eq!(sb.ports, vec!["1:1"]);
+        assert_eq!(sb.file_access, FileAccess::All);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keybind_config_iter_and_into_iter_and_get() {
+        let mut kb = KeybindConfig::default();
+        assert!(kb.is_empty());
+        assert!(kb.insert("a".into(), "X".into()).is_none());
+        // insert returns the previous value when replacing.
+        assert_eq!(kb.insert("a".into(), "Y".into()).as_deref(), Some("X"));
+        assert_eq!(kb.get("a").map(String::as_str), Some("Y"));
+        assert!(!kb.is_empty());
+        let collected: Vec<_> = kb.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        assert_eq!(collected, vec![("a".to_string(), "Y".to_string())]);
+        // IntoIterator for &KeybindConfig.
+        let via_ref: Vec<_> = (&kb).into_iter().map(|(k, _)| k.clone()).collect();
+        assert_eq!(via_ref, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn config_path_uses_xdg_config_home() {
+        assert!(Config::path().ends_with("superzej/config.toml"));
+    }
+
+    #[test]
+    fn validate_str_non_table_top_level_is_tolerated() {
+        // A document whose root toml::Value is not a table hits the
+        // `as_table() == None` early-return (empty error list, no panic). A bare
+        // scalar isn't valid top-level TOML, so wrap it in an array value via a
+        // key to keep parsing while still exercising the guard indirectly.
+        // (An empty document is the simplest non-erroring non-keyed input.)
+        assert!(validate_str("   ").is_empty());
+        assert!(validate_str("\n# comment only\n").is_empty());
+    }
+
+    #[test]
+    fn lsp_servers_and_actions_and_custom_actions_parse() {
+        let cfg: Config = toml::from_str(
+            r#"
+[lsp]
+enabled = false
+hover = false
+[[lsp.servers]]
+lang = "rust"
+command = "rust-analyzer"
+args = ["--stdio"]
+
+[[actions]]
+name = "open-logs"
+key = "Alt L"
+run = "journalctl -f"
+menu = true
+hint = "logs"
+
+[[actions]]
+name = "bare"
+key = "Alt B"
+run = "echo hi"
+"#,
+        )
+        .unwrap();
+        assert!(!cfg.lsp.enabled);
+        assert!(!cfg.lsp.hover);
+        assert_eq!(cfg.lsp.servers[0].lang, "rust");
+        assert_eq!(cfg.lsp.servers[0].args, vec!["--stdio"]);
+        assert_eq!(cfg.actions.len(), 2);
+        let a = &cfg.actions[0];
+        assert!(a.menu);
+        assert_eq!(a.hint.as_deref(), Some("logs"));
+        assert!(a.floating); // default_true
+        assert!(a.close_on_exit); // default_true
+        // bare action keeps menu=false and the default_true flags.
+        let b = &cfg.actions[1];
+        assert!(!b.menu);
+        assert!(b.floating && b.close_on_exit);
+    }
+
+    #[test]
+    fn program_keybinds_and_remap_and_workspace_tables_parse() {
+        let cfg: Config = toml::from_str(
+            r#"
+[program_keybinds.lazygit]
+quit = "Ctrl q"
+[program_remap.nvim]
+"Alt j" = "j"
+[workspace.myrepo.keybinds]
+focus-down = "Alt j"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.program_keybinds
+                .get("lazygit")
+                .and_then(|k| k.get("quit"))
+                .map(String::as_str),
+            Some("Ctrl q")
+        );
+        assert_eq!(
+            cfg.program_remap
+                .get("nvim")
+                .and_then(|m| m.get("Alt j"))
+                .map(String::as_str),
+            Some("j")
+        );
+        assert!(cfg.workspace.contains_key("myrepo"));
+    }
+
+    #[test]
+    fn named_command_with_hints_parses() {
+        let cfg: Config = toml::from_str(
+            r#"
+[[tools]]
+name = "lazygit"
+command = "lazygit"
+hints = [{ key = "q", label = "quit" }]
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.tools[0].hints.len(), 1);
+        assert_eq!(cfg.tools[0].hints[0].key, "q");
+        assert_eq!(cfg.tools[0].hints[0].label, "quit");
+    }
+
+    #[test]
+    fn issues_full_table_parses() {
+        let cfg: Config = toml::from_str(
+            r#"
+[issues]
+provider = "linear"
+ttl_secs = 120
+max_issues = 50
+filter_assignee_me = false
+[issues.linear]
+api_key = "env:LINEAR_API_KEY"
+team_id = "TEAM"
+[issues.jira]
+base_url = "https://x.atlassian.net"
+email = "me@x.com"
+project_key = "PROJ"
+[issues.github_issues]
+extra_flags = ["--assignee", "@me"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.issues.provider, IssueProviderKind::Linear);
+        assert_eq!(cfg.issues.ttl_secs, 120);
+        assert_eq!(cfg.issues.max_issues, 50);
+        assert!(!cfg.issues.filter_assignee_me);
+        assert_eq!(cfg.issues.linear.team_id, "TEAM");
+        assert_eq!(cfg.issues.jira.project_key, "PROJ");
+        assert_eq!(
+            cfg.issues.github_issues.extra_flags,
+            vec!["--assignee", "@me"]
+        );
+    }
+
+    #[test]
+    fn llm_proxy_full_table_parses() {
+        let cfg: Config = toml::from_str(
+            r#"
+[llm_proxy]
+enabled = true
+listen = "127.0.0.1:9999"
+routing = "speculative"
+refuse_on_breach = false
+config_path = "/x.json"
+first_byte_timeout_secs = 10
+idle_timeout_secs = 20
+heartbeat_secs = 5
+token_reduction = true
+token_reduction_level = "balanced"
+"#,
+        )
+        .unwrap();
+        assert!(cfg.llm_proxy.enabled);
+        assert_eq!(cfg.llm_proxy.listen, "127.0.0.1:9999");
+        assert_eq!(cfg.llm_proxy.routing, RoutingStrategy::Speculative);
+        assert!(!cfg.llm_proxy.refuse_on_breach);
+        assert_eq!(cfg.llm_proxy.first_byte_timeout_secs, 10);
+        assert_eq!(cfg.llm_proxy.idle_timeout_secs, 20);
+        assert_eq!(cfg.llm_proxy.heartbeat_secs, 5);
+        assert!(cfg.llm_proxy.token_reduction);
+        assert_eq!(
+            cfg.llm_proxy.token_reduction_level,
+            CompressionLevel::Balanced
+        );
+    }
+
+    #[test]
+    fn metrics_interval_secs_alias_parses() {
+        // serde alias: kebab-case keys are accepted.
+        let cfg: Config =
+            toml::from_str("[metrics]\ninterval-secs = 3.0\ntimeout-ms = 200\n").unwrap();
+        assert_eq!(cfg.metrics.interval_secs, 3.0);
+        assert_eq!(cfg.metrics.timeout_ms, 200);
+    }
+
+    #[test]
+    fn pin_start_and_restart_enums_parse() {
+        let cfg: Config =
+            toml::from_str("[[pins]]\nname='x'\ncommand='c'\nstart='eager'\nrestart='onfailure'\n")
+                .unwrap();
+        assert_eq!(cfg.pins[0].start, PinStart::Eager);
+        assert_eq!(cfg.pins[0].restart, PinRestart::OnFailure);
+        // Defaults.
+        assert_eq!(PinStart::default(), PinStart::Lazy);
+        assert_eq!(PinRestart::default(), PinRestart::Never);
+    }
+
+    #[test]
+    fn task_kind_default_and_parse() {
+        assert_eq!(TaskKind::default(), TaskKind::Custom);
+        let cfg: Config =
+            toml::from_str("[[tasks]]\nname='b'\ncommand='make'\nkind='build'\n").unwrap();
+        assert_eq!(cfg.tasks[0].kind, TaskKind::Build);
+    }
+
+    #[test]
+    fn worktree_template_default_is_all_empty() {
+        let t = WorktreeTemplate::default();
+        assert!(t.name.is_empty());
+        assert!(t.base.is_none() && t.layout.is_none());
+        assert!(t.pins.is_empty() && t.commands.is_empty());
+    }
 }

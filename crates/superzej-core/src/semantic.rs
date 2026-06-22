@@ -873,4 +873,168 @@ diff --git a/x.rs b/x.rs
         );
         assert!(none.is_empty());
     }
+
+    #[test]
+    fn entity_kind_label_for_every_variant() {
+        let pairs = [
+            (EntityKind::Function, "fn"),
+            (EntityKind::Method, "method"),
+            (EntityKind::Struct, "struct"),
+            (EntityKind::Enum, "enum"),
+            (EntityKind::Trait, "trait"),
+            (EntityKind::Impl, "impl"),
+            (EntityKind::Class, "class"),
+            (EntityKind::Interface, "interface"),
+            (EntityKind::TypeAlias, "type"),
+            (EntityKind::Const, "const"),
+            (EntityKind::Module, "mod"),
+        ];
+        for (kind, label) in pairs {
+            assert_eq!(kind.label(), label, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn entity_kind_from_node_kind_maps_and_rejects() {
+        // A representative node kind for each grammar family.
+        assert_eq!(
+            EntityKind::from_node_kind("method_declaration"),
+            Some(EntityKind::Method)
+        );
+        assert_eq!(
+            EntityKind::from_node_kind("interface_declaration"),
+            Some(EntityKind::Interface)
+        );
+        assert_eq!(
+            EntityKind::from_node_kind("class_definition"),
+            Some(EntityKind::Class)
+        );
+        assert_eq!(
+            EntityKind::from_node_kind("type_alias_declaration"),
+            Some(EntityKind::TypeAlias)
+        );
+        assert_eq!(
+            EntityKind::from_node_kind("static_item"),
+            Some(EntityKind::Const)
+        );
+        assert_eq!(
+            EntityKind::from_node_kind("mod_item"),
+            Some(EntityKind::Module)
+        );
+        // An unsurfaced node kind → None.
+        assert_eq!(EntityKind::from_node_kind("comment"), None);
+    }
+
+    #[test]
+    fn entity_contains_boundaries() {
+        let e = Entity {
+            kind: EntityKind::Function,
+            name: "f".into(),
+            start_line: 3,
+            end_line: 5,
+        };
+        assert!(!e.contains(2));
+        assert!(e.contains(3));
+        assert!(e.contains(4));
+        assert!(e.contains(5));
+        assert!(!e.contains(6));
+    }
+
+    #[test]
+    fn entity_summary_new_filters_empty_files_and_builds_impact() {
+        let per_file = vec![
+            (
+                "a.rs".to_string(),
+                vec![EntityChange {
+                    kind: EntityKind::Function,
+                    name: "f".into(),
+                    added: 1,
+                    deleted: 0,
+                    touch: Touch::Added,
+                }],
+            ),
+            // This file has no entity churn and must be dropped.
+            ("empty.rs".to_string(), Vec::new()),
+        ];
+        let s = EntitySummary::new(per_file);
+        assert_eq!(s.per_file.len(), 1);
+        assert_eq!(s.per_file[0].0, "a.rs");
+        let impact = s.impact.expect("impact present when churn exists");
+        assert_eq!(impact.entities, 1);
+        assert_eq!(impact.files, 1);
+    }
+
+    #[test]
+    fn entity_summary_new_empty_has_no_impact() {
+        let s = EntitySummary::new(Vec::new());
+        assert!(s.per_file.is_empty());
+        assert!(s.impact.is_none());
+        // Default is equivalent to an empty summary.
+        assert_eq!(EntitySummary::default(), s);
+    }
+
+    #[test]
+    fn impact_summary_singular_grammar_one_file_one_entity() {
+        let per_file = vec![(
+            "only.rs".to_string(),
+            vec![EntityChange {
+                kind: EntityKind::Struct,
+                name: "S".into(),
+                added: 1,
+                deleted: 0,
+                touch: Touch::Added,
+            }],
+        )];
+        let s = impact_summary(&per_file);
+        // Singular: "1 struct across 1 file" (no trailing 's').
+        assert!(s.summary.contains("1 struct"), "{}", s.summary);
+        assert!(s.summary.contains("across 1 file"), "{}", s.summary);
+        assert!(!s.summary.contains("files"), "{}", s.summary);
+    }
+
+    #[test]
+    fn derive_commit_message_skips_empty_file_sections() {
+        let per_file = vec![
+            (
+                "kept.rs".to_string(),
+                vec![EntityChange {
+                    kind: EntityKind::Function,
+                    name: "g".into(),
+                    added: 2,
+                    deleted: 1,
+                    touch: Touch::Modified,
+                }],
+            ),
+            // Empty section must be skipped in the body.
+            ("skipped.rs".to_string(), Vec::new()),
+        ];
+        let msg = derive_commit_message(&per_file);
+        assert!(msg.contains("kept.rs:"));
+        assert!(!msg.contains("skipped.rs"));
+        assert!(msg.starts_with("update `g`"));
+    }
+
+    #[test]
+    fn entities_for_diff_drops_churn_outside_any_entity() {
+        // Imports (outside any function) churn but are not attributed.
+        let new_source = "\
+use std::io;
+
+fn inside() -> i32 {
+    1
+}
+";
+        let diff = "\
+diff --git a/x.rs b/x.rs
+--- a/x.rs
++++ b/x.rs
+@@ -1,1 +1,1 @@
+-use std::fmt;
++use std::io;
+";
+        let files = parse_patch(diff);
+        let changes = entities_for_diff(new_source, Lang::Rust, &files[0].hunks);
+        // The import edit lands outside `inside`, so no entity change recorded.
+        assert!(changes.is_empty(), "{changes:?}");
+    }
 }
