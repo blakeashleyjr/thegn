@@ -358,6 +358,16 @@ pub(crate) fn prewarm_requests(
 /// what `compose_pane` paints).
 pub(crate) fn relayout(panes: &mut Panes, tree: &crate::center::CenterTree, center: Rect) {
     for (id, _, content) in tree.layout_framed(center) {
+        // A degenerate rect means the center is hidden behind a full-screen
+        // panel / zoomed zone (`compute_full`/`compute_chrome` collapse it to
+        // the mandatory single column). Resizing the PTY to ~1 col makes vt100
+        // reflow the shell to one column and spill its content into scrollback,
+        // which a later grow-back can't restore — the pane comes back blank.
+        // Leave hidden panes at their real size; relayout runs again with a
+        // real rect when the panel retracts.
+        if content.cols <= 1 || content.rows <= 1 {
+            continue;
+        }
         if let Some(p) = panes.table.get_mut(&id) {
             let _ = p.resize(content.rows.max(1) as u16, content.cols.max(1) as u16);
         }
@@ -427,6 +437,95 @@ mod tests {
         assert_eq!(prewarm_targets(2, 5, 0), Vec::<usize>::new());
         // Wider radius clamps at the ends.
         assert_eq!(prewarm_targets(1, 5, 2), vec![0, 2, 3]);
+    }
+
+    #[test]
+    fn relayout_skips_panes_hidden_behind_a_fullscreen_panel() {
+        // SAFETY: single-threaded test setup.
+        unsafe { std::env::set_var("SHELL", "/bin/sh") };
+        let mut session = one_tab_session();
+        let chrome = layout::compute(160, 40, true, true);
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
+        let mut panes = Panes::new(tx);
+        let path = session.worktrees[0].path.clone();
+        let mut cfg = superzej_core::config::Config::default();
+        cfg.sandbox.enabled = false;
+        let specs: Vec<(u32, crate::agent::LaunchSpec)> = panes
+            .missing_leaves(&session.worktrees[0].tabs[0])
+            .into_iter()
+            .map(|id| {
+                (
+                    id,
+                    crate::agent::launch_spec(&cfg, &path, None, "shell").unwrap(),
+                )
+            })
+            .collect();
+        panes
+            .materialize_with_specs(
+                &mut session.worktrees[0].tabs[0],
+                &path,
+                &specs,
+                chrome.center,
+            )
+            .unwrap();
+
+        let tree = session.worktrees[0].tabs[0].center.clone();
+        let id = match &tree {
+            crate::center::CenterTree::Leaf(id) => *id,
+            _ => panic!("expected a single leaf pane"),
+        };
+
+        // A real rect sizes the pane.
+        relayout(
+            &mut panes,
+            &tree,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 120,
+                rows: 30,
+            },
+        );
+        let real = panes.table.get(&id).unwrap().size();
+        assert!(
+            real.0 > 1 && real.1 > 1,
+            "pane sized to a real rect: {real:?}"
+        );
+
+        // A degenerate rect (center hidden behind a full-screen panel) must NOT
+        // resize the pane — that 1-col reflow destroys the shell's content.
+        relayout(
+            &mut panes,
+            &tree,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 1,
+                rows: 30,
+            },
+        );
+        assert_eq!(
+            panes.table.get(&id).unwrap().size(),
+            real,
+            "a hidden (1-col) pane keeps its real size"
+        );
+
+        // Retracting back to a real rect resizes it again.
+        relayout(
+            &mut panes,
+            &tree,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 80,
+                rows: 20,
+            },
+        );
+        assert_ne!(
+            panes.table.get(&id).unwrap().size(),
+            real,
+            "a real rect resizes the pane"
+        );
     }
 
     #[test]

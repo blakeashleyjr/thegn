@@ -83,6 +83,9 @@ pub enum Action {
     FocusSidebar,
     /// Move keyboard focus into the right panel (shows it if hidden).
     FocusPanel,
+    /// Open the right panel to the System ▸ Notifications section and focus it;
+    /// pressing it again while already there returns focus to the center.
+    ToggleNotifications,
     OpenPalette,
     Lazygit,
     Yazi,
@@ -376,6 +379,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         label: "Focus diff / PR panel",
         hint: "panel",
         default_chords: &["Alt ."],
+        palette: true,
+    },
+    ActionSpec {
+        id: "toggle-notifications",
+        label: "Toggle Notifications panel",
+        hint: "notifications",
+        default_chords: &["Alt i"],
         palette: true,
     },
     ActionSpec {
@@ -679,6 +689,7 @@ impl Action {
             Action::ToggleDrawer => "files-drawer",
             Action::FocusSidebar => "focus-sidebar",
             Action::FocusPanel => "focus-panel",
+            Action::ToggleNotifications => "toggle-notifications",
             Action::OpenPalette => "palette",
             Action::Lazygit => "lazygit",
             Action::Yazi => "yazi",
@@ -742,6 +753,7 @@ impl Action {
             "files" | "files-drawer" | "toggle-drawer" => Action::ToggleDrawer,
             "focus-sidebar" => Action::FocusSidebar,
             "focus-panel" => Action::FocusPanel,
+            "toggle-notifications" => Action::ToggleNotifications,
             "palette" | "menu" => Action::OpenPalette,
             "lazygit" | "tool-lazygit" => Action::Lazygit,
             "yazi" | "tool-yazi" => Action::Yazi,
@@ -968,6 +980,8 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl Alt f", Action::ToggleDrawer).unwrap();
     map.insert_all("Alt s", Action::FocusSidebar).unwrap();
     map.insert_all("Alt .", Action::FocusPanel).unwrap();
+    map.insert_all("Alt i", Action::ToggleNotifications)
+        .unwrap();
     map.insert_all("Ctrl Alt c", Action::CopyPane).unwrap();
     map.insert_all("Ctrl Alt n", Action::SwitchMode(Mode::Normal))
         .unwrap();
@@ -1510,6 +1524,28 @@ mod tests {
         assert_eq!(Action::from_key("pin-9"), Some(Action::SummonPin(9)));
         assert_eq!(Action::from_key("pin-0"), None);
         assert_eq!(Action::from_key("pin-99"), None);
+    }
+
+    #[test]
+    fn toggle_notifications_action_round_trips_and_is_in_the_palette() {
+        assert_eq!(Action::ToggleNotifications.key(), "toggle-notifications");
+        assert_eq!(
+            Action::from_key("toggle-notifications"),
+            Some(Action::ToggleNotifications)
+        );
+        let spec = action_spec("toggle-notifications").expect("spec registered");
+        assert!(spec.palette, "must appear in the command palette");
+        assert_eq!(spec.default_chords, &["Alt i"]);
+        // The default keymap must actually BIND Alt+i (default_chords is only
+        // metadata; the binding is a separate explicit insert).
+        let mut map = default_keymap();
+        assert_eq!(
+            map.dispatch(
+                Mode::Normal,
+                Key::modified(KeyCode::Char('i'), Modifiers::ALT)
+            ),
+            MatchResult::Matched(Action::ToggleNotifications)
+        );
     }
 
     #[test]
