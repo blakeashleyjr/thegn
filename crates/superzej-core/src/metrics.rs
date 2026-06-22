@@ -220,4 +220,73 @@ go_goroutines 42
         assert!(parse_metrics("good NaN\n").is_empty());
         assert!(parse_metrics("good{bad-label=\"x\"} 1\n").is_empty());
     }
+
+    #[test]
+    fn rejects_inf_and_unparseable_values() {
+        // +Inf / -Inf parse as f64 but are non-finite → rejected.
+        assert!(parse_metrics("good inf\n").is_empty());
+        assert!(parse_metrics("good -inf\n").is_empty());
+        // A value token that isn't a number at all.
+        assert!(parse_metrics("good notanumber\n").is_empty());
+    }
+
+    #[test]
+    fn rejects_malformed_label_blocks() {
+        // Opening brace but no closing brace.
+        assert!(parse_metrics("m{a=\"1\" 5\n").is_empty());
+        // A label with no '=' separator.
+        assert!(parse_metrics("m{nope} 5\n").is_empty());
+        // A label value that is not quoted.
+        assert!(parse_metrics("m{a=1} 5\n").is_empty());
+        // An empty label name.
+        assert!(parse_metrics("m{=\"x\"} 5\n").is_empty());
+        // Missing comma between two labels.
+        assert!(parse_metrics("m{a=\"1\" b=\"2\"} 5\n").is_empty());
+        // Unterminated quoted value (parse_quoted returns None).
+        assert!(parse_metrics("m{a=\"unterminated} 5\n").is_empty());
+    }
+
+    #[test]
+    fn rejects_lines_missing_value_or_name() {
+        // Only whitespace after trimming the name → split_first_ws yields None
+        // (handled as no-value); also a name-only line with no value token.
+        assert!(parse_metrics("lonely\n").is_empty());
+        // A line that is only a value with leading whitespace collapses to one
+        // token after trim, so there is no value field.
+        assert!(parse_metrics("   onlyname   \n").is_empty());
+    }
+
+    #[test]
+    fn bare_metric_without_labels_parses() {
+        let samples = parse_metrics("up 1\n");
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].name, "up");
+        assert!(samples[0].labels.is_empty());
+        // A name starting with ':' or '_' is valid.
+        assert_eq!(parse_metrics(":colon_ok 1\n").len(), 1);
+        assert_eq!(parse_metrics("_under 1\n").len(), 1);
+    }
+
+    #[test]
+    fn empty_allowlist_admits_all_but_label_filter_still_applies() {
+        let samples = parse_metrics("a{env=\"prod\"} 1\nb{env=\"dev\"} 2\nc 3\n");
+        let mut labels = BTreeMap::new();
+        labels.insert("env".to_string(), "prod".to_string());
+        // Empty allowlist → all names admitted, but env=prod required.
+        let filtered = filter_samples(&samples, &[], &labels);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "a");
+
+        // Empty allowlist + empty label filter → everything passes.
+        let all = filter_samples(&samples, &[], &BTreeMap::new());
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn parses_escaped_newline_and_passthrough_escapes() {
+        // \n maps to newline; an unknown escape (e.g. \t) passes the char through.
+        let samples = parse_metrics("m{a=\"x\\ny\",b=\"c\\td\"} 1\n");
+        assert_eq!(samples[0].labels.get("a").map(String::as_str), Some("x\ny"));
+        assert_eq!(samples[0].labels.get("b").map(String::as_str), Some("ctd"));
+    }
 }

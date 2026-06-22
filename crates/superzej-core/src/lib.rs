@@ -9,6 +9,14 @@
 //! bindings + collision detection for the cheatsheet/`keys validate`); the host
 //! owns terminal chord→Action routing.
 
+/// A process-wide lock serialising tests that read or mutate the `HOME`
+/// environment variable. `startup`'s gitconfig-repair tests mutate `HOME` to a
+/// temp dir; several `sandbox` tests read `HOME` to build bind mounts. Under
+/// the parallel test runner those race — `HOME` flips mid-assertion — so every
+/// such test acquires this lock for its `HOME`-sensitive window.
+#[cfg(test)]
+pub(crate) static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub mod activity;
 pub mod blame;
 pub mod config;

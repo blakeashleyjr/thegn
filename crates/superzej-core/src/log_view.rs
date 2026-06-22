@@ -192,4 +192,48 @@ mod tests {
         let p = log_file_path(&cfg);
         assert!(p.ends_with("szhost.log"), "got: {p:?}");
     }
+
+    #[test]
+    fn log_level_parse_accepts_lowercase_and_rejects_unknown() {
+        assert_eq!(LogLevel::parse("info"), Some(LogLevel::Info));
+        assert_eq!(LogLevel::parse("Error"), Some(LogLevel::Error));
+        assert_eq!(LogLevel::parse("trace"), Some(LogLevel::Trace));
+        assert_eq!(LogLevel::parse("FATAL"), None);
+        assert_eq!(LogLevel::parse(""), None);
+    }
+
+    #[test]
+    fn log_level_label_and_glyph_for_all_levels() {
+        let all = [
+            LogLevel::Error,
+            LogLevel::Warn,
+            LogLevel::Info,
+            LogLevel::Debug,
+            LogLevel::Trace,
+        ];
+        for lvl in all {
+            // label round-trips through parse.
+            assert_eq!(LogLevel::parse(lvl.label()), Some(lvl), "label {lvl:?}");
+            // glyph is a non-empty marker.
+            assert!(!lvl.glyph().is_empty(), "glyph {lvl:?}");
+        }
+        assert_eq!(LogLevel::Error.glyph(), "✗");
+        assert_eq!(LogLevel::Warn.glyph(), "!");
+        assert_eq!(LogLevel::Error.label(), "ERROR");
+        assert_eq!(LogLevel::Trace.label(), "TRACE");
+    }
+
+    #[test]
+    fn parse_log_line_rejects_unknown_level_token() {
+        // The structure is right but the level token is not a known level.
+        let line = "2026-06-05T12:00:00  BOGUS superzej::db  msg";
+        assert!(parse_log_line(line).is_none());
+    }
+
+    #[test]
+    fn parse_log_line_rejects_missing_target_message_split() {
+        // Has timestamp + level, but no double-space before the message.
+        let line = "2026-06-05T12:00:00  INFO superzej::db message-no-double-space";
+        assert!(parse_log_line(line).is_none());
+    }
 }

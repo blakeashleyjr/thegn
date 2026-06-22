@@ -352,4 +352,137 @@ mod spec {
         let back: IssueDetail = serde_json::from_str(&json).unwrap();
         assert_eq!(d, back);
     }
+
+    #[test]
+    fn status_string_representations() {
+        let cases = [
+            (IssueStatus::Backlog, "backlog", "Backlog", '○'),
+            (IssueStatus::Todo, "todo", "Todo", '◌'),
+            (IssueStatus::InProgress, "in_progress", "In Progress", '◑'),
+            (IssueStatus::Done, "done", "Done", '●'),
+            (IssueStatus::Cancelled, "cancelled", "Cancelled", '⊘'),
+        ];
+        for (s, as_str, label, glyph) in cases {
+            assert_eq!(s.as_str(), as_str);
+            assert_eq!(s.label(), label);
+            assert_eq!(s.glyph(), glyph);
+        }
+    }
+
+    #[test]
+    fn priority_string_representations() {
+        let cases = [
+            (IssuePriority::Urgent, "urgent", "URGENT"),
+            (IssuePriority::High, "high", "HIGH"),
+            (IssuePriority::Medium, "medium", "MED"),
+            (IssuePriority::Low, "low", "LOW"),
+            (IssuePriority::None, "none", "—"),
+        ];
+        for (p, as_str, label) in cases {
+            assert_eq!(p.as_str(), as_str);
+            assert_eq!(p.label(), label);
+        }
+    }
+
+    #[test]
+    fn defaults_for_drafts_and_patches() {
+        let draft = IssueDraft::default();
+        assert!(draft.title.is_empty());
+        assert!(draft.body.is_none());
+        assert_eq!(draft.priority, IssuePriority::Low);
+        assert!(draft.project_id.is_none());
+
+        let patch = IssuePatch::default();
+        assert!(patch.status.is_none());
+        assert!(patch.title.is_none());
+        assert!(patch.assignee_me.is_none());
+        assert!(patch.priority.is_none());
+
+        let comment = IssueComment::default();
+        assert!(comment.author.is_empty());
+        assert!(comment.body.is_empty());
+        assert_eq!(comment.created_at_ms, 0);
+
+        let filter = IssueFilter::default();
+        assert!(!filter.assignee_me);
+        assert!(filter.statuses.is_empty());
+        assert!(filter.project_id.is_none());
+        assert!(filter.query.is_none());
+        assert_eq!(filter.limit, 0);
+    }
+
+    #[test]
+    fn draft_and_patch_can_be_populated() {
+        let draft = IssueDraft {
+            title: "New issue".into(),
+            body: Some("details".into()),
+            priority: IssuePriority::Urgent,
+            project_id: Some("team-1".into()),
+        };
+        assert_eq!(draft.priority, IssuePriority::Urgent);
+        assert_eq!(draft.project_id.as_deref(), Some("team-1"));
+
+        let patch = IssuePatch {
+            status: Some(IssueStatus::Done),
+            title: Some("renamed".into()),
+            assignee_me: Some(true),
+            priority: Some(IssuePriority::Low),
+        };
+        assert_eq!(patch.status, Some(IssueStatus::Done));
+        assert_eq!(patch.assignee_me, Some(true));
+    }
+
+    #[test]
+    fn agent_dispatch_status_default_is_queued() {
+        assert_eq!(AgentDispatchStatus::default(), AgentDispatchStatus::Queued);
+    }
+
+    #[test]
+    fn agent_dispatch_status_string_representations() {
+        let cases = [
+            (AgentDispatchStatus::Queued, "queued", "⚙"),
+            (AgentDispatchStatus::Spawning, "spawning", "⚙"),
+            (AgentDispatchStatus::Running, "running", "⚙"),
+            (AgentDispatchStatus::WaitingHuman, "waiting_human", "⏸"),
+            (AgentDispatchStatus::PrOpen, "pr_open", "⎇"),
+            (AgentDispatchStatus::Merged, "merged", "✓"),
+            (AgentDispatchStatus::Abandoned, "abandoned", "✗"),
+        ];
+        for (s, as_str, glyph) in cases {
+            assert_eq!(s.as_str(), as_str);
+            assert_eq!(s.glyph(), glyph);
+        }
+    }
+
+    #[test]
+    fn agent_dispatch_status_roundtrip() {
+        for s in [
+            AgentDispatchStatus::Queued,
+            AgentDispatchStatus::Spawning,
+            AgentDispatchStatus::Running,
+            AgentDispatchStatus::WaitingHuman,
+            AgentDispatchStatus::PrOpen,
+            AgentDispatchStatus::Merged,
+            AgentDispatchStatus::Abandoned,
+        ] {
+            let json = serde_json::to_string(&s).unwrap();
+            let back: AgentDispatchStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(s, back, "roundtrip failed for {:?}", s);
+        }
+    }
+
+    #[test]
+    fn agent_dispatch_roundtrip() {
+        let orig = AgentDispatch {
+            id: 7,
+            issue_id: "linear:ABC-1".into(),
+            worktree_path: "/tmp/wt".into(),
+            agent_name: "claude".into(),
+            dispatched_at_ms: 1_700_000_000_000,
+            status: AgentDispatchStatus::Running,
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        let back: AgentDispatch = serde_json::from_str(&json).unwrap();
+        assert_eq!(orig, back);
+    }
 }
