@@ -217,3 +217,78 @@ impl Health {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn db() -> SharedDb {
+        Arc::new(Mutex::new(Db::open_memory().unwrap()))
+    }
+
+    #[test]
+    fn mark_exhausted_persists_and_reloads() {
+        let db = db();
+        let h = Health::new(db.clone(), 1000);
+        assert!(!h.is_exhausted("openrouter", "m", 1000));
+        // A rate-limit 429 cools the backend down (future next_probe).
+        h.mark_exhausted("openrouter", "m", "HTTP 429 (rate limit)", None, 1000);
+        assert!(h.is_exhausted("openrouter", "m", 1000));
+
+        // A fresh tracker hydrates the live marker from the DB (covers new() +
+        // kind_from_str reverse mapping).
+        let h2 = Health::new(db, 1000);
+        assert!(h2.is_exhausted("openrouter", "m", 1000));
+    }
+
+    #[test]
+    fn mark_exhausted_until_overrides_cooldown() {
+        let h = Health::new(db(), 0);
+        h.mark_exhausted("p", "m", "HTTP 429 (rate limit)", Some(5_000), 0);
+        assert!(h.is_exhausted("p", "m", 4_999));
+        assert!(!h.is_exhausted("p", "m", 5_000));
+    }
+
+    #[test]
+    fn record_success_clears_marker_and_db() {
+        let db = db();
+        let h = Health::new(db.clone(), 0);
+        h.mark_exhausted("p", "m", "HTTP 500 (upstream outage)", None, 0);
+        assert!(h.is_exhausted("p", "m", 0));
+        h.record_success("p", "m");
+        assert!(!h.is_exhausted("p", "m", 0));
+        // Cleared in the DB too: a fresh tracker sees nothing.
+        assert!(!Health::new(db, 0).is_exhausted("p", "m", 0));
+    }
+
+    #[test]
+    fn soft_cooldown_parks_briefly_then_clears() {
+        let h = Health::new(db(), 0);
+        h.mark_soft_cooldown(
+            "p",
+            "m",
+            "stream empty completion",
+            Duration::from_millis(100),
+            0,
+        );
+        assert!(h.is_exhausted("p", "m", 0));
+        // Never permanent — a no-op base does nothing.
+        h.record_success("p", "m");
+        h.mark_soft_cooldown("p", "m", "x", Duration::ZERO, 0);
+        assert!(!h.is_exhausted("p", "m", 0));
+    }
+
+    #[test]
+    fn status_reports_markers() {
+        let h = Health::new(db(), 0);
+        h.mark_exhausted("p", "m", "HTTP 402 (payment)", None, 0);
+        let snap = h.status(0);
+        assert_eq!(snap.len(), 1);
+        let (ident, reason, next_probe, healthy) = &snap[0];
+        assert_eq!(ident, "p:m");
+        assert!(reason.contains("payment"));
+        assert!(*next_probe > 0);
+        assert!(!*healthy); // still cooling at now=0
+    }
+}
