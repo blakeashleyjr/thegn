@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use axum::{Router, extract::State, http::StatusCode, routing::post};
+use axum::{Router, extract::State, http::HeaderMap, http::StatusCode, routing::post};
 use serde_json::{Value, json};
 use superzej_core::db::Db;
 use superzej_core::proxy::compress::Level;
@@ -450,6 +450,105 @@ async fn compression_disabled_forwards_unchanged() {
     let got = captured.lock().unwrap().clone().unwrap();
     // Tool content forwarded verbatim (ANSI + repeats intact).
     assert_eq!(got["messages"][2]["content"], req["messages"][2]["content"]);
+}
+
+/// Spawns a mock that keys off the `Authorization: Bearer` token: it records
+/// every bearer it sees and returns 429 for `bad_key`, 200 otherwise.
+async fn spawn_keyed_mock(bad_key: Option<&'static str>, seen: Arc<Mutex<Vec<String>>>) -> String {
+    type S = (Option<&'static str>, Arc<Mutex<Vec<String>>>);
+    async fn handler(State((bad, seen)): State<S>, headers: HeaderMap) -> (StatusCode, String) {
+        let bearer = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .unwrap_or("")
+            .to_string();
+        seen.lock().unwrap().push(bearer.clone());
+        if Some(bearer.as_str()) == bad {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({"error": {"message": "rate limited"}}).to_string(),
+            );
+        }
+        (StatusCode::OK, completion_body().to_string())
+    }
+    let app = Router::new()
+        .route("/chat/completions", post(handler))
+        .with_state((bad_key, seen));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+/// Builds a route whose single provider has two keys (k0, k1) sharing a pool,
+/// pointed at `up`, via the real config parser (so lane expansion is exercised).
+fn two_key_route(up: &str, strategy: &str) -> Vec<Route> {
+    let doc = format!(
+        r#"{{"routes":[{{"name":"standard","backends":[
+            {{"name":"echo","base_url":"{up}","model":"m","api_keys":["k0","k1"],"key_strategy":"{strategy}"}}
+        ]}}]}}"#
+    );
+    superzej_proxy::config::parse_config(&doc).unwrap().routes
+}
+
+#[tokio::test]
+async fn multi_key_failover_cools_only_one_key() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let up = spawn_keyed_mock(Some("k0"), seen.clone()).await; // k0 is rate-limited
+    let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+    let proxy = spawn_proxy(two_key_route(&up, "failover"), db).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&chat_request())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // The k0 lane 429'd, the k1 lane served — failover within the provider.
+    let observed = seen.lock().unwrap().clone();
+    assert_eq!(observed, vec!["k0".to_string(), "k1".to_string()]);
+    // /resolved attributes the serve to the #1 lane, not a wholesale provider cool.
+    let resolved: Value = reqwest::get(format!("{proxy}/resolved"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resolved["standard"], "echo#1");
+}
+
+#[tokio::test]
+async fn multi_key_round_robin_spreads_across_keys() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let up = spawn_keyed_mock(None, seen.clone()).await; // both keys healthy
+    let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+    let proxy = spawn_proxy(two_key_route(&up, "roundrobin"), db).await;
+
+    let client = reqwest::Client::new();
+    for _ in 0..2 {
+        let r = client
+            .post(format!("{proxy}/v1/chat/completions"))
+            .json(&chat_request())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+    }
+    // Round-robin advances the first-choice lane each request → both keys used.
+    let observed = seen.lock().unwrap().clone();
+    assert!(
+        observed.contains(&"k0".to_string()),
+        "observed: {observed:?}"
+    );
+    assert!(
+        observed.contains(&"k1".to_string()),
+        "observed: {observed:?}"
+    );
 }
 
 #[tokio::test]

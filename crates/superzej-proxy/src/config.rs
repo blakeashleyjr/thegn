@@ -14,6 +14,7 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use superzej_core::proxy::compress::{Level, Limits};
+use superzej_core::proxy::creds::{CredPool, KeyStrategy};
 use superzej_core::proxy::ratelimit::RatePolicy;
 use superzej_core::proxy::transform::CompressPolicy;
 
@@ -72,6 +73,19 @@ struct BackendDoc {
     /// Env var to read the key from.
     #[serde(default)]
     api_key_env: Option<String>,
+    /// Multiple keys for one provider (preferred form): each env var is read to a
+    /// key, expanded into its own rate-limited/health-tracked lane (U 280).
+    #[serde(default)]
+    api_key_envs: Vec<String>,
+    /// Inline multi-key list (discouraged; prefer `api_key_envs`).
+    #[serde(default)]
+    api_keys: Vec<String>,
+    /// Lane order strategy: `roundrobin` (default) | `failover` | `random` | `weighted`.
+    #[serde(default)]
+    key_strategy: Option<String>,
+    /// Per-key weights aligned to the resolved key order (weighted strategy).
+    #[serde(default)]
+    key_weights: Vec<u32>,
     #[serde(default)]
     anthropic: bool,
     #[serde(default)]
@@ -250,26 +264,7 @@ fn build_routes(doc: ConfigDoc) -> Result<Vec<Route>> {
     for r in doc.routes {
         let mut priority = Vec::new();
         for b in r.backends {
-            let api_key = match (&b.api_key, &b.api_key_env) {
-                (Some(k), _) => k.clone(),
-                (None, Some(env)) => std::env::var(env).unwrap_or_default(),
-                (None, None) => String::new(),
-            };
-            let rpm = b.rpm.unwrap_or(60.0);
-            let burst = b.burst.unwrap_or(5.0);
-            priority.push(Backend {
-                name: b.name,
-                key_id: String::new(),
-                base_url: b.base_url,
-                model: b.model,
-                api_key,
-                anthropic: b.anthropic,
-                context_limit: b.context_limit,
-                defaults: b.defaults,
-                rate: RatePolicy { rpm, burst },
-                inflight_cap: b.inflight_cap,
-                pool: None,
-            });
+            expand_backend(b, &mut priority);
         }
         routes.push(Route {
             name: r.name,
@@ -277,6 +272,66 @@ fn build_routes(doc: ConfigDoc) -> Result<Vec<Route>> {
         });
     }
     Ok(routes)
+}
+
+/// Resolves a backend's API keys and pushes one lane per key onto `priority`.
+/// 0/1 key → a single lane (`pool: None`, no `key_id`); N keys → N contiguous
+/// lanes sharing one [`CredPool`], each with `key_id = "#i"` so health and
+/// rate-limit identities (`name + key_id`) isolate per key.
+fn expand_backend(b: BackendDoc, priority: &mut Vec<Backend>) {
+    let keys = resolve_keys(&b);
+    let rpm = b.rpm.unwrap_or(60.0);
+    let burst = b.burst.unwrap_or(5.0);
+    let rate = RatePolicy { rpm, burst };
+    let mk = |key_id: String, api_key: String, pool: Option<std::sync::Arc<CredPool>>| Backend {
+        name: b.name.clone(),
+        key_id,
+        base_url: b.base_url.clone(),
+        model: b.model.clone(),
+        api_key,
+        anthropic: b.anthropic,
+        context_limit: b.context_limit,
+        defaults: b.defaults.clone(),
+        rate,
+        inflight_cap: b.inflight_cap,
+        pool,
+    };
+
+    match keys.len() {
+        0 => priority.push(mk(String::new(), String::new(), None)),
+        1 => priority.push(mk(String::new(), keys.into_iter().next().unwrap(), None)),
+        _ => {
+            let strategy = KeyStrategy::parse(b.key_strategy.as_deref().unwrap_or(""));
+            let pool = std::sync::Arc::new(CredPool::new(strategy, b.key_weights.clone()));
+            for (i, key) in keys.into_iter().enumerate() {
+                priority.push(mk(format!("#{i}"), key, Some(pool.clone())));
+            }
+        }
+    }
+}
+
+/// Resolves a backend's key list (inline list → env list → legacy single
+/// key/env), deduping while preserving order. Empty entries are dropped.
+fn resolve_keys(b: &BackendDoc) -> Vec<String> {
+    let mut raw: Vec<String> = Vec::new();
+    if !b.api_keys.is_empty() {
+        raw.extend(b.api_keys.iter().cloned());
+    } else if !b.api_key_envs.is_empty() {
+        raw.extend(
+            b.api_key_envs
+                .iter()
+                .map(|e| std::env::var(e).unwrap_or_default()),
+        );
+    } else if let Some(k) = &b.api_key {
+        raw.push(k.clone());
+    } else if let Some(env) = &b.api_key_env {
+        raw.push(std::env::var(env).unwrap_or_default());
+    }
+    let mut seen = std::collections::HashSet::new();
+    raw.into_iter()
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty() && seen.insert(k.clone()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -308,5 +363,59 @@ mod tests {
     fn lookup_route_defaults_to_first() {
         let cfg = parse_config(r#"{"routes":[{"name":"standard","backends":[]}]}"#).unwrap();
         assert_eq!(cfg.lookup_route("unknown-model").unwrap().name, "standard");
+    }
+
+    #[test]
+    fn multi_key_backend_expands_into_lanes() {
+        let cfg = parse_config(
+            r#"{"routes":[{"name":"standard","backends":[
+                {"name":"minimax","base_url":"https://x","model":"m",
+                 "api_keys":["k0","k1","k2"],"key_strategy":"failover"}
+            ]}]}"#,
+        )
+        .unwrap();
+        let lanes = &cfg.routes[0].priority;
+        assert_eq!(lanes.len(), 3);
+        assert_eq!(lanes[0].key_id, "#0");
+        assert_eq!(lanes[1].key_id, "#1");
+        assert_eq!(lanes[2].key_id, "#2");
+        assert_eq!(lanes[0].api_key, "k0");
+        assert_eq!(lanes[2].api_key, "k2");
+        // Identities isolate per key.
+        assert_eq!(lanes[0].identity(), "minimax#0");
+        assert_eq!(lanes[1].identity(), "minimax#1");
+        // All three share one pool.
+        let p0 = lanes[0].pool.as_ref().unwrap();
+        assert!(std::sync::Arc::ptr_eq(p0, lanes[1].pool.as_ref().unwrap()));
+        assert!(std::sync::Arc::ptr_eq(p0, lanes[2].pool.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn single_key_stays_one_lane() {
+        let cfg = parse_config(
+            r#"{"routes":[{"name":"standard","backends":[
+                {"name":"openrouter","base_url":"https://x","model":"m","api_key":"k"}
+            ]}]}"#,
+        )
+        .unwrap();
+        let lanes = &cfg.routes[0].priority;
+        assert_eq!(lanes.len(), 1);
+        assert_eq!(lanes[0].key_id, "");
+        assert!(lanes[0].pool.is_none());
+    }
+
+    #[test]
+    fn duplicate_and_blank_keys_are_dropped() {
+        let cfg = parse_config(
+            r#"{"routes":[{"name":"standard","backends":[
+                {"name":"p","base_url":"https://x","model":"m","api_keys":["k0","k0"," ","k1"]}
+            ]}]}"#,
+        )
+        .unwrap();
+        let lanes = &cfg.routes[0].priority;
+        // k0 deduped, blank dropped → k0, k1.
+        assert_eq!(lanes.len(), 2);
+        assert_eq!(lanes[0].api_key, "k0");
+        assert_eq!(lanes[1].api_key, "k1");
     }
 }
