@@ -4,6 +4,7 @@
 //! without a cooldown. Port of `routeRequest`/`attemptBackend` (non-streaming),
 //! plus spend attribution + audit logging (group V).
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
@@ -39,6 +40,50 @@ impl Surface {
     }
 }
 
+/// Returns the order in which a route's backends should be attempted this
+/// request. Contiguous runs of lanes sharing a [`CredPool`] are reordered by the
+/// pool's strategy (round-robin/failover/random/weighted) via `CredPool::order`;
+/// non-pool backends keep their natural position. `rand_start` is only consulted
+/// by the `Random` strategy.
+fn ordered_priority(route: &Route, rand_start: usize) -> Vec<usize> {
+    let lanes = &route.priority;
+    let mut out = Vec::with_capacity(lanes.len());
+    let mut i = 0;
+    while i < lanes.len() {
+        match &lanes[i].pool {
+            Some(pool) => {
+                let mut k = 1;
+                while i + k < lanes.len()
+                    && lanes[i + k]
+                        .pool
+                        .as_ref()
+                        .is_some_and(|p| Arc::ptr_eq(p, pool))
+                {
+                    k += 1;
+                }
+                for off in pool.order(k, rand_start) {
+                    out.push(i + off);
+                }
+                i += k;
+            }
+            None => {
+                out.push(i);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// A per-request seed for the `Random` lane strategy (sub-nanos of the wall
+/// clock). Deterministic strategies ignore it.
+fn rand_start() -> usize {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as usize)
+        .unwrap_or(0)
+}
+
 /// The result of routing a non-streaming request.
 pub struct RouteResult {
     pub status: u16,
@@ -61,15 +106,17 @@ pub async fn route_nonstreaming(
     let has_tools = transform::request_has_tools(&parsed);
     let est_tokens = transform::estimated_request_tokens(body.len());
 
-    let n = route.priority.len();
-    for (i, backend) in route.priority.iter().enumerate() {
-        let is_last = i + 1 == n;
+    let order = ordered_priority(route, rand_start());
+    let n = order.len();
+    for (pos, &idx) in order.iter().enumerate() {
+        let backend = &route.priority[idx];
+        let is_last = pos + 1 == n;
         let now = now_ms();
 
         // Skip cooled-down backends.
         if state
             .health
-            .is_exhausted(&backend.name, &backend.model, now)
+            .is_exhausted(&backend.identity(), &backend.model, now)
         {
             state
                 .metrics
@@ -132,7 +179,9 @@ pub async fn route_nonstreaming(
         let (kind, reason) = classify_response(resp.status, &resp.body);
         match kind {
             FailKind::Serve => {
-                state.health.record_success(&backend.name, &backend.model);
+                state
+                    .health
+                    .record_success(&backend.identity(), &backend.model);
                 state.metrics.inc_backend_attempt(&ident, "ok");
                 state.metrics.inc_request(&route.name, &ident, "ok");
                 state.metrics.add_tokens_saved(&ident, (saved / 4) as u64);
@@ -145,9 +194,13 @@ pub async fn route_nonstreaming(
             }
             FailKind::Exhausted => {
                 let until = parse_reset_from_body(&resp.body, now);
-                state
-                    .health
-                    .mark_exhausted(&backend.name, &backend.model, &reason, until, now);
+                state.health.mark_exhausted(
+                    &backend.identity(),
+                    &backend.model,
+                    &reason,
+                    until,
+                    now,
+                );
                 state.metrics.inc_backend_attempt(&ident, "exhausted");
                 state.metrics.inc_fallthrough(&ident, "exhausted");
             }
@@ -193,14 +246,16 @@ pub async fn route_streaming(
     let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     let est_tokens = transform::estimated_request_tokens(body.len());
     let cfg = state.relay_config;
-    let n = route.priority.len();
+    let order = ordered_priority(route, rand_start());
+    let n = order.len();
 
-    for (i, backend) in route.priority.iter().enumerate() {
-        let is_last = i + 1 == n;
+    for (pos, &idx) in order.iter().enumerate() {
+        let backend = &route.priority[idx];
+        let is_last = pos + 1 == n;
         let now = now_ms();
         if state
             .health
-            .is_exhausted(&backend.name, &backend.model, now)
+            .is_exhausted(&backend.identity(), &backend.model, now)
         {
             state
                 .metrics
@@ -239,7 +294,9 @@ pub async fn route_streaming(
                     let (kind, reason) = classify_response(resp.status, &resp.body);
                     match kind {
                         FailKind::Serve => {
-                            state.health.record_success(&backend.name, &backend.model);
+                            state
+                                .health
+                                .record_success(&backend.identity(), &backend.model);
                             finalize_success(
                                 &state,
                                 &identity,
@@ -272,7 +329,7 @@ pub async fn route_streaming(
                         FailKind::Exhausted => {
                             let until = parse_reset_from_body(&resp.body, now);
                             state.health.mark_exhausted(
-                                &backend.name,
+                                &backend.identity(),
                                 &backend.model,
                                 &reason,
                                 until,
@@ -300,9 +357,13 @@ pub async fn route_streaming(
                 let (kind, reason) = classify_response(status, &bytes);
                 if kind == FailKind::Exhausted {
                     let until = parse_reset_from_body(&bytes, now);
-                    state
-                        .health
-                        .mark_exhausted(&backend.name, &backend.model, &reason, until, now);
+                    state.health.mark_exhausted(
+                        &backend.identity(),
+                        &backend.model,
+                        &reason,
+                        until,
+                        now,
+                    );
                     state.metrics.inc_fallthrough(&ident, "exhausted");
                 } else {
                     state.metrics.inc_fallthrough(&ident, "soft_fail");
@@ -372,7 +433,9 @@ pub async fn route_streaming(
         };
 
         if let Some(body) = commit {
-            state.health.record_success(&backend.name, &backend.model);
+            state
+                .health
+                .record_success(&backend.identity(), &backend.model);
             state.set_resolved(&route.name, &ident);
             state.metrics.inc_request(&route.name, &ident, "ok_stream");
             state.metrics.add_tokens_saved(&ident, (saved / 4) as u64);
@@ -398,7 +461,7 @@ fn note_stream_fallthrough<S: relay::StreamSink>(
     match peek {
         Peek::Empty => {
             state.health.mark_soft_cooldown(
-                &backend.name,
+                ident,
                 &backend.model,
                 "stream empty completion",
                 base,
@@ -408,7 +471,7 @@ fn note_stream_fallthrough<S: relay::StreamSink>(
         }
         Peek::TimedOut => {
             state.health.mark_soft_cooldown(
-                &backend.name,
+                ident,
                 &backend.model,
                 "stream first byte timeout",
                 base,
@@ -609,5 +672,107 @@ fn parse_usage(body: &[u8]) -> Usage {
             .and_then(|u| u.get("completion_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or(0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use superzej_core::proxy::creds::{CredPool, KeyStrategy};
+    use superzej_core::proxy::ratelimit::RatePolicy;
+
+    fn lane(name: &str, key_id: &str, pool: Option<Arc<CredPool>>) -> Backend {
+        Backend {
+            name: name.into(),
+            key_id: key_id.into(),
+            base_url: "http://x".into(),
+            model: "m".into(),
+            api_key: "k".into(),
+            anthropic: false,
+            context_limit: 0,
+            defaults: serde_json::Map::new(),
+            rate: RatePolicy {
+                rpm: 60.0,
+                burst: 5.0,
+            },
+            inflight_cap: 0,
+            pool,
+        }
+    }
+
+    fn route_with(priority: Vec<Backend>) -> Route {
+        Route {
+            name: "standard".into(),
+            priority,
+        }
+    }
+
+    #[test]
+    fn non_pool_backends_keep_natural_order() {
+        let route = route_with(vec![lane("a", "", None), lane("b", "", None)]);
+        assert_eq!(ordered_priority(&route, 0), vec![0, 1]);
+    }
+
+    #[test]
+    fn round_robin_advances_first_choice() {
+        let pool = Arc::new(CredPool::new(KeyStrategy::RoundRobin, vec![]));
+        let route = route_with(vec![
+            lane("p", "#0", Some(pool.clone())),
+            lane("p", "#1", Some(pool.clone())),
+            lane("p", "#2", Some(pool.clone())),
+        ]);
+        assert_eq!(ordered_priority(&route, 0), vec![0, 1, 2]);
+        assert_eq!(ordered_priority(&route, 0), vec![1, 2, 0]);
+        assert_eq!(ordered_priority(&route, 0), vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn failover_is_natural_within_group() {
+        let pool = Arc::new(CredPool::new(KeyStrategy::Failover, vec![]));
+        let route = route_with(vec![
+            lane("p", "#0", Some(pool.clone())),
+            lane("p", "#1", Some(pool.clone())),
+        ]);
+        assert_eq!(ordered_priority(&route, 0), vec![0, 1]);
+        assert_eq!(ordered_priority(&route, 0), vec![0, 1]);
+    }
+
+    #[test]
+    fn pool_group_then_singleton_keeps_tail_position() {
+        let pool = Arc::new(CredPool::new(KeyStrategy::RoundRobin, vec![]));
+        // Two pooled lanes followed by a distinct fallback backend.
+        let route = route_with(vec![
+            lane("p", "#0", Some(pool.clone())),
+            lane("p", "#1", Some(pool.clone())),
+            lane("fallback", "", None),
+        ]);
+        // First request: pool natural [0,1], then the fallback at index 2.
+        assert_eq!(ordered_priority(&route, 0), vec![0, 1, 2]);
+        // Second: pool rotates to [1,0], fallback still last.
+        assert_eq!(ordered_priority(&route, 0), vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn weighted_biases_first_choice() {
+        let pool = Arc::new(CredPool::new(KeyStrategy::Weighted, vec![3, 1]));
+        let route = route_with(vec![
+            lane("p", "#0", Some(pool.clone())),
+            lane("p", "#1", Some(pool.clone())),
+        ]);
+        // Over 4 requests, lane 0 (weight 3) leads 3×.
+        let firsts: Vec<usize> = (0..4).map(|_| ordered_priority(&route, 0)[0]).collect();
+        assert_eq!(firsts.iter().filter(|&&x| x == 0).count(), 3);
+    }
+
+    #[test]
+    fn random_uses_seed() {
+        let pool = Arc::new(CredPool::new(KeyStrategy::Random, vec![]));
+        let route = route_with(vec![
+            lane("p", "#0", Some(pool.clone())),
+            lane("p", "#1", Some(pool.clone())),
+            lane("p", "#2", Some(pool.clone())),
+        ]);
+        // seed 2 → start at index 2.
+        assert_eq!(ordered_priority(&route, 2), vec![2, 0, 1]);
     }
 }
