@@ -1186,6 +1186,13 @@ pub(crate) fn spawn_issue_cache_refresh(
 /// worktree, pushes `RefreshKind::Model` and pulses the waker so the loop
 /// rehydrates the diff panel promptly. The previous watcher (if any) is dropped,
 /// which unregisters its watch.
+/// True when `p` lies inside a `.git` directory (any path component is
+/// `.git`) — used to filter the recursive worktree watcher so git's own
+/// metadata churn doesn't drive a refresh loop.
+fn in_dot_git(p: &std::path::Path) -> bool {
+    p.components().any(|c| c.as_os_str() == ".git")
+}
+
 pub(crate) fn retarget_diff_watcher(
     session: &crate::session::Session,
     watched: &mut Option<std::path::PathBuf>,
@@ -1228,6 +1235,16 @@ pub(crate) fn retarget_diff_watcher(
                         | notify::EventKind::Create(_)
                         | notify::EventKind::Remove(_)
                 )
+                // Ignore churn confined to `.git/` (index stat-cache rewrites,
+                // lock files, ref/object updates). Hydration's own `git` reads
+                // rewrite `.git/index`, so reacting to them creates a
+                // self-sustaining ~2 Hz refresh loop — each iteration ~1s of
+                // git work, which pins CPU and feels like a freeze. The diffs
+                // this watcher exists to track are real worktree edits, which
+                // live OUTSIDE `.git`; git-state changes (commits, branch
+                // moves) are covered by the 2s safety-net tick and by the
+                // explicit refresh the mutation runner fires after each op.
+                && (ev.paths.is_empty() || ev.paths.iter().any(|p| !in_dot_git(p)))
                 && last_send.elapsed() > Duration::from_millis(500)
             {
                 if tx.send(RefreshKind::Model).is_ok() {
