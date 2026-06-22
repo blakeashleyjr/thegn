@@ -9650,7 +9650,8 @@ async fn event_loop<T: Terminal>(
                     let mut handled = true;
                     if let Some(fp) = panel_ui.file_preview.as_mut() {
                         match k.key {
-                            KeyCode::Escape => {
+                            // esc or q closes (q for pager muscle memory).
+                            KeyCode::Escape | KeyCode::Char('q') => {
                                 panel_ui.file_preview = None;
                             }
                             KeyCode::Char('j') | KeyCode::DownArrow => fp.scroll_by(1, viewport),
@@ -10110,8 +10111,10 @@ async fn event_loop<T: Terminal>(
                                                         &entry.path,
                                                     );
                                                 } else {
-                                                    // Expand to full so the file gets the
-                                                    // whole pane, then read it off-thread.
+                                                    // Show the file inline. Default to the
+                                                    // half view (not full): widen a resting
+                                                    // Normal panel to Half, but leave an
+                                                    // already-wider panel as the user set it.
                                                     let abs =
                                                         active_tab_path(&session).join(&entry.path);
                                                     panel_ui.file_preview =
@@ -10119,10 +10122,10 @@ async fn event_loop<T: Terminal>(
                                                             entry.path.clone(),
                                                         ));
                                                     if panel_ui.width
-                                                        != crate::layout::PanelWidth::Full
+                                                        == crate::layout::PanelWidth::Normal
                                                     {
                                                         panel_ui.width =
-                                                            crate::layout::PanelWidth::Full;
+                                                            crate::layout::PanelWidth::Half;
                                                         need_relayout = true;
                                                     }
                                                     spawn_file_preview_fetch(

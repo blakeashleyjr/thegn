@@ -1166,7 +1166,7 @@ mod spec {
         let out = text(&content(Section::Files, &ctx));
         // Header names the file; the close hint is present.
         assert!(out.contains("src/main.rs"), "{out}");
-        assert!(out.contains("esc close"), "{out}");
+        assert!(out.contains("esc/q close"), "{out}");
         // Scrolled to line 10 (0-based) → the first body line is "11 …".
         assert!(out.contains("code line 10"), "{out}");
         assert!(out.contains("11"), "line numbers shown: {out}");
