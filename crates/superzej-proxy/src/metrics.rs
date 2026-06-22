@@ -13,6 +13,7 @@ pub struct Metrics {
     fallthroughs: Mutex<BTreeMap<String, u64>>,
     tokens: Mutex<BTreeMap<String, u64>>,
     cost_micros: Mutex<BTreeMap<String, u64>>, // USD * 1e6 to stay integer
+    tokens_saved: Mutex<BTreeMap<String, u64>>,
 }
 
 fn bump(map: &Mutex<BTreeMap<String, u64>>, label: String, by: u64) {
@@ -68,6 +69,13 @@ impl Metrics {
         }
     }
 
+    /// Records estimated tokens removed by in-flight compression (group W).
+    pub fn add_tokens_saved(&self, backend: &str, n: u64) {
+        if n > 0 {
+            bump(&self.tokens_saved, format!("backend=\"{backend}\""), n);
+        }
+    }
+
     /// Renders all families in Prometheus text exposition format.
     pub fn render(&self) -> String {
         let mut out = String::new();
@@ -105,6 +113,13 @@ impl Metrics {
             "Estimated spend in USD.",
             &self.cost_micros,
             1e-6,
+        );
+        render_counter(
+            &mut out,
+            "model_proxy_tokens_saved_total",
+            "Estimated tokens removed by in-flight compression.",
+            &self.tokens_saved,
+            1.0,
         );
         out
     }

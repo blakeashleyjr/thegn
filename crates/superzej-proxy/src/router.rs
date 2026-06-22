@@ -112,7 +112,7 @@ pub async fn route_nonstreaming(
             continue;
         }
 
-        let backend_body = apply_transforms(backend, &parsed, body);
+        let (backend_body, saved) = apply_transforms(backend, &state.compression, &parsed, body);
         state.inflight.enter(&ident);
         let attempt = upstream::call_backend(&state.client, backend, &backend_body).await;
         state.inflight.leave(&ident);
@@ -135,6 +135,7 @@ pub async fn route_nonstreaming(
                 state.health.record_success(&backend.name, &backend.model);
                 state.metrics.inc_backend_attempt(&ident, "ok");
                 state.metrics.inc_request(&route.name, &ident, "ok");
+                state.metrics.add_tokens_saved(&ident, (saved / 4) as u64);
                 finalize_success(state, identity, protocol, route, backend, &resp.body);
                 return RouteResult {
                     status: resp.status,
@@ -228,7 +229,7 @@ pub async fn route_streaming(
                 .try_acquire(&ident, backend.rate, Instant::now());
         }
 
-        let backend_body = apply_transforms(backend, &parsed, body);
+        let (backend_body, saved) = apply_transforms(backend, &state.compression, &parsed, body);
 
         if backend.anthropic {
             // Rare: an Anthropic-surface backend in streaming mode — buffer then
@@ -248,6 +249,7 @@ pub async fn route_streaming(
                                 &resp.body,
                             );
                             state.metrics.inc_request(&route.name, &ident, "ok");
+                            state.metrics.add_tokens_saved(&ident, (saved / 4) as u64);
                             let sse = match surface {
                                 Surface::OpenAi => {
                                     superzej_core::proxy::bridge::openai_completion_to_stream(
@@ -373,6 +375,7 @@ pub async fn route_streaming(
             state.health.record_success(&backend.name, &backend.model);
             state.set_resolved(&route.name, &ident);
             state.metrics.inc_request(&route.name, &ident, "ok_stream");
+            state.metrics.add_tokens_saved(&ident, (saved / 4) as u64);
             return StreamOutcome::Body(body);
         }
     }
@@ -492,16 +495,27 @@ fn synthesize_anthropic_sse(completion: &[u8], client_model: &str, input_est: u6
     out
 }
 
-/// Applies the per-backend body transforms (min max_tokens, injected defaults)
-/// and re-serializes. Falls back to the original bytes on any parse failure.
-fn apply_transforms(backend: &Backend, parsed: &Value, original: &[u8]) -> Vec<u8> {
+/// Applies the per-backend body transforms (min max_tokens, injected defaults,
+/// in-flight tool-output compression) and re-serializes. Returns the dispatch
+/// body and the number of characters token-reduction removed (0 when disabled).
+/// Falls back to the original bytes on any parse failure.
+fn apply_transforms(
+    backend: &Backend,
+    compression: &transform::CompressPolicy,
+    parsed: &Value,
+    original: &[u8],
+) -> (Vec<u8>, usize) {
     let mut body = parsed.clone();
     if body.is_object() {
         transform::ensure_max_tokens(&mut body);
         transform::apply_backend_defaults(&mut body, &backend.defaults);
-        serde_json::to_vec(&body).unwrap_or_else(|_| original.to_vec())
+        let saved = transform::compress_tool_messages(&mut body, compression);
+        (
+            serde_json::to_vec(&body).unwrap_or_else(|_| original.to_vec()),
+            saved,
+        )
     } else {
-        original.to_vec()
+        (original.to_vec(), 0)
     }
 }
 

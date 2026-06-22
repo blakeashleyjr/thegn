@@ -206,6 +206,19 @@ config_enum! {
     } default = Sequential;
 }
 
+config_enum! {
+    /// Token-reduction aggressiveness for in-flight tool-output compression
+    /// (group W). `conservative` is lossless-ish (ANSI/progress/blank-line
+    /// cleanup); higher levels add repeated-line/JSON/whitespace folding and
+    /// head/tail truncation.
+    pub enum CompressionLevel: "compression level" {
+        Off = "off" | "none",
+        Conservative = "conservative",
+        Balanced = "balanced",
+        Aggressive = "aggressive",
+    } default = Conservative;
+}
+
 /// `[llm_proxy]` — the AI-traffic chokepoint daemon (`szproxy`). The shell never
 /// hard-depends on this; AI is strictly additive, so the default is disabled.
 /// When `enabled`, the host launches `szproxy` as a pinned daemon and agents
@@ -233,6 +246,11 @@ pub struct LlmProxyConfig {
     pub idle_timeout_secs: u64,
     /// Streaming: keep-alive cadence (seconds) emitted during upstream silence.
     pub heartbeat_secs: u64,
+    /// In-flight token reduction: compress noisy `tool` output before it's sent
+    /// upstream (group W). Off by default — AI transforms are opt-in.
+    pub token_reduction: bool,
+    /// Aggressiveness when `token_reduction` is on.
+    pub token_reduction_level: CompressionLevel,
 }
 
 impl Default for LlmProxyConfig {
@@ -246,6 +264,8 @@ impl Default for LlmProxyConfig {
             first_byte_timeout_secs: 45,
             idle_timeout_secs: 120,
             heartbeat_secs: 10,
+            token_reduction: false,
+            token_reduction_level: CompressionLevel::default(),
         }
     }
 }
@@ -275,6 +295,14 @@ impl LlmProxyConfig {
         env.insert(
             "SZPROXY_STREAM_HEARTBEAT_INTERVAL".to_string(),
             self.heartbeat_secs.to_string(),
+        );
+        env.insert(
+            "SZPROXY_COMPRESS".to_string(),
+            if self.token_reduction { "1" } else { "0" }.to_string(),
+        );
+        env.insert(
+            "SZPROXY_COMPRESS_LEVEL".to_string(),
+            self.token_reduction_level.as_str().to_string(),
         );
         Some(("szproxy".to_string(), Vec::new(), env))
     }

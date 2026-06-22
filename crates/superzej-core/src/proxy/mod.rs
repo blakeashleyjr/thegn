@@ -14,6 +14,7 @@
 pub mod backoff;
 pub mod bridge;
 pub mod classify;
+pub mod compress;
 pub mod cost;
 pub mod creds;
 pub mod ratelimit;

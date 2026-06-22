@@ -71,6 +71,8 @@ pub struct ProxyConfig {
     pub routes: Vec<Route>,
     /// Streaming relay tunables (TTFB / idle / heartbeat).
     pub relay: crate::relay::RelayConfig,
+    /// In-flight token-reduction policy (group W).
+    pub compression: superzej_core::proxy::transform::CompressPolicy,
 }
 
 impl ProxyConfig {

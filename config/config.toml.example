@@ -722,3 +722,10 @@ config_path = ""
 first_byte_timeout_secs = 45
 idle_timeout_secs = 120
 heartbeat_secs = 10
+# In-flight token reduction: compress noisy tool/command output before it's sent
+# upstream (strip ANSI, fold progress redraws, collapse blank/repeated lines, and
+# at higher levels minify JSON / truncate huge blocks). Off by default — only
+# `tool`-role content is touched, never the system prompt, so prompt caching
+# holds. Levels: off | conservative | balanced | aggressive.
+token_reduction = false
+token_reduction_level = "conservative"

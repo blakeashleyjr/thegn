@@ -10,9 +10,12 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Map, Value};
+use superzej_core::proxy::compress::{Level, Limits};
 use superzej_core::proxy::ratelimit::RatePolicy;
+use superzej_core::proxy::transform::CompressPolicy;
 
 use crate::model::{Backend, ProxyConfig, Route};
 use crate::relay::RelayConfig;
@@ -21,6 +24,34 @@ use crate::relay::RelayConfig;
 struct ConfigDoc {
     #[serde(default)]
     routes: Vec<RouteDoc>,
+    /// Optional token-reduction settings (group W).
+    #[serde(default)]
+    compression: Option<CompressionDoc>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CompressionDoc {
+    /// "off" | "conservative" | "balanced" | "aggressive". Env overrides this.
+    #[serde(default)]
+    level: Option<String>,
+    #[serde(default)]
+    bypass_tools: Vec<String>,
+    #[serde(default)]
+    only_tools: Option<Vec<String>>,
+    #[serde(default)]
+    filters: Vec<FilterDoc>,
+    #[serde(default)]
+    max_block_chars: Option<usize>,
+    #[serde(default)]
+    keep_head: Option<usize>,
+    #[serde(default)]
+    keep_tail: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FilterDoc {
+    pattern: String,
+    replacement: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,12 +95,74 @@ fn default_listen() -> SocketAddr {
 pub fn from_env() -> Result<ProxyConfig> {
     let listen = resolve_listen()?;
     let doc = load_doc()?;
+    let compression = resolve_compression(doc.as_ref().and_then(|d| d.compression.as_ref()), true);
     let routes = doc.map(build_routes).transpose()?.unwrap_or_default();
     Ok(ProxyConfig {
         listen,
         routes,
         relay: relay_from_env(),
+        compression,
     })
+}
+
+/// Builds the token-reduction policy. The effective level is: env
+/// `SZPROXY_COMPRESS_LEVEL` (when `read_env`) → routes-doc `level` → `Off`; an
+/// explicit `SZPROXY_COMPRESS=0` forces it off. Bypass list, allow-list, custom
+/// filters, and truncation limits come from the routes doc.
+fn resolve_compression(doc: Option<&CompressionDoc>, read_env: bool) -> CompressPolicy {
+    // Resolve level.
+    let mut level = doc
+        .and_then(|d| d.level.as_deref())
+        .map(Level::parse)
+        .unwrap_or(Level::Off);
+    if read_env {
+        if let Ok(v) = std::env::var("SZPROXY_COMPRESS_LEVEL")
+            .or_else(|_| std::env::var("MODEL_PROXY_COMPRESS_LEVEL"))
+        {
+            level = Level::parse(&v);
+        }
+        match std::env::var("SZPROXY_COMPRESS").ok().as_deref() {
+            Some("0") | Some("false") | Some("off") | Some("no") => level = Level::Off,
+            Some(_)
+                if doc.and_then(|d| d.level.as_deref()).is_none()
+                    && std::env::var("SZPROXY_COMPRESS_LEVEL").is_err() =>
+            {
+                // SZPROXY_COMPRESS=1 with no explicit level → default conservative.
+                level = Level::Conservative;
+            }
+            _ => {}
+        }
+    }
+    let limits = Limits {
+        max_block_chars: doc
+            .and_then(|d| d.max_block_chars)
+            .unwrap_or(Limits::default().max_block_chars),
+        keep_head: doc
+            .and_then(|d| d.keep_head)
+            .unwrap_or(Limits::default().keep_head),
+        keep_tail: doc
+            .and_then(|d| d.keep_tail)
+            .unwrap_or(Limits::default().keep_tail),
+    };
+    let filters = doc
+        .map(|d| {
+            d.filters
+                .iter()
+                .filter_map(|f| {
+                    Regex::new(&f.pattern)
+                        .ok()
+                        .map(|re| (re, f.replacement.clone()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    CompressPolicy {
+        level,
+        limits,
+        bypass_tools: doc.map(|d| d.bypass_tools.clone()).unwrap_or_default(),
+        only_tools: doc.and_then(|d| d.only_tools.clone()),
+        filters,
+    }
 }
 
 /// Resolves the relay tunables from env, honoring the Go-compatible
@@ -139,10 +232,12 @@ fn load_doc() -> Result<Option<ConfigDoc>> {
 /// Parses a routes document (JSON), public for tests and config validation.
 pub fn parse_config(raw: &str) -> Result<ProxyConfig> {
     let doc = parse_doc(raw)?;
+    let compression = resolve_compression(doc.compression.as_ref(), false);
     Ok(ProxyConfig {
         listen: default_listen(),
         routes: build_routes(doc)?,
         relay: RelayConfig::default(),
+        compression,
     })
 }
 

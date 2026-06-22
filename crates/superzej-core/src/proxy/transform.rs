@@ -6,7 +6,12 @@
 //! Rust proxy parses the body once into a [`serde_json::Value`] and applies these
 //! transforms in place, re-serializing at dispatch.
 
+use std::collections::HashMap;
+
+use regex::Regex;
 use serde_json::{Map, Value, json};
+
+use crate::proxy::compress::{Level, Limits, compress};
 
 /// Minimum `max_tokens` the proxy will send. DeepSeek and others default to a
 /// tiny limit (4096) that truncates tool calls, so a missing or too-small value
@@ -115,6 +120,139 @@ fn positive_int(v: &Value) -> Option<i64> {
     }
 }
 
+// ── In-flight tool-output compression (group W) ─────────────────────────────
+
+/// Policy controlling tool-output token reduction. Built by the proxy from
+/// config; pure data so the transform stays testable.
+#[derive(Debug, Default, Clone)]
+pub struct CompressPolicy {
+    pub level: Level,
+    pub limits: Limits,
+    /// Tool names never compressed (per-command bypass, W 304).
+    pub bypass_tools: Vec<String>,
+    /// If set, ONLY these tool names are compressed (e.g. route file-reads
+    /// through it, W 305).
+    pub only_tools: Option<Vec<String>>,
+    /// Custom pre-filters applied before compression (W 308): each regex match
+    /// is replaced by its paired string.
+    pub filters: Vec<(Regex, String)>,
+}
+
+impl CompressPolicy {
+    /// A disabled policy (no compression).
+    pub fn off() -> Self {
+        Self {
+            level: Level::Off,
+            ..Default::default()
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.level != Level::Off
+    }
+
+    /// Whether a tool message with the given (resolved) tool name should be
+    /// compressed under this policy.
+    fn should_compress(&self, tool_name: Option<&str>) -> bool {
+        match tool_name {
+            Some(name) => {
+                if self.bypass_tools.iter().any(|b| b == name) {
+                    return false;
+                }
+                match &self.only_tools {
+                    Some(only) => only.iter().any(|o| o == name),
+                    None => true,
+                }
+            }
+            // Unknown tool name: compress unless an allow-list is in force.
+            None => self.only_tools.is_none(),
+        }
+    }
+}
+
+/// Applies a policy's custom regex filters to a string, in order.
+fn apply_filters(s: &str, filters: &[(Regex, String)]) -> String {
+    let mut out = s.to_string();
+    for (re, rep) in filters {
+        out = re.replace_all(&out, rep.as_str()).into_owned();
+    }
+    out
+}
+
+/// Compresses the content of `role == "tool"` messages in place, returning the
+/// total characters removed. Only tool messages are touched — the system prompt,
+/// tool definitions, and assistant turns (the cacheable prefix) are left
+/// byte-identical. Mirrors the pure-transform style of the rest of this module.
+pub fn compress_tool_messages(body: &mut Value, policy: &CompressPolicy) -> usize {
+    if !policy.enabled() {
+        return 0;
+    }
+    // First pass (immutable): map tool_call_id → tool name from assistant turns,
+    // so bypass/allow-list decisions can key off the originating command.
+    let mut name_by_id: HashMap<String, String> = HashMap::new();
+    if let Some(messages) = body.get("messages").and_then(Value::as_array) {
+        for m in messages {
+            if m.get("role").and_then(Value::as_str) != Some("assistant") {
+                continue;
+            }
+            if let Some(tcs) = m.get("tool_calls").and_then(Value::as_array) {
+                for tc in tcs {
+                    if let (Some(id), Some(name)) = (
+                        tc.get("id").and_then(Value::as_str),
+                        tc.get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(Value::as_str),
+                    ) {
+                        name_by_id.insert(id.to_string(), name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let mut saved = 0usize;
+    for m in messages.iter_mut() {
+        if m.get("role").and_then(Value::as_str) != Some("tool") {
+            continue;
+        }
+        let tool_name = m
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .and_then(|id| name_by_id.get(id))
+            .map(String::as_str);
+        if !policy.should_compress(tool_name) {
+            continue;
+        }
+        match m.get_mut("content") {
+            Some(Value::String(s)) => {
+                saved += compress_in_place(s, policy);
+            }
+            Some(Value::Array(parts)) => {
+                for part in parts.iter_mut() {
+                    if let Some(Value::String(t)) = part.get_mut("text") {
+                        saved += compress_in_place(t, policy);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    saved
+}
+
+/// Filters then compresses a single content string in place, returning chars saved.
+fn compress_in_place(s: &mut String, policy: &CompressPolicy) -> usize {
+    let original = s.chars().count();
+    let filtered = apply_filters(s, &policy.filters);
+    let result = compress(&filtered, policy.level, policy.limits);
+    let saved = original.saturating_sub(result.text.chars().count());
+    *s = result.text;
+    saved
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,5 +356,102 @@ mod tests {
         let mut b = json!({"stream_options": "weird"});
         ensure_stream_usage(&mut b);
         assert_eq!(b["stream_options"]["include_usage"], json!(true));
+    }
+
+    fn balanced_policy() -> CompressPolicy {
+        CompressPolicy {
+            level: Level::Balanced,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn compresses_tool_content_only() {
+        let mut b = json!({
+            "messages": [
+                {"role": "system", "content": "sys  with  spaces"},
+                {"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "bash"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "\u{1b}[31mERR\u{1b}[0m\n\n\n\n\nout"},
+            ]
+        });
+        let saved = compress_tool_messages(&mut b, &balanced_policy());
+        assert!(saved > 0);
+        // Tool content compressed (ANSI gone, blanks collapsed).
+        assert_eq!(b["messages"][2]["content"], json!("ERR\n\nout"));
+        // System prompt left byte-identical (cacheable prefix untouched).
+        assert_eq!(b["messages"][0]["content"], json!("sys  with  spaces"));
+    }
+
+    #[test]
+    fn disabled_policy_is_noop() {
+        let mut b = json!({"messages": [{"role": "tool", "tool_call_id": "x", "content": "\u{1b}[31mhi\u{1b}[0m"}]});
+        let before = b.clone();
+        assert_eq!(compress_tool_messages(&mut b, &CompressPolicy::off()), 0);
+        assert_eq!(b, before);
+    }
+
+    #[test]
+    fn bypass_tool_passes_through() {
+        let mut b = json!({
+            "messages": [
+                {"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "read_file"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "\u{1b}[31mkeep\u{1b}[0m"},
+            ]
+        });
+        let policy = CompressPolicy {
+            level: Level::Conservative,
+            bypass_tools: vec!["read_file".into()],
+            ..Default::default()
+        };
+        assert_eq!(compress_tool_messages(&mut b, &policy), 0);
+        assert_eq!(
+            b["messages"][1]["content"],
+            json!("\u{1b}[31mkeep\u{1b}[0m")
+        );
+    }
+
+    #[test]
+    fn only_tools_allow_list() {
+        let mut b = json!({
+            "messages": [
+                {"role": "assistant", "tool_calls": [
+                    {"id": "a", "function": {"name": "bash"}},
+                    {"id": "b", "function": {"name": "grep"}}
+                ]},
+                {"role": "tool", "tool_call_id": "a", "content": "x  y"},
+                {"role": "tool", "tool_call_id": "b", "content": "x  y"},
+            ]
+        });
+        let policy = CompressPolicy {
+            level: Level::Aggressive,
+            only_tools: Some(vec!["bash".into()]),
+            ..Default::default()
+        };
+        compress_tool_messages(&mut b, &policy);
+        assert_eq!(b["messages"][1]["content"], json!("x y")); // bash compressed
+        assert_eq!(b["messages"][2]["content"], json!("x  y")); // grep untouched
+    }
+
+    #[test]
+    fn custom_filter_applied_before_compression() {
+        let mut b = json!({"messages": [{"role": "tool", "tool_call_id": "x", "content": "SECRET=abc123 done"}]});
+        let policy = CompressPolicy {
+            level: Level::Conservative,
+            filters: vec![(Regex::new(r"SECRET=\S+").unwrap(), "SECRET=***".into())],
+            ..Default::default()
+        };
+        compress_tool_messages(&mut b, &policy);
+        assert_eq!(b["messages"][0]["content"], json!("SECRET=*** done"));
+    }
+
+    #[test]
+    fn compresses_array_content_text_parts() {
+        let mut b = json!({
+            "messages": [{"role": "tool", "tool_call_id": "x", "content": [
+                {"type": "text", "text": "a\n\n\n\n\nb"}
+            ]}]
+        });
+        compress_tool_messages(&mut b, &balanced_policy());
+        assert_eq!(b["messages"][0]["content"][0]["text"], json!("a\n\nb"));
     }
 }
