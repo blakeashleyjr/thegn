@@ -2019,7 +2019,6 @@ mod tests {
 
     #[test]
     fn mount_parsing() {
-        let _home_guard = crate::HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = std::env::var("HOME").unwrap_or_default();
         assert_eq!(
             parse_mount("~/.gitconfig:ro"),
@@ -2088,7 +2087,6 @@ mod tests {
         // a cfg.mounts entry for a child path (e.g. ~/.gitconfig) must be dropped.
         // Keeping it causes bwrap "Can't create file" because bwrap cannot create a
         // file mount-point inside an already-mounted parent directory.
-        let _home_guard = crate::HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = std::env::var("HOME").unwrap_or_default();
         if home.is_empty() {
             return; // can't test without $HOME
@@ -2118,7 +2116,6 @@ mod tests {
         // For OCI backends, host_toolchain_mounts() contributes only paths that
         // exist on the current host — verify that invariant holds by checking
         // any mount whose host path is NOT the synthetic worktree path.
-        let _home_guard = crate::HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let cfg = crate::config::SandboxConfig {
             file_access: crate::config::FileAccess::WorktreePlusCaches,
             auto_caches: true,

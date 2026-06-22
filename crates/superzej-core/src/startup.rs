@@ -35,11 +35,17 @@ pub fn run_checks() {
         Ok(h) if !h.is_empty() => PathBuf::from(h),
         _ => return,
     };
+    run_checks_in(&home);
+}
 
+/// The masked-path checks against an explicit `home`. Split out so tests can
+/// exercise the real behaviour without mutating the process-global `HOME` (a
+/// parallel-test data race against everything that reads `HOME`).
+fn run_checks_in(home: &Path) {
     for rel in MASKED_PATHS {
         let path = home.join(rel);
         if is_sandbox_mask(&path) {
-            repair_mask(&path, &home, rel);
+            repair_mask(&path, home, rel);
         }
     }
 }
@@ -132,10 +138,6 @@ fn repair_gitconfig(gitconfig: &Path, home: &Path) {
 mod tests {
     use super::*;
     use std::fs;
-
-    // Serialises HOME mutation against sandbox tests that read HOME — shared
-    // crate-wide so readers in other modules lock the SAME mutex.
-    use crate::HOME_LOCK;
 
     /// Create a unique temp directory for each test — avoids cross-test
     /// interference without requiring the `tempfile` crate.
@@ -254,31 +256,13 @@ mod tests {
         let gitconfig = home.join(".gitconfig");
         fs::create_dir(&gitconfig).unwrap();
 
-        // Hold the lock for the entire HOME-mutation window so that the
-        // sandbox test, which reads HOME to build toolchain mounts, never
-        // sees a temp path that's about to be deleted.
-        let _guard = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Drive the real check against an explicit home — no global `HOME`
+        // mutation, so this can't race the many tests that read `HOME`.
+        run_checks_in(&home);
 
-        let original_home = std::env::var("HOME").ok();
-        // SAFETY: test-only mutation, protected by HOME_LOCK above.
-        unsafe { std::env::set_var("HOME", &home) };
-
-        run_checks();
-
-        // Assert before cleanup: the symlink must exist while the temp home dir
-        // is still on disk.
         let meta = fs::symlink_metadata(&gitconfig).unwrap();
         assert!(meta.file_type().is_symlink());
-
-        // Restore HOME and remove temp dir while still holding the lock so no
-        // concurrent reader can observe a HOME pointing at a deleted path.
-        if let Some(h) = original_home {
-            unsafe { std::env::set_var("HOME", h) };
-        } else {
-            unsafe { std::env::remove_var("HOME") };
-        }
         let _ = fs::remove_dir_all(&home);
-        drop(_guard); // HOME is restored and temp dir is gone
     }
 
     #[test]
@@ -324,44 +308,17 @@ mod tests {
     }
 
     #[test]
-    fn run_checks_is_noop_when_home_empty() {
-        let _guard = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let original_home = std::env::var("HOME").ok();
-        // An empty HOME triggers the early return; no panic, no work done.
-        // SAFETY: test-only mutation, protected by HOME_LOCK.
-        unsafe { std::env::set_var("HOME", "") };
-        run_checks();
-        // Also exercise the fully-unset path.
-        unsafe { std::env::remove_var("HOME") };
-        run_checks();
-        if let Some(h) = original_home {
-            unsafe { std::env::set_var("HOME", h) };
-        }
-        drop(_guard);
-    }
-
-    #[test]
     fn run_checks_skips_when_no_mask_present() {
-        // HOME points at a dir where ~/.gitconfig is a real file (not a mask):
-        // run_checks must leave it untouched.
+        // A home where ~/.gitconfig is a real file (not a mask): run_checks_in
+        // must leave it untouched. No global HOME mutation (see above).
         let home = tmp_home("no-mask");
         let gitconfig = home.join(".gitconfig");
         fs::write(&gitconfig, b"[user]\n\tname = Real\n").unwrap();
 
-        let _guard = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let original_home = std::env::var("HOME").ok();
-        // SAFETY: test-only mutation, protected by HOME_LOCK.
-        unsafe { std::env::set_var("HOME", &home) };
-        run_checks();
+        run_checks_in(&home);
         // Still a regular file with its original contents.
         let content = fs::read_to_string(&gitconfig).unwrap();
         assert!(content.contains("Real"));
-        if let Some(h) = original_home {
-            unsafe { std::env::set_var("HOME", h) };
-        } else {
-            unsafe { std::env::remove_var("HOME") };
-        }
         let _ = fs::remove_dir_all(&home);
-        drop(_guard);
     }
 }
