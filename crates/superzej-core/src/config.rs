@@ -304,6 +304,10 @@ impl LlmProxyConfig {
             "SZPROXY_COMPRESS_LEVEL".to_string(),
             self.token_reduction_level.as_str().to_string(),
         );
+        env.insert(
+            "SZPROXY_ROUTING".to_string(),
+            self.routing.as_str().to_string(),
+        );
         Some(("szproxy".to_string(), Vec::new(), env))
     }
 }

@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Map, Value};
+use superzej_core::config::RoutingStrategy;
 use superzej_core::proxy::compress::{Level, Limits};
 use superzej_core::proxy::creds::{CredPool, KeyStrategy};
 use superzej_core::proxy::ratelimit::RatePolicy;
@@ -60,6 +61,10 @@ struct RouteDoc {
     name: String,
     #[serde(default)]
     backends: Vec<BackendDoc>,
+    /// `sequential` | `load_balanced` | `speculative`. Falls back to the global
+    /// `SZPROXY_ROUTING` (then `sequential`).
+    #[serde(default)]
+    strategy: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,7 +115,10 @@ pub fn from_env() -> Result<ProxyConfig> {
     let listen = resolve_listen()?;
     let doc = load_doc()?;
     let compression = resolve_compression(doc.as_ref().and_then(|d| d.compression.as_ref()), true);
-    let routes = doc.map(build_routes).transpose()?.unwrap_or_default();
+    let routes = doc
+        .map(|d| build_routes(d, global_routing_from_env()))
+        .transpose()?
+        .unwrap_or_default();
     Ok(ProxyConfig {
         listen,
         routes,
@@ -247,9 +255,11 @@ fn load_doc() -> Result<Option<ConfigDoc>> {
 pub fn parse_config(raw: &str) -> Result<ProxyConfig> {
     let doc = parse_doc(raw)?;
     let compression = resolve_compression(doc.compression.as_ref(), false);
+    // parse_config is env-free (tests/validation): per-route `strategy` still
+    // applies; the global default is sequential.
     Ok(ProxyConfig {
         listen: default_listen(),
-        routes: build_routes(doc)?,
+        routes: build_routes(doc, RoutingStrategy::default())?,
         relay: RelayConfig::default(),
         compression,
     })
@@ -259,19 +269,38 @@ fn parse_doc(raw: &str) -> Result<ConfigDoc> {
     serde_json::from_str(raw).context("parse proxy config JSON")
 }
 
-fn build_routes(doc: ConfigDoc) -> Result<Vec<Route>> {
+fn build_routes(doc: ConfigDoc, global_routing: RoutingStrategy) -> Result<Vec<Route>> {
     let mut routes = Vec::new();
     for r in doc.routes {
         let mut priority = Vec::new();
         for b in r.backends {
             expand_backend(b, &mut priority);
         }
+        // Per-route strategy → global default → sequential.
+        let strategy = r
+            .strategy
+            .as_deref()
+            .and_then(|s| RoutingStrategy::from_str_validated(s).ok())
+            .unwrap_or(global_routing);
+        // LoadBalanced needs a persistent round-robin cursor over the slots.
+        let order_pool = (strategy == RoutingStrategy::LoadBalanced)
+            .then(|| std::sync::Arc::new(CredPool::new(KeyStrategy::RoundRobin, vec![])));
         routes.push(Route {
             name: r.name,
             priority,
+            strategy,
+            order_pool,
         });
     }
     Ok(routes)
+}
+
+/// The global default routing strategy from `SZPROXY_ROUTING` (then sequential).
+fn global_routing_from_env() -> RoutingStrategy {
+    std::env::var("SZPROXY_ROUTING")
+        .ok()
+        .and_then(|s| RoutingStrategy::from_str_validated(&s).ok())
+        .unwrap_or_default()
 }
 
 /// Resolves a backend's API keys and pushes one lane per key onto `priority`.
@@ -417,5 +446,32 @@ mod tests {
         assert_eq!(lanes.len(), 2);
         assert_eq!(lanes[0].api_key, "k0");
         assert_eq!(lanes[1].api_key, "k1");
+    }
+
+    #[test]
+    fn route_strategy_defaults_to_sequential() {
+        let cfg = parse_config(r#"{"routes":[{"name":"standard","backends":[]}]}"#).unwrap();
+        assert_eq!(cfg.routes[0].strategy, RoutingStrategy::Sequential);
+        assert!(cfg.routes[0].order_pool.is_none());
+    }
+
+    #[test]
+    fn per_route_load_balanced_gets_order_pool() {
+        let cfg = parse_config(
+            r#"{"routes":[{"name":"standard","strategy":"load_balanced","backends":[]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.routes[0].strategy, RoutingStrategy::LoadBalanced);
+        assert!(cfg.routes[0].order_pool.is_some());
+    }
+
+    #[test]
+    fn per_route_speculative_has_no_pool() {
+        let cfg = parse_config(
+            r#"{"routes":[{"name":"standard","strategy":"speculative","backends":[]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.routes[0].strategy, RoutingStrategy::Speculative);
+        assert!(cfg.routes[0].order_pool.is_none());
     }
 }

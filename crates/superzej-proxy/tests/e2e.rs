@@ -122,6 +122,8 @@ async fn serves_a_completion() {
     let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
     let routes = vec![Route {
         name: "standard".into(),
+        strategy: superzej_core::config::RoutingStrategy::Sequential,
+        order_pool: None,
         priority: vec![backend("primary", &up)],
     }];
     let proxy = spawn_proxy(routes, db.clone()).await;
@@ -149,6 +151,8 @@ async fn fails_over_past_exhausted_backend() {
     let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
     let routes = vec![Route {
         name: "standard".into(),
+        strategy: superzej_core::config::RoutingStrategy::Sequential,
+        order_pool: None,
         priority: vec![backend("primary", &bad), backend("secondary", &good)],
     }];
     let proxy = spawn_proxy(routes, db).await;
@@ -183,6 +187,8 @@ async fn refuses_when_budget_kill_switch_set() {
         .unwrap();
     let routes = vec![Route {
         name: "standard".into(),
+        strategy: superzej_core::config::RoutingStrategy::Sequential,
+        order_pool: None,
         priority: vec![backend("primary", &up)],
     }];
     let proxy = spawn_proxy(routes, db).await;
@@ -209,6 +215,8 @@ async fn all_backends_failed_returns_503() {
     let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
     let routes = vec![Route {
         name: "standard".into(),
+        strategy: superzej_core::config::RoutingStrategy::Sequential,
+        order_pool: None,
         priority: vec![backend("only", &bad)],
     }];
     let proxy = spawn_proxy(routes, db).await;
@@ -246,6 +254,8 @@ async fn openai_surface_streams_and_reconciles_usage() {
     let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
     let routes = vec![Route {
         name: "standard".into(),
+        strategy: superzej_core::config::RoutingStrategy::Sequential,
+        order_pool: None,
         priority: vec![backend("primary", &up)],
     }];
     let proxy = spawn_proxy(routes, db.clone()).await;
@@ -272,6 +282,8 @@ async fn anthropic_surface_translates_stream_to_events() {
     let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
     let routes = vec![Route {
         name: "standard".into(),
+        strategy: superzej_core::config::RoutingStrategy::Sequential,
+        order_pool: None,
         priority: vec![backend("primary", &up)],
     }];
     let proxy = spawn_proxy(routes, db).await;
@@ -303,6 +315,8 @@ async fn empty_stream_peek_falls_through() {
     let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
     let routes = vec![Route {
         name: "standard".into(),
+        strategy: superzej_core::config::RoutingStrategy::Sequential,
+        order_pool: None,
         priority: vec![backend("empty", &empty), backend("secondary", &good)],
     }];
     let proxy = spawn_proxy(routes, db).await;
@@ -376,6 +390,8 @@ async fn compresses_tool_output_in_flight() {
     let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
     let routes = vec![Route {
         name: "standard".into(),
+        strategy: superzej_core::config::RoutingStrategy::Sequential,
+        order_pool: None,
         priority: vec![backend("primary", &up)],
     }];
     let policy = CompressPolicy {
@@ -435,6 +451,8 @@ async fn compression_disabled_forwards_unchanged() {
     let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
     let routes = vec![Route {
         name: "standard".into(),
+        strategy: superzej_core::config::RoutingStrategy::Sequential,
+        order_pool: None,
         priority: vec![backend("primary", &up)],
     }];
     let proxy = spawn_proxy_cfg(routes, db, CompressPolicy::off()).await;
@@ -551,11 +569,87 @@ async fn multi_key_round_robin_spreads_across_keys() {
     );
 }
 
+/// Parses a routes doc with two backends (`a`, `b`) at `up` under `strategy`.
+fn two_backend_route(
+    up: &str,
+    strategy: &str,
+    names: (&str, &str),
+    models: (&str, &str),
+) -> Vec<Route> {
+    let doc = format!(
+        r#"{{"routes":[{{"name":"standard","strategy":"{strategy}","backends":[
+            {{"name":"{}","base_url":"{up}","model":"{}","api_key":"k"}},
+            {{"name":"{}","base_url":"{up}","model":"{}","api_key":"k"}}
+        ]}}]}}"#,
+        names.0, models.0, names.1, models.1
+    );
+    superzej_proxy::config::parse_config(&doc).unwrap().routes
+}
+
+async fn resolved_backend(proxy: &str) -> String {
+    let v: Value = reqwest::get(format!("{proxy}/resolved"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    v["standard"].as_str().unwrap_or("").to_string()
+}
+
+#[tokio::test]
+async fn load_balanced_spreads_across_backends() {
+    let up = spawn_mock(200, completion_body()).await;
+    let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+    let routes = two_backend_route(&up, "load_balanced", ("a", "b"), ("m", "m"));
+    let proxy = spawn_proxy(routes, db).await;
+
+    let client = reqwest::Client::new();
+    let mut served = std::collections::HashSet::new();
+    for _ in 0..2 {
+        client
+            .post(format!("{proxy}/v1/chat/completions"))
+            .json(&chat_request())
+            .send()
+            .await
+            .unwrap();
+        served.insert(resolved_backend(&proxy).await);
+    }
+    // Round-robin rotates the first-choice backend → both serve across 2 requests.
+    assert!(served.contains("a"), "served: {served:?}");
+    assert!(served.contains("b"), "served: {served:?}");
+}
+
+#[tokio::test]
+async fn speculative_serves_cheapest_despite_config_order() {
+    let up = spawn_mock(200, completion_body()).await;
+    let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+    // Configured paid-first; the cheap (subscription) lane must win.
+    let routes = two_backend_route(
+        &up,
+        "speculative",
+        ("openrouter", "codex"),
+        ("deepseek/deepseek-v4-pro", "gpt-5.5"),
+    );
+    let proxy = spawn_proxy(routes, db).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&chat_request())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    // codex (subscription, $0) is cheaper than the paid openrouter lane.
+    assert_eq!(resolved_backend(&proxy).await, "codex");
+}
+
 #[tokio::test]
 async fn health_and_models_endpoints() {
     let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
     let routes = vec![Route {
         name: "standard".into(),
+        strategy: superzej_core::config::RoutingStrategy::Sequential,
+        order_pool: None,
         priority: vec![],
     }];
     let proxy = spawn_proxy(routes, db).await;
