@@ -177,8 +177,8 @@ ttl_secs = 30          # cache TTL before a live `gh` re-fetch (SUPERZEJ_PR_TTL)
 # Top-level app tab strip. Defaults make the dashboard the first and focused tab.
 # Valid ids: "dashboard", "work", "chat".
 [apps]
-default_tab = "dashboard" # initial tab (SUPERZEJ_APPS_DEFAULT_TAB)
-tab_order = ["dashboard", "work", "chat"]
+default_tab = "work" # initial tab (SUPERZEJ_APPS_DEFAULT_TAB); "work" = your worktree
+tab_order = ["work", "dashboard", "chat"]
 
 # The terminal-native dashboard app.
 [dashboard]
