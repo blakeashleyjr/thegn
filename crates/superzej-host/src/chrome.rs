@@ -1076,44 +1076,14 @@ fn draw_masthead_cluster(
 /// transient status) right-aligned with `│` rules, and the zoom/lock badges
 /// as inverse chips always outermost-right.
 pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
-    use crate::seg::{Line, Seg, Tok, draw_line, seg};
+    use crate::seg::{Line, Seg, Tok, draw_line, seg, seg_width};
     if rect.rows == 0 {
         return;
     }
 
-    let mut l: Vec<Seg> = vec![seg(Tok::Slot(S::Text), " ")];
-    if !model.mode_chip.is_empty() {
-        l.push(Seg::chip(
-            Tok::Slot(S::Accent),
-            format!(" {} ", model.mode_chip),
-        ));
-        l.push(seg(Tok::Slot(S::Text), "  "));
-    }
-    let mut first = true;
-    for id in &model.bars.bottom_left {
-        if id == "keyhints" {
-            for (chord, label) in &model.keyhints {
-                if !first {
-                    l.push(seg(Tok::Slot(S::Text), "   "));
-                }
-                first = false;
-                l.push(seg(Tok::Slot(S::Faint), chord.clone()));
-                l.push(seg(Tok::Slot(S::Ghost), format!(" {label}")));
-            }
-            continue;
-        }
-        let Some(wd) = bottombar_widget(id, model) else {
-            continue;
-        };
-        if !first {
-            l.push(seg(Tok::Slot(S::Ghost3), " \u{00b7} "));
-        }
-        first = false;
-        l.push(seg(Tok::Attr(wd.fg), wd.text));
-    }
-
     // Right side: per-widget colors (e.g. the PR state) with `│` rules, then
-    // the zoom/lock badges outermost (the lock badge is safety-critical).
+    // the zoom/lock badges outermost (the lock badge is safety-critical). Built
+    // first because the right cluster wins space — the left fits in what's left.
     let mut r: Vec<Seg> = Vec::new();
     let parts: Vec<MastheadWidget> = model
         .bars
@@ -1156,6 +1126,51 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
         ));
     }
     r.push(seg(Tok::Slot(S::Text), " "));
+
+    // Cells the left cluster gets once the right wins its space — mirrors
+    // `Line::split`'s math so keyhints can be trimmed at whole-binding
+    // boundaries here instead of being cut mid-chord by the generic ellipsis.
+    let rl = seg_width(&r);
+    let left_budget = rect.cols.saturating_sub(rl + usize::from(rl > 0));
+
+    let mut l: Vec<Seg> = vec![seg(Tok::Slot(S::Text), " ")];
+    if !model.mode_chip.is_empty() {
+        l.push(Seg::chip(
+            Tok::Slot(S::Accent),
+            format!(" {} ", model.mode_chip),
+        ));
+        l.push(seg(Tok::Slot(S::Text), "  "));
+    }
+    let mut first = true;
+    for id in &model.bars.bottom_left {
+        if id == "keyhints" {
+            for (chord, label) in &model.keyhints {
+                // Stage each binding as a unit; only commit it if the whole
+                // thing still fits. Once one overflows, stop — never paint a
+                // half-cut keybind.
+                let mut hint: Vec<Seg> = Vec::new();
+                if !first {
+                    hint.push(seg(Tok::Slot(S::Text), "   "));
+                }
+                hint.push(seg(Tok::Slot(S::Faint), chord.clone()));
+                hint.push(seg(Tok::Slot(S::Ghost), format!(" {label}")));
+                if seg_width(&l) + seg_width(&hint) > left_budget {
+                    break;
+                }
+                l.extend(hint);
+                first = false;
+            }
+            continue;
+        }
+        let Some(wd) = bottombar_widget(id, model) else {
+            continue;
+        };
+        if !first {
+            l.push(seg(Tok::Slot(S::Ghost3), " \u{00b7} "));
+        }
+        first = false;
+        l.push(seg(Tok::Attr(wd.fg), wd.text));
+    }
 
     draw_line(
         surface,
@@ -2655,6 +2670,64 @@ mod tests {
         assert!(all.contains("WORKSPACES"));
         assert!(all.contains("CENTER-CONTENT"));
         assert!(all.contains("#42"));
+    }
+
+    #[test]
+    fn statusbar_keyhints_stop_at_last_whole_binding() {
+        // Three bindings; "a alpha" (7) + "   b bravo" (10) overflow a tight bar.
+        let model = FrameModel {
+            keyhints: vec![
+                ("a".into(), "alpha".into()),
+                ("b".into(), "bravo".into()),
+                ("c".into(), "charlie".into()),
+            ],
+            bars: superzej_core::config::BarsConfig {
+                bottom_left: vec!["keyhints".into()],
+                bottom_right: vec![],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // Budget = 16 - 2 = 14: " " (1) + "a alpha" (7) fits at 8; the next
+        // binding would land at 18, so it is dropped whole.
+        let mut s = Surface::new(16, 1);
+        draw_statusbar(
+            &mut s,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 16,
+                rows: 1,
+            },
+            &model,
+        );
+        let text = s.screen_chars_to_string();
+        assert!(text.contains("alpha"), "first binding shown: {text:?}");
+        // No mid-binding cut: the dropped binding is fully absent, not "b…".
+        assert!(
+            !text.contains('\u{2026}'),
+            "no ellipsis truncation: {text:?}"
+        );
+        assert!(!text.contains("bravo"), "overflowing binding dropped: {text:?}");
+        assert!(!text.contains("charlie"), "overflowing binding dropped: {text:?}");
+
+        // With ample width every binding is present, untouched.
+        let mut wide = Surface::new(60, 1);
+        draw_statusbar(
+            &mut wide,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 60,
+                rows: 1,
+            },
+            &model,
+        );
+        let wtext = wide.screen_chars_to_string();
+        assert!(
+            wtext.contains("alpha") && wtext.contains("bravo") && wtext.contains("charlie"),
+            "all bindings fit when wide: {wtext:?}"
+        );
     }
 
     /// A minimal panel model with one unstaged change.
