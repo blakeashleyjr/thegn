@@ -9,7 +9,9 @@ use std::sync::Mutex;
 use axum::{Router, extract::State, http::StatusCode, routing::post};
 use serde_json::{Value, json};
 use superzej_core::db::Db;
+use superzej_core::proxy::compress::Level;
 use superzej_core::proxy::ratelimit::RatePolicy;
+use superzej_core::proxy::transform::CompressPolicy;
 use superzej_proxy::model::{Backend, ProxyConfig, Route};
 use superzej_proxy::server;
 use superzej_proxy::shared::{SharedDb, now_ms};
@@ -77,12 +79,18 @@ fn backend(name: &str, base_url: &str) -> Backend {
     }
 }
 
-/// Spawns the proxy against `routes` + `db`, returns its base URL.
+/// Spawns the proxy against `routes` + `db` (no compression), returns its base URL.
 async fn spawn_proxy(routes: Vec<Route>, db: SharedDb) -> String {
+    spawn_proxy_cfg(routes, db, CompressPolicy::off()).await
+}
+
+/// Spawns the proxy with an explicit token-reduction policy.
+async fn spawn_proxy_cfg(routes: Vec<Route>, db: SharedDb, compression: CompressPolicy) -> String {
     let config = ProxyConfig {
         listen: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         routes,
         relay: superzej_proxy::relay::RelayConfig::default(),
+        compression,
     };
     // Bind first so we know the port, then hand the listener to axum::serve.
     let listener = tokio::net::TcpListener::bind(config.listen).await.unwrap();
@@ -321,6 +329,127 @@ async fn empty_stream_peek_falls_through() {
         .await
         .unwrap();
     assert_eq!(resolved["standard"], "secondary");
+}
+
+/// Spawns a mock that records the request body it received and returns a normal
+/// completion — so a test can assert what the proxy forwarded upstream.
+async fn spawn_echo_mock(captured: Arc<Mutex<Option<Value>>>) -> String {
+    async fn handler(
+        State(cap): State<Arc<Mutex<Option<Value>>>>,
+        body: axum::body::Bytes,
+    ) -> (StatusCode, String) {
+        if let Ok(v) = serde_json::from_slice::<Value>(&body) {
+            *cap.lock().unwrap() = Some(v);
+        }
+        (StatusCode::OK, completion_body().to_string())
+    }
+    let app = Router::new()
+        .route("/chat/completions", post(handler))
+        .with_state(captured);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+fn tool_request() -> Value {
+    // Realistically noisy command output: ANSI color, blank-line padding, and a
+    // long run of identical log lines — so compression clearly pays off.
+    let repeated = "[INFO] processing record id=42 status=ok\n".repeat(40);
+    let noisy = format!("\u{1b}[31mERROR\u{1b}[0m\n\n\n\n\n{repeated}done");
+    json!({
+        "model": "model-proxy/standard",
+        "messages": [
+            {"role": "system", "content": "keep  me  verbatim"},
+            {"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "bash"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": noisy},
+        ]
+    })
+}
+
+#[tokio::test]
+async fn compresses_tool_output_in_flight() {
+    let captured = Arc::new(Mutex::new(None));
+    let up = spawn_echo_mock(captured.clone()).await;
+    let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+    let routes = vec![Route {
+        name: "standard".into(),
+        priority: vec![backend("primary", &up)],
+    }];
+    let policy = CompressPolicy {
+        level: Level::Balanced,
+        ..Default::default()
+    };
+    let proxy = spawn_proxy_cfg(routes, db, policy).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&tool_request())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let got = captured.lock().unwrap().clone().unwrap();
+    let tool_content = got["messages"][2]["content"].as_str().unwrap();
+    assert!(
+        !tool_content.contains('\u{1b}'),
+        "ANSI should be stripped: {tool_content:?}"
+    );
+    assert!(
+        tool_content.contains("identical lines omitted"),
+        "repeats should fold: {tool_content:?}"
+    );
+    // The system prompt (cacheable prefix) is forwarded byte-identical.
+    assert_eq!(got["messages"][0]["content"], "keep  me  verbatim");
+
+    // Savings are tracked on /metrics.
+    let metrics = reqwest::get(format!("{proxy}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let saved_line = metrics
+        .lines()
+        .find(|l| l.starts_with("model_proxy_tokens_saved_total{"))
+        .unwrap_or("");
+    let saved: u64 = saved_line
+        .rsplit(' ')
+        .next()
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or(0);
+    assert!(
+        saved > 0,
+        "expected non-zero tokens saved, metrics:\n{metrics}"
+    );
+}
+
+#[tokio::test]
+async fn compression_disabled_forwards_unchanged() {
+    let captured = Arc::new(Mutex::new(None));
+    let up = spawn_echo_mock(captured.clone()).await;
+    let db: SharedDb = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+    let routes = vec![Route {
+        name: "standard".into(),
+        priority: vec![backend("primary", &up)],
+    }];
+    let proxy = spawn_proxy_cfg(routes, db, CompressPolicy::off()).await;
+
+    let req = tool_request();
+    reqwest::Client::new()
+        .post(format!("{proxy}/v1/chat/completions"))
+        .json(&req)
+        .send()
+        .await
+        .unwrap();
+
+    let got = captured.lock().unwrap().clone().unwrap();
+    // Tool content forwarded verbatim (ANSI + repeats intact).
+    assert_eq!(got["messages"][2]["content"], req["messages"][2]["content"]);
 }
 
 #[tokio::test]

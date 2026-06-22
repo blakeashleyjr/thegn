@@ -20,6 +20,8 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 toml.workspace = true
 walkdir.workspace = true
+# Token-reduction engine: ANSI stripping + custom-filter regexes (proxy::compress).
+regex.workspace = true
 syntect.workspace = true
 tree-sitter.workspace = true
 tree-sitter-rust.workspace = true

@@ -24,6 +24,8 @@ pub struct AppState {
     pub db: SharedDb,
     /// Streaming relay tunables (copied from config for cheap access).
     pub relay_config: RelayConfig,
+    /// In-flight token-reduction policy.
+    pub compression: superzej_core::proxy::transform::CompressPolicy,
     /// Route name → identity of the backend that last served it (`/resolved`).
     resolved: Mutex<HashMap<String, String>>,
     /// Whether a budget breach refuses (true) or downgrades (false).
@@ -37,10 +39,12 @@ impl AppState {
     pub fn new(config: ProxyConfig, db: SharedDb, now_ms: i64) -> Arc<Self> {
         let health = Arc::new(Health::new(db.clone(), now_ms));
         let relay_config = config.relay;
+        let compression = config.compression.clone();
         Arc::new(Self {
             config,
             health,
             relay_config,
+            compression,
             limiter: Arc::new(RateLimiter::new()),
             inflight: Arc::new(InflightTracker::new()),
             metrics: Arc::new(Metrics::new()),

@@ -4998,6 +4998,7 @@ dependencies = [
  "chrono",
  "clap",
  "nucleo-matcher",
+ "regex",
  "rusqlite",
  "schemars",
  "serde",
