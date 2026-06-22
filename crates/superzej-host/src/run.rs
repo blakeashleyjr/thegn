@@ -1995,6 +1995,7 @@ fn open_panel_section(
     panel_ui.cursor = 0;
     panel_ui.symbols_show_refs = false;
     panel_ui.chg_sel = None;
+    panel_ui.file_preview = None;
     panel_ui.scroll = 0;
     panel_ui.diff_hunk = 0;
     persist_panel_state(panel_ui);
@@ -4230,6 +4231,98 @@ fn drain_wheel_ticks(
     )
 }
 
+/// Coalesce a left-drag's backlog: keep pulling queued left-button mouse
+/// events, returning the LAST one (only its position matters for the
+/// selection) plus the first non-drag event to push back (`None` if the queue
+/// drained). A fast drag emits many move samples; rendering each one makes the
+/// highlight visibly lag the cursor — applying only the latest keeps it glued.
+/// The terminating release (LEFT cleared) is returned as the leftover so the
+/// caller's release handler runs next.
+fn drain_drag_events(
+    first: termwiz::input::MouseEvent,
+    mut next: impl FnMut() -> Option<InputEvent>,
+) -> (termwiz::input::MouseEvent, Option<InputEvent>) {
+    use termwiz::input::MouseButtons;
+    let mut last = first;
+    loop {
+        match next() {
+            Some(InputEvent::Mouse(m))
+                if m.mouse_buttons.contains(MouseButtons::LEFT)
+                    && !m.mouse_buttons.contains(MouseButtons::VERT_WHEEL) =>
+            {
+                last = m;
+            }
+            Some(other) => return (last, Some(other)),
+            None => return (last, None),
+        }
+    }
+}
+
+/// Spawn a one-shot thread that pulses the waker once a toast's lifetime has
+/// elapsed, so the expired toast is pruned and re-rendered even with no further
+/// input (the event loop never polls on a timer).
+fn schedule_toast_clear(waker: &TerminalWaker) {
+    let wk = waker.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(crate::toast::DEFAULT_TTL + std::time::Duration::from_millis(50));
+        let _ = wk.wake();
+    });
+}
+
+/// Read a file off the loop for the inline Files preview, sending
+/// `(rel_path, Ok(lines) | Err(reason))` back and pulsing the waker. The
+/// rel_path tags the result so a fast esc/reopen drops strays.
+fn spawn_file_preview_fetch(
+    rel: String,
+    abs: std::path::PathBuf,
+    tx: tokio_mpsc::UnboundedSender<(String, Result<Vec<String>, String>)>,
+    waker: TerminalWaker,
+) {
+    tokio::task::spawn_blocking(move || {
+        let result = read_file_preview(&abs);
+        if tx.send((rel, result)).is_ok() {
+            let _ = waker.wake();
+        }
+    });
+}
+
+/// Read + decode a file for preview, rejecting files that are too large before
+/// reading them. The decode/limits live in [`prepare_preview`] (pure).
+fn read_file_preview(abs: &std::path::Path) -> Result<Vec<String>, String> {
+    const MAX_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
+    if let Ok(meta) = std::fs::metadata(abs)
+        && meta.len() > MAX_BYTES
+    {
+        return Err(format!("file too large ({} KiB)", meta.len() / 1024));
+    }
+    let bytes = std::fs::read(abs).map_err(|e| format!("cannot read: {e}"))?;
+    prepare_preview(&bytes)
+}
+
+/// Decode bytes into preview lines: reject binary content (a NUL byte), expand
+/// tabs to 4 spaces, strip CRs, and cap the line count. Pure + unit-tested.
+fn prepare_preview(bytes: &[u8]) -> Result<Vec<String>, String> {
+    if bytes.contains(&0) {
+        return Err("binary file".into());
+    }
+    const MAX_LINES: usize = 50_000;
+    let text = String::from_utf8_lossy(bytes);
+    let mut lines: Vec<String> = text
+        .split('\n')
+        .take(MAX_LINES)
+        .map(|l| l.trim_end_matches('\r').replace('\t', "    "))
+        .collect();
+    // A trailing newline splits into a spurious empty final element — drop it,
+    // but keep a single empty line for a genuinely empty file.
+    if text.ends_with('\n') && lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    Ok(lines)
+}
+
 /// Run the detected test command off-thread; results (parsed indicator
 /// lines + summary) ride the channel back to the loop with a waker pulse.
 /// Run a test task off the loop, capped + single-flight (see `crate::task`),
@@ -5239,6 +5332,9 @@ async fn event_loop<T: Terminal>(
     // re-selects while a fetch is still out.
     let (hunk_tx, mut hunk_rx) =
         tokio_mpsc::unbounded_channel::<(u64, String, Vec<superzej_svc::git::Hunk>)>();
+    // The inline Files preview reader: `(rel_path, Ok(lines) | Err(reason))`.
+    let (file_preview_tx, mut file_preview_rx) =
+        tokio_mpsc::unbounded_channel::<(String, Result<Vec<String>, String>)>();
     // The git mutation runner + the line-cursor document fetches (staging
     // diff, drilled-commit files, patch doc). Results are tagged with
     // `panel_ui.git.op_gen` so a worktree switch kills strays on arrival.
@@ -5419,6 +5515,10 @@ async fn event_loop<T: Terminal>(
     // from the language server, dismissed by any key.
     let (hover_tx, mut hover_rx) = tokio_mpsc::unbounded_channel::<crate::hover::HoverPopup>();
     let mut hover_popup: Option<crate::hover::HoverPopup> = None;
+    // Transient bottom-anchored notifications ("Text copied to clipboard", …).
+    // Each push schedules a one-shot waker pulse so the toast clears on its own
+    // even with no further input (the loop never polls on a timer).
+    let mut toasts = crate::toast::Toasts::default();
     // Live theme-cycle position within `theme::PRESETS` (Ctrl+Alt+t).
     let mut theme_idx: usize = superzej_core::theme::PRESETS
         .iter()
@@ -5710,6 +5810,8 @@ async fn event_loop<T: Terminal>(
             // materialise immediately without requiring a key-press to dismiss.
             center_dormant = false;
             panel_ui.chg_sel = None;
+            // The preview is per-worktree (paths don't carry over).
+            panel_ui.file_preview = None;
             panel_ui.hunks_gen = hydration_gen;
             // Git interaction state is per-worktree: cursors, flows, marks
             // and fetched docs all reset; `op_gen` bumps so in-flight op/doc
@@ -6414,6 +6516,28 @@ async fn event_loop<T: Terminal>(
             hunk_inflight.remove(&path);
             if generation >= panel_ui.hunks_gen {
                 panel_ui.hunks.insert(path, hunks);
+                dirty = true;
+            }
+        }
+
+        // Completed inline-file reads land on the open preview (if it's still
+        // the same path and still loading — a fast esc/reopen drops strays).
+        while let Ok((path, result)) = file_preview_rx.try_recv() {
+            if let Some(fp) = panel_ui.file_preview.as_mut()
+                && fp.path == path
+                && fp.loading
+            {
+                match result {
+                    Ok(lines) => {
+                        fp.lines = lines;
+                        fp.loading = false;
+                        fp.error = None;
+                    }
+                    Err(reason) => {
+                        fp.loading = false;
+                        fp.error = Some(reason);
+                    }
+                }
                 dirty = true;
             }
         }
@@ -7366,6 +7490,12 @@ async fn event_loop<T: Terminal>(
             }
         }
 
+        // Expire any toasts whose deadline passed; their scheduled wake lands
+        // here even absent other input, so they clear on their own.
+        if toasts.prune(std::time::Instant::now()) {
+            dirty = true;
+        }
+
         // 2. Render if anything changed (diff-flush): all visible panes of the
         //    active tab + the chrome, with the hardware cursor in the focused pane.
         if dirty {
@@ -7571,6 +7701,8 @@ async fn event_loop<T: Terminal>(
             if let Some((question, _)) = &pending_delete {
                 crate::chrome::draw_confirm(&mut scratch, screen, question);
             }
+            // Toasts float above everything else — last in, top of the stack.
+            toasts.render(&mut scratch, screen);
             // Flush path: diff `scratch` against our own `front` buffer and
             // render the change list directly on the terminal.
             //
@@ -7925,7 +8057,11 @@ async fn event_loop<T: Terminal>(
                                     .unwrap_or(0);
                                 let next = rates[idx].max(0.5);
                                 stats_interval_ms.store((next * 1000.0) as u64, Ordering::Relaxed);
-                                model.status = format!("Stats refresh: {next}s");
+                                toasts.info(
+                                    format!("Stats refresh: {next}s"),
+                                    std::time::Instant::now(),
+                                );
+                                schedule_toast_clear(&waker);
                             }
                         }
                     } else if contains(chrome.center_tabs, mx, my) {
@@ -8087,6 +8223,22 @@ async fn event_loop<T: Terminal>(
                     }
                     dirty = true;
                 } else if left && mouse_left_down && mouse_selecting {
+                    // Coalesce the drag backlog: a fast drag emits many move
+                    // samples; applying only the latest (and rendering once)
+                    // keeps the highlight glued to the cursor instead of
+                    // lagging behind it. The terminating release comes back as
+                    // the leftover and is requeued for the release handler.
+                    let (m, leftover) = drain_drag_events(m, || {
+                        buf.terminal()
+                            .poll_input(Some(std::time::Duration::ZERO))
+                            .ok()
+                            .flatten()
+                    });
+                    if let Some(ev) = leftover {
+                        pending_input.push_back(ev);
+                    }
+                    let mx = (m.x as usize).saturating_sub(1);
+                    let my = (m.y as usize).saturating_sub(1);
                     // Drag: extend the selection, clamped to the anchored pane.
                     if let Some((id, sel)) = mouse_sel.as_mut()
                         && let Some((_, _, content)) = frames.iter().find(|(fid, _, _)| fid == id)
@@ -8123,10 +8275,19 @@ async fn event_loop<T: Terminal>(
                                 let text = crate::copymode::extract(p.emulator(), sel);
                                 if !text.trim().is_empty() {
                                     use std::io::Write;
+                                    // OSC52 reaches the outer terminal (and over
+                                    // SSH); the native tool hits the local
+                                    // clipboard directly for terminals that
+                                    // ignore OSC52. Belt and braces.
                                     let mut out = std::io::stdout();
                                     let _ = out.write_all(&crate::copymode::osc52(&text));
                                     let _ = out.flush();
-                                    model.status = format!("Copied {} chars", text.chars().count());
+                                    crate::clipboard::copy(&text);
+                                    toasts.success(
+                                        "Text copied to clipboard",
+                                        std::time::Instant::now(),
+                                    );
+                                    schedule_toast_clear(&waker);
                                 }
                             }
                         }
@@ -9474,6 +9635,44 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+                // While the inline file preview is open, the panel keys
+                // scroll/close it (esc closes, j/k & friends scroll) instead of
+                // walking the file tree behind it.
+                if focus.panel()
+                    && panel_ui.open == crate::panel::Section::Files
+                    && panel_ui.file_preview.is_some()
+                {
+                    let (_, panel_rows) = panel_geom(&chrome);
+                    // Body viewport ≈ panel rows minus the preview's 2-row
+                    // header and the surrounding chrome.
+                    let viewport = panel_rows.saturating_sub(4).max(1);
+                    let page = viewport.saturating_sub(1).max(1) as isize;
+                    let mut handled = true;
+                    if let Some(fp) = panel_ui.file_preview.as_mut() {
+                        match k.key {
+                            KeyCode::Escape => {
+                                panel_ui.file_preview = None;
+                            }
+                            KeyCode::Char('j') | KeyCode::DownArrow => fp.scroll_by(1, viewport),
+                            KeyCode::Char('k') | KeyCode::UpArrow => fp.scroll_by(-1, viewport),
+                            KeyCode::Char('d') if k.modifiers.contains(Modifiers::CTRL) => {
+                                fp.scroll_by(page / 2, viewport)
+                            }
+                            KeyCode::Char('u') if k.modifiers.contains(Modifiers::CTRL) => {
+                                fp.scroll_by(-(page / 2), viewport)
+                            }
+                            KeyCode::PageDown | KeyCode::Char(' ') => fp.scroll_by(page, viewport),
+                            KeyCode::PageUp => fp.scroll_by(-page, viewport),
+                            KeyCode::Char('g') => fp.scroll = 0,
+                            KeyCode::Char('G') => fp.scroll = fp.max_scroll(viewport),
+                            _ => handled = false,
+                        }
+                    }
+                    if handled {
+                        dirty = true;
+                        continue;
+                    }
+                }
                 if forced_palette_action.is_none()
                     && focus.panel()
                     && k.modifiers == Modifiers::SHIFT
@@ -9896,7 +10095,10 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                         Section::Files => {
-                                            // Enter/Space: dirs toggle collapse, files open in bat.
+                                            // Enter: dirs toggle collapse; files open
+                                            // INLINE (full pane) in the panel itself —
+                                            // `o` still opens bat in a split pane for
+                                            // those who want a separate view.
                                             if let Some(entry) = file_entry_at(
                                                 &model,
                                                 &panel_ui.files_collapsed,
@@ -9908,32 +10110,27 @@ async fn event_loop<T: Terminal>(
                                                         &entry.path,
                                                     );
                                                 } else {
-                                                    // Open file in bat (split pane).
-                                                    let bat = keymap
-                                                        .config()
-                                                        .tool_command("bat")
-                                                        .unwrap_or("bat --paging=always")
-                                                        .to_string();
-                                                    let wt = active_tab_path(&session);
-                                                    let abs = wt.join(&entry.path);
-                                                    let cmd = format!(
-                                                        "{bat} {}",
-                                                        test_shell_quote(&abs.to_string_lossy())
+                                                    // Expand to full so the file gets the
+                                                    // whole pane, then read it off-thread.
+                                                    let abs =
+                                                        active_tab_path(&session).join(&entry.path);
+                                                    panel_ui.file_preview =
+                                                        Some(crate::panel::FilePreview::loading(
+                                                            entry.path.clone(),
+                                                        ));
+                                                    if panel_ui.width
+                                                        != crate::layout::PanelWidth::Full
+                                                    {
+                                                        panel_ui.width =
+                                                            crate::layout::PanelWidth::Full;
+                                                        need_relayout = true;
+                                                    }
+                                                    spawn_file_preview_fetch(
+                                                        entry.path,
+                                                        abs,
+                                                        file_preview_tx.clone(),
+                                                        waker.clone(),
                                                     );
-                                                    let cwd = active_cwd(&session);
-                                                    open_command_pane(
-                                                        &mut session,
-                                                        &mut panes,
-                                                        focused,
-                                                        &cmd,
-                                                        cwd.as_deref(),
-                                                        chrome.center,
-                                                    );
-                                                    focus.zone = crate::focus::Zone::Center;
-                                                    refresh_tab_model(
-                                                        &mut model, &session, &mut sb,
-                                                    );
-                                                    need_relayout = true;
                                                 }
                                             }
                                         }
@@ -13526,6 +13723,90 @@ mod tests {
         assert!(
             matches!(&leftover, Some(InputEvent::Mouse(m)) if m.mouse_buttons.contains(termwiz::input::MouseButtons::WHEEL_POSITIVE))
         );
+    }
+
+    fn mk_drag(x: u16, y: u16) -> InputEvent {
+        use termwiz::input::{MouseButtons, MouseEvent};
+        InputEvent::Mouse(MouseEvent {
+            x,
+            y,
+            mouse_buttons: MouseButtons::LEFT,
+            modifiers: Modifiers::NONE,
+        })
+    }
+
+    fn mk_release(x: u16, y: u16) -> InputEvent {
+        use termwiz::input::{MouseButtons, MouseEvent};
+        InputEvent::Mouse(MouseEvent {
+            x,
+            y,
+            mouse_buttons: MouseButtons::NONE,
+            modifiers: Modifiers::NONE,
+        })
+    }
+
+    fn first_drag(x: u16, y: u16) -> termwiz::input::MouseEvent {
+        match mk_drag(x, y) {
+            InputEvent::Mouse(m) => m,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn drain_drag_keeps_only_the_latest_position() {
+        // Three drag samples queued behind the first; only the last position
+        // should survive, and the release is handed back to requeue.
+        let mut q: std::collections::VecDeque<InputEvent> =
+            [mk_drag(5, 5), mk_drag(7, 9), mk_release(7, 9)].into();
+        let (last, leftover) = drain_drag_events(first_drag(2, 2), || q.pop_front());
+        assert_eq!((last.x, last.y), (7, 9), "latest drag wins");
+        assert!(
+            matches!(&leftover, Some(InputEvent::Mouse(m)) if !m.mouse_buttons.contains(termwiz::input::MouseButtons::LEFT)),
+            "the release stops the drain and is returned"
+        );
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn drain_drag_empty_queue_returns_first() {
+        let (last, leftover) = drain_drag_events(first_drag(3, 4), || None);
+        assert_eq!((last.x, last.y), (3, 4));
+        assert!(leftover.is_none());
+    }
+
+    #[test]
+    fn drain_drag_stops_on_non_drag_event() {
+        // A keypress mid-drag interrupts coalescing and is returned.
+        let mut q: std::collections::VecDeque<InputEvent> =
+            [mk_drag(6, 6), mk_key(KeyCode::Char('x'))].into();
+        let (last, leftover) = drain_drag_events(first_drag(1, 1), || q.pop_front());
+        assert_eq!((last.x, last.y), (6, 6));
+        assert!(matches!(leftover, Some(InputEvent::Key(_))));
+    }
+
+    #[test]
+    fn prepare_preview_expands_tabs_and_drops_trailing_newline() {
+        let lines = prepare_preview(b"a\tb\nc\n").unwrap();
+        assert_eq!(lines, vec!["a    b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn prepare_preview_rejects_binary() {
+        assert_eq!(prepare_preview(b"abc\0def"), Err("binary file".into()));
+    }
+
+    #[test]
+    fn prepare_preview_strips_cr_and_keeps_interior_blank_lines() {
+        let lines = prepare_preview(b"one\r\n\r\nthree").unwrap();
+        assert_eq!(
+            lines,
+            vec!["one".to_string(), String::new(), "three".to_string()]
+        );
+    }
+
+    #[test]
+    fn prepare_preview_empty_file_is_one_blank_line() {
+        assert_eq!(prepare_preview(b"").unwrap(), vec![String::new()]);
     }
 
     #[test]

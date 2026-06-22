@@ -196,6 +196,9 @@ pub enum Anchor {
     Center,
     /// Centered, with the box's top at ~1/4 of the screen (palette position).
     TopThird,
+    /// Horizontally centered, near the bottom (toast position, above the
+    /// statusbar).
+    Bottom,
 }
 
 /// A summoned layer: boxed, filled, optionally dimming the backdrop and
@@ -249,6 +252,9 @@ pub fn open_layer(surface: &mut Surface, screen: Rect, spec: &LayerSpec) -> Opti
     let by = match spec.anchor {
         Anchor::Center => screen.y + (screen.rows - bh) / 2,
         Anchor::TopThird => screen.y + (screen.rows / 4).min(screen.rows - bh),
+        // One row of breathing room above the bottom edge (the statusbar sits
+        // outside `screen` for overlays, so this hugs the content's bottom).
+        Anchor::Bottom => screen.y + screen.rows.saturating_sub(bh + 1),
     };
     let boxr = Rect {
         x: bx,

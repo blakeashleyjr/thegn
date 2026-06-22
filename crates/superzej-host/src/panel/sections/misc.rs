@@ -14,6 +14,10 @@ use super::{
 // ---- files ------------------------------------------------------------------
 
 pub(super) fn files(ctx: &SectionCtx) -> Vec<PanelRow> {
+    // An open file preview takes over the whole section body (full pane).
+    if let Some(fp) = &ctx.ui.file_preview {
+        return file_preview_rows(fp, ctx.cols, ctx.rows);
+    }
     let (model, deep, full) = (ctx.model, ctx.deep(), ctx.full());
     let data = &model.panel;
     let mut rows: Vec<PanelRow> = Vec::new();
@@ -119,6 +123,62 @@ pub(super) fn files(ctx: &SectionCtx) -> Vec<PanelRow> {
         )));
     }
     rows
+}
+
+/// Render the inline file preview (full pane): a header (path + status + close
+/// hint) then line-numbered content scrolled to `fp.scroll`, each line
+/// truncated to `cols`. Pure — the host owns scroll/loading state.
+fn file_preview_rows(fp: &crate::panel::FilePreview, cols: usize, rows: usize) -> Vec<PanelRow> {
+    let mut out: Vec<PanelRow> = Vec::new();
+    let status = if fp.loading {
+        "  loading…".to_string()
+    } else if fp.error.is_some() {
+        String::new()
+    } else {
+        format!("  {} lines", fp.lines.len())
+    };
+    out.push(PanelRow::plain(Line::segs(vec![
+        sp(1),
+        seg(d(), fp.path.clone()).bold(),
+        seg(g2(), status),
+    ])));
+    out.push(PanelRow::plain(Line::segs(vec![
+        sp(1),
+        seg(g2(), "esc close · j/k scroll".to_string()),
+    ])));
+
+    if fp.loading {
+        out.push(PanelRow::plain(Line::segs(vec![
+            sp(1),
+            seg(g(), "loading…".to_string()),
+        ])));
+        return out;
+    }
+    if let Some(err) = &fp.error {
+        out.push(PanelRow::plain(Line::segs(vec![
+            sp(1),
+            seg(hue(Hue::Red), err.clone()),
+        ])));
+        return out;
+    }
+
+    // Line-numbered body window. The gutter widens to fit the largest number.
+    let total = fp.lines.len();
+    let gutter = total.to_string().len().max(2);
+    let body = rows.saturating_sub(out.len()).max(1);
+    let avail = cols.saturating_sub(gutter + 2);
+    // Clamp the start so a stale scroll (e.g. after a resize shrank the
+    // viewport) still shows content rather than a blank pane.
+    let start = fp.scroll.min(total.saturating_sub(1));
+    for (off, line) in fp.lines.iter().enumerate().skip(start).take(body) {
+        let num = off + 1;
+        let text: String = line.chars().take(avail).collect();
+        out.push(PanelRow::plain(Line::segs(vec![
+            seg(f(), format!("{num:>gutter$} ")),
+            seg(d(), text),
+        ])));
+    }
+    out
 }
 
 // ---- tests ------------------------------------------------------------------
