@@ -5650,6 +5650,15 @@ async fn event_loop<T: Terminal>(
     if ensure_app_loaded(&mut app_host, initial_app, &app_tx, &waker, &current_config).await {
         dirty = true;
     }
+    // Pre-warm the dashboard so switching to it is instant. Its build just
+    // spawns the background data thread (system stats / HN / recent repos) and
+    // returns, so this costs ~nothing at startup but means the dashboard is
+    // already populated — no loading spinner — by the time the user focuses it.
+    if let Some(dash) = app_host.dashboard_target()
+        && app_host.active != dash
+    {
+        let _ = ensure_app_loaded(&mut app_host, dash, &app_tx, &waker, &current_config).await;
+    }
     // The workspace the keymap was last built for; when the focused workspace
     // changes we rebuild so per-workspace/repo-root keybind layers follow it.
     let mut keymap_workspace = session.id.clone();
@@ -6026,6 +6035,12 @@ async fn event_loop<T: Terminal>(
             );
             need_relayout = true;
             dirty = true;
+            // A width change is a large geometry change (Full claims/relinquishes
+            // the whole band). The diff-only path leaves the screen glitched
+            // across that transition — most visibly when leaving Full, where the
+            // panel never properly refreshes — so reset the baseline and redraw
+            // it whole. The momentary flash is fine for an explicit keypress.
+            full_repaint = true;
         }
 
         if need_relayout {
@@ -11697,6 +11712,48 @@ async fn event_loop<T: Terminal>(
                                     need_relayout = true;
                                 }
                                 focus.zone = crate::focus::Zone::Panel;
+                            }
+                            Action::ToggleNotifications => {
+                                panel_auto_revealed = None;
+                                // Already parked on Notifications with the panel
+                                // focused → toggle back to the center terminal.
+                                if focus.panel()
+                                    && panel_ui.open == crate::panel::Section::Notifications
+                                {
+                                    focus.zone = crate::focus::Zone::Center;
+                                } else {
+                                    if chrome.panel.is_none() {
+                                        want_panel = true;
+                                        panel_forced = cols < layout::PANEL_MIN_COLS;
+                                        chrome = compute_chrome(
+                                            cols,
+                                            rows,
+                                            want_sidebar,
+                                            want_panel,
+                                            panel_forced,
+                                            panel_width,
+                                            sidebar_cols,
+                                            zoom,
+                                            &supervisor,
+                                        );
+                                        need_relayout = true;
+                                    }
+                                    panel_ui.switch_tab(crate::panel::PanelTab::System);
+                                    open_panel_section(
+                                        crate::panel::Section::Notifications,
+                                        &mut panel_ui,
+                                        &mut hydration_gen,
+                                        &model_tx,
+                                        &session,
+                                        &waker,
+                                        PanelDocsWiring {
+                                            model: &model,
+                                            generation: docs_gen,
+                                            tx: &docs_tx,
+                                        },
+                                    );
+                                    focus.zone = crate::focus::Zone::Panel;
+                                }
                             }
                             Action::NextTab => {
                                 session.next_tab();
