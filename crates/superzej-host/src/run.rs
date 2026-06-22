@@ -10272,83 +10272,19 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                         Section::Notifications => {
-                                            let notif = model
-                                                .panel
-                                                .notifications
-                                                .iter()
-                                                .filter(|n| {
-                                                    (panel_ui.notifications_show_read || !n.read)
-                                                        && (panel_ui
-                                                            .notifications_filter
-                                                            .is_empty()
-                                                            || n.message.to_lowercase().contains(
-                                                                &panel_ui
-                                                                    .notifications_filter
-                                                                    .to_lowercase(),
-                                                            )
-                                                            || n.source_ref
-                                                                .to_lowercase()
-                                                                .contains(
-                                                                    &panel_ui
-                                                                        .notifications_filter
-                                                                        .to_lowercase(),
-                                                                ))
-                                                })
-                                                .nth(panel_ui.notifications_cursor)
-                                                .cloned();
-                                            if let Some(n) = notif {
-                                                let id = n.id;
-                                                let kind = n.kind;
-                                                let wt_path = n.worktree_path.clone();
-                                                tokio::task::spawn_blocking(move || {
-                                                    let Ok(db) = superzej_core::db::Db::open()
-                                                    else {
-                                                        return;
-                                                    };
-                                                    let _ = db.mark_notification_read(id);
-                                                });
-                                                use superzej_core::notification::NotificationKind as NK;
-                                                match kind {
-                                                    NK::PrStateChanged => {
-                                                        panel_ui.open = crate::panel::Section::Pr;
-                                                    }
-                                                    NK::TestFailed => {
-                                                        panel_ui.open =
-                                                            crate::panel::Section::Tests;
-                                                    }
-                                                    NK::WorktreeCreated => {
-                                                        if let Some(idx) = session
-                                                            .worktrees
-                                                            .iter()
-                                                            .position(|g| g.path == wt_path)
-                                                        {
-                                                            session.switch_to(idx);
-                                                            refresh_tab_model(
-                                                                &mut model, &session, &mut sb,
-                                                            );
-                                                            need_relayout = true;
-                                                        }
-                                                        panel_ui.open =
-                                                            crate::panel::Section::Changes;
-                                                    }
-                                                    _ => {
-                                                        panel_ui.open =
-                                                            crate::panel::Section::Issues;
-                                                    }
-                                                }
-                                                panel_ui.cursor = 0;
-                                                hydration_gen += 1;
-                                                crate::hydrate::spawn_model_hydration(
-                                                    model_tx.clone(),
-                                                    hydration_gen,
-                                                    session.clone(),
-                                                    Some(waker.clone()),
-                                                    crate::hydrate::HydrateHints {
-                                                        open: panel_ui.open,
-                                                        expanded: panel_ui.width.is_expanded(),
-                                                        ..Default::default()
-                                                    },
-                                                );
+                                            // Enter widens the panel to half so
+                                            // the full notification is readable —
+                                            // the resting width truncates it. It
+                                            // deliberately does NOT mark the
+                                            // notification read (that's `r`) or
+                                            // navigate away: reading shouldn't
+                                            // dismiss it.
+                                            if !model.panel.notifications.is_empty()
+                                                && panel_ui.width
+                                                    == crate::layout::PanelWidth::Normal
+                                            {
+                                                panel_ui.width = crate::layout::PanelWidth::Half;
+                                                need_relayout = true;
                                             }
                                         }
                                         Section::Jobs => {
