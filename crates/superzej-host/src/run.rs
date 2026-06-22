@@ -9772,11 +9772,13 @@ async fn event_loop<T: Terminal>(
                         }
                     }
                     // Drilling enters a detail view (commit files, staging,
-                    // patch, blame, rebase todo) that ONLY the Full git frame
-                    // renders — at Normal/Half the accordion shows the list, so
-                    // the drill would look like it did nothing. Widen so the
-                    // drilled view is actually visible.
-                    if panel_ui.width != crate::layout::PanelWidth::Full
+                    // patch, blame, rebase todo) that the accordion list layout
+                    // doesn't render. Widen a resting Normal panel to Half so
+                    // the drill is visible — Half renders the git frame beside
+                    // the center pane (build_panel), NOT the screen-filling Full
+                    // layout. An already-Half/Full panel is left as the user set
+                    // it.
+                    if panel_ui.width == crate::layout::PanelWidth::Normal
                         && matches!(
                             panel_ui.git.focus,
                             gitui::GitView::CommitFiles
@@ -9786,7 +9788,7 @@ async fn event_loop<T: Terminal>(
                                 | gitui::GitView::RebaseTodo
                         )
                     {
-                        panel_ui.width = crate::layout::PanelWidth::Full;
+                        panel_ui.width = crate::layout::PanelWidth::Half;
                         need_relayout = true;
                     }
                     dirty = true;
