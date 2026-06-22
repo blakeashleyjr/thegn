@@ -58,10 +58,15 @@ impl std::fmt::Debug for Backend {
 }
 
 /// A named priority chain of backends (e.g. `standard`, `fast`, `free`).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Route {
     pub name: String,
     pub priority: Vec<Backend>,
+    /// How backend *slots* are ordered per request (the M4 key-level pool order
+    /// applies within each slot).
+    pub strategy: superzej_core::config::RoutingStrategy,
+    /// Round-robin cursor over slots; `Some` only for `LoadBalanced`.
+    pub order_pool: Option<std::sync::Arc<superzej_core::proxy::creds::CredPool>>,
 }
 
 /// The resolved proxy configuration the daemon serves.

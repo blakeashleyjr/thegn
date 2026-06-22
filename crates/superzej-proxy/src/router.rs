@@ -9,9 +9,10 @@ use std::time::Instant;
 
 use axum::body::Body;
 use serde_json::Value;
+use superzej_core::config::RoutingStrategy;
 use superzej_core::db::ProxyRequestRow;
 use superzej_core::proxy::classify::{FailKind, classify_response};
-use superzej_core::proxy::cost::{Usage, cost_usd};
+use superzej_core::proxy::cost::{PriceTable, Usage, cost_usd};
 use superzej_core::proxy::transform;
 
 use crate::anthropic_stream::AnthropicSink;
@@ -40,14 +41,21 @@ impl Surface {
     }
 }
 
-/// Returns the order in which a route's backends should be attempted this
-/// request. Contiguous runs of lanes sharing a [`CredPool`] are reordered by the
-/// pool's strategy (round-robin/failover/random/weighted) via `CredPool::order`;
-/// non-pool backends keep their natural position. `rand_start` is only consulted
-/// by the `Random` strategy.
-fn ordered_priority(route: &Route, rand_start: usize) -> Vec<usize> {
+/// Returns the order in which a route's backend lanes should be attempted this
+/// request, composing two levels of ordering:
+///
+/// 1. **Slots** — the route is partitioned into slots (a single backend, or a
+///    contiguous multi-key pool-group). The *route* strategy orders the slots:
+///    `Sequential` natural, `LoadBalanced` round-robin (via the route's
+///    `order_pool`), `Speculative` cheapest-cost-first (via `prices`).
+/// 2. **Within a slot** — a pool-group's key lanes are ordered by the *key*
+///    strategy via `CredPool::order` (M4). `rand_start` seeds the `Random` key
+///    strategy and the load-balanced slot rotation's random variant.
+fn ordered_priority(route: &Route, rand_start: usize, prices: &PriceTable) -> Vec<usize> {
     let lanes = &route.priority;
-    let mut out = Vec::with_capacity(lanes.len());
+
+    // 1. Partition into slots, each already key-ordered.
+    let mut slots: Vec<Vec<usize>> = Vec::new();
     let mut i = 0;
     while i < lanes.len() {
         match &lanes[i].pool {
@@ -61,18 +69,56 @@ fn ordered_priority(route: &Route, rand_start: usize) -> Vec<usize> {
                 {
                     k += 1;
                 }
-                for off in pool.order(k, rand_start) {
-                    out.push(i + off);
-                }
+                slots.push(
+                    pool.order(k, rand_start)
+                        .into_iter()
+                        .map(|off| i + off)
+                        .collect(),
+                );
                 i += k;
             }
             None => {
-                out.push(i);
+                slots.push(vec![i]);
                 i += 1;
             }
         }
     }
-    out
+
+    // 2. Order the slots by the route strategy.
+    let slot_order: Vec<usize> = match route.strategy {
+        RoutingStrategy::Sequential => (0..slots.len()).collect(),
+        RoutingStrategy::LoadBalanced => match &route.order_pool {
+            Some(pool) => pool.order(slots.len(), rand_start),
+            None => (0..slots.len()).collect(),
+        },
+        RoutingStrategy::Speculative => {
+            // Cascade: cheapest backend first (stable, so equal-cost ties keep
+            // natural order). Subscription/free lanes price to 0 → tried first.
+            let mut idx: Vec<usize> = (0..slots.len()).collect();
+            idx.sort_by(|&a, &b| {
+                slot_cost(prices, &lanes[slots[a][0]])
+                    .total_cmp(&slot_cost(prices, &lanes[slots[b][0]]))
+            });
+            idx
+        }
+    };
+
+    // 3. Flatten slots (in their chosen order) back into a lane-index list.
+    slot_order
+        .into_iter()
+        .flat_map(|s| slots[s].clone())
+        .collect()
+}
+
+/// A representative per-request cost for a lane, used to order `Speculative`
+/// slots cheapest-first. Uses a nominal 1M-in/1M-out usage so paid lanes compare
+/// by their price-table rate; subscription/free lanes return 0.
+fn slot_cost(prices: &PriceTable, lane: &Backend) -> f64 {
+    let nominal = Usage {
+        prompt_tokens: 1_000_000,
+        completion_tokens: 1_000_000,
+    };
+    cost_usd(prices, &lane.name, &lane.model, nominal, None).0
 }
 
 /// A per-request seed for the `Random` lane strategy (sub-nanos of the wall
@@ -106,7 +152,7 @@ pub async fn route_nonstreaming(
     let has_tools = transform::request_has_tools(&parsed);
     let est_tokens = transform::estimated_request_tokens(body.len());
 
-    let order = ordered_priority(route, rand_start());
+    let order = ordered_priority(route, rand_start(), &state.price_table);
     let n = order.len();
     for (pos, &idx) in order.iter().enumerate() {
         let backend = &route.priority[idx];
@@ -246,7 +292,7 @@ pub async fn route_streaming(
     let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     let est_tokens = transform::estimated_request_tokens(body.len());
     let cfg = state.relay_config;
-    let order = ordered_priority(route, rand_start());
+    let order = ordered_priority(route, rand_start(), &state.price_table);
     let n = order.len();
 
     for (pos, &idx) in order.iter().enumerate() {
@@ -700,17 +746,38 @@ mod tests {
         }
     }
 
+    /// A lane with an explicit model (for cost-based ordering tests).
+    fn lane_model(name: &str, model: &str, key_id: &str, pool: Option<Arc<CredPool>>) -> Backend {
+        let mut b = lane(name, key_id, pool);
+        b.model = model.into();
+        b
+    }
+
     fn route_with(priority: Vec<Backend>) -> Route {
+        route_strat(priority, RoutingStrategy::Sequential, None)
+    }
+
+    fn route_strat(
+        priority: Vec<Backend>,
+        strategy: RoutingStrategy,
+        order_pool: Option<Arc<CredPool>>,
+    ) -> Route {
         Route {
             name: "standard".into(),
             priority,
+            strategy,
+            order_pool,
         }
+    }
+
+    fn prices() -> PriceTable {
+        PriceTable::with_defaults()
     }
 
     #[test]
     fn non_pool_backends_keep_natural_order() {
         let route = route_with(vec![lane("a", "", None), lane("b", "", None)]);
-        assert_eq!(ordered_priority(&route, 0), vec![0, 1]);
+        assert_eq!(ordered_priority(&route, 0, &prices()), vec![0, 1]);
     }
 
     #[test]
@@ -721,9 +788,9 @@ mod tests {
             lane("p", "#1", Some(pool.clone())),
             lane("p", "#2", Some(pool.clone())),
         ]);
-        assert_eq!(ordered_priority(&route, 0), vec![0, 1, 2]);
-        assert_eq!(ordered_priority(&route, 0), vec![1, 2, 0]);
-        assert_eq!(ordered_priority(&route, 0), vec![2, 0, 1]);
+        assert_eq!(ordered_priority(&route, 0, &prices()), vec![0, 1, 2]);
+        assert_eq!(ordered_priority(&route, 0, &prices()), vec![1, 2, 0]);
+        assert_eq!(ordered_priority(&route, 0, &prices()), vec![2, 0, 1]);
     }
 
     #[test]
@@ -733,8 +800,8 @@ mod tests {
             lane("p", "#0", Some(pool.clone())),
             lane("p", "#1", Some(pool.clone())),
         ]);
-        assert_eq!(ordered_priority(&route, 0), vec![0, 1]);
-        assert_eq!(ordered_priority(&route, 0), vec![0, 1]);
+        assert_eq!(ordered_priority(&route, 0, &prices()), vec![0, 1]);
+        assert_eq!(ordered_priority(&route, 0, &prices()), vec![0, 1]);
     }
 
     #[test]
@@ -747,9 +814,9 @@ mod tests {
             lane("fallback", "", None),
         ]);
         // First request: pool natural [0,1], then the fallback at index 2.
-        assert_eq!(ordered_priority(&route, 0), vec![0, 1, 2]);
+        assert_eq!(ordered_priority(&route, 0, &prices()), vec![0, 1, 2]);
         // Second: pool rotates to [1,0], fallback still last.
-        assert_eq!(ordered_priority(&route, 0), vec![1, 0, 2]);
+        assert_eq!(ordered_priority(&route, 0, &prices()), vec![1, 0, 2]);
     }
 
     #[test]
@@ -760,7 +827,9 @@ mod tests {
             lane("p", "#1", Some(pool.clone())),
         ]);
         // Over 4 requests, lane 0 (weight 3) leads 3×.
-        let firsts: Vec<usize> = (0..4).map(|_| ordered_priority(&route, 0)[0]).collect();
+        let firsts: Vec<usize> = (0..4)
+            .map(|_| ordered_priority(&route, 0, &prices())[0])
+            .collect();
         assert_eq!(firsts.iter().filter(|&&x| x == 0).count(), 3);
     }
 
@@ -773,6 +842,68 @@ mod tests {
             lane("p", "#2", Some(pool.clone())),
         ]);
         // seed 2 → start at index 2.
-        assert_eq!(ordered_priority(&route, 2), vec![2, 0, 1]);
+        assert_eq!(ordered_priority(&route, 2, &prices()), vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn load_balanced_rotates_slots() {
+        let order_pool = Arc::new(CredPool::new(KeyStrategy::RoundRobin, vec![]));
+        let route = route_strat(
+            vec![lane("a", "", None), lane("b", "", None)],
+            RoutingStrategy::LoadBalanced,
+            Some(order_pool),
+        );
+        // First-choice slot rotates each request.
+        assert_eq!(ordered_priority(&route, 0, &prices()), vec![0, 1]);
+        assert_eq!(ordered_priority(&route, 0, &prices()), vec![1, 0]);
+        assert_eq!(ordered_priority(&route, 0, &prices()), vec![0, 1]);
+    }
+
+    #[test]
+    fn load_balanced_still_orders_keys_within_slot() {
+        // A LoadBalanced route whose single slot is a multi-key pool: the slot
+        // rotation is a no-op (one slot), but keys still round-robin within.
+        let key_pool = Arc::new(CredPool::new(KeyStrategy::RoundRobin, vec![]));
+        let order_pool = Arc::new(CredPool::new(KeyStrategy::RoundRobin, vec![]));
+        let route = route_strat(
+            vec![
+                lane("p", "#0", Some(key_pool.clone())),
+                lane("p", "#1", Some(key_pool.clone())),
+            ],
+            RoutingStrategy::LoadBalanced,
+            Some(order_pool),
+        );
+        assert_eq!(ordered_priority(&route, 0, &prices()), vec![0, 1]);
+        assert_eq!(ordered_priority(&route, 0, &prices()), vec![1, 0]);
+    }
+
+    #[test]
+    fn speculative_orders_cheapest_first() {
+        // openrouter:deepseek/deepseek-v4-pro is paid; codex:gpt-5.5 is
+        // subscription ($0). Configured paid-first, Speculative must try the
+        // free/subscription lane first.
+        let route = route_strat(
+            vec![
+                lane_model("openrouter", "deepseek/deepseek-v4-pro", "", None),
+                lane_model("codex", "gpt-5.5", "", None),
+            ],
+            RoutingStrategy::Speculative,
+            None,
+        );
+        assert_eq!(ordered_priority(&route, 0, &prices()), vec![1, 0]);
+    }
+
+    #[test]
+    fn speculative_equal_cost_keeps_natural_order() {
+        // Two subscription ($0) lanes — stable sort keeps configured order.
+        let route = route_strat(
+            vec![
+                lane_model("codex", "gpt-5.5", "", None),
+                lane_model("gemini", "x", "", None),
+            ],
+            RoutingStrategy::Speculative,
+            None,
+        );
+        assert_eq!(ordered_priority(&route, 0, &prices()), vec![0, 1]);
     }
 }
