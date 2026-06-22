@@ -1053,8 +1053,8 @@ pub struct AppsConfig {
 impl Default for AppsConfig {
     fn default() -> Self {
         AppsConfig {
-            default_tab: "dashboard".into(),
-            tab_order: vec!["dashboard".into(), "work".into(), "chat".into()],
+            default_tab: "work".into(),
+            tab_order: vec!["work".into(), "dashboard".into(), "chat".into()],
         }
     }
 }
@@ -1086,7 +1086,7 @@ impl AppsConfig {
             self.effective_tab_order()
                 .into_iter()
                 .next()
-                .unwrap_or_else(|| "dashboard".into())
+                .unwrap_or_else(|| "work".into())
         }
     }
 }
@@ -2703,12 +2703,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn app_tab_config_defaults_to_dashboard_first_and_default() {
+    fn app_tab_config_defaults_to_work_first_and_default() {
         let cfg = Config::default();
-        assert_eq!(cfg.apps.default_tab, "dashboard");
+        assert_eq!(cfg.apps.default_tab, "work");
         assert_eq!(
             cfg.apps.effective_tab_order(),
-            vec!["dashboard", "work", "chat"]
+            vec!["work", "dashboard", "chat"]
         );
     }
 
