@@ -94,6 +94,11 @@ impl Toasts {
         self.stack.len() != before
     }
 
+    /// True when no toasts are live.
+    pub fn is_empty(&self) -> bool {
+        self.stack.is_empty()
+    }
+
     /// The styled content lines for the live toasts (oldest first). Pure.
     pub fn lines(&self) -> Vec<Line> {
         self.stack
