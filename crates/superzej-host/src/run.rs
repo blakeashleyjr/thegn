@@ -5551,6 +5551,11 @@ async fn event_loop<T: Terminal>(
     );
     sb.rebuild(&mut model, &session);
     let mut dirty = true;
+    // Set by a mouse selection-drag move to request the cheap render fast path
+    // (recompose only the anchored pane + selection, not the whole frame).
+    // Consumed and cleared by the render block; any non-drag change leaves it
+    // false, forcing a full frame.
+    let mut selection_only = false;
     // One zone owns the keyboard at any time; Ctrl+g toggles the keybind lock.
     // `sb.focused` / `model.panel_focused` / `model.center_focused` mirror it.
     let mut focus = crate::focus::FocusState::default();
@@ -7540,140 +7545,181 @@ async fn event_loop<T: Terminal>(
                 scratch = Surface::new(cols, rows);
                 full_repaint = true;
             }
-            crate::chrome::clear_frame(&mut scratch);
-            // Card titles: "{title} · {worktree-leaf}" — the OSC window title
-            // the app sets, else the program name derived from the spawn argv.
-            let title_leaf = model
-                .worktree
-                .rsplit_once('/')
-                .map(|(_, l)| l.to_string())
-                .unwrap_or_else(|| model.worktree.clone());
-            // Top-level app tabs: reflect the strip into the model so the
-            // masthead chips render every frame.
-            {
-                model.app_tabs = app_host.tab_labels();
-                model.active_app = app_host.active_tab_index();
-            }
             let app_tile_active = app_host.active_tile_mut().is_some();
-            if app_tile_active {
-                // App-tab takeover: the masthead (with chips) + statusbar frame
-                // the focused tile, which owns the whole band between them. The
-                // worktree IDE (sidebar/center/panel) is hidden while it's up.
-                if let Some(s) = app_host.active_tile_mut().and_then(|t| t.status_line()) {
-                    model.status = s;
-                }
-                crate::chrome::draw_masthead(&mut scratch, &chrome, &model);
-                crate::chrome::draw_statusbar(&mut scratch, chrome.statusbar, &model);
-                let top = chrome.divider.y + chrome.divider.rows;
-                let band = Rect {
-                    x: 0,
-                    y: top,
-                    cols,
-                    rows: chrome.statusbar.y.saturating_sub(top),
-                };
-                if let Some(tile) = app_host.active_tile_mut()
-                    && band.cols > 0
-                    && band.rows > 0
-                {
-                    let area = sz_kit::ratatui::layout::Rect::new(
-                        0,
-                        0,
-                        band.cols as u16,
-                        band.rows as u16,
-                    );
-                    let mut tbuf = sz_kit::ratatui::buffer::Buffer::empty(area);
-                    tile.render(area, &mut tbuf);
-                    crate::apps::bridge::blit(&mut scratch, &tbuf, band);
+            // FAST PATH: a pure selection-drag move only changes the highlighted
+            // cells. Reuse the last full frame already in `scratch` (skip the
+            // clear + the chrome/sidebar/panel/all-pane recompose that
+            // `render_tab` does) and repaint ONLY the anchored pane — clearing
+            // its old highlight — plus the new selection overlay. The diff-flush
+            // below then emits just the selection delta. Guarded so no transient
+            // overlay is skipped; any non-drag event or the mouse release runs a
+            // full frame that heals anything deferred during the drag.
+            let fast_select = selection_only
+                && !full_repaint
+                && !app_tile_active
+                && mouse_sel.is_some()
+                && palette.is_none()
+                && active_menu.is_none()
+                && git_input.is_none()
+                && host_input.is_none()
+                && wizard_ui.is_none()
+                && hover_popup.is_none()
+                && search.is_none()
+                && which_key.is_empty()
+                && pending_delete.is_none()
+                && toasts.is_empty();
+            if fast_select {
+                if let Some((sp, sel)) = mouse_sel.as_ref() {
+                    let target = tree
+                        .layout_framed(chrome.center)
+                        .into_iter()
+                        .find(|(id, _, _)| id == sp)
+                        .map(|(_, _, c)| c);
+                    if let (Some(content), Some(p)) = (target, panes.table.get(sp)) {
+                        crate::compositor::compose_pane(&mut scratch, p.emulator(), content);
+                        crate::compositor::overlay_selection(
+                            &mut scratch,
+                            content,
+                            sel,
+                            crate::chrome::col(crate::chrome::S::Panel2),
+                        );
+                    }
                 }
             } else {
-                render_tab(
-                    &mut scratch,
-                    &chrome,
-                    &tree,
-                    focused,
-                    &model,
-                    &panel_ui,
-                    |id| panes.table.get(&id).map(|p| p.emulator()),
-                    &|id| {
-                        panes
-                            .table
-                            .get(&id)
-                            .map(|p| {
-                                // Prefer the OSC window title the app sets (zsh +
-                                // starship, tmux, etc.); fall back to the program
-                                // name derived from the spawn argv.
-                                let name = p
-                                    .emulator()
-                                    .title()
-                                    .filter(|t| !t.trim().is_empty())
-                                    .unwrap_or_else(|| p.program().to_string());
-                                if title_leaf.is_empty() {
-                                    name
-                                } else {
-                                    format!("{name} \u{00b7} {title_leaf}")
-                                }
-                            })
-                            .unwrap_or_default()
-                    },
-                );
-            }
-            // Mouse-selection highlight, clipped to the anchored pane.
-            if !app_tile_active
-                && let Some((sel_pane, sel)) = &mouse_sel
-                && let Some((_, _, content)) = tree
-                    .layout_framed(chrome.center)
-                    .iter()
-                    .find(|(id, _, _)| id == sel_pane)
-            {
-                crate::compositor::overlay_selection(
-                    &mut scratch,
-                    *content,
-                    sel,
-                    crate::chrome::col(crate::chrome::S::Panel2),
-                );
-            }
-            if !app_tile_active && let Some(strip_rect) = chrome.strip {
-                let cells: Vec<crate::chrome::StripCell> = supervisor
-                    .strip_layout(strip_rect)
-                    .into_iter()
-                    .filter_map(|(pane, rect)| {
-                        supervisor
-                            .instance_of_pane(pane)
-                            .map(|inst| crate::chrome::StripCell {
-                                pane,
-                                rect,
-                                label: inst.label.clone(),
-                                glyph: inst.health.glyph(),
-                                focused: false,
-                            })
-                    })
-                    .collect();
-                crate::chrome::draw_strip(
-                    &mut scratch,
-                    strip_rect,
-                    &cells,
-                    model.accent_or_default(),
-                    |id| panes.table.get(&id).map(|p| p.emulator()),
-                );
-            }
-            if !app_tile_active
-                && let Some(drawer_id) = drawer
-                && let Some(p) = panes.table.get(&drawer_id)
-            {
-                let height = current_config
-                    .drawer
-                    .height
-                    .parse::<usize>()
-                    .unwrap_or(20)
-                    .min(rows); // cfg.drawer.height equivalent
-                let rect = Rect {
-                    x: 0,
-                    y: rows.saturating_sub(height),
-                    cols,
-                    rows: height,
-                };
-                crate::compositor::compose_pane(&mut scratch, p.emulator(), rect);
-            }
+                crate::chrome::clear_frame(&mut scratch);
+                // Card titles: "{title} · {worktree-leaf}" — the OSC window title
+                // the app sets, else the program name derived from the spawn argv.
+                let title_leaf = model
+                    .worktree
+                    .rsplit_once('/')
+                    .map(|(_, l)| l.to_string())
+                    .unwrap_or_else(|| model.worktree.clone());
+                // Top-level app tabs: reflect the strip into the model so the
+                // masthead chips render every frame.
+                {
+                    model.app_tabs = app_host.tab_labels();
+                    model.active_app = app_host.active_tab_index();
+                }
+                if app_tile_active {
+                    // App-tab takeover: the masthead (with chips) + statusbar frame
+                    // the focused tile, which owns the whole band between them. The
+                    // worktree IDE (sidebar/center/panel) is hidden while it's up.
+                    if let Some(s) = app_host.active_tile_mut().and_then(|t| t.status_line()) {
+                        model.status = s;
+                    }
+                    crate::chrome::draw_masthead(&mut scratch, &chrome, &model);
+                    crate::chrome::draw_statusbar(&mut scratch, chrome.statusbar, &model);
+                    let top = chrome.divider.y + chrome.divider.rows;
+                    let band = Rect {
+                        x: 0,
+                        y: top,
+                        cols,
+                        rows: chrome.statusbar.y.saturating_sub(top),
+                    };
+                    if let Some(tile) = app_host.active_tile_mut()
+                        && band.cols > 0
+                        && band.rows > 0
+                    {
+                        let area = sz_kit::ratatui::layout::Rect::new(
+                            0,
+                            0,
+                            band.cols as u16,
+                            band.rows as u16,
+                        );
+                        let mut tbuf = sz_kit::ratatui::buffer::Buffer::empty(area);
+                        tile.render(area, &mut tbuf);
+                        crate::apps::bridge::blit(&mut scratch, &tbuf, band);
+                    }
+                } else {
+                    render_tab(
+                        &mut scratch,
+                        &chrome,
+                        &tree,
+                        focused,
+                        &model,
+                        &panel_ui,
+                        |id| panes.table.get(&id).map(|p| p.emulator()),
+                        &|id| {
+                            panes
+                                .table
+                                .get(&id)
+                                .map(|p| {
+                                    // Prefer the OSC window title the app sets (zsh +
+                                    // starship, tmux, etc.); fall back to the program
+                                    // name derived from the spawn argv.
+                                    let name = p
+                                        .emulator()
+                                        .title()
+                                        .filter(|t| !t.trim().is_empty())
+                                        .unwrap_or_else(|| p.program().to_string());
+                                    if title_leaf.is_empty() {
+                                        name
+                                    } else {
+                                        format!("{name} \u{00b7} {title_leaf}")
+                                    }
+                                })
+                                .unwrap_or_default()
+                        },
+                    );
+                }
+                // Mouse-selection highlight, clipped to the anchored pane.
+                if !app_tile_active
+                    && let Some((sel_pane, sel)) = &mouse_sel
+                    && let Some((_, _, content)) = tree
+                        .layout_framed(chrome.center)
+                        .iter()
+                        .find(|(id, _, _)| id == sel_pane)
+                {
+                    crate::compositor::overlay_selection(
+                        &mut scratch,
+                        *content,
+                        sel,
+                        crate::chrome::col(crate::chrome::S::Panel2),
+                    );
+                }
+                if !app_tile_active && let Some(strip_rect) = chrome.strip {
+                    let cells: Vec<crate::chrome::StripCell> = supervisor
+                        .strip_layout(strip_rect)
+                        .into_iter()
+                        .filter_map(|(pane, rect)| {
+                            supervisor
+                                .instance_of_pane(pane)
+                                .map(|inst| crate::chrome::StripCell {
+                                    pane,
+                                    rect,
+                                    label: inst.label.clone(),
+                                    glyph: inst.health.glyph(),
+                                    focused: false,
+                                })
+                        })
+                        .collect();
+                    crate::chrome::draw_strip(
+                        &mut scratch,
+                        strip_rect,
+                        &cells,
+                        model.accent_or_default(),
+                        |id| panes.table.get(&id).map(|p| p.emulator()),
+                    );
+                }
+                if !app_tile_active
+                    && let Some(drawer_id) = drawer
+                    && let Some(p) = panes.table.get(&drawer_id)
+                {
+                    let height = current_config
+                        .drawer
+                        .height
+                        .parse::<usize>()
+                        .unwrap_or(20)
+                        .min(rows); // cfg.drawer.height equivalent
+                    let rect = Rect {
+                        x: 0,
+                        y: rows.saturating_sub(height),
+                        cols,
+                        rows: height,
+                    };
+                    crate::compositor::compose_pane(&mut scratch, p.emulator(), rect);
+                }
+            } // end full-compose else (fast_select reuses the prior scratch)
             let screen = Rect {
                 x: 0,
                 y: 0,
@@ -7804,6 +7850,8 @@ async fn event_loop<T: Terminal>(
                 out.flush().context("terminal flush")?;
             }
             dirty = false;
+            // Consumed: the next frame is full unless another drag move re-arms it.
+            selection_only = false;
             if muse_ready {
                 // Only emit the ready marker when the event queue is
                 // completely drained.  If szhost still has buffered input (e.g.
@@ -8285,6 +8333,9 @@ async fn event_loop<T: Terminal>(
                             - content.x;
                         sel.cursor = (row as u16, col as u16);
                         dirty = true;
+                        // Request the cheap selection-only render: only the
+                        // highlight moved, so the full frame need not recompose.
+                        selection_only = true;
                     }
                 } else if !left && mouse_left_down {
                     // Release: auto-copy a non-empty selection (zellij-style).
