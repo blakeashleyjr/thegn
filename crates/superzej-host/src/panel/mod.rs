@@ -614,6 +614,48 @@ pub fn file_tree_visible<'a>(
         .collect()
 }
 
+/// An inline file view shown in the Files section (full pane): the contents of
+/// a selected file, scrolled with j/k, dismissed with esc. The read happens
+/// off-thread; until it lands `loading` is true. The scroll math is pure and
+/// unit-tested.
+#[derive(Debug, Clone, Default)]
+pub struct FilePreview {
+    /// Repo-relative path being shown (the header label).
+    pub path: String,
+    /// File contents, one entry per line (tabs already expanded).
+    pub lines: Vec<String>,
+    /// True while the background read is still in flight.
+    pub loading: bool,
+    /// Set when the read failed (binary, too large, unreadable) — shown in
+    /// place of content.
+    pub error: Option<String>,
+    /// Index of the topmost visible content line.
+    pub scroll: usize,
+}
+
+impl FilePreview {
+    /// A freshly-opened preview waiting on its background read.
+    pub fn loading(path: impl Into<String>) -> Self {
+        FilePreview {
+            path: path.into(),
+            loading: true,
+            ..FilePreview::default()
+        }
+    }
+
+    /// The largest valid scroll offset for a `viewport`-row content area: the
+    /// last line still anchored so at least one row of content shows.
+    pub fn max_scroll(&self, viewport: usize) -> usize {
+        self.lines.len().saturating_sub(viewport.max(1))
+    }
+
+    /// Scroll by `delta` rows (negative = up), clamped to the content bounds.
+    pub fn scroll_by(&mut self, delta: isize, viewport: usize) {
+        let max = self.max_scroll(viewport) as isize;
+        self.scroll = (self.scroll as isize + delta).clamp(0, max) as usize;
+    }
+}
+
 /// The panel's interactive state, owned by the event loop.
 #[derive(Debug, Clone)]
 pub struct PanelUi {
@@ -656,6 +698,10 @@ pub struct PanelUi {
     /// Persisted to the DB (`ui_state` table, prefix `panel.files.col/`) so the
     /// tree survives restarts.
     pub files_collapsed: std::collections::HashSet<String>,
+    /// When set, the Files section shows this file's contents inline (full
+    /// pane) instead of the tree — `enter` on a file opens it, `esc` closes it.
+    /// Populated off-thread by the file-read worker.
+    pub file_preview: Option<FilePreview>,
     /// Row cursor within the Problems section's list.
     pub problems_cursor: usize,
     /// Row cursor within the Symbols outline list.
@@ -709,6 +755,7 @@ impl Default for PanelUi {
             docs: docs::PanelDocs::default(),
             git: gitui::GitUi::default(),
             files_collapsed: std::collections::HashSet::new(),
+            file_preview: None,
             problems_cursor: 0,
             symbols_cursor: 0,
             symbols_show_refs: false,
@@ -1366,5 +1413,43 @@ mod tests {
         assert_eq!(ui.open, Section::Pr);
         assert_eq!(ui.width, crate::layout::PanelWidth::Half);
         assert_eq!(ui.cursor, 3);
+    }
+
+    #[test]
+    fn file_preview_scroll_clamps_to_content_bounds() {
+        let mut fp = FilePreview {
+            path: "src/main.rs".into(),
+            lines: (0..100).map(|i| format!("line {i}")).collect(),
+            ..FilePreview::default()
+        };
+        // viewport of 20 rows over 100 lines: last valid top is 80.
+        assert_eq!(fp.max_scroll(20), 80);
+        fp.scroll_by(1000, 20);
+        assert_eq!(fp.scroll, 80, "cannot scroll past the end");
+        fp.scroll_by(-1000, 20);
+        assert_eq!(fp.scroll, 0, "cannot scroll above the top");
+        fp.scroll_by(25, 20);
+        assert_eq!(fp.scroll, 25);
+    }
+
+    #[test]
+    fn file_preview_shorter_than_viewport_never_scrolls() {
+        let mut fp = FilePreview {
+            lines: vec!["a".into(), "b".into()],
+            ..FilePreview::default()
+        };
+        assert_eq!(fp.max_scroll(40), 0);
+        // Any scroll attempt is pinned to the top when content fits.
+        fp.scroll_by(5, 40);
+        assert_eq!(fp.scroll, 0);
+    }
+
+    #[test]
+    fn file_preview_loading_constructor_sets_flag_and_path() {
+        let fp = FilePreview::loading("README.md");
+        assert!(fp.loading);
+        assert_eq!(fp.path, "README.md");
+        assert!(fp.lines.is_empty());
+        assert!(fp.error.is_none());
     }
 }

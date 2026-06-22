@@ -1145,4 +1145,62 @@ mod spec {
         assert!(segs(&lines[1]).starts_with("a-very-"));
         assert!(segs(&lines[1]).contains('…'));
     }
+
+    #[test]
+    fn files_section_renders_inline_file_preview_when_set() {
+        let m = model();
+        let mut u = ui(PanelWidth::Full, Section::Files);
+        u.file_preview = Some(crate::panel::FilePreview {
+            path: "src/main.rs".into(),
+            lines: (0..50).map(|i| format!("code line {i}")).collect(),
+            loading: false,
+            error: None,
+            scroll: 10,
+        });
+        let ctx = SectionCtx {
+            model: &m,
+            ui: &u,
+            cols: 150,
+            rows: 38,
+        };
+        let out = text(&content(Section::Files, &ctx));
+        // Header names the file; the close hint is present.
+        assert!(out.contains("src/main.rs"), "{out}");
+        assert!(out.contains("esc close"), "{out}");
+        // Scrolled to line 10 (0-based) → the first body line is "11 …".
+        assert!(out.contains("code line 10"), "{out}");
+        assert!(out.contains("11"), "line numbers shown: {out}");
+        // Content above the scroll point is not shown.
+        assert!(
+            !out.contains("code line 0\n") && !out.contains("code line 9 "),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn files_section_preview_shows_loading_then_error() {
+        let m = model();
+        let mut u = ui(PanelWidth::Full, Section::Files);
+        u.file_preview = Some(crate::panel::FilePreview::loading("big.bin"));
+        let ctx = SectionCtx {
+            model: &m,
+            ui: &u,
+            cols: 80,
+            rows: 20,
+        };
+        assert!(text(&content(Section::Files, &ctx)).contains("loading"));
+
+        u.file_preview = Some(crate::panel::FilePreview {
+            path: "big.bin".into(),
+            error: Some("binary file".into()),
+            ..Default::default()
+        });
+        let ctx = SectionCtx {
+            model: &m,
+            ui: &u,
+            cols: 80,
+            rows: 20,
+        };
+        assert!(text(&content(Section::Files, &ctx)).contains("binary file"));
+    }
 }

@@ -9,6 +9,7 @@ mod apps;
 mod borders;
 mod center;
 mod chrome;
+mod clipboard;
 mod cmd;
 mod compositor;
 mod copymode;
@@ -49,6 +50,7 @@ mod stats;
 mod task;
 mod telemetry;
 mod testkit;
+mod toast;
 mod wire;
 mod wizard;
 
