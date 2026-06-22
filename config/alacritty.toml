@@ -14,7 +14,7 @@ opacity = 1.0
 [font]
 # Match the ghostty daily-driver setup: Nerd Font glyphs back the bar icons,
 # and a touch of extra line height keeps the chrome airy.
-normal = { family = "FiraCode Nerd Font" }
+normal = { family = "CaskaydiaCove Nerd Font" }
 size = 13
 offset = { x = 0, y = 2 }
 glyph_offset = { x = 0, y = 1 }

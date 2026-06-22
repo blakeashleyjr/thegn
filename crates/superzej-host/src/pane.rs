@@ -45,6 +45,15 @@ pub struct PtyPane {
     /// Stateful ANSI stripper carried across PTY read chunks so sequences that
     /// arrive split at a chunk boundary are handled correctly.
     history_stripper: AnsiStripper,
+    /// The child process id, captured before the child handle moves into the
+    /// reader thread. Used to read the live working directory (`/proc/<pid>/cwd`)
+    /// at persist time so a resurrected pane can respawn where it was.
+    pid: Option<u32>,
+    /// A foreground command to offer relaunching (e.g. `"nvim src/main.rs"`),
+    /// shown as an overlay over the pane. Set when a resurrected pane had a
+    /// captured command, or when a crashed pane is kept as a husk; cleared once
+    /// the user accepts (Enter) or dismisses it. `None` for an ordinary pane.
+    pending_relaunch: Option<String>,
 }
 
 /// Derive a pane's program name from its spawn argv. Handles the common
@@ -92,6 +101,54 @@ pub fn is_interactive_shell(program: &str) -> bool {
     matches!(program, "sh" | "bash" | "zsh" | "dash" | "fish")
 }
 
+/// Whether `program` is a sandbox/remote wrapper rather than the user's actual
+/// foreground program — its `/proc` child is the runtime shim, so relaunching it
+/// from the host is meaningless. Used to skip foreground-command capture for
+/// containerized/remote panes.
+fn is_runtime_wrapper(program: &str) -> bool {
+    matches!(
+        program,
+        "podman" | "docker" | "conmon" | "runc" | "crun" | "bwrap" | "systemd-run" | "ssh"
+    )
+}
+
+/// The most-recently-started direct child of `pid` (the shell's foreground job),
+/// if any. Walks `/proc/*/stat` for the `ppid` field; ties break to the highest
+/// pid (newest). Linux-only — returns `None` where `/proc` is absent.
+fn newest_child(pid: u32) -> Option<u32> {
+    let mut best: Option<u32> = None;
+    for ent in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Some(child) = ent.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        if child != pid && stat_ppid(child) == Some(pid) {
+            best = Some(best.map_or(child, |b| b.max(child)));
+        }
+    }
+    best
+}
+
+/// The parent pid from `/proc/<pid>/stat`. The `comm` field (field 2) can itself
+/// contain spaces and parens, so the numeric fields are parsed after the final
+/// `)`: state is the first token, ppid the second.
+fn stat_ppid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Parse `/proc/<pid>/cmdline` (NUL-separated argv) into a `Vec`, dropping empty
+/// trailing entries. `None` when unreadable or empty (e.g. a kernel thread).
+fn read_cmdline(pid: u32) -> Option<Vec<String>> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let argv: Vec<String> = raw
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    (!argv.is_empty()).then_some(argv)
+}
+
 impl PtyPane {
     /// Spawn `argv` (already composed by `sandbox::enter_argv`) in `cwd` on a
     /// fresh PTY of `rows`x`cols`, injecting `env` (key/value pairs) into the
@@ -136,6 +193,9 @@ impl PtyPane {
             cmd.env(k, v);
         }
         let mut child = pair.slave.spawn_command(cmd).context("spawn child")?;
+        // Capture the pid before `child` moves into the reader thread below —
+        // it's the handle we use to read the pane's live cwd for persistence.
+        let pid = child.process_id();
         // Drop the slave so the master sees EOF when the child exits.
         drop(pair.slave);
 
@@ -191,12 +251,65 @@ impl PtyPane {
             history: HistoryBuffer::new(10_000),
             history_partial: Vec::new(),
             history_stripper: AnsiStripper::default(),
+            pid,
+            pending_relaunch: None,
         })
+    }
+
+    /// The pane's current working directory, read live from `/proc/<pid>/cwd`.
+    /// `None` when the pid is unknown, the process is gone, or the symlink can't
+    /// be resolved (e.g. a sandbox runtime whose cwd isn't host-meaningful — the
+    /// caller gates capture on the host backend regardless). Linux-only; other
+    /// platforms (where superzej does not run) return `None`.
+    pub fn cwd(&self) -> Option<std::path::PathBuf> {
+        let pid = self.pid?;
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    }
+
+    /// The pane's live foreground command (argv + cwd), read from `/proc`: the
+    /// shell's foreground child job, when it is a real non-shell program. `None`
+    /// for an idle shell prompt, a nested shell, a sandbox/remote runtime child,
+    /// an unknown pid, or non-Linux. Captured at persist time so a resurrected
+    /// or crashed pane can offer to relaunch what was running.
+    pub fn foreground_command(&self) -> Option<crate::session::PaneCmd> {
+        let shell = self.pid?;
+        let child = newest_child(shell)?;
+        let argv = read_cmdline(child)?;
+        let name = std::path::Path::new(argv.first()?)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // A bare shell prompt or a nested shell isn't worth relaunching, and a
+        // sandbox/remote runtime child (the container shim, not the inner
+        // program) can't be relaunched from the host.
+        if name.is_empty() || is_interactive_shell(&name) || is_runtime_wrapper(&name) {
+            return None;
+        }
+        let cwd = std::fs::read_link(format!("/proc/{child}/cwd"))
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned());
+        Some(crate::session::PaneCmd { argv, cwd })
     }
 
     /// The launched program's short name (keys per-program keybind overlays).
     pub fn program(&self) -> &str {
         &self.program
+    }
+
+    /// The command this pane is offering to relaunch, if any (drives the
+    /// overlay; `Some` means the pane is awaiting an Enter/dismiss).
+    pub fn pending_relaunch(&self) -> Option<&str> {
+        self.pending_relaunch.as_deref()
+    }
+
+    /// Arm (or clear) the relaunch overlay for this pane.
+    pub fn set_pending_relaunch(&mut self, cmd: Option<String>) {
+        self.pending_relaunch = cmd;
+    }
+
+    /// Take the pending relaunch command, clearing the overlay (on Enter).
+    pub fn take_pending_relaunch(&mut self) -> Option<String> {
+        self.pending_relaunch.take()
     }
 
     /// Feed PTY output into the emulator grid and the plain-text history ring.

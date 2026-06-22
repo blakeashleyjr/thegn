@@ -1693,7 +1693,7 @@ pub(crate) fn panel_help_pairs(ui: &crate::panel::PanelUi) -> Vec<(String, Strin
             ("j/k", "section"),
             (jumps.as_str(), "jump"),
             ("↵", "open"),
-            ("alt+1-3", "tab"),
+            ("⇥", "tabs"),
             ("e", "expand"),
         ]
         .iter()
@@ -1927,6 +1927,34 @@ pub fn draw_confirm(surface: &mut Surface, screen: Rect, msg: &str) {
 /// content (resolved via `lookup`), draw the frames (focused ring in the
 /// focus color when the center zone owns the keyboard), then the chrome.
 #[allow(clippy::too_many_arguments)]
+/// Draw the relaunch prompt for a pane along the bottom row of its content rect:
+/// `↻ <cmd> — Enter to relaunch · Esc to dismiss`. Painted over live content
+/// (a resurrected shell) or a crash husk; cleared once the user acts.
+fn draw_relaunch_overlay(surface: &mut Surface, content: Rect, cmd: &str) {
+    if content.rows == 0 || content.cols < 4 {
+        return;
+    }
+    let y = content.y + content.rows - 1;
+    let bar = format!(" \u{21bb} {cmd} \u{2014} Enter to relaunch \u{00b7} Esc to dismiss ");
+    let row = Rect {
+        x: content.x,
+        y,
+        cols: content.cols,
+        rows: 1,
+    };
+    fill(surface, row, col(S::Raise));
+    draw_text(
+        surface,
+        content.x,
+        y,
+        &bar,
+        col(S::Text),
+        col(S::Raise),
+        content.cols,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn render_tab<'a>(
     surface: &mut Surface,
     chrome: &crate::layout::ChromeLayout,
@@ -1936,6 +1964,7 @@ pub fn render_tab<'a>(
     panel_ui: &crate::panel::PanelUi,
     lookup: impl Fn(crate::center::PaneId) -> Option<&'a dyn PaneEmulator>,
     title_of: &dyn Fn(crate::center::PaneId) -> String,
+    relaunch_of: &dyn Fn(crate::center::PaneId) -> Option<String>,
 ) {
     let frames = center.layout_framed(chrome.center);
     // "Empty center" = no visible leaf has a live emulator behind it (fresh
@@ -1955,6 +1984,11 @@ pub fn render_tab<'a>(
         for (id, _, content) in &frames {
             if let Some(emu) = lookup(*id) {
                 compose_pane(surface, emu, *content);
+            }
+            // A pane awaiting relaunch (resurrected with a remembered command,
+            // or a crashed husk) shows a one-line prompt over its bottom row.
+            if let Some(cmd) = relaunch_of(*id) {
+                draw_relaunch_overlay(surface, *content, &cmd);
             }
         }
         // The focused pane keeps a distinct ring at all times: focus blue
@@ -2466,6 +2500,7 @@ mod tests {
             &crate::panel::PanelUi::default(),
             |id| (id == 1).then_some(&emu as &dyn PaneEmulator),
             &|_| String::new(),
+            &|_| None,
         );
 
         let l = lines(&s);
@@ -2525,6 +2560,7 @@ mod tests {
                 _ => None,
             },
             &|id| format!("pane-{id}"),
+            &|_| None,
         );
         let text = s.screen_chars_to_string();
         assert!(text.contains("LEFTPANE"), "left pane painted");
@@ -2555,6 +2591,7 @@ mod tests {
             &crate::panel::PanelUi::default(),
             |_| None,
             &|_| String::new(),
+            &|_| None,
         );
         let l = lines(&s);
         // The splash wordmark lands inside the center band, with chrome intact.
@@ -2631,6 +2668,7 @@ mod tests {
             &panel_ui,
             |id| (id == 1).then_some(&emu as &dyn PaneEmulator),
             &|_| String::new(),
+            &|_| None,
         );
         let l = lines(&s);
 
@@ -2708,8 +2746,14 @@ mod tests {
             !text.contains('\u{2026}'),
             "no ellipsis truncation: {text:?}"
         );
-        assert!(!text.contains("bravo"), "overflowing binding dropped: {text:?}");
-        assert!(!text.contains("charlie"), "overflowing binding dropped: {text:?}");
+        assert!(
+            !text.contains("bravo"),
+            "overflowing binding dropped: {text:?}"
+        );
+        assert!(
+            !text.contains("charlie"),
+            "overflowing binding dropped: {text:?}"
+        );
 
         // With ample width every binding is present, untouched.
         let mut wide = Surface::new(60, 1);

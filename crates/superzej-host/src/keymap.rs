@@ -58,6 +58,8 @@ pub enum Action {
     CloseTab,
     CloseWorktree,
     SwitchWorkspace,
+    /// Open the coding-agent account switcher for the focused worktree (item 656).
+    SwitchAccount,
     Dashboard,
     NextTab,
     PrevTab,
@@ -267,6 +269,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         label: "Switch workspace",
         hint: "switch",
         default_chords: &["Alt o"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "switch-account",
+        label: "Switch agent account",
+        hint: "account",
+        default_chords: &["Ctrl Alt a"],
         palette: true,
     },
     ActionSpec {
@@ -670,6 +679,7 @@ impl Action {
             Action::CloseTab => "close-tab",
             Action::CloseWorktree => "close-worktree",
             Action::SwitchWorkspace => "switch-workspace",
+            Action::SwitchAccount => "switch-account",
             Action::Dashboard => "dashboard",
             Action::NextTab => "next-tab",
             Action::PrevTab => "prev-tab",
@@ -734,6 +744,7 @@ impl Action {
             "close-tab" => Action::CloseTab,
             "close-worktree" => Action::CloseWorktree,
             "switch-workspace" | "switch-repo" => Action::SwitchWorkspace,
+            "switch-account" => Action::SwitchAccount,
             "dashboard" => Action::Dashboard,
             "next-tab" => Action::NextTab,
             "prev-tab" => Action::PrevTab,

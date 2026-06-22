@@ -303,6 +303,10 @@ format = "text"           # text | json
 
 # Coding agents offered in the new-worktree picker.
 # Use "__shell__" for a plain login shell.
+#
+# `provider` (optional) tags an agent for client-side account switching
+# (CODEX_HOME / CLAUDE_CONFIG_DIR). When omitted, the provider is inferred from
+# the command's program basename (e.g. "codex …" → codex, "claude …" → claude).
 [[agents]]
 name = "claude"
 command = "claude"
@@ -335,6 +339,35 @@ command = "${EDITOR:-vi} ."
 [[tools]]
 name = "diff"
 command = "git diff"
+
+# Coding-agent subscription accounts (client-side account switching, item 656).
+# Keep N logins per provider (e.g. personal + work) and pick which one a newly
+# launched agent uses. superzej points the agent's credential-home env var
+# (CODEX_HOME for codex, CLAUDE_CONFIG_DIR for claude) at the chosen account on
+# launch — your real ~/.codex / ~/.claude is never modified, and a switch only
+# affects agents started *after* it (running ones keep their account).
+#
+# Switch with Ctrl+Alt+a (or the "Switch agent account" palette entry). The
+# picker also has "Add <provider> account…", which runs the provider's login in
+# the focused pane against a fresh superzej-managed dir.
+#
+# Omit `dir` to let superzej manage the dir under
+# $XDG_STATE_HOME/superzej/accounts/<provider>/<name>/ (then log in via the
+# picker); set `dir` to adopt an existing login dir.
+#
+# [[accounts]]
+# name = "personal"
+# provider = "codex"
+#
+# [[accounts]]
+# name = "work"
+# provider = "codex"
+# dir = "~/.codex-work"   # adopt an existing CODEX_HOME
+#
+# Make a repo default to an account (resolution: worktree override → this
+# workspace default → global active → the CLI's own default home):
+# [workspace.my-work-repo]
+# accounts = { codex = "work", claude = "work" }
 
 # General tasks: surfaced in the Tests panel and, later, Problems/Timeline/Search
 # Everywhere. `kind = "test"` makes a task eligible for test discovery/runs.

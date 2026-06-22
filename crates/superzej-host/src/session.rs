@@ -35,6 +35,26 @@ impl GroupKind {
     }
 }
 
+/// The last foreground command observed in a pane, captured from `/proc` at
+/// persist time so a resurrected (or crashed) pane can offer to relaunch the
+/// program that was running — never the bare interactive shell.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PaneCmd {
+    /// The foreground process's argv (e.g. `["nvim", "src/main.rs"]`).
+    pub argv: Vec<String>,
+    /// Its working directory, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+impl PaneCmd {
+    /// A shell-ready command line for the overlay + relaunch (naive join; argv
+    /// elements with spaces are rare for the editor/REPL programs this targets).
+    pub fn display(&self) -> String {
+        self.argv.join(" ")
+    }
+}
+
 /// One tab inside a worktree group: a pane tree and which leaf has focus.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tab {
@@ -42,6 +62,16 @@ pub struct Tab {
     pub title: String,
     pub center: CenterTree,
     pub focused_pane: u32,
+    /// Last-known working directory of each leaf pane (`pane id → cwd`),
+    /// captured at persist time so resurrected panes respawn where they were
+    /// rather than at the worktree root. Only host (non-sandbox) panes whose
+    /// dir still exists are honored on respawn; missing entries fall back to
+    /// the worktree root.
+    pub pane_cwds: std::collections::BTreeMap<u32, String>,
+    /// Last-known foreground command of each leaf pane (`pane id → PaneCmd`),
+    /// captured at persist time so a resurrected pane can offer to relaunch the
+    /// program that was running. Only set for non-shell foreground programs.
+    pub pane_cmds: std::collections::BTreeMap<u32, PaneCmd>,
 }
 
 impl Tab {
@@ -50,15 +80,28 @@ impl Tab {
             title: title.into(),
             center: CenterTree::Leaf(0),
             focused_pane: 0,
+            pane_cwds: std::collections::BTreeMap::new(),
+            pane_cmds: std::collections::BTreeMap::new(),
         }
     }
 
     /// Reconstruct a tab from its persisted row. A malformed `pane_tree` falls
-    /// back to a single pane rather than failing the whole resurrect.
+    /// back to a single pane rather than failing the whole resurrect; malformed
+    /// or absent `pane_cwds` simply yields no cwd hints.
     pub fn from_row(row: &GroupTabRow) -> Tab {
         let center = serde_json::from_str::<CenterTree>(&row.pane_tree)
             .inspect_err(|e| tracing::warn!("malformed pane_tree in tab '{}': {e}", row.group_name))
             .unwrap_or(CenterTree::Leaf(0));
+        let pane_cwds = if row.pane_cwds.is_empty() {
+            std::collections::BTreeMap::new()
+        } else {
+            serde_json::from_str(&row.pane_cwds).unwrap_or_default()
+        };
+        let pane_cmds = if row.pane_cmds.is_empty() {
+            std::collections::BTreeMap::new()
+        } else {
+            serde_json::from_str(&row.pane_cmds).unwrap_or_default()
+        };
         Tab {
             title: if row.title.is_empty() {
                 (row.ordinal + 1).to_string()
@@ -67,17 +110,42 @@ impl Tab {
             },
             center,
             focused_pane: row.focused_pane.max(0) as u32,
+            pane_cwds,
+            pane_cmds,
         }
     }
 
-    /// Serialize this tab to a persistable row at the given position.
+    /// Serialize this tab to a persistable row at the given position. Stale cwd
+    /// entries for leaves no longer in the tree are pruned so the map can't grow
+    /// unbounded across splits/closes.
     pub fn to_row(&self, group: &str, ordinal: i64) -> GroupTabRow {
+        let ids = self.center.pane_ids();
+        let live_cwds: std::collections::BTreeMap<&u32, &String> = self
+            .pane_cwds
+            .iter()
+            .filter(|(id, _)| ids.contains(id))
+            .collect();
+        let live_cmds: std::collections::BTreeMap<&u32, &PaneCmd> = self
+            .pane_cmds
+            .iter()
+            .filter(|(id, _)| ids.contains(id))
+            .collect();
         GroupTabRow {
             group_name: group.to_string(),
             ordinal,
             title: self.title.clone(),
             pane_tree: serde_json::to_string(&self.center).unwrap_or_else(|_| "0".into()),
             focused_pane: self.focused_pane as i64,
+            pane_cwds: if live_cwds.is_empty() {
+                String::new()
+            } else {
+                serde_json::to_string(&live_cwds).unwrap_or_default()
+            },
+            pane_cmds: if live_cmds.is_empty() {
+                String::new()
+            } else {
+                serde_json::to_string(&live_cmds).unwrap_or_default()
+            },
         }
     }
 }
@@ -328,6 +396,30 @@ impl Session {
         self.active
     }
 
+    /// Rewrite every pane id in the session through `f`, keeping each tab's
+    /// `center` tree, `focused_pane`, and the `pane_cwds` hint map consistent.
+    /// Used to move a cold-resurrected workspace onto a fresh, disjoint id
+    /// range so its persisted ids can't collide with the live panes of other
+    /// resident workspaces (which are no longer reaped on a switch).
+    pub fn remap_pane_ids(&mut self, mut f: impl FnMut(u32) -> u32) {
+        for g in &mut self.worktrees {
+            for tab in &mut g.tabs {
+                tab.center.remap(&mut |id| f(id));
+                tab.focused_pane = f(tab.focused_pane);
+                tab.pane_cwds = tab
+                    .pane_cwds
+                    .iter()
+                    .map(|(id, cwd)| (f(*id), cwd.clone()))
+                    .collect();
+                tab.pane_cmds = tab
+                    .pane_cmds
+                    .iter()
+                    .map(|(id, cmd)| (f(*id), cmd.clone()))
+                    .collect();
+            }
+        }
+    }
+
     /// Focus the group at `idx` (clamped); no-op if empty.
     pub fn switch_to(&mut self, idx: usize) {
         if !self.worktrees.is_empty() {
@@ -388,6 +480,9 @@ impl Session {
         self.worktrees = worktrees;
         self.active = active;
         self.persist(db, &self.id, now)?;
+        // Record the workspace we just entered as the global "last active" so
+        // the next cold start reopens it (not whatever sorts first by recency).
+        let _ = db.set_active_workspace(repo_path);
 
         Ok(())
     }
@@ -505,9 +600,78 @@ mod tests {
                 ],
             },
             focused_pane: 1,
+            pane_cwds: std::collections::BTreeMap::new(),
+            pane_cmds: std::collections::BTreeMap::new(),
         };
         let back = Tab::from_row(&tab.to_row("app/feat", 1));
         assert_eq!(tab, back);
+    }
+
+    #[test]
+    fn tab_row_roundtrip_preserves_pane_cwds() {
+        let mut tab = Tab::new("1");
+        tab.center = CenterTree::Split {
+            dir: Dir::Row,
+            children: vec![
+                Branch {
+                    weight: 1.0,
+                    child: CenterTree::Leaf(3),
+                },
+                Branch {
+                    weight: 1.0,
+                    child: CenterTree::Leaf(7),
+                },
+            ],
+        };
+        tab.focused_pane = 7;
+        tab.pane_cwds.insert(3, "/home/u/repo".into());
+        tab.pane_cwds.insert(7, "/home/u/repo/src".into());
+        // A stale entry for a leaf no longer in the tree is pruned on serialize.
+        tab.pane_cwds.insert(99, "/gone".into());
+
+        let back = Tab::from_row(&tab.to_row("app/feat", 0));
+        assert_eq!(
+            back.pane_cwds.get(&3).map(String::as_str),
+            Some("/home/u/repo")
+        );
+        assert_eq!(
+            back.pane_cwds.get(&7).map(String::as_str),
+            Some("/home/u/repo/src")
+        );
+        assert!(!back.pane_cwds.contains_key(&99), "stale leaf cwd pruned");
+    }
+
+    #[test]
+    fn tab_row_roundtrip_preserves_pane_cmds() {
+        let mut tab = Tab::new("1");
+        tab.center = CenterTree::Leaf(3);
+        tab.focused_pane = 3;
+        tab.pane_cmds.insert(
+            3,
+            PaneCmd {
+                argv: vec!["nvim".into(), "src/main.rs".into()],
+                cwd: Some("/home/u/repo/src".into()),
+            },
+        );
+        // A stale entry for a leaf no longer in the tree is pruned on serialize.
+        tab.pane_cmds.insert(
+            99,
+            PaneCmd {
+                argv: vec!["gone".into()],
+                cwd: None,
+            },
+        );
+
+        let back = Tab::from_row(&tab.to_row("app/feat", 0));
+        assert_eq!(
+            back.pane_cmds.get(&3).map(PaneCmd::display),
+            Some("nvim src/main.rs".to_string())
+        );
+        assert_eq!(
+            back.pane_cmds.get(&3).and_then(|c| c.cwd.as_deref()),
+            Some("/home/u/repo/src")
+        );
+        assert!(!back.pane_cmds.contains_key(&99), "stale leaf cmd pruned");
     }
 
     #[test]
@@ -518,6 +682,8 @@ mod tests {
             title: String::new(),
             pane_tree: "this is not json".into(),
             focused_pane: 0,
+            pane_cwds: String::new(),
+            pane_cmds: String::new(),
         };
         let tab = Tab::from_row(&row);
         assert_eq!(tab.center, CenterTree::Leaf(0));
@@ -618,6 +784,39 @@ mod tests {
         s.switch_to_tab(9, 9);
         assert_eq!(s.active, 0);
         assert_eq!(s.active_group().unwrap().active_tab, 0);
+    }
+
+    #[test]
+    fn remap_pane_ids_rewrites_trees_focus_and_cwds() {
+        let mut s = Session::default();
+        let mut g = group("a");
+        g.tabs[0].center = CenterTree::Split {
+            dir: Dir::Row,
+            children: vec![
+                Branch {
+                    weight: 1.0,
+                    child: CenterTree::Leaf(3),
+                },
+                Branch {
+                    weight: 1.0,
+                    child: CenterTree::Leaf(7),
+                },
+            ],
+        };
+        g.tabs[0].focused_pane = 7;
+        g.tabs[0].pane_cwds.insert(3, "/a".into());
+        g.tabs[0].pane_cwds.insert(7, "/b".into());
+        s.add_group(g);
+
+        // Shift every id by 100.
+        s.remap_pane_ids(|id| id + 100);
+
+        let tab = &s.worktrees[0].tabs[0];
+        assert_eq!(tab.center.pane_ids(), vec![103, 107]);
+        assert_eq!(tab.focused_pane, 107);
+        assert_eq!(tab.pane_cwds.get(&103).map(String::as_str), Some("/a"));
+        assert_eq!(tab.pane_cwds.get(&107).map(String::as_str), Some("/b"));
+        assert!(!tab.pane_cwds.contains_key(&3), "old cwd key remapped");
     }
 
     #[test]

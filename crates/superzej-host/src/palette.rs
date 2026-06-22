@@ -449,6 +449,33 @@ pub(crate) fn build_agent_palette(
         .collect()
 }
 
+/// Build the account-switcher palette: every coding-agent account (config +
+/// managed) grouped by provider, plus an "Add account" row per provider.
+/// Selecting `account:<provider>:<name>` pins it as the focused repo's default
+/// (or the global default when no repo is focused); `account-add:<provider>`
+/// starts an interactive login. See [`superzej_core::account`].
+pub(crate) fn build_account_palette(
+    cfg: &superzej_core::config::Config,
+    db: &superzej_core::db::Db,
+) -> Vec<PaletteItem> {
+    use superzej_core::account;
+    let mut items = Vec::new();
+    for p in account::PROVIDERS {
+        for a in account::list(cfg, db, p.id) {
+            let mark = if a.authed { "✓" } else { "• needs login" };
+            items.push(PaletteItem::new(
+                format!("account:{}:{}", p.id, a.name),
+                format!("◈ {} · {} {mark}", p.id, a.name),
+            ));
+        }
+        items.push(PaletteItem::new(
+            format!("account-add:{}", p.id),
+            format!("➕ Add {} account…", p.id),
+        ));
+    }
+    items
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

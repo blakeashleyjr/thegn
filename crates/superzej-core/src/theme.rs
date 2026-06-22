@@ -50,7 +50,7 @@ pub const P_PANEL2: &str = "26;32;49"; // #1a2031
 pub const P_RAISE: &str = "34;41;66"; // #222942
 // fg ramp t d f g g2 g3
 pub const P_TEXT: &str = "237;240;248"; // #edf0f8
-pub const P_DIM: &str = "170;177;197"; // #aab1c5
+pub const P_DIM: &str = "198;204;219"; // #c6ccdb (brighter secondary — readable on dark panels)
 pub const P_FAINT: &str = "122;129;151"; // #7a8197
 pub const P_GHOST: &str = "78;85;110"; // #4e556e
 pub const P_GHOST2: &str = "52;58;82"; // #343a52

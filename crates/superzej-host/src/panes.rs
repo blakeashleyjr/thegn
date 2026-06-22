@@ -231,6 +231,18 @@ impl Panes {
         self.spawn_times.remove(&id);
     }
 
+    /// Reserve `n` fresh, never-reused pane ids and return the first. Used to
+    /// remap a cold-resurrected workspace's persisted tree ids onto a disjoint
+    /// range so they cannot collide with the live panes of other resident
+    /// workspaces — which, unlike before, we no longer reap on a workspace
+    /// switch. The reserved ids are placeholders: `materialize_with_specs`
+    /// spawns real panes (allocating even fresher ids) and remaps onto them.
+    pub(crate) fn reserve_ids(&mut self, n: u32) -> u32 {
+        let base = self.next_id;
+        self.next_id += n;
+        base
+    }
+
     /// The leaves of `tab.center` not yet backed by live panes — the targets
     /// a spec-resolution pass must cover before [`Self::materialize_with_specs`].
     pub(crate) fn missing_leaves(&self, tab: &crate::session::Tab) -> Vec<u32> {
@@ -265,13 +277,38 @@ impl Panes {
             if self.table.contains_key(old) || map.contains_key(old) {
                 continue; // raced a direct spawn; keep the live pane
             }
-            match self.spawn_argv_env(
-                &spec.argv,
-                spec.cwd.as_deref().or(cwd.as_deref()),
-                &spec.env,
-                center,
-            ) {
+            // Restore this leaf's last-known cwd when we have one. Only host
+            // panes are honored: a sandbox/remote launch wraps the spawn in a
+            // runtime whose `cwd` is the container spec, not a host path, so
+            // overriding it would break the launch — those fall back to the
+            // worktree root. A recorded dir that no longer exists is ignored.
+            let leaf_cwd: Option<std::path::PathBuf> = if spec.backend == "host" {
+                tab.pane_cwds
+                    .get(old)
+                    .map(std::path::PathBuf::from)
+                    .filter(|p| p.is_dir())
+            } else {
+                None
+            };
+            let spawn_cwd = leaf_cwd
+                .as_deref()
+                .or(spec.cwd.as_deref())
+                .or(cwd.as_deref());
+            match self.spawn_argv_env(&spec.argv, spawn_cwd, &spec.env, center) {
                 Ok(fresh) => {
+                    // Offer to relaunch the program this leaf was last running.
+                    // Host panes only: a sandbox/remote pane's captured command
+                    // isn't host-runnable, and its cwd wasn't restored either.
+                    if spec.backend == "host"
+                        && let Some(cmd) = tab.pane_cmds.get(old)
+                    {
+                        let line = cmd.display();
+                        if !line.is_empty()
+                            && let Some(p) = self.table.get_mut(&fresh)
+                        {
+                            p.set_pending_relaunch(Some(line));
+                        }
+                    }
                     map.insert(*old, fresh);
                 }
                 Err(e) => {

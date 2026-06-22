@@ -153,12 +153,25 @@ pub(crate) fn load_or_seed_session(cwd: &std::path::Path) -> (crate::session::Se
     };
 
     // sj is directory-agnostic: the launch directory never selects (or
-    // creates) a workspace. An inherited SUPERZEJ_SESSION wins (so child shells
-    // stay in the same session); otherwise we reopen the most-recently-active
-    // workspace recorded in the DB (`workspaces()` is `last_active DESC`). Only
-    // a genuine first run — no env, no DB history — falls back to the cwd.
+    // creates) a workspace. Resolution order:
+    //   1. An inherited SUPERZEJ_SESSION (so child shells stay in the session).
+    //   2. The explicit "active workspace" pointer — the workspace the user was
+    //      actually in at the last switch — provided its dir still exists.
+    //   3. The most-recently-active workspace by `workspaces()` (last_active
+    //      DESC) as a fallback for pre-pointer state.
+    //   4. A genuine first run (no env, no DB history) falls back to the cwd.
+    // The pointer is separate from `last_active` on purpose: that column also
+    // orders the sidebar tree, which must not reshuffle on every switch.
     let session_name = env_session
         .clone()
+        .or_else(|| {
+            db.as_ref().ok().and_then(|db| {
+                db.active_workspace()
+                    .ok()
+                    .flatten()
+                    .filter(|p| std::path::Path::new(p).is_dir())
+            })
+        })
         .or_else(|| {
             db.as_ref().ok().and_then(|db| {
                 db.workspaces()
@@ -256,6 +269,9 @@ pub(crate) fn load_or_seed_session(cwd: &std::path::Path) -> (crate::session::Se
         let _ = session.persist(&db, &session_name, now_secs());
     }
     session.id = session_name; // Need to add id to session
+    // Record the resolved workspace as the active pointer so the next cold
+    // start reopens it even on a first run (where no switch has happened yet).
+    let _ = db.set_active_workspace(&session.id);
     (session, seeded)
 }
 
