@@ -329,13 +329,16 @@ pub trait GitBackend: Send + Sync {
 
     /// All local branches with upstream/divergence detail, newest first.
     fn branches_full(&self, loc: &GitLoc) -> Result<Vec<BranchInfo>> {
+        // NB: `for-each-ref` uses `%XX` for hex bytes, NOT `git log`'s `%xXX`
+        // — `%x1f` would emit the literal text "%x1f". Pass a real 0x1f byte so
+        // `parse_branches` finds its separators (see the round-trip test).
         let out = run(
             loc,
             &[
                 "for-each-ref",
                 "refs/heads",
                 "--sort=-committerdate",
-                "--format=%(HEAD)%x1f%(refname:short)%x1f%(upstream:short)%x1f%(upstream:track)%x1f%(objectname)%x1f%(committerdate:unix)%x1f%(contents:subject)",
+                "--format=%(HEAD)\u{1f}%(refname:short)\u{1f}%(upstream:short)\u{1f}%(upstream:track)\u{1f}%(objectname)\u{1f}%(committerdate:unix)\u{1f}%(contents:subject)",
             ],
         )?;
         Ok(superzej_core::gitrefs::parse_branches(&out))
@@ -915,6 +918,48 @@ mod tests {
                 .filter(|b| b.is_head)
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn branches_full_round_trips_through_for_each_ref() {
+        // Regression guard for the command↔parser contract. `for-each-ref`
+        // takes `%XX` for a hex byte, NOT `git log`'s `%xXX`: the format once
+        // used `%x1f`, which for-each-ref emitted as the literal text "%x1f",
+        // so `parse_branches` found no 0x1f separators and dropped every row —
+        // the panel showed "no branches" on a repo full of them. A unit test of
+        // the parser alone can't catch this; only running the real command
+        // through the parser does.
+        let repo = testutil::TestRepo::new("branches-full");
+        repo.commit_file("a.txt", "1", "first");
+        repo.commit_file("b.txt", "2", "second");
+        testutil::git_in(&repo.dir, &["branch", "feature/x"]);
+        testutil::git_in(&repo.dir, &["branch", "bugfix/y"]);
+
+        let full = CliGit.branches_full(&repo.loc()).unwrap();
+        let mut names: Vec<&str> = full.iter().map(|b| b.name.as_str()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["bugfix/y", "feature/x", "main"],
+            "branches_full must list every branch (empty ⇒ format/parse mismatch)"
+        );
+
+        // Fields actually landed (the separators parsed): a 40-char sha, a real
+        // committer date, and the subject (which rides last, after every sep).
+        for b in &full {
+            assert_eq!(b.sha.len(), 40, "sha not parsed for {}", b.name);
+            assert!(b.date > 0, "committer date not parsed for {}", b.name);
+        }
+        let head: Vec<&str> = full
+            .iter()
+            .filter(|b| b.is_head)
+            .map(|b| b.name.as_str())
+            .collect();
+        assert_eq!(head, vec!["main"], "exactly one HEAD, and it's main");
+        assert_eq!(
+            full.iter().find(|b| b.name == "main").unwrap().subject,
+            "second"
         );
     }
 
