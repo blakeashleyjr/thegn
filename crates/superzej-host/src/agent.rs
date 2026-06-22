@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use superzej_core::config::Config;
 use superzej_core::db::Db;
 use superzej_core::remote::GitLoc;
-use superzej_core::{repo, sandbox};
+use superzej_core::{account, repo, sandbox};
 
 /// The literal shell sentinel — distinct from any configured agent/tool name.
 const SHELL: &str = "shell";
@@ -361,7 +361,49 @@ pub fn launch_spec_with_key(
         spec.env.retain(|(k, _)| k != "ANTHROPIC_API_KEY");
     }
 
-    Ok(compose_spec(cfg, worktree, branch, choice, &loc, &outcome))
+    // Client-side account switching (item 656): point the agent's credential
+    // home (CODEX_HOME / CLAUDE_CONFIG_DIR) at the active account, resolved by
+    // worktree → workspace → global precedence. Local worktrees only — a remote
+    // agent runs where the host's account dir doesn't exist.
+    let account_env = (!loc.is_remote())
+        .then(|| Db::open().ok())
+        .flatten()
+        .and_then(|db| {
+            let slug = repo_slug(&db, &repo_root);
+            account::launch_env(cfg, &db, worktree, slug.as_deref(), choice)
+        });
+    if let Some((var, dir)) = account_env.as_ref() {
+        // The CLI writes tokens/history here; ensure it exists.
+        let _ = std::fs::create_dir_all(dir);
+        let dir_s = dir.to_string_lossy().into_owned();
+        if let Some(spec) = outcome.spec.as_mut() {
+            spec.env_overrides.insert(var.clone(), dir_s.clone());
+            // Path-preserving mount so the dir is reachable at the same path
+            // inside the sandbox (mirrors the worktree mount).
+            spec.mounts.push(sandbox::Mount {
+                host: dir_s.clone(),
+                dest: dir_s,
+                ro: false,
+                cache: false,
+            });
+        }
+    }
+
+    let mut spec = compose_spec(cfg, worktree, branch, choice, &loc, &outcome);
+    // On the host path (no sandbox spec) the credential home rides the pane env.
+    if outcome.spec.is_none()
+        && let Some((var, dir)) = account_env
+    {
+        spec.env.push((var, dir.to_string_lossy().into_owned()));
+    }
+    Ok(spec)
+}
+
+/// The persisted slug for a repo root (for per-workspace account defaults), or
+/// `None` if the DB has no slug yet.
+fn repo_slug(db: &Db, repo_root: &Path) -> Option<String> {
+    let base = repo_root.file_name()?.to_string_lossy().into_owned();
+    db.slug_for_repo(&repo_root.to_string_lossy(), &base).ok()
 }
 
 fn sandbox_candidates(
@@ -399,6 +441,7 @@ mod tests {
             name: n.to_string(),
             command: c.to_string(),
             hints: Vec::new(),
+            provider: None,
         };
         cfg.agents = agents.iter().map(mk).collect();
         cfg.tools = tools.iter().map(mk).collect();

@@ -1428,6 +1428,7 @@ fn activate_row_target(
     drawer: &mut Option<u32>,
     pool: &mut DrawerPool,
     home: &mut Option<std::path::PathBuf>,
+    workspace_pool: &mut WorkspacePool,
     cfg: &superzej_core::config::Config,
     center: Rect,
 ) {
@@ -1442,29 +1443,19 @@ fn activate_row_target(
             let Ok(db) = superzej_core::db::Db::open() else {
                 return;
             };
-            // Collect the OUTGOING workspace's pane ids before the trees are
-            // replaced; reap them only on success. Without this, the new
-            // workspace's persisted trees can reference ids that still belong
-            // to live panes of the old workspace (e.g. an editor pane bleeds
-            // across the switch).
-            let outgoing = session_pane_ids(session);
-            let landed = group
-                .as_deref()
-                .map(|name| {
-                    switch_to_workspace_tab(session, &db, &repo_path, name).unwrap_or(false)
-                })
-                .unwrap_or(false);
-            if !landed && session.switch_to_workspace(&repo_path, &db).is_err() {
+            // Park the outgoing workspace's panes (kept alive) and restore the
+            // target's — no reaping, so an editor/server keeps running across
+            // the switch. `switch_workspace` handles the id-aliasing that the
+            // old reap guarded against by remapping cold-resurrected ids.
+            if !switch_workspace(
+                &repo_path,
+                group.as_deref(),
+                session,
+                panes,
+                workspace_pool,
+                &db,
+            ) {
                 return;
-            }
-            for id in outgoing {
-                panes.table.remove(&id);
-            }
-            if let Some(id) = drawer.take() {
-                panes.table.remove(&id);
-            }
-            for id in pool.drain_ids() {
-                panes.table.remove(&id);
             }
         }
     }
@@ -1480,6 +1471,10 @@ fn activate_row_target(
     }
     refresh_tab_model(model, session, sb);
     sync_drawer_persistence(session, panes, drawer, pool, home, cfg, center);
+    // Persist the new active worktree/tab so it survives a non-graceful exit
+    // (the Workspace arm already persisted via switch_to_workspace; this also
+    // covers the in-workspace Tab arm and is cheap/idempotent).
+    persist_session_layout(session, panes);
 }
 
 /// Worktree group indices in the order the sidebar DISPLAYS them (home-first
@@ -1690,15 +1685,128 @@ fn prune_vanished_group(session: &mut crate::session::Session, gi: usize) -> Vec
     ids
 }
 
-/// Every pane id referenced by the session's tab trees. Pins and the drawer
-/// live outside the trees, so they are naturally excluded.
-fn session_pane_ids(session: &crate::session::Session) -> Vec<u32> {
-    session
+/// A workspace parked in the [`WorkspacePool`]: just the center pane trees and
+/// the active group index. Its `PtyPane`s stay live in `Panes` (we never reap on
+/// a switch), so restoring it reattaches the still-running processes by id. The
+/// drawer rides the shared (dir-keyed) `DrawerPool`, so it isn't parked here.
+struct ResidentWorkspace {
+    worktrees: Vec<crate::session::WorktreeGroup>,
+    active: usize,
+}
+
+/// Keeps every visited workspace's panes alive in memory, keyed by `repo_path`
+/// (`Session::id`). Switching parks the outgoing workspace and restores the
+/// target's live panes instead of killing and respawning them.
+#[derive(Default)]
+struct WorkspacePool {
+    map: std::collections::HashMap<String, ResidentWorkspace>,
+}
+
+impl WorkspacePool {
+    fn contains(&self, repo: &str) -> bool {
+        self.map.contains_key(repo)
+    }
+    fn take(&mut self, repo: &str) -> Option<ResidentWorkspace> {
+        self.map.remove(repo)
+    }
+    fn stash(&mut self, repo: String, rw: ResidentWorkspace) {
+        self.map.insert(repo, rw);
+    }
+}
+
+/// Move a freshly cold-resurrected workspace's pane ids onto a disjoint range
+/// reserved past every live pane, so its persisted tree can't alias a live pane
+/// of another resident workspace (the bleed the old reap-on-switch prevented).
+/// `materialize_with_specs` then spawns real panes over these placeholders.
+fn remap_cold_workspace_ids(session: &mut crate::session::Session, panes: &mut Panes) {
+    let mut uniq: Vec<u32> = session
         .worktrees
         .iter()
         .flat_map(|g| g.tabs.iter())
         .flat_map(|t| t.center.pane_ids())
-        .collect()
+        .collect();
+    uniq.sort_unstable();
+    uniq.dedup();
+    if uniq.is_empty() {
+        return;
+    }
+    let base = panes.reserve_ids(uniq.len() as u32);
+    let map: std::collections::HashMap<u32, u32> = uniq
+        .iter()
+        .enumerate()
+        .map(|(i, &old)| (old, base + i as u32))
+        .collect();
+    session.remap_pane_ids(|id| map.get(&id).copied().unwrap_or(id));
+}
+
+/// Switch the active workspace to `target` (optionally landing on the named
+/// group), keeping the outgoing workspace's panes alive in `pool`. Returns
+/// whether the switch happened.
+///
+/// - **Same workspace:** just re-focus the requested group.
+/// - **Warm (target resident):** park the current trees, restore the target's
+///   live trees from the pool — no DB resurrect, no respawn, processes intact.
+/// - **Cold (first visit):** resurrect from the DB via the existing path, then
+///   remap its ids off the live range so it can't alias a parked workspace.
+fn switch_workspace(
+    target: &str,
+    group: Option<&str>,
+    session: &mut crate::session::Session,
+    panes: &mut Panes,
+    pool: &mut WorkspacePool,
+    db: &superzej_core::db::Db,
+) -> bool {
+    let land_on = |session: &mut crate::session::Session, group: Option<&str>| {
+        if let Some(name) = group
+            && let Some(idx) = session.worktrees.iter().position(|g| g.name == name)
+        {
+            session.switch_to(idx);
+        }
+    };
+
+    if session.id == target {
+        land_on(session, group);
+        return true;
+    }
+
+    // Snapshot the workspace we're leaving (fresh cwds) before parking it.
+    persist_session_layout(session, panes);
+    let prev_id = session.id.clone();
+
+    if pool.contains(target) {
+        // Warm: swap the live trees in; the outgoing trees' panes stay live.
+        let parked = ResidentWorkspace {
+            worktrees: std::mem::take(&mut session.worktrees),
+            active: session.active,
+        };
+        let rw = pool.take(target).expect("contains() just checked");
+        session.id = target.to_string();
+        session.worktrees = rw.worktrees;
+        session.active = rw.active;
+        pool.stash(prev_id, parked);
+        land_on(session, group);
+        let _ = db.set_active_workspace(target);
+        return true;
+    }
+
+    // Cold: clone the outgoing trees for the pool (their panes stay live), then
+    // resurrect the target in place via the existing path. `switch_to_workspace`
+    // leaves `session` untouched if resurrect fails, so the clone is only
+    // committed on success.
+    let snapshot = ResidentWorkspace {
+        worktrees: session.worktrees.clone(),
+        active: session.active,
+    };
+    let landed = match group {
+        Some(name) => switch_to_workspace_tab(session, db, target, name).unwrap_or(false),
+        None => false,
+    };
+    if !landed && session.switch_to_workspace(target, db).is_err() {
+        return false;
+    }
+    pool.stash(prev_id, snapshot);
+    remap_cold_workspace_ids(session, panes);
+    true
 }
 
 /// The editor invocation for a worktree-relative `path`, with the universal
@@ -4699,10 +4807,6 @@ impl DrawerPool {
             panes.table.remove(&id);
         }
     }
-    /// All pooled pane ids (workspace switch reaps them).
-    fn drain_ids(&mut self) -> Vec<u32> {
-        self.hidden.drain(..).map(|(_, id)| id).collect()
-    }
 }
 
 /// Wrap a drawer yazi argv in a bounded user `systemd-run --scope` so its whole
@@ -5173,7 +5277,53 @@ fn kick_palette_search(
     }
 }
 
-fn persist_session_layout(session: &crate::session::Session) {
+/// Capture each live pane's current working directory into its tab's
+/// `pane_cwds` so the next resurrect respawns panes where they were. Only
+/// materialized (live) leaves are updated; tabs that were never opened keep the
+/// cwd hints they resurrected with. Cheap: a `/proc/<pid>/cwd` readlink per live
+/// pane, run only at persist time.
+fn capture_pane_cwds(session: &mut crate::session::Session, panes: &Panes) {
+    for g in &mut session.worktrees {
+        for tab in &mut g.tabs {
+            for id in tab.center.pane_ids() {
+                if let Some(p) = panes.table.get(&id)
+                    && let Some(cwd) = p.cwd()
+                {
+                    tab.pane_cwds.insert(id, cwd.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+}
+
+/// Capture each live pane's foreground command into its tab's `pane_cmds` so a
+/// resurrected or crashed pane can offer to relaunch it. An idle shell prompt
+/// clears any stale entry, so the hint always reflects what was last running.
+/// Same cost profile as [`capture_pane_cwds`]: a small `/proc` scan per pane at
+/// persist time.
+fn capture_pane_cmds(session: &mut crate::session::Session, panes: &Panes) {
+    for g in &mut session.worktrees {
+        for tab in &mut g.tabs {
+            for id in tab.center.pane_ids() {
+                let Some(p) = panes.table.get(&id) else {
+                    continue;
+                };
+                match p.foreground_command() {
+                    Some(cmd) => {
+                        tab.pane_cmds.insert(id, cmd);
+                    }
+                    None => {
+                        tab.pane_cmds.remove(&id);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn persist_session_layout(session: &mut crate::session::Session, panes: &Panes) {
+    capture_pane_cwds(session, panes);
+    capture_pane_cmds(session, panes);
     if let Ok(db) = superzej_core::db::Db::open() {
         let _ = session.persist(&db, &session.id, now_secs());
     }
@@ -5609,6 +5759,9 @@ async fn event_loop<T: Terminal>(
     let mut drawer_pool = DrawerPool::default();
     // The dir the VISIBLE drawer was opened for (its pool key when hidden).
     let mut drawer_home: Option<std::path::PathBuf> = None;
+    // Keeps every visited workspace's panes alive in memory across switches, so
+    // a program left running in one repo is still there on return (no cap).
+    let mut workspace_pool = WorkspacePool::default();
 
     // Diff fs-watcher: bound to the active worktree, re-targeted on tab switch.
     // On a (debounced) change it pushes `RefreshKind::Model` into the shared
@@ -5735,7 +5888,7 @@ async fn event_loop<T: Terminal>(
             return Ok(()); // last worktree closed
         }
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            persist_session_layout(&session);
+            persist_session_layout(&mut session, &panes);
             return Ok(());
         }
         // Per-workspace keybinds: rebuild when the focused workspace changed.
@@ -6224,16 +6377,25 @@ async fn event_loop<T: Terminal>(
                                     age,
                                     CRASH_THRESHOLD,
                                 );
+                                // Prefer the real exit code; fall back to the
+                                // fast-crash heuristic when the child status
+                                // couldn't be reaped. A failed exit arms the
+                                // relaunch overlay on the respawned shell.
+                                let failed = match exit_code {
+                                    Some(c) => c != 0,
+                                    None => crashes > 0,
+                                };
+                                // What this pane was last running (captured at
+                                // persist time) — offered for relaunch after a
+                                // crash. Grabbed before the pane's tab is mutated.
+                                let remembered = session
+                                    .tab_mut(gi, ti)
+                                    .and_then(|t| t.pane_cmds.get(&id))
+                                    .map(|c| c.display())
+                                    .filter(|s| !s.is_empty());
                                 {
                                     let wt = session.worktrees[gi].path.clone();
                                     if !wt.is_empty() {
-                                        // Prefer the real exit code; fall back to
-                                        // the fast-crash heuristic when the child
-                                        // status couldn't be reaped.
-                                        let failed = match exit_code {
-                                            Some(c) => c != 0,
-                                            None => crashes > 0,
-                                        };
                                         let program = exited_program.clone().unwrap_or_default();
                                         let is_shell = crate::pane::is_interactive_shell(&program);
                                         let policy =
@@ -6349,8 +6511,24 @@ async fn event_loop<T: Terminal>(
                                                             tab, id, fresh,
                                                         );
                                                     }
-                                                    model.status =
-                                                        "Pane exited; spawned a fresh shell".into();
+                                                    // On a crash, offer to relaunch what was
+                                                    // running (if known) over the fresh shell;
+                                                    // a clean exit just lands at a prompt.
+                                                    if failed && let Some(cmd) = remembered.clone()
+                                                    {
+                                                        if let Some(p) = panes.table.get_mut(&fresh)
+                                                        {
+                                                            p.set_pending_relaunch(Some(cmd));
+                                                        }
+                                                        model.status =
+                                                            "Pane crashed; press Enter to relaunch \
+                                                             (Esc for a shell)"
+                                                                .into();
+                                                    } else {
+                                                        model.status =
+                                                            "Pane exited; spawned a fresh shell"
+                                                                .into();
+                                                    }
                                                     need_relayout = true;
                                                 }
                                                 Err(err) => {
@@ -7318,7 +7496,7 @@ async fn event_loop<T: Terminal>(
                             }
                         }
                         refresh_tab_model(&mut model, &session, &mut sb);
-                        persist_session_layout(&session);
+                        persist_session_layout(&mut session, &panes);
                     }
                     // Fresh worktree + agent pane: re-hydrate so the sidebar
                     // and panel reflect it immediately.
@@ -7659,6 +7837,12 @@ async fn event_loop<T: Terminal>(
                                     }
                                 })
                                 .unwrap_or_default()
+                        },
+                        &|id| {
+                            panes
+                                .table
+                                .get(&id)
+                                .and_then(|p| p.pending_relaunch().map(str::to_string))
                         },
                     );
                 }
@@ -8048,6 +8232,31 @@ async fn event_loop<T: Terminal>(
                             dirty = true;
                         }
                     } else if chrome.panel.is_some_and(|r| contains(r, mx, my)) {
+                        // The inline file preview owns the wheel while open:
+                        // scroll its viewport instead of walking the tree /
+                        // accordion behind it. Coalesce the whole gesture's
+                        // queued ticks into one render pass (no inertia).
+                        if panel_ui.open == crate::panel::Section::Files
+                            && panel_ui.file_preview.is_some()
+                        {
+                            let (ticks, leftover) = drain_wheel_ticks(up, || {
+                                buf.terminal()
+                                    .poll_input(Some(std::time::Duration::ZERO))
+                                    .ok()
+                                    .flatten()
+                            });
+                            if let Some(ev) = leftover {
+                                pending_input.push_back(ev);
+                            }
+                            let (_, panel_rows) = panel_geom(&chrome);
+                            let viewport = panel_rows.saturating_sub(4).max(1);
+                            if let Some(fp) = panel_ui.file_preview.as_mut() {
+                                let delta = (ticks * 3) as isize;
+                                fp.scroll_by(if up { -delta } else { delta }, viewport);
+                            }
+                            dirty = true;
+                            continue;
+                        }
                         // Row mode walks the open section's rows; section mode
                         // wheels through the accordion itself.
                         if panel_ui.row_mode {
@@ -8183,6 +8392,7 @@ async fn event_loop<T: Terminal>(
                                             &mut drawer,
                                             &mut drawer_pool,
                                             &mut drawer_home,
+                                            &mut workspace_pool,
                                             keymap.config(),
                                             chrome.center,
                                         );
@@ -8557,7 +8767,16 @@ async fn event_loop<T: Terminal>(
                             if let Some((_, kind)) = host_input.take() {
                                 match kind {
                                     HostInputKind::NewWorkspace => {
-                                        let outgoing = session_pane_ids(&session);
+                                        // Snapshot the outgoing workspace (with
+                                        // fresh cwds) so its panes are parked
+                                        // alive in the pool rather than reaped
+                                        // when the new workspace takes over.
+                                        persist_session_layout(&mut session, &panes);
+                                        let prev_id = session.id.clone();
+                                        let snapshot = ResidentWorkspace {
+                                            worktrees: session.worktrees.clone(),
+                                            active: session.active,
+                                        };
                                         match superzej_core::db::Db::open()
                                             .context("open superzej db")
                                             .and_then(|db| {
@@ -8569,15 +8788,8 @@ async fn event_loop<T: Terminal>(
                                                 )
                                             }) {
                                             Ok(path) => {
-                                                for id in outgoing {
-                                                    panes.table.remove(&id);
-                                                }
-                                                if let Some(id) = drawer.take() {
-                                                    panes.table.remove(&id);
-                                                }
-                                                for id in drawer_pool.drain_ids() {
-                                                    panes.table.remove(&id);
-                                                }
+                                                workspace_pool.stash(prev_id, snapshot);
+                                                remap_cold_workspace_ids(&mut session, &mut panes);
                                                 focus.zone = crate::focus::Zone::Center;
                                                 refresh_tab_model(&mut model, &session, &mut sb);
                                                 sync_drawer_persistence(
@@ -8647,7 +8859,7 @@ async fn event_loop<T: Terminal>(
                                                         &want,
                                                     );
                                                 }
-                                                persist_session_layout(&session);
+                                                persist_session_layout(&mut session, &panes);
                                                 refresh_tab_model(&mut model, &session, &mut sb);
                                                 sb.focus_active_row(&mut model);
                                                 model.status = format!("Renamed to {want}");
@@ -8696,7 +8908,7 @@ async fn event_loop<T: Terminal>(
                                                 )
                                                 .is_some()
                                                 {
-                                                    persist_session_layout(&session);
+                                                    persist_session_layout(&mut session, &panes);
                                                     need_relayout = true;
                                                     model.status =
                                                         format!("Applied layout \"{name}\"");
@@ -8750,7 +8962,7 @@ async fn event_loop<T: Terminal>(
                                                 )
                                                 .is_some()
                                                 {
-                                                    persist_session_layout(&session);
+                                                    persist_session_layout(&mut session, &panes);
                                                     need_relayout = true;
                                                     model.status =
                                                         format!("Imported layout from {path}");
@@ -8882,7 +9094,7 @@ async fn event_loop<T: Terminal>(
                                     {
                                         forget_worktree_group(&db, &session.id, &g);
                                     }
-                                    persist_session_layout(&session);
+                                    persist_session_layout(&mut session, &panes);
                                     focus.zone = crate::focus::Zone::Center;
                                     refresh_tab_model(&mut model, &session, &mut sb);
                                     need_relayout = true;
@@ -9168,6 +9380,88 @@ async fn event_loop<T: Terminal>(
                                     palette = None;
                                     dirty = true;
                                     continue;
+                                } else if let Some(provider) = key.strip_prefix("account-add:") {
+                                    // Add a coding-agent account: register a managed
+                                    // credential dir and run the provider's login in
+                                    // the focused pane, with its credential-home env
+                                    // pointed at that dir (item 656).
+                                    if let Some(p) = superzej_core::account::provider(provider) {
+                                        let db = superzej_core::db::Db::open().ok();
+                                        let n = db
+                                            .as_ref()
+                                            .and_then(|db| db.list_accounts(provider).ok())
+                                            .map(|v| v.len())
+                                            .unwrap_or(0)
+                                            + 1;
+                                        let name = format!("acct{n}");
+                                        let dir =
+                                            superzej_core::account::managed_dir(provider, &name);
+                                        let dir_s = dir.to_string_lossy().into_owned();
+                                        let _ = std::fs::create_dir_all(&dir);
+                                        if let Some(db) = &db {
+                                            let _ = db.put_account(
+                                                provider,
+                                                &name,
+                                                &dir_s,
+                                                true,
+                                                superzej_core::util::now(),
+                                            );
+                                        }
+                                        if let Some(focused_pane) = panes.table.get_mut(&focused) {
+                                            let cmd = format!(
+                                                "{}={} {}\n",
+                                                p.home_env,
+                                                dir_s,
+                                                p.login_argv.join(" ")
+                                            );
+                                            let _ = focused_pane.write_input(cmd.as_bytes());
+                                        }
+                                        model.status = format!(
+                                            "Logging into {provider}:{name} — finish in the terminal"
+                                        );
+                                    }
+                                    palette = None;
+                                    dirty = true;
+                                    continue;
+                                } else if let Some(rest) = key.strip_prefix("account:") {
+                                    // "account:<provider>:<name>" — pin the account as
+                                    // the focused repo's default (workspace scope), or
+                                    // the global default when no repo is resolvable.
+                                    if let Some((provider, name)) = rest.split_once(':') {
+                                        let wt = active_tab_path(&session);
+                                        let wt_s = wt.to_string_lossy().into_owned();
+                                        if let Ok(db) = superzej_core::db::Db::open() {
+                                            let slug = db
+                                                .repo_root_for(&wt_s)
+                                                .ok()
+                                                .flatten()
+                                                .filter(|s| !s.is_empty())
+                                                .and_then(|root| {
+                                                    let base = std::path::Path::new(&root)
+                                                        .file_name()?
+                                                        .to_string_lossy()
+                                                        .into_owned();
+                                                    db.slug_for_repo(&root, &base).ok()
+                                                });
+                                            let bind = if slug.is_some() {
+                                                superzej_core::account::Bind::Workspace
+                                            } else {
+                                                superzej_core::account::Bind::Global
+                                            };
+                                            let _ = superzej_core::account::set_active(
+                                                &db,
+                                                bind,
+                                                &wt_s,
+                                                slug.as_deref(),
+                                                provider,
+                                                name,
+                                            );
+                                            model.status = format!("Account → {provider}:{name}");
+                                        }
+                                    }
+                                    palette = None;
+                                    dirty = true;
+                                    continue;
                                 } else if let Some(branch) = key.strip_prefix("git-branch:") {
                                     let wt_path = active_tab_path(&session);
                                     if let Some(focused_pane) = panes.table.get_mut(&focused) {
@@ -9223,28 +9517,17 @@ async fn event_loop<T: Terminal>(
                                 } else if key == "quit" {
                                     return Ok(());
                                 } else if let Some(payload) = key.strip_prefix("wt:") {
-                                    let outgoing = session_pane_ids(&session);
                                     if let Some((repo_path, tab_name)) = payload.split_once('\t')
                                         && let Ok(db) = superzej_core::db::Db::open()
-                                        && switch_to_workspace_tab(
-                                            &mut session,
-                                            &db,
+                                        && switch_workspace(
                                             repo_path,
-                                            tab_name,
+                                            Some(tab_name),
+                                            &mut session,
+                                            &mut panes,
+                                            &mut workspace_pool,
+                                            &db,
                                         )
-                                        .unwrap_or(false)
                                     {
-                                        // Reap the outgoing workspace's panes
-                                        // (persisted-id collisions otherwise).
-                                        for id in outgoing {
-                                            panes.table.remove(&id);
-                                        }
-                                        if let Some(id) = drawer.take() {
-                                            panes.table.remove(&id);
-                                        }
-                                        for id in drawer_pool.drain_ids() {
-                                            panes.table.remove(&id);
-                                        }
                                         refresh_tab_model(&mut model, &session, &mut sb);
                                         need_relayout = true;
                                         sync_drawer_persistence(
@@ -9258,19 +9541,16 @@ async fn event_loop<T: Terminal>(
                                         );
                                     }
                                 } else if let Some(repo_path) = key.strip_prefix("repo:") {
-                                    let outgoing = session_pane_ids(&session);
                                     if let Ok(db) = superzej_core::db::Db::open()
-                                        && session.switch_to_workspace(repo_path, &db).is_ok()
+                                        && switch_workspace(
+                                            repo_path,
+                                            None,
+                                            &mut session,
+                                            &mut panes,
+                                            &mut workspace_pool,
+                                            &db,
+                                        )
                                     {
-                                        for id in outgoing {
-                                            panes.table.remove(&id);
-                                        }
-                                        if let Some(id) = drawer.take() {
-                                            panes.table.remove(&id);
-                                        }
-                                        for id in drawer_pool.drain_ids() {
-                                            panes.table.remove(&id);
-                                        }
                                         refresh_tab_model(&mut model, &session, &mut sb);
                                         need_relayout = true;
                                         sync_drawer_persistence(
@@ -9511,6 +9791,7 @@ async fn event_loop<T: Terminal>(
                                 &mut drawer,
                                 &mut drawer_pool,
                                 &mut drawer_home,
+                                &mut workspace_pool,
                                 keymap.config(),
                                 chrome.center,
                             );
@@ -9623,7 +9904,7 @@ async fn event_loop<T: Terminal>(
                             if skipped_home > 0 {
                                 model.status = "Root workspace cannot be closed".into();
                             }
-                            persist_session_layout(&session);
+                            persist_session_layout(&mut session, &panes);
                             sb.marked.clear();
                             refresh_tab_model(&mut model, &session, &mut sb);
                             sb.focus_active_row(&mut model);
@@ -9723,24 +10004,47 @@ async fn event_loop<T: Terminal>(
                     let page = viewport.saturating_sub(1).max(1) as isize;
                     let mut handled = true;
                     if let Some(fp) = panel_ui.file_preview.as_mut() {
-                        match k.key {
-                            // esc or q closes (q for pager muscle memory).
-                            KeyCode::Escape | KeyCode::Char('q') => {
-                                panel_ui.file_preview = None;
-                            }
-                            KeyCode::Char('j') | KeyCode::DownArrow => fp.scroll_by(1, viewport),
-                            KeyCode::Char('k') | KeyCode::UpArrow => fp.scroll_by(-1, viewport),
+                        // Per-press delta for the repeatable scroll keys
+                        // (`None` = a close / absolute-jump / unhandled key
+                        // that must not be repeat-coalesced).
+                        let step: Option<isize> = match k.key {
+                            KeyCode::Char('j') | KeyCode::DownArrow => Some(1),
+                            KeyCode::Char('k') | KeyCode::UpArrow => Some(-1),
                             KeyCode::Char('d') if k.modifiers.contains(Modifiers::CTRL) => {
-                                fp.scroll_by(page / 2, viewport)
+                                Some(page / 2)
                             }
                             KeyCode::Char('u') if k.modifiers.contains(Modifiers::CTRL) => {
-                                fp.scroll_by(-(page / 2), viewport)
+                                Some(-(page / 2))
                             }
-                            KeyCode::PageDown | KeyCode::Char(' ') => fp.scroll_by(page, viewport),
-                            KeyCode::PageUp => fp.scroll_by(-page, viewport),
-                            KeyCode::Char('g') => fp.scroll = 0,
-                            KeyCode::Char('G') => fp.scroll = fp.max_scroll(viewport),
-                            _ => handled = false,
+                            KeyCode::PageDown | KeyCode::Char(' ') => Some(page),
+                            KeyCode::PageUp => Some(-page),
+                            _ => None,
+                        };
+                        if let Some(step) = step {
+                            // Coalesce a held key's queued repeats into one
+                            // clamped step-per-tick applied in a single render
+                            // pass: the viewport stops the instant the key is
+                            // released instead of coasting through the backlog.
+                            let (repeat, leftover) = drain_key_repeats(&k, || {
+                                buf.terminal()
+                                    .poll_input(Some(std::time::Duration::ZERO))
+                                    .ok()
+                                    .flatten()
+                            });
+                            if let Some(ev) = leftover {
+                                pending_input.push_back(ev);
+                            }
+                            fp.scroll_by(step * repeat as isize, viewport);
+                        } else {
+                            match k.key {
+                                // esc or q closes (q for pager muscle memory).
+                                KeyCode::Escape | KeyCode::Char('q') => {
+                                    panel_ui.file_preview = None;
+                                }
+                                KeyCode::Char('g') => fp.scroll = 0,
+                                KeyCode::Char('G') => fp.scroll = fp.max_scroll(viewport),
+                                _ => handled = false,
+                            }
                         }
                     }
                     if handled {
@@ -11533,7 +11837,7 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::Quit => {
-                                persist_session_layout(&session);
+                                persist_session_layout(&mut session, &panes);
                                 return Ok(());
                             }
                             Action::SwitchFont => match crate::font::font_palette_items() {
@@ -11557,6 +11861,13 @@ async fn event_loop<T: Terminal>(
                                             &current_config,
                                             &model.panel.tracker_issues,
                                         ),
+                                    ));
+                                }
+                            }
+                            Action::SwitchAccount => {
+                                if let Ok(db) = superzej_core::db::Db::open() {
+                                    palette = Some(crate::search_everywhere::PaletteSession::new(
+                                        crate::palette::build_account_palette(&current_config, &db),
                                     ));
                                 }
                             }
@@ -11758,6 +12069,7 @@ async fn event_loop<T: Terminal>(
                                     keymap.config(),
                                     chrome.center,
                                 );
+                                persist_session_layout(&mut session, &panes);
                             }
                             Action::PrevTab => {
                                 session.prev_tab();
@@ -11775,6 +12087,7 @@ async fn event_loop<T: Terminal>(
                                     keymap.config(),
                                     chrome.center,
                                 );
+                                persist_session_layout(&mut session, &panes);
                             }
                             Action::NextWorktree | Action::PrevWorktree => {
                                 // Step in the sidebar's display order so the
@@ -11809,6 +12122,7 @@ async fn event_loop<T: Terminal>(
                                     keymap.config(),
                                     chrome.center,
                                 );
+                                persist_session_layout(&mut session, &panes);
                             }
                             Action::MoveWorktreeUp | Action::MoveWorktreeDown => {
                                 // Reorder the active worktree within its
@@ -12200,17 +12514,14 @@ async fn event_loop<T: Terminal>(
                                 {
                                     let repo_path =
                                         target.strip_prefix("repo:").unwrap_or(&target).to_string();
-                                    let outgoing = session_pane_ids(&session);
-                                    if session.switch_to_workspace(&repo_path, &db).is_ok() {
-                                        for id in outgoing {
-                                            panes.table.remove(&id);
-                                        }
-                                        if let Some(id) = drawer.take() {
-                                            panes.table.remove(&id);
-                                        }
-                                        for id in drawer_pool.drain_ids() {
-                                            panes.table.remove(&id);
-                                        }
+                                    if switch_workspace(
+                                        &repo_path,
+                                        None,
+                                        &mut session,
+                                        &mut panes,
+                                        &mut workspace_pool,
+                                        &db,
+                                    ) {
                                         refresh_tab_model(&mut model, &session, &mut sb);
                                         need_relayout = true;
                                         sync_drawer_persistence(
@@ -12340,7 +12651,7 @@ async fn event_loop<T: Terminal>(
                                             tab.focused_pane = first;
                                         }
                                         need_relayout = true;
-                                        persist_session_layout(&session);
+                                        persist_session_layout(&mut session, &panes);
                                     }
                                 }
                                 refresh_tab_model(&mut model, &session, &mut sb);
@@ -12381,7 +12692,7 @@ async fn event_loop<T: Terminal>(
                                     }
                                     crate::session::CloseResult::Nothing => {}
                                 }
-                                persist_session_layout(&session);
+                                persist_session_layout(&mut session, &panes);
                                 // Close always lands the user on the center
                                 // terminal of whichever tab is now active.
                                 focus.zone = crate::focus::Zone::Center;
@@ -12663,6 +12974,43 @@ async fn event_loop<T: Terminal>(
                     keymap.reset();
                     dirty = true;
                     continue;
+                }
+                // A pane offering a relaunch (resurrected with a remembered
+                // command, or a crashed husk) intercepts the next key: Enter
+                // runs the saved command, Esc dismisses, and any other key
+                // dismisses the overlay and is then delivered normally.
+                let relaunch_target = drawer.unwrap_or(focused);
+                if panes
+                    .table
+                    .get(&relaunch_target)
+                    .is_some_and(|p| p.pending_relaunch().is_some())
+                {
+                    match k.key {
+                        KeyCode::Enter => {
+                            if let Some(p) = panes.table.get_mut(&relaunch_target)
+                                && let Some(cmd) = p.take_pending_relaunch()
+                            {
+                                let _ = p.write_input(format!("{cmd}\r").as_bytes());
+                            }
+                            keymap.reset();
+                            dirty = true;
+                            continue;
+                        }
+                        KeyCode::Escape => {
+                            if let Some(p) = panes.table.get_mut(&relaunch_target) {
+                                p.set_pending_relaunch(None);
+                            }
+                            keymap.reset();
+                            dirty = true;
+                            continue;
+                        }
+                        _ => {
+                            if let Some(p) = panes.table.get_mut(&relaunch_target) {
+                                p.set_pending_relaunch(None);
+                            }
+                            dirty = true;
+                        }
+                    }
                 }
                 // Per-program key-injection remap: an unclaimed chord is rewritten
                 // into the program's own keys before forwarding. Falls back to the
@@ -13454,6 +13802,8 @@ mod tests {
                 title: "1".into(),
                 pane_tree: r#"{"leaf":0}"#.into(),
                 focused_pane: 0,
+                pane_cwds: String::new(),
+                pane_cmds: String::new(),
             },
         )
         .unwrap();
@@ -13945,13 +14295,66 @@ mod tests {
     }
 
     #[test]
-    fn session_pane_ids_collects_all_tab_tree_leaves() {
+    fn workspace_pool_stash_take_roundtrips_trees() {
+        let mut pool = WorkspacePool::default();
+        assert!(!pool.contains("/r/a"));
+        pool.stash(
+            "/r/a".into(),
+            ResidentWorkspace {
+                worktrees: vec![WorktreeGroup::new("a/home", GroupKind::Home, "/r/a")],
+                active: 0,
+            },
+        );
+        assert!(pool.contains("/r/a"));
+        let rw = pool.take("/r/a").expect("stashed");
+        assert_eq!(rw.worktrees.len(), 1);
+        assert_eq!(rw.worktrees[0].name, "a/home");
+        assert!(!pool.contains("/r/a"), "take removes the entry");
+        assert!(pool.take("/r/a").is_none());
+    }
+
+    #[test]
+    fn remap_cold_workspace_ids_moves_ids_past_the_live_range() {
+        // A cold-resurrected workspace's persisted ids must be rewritten onto a
+        // fresh range so they can't alias the live panes of a parked workspace.
         let mut session = two_worktree_session();
         session.worktrees[0].tabs[0].center = crate::center::CenterTree::Leaf(3);
+        session.worktrees[0].tabs[0].focused_pane = 3;
+        session.worktrees[0].tabs[0]
+            .pane_cwds
+            .insert(3, "/x".into());
         session.worktrees[1].tabs[0].center = crate::center::CenterTree::Leaf(8);
-        let mut ids = session_pane_ids(&session);
+
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(16);
+        let mut panes = Panes::new(tx);
+        // Pretend ids 1..=10 are already issued to live panes.
+        let reserved = panes.reserve_ids(10);
+        assert_eq!(reserved, 1);
+
+        remap_cold_workspace_ids(&mut session, &mut panes);
+
+        let mut ids: Vec<u32> = session
+            .worktrees
+            .iter()
+            .flat_map(|g| g.tabs.iter())
+            .flat_map(|t| t.center.pane_ids())
+            .collect();
         ids.sort_unstable();
-        assert_eq!(ids, vec![3, 8]);
+        assert_eq!(ids.len(), 2);
+        assert!(
+            ids.iter().all(|&id| id > 10),
+            "remapped ids are disjoint from the live range: {ids:?}"
+        );
+        // The cwd key and focus followed the leaf through the remap.
+        let new0 = session.worktrees[0].tabs[0].center.pane_ids()[0];
+        assert_eq!(session.worktrees[0].tabs[0].focused_pane, new0);
+        assert_eq!(
+            session.worktrees[0].tabs[0]
+                .pane_cwds
+                .get(&new0)
+                .map(String::as_str),
+            Some("/x")
+        );
     }
 
     #[test]

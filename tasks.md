@@ -1,6 +1,6 @@
 # superzej — roadmap & progress
 
-579 features across 44 groups (A–AR). The list is really **two tracks joined by
+636 features across 46 groups (A–AT). The list is really **two tracks joined by
 one keystone**: an AI-free _shell_ track and an AI track, bridged by the **proxy**.
 That shape drives the phasing below. The proxy is not just a router — it is the
 **AI control plane**: the single interception point every agent's model traffic
@@ -17,37 +17,59 @@ Per-feature statuses below are verified against the current codebase. See
 
 ---
 
-## Progress summary (as of 2026-06-06)
+## Progress summary (as of 2026-06-22)
 
-**Where we are:** deep into **Phase 1** (the AI-free shell), with parts of **Phase 2's
-substrate** (sandbox + remote) already landed. No AI half yet (proxy/agents/MCP all
-unstarted) — by design.
+**Where we are:** **Phase 1** (the AI-free shell) is largely complete — native git
+management, the notification/event bus, and IDE panels (problems/tasks/tests/symbols)
+have landed. **Phase 2's substrate** (sandbox + remote) and, more recently, **the
+proxy** (groups U/V/W) are in. The agent layer (Q–T) and MCP (AL) remain unstarted —
+still by design; the proxy was built and validated standalone, and is the next major
+track's prerequisite.
 
 **Shipped & solid:**
 
-- **Shell core** — one-session model, sidebar/panel/tabbar/statusbar WASM plugins,
-  workspaces (repos) + worktrees as tabs, session detach/attach/resurrection, the
-  managed `~/.superzej` zellij namespace.
+- **Shell core** — the native `superzej-host` compositor (termwiz + portable-pty +
+  `CenterTree`); in-process chrome (sidebar/panel/tabbar/statusbar), workspaces (repos)
+  - worktrees as tabs, session detach/attach/resurrection. (Zellij/WASM was stripped in
+    Phase 0.)
 - **Keybinds** — full registry, KDL splice, conflict detection, cheatsheet feed (`F`).
 - **Config** — declarative TOML, layering, env/flag overlays, live reload, validation,
   95%-gated core.
 - **Palette** — native iocraft Cmd-K, nucleo fuzzy + embedded ripgrep, file open.
-- **Git/GitHub** — per-worktree diff (syntect-highlighted), full PR panel (status/
-  checks/review/create/merge/approve/rerun) via `gh`, lazygit tool.
+- **Git** — complete native git management (stage/commit, branch, log/graph, blame,
+  stash, merge/rebase sequencer, conflict UI, cherry-pick/revert) + per-worktree diff;
+  **GitHub** PR panel (status/checks/review/create/merge/approve/rerun) via `gh`;
+  lazygit as the fallback.
 - **Files/editor/monitor** — yazi bottom drawer, fuzzy finder + ripgrep search,
   `$EDITOR` tool, embedded system/GPU monitors, tabbar stats widget.
 - **Activity dots** — host-side `none→active→quiet→acked` state machine (`activity`).
 - **Sandbox + remote (Phase 2 substrate)** — per-worktree podman/docker/bwrap/none
   backends, bind-mount-at-real-path, remote worktrees over ssh/mosh.
+- **Notification/event bus** — first-class `EventBus` in core (PR/agent/test/log/
+  worktree/process events), urgency thresholds, desktop notifications (`notify-send`),
+  a notifications panel/inbox with Enter-to-expand, sidebar badges.
+- **Proxy (AI substrate, Phase 2)** — `superzej-proxy` crate: dual-protocol relay
+  (Anthropic SSE + OpenAI), ordered failover + load-balanced/speculative routing,
+  limit-exhaustion/reset tracking, per-scope budgets + spend attribution, native
+  in-flight token reduction; host auto-launches it.
+- **IDE panels** — problems/diagnostics, task registry + test discovery, document
+  symbols, and an LSP substrate (hover/signature/code-action preview, item 532).
 
-**Notable Phase-1 gaps (candidate next work):**
+**Notable remaining gaps (candidate next work):**
 
-- **IDE Tier 1 shell parity** — full native git management, task/test/problems
-  surfaces, Search Everywhere, and attention routing are now scoped in
-  `docs/superpowers/specs/2026-06-10-ide-feature-tiers-design.md`.
-- **AI. Notification bus** — only activity dots (425) exist; no event→action rules
-  (420), desktop notifications (421), or aggregated bus (430).
-- **B.** multi-select/context-menu/badge-count tree polish (26–28).
+- **Agent layer (Q–T) + MCP (AL)** — still unstarted. The proxy that gates them is now
+  in, so this is the next major track.
+- **AI. Notification bus polish** — bus, desktop notifications, and inbox are live;
+  420 is a fixed event→notification mapping + urgency thresholds, not yet a
+  user-configurable action-rules engine. Still missing: DND/quiet hours (426),
+  per-profile routing (427), sound/bell (429), push-to-phone (422/423).
+- **IDE Tier 1 tail** — Search Everywhere aggregation (523) and the agent-side of
+  attention routing remain; git, problems, tasks/tests, and symbols panels have landed.
+- **B.** badge counts per row (28).
+- **Orca-audit adds (654–658)** — per-line AI/human attribution overlay (654), agent-writable
+  worktree status field (655), per-agent account hot-swap chip (656), agent-hook passthrough +
+  worktree setup hooks (657), and agent session history/hibernation (658); plus enriched
+  scheduled automations (226/504) and worktree setup hooks (54). Captured from an Orca feature audit.
 
 **✔ E. Pinned programs / tiles — complete on the native host (items 57–74).** The
 full config-driven pin/daemon system ships in `superzej-host`: a `PinSupervisor`
@@ -108,7 +130,7 @@ every feature here must **not hard-depend on AI**.
 
 - Shell: **B (13–25), C (29–36), D (41–49), E (57–66, 73), F (75–83), G (89–92), I (111–113)**
 - Cheap, high-value enrichment: basic git **Y (319–327)**, files **AF (395–398, 401)**,
-  editor **AG (405–406, 408–409)**, palette **M (161–166)**, theming
+  editor handoff **AG (405–406, 408–409)**, palette **M (161–166)**, theming
   **N (171–176, 181)**, notification bus + basics **AI (419–421, 425, 430)**, monitor
   **AH (411, 413, 415)**, basic remote **J (121–123, 130, 132–133)**, defaults + install
   **AO (493–494)**
@@ -122,15 +144,26 @@ The IDE tier overlay is defined in
 existing phases rather than creating a new phase taxonomy.
 
 - **Tier 1 (Phase 1 / Phase-1 tail):** complete the AI-free shell's IDE parity:
-  full native git management **Y (319–330)**, Search Everywhere **M (161–170) +
-  AQ (523)**, run/task configs **AQ (520–522)**, test explorer **AQ (516–518)**,
-  Problems panel **AQ (519)**, and attention routing **AI (419–430), S (256), T
-  (259), AQ (524)**.
+  full native git management **Y (319–330, 601–602, 604–605)**, a backend-agnostic
+  VCS layer so git _and_ jujutsu share every diff/commit/history surface **AS
+  (587–600)**, file-tree management **AF (606)**, Search Everywhere \*\*M (161–170)
+  - AQ (523)**, run/task configs **AQ (520–522)**, test explorer **AQ (516–518)**,
+    Problems panel **AQ (519)**, and attention routing **AI (419–430), S (256), T
+    (259), AQ (524)\*\*.
 - **Tier 2 (Phase 4 differentiation):** deeper language/runtime tooling once the
   Tier-1 surfaces exist: DAP debugging **AQ (525–528)**, LSP navigation/symbols
   **AQ (529–532)**, worktree timeline/history **AQ (533–534) + AN (481–488)**,
   and unified layout+task templates **D (54), G (89/94/95/99), AM (480), AQ
   (535)**.
+
+The visual-staging (**Y 601–602, 604–605**), file-management (**AF 606**), and
+jujutsu/VCS-backend (**AS 587–600**) groups are a deliberate import of the
+**Kyde** feature set ("git add -p, made visual" — a fast native commit/diff
+client) extended to a second VCS. Deliberately **excluded**: Kyde's in-place
+text editing (native editor, in-buffer find/replace, editable diff) — superzej
+stays a viewer/VCS client and hands editing off to `$EDITOR` (AG). A backend
+abstraction means each remaining surface ships once and works for both git and
+jujutsu.
 
 ### Phase 2 — Sandbox + inference plumbing · P1 · the AI substrate
 
@@ -172,7 +205,10 @@ The "magical" layer; mostly composition of what's built.
 - **IDE Tier 2 AQ (525–535)** — DAP/LSP client substrates, debug panels,
   symbol/reference navigation, worktree timeline/history, and layout+task
   templates compose the Phase-1 shell surfaces into deeper IDE workflows.
-- **GitHub Z (331–340)** + **Linear AA (341–348)**
+- **Multi-forge PR/issue/review + kanban AT (631–653)** — a forge abstraction over
+  **GitHub Z (331–340)** + GitLab/Gitea/Forgejo, Stage-style structured review
+  (chapters/narrative/risk/assistant, AI-additive) and project boards; **Linear
+  AA (341–348)** becomes one tracker provider behind it
 - **API AK (445–454)** + **MCP server AL (455–466)** + governors (436) gating recursive
   spawn (461)
 - **Daily-driver tiles AM (467–480)** — nearly free once pins (E) + adapters (199) exist
@@ -231,7 +267,7 @@ Tor (444) and GPU passthrough (393) as niche opt-ins.
 - [~] 6. One core, many front doors — TUI (host) + CLI verbs share `superzej-core`; API/MCP still aspirational (AK/AL)
 - [ ] 7. Headless daemon — UI attaches/detaches _(not yet; host is a foreground compositor, state resurrects from SQLite)_
 - [ ] 8. Daemon supervision — crash recovery _(state resurrection only; no supervisor)_
-- [ ] 9. Internal event bus — normalized events _(ad-hoc tokio mpsc in the host loop; no first-class bus)_
+- [x] 9. Internal event bus — normalized events _(first-class `EventBus` in `superzej-core`: subscribe/publish, urgency ranking, desktop-notification derivation)_
 - [x] 10. Embedded state store — sqlite
 - [x] 11. Config hot-reload — without dropping sessions
 - [x] 12. Structured logging
@@ -294,7 +330,7 @@ _Tier-2 layout/task templates generalize worktree templates (54) with native
 - [~] 51. Per-worktree disk usage
 - [ ] 52. Fork worktree (branch from existing)
 - [ ] 53. Rename worktree/branch
-- [ ] 54. Worktree templates — layout+programs+container preset
+- [ ] 54. Worktree templates — layout+programs+container preset + setup/post-create hooks (deps install, env restore; see 657)
 - [~] 55. Worktree↔PR mapping
 - [~] 56. Bulk worktree cleanup
 
@@ -347,6 +383,7 @@ launch-or-focus via `Alt-1..9`, restart per policy on PTY exit, and resurrect fr
 - [ ] 86. Chorded/sequence binds
 - [ ] 87. Which-key hint popup
 - [ ] 88. Vim/emacs presets
+- [ ] 621. IDE keymap presets (VSCode/JetBrains-style) + first-launch keymap picker, per-action overrides
 
 ### G. Panes & layouts
 
@@ -448,7 +485,7 @@ into work/personal (see AM. 479–480, 536–539 below).
 - [ ] 150. Tokens-per-minute widget
 - [~] 151. System load widget
 - [~] 152. Per-worktree disk widget
-- [ ] 153. Notification badges
+- [~] 153. Notification badges _(sidebar + panel inbox badges; statusbar badge pending)_
 - [ ] 154. Now-playing / arbitrary program widget
 - [ ] 155. Next calendar event widget
 - [~] 156. Remote/network status widget
@@ -540,9 +577,10 @@ tests, symbols, git objects, and worktrees._
 - [ ] 223. Task history/audit
 - [ ] 224. Batch/parallel launch
 - [ ] 225. Best-of-N attempts _(deferred)_
-- [ ] 226. Scheduled/cron tasks _(deferred)_
+- [ ] 226. Scheduled/cron tasks — presets (hourly/daily/weekdays/weekly) + cron + RRULE + IANA timezone; target a repo or an existing worktree; `--reuse-session` to continue in the same live terminal; create-disabled → test-trigger → enable (Orca automations) _(deferred)_
 - [ ] 227. Task dependencies (run-after) _(deferred)_
 - [ ] 228. Task priority _(deferred)_
+- [ ] 658. Agent session history + hibernation — list/resume past agent sessions per worktree; hibernate idle sessions to reclaim resources and rehydrate on demand (feeds resource-aware cap 214; history complements S 255/257 + I 117) (Orca)
 
 ### R. Agent integration protocols
 
@@ -560,6 +598,7 @@ tests, symbols, git objects, and worktrees._
 - [ ] 240. Top-10 harness support
 - [ ] 241. Plugin adapters for the long tail
 - [ ] 242. Per-harness capability detection + fallback
+- [ ] 657. Agent hook passthrough — run the repo's existing `.claude/`/`.codex/` hooks when launching a harness, plus worktree setup/post-create hooks (deps install, env restore); surface `CLAUDE.md`/`AGENTS.md` in the file tree for inline editing, untouched (Orca; extends D 54, P 205, AR 547)
 - [~] _(current: `pick_agent` launches claude/aider/shell as the worktree process)_
 
 ### S. Agent observability
@@ -583,6 +622,7 @@ rich token/tool telemetry remains Phase 3 once proxy/adapters exist._
 - [ ] 256. Needs-attention surfacing
 - [ ] 257. Transcript viewer
 - [ ] 258. Session replay
+- [ ] 655. Per-worktree status/checkpoint field — agent-writable free-text "what just happened / status / next step" string (set via a CLI verb, `--json`), surfaced in the sidebar (feeds B 28), statusbar, panel, and the attention queue; read-before-write to preserve context (Orca worktree-comment pattern)
 
 ### T. Agent review & merge
 
@@ -601,51 +641,53 @@ as the agent-specific side of the broader attention queue._
 - [ ] 268. Squash/rebase pre-merge
 - [~] 269. PR creation from review
 - [ ] 270. Semantic merge via weave
+- [ ] 654. Per-line agent-vs-human attribution overlay — track provenance on every line an agent touches; AI/human gutter markers in the diff/review pane; reassign to human on a subsequent human edit; local-only (never written to git), exportable from the diff toolbar (Orca-style; complements entity-blame X 312)
 
 ### U. LLM proxy
 
-- [ ] 271. Dual-protocol proxy — Anthropic + OpenAI
-- [ ] 272. Hook up any provider
-- [ ] 273. Aggregate models — standard/fast/free
-- [ ] 274. Ordered sequential failover
-- [ ] 275. Limit-exhaustion detection
-- [ ] 276. Reset-window / Retry-After tracking
-- [ ] 277. Automatic failback (half-open probing)
-- [ ] 278. Per-upstream circuit breaker
-- [ ] 279. Retries with backoff
-- [ ] 280. Key/upstream load balancing
+- [x] 271. Dual-protocol proxy — Anthropic + OpenAI _(SSE translation)_
+- [~] 272. Hook up any provider _(configurable upstreams/backends)_
+- [~] 273. Aggregate models — standard/fast/free
+- [x] 274. Ordered sequential failover _(+ load-balanced & speculative routing strategies)_
+- [x] 275. Limit-exhaustion detection
+- [x] 276. Reset-window / Retry-After tracking
+- [~] 277. Automatic failback (half-open probing) _(soft cooldown + success recovery)_
+- [~] 278. Per-upstream circuit breaker _(exhaustion + cooldown state per backend/model)_
+- [~] 279. Retries with backoff
+- [x] 280. Key/upstream load balancing _(multi-key lanes + pool rotation)_
 - [ ] 281. Model/tier aliasing
-- [ ] 282. Auto-downgrade under pressure
+- [~] 282. Auto-downgrade under pressure
 - [ ] 283. Local model upstreams (Ollama/vLLM)
 - [ ] 284. Prompt-cache preservation (native Anthropic path)
-- [ ] 285. Streaming passthrough (no buffering)
-- [ ] 286. Tool-call field preservation
-- [ ] 287. Per-agent virtual keys
-- [ ] 288. Proxy managed as daemon/pinned program
+- [x] 285. Streaming passthrough (no buffering)
+- [~] 286. Tool-call field preservation
+- [~] 287. Per-agent virtual keys _(virtual-key identity resolution + per-identity budgets)_
+- [x] 288. Proxy managed as daemon/pinned program _(host auto-launch)_
+- [~] 656. Interactive per-agent account/credential switcher — status-bar chip to hot-swap which subscription/account (or virtual key) a harness uses without re-auth; UX layer over the proxy's key load-balancing (280) + per-agent virtual keys (287); running sessions keep their account until restart (Orca hot-swap)
 
 ### V. Cost / limit / budget
 
-- [ ] 289. Per-request cost logging
-- [ ] 290. Spend attribution — agent/worktree/workspace
+- [x] 289. Per-request cost logging
+- [x] 290. Spend attribution — agent/worktree/workspace
 - [ ] 291. Spend-mode vs subscription-mode accounting
-- [ ] 292. Budget caps ($/tokens) per scope
-- [ ] 293. Enforce caps (refuse/downgrade)
+- [x] 292. Budget caps ($/tokens) per scope
+- [x] 293. Enforce caps (refuse/downgrade) _(refuse-on-breach)_
 - [ ] 294. RPM/TPM rate limiting
 - [ ] 295. Daily/weekly/monthly ceilings
-- [ ] 296. Kill-switch on breach
+- [~] 296. Kill-switch on breach
 - [ ] 297. Cache-hit-ratio tracking
-- [ ] 298. Spend history + export
+- [~] 298. Spend history + export _(spend persisted to DB)_
 - [ ] 299. Cost dashboards/charts
-- [ ] 300. Quota refresh tracking/forecast
+- [~] 300. Quota refresh tracking/forecast _(reset-window tracking)_
 
 ### W. Token reduction (rtk)
 
-- [ ] 301. Built-in rtk output compression
+- [~] 301. Built-in rtk output compression _(native in-flight token-reduction engine)_
 - [ ] 302. Auto-hook rtk into agent bash calls
 - [ ] 303. rtk telemetry off by default
 - [ ] 304. Per-command bypass
 - [ ] 305. Route file reads through rtk
-- [ ] 306. Tokens-saved tracking
+- [x] 306. Tokens-saved tracking
 - [ ] 307. Configurable aggressiveness
 - [ ] 308. Custom rtk filters per project
 
@@ -674,17 +716,21 @@ native staging/commit, branch, stash, conflict, history, and rebase flows while
 keeping `lazygit` as the fallback escape hatch._
 
 - [x] 319. Per-worktree status/diff
-- [~] 320. Stage/commit from TUI
-- [~] 321. Merge/rebase from TUI
-- [ ] 322. Conflict resolution UI
-- [~] 323. Branch management
-- [~] 324. Log/graph view
-- [~] 325. Blame view
-- [~] 326. Stash management
+- [x] 320. Stage/commit from TUI
+- [x] 321. Merge/rebase from TUI _(sequencer flow UI)_
+- [x] 322. Conflict resolution UI _(conflict chips + resolve/continue/abort)_
+- [x] 323. Branch management
+- [x] 324. Log/graph view
+- [x] 325. Blame view
+- [x] 326. Stash management
 - [x] 327. lazygit pin (fallback)
-- [ ] 328. Commit signing
+- [~] 328. Commit signing _(GPG signing args plumbed through commit/cherry/revert)_
 - [~] 329. Hooks-aware (pre-commit)
-- [ ] 330. Cherry-pick/revert
+- [x] 330. Cherry-pick/revert _(+ continue/skip/abort)_
+- [ ] 601. Word-level / intra-line diff highlighting (base vs working copy)
+- [ ] 602. Center-gutter visual hunk stage/revert — "`git add -p`, made visual"
+- [ ] 604. Rollback/discard window — checkbox tree of changes, optional delete of added files, per-row diff
+- [ ] 605. Plain push/pull/fetch when ahead/behind upstream (non-PR fast path)
 
 ### Z. GitHub
 
@@ -780,6 +826,7 @@ keeping `lazygit` as the fallback escape hatch._
 - [~] 402. Recent files
 - [ ] 403. Bookmarks/marks
 - [ ] 404. Diff-against-branch from file
+- [ ] 606. File management from the tree — new/rename/delete (with confirm), file-type icons, git/VCS-status colors
 
 ### AG. Editor integration
 
@@ -807,18 +854,18 @@ _Tier-1 attention routing uses this group for the event→action bus, desktop
 notifications, and aggregation. AQ 524 extends the same attention model to
 non-agent processes and plain task panes._
 
-- [~] 419. fs-watch triggers (notify) _(notify wired, but only drives panel diff refresh)_
-- [ ] 420. Rules engine — event→action
-- [ ] 421. Desktop notifications (notify-rust) _(no notify-rust dep yet)_
+- [~] 419. fs-watch triggers (notify) _(drives panel diff refresh; also feeds the event bus)_
+- [~] 420. Rules engine — event→action _(fixed event→notification mapping + urgency thresholds; no user-defined action rules yet)_
+- [x] 421. Desktop notifications _(via `notify-send`, gated by `desktop_min_urgency`; not the notify-rust crate)_
 - [ ] 422. Push to phone (ntfy)
 - [ ] 423. Push to phone (Telegram)
-- [ ] 424. Per-event opt-in
+- [~] 424. Per-event opt-in _(urgency-threshold gating, not yet per-event)_
 - [x] 425. Contextual tree dots _(activity-dot state machine)_
 - [ ] 426. Do-not-disturb / quiet hours
 - [ ] 427. Per-profile routing
-- [ ] 428. Notification history/center
+- [x] 428. Notification history/center _(notifications panel section + inbox, Enter-to-expand)_
 - [ ] 429. Sound/bell config
-- [~] 430. Aggregated bus across all sources
+- [x] 430. Aggregated bus across all sources _(core `EventBus` aggregates PR/agent/test/log/worktree/process events)_
 
 ### AJ. Security / opsec
 
@@ -911,7 +958,7 @@ non-agent processes and plain task panes._
 - [ ] 498. Shared / pair sessions — live co-presence + control handoff over iroh p2p
 - [ ] 501. Cross-machine federation — daemons meshed via NATS/iroh; agents run where the compute is
 - [ ] 503. e2e-encrypted config sync — preferences across machines, client-side encrypted
-- [ ] 504. Scriptable automations / macros — event-bus triggers → action-API actions
+- [ ] 504. Scriptable automations / macros — event-bus triggers → action-API actions; shares the scheduling model with 226 (cron/RRULE/presets, repo-or-worktree target, session reuse)
 - [ ] 508. Whole-workspace snapshot (env+state) — Nix devshell + container checkpoint + session snapshot
 - [ ] 509. Offline mode (local models only) — offline aggregate of local upstreams; graceful degradation
 
@@ -923,23 +970,23 @@ new IDE-shaped capabilities that were not already covered by existing roadmap
 groups; existing git, palette, notification, layout, and editor items remain in
 their original groups._
 
-- [ ] 516. Test explorer tree — discover and render runnable test targets per worktree
-- [ ] 517. Test status rollups — pass/fail/running state in panel, sidebar, and statusbar
-- [ ] 518. Run/debug selected test — nearest/file/package/failed-test actions, DAP handoff later
-- [ ] 519. Problems / diagnostics panel — compiler/linter/config/LSP diagnostics with file:line jumps
-- [ ] 520. Named task registry — `[[tasks]]` (explicit config) + discovered providers (just, cargo, npm, etc.) and aliases
-- [ ] 521. Task lifecycle controls — run/stop/restart/rerun from palette/panel/keybinds for any task
-- [ ] 522. Task output capture + problem matching — feed Tests and Problems without polling
+- [~] 516. Test explorer tree — discover and render runnable test targets per worktree _(test discovery in `task.rs`)_
+- [~] 517. Test status rollups — pass/fail/running state in panel, sidebar, and statusbar
+- [~] 518. Run/debug selected test — nearest/file/package/failed-test actions, DAP handoff later
+- [~] 519. Problems / diagnostics panel — compiler/linter/config/LSP diagnostics with file:line jumps _(problems panel)_
+- [~] 520. Named task registry — `[[tasks]]` (explicit config) + discovered providers (just, cargo, npm, etc.) and aliases
+- [~] 521. Task lifecycle controls — run/stop/restart/rerun from palette/panel/keybinds for any task
+- [~] 522. Task output capture + problem matching — feed Tests and Problems without polling
 - [ ] 523. Search Everywhere provider aggregation — actions, files, symbols, tasks, tests, problems, git, worktrees
-- [ ] 524. Non-agent process attention routing — exited/failed/waiting panes join the attention queue
+- [~] 524. Non-agent process attention routing — exited/failed/waiting panes join the attention queue _(`ProcessExited` event + exit classification/policy)_
 - [ ] 525. DAP client substrate — debug adapter JSON-RPC service seam in `superzej-svc`
 - [ ] 526. Debug breakpoints and stepping — continue/pause/step controls and breakpoint state
 - [ ] 527. Debug variables/watch/call-stack panel — inspect runtime state in the right panel
 - [ ] 528. Debug launch/attach configurations — task-backed debug profiles per workspace
-- [ ] 529. LSP client substrate — language-server JSON-RPC service seam in `superzej-svc`
+- [~] 529. LSP client substrate — language-server JSON-RPC service seam in `superzej-svc`
 - [ ] 530. Go-to-definition and find-references — navigate via `$EDITOR`/panel handoff, not in-place editing
-- [ ] 531. Document/workspace symbols — feed Search Everywhere and outline/reference views
-- [ ] 532. Hover/signature/code-action preview — read-only context and previewable actions
+- [~] 531. Document/workspace symbols — feed Search Everywhere and outline/reference views _(symbols panel)_
+- [x] 532. Hover/signature/code-action preview — read-only context and previewable actions
 - [ ] 533. Per-worktree local timeline — git/files/tasks/tests/agents/checks activity history
 - [ ] 534. Restore/compare from local timeline — inspect or recover local snapshots where available
 - [ ] 535. Unified layout+task template — native `CenterTree` layout + tasks + pins + sandbox preset
@@ -975,7 +1022,7 @@ context — don't fight it)._
 
 **Context & token economy — rides W, applied to every harness:**
 
-- [ ] 552. In-flight `tool_result` compression — rtk-style, applied to result blocks regardless of how the command ran _(extends W 301/305)_
+- [~] 552. In-flight `tool_result` compression — rtk-style, applied to result blocks regardless of how the command ran _(native token-reduction engine; extends W 301/305)_
 - [ ] 553. Prompt-cache optimization — structure requests for max cache hits, insert breakpoints, track savings _(extends U 284, V 297; the biggest cost lever)_
 - [ ] 554. Context-window management — auto-summarize/compact near the limit; sliding window; context GC `[581]`
 - [ ] 555. Semantic dedup — strip files/outputs already present in context; never re-send the same file twice
@@ -1017,7 +1064,7 @@ context — don't fight it)._
 **Observability, cost & eval:**
 
 - [ ] 577. Per-request/agent/tool token + cost accounting _(extends V 289/290)_
-- [ ] 578. Compression-savings + cache-hit-ratio tracking _(extends V 297, W 306)_
+- [~] 578. Compression-savings + cache-hit-ratio tracking _(tokens-saved metric; extends V 297, W 306)_
 - [ ] 579. Tool-call analytics — which tools agents actually use, latency, failure rates
 - [ ] 580. Context-utilization tracking — how full the window runs per agent _(extends S 246)_
 - [ ] 581. Quality/eval hooks — score responses; A/B transformations to prove they help (the eval harness, ex-505/506; gates 554/557/risky transforms)
@@ -1029,6 +1076,78 @@ context — don't fight it)._
 - [ ] 584. Request inspector — see the exact context that was sent
 - [ ] 585. Record/mock mode — run agents against recorded responses offline, for testing
 - [ ] 586. Cost dry-run — "what would this conversation cost on model X"
+
+### AS. Version-control backends (git + jujutsu)
+
+_The bridge that makes "every feature, for both git **and** jujutsu" real: a
+pluggable VCS provider behind one trait so every diff/status/commit/history/branch
+surface (Y, X, T, and the visual-staging items Y 601–602, 604–605) routes through it once
+and works on either backend. jj's change-centric model (working-copy-as-a-commit,
+first-class conflicts, operation log) maps onto the same panel/sidebar/gutter UI
+rather than forking it. **Viewer + VCS-operations only — no in-place text
+editing**; editing stays handoff via AG. AI-free and additive — pull forward
+opportunistically alongside basic git (Phase 1)._
+
+- [ ] 587. VCS backend abstraction — `git` | `jj` provider trait; all diff/commit/history/branch surfaces route through it
+- [ ] 588. Jujutsu backend — jj-native status/diff/log via `jj` CLI (+ jj-lib reads where available), CLI fallback like the GitRouter
+- [ ] 589. Colocated git+jj repos — operate over `.jj` and `.git` together; detect backend per workspace/worktree
+- [ ] 590. Change-centric model — working-copy-as-a-commit; surface change IDs vs commit IDs in panel/sidebar
+- [ ] 591. `jj describe` — edit change descriptions (the commit-message-box equivalent)
+- [ ] 592. `jj new` / `edit` / `abandon` — create, switch-to-edit, and drop changes
+- [ ] 593. `jj squash` / `split` — move hunks between changes; the center-gutter staging (602) maps to squash/split
+- [ ] 594. `jj rebase` / `restore` — re-parent changes, restore paths (maps onto Y 321/330)
+- [ ] 595. Bookmarks — jj bookmark create/move/delete, mapped onto the branch switcher (Y 323)
+- [ ] 596. Operation log + undo/redo — `jj op log`, `jj undo`, `jj op restore` (the rollback window, jj-flavoured)
+- [ ] 597. First-class conflict handling — show/resolve jj's in-tree conflicts in the diff/merge UI (Y 322)
+- [ ] 598. Revset-powered log/graph view — `jj log` revsets feed the graph (Y 324)
+- [ ] 599. jj fetch/push to git remotes — incl. PR/worktree mapping (Z 336, Y 605)
+- [ ] 600. jj workspaces ↔ superzej worktree-tab model — map `jj workspace` onto the per-worktree tab/sidebar
+- [ ] 622. Repo adoption — `jj git init` (colocate in an existing git worktree) + `jj git clone` (fresh jj repo); auto-detect and offer to adopt (extends 589)
+- [ ] 623. `jj absorb` — auto-distribute working-copy edits into the ancestor changes that last touched each line (the "smart squash", no git equivalent)
+- [ ] 624. `jj duplicate` / `jj backout` — copy a change elsewhere; create an inverse change (jj's revert)
+- [ ] 625. `jj evolog` — per-change evolution history, distinct from the operation log (596)
+- [ ] 626. File tracking — `jj file track`/`untrack` + filesets; surface jj's auto-snapshot model vs git's index
+- [ ] 627. Remote-bookmark tracking — `jj bookmark track`/`untrack`, push `--allow-new`; tracked/ahead/behind per remote (extends 595/599)
+- [ ] 628. jj commit signing — GPG/SSH signing for jj changes (parallels git 328)
+- [ ] 629. `jj resolve` — external merge-tool flow + conflict materialization/round-trip (extends in-UI conflicts 597)
+- [ ] 630. Advanced history rewriting — `jj parallelize`, `jj simplify-parents`, and other revset-targeted rewrites (extends 594)
+
+### AT. Multi-forge PR/MR, issues, reviews & boards (GitHub/GitLab/Gitea/Forgejo)
+
+_Does for code-forges what AS does for VCS backends: one provider trait so PR/MR,
+issue, review, comment, board, and CI surfaces work across **GitHub, GitLab,
+Gitea, and Forgejo** (and self-hosted instances), generalizing the GitHub-only Z
+group. It also imports the **Stage** (stagereview.app / `stagereview` CLI) review
+workflow — break a diff into ordered "chapters", surface intent/risk, and a
+review-plan assistant that cites exact `file:line`. Split by AI-dependence: the
+forge plumbing, dashboard, comments/reviews, boards, local-diff review, and
+notifications are **AI-free**; the narrative/risk/assistant layer is
+**AI-additive via the proxy** (can target local models for the local-first
+posture) and degrades to a plain diff when AI is off._
+
+- [ ] 631. Forge backend abstraction — pluggable provider trait; PR/MR, issue, review, comment, board, CI surfaces route through it (generalizes Z the way AS generalizes Y)
+- [ ] 632. GitHub provider — `gh`/octocrab; the existing Z (331–340) becomes the reference implementation
+- [ ] 633. GitLab provider — merge requests, issues, notes, pipelines via GitLab API / `glab`
+- [ ] 634. Gitea provider — PRs, issues, reviews via Gitea API / `tea` CLI
+- [ ] 635. Forgejo provider — Forgejo API (Gitea-compatible + Forgejo extensions)
+- [ ] 636. Self-hosted / enterprise endpoints — per-instance base URL + token/SSO config per forge
+- [ ] 637. Unified cross-forge PR/MR dashboard — every PR/MR across repos & forges, grouped Ready-to-review / Yours / Recently-completed (extends Z 340)
+- [ ] 638. PR/MR triage states — needs-review / changes-requested / approved / mergeable, reviewer + comment counts, age, ± (feeds sidebar badge counts B 28)
+- [ ] 639. Structured "chapters" — break a diff into ordered, themed groups (intent + dependencies + the files that matter) with per-chapter review progress
+- [ ] 640. Local working-tree review — chapters over staged/unstaged/untracked or any `base..compare` diff, before a PR exists (extends Y 319; the stage-cli `--base/--compare/--ref/--pr` model)
+- [ ] 641. `.stageignore` exclusions + "Other changes" catch-all — gitignore-style patterns scope what review analyzes; excluded files still surfaced, never silently hidden
+- [ ] 642. PR narrative / "prologue" — why-this-PR / what-it-does / key-changes summary (AI via proxy; plain diff when AI-free)
+- [ ] 643. Review-focus / risk callouts — surface the riskiest files/hunks with reasoning (ties to X 316 inspect, T 265)
+- [ ] 644. Review-plan assistant ("Stagent") — what-to-review-first / what's-risky / how-this-fits, answers citing exact `file:line` (ties to T 266; via proxy)
+- [ ] 645. Threaded review comments — read/post/resolve inline + top-level per forge, plus a local review-comments model (stage-cli) for pre-PR diffs
+- [ ] 646. Two-way comment & approval sync — comments/approvals/review state round-trip with the forge; status checks, required reviews, and merge rules preserved
+- [ ] 647. Submit a review — approve / request-changes / comment with batched line comments + apply-suggestion round-trip
+- [ ] 648. Cross-forge issue list/triage — extends AA's generic tracker (348) to GitHub/GitLab/Gitea/Forgejo issues
+- [ ] 649. Issue ↔ worktree/branch/PR linkage — branch/worktree from an issue, auto-close on merge (generalizes AA 342–344)
+- [ ] 650. Kanban / project boards — Gitea/Forgejo/GitLab boards + GitHub Projects: view columns, move cards, WIP at a glance
+- [ ] 651. Board card ↔ worktree/PR binding — open a card's branch as a worktree tab; reflect PR/CI state back on the card
+- [ ] 652. Cross-forge notification feed — review-requested / mentioned / CI-failed / merged events into the notification bus (AI 419–430)
+- [ ] 653. CI/checks status across forges — checks, required gates, mergeability per PR/MR (generalizes Z 332)
 
 ### AI-free mode (audience-widener)
 

@@ -34,7 +34,12 @@ use std::path::PathBuf;
 /// (per-agent keys → upstream binding + scope), and `proxy_budgets` (per-scope
 /// spend + caps). Also formalizes the already-present `container_events` /
 /// `layouts` tables under this version.
-const SCHEMA_VERSION: i64 = 13;
+/// v14: adds `group_tabs.pane_cwds` (per-leaf working directories) so
+/// resurrected panes respawn where they last were.
+/// v15: adds `group_tabs.pane_cmds` (per-leaf last foreground command, JSON
+/// `pane id → {argv, cwd}`) so a resurrected pane can offer to relaunch the
+/// program that was running after a crash or full restart.
+const SCHEMA_VERSION: i64 = 15;
 
 pub struct Db {
     conn: Connection,
@@ -266,6 +271,8 @@ impl Db {
               title        TEXT NOT NULL,
               pane_tree    TEXT NOT NULL,
               focused_pane INTEGER NOT NULL DEFAULT 0,
+              pane_cwds    TEXT,
+              pane_cmds    TEXT,
               PRIMARY KEY (session_name, group_name, ordinal)
             );
             -- v4: which tab (v6: which worktree group) was active at exit.
@@ -454,6 +461,22 @@ impl Db {
               reset_ms       INTEGER NOT NULL DEFAULT 0,
               killed         INTEGER NOT NULL DEFAULT 0
             );
+            -- accounts: superzej-managed coding-agent credential homes for
+            -- client-side account switching (item 656). Config `[[accounts]]`
+            -- entries are merged in read-only at the call site; this table holds
+            -- accounts created by the in-app "Add account" login flow. `dir` is
+            -- the credential home (CODEX_HOME / CLAUDE_CONFIG_DIR); `managed` is 1
+            -- when superzej owns the dir. Active-account pointers live in ui_state
+            -- under scope `account:<provider>[:ws:<slug>|:wt:<path>]`.
+            CREATE TABLE IF NOT EXISTS accounts (
+              provider   TEXT    NOT NULL,
+              name       TEXT    NOT NULL,
+              dir        TEXT    NOT NULL,
+              managed    INTEGER NOT NULL DEFAULT 1,
+              created_at INTEGER NOT NULL,
+              last_used  INTEGER,
+              PRIMARY KEY (provider, name)
+            );
             COMMIT;
             "#,
         )?;
@@ -473,6 +496,14 @@ impl Db {
         // v8: a persistent per-worktree sort key — the single source of truth
         // for sidebar order (loaded + unloaded). Additive; backfilled below.
         let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN position INTEGER", []);
+        // v14: per-leaf working directories (JSON map of pane id → cwd) so
+        // resurrected panes respawn where they last were, not at the worktree
+        // root. Additive; absent/NULL on pre-v14 rows = no cwd hints.
+        let _ = conn.execute("ALTER TABLE group_tabs ADD COLUMN pane_cwds TEXT", []);
+        // v15: per-leaf last foreground command (JSON map of pane id →
+        // {argv, cwd}) so a resurrected/crashed pane can offer to relaunch the
+        // program it was running. Additive; absent/NULL on pre-v15 rows = none.
+        let _ = conn.execute("ALTER TABLE group_tabs ADD COLUMN pane_cmds TEXT", []);
         // Backfill any unset positions deterministically by creation order
         // (path as the tie-breaker), giving pre-v8 worktrees a stable,
         // collision-free order on first launch after upgrade. Runs once: after
@@ -1687,10 +1718,10 @@ impl Db {
     pub fn put_group_tab(&self, session: &str, row: &crate::models::GroupTabRow) -> Result<()> {
         self.conn.execute(
             "INSERT INTO group_tabs
-               (session_name, group_name, ordinal, title, pane_tree, focused_pane)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+               (session_name, group_name, ordinal, title, pane_tree, focused_pane, pane_cwds, pane_cmds)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(session_name, group_name, ordinal) DO UPDATE SET
-               title=?4, pane_tree=?5, focused_pane=?6",
+               title=?4, pane_tree=?5, focused_pane=?6, pane_cwds=?7, pane_cmds=?8",
             params![
                 session,
                 row.group_name,
@@ -1698,6 +1729,8 @@ impl Db {
                 row.title,
                 row.pane_tree,
                 row.focused_pane,
+                row.pane_cwds,
+                row.pane_cmds,
             ],
         )?;
         Ok(())
@@ -1724,7 +1757,7 @@ impl Db {
     /// All persisted tabs for every group in a session, ordered (group, tab).
     pub fn group_tabs_for_session(&self, session: &str) -> Result<Vec<crate::models::GroupTabRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT group_name, ordinal, title, pane_tree, focused_pane
+            "SELECT group_name, ordinal, title, pane_tree, focused_pane, pane_cwds, pane_cmds
                FROM group_tabs WHERE session_name=?1 ORDER BY group_name, ordinal",
         )?;
         let rows = stmt.query_map(params![session], |r| {
@@ -1734,6 +1767,8 @@ impl Db {
                 title: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 pane_tree: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
                 focused_pane: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                pane_cwds: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                pane_cmds: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -1776,6 +1811,20 @@ impl Db {
             params![session, tab, now],
         )?;
         Ok(())
+    }
+
+    /// Record the workspace (repo path) that was focused at the last switch.
+    /// Stored as a global `ui_state` pointer ("" scope) so startup can reopen
+    /// the workspace the user was actually in — independent of the
+    /// `workspaces.last_active` column, which also orders the sidebar tree and
+    /// must not reshuffle on every switch.
+    pub fn set_active_workspace(&self, repo_path: &str) -> Result<()> {
+        self.set_ui_state("", "active_workspace", repo_path)
+    }
+
+    /// The workspace recorded by [`Self::set_active_workspace`], if any.
+    pub fn active_workspace(&self) -> Result<Option<String>> {
+        self.get_ui_state("", "active_workspace")
     }
 
     /// The tab that was active at exit, if recorded.
@@ -1840,6 +1889,76 @@ impl Db {
             .filter_map(|(k, v)| v.map(|v| (k, v)))
             .collect();
         Ok(rows)
+    }
+
+    // --- accounts (client-side account switching; see crate::account) -------
+
+    /// The credential-home dir for a managed account, `None` if unknown.
+    pub fn account_dir(&self, provider: &str, name: &str) -> Result<Option<String>> {
+        let r = self
+            .conn
+            .query_row(
+                "SELECT dir FROM accounts WHERE provider=?1 AND name=?2",
+                params![provider, name],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(r)
+    }
+
+    /// Every managed account for a provider, as `(name, dir, managed)`.
+    pub fn list_accounts(&self, provider: &str) -> Result<Vec<(String, String, bool)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, dir, managed FROM accounts WHERE provider=?1 \
+             ORDER BY last_used DESC, name",
+        )?;
+        let rows = stmt
+            .query_map(params![provider], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)? != 0,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Register (or update) an account's credential-home dir.
+    pub fn put_account(
+        &self,
+        provider: &str,
+        name: &str,
+        dir: &str,
+        managed: bool,
+        now_ms: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO accounts (provider, name, dir, managed, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(provider, name) DO UPDATE SET dir=?3, managed=?4",
+            params![provider, name, dir, managed as i64, now_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Mark an account as just used (for picker ordering).
+    pub fn touch_account(&self, provider: &str, name: &str, now_ms: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE accounts SET last_used=?3 WHERE provider=?1 AND name=?2",
+            params![provider, name, now_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Forget a managed account (does not delete its on-disk credential dir).
+    pub fn del_account(&self, provider: &str, name: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM accounts WHERE provider=?1 AND name=?2",
+            params![provider, name],
+        )?;
+        Ok(())
     }
 
     /// Record the running-pin set (an opaque JSON string) for a session without
@@ -2033,6 +2152,52 @@ mod tests {
     }
 
     #[test]
+    fn accounts_crud_roundtrips() {
+        let db = db();
+        assert!(db.account_dir("codex", "work").unwrap().is_none());
+        assert!(db.list_accounts("codex").unwrap().is_empty());
+
+        db.put_account("codex", "work", "/creds/work", true, 10)
+            .unwrap();
+        db.put_account("codex", "personal", "/creds/personal", false, 5)
+            .unwrap();
+        assert_eq!(
+            db.account_dir("codex", "work").unwrap().as_deref(),
+            Some("/creds/work")
+        );
+
+        // last_used DESC ordering: touch personal so it floats above work.
+        db.touch_account("codex", "personal", 99).unwrap();
+        let names: Vec<String> = db
+            .list_accounts("codex")
+            .unwrap()
+            .into_iter()
+            .map(|(n, _, _)| n)
+            .collect();
+        assert_eq!(names, vec!["personal".to_string(), "work".to_string()]);
+        // managed flag survives the round-trip.
+        let managed: Vec<bool> = db
+            .list_accounts("codex")
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, m)| m)
+            .collect();
+        assert_eq!(managed, vec![false, true]);
+
+        // put is an upsert on (provider, name).
+        db.put_account("codex", "work", "/creds/work2", true, 20)
+            .unwrap();
+        assert_eq!(
+            db.account_dir("codex", "work").unwrap().as_deref(),
+            Some("/creds/work2")
+        );
+
+        db.del_account("codex", "work").unwrap();
+        assert!(db.account_dir("codex", "work").unwrap().is_none());
+        assert_eq!(db.list_accounts("codex").unwrap().len(), 1);
+    }
+
+    #[test]
     fn commit_cache_roundtrips_json_and_timestamp() {
         let db = db();
         assert!(db.get_commit_cache("/wt").unwrap().is_none());
@@ -2087,6 +2252,8 @@ mod tests {
             title: (ord + 1).to_string(),
             pane_tree: r#"{"leaf":0}"#.into(),
             focused_pane: 0,
+            pane_cwds: String::new(),
+            pane_cmds: String::new(),
         };
         // Insert out of order; expect ordinal ordering back.
         db.put_tab_group(sess, &mk("app/feat", 1)).unwrap();
@@ -2127,6 +2294,68 @@ mod tests {
         assert!(db.groups_for_session(sess).unwrap().is_empty());
         assert!(db.group_tabs_for_session(sess).unwrap().is_empty());
         assert_eq!(db.groups_for_session("other").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn group_tab_pane_cwds_column_roundtrips() {
+        use crate::models::GroupTabRow;
+        let db = db();
+        let sess = "s-cwd";
+        db.put_group_tab(
+            sess,
+            &GroupTabRow {
+                group_name: "app/home".into(),
+                ordinal: 0,
+                title: "1".into(),
+                pane_tree: r#"{"leaf":0}"#.into(),
+                focused_pane: 0,
+                pane_cwds: r#"{"0":"/home/u/repo"}"#.into(),
+                pane_cmds: r#"{"0":{"argv":["nvim"],"cwd":"/home/u/repo"}}"#.into(),
+            },
+        )
+        .unwrap();
+        let tabs = db.group_tabs_for_session(sess).unwrap();
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0].pane_cwds, r#"{"0":"/home/u/repo"}"#);
+        assert_eq!(
+            tabs[0].pane_cmds,
+            r#"{"0":{"argv":["nvim"],"cwd":"/home/u/repo"}}"#
+        );
+
+        // An upsert overwrites the cwd + cmd maps (no stale merge).
+        db.put_group_tab(
+            sess,
+            &GroupTabRow {
+                group_name: "app/home".into(),
+                ordinal: 0,
+                title: "1".into(),
+                pane_tree: r#"{"leaf":0}"#.into(),
+                focused_pane: 0,
+                pane_cwds: String::new(),
+                pane_cmds: String::new(),
+            },
+        )
+        .unwrap();
+        let back = db.group_tabs_for_session(sess).unwrap();
+        assert_eq!(back[0].pane_cwds, "");
+        assert_eq!(back[0].pane_cmds, "");
+    }
+
+    #[test]
+    fn active_workspace_pointer_roundtrips() {
+        let db = db();
+        assert_eq!(db.active_workspace().unwrap(), None);
+        db.set_active_workspace("/home/u/repo-a").unwrap();
+        assert_eq!(
+            db.active_workspace().unwrap().as_deref(),
+            Some("/home/u/repo-a")
+        );
+        // Pointer is a single global slot: a later switch overwrites it.
+        db.set_active_workspace("/home/u/repo-b").unwrap();
+        assert_eq!(
+            db.active_workspace().unwrap().as_deref(),
+            Some("/home/u/repo-b")
+        );
     }
 
     #[test]

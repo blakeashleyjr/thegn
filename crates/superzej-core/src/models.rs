@@ -73,6 +73,13 @@ pub struct GroupTabRow {
     /// Serialized pane tree (opaque JSON to core).
     pub pane_tree: String,
     pub focused_pane: i64,
+    /// Per-leaf working directories: a JSON map of `pane id → cwd` (opaque to
+    /// core). Empty string when unset (pre-v14 rows / no captured cwds).
+    pub pane_cwds: String,
+    /// Per-leaf last foreground command: a JSON map of `pane id → {argv, cwd}`
+    /// (opaque to core). Empty string when unset (pre-v15 rows / idle shell, no
+    /// non-shell program was running).
+    pub pane_cmds: String,
 }
 
 /// A worktree enriched with live git status, for `list` / `dashboard` output.

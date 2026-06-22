@@ -319,6 +319,11 @@ pub struct NamedCommand {
     /// Optional list of hint overrides for the statusbar when this tool is focused.
     #[serde(default)]
     pub hints: Vec<CommandHint>,
+    /// Optional account-provider id (`"codex"`, `"claude"`) for client-side
+    /// account switching. When unset, the provider is inferred from the
+    /// command's program basename. See [`crate::account`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 /// A statusbar hint override for a specific tool.
@@ -326,6 +331,23 @@ pub struct NamedCommand {
 pub struct CommandHint {
     pub key: String,
     pub label: String,
+}
+
+/// A `[[accounts]]` entry — one credential home for a coding-agent provider
+/// (`codex`/`claude`), used by client-side account switching. superzej points
+/// the agent's credential-home env var (`CODEX_HOME` / `CLAUDE_CONFIG_DIR`) at
+/// the chosen account on launch, so the user's real `~/.codex` / `~/.claude` is
+/// never modified. `dir` omitted ⇒ superzej manages the dir under the state dir
+/// (use "Add account" to log in); `dir` set ⇒ adopt an existing login dir.
+/// See [`crate::account`].
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct Account {
+    pub name: String,
+    pub provider: String,
+    /// Credential home directory (`~` expanded). When absent, superzej manages a
+    /// dir at `$XDG_STATE_HOME/superzej/accounts/<provider>/<slug>/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
 }
 
 /// A `[[pins]]` entry — a named program that opens either as its own session
@@ -646,6 +668,12 @@ pub struct WorkspaceConfig {
     /// Keybind overrides applied when this workspace is focused.
     #[serde(skip_serializing_if = "KeybindConfig::is_empty")]
     pub keybinds: KeybindConfig,
+    /// Default coding-agent account per provider for this workspace
+    /// (`[workspace.<slug>] accounts = { codex = "work" }`). Maps a provider id
+    /// to an account name; consulted below a worktree override and above the
+    /// global active account. See [`crate::account`].
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub accounts: std::collections::BTreeMap<String, String>,
 }
 
 /// `[theme]` — visual tuning: the accent, the focus frame color, and optional
@@ -1778,6 +1806,9 @@ pub struct Config {
     // --- arrays of tables (must serialize before any plain sub-table) ---
     pub agents: Vec<NamedCommand>,
     pub tools: Vec<NamedCommand>,
+    /// Coding-agent subscription accounts (`[[accounts]]`) for client-side
+    /// account switching. See [`crate::account`].
+    pub accounts: Vec<Account>,
     pub pins: Vec<Pin>,
     pub tasks: Vec<Task>,
     pub worktree_templates: Vec<WorktreeTemplate>,
@@ -1851,6 +1882,7 @@ impl Default for Config {
             repo_scan_depth: 5,
             agents: Vec::new(),
             tools: Vec::new(),
+            accounts: Vec::new(),
             pins: Vec::new(),
             tasks: Vec::new(),
             worktree_templates: Vec::new(),
@@ -2245,16 +2277,19 @@ impl Config {
                     name: "claude".into(),
                     command: "claude".into(),
                     hints: vec![],
+                    provider: None,
                 },
                 NamedCommand {
                     name: "termite".into(),
                     command: "termite tui".into(),
                     hints: vec![],
+                    provider: None,
                 },
                 NamedCommand {
                     name: "shell".into(),
                     command: "__shell__".into(),
                     hints: vec![],
+                    provider: None,
                 },
             ];
         }
@@ -2264,21 +2299,25 @@ impl Config {
                     name: "lazygit".into(),
                     command: "lazygit".into(),
                     hints: vec![],
+                    provider: None,
                 },
                 NamedCommand {
                     name: "yazi".into(),
                     command: "yazi".into(),
                     hints: vec![],
+                    provider: None,
                 },
                 NamedCommand {
                     name: "editor".into(),
                     command: "${EDITOR:-vi} .".into(),
                     hints: vec![],
+                    provider: None,
                 },
                 NamedCommand {
                     name: "diff".into(),
                     command: "git diff".into(),
                     hints: vec![],
+                    provider: None,
                 },
             ];
         }
@@ -3833,6 +3872,7 @@ format = \"bad\"
             name: "test".into(),
             command: "echo test".into(),
             hints: vec![],
+            provider: None,
         });
         assert_eq!(cfg.agent_command("test"), Some("echo test"));
         assert_eq!(cfg.agent_command("missing"), None);
@@ -3845,6 +3885,7 @@ format = \"bad\"
             name: "test".into(),
             command: "echo test".into(),
             hints: vec![],
+            provider: None,
         });
         assert_eq!(cfg.tool_command("test"), Some("echo test"));
         assert_eq!(cfg.tool_command("missing"), None);

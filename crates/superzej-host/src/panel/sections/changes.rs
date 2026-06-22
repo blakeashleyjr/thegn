@@ -61,7 +61,7 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
                 }
                 rows.push(PanelRow::plain(Line::segs(segs)));
             }
-            rows.extend(hunk_preview(c, ui, deep));
+            rows.extend(hunk_preview(c, ui, deep, ctx.cols));
             rows.push(PanelRow::blank());
         }
     }
@@ -156,7 +156,7 @@ fn clip_dir_left(dir: &str, name_w: usize, budget: usize) -> String {
 
 /// The inline hunk preview under a highlighted change row. The Half view
 /// shows more hunks and more lines per hunk.
-fn hunk_preview(c: &ChangeRow, ui: &PanelUi, deep: bool) -> Vec<PanelRow> {
+fn hunk_preview(c: &ChangeRow, ui: &PanelUi, deep: bool, cols: usize) -> Vec<PanelRow> {
     let (hunk_cap, line_cap) = if deep { (3, 12) } else { (2, 6) };
     let mut rows = Vec::new();
     if c.stage == Stage::Untracked {
@@ -200,10 +200,7 @@ fn hunk_preview(c: &ChangeRow, ui: &PanelUi, deep: bool) -> Vec<PanelRow> {
                         '-' => "− ",
                         _ => "  ",
                     };
-                    rows.push(PanelRow::plain(Line::segs(vec![
-                        sp(2),
-                        seg(tok, format!("{mark}{text}")),
-                    ])));
+                    rows.extend(wrap_preview(tok, mark, text, cols));
                 }
                 if h.truncated || h.lines.len() > line_cap {
                     rows.push(PanelRow::plain(Line::segs(vec![sp(2), seg(g2(), "…")])));
@@ -218,36 +215,90 @@ fn hunk_preview(c: &ChangeRow, ui: &PanelUi, deep: bool) -> Vec<PanelRow> {
     rows
 }
 
+/// Wrap one inline-preview line onto continuation rows instead of letting the
+/// renderer clip it. The first row carries the `+ `/`− ` mark at the 2-cell
+/// indent; continuations align under the text at a 4-cell indent.
+fn wrap_preview(tok: crate::seg::Tok, mark: &str, text: &str, cols: usize) -> Vec<PanelRow> {
+    let text_w = cols.saturating_sub(4).max(1);
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return vec![PanelRow::plain(Line::segs(vec![
+            sp(2),
+            seg(tok, mark.to_string()),
+        ]))];
+    }
+    let mut rows = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let end = (i + text_w).min(chars.len());
+        let chunk: String = chars[i..end].iter().collect();
+        let segs = if i == 0 {
+            vec![sp(2), seg(tok, format!("{mark}{chunk}"))]
+        } else {
+            vec![sp(4), seg(tok, chunk)]
+        };
+        rows.push(PanelRow::plain(Line::segs(segs)));
+        i = end;
+    }
+    rows
+}
+
 // ---- Full: the side-by-side diff (the former diff overlay) -----------------
 
-/// One side of a side-by-side row, exactly `w` cells: 4-char line number +
-/// gutter + clipped text, changed cells tinted across their full width.
-fn diff_cell(cell: Option<&SbsCell>, w: usize) -> Vec<Seg> {
+/// One side of a side-by-side row, each visual row exactly `w` cells: 4-char
+/// line number + gutter + text, changed cells tinted across their full width.
+///
+/// Long text wraps onto continuation rows instead of being clipped: the first
+/// row shows the line number, continuations blank the gutter. Returns one entry
+/// per visual row (always at least one), so an absent cell yields a single
+/// blank `w`-cell row.
+fn diff_cell(cell: Option<&SbsCell>, w: usize) -> Vec<Vec<Seg>> {
     let Some(cell) = cell else {
-        return vec![sp(w)];
+        return vec![vec![sp(w)]];
     };
     let (fg, bg) = match cell.kind {
         CellKind::Context => (t(), None),
         CellKind::Removed => (hue(Hue::Red), Some(crate::seg::Tok::Sel(Hue::Red, 14))),
         CellKind::Added => (hue(Hue::Green), Some(crate::seg::Tok::Sel(Hue::Green, 14))),
     };
-    let text_w = w.saturating_sub(5);
-    let text: String = cell.text.chars().take(text_w).collect();
-    let pad = text_w - text.chars().count();
-    let mut no = seg(g3(), format!("{:>4} ", cell.line_no));
-    let mut body = seg(fg, format!("{text}{}", " ".repeat(pad)));
-    if let Some(bg) = bg {
-        no = no.bg(bg);
-        body = body.bg(bg);
+    let text_w = w.saturating_sub(5).max(1);
+    let chars: Vec<char> = cell.text.chars().collect();
+    let mut out: Vec<Vec<Seg>> = Vec::new();
+    let mut i = 0;
+    let mut first = true;
+    loop {
+        let end = (i + text_w).min(chars.len());
+        let chunk: String = chars[i..end].iter().collect();
+        let pad = text_w - chunk.chars().count();
+        let no_text = if first {
+            format!("{:>4} ", cell.line_no)
+        } else {
+            "     ".to_string()
+        };
+        let mut no = seg(g3(), no_text);
+        let mut body = seg(fg, format!("{chunk}{}", " ".repeat(pad)));
+        if let Some(bg) = bg {
+            no = no.bg(bg);
+            body = body.bg(bg);
+        }
+        out.push(vec![no, body]);
+        first = false;
+        i = end;
+        if i >= chars.len() {
+            break;
+        }
     }
-    vec![no, body]
+    out
 }
 
-/// The flattened line at index `at`: a hunk header or an aligned row pair.
-fn diff_flat_line(file: &SbsFile, starts: &[usize], at: usize, side: usize) -> Line {
+/// The flattened line at index `at`: a hunk header (one visual row) or an
+/// aligned old/new row pair. Long cells wrap, so a row pair can span several
+/// visual rows; the old and new sides wrap independently and stay column-locked
+/// (the shorter side blanks its trailing continuation rows). Always ≥ 1 row.
+fn diff_flat_line(file: &SbsFile, starts: &[usize], at: usize, side: usize) -> Vec<Line> {
     let h = diff_hunk_at(starts, at);
     let Some(hunk) = file.hunks.get(h) else {
-        return Line::Blank;
+        return vec![Line::Blank];
     };
     let off = at - starts[h];
     if off == 0 {
@@ -258,15 +309,23 @@ fn diff_flat_line(file: &SbsFile, starts: &[usize], at: usize, side: usize) -> L
         if !hunk.func.is_empty() {
             segs.push(seg(g2(), format!(" {}", hunk.func)));
         }
-        return Line::segs(segs);
+        return vec![Line::segs(segs)];
     }
     let Some(row) = hunk.rows.get(off - 1) else {
-        return Line::Blank;
+        return vec![Line::Blank];
     };
-    let mut segs = diff_cell(row.old.as_ref(), side);
-    segs.push(seg(g3(), "│"));
-    segs.extend(diff_cell(row.new.as_ref(), side));
-    Line::segs(segs)
+    let old = diff_cell(row.old.as_ref(), side);
+    let new = diff_cell(row.new.as_ref(), side);
+    let n = old.len().max(new.len());
+    let blank = || vec![sp(side)];
+    (0..n)
+        .map(|k| {
+            let mut segs = old.get(k).cloned().unwrap_or_else(blank);
+            segs.push(seg(g3(), "│"));
+            segs.extend(new.get(k).cloned().unwrap_or_else(blank));
+            Line::segs(segs)
+        })
+        .collect()
 }
 
 fn side_by_side(ctx: &SectionCtx) -> Vec<PanelRow> {
@@ -314,10 +373,21 @@ fn side_by_side(ctx: &SectionCtx) -> Vec<PanelRow> {
         ],
     )));
     rows.push(rule());
-    for at in scroll..(scroll + body).min(len) {
-        rows.push(PanelRow::plain(diff_flat_line(
-            &doc.file, &starts, at, side,
-        )));
+    // Scroll stays in flat-line units (j/k and hunk-nav land on hunk starts);
+    // expand each flat line into its wrapped visual rows, stopping once the
+    // viewport is full. A flat line longer than the band shows its head and the
+    // tail spills below the fold — strictly better than the old hard clip.
+    let mut produced = 0;
+    let mut at = scroll;
+    while produced < body && at < len {
+        for line in diff_flat_line(&doc.file, &starts, at, side) {
+            if produced >= body {
+                break;
+            }
+            rows.push(PanelRow::plain(line));
+            produced += 1;
+        }
+        at += 1;
     }
     rows.push(footer);
     rows
@@ -326,6 +396,104 @@ fn side_by_side(ctx: &SectionCtx) -> Vec<PanelRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cell(line_no: u32, text: &str, kind: CellKind) -> SbsCell {
+        SbsCell {
+            line_no,
+            text: text.to_string(),
+            kind,
+        }
+    }
+
+    /// Concatenated text of a built seg run, for asserting on rendered content.
+    fn segs_text(segs: &[Seg]) -> String {
+        segs.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    #[test]
+    fn diff_cell_wraps_long_text_onto_continuation_rows() {
+        // side = 15 → text_w = 10. A 25-char line needs 3 rows.
+        let c = cell(7, "0123456789abcdefghijklmno", CellKind::Added);
+        let rows = diff_cell(Some(&c), 15);
+        assert_eq!(rows.len(), 3);
+        // First row carries the line number; continuations blank the gutter.
+        assert_eq!(segs_text(&rows[0]), "   7 0123456789");
+        assert_eq!(segs_text(&rows[1]), "     abcdefghij");
+        assert_eq!(segs_text(&rows[2]), "     klmno     ");
+        // Every visual row is exactly `side` cells wide.
+        for r in &rows {
+            assert_eq!(seg_width(r), 15);
+        }
+    }
+
+    #[test]
+    fn diff_cell_short_text_is_a_single_row() {
+        let c = cell(3, "hi", CellKind::Context);
+        let rows = diff_cell(Some(&c), 15);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(segs_text(&rows[0]), "   3 hi        ");
+        // Absent cell → one blank row of full width.
+        let blank = diff_cell(None, 15);
+        assert_eq!(blank.len(), 1);
+        assert_eq!(seg_width(&blank[0]), 15);
+    }
+
+    #[test]
+    fn diff_flat_line_locks_columns_when_sides_wrap_unevenly() {
+        let mut file = SbsFile::default();
+        file.hunks.push(superzej_core::diff_sbs::SbsHunk {
+            old_start: 1,
+            new_start: 1,
+            func: String::new(),
+            rows: vec![superzej_core::diff_sbs::SbsRow {
+                old: Some(cell(1, "short", CellKind::Removed)),
+                new: Some(cell(1, "0123456789abcdefghij", CellKind::Added)),
+            }],
+        });
+        let starts = diff_hunk_starts(&file);
+        // at=1 is the first row (at=0 is the hunk header). side=15 → text_w=10:
+        // old fits in 1 row, new needs 2 → the pair spans 2 column-locked rows.
+        let lines = diff_flat_line(&file, &starts, 1, 15);
+        assert_eq!(lines.len(), 2);
+        for line in &lines {
+            if let Line::Segs(segs) = line {
+                // 15 (old) + 1 (│ separator) + 15 (new) = 31 cells.
+                assert_eq!(seg_width(segs), 31);
+            } else {
+                panic!("expected Segs");
+            }
+        }
+    }
+
+    #[test]
+    fn wrap_preview_continues_long_lines_under_the_text() {
+        // cols = 14 → text_w = 10.
+        let rows = wrap_preview(t(), "+ ", "0123456789abcde", 14);
+        assert_eq!(rows.len(), 2);
+        if let Line::Segs(segs) = &rows[0].line {
+            // sp(2) + "+ " + first 10 chars.
+            assert_eq!(segs_text(segs), "  + 0123456789");
+        } else {
+            panic!("expected Segs");
+        }
+        if let Line::Segs(segs) = &rows[1].line {
+            // continuation aligns under the text at the 4-cell indent.
+            assert_eq!(segs_text(segs), "    abcde");
+        } else {
+            panic!("expected Segs");
+        }
+    }
+
+    #[test]
+    fn wrap_preview_empty_text_keeps_the_mark() {
+        let rows = wrap_preview(t(), "  ", "", 40);
+        assert_eq!(rows.len(), 1);
+        if let Line::Segs(segs) = &rows[0].line {
+            assert_eq!(segs_text(segs), "    ");
+        } else {
+            panic!("expected Segs");
+        }
+    }
 
     #[test]
     fn clip_dir_left_passes_through_short_paths() {

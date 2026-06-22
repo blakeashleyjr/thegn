@@ -9,6 +9,7 @@
 //! bindings + collision detection for the cheatsheet/`keys validate`); the host
 //! owns terminal chord→Action routing.
 
+pub mod account;
 pub mod activity;
 pub mod blame;
 pub mod config;
