@@ -3,8 +3,8 @@
 //! `apps/input.rs`; the standalone harness translates crossterm via
 //! [`from_crossterm`] / [`from_crossterm_event`] (feature `standalone`).
 //!
-//! These types are the canonical definitions — `sw-tui` re-exports them so the
-//! switchboard library and the host agree on one input vocabulary.
+//! These types are the canonical definitions — embedded app crates re-export
+//! them so each app library and the host agree on one input vocabulary.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Modifiers {

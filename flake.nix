@@ -14,10 +14,6 @@
     # Embedded app crates are git submodules. Local flake `self` sources contain
     # only gitlinks for submodules, so package builds need them as explicit
     # non-flake inputs and then copy them into Cargo's expected path-dep dirs.
-    switchboard = {
-      url = "github:blakeashleyjr/switchboard/9ec679706e9f0a4d40319e235f35a67ddf14db0c";
-      flake = false;
-    };
     termiteChat = {
       url = "github:blakeashleyjr/termite-chat/26b0aebfb8284cf7d1dfd76dcbb786c96eeface2";
       flake = false;
@@ -37,7 +33,6 @@
     flake-utils,
     rust-overlay,
     nixpkgs-yazi,
-    switchboard,
     termiteChat,
     muse,
   }:
@@ -107,9 +102,8 @@
         cp -R ${rootSrc}/. $out/
         chmod -R u+w $out
 
-        rm -rf $out/apps/switchboard $out/apps/termite-chat
+        rm -rf $out/apps/termite-chat
         mkdir -p $out/apps
-        cp -R ${switchboard} $out/apps/switchboard
         cp -R ${termiteChat} $out/apps/termite-chat
       '';
       superzej = pkgs.callPackage ./nix/package.nix {

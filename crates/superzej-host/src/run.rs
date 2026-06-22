@@ -5172,7 +5172,6 @@ async fn ensure_app_loaded(
     let theme = crate::apps::kit_theme(&current_config.palette());
     let id = app_host.slots[i].id;
     let tile = match id {
-        "comms" => crate::apps::comms::build(handle, hook, theme).await,
         "chat" => crate::apps::chat::build(handle, hook, theme).await,
         "dashboard" => {
             crate::apps::dashboard::build(handle, hook, theme, &current_config.dashboard).await
@@ -5313,7 +5312,7 @@ async fn event_loop<T: Terminal>(
     // here until the worktree-ready event applies its layout + starts its pins.
     let mut pending_template: Option<superzej_core::config::WorktreeTemplate> = None;
     let mut create_gen: u64 = 0;
-    // Top-level app tabs (comms/chat/agent) hosted as tiles above the worktree
+    // Top-level app tabs (chat/agent) hosted as tiles above the worktree
     // IDE. A tile's ChangeHook posts its slot index here and pulses the waker,
     // so async results fold in and re-render on the existing 0%-idle path.
     // Tiles lazy-load on first focus.

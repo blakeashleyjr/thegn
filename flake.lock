@@ -74,7 +74,6 @@
         "nixpkgs": "nixpkgs",
         "nixpkgs-yazi": "nixpkgs-yazi",
         "rust-overlay": "rust-overlay",
-        "switchboard": "switchboard",
         "termiteChat": "termiteChat"
       }
     },
@@ -95,23 +94,6 @@
       "original": {
         "owner": "oxalica",
         "repo": "rust-overlay",
-        "type": "github"
-      }
-    },
-    "switchboard": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1781329543,
-        "narHash": "sha256-NVWajxVjmDru8Sblztnj57ZUmqxvB1nyNgHvFzDZ7ho=",
-        "owner": "blakeashleyjr",
-        "repo": "switchboard",
-        "rev": "9ec679706e9f0a4d40319e235f35a67ddf14db0c",
-        "type": "github"
-      },
-      "original": {
-        "owner": "blakeashleyjr",
-        "repo": "switchboard",
-        "rev": "9ec679706e9f0a4d40319e235f35a67ddf14db0c",
         "type": "github"
       }
     },

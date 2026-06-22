@@ -49,11 +49,5 @@ sz-kit = { path = "../sz-kit" }
 # Path deps resolve the package directly against the submodule's own
 # [workspace]; superzej's `exclude` keeps these out of this workspace. Their
 # sz-kit git-dep is redirected to the in-tree crate by the root [patch].
-sw-tui = { path = "../../apps/switchboard/crates/sw-tui" }
-sw-rpc = { path = "../../apps/switchboard/crates/sw-rpc" }
-# sw-core (no libsql in the client link) + ulid: just for seeding the comms
-# mock client until the daemon path is wired.
-sw-core = { path = "../../apps/switchboard/crates/sw-core", default-features = false }
-ulid = "1"
 # termite-chat's embeddable TUI (the `chat` tab).
 termite-chat = { path = "../../apps/termite-chat" }

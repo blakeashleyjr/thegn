@@ -339,7 +339,7 @@ pub struct FrameModel {
     /// Names of orphan containers removed at startup GC (shown once in System panel).
     pub startup_orphans_removed: Vec<String>,
     /// Top-level app-tab chip labels in masthead order: `work` first, then the
-    /// embedded apps (`comms`, …). Empty hides the strip entirely.
+    /// embedded apps (`chat`, …). Empty hides the strip entirely.
     pub app_tabs: Vec<String>,
     /// Index of the active app tab in [`Self::app_tabs`] (0 = `work`).
     pub active_app: usize,
@@ -623,7 +623,7 @@ pub fn draw_masthead(
     draw_masthead_left(surface, stats_row, model, brand_cols + chips_w);
 }
 
-/// The top-level app-tab chips (`work`, `comms`, …) in the masthead, just after
+/// The top-level app-tab chips (`work`, `chat`, …) in the masthead, just after
 /// the brand. Active chip in the focus color on a focus-tinted pill; the rest
 /// quiet on the bar. Returns the columns consumed (0 when there are no tabs),
 /// so the caller can place the remaining masthead-left widgets after them.
