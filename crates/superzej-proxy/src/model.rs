@@ -97,3 +97,74 @@ impl ProxyConfig {
         self.routes.iter().map(|r| r.name.clone()).collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use superzej_core::proxy::ratelimit::RatePolicy;
+
+    fn backend(name: &str, key_id: &str) -> Backend {
+        Backend {
+            name: name.into(),
+            key_id: key_id.into(),
+            base_url: "http://x".into(),
+            model: "m".into(),
+            api_key: "super-secret-key".into(),
+            anthropic: false,
+            context_limit: 0,
+            defaults: serde_json::Map::new(),
+            rate: RatePolicy {
+                rpm: 60.0,
+                burst: 5.0,
+            },
+            inflight_cap: 0,
+            pool: None,
+        }
+    }
+
+    #[test]
+    fn identity_combines_name_and_key_id() {
+        assert_eq!(backend("openrouter", "#1").identity(), "openrouter#1");
+        assert_eq!(backend("codex", "").identity(), "codex");
+    }
+
+    #[test]
+    fn debug_never_leaks_api_key() {
+        let dbg = format!("{:?}", backend("p", "#0"));
+        assert!(dbg.contains("\"p\""));
+        assert!(dbg.contains("#0"));
+        assert!(
+            !dbg.contains("super-secret-key"),
+            "api_key leaked into Debug: {dbg}"
+        );
+    }
+
+    #[test]
+    fn lookup_route_strips_prefix_and_defaults_to_first() {
+        let cfg = ProxyConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            routes: vec![
+                Route {
+                    name: "standard".into(),
+                    priority: vec![],
+                    strategy: Default::default(),
+                    order_pool: None,
+                },
+                Route {
+                    name: "fast".into(),
+                    priority: vec![],
+                    strategy: Default::default(),
+                    order_pool: None,
+                },
+            ],
+            relay: crate::relay::RelayConfig::default(),
+            compression: superzej_core::proxy::transform::CompressPolicy::off(),
+        };
+        assert_eq!(cfg.lookup_route("model-proxy/fast").unwrap().name, "fast");
+        assert_eq!(
+            cfg.lookup_route("anything-unknown").unwrap().name,
+            "standard"
+        );
+        assert_eq!(cfg.route_names(), vec!["standard", "fast"]);
+    }
+}

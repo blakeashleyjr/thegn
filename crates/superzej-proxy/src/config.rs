@@ -474,4 +474,162 @@ mod tests {
         assert_eq!(cfg.routes[0].strategy, RoutingStrategy::Speculative);
         assert!(cfg.routes[0].order_pool.is_none());
     }
+
+    // ── Env-bootstrap tests ──────────────────────────────────────────────────
+    // Process env is global, so serialize and restore around each test.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<(String, Option<String>)> = vars
+            .iter()
+            .map(|(k, _)| (k.to_string(), std::env::var(k).ok()))
+            .collect();
+        // SAFETY: serialized by ENV_LOCK; restored below.
+        unsafe {
+            for (k, v) in vars {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        f();
+        unsafe {
+            for (k, old) in saved {
+                match old {
+                    Some(val) => std::env::set_var(&k, val),
+                    None => std::env::remove_var(&k),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn relay_tunables_from_env() {
+        with_env(
+            &[
+                ("SZPROXY_FIRST_BYTE_TIMEOUT", Some("5")),
+                ("SZPROXY_STREAM_IDLE_TIMEOUT", Some("6")),
+                ("SZPROXY_STREAM_HEARTBEAT_INTERVAL", Some("7")),
+            ],
+            || {
+                let r = relay_from_env();
+                assert_eq!(r.first_byte, Duration::from_secs(5));
+                assert_eq!(r.idle, Duration::from_secs(6));
+                assert_eq!(r.heartbeat, Duration::from_secs(7));
+            },
+        );
+        with_env(
+            &[
+                ("SZPROXY_FIRST_BYTE_TIMEOUT", None),
+                ("SZPROXY_STREAM_IDLE_TIMEOUT", None),
+                ("SZPROXY_STREAM_HEARTBEAT_INTERVAL", None),
+                ("MODEL_PROXY_FIRST_BYTE_TIMEOUT", None),
+                ("MODEL_PROXY_STREAM_IDLE_TIMEOUT", None),
+                ("MODEL_PROXY_STREAM_HEARTBEAT_INTERVAL", None),
+            ],
+            || {
+                let r = relay_from_env();
+                assert_eq!(r.first_byte, Duration::from_secs(45)); // Go defaults
+                assert_eq!(r.idle, Duration::from_secs(120));
+                assert_eq!(r.heartbeat, Duration::from_secs(10));
+            },
+        );
+    }
+
+    #[test]
+    fn global_routing_from_env_parses_and_defaults() {
+        with_env(&[("SZPROXY_ROUTING", Some("load_balanced"))], || {
+            assert_eq!(global_routing_from_env(), RoutingStrategy::LoadBalanced);
+        });
+        with_env(&[("SZPROXY_ROUTING", Some("nonsense"))], || {
+            // config_enum infallible-ish: from_str_validated rejects → default.
+            assert_eq!(global_routing_from_env(), RoutingStrategy::Sequential);
+        });
+        with_env(&[("SZPROXY_ROUTING", None)], || {
+            assert_eq!(global_routing_from_env(), RoutingStrategy::Sequential);
+        });
+    }
+
+    #[test]
+    fn resolve_listen_precedence() {
+        with_env(&[("SZPROXY_LISTEN", Some("127.0.0.1:9999"))], || {
+            assert_eq!(resolve_listen().unwrap(), "127.0.0.1:9999".parse().unwrap());
+        });
+        with_env(
+            &[("SZPROXY_LISTEN", None), ("META_ROUTER_PORT", Some("8080"))],
+            || {
+                assert_eq!(resolve_listen().unwrap(), "127.0.0.1:8080".parse().unwrap());
+            },
+        );
+        with_env(
+            &[("SZPROXY_LISTEN", None), ("META_ROUTER_PORT", None)],
+            || {
+                assert_eq!(resolve_listen().unwrap(), default_listen());
+            },
+        );
+    }
+
+    #[test]
+    fn compression_level_from_env() {
+        let doc = CompressionDoc::default();
+        with_env(
+            &[
+                ("SZPROXY_COMPRESS", Some("1")),
+                ("SZPROXY_COMPRESS_LEVEL", None),
+                ("MODEL_PROXY_COMPRESS_LEVEL", None),
+            ],
+            || {
+                // SZPROXY_COMPRESS=1 with no explicit level → conservative.
+                assert_eq!(
+                    resolve_compression(Some(&doc), true).level,
+                    Level::Conservative
+                );
+            },
+        );
+        with_env(
+            &[
+                ("SZPROXY_COMPRESS", Some("1")),
+                ("SZPROXY_COMPRESS_LEVEL", Some("balanced")),
+            ],
+            || {
+                assert_eq!(resolve_compression(Some(&doc), true).level, Level::Balanced);
+            },
+        );
+        with_env(
+            &[
+                ("SZPROXY_COMPRESS", Some("0")),
+                ("SZPROXY_COMPRESS_LEVEL", Some("aggressive")),
+            ],
+            || {
+                // Explicit off wins.
+                assert_eq!(resolve_compression(Some(&doc), true).level, Level::Off);
+            },
+        );
+    }
+
+    #[test]
+    fn from_env_reads_inline_routes_and_global_strategy() {
+        with_env(
+            &[
+                ("SZPROXY_CONFIG", None),
+                (
+                    "SZPROXY_ROUTES_JSON",
+                    Some(r#"{"routes":[{"name":"standard","backends":[]}]}"#),
+                ),
+                ("SZPROXY_ROUTING", Some("load_balanced")),
+                ("SZPROXY_LISTEN", None),
+                ("META_ROUTER_PORT", None),
+            ],
+            || {
+                let cfg = from_env().unwrap();
+                assert_eq!(cfg.routes.len(), 1);
+                assert_eq!(cfg.routes[0].name, "standard");
+                // Global SZPROXY_ROUTING applies when the route omits its own.
+                assert_eq!(cfg.routes[0].strategy, RoutingStrategy::LoadBalanced);
+                assert_eq!(cfg.listen, default_listen());
+            },
+        );
+    }
 }

@@ -110,13 +110,24 @@ e2e-update: build
 # above are excluded).
 cov_ignore := 'superzej-core/src/(repo|worktree|sandbox|remote|github|picker|util|msg|out|log|plugin_api|forge/mod)\.rs'
 
-# Coverage gate: 95% lines on the testable core. Writes lcov to target/coverage.
+# The LLM-proxy crate is gated separately at 88% lines (its decision logic lives
+# in the 95%-gated core::proxy; this covers the I/O shell — router, server, relay,
+# upstream — via unit + integration (`tests/e2e.rs`) tests, hence `--tests`).
+# EXCLUDED: `main.rs`/`lib.rs` — the bind+serve loop, signal handling, and binary
+# entry can't be unit-covered (same rationale as core's seams; exercised live).
+proxy_cov_ignore := 'superzej-proxy/src/(main|lib)\.rs'
+
+# Coverage gate: core ≥95% lines + proxy ≥88% lines. Writes lcov to target/coverage.
 coverage:
     mkdir -p target/coverage
     cargo llvm-cov -p superzej-core --lib --fail-under-lines 95 \
       --ignore-filename-regex '{{cov_ignore}}' \
       --lcov --output-path target/coverage/lcov.info
     @echo "coverage: core ≥95% lines"
+    cargo llvm-cov -p superzej-proxy --lib --tests --fail-under-lines 88 \
+      --ignore-filename-regex '{{proxy_cov_ignore}}' \
+      --lcov --output-path target/coverage/lcov-proxy.info
+    @echo "coverage: proxy ≥88% lines"
 
 # Coverage as a browsable HTML report (target/llvm-cov/html).
 coverage-html:
