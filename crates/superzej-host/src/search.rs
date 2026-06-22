@@ -111,7 +111,9 @@ impl SearchOverlay {
                 self.engine.backspace(sources);
             }
 
-            KeyCode::Char(c) if mods.is_empty() || mods == Modifiers::SHIFT => {
+            KeyCode::Char(c)
+                if (mods.is_empty() || mods == Modifiers::SHIFT) && !c.is_control() =>
+            {
                 self.engine.push_char(*c, sources);
             }
 
@@ -263,7 +265,11 @@ impl SearchOverlay {
 }
 
 fn is_escape(key: &KeyCode, mods: Modifiers) -> bool {
-    matches!(key, KeyCode::Escape)
+    // `is_escape_key` matches both `KeyCode::Escape` and the
+    // `KeyCode::Char('\x1b')` that CSI-u/fixterms terminals report for the
+    // physical Escape key. Without it, Esc on those terminals falls through to
+    // the `Char` arm and gets typed into the query instead of dismissing.
+    crate::input::is_escape_key(key)
         || (mods.contains(Modifiers::CTRL)
             && matches!(
                 key,
@@ -373,6 +379,18 @@ mod tests {
         let mut ov = overlay(1);
         let r = ov.handle_key(&KeyCode::Escape, Modifiers::NONE, &srcs);
         assert!(matches!(r, SearchOutcome::Dismiss));
+    }
+
+    #[test]
+    fn handle_key_csi_u_escape_char_returns_dismiss() {
+        // CSI-u/fixterms terminals report Escape as `Char('\x1b')`. It must
+        // dismiss the overlay, not get typed into the query as a blank.
+        let buf = buf_from(&["cargo build"]);
+        let srcs = sources(1, &buf);
+        let mut ov = overlay(1);
+        let r = ov.handle_key(&KeyCode::Char('\x1b'), Modifiers::NONE, &srcs);
+        assert!(matches!(r, SearchOutcome::Dismiss));
+        assert_eq!(ov.engine().query(), "");
     }
 
     #[test]
