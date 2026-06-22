@@ -125,9 +125,10 @@ impl Toasts {
             cols,
             rows: lines.len(),
             anchor: Anchor::Bottom,
-            // A toast must not steal the eye or dim the work behind it.
+            // A toast must not steal the eye or dim the work behind it — and
+            // no drop-shadow, which reads as rendering cruft on a transient box.
             dim: false,
-            shadow: true,
+            shadow: false,
             border,
             ..LayerSpec::default()
         };
