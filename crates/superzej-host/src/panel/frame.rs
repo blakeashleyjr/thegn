@@ -301,6 +301,25 @@ pub fn build_panel(
         return build_full(model, ui, cols, rows, focused);
     }
 
+    // A drill detail view (commit files, staging, patch, blame, rebase todo)
+    // is only rendered by the git frame. Render it INTO the half-width panel —
+    // the center pane stays visible — instead of forcing the screen-filling
+    // Full layout (which hides all chrome and feels like a trap). The accordion
+    // list views keep the vertical skeleton below.
+    if ui.width == crate::layout::PanelWidth::Half
+        && ui.open.is_git_family()
+        && matches!(
+            ui.git.focus,
+            super::gitui::GitView::Staging
+                | super::gitui::GitView::CommitFiles
+                | super::gitui::GitView::PatchBuilding
+                | super::gitui::GitView::Blame
+                | super::gitui::GitView::RebaseTodo
+        )
+    {
+        return super::gitfull::build_git_full(model, ui, cols, rows, focused);
+    }
+
     // Reserve 1 row for the tab bar at the top; account for it in the budget.
     let (tab_row, tab_spans) = tab_bar_row(ui, focused);
     let rows_for_body = rows.saturating_sub(1);
