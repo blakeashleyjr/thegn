@@ -1,4 +1,4 @@
-//! App tabs — hosting full sibling TUIs (`comms`/`chat`/`agent`) as top-level
+//! App tabs — hosting full sibling TUIs (`chat`/`agent`) as top-level
 //! tabs alongside the `work` IDE.
 //!
 //! Each app implements [`sz_kit::AppTile`] and is driven by the host loop the
@@ -20,7 +20,6 @@
 
 pub mod bridge;
 pub mod chat;
-pub mod comms;
 pub mod dashboard;
 pub mod input;
 
@@ -119,7 +118,6 @@ impl AppHost {
             slots.push(AppSlot::new(
                 match label {
                     "dashboard" => "dashboard",
-                    "comms" => "comms",
                     "chat" => "chat",
                     _ => continue,
                 },
@@ -308,15 +306,13 @@ mod tests {
 
         let host = AppHost::from_config(&cfg);
 
-        assert_eq!(
-            host.tab_labels(),
-            vec!["chat", "work", "dashboard", "comms"]
-        );
+        assert_eq!(host.tab_labels(), vec!["chat", "work", "dashboard"]);
         assert_eq!(host.active, ActiveApp::Tile(1));
         assert_eq!(host.active_tab_index(), 2);
         assert_eq!(host.tab_target(0), Some(ActiveApp::Tile(0)));
         assert_eq!(host.tab_target(1), Some(ActiveApp::Work));
         assert_eq!(host.dashboard_target(), Some(ActiveApp::Tile(1)));
-        assert_eq!(host.cycle(ActiveApp::Tile(1), 1), ActiveApp::Tile(2));
+        // Cycling forward from the last tab wraps to the first.
+        assert_eq!(host.cycle(ActiveApp::Tile(1), 1), ActiveApp::Tile(0));
     }
 }

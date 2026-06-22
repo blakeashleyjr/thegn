@@ -1,7 +1,7 @@
 //! `sz-kit` — the superzej embedding contract.
 //!
-//! Three sibling TUIs (switchboard/`comms`, termite-chat/`chat`,
-//! termite-agent/`agent`) plug into the superzej compositor as top-level
+//! Sibling TUIs (termite-chat/`chat`, termite-agent/`agent`) plug into the
+//! superzej compositor as top-level
 //! **app tabs**, while each still ships as a standalone binary. This crate is
 //! the seam they share so the look, input model, and event discipline stay
 //! identical in both modes — and it deliberately depends on neither tokio,

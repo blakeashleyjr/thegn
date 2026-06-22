@@ -26,7 +26,7 @@ pub type ChangeHook = std::sync::Arc<dyn Fn() + Send + Sync>;
 /// 0.30 widgets a tile may hold (e.g. a `Block` with a shadow `Effect`) are
 /// themselves `!Send`. Async work is offloaded via the `ChangeHook` instead.
 pub trait AppTile {
-    /// Stable identifier — the tab id and config key (`"comms"`, `"chat"`, …).
+    /// Stable identifier — the tab id and config key (`"chat"`, `"dashboard"`, …).
     fn id(&self) -> &'static str;
 
     /// The chip label shown in the masthead app strip. May carry a badge
@@ -74,6 +74,6 @@ pub trait AppTile {
     fn on_resize(&mut self, _cols: u16, _rows: u16) {}
 
     /// Tear down: abort spawned tasks and drop clients. Long-lived external
-    /// daemons (e.g. switchboardd) are intentionally NOT killed here.
+    /// daemons an app may talk to are intentionally NOT killed here.
     fn shutdown(&mut self) {}
 }

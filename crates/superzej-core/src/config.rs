@@ -1044,7 +1044,7 @@ impl Default for JiraConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct AppsConfig {
-    /// Tab focused on startup. Valid ids: "dashboard", "work", "comms", "chat".
+    /// Tab focused on startup. Valid ids: "dashboard", "work", "chat".
     pub default_tab: String,
     /// Ordered top-level tab ids. Unknown ids are ignored; missing built-ins are appended.
     pub tab_order: Vec<String>,
@@ -1054,18 +1054,13 @@ impl Default for AppsConfig {
     fn default() -> Self {
         AppsConfig {
             default_tab: "dashboard".into(),
-            tab_order: vec![
-                "dashboard".into(),
-                "work".into(),
-                "comms".into(),
-                "chat".into(),
-            ],
+            tab_order: vec!["dashboard".into(), "work".into(), "chat".into()],
         }
     }
 }
 
 impl AppsConfig {
-    pub const BUILTIN_TABS: [&'static str; 4] = ["dashboard", "work", "comms", "chat"];
+    pub const BUILTIN_TABS: [&'static str; 3] = ["dashboard", "work", "chat"];
 
     pub fn effective_tab_order(&self) -> Vec<String> {
         let mut out = Vec::new();
@@ -2713,13 +2708,14 @@ mod tests {
         assert_eq!(cfg.apps.default_tab, "dashboard");
         assert_eq!(
             cfg.apps.effective_tab_order(),
-            vec!["dashboard", "work", "comms", "chat"]
+            vec!["dashboard", "work", "chat"]
         );
     }
 
     #[test]
     fn app_tab_config_honors_file_env_and_cli_order() {
         let mut env = MapEnv::default();
+        // `comms` is no longer a built-in id; it must be filtered out.
         env.0.insert(
             "SUPERZEJ_APPS_TAB_ORDER".into(),
             "chat,work,dashboard,comms".into(),
@@ -2732,7 +2728,7 @@ mod tests {
         assert_eq!(cfg.apps.default_tab, "work");
         assert_eq!(
             cfg.apps.effective_tab_order(),
-            vec!["chat", "work", "dashboard", "comms"]
+            vec!["chat", "work", "dashboard"]
         );
     }
 
