@@ -21,6 +21,25 @@ pub(crate) fn key_bytes(key: &KeyCode, mods: Modifiers) -> Option<Vec<u8>> {
     key_bytes_mode(key, mods, false)
 }
 
+/// The CSI-u / kitty modifier parameter: `1 + bitmask` where shift=1, alt=2,
+/// ctrl=4, super=8.
+fn csi_u_modifier(mods: Modifiers) -> u8 {
+    let mut bits = 0u8;
+    if mods.contains(Modifiers::SHIFT) {
+        bits |= 1;
+    }
+    if mods.contains(Modifiers::ALT) {
+        bits |= 2;
+    }
+    if mods.contains(Modifiers::CTRL) {
+        bits |= 4;
+    }
+    if mods.contains(Modifiers::SUPER) {
+        bits |= 8;
+    }
+    1 + bits
+}
+
 /// As [`key_bytes`], honoring DECCKM: when the app set application cursor
 /// keys, unmodified arrows/Home/End are SS3-encoded (`ESC O A`) — full-screen
 /// apps (htop, less, vim) expect exactly the encoding their terminfo entry
@@ -51,7 +70,14 @@ pub(crate) fn key_bytes_mode(key: &KeyCode, mods: Modifiers, app_cursor: bool) -
         }
         KeyCode::Enter => Some(vec![b'\r']),
         KeyCode::Backspace => Some(vec![0x7f]),
-        KeyCode::Tab if mods.contains(Modifiers::SHIFT) => Some(b"\x1b[Z".to_vec()),
+        // Shift+Tab keeps its legacy back-tab encoding (vim/readline expect it).
+        KeyCode::Tab if mods == Modifiers::SHIFT => Some(b"\x1b[Z".to_vec()),
+        // Ctrl/Alt/Super+Tab have no legacy byte (Tab and Ctrl-I collide), so
+        // forward the CSI-u form the host's own kitty-keyboard mode (ESC [ >1u)
+        // disambiguates. Tab's codepoint is 9; the modifier param is 1 + bitmask.
+        KeyCode::Tab if !(mods & !Modifiers::SHIFT).is_empty() => {
+            Some(format!("\x1b[9;{}u", csi_u_modifier(mods)).into_bytes())
+        }
         KeyCode::Tab => Some(vec![b'\t']),
         KeyCode::Escape => Some(vec![0x1b]),
         KeyCode::LeftArrow => Some(b"\x1b[D".to_vec()),
@@ -139,6 +165,26 @@ mod tests {
             b"\x1b[Z"
         );
         assert_eq!(key_bytes(&KeyCode::Tab, Modifiers::NONE).unwrap(), b"\t");
+    }
+
+    #[test]
+    fn modified_tab_forwards_csi_u() {
+        // Ctrl+Tab has no legacy byte; forward the CSI-u form (Tab=9, ctrl mod=5)
+        // instead of silently collapsing to a plain Tab.
+        assert_eq!(
+            key_bytes(&KeyCode::Tab, Modifiers::CTRL).unwrap(),
+            b"\x1b[9;5u"
+        );
+        // Ctrl+Shift+Tab still disambiguates (mod = 1 + shift(1) + ctrl(4) = 6).
+        assert_eq!(
+            key_bytes(&KeyCode::Tab, Modifiers::CTRL | Modifiers::SHIFT).unwrap(),
+            b"\x1b[9;6u"
+        );
+        // Alt+Tab (mod = 1 + alt(2) = 3).
+        assert_eq!(
+            key_bytes(&KeyCode::Tab, Modifiers::ALT).unwrap(),
+            b"\x1b[9;3u"
+        );
     }
 
     #[test]
