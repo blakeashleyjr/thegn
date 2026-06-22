@@ -1990,6 +1990,14 @@ fn open_panel_section(
     docs: PanelDocsWiring<'_>,
 ) {
     panel_ui.open = s;
+    // Sync the git context to the section being opened: `git_key` keys its
+    // action table off `git.focus`, NOT `panel_ui.open`, so without this an
+    // open Commits/Branches/Stash section still dispatches against whatever
+    // detail view `git.focus` last held (e.g. Staging) — Enter on a commit
+    // then ran the staging-line action and looked like a no-op.
+    if let Some(view) = s.home_view() {
+        panel_ui.git.focus = view;
+    }
     // Land at the top of the new section's items (row_mode tracks panel focus,
     // not the section, so a focused panel keeps walking rows across switches).
     panel_ui.cursor = 0;
@@ -9762,6 +9770,24 @@ async fn event_loop<T: Terminal>(
                             refresh_tab_model(&mut model, &session, &mut sb);
                             need_relayout = true;
                         }
+                    }
+                    // Drilling enters a detail view (commit files, staging,
+                    // patch, blame, rebase todo) that ONLY the Full git frame
+                    // renders — at Normal/Half the accordion shows the list, so
+                    // the drill would look like it did nothing. Widen so the
+                    // drilled view is actually visible.
+                    if panel_ui.width != crate::layout::PanelWidth::Full
+                        && matches!(
+                            panel_ui.git.focus,
+                            gitui::GitView::CommitFiles
+                                | gitui::GitView::Staging
+                                | gitui::GitView::PatchBuilding
+                                | gitui::GitView::Blame
+                                | gitui::GitView::RebaseTodo
+                        )
+                    {
+                        panel_ui.width = crate::layout::PanelWidth::Full;
+                        need_relayout = true;
                     }
                     dirty = true;
                     if forced_palette_action.is_none() {
