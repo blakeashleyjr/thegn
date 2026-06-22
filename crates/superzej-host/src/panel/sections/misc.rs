@@ -144,7 +144,7 @@ fn file_preview_rows(fp: &crate::panel::FilePreview, cols: usize, rows: usize) -
     ])));
     out.push(PanelRow::plain(Line::segs(vec![
         sp(1),
-        seg(g2(), "esc close · j/k scroll".to_string()),
+        seg(g2(), "esc/q close · j/k scroll · e width".to_string()),
     ])));
 
     if fp.loading {
