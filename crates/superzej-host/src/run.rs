@@ -9484,6 +9484,27 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+                // Enter on a git-family LIST (commits / branches / stash)
+                // drills into the row at cursor — even before j/k has entered
+                // row-mode (the panel starts in section-nav mode on focus, see
+                // `row_mode = false` on panel entry). Without this the first
+                // Enter is swallowed: `git_key` owns `Drill` but is gated on
+                // `row_mode`, and the accordion's `Select` has no action for
+                // these sections, so nothing happens until a second press.
+                // Changes/Pr keep their own `Select` behaviour (diff preview /
+                // open-thread), so they're deliberately excluded.
+                if focus.panel()
+                    && !panel_ui.row_mode
+                    && matches!(k.key, KeyCode::Enter)
+                    && matches!(
+                        panel_ui.open,
+                        crate::panel::Section::Commits
+                            | crate::panel::Section::Branches
+                            | crate::panel::Section::Stash
+                    )
+                {
+                    panel_ui.row_mode = true;
+                }
                 // Panel zone, git-family contexts: the table-driven git keys
                 // resolve BEFORE the accordion (space = stage-line in the
                 // staging view, stage-file in the files list, …). Ctrl is
