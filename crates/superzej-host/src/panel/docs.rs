@@ -47,6 +47,8 @@ pub struct PanelDocs {
     pub diff: Option<DiffDoc>,
     /// Rolling stats history feeding the telemetry graphs.
     pub telemetry: crate::telemetry::TelemetryHistory,
+    /// Rolling event-loop self-profiler history (the Telemetry "Loop" sub-block).
+    pub loop_perf: crate::telemetry::LoopPerfHistory,
     /// Cheatsheet groups from the effective keymap, refreshed on config
     /// reload (the keys section's content).
     pub cfg_keys: Vec<crate::keyhint::HintGroup>,

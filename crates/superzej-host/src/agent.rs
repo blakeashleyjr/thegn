@@ -495,10 +495,12 @@ mod tests {
         assert_eq!(resolve_command(&cfg, "nope"), shell_inner(false));
     }
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Crate-wide env lock (shared with `run`'s sidebar tests): both redirect the
+    // process-global `XDG_STATE_HOME`, so they must serialize on the SAME mutex.
+    use crate::testenv::ENV_LOCK;
 
     fn with_temp_state<T>(name: &str, f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("sz-agent-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

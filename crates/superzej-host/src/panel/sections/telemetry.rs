@@ -18,13 +18,61 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
             "sampling system stats…",
         )]))];
     }
-    if ctx.full() {
+    let mut rows = if ctx.full() {
         full(ctx)
     } else if ctx.deep() {
         half(ctx)
     } else {
         normal(ctx)
+    };
+    rows.extend(loop_block(ctx));
+    rows
+}
+
+/// The event-loop self-profiler sub-block: how hard the loop works (wakes/s),
+/// how often it repaints, tail render latency, the dominant wake source, and
+/// the idle ratio. Fed by the `szhost::perf` rollup (forced on while this
+/// section is open). The live counterpart to the `szhost::perf` log.
+fn loop_block(ctx: &SectionCtx) -> Vec<PanelRow> {
+    let h = &ctx.ui.docs.loop_perf;
+    let mut rows = vec![
+        PanelRow::blank(),
+        PanelRow::plain(Line::segs(vec![seg(g2(), "LOOP").bold()])),
+    ];
+    if !h.has_data() {
+        rows.push(PanelRow::plain(Line::segs(vec![
+            sp(1),
+            seg(g(), "profiling… (rollup every 1s)"),
+        ])));
+        return rows;
     }
+    let s = h.last();
+    rows.push(PanelRow::plain(Line::segs(vec![
+        sp(1),
+        seg(t(), format!("{:.0} wake/s", s.wakes_per_s)),
+        seg(g(), "  "),
+        seg(t(), format!("{:.0} rend/s", s.renders_per_s)),
+        seg(g(), "  "),
+        seg(d(), format!("p99 {:.1}ms", s.render_p99_us as f64 / 1000.0)),
+    ])));
+    rows.push(PanelRow::plain(Line::split(
+        vec![
+            sp(1),
+            seg(g(), "hot "),
+            seg(ac(), s.hot_source),
+        ],
+        vec![seg(d(), format!("idle {:.0}%", s.idle_ratio * 100.0))],
+    )));
+    if ctx.deep() {
+        let gw = ctx.cols.saturating_sub(8).clamp(12, 64);
+        for row in viz::braille_graph(&h.wakes_series(gw * 2), gw, 2) {
+            rows.push(PanelRow::plain(Line::segs(vec![
+                sp(1),
+                seg(hue(Hue::Amber), row),
+            ])));
+        }
+    }
+    rows
 }
 
 /// Normal: one labelled meter row per metric.

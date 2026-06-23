@@ -60,6 +60,12 @@ layers; AI is strictly additive.
 - `just bench` (hyperfine) measures process baseline + real launch→first-frame
   via `SUPERZEJ_BENCH_FIRST_FRAME_EXIT=1`. Machine-dependent, so not in `ci`;
   perf commits should record before/after deltas.
+- **Perf suite** (`docs/superpowers/specs/perf-suite.md`): runtime self-profiler
+  (`SUPERZEJ_PERF=1` → `szhost::perf` rollup with wake-source + per-subsystem-CPU
+  attribution + wake-storm warning), steady-state idle harness (`just bench-idle`,
+  `SUPERZEJ_BENCH_RUN_MS`), criterion micro-benches (`just bench-micro`), a live
+  Telemetry "LOOP" overlay, and an in-process flame-graph profiler (`just profile`,
+  SIGUSR2, `profiling` feature). All free when off; none in `ci` (machine-dependent).
 - Expensive setup belongs off-thread (see the diff fs-watcher: recursive
   inotify registration is ~1s on large worktrees and is done on a background
   thread, handed back over a channel).
