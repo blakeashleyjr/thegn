@@ -24,6 +24,23 @@ pub struct GridCell {
     pub inverse: bool,
 }
 
+/// A borrowing view of a cell — same fields as [`GridCell`] but the glyph is a
+/// `&str` into the emulator's own grid instead of an owned `String`. The render
+/// hot path ([`crate::compositor::compose_pane`]) reads every visible cell every
+/// frame and only ever appends the glyph to a run buffer, so borrowing here
+/// avoids a heap allocation per cell per frame (vt100 stores glyphs inline, so
+/// `Cell::contents()` is already a cheap borrow).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellRef<'a> {
+    pub text: &'a str,
+    pub fg: CellColor,
+    pub bg: CellColor,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub inverse: bool,
+}
+
 /// A color in terminal terms, normalized away from any one library's enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CellColor {
@@ -45,6 +62,13 @@ pub trait PaneEmulator: Send {
     fn size(&self) -> (u16, u16);
     /// Cell at `(row, col)`, or `None` if out of range.
     fn cell(&self, row: u16, col: u16) -> Option<GridCell>;
+    /// Borrowing view of the cell at `(row, col)` — the allocation-free path the
+    /// compositor uses. Defaults to `None`; emulators that can expose the glyph
+    /// as a borrow override it (the compositor falls back to [`Self::cell`] when
+    /// this returns `None`).
+    fn cell_ref(&self, _row: u16, _col: u16) -> Option<CellRef<'_>> {
+        None
+    }
     /// The OSC window title (OSC 0/2) the app last set, if any. `None` when the
     /// app has set no title, so callers can fall back to a derived name.
     fn title(&self) -> Option<String> {
@@ -65,9 +89,11 @@ pub trait PaneEmulator: Send {
     fn scrollback(&self) -> usize {
         0
     }
-    /// Borrow the underlying row text as a single string if supported.
-    /// Returns `None` if the emulator cannot provide a fast-path row string,
-    /// in which case the compositor will fall back to cell-by-cell iteration.
+    /// Borrow a visible row as a single plain string when it carries no
+    /// styling, else `None`. The compositor composes cell-by-cell (so this is
+    /// no longer on its hot path), but it stays as a cheap accessor that tests
+    /// use to assert PTY output landed in the grid.
+    #[allow(dead_code)]
     fn row_text(&self, _row: u16) -> Option<String> {
         None
     }
@@ -208,6 +234,22 @@ impl PaneEmulator for Vt100Emulator {
         let cell = self.parser.screen().cell(row, col)?;
         Some(GridCell {
             text: cell.contents().to_string(),
+            fg: conv_color(cell.fgcolor()),
+            bg: conv_color(cell.bgcolor()),
+            bold: cell.bold(),
+            italic: cell.italic(),
+            underline: cell.underline(),
+            inverse: cell.inverse(),
+        })
+    }
+
+    fn cell_ref(&self, row: u16, col: u16) -> Option<CellRef<'_>> {
+        // `contents()` borrows the cell's inline glyph buffer, and the cell
+        // borrows the screen which borrows `self.parser` — so the elided
+        // lifetime ties cleanly to `&self`, no allocation.
+        let cell = self.parser.screen().cell(row, col)?;
+        Some(CellRef {
+            text: cell.contents(),
             fg: conv_color(cell.fgcolor()),
             bg: conv_color(cell.bgcolor()),
             bold: cell.bold(),
