@@ -175,10 +175,12 @@ prewarm = false
 ttl_secs = 30          # cache TTL before a live `gh` re-fetch (SUPERZEJ_PR_TTL)
 
 # Top-level app tab strip. Defaults make the dashboard the first and focused tab.
-# Valid ids: "dashboard", "work", "chat".
+# Valid ids: "dashboard", "work", "chat", "agent".
+# "agent" is the embedded coding-agent harness (termite-agent); it routes its
+# model traffic through [llm_proxy] when that is enabled.
 [apps]
 default_tab = "work" # initial tab (SUPERZEJ_APPS_DEFAULT_TAB); "work" = your worktree
-tab_order = ["work", "dashboard", "chat"]
+tab_order = ["work", "dashboard", "chat", "agent"]
 
 # The terminal-native dashboard app.
 [dashboard]
@@ -368,6 +370,10 @@ command = "git diff"
 # workspace default → global active → the CLI's own default home):
 # [workspace.my-work-repo]
 # accounts = { codex = "work", claude = "work" }
+# Bind extra directories into the sandbox for THIS workspace only (same format
+# as [sandbox] mounts below). These extend the global mounts; the global list is
+# the "all workspaces" scope, this is the "per workspace" scope:
+# sandbox_mounts = ["~/datasets:ro", "/opt/toolchain"]
 
 # General tasks: surfaced in the Tests panel and, later, Problems/Timeline/Search
 # Everywhere. `kind = "test"` makes a task eligible for test discovery/runs.
@@ -657,6 +663,10 @@ auto_caches = true
 #          "host_path:dest:ro"      → read-only at dest
 #          "host_path:dest:cache"   → read-write cache (shown in sandbox summary)
 # ~ is expanded to $HOME.
+# This is the GLOBAL ("all workspaces") scope for default bind dirs. For a
+# single workspace, add `sandbox_mounts` under `[workspace.<slug>]` (see above);
+# those extend this list. A repo-root `.superzej.toml` `[sandbox] mounts` can
+# also override per repo.
 mounts = ["~/.gitconfig:ro"]
 
 # ── GPU passthrough (OCI only) ───────────────────────────────────────────────

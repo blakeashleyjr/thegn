@@ -59,8 +59,18 @@ track's prerequisite.
 
 **Notable remaining gaps (candidate next work):**
 
-- **Agent layer (Q–T) + MCP (AL)** — still unstarted. The proxy that gates them is now
-  in, so this is the next major track.
+- **Agent layer (Q–T) + MCP (AL)** — now **underway via an embedded first-party
+  harness**, not external-adapter-first. The harness is **`termite-agent`** (the
+  `apps/termite-agent` submodule, its own `docs/ROADMAP.md`, currently through its
+  Phase 4 autonomous-coding MVP). It is hosted as the **`agent` app tab**
+  (`superzej-host/src/apps/agent.rs`, an `sz_kit::AppTile` driving termite-core's
+  `AgentRuntime` on `spawn_blocking`). This makes group **R**'s ACP/native-adapter
+  path **secondary** — superzej runs its own harness first; foreign-harness adapters
+  are additive later. Substrate-first sequencing **all landed**: embedding seam →
+  proxy as model path (per-worktree scoped virtual keys, revoked on teardown) →
+  sandbox/policy boundary (`SandboxTerminalTool` via `enter_argv`) → notifications
+  (`AgentDone`/`AgentFailed`) + live proxy-spend observability. See
+  `docs/superpowers/specs/2026-06-22-embedded-agent-integration-design.md`.
 - **AI. Notification bus polish** — bus, desktop notifications, and inbox are live;
   420 is a fixed event→notification mapping + urgency thresholds, not yet a
   user-configurable action-rules engine. Still missing: DND/quiet hours (426),
@@ -205,8 +215,12 @@ orchestrator.
 
 Depends on Phase 1 (shell) + Phase 2 (proxy + containers).
 
+- **Embedded harness first** — the `termite-agent` submodule is superzej's first-party
+  coding agent, hosted as the `agent` app tab. Q/S/T track against **its** roadmap
+  (`apps/termite-agent/docs/ROADMAP.md`) as the source of truth.
 - Orchestration core **Q (211–224)** (defer 225–228)
-- **ACP client first: R (229–235)**, then native adapters **(236–239, 242)** as enhancement
+- **R is now secondary:** ACP client + native adapters **(229–242)** are an *additive*
+  path for running *foreign* harnesses, not the headline — superzej ships its own.
 - Observability **S (243–258)** (tokens/cost 249–250 light up because the proxy exists)
 - Review/merge basics **T (259–263, 267–268)**
 - **Milestone:** spawn, monitor, review, and merge agents across worktrees, metered
@@ -599,6 +613,12 @@ tests, symbols, git objects, and worktrees._
 - [ ] 658. Agent session history + hibernation — list/resume past agent sessions per worktree; hibernate idle sessions to reclaim resources and rehydrate on demand (feeds resource-aware cap 214; history complements S 255/257 + I 117) (Orca)
 
 ### R. Agent integration protocols
+
+_Reframed (2026-06-22): superzej's primary agent is the **embedded first-party
+harness** `termite-agent` (the `agent` app tab). This group — ACP + native adapters
+for **foreign** harnesses — is now an **additive, secondary** path, not the primary
+one. "Primary path" below refers to ACP being the preferred way to integrate an
+external harness, not to ACP being superzej's primary agent._
 
 - [ ] 229. ACP client (primary path)
 - [ ] 230. ACP session management

@@ -674,6 +674,15 @@ pub struct WorkspaceConfig {
     /// global active account. See [`crate::account`].
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub accounts: std::collections::BTreeMap<String, String>,
+    /// Extra sandbox bind mounts for this workspace, same format as
+    /// `[sandbox] mounts` (`"host"`, `"host:dest"`, `"host:dest:ro|rw|cache"`;
+    /// `~` is expanded). These **extend** the global `[sandbox] mounts` (plus
+    /// any profile / repo-root `.superzej.*` overlay) for every worktree of
+    /// this workspace — the per-workspace half of "bind dirs by default".
+    /// (`[workspace.<slug>] sandbox_mounts = ["~/datasets:ro"]`.) Keyed by the
+    /// repo slug, like the other `[workspace.<slug>]` keys.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sandbox_mounts: Vec<String>,
 }
 
 /// `[theme]` — visual tuning: the accent, the focus frame color, and optional
@@ -1072,7 +1081,7 @@ impl Default for JiraConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct AppsConfig {
-    /// Tab focused on startup. Valid ids: "dashboard", "work", "chat".
+    /// Tab focused on startup. Valid ids: "dashboard", "work", "chat", "agent".
     pub default_tab: String,
     /// Ordered top-level tab ids. Unknown ids are ignored; missing built-ins are appended.
     pub tab_order: Vec<String>,
@@ -1082,13 +1091,18 @@ impl Default for AppsConfig {
     fn default() -> Self {
         AppsConfig {
             default_tab: "work".into(),
-            tab_order: vec!["work".into(), "dashboard".into(), "chat".into()],
+            tab_order: vec![
+                "work".into(),
+                "dashboard".into(),
+                "chat".into(),
+                "agent".into(),
+            ],
         }
     }
 }
 
 impl AppsConfig {
-    pub const BUILTIN_TABS: [&'static str; 3] = ["dashboard", "work", "chat"];
+    pub const BUILTIN_TABS: [&'static str; 4] = ["dashboard", "work", "chat", "agent"];
 
     pub fn effective_tab_order(&self) -> Vec<String> {
         let mut out = Vec::new();
@@ -2491,6 +2505,21 @@ impl Config {
         if let Some(overlay) = load_repo_overlay(repo_root) {
             overlay.sandbox.apply(&mut sb);
         }
+        // Per-workspace bind dirs ([workspace.<slug>] sandbox_mounts) extend the
+        // global/profile/overlay mounts. Keyed by the repo's base slug — the
+        // same slugify(repo_name) used for [workspace.<slug>] keybinds/accounts
+        // (sans the DB collision suffix; we avoid a DB write on the launch path).
+        if !self.workspace.is_empty() {
+            let base = util::slugify(&crate::repo::repo_name(repo_root));
+            let slug = if base.is_empty() {
+                "repo".to_string()
+            } else {
+                base
+            };
+            if let Some(ws) = self.workspace.get(&slug) {
+                sb.mounts.extend(ws.sandbox_mounts.iter().cloned());
+            }
+        }
         sb.mounts = sb
             .mounts
             .iter()
@@ -2790,7 +2819,7 @@ mod tests {
         assert_eq!(cfg.apps.default_tab, "work");
         assert_eq!(
             cfg.apps.effective_tab_order(),
-            vec!["work", "dashboard", "chat"]
+            vec!["work", "dashboard", "chat", "agent"]
         );
     }
 
@@ -2810,7 +2839,7 @@ mod tests {
         assert_eq!(cfg.apps.default_tab, "work");
         assert_eq!(
             cfg.apps.effective_tab_order(),
-            vec!["chat", "work", "dashboard"]
+            vec!["chat", "work", "dashboard", "agent"]
         );
     }
 
@@ -3171,6 +3200,49 @@ name = "minimal"
         let sb = cfg.repo_sandbox(&dir);
         assert_eq!(sb.image, ""); // global default (host-toolchain)
         assert!(!sb.remote.is_remote());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn workspace_sandbox_mounts_extend_global() {
+        let dir = tmpdir("ws-binds");
+        // Same base slug repo_sandbox derives (slugify(repo_name); no DB).
+        let base = util::slugify(&crate::repo::repo_name(&dir));
+        let slug = if base.is_empty() {
+            "repo".to_string()
+        } else {
+            base
+        };
+        let mut cfg = Config::default();
+        cfg.sandbox.mounts = vec!["/srv/global".into()];
+        cfg.workspace.insert(
+            slug,
+            WorkspaceConfig {
+                sandbox_mounts: vec!["~/datasets:ro".into()],
+                ..Default::default()
+            },
+        );
+        let sb = cfg.repo_sandbox(&dir);
+        // Global mount survives, workspace mount is appended and tilde-expanded.
+        assert!(sb.mounts.iter().any(|m| m == "/srv/global"));
+        assert!(
+            sb.mounts
+                .iter()
+                .any(|m| m.ends_with("/datasets:ro") && !m.starts_with('~')),
+            "workspace mount appended + tilde-expanded: {:?}",
+            sb.mounts
+        );
+        // A workspace with no entry for this slug adds nothing.
+        let mut other = Config::default();
+        other.workspace.insert(
+            "some-other-repo".into(),
+            WorkspaceConfig {
+                sandbox_mounts: vec!["/should/not/appear".into()],
+                ..Default::default()
+            },
+        );
+        let sb2 = other.repo_sandbox(&dir);
+        assert!(!sb2.mounts.iter().any(|m| m == "/should/not/appear"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4527,7 +4599,7 @@ forward_agent = false
 
         let a = AppsConfig::default();
         assert_eq!(a.default_tab, "work");
-        assert_eq!(a.tab_order, vec!["work", "dashboard", "chat"]);
+        assert_eq!(a.tab_order, vec!["work", "dashboard", "chat", "agent"]);
 
         let n = NotificationsConfig::default();
         assert!(n.desktop);
@@ -4735,8 +4807,11 @@ forward_agent = false
             ],
         };
         // dedup keeps first occurrence, unknown dropped, trimmed, missing
-        // built-in (dashboard) appended.
-        assert_eq!(a.effective_tab_order(), vec!["chat", "work", "dashboard"]);
+        // built-ins (dashboard, agent) appended in BUILTIN_TABS order.
+        assert_eq!(
+            a.effective_tab_order(),
+            vec!["chat", "work", "dashboard", "agent"]
+        );
     }
 
     #[test]
@@ -4745,7 +4820,10 @@ forward_agent = false
             default_tab: "work".into(),
             tab_order: Vec::new(),
         };
-        assert_eq!(a.effective_tab_order(), vec!["dashboard", "work", "chat"]);
+        assert_eq!(
+            a.effective_tab_order(),
+            vec!["dashboard", "work", "chat", "agent"]
+        );
     }
 
     #[test]

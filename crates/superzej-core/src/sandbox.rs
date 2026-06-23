@@ -1541,6 +1541,126 @@ fn auto_cache_mounts() -> Vec<Mount> {
         .collect()
 }
 
+/// ssh refuses a config file — or any file it `Include`s — unless it is owned
+/// by the invoking user or root. Under unprivileged bwrap the whole nix store
+/// (where home-manager keeps `~/.ssh/config` and its includes) is owned by
+/// `nobody` (the user-namespace overflow uid), so ssh rejects it with "Bad
+/// owner or permissions" and every ssh-based git op fails inside the sandbox.
+///
+/// superzej-host runs UNSANDBOXED, so it can read the resolved config and every
+/// file it includes — even agenix-backed ones under `/run/agenix`, which we
+/// deliberately do not bind — and flatten them into a single user-owned `0600`
+/// file under the state dir. The caller points sandboxed git at it via
+/// `GIT_SSH_COMMAND='ssh -F <file>'`. (We cannot bind it over `~/.ssh/config`:
+/// when `$HOME` is rw-bound and that path is a symlink, bwrap dereferences the
+/// symlink onto the read-only store and fails with "Can't create file".)
+///
+/// Returns the path of the materialized config (which is also its in-sandbox
+/// path, since it lives under the rw-bound `$HOME`), or `None` if there is no
+/// usable `~/.ssh/config`.
+pub fn prepare_ssh_config() -> Option<String> {
+    let home = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
+    let ssh_dir = std::path::Path::new(&home).join(".ssh");
+    let content = std::fs::read_to_string(ssh_dir.join("config")).ok()?;
+    let flattened = flatten_ssh_config(&content, &|tok| read_ssh_include(&ssh_dir, &home, tok), 0);
+    let state = std::env::var("XDG_STATE_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::Path::new(&home).join(".local/state"));
+    let dir = state.join("superzej/sandbox");
+    std::fs::create_dir_all(&dir).ok()?;
+    let out = dir.join("ssh_config");
+    std::fs::write(&out, flattened).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o600));
+    }
+    Some(out.to_string_lossy().into_owned())
+}
+
+/// Read the contents of every file an ssh `Include` token expands to (host
+/// side), honoring `~`, absolute paths, paths relative to `~/.ssh`, and simple
+/// `*`/`?` globs.
+fn read_ssh_include(ssh_dir: &std::path::Path, home: &str, token: &str) -> Vec<String> {
+    let path = if let Some(rest) = token.strip_prefix("~/") {
+        std::path::Path::new(home).join(rest)
+    } else if token.starts_with('/') {
+        std::path::PathBuf::from(token)
+    } else {
+        ssh_dir.join(token)
+    };
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string();
+    if name.contains('*') || name.contains('?') {
+        let parent = path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| ssh_dir.to_path_buf());
+        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&parent)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| wildcard_match(&name, &e.file_name().to_string_lossy()))
+            .map(|e| e.path())
+            .collect();
+        paths.sort();
+        paths
+            .iter()
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .collect()
+    } else {
+        std::fs::read_to_string(&path).ok().into_iter().collect()
+    }
+}
+
+/// Inline ssh `Include` directives so the output is a single self-contained
+/// config. `read` returns the contents of every file an include token expands
+/// to. Depth-guarded against include cycles.
+fn flatten_ssh_config(content: &str, read: &dyn Fn(&str) -> Vec<String>, depth: u8) -> String {
+    let mut out = String::new();
+    for line in content.lines() {
+        let t = line.trim_start();
+        let is_include = t
+            .get(..7)
+            .is_some_and(|h| h.eq_ignore_ascii_case("include"))
+            && t[7..].starts_with(char::is_whitespace);
+        if is_include && depth < 16 {
+            let args = t[7..].trim();
+            out.push_str(&format!("# superzej: inlined `Include {args}`\n"));
+            for token in args.split_whitespace() {
+                for body in read(token) {
+                    out.push_str(&flatten_ssh_config(&body, read, depth + 1));
+                    if !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                }
+            }
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Minimal shell-style glob matcher supporting `*` and `?` (no char classes).
+fn wildcard_match(pat: &str, name: &str) -> bool {
+    fn helper(p: &[u8], n: &[u8]) -> bool {
+        match p.first() {
+            None => n.is_empty(),
+            Some(b'*') => helper(&p[1..], n) || (!n.is_empty() && helper(p, &n[1..])),
+            Some(b'?') => !n.is_empty() && helper(&p[1..], &n[1..]),
+            Some(&c) => n.first() == Some(&c) && helper(&p[1..], &n[1..]),
+        }
+    }
+    helper(pat.as_bytes(), name.as_bytes())
+}
+
 fn parse_mount(spec: &str) -> Mount {
     // "host", "host:ro", or "host:dest" / "host:dest:ro".
     // Paths starting with "~/" are expanded to the real home directory so the
@@ -1735,6 +1855,49 @@ mod tests {
         let body = argv.last().unwrap();
         assert!(body.contains("safe.directory"));
         assert!(body.contains("exec ${SHELL:-/bin/sh} -l"));
+    }
+
+    #[test]
+    fn flatten_ssh_inlines_includes_and_guards() {
+        let read = |tok: &str| -> Vec<String> {
+            match tok {
+                "inc" => vec!["Host foo\n  User bar\n".to_string()],
+                "multi" => vec!["A\n".to_string(), "B\n".to_string()],
+                _ => vec![],
+            }
+        };
+        let out = flatten_ssh_config("Host *\n  AddKeysToAgent yes\n  Include inc\n", &read, 0);
+        assert!(out.contains("AddKeysToAgent yes"));
+        assert!(out.contains("Host foo") && out.contains("User bar"));
+        // No live (non-comment) Include directive should remain.
+        assert!(!out.lines().any(|l| {
+            let t = l.trim_start();
+            !t.starts_with('#')
+                && t.get(..8)
+                    .is_some_and(|h| h.eq_ignore_ascii_case("include "))
+        }));
+        // Multiple expansions of one token are concatenated.
+        let multi = flatten_ssh_config("Include multi\n", &read, 0);
+        assert!(multi.contains("A") && multi.contains("B"));
+        // Unknown include leaves only the marker comment (no panic).
+        assert!(flatten_ssh_config("Include missing\n", &read, 0).contains("inlined"));
+    }
+
+    #[test]
+    fn flatten_ssh_ignores_include_substrings() {
+        let read = |_: &str| Vec::new();
+        let out = flatten_ssh_config("  IncludeFoo bar\n  Includes x\n", &read, 0);
+        assert!(out.contains("IncludeFoo bar"));
+        assert!(out.contains("Includes x"));
+    }
+
+    #[test]
+    fn wildcard_match_handles_star_and_question() {
+        assert!(wildcard_match("*.conf", "a.conf"));
+        assert!(wildcard_match("h?st", "host"));
+        assert!(wildcard_match("*", "anything"));
+        assert!(!wildcard_match("*.conf", "a.txt"));
+        assert!(!wildcard_match("h?st", "ht"));
     }
 
     #[test]
