@@ -19,9 +19,10 @@ pub enum RowKind {
     Worktree,
 }
 
-/// Contextual activity, mirrored from the host-side `activity` state machine
-/// (`superzej activity`). `Active` pulses; `Quiet` is the steady "done, look at
-/// me" dot; `None`/acked render no dot.
+/// Contextual activity, mirrored from the host-side `activity` state machine.
+/// Drives the sidebar dot's color: `Active` (worktree busy / agent working)
+/// renders a white dot; `Quiet` (was active, now idle — the agent is waiting
+/// for the user) renders a red dot; `None`/acked (dormant) render no dot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ActivityState {
     #[default]

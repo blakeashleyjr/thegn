@@ -47,6 +47,8 @@ pub enum S {
     ShadowFg,
     ChipFg,
     Accent,
+    ActivityActive,
+    ActivityWaiting,
 }
 
 /// The "R;G;B" fragment for a slot within a palette (shared by [`col`] and
@@ -70,6 +72,8 @@ pub fn slot_rgb(p: &theme::Palette, s: S) -> &str {
         S::ShadowFg => &p.shadow_fg,
         S::ChipFg => &p.chip_fg,
         S::Accent => &p.accent,
+        S::ActivityActive => &p.activity_active,
+        S::ActivityWaiting => &p.activity_waiting,
     }
 }
 
@@ -1290,6 +1294,23 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             bg,
             rect.cols.saturating_sub(1),
         );
+        // Recolor the activity dot (item 20) in its own state color: white while
+        // the worktree is working, red when its agent is waiting for input. The
+        // dormant state draws no dot, so `activity_col` is None and we skip.
+        if let Some(dc) = composed.activity_col {
+            let dx = rect.x + 1 + dc;
+            if dx < rect.x + rect.cols {
+                draw_text(
+                    surface,
+                    dx,
+                    y,
+                    activity_dot(row.activity).trim_end(),
+                    activity_dot_color(row.activity),
+                    bg,
+                    (rect.x + rect.cols).saturating_sub(dx),
+                );
+            }
+        }
         // Overpaint the status segment (git/agent/activity) in its own colors,
         // right after the label, when there's room. Track the running column so
         // badges paint after the status tail.
@@ -1443,6 +1464,9 @@ struct ComposedRow {
     text: String,
     status: Option<String>,
     status_col: usize,
+    /// Char column of the activity dot within `text`, when the row renders one
+    /// (item 20). The renderer over-paints just this glyph in its state color.
+    activity_col: Option<usize>,
     /// Badge segments (item 28): PR / unread / alert counts, each with its own
     /// color, drawn after the git status tail.
     badges: Vec<Badge>,
@@ -1457,6 +1481,7 @@ struct Badge {
 fn compose_sidebar_row(row: &crate::sidebar::SidebarRow) -> ComposedRow {
     use crate::sidebar::RowKind;
     let mut text = String::new();
+    let mut activity_col = None;
 
     match row.kind {
         RowKind::Workspace => {
@@ -1476,7 +1501,11 @@ fn compose_sidebar_row(row: &crate::sidebar::SidebarRow) -> ComposedRow {
         }
         RowKind::Worktree => {
             text.push_str("  ");
-            text.push_str(activity_dot(row.activity));
+            let dot = activity_dot(row.activity);
+            if !dot.is_empty() {
+                activity_col = Some(text.chars().count());
+            }
+            text.push_str(dot);
             text.push_str(&row.label);
         }
     }
@@ -1508,6 +1537,7 @@ fn compose_sidebar_row(row: &crate::sidebar::SidebarRow) -> ComposedRow {
         text,
         status,
         status_col,
+        activity_col,
         badges,
     }
 }
@@ -1541,14 +1571,27 @@ fn compose_badges(row: &crate::sidebar::SidebarRow) -> Vec<Badge> {
     badges
 }
 
-/// The activity dot prefix for a worktree row (item 20). Active rows pulse via
-/// the accent; quiet rows show a steady amber "look at me"; idle shows nothing.
+/// The activity dot prefix for a worktree row (item 20), recolored at render by
+/// [`activity_dot_color`]: `Active` (worktree busy / agent working) is a filled
+/// white ●; `Quiet` (was active, now idle — the agent is waiting for the user)
+/// is a hollow red ○; dormant (`None`/acked) shows nothing.
 fn activity_dot(state: crate::sidebar::ActivityState) -> &'static str {
     use crate::sidebar::ActivityState::*;
     match state {
-        Active => "\u{25cf} ", // ● (colored at render via row.active/accent path is separate)
+        Active => "\u{25cf} ", // ●
         Quiet => "\u{25cb} ",  // ○
         None => "",
+    }
+}
+
+/// The color the activity dot is over-painted in, per state (configurable via
+/// `[theme.colors] activity_active` / `activity_waiting`). `None` never draws.
+fn activity_dot_color(state: crate::sidebar::ActivityState) -> ColorAttribute {
+    use crate::sidebar::ActivityState::*;
+    match state {
+        Active => col(S::ActivityActive),
+        Quiet => col(S::ActivityWaiting),
+        None => col(S::Dim),
     }
 }
 

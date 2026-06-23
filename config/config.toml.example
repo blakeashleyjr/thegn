@@ -73,6 +73,8 @@ undercurl = "auto"
 # shadow_bg = "#05070c" # layer shadow cell background
 # shadow_fg = "#1c2233" # layer shadow cell foreground
 # chip_fg = "#0b0e16"   # text inside inverse chips (defaults to bg0)
+# activity_active = "#edf0f8"   # sidebar dot: agent/worktree working (white)
+# activity_waiting = "#ef6f6f"  # sidebar dot: agent waiting for your input (red)
 
 # Optional: override the eight semantic hues (identity + status colors).
 # Unset keys keep the preset's hues; legacy presets default to the prism set
