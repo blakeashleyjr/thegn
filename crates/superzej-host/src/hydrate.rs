@@ -439,6 +439,10 @@ fn collect_sidebar_status(
     db: &superzej_core::db::Db,
     alert_kinds: &[&str],
     counted_kinds: &[&str],
+    // The active worktree's `ahead_behind`, precomputed by `build_model` (which
+    // also needs it for the panel header). Lets the per-worktree loop skip a
+    // second `ahead_behind` (two rev-walks) for that one path. `(path, value)`.
+    active_ahead_behind: Option<(&str, Option<(usize, usize)>)>,
 ) -> crate::sidebar::SidebarStatus {
     use superzej_core::remote::GitLoc;
     use superzej_svc::git::{GitBackend, GixGit};
@@ -483,7 +487,10 @@ fn collect_sidebar_status(
         }
         let loc = GitLoc::for_worktree(path);
         let dirty = git.is_dirty(&loc).unwrap_or(false);
-        let (ahead, behind) = git.ahead_behind(&loc).ok().flatten().unwrap_or((0, 0));
+        let (ahead, behind) = match active_ahead_behind {
+            Some((p, ab)) if p == g.path => ab.unwrap_or((0, 0)),
+            _ => git.ahead_behind(&loc).ok().flatten().unwrap_or((0, 0)),
+        };
         status.git.insert(
             g.path.clone(),
             crate::sidebar::GitGlyphs {
@@ -608,6 +615,26 @@ impl HydrateHints {
 }
 
 const COMMIT_CACHE_TTL_SECS: i64 = 30;
+
+/// Load the commit rows from the DB cache into `panel`, truncating to the
+/// visible limit and flagging `commits_loading` when the cache is stale/missing.
+/// Shared by `build_model` and the post-`refresh_commit_cache` splice so both
+/// stay in sync.
+fn apply_commit_cache(
+    panel: &mut crate::panel::PanelData,
+    db: &superzej_core::db::Db,
+    loc: &superzej_core::remote::GitLoc,
+    hints: &HydrateHints,
+) {
+    let cached = db.get_commit_cache(&loc.path()).ok().flatten();
+    if let Some((json, _)) = cached.as_ref()
+        && let Ok(mut rows) = serde_json::from_str::<Vec<crate::panel::CommitRow>>(json)
+    {
+        rows.truncate(hints.visible_commit_limit());
+        panel.commits = rows;
+    }
+    panel.commits_loading = commit_cache_needs_refresh(cached.as_ref());
+}
 
 fn commit_cache_needs_refresh(cache: Option<&(String, i64)>) -> bool {
     let Some((json, fetched_at)) = cache else {
@@ -734,6 +761,11 @@ pub(crate) fn build_model(
     let loc = GitLoc::for_worktree(&cwd);
     let git = GixGit::new();
     let branch = git.current_branch(&loc).unwrap_or_else(|_| "—".into());
+    // Computed once and shared with the sidebar collector + the panel header
+    // (both need the active worktree's upstream divergence) — avoids a second
+    // `ahead_behind` (two rev-walks) for the active path per hydration.
+    let active_ahead_behind = git.ahead_behind(&loc).ok().flatten();
+    let cwd_key = cwd.to_string_lossy().into_owned();
 
     // Single layered-config load reused for notification priority + tasks below.
     let app_cfg = superzej_core::config::Config::try_load_layered(
@@ -747,7 +779,13 @@ pub(crate) fn build_model(
 
     let sidebar_workspaces = workspace_list(session, Some(db));
     let sidebar_db_worktrees = db_worktree_list(db);
-    let sidebar_status = collect_sidebar_status(session, db, &alert_kinds, &counted_kinds);
+    let sidebar_status = collect_sidebar_status(
+        session,
+        db,
+        &alert_kinds,
+        &counted_kinds,
+        Some((&cwd_key, active_ahead_behind)),
+    );
     let loc_count = worktree_loc(db, &cwd);
 
     let mut panel = crate::panel::PanelData {
@@ -782,7 +820,7 @@ pub(crate) fn build_model(
     panel.entities = compute_entity_summary(&loc, &diff_entries);
 
     // Header zone: upstream divergence + merge-in-progress banner.
-    panel.ahead_behind = git.ahead_behind(&loc).ok().flatten();
+    panel.ahead_behind = active_ahead_behind;
     let unresolved = superzej_svc::git::conflict_count(&status);
     let merge_info = git.merge_state(&loc).ok().flatten();
     let total = merge_total(db, &loc.path(), merge_info.is_some(), unresolved);
@@ -805,14 +843,7 @@ pub(crate) fn build_model(
     // any open git-family section at Full hydrates them all.
     let git_family_full = hints.expanded && hints.open.is_git_family();
     if hints.wants_commits() {
-        let cached = db.get_commit_cache(&loc.path()).ok().flatten();
-        if let Some((json, _)) = cached.as_ref()
-            && let Ok(mut rows) = serde_json::from_str::<Vec<crate::panel::CommitRow>>(json)
-        {
-            rows.truncate(hints.visible_commit_limit());
-            panel.commits = rows;
-        }
-        panel.commits_loading = commit_cache_needs_refresh(cached.as_ref());
+        apply_commit_cache(&mut panel, db, &loc, &hints);
     }
     if hints.open == crate::panel::Section::Branches || git_family_full {
         // The per-repo open-PR cache joins onto branch rows by head ref.
@@ -1032,6 +1063,10 @@ pub(crate) fn spawn_model_hydration(
         };
         let first = build_model(&session, &db, hints.clone());
         let refresh_commits = first.panel.commits_loading;
+        // Keep a copy to splice refreshed commits into — avoids a second full
+        // `build_model` (re-running status/diff/ahead_behind/… subprocesses)
+        // just to pick up the new commit list.
+        let mut pending = refresh_commits.then(|| first.clone());
         if tx.send((generation, first)).is_ok()
             && let Some(w) = &waker
         {
@@ -1039,17 +1074,20 @@ pub(crate) fn spawn_model_hydration(
         }
 
         // `git log` can be expensive on large repos. Run it only after the
-        // cache-backed model has already landed, then send a second model from
-        // the refreshed cache. Generation tagging in the event loop drops this
-        // safely if the user switched worktrees meanwhile.
-        if refresh_commits
+        // cache-backed model has already landed, then re-send the SAME model with
+        // only its commit list refreshed from the now-warm cache. Generation
+        // tagging in the event loop drops this safely on a worktree switch.
+        if let Some(mut model) = pending.take()
             && refresh_commit_cache(&db, &session)
-            && tx
-                .send((generation, build_model(&session, &db, hints)))
-                .is_ok()
-            && let Some(w) = &waker
         {
-            let _ = w.wake();
+            let loc =
+                superzej_core::remote::GitLoc::for_worktree(&active_tab_path(&session));
+            apply_commit_cache(&mut model.panel, &db, &loc, &hints);
+            if tx.send((generation, model)).is_ok()
+                && let Some(w) = &waker
+            {
+                let _ = w.wake();
+            }
         }
     });
 }
