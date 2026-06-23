@@ -883,7 +883,10 @@ pub enum HostCustomAction {
         close_on_exit: bool,
     },
     /// A built-in composite operation (`[[actions]] action = "…"`).
-    Composite { name: String, action: CompositeAction },
+    Composite {
+        name: String,
+        action: CompositeAction,
+    },
 }
 
 impl HostCustomAction {
@@ -925,9 +928,7 @@ fn parse_composite(
                 Some(s) => {
                     let valid: Vec<String> = crate::palette::build_sandbox_palette(cfg)
                         .into_iter()
-                        .filter_map(|i| {
-                            i.key.strip_prefix("sandbox:").map(|k| k.to_string())
-                        })
+                        .filter_map(|i| i.key.strip_prefix("sandbox:").map(|k| k.to_string()))
                         .collect();
                     if !valid.iter().any(|v| v == s) {
                         warn(&format!(
@@ -969,7 +970,9 @@ fn parse_composite(
                 None | Some("right") => PanePlacement::Right,
                 Some("down") => PanePlacement::Down,
                 Some(other) => {
-                    warn(&format!("unknown placement {other:?} (expected down|right)"));
+                    warn(&format!(
+                        "unknown placement {other:?} (expected down|right)"
+                    ));
                     return None;
                 }
             };
@@ -2060,10 +2063,7 @@ mod tests {
     }
 
     /// Build a config with a single composite `[[actions]]` entry.
-    fn cfg_with_composite(
-        action: &str,
-        params: &[(&str, &str)],
-    ) -> superzej_core::config::Config {
+    fn cfg_with_composite(action: &str, params: &[(&str, &str)]) -> superzej_core::config::Config {
         let mut cfg = superzej_core::config::Config::default();
         cfg.actions.push(superzej_core::config::CustomAction {
             name: "composite".into(),
@@ -2105,9 +2105,14 @@ mod tests {
             }
             other => panic!("expected NewWorktree composite, got {other:?}"),
         }
-        // The chord routes to the custom action.
+        // The chord routes to the custom action. `Alt N` parses to Char('N')
+        // (case preserved, no Shift modifier), so the press must use 'N' — 'n'
+        // is the distinct `Alt n` → SplitDown default.
         assert_eq!(
-            map.dispatch(Mode::Normal, Key::modified(KeyCode::Char('n'), Modifiers::ALT)),
+            map.dispatch(
+                Mode::Normal,
+                Key::modified(KeyCode::Char('N'), Modifiers::ALT)
+            ),
             MatchResult::Matched(Action::Custom(0))
         );
     }
@@ -2129,7 +2134,11 @@ mod tests {
     fn composite_new_pane_placement_and_cwd() {
         let cfg = cfg_with_composite(
             "new-pane",
-            &[("run", "tail -f x"), ("placement", "down"), ("cwd", "worktree")],
+            &[
+                ("run", "tail -f x"),
+                ("placement", "down"),
+                ("cwd", "worktree"),
+            ],
         );
         let map = default_keymap_for(&cfg, None, None);
         match &map.custom_actions()[0] {
@@ -2159,10 +2168,24 @@ mod tests {
 
     #[test]
     fn composite_bad_sandbox_and_placement_are_skipped() {
-        let map = default_keymap_for(&cfg_with_composite("new-worktree", &[("sandbox", "nope")]), None, None);
-        assert!(map.custom_actions().is_empty(), "bad sandbox skips the action");
-        let map = default_keymap_for(&cfg_with_composite("new-pane", &[("placement", "sideways")]), None, None);
-        assert!(map.custom_actions().is_empty(), "bad placement skips the action");
+        let map = default_keymap_for(
+            &cfg_with_composite("new-worktree", &[("sandbox", "nope")]),
+            None,
+            None,
+        );
+        assert!(
+            map.custom_actions().is_empty(),
+            "bad sandbox skips the action"
+        );
+        let map = default_keymap_for(
+            &cfg_with_composite("new-pane", &[("placement", "sideways")]),
+            None,
+            None,
+        );
+        assert!(
+            map.custom_actions().is_empty(),
+            "bad placement skips the action"
+        );
     }
 
     #[test]
