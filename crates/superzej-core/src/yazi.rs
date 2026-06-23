@@ -32,6 +32,32 @@ prepend_preloaders = [
 /// `theme.toml` with an `{{ACCENT}}` placeholder (an `#rrggbb`), filled per-open.
 const THEME_TMPL: &str = include_str!("../../../config/yazi/theme.toml");
 
+/// The vendored `git.yazi` plugin (MIT, yazi-rs), seeded so the drawer can show
+/// git status as a linemode (item 606).
+const GIT_PLUGIN_LUA: &str = include_str!("../../../config/yazi/plugins/git.yazi/main.lua");
+const GIT_POLICY_BEGIN: &str = "# BEGIN SUPERZEJ MANAGED GIT STATUS POLICY";
+const GIT_POLICY_END: &str = "# END SUPERZEJ MANAGED GIT STATUS POLICY";
+/// `prepend_fetchers` registering the git plugin. Array-of-tables syntax so it
+/// extends the existing `[plugin]` table (the image policy block) without a
+/// duplicate-table TOML error. No `id` field — the pinned yazi is > v26.1.22.
+const GIT_FETCHERS_BLOCK: &str = r#"# BEGIN SUPERZEJ MANAGED GIT STATUS POLICY
+# Show git status as a drawer linemode (item 606): the vendored git.yazi plugin
+# under plugins/ is registered as a fetcher here and initialised in init.lua.
+# Set [drawer].git_status = false to remove this block from the generated config.
+[[plugin.prepend_fetchers]]
+url = "*"
+run = "git"
+
+[[plugin.prepend_fetchers]]
+url = "*/"
+run = "git"
+# END SUPERZEJ MANAGED GIT STATUS POLICY"#;
+const GIT_INIT_BEGIN: &str = "-- BEGIN SUPERZEJ MANAGED GIT STATUS INIT";
+const GIT_INIT_END: &str = "-- END SUPERZEJ MANAGED GIT STATUS INIT";
+const GIT_INIT_BLOCK: &str = r#"-- BEGIN SUPERZEJ MANAGED GIT STATUS INIT
+require("git"):setup { order = 1500 }
+-- END SUPERZEJ MANAGED GIT STATUS INIT"#;
+
 /// The file manager the drawer runs: an explicit `[drawer] command`, else the
 /// pinned yazi (`SUPERZEJ_YAZI_BIN`), else `yazi` on PATH.
 pub fn bin(cfg: &Config) -> String {
@@ -72,9 +98,71 @@ pub fn ensure_config(cfg: &Config) -> Option<PathBuf> {
     let _ = std::fs::create_dir_all(&dir);
     seed_once(&dir, "yazi.toml", YAZI_TOML);
     apply_image_preview_policy(&dir, cfg.drawer.image_previews);
+    apply_git_status_policy(&dir, cfg.drawer.git_status);
     seed_once(&dir, "keymap.toml", KEYMAP_TOML);
     write_theme(&dir, &cfg.accent_hex());
     Some(dir)
+}
+
+/// Add or remove superzej's managed git-status integration (item 606). When
+/// enabled: (re)write the vendored `git.yazi` plugin (derived state), register
+/// its fetchers in `yazi.toml`, and initialise it in `init.lua`. When disabled:
+/// strip the managed blocks (the plugin files are left in place, inert without
+/// the fetcher). Best-effort — failures just leave git status off.
+fn apply_git_status_policy(dir: &std::path::Path, enabled: bool) {
+    let toml = dir.join("yazi.toml");
+    let init = dir.join("init.lua");
+    if enabled {
+        let pdir = dir.join("plugins").join("git.yazi");
+        let _ = std::fs::create_dir_all(&pdir);
+        // The plugin is vendored, not user config: always refresh it so a pinned
+        // yazi/plugin bump lands (mirrors theme.toml's regenerate-always policy).
+        let _ = std::fs::write(pdir.join("main.lua"), GIT_PLUGIN_LUA);
+        ensure_managed_block(&toml, GIT_POLICY_BEGIN, GIT_FETCHERS_BLOCK);
+        ensure_managed_block(&init, GIT_INIT_BEGIN, GIT_INIT_BLOCK);
+    } else {
+        remove_managed_block(&toml, GIT_POLICY_BEGIN, GIT_POLICY_END);
+        remove_managed_block(&init, GIT_INIT_BEGIN, GIT_INIT_END);
+    }
+}
+
+/// Append a `begin..end`-delimited managed block to `path` (creating the file if
+/// absent) when it isn't already present. Idempotent: a present block is left
+/// untouched so user edits around it survive.
+fn ensure_managed_block(path: &std::path::Path, begin: &str, block: &str) {
+    let body = std::fs::read_to_string(path).unwrap_or_default();
+    if body.contains(begin) {
+        return;
+    }
+    let next = if body.trim().is_empty() {
+        format!("{block}\n")
+    } else {
+        format!("{}\n\n{}\n", body.trim_end(), block)
+    };
+    let _ = std::fs::write(path, next);
+}
+
+/// Remove a `begin..end`-delimited managed block from `path` (no-op if absent).
+fn remove_managed_block(path: &std::path::Path, begin: &str, end: &str) {
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let (Some(start), Some(end_at)) = (body.find(begin), body.find(end)) else {
+        return;
+    };
+    let end = end_at + end.len();
+    let mut next = String::with_capacity(body.len());
+    next.push_str(body[..start].trim_end());
+    next.push_str(body[end..].trim_start_matches(['\r', '\n']));
+    let next = next.trim_start_matches('\n').to_string();
+    let next = if next.is_empty() {
+        String::new()
+    } else if next.ends_with('\n') {
+        next
+    } else {
+        format!("{next}\n")
+    };
+    let _ = std::fs::write(path, next);
 }
 
 /// Write `name` into `dir` only if it does not already exist.
@@ -237,6 +325,87 @@ mod tests {
         let yazi = std::fs::read_to_string(dir.join("yazi.toml")).unwrap();
         assert!(!yazi.contains(IMAGE_POLICY_BEGIN));
         assert!(!yazi.contains(IMAGE_POLICY_END));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_config_seeds_git_status_by_default() {
+        let dir = tmpdir();
+        let cfg = cfg_with("", dir.to_str().unwrap());
+        ensure_config(&cfg).unwrap();
+
+        // Plugin vendored under plugins/git.yazi/main.lua.
+        let plugin = dir.join("plugins").join("git.yazi").join("main.lua");
+        assert!(plugin.exists(), "git.yazi plugin seeded");
+        let lua = std::fs::read_to_string(&plugin).unwrap();
+        assert!(lua.contains("return { setup = setup, fetch = fetch }"));
+
+        // Fetchers registered in yazi.toml; setup wired in init.lua.
+        let yazi = std::fs::read_to_string(dir.join("yazi.toml")).unwrap();
+        assert!(yazi.contains(GIT_POLICY_BEGIN));
+        assert!(yazi.contains("[[plugin.prepend_fetchers]]"));
+        assert!(yazi.contains("run = \"git\""));
+        let init = std::fs::read_to_string(dir.join("init.lua")).unwrap();
+        assert!(init.contains("require(\"git\"):setup"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_status_block_is_idempotent_and_keeps_one_plugin_table() {
+        let dir = tmpdir();
+        let cfg = cfg_with("", dir.to_str().unwrap());
+        ensure_config(&cfg).unwrap();
+        ensure_config(&cfg).unwrap(); // second pass must not duplicate
+
+        let yazi = std::fs::read_to_string(dir.join("yazi.toml")).unwrap();
+        assert_eq!(
+            yazi.matches(GIT_POLICY_BEGIN).count(),
+            1,
+            "no duplicate block"
+        );
+        // Image policy owns the only literal `[plugin]` table; git uses
+        // array-of-tables, so the config stays valid TOML.
+        assert_eq!(yazi.matches("\n[plugin]\n").count(), 1);
+        let init = std::fs::read_to_string(dir.join("init.lua")).unwrap();
+        assert_eq!(init.matches(GIT_INIT_BEGIN).count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generated_yazi_toml_stays_valid_with_image_and_git_blocks() {
+        // The git fetchers use array-of-tables so they extend the image policy's
+        // `[plugin]` table instead of duplicating it. A regression here would
+        // make yazi silently fall back to presets, so assert the file parses.
+        let dir = tmpdir();
+        let cfg = cfg_with("", dir.to_str().unwrap());
+        ensure_config(&cfg).unwrap();
+        let body = std::fs::read_to_string(dir.join("yazi.toml")).unwrap();
+        let parsed: toml::Value = toml::from_str(&body).expect("generated yazi.toml is valid TOML");
+        let fetchers = parsed["plugin"]["prepend_fetchers"]
+            .as_array()
+            .expect("prepend_fetchers array");
+        assert_eq!(fetchers.len(), 2, "two git fetchers registered");
+        // Image policy keys remain on the same table.
+        assert!(parsed["plugin"].get("prepend_previewers").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_status_opt_out_removes_managed_blocks() {
+        let dir = tmpdir();
+        let mut cfg = cfg_with("", dir.to_str().unwrap());
+        ensure_config(&cfg).unwrap();
+
+        cfg.drawer.git_status = false;
+        ensure_config(&cfg).unwrap();
+        let yazi = std::fs::read_to_string(dir.join("yazi.toml")).unwrap();
+        assert!(!yazi.contains(GIT_POLICY_BEGIN));
+        assert!(!yazi.contains(GIT_POLICY_END));
+        assert!(!yazi.contains("[[plugin.prepend_fetchers]]"));
+        // The image policy block survives the git-block removal.
+        assert!(yazi.contains(IMAGE_POLICY_BEGIN));
+        let init = std::fs::read_to_string(dir.join("init.lua")).unwrap();
+        assert!(!init.contains(GIT_INIT_BEGIN));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

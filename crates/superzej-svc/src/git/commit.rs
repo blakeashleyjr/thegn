@@ -188,7 +188,9 @@ mod tests {
         std::fs::write(repo.dir.join("f.txt"), "two\n").unwrap();
         git_in(&repo.dir, &["add", "f.txt"]);
         let loc = repo.loc();
-        CliGit.commit(&loc, "signed off", false, Some(false)).unwrap();
+        CliGit
+            .commit(&loc, "signed off", false, Some(false))
+            .unwrap();
         assert_eq!(repo.subjects()[0], "signed off");
         assert!(CliGit.status(&loc).unwrap().is_empty());
     }
@@ -202,7 +204,11 @@ mod tests {
         repo.commit_file("f.txt", "one\n", "c0");
 
         let hook = repo.dir.join(".git/hooks/pre-commit");
-        std::fs::write(&hook, "#!/bin/sh\necho 'LINT FAILED: tabs not allowed'\nexit 1\n").unwrap();
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\necho 'LINT FAILED: tabs not allowed'\nexit 1\n",
+        )
+        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

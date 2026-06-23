@@ -990,6 +990,25 @@ fn bottombar_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> {
                 w(format!("{repo} #{}", pr.number), fg)
             }
         }),
+        // Test rollup (item 517): ✓passed plus ✗failed when any fail; green
+        // when the last run was all-pass, red when anything failed. Hidden
+        // until a run has produced counts (mirrors the panel Tests section).
+        "tests" => model.panel.tests.as_ref().and_then(|t| {
+            if t.passed == 0 && t.failed == 0 {
+                return None;
+            }
+            let fg = if t.failed > 0 {
+                theme_color(theme::RED)
+            } else {
+                theme_color(theme::GREEN)
+            };
+            let text = if t.failed > 0 {
+                format!("\u{2713}{} \u{2717}{}", t.passed, t.failed)
+            } else {
+                format!("\u{2713}{}", t.passed)
+            };
+            Some(w(text, fg))
+        }),
         "status" => (!model.status.is_empty()).then(|| w(model.status.clone(), col(S::Dim))),
         _ => None,
     }
@@ -2819,6 +2838,81 @@ mod tests {
         assert!(
             wtext.contains("alpha") && wtext.contains("bravo") && wtext.contains("charlie"),
             "all bindings fit when wide: {wtext:?}"
+        );
+    }
+
+    #[test]
+    fn statusbar_tests_widget_renders_pass_fail_rollup() {
+        use crate::panel::{PanelData, TestsLite};
+        let bars = || superzej_core::config::BarsConfig {
+            bottom_left: vec![],
+            bottom_right: vec!["tests".into()],
+            ..Default::default()
+        };
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 40,
+            rows: 1,
+        };
+
+        // All-pass run: only the ✓ count, no ✗.
+        let pass = FrameModel {
+            panel: PanelData {
+                tests: Some(TestsLite {
+                    passed: 12,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            bars: bars(),
+            ..Default::default()
+        };
+        let mut s = Surface::new(40, 1);
+        draw_statusbar(&mut s, rect, &pass);
+        let text = s.screen_chars_to_string();
+        assert!(text.contains("\u{2713}12"), "pass count shown: {text:?}");
+        assert!(
+            !text.contains('\u{2717}'),
+            "no fail glyph all-pass: {text:?}"
+        );
+
+        // Mixed run: ✓ and ✗ both shown.
+        let mixed = FrameModel {
+            panel: PanelData {
+                tests: Some(TestsLite {
+                    passed: 8,
+                    failed: 3,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            bars: bars(),
+            ..Default::default()
+        };
+        let mut s2 = Surface::new(40, 1);
+        draw_statusbar(&mut s2, rect, &mixed);
+        let t2 = s2.screen_chars_to_string();
+        assert!(
+            t2.contains("\u{2713}8") && t2.contains("\u{2717}3"),
+            "pass+fail counts shown: {t2:?}"
+        );
+
+        // No run yet (default counts) → widget hidden.
+        let empty = FrameModel {
+            panel: PanelData {
+                tests: Some(TestsLite::default()),
+                ..Default::default()
+            },
+            bars: bars(),
+            ..Default::default()
+        };
+        let mut s3 = Surface::new(40, 1);
+        draw_statusbar(&mut s3, rect, &empty);
+        let t3 = s3.screen_chars_to_string();
+        assert!(
+            !t3.contains('\u{2713}') && !t3.contains('\u{2717}'),
+            "widget hidden with no counts: {t3:?}"
         );
     }
 

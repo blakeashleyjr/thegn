@@ -458,8 +458,10 @@ fn tests_full_tree(ctx: &SectionCtx) -> Vec<PanelRow> {
     let _ = cursor_visible_pos; // used for scroll tracking in future
     rows.push(super::hint_row(&[
         ("r", "run"),
+        ("F", "file"),
+        ("p", "pkg"),
+        ("R", "all"),
         ("↵", "open"),
-        ("j/k", "select"),
     ]));
     rows
 }

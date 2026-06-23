@@ -1385,6 +1385,38 @@ pub fn default_keymap_with_config(cfg: &superzej_core::config::Config) -> KeyMap
     default_keymap_for(cfg, None, None)
 }
 
+/// Overlay an IDE keymap preset (item 621) onto `map`: a small set of familiar
+/// chords mapped to existing host actions, applied after the built-in defaults
+/// and before user `[keybinds]` so user overrides still win. Chords are chosen
+/// to avoid the core nav defaults (`Ctrl h/j/k/l`, `Ctrl w`). `"default"` (and
+/// the Vim/Emacs modes, which live in `default_keymap`) are a no-op. A bad chord
+/// is skipped, never fatal.
+pub fn apply_keymap_preset(map: &mut KeyMap, preset: &str) {
+    let binds: &[(&str, Action)] = match preset.trim().to_ascii_lowercase().as_str() {
+        "vscode" | "vs-code" | "code" => &[
+            ("Ctrl p", Action::SearchGlobal),       // quick open / go to file
+            ("Ctrl Shift p", Action::OpenPalette),  // command palette
+            ("Ctrl b", Action::ToggleSidebar),      // toggle side bar
+            ("Ctrl Shift e", Action::FocusSidebar), // explorer focus
+            ("Ctrl Shift g", Action::FocusPanel),   // source-control panel
+        ],
+        "jetbrains" | "intellij" | "idea" => &[
+            ("Ctrl Shift a", Action::OpenPalette),  // Find Action
+            ("Ctrl e", Action::SearchGlobal),       // Recent Files
+            ("Ctrl Shift f", Action::SearchGlobal), // Find in Path
+            ("Alt 1", Action::ToggleSidebar),       // Project tool window
+        ],
+        _ => return,
+    };
+    for (chord, action) in binds {
+        if let Err(e) = map.insert_all(chord, action.clone()) {
+            superzej_core::msg::warn(&format!(
+                "keymap_preset {preset}: chord {chord:?}: {e}; skipped"
+            ));
+        }
+    }
+}
+
 /// Build the host keymap for a focused context: the built-in defaults, custom
 /// `[[actions]]`, then each keybind layer from
 /// [`Config::effective_keybinds`](superzej_core::config::Config::effective_keybinds)
@@ -1396,6 +1428,7 @@ pub fn default_keymap_for(
     slug: Option<&str>,
 ) -> KeyMap {
     let mut map = default_keymap();
+    apply_keymap_preset(&mut map, &cfg.keymap_preset);
     map.config = cfg.clone();
 
     for action in &cfg.actions {
@@ -1965,6 +1998,67 @@ mod tests {
         assert_eq!(
             map.dispatch(Mode::Emacs, Key::ctrl('c')),
             MatchResult::Matched(Action::Quit)
+        );
+    }
+
+    #[test]
+    fn keymap_preset_default_leaves_ide_chords_unbound() {
+        let cfg = superzej_core::config::Config::default(); // "default"
+        let mut map = default_keymap_for(&cfg, None, None);
+        // Ctrl+p is not a built-in default — without a preset it stays unbound.
+        assert_eq!(
+            map.dispatch(Mode::Normal, Key::ctrl('p')),
+            MatchResult::None
+        );
+    }
+
+    #[test]
+    fn keymap_preset_vscode_binds_ide_chords() {
+        let cfg = superzej_core::config::Config {
+            keymap_preset: "vscode".into(),
+            ..Default::default()
+        };
+        let mut map = default_keymap_for(&cfg, None, None);
+        assert_eq!(
+            map.dispatch(Mode::Normal, Key::ctrl('p')),
+            MatchResult::Matched(Action::SearchGlobal)
+        );
+        assert_eq!(
+            map.dispatch(Mode::Normal, Key::ctrl('b')),
+            MatchResult::Matched(Action::ToggleSidebar)
+        );
+        // Core nav defaults the preset deliberately avoids still work.
+        assert_eq!(
+            map.dispatch(Mode::Normal, Key::ctrl('h')),
+            MatchResult::Matched(Action::FocusLeft)
+        );
+    }
+
+    #[test]
+    fn keymap_preset_jetbrains_binds_ide_chords() {
+        let cfg = superzej_core::config::Config {
+            keymap_preset: "jetbrains".into(),
+            ..Default::default()
+        };
+        let mut map = default_keymap_for(&cfg, None, None);
+        assert_eq!(
+            map.dispatch(Mode::Normal, Key::ctrl('e')),
+            MatchResult::Matched(Action::SearchGlobal)
+        );
+    }
+
+    #[test]
+    fn user_keybind_overrides_preset() {
+        let mut cfg = superzej_core::config::Config {
+            keymap_preset: "vscode".into(),
+            ..Default::default()
+        };
+        // A user rebind of Ctrl+p must win over the preset's SearchGlobal.
+        cfg.keybinds.insert("toggle-panel".into(), "Ctrl p".into());
+        let mut map = default_keymap_for(&cfg, None, None);
+        assert_eq!(
+            map.dispatch(Mode::Normal, Key::ctrl('p')),
+            MatchResult::Matched(Action::TogglePanel)
         );
     }
 

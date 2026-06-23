@@ -4504,6 +4504,9 @@ fn dispatch_menu_choice(
         MenuChoice::Confirm { .. } | MenuChoice::Dismiss => {
             *ov.confirm_op = None;
         }
+        // Handled at the call site (item 621) — it needs the live config + keymap,
+        // which this git-scoped dispatcher doesn't carry. Never reaches here.
+        MenuChoice::SetKeymapPreset(_) => {}
     }
     GitAfter::None
 }
@@ -4986,54 +4989,94 @@ enum TestRun {
     Failed,
     /// `R`: everything.
     All,
+    /// `F`: every test in the selected node's file. Path-native runners
+    /// (pytest/jest/vitest) take the file path; id-filter runners (cargo/go)
+    /// have no file selector and fall back to the enclosing module/package.
+    File,
+    /// `p`: the selected node's enclosing module/package/suite.
+    Package,
 }
 
-/// For `Selected`/`Failed`, narrow the base task command to the selected/failed
-/// test where the runner supports it; otherwise run the whole suite.
+/// How a run is narrowed below the whole suite: by a test/group id filter (the
+/// mechanism shared by Selected/Failed/Package and File on id-filter runners),
+/// or by a file path (File on path-native runners). `None` → whole suite.
+enum TestNarrow {
+    None,
+    /// `(filter_id, display_label)`
+    Id(String, String),
+    /// `(file_path, display_label)`
+    Path(String, String),
+}
+
+/// Narrow the base task command to the slice `kind` selects, where the runner
+/// supports it; otherwise run the whole suite. Selected/Failed target a single
+/// test; Package targets the enclosing group; File targets the selected node's
+/// file (path-native runners) or its module (id-filter runners).
 fn test_task_for_run(
-    ui: &crate::panel::PanelUi,
+    tests: &crate::panel::TestPanelState,
     kind: TestRun,
     base: crate::panel::TestTask,
 ) -> crate::panel::TestTask {
     use crate::panel::{TestNodeKind, TestState};
-    let selected = ui
-        .tests
+    let id_of = |n: Option<&crate::panel::TestNode>| match n {
+        Some(n) => TestNarrow::Id(n.id.clone(), n.label.clone()),
+        None => TestNarrow::None,
+    };
+    let selected = tests
         .selected_node()
         .filter(|n| n.kind == TestNodeKind::Test);
-    let failed = ui
-        .tests
+    let failed = tests
         .nodes
         .iter()
         .find(|n| n.kind == TestNodeKind::Test && n.state == TestState::Fail);
-    let target = match kind {
-        TestRun::Selected => selected,
-        TestRun::Failed => failed.or(selected),
-        TestRun::All => None,
+    // Path-native runners take a file path directly; everything else filters by
+    // a test/group id substring, so File on those falls back to the module.
+    let path_native = matches!(
+        base.matcher.as_str(),
+        "pytest" | "vitest" | "jest" | "javascript"
+    );
+    let narrow = match kind {
+        TestRun::All => TestNarrow::None,
+        TestRun::Selected => id_of(selected),
+        TestRun::Failed => id_of(failed.or(selected)),
+        TestRun::Package => id_of(tests.selected_group()),
+        TestRun::File => match tests.selected_path() {
+            Some(p) if path_native => {
+                let label = std::path::Path::new(p)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.to_string());
+                TestNarrow::Path(p.to_string(), label)
+            }
+            _ => id_of(tests.selected_group()),
+        },
     };
-    let Some(target) = target else {
-        return base;
-    };
+
     let mut task = base;
-    match task.matcher.as_str() {
-        "cargo-test" | "nextest" => {
-            task.command = format!("{} {}", task.command, test_shell_quote(&target.id))
+    let label = match narrow {
+        TestNarrow::None => return task,
+        TestNarrow::Id(id, label) => {
+            match task.matcher.as_str() {
+                "go-test" => {
+                    task.command = format!("{} -run {}", task.command, test_shell_quote(&id))
+                }
+                "nix-flake" => {
+                    let attr = format!("checks.{}", id.replace("::", "."));
+                    task.command =
+                        format!("nix build -L {}", test_shell_quote(&format!(".#{attr}")));
+                }
+                // cargo-test, nextest, pytest, swift, vitest, jest, javascript:
+                // a trailing id token is a name/substring filter.
+                _ => task.command = format!("{} {}", task.command, test_shell_quote(&id)),
+            }
+            label
         }
-        "go-test" => {
-            task.command = format!("{} -run {}", task.command, test_shell_quote(&target.id))
+        TestNarrow::Path(path, label) => {
+            task.command = format!("{} {}", task.command, test_shell_quote(&path));
+            label
         }
-        "pytest" | "swift" => {
-            task.command = format!("{} {}", task.command, test_shell_quote(&target.id))
-        }
-        "vitest" | "jest" | "javascript" => {
-            task.command = format!("{} {}", task.command, test_shell_quote(&target.id))
-        }
-        "nix-flake" => {
-            let attr = format!("checks.{}", target.id.replace("::", "."));
-            task.command = format!("nix build -L {}", test_shell_quote(&format!(".#{attr}")));
-        }
-        _ => {}
-    }
-    task.name = format!("{} ({})", task.name, target.label);
+    };
+    task.name = format!("{} ({})", task.name, label);
     task
 }
 
@@ -6318,6 +6361,26 @@ async fn event_loop<T: Terminal>(
     );
 
     let mut current_config = keymap.config().clone();
+
+    // First-launch keymap picker (item 621). Skip entirely when the user has set
+    // `keymap_preset` in config (an explicit choice). Otherwise apply a preset
+    // remembered in `ui_state` from a previous run, or — on the very first launch
+    // — arm the one-time picker overlay (its pick/cancel persists to ui_state, so
+    // it shows exactly once).
+    if current_config.keymap_preset.is_empty() || current_config.keymap_preset == "default" {
+        match superzej_core::db::Db::open()
+            .ok()
+            .and_then(|db| db.get_ui_state("", "keymap_preset").ok().flatten())
+        {
+            Some(remembered) if remembered != "default" => {
+                current_config.keymap_preset = remembered;
+                keymap = rebuild_keymap(&current_config, &session);
+            }
+            Some(_) => {} // remembered "default" — no overlay, no picker
+            None => active_menu = Some(crate::menu::keymap_preset_menu()),
+        }
+    }
+
     let initial_app = app_host.active;
     if ensure_app_loaded(
         &mut app_host,
@@ -9776,12 +9839,37 @@ async fn event_loop<T: Terminal>(
                     match m.handle_key(&k.key, k.modifiers) {
                         menu::MenuOutcome::Pending => {}
                         menu::MenuOutcome::Cancel => {
+                            // Dismissing the first-launch keymap picker (item 621)
+                            // counts as choosing the defaults — persist so it
+                            // never reappears.
+                            if m.tag == menu::MenuKindTag::KeymapPicker
+                                && let Ok(db) = superzej_core::db::Db::open()
+                            {
+                                let _ = db.set_ui_state("", "keymap_preset", "default");
+                            }
                             active_menu = None;
                             pending_confirm_op = None;
                             pending_undo = None;
                         }
                         menu::MenuOutcome::Pick(choice) => {
                             active_menu = None;
+                            // First-launch keymap picker (item 621): persist the
+                            // choice to ui_state and rebuild the live keymap. Not
+                            // a git op, so handle it before the git dispatch.
+                            if let menu::MenuChoice::SetKeymapPreset(preset) = &choice {
+                                if let Ok(db) = superzej_core::db::Db::open() {
+                                    let _ = db.set_ui_state("", "keymap_preset", preset);
+                                }
+                                current_config.keymap_preset = preset.clone();
+                                keymap = rebuild_keymap(&current_config, &session);
+                                model.status = if preset == "default" {
+                                    "Keymap: superzej defaults".into()
+                                } else {
+                                    format!("Keymap preset: {preset}")
+                                };
+                                dirty = true;
+                                continue;
+                            }
                             let wires = GitWires {
                                 session: &session,
                                 cfg: keymap.config(),
@@ -11715,17 +11803,19 @@ async fn event_loop<T: Terminal>(
                             true
                         }
                         // -- tests: run / discover (capped, single-flight) ---
-                        (Section::Tests, KeyCode::Char(c @ ('r' | 'R' | 'f'))) => {
+                        (Section::Tests, KeyCode::Char(c @ ('r' | 'R' | 'f' | 'F' | 'p'))) => {
                             let kind = match c {
                                 'r' => TestRun::Selected,
                                 'R' => TestRun::All,
+                                'F' => TestRun::File,
+                                'p' => TestRun::Package,
                                 _ => TestRun::Failed,
                             };
                             let wt = active_tab_path(&session);
                             sync_tests_for_worktree(&mut panel_ui, &wt, keymap.config());
                             if let Some(base) = panel_ui.tests.task.clone() {
                                 if !panel_ui.tests.running {
-                                    let task_spec = test_task_for_run(&panel_ui, kind, base);
+                                    let task_spec = test_task_for_run(&panel_ui.tests, kind, base);
                                     test_generation += 1;
                                     panel_ui.tests.running = true;
                                     panel_ui.tests.summary.running = true;
@@ -14292,6 +14382,126 @@ mod tests {
     use crate::center::CenterTree;
     use crate::hydrate::build_model;
     use crate::session::{GroupKind, Session, WorktreeGroup};
+
+    // ---- test-run scope narrowing (item 518) -------------------------------
+    fn t_node(
+        id: &str,
+        label: &str,
+        depth: usize,
+        kind: crate::panel::TestNodeKind,
+        state: crate::panel::TestState,
+        path: Option<&str>,
+    ) -> crate::panel::TestNode {
+        crate::panel::TestNode {
+            id: id.into(),
+            label: label.into(),
+            depth,
+            kind,
+            state,
+            location: path.map(|p| crate::panel::TestLocation {
+                path: p.into(),
+                line: 1,
+                column: None,
+            }),
+            message: None,
+            placeholder: false,
+        }
+    }
+
+    /// A group `mod` with one test child; `cursor` selects within `nodes` order.
+    fn tests_state(matcher_path: Option<&str>, cursor: usize) -> crate::panel::TestPanelState {
+        use crate::panel::{TestNodeKind, TestState};
+        let mut st = crate::panel::TestPanelState::default();
+        st.nodes = vec![
+            t_node(
+                "mymod",
+                "mymod",
+                0,
+                TestNodeKind::Group,
+                TestState::Unknown,
+                None,
+            ),
+            t_node(
+                "mymod::test_a",
+                "test_a",
+                1,
+                TestNodeKind::Test,
+                TestState::Pass,
+                matcher_path,
+            ),
+        ];
+        st.cursor = cursor;
+        st
+    }
+
+    #[test]
+    fn test_run_selected_appends_test_id() {
+        let st = tests_state(Some("src/lib.rs"), 1);
+        let base = crate::panel::TestTask::new("cargo test", "cargo test", "cargo-test");
+        let task = test_task_for_run(&st, TestRun::Selected, base);
+        assert!(
+            task.command.ends_with("'mymod::test_a'"),
+            "{}",
+            task.command
+        );
+        assert!(task.name.contains("test_a"));
+    }
+
+    #[test]
+    fn test_run_package_targets_parent_group() {
+        // Cursor on the test node → Package resolves to the enclosing `mymod`.
+        let st = tests_state(Some("src/lib.rs"), 1);
+        let base = crate::panel::TestTask::new("cargo test", "cargo test", "cargo-test");
+        let task = test_task_for_run(&st, TestRun::Package, base);
+        assert!(task.command.ends_with("'mymod'"), "{}", task.command);
+        assert!(!task.command.contains("test_a"), "{}", task.command);
+    }
+
+    #[test]
+    fn test_run_file_uses_path_for_pytest() {
+        let st = tests_state(Some("tests/test_x.py"), 1);
+        let base = crate::panel::TestTask::new("pytest", "pytest", "pytest");
+        let task = test_task_for_run(&st, TestRun::File, base);
+        assert!(
+            task.command.ends_with("'tests/test_x.py'"),
+            "{}",
+            task.command
+        );
+        assert!(task.name.contains("test_x.py"));
+    }
+
+    #[test]
+    fn test_run_file_falls_back_to_module_for_cargo() {
+        // cargo has no file selector → File runs the enclosing module.
+        let st = tests_state(Some("src/lib.rs"), 1);
+        let base = crate::panel::TestTask::new("cargo test", "cargo test", "cargo-test");
+        let task = test_task_for_run(&st, TestRun::File, base);
+        assert!(task.command.ends_with("'mymod'"), "{}", task.command);
+        assert!(!task.command.contains("lib.rs"), "{}", task.command);
+    }
+
+    #[test]
+    fn test_run_all_runs_whole_suite() {
+        let st = tests_state(Some("src/lib.rs"), 1);
+        let base = crate::panel::TestTask::new("cargo test", "cargo test", "cargo-test");
+        let task = test_task_for_run(&st, TestRun::All, base.clone());
+        assert_eq!(
+            task.command, base.command,
+            "All leaves the command untouched"
+        );
+    }
+
+    #[test]
+    fn test_run_go_uses_run_flag() {
+        let st = tests_state(Some("x_test.go"), 1);
+        let base = crate::panel::TestTask::new("go test", "go test ./...", "go-test");
+        let task = test_task_for_run(&st, TestRun::Selected, base);
+        assert!(
+            task.command.contains("-run 'mymod::test_a'"),
+            "{}",
+            task.command
+        );
+    }
 
     #[test]
     fn commit_message_prefill_from_entities() {
