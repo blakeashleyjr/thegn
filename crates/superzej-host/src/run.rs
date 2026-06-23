@@ -6024,6 +6024,11 @@ async fn event_loop<T: Terminal>(
     // Consumed and cleared by the render block; any non-drag change leaves it
     // false, forcing a full frame.
     let mut selection_only = false;
+    // Same idea for a pure mouse-wheel scroll: only the scrolled pane's content
+    // changed, so reuse the prior frame and recompose just that pane (skip the
+    // chrome + sibling-pane recompose). `scroll_pane` names the pane to repaint.
+    let mut scroll_only = false;
+    let mut scroll_pane: Option<u32> = None;
     // One zone owns the keyboard at any time; Ctrl+g toggles the keybind lock.
     // `sb.focused` / `model.panel_focused` / `model.center_focused` mirror it.
     let mut focus = crate::focus::FocusState::default();
@@ -6580,9 +6585,11 @@ async fn event_loop<T: Terminal>(
         // cloned inside the render block — only on dirty frames (most wakes
         // aren't), and after the drain, so an exit-mutated tree renders fresh
         // this frame instead of one wake late.
-        let visible: Vec<u32> = session
+        // A set, not a Vec: the drain checks membership once per output chunk
+        // (and per chunk-budget loop), so O(1) lookups beat a linear scan.
+        let visible: std::collections::HashSet<u32> = session
             .active_tab()
-            .map(|t| t.center.pane_ids())
+            .map(|t| t.center.pane_ids().into_iter().collect())
             .unwrap_or_default();
 
         // 1. Drain pending PTY output, routed by pane id. Only output from a pane
@@ -8112,6 +8119,28 @@ async fn event_loop<T: Terminal>(
                 && which_key.is_empty()
                 && pending_confirm.is_none()
                 && toasts.is_empty();
+            // FAST PATH: a pure mouse-wheel scroll changes only the scrolled
+            // pane's content. Same reuse-the-prior-`scratch` trick as the
+            // selection drag — recompose just that pane, skip chrome + siblings.
+            // A live drawer overlays the center band (recomposing a pane behind
+            // it would paint over the drawer), and an active selection would be
+            // dropped, so both fall through to a full frame.
+            let scroll_fast = scroll_only
+                && !fast_select
+                && !full_repaint
+                && !app_tile_active
+                && drawer.is_none()
+                && mouse_sel.is_none()
+                && palette.is_none()
+                && active_menu.is_none()
+                && git_input.is_none()
+                && host_input.is_none()
+                && wizard_ui.is_none()
+                && hover_popup.is_none()
+                && search.is_none()
+                && which_key.is_empty()
+                && pending_confirm.is_none()
+                && toasts.is_empty();
             if fast_select {
                 if let Some((sp, sel)) = mouse_sel.as_ref() {
                     let target = tree
@@ -8127,6 +8156,17 @@ async fn event_loop<T: Terminal>(
                             sel,
                             crate::chrome::col(crate::chrome::S::Panel2),
                         );
+                    }
+                }
+            } else if scroll_fast {
+                if let Some(sp) = scroll_pane {
+                    let target = tree
+                        .layout_framed(chrome.center)
+                        .into_iter()
+                        .find(|(id, _, _)| *id == sp)
+                        .map(|(_, _, c)| c);
+                    if let (Some(content), Some(p)) = (target, panes.table.get(&sp)) {
+                        crate::compositor::compose_pane(&mut scratch, p.emulator(), content);
                     }
                 }
             } else {
@@ -8409,8 +8449,9 @@ async fn event_loop<T: Terminal>(
                 out.flush().context("terminal flush")?;
             }
             dirty = false;
-            // Consumed: the next frame is full unless another drag move re-arms it.
+            // Consumed: the next frame is full unless another drag/scroll re-arms it.
             selection_only = false;
+            scroll_only = false;
             if muse_ready {
                 // Only emit the ready marker when the event queue is
                 // completely drained.  If szhost still has buffered input (e.g.
@@ -8605,6 +8646,11 @@ async fn event_loop<T: Terminal>(
                                 p.scroll_down(delta);
                             }
                             dirty = true;
+                            // Only this pane's content moved — arm the partial
+                            // recompose (the render gate re-checks that no overlay
+                            // is up before taking the fast path).
+                            scroll_only = true;
+                            scroll_pane = Some(id);
                         }
                     } else if chrome.panel.is_some_and(|r| contains(r, mx, my)) {
                         // The inline file preview owns the wheel while open:
@@ -13014,105 +13060,141 @@ async fn event_loop<T: Terminal>(
                                     Action::FocusUp => Move::Up,
                                     _ => Move::Down,
                                 };
-                                // One spatial graph: panes first, then across
-                                // the chrome seams (sidebar ← center → panel).
-                                let pane_layout = session
-                                    .active_tab()
-                                    .map(|t| t.center.layout(chrome.center))
-                                    .unwrap_or_default();
-                                let ctx = crate::focus::RouteCtx {
-                                    sidebar_visible: want_sidebar && chrome.sidebar.is_some(),
-                                    panel_visible: want_panel && chrome.panel.is_some(),
-                                    layout: &pane_layout,
-                                    focused_pane: focused,
-                                };
-                                match crate::focus::route(focus.zone, mv, &ctx) {
-                                    FocusMove::CenterPane(n) => {
-                                        if let Some(tab) = session.active_tab_mut() {
-                                            tab.focused_pane = n;
-                                        }
-                                    }
-                                    FocusMove::Enter(zone) => {
-                                        focus.zone = zone;
-                                        if zone == Zone::Sidebar {
-                                            sb.focused = true;
-                                            sb.rebuild(&mut model, &session);
-                                        }
-                                    }
-                                    FocusMove::WithinZone(delta) => {
-                                        if focus.sidebar() {
-                                            let visible = SidebarState::visible_len(&model);
-                                            if delta < 0 {
-                                                sb.cursor = sb.cursor.saturating_sub(1);
-                                            } else if visible > 0 {
-                                                sb.cursor = (sb.cursor + 1).min(visible - 1);
+                                // Coalesce a held direction key's backlog into a
+                                // single gesture so focus stops the instant the
+                                // key is released (no drain-after-release
+                                // inertia), exactly as the panel j/k path does.
+                                let (repeat, leftover) = drain_key_repeats(&k, || {
+                                    buf.terminal()
+                                        .poll_input(Some(std::time::Duration::ZERO))
+                                        .ok()
+                                        .flatten()
+                                });
+                                if let Some(ev) = leftover {
+                                    pending_input.push_back(ev);
+                                }
+                                // Stepping the panel accordion persists + spawns
+                                // a git rehydration; do that once for the whole
+                                // gesture instead of once per coalesced repeat.
+                                let mut panel_section_changed = false;
+                                for _ in 0..repeat {
+                                    // One spatial graph: panes first, then across
+                                    // the chrome seams (sidebar ← center →
+                                    // panel). Recomputed each step so a multi-pane
+                                    // sweep (and any mid-gesture zone change)
+                                    // routes from the updated focus.
+                                    let cur_focused = session
+                                        .active_tab()
+                                        .map(|t| t.focused_pane)
+                                        .unwrap_or(focused);
+                                    let pane_layout = session
+                                        .active_tab()
+                                        .map(|t| t.center.layout(chrome.center))
+                                        .unwrap_or_default();
+                                    let ctx = crate::focus::RouteCtx {
+                                        sidebar_visible: want_sidebar
+                                            && chrome.sidebar.is_some(),
+                                        panel_visible: want_panel && chrome.panel.is_some(),
+                                        layout: &pane_layout,
+                                        focused_pane: cur_focused,
+                                    };
+                                    match crate::focus::route(focus.zone, mv, &ctx) {
+                                        FocusMove::CenterPane(n) => {
+                                            if let Some(tab) = session.active_tab_mut() {
+                                                tab.focused_pane = n;
                                             }
-                                            sb.sync(&mut model);
-                                        } else if focus.panel() {
-                                            // Row mode walks the open section's
-                                            // rows; section mode steps the
-                                            // accordion itself.
-                                            if panel_ui.row_mode {
-                                                let (pc, pr) = panel_geom(&chrome);
-                                                let max = crate::panel::frame::actionable_rows(
-                                                    &model, &panel_ui, pc, pr,
-                                                )
-                                                .saturating_sub(1);
-                                                panel_ui.cursor = if delta < 0 {
-                                                    panel_ui.cursor.saturating_sub(1)
+                                        }
+                                        FocusMove::Enter(zone) => {
+                                            focus.zone = zone;
+                                            if zone == Zone::Sidebar {
+                                                sb.focused = true;
+                                                sb.rebuild(&mut model, &session);
+                                            }
+                                        }
+                                        FocusMove::WithinZone(delta) => {
+                                            if focus.sidebar() {
+                                                let visible = SidebarState::visible_len(&model);
+                                                if delta < 0 {
+                                                    sb.cursor = sb.cursor.saturating_sub(1);
+                                                } else if visible > 0 {
+                                                    sb.cursor = (sb.cursor + 1).min(visible - 1);
+                                                }
+                                                sb.sync(&mut model);
+                                            } else if focus.panel() {
+                                                // Row mode walks the open
+                                                // section's rows; section mode
+                                                // steps the accordion itself (the
+                                                // persist + rehydrate is deferred
+                                                // until after the loop).
+                                                if panel_ui.row_mode {
+                                                    let (pc, pr) = panel_geom(&chrome);
+                                                    let max =
+                                                        crate::panel::frame::actionable_rows(
+                                                            &model, &panel_ui, pc, pr,
+                                                        )
+                                                        .saturating_sub(1);
+                                                    panel_ui.cursor = if delta < 0 {
+                                                        panel_ui.cursor.saturating_sub(1)
+                                                    } else {
+                                                        (panel_ui.cursor + 1).min(max)
+                                                    };
                                                 } else {
-                                                    (panel_ui.cursor + 1).min(max)
-                                                };
-                                            } else {
-                                                let next = if delta < 0 {
-                                                    panel_ui.prev_section()
-                                                } else {
-                                                    panel_ui.next_section()
-                                                };
-                                                open_panel_section(
-                                                    next,
-                                                    &mut panel_ui,
-                                                    &mut hydration_gen,
-                                                    &model_tx,
-                                                    &session,
-                                                    &waker,
-                                                    PanelDocsWiring {
-                                                        model: &model,
-                                                        generation: docs_gen,
-                                                        tx: &docs_tx,
-                                                    },
+                                                    panel_ui.open = if delta < 0 {
+                                                        panel_ui.prev_section()
+                                                    } else {
+                                                        panel_ui.next_section()
+                                                    };
+                                                    panel_section_changed = true;
+                                                }
+                                            }
+                                        }
+                                        FocusMove::None => {
+                                            // Ctrl+→ at the center's right edge
+                                            // with the panel hidden: pop it up at
+                                            // its normal width and focus it; the
+                                            // Panel-leave detector restores the
+                                            // saved visibility when navigated off.
+                                            if mv == Move::Right
+                                                && focus.zone == Zone::Center
+                                                && chrome.panel.is_none()
+                                            {
+                                                panel_auto_revealed =
+                                                    Some((want_panel, panel_forced));
+                                                want_panel = true;
+                                                panel_forced = cols < layout::PANEL_MIN_COLS;
+                                                chrome = compute_chrome(
+                                                    cols,
+                                                    rows,
+                                                    want_sidebar,
+                                                    want_panel,
+                                                    panel_forced,
+                                                    panel_width,
+                                                    sidebar_cols,
+                                                    zoom,
+                                                    &supervisor,
                                                 );
+                                                need_relayout = true;
+                                                focus.zone = Zone::Panel;
                                             }
                                         }
                                     }
-                                    FocusMove::None => {
-                                        // Ctrl+→ at the center's right edge
-                                        // with the panel hidden: pop it up at
-                                        // its normal width and focus it; the
-                                        // Panel-leave detector restores the
-                                        // saved visibility when navigated off.
-                                        if mv == Move::Right
-                                            && focus.zone == Zone::Center
-                                            && chrome.panel.is_none()
-                                        {
-                                            panel_auto_revealed = Some((want_panel, panel_forced));
-                                            want_panel = true;
-                                            panel_forced = cols < layout::PANEL_MIN_COLS;
-                                            chrome = compute_chrome(
-                                                cols,
-                                                rows,
-                                                want_sidebar,
-                                                want_panel,
-                                                panel_forced,
-                                                panel_width,
-                                                sidebar_cols,
-                                                zoom,
-                                                &supervisor,
-                                            );
-                                            need_relayout = true;
-                                            focus.zone = Zone::Panel;
-                                        }
-                                    }
+                                }
+                                // The accordion landed on its final section;
+                                // persist + rehydrate it exactly once.
+                                if panel_section_changed {
+                                    open_panel_section(
+                                        panel_ui.open,
+                                        &mut panel_ui,
+                                        &mut hydration_gen,
+                                        &model_tx,
+                                        &session,
+                                        &waker,
+                                        PanelDocsWiring {
+                                            model: &model,
+                                            generation: docs_gen,
+                                            tx: &docs_tx,
+                                        },
+                                    );
                                 }
                             }
                             Action::NewWorkspace => {
@@ -13660,6 +13742,26 @@ async fn event_loop<T: Terminal>(
                 let bytes = remapped
                     .or_else(|| crate::input::key_bytes_mode(&k.key, k.modifiers, app_cursor));
                 if let Some(bytes) = bytes {
+                    // Held-key autorepeat (typing, or arrow/nav keys consumed by
+                    // the program inside the pane) floods the input queue. Without
+                    // coalescing, each repeat is read on its own loop iteration and
+                    // interleaves with the pane's echo renders, so the backlog
+                    // drains as visible inertia *after* the key is released — and
+                    // worse than a raw multiplexer, which forwards bytes as fast as
+                    // they arrive. Drain the identical repeats and forward them as a
+                    // single batch (every keystroke is still delivered — N repeats →
+                    // the bytes written N times — we just skip the per-key render
+                    // round-trips). Same idiom as the wheel/panel coalescers above.
+                    let (repeat, leftover) = drain_key_repeats(&k, || {
+                        buf.terminal()
+                            .poll_input(Some(std::time::Duration::ZERO))
+                            .ok()
+                            .flatten()
+                    });
+                    if let Some(ev) = leftover {
+                        pending_input.push_back(ev);
+                    }
+                    let batched = if repeat > 1 { bytes.repeat(repeat) } else { bytes };
                     // Sync-panes (item 96): broadcast to every pane in the active
                     // tab. The drawer is excluded (it's a transient overlay, not
                     // part of the tab layout); broadcasting only happens when
@@ -13671,11 +13773,11 @@ async fn event_loop<T: Terminal>(
                             .unwrap_or_default();
                         for id in ids {
                             if let Some(p) = panes.table.get_mut(&id) {
-                                let _ = p.write_input(&bytes);
+                                let _ = p.write_input(&batched);
                             }
                         }
                     } else if let Some(p) = panes.table.get_mut(&target_pane) {
-                        p.write_input(&bytes)?;
+                        p.write_input(&batched)?;
                     }
                     keymap.reset();
                     // Typing into the terminal clears selections elsewhere
