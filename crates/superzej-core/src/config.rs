@@ -500,16 +500,27 @@ fn default_true() -> bool {
     true
 }
 
-/// A user-defined keybind action (`[[actions]]`): a chord bound to a shell
-/// command, optionally surfaced in the Cmd+K menu. See `src/keymap.rs`.
+/// A user-defined keybind action (`[[actions]]`): a chord bound to either a
+/// shell command (`run`) or a built-in composite operation (`action` +
+/// `params`), optionally surfaced in the Cmd+K menu. Exactly one of `run` /
+/// `action` must be set; see `src/keymap.rs`.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CustomAction {
     /// Stable id + default menu/hint label.
     pub name: String,
     /// Key chord (e.g. "Alt D"); validated by the host keymap.
     pub key: String,
-    /// Shell command line run via `sh -c`.
-    pub run: String,
+    /// Shell command line run via `sh -c`. Mutually exclusive with `action`.
+    #[serde(default)]
+    pub run: Option<String>,
+    /// Name of a built-in composite operation (e.g. `new-worktree`,
+    /// `new-pane`) to invoke in-process. Mutually exclusive with `run`.
+    #[serde(default)]
+    pub action: Option<String>,
+    /// String parameters for `action` (e.g. `sandbox`, `agent`, `name`).
+    /// Meaningless without `action`; the host keymap validates the keys.
+    #[serde(default)]
+    pub params: std::collections::BTreeMap<String, String>,
     /// Show in the command palette.
     #[serde(default)]
     pub menu: bool,
@@ -5198,6 +5209,40 @@ run = "echo hi"
         let b = &cfg.actions[1];
         assert!(!b.menu);
         assert!(b.floating && b.close_on_exit);
+        // run-form leaves the composite fields empty.
+        assert_eq!(a.run.as_deref(), Some("journalctl -f"));
+        assert!(a.action.is_none() && a.params.is_empty());
+    }
+
+    #[test]
+    fn composite_action_with_params_parses() {
+        let cfg: Config = toml::from_str(
+            r#"
+[[actions]]
+name = "scratch-shell"
+key = "Alt N"
+action = "new-worktree"
+params = { sandbox = "bwrap", agent = "shell" }
+menu = true
+
+[[actions]]
+name = "logs-pane"
+key = "Alt L"
+action = "new-pane"
+params = { run = "tail -f log/dev.log", placement = "right" }
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.actions.len(), 2);
+        let a = &cfg.actions[0];
+        assert!(a.run.is_none());
+        assert_eq!(a.action.as_deref(), Some("new-worktree"));
+        assert_eq!(a.params.get("sandbox").map(String::as_str), Some("bwrap"));
+        assert_eq!(a.params.get("agent").map(String::as_str), Some("shell"));
+        assert!(a.menu);
+        let b = &cfg.actions[1];
+        assert_eq!(b.action.as_deref(), Some("new-pane"));
+        assert_eq!(b.params.get("placement").map(String::as_str), Some("right"));
     }
 
     #[test]
