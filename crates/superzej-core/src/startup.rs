@@ -307,6 +307,109 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
+    /// Serializes the few tests that mutate the process-global `HOME`, so they
+    /// can't race each other (or anything else that reads `HOME`) when the test
+    /// binary runs them in parallel.
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn run_checks_uses_home_env_and_repairs() {
+        let _guard = HOME_LOCK.lock().unwrap();
+        let home = tmp_home("run-checks-env");
+
+        // Plant XDG config + the gitconfig mask.
+        let xdg_cfg = home.join(".config/git/config");
+        fs::create_dir_all(xdg_cfg.parent().unwrap()).unwrap();
+        fs::write(&xdg_cfg, b"[user]\n\tname = Env\n").unwrap();
+        let gitconfig = home.join(".gitconfig");
+        fs::create_dir(&gitconfig).unwrap();
+
+        // Drive the public entry point via the real HOME read.
+        let prev = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &home) };
+        run_checks();
+        match prev {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        let meta = fs::symlink_metadata(&gitconfig).unwrap();
+        assert!(meta.file_type().is_symlink());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn run_checks_returns_when_home_empty() {
+        let _guard = HOME_LOCK.lock().unwrap();
+        // An empty HOME (and an unset HOME) must take the early `return` arm
+        // and do nothing — no panic, no filesystem touch.
+        let prev = std::env::var_os("HOME");
+
+        unsafe { std::env::set_var("HOME", "") };
+        run_checks();
+
+        unsafe { std::env::remove_var("HOME") };
+        run_checks();
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    #[test]
+    fn repair_mask_logs_when_remove_dir_fails() {
+        // `repair_mask` called on a NON-empty directory: `remove_dir` fails with
+        // ENOTEMPTY, so it logs and bails (the early-return error arm). The
+        // directory is left untouched.
+        let home = tmp_home("remove-fail");
+        let gitconfig = home.join(".gitconfig");
+        fs::create_dir(&gitconfig).unwrap();
+        fs::write(gitconfig.join("keep"), b"x").unwrap();
+
+        repair_mask(&gitconfig, &home, ".gitconfig");
+
+        // Still a directory, contents preserved — repair aborted cleanly.
+        assert!(gitconfig.is_dir());
+        assert!(gitconfig.join("keep").exists());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn repair_gitconfig_logs_when_symlink_fails() {
+        // XDG config exists (so we take the symlink branch), but the target
+        // `gitconfig` path already exists as a file → `symlink` fails EEXIST,
+        // exercising the symlink-error arm.
+        let home = tmp_home("symlink-fail");
+        let xdg_dir = home.join(".config/git");
+        fs::create_dir_all(&xdg_dir).unwrap();
+        fs::write(xdg_dir.join("config"), b"[user]\n").unwrap();
+
+        let gitconfig = home.join(".gitconfig");
+        fs::write(&gitconfig, b"already here\n").unwrap();
+
+        repair_gitconfig(&gitconfig, &home);
+
+        // The pre-existing file is left as-is (symlink could not clobber it).
+        assert_eq!(fs::read_to_string(&gitconfig).unwrap(), "already here\n");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn repair_gitconfig_logs_when_write_fails() {
+        // No XDG config (placeholder branch), and the gitconfig parent dir does
+        // not exist → `fs::write` fails ENOENT, exercising the write-error arm.
+        let home = tmp_home("write-fail");
+        let gitconfig = home.join("missing-parent/.gitconfig");
+        assert!(!gitconfig.parent().unwrap().exists());
+
+        repair_gitconfig(&gitconfig, &home);
+
+        // Nothing was created — the write failed and was logged.
+        assert!(!gitconfig.exists());
+        let _ = fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn run_checks_skips_when_no_mask_present() {
         // A home where ~/.gitconfig is a real file (not a mask): run_checks_in

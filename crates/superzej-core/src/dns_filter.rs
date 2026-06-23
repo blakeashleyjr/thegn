@@ -292,4 +292,218 @@ mod tests {
         ];
         assert_eq!(extract_query_name(&packet), None);
     }
+
+    #[test]
+    fn extract_name_rejects_unterminated_labels() {
+        // A 12-byte header plus exactly one full label and nothing after it: the
+        // loop consumes the label, advances `pos` to the end, then re-enters the
+        // loop and finds `pos >= packet.len()` with no zero terminator → None.
+        let packet = vec![
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 1, b'a',
+        ];
+        assert_eq!(extract_query_name(&packet), None);
+    }
+
+    #[test]
+    fn extract_name_too_short_header() {
+        // Fewer than 13 bytes → immediate None.
+        assert_eq!(extract_query_name(&[0u8; 12]), None);
+        assert_eq!(extract_query_name(&[]), None);
+    }
+
+    #[test]
+    fn extract_name_multi_label() {
+        let packet = vec![
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 3, b'f', b'o',
+            b'o', 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ];
+        assert_eq!(extract_query_name(&packet), Some("foo.example.com".into()));
+    }
+
+    #[test]
+    fn name_matches_trailing_dots_normalised() {
+        // The pattern's trailing dot is stripped inside name_matches (the query's
+        // trailing dot is normalised earlier, in DnsPolicy::allows).
+        assert!(name_matches("example.com", "example.com."));
+        assert!(name_matches("sub.example.com", "example.com."));
+        assert!(name_matches("sub.example.com", "example.com"));
+        assert!(!name_matches("notexample.com", "example.com"));
+    }
+
+    #[test]
+    fn name_matches_exact_and_suffix() {
+        assert!(name_matches("example.com", "example.com"));
+        assert!(name_matches("a.b.example.com", "example.com"));
+        // suffix must be on a label boundary
+        assert!(!name_matches("fooexample.com", "example.com"));
+    }
+
+    #[test]
+    fn policy_trims_trailing_dot_on_query() {
+        let p = DnsPolicy {
+            allow: vec!["example.com".into()],
+            block: vec![],
+        };
+        assert!(p.allows("example.com."));
+        assert!(p.allows("sub.example.com."));
+    }
+
+    #[test]
+    fn wildcard_does_not_match_unrelated_suffix() {
+        let p = DnsPolicy {
+            allow: vec!["*.example.com".into()],
+            block: vec![],
+        };
+        assert!(p.allows("a.example.com"));
+        assert!(!p.allows("example.com"));
+        assert!(!p.allows("a.other.com"));
+    }
+
+    #[test]
+    fn build_response_short_query_returns_empty() {
+        assert_eq!(build_response(&[0u8; 11], 3), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn build_response_sets_flags_and_rcode() {
+        // 12-byte header + a question section.
+        let query = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xAB, 0xCD,
+        ];
+        let resp = nxdomain(&query);
+        // id preserved
+        assert_eq!(&resp[..2], &[0x12, 0x34]);
+        // QR + flags byte set
+        assert_eq!(resp[2], 0x81);
+        // rcode for NXDOMAIN
+        assert_eq!(resp[3] & 0x0F, 3);
+        // tail (question) carried over
+        assert_eq!(&resp[12..], &[0xAB, 0xCD]);
+
+        let sf = servfail(&query);
+        assert_eq!(sf[3] & 0x0F, 2);
+    }
+
+    #[test]
+    fn find_system_resolver_returns_addr() {
+        // Whatever the host's /etc/resolv.conf says (or the 8.8.8.8 fallback),
+        // this must return a usable address on port 53.
+        let addr = find_system_resolver();
+        assert_eq!(addr.port(), 53);
+    }
+
+    #[test]
+    fn forward_query_round_trips_against_fake_resolver() {
+        // Stand up a fake UDP "resolver" that echoes back a canned response.
+        let resolver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let resolver_addr = resolver.local_addr().unwrap();
+        let canned: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02];
+        let canned_clone = canned.clone();
+        let handle = std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let (_n, src) = resolver.recv_from(&mut buf).unwrap();
+            resolver.send_to(&canned_clone, src).unwrap();
+        });
+
+        let query = vec![0x00, 0x01, 0x02, 0x03];
+        let resp = forward_query(&query, &resolver_addr).expect("should get a response");
+        assert_eq!(resp, canned);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn forward_query_times_out_when_no_resolver() {
+        // An address with nothing listening: send succeeds, recv times out → None.
+        let dead = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead); // free the port so nothing answers
+        let query = vec![0x00, 0x01, 0x02, 0x03];
+        // recv_from on a connectionless socket with no responder times out after 3s.
+        assert_eq!(forward_query(&query, &dead_addr), None);
+    }
+
+    fn build_query(id: u16, name: &str) -> Vec<u8> {
+        let mut p = vec![
+            (id >> 8) as u8,
+            (id & 0xFF) as u8,
+            0x01,
+            0x00,
+            0x00,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+        ];
+        for label in name.split('.') {
+            p.push(label.len() as u8);
+            p.extend_from_slice(label.as_bytes());
+        }
+        p.push(0); // root terminator
+        p.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // QTYPE=A, QCLASS=IN
+        p
+    }
+
+    #[test]
+    fn server_end_to_end_singleton_and_events() {
+        // Exercises get_or_start (cold + warm), the running server thread
+        // (blocked + allowed branches, ring-buffer logging) and drain_events.
+        let policy = DnsPolicy {
+            allow: vec![],
+            block: vec!["blocked.example".into()],
+        };
+        let port = get_or_start(policy).expect("should bind a loopback port");
+
+        // Calling again returns the same warm port (the early-return branch).
+        let port2 = get_or_start(DnsPolicy {
+            allow: vec!["ignored".into()],
+            block: vec![],
+        })
+        .expect("warm port");
+        assert_eq!(port, port2);
+
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+        // Blocked name → NXDOMAIN (rcode 3), no network needed.
+        let q_blocked = build_query(0x1111, "blocked.example");
+        client.send_to(&q_blocked, server_addr).unwrap();
+        let mut buf = [0u8; 512];
+        let (n, _) = client.recv_from(&mut buf).unwrap();
+        assert!(n >= 4);
+        assert_eq!(&buf[..2], &[0x11, 0x11], "id echoed back");
+        assert_eq!(buf[3] & 0x0F, 3, "blocked name returns NXDOMAIN");
+
+        // Allowed name → server forwards to the real resolver. We don't assert on
+        // the payload (network may be unavailable; could be a real answer or a
+        // SERVFAIL), only that the server replies and logs the event.
+        let q_allowed = build_query(0x2222, "allowed.example");
+        client.send_to(&q_allowed, server_addr).unwrap();
+        let (n2, _) = client.recv_from(&mut buf).unwrap();
+        assert!(n2 >= 4);
+
+        // A malformed packet (too short to extract a name) is still handled: the
+        // name comes back empty and the server replies rather than crashing.
+        client.send_to(&[0u8; 4], server_addr).unwrap();
+        let _ = client.recv_from(&mut buf);
+
+        // Drain should surface the logged queries.
+        let events = drain_events();
+        let names: Vec<&str> = events.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"blocked.example"), "events: {names:?}");
+        assert!(
+            events
+                .iter()
+                .any(|e| e.name == "blocked.example" && !e.allowed),
+            "blocked event marked disallowed"
+        );
+
+        // A second drain returns nothing (the ring was emptied).
+        assert!(drain_events().is_empty());
+    }
 }

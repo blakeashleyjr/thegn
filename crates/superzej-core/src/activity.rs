@@ -336,4 +336,162 @@ mod tests {
         assert_eq!(read_states_at(&path).len(), 1);
         let _ = std::fs::remove_file(&path);
     }
+
+    /// Seed an `active` entry with a known low jiffies baseline so the next
+    /// poll (no real CPU advance under the bogus path) sees `delta < threshold`
+    /// and `now - last_active_at >= QUIET_GRACE_SECS`, flipping it to `quiet`.
+    #[test]
+    fn active_goes_quiet_after_grace() {
+        let path = tmp("quiet");
+        let _ = std::fs::remove_file(&path);
+        let managed = vec![ManagedWorktree {
+            worktree: "/nonexistent/wt-quiet".into(),
+            tab: "app/q".into(),
+        }];
+        // Baseline poll establishes prev + polled_at.
+        poll_and_save_at(&path, &managed, 1000.0);
+
+        // Hand-edit the entry into the `active` state with an old activity
+        // timestamp, then poll again past the grace window with no CPU advance.
+        let mut snap = load(&path);
+        {
+            let e = snap.worktrees.get_mut("/nonexistent/wt-quiet").unwrap();
+            e.state = "active".into();
+            e.cpu_jiffies = 0;
+            e.last_active_at = Some(1000.0);
+            e.quiet_since = None;
+        }
+        save(&path, &snap);
+
+        // wall = 1010 - 1000 = 10s > 0; delta = 0 < threshold; grace elapsed.
+        poll_and_save_at(&path, &managed, 1010.0);
+        let st = read_states_at(&path);
+        assert_eq!(st.get("app/q").map(String::as_str), Some("quiet"));
+
+        // The quiet_since stamp was recorded.
+        let snap = load(&path);
+        assert_eq!(
+            snap.worktrees["/nonexistent/wt-quiet"].quiet_since,
+            Some(1010.0)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An `active` entry still inside the grace window neither flaps to quiet
+    /// nor (without CPU advance) re-arms active — it just holds `active`.
+    #[test]
+    fn active_holds_within_grace() {
+        let path = tmp("hold");
+        let _ = std::fs::remove_file(&path);
+        let managed = vec![ManagedWorktree {
+            worktree: "/nonexistent/wt-hold".into(),
+            tab: "app/h".into(),
+        }];
+        poll_and_save_at(&path, &managed, 1000.0);
+
+        let mut snap = load(&path);
+        {
+            let e = snap.worktrees.get_mut("/nonexistent/wt-hold").unwrap();
+            e.state = "active".into();
+            e.cpu_jiffies = 0;
+            e.last_active_at = Some(1000.5);
+        }
+        save(&path, &snap);
+
+        // 1s wall, only 0.5s since last activity → within QUIET_GRACE_SECS.
+        poll_and_save_at(&path, &managed, 1001.0);
+        let st = read_states_at(&path);
+        assert_eq!(st.get("app/h").map(String::as_str), Some("active"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Drive the `active` transition (lines 157-159) and the `/proc` scan
+    /// (`scan_proc` + `stat_jiffies`) with a real CPU-burning child process
+    /// whose cwd lives under a managed worktree directory.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_cpu_burn_marks_active() {
+        use std::process::Command;
+        let wt = std::env::temp_dir().join(format!("sz-act-burn-{}", std::process::id()));
+        std::fs::create_dir_all(&wt).unwrap();
+        let path = tmp("burn");
+        let _ = std::fs::remove_file(&path);
+        let managed = vec![ManagedWorktree {
+            worktree: wt.to_string_lossy().into_owned(),
+            tab: "app/burn".into(),
+        }];
+
+        // A shell that spins, burning CPU, with cwd inside the worktree so
+        // scan_proc attributes its jiffies to this worktree.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("while :; do :; done")
+            .current_dir(&wt)
+            .spawn()
+            .expect("spawn cpu burner");
+
+        // Baseline poll records the burner's current jiffies.
+        poll_and_save_at(&path, &managed, 1000.0);
+
+        // Let it accumulate CPU, then poll again far enough apart that the
+        // scan actually runs (>= MIN_SCAN_INTERVAL_SECS) and the delta clears
+        // the active threshold.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        poll_and_save_at(&path, &managed, 1001.0);
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let st = read_states_at(&path);
+        // The burner ran for ~400ms wall against a 1s "wall" the FSM was told,
+        // so threshold = 3 jiffies and the delta (tens of jiffies) clears it.
+        assert_eq!(st.get("app/burn").map(String::as_str), Some("active"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    /// `stat_jiffies` parses utime+stime from a synthetic /proc/PID/stat line,
+    /// including a `comm` field that itself contains spaces and parens.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stat_jiffies_parses_fields() {
+        let p = std::env::temp_dir().join(format!("sz-stat-{}.txt", std::process::id()));
+        // pid (comm) state ppid pgrp ... fields 14/15 (utime/stime) are the
+        // 11th/12th whitespace tokens after the last ')'. Build a line where
+        // comm = "(weird cmd)" to exercise the rfind(')') logic.
+        // After ')': state(3) ppid(4) pgrp(5) session(6) tty(7) tpgid(8)
+        // flags(9) minflt(10) cminflt(11) majflt(12) cmajflt(13) utime(14)
+        // stime(15) ...
+        let line = "42 ((weird cmd)) R 1 1 1 0 -1 0 0 0 0 0 7 11 0 0";
+        std::fs::write(&p, line).unwrap();
+        assert_eq!(stat_jiffies(p.clone()), Some(18));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A malformed stat line (no ')') yields None.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stat_jiffies_handles_garbage() {
+        let p = std::env::temp_dir().join(format!("sz-stat-bad-{}.txt", std::process::id()));
+        std::fs::write(&p, "no parens here").unwrap();
+        assert_eq!(stat_jiffies(p.clone()), None);
+        let _ = std::fs::remove_file(&p);
+        // A missing file also yields None.
+        assert_eq!(stat_jiffies(PathBuf::from("/no/such/stat")), None);
+    }
+
+    /// The public, default-path wrappers must run without panicking, covering
+    /// `state_path`/`unix_now` plumbing.
+    #[test]
+    fn default_path_wrappers_dont_panic() {
+        let _ = read_states();
+        // poll_and_save against the real default path with no managed worktrees:
+        // a no-op step that just persists an empty snapshot.
+        poll_and_save(&[]);
+        // ack of a tab that isn't quiet anywhere: a harmless no-op.
+        ack("definitely-not-a-real-tab");
+        // unix_now returns a positive, monotonic-ish wall clock.
+        assert!(unix_now() > 0.0);
+    }
 }

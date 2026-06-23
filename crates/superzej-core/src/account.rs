@@ -425,6 +425,135 @@ mod tests {
     }
 
     #[test]
+    fn marked_authed_checks_marker_and_unknown_provider() {
+        let tmp = std::env::temp_dir().join(format!("sz-acct-mark-{}", util::now()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // No marker yet → not authed.
+        assert!(!marked_authed("claude", &tmp));
+        // Drop the provider's marker → authed.
+        std::fs::write(tmp.join(".credentials.json"), b"{}").unwrap();
+        assert!(marked_authed("claude", &tmp));
+        // Unknown provider has no marker concept → never authed.
+        assert!(!marked_authed("nope", &tmp));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn list_merges_config_and_db_with_dedup_and_auth() {
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+
+        // A config-adopted account whose dir contains the auth marker.
+        let authed_dir = std::env::temp_dir().join(format!("sz-acct-list-{}", util::now()));
+        std::fs::create_dir_all(&authed_dir).unwrap();
+        std::fs::write(authed_dir.join("auth.json"), b"{}").unwrap();
+        cfg.accounts.push(Account {
+            name: "adopted".into(),
+            provider: "codex".into(),
+            dir: Some(authed_dir.to_string_lossy().into_owned()),
+        });
+        // A config account with no dir → managed, not authed.
+        cfg.accounts.push(Account {
+            name: "managed".into(),
+            provider: "codex".into(),
+            dir: None,
+        });
+        // An account of a different provider must be filtered out.
+        cfg.accounts.push(Account {
+            name: "other".into(),
+            provider: "claude".into(),
+            dir: None,
+        });
+
+        // DB rows: one new, one that collides with a config name (skipped).
+        db.put_account("codex", "db-only", "/var/db-creds", true, 1)
+            .unwrap();
+        db.put_account("codex", "adopted", "/should/be/ignored", false, 2)
+            .unwrap();
+
+        let out = list(&cfg, &db, "codex");
+        let names: Vec<&str> = out.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["adopted", "managed", "db-only"]);
+
+        let adopted = &out[0];
+        assert!(!adopted.managed); // has an explicit dir
+        assert!(adopted.authed); // marker present
+        assert_eq!(adopted.dir, authed_dir);
+
+        let managed = &out[1];
+        assert!(managed.managed); // config dir is None
+        assert!(!managed.authed);
+        assert_eq!(managed.dir, managed_dir("codex", "managed"));
+
+        let db_only = &out[2];
+        assert!(db_only.managed); // DB row marked managed=true
+        assert!(!db_only.authed);
+        assert_eq!(db_only.dir, PathBuf::from("/var/db-creds"));
+        assert_eq!(db_only.provider, "codex");
+
+        std::fs::remove_dir_all(&authed_dir).ok();
+    }
+
+    #[test]
+    fn resolve_dir_follows_active_selection() {
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.accounts.push(Account {
+            name: "work".into(),
+            provider: "codex".into(),
+            dir: Some("/creds/codex-work".into()),
+        });
+        // No active selection → nothing to resolve.
+        assert_eq!(resolve_dir(&cfg, &db, "/wt", None, "codex"), None);
+
+        set_active(&db, Bind::Global, "/wt", None, "codex", "work").unwrap();
+        assert_eq!(
+            resolve_dir(&cfg, &db, "/wt", None, "codex"),
+            Some(PathBuf::from("/creds/codex-work"))
+        );
+    }
+
+    #[test]
+    fn set_active_workspace_and_worktree_scopes() {
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.workspace.entry("repo".into()).or_default();
+
+        // Workspace pointer with a missing slug falls back to the empty scope.
+        set_active(&db, Bind::Workspace, "/wt", None, "codex", "ws-default").unwrap();
+        // Worktree binding is keyed on the worktree path.
+        set_active(&db, Bind::Worktree, "/wt", Some("repo"), "codex", "wt-pin").unwrap();
+        assert_eq!(
+            active_name(&cfg, &db, "/wt", Some("repo"), "codex").as_deref(),
+            Some("wt-pin")
+        );
+        // The empty-slug workspace pointer is visible for that empty slug.
+        assert_eq!(
+            active_name(&cfg, &db, "/elsewhere", Some(""), "codex").as_deref(),
+            Some("ws-default")
+        );
+    }
+
+    #[test]
+    fn chip_label_formats_provider_and_name() {
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.agents.push(agent("codex", "codex", None));
+        // No active account → no chip.
+        assert_eq!(chip_label(&cfg, &db, "/wt", None, "codex"), None);
+
+        set_active(&db, Bind::Global, "/wt", None, "codex", "work").unwrap();
+        assert_eq!(
+            chip_label(&cfg, &db, "/wt", None, "codex").as_deref(),
+            Some("codex:work")
+        );
+
+        // A non-provider agent yields no chip.
+        cfg.agents.push(agent("sh", "bash", None));
+        assert_eq!(chip_label(&cfg, &db, "/wt", None, "sh"), None);
+    }
+
+    #[test]
     fn managed_dir_is_under_state_home() {
         let d = managed_dir("codex", "My Work!");
         assert!(
