@@ -179,6 +179,66 @@ pub fn highlight_file(text: &str, file_path: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Word-level / intra-line diff (item 601).
+// ---------------------------------------------------------------------------
+
+/// One run of characters within a diff line, tagged by whether it differs from
+/// the paired line. The host's panel renderer maps `changed` runs to a brighter
+/// emphasis tint over the line's add/remove background, so only the bytes that
+/// actually changed pop — not the whole line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WordSeg {
+    pub text: String,
+    pub changed: bool,
+}
+
+/// Append `text` to `segs`, coalescing with the previous run when it carries
+/// the same `changed` flag — keeps the segment list minimal for the renderer.
+fn push_word_seg(segs: &mut Vec<WordSeg>, text: &str, changed: bool) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(last) = segs.last_mut()
+        && last.changed == changed
+    {
+        last.text.push_str(text);
+        return;
+    }
+    segs.push(WordSeg {
+        text: text.to_string(),
+        changed,
+    });
+}
+
+/// Word-level intra-line diff between a removed line `old` and the paired added
+/// line `new`. Returns `(old_segs, new_segs)`: the old side tags deleted runs
+/// `changed`, the new side tags inserted runs `changed`, and runs common to
+/// both are `changed: false`. Tokenized on word boundaries, so a single changed
+/// word in an otherwise-equal line emphasizes just that word.
+///
+/// A side with no content (e.g. `old` empty on a pure insertion) returns an
+/// empty `Vec` for that side.
+pub fn word_diff(old: &str, new: &str) -> (Vec<WordSeg>, Vec<WordSeg>) {
+    use similar::{ChangeTag, TextDiff};
+
+    let diff = TextDiff::from_words(old, new);
+    let mut old_segs: Vec<WordSeg> = Vec::new();
+    let mut new_segs: Vec<WordSeg> = Vec::new();
+    for change in diff.iter_all_changes() {
+        let val = change.value();
+        match change.tag() {
+            ChangeTag::Equal => {
+                push_word_seg(&mut old_segs, val, false);
+                push_word_seg(&mut new_segs, val, false);
+            }
+            ChangeTag::Delete => push_word_seg(&mut old_segs, val, true),
+            ChangeTag::Insert => push_word_seg(&mut new_segs, val, true),
+        }
+    }
+    (old_segs, new_segs)
+}
+
+// ---------------------------------------------------------------------------
 // Helper — build ANSI escape sequence for a syntect style + optional diff bg.
 // ---------------------------------------------------------------------------
 
@@ -268,6 +328,102 @@ diff --git a/x.rs b/x.rs
         // Unknown extensions fall back to plain text without panicking.
         let plain = highlight_file("hello\n", "f.unknownext");
         assert!(plain.ends_with("\x1b[0m\n"));
+    }
+
+    // ---- word_diff (item 601) -------------------------------------------
+
+    /// The full text of a side, ignoring tags — must always reconstruct the
+    /// input so we never drop or duplicate characters.
+    fn joined(segs: &[WordSeg]) -> String {
+        segs.iter().map(|s| s.text.as_str()).collect()
+    }
+    /// Concatenated text of only the `changed` runs.
+    fn changed_text(segs: &[WordSeg]) -> String {
+        segs.iter()
+            .filter(|s| s.changed)
+            .map(|s| s.text.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn word_diff_identical_lines_have_no_emphasis() {
+        let (old, new) = word_diff("let x = 1;", "let x = 1;");
+        assert_eq!(joined(&old), "let x = 1;");
+        assert_eq!(joined(&new), "let x = 1;");
+        assert!(old.iter().all(|s| !s.changed));
+        assert!(new.iter().all(|s| !s.changed));
+        // Coalesced into a single equal run on each side.
+        assert_eq!(old.len(), 1);
+        assert_eq!(new.len(), 1);
+    }
+
+    #[test]
+    fn word_diff_single_word_change_emphasizes_only_that_word() {
+        let (old, new) = word_diff("let x = 1;", "let x = 2;");
+        // Both sides reconstruct fully.
+        assert_eq!(joined(&old), "let x = 1;");
+        assert_eq!(joined(&new), "let x = 2;");
+        // Only the differing region is flagged — the changed run carries the
+        // new digit, and the long shared prefix is NOT emphasized. (We assert
+        // containment, not an exact token, so the test isn't coupled to how
+        // `similar` groups adjacent punctuation like `1;`.)
+        assert!(changed_text(&old).contains('1'));
+        assert!(changed_text(&new).contains('2'));
+        assert!(!changed_text(&old).contains("let"));
+        assert!(!changed_text(&new).contains("let"));
+        // The shared prefix survives as a non-emphasized run.
+        assert!(old.iter().any(|s| !s.changed && s.text.contains("let x = ")));
+    }
+
+    #[test]
+    fn word_diff_insertion_only_flags_new_side_only() {
+        let (old, new) = word_diff("foo", "foo bar");
+        assert_eq!(joined(&old), "foo");
+        assert_eq!(joined(&new), "foo bar");
+        assert_eq!(changed_text(&old), ""); // nothing removed
+        assert!(changed_text(&new).contains("bar"));
+        assert!(old.iter().all(|s| !s.changed));
+    }
+
+    #[test]
+    fn word_diff_deletion_only_flags_old_side_only() {
+        let (old, new) = word_diff("foo bar", "foo");
+        assert_eq!(joined(&old), "foo bar");
+        assert_eq!(joined(&new), "foo");
+        assert!(changed_text(&old).contains("bar"));
+        assert_eq!(changed_text(&new), "");
+        assert!(new.iter().all(|s| !s.changed));
+    }
+
+    #[test]
+    fn word_diff_empty_sides_return_empty_vecs() {
+        // Pure insertion: old side has no segments at all.
+        let (old, new) = word_diff("", "abc");
+        assert!(old.is_empty());
+        assert_eq!(joined(&new), "abc");
+        assert_eq!(changed_text(&new), "abc");
+        // Pure deletion: symmetric.
+        let (old2, new2) = word_diff("abc", "");
+        assert!(new2.is_empty());
+        assert_eq!(changed_text(&old2), "abc");
+        // Both empty: nothing on either side.
+        let (old3, new3) = word_diff("", "");
+        assert!(old3.is_empty() && new3.is_empty());
+    }
+
+    #[test]
+    fn word_diff_respects_word_and_punctuation_boundaries() {
+        // Changing inside a call: the function name stays, the arg changes.
+        let (old, new) = word_diff("draw(a, b)", "draw(a, c)");
+        assert_eq!(joined(&old), "draw(a, b)");
+        assert_eq!(joined(&new), "draw(a, c)");
+        assert!(changed_text(&old).contains('b'));
+        assert!(changed_text(&new).contains('c'));
+        // The function name is shared and must not be emphasized on either side.
+        assert!(!changed_text(&old).contains("draw"));
+        assert!(!changed_text(&new).contains("draw"));
+        // The unchanged head is preserved as a non-emphasized run.
+        assert!(new.iter().any(|s| !s.changed && s.text.contains("draw")));
     }
 
     #[test]

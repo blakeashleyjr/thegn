@@ -23,14 +23,40 @@ impl ResetMode {
     }
 }
 
+/// Build the `git commit` argv for the given toggles (message is piped on
+/// stdin via the trailing `-F -`). Pure, so the flag wiring is unit-tested
+/// without invoking git or a live gpg-agent.
+///
+/// `sign`: `Some(true)` forces `--gpg-sign`, `Some(false)` forces
+/// `--no-gpg-sign`, `None` inherits the repo's `commit.gpgSign` config.
+/// `no_verify` skips the pre-commit / commit-msg hooks.
+pub(crate) fn commit_args(no_verify: bool, sign: Option<bool>) -> Vec<&'static str> {
+    let mut args = vec!["commit"];
+    if no_verify {
+        args.push("--no-verify");
+    }
+    match sign {
+        Some(true) => args.push("--gpg-sign"),
+        Some(false) => args.push("--no-gpg-sign"),
+        None => {}
+    }
+    args.extend(["-F", "-"]);
+    args
+}
+
 pub trait CommitOps: GitBackend {
-    /// Commit the staged changes (`git commit -F -`).
-    fn commit(&self, loc: &GitLoc, message: &str, no_verify: bool) -> Result<()> {
-        let mut args = vec!["commit"];
-        if no_verify {
-            args.push("--no-verify");
-        }
-        args.extend(["-F", "-"]);
+    /// Commit the staged changes (`git commit -F -`). `no_verify` skips hooks;
+    /// `sign` overrides the repo's commit-signing config (item 328). On
+    /// failure the error carries the combined hook output so the caller can
+    /// surface why a pre-commit hook rejected the commit (item 329).
+    fn commit(
+        &self,
+        loc: &GitLoc,
+        message: &str,
+        no_verify: bool,
+        sign: Option<bool>,
+    ) -> Result<()> {
+        let args = commit_args(no_verify, sign);
         run_stdin(loc, &[], &args, message.as_bytes()).map(|_| ())
     }
 
@@ -122,11 +148,85 @@ mod tests {
         let loc = repo.loc();
 
         let msg = "subject with 'single' \"double\" $VARS\n\nbody `backticks` and $HOME\nsecond body line";
-        CliGit.commit(&loc, msg, false).unwrap();
+        CliGit.commit(&loc, msg, false, None).unwrap();
         // %B is the raw body; stdin piping must round-trip it verbatim
         // (modulo git's trailing-newline cleanup, matched by out()'s trim).
         assert_eq!(repo.out(&["log", "-1", "--format=%B"]), msg);
         assert!(CliGit.status(&loc).unwrap().is_empty());
+    }
+
+    #[test]
+    fn commit_args_wires_signing_and_no_verify_flags() {
+        // Item 328: pure arg-building, no live gpg needed.
+        assert_eq!(super::commit_args(false, None), vec!["commit", "-F", "-"]);
+        assert_eq!(
+            super::commit_args(true, None),
+            vec!["commit", "--no-verify", "-F", "-"]
+        );
+        assert_eq!(
+            super::commit_args(false, Some(true)),
+            vec!["commit", "--gpg-sign", "-F", "-"]
+        );
+        assert_eq!(
+            super::commit_args(false, Some(false)),
+            vec!["commit", "--no-gpg-sign", "-F", "-"]
+        );
+        // Both toggles together, in order.
+        assert_eq!(
+            super::commit_args(true, Some(false)),
+            vec!["commit", "--no-verify", "--no-gpg-sign", "-F", "-"]
+        );
+    }
+
+    #[test]
+    fn commit_signing_off_succeeds_without_a_gpg_key() {
+        // `--no-gpg-sign` (sign=Some(false)) must commit cleanly even with no
+        // gpg key configured — proves the flag is accepted end-to-end.
+        let repo = TestRepo::new("co-sign-off");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "one\n", "c0");
+        std::fs::write(repo.dir.join("f.txt"), "two\n").unwrap();
+        git_in(&repo.dir, &["add", "f.txt"]);
+        let loc = repo.loc();
+        CliGit.commit(&loc, "signed off", false, Some(false)).unwrap();
+        assert_eq!(repo.subjects()[0], "signed off");
+        assert!(CliGit.status(&loc).unwrap().is_empty());
+    }
+
+    #[test]
+    fn failing_pre_commit_hook_surfaces_its_output_and_no_verify_bypasses() {
+        // Item 329: a rejecting pre-commit hook's message (printed to stdout)
+        // must reach the error; `no_verify` skips the hook entirely.
+        let repo = TestRepo::new("co-hook");
+        ident(&repo.dir);
+        repo.commit_file("f.txt", "one\n", "c0");
+
+        let hook = repo.dir.join(".git/hooks/pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\necho 'LINT FAILED: tabs not allowed'\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        std::fs::write(repo.dir.join("f.txt"), "two\n").unwrap();
+        git_in(&repo.dir, &["add", "f.txt"]);
+        let loc = repo.loc();
+
+        // Hooks run → commit is rejected and the hook's stdout is surfaced.
+        let err = CliGit
+            .commit(&loc, "blocked", false, None)
+            .expect_err("pre-commit hook should reject the commit");
+        assert!(
+            err.to_string().contains("LINT FAILED"),
+            "hook output missing from error: {err}"
+        );
+        // The rejected commit left HEAD untouched.
+        assert_eq!(repo.subjects(), vec!["c0"]);
+
+        // `no_verify` skips the hook → the commit lands.
+        CliGit.commit(&loc, "forced", true, None).unwrap();
+        assert_eq!(repo.subjects()[0], "forced");
     }
 
     #[test]

@@ -93,6 +93,15 @@ pub enum Action {
     Yazi,
     Editor,
     Diff,
+    /// Push the current branch to its upstream — fast-path, no branches-panel
+    /// navigation (item 605). Offers `push -u` when there is no upstream.
+    Push,
+    /// Pull the current branch from its upstream (item 605).
+    Pull,
+    /// Fetch all remotes with prune (item 605).
+    Fetch,
+    /// Open the rollback/discard window for the active worktree (item 604).
+    Rollback,
     ScrollUp,
     ScrollDown,
     CopyPane,
@@ -433,6 +442,34 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         palette: true,
     },
     ActionSpec {
+        id: "git-push",
+        label: "Git push (current branch)",
+        hint: "push",
+        default_chords: &[],
+        palette: true,
+    },
+    ActionSpec {
+        id: "git-pull",
+        label: "Git pull (current branch)",
+        hint: "pull",
+        default_chords: &[],
+        palette: true,
+    },
+    ActionSpec {
+        id: "git-fetch",
+        label: "Git fetch (all remotes, prune)",
+        hint: "fetch",
+        default_chords: &[],
+        palette: true,
+    },
+    ActionSpec {
+        id: "rollback",
+        label: "Rollback / discard changes…",
+        hint: "rollback",
+        default_chords: &[],
+        palette: true,
+    },
+    ActionSpec {
         id: "scroll-up",
         label: "Scroll pane up",
         hint: "scroll↑",
@@ -705,6 +742,10 @@ impl Action {
             Action::Yazi => "yazi",
             Action::Editor => "editor",
             Action::Diff => "show-diff",
+            Action::Push => "git-push",
+            Action::Pull => "git-pull",
+            Action::Fetch => "git-fetch",
+            Action::Rollback => "rollback",
             Action::ScrollUp => "scroll-up",
             Action::ScrollDown => "scroll-down",
             Action::CopyPane => "copy-pane",
@@ -770,6 +811,10 @@ impl Action {
             "yazi" | "tool-yazi" => Action::Yazi,
             "editor" | "tool-editor" => Action::Editor,
             "show-diff" | "diff" | "tool-diff" => Action::Diff,
+            "git-push" | "push" => Action::Push,
+            "git-pull" | "pull" => Action::Pull,
+            "git-fetch" | "fetch" => Action::Fetch,
+            "rollback" | "discard-window" => Action::Rollback,
             "scroll-up" => Action::ScrollUp,
             "scroll-down" => Action::ScrollDown,
             "copy-pane" => Action::CopyPane,
@@ -1535,6 +1580,27 @@ mod tests {
         assert_eq!(Action::from_key("pin-9"), Some(Action::SummonPin(9)));
         assert_eq!(Action::from_key("pin-0"), None);
         assert_eq!(Action::from_key("pin-99"), None);
+    }
+
+    #[test]
+    fn git_fastpath_actions_round_trip_and_are_in_the_palette() {
+        // Item 605: push/pull/fetch reachable from the palette (no default
+        // chord — user-bindable), with stable ids + alias parsing.
+        for (action, id, alias) in [
+            (Action::Push, "git-push", "push"),
+            (Action::Pull, "git-pull", "pull"),
+            (Action::Fetch, "git-fetch", "fetch"),
+        ] {
+            assert_eq!(action.key(), id);
+            assert_eq!(Action::from_key(id), Some(action.clone()));
+            assert_eq!(Action::from_key(alias), Some(action.clone()));
+            let spec = action_spec(id).expect("spec registered");
+            assert!(spec.palette, "{id} must appear in the command palette");
+            assert!(
+                spec.default_chords.is_empty(),
+                "{id} ships without a default chord"
+            );
+        }
     }
 
     #[test]
