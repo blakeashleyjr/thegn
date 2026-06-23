@@ -509,25 +509,33 @@ fn collect_sidebar_status(
         .filter(|p| seen.insert(p.clone()) && std::path::Path::new(p).is_dir())
         .collect();
 
-    // (path, dirty, ahead, behind, branch) — git only, no DB access in the scope.
-    let git_rows: Vec<(String, bool, usize, usize, Option<String>)> = std::thread::scope(|s| {
-        let handles: Vec<_> = paths
-            .iter()
-            .map(|p| {
-                s.spawn(move || {
-                    let loc = GitLoc::for_worktree(std::path::Path::new(p));
-                    let git = GixGit::new();
-                    let dirty = git.is_dirty(&loc).unwrap_or(false);
-                    let (ahead, behind) = git.ahead_behind(&loc).ok().flatten().unwrap_or((0, 0));
-                    let branch = git.current_branch(&loc).ok();
-                    (p.clone(), dirty, ahead, behind, branch)
+    // (path, dirty, ahead, behind, branch, repo_root) — git only, no DB access
+    // in the scope. `repo_root` is the main-worktree root shared by every linked
+    // worktree of the repo; it keys the repo-wide `pr_branch_cache` (item 28).
+    let git_rows: Vec<(String, bool, usize, usize, Option<String>, String)> =
+        std::thread::scope(|s| {
+            let handles: Vec<_> = paths
+                .iter()
+                .map(|p| {
+                    s.spawn(move || {
+                        let wt = std::path::Path::new(p);
+                        let loc = GitLoc::for_worktree(wt);
+                        let git = GixGit::new();
+                        let dirty = git.is_dirty(&loc).unwrap_or(false);
+                        let (ahead, behind) =
+                            git.ahead_behind(&loc).ok().flatten().unwrap_or((0, 0));
+                        let branch = git.current_branch(&loc).ok();
+                        let repo_root = superzej_core::repo::main_worktree(wt)
+                            .map(|r| r.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| p.clone());
+                        (p.clone(), dirty, ahead, behind, branch, repo_root)
+                    })
                 })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
 
-    for (path, dirty, ahead, behind, branch) in git_rows {
+    for (path, dirty, ahead, behind, branch, repo_root) in git_rows {
         status.git.insert(
             path.clone(),
             crate::sidebar::GitGlyphs {
@@ -540,9 +548,10 @@ fn collect_sidebar_status(
             status.agent.insert(path.clone(), agent);
         }
         // PR badge: open PRs for this worktree's current branch, joined from the
-        // `pr_branch_cache` (keyed by worktree path, matching the branches view).
+        // repo-wide `pr_branch_cache` (keyed by repo root, so every worktree of
+        // the repo — not just the active one — resolves its branch's count).
         if let Some(branch) = branch
-            && let Ok(counts) = db.get_open_pr_counts_by_branch(&path)
+            && let Ok(counts) = db.get_open_pr_counts_by_branch(&repo_root)
             && let Some(&n) = counts.get(&branch)
             && n > 0
         {
@@ -1303,7 +1312,13 @@ pub(crate) fn spawn_pr_cache_refresh(
             && let Ok(json) = serde_json::to_string(&prs)
             && let Ok(db) = superzej_core::db::Db::open()
         {
-            let _ = db.put_pr_branch_cache(&loc.path(), &json);
+            // `pr_list` returns the repo's open PRs (branch-independent), so key
+            // the cache by repo root — every worktree of the repo reads the same
+            // entry to resolve its own branch's badge (item 28).
+            let repo_root = superzej_core::repo::main_worktree(&cwd)
+                .map(|r| r.to_string_lossy().into_owned())
+                .unwrap_or_else(|| loc.path());
+            let _ = db.put_pr_branch_cache(&repo_root, &json);
             if let Some(w) = &branch_waker {
                 let _ = w.wake();
             }

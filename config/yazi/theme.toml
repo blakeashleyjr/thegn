@@ -37,3 +37,15 @@ fg = "{{ACCENT}}"
 bg = "{{ACCENT}}"
 fg = "#14161f"
 bold = true
+
+# git.yazi status linemode (item 606). Colors mirror superzej's panel diff hues:
+# added/untracked green, modified amber, deleted red, updated accent, rest faint.
+[git]
+modified  = { fg = "#f0c674" }
+added     = { fg = "#79e3a5" }
+untracked = { fg = "#79e3a5" }
+deleted   = { fg = "#f7768e" }
+updated   = { fg = "{{ACCENT}}" }
+unknown   = { fg = "#6b7089" }
+ignored   = { fg = "#6b7089" }
+clean     = { fg = "#6b7089" }

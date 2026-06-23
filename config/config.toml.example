@@ -100,12 +100,15 @@ gpu = "nvtop"    # GPU monitor
 # list of widget ids; unknown ids are skipped. Top-bar widgets: "brand"
 # (superzej + version), "cpu", "mem", "gpu" (NVIDIA only; hidden if absent),
 # "net", "date", "clock". Bottom-bar widgets: "keyhints" (context-dependent
-# keybinds for the focused zone), "status" (transient messages).
+# keybinds for the focused zone), "pr" (forge + PR number, state-colored),
+# "tests" (✓pass ✗fail rollup of the last test run; green all-pass, red on
+# failure; hidden until a run), "loc" (tokei line count), "status" (transient
+# messages).
 [bars]
 top_left = ["brand"]
 top_right = ["cpu", "mem", "gpu", "net", "battery", "date", "clock"]
 bottom_left = ["keyhints"]
-bottom_right = ["pr", "loc", "status"]   # "loc" = tokei line count (needs tokei)
+bottom_right = ["pr", "tests", "loc", "status"]   # "loc" = tokei line count (needs tokei)
 # chrono format strings for the date/clock widgets.
 date_format = "%a %b %-d"
 clock_format = "%H:%M"
@@ -159,6 +162,10 @@ width = "full"
 # previews remain on. With config_home = "system", superzej does not rewrite your
 # yazi config, so containment below is still the safety net.
 image_previews = false
+# Show git status as a linemode in the drawer (added/modified/deleted/etc.).
+# Seeds the bundled git.yazi plugin into the private config and registers it as a
+# fetcher; set false to remove it. Ignored with config_home = "system".
+git_status = true
 # Run yazi and preview helper children in a bounded user systemd scope when
 # systemd-run is available. Empty limit strings omit that property.
 contain = true
@@ -244,6 +251,13 @@ format = "text"           # text | json
 #
 # Rebind a built-in by its id (see `superzej keys list` for ids).
 # Flat entries override chords globally.
+# IDE keymap preset overlaid on the built-in defaults: "default" (none),
+# "vscode", or "jetbrains". Maps familiar chords (Ctrl+P quick-open, Ctrl+Shift+P
+# command palette, Ctrl+B sidebar, …) to existing actions; [keybinds] below still
+# override it. On first launch a one-time picker offers these; setting this key
+# explicitly skips the picker. The vim/emacs MODES are separate — see [profiles].
+# keymap_preset = "vscode"
+
 [keybinds]
 # new-worktree = "Ctrl w"
 # toggle-sidebar = "Alt s"
