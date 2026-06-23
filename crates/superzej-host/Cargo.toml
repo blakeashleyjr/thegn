@@ -11,6 +11,13 @@ description = "superzej native terminal host: the compositor + in-process chrome
 name = "szhost"
 path = "src/main.rs"
 
+[features]
+# In-process sampling profiler (SIGUSR2 → flamegraph dump from the live process,
+# sidestepping ptrace_scope=1). Zero cost when off: the `pprof` dep and the
+# signal handler are only compiled in under this feature. Build with
+# `cargo build --features profiling` (see `just profile`).
+profiling = ["dep:pprof"]
+
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
 superzej-core.workspace = true
@@ -41,6 +48,9 @@ reqwest = { version = "0.12", default-features = false, features = [
   "blocking",
   "rustls-tls",
 ] }
+# Optional in-process sampling profiler (the `profiling` feature). flamegraph
+# feature emits an SVG directly; protobuf would add pprof output.
+pprof = { version = "0.14", features = ["flamegraph"], optional = true }
 # The app-tab embedding contract (AppTile, shared theme, the pinned ratatui
 # re-export). The host renders embedded apps' ratatui buffers through
 # `sz_kit::ratatui` so the Buffer type is identical to what the apps produce.

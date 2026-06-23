@@ -50,6 +50,69 @@ bench: release
     hyperfine --warmup 3 \
       "script -qec 'env XDG_STATE_HOME=/tmp/sz-bench-state SUPERZEJ_BENCH_FIRST_FRAME_EXIT=1 target/release/szhost' /dev/null"
 
+# Guard run by every perf recipe: refuse to measure a debug or stale binary.
+# The debug-vs-release CPU gap is ~2.5x (and cargo test/clippy don't rebuild
+# target/debug/szhost), so a perf number from the wrong binary is worse than
+# none. Prints the resolved binary + mtime + profile so reports self-describe.
+_perf-guard:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    b="target/release/szhost"
+    if [ ! -x "$b" ]; then
+      echo "perf: $b not built — run 'just release' first" >&2; exit 1
+    fi
+    src_newest="$(find crates apps -name '*.rs' -newer "$b" 2>/dev/null | head -1 || true)"
+    if [ -n "$src_newest" ]; then
+      echo "perf: $b is STALE (newer source: $src_newest) — run 'just release'" >&2; exit 1
+    fi
+    echo "perf: binary=$b mtime=$(date -r "$b" '+%F %T') profile=release"
+
+# Idle CPU benchmark: launch szhost in a PTY over a fixture of N worktrees, let
+# it settle, sample /proc CPU over a window, and assert it stays under the
+# 0%-idle ceiling. This is the steady-state cost `just bench` never sees.
+bench-idle: release _perf-guard
+    bash test/perf/cpu-sample.sh --scenario idle
+
+# Record the current idle reading as this machine's baseline (machine-scoped).
+bench-idle-record: release _perf-guard
+    bash test/perf/cpu-sample.sh --scenario idle --record
+
+# Steady-workload CPU benchmark (A/B only — feeds scripted keystrokes).
+bench-steady: release _perf-guard
+    bash test/perf/cpu-sample.sh --scenario steady-workload --window-ms 6000
+
+# Criterion micro-benchmarks across the workspace (hot git path, core models).
+# `cargo bench` uses the release-grade bench profile. For a debug-vs-release
+# A/B, append `--profile dev`. Pass extra criterion args after `--`.
+bench-micro *args:
+    cargo bench --workspace {{args}}
+
+# Just the git hot-path benches (is_dirty / ahead_behind / current_branch,
+# gix vs CLI, scaled by worktree count) — the dominant idle cost.
+bench-micro-svc *args:
+    cargo bench -p superzej-svc --bench git_hot {{args}}
+
+# Umbrella: startup (hyperfine) + idle CPU + micro-benches. Self-describing
+# (each sub-recipe prints its binary/profile). Machine-dependent — not in CI.
+perf: bench bench-idle bench-micro
+    @echo "perf: startup + idle + micro complete"
+
+# Build szhost with the in-process sampling profiler (release + profiling
+# feature). SIGUSR2 toggles a flamegraph capture written to
+# $XDG_STATE_HOME/superzej/profiles/. Profiles the live process (sidesteps
+# ptrace_scope=1, which blocks external perf/gdb attach).
+release-profiling:
+    cargo build --release --features profiling -p superzej-host
+
+# Launch szhost under the profiler and print how to drive it. Run from a real
+# terminal. `kill -USR2 <pid>` once to start sampling, again to dump.
+profile *args: release-profiling
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "profiler: send 'kill -USR2 \$(pgrep -n szhost)' to start, again to dump."
+    echo "profiles land in \$XDG_STATE_HOME/superzej/profiles/ (or ~/.local/state/...)."
+    SUPERZEJ_LOG=szhost::perf=info target/release/szhost {{args}}
+
 # Build the Nix package; symlinks ./result.
 nix-build:
     nix build .#default
