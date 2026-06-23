@@ -124,7 +124,9 @@ pub fn thread_cpu_ns() -> u64 {
     // SAFETY: `ts` is a valid, fully-owned timespec for the duration of the call.
     let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
     if rc == 0 {
-        (ts.tv_sec as u64).wrapping_mul(1_000_000_000).wrapping_add(ts.tv_nsec as u64)
+        (ts.tv_sec as u64)
+            .wrapping_mul(1_000_000_000)
+            .wrapping_add(ts.tv_nsec as u64)
     } else {
         0
     }
@@ -172,6 +174,7 @@ impl Subsys {
     ];
     pub const N: usize = Self::ALL.len();
 
+    #[allow(dead_code)] // subsystem label, used by the Telemetry overlay's CPU breakdown
     pub fn label(self) -> &'static str {
         match self {
             Subsys::Hydrate => "hydrate",
@@ -218,8 +221,8 @@ impl CpuLedger {
     /// in [`Subsys::ALL`] order. Called once per rollup interval.
     pub fn take(&self) -> [(u64, u64); Subsys::N] {
         let mut out = [(0u64, 0u64); Subsys::N];
-        for i in 0..Subsys::N {
-            out[i] = (
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = (
                 self.ns[i].swap(0, Ordering::Relaxed),
                 self.calls[i].swap(0, Ordering::Relaxed),
             );
@@ -294,6 +297,7 @@ impl Histo {
         self.count += 1;
     }
 
+    #[allow(dead_code)] // histogram helper, used by the Telemetry overlay
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
@@ -545,6 +549,7 @@ impl LoopPerf {
     }
 
     /// Per-source message counts in [`WakeSource::ALL`] order.
+    #[allow(dead_code)] // consumed by the Telemetry overlay's wake-source breakdown
     pub fn per_source(&self) -> [u64; WakeSource::N] {
         self.drain_items
     }
@@ -583,6 +588,7 @@ impl Default for LoopPerf {
 /// and consumed by the live Telemetry overlay. All rates are per-second.
 #[derive(Clone, Debug, Default)]
 pub struct PerfSnapshot {
+    #[allow(dead_code)] // rollup interval length; surfaced by the Telemetry overlay
     pub secs: f64,
     pub wakes_per_s: f64,
     pub renders_per_s: f64,
@@ -594,6 +600,7 @@ pub struct PerfSnapshot {
     pub hot_items_per_s: f64,
     pub pty_chunks_per_s: f64,
     /// Per-subsystem CPU ms this interval, in [`Subsys::ALL`] order.
+    #[allow(dead_code)] // surfaced by the Telemetry overlay's per-subsystem breakdown
     pub cpu_ms: [f64; Subsys::N],
 }
 

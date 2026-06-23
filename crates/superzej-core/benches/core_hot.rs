@@ -12,7 +12,9 @@ use superzej_core::theme::{Palette, extend_palette, preset};
 
 fn bench_theme(c: &mut Criterion) {
     let mut g = c.benchmark_group("theme");
-    g.bench_function("palette_default", |b| b.iter(|| black_box(Palette::default())));
+    g.bench_function("palette_default", |b| {
+        b.iter(|| black_box(Palette::default()))
+    });
     g.bench_function("extend_palette", |b| {
         b.iter(|| {
             let mut p = Palette::default();

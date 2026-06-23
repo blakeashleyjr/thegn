@@ -19,6 +19,9 @@ use tempfile::TempDir;
 /// A built fixture. Hold it for the lifetime of the bench — dropping it removes
 /// the tempdir.
 pub struct GitFixture {
+    /// Owns the tempdir; never read directly — held so its `Drop` cleans up when
+    /// the fixture goes out of scope.
+    #[allow(dead_code)]
     pub dir: TempDir,
     pub worktrees: Vec<GitLoc>,
 }
@@ -115,7 +118,12 @@ pub fn build(n: usize, dirty: usize) -> GitFixture {
         // Track origin/main so ahead/behind does real work.
         git(
             &wt,
-            &["branch", "-q", "--set-upstream-to=origin/main", &format!("wt-{i}")],
+            &[
+                "branch",
+                "-q",
+                "--set-upstream-to=origin/main",
+                &format!("wt-{i}"),
+            ],
             &home,
             &gitconfig,
         );

@@ -133,11 +133,13 @@ impl LoopPerfHistory {
     }
 
     /// Renders/s series normalized by the window max.
+    #[allow(dead_code)] // sparkline series for the Telemetry overlay
     pub fn renders_series(&self, n: usize) -> Vec<f32> {
         norm(series(&self.renders, n))
     }
 
     /// Render p99 (µs) series normalized by the window max.
+    #[allow(dead_code)] // sparkline series for the Telemetry overlay
     pub fn render_p99_series(&self, n: usize) -> Vec<f32> {
         norm(series(&self.render_p99_us, n))
     }
