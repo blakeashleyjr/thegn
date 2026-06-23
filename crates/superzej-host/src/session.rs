@@ -521,6 +521,10 @@ impl Session {
     }
 
     /// Move to the next worktree group (wraps); it restores its own active tab.
+    /// Simple session-order wrap; the live `Action::NextWorktree` uses the richer
+    /// workspace-confined display-order walk in `run.rs`. Retained as the tested
+    /// baseline model.
+    #[allow(dead_code)]
     pub fn next_worktree(&mut self) {
         if !self.worktrees.is_empty() {
             self.active = (self.active + 1) % self.worktrees.len();
@@ -528,6 +532,7 @@ impl Session {
     }
 
     /// Move to the previous worktree group (wraps).
+    #[allow(dead_code)]
     pub fn prev_worktree(&mut self) {
         if !self.worktrees.is_empty() {
             self.active = (self.active + self.worktrees.len() - 1) % self.worktrees.len();

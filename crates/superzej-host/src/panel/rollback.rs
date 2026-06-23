@@ -138,7 +138,10 @@ impl RollbackModal {
             Some(hs) if !hs.is_empty() => {
                 let mut lines = Vec::new();
                 for h in hs.iter().take(2) {
-                    lines.push(Line::segs(vec![seg(Tok::Slot(S::Ghost2), h.header.clone())]));
+                    lines.push(Line::segs(vec![seg(
+                        Tok::Slot(S::Ghost2),
+                        h.header.clone(),
+                    )]));
                     for (origin, text) in h.lines.iter().take(4) {
                         let (tok, mark) = match origin {
                             '+' => (Tok::Hue(superzej_core::theme::Hue::Green), "+ "),
@@ -153,7 +156,10 @@ impl RollbackModal {
                 }
                 lines
             }
-            _ => vec![Line::segs(vec![seg(Tok::Slot(S::Ghost2), "no cached diff")])],
+            _ => vec![Line::segs(vec![seg(
+                Tok::Slot(S::Ghost2),
+                "no cached diff",
+            )])],
         }
     }
 
@@ -222,13 +228,7 @@ impl RollbackModal {
 
         // Rows: checkbox + status + path; cursor row tinted.
         let offset = self.cursor.saturating_sub(list_rows.saturating_sub(1));
-        for (row, r) in self
-            .rows
-            .iter()
-            .enumerate()
-            .skip(offset)
-            .take(list_rows)
-        {
+        for (row, r) in self.rows.iter().enumerate().skip(offset).take(list_rows) {
             let checked = self.marked.contains(&row);
             let box_glyph = if checked { "☑ " } else { "☐ " };
             let status_tok = if r.untracked {

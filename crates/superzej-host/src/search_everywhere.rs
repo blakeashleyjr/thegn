@@ -111,7 +111,6 @@ impl PaletteMode {
             PaletteMode::Problems => PaletteMode::All,
         }
     }
-
 }
 
 // ── File index ───────────────────────────────────────────────────────────────

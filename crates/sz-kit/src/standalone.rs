@@ -10,15 +10,15 @@
 use std::io::{self, Stdout};
 use std::sync::mpsc;
 
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use ratatui::Terminal;
 
-use crate::input::{InputEvent, InputResult, from_crossterm_event};
+use crate::input::{from_crossterm_event, InputEvent, InputResult};
 use crate::tile::{AppTile, ChangeHook};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
