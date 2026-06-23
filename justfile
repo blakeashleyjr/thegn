@@ -23,12 +23,33 @@ default:
 
 # --- build / package ------------------------------------------------------
 
+# Self-heal the embedded-app sources the host's path deps need (termite-chat,
+# termite-agent under apps/). These live ONLY in the canonical checkout: apps/
+# is gitignored + untracked, and the submodules need network/SSH (bwrap blocks
+# it), so a fresh `git worktree` has no apps/ at all and the whole workspace
+# fails to resolve — not just the host. Symlink to the shared checkout, derived
+# from the common git dir (no hardcoded path); apps/ is gitignored so the link
+# never shows in `git status`. No-op in the canonical checkout (apps/ is a real
+# dir) or once already linked. This is what lets agents in sandboxed worktrees
+# build without copying apps/ in by hand.
+_apps:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ -e apps ] && exit 0
+    root="$(cd "$(dirname "$(git rev-parse --git-common-dir)")" && pwd)"
+    if [ "$root" != "$PWD" ] && [ -d "$root/apps" ]; then
+      ln -s "$root/apps" apps
+      echo "linked apps/ -> $root/apps (embedded-app sources for the host build)"
+    else
+      echo "warning: no apps/ here and none at $root/apps — host chat/agent tabs will not build" >&2
+    fi
+
 # Debug build (the whole cargo workspace: core, svc, host).
-build:
+build: _apps
     cargo build --workspace
 
 # Release build (the whole cargo workspace).
-release:
+release: _apps
     cargo build --workspace --release
 
 # Run the native host compositor. Builds it first. Run from a real terminal —
@@ -181,7 +202,7 @@ cov_ignore := 'superzej-core/src/(repo|worktree|sandbox|remote|github|picker|uti
 proxy_cov_ignore := 'superzej-proxy/src/(main|lib)\.rs'
 
 # Coverage gate: core ≥95% lines + proxy ≥88% lines. Writes lcov to target/coverage.
-coverage:
+coverage: _apps
     mkdir -p target/coverage
     cargo llvm-cov -p superzej-core --lib --fail-under-lines 95 \
       --ignore-filename-regex '{{cov_ignore}}' \
@@ -200,7 +221,7 @@ coverage-html:
 # --- quality --------------------------------------------------------------
 
 # Comprehensive linting: rust (clippy), bash (shellcheck), yaml (yamllint), toml (taplo).
-lint:
+lint: _apps
     cargo clippy --workspace --all-targets -- -D warnings
     shellcheck -x install.sh test/smoke.sh test/pty-smoke.sh test/install-plan.sh test/dev-tui-plan.sh test/sandbox-network.sh
     yamllint .
@@ -219,7 +240,7 @@ fmt-check:
     nix fmt -- --ci
 
 # Unit tests.
-test:
+test: _apps
     cargo test
 
 # Hermetic end-to-end test against the debug binary.
