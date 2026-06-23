@@ -95,7 +95,11 @@ pub(crate) fn spawn_refresh_ticker(
                 Duration::from_millis(stats_interval_ms.load(Ordering::Relaxed).max(500));
             if stats_live.load(Ordering::Relaxed) || last_stats.elapsed() >= interval {
                 last_stats = Instant::now();
-                if stats_tx.send(sampler.sample()).is_err() {
+                let snap = {
+                    let _g = crate::perf::measure(crate::perf::Subsys::Stats);
+                    sampler.sample()
+                };
+                if stats_tx.send(snap).is_err() {
                     break;
                 }
                 wake = true;
@@ -103,7 +107,10 @@ pub(crate) fn spawn_refresh_ticker(
             // Container list refresh: runs OCI `ps` subprocesses, so keep it on
             // its own cadence (5s) rather than tying it to the fast stats tick.
             if ticks.is_multiple_of(container_every) {
-                let containers = superzej_core::sandbox::running_containers();
+                let containers = {
+                    let _g = crate::perf::measure(crate::perf::Subsys::Container);
+                    superzej_core::sandbox::running_containers()
+                };
                 if container_tx.send(containers).is_err() {
                     break;
                 }
@@ -1153,7 +1160,10 @@ pub(crate) fn spawn_model_hydration(
         let Ok(db) = superzej_core::db::Db::open() else {
             return;
         };
-        let first = build_model(&session, &db, hints.clone());
+        let first = {
+            let _g = crate::perf::measure(crate::perf::Subsys::Hydrate);
+            build_model(&session, &db, hints.clone())
+        };
         let refresh_commits = first.panel.commits_loading;
         if tx.send((generation, first)).is_ok()
             && let Some(w) = &waker

@@ -94,6 +94,55 @@ impl TelemetryHistory {
     }
 }
 
+/// Rolling history of the event-loop self-profiler, fed by each `szhost::perf`
+/// rollup. Powers the Telemetry section's "Loop" sub-block: how hard the loop is
+/// working (wakes/s), how much it repaints (renders/s), and the tail render
+/// latency — the live view of the same data the `szhost::perf` log emits.
+#[derive(Debug, Clone, Default)]
+pub struct LoopPerfHistory {
+    wakes: VecDeque<f32>,
+    renders: VecDeque<f32>,
+    render_p99_us: VecDeque<f32>,
+    /// The most recent snapshot, for the headline.
+    last: crate::perf::PerfSnapshot,
+    any: bool,
+}
+
+impl LoopPerfHistory {
+    pub fn push(&mut self, snap: &crate::perf::PerfSnapshot) {
+        push_cap(&mut self.wakes, snap.wakes_per_s as f32);
+        push_cap(&mut self.renders, snap.renders_per_s as f32);
+        push_cap(&mut self.render_p99_us, snap.render_p99_us as f32);
+        self.last = snap.clone();
+        self.any = true;
+    }
+
+    /// True once at least one rollup has landed (else the sub-block shows a hint).
+    pub fn has_data(&self) -> bool {
+        self.any
+    }
+
+    /// The most recent snapshot (for the headline line).
+    pub fn last(&self) -> &crate::perf::PerfSnapshot {
+        &self.last
+    }
+
+    /// Wakes/s series normalized by the window max.
+    pub fn wakes_series(&self, n: usize) -> Vec<f32> {
+        norm(series(&self.wakes, n))
+    }
+
+    /// Renders/s series normalized by the window max.
+    pub fn renders_series(&self, n: usize) -> Vec<f32> {
+        norm(series(&self.renders, n))
+    }
+
+    /// Render p99 (µs) series normalized by the window max.
+    pub fn render_p99_series(&self, n: usize) -> Vec<f32> {
+        norm(series(&self.render_p99_us, n))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +201,29 @@ mod tests {
         assert_eq!(h.cpu_series(1), vec![0.0]);
         assert_eq!(h.mem_series(1), vec![0.0]);
         assert_eq!(h.last_rates(), (0, 0));
+    }
+
+    #[test]
+    fn loop_perf_history_tracks_snapshots() {
+        let mut h = LoopPerfHistory::default();
+        assert!(!h.has_data());
+        h.push(&crate::perf::PerfSnapshot {
+            wakes_per_s: 5.0,
+            renders_per_s: 4.0,
+            render_p99_us: 800,
+            hot_source: "Model",
+            ..Default::default()
+        });
+        h.push(&crate::perf::PerfSnapshot {
+            wakes_per_s: 10.0,
+            renders_per_s: 8.0,
+            render_p99_us: 1600,
+            hot_source: "Stats",
+            ..Default::default()
+        });
+        assert!(h.has_data());
+        assert_eq!(h.last().hot_source, "Stats");
+        // Normalized against the window max (the second sample).
+        assert_eq!(h.wakes_series(2), vec![0.5, 1.0]);
     }
 }

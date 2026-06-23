@@ -35,7 +35,9 @@ mod palette;
 mod pane;
 mod panel;
 mod panes;
+mod perf;
 mod pins;
+mod profile;
 mod proxy_daemon;
 mod queries;
 mod run;
@@ -49,6 +51,8 @@ mod sidebar;
 mod stats;
 mod task;
 mod telemetry;
+#[cfg(test)]
+mod testenv;
 mod testkit;
 mod toast;
 mod wire;

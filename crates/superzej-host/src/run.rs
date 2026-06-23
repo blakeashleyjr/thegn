@@ -314,6 +314,14 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         );
     }
 
+    // Perf self-profiler master switch: on when `SUPERZEJ_PERF=1` or
+    // `SUPERZEJ_LOG` selects the `szhost::perf` target. Off by default, so every
+    // instrumentation hook is a single relaxed atomic load.
+    crate::perf::init();
+    // Arm the in-process sampling profiler (no-op unless built `--features
+    // profiling`): SIGUSR2 toggles a flamegraph capture from the live process.
+    crate::profile::install();
+
     // While the compositor owns the screen, any stray write to stderr (e.g.
     // `msg::warn`'s eprintln fallback when no log subscriber is installed)
     // scrolls the alt screen and corrupts the damage-tracked frame — ghost
@@ -576,6 +584,20 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
             flag.store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = sig_waker.wake();
         });
+    }
+
+    // Steady-state bench window (`SUPERZEJ_BENCH_RUN_MS`): run the full loop —
+    // ticker, hydration, tokio pool and all — for a fixed window then exit, so
+    // the idle-CPU harness measures real steady state (unlike
+    // `SUPERZEJ_BENCH_FIRST_FRAME_EXIT`, which quits before the ticker fires).
+    // Reuses the `shutdown` flag + a single waker pulse, honoring the
+    // no-timeout invariant: the loop only wakes once, at the deadline.
+    if let Some(ms) = crate::perf::request_stop_after(shutdown.clone(), waker.clone()) {
+        tracing::info!(
+            target: "szhost::startup",
+            run_ms = ms,
+            "bench window armed (SUPERZEJ_BENCH_RUN_MS)"
+        );
     }
 
     let result = event_loop(
@@ -6160,6 +6182,19 @@ async fn event_loop<T: Terminal>(
         &supervisor,
     );
     sb.rebuild(&mut model, &session);
+    // Loop-owned perf tally (wakes, renders, per-source drains, render latency).
+    // Lock-free; every mutator is a no-op unless `SUPERZEJ_PERF`/`szhost::perf`
+    // is on. Emits a `szhost::perf` rollup every `report_interval()`.
+    let mut loop_perf = crate::perf::LoopPerf::new();
+    let perf_interval = crate::perf::report_interval();
+    // Stamped at each loop-top when perf is on; the span until the blocking
+    // poll is the loop's "busy" time (drives the idle ratio).
+    let mut iter_t0 = std::time::Instant::now();
+    // Telemetry-panel "Loop" sub-block: while the section is open we force perf
+    // accounting on (restoring the prior state on close) and roll up faster so
+    // the live graphs move. `perf_was_on` remembers the pre-open state.
+    let mut telemetry_open = false;
+    let mut perf_was_on = false;
     let mut dirty = true;
     // Set by a mouse selection-drag move to request the cheap render fast path
     // (recompose only the anchored pane + selection, not the whole frame).
@@ -6384,6 +6419,26 @@ async fn event_loop<T: Terminal>(
         }
     }
     loop {
+        // Perf self-profiler: count the wake, stamp busy-time start, and emit
+        // the periodic rollup when due (piggy-backing on this wake — never a
+        // dedicated timer thread). All no-ops unless perf accounting is on.
+        loop_perf.wake();
+        // Service a pending SIGUSR2 profiler toggle (no-op without the feature).
+        crate::profile::poll();
+        if crate::perf::enabled() {
+            iter_t0 = std::time::Instant::now();
+            // Roll up faster (1s) while the Telemetry section is watching, else
+            // at the configured cadence (default 10s).
+            let interval = if telemetry_open {
+                std::time::Duration::from_secs(1)
+            } else {
+                perf_interval
+            };
+            if loop_perf.due(interval) {
+                let snap = loop_perf.rollup();
+                panel_ui.docs.loop_perf.push(&snap);
+            }
+        }
         if session.worktrees.is_empty() {
             return Ok(()); // last worktree closed
         }
@@ -7083,6 +7138,9 @@ async fn event_loop<T: Terminal>(
                 }
             }
         }
+        // Attribute the PTY chunks drained this wake (and whether the 64-chunk
+        // budget capped a chatty pane).
+        loop_perf.pty(drain_stats_chunks as u64, budget_exhausted);
         if disconnected {
             return Ok(());
         }
@@ -7099,6 +7157,7 @@ async fn event_loop<T: Terminal>(
         // Discovery results: seed newly-found tests as Unknown (merge, not
         // replace). Stale generations / other worktrees are dropped.
         while let Ok(d) = test_discovery_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
             if d.generation == test_generation && d.worktree == loaded_tests_worktree {
                 panel_ui.tests.discovering = false;
                 panel_ui.tests.task = Some(d.task);
@@ -7114,6 +7173,7 @@ async fn event_loop<T: Terminal>(
         }
         // Named task (Tasks section) run outcomes.
         while let Ok(outcome) = named_task_run_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
             let elapsed_s = outcome.duration_ms as f64 / 1000.0;
             let exit = outcome.exit_code.unwrap_or(-1);
             let rec = crate::panel::TaskRunRecord {
@@ -7171,6 +7231,7 @@ async fn event_loop<T: Terminal>(
             let root = root.is_dir().then_some(root.as_path());
             let mut got = false;
             while let Ok(pd) = lsp_diag_rx.try_recv() {
+                loop_perf.tick(crate::perf::WakeSource::Lsp);
                 lsp_diags.apply(pd, root);
                 got = true;
             }
@@ -7182,6 +7243,7 @@ async fn event_loop<T: Terminal>(
         // Run results: the latest run upserts each reported test's status while
         // leaving other tests' most-recent status intact.
         while let Ok(outcome) = test_run_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
             if outcome.generation == test_generation && outcome.worktree == loaded_tests_worktree {
                 panel_ui.tests.running = false;
                 panel_ui.tests.task = Some(outcome.task.clone());
@@ -7241,6 +7303,7 @@ async fn event_loop<T: Terminal>(
         // are dropped (`hunks_gen` records the acceptance cutoff); a fetch
         // outliving an ordinary refresh is fine — same worktree, same diff.
         while let Ok((generation, path, hunks)) = hunk_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Hunk);
             hunk_inflight.remove(&path);
             if generation >= panel_ui.hunks_gen {
                 panel_ui.hunks.insert(path, hunks);
@@ -7251,6 +7314,7 @@ async fn event_loop<T: Terminal>(
         // Completed inline-file reads land on the open preview (if it's still
         // the same path and still loading — a fast esc/reopen drops strays).
         while let Ok((path, result)) = file_preview_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::FilePreview);
             if let Some(fp) = panel_ui.file_preview.as_mut()
                 && fp.path == path
                 && fp.loading
@@ -7274,6 +7338,7 @@ async fn event_loop<T: Terminal>(
         // outcome, close ended flows, and rehydrate (even failures may have
         // half-moved state). Stale generations died with their worktree.
         while let Ok(done) = gitop_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::GitOp);
             if done.generation != panel_ui.git.op_gen {
                 continue;
             }
@@ -7449,6 +7514,7 @@ async fn event_loop<T: Terminal>(
         // Fetched git documents for the line-cursor views (generation-tagged
         // like the hunk previews).
         while let Ok((generation, doc)) = gitdoc_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::GitDoc);
             if generation != panel_ui.git.op_gen {
                 continue;
             }
@@ -7514,6 +7580,7 @@ async fn event_loop<T: Terminal>(
         // mid-flight are dropped; `materialize_with_specs` itself skips
         // leaves that came alive some other way in the meantime.
         while let Ok((wt, ti, specs)) = spec_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Spec);
             if materialize_inflight.as_ref() == Some(&(wt.clone(), ti)) {
                 materialize_inflight = None;
             }
@@ -7656,6 +7723,7 @@ async fn event_loop<T: Terminal>(
         }
 
         while let Ok((generation, next_model)) = model_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Model);
             if generation != hydration_gen {
                 continue;
             }
@@ -7765,6 +7833,7 @@ async fn event_loop<T: Terminal>(
         // Neighbor-prefetch results: seed the switch cache only. No repaint —
         // these warm worktrees the user hasn't focused yet.
         while let Ok((path, panel)) = prefetch_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Prefetch);
             panel_cache.insert(path, panel);
         }
 
@@ -7775,6 +7844,7 @@ async fn event_loop<T: Terminal>(
         let telemetry_visible =
             chrome.panel.is_some() && panel_ui.open == crate::panel::Section::Telemetry;
         while let Ok(snap) = stats_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Stats);
             panel_ui.docs.telemetry.push(&snap);
             panel_ui.docs.tick = panel_ui.docs.tick.wrapping_add(1);
             if model.stats != snap || telemetry_visible {
@@ -7786,6 +7856,7 @@ async fn event_loop<T: Terminal>(
         // Container list from the 5s ticker — replaces the old inline call
         // inside model hydration so `podman ps` never blocks the hydrate path.
         while let Ok(containers) = container_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Container);
             if model.containers != containers {
                 // Derive container health for the active worktree from the
                 // snapshot: if the named container is present and running →
@@ -7816,6 +7887,7 @@ async fn event_loop<T: Terminal>(
         // badges track unfocused tiles, the active tile shows its new state.
         let mut app_signalled = false;
         while app_rx.try_recv().is_ok() {
+            loop_perf.tick(crate::perf::WakeSource::App);
             app_signalled = true;
         }
         if app_signalled {
@@ -7825,6 +7897,7 @@ async fn event_loop<T: Terminal>(
 
         // Fresh metrics readings from the scrape supervisor (sidebar section).
         while let Ok(state) = metrics_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Metrics);
             if model.metrics != state {
                 model.metrics = state;
                 dirty = true;
@@ -7834,6 +7907,7 @@ async fn event_loop<T: Terminal>(
         // Panel document payloads from the on-entry fetches; stale
         // generations (pre-worktree-switch) are dropped.
         while let Ok((generation, payload)) = docs_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Docs);
             if generation != docs_gen {
                 continue;
             }
@@ -7847,6 +7921,7 @@ async fn event_loop<T: Terminal>(
         // Worktree-creation progress from the wizard worker; stale
         // generations (a cancelled run's stragglers) are dropped.
         while let Ok(ev) = create_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Create);
             match ev {
                 wizard::CreateEvent::Preflight {
                     generation,
@@ -8059,12 +8134,14 @@ async fn event_loop<T: Terminal>(
         // Adopt freshly-registered diff watchers; drop stale ones (the user
         // switched worktrees again before the recursive registration finished).
         while let Ok((path, nw)) = watcher_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Watcher);
             if watched_worktree.as_deref() == Some(path.as_path()) {
                 diff_watcher = Some(nw);
             }
         }
 
         while let Ok(cfg_res) = config_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Config);
             match cfg_res {
                 Ok(new_cfg) => {
                     keymap = rebuild_keymap(&new_cfg, &session);
@@ -8102,6 +8179,7 @@ async fn event_loop<T: Terminal>(
         let mut want_pr_refresh = false;
         let mut want_issue_refresh = false;
         while let Ok(kind) = refresh_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Refresh);
             match kind {
                 RefreshKind::Model => want_model_refresh = true,
                 RefreshKind::Pr => {
@@ -8166,13 +8244,25 @@ async fn event_loop<T: Terminal>(
         model.keyhints = context_hints(&focus, &panel_ui, keymap.config());
         // The ticker samples at live (500ms) cadence while the telemetry
         // section is on screen, so its graphs actually move.
-        stats_live.store(
-            chrome.panel.is_some() && panel_ui.open == crate::panel::Section::Telemetry,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        let telemetry_now =
+            chrome.panel.is_some() && panel_ui.open == crate::panel::Section::Telemetry;
+        stats_live.store(telemetry_now, std::sync::atomic::Ordering::Relaxed);
+        // On open, force perf accounting on (saving the prior state) so the
+        // "Loop" sub-block has data; on close, restore — a `SUPERZEJ_PERF=1`
+        // user keeps accounting, a default user goes back to free.
+        if telemetry_now != telemetry_open {
+            if telemetry_now {
+                perf_was_on = crate::perf::enabled();
+                crate::perf::set_enabled(true);
+            } else {
+                crate::perf::set_enabled(perf_was_on);
+            }
+            telemetry_open = telemetry_now;
+        }
 
         // Symbols section: drain completed outline/refs fetches into their caches.
         while let Ok(msg) = outline_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Outline);
             match msg {
                 SymbolsFetch::Outline { file, rows } => {
                     if outline_inflight.as_deref() == Some(file.as_str()) {
@@ -8191,6 +8281,7 @@ async fn event_loop<T: Terminal>(
         }
         // Hover preview: a completed fetch pops the overlay open.
         while let Ok(popup) = hover_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Hover);
             hover_popup = Some(popup);
             dirty = true;
         }
@@ -8243,6 +8334,10 @@ async fn event_loop<T: Terminal>(
 
         // 2. Render if anything changed (diff-flush): all visible panes of the
         //    active tab + the chrome, with the hardware cursor in the focused pane.
+        if !dirty {
+            // Woke but nothing changed — a wasted wakeup (storm signal).
+            loop_perf.render_skip();
+        }
         if dirty {
             let frame_t0 = std::time::Instant::now();
             let tree = if zoom == Some(crate::focus::Zone::Center) {
@@ -8619,6 +8714,8 @@ async fn event_loop<T: Terminal>(
                 out.flush().context("terminal flush")?;
             }
             dirty = false;
+            // Record the frame's compose+flush latency (p50/p99 in the rollup).
+            loop_perf.render(frame_t0.elapsed());
             // Consumed: the next frame is full unless another drag/scroll re-arms it.
             selection_only = false;
             scroll_only = false;
@@ -8712,6 +8809,10 @@ async fn event_loop<T: Terminal>(
                 }
             }
         }
+
+        // Everything above this point was the loop doing work for this wake;
+        // the poll below is idle time. Record the busy span for the idle ratio.
+        loop_perf.add_busy(iter_t0.elapsed());
 
         // 3. Block until something happens: a real terminal event, or a
         //    `waker.wake()` from any producer (PTY reader, model/PR hydration,
@@ -14205,9 +14306,11 @@ mod tests {
     }
 
     /// Tests that set `XDG_STATE_HOME` race each other (the env is process
-    /// global); serialize them. Poisoning is fine to ignore — the env is
-    /// re-set by the next holder either way.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// global); serialize them. Crate-wide so `agent`'s sandbox tests (which
+    /// also redirect `XDG_STATE_HOME`) serialize against these too — a
+    /// per-module lock would leave that cross-module race open. Poisoning is
+    /// fine to ignore — the env is re-set by the next holder either way.
+    use crate::testenv::ENV_LOCK;
 
     fn one_tab_session() -> Session {
         Session {
