@@ -33,3 +33,6 @@ chrono.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 nucleo-matcher.workspace = true
+# Word-level / intra-line diff for the diff view (item 601): pure-Rust,
+# `TextDiff::from_words` tokenizes on word boundaries.
+similar = "2"

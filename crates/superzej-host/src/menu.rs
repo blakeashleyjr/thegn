@@ -587,6 +587,43 @@ pub fn output_menu(title: impl Into<String>, text: &str) -> MenuOverlay {
     MenuOverlay::new(MenuKindTag::CustomCommands, title, items)
 }
 
+/// Commit-input toggles (item 328) carried by the commit message overlay:
+/// Ctrl+N flips hook-skipping, Ctrl+S cycles signing. Rendered as a badge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CommitToggles {
+    /// `--no-verify`: skip pre-commit / commit-msg hooks.
+    pub no_verify: bool,
+    /// Signing override: `None` inherit · `Some(true)` `--gpg-sign` ·
+    /// `Some(false)` `--no-gpg-sign`.
+    pub sign: Option<bool>,
+}
+
+impl CommitToggles {
+    /// Cycle the signing override: inherit → sign → no-sign → inherit.
+    fn cycle_sign(&mut self) {
+        self.sign = match self.sign {
+            None => Some(true),
+            Some(true) => Some(false),
+            Some(false) => None,
+        };
+    }
+
+    /// Compact badge text reflecting the current toggles.
+    fn badge(self) -> String {
+        let sign = match self.sign {
+            None => "sign:auto",
+            Some(true) => "sign:on",
+            Some(false) => "sign:off",
+        };
+        let verify = if self.no_verify {
+            "hooks:skip"
+        } else {
+            "hooks:on"
+        };
+        format!(" {sign} · {verify} ")
+    }
+}
+
 /// A one-line text input overlay (commit message, stash message, command
 /// prompts): printable keys edit, Backspace deletes, Enter submits, Esc (or
 /// Ctrl+c) cancels. The loop holds it like the palette — feeds keys through
@@ -596,6 +633,9 @@ pub fn output_menu(title: impl Into<String>, text: &str) -> MenuOverlay {
 pub struct InputOverlay {
     pub title: String,
     value: String,
+    /// When set, this is the commit-message overlay: Ctrl+S/Ctrl+N drive the
+    /// signing / hook toggles (item 328) and the state shows as a badge.
+    commit_toggles: Option<CommitToggles>,
 }
 
 /// What a key delivered to the input overlay meant.
@@ -611,6 +651,19 @@ impl InputOverlay {
         InputOverlay {
             title: title.into(),
             value: prefill.into(),
+            commit_toggles: None,
+        }
+    }
+
+    /// The commit-message overlay: like [`new`], but Ctrl+S/Ctrl+N drive the
+    /// signing / hook toggles (item 328).
+    ///
+    /// [`new`]: InputOverlay::new
+    pub fn new_commit(title: impl Into<String>, prefill: impl Into<String>) -> Self {
+        InputOverlay {
+            title: title.into(),
+            value: prefill.into(),
+            commit_toggles: Some(CommitToggles::default()),
         }
     }
 
@@ -618,8 +671,27 @@ impl InputOverlay {
         &self.value
     }
 
+    /// The current commit toggles, if this is the commit overlay.
+    pub fn commit_toggles(&self) -> Option<CommitToggles> {
+        self.commit_toggles
+    }
+
     pub fn handle_key(&mut self, key: &KeyCode, mods: Modifiers) -> InputOutcome {
         if mods.contains(Modifiers::CTRL) {
+            // Commit-overlay toggles (item 328) — consumed, overlay stays open.
+            if let Some(t) = &mut self.commit_toggles {
+                match key {
+                    KeyCode::Char('n' | 'N') => {
+                        t.no_verify = !t.no_verify;
+                        return InputOutcome::Pending;
+                    }
+                    KeyCode::Char('s' | 'S') => {
+                        t.cycle_sign();
+                        return InputOutcome::Pending;
+                    }
+                    _ => {}
+                }
+            }
             return match key {
                 KeyCode::Char('c' | 'C' | 'g' | 'G') => InputOutcome::Cancel,
                 _ => InputOutcome::Pending,
@@ -645,11 +717,16 @@ impl InputOverlay {
         }
     }
 
-    /// Paint as a one-row centered layer: `❯ value▏`.
+    /// Paint as a one-row centered layer: `❯ value▏`. The commit overlay shows
+    /// its signing/hook toggles in the badge (item 328).
     pub fn render(&self, surface: &mut Surface, screen: Rect) {
+        let badge = match self.commit_toggles {
+            Some(t) => t.badge(),
+            None => " input ".into(),
+        };
         let spec = LayerSpec {
             title: self.title.clone(),
-            badge: Some(" input ".into()),
+            badge: Some(badge),
             cols: (self.value.chars().count() + 8)
                 .max(self.title.chars().count() + 6)
                 .max(40),
@@ -713,6 +790,60 @@ mod tests {
             .filter_map(|i| i.key)
             .map(|c| c.to_ascii_lowercase())
             .collect()
+    }
+
+    #[test]
+    fn commit_overlay_toggles_cycle_signing_and_no_verify() {
+        // Item 328: the commit overlay carries signing/hook toggles driven by
+        // Ctrl+S / Ctrl+N; a plain input overlay has none.
+        let mut ov = InputOverlay::new_commit("commit message", "");
+        assert_eq!(ov.commit_toggles(), Some(CommitToggles::default()));
+
+        // Ctrl+N toggles hooks; overlay stays open and the text is untouched.
+        assert_eq!(
+            ov.handle_key(&KeyCode::Char('n'), Modifiers::CTRL),
+            InputOutcome::Pending
+        );
+        assert!(ov.commit_toggles().unwrap().no_verify);
+        assert_eq!(ov.value(), "", "toggle key is not typed into the message");
+
+        // Ctrl+S cycles signing: auto → on → off → auto.
+        ov.handle_key(&KeyCode::Char('s'), Modifiers::CTRL);
+        assert_eq!(ov.commit_toggles().unwrap().sign, Some(true));
+        ov.handle_key(&KeyCode::Char('s'), Modifiers::CTRL);
+        assert_eq!(ov.commit_toggles().unwrap().sign, Some(false));
+        ov.handle_key(&KeyCode::Char('s'), Modifiers::CTRL);
+        assert_eq!(ov.commit_toggles().unwrap().sign, None);
+
+        // Ctrl+C still cancels.
+        assert_eq!(
+            ov.handle_key(&KeyCode::Char('c'), Modifiers::CTRL),
+            InputOutcome::Cancel
+        );
+
+        // A plain overlay has no toggles and types normal chars.
+        let mut plain = InputOverlay::new("x", "");
+        assert!(plain.commit_toggles().is_none());
+        plain.handle_key(&KeyCode::Char('a'), NONE);
+        assert_eq!(plain.value(), "a");
+
+        // Badge reflects state.
+        assert!(
+            CommitToggles {
+                no_verify: true,
+                sign: Some(false)
+            }
+            .badge()
+            .contains("hooks:skip")
+        );
+        assert!(
+            CommitToggles {
+                no_verify: false,
+                sign: Some(true)
+            }
+            .badge()
+            .contains("sign:on")
+        );
     }
 
     #[test]
