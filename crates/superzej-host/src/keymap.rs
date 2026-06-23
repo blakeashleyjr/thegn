@@ -1053,8 +1053,8 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Shift PageDown", Action::ScrollDown)
         .unwrap();
 
-    // Search: "/" for focused-pane history, "Ctrl /" for worktree-wide scope.
-    map.insert_all("/", Action::SearchPane).unwrap();
+    // Single key keybinds are prevented by rule. We shouldn't use "/" for SearchPane.
+    map.insert_all("Ctrl Alt /", Action::SearchPane).unwrap();
     map.insert_all("Ctrl /", Action::SearchGlobal).unwrap();
 
     // Pins: Alt-1..9 launch-or-focus the configured pin in registration order;
