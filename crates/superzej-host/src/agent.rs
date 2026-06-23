@@ -140,31 +140,36 @@ pub struct SandboxOutcome {
 /// human-visible fallback warnings; an explicit choice (config or
 /// `backend_choice`) must not silently fall back — it errors instead. Host is
 /// the last fallback for the auto chain only.
+///
+/// `choice_is_explicit` distinguishes the two callers of `backend_choice`: the
+/// new-worktree wizard passes the user's *fresh* pick (`true` — always wins
+/// over config), while a relaunch passes the *DB-saved* per-worktree value
+/// (`false` — only overrides when config is "auto", so an explicit config
+/// backend still beats a stale DB entry).
 pub fn prepare_sandbox(
     cfg: &Config,
     repo_root: &Path,
     worktree: &str,
     loc: &GitLoc,
     backend_choice: Option<&str>,
+    choice_is_explicit: bool,
 ) -> anyhow::Result<SandboxOutcome> {
     let mut sb = cfg.repo_sandbox(repo_root);
-    let mut explicit_backend =
-        sandbox::Backend::from_config(sb.backend).filter(|b| *b != sandbox::Backend::None);
-    // Only let the DB-saved per-worktree backend override when config is "auto".
-    // An explicit config backend (e.g. `backend = "bwrap"`) always wins so that
-    // changing the config actually takes effect instead of being silently trumped
-    // by a stale DB entry from a previous backend that no longer works.
+    // An explicit user choice (new-worktree wizard) always wins over config.
+    // A DB-saved per-worktree value (relaunch) only overrides when config is
+    // "auto" — an explicit config backend (e.g. `backend = "bwrap"`) must beat a
+    // stale DB entry from a previous backend that no longer works. An explicit
+    // choice may itself legitimately be "auto"/"host"/"none", so don't drop those.
     let config_is_auto = sb.backend == superzej_core::config::SandboxBackend::Auto;
-    if config_is_auto
-        && let Some(saved) = backend_choice.map(str::trim)
+    if let Some(saved) = backend_choice.map(str::trim)
         && !saved.is_empty()
-        && saved != "auto"
+        && (choice_is_explicit || (config_is_auto && saved != "auto"))
         && let Ok(b) = superzej_core::config::SandboxBackend::from_str_validated(saved)
     {
-        explicit_backend =
-            sandbox::Backend::from_config(b).filter(|b| *b != sandbox::Backend::None);
         sb.backend = b;
     }
+    let explicit_backend =
+        sandbox::Backend::from_config(sb.backend).filter(|b| *b != sandbox::Backend::None);
     let explicit_choice = explicit_backend.is_some();
     let auto_choice = sb.backend == superzej_core::config::SandboxBackend::Auto;
     let mut warnings = Vec::new();
@@ -366,7 +371,10 @@ pub fn launch_spec_with_key(
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
 
-    let mut outcome = prepare_sandbox(cfg, &repo_root, worktree, &loc, saved_backend.as_deref())?;
+    // Relaunch: `saved_backend` is the DB-saved per-worktree value, not a fresh
+    // user pick — config may override it (see `prepare_sandbox`), so `false`.
+    let mut outcome =
+        prepare_sandbox(cfg, &repo_root, worktree, &loc, saved_backend.as_deref(), false)?;
     if let Ok(db) = Db::open() {
         let _ = db.set_worktree_sandbox(worktree, &outcome.backend_label);
     }
@@ -640,12 +648,27 @@ mod tests {
         let mut cfg = Config::default();
         cfg.sandbox.backend = superzej_core::config::SandboxBackend::None;
         let loc = GitLoc::from_db("/wt/x", None);
-        let out = prepare_sandbox(&cfg, Path::new("/repo"), "/wt/x", &loc, None).unwrap();
+        let out = prepare_sandbox(&cfg, Path::new("/repo"), "/wt/x", &loc, None, false).unwrap();
         assert!(out.spec.is_none());
         assert_eq!(out.backend_label, "host");
         // An explicit "none" choice behaves the same as the configured backend.
-        let out = prepare_sandbox(&cfg, Path::new("/repo"), "/wt/x", &loc, Some("none")).unwrap();
+        let out =
+            prepare_sandbox(&cfg, Path::new("/repo"), "/wt/x", &loc, Some("none"), true).unwrap();
         assert!(out.spec.is_none());
+    }
+
+    #[test]
+    fn prepare_sandbox_explicit_host_choice_overrides_non_auto_config() {
+        // The new-worktree wizard passes the user's explicit pick; it must win
+        // over a concrete configured default (regression: picking Host with
+        // `default_backend = bwrap` used to silently keep bwrap).
+        let mut cfg = Config::default();
+        cfg.sandbox.backend = superzej_core::config::SandboxBackend::Bwrap;
+        let loc = GitLoc::from_db("/wt/x", None);
+        let out =
+            prepare_sandbox(&cfg, Path::new("/repo"), "/wt/x", &loc, Some("host"), true).unwrap();
+        assert!(out.spec.is_none());
+        assert_eq!(out.backend_label, "host");
     }
 
     // H1: E2E launch_spec test — backend="none" → host fallback path.
