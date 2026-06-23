@@ -69,6 +69,14 @@ impl SequenceMatcher {
         if sequence.is_empty() {
             return;
         }
+        // Last-write-wins per chord. `feed` returns the *first* stored sequence
+        // that matches, so without dropping a prior identical chord an override
+        // layered on top of a default could never take effect — the default,
+        // inserted first, would always match. Keymap layers are applied
+        // lowest-precedence-first (defaults → custom actions → config layers →
+        // program overlays), so replacing the earlier identical chord lets the
+        // later, higher-precedence binding win.
+        self.sequences.retain(|(s, _)| *s != sequence);
         self.sequences.push((sequence, action));
     }
 
