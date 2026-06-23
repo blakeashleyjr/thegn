@@ -18,6 +18,7 @@
 //! [`ChangeHook`]: sz_kit::ChangeHook
 #![allow(dead_code)] // wired into run.rs incrementally (Phase 2)
 
+pub mod agent;
 pub mod bridge;
 pub mod chat;
 pub mod dashboard;
@@ -119,6 +120,7 @@ impl AppHost {
                 match label {
                     "dashboard" => "dashboard",
                     "chat" => "chat",
+                    "agent" => "agent",
                     _ => continue,
                 },
                 label,
@@ -301,18 +303,26 @@ mod tests {
     #[test]
     fn app_host_uses_configured_tab_order_and_default_tab() {
         let mut cfg = superzej_core::config::Config::default();
-        cfg.apps.tab_order = vec!["chat".into(), "work".into(), "dashboard".into()];
+        cfg.apps.tab_order = vec![
+            "chat".into(),
+            "work".into(),
+            "dashboard".into(),
+            "agent".into(),
+        ];
         cfg.apps.default_tab = "dashboard".into();
 
         let host = AppHost::from_config(&cfg);
 
-        assert_eq!(host.tab_labels(), vec!["chat", "work", "dashboard"]);
+        assert_eq!(
+            host.tab_labels(),
+            vec!["chat", "work", "dashboard", "agent"]
+        );
         assert_eq!(host.active, ActiveApp::Tile(1));
         assert_eq!(host.active_tab_index(), 2);
         assert_eq!(host.tab_target(0), Some(ActiveApp::Tile(0)));
         assert_eq!(host.tab_target(1), Some(ActiveApp::Work));
         assert_eq!(host.dashboard_target(), Some(ActiveApp::Tile(1)));
-        // Cycling forward from the last tab wraps to the first.
-        assert_eq!(host.cycle(ActiveApp::Tile(1), 1), ActiveApp::Tile(0));
+        // Cycling forward from the last tab (agent) wraps to the first (chat).
+        assert_eq!(host.cycle(ActiveApp::Tile(2), 1), ActiveApp::Tile(0));
     }
 }
