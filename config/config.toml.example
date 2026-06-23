@@ -251,11 +251,18 @@ format = "text"           # text | json
 # before reaching the focused pane), e.g.:
 # [keybinds.vim_normal]
 # new-worktree = "Space g w"   # press Space, then g, then w
-# Alt ↑/↓ navigate worktrees; Shift+Alt ↑/↓ *move* the active worktree within
-# its repo. Worktrees default to creation order ("manual" sort) and keep the
-# order you set; cycle sort modes with `s` while the sidebar is focused.
-# move-worktree-up = "Shift Alt Up"
-# move-worktree-down = "Shift Alt Down"
+# Sidebar navigation (global):
+#   Alt ↑/↓        navigate worktrees, wrapping WITHIN the current workspace
+#   Shift+Alt ↑/↓  switch to the previous/next *workspace* (a real context switch)
+#   Ctrl+Alt ↑/↓   *reorder* (move) the selected item: the workspace under the
+#                  sidebar cursor if the sidebar is focused, else the active
+#                  worktree within its workspace
+# Workspaces and worktrees keep the order you set; cycle worktree sort modes
+# with `s` while the sidebar is focused.
+# prev-workspace = "Shift Alt Up"
+# next-workspace = "Shift Alt Down"
+# move-item-up = "Ctrl Alt Up"     # (legacy id move-worktree-up still works)
+# move-item-down = "Ctrl Alt Down"
 
 # You can also scope rebinds to a specific mode:
 [keybinds.vim_normal]

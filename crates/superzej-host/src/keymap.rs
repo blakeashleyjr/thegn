@@ -63,14 +63,20 @@ pub enum Action {
     Dashboard,
     NextTab,
     PrevTab,
-    /// Move to the next worktree group (Alt+Down); restores its active tab.
+    /// Switch to the next worktree (Alt+Down), wrapping WITHIN the active
+    /// worktree's workspace only; restores its active tab.
     NextWorktree,
-    /// Move to the previous worktree group (Alt+Up).
+    /// Switch to the previous worktree (Alt+Up), wrapping within the workspace.
     PrevWorktree,
-    /// Move the active worktree one slot up within its workspace (Shift+Alt+Up).
-    MoveWorktreeUp,
-    /// Move the active worktree one slot down within its workspace (Shift+Alt+Down).
-    MoveWorktreeDown,
+    /// Switch to the next workspace (Shift+Alt+Down) — a real context switch.
+    NextWorkspace,
+    /// Switch to the previous workspace (Shift+Alt+Up).
+    PrevWorkspace,
+    /// Reorder the selected item up (Ctrl+Alt+Up): the cursor workspace if the
+    /// sidebar is focused on one, else the active worktree within its workspace.
+    MoveItemUp,
+    /// Reorder the selected item down (Ctrl+Alt+Down).
+    MoveItemDown,
     SplitDown,
     SplitRight,
     CloseSplitPane,
@@ -314,17 +320,31 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         palette: true,
     },
     ActionSpec {
-        id: "move-worktree-up",
-        label: "Move worktree up",
-        hint: "move wt↑",
+        id: "prev-workspace",
+        label: "Previous workspace",
+        hint: "prev ws",
         default_chords: &["Shift Alt Up"],
         palette: true,
     },
     ActionSpec {
-        id: "move-worktree-down",
-        label: "Move worktree down",
-        hint: "move wt↓",
+        id: "next-workspace",
+        label: "Next workspace",
+        hint: "next ws",
         default_chords: &["Shift Alt Down"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "move-item-up",
+        label: "Move up (workspace/worktree)",
+        hint: "move↑",
+        default_chords: &["Ctrl Alt Up"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "move-item-down",
+        label: "Move down (workspace/worktree)",
+        hint: "move↓",
+        default_chords: &["Ctrl Alt Down"],
         palette: true,
     },
     ActionSpec {
@@ -685,8 +705,10 @@ impl Action {
             Action::PrevTab => "prev-tab",
             Action::NextWorktree => "next-worktree",
             Action::PrevWorktree => "prev-worktree",
-            Action::MoveWorktreeUp => "move-worktree-up",
-            Action::MoveWorktreeDown => "move-worktree-down",
+            Action::NextWorkspace => "next-workspace",
+            Action::PrevWorkspace => "prev-workspace",
+            Action::MoveItemUp => "move-item-up",
+            Action::MoveItemDown => "move-item-down",
             Action::SplitDown => "split-down",
             Action::SplitRight => "split-right",
             Action::CloseSplitPane => "close-pane",
@@ -750,8 +772,10 @@ impl Action {
             "prev-tab" => Action::PrevTab,
             "next-worktree" => Action::NextWorktree,
             "prev-worktree" => Action::PrevWorktree,
-            "move-worktree-up" => Action::MoveWorktreeUp,
-            "move-worktree-down" => Action::MoveWorktreeDown,
+            "next-workspace" => Action::NextWorkspace,
+            "prev-workspace" => Action::PrevWorkspace,
+            "move-item-up" | "move-worktree-up" => Action::MoveItemUp,
+            "move-item-down" | "move-worktree-down" => Action::MoveItemDown,
             "split-down" | "new-panel-native" => Action::SplitDown,
             "split-right" | "new-panel" => Action::SplitRight,
             "close-pane" => Action::CloseSplitPane,
@@ -1037,16 +1061,20 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl k", Action::FocusUp).unwrap();
     map.insert_all("Ctrl l", Action::FocusRight).unwrap();
     // Alt owns tabs/worktrees: ←/→ cycles tabs WITHIN the active worktree,
-    // ↑/↓ moves between worktrees (each restores its own active tab).
+    // ↑/↓ navigates worktrees, wrapping WITHIN the current workspace only.
     map.insert_all("Alt Left", Action::PrevTab).unwrap();
     map.insert_all("Alt Right", Action::NextTab).unwrap();
     map.insert_all("Alt Up", Action::PrevWorktree).unwrap();
     map.insert_all("Alt Down", Action::NextWorktree).unwrap();
-    // Shift+Alt+↑/↓ moves the active worktree within its workspace (manual
-    // reorder), mirroring the plain-Alt navigation.
-    map.insert_all("Shift Alt Up", Action::MoveWorktreeUp)
+    // Shift+Alt+↑/↓ switches workspace (a real context switch).
+    map.insert_all("Shift Alt Up", Action::PrevWorkspace)
         .unwrap();
-    map.insert_all("Shift Alt Down", Action::MoveWorktreeDown)
+    map.insert_all("Shift Alt Down", Action::NextWorkspace)
+        .unwrap();
+    // Ctrl+Alt+↑/↓ reorders the selected item: the workspace under the sidebar
+    // cursor if the sidebar is focused, else the active worktree.
+    map.insert_all("Ctrl Alt Up", Action::MoveItemUp).unwrap();
+    map.insert_all("Ctrl Alt Down", Action::MoveItemDown)
         .unwrap();
 
     map.insert_all("Shift PageUp", Action::ScrollUp).unwrap();
@@ -1432,6 +1460,51 @@ mod tests {
         // Alt+hjkl no longer claims focus moves (forwards to the pane).
         assert_eq!(k('h', Modifiers::ALT), None);
         assert_eq!(k('l', Modifiers::ALT), None);
+    }
+
+    #[test]
+    fn workspace_nav_and_reorder_chords() {
+        // Shift+Alt+↑/↓ switches workspace; Ctrl+Alt+↑/↓ reorders the item.
+        let shift_alt = Modifiers::SHIFT | Modifiers::ALT;
+        let ctrl_alt = Modifiers::CTRL | Modifiers::ALT;
+        assert_eq!(
+            map_key(&KeyCode::UpArrow, shift_alt),
+            Some(Action::PrevWorkspace)
+        );
+        assert_eq!(
+            map_key(&KeyCode::DownArrow, shift_alt),
+            Some(Action::NextWorkspace)
+        );
+        assert_eq!(
+            map_key(&KeyCode::UpArrow, ctrl_alt),
+            Some(Action::MoveItemUp)
+        );
+        assert_eq!(
+            map_key(&KeyCode::DownArrow, ctrl_alt),
+            Some(Action::MoveItemDown)
+        );
+    }
+
+    #[test]
+    fn move_item_keeps_legacy_worktree_aliases() {
+        // Renamed action; existing configs using the old ids must still bind.
+        assert_eq!(Action::from_key("move-item-up"), Some(Action::MoveItemUp));
+        assert_eq!(
+            Action::from_key("move-worktree-up"),
+            Some(Action::MoveItemUp)
+        );
+        assert_eq!(
+            Action::from_key("move-worktree-down"),
+            Some(Action::MoveItemDown)
+        );
+        assert_eq!(
+            Action::from_key("next-workspace"),
+            Some(Action::NextWorkspace)
+        );
+        assert_eq!(
+            Action::from_key("prev-workspace"),
+            Some(Action::PrevWorkspace)
+        );
     }
 
     #[test]

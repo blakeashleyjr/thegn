@@ -1070,6 +1070,64 @@ impl SidebarState {
         true
     }
 
+    /// Reorder the workspace under the sidebar cursor one slot (Ctrl+Alt+↑/↓).
+    /// Swaps its persisted `position` with the adjacent DB-backed workspace and
+    /// mirrors the swap into `model.sidebar_workspaces` so the move shows at
+    /// once (the next hydration rebuilds that list from the just-written DB, so
+    /// the two stay consistent). Live-only workspaces (no DB row, hence no
+    /// position) are skipped. Returns whether anything moved.
+    fn move_selected_workspace(
+        &mut self,
+        model: &mut FrameModel,
+        session: &crate::session::Session,
+        up: bool,
+    ) -> bool {
+        let Some(slug) = self
+            .selected_row(model)
+            .map(|r| r.workspace_slug.clone())
+        else {
+            return false;
+        };
+        // The reorderable (DB-backed) workspaces in display order, as
+        // (full-vec index, repo_path). Empty repo_path = live-only, no position.
+        let order: Vec<(usize, String)> = model
+            .sidebar_workspaces
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, _, _, repo))| !repo.is_empty())
+            .map(|(i, (_, _, _, repo))| (i, repo.clone()))
+            .collect();
+        // Locate the cursor workspace within that order by slug.
+        let Some(p) = model
+            .sidebar_workspaces
+            .iter()
+            .position(|(s, _, _, _)| *s == slug)
+            .and_then(|fi| order.iter().position(|(i, _)| *i == fi))
+        else {
+            return false;
+        };
+        let neighbor = if up {
+            p.checked_sub(1)
+        } else {
+            (p + 1 < order.len()).then_some(p + 1)
+        };
+        let Some(np) = neighbor else { return false };
+        let (ia, repo_a) = order[p].clone();
+        let (ib, repo_b) = order[np].clone();
+
+        if let Ok(db) = superzej_core::db::Db::open() {
+            let _ = db.swap_workspace_positions(&repo_a, &repo_b);
+        }
+        // Reflect immediately; keep the cursor on the moved workspace's header.
+        model.sidebar_workspaces.swap(ia, ib);
+        self.rebuild(model, session);
+        if let Some(idx) = visible_index_of_workspace(model, &slug) {
+            self.cursor = idx;
+            self.sync(model);
+        }
+        true
+    }
+
     /// What the cursor row activates, if anything.
     fn cursor_target(&self, model: &FrameModel) -> Option<crate::sidebar::RowTarget> {
         self.selected_row(model).and_then(|r| r.tab_target.clone())
@@ -1549,6 +1607,17 @@ fn visible_index_of_active(model: &FrameModel) -> usize {
         .filter(|r| r.visible)
         .position(|r| r.active)
         .unwrap_or(0)
+}
+
+/// The visible-row index of a workspace's header row (by slug), if present.
+fn visible_index_of_workspace(model: &FrameModel, slug: &str) -> Option<usize> {
+    model
+        .sidebar_rows
+        .iter()
+        .filter(|r| r.visible)
+        .position(|r| {
+            r.kind == crate::sidebar::RowKind::Workspace && r.workspace_slug == slug
+        })
 }
 
 fn switch_to_workspace_tab(
@@ -12261,23 +12330,42 @@ async fn event_loop<T: Terminal>(
                             }
                             Action::NextWorktree | Action::PrevWorktree => {
                                 // Step in the sidebar's display order so the
-                                // motion matches what the user sees.
-                                let order = sidebar_worktree_order(&model);
+                                // motion matches what the user sees, but confined
+                                // to the active worktree's workspace so wrapping
+                                // never crosses into another workspace.
+                                let active_slug = session
+                                    .worktrees
+                                    .get(session.active)
+                                    .and_then(|g| {
+                                        crate::sidebar::split_tab(&g.name).map(|(s, _)| s)
+                                    });
+                                let order: Vec<usize> = sidebar_worktree_order(&model)
+                                    .into_iter()
+                                    .filter(|&g| {
+                                        session
+                                            .worktrees
+                                            .get(g)
+                                            .and_then(|w| {
+                                                crate::sidebar::split_tab(&w.name).map(|(s, _)| s)
+                                            })
+                                            == active_slug
+                                    })
+                                    .collect();
                                 let pos = order.iter().position(|&g| g == session.active);
-                                match (order.len(), pos) {
-                                    (n, Some(p)) if n > 1 => {
-                                        let next = if action == Action::NextWorktree {
-                                            (p + 1) % n
-                                        } else {
-                                            (p + n - 1) % n
-                                        };
-                                        session.switch_to(order[next]);
-                                    }
-                                    // No usable display order (filtered away,
-                                    // hydrating): fall back to session order.
-                                    _ if action == Action::NextWorktree => session.next_worktree(),
-                                    _ => session.prev_worktree(),
+                                if let (n, Some(p)) = (order.len(), pos)
+                                    && n > 1
+                                {
+                                    let next = if action == Action::NextWorktree {
+                                        (p + 1) % n
+                                    } else {
+                                        (p + n - 1) % n
+                                    };
+                                    session.switch_to(order[next]);
                                 }
+                                // A single worktree in the workspace (or the
+                                // active group filtered away) is a no-op — we do
+                                // NOT fall back to session order, which would
+                                // cross into another workspace.
                                 // Worktree switches always land focus on the
                                 // center terminal — the user switched to work there.
                                 focus.zone = crate::focus::Zone::Center;
@@ -12294,14 +12382,71 @@ async fn event_loop<T: Terminal>(
                                 );
                                 persist_session_layout(&mut session, &panes);
                             }
-                            Action::MoveWorktreeUp | Action::MoveWorktreeDown => {
-                                // Reorder the active worktree within its
-                                // workspace; the move method rebuilds the tree
-                                // and persists the new order itself. The active
+                            Action::NextWorkspace | Action::PrevWorkspace => {
+                                // Switch to the prev/next workspace in the
+                                // sidebar's order (wraps). Only DB-backed
+                                // workspaces (non-empty repo_path) are
+                                // switchable; the active one is always among them.
+                                let switchable: Vec<String> = model
+                                    .sidebar_workspaces
+                                    .iter()
+                                    .filter(|(_, _, _, repo)| !repo.is_empty())
+                                    .map(|(_, _, _, repo)| repo.clone())
+                                    .collect();
+                                let cur = switchable.iter().position(|p| *p == session.id);
+                                if let (n, Some(p)) = (switchable.len(), cur)
+                                    && n > 1
+                                {
+                                    let next = if action == Action::NextWorkspace {
+                                        (p + 1) % n
+                                    } else {
+                                        (p + n - 1) % n
+                                    };
+                                    let target = switchable[next].clone();
+                                    if let Ok(db) = superzej_core::db::Db::open()
+                                        && switch_workspace(
+                                            &target,
+                                            None,
+                                            &mut session,
+                                            &mut panes,
+                                            &mut workspace_pool,
+                                            &db,
+                                        )
+                                    {
+                                        focus.zone = crate::focus::Zone::Center;
+                                        refresh_tab_model(&mut model, &session, &mut sb);
+                                        need_relayout = true;
+                                        sync_drawer_persistence(
+                                            &session,
+                                            &mut panes,
+                                            &mut drawer,
+                                            &mut drawer_pool,
+                                            &mut drawer_home,
+                                            keymap.config(),
+                                            chrome.center,
+                                        );
+                                    }
+                                }
+                            }
+                            Action::MoveItemUp | Action::MoveItemDown => {
+                                // Reorder the selected item: the workspace under
+                                // the sidebar cursor if the sidebar is focused on
+                                // one, else the active worktree within its
+                                // workspace. The move methods rebuild the tree and
+                                // persist the new order themselves; the active
                                 // group's content is unchanged, so only a redraw
                                 // is needed.
-                                let up = action == Action::MoveWorktreeUp;
-                                if sb.move_active_worktree(&mut model, &mut session, up) {
+                                let up = action == Action::MoveItemUp;
+                                let on_workspace = focus.sidebar()
+                                    && sb.selected_row(&model).is_some_and(|r| {
+                                        r.kind == crate::sidebar::RowKind::Workspace
+                                    });
+                                let moved = if on_workspace {
+                                    sb.move_selected_workspace(&mut model, &session, up)
+                                } else {
+                                    sb.move_active_worktree(&mut model, &mut session, up)
+                                };
+                                if moved {
                                     need_relayout = true;
                                 }
                             }
