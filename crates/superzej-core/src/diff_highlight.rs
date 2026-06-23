@@ -372,7 +372,10 @@ diff --git a/x.rs b/x.rs
         assert!(!changed_text(&old).contains("let"));
         assert!(!changed_text(&new).contains("let"));
         // The shared prefix survives as a non-emphasized run.
-        assert!(old.iter().any(|s| !s.changed && s.text.contains("let x = ")));
+        assert!(
+            old.iter()
+                .any(|s| !s.changed && s.text.contains("let x = "))
+        );
     }
 
     #[test]

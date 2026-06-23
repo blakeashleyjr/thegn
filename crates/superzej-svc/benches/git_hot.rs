@@ -35,8 +35,10 @@ fn model_scan<G: GitBackend>(git: &G, locs: &[GitLoc]) {
 fn bench_git_hot(c: &mut Criterion) {
     // Build one fixture per worktree count up front; the ops are read-only so a
     // single fixture is reused across all iterations.
-    let fixtures: Vec<(usize, fixture::GitFixture)> =
-        COUNTS.iter().map(|&n| (n, fixture::build(n, n.min(2)))).collect();
+    let fixtures: Vec<(usize, fixture::GitFixture)> = COUNTS
+        .iter()
+        .map(|&n| (n, fixture::build(n, n.min(2))))
+        .collect();
 
     let gix = GixGit::new();
 

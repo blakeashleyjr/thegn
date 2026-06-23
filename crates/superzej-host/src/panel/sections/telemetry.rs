@@ -56,11 +56,7 @@ fn loop_block(ctx: &SectionCtx) -> Vec<PanelRow> {
         seg(d(), format!("p99 {:.1}ms", s.render_p99_us as f64 / 1000.0)),
     ])));
     rows.push(PanelRow::plain(Line::split(
-        vec![
-            sp(1),
-            seg(g(), "hot "),
-            seg(ac(), s.hot_source),
-        ],
+        vec![sp(1), seg(g(), "hot "), seg(ac(), s.hot_source)],
         vec![seg(d(), format!("idle {:.0}%", s.idle_ratio * 100.0))],
     )));
     if ctx.deep() {
