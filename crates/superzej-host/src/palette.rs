@@ -611,7 +611,9 @@ mod tests {
         cfg.actions.push(superzej_core::config::CustomAction {
             name: "run-tests".into(),
             key: "Ctrl Alt r".into(),
-            run: "just test".into(),
+            run: Some("just test".into()),
+            action: None,
+            params: Default::default(),
             menu: true,
             hint: Some("tests".into()),
             floating: true,

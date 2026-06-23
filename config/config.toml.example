@@ -271,13 +271,43 @@ format = "text"           # text | json
 [keybinds.emacs]
 # quit = "Ctrl x q"
 
-# Define your own actions — a chord bound to a shell command. `menu = true`
-# surfaces it in the Cmd+K palette.
+# Define your own actions — a chord bound to either a shell command (`run`) or
+# a built-in composite operation (`action` + `params`). Exactly one of `run` /
+# `action` is required. `menu = true` surfaces it in the Cmd+K palette.
 # [[actions]]
 # name = "deploy"
 # key = "Alt D"
 # run = "just deploy"
 # menu = true
+
+# Composite actions invoke a built-in operation in-process (a shell `run`
+# cannot — superzej is a single session with no IPC). Supported `action`s:
+#
+#   new-worktree — create a worktree non-interactively (the Alt+w wizard,
+#     headless). params: `name` (a tail, or omit/"random" for an adjective-noun
+#     name), `sandbox` (auto | podman-rootless | podman-rootful | docker |
+#     bwrap | host; default = your configured default backend), `agent`
+#     (shell | an [[agents]]/[[tools]] name; default = shell), `base` (source
+#     ref; default = configured/auto base).
+#
+#   new-pane — spawn a pane in the active tab. params: `run` (command via your
+#     shell; omit for an interactive shell), `placement` (down | right; default
+#     right), `cwd` (worktree | active; default active).
+#
+# A scratch worktree on bwrap with a shell, no prompts:
+# [[actions]]
+# name = "scratch-shell"
+# key = "Alt N"
+# action = "new-worktree"
+# params = { sandbox = "bwrap", agent = "shell" }
+# menu = true
+#
+# A pane tailing the dev log, split to the right:
+# [[actions]]
+# name = "logs-pane"
+# key = "Alt L"
+# action = "new-pane"
+# params = { run = "tail -f log/dev.log", placement = "right" }
 
 # Keybind profiles: a named layer selected by `profile = "<name>"` (or the
 # SUPERZEJ_PROFILE env var / --profile flag). Applied *under* [keybinds], so a

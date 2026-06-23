@@ -823,12 +823,177 @@ impl Action {
     }
 }
 
+/// How a `[[actions]]` name is resolved when creating a worktree composite.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HostCustomAction {
-    pub name: String,
-    pub run: String,
-    pub floating: bool,
-    pub close_on_exit: bool,
+pub enum NameSpec {
+    /// Generate a random adjective-noun name (param absent or `"random"`).
+    Random,
+    /// Use this literal tail (the configured branch prefix is prepended).
+    Fixed(String),
+}
+
+/// Where a `new-pane` composite splits the focused pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanePlacement {
+    /// Split below (`placement = "down"`).
+    Down,
+    /// Split to the right (`placement = "right"`, the default).
+    Right,
+}
+
+/// The working directory a `new-pane` composite spawns in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneCwd {
+    /// The active worktree's directory.
+    Worktree,
+    /// The active pane's cwd (the default).
+    Active,
+}
+
+/// A built-in composite operation bound to a custom keybind
+/// (`[[actions]] action = "…"`). Parsed + validated at keymap build time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompositeAction {
+    /// Create a worktree non-interactively (the wizard, headless).
+    NewWorktree {
+        name: NameSpec,
+        /// Sandbox backend key (`bwrap`, `auto`, …); `None` = configured default.
+        sandbox: Option<String>,
+        /// Agent/tool choice (`shell`, an agent name, …); `None` = `shell`.
+        agent: Option<String>,
+        /// Source ref to branch from; `None` = configured/auto base.
+        base: Option<String>,
+    },
+    /// Spawn a pane in the active tab, optionally running a command.
+    NewPane {
+        /// Command line run via the host shell; `None` = an interactive shell.
+        run: Option<String>,
+        placement: PanePlacement,
+        cwd: PaneCwd,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostCustomAction {
+    /// A shell command (`[[actions]] run = "…"`).
+    Shell {
+        name: String,
+        run: String,
+        floating: bool,
+        close_on_exit: bool,
+    },
+    /// A built-in composite operation (`[[actions]] action = "…"`).
+    Composite { name: String, action: CompositeAction },
+}
+
+impl HostCustomAction {
+    /// The action's stable id / menu label.
+    pub fn name(&self) -> &str {
+        match self {
+            HostCustomAction::Shell { name, .. } | HostCustomAction::Composite { name, .. } => name,
+        }
+    }
+}
+
+/// Parse + validate a `[[actions]] action`/`params` entry into a typed
+/// composite. Warns and returns `None` (the action is skipped) on an unknown
+/// action name or an invalid parameter value.
+fn parse_composite(
+    cfg: &superzej_core::config::Config,
+    name: &str,
+    action: &str,
+    params: &std::collections::BTreeMap<String, String>,
+) -> Option<CompositeAction> {
+    let warn = |msg: &str| superzej_core::msg::warn(&format!("[[actions]] {name}: {msg}; skipped"));
+    let warn_unknown = |allowed: &[&str]| {
+        for key in params.keys() {
+            if !allowed.contains(&key.as_str()) {
+                superzej_core::msg::warn(&format!(
+                    "[[actions]] {name}: unknown param {key:?} for action {action:?}; ignored"
+                ));
+            }
+        }
+    };
+    match action {
+        "new-worktree" => {
+            warn_unknown(&["name", "sandbox", "agent", "base"]);
+            let name_spec = match params.get("name").map(String::as_str) {
+                None | Some("") | Some("random") => NameSpec::Random,
+                Some(tail) => NameSpec::Fixed(tail.to_string()),
+            };
+            let sandbox = match params.get("sandbox") {
+                Some(s) => {
+                    let valid: Vec<String> = crate::palette::build_sandbox_palette(cfg)
+                        .into_iter()
+                        .filter_map(|i| {
+                            i.key.strip_prefix("sandbox:").map(|k| k.to_string())
+                        })
+                        .collect();
+                    if !valid.iter().any(|v| v == s) {
+                        warn(&format!(
+                            "unknown sandbox {s:?} (expected one of {})",
+                            valid.join(", ")
+                        ));
+                        return None;
+                    }
+                    Some(s.clone())
+                }
+                None => None,
+            };
+            let agent = match params.get("agent") {
+                Some(a) => {
+                    let valid = crate::agent::choices(cfg);
+                    if !valid.iter().any(|v| v == a) {
+                        warn(&format!(
+                            "unknown agent {a:?} (expected one of {})",
+                            valid.join(", ")
+                        ));
+                        return None;
+                    }
+                    Some(a.clone())
+                }
+                None => None,
+            };
+            let base = params.get("base").filter(|b| !b.is_empty()).cloned();
+            Some(CompositeAction::NewWorktree {
+                name: name_spec,
+                sandbox,
+                agent,
+                base,
+            })
+        }
+        "new-pane" => {
+            warn_unknown(&["run", "placement", "cwd"]);
+            let run = params.get("run").filter(|r| !r.is_empty()).cloned();
+            let placement = match params.get("placement").map(String::as_str) {
+                None | Some("right") => PanePlacement::Right,
+                Some("down") => PanePlacement::Down,
+                Some(other) => {
+                    warn(&format!("unknown placement {other:?} (expected down|right)"));
+                    return None;
+                }
+            };
+            let cwd = match params.get("cwd").map(String::as_str) {
+                None | Some("active") => PaneCwd::Active,
+                Some("worktree") => PaneCwd::Worktree,
+                Some(other) => {
+                    warn(&format!("unknown cwd {other:?} (expected worktree|active)"));
+                    return None;
+                }
+            };
+            Some(CompositeAction::NewPane {
+                run,
+                placement,
+                cwd,
+            })
+        }
+        other => {
+            warn(&format!(
+                "unknown action {other:?} (expected new-worktree|new-pane)"
+            ));
+            None
+        }
+    }
 }
 
 pub struct KeyMap {
@@ -1186,11 +1351,37 @@ pub fn default_keymap_for(
     map.config = cfg.clone();
 
     for action in &cfg.actions {
-        let ca = HostCustomAction {
-            name: action.name.clone(),
-            run: action.run.clone(),
-            floating: action.floating,
-            close_on_exit: action.close_on_exit,
+        // Exactly one of `run` (shell) / `action` (built-in composite); skip
+        // (and warn) otherwise. Skipping before the push keeps `custom_actions`
+        // indices aligned with the `Action::Custom(idx)` overrides.
+        let ca = match (&action.run, &action.action) {
+            (Some(run), None) => HostCustomAction::Shell {
+                name: action.name.clone(),
+                run: run.clone(),
+                floating: action.floating,
+                close_on_exit: action.close_on_exit,
+            },
+            (None, Some(act)) => match parse_composite(cfg, &action.name, act, &action.params) {
+                Some(composite) => HostCustomAction::Composite {
+                    name: action.name.clone(),
+                    action: composite,
+                },
+                None => continue, // parse_composite already warned
+            },
+            (Some(_), Some(_)) => {
+                superzej_core::msg::warn(&format!(
+                    "[[actions]] {}: set exactly one of `run` or `action`; skipped",
+                    action.name
+                ));
+                continue;
+            }
+            (None, None) => {
+                superzej_core::msg::warn(&format!(
+                    "[[actions]] {}: needs a `run` command or an `action`; skipped",
+                    action.name
+                ));
+                continue;
+            }
         };
         let idx = map.custom_actions.len() as u16;
         map.custom_actions.push(ca);
@@ -1866,5 +2057,133 @@ mod tests {
             map.dispatch(Mode::Emacs, Key::char('q')),
             MatchResult::Matched(Action::Quit)
         );
+    }
+
+    /// Build a config with a single composite `[[actions]]` entry.
+    fn cfg_with_composite(
+        action: &str,
+        params: &[(&str, &str)],
+    ) -> superzej_core::config::Config {
+        let mut cfg = superzej_core::config::Config::default();
+        cfg.actions.push(superzej_core::config::CustomAction {
+            name: "composite".into(),
+            key: "Alt N".into(),
+            run: None,
+            action: Some(action.into()),
+            params: params
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            menu: true,
+            hint: None,
+            floating: true,
+            close_on_exit: true,
+        });
+        cfg
+    }
+
+    #[test]
+    fn composite_new_worktree_registers_and_routes() {
+        let cfg = cfg_with_composite("new-worktree", &[("sandbox", "bwrap"), ("agent", "shell")]);
+        let mut map = default_keymap_for(&cfg, None, None);
+        assert_eq!(map.custom_actions().len(), 1);
+        match &map.custom_actions()[0] {
+            HostCustomAction::Composite {
+                name,
+                action:
+                    CompositeAction::NewWorktree {
+                        name: NameSpec::Random,
+                        sandbox,
+                        agent,
+                        base,
+                    },
+            } => {
+                assert_eq!(name, "composite");
+                assert_eq!(sandbox.as_deref(), Some("bwrap"));
+                assert_eq!(agent.as_deref(), Some("shell"));
+                assert!(base.is_none());
+            }
+            other => panic!("expected NewWorktree composite, got {other:?}"),
+        }
+        // The chord routes to the custom action.
+        assert_eq!(
+            map.dispatch(Mode::Normal, Key::modified(KeyCode::Char('n'), Modifiers::ALT)),
+            MatchResult::Matched(Action::Custom(0))
+        );
+    }
+
+    #[test]
+    fn composite_new_worktree_fixed_name() {
+        let cfg = cfg_with_composite("new-worktree", &[("name", "my-fix")]);
+        let map = default_keymap_for(&cfg, None, None);
+        match &map.custom_actions()[0] {
+            HostCustomAction::Composite {
+                action: CompositeAction::NewWorktree { name, .. },
+                ..
+            } => assert_eq!(*name, NameSpec::Fixed("my-fix".into())),
+            other => panic!("expected NewWorktree composite, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn composite_new_pane_placement_and_cwd() {
+        let cfg = cfg_with_composite(
+            "new-pane",
+            &[("run", "tail -f x"), ("placement", "down"), ("cwd", "worktree")],
+        );
+        let map = default_keymap_for(&cfg, None, None);
+        match &map.custom_actions()[0] {
+            HostCustomAction::Composite {
+                action:
+                    CompositeAction::NewPane {
+                        run,
+                        placement,
+                        cwd,
+                    },
+                ..
+            } => {
+                assert_eq!(run.as_deref(), Some("tail -f x"));
+                assert_eq!(*placement, PanePlacement::Down);
+                assert_eq!(*cwd, PaneCwd::Worktree);
+            }
+            other => panic!("expected NewPane composite, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn composite_unknown_action_is_skipped() {
+        let cfg = cfg_with_composite("frobnicate", &[]);
+        let map = default_keymap_for(&cfg, None, None);
+        assert!(map.custom_actions().is_empty());
+    }
+
+    #[test]
+    fn composite_bad_sandbox_and_placement_are_skipped() {
+        let map = default_keymap_for(&cfg_with_composite("new-worktree", &[("sandbox", "nope")]), None, None);
+        assert!(map.custom_actions().is_empty(), "bad sandbox skips the action");
+        let map = default_keymap_for(&cfg_with_composite("new-pane", &[("placement", "sideways")]), None, None);
+        assert!(map.custom_actions().is_empty(), "bad placement skips the action");
+    }
+
+    #[test]
+    fn composite_new_pane_defaults() {
+        // No params: an interactive shell pane split to the right of the active pane.
+        let map = default_keymap_for(&cfg_with_composite("new-pane", &[]), None, None);
+        match &map.custom_actions()[0] {
+            HostCustomAction::Composite {
+                action:
+                    CompositeAction::NewPane {
+                        run,
+                        placement,
+                        cwd,
+                    },
+                ..
+            } => {
+                assert!(run.is_none());
+                assert_eq!(*placement, PanePlacement::Right);
+                assert_eq!(*cwd, PaneCwd::Active);
+            }
+            other => panic!("expected NewPane composite, got {other:?}"),
+        }
     }
 }
