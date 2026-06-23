@@ -2690,6 +2690,78 @@ fn begin_worktree_wizard(
     *wizard_ui = Some(w);
 }
 
+/// Non-interactive worktree creation for a `[[actions]] action = "new-worktree"`
+/// keybind: spawn the same worker as the wizard, then immediately synthesize the
+/// `SandboxChosen` + `Submit` decisions so there is no overlay to drive. The
+/// creation-progress overlay is revealed straight away for feedback; the
+/// `CreateEvent::Done` handler builds the tab + pane exactly as for the wizard.
+#[allow(clippy::too_many_arguments)]
+fn begin_worktree_preset(
+    root: std::path::PathBuf,
+    name: crate::keymap::NameSpec,
+    sandbox: Option<String>,
+    agent: Option<String>,
+    base: Option<String>,
+    cfg: &superzej_core::config::Config,
+    create_gen: &mut u64,
+    create_tx: &tokio_mpsc::UnboundedSender<wizard::CreateEvent>,
+    waker: &TerminalWaker,
+    creating: &mut Option<wizard::CreationProgress>,
+    wizard_cmd_tx: &mut Option<std::sync::mpsc::Sender<wizard::WizardCmd>>,
+    wizard_ui: &mut Option<wizard::NewWorktreeWizard>,
+    model: &mut FrameModel,
+) {
+    if wizard_ui.is_some() || creating.is_some() {
+        model.status = "worktree creation already in progress".into();
+        return;
+    }
+    *create_gen += 1;
+    let candidate = superzej_core::worktree::candidate_name(cfg);
+    let sandbox = sandbox.unwrap_or_else(|| cfg.sandbox.default_backend.as_str().to_string());
+    let agent = agent.unwrap_or_else(|| "shell".to_string());
+    let name_choice = match name {
+        crate::keymap::NameSpec::Random => wizard::NameChoice::Generated,
+        crate::keymap::NameSpec::Fixed(tail) => wizard::NameChoice::Human(tail),
+    };
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    let ctx = wizard::WorkerCtx {
+        cfg: cfg.clone(),
+        repo_root: root,
+        candidate: candidate.clone(),
+        generation: *create_gen,
+        db_path: None,
+        base_override: base,
+    };
+    let tx = create_tx.clone();
+    let wk = waker.clone();
+    task::spawn_blocking(move || {
+        wizard::run_worker(ctx, cmd_rx, tx, move || {
+            let _ = wk.wake();
+        });
+    });
+    // Drive the worker headlessly — the mpsc channel buffers these until the
+    // worker reaches its command loop (after the speculative create).
+    let _ = cmd_tx.send(wizard::WizardCmd::SandboxChosen(sandbox.clone()));
+    let _ = cmd_tx.send(wizard::WizardCmd::Submit(wizard::WizardChoices {
+        name: name_choice,
+        sandbox,
+        agent,
+    }));
+    *wizard_cmd_tx = Some(cmd_tx);
+    // No interactive overlay (`wizard_ui` stays None); reveal the progress
+    // overlay and start its ticker, mirroring the wizard's submit path.
+    let mut cp = wizard::CreationProgress::new(*create_gen, candidate);
+    cp.revealed = true;
+    wizard::spawn_ticker(cp.generation, cp.ticker_alive.clone(), create_tx.clone(), {
+        let wk = waker.clone();
+        move || {
+            let _ = wk.wake();
+        }
+    });
+    *creating = Some(cp);
+    model.status = "Creating worktree…".into();
+}
+
 fn begin_new_workspace_prompt(
     host_input: &mut Option<(menu::InputOverlay, HostInputKind)>,
     model: &mut FrameModel,
@@ -9670,7 +9742,7 @@ async fn event_loop<T: Terminal>(
                                 } else if let Some(idx) = keymap
                                     .custom_actions()
                                     .iter()
-                                    .position(|action| action.name == key)
+                                    .position(|action| action.name() == key)
                                 {
                                     forced_palette_action =
                                         Some(crate::keymap::Action::Custom(idx as u16));
@@ -11842,22 +11914,162 @@ async fn event_loop<T: Terminal>(
                                 model.status = "Keybinds locked — Ctrl+g to unlock".into();
                             }
                             Action::Custom(idx) => {
-                                if let Some(ca) = keymap.custom_actions().get(idx as usize) {
-                                    let mut cmd =
-                                        std::process::Command::new(superzej_core::util::shell());
-                                    cmd.arg("-c").arg(&ca.run);
-                                    if ca.floating {
-                                        let cwd = active_cwd(&session);
-                                        if let Some(dir) = cwd {
+                                // Clone out so the keymap borrow ends before the
+                                // composite arms re-borrow `keymap.config()` and
+                                // the mutable wizard/session/panes state.
+                                match keymap.custom_actions().get(idx as usize).cloned() {
+                                    Some(crate::keymap::HostCustomAction::Shell {
+                                        run, ..
+                                    }) => {
+                                        let mut cmd = std::process::Command::new(
+                                            superzej_core::util::shell(),
+                                        );
+                                        cmd.arg("-c").arg(&run);
+                                        if let Some(dir) = active_cwd(&session) {
                                             cmd.current_dir(dir);
                                         }
                                         let _ = cmd.spawn();
-                                    } else {
-                                        // A non-floating run should spawn in the current center/pane
-                                        // or split, but for the spike we'll just shell out similarly
-                                        // or spawn a new pane. For now, spawn floating.
-                                        let _ = cmd.spawn();
                                     }
+                                    Some(crate::keymap::HostCustomAction::Composite {
+                                        action: composite,
+                                        ..
+                                    }) => match composite {
+                                        crate::keymap::CompositeAction::NewWorktree {
+                                            name,
+                                            sandbox,
+                                            agent,
+                                            base,
+                                        } => {
+                                            // Same repo-root resolution as Action::NewWorktree:
+                                            // sidebar-selected workspace, else active group, else cwd.
+                                            let sidebar_repo = focus
+                                                .sidebar()
+                                                .then(|| sb.selected_row(&model))
+                                                .flatten()
+                                                .map(|r| r.workspace_slug.clone())
+                                                .and_then(|slug| {
+                                                    model
+                                                        .sidebar_workspaces
+                                                        .iter()
+                                                        .find(|(s, _, _, _)| *s == slug)
+                                                        .map(|(_, _, _, p)| p.clone())
+                                                })
+                                                .filter(|p| !p.is_empty());
+                                            let src_wt = sidebar_repo.unwrap_or_else(|| {
+                                                session
+                                                    .active_group()
+                                                    .map(|g| g.path.clone())
+                                                    .unwrap_or_default()
+                                            });
+                                            let repo_root = (!src_wt.is_empty())
+                                                .then(|| {
+                                                    superzej_core::repo::main_worktree(Path::new(
+                                                        &src_wt,
+                                                    ))
+                                                })
+                                                .flatten()
+                                                .or_else(|| {
+                                                    std::env::current_dir().ok().and_then(|c| {
+                                                        superzej_core::repo::main_worktree(&c)
+                                                    })
+                                                });
+                                            if let Some(root) = repo_root {
+                                                begin_worktree_preset(
+                                                    root,
+                                                    name,
+                                                    sandbox,
+                                                    agent,
+                                                    base,
+                                                    keymap.config(),
+                                                    &mut create_gen,
+                                                    &create_tx,
+                                                    &waker,
+                                                    &mut creating,
+                                                    &mut wizard_cmd_tx,
+                                                    &mut wizard_ui,
+                                                    &mut model,
+                                                );
+                                            } else {
+                                                superzej_core::msg::warn(
+                                                    "new-worktree: not inside a git repository",
+                                                );
+                                            }
+                                        }
+                                        crate::keymap::CompositeAction::NewPane {
+                                            run,
+                                            placement,
+                                            cwd,
+                                        } => {
+                                            const MAX_PANES: usize = 16;
+                                            if session
+                                                .active_tab()
+                                                .map(|t| t.center.pane_ids().len())
+                                                .unwrap_or(0)
+                                                >= MAX_PANES
+                                            {
+                                                model.status = format!(
+                                                    "Pane limit reached ({MAX_PANES} per tab)"
+                                                );
+                                                dirty = true;
+                                                continue;
+                                            }
+                                            let dir = match placement {
+                                                crate::keymap::PanePlacement::Down => {
+                                                    crate::center::Dir::Col
+                                                }
+                                                crate::keymap::PanePlacement::Right => {
+                                                    crate::center::Dir::Row
+                                                }
+                                            };
+                                            let pane_cwd = match cwd {
+                                                crate::keymap::PaneCwd::Worktree => session
+                                                    .active_group()
+                                                    .map(|g| std::path::PathBuf::from(&g.path)),
+                                                crate::keymap::PaneCwd::Active => {
+                                                    active_cwd(&session)
+                                                }
+                                            };
+                                            let spawned = match &run {
+                                                Some(cmdline) => {
+                                                    let argv = vec![
+                                                        superzej_core::util::shell(),
+                                                        "-c".to_string(),
+                                                        cmdline.clone(),
+                                                    ];
+                                                    panes.spawn_argv(
+                                                        &argv,
+                                                        pane_cwd.as_deref(),
+                                                        chrome.center,
+                                                    )
+                                                }
+                                                None => spawn_worktree_shell_pane(
+                                                    &mut panes,
+                                                    keymap.config(),
+                                                    pane_cwd.as_deref(),
+                                                    chrome.center,
+                                                ),
+                                            };
+                                            match spawned {
+                                                Ok(new) => {
+                                                    if let Some(tab) = session.active_tab_mut() {
+                                                        if tab.center.split(focused, dir, new) {
+                                                            tab.focused_pane = new;
+                                                            need_relayout = true;
+                                                        } else {
+                                                            panes.table.remove(&new);
+                                                        }
+                                                    } else {
+                                                        panes.table.remove(&new);
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    model.status =
+                                                        format!("Pane spawn failed: {e}");
+                                                }
+                                            }
+                                        }
+                                    },
+                                    None => {}
                                 }
                             }
                             Action::Quit => {
