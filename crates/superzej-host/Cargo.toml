@@ -51,3 +51,7 @@ sz-kit = { path = "../sz-kit" }
 # sz-kit git-dep is redirected to the in-tree crate by the root [patch].
 # termite-chat's embeddable TUI (the `chat` tab).
 termite-chat = { path = "../../apps/termite-chat" }
+# termite-agent's coding-agent runtime (the `agent` tab). The host owns the
+# `AppTile` (apps/agent.rs) and drives `termite-core`'s blocking `AgentRuntime`
+# on `spawn_blocking`; the submodule stays a clean library dep.
+termite-core = { path = "../../apps/termite-agent/crates/termite-core" }

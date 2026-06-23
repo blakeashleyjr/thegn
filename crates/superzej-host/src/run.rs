@@ -5428,6 +5428,7 @@ async fn ensure_app_loaded(
     app_tx: &tokio_mpsc::UnboundedSender<usize>,
     waker: &TerminalWaker,
     current_config: &superzej_core::config::Config,
+    event_bus: &superzej_core::event_bus::EventBus,
 ) -> bool {
     let crate::apps::ActiveApp::Tile(i) = target else {
         return true;
@@ -5448,6 +5449,10 @@ async fn ensure_app_loaded(
     let id = app_host.slots[i].id;
     let tile = match id {
         "chat" => crate::apps::chat::build(handle, hook, theme).await,
+        "agent" => {
+            crate::apps::agent::build(handle, hook, theme, current_config, Some(event_bus.clone()))
+                .await
+        }
         "dashboard" => {
             crate::apps::dashboard::build(handle, hook, theme, &current_config.dashboard).await
         }
@@ -5829,7 +5834,16 @@ async fn event_loop<T: Terminal>(
 
     let mut current_config = keymap.config().clone();
     let initial_app = app_host.active;
-    if ensure_app_loaded(&mut app_host, initial_app, &app_tx, &waker, &current_config).await {
+    if ensure_app_loaded(
+        &mut app_host,
+        initial_app,
+        &app_tx,
+        &waker,
+        &current_config,
+        &event_bus,
+    )
+    .await
+    {
         dirty = true;
     }
     // Pre-warm the dashboard so switching to it is instant. Its build just
@@ -5839,7 +5853,15 @@ async fn event_loop<T: Terminal>(
     if let Some(dash) = app_host.dashboard_target()
         && app_host.active != dash
     {
-        let _ = ensure_app_loaded(&mut app_host, dash, &app_tx, &waker, &current_config).await;
+        let _ = ensure_app_loaded(
+            &mut app_host,
+            dash,
+            &app_tx,
+            &waker,
+            &current_config,
+            &event_bus,
+        )
+        .await;
     }
     // The workspace the keymap was last built for; when the focused workspace
     // changes we rebuild so per-workspace/repo-root keybind layers follow it.
@@ -8657,6 +8679,7 @@ async fn event_loop<T: Terminal>(
                             &app_tx,
                             &waker,
                             &current_config,
+                            &event_bus,
                         )
                         .await
                         {
@@ -12524,6 +12547,7 @@ async fn event_loop<T: Terminal>(
                                         &app_tx,
                                         &waker,
                                         &current_config,
+                                        &event_bus,
                                     )
                                     .await
                                     {
