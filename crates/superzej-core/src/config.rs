@@ -764,6 +764,14 @@ pub struct ThemeColors {
     /// Text inside inverse chips (defaults to bg0).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chip_fg: Option<String>,
+    /// Sidebar activity dot when a worktree is busy / its agent is working
+    /// (defaults to the text tone, "white").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity_active: Option<String>,
+    /// Sidebar activity dot when an agent is waiting for the user's input
+    /// (defaults to the red status hue).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity_waiting: Option<String>,
 }
 
 /// `[theme.hues]` — all optional "#rrggbb" overrides for the eight semantic
@@ -2551,6 +2559,8 @@ impl Config {
         set(&mut p.shadow_bg, &c.shadow_bg);
         set(&mut p.shadow_fg, &c.shadow_fg);
         set(&mut p.chip_fg, &c.chip_fg);
+        set(&mut p.activity_active, &c.activity_active);
+        set(&mut p.activity_waiting, &c.activity_waiting);
         let h = &self.theme.hues;
         set(&mut p.hues.teal, &h.teal);
         set(&mut p.hues.magenta, &h.magenta);
@@ -3042,6 +3052,24 @@ name = "minimal"
             assert!(!p.hues.orange.is_empty(), "{name}: hues");
             assert!(p.heat.iter().all(|h| !h.is_empty()), "{name}: heat");
         }
+    }
+
+    #[test]
+    fn activity_dot_colors_resolve_and_honor_overrides() {
+        let cfg = Config::default();
+        for name in crate::theme::PRESETS {
+            let p = cfg.palette_with_preset(name);
+            // Default: active borrows the text tone, waiting borrows red.
+            assert_eq!(p.activity_active, p.text, "{name}: activity_active");
+            assert_eq!(p.activity_waiting, p.hues.red, "{name}: activity_waiting");
+        }
+        // Explicit `[theme.colors]` overrides win over the derived defaults.
+        let mut cfg = Config::default();
+        cfg.theme.colors.activity_active = Some("#010203".into());
+        cfg.theme.colors.activity_waiting = Some("#0a0b0c".into());
+        let p = cfg.palette();
+        assert_eq!(p.activity_active, "1;2;3");
+        assert_eq!(p.activity_waiting, "10;11;12");
     }
 
     #[test]

@@ -170,6 +170,10 @@ pub struct Palette {
     pub shadow_fg: String,
     /// Text inside inverse chips (≈ bg0 so chips read as filled).
     pub chip_fg: String,
+    /// Sidebar activity dot — worktree busy / agent working (white).
+    pub activity_active: String,
+    /// Sidebar activity dot — agent waiting for the user's input (red).
+    pub activity_waiting: String,
     /// Semantic hues (identity + status colors).
     pub hues: Hues,
     /// Commit-calendar heat ramp, cold → hot.
@@ -196,6 +200,8 @@ impl Default for Palette {
             shadow_bg: P_SHADOW_BG.into(),
             shadow_fg: P_SHADOW_FG.into(),
             chip_fg: P_BG0.into(),
+            activity_active: P_TEXT.into(),
+            activity_waiting: HUE_RED.into(),
             hues: Hues::prism(),
             heat: P_HEAT.map(String::from),
         }
@@ -260,6 +266,10 @@ pub fn extend_palette(p: &mut Palette) {
     if p.chip_fg.is_empty() {
         p.chip_fg = p.bg0.clone();
     }
+    if p.activity_active.is_empty() {
+        // Regular activity reads as the brightest text tone ("white").
+        p.activity_active = p.text.clone();
+    }
     let d = Hues::prism();
     let h = &mut p.hues;
     for (slot, def) in [
@@ -275,6 +285,10 @@ pub fn extend_palette(p: &mut Palette) {
         if slot.is_empty() {
             *slot = def;
         }
+    }
+    if p.activity_waiting.is_empty() {
+        // "Waiting for the user" borrows the red status hue (resolved above).
+        p.activity_waiting = p.hues.red.clone();
     }
     let green = p.hues.green.clone();
     for (i, t) in [0.04, 0.22, 0.45, 0.68, 0.95].into_iter().enumerate() {
@@ -305,6 +319,8 @@ fn pal(c: [&str; 12]) -> Palette {
         shadow_bg: String::new(),
         shadow_fg: String::new(),
         chip_fg: String::new(),
+        activity_active: String::new(),
+        activity_waiting: String::new(),
         hues: Hues::default(),
         heat: Default::default(),
     }
