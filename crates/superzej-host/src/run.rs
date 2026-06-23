@@ -1099,10 +1099,7 @@ impl SidebarState {
         session: &crate::session::Session,
         up: bool,
     ) -> bool {
-        let Some(slug) = self
-            .selected_row(model)
-            .map(|r| r.workspace_slug.clone())
-        else {
+        let Some(slug) = self.selected_row(model).map(|r| r.workspace_slug.clone()) else {
             return false;
         };
         // The reorderable (DB-backed) workspaces in display order, as
@@ -1648,9 +1645,7 @@ fn visible_index_of_workspace(model: &FrameModel, slug: &str) -> Option<usize> {
         .sidebar_rows
         .iter()
         .filter(|r| r.visible)
-        .position(|r| {
-            r.kind == crate::sidebar::RowKind::Workspace && r.workspace_slug == slug
-        })
+        .position(|r| r.kind == crate::sidebar::RowKind::Workspace && r.workspace_slug == slug)
 }
 
 fn switch_to_workspace_tab(
@@ -12715,22 +12710,16 @@ async fn event_loop<T: Terminal>(
                                 // motion matches what the user sees, but confined
                                 // to the active worktree's workspace so wrapping
                                 // never crosses into another workspace.
-                                let active_slug = session
-                                    .worktrees
-                                    .get(session.active)
-                                    .and_then(|g| {
+                                let active_slug =
+                                    session.worktrees.get(session.active).and_then(|g| {
                                         crate::sidebar::split_tab(&g.name).map(|(s, _)| s)
                                     });
                                 let order: Vec<usize> = sidebar_worktree_order(&model)
                                     .into_iter()
                                     .filter(|&g| {
-                                        session
-                                            .worktrees
-                                            .get(g)
-                                            .and_then(|w| {
-                                                crate::sidebar::split_tab(&w.name).map(|(s, _)| s)
-                                            })
-                                            == active_slug
+                                        session.worktrees.get(g).and_then(|w| {
+                                            crate::sidebar::split_tab(&w.name).map(|(s, _)| s)
+                                        }) == active_slug
                                     })
                                     .collect();
                                 let pos = order.iter().position(|&g| g == session.active);
@@ -13115,8 +13104,7 @@ async fn event_loop<T: Terminal>(
                                         .map(|t| t.center.layout(chrome.center))
                                         .unwrap_or_default();
                                     let ctx = crate::focus::RouteCtx {
-                                        sidebar_visible: want_sidebar
-                                            && chrome.sidebar.is_some(),
+                                        sidebar_visible: want_sidebar && chrome.sidebar.is_some(),
                                         panel_visible: want_panel && chrome.panel.is_some(),
                                         layout: &pane_layout,
                                         focused_pane: cur_focused,
@@ -13151,11 +13139,10 @@ async fn event_loop<T: Terminal>(
                                                 // until after the loop).
                                                 if panel_ui.row_mode {
                                                     let (pc, pr) = panel_geom(&chrome);
-                                                    let max =
-                                                        crate::panel::frame::actionable_rows(
-                                                            &model, &panel_ui, pc, pr,
-                                                        )
-                                                        .saturating_sub(1);
+                                                    let max = crate::panel::frame::actionable_rows(
+                                                        &model, &panel_ui, pc, pr,
+                                                    )
+                                                    .saturating_sub(1);
                                                     panel_ui.cursor = if delta < 0 {
                                                         panel_ui.cursor.saturating_sub(1)
                                                     } else {
@@ -13785,7 +13772,11 @@ async fn event_loop<T: Terminal>(
                     if let Some(ev) = leftover {
                         pending_input.push_back(ev);
                     }
-                    let batched = if repeat > 1 { bytes.repeat(repeat) } else { bytes };
+                    let batched = if repeat > 1 {
+                        bytes.repeat(repeat)
+                    } else {
+                        bytes
+                    };
                     // Sync-panes (item 96): broadcast to every pane in the active
                     // tab. The drawer is excluded (it's a transient overlay, not
                     // part of the tab layout); broadcasting only happens when
@@ -14520,7 +14511,8 @@ mod tests {
     fn sidebar_e_toggles_wide_expand_and_persists() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Persisting the flag opens the global DB; redirect it to a temp dir.
-        let state_home = std::env::temp_dir().join(format!("sz-host-expand-{}", std::process::id()));
+        let state_home =
+            std::env::temp_dir().join(format!("sz-host-expand-{}", std::process::id()));
         // SAFETY: test is single-threaded; sets/clears an XDG var around calls.
         unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
 

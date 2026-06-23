@@ -2678,7 +2678,11 @@ mod tests {
             .into_iter()
             .map(|w| w.repo_path)
             .collect();
-        assert_eq!(order, vec!["/a", "/b", "/c"], "upsert must preserve position");
+        assert_eq!(
+            order,
+            vec!["/a", "/b", "/c"],
+            "upsert must preserve position"
+        );
     }
 
     #[test]
@@ -2701,7 +2705,13 @@ mod tests {
         // set_workspace_position is the persist-side primitive; floating c to a
         // fresh min puts it first.
         db.set_workspace_position("/c", -1).unwrap();
-        let first = db.workspaces().unwrap().into_iter().next().unwrap().repo_path;
+        let first = db
+            .workspaces()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .repo_path;
         assert_eq!(first, "/c");
     }
 

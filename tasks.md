@@ -219,8 +219,8 @@ Depends on Phase 1 (shell) + Phase 2 (proxy + containers).
   coding agent, hosted as the `agent` app tab. Q/S/T track against **its** roadmap
   (`apps/termite-agent/docs/ROADMAP.md`) as the source of truth.
 - Orchestration core **Q (211–224)** (defer 225–228)
-- **R is now secondary:** ACP client + native adapters **(229–242)** are an *additive*
-  path for running *foreign* harnesses, not the headline — superzej ships its own.
+- **R is now secondary:** ACP client + native adapters **(229–242)** are an _additive_
+  path for running _foreign_ harnesses, not the headline — superzej ships its own.
 - Observability **S (243–258)** (tokens/cost 249–250 light up because the proxy exists)
 - Review/merge basics **T (259–263, 267–268)**
 - **Milestone:** spawn, monitor, review, and merge agents across worktrees, metered
