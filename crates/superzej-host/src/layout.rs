@@ -92,6 +92,14 @@ pub struct ChromeLayout {
     /// directly below the center tab bar). `None` when hidden or too short.
     pub strip: Option<Rect>,
     pub center: Rect,
+    /// The bottom drawer's content rect (where the file-manager PTY composites),
+    /// when visible. `"full"` width spans the whole band bottom (sidebar/center/
+    /// panel all shorten); `"center"` spans only the center column. `None` when
+    /// closed or the band is too short to spare it.
+    pub drawer: Option<Rect>,
+    /// The 1-row horizontal rule directly above the drawer (spans the drawer's
+    /// columns). `None` whenever `drawer` is `None`.
+    pub drawer_divider: Option<Rect>,
 }
 
 impl ChromeLayout {
@@ -125,6 +133,8 @@ pub fn compute(cols: usize, rows: usize, want_sidebar: bool, want_panel: bool) -
         SIDEBAR_COLS,
         false,
         0.0,
+        0,
+        false,
     )
 }
 
@@ -147,6 +157,8 @@ pub fn compute_with_width(
         sidebar_cols,
         false,
         0.0,
+        0,
+        false,
     )
 }
 
@@ -173,6 +185,35 @@ pub fn compute_with_strip(
         SIDEBAR_COLS,
         want_strip,
         strip_ratio,
+        0,
+        false,
+    )
+}
+
+/// Compute the chrome cross reserving a bottom drawer of `drawer_rows` rows
+/// (full-width or center-only) when the band can spare it. (Convenience used by
+/// tests; the live loop calls [`compute_full`].)
+#[allow(dead_code)]
+pub fn compute_with_drawer(
+    cols: usize,
+    rows: usize,
+    want_sidebar: bool,
+    want_panel: bool,
+    drawer_rows: usize,
+    drawer_full_width: bool,
+) -> ChromeLayout {
+    compute_full(
+        cols,
+        rows,
+        want_sidebar,
+        want_panel,
+        false,
+        PanelWidth::Normal,
+        SIDEBAR_COLS,
+        false,
+        0.0,
+        drawer_rows,
+        drawer_full_width,
     )
 }
 
@@ -184,6 +225,11 @@ pub fn compute_with_strip(
 /// screen (the clamp below always leaves the center ≥ 1 column).
 /// `panel_width` (cycled by the accordion's `e` key) widens the panel: `Half`
 /// claims half the window, `Full` fills the whole band (sidebar suppressed).
+/// `drawer_rows` (> 0) reserves a bottom drawer: `drawer_full_width` spans the
+/// whole band bottom — sidebar/center/panel all shorten — while a center-only
+/// drawer is carved from the bottom of the center column (a mirror of the top
+/// strip). The drawer is suppressed when the band can't spare it while leaving
+/// the columns a usable height.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_full(
     cols: usize,
@@ -195,6 +241,8 @@ pub fn compute_full(
     sidebar_cols: usize,
     want_strip: bool,
     strip_ratio: f32,
+    drawer_rows: usize,
+    drawer_full_width: bool,
 ) -> ChromeLayout {
     // A full-width panel claims the whole band — the sidebar steps aside.
     let show_sidebar = want_sidebar && cols >= SIDEBAR_MIN_COLS && panel_width != PanelWidth::Full;
@@ -229,6 +277,29 @@ pub fn compute_full(
     // here, with the column tops aligned at `band_y`.
     let band_y = masthead.rows + divider_rows;
     let band_rows = rows.saturating_sub(band_y + statusbar.rows);
+
+    // A full-width bottom drawer claims a horizontal slice of the band bottom
+    // (its own 1-row divider + `drawer_rows`) before the columns lay out, so
+    // sidebar/center/panel all shorten together. Suppressed when the band can't
+    // spare it while leaving the columns ≥ STRIP_MIN_ROWS. A center-only drawer
+    // (`!drawer_full_width`) leaves the full band to the columns and is carved
+    // from the center column further down.
+    let full_drawer_rows = if drawer_rows > 0
+        && drawer_full_width
+        && band_rows >= drawer_rows + 1 + STRIP_MIN_ROWS
+    {
+        drawer_rows
+    } else {
+        0
+    };
+    let drawer_reserve = if full_drawer_rows > 0 {
+        full_drawer_rows + 1
+    } else {
+        0
+    };
+    // Rows available to the columns (sidebar / center / panel) after the
+    // full-width drawer slice, if any.
+    let col_rows = band_rows.saturating_sub(drawer_reserve);
 
     // Clamp the surface widths so the center keeps ≥ 1 column after the
     // 1-col separators between sidebar|center and center|panel are reserved.
@@ -273,7 +344,7 @@ pub fn compute_full(
         x: 0,
         y: band_y,
         cols: left,
-        rows: band_rows,
+        rows: col_rows,
     });
     let sep_left = (left > 0).then_some(left);
     let panel_x = cols.saturating_sub(right);
@@ -281,7 +352,7 @@ pub fn compute_full(
         x: panel_x,
         y: band_y,
         cols: right,
-        rows: band_rows,
+        rows: col_rows,
     });
     let sep_right = (right > 0).then_some(panel_x.saturating_sub(1));
 
@@ -290,7 +361,7 @@ pub fn compute_full(
 
     // The center column's tab bar sits directly below the divider, level with
     // the sidebar header and the panel switcher.
-    let tabs_rows = band_rows.min(1);
+    let tabs_rows = col_rows.min(1);
     let center_tabs = Rect {
         x: center_x,
         y: band_y,
@@ -300,7 +371,7 @@ pub fn compute_full(
 
     // Carve a top strip out of the center column when wanted and the band can
     // spare the rows (strip ≥ STRIP_MIN_ROWS while leaving center ≥ STRIP_MIN_ROWS).
-    let column_rows = band_rows.saturating_sub(tabs_rows);
+    let column_rows = col_rows.saturating_sub(tabs_rows);
     let strip_rows = if want_strip {
         let r = (column_rows as f32 * strip_ratio.clamp(0.0, 0.9)).round() as usize;
         let r = r.max(STRIP_MIN_ROWS);
@@ -319,11 +390,55 @@ pub fn compute_full(
         cols: center_cols,
         rows: strip_rows,
     });
-    let center = Rect {
+    let mut center = Rect {
         x: center_x,
         y: band_y + tabs_rows + strip_rows,
         cols: center_cols,
-        rows: band_rows.saturating_sub(tabs_rows + strip_rows),
+        rows: col_rows.saturating_sub(tabs_rows + strip_rows),
+    };
+
+    // The bottom drawer. Full-width: the slice reserved up front below the
+    // columns, spanning the whole width. Center-only: carved from the bottom of
+    // the center column here (its own 1-row divider + `drawer_rows`), suppressed
+    // when the center can't spare it while keeping ≥ STRIP_MIN_ROWS.
+    let (drawer, drawer_divider) = if full_drawer_rows > 0 {
+        let div_y = band_y + col_rows;
+        (
+            Some(Rect {
+                x: 0,
+                y: div_y + 1,
+                cols,
+                rows: full_drawer_rows,
+            }),
+            Some(Rect {
+                x: 0,
+                y: div_y,
+                cols,
+                rows: 1,
+            }),
+        )
+    } else if drawer_rows > 0
+        && !drawer_full_width
+        && center.rows >= drawer_rows + 1 + STRIP_MIN_ROWS
+    {
+        center.rows -= drawer_rows + 1;
+        let div_y = center.y + center.rows;
+        (
+            Some(Rect {
+                x: center_x,
+                y: div_y + 1,
+                cols: center_cols,
+                rows: drawer_rows,
+            }),
+            Some(Rect {
+                x: center_x,
+                y: div_y,
+                cols: center_cols,
+                rows: 1,
+            }),
+        )
+    } else {
+        (None, None)
     };
 
     ChromeLayout {
@@ -337,6 +452,8 @@ pub fn compute_full(
         center_tabs,
         strip,
         center,
+        drawer,
+        drawer_divider,
     }
 }
 
@@ -431,6 +548,8 @@ mod tests {
             SIDEBAR_COLS,
             false,
             0.0,
+            0,
+            false,
         );
         let half = compute_full(
             160,
@@ -442,6 +561,8 @@ mod tests {
             SIDEBAR_COLS,
             false,
             0.0,
+            0,
+            false,
         );
         let full = compute_full(
             160,
@@ -453,6 +574,8 @@ mod tests {
             SIDEBAR_COLS,
             false,
             0.0,
+            0,
+            false,
         );
         assert_eq!(resting.panel.unwrap().cols, PANEL_COLS);
         // Half claims ~half the window (≥ resting), center stays alive.
@@ -474,6 +597,8 @@ mod tests {
             SIDEBAR_COLS,
             false,
             0.0,
+            0,
+            false,
         );
         assert!(tiny.panel.unwrap().cols >= PANEL_COLS);
         assert!(tiny.center.cols >= 1);
@@ -524,24 +649,30 @@ mod tests {
                 && b.y < a.y + a.rows
         }
 
-        for rows in 0..=4 {
-            let l = compute(24, rows, true, true);
-            let named = [
-                ("masthead", Some(l.masthead)),
-                ("divider", Some(l.divider)),
-                ("statusbar", Some(l.statusbar)),
-                ("tabs", Some(l.center_tabs)),
-                ("center", Some(l.center)),
-                ("sidebar", l.sidebar),
-                ("panel", l.panel),
-            ];
-            for (i, (an, a)) in named.iter().enumerate() {
-                for (bn, b) in named.iter().skip(i + 1) {
-                    if let (Some(a), Some(b)) = (a, b) {
-                        assert!(
-                            !overlaps(*a, *b),
-                            "{an} overlaps {bn} at rows={rows}: {l:?}"
-                        );
+        // Sweep across heights and both drawer widths so the drawer/divider
+        // rects never collide with the rest of the cross at tiny sizes.
+        for rows in 0..=12 {
+            for (drawer_rows, full) in [(0, false), (3, true), (3, false), (8, true)] {
+                let l = compute_with_drawer(24, rows, true, true, drawer_rows, full);
+                let named = [
+                    ("masthead", Some(l.masthead)),
+                    ("divider", Some(l.divider)),
+                    ("statusbar", Some(l.statusbar)),
+                    ("tabs", Some(l.center_tabs)),
+                    ("center", Some(l.center)),
+                    ("sidebar", l.sidebar),
+                    ("panel", l.panel),
+                    ("drawer", l.drawer),
+                    ("drawer_divider", l.drawer_divider),
+                ];
+                for (i, (an, a)) in named.iter().enumerate() {
+                    for (bn, b) in named.iter().skip(i + 1) {
+                        if let (Some(a), Some(b)) = (a, b) {
+                            assert!(
+                                !overlaps(*a, *b),
+                                "{an} overlaps {bn} at rows={rows} drawer={drawer_rows} full={full}: {l:?}"
+                            );
+                        }
                     }
                 }
             }
@@ -593,6 +724,70 @@ mod tests {
         let l = compute_with_strip(160, 40, true, true, false, 0.2);
         assert!(l.strip.is_none());
         assert_eq!(l.center.y, 3);
+        assert_eq!(l.center.rows, 36);
+    }
+
+    #[test]
+    fn full_width_drawer_reserves_band_bottom_and_shrinks_all_columns() {
+        // 40 rows: band is 38 (masthead 1 + statusbar 1). A 10-row full-width
+        // drawer + its 1-row divider claim 11 rows from the band bottom; the
+        // sidebar, panel, and center all shorten by the same amount.
+        let l = compute_with_drawer(160, 40, true, true, 10, true);
+        let drawer = l.drawer.expect("drawer visible");
+        let div = l.drawer_divider.expect("divider visible");
+        assert_eq!(drawer.x, 0);
+        assert_eq!(drawer.cols, 160, "full-width drawer spans the terminal");
+        assert_eq!(drawer.rows, 10);
+        // Drawer sits flush above the statusbar; divider directly above it.
+        assert_eq!(drawer.y + drawer.rows, l.statusbar.y);
+        assert_eq!(div.y + div.rows, drawer.y);
+        assert_eq!(div.cols, 160);
+        // All three columns end at the divider — they shorten together.
+        let sb = l.sidebar.unwrap();
+        let pn = l.panel.unwrap();
+        assert_eq!(sb.y + sb.rows, div.y);
+        assert_eq!(pn.y + pn.rows, div.y);
+        assert_eq!(l.center.y + l.center.rows, div.y);
+    }
+
+    #[test]
+    fn center_only_drawer_shrinks_only_center() {
+        // The sidebar and panel keep their full band height; only the center
+        // column gives up rows to the drawer (a mirror of the top strip).
+        let full_band = compute(160, 40, true, true);
+        let l = compute_with_drawer(160, 40, true, true, 10, false);
+        let drawer = l.drawer.expect("drawer visible");
+        let div = l.drawer_divider.expect("divider visible");
+        assert_eq!(drawer.x, l.center.x, "center-only drawer spans the center");
+        assert_eq!(drawer.cols, l.center.cols);
+        assert_eq!(drawer.rows, 10);
+        // Sidebar/panel keep full height; center shortened by drawer + divider.
+        assert_eq!(l.sidebar.unwrap().rows, full_band.sidebar.unwrap().rows);
+        assert_eq!(l.panel.unwrap().rows, full_band.panel.unwrap().rows);
+        assert_eq!(l.center.rows, full_band.center.rows - 11);
+        assert_eq!(l.center.y + l.center.rows, div.y);
+        assert_eq!(div.y + div.rows, drawer.y);
+        assert_eq!(drawer.y + drawer.rows, l.statusbar.y);
+    }
+
+    #[test]
+    fn drawer_suppressed_when_band_too_short() {
+        // A short band can't give the drawer its rows and keep the columns
+        // alive: the drawer is dropped rather than overlapping.
+        let l = compute_with_drawer(160, 6, true, true, 10, true);
+        assert!(l.drawer.is_none());
+        assert!(l.drawer_divider.is_none());
+        assert!(l.center.rows >= 1);
+        let l = compute_with_drawer(160, 6, true, true, 10, false);
+        assert!(l.drawer.is_none());
+        assert!(l.center.rows >= 1);
+    }
+
+    #[test]
+    fn drawer_absent_when_zero_rows() {
+        let l = compute_with_drawer(160, 40, true, true, 0, true);
+        assert!(l.drawer.is_none());
+        assert!(l.drawer_divider.is_none());
         assert_eq!(l.center.rows, 36);
     }
 

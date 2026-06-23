@@ -1937,6 +1937,22 @@ fn draw_columns_frame(surface: &mut Surface, chrome: &crate::layout::ChromeLayou
             chrome.divider.cols,
         );
     }
+    // The bottom drawer's horizontal rule, matching the top divider — the seam
+    // that gives the popped-up drawer a real panel edge.
+    if let Some(div) = chrome.drawer_divider
+        && div.rows > 0
+    {
+        let line = "\u{2500}".repeat(div.cols);
+        draw_text(
+            surface,
+            div.x,
+            div.y,
+            &line,
+            col(S::Border),
+            col(S::Panel),
+            div.cols,
+        );
+    }
 }
 
 /// A centered confirmation modal: `msg` in a summoned layer (dimmed backdrop,
