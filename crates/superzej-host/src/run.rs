@@ -4278,6 +4278,30 @@ fn normalize_key(k: termwiz::input::KeyEvent) -> termwiz::input::KeyEvent {
             modifiers: k.modifiers | Modifiers::CTRL,
         };
     }
+    // The kitty keyboard protocol (we enable `ESC [ >1u` on the parent) reports
+    // modified ASCII control keys in CSI-u form (`ESC [ 9 ; 2 u` = Shift+Tab),
+    // which termwiz decodes to `KeyCode::Char('\t')` rather than the functional
+    // `KeyCode::Tab` it gives for the legacy `ESC [ Z` spelling. Canonicalize
+    // back to the functional keycode so chord matching and byte encoding treat
+    // both spellings identically — otherwise Shift+Tab collapses to a bare Tab
+    // (the SHIFT is silently dropped) and never reaches the pane as back-tab.
+    if let KeyCode::Char(c) = k.key
+        && !k.modifiers.is_empty()
+    {
+        let canon = match c {
+            '\t' => Some(KeyCode::Tab),
+            '\r' | '\n' => Some(KeyCode::Enter),
+            '\x08' | '\x7f' => Some(KeyCode::Backspace),
+            '\x1b' => Some(KeyCode::Escape),
+            _ => None,
+        };
+        if let Some(key) = canon {
+            return termwiz::input::KeyEvent {
+                key,
+                modifiers: k.modifiers,
+            };
+        }
+    }
     k
 }
 
@@ -6397,7 +6421,7 @@ async fn event_loop<T: Terminal>(
                                     let wt = session.worktrees[gi].path.clone();
                                     if !wt.is_empty() {
                                         let program = exited_program.clone().unwrap_or_default();
-                                        let is_shell = crate::pane::is_interactive_shell(&program);
+                                        let is_shell = crate::pane::is_routine_pane(&program);
                                         let policy =
                                             superzej_core::event_bus::ProcessExitPolicy::parse(
                                                 &current_config.notifications.process_exit,
@@ -14020,6 +14044,50 @@ mod tests {
         let k = normalize_key(kitty.clone());
         assert_eq!(k.key, kitty.key);
         assert_eq!(k.modifiers, kitty.modifiers);
+    }
+
+    #[test]
+    fn normalize_key_canonicalizes_kitty_csi_u_control_chars() {
+        // Shift+Tab over the kitty protocol arrives as Char('\t') + SHIFT; it
+        // must become Tab + SHIFT so key_bytes emits the `ESC [ Z` back-tab
+        // (and so apps like Claude Code see a real Shift+Tab, not a plain Tab).
+        let shift_tab = normalize_key(termwiz::input::KeyEvent {
+            key: KeyCode::Char('\t'),
+            modifiers: Modifiers::SHIFT,
+        });
+        assert_eq!(shift_tab.key, KeyCode::Tab);
+        assert_eq!(shift_tab.modifiers, Modifiers::SHIFT);
+        assert_eq!(
+            crate::input::key_bytes(&shift_tab.key, shift_tab.modifiers).unwrap(),
+            b"\x1b[Z"
+        );
+        // The same canonicalization covers the other ASCII control keys.
+        assert_eq!(
+            normalize_key(termwiz::input::KeyEvent {
+                key: KeyCode::Char('\r'),
+                modifiers: Modifiers::SHIFT,
+            })
+            .key,
+            KeyCode::Enter
+        );
+        assert_eq!(
+            normalize_key(termwiz::input::KeyEvent {
+                key: KeyCode::Char('\x7f'),
+                modifiers: Modifiers::CTRL,
+            })
+            .key,
+            KeyCode::Backspace
+        );
+        // An unmodified control char (a literal Tab/Esc) is left untouched so
+        // is_escape_key and the plain-Tab path keep working.
+        assert_eq!(
+            normalize_key(termwiz::input::KeyEvent {
+                key: KeyCode::Char('\t'),
+                modifiers: Modifiers::NONE,
+            })
+            .key,
+            KeyCode::Char('\t')
+        );
     }
 
     // ── drain helpers ────────────────────────────────────────────────────────
