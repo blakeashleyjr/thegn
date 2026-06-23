@@ -124,8 +124,10 @@ pub struct SidebarRow {
     pub tab_target: Option<RowTarget>,
     /// Whether this row is (in) the session's active worktree/tab.
     pub active: bool,
-    /// Worktree path (Worktree rows only) — the key for git/agent/activity
-    /// lookups, and for row actions like "copy path".
+    /// For Worktree rows: the worktree path — the key for git/agent/activity
+    /// lookups, and for row actions like "copy path". For Workspace rows: the
+    /// repo path (the remove-workspace target), or `None` for a live fallback
+    /// with no DB row yet.
     #[allow(dead_code)]
     pub worktree_path: Option<String>,
     /// A stable key for pinning a row (workspace slug, or `slug/branch`).
@@ -253,7 +255,10 @@ pub fn build_rows(
             workspace_slug: repo_slug.clone(),
             tab_target: None,
             active: false,
-            worktree_path: None,
+            // Workspace rows carry the repo path (not a worktree path) so the
+            // remove-workspace action can resolve its DB target without a
+            // slug→path lookup. Empty for live fallbacks with no DB row yet.
+            worktree_path: (!repo_path.is_empty()).then(|| repo_path.clone()),
             pin_key: repo_slug.clone(),
             branch: None,
             git: None,
