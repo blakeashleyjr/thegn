@@ -741,35 +741,51 @@ impl Db {
 
     /// Get unread notification counts grouped by worktree_path.
     /// Returns a map from worktree_path to count of unread notifications.
+    /// Unread notification counts grouped by worktree, restricted to `counted_kinds`
+    /// (the config-derived non-`info` kinds). Informational kinds are excluded by
+    /// passing only the counted set, so lifecycle events never inflate the badge.
+    /// An empty slice yields an empty map.
     pub fn get_unread_counts_by_worktree(
         &self,
+        counted_kinds: &[&str],
     ) -> Result<std::collections::BTreeMap<String, usize>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT worktree_path, COUNT(*) FROM notifications \
-             WHERE read=0 AND worktree_path != '' \
-             GROUP BY worktree_path",
-        )?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
-        let mut counts = std::collections::BTreeMap::new();
-        for row in rows.filter_map(|r| r.ok()) {
-            counts.insert(row.0, row.1 as usize);
-        }
-        Ok(counts)
+        self.unread_counts_for_kinds(counted_kinds)
     }
 
-    /// Get alert counts (test_failed, agent_failed, log_error, process_failed
-    /// notifications) grouped by worktree_path. Returns a map from
-    /// worktree_path to alert count.
+    /// Alert counts grouped by worktree, restricted to `alert_kinds` (the
+    /// config-derived `alert`-priority kinds). Drives the red ⚑ flag badge. An
+    /// empty slice yields an empty map (no flag).
     pub fn get_alert_counts_by_worktree(
         &self,
+        alert_kinds: &[&str],
     ) -> Result<std::collections::BTreeMap<String, usize>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT worktree_path, COUNT(*) FROM notifications \
-             WHERE read=0 AND kind IN ('test_failed', 'agent_failed', 'log_error', 'process_failed') \
-             GROUP BY worktree_path",
-        )?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        self.unread_counts_for_kinds(alert_kinds)
+    }
+
+    /// Shared implementation: unread (`read=0`) notifications with a non-empty
+    /// worktree, grouped by worktree, where `kind` is one of `kinds`. Builds a
+    /// `kind IN (?, …)` clause so a config priority remap reclassifies counts
+    /// without touching stored rows.
+    fn unread_counts_for_kinds(
+        &self,
+        kinds: &[&str],
+    ) -> Result<std::collections::BTreeMap<String, usize>> {
         let mut counts = std::collections::BTreeMap::new();
+        if kinds.is_empty() {
+            return Ok(counts);
+        }
+        let placeholders = std::iter::repeat_n("?", kinds.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT worktree_path, COUNT(*) FROM notifications \
+             WHERE read=0 AND worktree_path != '' AND kind IN ({placeholders}) \
+             GROUP BY worktree_path"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(kinds.iter()), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
         for row in rows.filter_map(|r| r.ok()) {
             counts.insert(row.0, row.1 as usize);
         }
@@ -3054,7 +3070,10 @@ mod tests {
         assert_eq!(unread.len(), 3);
         db.mark_notification_read(unread[0].id).unwrap();
 
-        let counts = db.get_unread_counts_by_worktree().unwrap();
+        let cfg = crate::config::NotificationsConfig::default();
+        let counts = db
+            .get_unread_counts_by_worktree(&cfg.counted_unread_kind_names())
+            .unwrap();
         // /wt/app has 1 unread, /wt/other has 1 unread
         assert_eq!(counts.get("/wt/app"), Some(&1));
         assert_eq!(counts.get("/wt/other"), Some(&1));
@@ -3075,7 +3094,10 @@ mod tests {
         db.put_notification("assigned", "ref:5", "msg", "/wt/other")
             .unwrap(); // not an alert
 
-        let counts = db.get_alert_counts_by_worktree().unwrap();
+        let cfg = crate::config::NotificationsConfig::default();
+        let counts = db
+            .get_alert_counts_by_worktree(&cfg.alert_kind_names())
+            .unwrap();
         // /wt/app has 2 alerts (test_failed + agent_failed)
         // /wt/other has 1 alert (log_error)
         assert_eq!(counts.get("/wt/app"), Some(&2));
@@ -3083,12 +3105,13 @@ mod tests {
     }
 
     #[test]
-    fn process_failed_is_an_alert_process_exited_is_only_unread() {
+    fn process_failed_alerts_process_exited_is_info_only() {
         let db = db();
-        // A clean task completion: unread, but NOT an alert.
+        let cfg = crate::config::NotificationsConfig::default();
+        // A clean task completion: Info — inbox-only, counted by neither badge.
         db.put_notification("process_exited", "make", "make finished", "/wt/app")
             .unwrap();
-        // A failure: both unread and an alert (red badge).
+        // A failure: Alert — counted by both the unread and the alert badge.
         db.put_notification(
             "process_failed",
             "cargo",
@@ -3097,14 +3120,55 @@ mod tests {
         )
         .unwrap();
 
-        let unread = db.get_unread_counts_by_worktree().unwrap();
-        assert_eq!(unread.get("/wt/app"), Some(&2), "both count toward unread");
+        let unread = db
+            .get_unread_counts_by_worktree(&cfg.counted_unread_kind_names())
+            .unwrap();
+        assert_eq!(
+            unread.get("/wt/app"),
+            Some(&1),
+            "only the Alert counts toward unread; process_exited is Info"
+        );
 
-        let alerts = db.get_alert_counts_by_worktree().unwrap();
+        let alerts = db
+            .get_alert_counts_by_worktree(&cfg.alert_kind_names())
+            .unwrap();
         assert_eq!(
             alerts.get("/wt/app"),
             Some(&1),
             "only process_failed is an alert"
+        );
+    }
+
+    #[test]
+    fn empty_kind_set_yields_no_counts() {
+        let db = db();
+        db.put_notification("test_failed", "ref", "boom", "/wt/app")
+            .unwrap();
+        assert!(
+            db.get_alert_counts_by_worktree(&[]).unwrap().is_empty(),
+            "no kinds → no flag"
+        );
+    }
+
+    #[test]
+    fn config_demotion_reclassifies_counts_live() {
+        let db = db();
+        db.put_notification("test_failed", "ref", "boom", "/wt/app")
+            .unwrap();
+        let mut cfg = crate::config::NotificationsConfig::default();
+        // Demote test_failed to notice: it drops out of the alert badge but stays
+        // in the neutral unread count — no stored row changed.
+        cfg.priority.insert("test_failed".into(), "notice".into());
+        assert!(
+            db.get_alert_counts_by_worktree(&cfg.alert_kind_names())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.get_unread_counts_by_worktree(&cfg.counted_unread_kind_names())
+                .unwrap()
+                .get("/wt/app"),
+            Some(&1)
         );
     }
 

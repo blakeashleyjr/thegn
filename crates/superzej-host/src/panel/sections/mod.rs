@@ -419,11 +419,16 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
             }
         }
         Section::Notifications => {
-            let u = model.panel.unread_notifications;
-            if u == 0 {
-                vec![seg(g2(), "inbox zero")]
+            // Red ⚑ flag for attention (Alert) only; a dim "N unread" for Notice;
+            // Info never counts, so an inbox of only lifecycle events reads as zero.
+            let alert = model.panel.alert_notifications;
+            let unread = model.panel.unread_notifications;
+            if alert > 0 {
+                vec![seg(hue(Hue::Red), format!("⚑ {alert}"))]
+            } else if unread > 0 {
+                vec![seg(f(), format!("{unread} unread"))]
             } else {
-                vec![seg(hue(Hue::Red), format!("⚑ {u}"))]
+                vec![seg(g2(), "inbox zero")]
             }
         }
         Section::Logs => {
@@ -797,6 +802,30 @@ mod spec {
             rows,
         };
         text(&content(section, &ctx))
+    }
+
+    #[test]
+    fn notifications_summary_flags_alerts_not_info() {
+        let seg_text = |segs: &[Seg]| segs.iter().map(|s| s.text.clone()).collect::<String>();
+        let mut m = FrameModel::default();
+
+        // Info-only inbox (worktree created / process exited never count): no flag.
+        m.panel.alert_notifications = 0;
+        m.panel.unread_notifications = 0;
+        let s = seg_text(&summary(Section::Notifications, &m));
+        assert_eq!(s, "inbox zero");
+        assert!(!s.contains('⚑'));
+
+        // Notice-priority unread: a neutral count, still no red flag.
+        m.panel.unread_notifications = 2;
+        let s = seg_text(&summary(Section::Notifications, &m));
+        assert_eq!(s, "2 unread");
+        assert!(!s.contains('⚑'));
+
+        // An Alert raises the red flag and wins precedence over the unread count.
+        m.panel.alert_notifications = 1;
+        let s = seg_text(&summary(Section::Notifications, &m));
+        assert_eq!(s, "⚑ 1");
     }
 
     #[test]

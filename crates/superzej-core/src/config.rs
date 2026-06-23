@@ -1643,6 +1643,12 @@ pub struct NotificationsConfig {
     /// `"failures"` (only non-zero exits), `"all"` (every exit incl. clean
     /// shells), or `"off"`.
     pub process_exit: String,
+    /// Per-kind attention priority overrides: maps a notification kind
+    /// (snake_case, e.g. `"agent_done"`) to `"alert"`, `"notice"`, or `"info"`.
+    /// Unset kinds use their built-in [`NotificationKind::default_priority`];
+    /// unknown keys/values are ignored. `alert` raises the red flag, `notice`
+    /// the neutral unread count, `info` is inbox-only (never counted).
+    pub priority: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for NotificationsConfig {
@@ -1651,7 +1657,44 @@ impl Default for NotificationsConfig {
             desktop: true,
             desktop_min_urgency: "normal".into(),
             process_exit: "failures_and_tasks".into(),
+            priority: std::collections::BTreeMap::new(),
         }
+    }
+}
+
+impl NotificationsConfig {
+    /// Effective priority of a kind: a valid config override wins, else the kind's
+    /// built-in default. Garbage override values fall through to the default.
+    pub fn priority_of(
+        &self,
+        kind: crate::notification::NotificationKind,
+    ) -> crate::notification::Priority {
+        self.priority
+            .get(kind.as_str())
+            .and_then(|s| crate::notification::Priority::parse(s))
+            .unwrap_or_else(|| kind.default_priority())
+    }
+
+    /// The snake_case names of kinds whose effective priority is `>= min`.
+    pub fn kind_names_at_or_above(&self, min: crate::notification::Priority) -> Vec<&'static str> {
+        crate::notification::NotificationKind::ALL
+            .into_iter()
+            .filter(|k| self.priority_of(*k).rank() >= min.rank())
+            .map(|k| k.as_str())
+            .collect()
+    }
+
+    /// Kinds that raise the red ⚑ flag (effective priority `Alert`). Feeds the
+    /// alert-count query.
+    pub fn alert_kind_names(&self) -> Vec<&'static str> {
+        self.kind_names_at_or_above(crate::notification::Priority::Alert)
+    }
+
+    /// Kinds that count toward the neutral unread badge (effective priority
+    /// `Notice` or above — i.e. everything except `Info`). Feeds the unread-count
+    /// query so informational kinds are never counted.
+    pub fn counted_unread_kind_names(&self) -> Vec<&'static str> {
+        self.kind_names_at_or_above(crate::notification::Priority::Notice)
     }
 }
 
@@ -4160,6 +4203,55 @@ forward_agent = false
         assert!(cfg.issues.filter_assignee_me);
         assert_eq!(cfg.issues.linear.api_key, "env:LINEAR_API_KEY");
         assert_eq!(cfg.issues.jira.api_token, "env:JIRA_API_TOKEN");
+    }
+
+    #[test]
+    fn notification_priority_defaults_and_overrides() {
+        use crate::notification::{NotificationKind, Priority};
+        let mut cfg = NotificationsConfig::default();
+
+        // Defaults: failures alert, lifecycle info, the rest notice.
+        assert_eq!(
+            cfg.priority_of(NotificationKind::TestFailed),
+            Priority::Alert
+        );
+        assert_eq!(
+            cfg.priority_of(NotificationKind::WorktreeCreated),
+            Priority::Info
+        );
+        assert_eq!(
+            cfg.priority_of(NotificationKind::AgentDone),
+            Priority::Notice
+        );
+
+        // Alert set is exactly the four failures; unread set excludes Info.
+        let alerts = cfg.alert_kind_names();
+        assert_eq!(alerts.len(), 4);
+        for k in ["agent_failed", "test_failed", "log_error", "process_failed"] {
+            assert!(alerts.contains(&k), "missing {k}");
+        }
+        let counted = cfg.counted_unread_kind_names();
+        assert!(!counted.contains(&"worktree_created"));
+        assert!(!counted.contains(&"process_exited"));
+        assert!(counted.contains(&"test_failed") && counted.contains(&"agent_done"));
+
+        // Override: garbage falls back to default; a demotion reclassifies live.
+        cfg.priority.insert("test_failed".into(), "garbage".into());
+        assert_eq!(
+            cfg.priority_of(NotificationKind::TestFailed),
+            Priority::Alert
+        );
+        cfg.priority.insert("test_failed".into(), "notice".into());
+        assert_eq!(
+            cfg.priority_of(NotificationKind::TestFailed),
+            Priority::Notice
+        );
+        assert!(!cfg.alert_kind_names().contains(&"test_failed"));
+        assert!(cfg.counted_unread_kind_names().contains(&"test_failed"));
+        // Promote an info kind to alert.
+        cfg.priority
+            .insert("worktree_created".into(), "alert".into());
+        assert!(cfg.alert_kind_names().contains(&"worktree_created"));
     }
 
     #[test]
