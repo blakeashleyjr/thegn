@@ -156,6 +156,7 @@ fn context_hints(
         crate::focus::Zone::Sidebar => [
             pair("↑↓", "move"),
             pair("Enter", "open"),
+            pair("e", "expand"),
             pair("Space", "mark"),
             pair("m", "menu"),
             hint("tab", "prev-tab").or_else(|| chord("next-tab").map(|c| (c, "tab".into()))),
@@ -869,6 +870,9 @@ struct SidebarState {
     menu: Option<crate::chrome::RowMenu>,
     /// Adjustable bar width in columns (item 25); `None` = layout default.
     width: Option<usize>,
+    /// Wide expand toggle (`e`): mirrors the panel's expand affordance. When
+    /// set, the sidebar claims ~half the window, ignoring [`width`].
+    expanded: bool,
 }
 
 impl SidebarState {
@@ -887,7 +891,19 @@ impl SidebarState {
                 self.view.sort = crate::sidebar::SortMode::from_str(&value);
             } else if key == "sidebar_cols" {
                 self.width = value.parse().ok();
+            } else if key == "sidebar_expanded" {
+                self.expanded = value == "1";
             }
+        }
+    }
+
+    /// Effective sidebar width in columns: half the window when expanded
+    /// (Wide), else the user's fine-nudged width (or the layout default).
+    fn effective_cols(&self, cols: usize) -> usize {
+        if self.expanded {
+            (cols / 2).max(crate::layout::SIDEBAR_COLS)
+        } else {
+            self.width.unwrap_or(crate::layout::SIDEBAR_COLS)
         }
     }
 
@@ -1349,6 +1365,17 @@ impl SidebarState {
             KeyCode::Char('>') | KeyCode::Char('.') => {
                 return self.adjust_width(2, session);
             }
+            KeyCode::Char('e') => {
+                // Toggle the Wide expand (mirrors the panel's `e`): ~half the
+                // window vs. the fine-nudged width.
+                self.expanded = !self.expanded;
+                self.persist(
+                    &session.id,
+                    "sidebar_expanded",
+                    if self.expanded { "1" } else { "0" },
+                );
+                return SidebarOutcome::Relayout;
+            }
             _ => return SidebarOutcome::NotHandled,
         }
         self.sync(model);
@@ -1443,6 +1470,11 @@ impl SidebarState {
     }
 
     fn adjust_width(&mut self, delta: i32, session: &crate::session::Session) -> SidebarOutcome {
+        // A fine nudge drops out of Wide so the change is visible and sticks.
+        if self.expanded {
+            self.expanded = false;
+            self.persist(&session.id, "sidebar_expanded", "0");
+        }
         let cur = self.width.unwrap_or(crate::layout::SIDEBAR_COLS) as i32;
         let next = (cur + delta).clamp(
             crate::layout::SIDEBAR_MIN_WIDTH as i32,
@@ -5920,7 +5952,7 @@ async fn event_loop<T: Terminal>(
         since_start_ms = start.elapsed().as_millis() as u64,
         "sidebar state loaded"
     );
-    let mut sidebar_cols = sb.width.unwrap_or(layout::SIDEBAR_COLS);
+    let mut sidebar_cols = sb.effective_cols(cols);
     // The last tab name we acked activity for (clears its "look at me" dot).
     let mut last_acked_tab: Option<String> = None;
 
@@ -10123,7 +10155,7 @@ async fn event_loop<T: Terminal>(
                             continue;
                         }
                         SidebarOutcome::Relayout => {
-                            sidebar_cols = sb.width.unwrap_or(layout::SIDEBAR_COLS);
+                            sidebar_cols = sb.effective_cols(cols);
                             chrome = compute_chrome(
                                 cols,
                                 rows,
@@ -13658,6 +13690,8 @@ async fn event_loop<T: Terminal>(
             Ok(Some(InputEvent::Resized { rows: r, cols: c })) => {
                 rows = r;
                 cols = c;
+                // A Wide sidebar tracks the new window width.
+                sidebar_cols = sb.effective_cols(cols);
                 chrome = compute_chrome(
                     cols,
                     rows,
@@ -14350,6 +14384,49 @@ mod tests {
         assert_eq!(sb.width, Some(crate::layout::SIDEBAR_MIN_WIDTH));
         let out = press(&mut sb, '>', &mut model, &session);
         assert!(matches!(out, SidebarOutcome::Relayout));
+
+        // SAFETY: test is single-threaded.
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+        let _ = std::fs::remove_dir_all(&state_home);
+    }
+
+    #[test]
+    fn sidebar_e_toggles_wide_expand_and_persists() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Persisting the flag opens the global DB; redirect it to a temp dir.
+        let state_home = std::env::temp_dir().join(format!("sz-host-expand-{}", std::process::id()));
+        // SAFETY: test is single-threaded; sets/clears an XDG var around calls.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+
+        let session = one_tab_session();
+        let mut model = build_initial_model(&session, None);
+        let mut sb = focused_state(&mut model, &session);
+
+        // Resting: not expanded; effective width is the layout default.
+        assert!(!sb.expanded);
+        assert_eq!(sb.effective_cols(160), crate::layout::SIDEBAR_COLS);
+
+        // `e` flips to Wide and asks for a relayout; effective width ≈ half.
+        let out = press(&mut sb, 'e', &mut model, &session);
+        assert!(matches!(out, SidebarOutcome::Relayout));
+        assert!(sb.expanded);
+        assert_eq!(sb.effective_cols(160), 80);
+
+        // `e` again restores.
+        let _ = press(&mut sb, 'e', &mut model, &session);
+        assert!(!sb.expanded);
+
+        // The flag round-trips through the DB: re-expand, then a fresh state
+        // loaded from the same scope comes back expanded.
+        let _ = press(&mut sb, 'e', &mut model, &session);
+        let db = superzej_core::db::Db::open().unwrap();
+        let mut reloaded = SidebarState::default();
+        reloaded.load(&db, &session.id);
+        assert!(reloaded.expanded, "expanded state restored from the DB");
+
+        // A fine `<` nudge drops out of Wide so the change is visible.
+        let _ = press(&mut sb, '<', &mut model, &session);
+        assert!(!sb.expanded);
 
         // SAFETY: test is single-threaded.
         unsafe { std::env::remove_var("XDG_STATE_HOME") };
