@@ -3,7 +3,7 @@
 //! frame and emits only changed cells — the "no-flash" mechanism. Chrome widgets
 //! (Phase 2) draw into the same surface around the pane rect.
 
-use termwiz::cell::{AttributeChange, Intensity, Underline};
+use termwiz::cell::{AttributeChange, CellAttributes, Intensity, Underline};
 use termwiz::color::{ColorAttribute, SrgbaTuple};
 use termwiz::surface::{Change, Position, Surface};
 
@@ -41,27 +41,26 @@ struct CellStyle {
 }
 
 fn emit_style(surface: &mut Surface, style: CellStyle) {
-    surface.add_change(Change::Attribute(AttributeChange::Foreground(color_attr(
-        style.fg,
-    ))));
-    surface.add_change(Change::Attribute(AttributeChange::Background(color_attr(
-        style.bg,
-    ))));
-    surface.add_change(Change::Attribute(AttributeChange::Intensity(
-        if style.bold {
+    // One `AllAttributes` instead of five `Attribute` changes per style run:
+    // fewer change objects in the surface's per-frame change log, and it resets
+    // to a known-clean baseline (reverse/strikethrough/blink off) each run. The
+    // resulting cells are identical — the compositor only ever sets these five.
+    let mut attrs = CellAttributes::default();
+    attrs
+        .set_foreground(color_attr(style.fg))
+        .set_background(color_attr(style.bg))
+        .set_intensity(if style.bold {
             Intensity::Bold
         } else {
             Intensity::Normal
-        },
-    )));
-    surface.add_change(Change::Attribute(AttributeChange::Italic(style.italic)));
-    surface.add_change(Change::Attribute(AttributeChange::Underline(
-        if style.underline {
+        })
+        .set_italic(style.italic)
+        .set_underline(if style.underline {
             Underline::Single
         } else {
             Underline::None
-        },
-    )));
+        });
+    surface.add_change(Change::AllAttributes(attrs));
 }
 
 fn flush_run(surface: &mut Surface, run: &mut String) {
@@ -72,52 +71,59 @@ fn flush_run(surface: &mut Surface, run: &mut String) {
 
 /// Paint `emu`'s visible grid into `surface` at `rect`. Cells beyond the
 /// emulator's size are left untouched (chrome owns them).
+///
+/// A single cell-by-cell pass per row, coalescing same-style cells into one
+/// `Change::Text` run — so an all-default row still emits as a single blit, but
+/// without the extra full-row `row_text` pre-scan that used to run (and allocate
+/// a `String` per cell) only to be discarded on the first styled cell. Styled
+/// content is the common case, so that pre-scan doubled the hot-path cost.
 pub fn compose_pane(surface: &mut Surface, emu: &dyn PaneEmulator, rect: Rect) {
     let (erows, ecols) = emu.size();
     let mut current_style: Option<CellStyle> = None;
     let mut run = String::new();
     for row in 0..rect.rows.min(erows as usize) {
         flush_run(surface, &mut run);
-
-        // FAST PATH: an all-default-attribute row blits as one plain string.
-        // (`row_text` returns None for any styled row, so colors never take
-        // this path.) Reset attributes first — the previous row's run may have
-        // left colors active.
-        if let Some(text) = emu.row_text(row as u16) {
-            if current_style.take().is_some() {
-                emit_style(surface, CellStyle::default());
-            }
-            surface.add_change(Change::CursorPosition {
-                x: Position::Absolute(rect.x),
-                y: Position::Absolute(rect.y + row),
-            });
-            surface.add_change(Change::Text(text));
-            continue;
-        }
-
-        // SLOW PATH: Fallback to cell-by-cell iteration with style tracking
         surface.add_change(Change::CursorPosition {
             x: Position::Absolute(rect.x),
             y: Position::Absolute(rect.y + row),
         });
         for col in 0..rect.cols.min(ecols as usize) {
-            let cell = emu.cell(row as u16, col as u16).unwrap_or_default();
+            // Prefer the borrowing accessor (no per-cell `String` alloc); fall
+            // back to the owning `cell()` for any emulator that doesn't implement
+            // `cell_ref`. Indices are in-bounds, so `cell_ref` is `Some` for the
+            // real (vt100) emulator and the fallback never runs in production.
+            let owned;
+            let (text, fg, bg, bold, italic, underline, inverse): (&str, _, _, _, _, _, _) =
+                if let Some(c) = emu.cell_ref(row as u16, col as u16) {
+                    (c.text, c.fg, c.bg, c.bold, c.italic, c.underline, c.inverse)
+                } else {
+                    owned = emu.cell(row as u16, col as u16).unwrap_or_default();
+                    (
+                        owned.text.as_str(),
+                        owned.fg,
+                        owned.bg,
+                        owned.bold,
+                        owned.italic,
+                        owned.underline,
+                        owned.inverse,
+                    )
+                };
             let style = CellStyle {
-                fg: if cell.inverse { cell.bg } else { cell.fg },
-                bg: if cell.inverse { cell.fg } else { cell.bg },
-                bold: cell.bold,
-                italic: cell.italic,
-                underline: cell.underline,
+                fg: if inverse { bg } else { fg },
+                bg: if inverse { fg } else { bg },
+                bold,
+                italic,
+                underline,
             };
             if current_style != Some(style) {
                 flush_run(surface, &mut run);
                 emit_style(surface, style);
                 current_style = Some(style);
             }
-            if cell.text.is_empty() {
+            if text.is_empty() {
                 run.push(' ');
             } else {
-                run.push_str(&cell.text);
+                run.push_str(text);
             }
         }
     }
@@ -201,6 +207,59 @@ mod tests {
         assert!(text.contains("alpha"), "got: {text:?}");
         assert!(text.contains("bravo"), "got: {text:?}");
         assert!(text.contains("charlie"), "got: {text:?}");
+    }
+
+    #[test]
+    fn cell_ref_matches_cell() {
+        // The borrowing accessor must agree with the owning one on glyph + style
+        // for plain, styled, and wide-glyph cells (compose_pane relies on this).
+        let mut emu = Vt100Emulator::new(1, 6, 0);
+        emu.advance("a\x1b[1;31mB\x1b[0m世".as_bytes());
+        for col in 0..6u16 {
+            let owned = emu.cell(0, col);
+            let borrowed = emu.cell_ref(0, col);
+            match (owned, borrowed) {
+                (Some(o), Some(b)) => {
+                    assert_eq!(o.text, b.text, "glyph mismatch at col {col}");
+                    assert_eq!(o.fg, b.fg, "fg mismatch at col {col}");
+                    assert_eq!(o.bg, b.bg, "bg mismatch at col {col}");
+                    assert_eq!(o.bold, b.bold, "bold mismatch at col {col}");
+                    assert_eq!(o.italic, b.italic, "italic mismatch at col {col}");
+                    assert_eq!(o.underline, b.underline, "underline at col {col}");
+                    assert_eq!(o.inverse, b.inverse, "inverse mismatch at col {col}");
+                }
+                (None, None) => {}
+                (o, b) => panic!("cell/cell_ref presence differ at col {col}: {o:?} vs {b:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn composing_preserves_cell_styling() {
+        // The single pass must carry color/attrs through. (The old fast path
+        // blitted unstyled rows as plain text and bailed to cell-by-cell only
+        // for styled rows; now every row is composed cell-by-cell, so guard
+        // that styling still survives.)
+        let mut emu = Vt100Emulator::new(1, 4, 0);
+        emu.advance(b"\x1b[31mRED\x1b[0m");
+        let mut surface = Surface::new(4, 1);
+        compose_pane(
+            &mut surface,
+            &emu,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 4,
+                rows: 1,
+            },
+        );
+        let cells = surface.screen_cells();
+        assert_eq!(cells[0][0].str(), "R");
+        assert_eq!(
+            cells[0][0].attrs().foreground(),
+            ColorAttribute::PaletteIndex(1),
+            "red SGR must survive compose",
+        );
     }
 
     #[test]
