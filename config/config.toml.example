@@ -484,6 +484,21 @@ desktop_min_urgency = "normal"
 #   "off"                — never route pane exits
 process_exit = "failures_and_tasks"
 
+# Per-kind attention priority. Three tiers drive the badges coherently:
+#   "alert"  — raises the red ⚑ flag (panel header + sidebar + statusbar) and,
+#              mapped to "critical" urgency, a desktop toast
+#   "notice" — counts toward the neutral "N unread" badge, never the red flag
+#   "info"   — inbox history only; never counted toward any badge
+# Defaults: failures (agent_failed, test_failed, log_error, process_failed) are
+# "alert"; lifecycle events (worktree_created, process_exited) are "info";
+# everything else (assigned, mentioned, status_changed, blocker_resolved,
+# pr_linked, overdue, pr_state_changed, agent_done) is "notice". Override any
+# kind below (keys are the snake_case kind names). Unknown keys/values are ignored.
+# [notifications.priority]
+# agent_done = "alert"        # promote: flag me when an agent finishes
+# worktree_created = "notice" # demote less: show in the unread count
+# pr_state_changed = "info"   # silence: inbox-only
+
 # Top pinned-program strip: a horizontal band above the center that renders
 # `location = "strip"` pins side by side (toggle Ctrl+Alt+t; grow/shrink at
 # runtime). `ratio` is the fraction of the center band it occupies.

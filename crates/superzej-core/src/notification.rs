@@ -29,7 +29,7 @@ pub struct Notification {
 }
 
 /// What triggered the notification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationKind {
     // --- issue-tracker kinds ---
@@ -64,7 +64,108 @@ pub enum NotificationKind {
     ProcessFailed,
 }
 
+/// Attention priority of a notification — the single source of truth that drives
+/// the inbox flag badge, the neutral unread count, and (mapped to urgency) desktop
+/// toasts. Derived from [`NotificationKind::default_priority`], overridable per
+/// kind in `[notifications.priority]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Priority {
+    /// Informational lifecycle events (worktree created, process exited). Shown in
+    /// the inbox list as history but never counted toward any badge.
+    Info,
+    /// Normal awareness (mentions, assignments, agent done, PR/status changes).
+    /// Counts toward the neutral unread badge but never raises the red flag.
+    Notice,
+    /// Needs attention (failures). Raises the red ⚑ flag and a desktop toast.
+    Alert,
+}
+
+impl Priority {
+    /// Numeric rank for ordering/threshold comparison (higher = more urgent).
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Info => 0,
+            Self::Notice => 1,
+            Self::Alert => 2,
+        }
+    }
+
+    /// Parse a priority from a config string (`"info"`, `"notice"`, `"alert"`).
+    /// Returns `None` for unknown values so the caller can fall back to the kind's
+    /// default.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "info" => Some(Self::Info),
+            "notice" => Some(Self::Notice),
+            "alert" => Some(Self::Alert),
+            _ => None,
+        }
+    }
+}
+
 impl NotificationKind {
+    /// Every notification kind, for exhaustive iteration (config classification,
+    /// SQL `IN` set construction, tests). Kept in sync with the enum by the
+    /// `notification_kind_*` tests, which loop over this.
+    pub const ALL: [NotificationKind; 14] = [
+        Self::Assigned,
+        Self::Mentioned,
+        Self::StatusChanged,
+        Self::BlockerResolved,
+        Self::PrLinked,
+        Self::Overdue,
+        Self::PrStateChanged,
+        Self::AgentDone,
+        Self::AgentFailed,
+        Self::TestFailed,
+        Self::WorktreeCreated,
+        Self::LogError,
+        Self::ProcessExited,
+        Self::ProcessFailed,
+    ];
+
+    /// The snake_case identifier for this kind — matches both the serde
+    /// representation and the `kind` strings persisted in the DB, so it is the key
+    /// for config overrides and SQL `kind IN (...)` filters.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Assigned => "assigned",
+            Self::Mentioned => "mentioned",
+            Self::StatusChanged => "status_changed",
+            Self::BlockerResolved => "blocker_resolved",
+            Self::PrLinked => "pr_linked",
+            Self::Overdue => "overdue",
+            Self::PrStateChanged => "pr_state_changed",
+            Self::AgentDone => "agent_done",
+            Self::AgentFailed => "agent_failed",
+            Self::TestFailed => "test_failed",
+            Self::WorktreeCreated => "worktree_created",
+            Self::LogError => "log_error",
+            Self::ProcessExited => "process_exited",
+            Self::ProcessFailed => "process_failed",
+        }
+    }
+
+    /// The built-in attention priority for this kind, before any config override.
+    /// Failures are `Alert`; lifecycle/info events (`WorktreeCreated`,
+    /// `ProcessExited`) are `Info`; everything else is `Notice`.
+    pub fn default_priority(self) -> Priority {
+        match self {
+            Self::AgentFailed | Self::TestFailed | Self::LogError | Self::ProcessFailed => {
+                Priority::Alert
+            }
+            Self::WorktreeCreated | Self::ProcessExited => Priority::Info,
+            Self::Assigned
+            | Self::Mentioned
+            | Self::StatusChanged
+            | Self::BlockerResolved
+            | Self::PrLinked
+            | Self::Overdue
+            | Self::PrStateChanged
+            | Self::AgentDone => Priority::Notice,
+        }
+    }
+
     pub fn glyph(self) -> &'static str {
         match self {
             Self::Assigned => "→",
@@ -110,22 +211,7 @@ mod tests {
 
     #[test]
     fn notification_kind_roundtrips() {
-        for kind in [
-            NotificationKind::Assigned,
-            NotificationKind::Mentioned,
-            NotificationKind::StatusChanged,
-            NotificationKind::BlockerResolved,
-            NotificationKind::PrLinked,
-            NotificationKind::Overdue,
-            NotificationKind::PrStateChanged,
-            NotificationKind::AgentDone,
-            NotificationKind::AgentFailed,
-            NotificationKind::TestFailed,
-            NotificationKind::WorktreeCreated,
-            NotificationKind::LogError,
-            NotificationKind::ProcessExited,
-            NotificationKind::ProcessFailed,
-        ] {
+        for kind in NotificationKind::ALL {
             let json = serde_json::to_string(&kind).unwrap();
             let back: NotificationKind = serde_json::from_str(&json).unwrap();
             assert_eq!(kind, back);
@@ -134,25 +220,65 @@ mod tests {
 
     #[test]
     fn notification_kind_glyphs_and_labels_are_non_empty() {
-        for kind in [
-            NotificationKind::Assigned,
-            NotificationKind::Mentioned,
-            NotificationKind::StatusChanged,
-            NotificationKind::BlockerResolved,
-            NotificationKind::PrLinked,
-            NotificationKind::Overdue,
-            NotificationKind::PrStateChanged,
-            NotificationKind::AgentDone,
-            NotificationKind::AgentFailed,
-            NotificationKind::TestFailed,
-            NotificationKind::WorktreeCreated,
-            NotificationKind::LogError,
-            NotificationKind::ProcessExited,
-            NotificationKind::ProcessFailed,
-        ] {
+        for kind in NotificationKind::ALL {
             assert!(!kind.glyph().is_empty(), "{kind:?} glyph is empty");
             assert!(!kind.label().is_empty(), "{kind:?} label is empty");
         }
+    }
+
+    #[test]
+    fn as_str_matches_serde_snake_case() {
+        // as_str must equal the serde representation so config keys and DB `kind`
+        // values line up. ALL must also be complete + free of duplicates.
+        let mut seen = std::collections::HashSet::new();
+        for kind in NotificationKind::ALL {
+            let json = serde_json::to_string(&kind).unwrap();
+            let serde_name = json.trim_matches('"');
+            assert_eq!(kind.as_str(), serde_name, "{kind:?}");
+            assert!(seen.insert(kind), "{kind:?} duplicated in ALL");
+        }
+        assert_eq!(seen.len(), 14, "ALL is missing kinds");
+    }
+
+    #[test]
+    fn default_priority_is_total_and_correct() {
+        use Priority::*;
+        for kind in NotificationKind::ALL {
+            // Total: every kind classifies (the match is exhaustive, so this just
+            // exercises it) and the failure/info sets are exactly as designed.
+            let p = kind.default_priority();
+            let expect_alert = matches!(
+                kind,
+                NotificationKind::AgentFailed
+                    | NotificationKind::TestFailed
+                    | NotificationKind::LogError
+                    | NotificationKind::ProcessFailed
+            );
+            let expect_info = matches!(
+                kind,
+                NotificationKind::WorktreeCreated | NotificationKind::ProcessExited
+            );
+            let expected = if expect_alert {
+                Alert
+            } else if expect_info {
+                Info
+            } else {
+                Notice
+            };
+            assert_eq!(p, expected, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn priority_parse_and_rank() {
+        assert_eq!(Priority::parse("alert"), Some(Priority::Alert));
+        assert_eq!(Priority::parse(" Notice "), Some(Priority::Notice));
+        assert_eq!(Priority::parse("INFO"), Some(Priority::Info));
+        assert_eq!(Priority::parse("bogus"), None);
+        assert!(Priority::Alert.rank() > Priority::Notice.rank());
+        assert!(Priority::Notice.rank() > Priority::Info.rank());
+        // Ord matches rank (used for >= threshold comparisons).
+        assert!(Priority::Alert > Priority::Notice && Priority::Notice > Priority::Info);
     }
 
     #[test]

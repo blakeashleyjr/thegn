@@ -479,8 +479,11 @@ pub struct PanelData {
     pub tracker_issues: Vec<superzej_core::issue::Issue>,
     /// Issue ids (in `"<provider>:<key>"` form) linked to the current worktree.
     pub tracker_links: Vec<String>,
-    /// Unread notification count for the status bar badge.
+    /// Neutral unread notification count (Alert + Notice priority; Info excluded).
+    /// Drives the dim "N unread" badge.
     pub unread_notifications: usize,
+    /// Alert-priority unread count — drives the red ⚑ attention flag.
+    pub alert_notifications: usize,
     /// Full notification list (newest first, capped at 50) for the inbox section.
     pub notifications: Vec<superzej_core::notification::Notification>,
     /// Last 500 lines of szhost.log, parsed. Empty when SUPERZEJ_LOG is unset.

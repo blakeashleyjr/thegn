@@ -81,6 +81,20 @@ impl NotificationUrgency {
     }
 }
 
+impl crate::notification::Priority {
+    /// The desktop-toast urgency for this attention priority, so the inbox
+    /// priority and the desktop threshold stay coherent: `Alert` is `Critical`,
+    /// `Notice` is `Normal`, `Info` is `Low` (below the default `Normal`
+    /// threshold, so informational events never pop a toast).
+    pub fn urgency(self) -> NotificationUrgency {
+        match self {
+            Self::Alert => NotificationUrgency::Critical,
+            Self::Notice => NotificationUrgency::Normal,
+            Self::Info => NotificationUrgency::Low,
+        }
+    }
+}
+
 /// How aggressively non-agent pane exits route into the attention model
 /// (item 524). Parsed from `[notifications] process_exit`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -525,6 +539,33 @@ mod tests {
                 count: 1
             }),
             NotificationUrgency::Critical
+        );
+    }
+
+    #[test]
+    fn priority_maps_to_urgency_coherently() {
+        use crate::notification::{NotificationKind, Priority};
+        assert_eq!(Priority::Alert.urgency(), NotificationUrgency::Critical);
+        assert_eq!(Priority::Notice.urgency(), NotificationUrgency::Normal);
+        assert_eq!(Priority::Info.urgency(), NotificationUrgency::Low);
+        // The user-relevant property: Info-priority kinds stay below the default
+        // desktop threshold, so a worktree-created / process-exited never toasts.
+        let default_threshold = NotificationUrgency::parse("normal");
+        for kind in [
+            NotificationKind::WorktreeCreated,
+            NotificationKind::ProcessExited,
+        ] {
+            assert!(
+                !kind.default_priority().urgency().meets(default_threshold),
+                "{kind:?} must not reach the desktop"
+            );
+        }
+        // Failures clear the threshold.
+        assert!(
+            NotificationKind::TestFailed
+                .default_priority()
+                .urgency()
+                .meets(default_threshold)
         );
     }
 

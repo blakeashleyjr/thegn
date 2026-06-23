@@ -437,6 +437,8 @@ fn compute_entity_summary(
 fn collect_sidebar_status(
     session: &crate::session::Session,
     db: &superzej_core::db::Db,
+    alert_kinds: &[&str],
+    counted_kinds: &[&str],
 ) -> crate::sidebar::SidebarStatus {
     use superzej_core::remote::GitLoc;
     use superzej_svc::git::{GitBackend, GixGit};
@@ -462,8 +464,12 @@ fn collect_sidebar_status(
         .collect();
 
     // Badge counts (item 28): unread + alert notifications grouped by worktree.
-    status.unread_counts = db.get_unread_counts_by_worktree().unwrap_or_default();
-    status.alert_counts = db.get_alert_counts_by_worktree().unwrap_or_default();
+    status.unread_counts = db
+        .get_unread_counts_by_worktree(counted_kinds)
+        .unwrap_or_default();
+    status.alert_counts = db
+        .get_alert_counts_by_worktree(alert_kinds)
+        .unwrap_or_default();
 
     // git glyphs + agent per distinct worktree path.
     let mut seen = std::collections::HashSet::new();
@@ -729,9 +735,19 @@ pub(crate) fn build_model(
     let git = GixGit::new();
     let branch = git.current_branch(&loc).unwrap_or_else(|_| "—".into());
 
+    // Single layered-config load reused for notification priority + tasks below.
+    let app_cfg = superzej_core::config::Config::try_load_layered(
+        &superzej_core::config::ProcessEnv,
+        &[],
+        None,
+    )
+    .unwrap_or_default();
+    let alert_kinds = app_cfg.notifications.alert_kind_names();
+    let counted_kinds = app_cfg.notifications.counted_unread_kind_names();
+
     let sidebar_workspaces = workspace_list(session, Some(db));
     let sidebar_db_worktrees = db_worktree_list(db);
-    let sidebar_status = collect_sidebar_status(session, db);
+    let sidebar_status = collect_sidebar_status(session, db, &alert_kinds, &counted_kinds);
     let loc_count = worktree_loc(db, &cwd);
 
     let mut panel = crate::panel::PanelData {
@@ -883,19 +899,31 @@ pub(crate) fn build_model(
             panel.tracker_links = links;
         }
     }
-    // Full notification list for the inbox panel; badge count is derived from it.
+    // Full notification list for the inbox panel; badge counts are derived from it
+    // by effective priority (Info kinds never count; the red flag is Alert-only).
     if let Ok(notifications) = db.get_all_notifications(50) {
-        panel.unread_notifications = notifications.iter().filter(|n| !n.read).count();
+        use superzej_core::notification::Priority;
+        let unread = notifications.iter().filter(|n| !n.read);
+        let (mut alert, mut counted) = (0usize, 0usize);
+        for n in unread {
+            match app_cfg.notifications.priority_of(n.kind) {
+                Priority::Alert => {
+                    alert += 1;
+                    counted += 1;
+                }
+                Priority::Notice => counted += 1,
+                Priority::Info => {}
+            }
+        }
+        panel.alert_notifications = alert;
+        panel.unread_notifications = counted;
         panel.notifications = notifications;
     }
-    // Tasks section: populate task specs from config + auto-discovery.
-    // Configured tasks win by name; discovered tasks from manifests fill gaps.
-    if let Ok(task_cfg) = superzej_core::config::Config::try_load_layered(
-        &superzej_core::config::ProcessEnv,
-        &[],
-        None,
-    ) {
-        let configured = task_cfg.tasks.clone();
+    // Tasks section: populate task specs from config + auto-discovery (reusing the
+    // single layered-config load above). Configured tasks win by name; discovered
+    // tasks from manifests fill gaps.
+    {
+        let configured = app_cfg.tasks.clone();
         let discovered = crate::task::discover_all_tasks(&cwd);
         panel.task_specs = crate::task::merge_tasks(configured, discovered);
     }

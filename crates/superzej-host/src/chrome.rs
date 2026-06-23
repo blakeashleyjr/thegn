@@ -1097,11 +1097,19 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
         }
         r.push(seg(Tok::Attr(p.fg), p.text));
     }
-    if model.panel.unread_notifications > 0 {
+    // Red ⚑ flag is reserved for attention (Alert priority); a neutral blue inbox
+    // chip carries Notice-priority unread. Info-priority events show in neither.
+    if model.panel.alert_notifications > 0 {
         r.push(seg(Tok::Slot(S::Text), " "));
         r.push(Seg::chip(
             Tok::Hue(superzej_core::theme::Hue::Red),
-            format!(" \u{2691} {} ", model.panel.unread_notifications),
+            format!(" \u{2691} {} ", model.panel.alert_notifications),
+        ));
+    } else if model.panel.unread_notifications > 0 {
+        r.push(seg(Tok::Slot(S::Text), " "));
+        r.push(Seg::chip(
+            Tok::Hue(superzej_core::theme::Hue::Blue),
+            format!(" \u{2709} {} ", model.panel.unread_notifications),
         ));
     }
     if model.zoomed {
