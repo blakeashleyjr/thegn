@@ -25,8 +25,9 @@ use crate::chrome::{FrameModel, LoadStep, render_tab};
 use crate::compositor::Rect;
 use crate::gitmut::{GitOp, GitOpResult};
 use crate::hydrate::{
-    RefreshKind, active_tab_path, build_initial_model, load_or_seed_session, retarget_diff_watcher,
-    spawn_model_hydration, spawn_pr_cache_refresh, spawn_refresh_ticker, workspace_list,
+    RefreshKind, active_tab_path, build_initial_model, load_or_seed_session,
+    neighbor_worktree_paths, retarget_diff_watcher, spawn_model_hydration, spawn_panel_prefetch,
+    spawn_pr_cache_refresh, spawn_refresh_ticker, workspace_list,
 };
 use crate::input::key_bytes;
 use crate::layout;
@@ -5514,6 +5515,17 @@ async fn event_loop<T: Terminal>(
     // re-selects while a fetch is still out.
     let (hunk_tx, mut hunk_rx) =
         tokio_mpsc::unbounded_channel::<(u64, String, Vec<superzej_svc::git::Hunk>)>();
+    // Stale-while-revalidate panel cache: the last-known `PanelData` per worktree
+    // dir. On a worktree switch we paint the cached panel instantly (no blank
+    // flash) while the background hydration refreshes it in place. Fed by both
+    // live model arrivals (active worktree) and neighbor prefetch.
+    let mut panel_cache: std::collections::HashMap<std::path::PathBuf, crate::panel::PanelData> =
+        std::collections::HashMap::new();
+    // Background neighbor-prefetch results: `(worktree_path, panel)` warmed by
+    // `spawn_panel_prefetch` for the worktrees above/below the selection. These
+    // only seed `panel_cache`; they never touch the live frame.
+    let (prefetch_tx, mut prefetch_rx) =
+        tokio_mpsc::unbounded_channel::<(std::path::PathBuf, crate::panel::PanelData)>();
     // The inline Files preview reader: `(rel_path, Ok(lines) | Err(reason))`.
     let (file_preview_tx, mut file_preview_rx) =
         tokio_mpsc::unbounded_channel::<(String, Result<Vec<String>, String>)>();
@@ -5907,6 +5919,24 @@ async fn event_loop<T: Terminal>(
         since_start_ms = start.elapsed().as_millis() as u64,
         "pins launched, entering loop"
     );
+    // Warm the launch worktree's neighbors so even the first switch is instant
+    // (the on-switch detector only fires for destinations reached after launch).
+    {
+        let hints = crate::hydrate::HydrateHints {
+            open: panel_ui.open,
+            expanded: panel_ui.width.is_expanded(),
+            profile: current_config.profile.clone(),
+            ..Default::default()
+        };
+        for path in neighbor_worktree_paths(&session) {
+            spawn_panel_prefetch(
+                prefetch_tx.clone(),
+                path,
+                hints.clone(),
+                Some(waker.clone()),
+            );
+        }
+    }
     loop {
         if session.worktrees.is_empty() {
             return Ok(()); // last worktree closed
@@ -5990,11 +6020,16 @@ async fn event_loop<T: Terminal>(
             panel_ui.tests = crate::panel::TestPanelState::default();
             sync_tests_for_worktree(&mut panel_ui, &current_worktree, keymap.config());
             loaded_tests_worktree = current_worktree.to_string_lossy().into_owned();
-            // Immediate hydrate for the newly-focused worktree. Clear the stale
-            // panel data immediately so the panel shows the new worktree's branch
-            // name and empty changes rather than the previous worktree's data
-            // while the background hydration is in flight.
-            model.panel = crate::panel::PanelData::default();
+            // Immediate hydrate for the newly-focused worktree. Paint this
+            // worktree's last-known panel from the cache (seeded by prior visits
+            // and neighbor prefetch) so the switch is instant instead of flashing
+            // the previous worktree's data or an empty panel; the background
+            // hydration below refreshes it in place a beat later. Falls back to an
+            // empty panel for a worktree never hydrated this session.
+            model.panel = panel_cache
+                .get(&current_worktree)
+                .cloned()
+                .unwrap_or_default();
             // The old worktree's hunk previews are meaningless here: drop them and
             // raise the acceptance cutoff so in-flight fetches die on arrival.
             hydration_gen += 1;
@@ -6032,18 +6067,33 @@ async fn event_loop<T: Terminal>(
             panel_ui.scroll = 0;
             panel_ui.diff_hunk = 0;
             sync_panel_docs(&mut panel_ui, &model, &session, docs_gen, &docs_tx, &waker);
+            let hints = crate::hydrate::HydrateHints {
+                open: panel_ui.open,
+                expanded: panel_ui.width.is_expanded(),
+                profile: current_config.profile.clone(),
+                ..Default::default()
+            };
             spawn_model_hydration(
                 model_tx.clone(),
                 hydration_gen,
                 session.clone(),
                 Some(waker.clone()),
-                crate::hydrate::HydrateHints {
-                    open: panel_ui.open,
-                    expanded: panel_ui.width.is_expanded(),
-                    profile: current_config.profile.clone(),
-                    ..Default::default()
-                },
+                hints.clone(),
             );
+            // Warm the worktrees above/below the selection into the cache so a
+            // follow-on switch to a neighbor is instant too. Skip ones already
+            // cached — the on-switch hydration refreshes them when truly focused.
+            for path in neighbor_worktree_paths(&session) {
+                if panel_cache.contains_key(&path) {
+                    continue;
+                }
+                spawn_panel_prefetch(
+                    prefetch_tx.clone(),
+                    path,
+                    hints.clone(),
+                    Some(waker.clone()),
+                );
+            }
             spawn_pr_cache_refresh(session.clone(), Some(waker.clone()));
             crate::hydrate::spawn_issue_cache_refresh(
                 session.clone(),
@@ -7189,6 +7239,10 @@ async fn event_loop<T: Terminal>(
             if model.status.is_empty() {
                 model.status = prev_status;
             }
+            // Seed the stale-while-revalidate cache with this worktree's fresh
+            // git panel (pre LSP-merge: LSP diags are editor-global, not
+            // per-worktree) so a later switch back paints instantly.
+            panel_cache.insert(active_tab_path(&session), model.panel.clone());
             // A fresh model carries only git/db diagnostics; re-apply LSP ones.
             if !lsp_diags.is_empty() {
                 lsp_diags.merge_into(&mut model.panel.diagnostics);
@@ -7251,6 +7305,12 @@ async fn event_loop<T: Terminal>(
                 panel_ui.cursor = panel_ui.logs_cursor;
             }
             dirty = true;
+        }
+
+        // Neighbor-prefetch results: seed the switch cache only. No repaint —
+        // these warm worktrees the user hasn't focused yet.
+        while let Ok((path, panel)) = prefetch_rx.try_recv() {
+            panel_cache.insert(path, panel);
         }
 
         // Fresh stats reading from the ticker thread (top-bar widgets + the

@@ -286,6 +286,23 @@ pub(crate) fn active_tab_path(session: &crate::session::Session) -> std::path::P
         .unwrap_or_else(|| ".".into())
 }
 
+/// The worktree dirs immediately above and below the active one in the sidebar
+/// order — the prefetch targets so moving to a neighbor is already warm. Skips
+/// the active worktree, empties, and paths that no longer exist on disk.
+pub(crate) fn neighbor_worktree_paths(
+    session: &crate::session::Session,
+) -> Vec<std::path::PathBuf> {
+    let active = session.active;
+    [active.wrapping_sub(1), active + 1]
+        .into_iter()
+        .filter(|&i| i != active)
+        .filter_map(|i| session.worktrees.get(i))
+        .filter(|g| !g.path.is_empty())
+        .map(|g| std::path::PathBuf::from(&g.path))
+        .filter(|p| p.is_dir())
+        .collect()
+}
+
 /// The tabbar strip for the active worktree: (worktree label, tab chip titles,
 /// active chip index).
 pub(crate) fn tab_strip(session: &crate::session::Session) -> (String, Vec<String>, usize) {
@@ -442,7 +459,6 @@ fn collect_sidebar_status(
 ) -> crate::sidebar::SidebarStatus {
     use superzej_core::remote::GitLoc;
     use superzej_svc::git::{GitBackend, GixGit};
-    let git = GixGit::new();
     let mut status = crate::sidebar::SidebarStatus::default();
     let t0 = std::time::Instant::now();
 
@@ -471,44 +487,65 @@ fn collect_sidebar_status(
         .get_alert_counts_by_worktree(alert_kinds)
         .unwrap_or_default();
 
-    // git glyphs + agent per distinct worktree path.
+    // git glyphs + agent + PR badge per distinct worktree path. `is_dirty` does a
+    // full `git status` scan (50-150ms), so a serial loop over N worktrees was the
+    // dominant hydration cost. Fan the per-worktree git reads (dirty, ahead/behind,
+    // current branch — independent and read-only) out across scoped threads, then
+    // do the DB-keyed inserts (agent, PR counts) on this thread, since `Db` isn't
+    // `Send`. Wall-clock collapses from N×scan to ~one scan.
     let mut seen = std::collections::HashSet::new();
-    for g in &session.worktrees {
-        if g.path.is_empty() || !seen.insert(g.path.clone()) {
-            continue;
-        }
-        let path = std::path::Path::new(&g.path);
-        if !path.is_dir() {
-            continue;
-        }
-        let loc = GitLoc::for_worktree(path);
-        let dirty = git.is_dirty(&loc).unwrap_or(false);
-        let (ahead, behind) = git.ahead_behind(&loc).ok().flatten().unwrap_or((0, 0));
+    let paths: Vec<String> = session
+        .worktrees
+        .iter()
+        .filter(|g| !g.path.is_empty())
+        .map(|g| g.path.clone())
+        .filter(|p| seen.insert(p.clone()) && std::path::Path::new(p).is_dir())
+        .collect();
+
+    // (path, dirty, ahead, behind, branch) — git only, no DB access in the scope.
+    let git_rows: Vec<(String, bool, usize, usize, Option<String>)> = std::thread::scope(|s| {
+        let handles: Vec<_> = paths
+            .iter()
+            .map(|p| {
+                s.spawn(move || {
+                    let loc = GitLoc::for_worktree(std::path::Path::new(p));
+                    let git = GixGit::new();
+                    let dirty = git.is_dirty(&loc).unwrap_or(false);
+                    let (ahead, behind) = git.ahead_behind(&loc).ok().flatten().unwrap_or((0, 0));
+                    let branch = git.current_branch(&loc).ok();
+                    (p.clone(), dirty, ahead, behind, branch)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    for (path, dirty, ahead, behind, branch) in git_rows {
         status.git.insert(
-            g.path.clone(),
+            path.clone(),
             crate::sidebar::GitGlyphs {
                 dirty,
                 ahead,
                 behind,
             },
         );
-        if let Ok(Some(agent)) = db.worktree_agent(&g.path) {
-            status.agent.insert(g.path.clone(), agent);
+        if let Ok(Some(agent)) = db.worktree_agent(&path) {
+            status.agent.insert(path.clone(), agent);
         }
         // PR badge: open PRs for this worktree's current branch, joined from the
         // `pr_branch_cache` (keyed by worktree path, matching the branches view).
-        if let Ok(branch) = git.current_branch(&loc)
-            && let Ok(counts) = db.get_open_pr_counts_by_branch(&g.path)
+        if let Some(branch) = branch
+            && let Ok(counts) = db.get_open_pr_counts_by_branch(&path)
             && let Some(&n) = counts.get(&branch)
             && n > 0
         {
-            status.pr_counts.insert(g.path.clone(), n);
+            status.pr_counts.insert(path.clone(), n);
         }
     }
     tracing::debug!(
         target: "szhost::hydrate",
         status_ms = t0.elapsed().as_millis() as u64,
-        worktrees = seen.len(),
+        worktrees = paths.len(),
         "sidebar status collected"
     );
     status
@@ -727,13 +764,10 @@ pub(crate) fn build_model(
     hints: HydrateHints,
 ) -> FrameModel {
     use superzej_core::remote::GitLoc;
-    use superzej_svc::git::{GitBackend, GixGit};
 
     let t0 = std::time::Instant::now();
     let cwd = active_tab_path(session);
     let loc = GitLoc::for_worktree(&cwd);
-    let git = GixGit::new();
-    let branch = git.current_branch(&loc).unwrap_or_else(|_| "—".into());
 
     // Single layered-config load reused for notification priority + tasks below.
     let app_cfg = superzej_core::config::Config::try_load_layered(
@@ -750,224 +784,7 @@ pub(crate) fn build_model(
     let sidebar_status = collect_sidebar_status(session, db, &alert_kinds, &counted_kinds);
     let loc_count = worktree_loc(db, &cwd);
 
-    let mut panel = crate::panel::PanelData {
-        branch: branch.clone(),
-        ..Default::default()
-    };
-
-    // The typed PR cache: summary + checks + review threads + issues.
-    if let Ok(Some((json, _))) = db.get_pr_cache(&loc.path())
-        && let Ok(cached) = serde_json::from_str::<superzej_core::github::PrPanel>(&json)
-    {
-        apply_pr_cache(&mut panel, cached);
-    }
-
-    let diff_entries = git.diff_files(&loc, "HEAD").unwrap_or_default();
-    panel.files = diff_entries
-        .iter()
-        .map(|f| crate::panel::DiffFile {
-            status: f.path.chars().next().unwrap_or('M'),
-            path: f.path.clone(),
-            added: f.added,
-            deleted: f.deleted,
-        })
-        .collect();
-
-    // Changes section: porcelain status joined with the diffstat.
-    let status = git.status(&loc).unwrap_or_default();
-    panel.changes = crate::panel::build_change_rows(&status, &diff_entries);
-
-    // Semantic git layer (items 311/313/317): entity-level view of the pending
-    // changes, computed here on the hydration thread (parses each changed file).
-    panel.entities = compute_entity_summary(&loc, &diff_entries);
-
-    // Header zone: upstream divergence + merge-in-progress banner.
-    panel.ahead_behind = git.ahead_behind(&loc).ok().flatten();
-    let unresolved = superzej_svc::git::conflict_count(&status);
-    let merge_info = git.merge_state(&loc).ok().flatten();
-    let total = merge_total(db, &loc.path(), merge_info.is_some(), unresolved);
-    panel.merge = merge_info.map(|m| crate::panel::MergeBanner {
-        label: m.kind.label().to_string(),
-        onto: m.onto,
-        unresolved,
-        total,
-    });
-    panel.stash_count = git.stash_count(&loc).unwrap_or(0);
-
-    // The git section's LOG block — only fetched while that section is open.
-    if hints.open == crate::panel::Section::Pr {
-        let n = if hints.expanded { 12 } else { 6 };
-        panel.log = git.log_graph(&loc, n).unwrap_or_default();
-    }
-
-    // The lazygit-family lists — hints-gated so an idle Normal-width panel
-    // pays only for what's visible. The Full git frame shows every list, so
-    // any open git-family section at Full hydrates them all.
-    let git_family_full = hints.expanded && hints.open.is_git_family();
-    if hints.wants_commits() {
-        let cached = db.get_commit_cache(&loc.path()).ok().flatten();
-        if let Some((json, _)) = cached.as_ref()
-            && let Ok(mut rows) = serde_json::from_str::<Vec<crate::panel::CommitRow>>(json)
-        {
-            rows.truncate(hints.visible_commit_limit());
-            panel.commits = rows;
-        }
-        panel.commits_loading = commit_cache_needs_refresh(cached.as_ref());
-    }
-    if hints.open == crate::panel::Section::Branches || git_family_full {
-        // The per-repo open-PR cache joins onto branch rows by head ref.
-        let badges: Vec<superzej_core::github::PrHeader> = db
-            .get_pr_branch_cache(&loc.path())
-            .ok()
-            .flatten()
-            .map(|(json, _)| superzej_core::github::parse_pr_headers(&json))
-            .unwrap_or_default();
-        panel.branches =
-            git.branches_full(&loc)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|b| {
-                    let pr = badges.iter().find(|p| p.head_ref == b.name).map(|p| {
-                        crate::panel::PrBadge {
-                            number: p.number,
-                            state: p.state.clone(),
-                            is_draft: p.is_draft,
-                            url: p.url.clone(),
-                        }
-                    });
-                    crate::panel::BranchRow {
-                        name: b.name,
-                        is_head: b.is_head,
-                        upstream: b.upstream,
-                        ahead: b.ahead,
-                        behind: b.behind,
-                        upstream_gone: b.upstream_gone,
-                        sha: b.sha,
-                        date: b.date,
-                        subject: b.subject,
-                        pr,
-                    }
-                })
-                .collect();
-    }
-    if hints.open == crate::panel::Section::Stash || git_family_full {
-        panel.stashes = git
-            .stash_list(&loc)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|s| crate::panel::StashRow {
-                index: s.index,
-                sha: s.sha,
-                date: s.date,
-                message: s.message,
-            })
-            .collect();
-    }
-
-    // Tests section snapshot from the cache (summary + failures + history).
-    if let Ok(Some((json, _))) = db.get_test_cache(&loc.path())
-        && let Ok(cache) = serde_json::from_str::<crate::testkit::model::TestCache>(&json)
-    {
-        panel.tests = Some(crate::panel::tests_lite(&cache));
-    }
-
-    // Tracked-file list for the Files accordion — only while Files is open
-    // (`git ls-files` is cheap but not free on big repos every 2s).
-    if hints.open == crate::panel::Section::Files
-        && let Ok(out) = loc.git_command(&["ls-files"]).output()
-        && out.status.success()
-    {
-        let files: Vec<String> = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(|l| l.to_string())
-            .collect();
-        panel.file_count = Some(files.len() as u64);
-        panel.all_files = files;
-    }
-
-    // Issue tracker cache — reads directly from the DB (no network;
-    // the background `spawn_issue_cache_refresh` keeps the cache warm).
-    let provider = hints.issues_provider.as_str();
-    if !provider.is_empty() && provider != "none" {
-        if let Ok(Some((json, _))) = db.get_issue_cache(&loc.path(), provider)
-            && let Ok(issues) = serde_json::from_str::<Vec<superzej_core::issue::Issue>>(&json)
-        {
-            panel.tracker_issues = issues;
-        }
-        if let Ok(links) = db.linked_issues(&cwd.to_string_lossy()) {
-            panel.tracker_links = links;
-        }
-    }
-    // Full notification list for the inbox panel; badge counts are derived from it
-    // by effective priority (Info kinds never count; the red flag is Alert-only).
-    if let Ok(notifications) = db.get_all_notifications(50) {
-        use superzej_core::notification::Priority;
-        let unread = notifications.iter().filter(|n| !n.read);
-        let (mut alert, mut counted) = (0usize, 0usize);
-        for n in unread {
-            match app_cfg.notifications.priority_of(n.kind) {
-                Priority::Alert => {
-                    alert += 1;
-                    counted += 1;
-                }
-                Priority::Notice => counted += 1,
-                Priority::Info => {}
-            }
-        }
-        panel.alert_notifications = alert;
-        panel.unread_notifications = counted;
-        panel.notifications = notifications;
-    }
-    // Tasks section: populate task specs from config + auto-discovery (reusing the
-    // single layered-config load above). Configured tasks win by name; discovered
-    // tasks from manifests fill gaps.
-    {
-        let configured = app_cfg.tasks.clone();
-        let discovered = crate::task::discover_all_tasks(&cwd);
-        panel.task_specs = crate::task::merge_tasks(configured, discovered);
-    }
-
-    // Logs section: tail the szhost log file.
-    // Always scan for new ERRORs to surface as notifications; full tail only
-    // when the section is open (to avoid reading 5 MB on every tick).
-    let log_path = superzej_core::util::xdg_state_home().join("superzej/logs/szhost.log");
-    if log_path.exists()
-        && let Ok(bytes) = std::fs::read(&log_path)
-    {
-        let content = String::from_utf8_lossy(bytes.as_ref());
-        let all_lines: Vec<_> = content
-            .lines()
-            .filter_map(superzej_core::log_view::parse_log_line)
-            .collect();
-
-        // Surface new ERROR lines as a notification (at most once per 5 min).
-        let now_ms = superzej_core::util::now();
-        let five_min_ms: i64 = 5 * 60 * 1_000;
-        let has_recent_log_error = panel
-            .notifications
-            .iter()
-            .any(|n| n.source_ref == "log:szhost" && now_ms - n.created_at_ms < five_min_ms);
-        if !has_recent_log_error {
-            let error_count = all_lines
-                .iter()
-                .filter(|l| l.level == superzej_core::log_view::LogLevel::Error)
-                .count();
-            if error_count > 0 {
-                let msg = format!(
-                    "{} error{} in szhost.log",
-                    error_count,
-                    if error_count == 1 { "" } else { "s" }
-                );
-                let _ = db.put_notification("log_error", "log:szhost", &msg, "");
-            }
-        }
-
-        if hints.open == crate::panel::Section::Logs {
-            let start = all_lines.len().saturating_sub(500);
-            panel.log_lines = all_lines[start..].to_vec();
-        }
-    }
+    let panel = build_panel(&cwd, db, &hints, &app_cfg);
 
     tracing::debug!(
         target: "szhost::hydrate",
@@ -1016,6 +833,312 @@ pub(crate) fn build_model(
     }
 }
 
+/// Build just the right-side panel for a worktree directory. This is the
+/// path-keyed core of model hydration: it touches only `cwd`/`db`/`hints`,
+/// never the session, so a background task can warm a not-yet-focused
+/// worktree's panel into the switch cache before the user lands on it.
+pub(crate) fn build_panel(
+    cwd: &std::path::Path,
+    db: &superzej_core::db::Db,
+    hints: &HydrateHints,
+    app_cfg: &superzej_core::config::Config,
+) -> crate::panel::PanelData {
+    use superzej_core::remote::GitLoc;
+    use superzej_svc::git::{GitBackend, GixGit};
+
+    let loc = GitLoc::for_worktree(cwd);
+
+    // Section-gate flags precomputed as plain `Copy` values so the fan-out
+    // closures below never capture `&HydrateHints` (keeps them trivially `Send`).
+    let want_log = hints.open == crate::panel::Section::Pr;
+    let log_n = if hints.expanded { 12 } else { 6 };
+    // The Full git frame shows every list, so any open git-family section at
+    // Full hydrates branches + stashes too.
+    let git_family_full = hints.expanded && hints.open.is_git_family();
+    let want_branches = hints.open == crate::panel::Section::Branches || git_family_full;
+    let want_stashes = hints.open == crate::panel::Section::Stash || git_family_full;
+    let want_lsfiles = hints.open == crate::panel::Section::Files;
+
+    // Fan the independent, read-only git reads out across scoped threads: each
+    // builds its own (trivial) `GixGit`, borrows `&loc` (read-only; `git -C` so
+    // no chdir hazard) and applies the SAME error fallback inline, so a join
+    // yields an already-defaulted value and `PanelData` is field-for-field
+    // identical to the serial version. This collapses the sum of the git
+    // subprocess latencies to roughly the slowest single one. No DB access in
+    // here (`Db` is not `Send`); the DB-backed joins run after the scope.
+    let t_git = std::time::Instant::now();
+    let (
+        branch,
+        diff_entries,
+        entities,
+        status,
+        ahead_behind,
+        merge_info,
+        stash_count,
+        log,
+        branches_raw,
+        stashes_raw,
+        ls_files,
+    ) = std::thread::scope(|s| {
+        let h_branch = s.spawn(|| {
+            GixGit::new()
+                .current_branch(&loc)
+                .unwrap_or_else(|_| "—".into())
+        });
+        // diff + the semantic entity summary share the diff result and need only
+        // `loc`, so they ride one thread (entity parsing is CPU, kept off the rest).
+        let h_diff = s.spawn(|| {
+            let entries = GixGit::new().diff_files(&loc, "HEAD").unwrap_or_default();
+            let entities = compute_entity_summary(&loc, &entries);
+            (entries, entities)
+        });
+        let h_status = s.spawn(|| GixGit::new().status(&loc).unwrap_or_default());
+        let h_ahead = s.spawn(|| GixGit::new().ahead_behind(&loc).ok().flatten());
+        let h_merge = s.spawn(|| GixGit::new().merge_state(&loc).ok().flatten());
+        let h_stash_count = s.spawn(|| GixGit::new().stash_count(&loc).unwrap_or(0));
+        // Section-gated heavy reads: spawned only when their section is open, so
+        // an idle panel pays nothing. The branch PR-badge join is DB-backed and
+        // stays on the main thread below; only the raw `branches_full` runs here.
+        let h_log =
+            want_log.then(|| s.spawn(|| GixGit::new().log_graph(&loc, log_n).unwrap_or_default()));
+        let h_branches = want_branches
+            .then(|| s.spawn(|| GixGit::new().branches_full(&loc).unwrap_or_default()));
+        let h_stashes =
+            want_stashes.then(|| s.spawn(|| GixGit::new().stash_list(&loc).unwrap_or_default()));
+        let h_ls = want_lsfiles.then(|| {
+            s.spawn(|| {
+                loc.git_command(&["ls-files"])
+                    .output()
+                    .ok()
+                    .and_then(|out| {
+                        out.status.success().then(|| {
+                            String::from_utf8_lossy(&out.stdout)
+                                .lines()
+                                .filter(|l| !l.is_empty())
+                                .map(|l| l.to_string())
+                                .collect::<Vec<_>>()
+                        })
+                    })
+            })
+        });
+
+        let (diff_entries, entities) = h_diff.join().unwrap();
+        (
+            h_branch.join().unwrap(),
+            diff_entries,
+            entities,
+            h_status.join().unwrap(),
+            h_ahead.join().unwrap(),
+            h_merge.join().unwrap(),
+            h_stash_count.join().unwrap(),
+            h_log.map(|h| h.join().unwrap()).unwrap_or_default(),
+            h_branches.map(|h| h.join().unwrap()).unwrap_or_default(),
+            h_stashes.map(|h| h.join().unwrap()).unwrap_or_default(),
+            h_ls.and_then(|h| h.join().unwrap()),
+        )
+    });
+    tracing::debug!(
+        target: "szhost::hydrate",
+        panel_git_ms = t_git.elapsed().as_millis() as u64,
+        "panel git fan-out done"
+    );
+
+    let mut panel = crate::panel::PanelData {
+        branch,
+        ..Default::default()
+    };
+
+    // The typed PR cache: summary + checks + review threads + issues.
+    if let Ok(Some((json, _))) = db.get_pr_cache(&loc.path())
+        && let Ok(cached) = serde_json::from_str::<superzej_core::github::PrPanel>(&json)
+    {
+        apply_pr_cache(&mut panel, cached);
+    }
+
+    panel.files = diff_entries
+        .iter()
+        .map(|f| crate::panel::DiffFile {
+            status: f.path.chars().next().unwrap_or('M'),
+            path: f.path.clone(),
+            added: f.added,
+            deleted: f.deleted,
+        })
+        .collect();
+
+    // Changes section: porcelain status joined with the diffstat.
+    panel.changes = crate::panel::build_change_rows(&status, &diff_entries);
+    // Semantic git layer (items 311/313/317): entity-level view of the changes.
+    panel.entities = entities;
+
+    // Header zone: upstream divergence + merge-in-progress banner.
+    panel.ahead_behind = ahead_behind;
+    let unresolved = superzej_svc::git::conflict_count(&status);
+    let total = merge_total(db, &loc.path(), merge_info.is_some(), unresolved);
+    panel.merge = merge_info.map(|m| crate::panel::MergeBanner {
+        label: m.kind.label().to_string(),
+        onto: m.onto,
+        unresolved,
+        total,
+    });
+    panel.stash_count = stash_count;
+    panel.log = log;
+
+    if hints.wants_commits() {
+        let cached = db.get_commit_cache(&loc.path()).ok().flatten();
+        if let Some((json, _)) = cached.as_ref()
+            && let Ok(mut rows) = serde_json::from_str::<Vec<crate::panel::CommitRow>>(json)
+        {
+            rows.truncate(hints.visible_commit_limit());
+            panel.commits = rows;
+        }
+        panel.commits_loading = commit_cache_needs_refresh(cached.as_ref());
+    }
+    if want_branches {
+        // The per-repo open-PR cache joins onto branch rows by head ref.
+        let badges: Vec<superzej_core::github::PrHeader> = db
+            .get_pr_branch_cache(&loc.path())
+            .ok()
+            .flatten()
+            .map(|(json, _)| superzej_core::github::parse_pr_headers(&json))
+            .unwrap_or_default();
+        panel.branches =
+            branches_raw
+                .into_iter()
+                .map(|b| {
+                    let pr = badges.iter().find(|p| p.head_ref == b.name).map(|p| {
+                        crate::panel::PrBadge {
+                            number: p.number,
+                            state: p.state.clone(),
+                            is_draft: p.is_draft,
+                            url: p.url.clone(),
+                        }
+                    });
+                    crate::panel::BranchRow {
+                        name: b.name,
+                        is_head: b.is_head,
+                        upstream: b.upstream,
+                        ahead: b.ahead,
+                        behind: b.behind,
+                        upstream_gone: b.upstream_gone,
+                        sha: b.sha,
+                        date: b.date,
+                        subject: b.subject,
+                        pr,
+                    }
+                })
+                .collect();
+    }
+    if want_stashes {
+        panel.stashes = stashes_raw
+            .into_iter()
+            .map(|s| crate::panel::StashRow {
+                index: s.index,
+                sha: s.sha,
+                date: s.date,
+                message: s.message,
+            })
+            .collect();
+    }
+
+    // Tests section snapshot from the cache (summary + failures + history).
+    if let Ok(Some((json, _))) = db.get_test_cache(&loc.path())
+        && let Ok(cache) = serde_json::from_str::<crate::testkit::model::TestCache>(&json)
+    {
+        panel.tests = Some(crate::panel::tests_lite(&cache));
+    }
+
+    // Tracked-file list for the Files accordion — fetched in the fan-out above
+    // (only while Files is open; `git ls-files` isn't free on big repos every 2s).
+    if let Some(files) = ls_files {
+        panel.file_count = Some(files.len() as u64);
+        panel.all_files = files;
+    }
+
+    // Issue tracker cache — reads directly from the DB (no network;
+    // the background `spawn_issue_cache_refresh` keeps the cache warm).
+    let provider = hints.issues_provider.as_str();
+    if !provider.is_empty() && provider != "none" {
+        if let Ok(Some((json, _))) = db.get_issue_cache(&loc.path(), provider)
+            && let Ok(issues) = serde_json::from_str::<Vec<superzej_core::issue::Issue>>(&json)
+        {
+            panel.tracker_issues = issues;
+        }
+        if let Ok(links) = db.linked_issues(&cwd.to_string_lossy()) {
+            panel.tracker_links = links;
+        }
+    }
+    // Full notification list for the inbox panel; badge counts are derived from it
+    // by effective priority (Info kinds never count; the red flag is Alert-only).
+    if let Ok(notifications) = db.get_all_notifications(50) {
+        use superzej_core::notification::Priority;
+        let unread = notifications.iter().filter(|n| !n.read);
+        let (mut alert, mut counted) = (0usize, 0usize);
+        for n in unread {
+            match app_cfg.notifications.priority_of(n.kind) {
+                Priority::Alert => {
+                    alert += 1;
+                    counted += 1;
+                }
+                Priority::Notice => counted += 1,
+                Priority::Info => {}
+            }
+        }
+        panel.alert_notifications = alert;
+        panel.unread_notifications = counted;
+        panel.notifications = notifications;
+    }
+    // Tasks section: populate task specs from config + auto-discovery (reusing the
+    // single layered-config load above). Configured tasks win by name; discovered
+    // tasks from manifests fill gaps.
+    {
+        let configured = app_cfg.tasks.clone();
+        let discovered = crate::task::discover_all_tasks(cwd);
+        panel.task_specs = crate::task::merge_tasks(configured, discovered);
+    }
+
+    // Logs section: tail the szhost log file.
+    // Always scan for new ERRORs to surface as notifications; full tail only
+    // when the section is open (to avoid reading 5 MB on every tick).
+    let log_path = superzej_core::util::xdg_state_home().join("superzej/logs/szhost.log");
+    if log_path.exists()
+        && let Ok(bytes) = std::fs::read(&log_path)
+    {
+        let content = String::from_utf8_lossy(bytes.as_ref());
+        let all_lines: Vec<_> = content
+            .lines()
+            .filter_map(superzej_core::log_view::parse_log_line)
+            .collect();
+
+        // Surface new ERROR lines as a notification (at most once per 5 min).
+        let now_ms = superzej_core::util::now();
+        let five_min_ms: i64 = 5 * 60 * 1_000;
+        let has_recent_log_error = panel
+            .notifications
+            .iter()
+            .any(|n| n.source_ref == "log:szhost" && now_ms - n.created_at_ms < five_min_ms);
+        if !has_recent_log_error {
+            let error_count = all_lines
+                .iter()
+                .filter(|l| l.level == superzej_core::log_view::LogLevel::Error)
+                .count();
+            if error_count > 0 {
+                let msg = format!(
+                    "{} error{} in szhost.log",
+                    error_count,
+                    if error_count == 1 { "" } else { "s" }
+                );
+                let _ = db.put_notification("log_error", "log:szhost", &msg, "");
+            }
+        }
+
+        if hints.open == crate::panel::Section::Logs {
+            let start = all_lines.len().saturating_sub(500);
+            panel.log_lines = all_lines[start..].to_vec();
+        }
+    }
+    panel
+}
+
 /// `gen` tags the result so the event loop can drop models that were spawned
 /// before a workspace/worktree switch but land after it (spawn_blocking tasks
 /// complete out of order; a stale model would resurrect the old sidebar).
@@ -1047,6 +1170,40 @@ pub(crate) fn spawn_model_hydration(
             && tx
                 .send((generation, build_model(&session, &db, hints)))
                 .is_ok()
+            && let Some(w) = &waker
+        {
+            let _ = w.wake();
+        }
+    });
+}
+
+/// Warm a not-yet-focused worktree's panel into the switch cache. Builds only
+/// the path-keyed [`build_panel`] data (no sidebar/tab work, no `git log`
+/// refresh) on a blocking worker and ships `(worktree_path, panel)` back so the
+/// event loop can serve it instantly when the user switches to that worktree.
+/// Unlike [`spawn_model_hydration`] this is fire-and-forget background warming —
+/// the result never replaces the live frame, only seeds the cache.
+pub(crate) fn spawn_panel_prefetch(
+    tx: tokio_mpsc::UnboundedSender<(std::path::PathBuf, crate::panel::PanelData)>,
+    cwd: std::path::PathBuf,
+    hints: HydrateHints,
+    waker: Option<TerminalWaker>,
+) {
+    task::spawn_blocking(move || {
+        if !cwd.is_dir() {
+            return;
+        }
+        let Ok(db) = superzej_core::db::Db::open() else {
+            return;
+        };
+        let app_cfg = superzej_core::config::Config::try_load_layered(
+            &superzej_core::config::ProcessEnv,
+            &[],
+            None,
+        )
+        .unwrap_or_default();
+        let panel = build_panel(&cwd, &db, &hints, &app_cfg);
+        if tx.send((cwd, panel)).is_ok()
             && let Some(w) = &waker
         {
             let _ = w.wake();
