@@ -112,9 +112,14 @@ fn run_supervisor(
     loop {
         let now = Instant::now();
         for (i, target_cfg) in config.targets.iter().enumerate() {
-            let result = match &client {
-                Ok(client) => scrape_target(client, &target_cfg.url, config.max_body_bytes.max(1)),
-                Err(e) => Err(format!("http client: {e}")),
+            let result = {
+                let _g = crate::perf::measure(crate::perf::Subsys::Metrics);
+                match &client {
+                    Ok(client) => {
+                        scrape_target(client, &target_cfg.url, config.max_body_bytes.max(1))
+                    }
+                    Err(e) => Err(format!("http client: {e}")),
+                }
             };
 
             let target_state = &mut state.targets[i];
