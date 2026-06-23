@@ -1,6 +1,6 @@
 # superzej — roadmap & progress
 
-636 features across 46 groups (A–AT). The list is really **two tracks joined by
+661 features across 46 groups (A–AT). The list is really **two tracks joined by
 one keystone**: an AI-free _shell_ track and an AI track, bridged by the **proxy**.
 That shape drives the phasing below. The proxy is not just a router — it is the
 **AI control plane**: the single interception point every agent's model traffic
@@ -8,7 +8,9 @@ crosses, so any cross-cutting concern is configured **once and inherited by ever
 harness**. The proxy track (**U/V/W**) graduates into a full **AI gateway / context
 fabric** in **AR (541–586)**. Original numbering is preserved; gaps are deliberate
 cuts (499, 500, 502, 505, 506, 507, 510 dropped from the moonshot set; web
-dashboard 510 and voice 499 already cut). The dropped eval harness (505/506)
+dashboard 510 and voice 499 already cut; deadbranch stale-branch cleanup imported
+as 659–671 under Y; brows-style release management imported as 672–683 under AT).
+The dropped eval harness (505/506)
 resurfaces, scoped, as the gateway's eval hooks (**AR 581**).
 
 **Status legend:** `[x]` done · `[~]` in progress / partial · `[ ]` not started.
@@ -70,6 +72,20 @@ track's prerequisite.
   worktree status field (655), per-agent account hot-swap chip (656), agent-hook passthrough +
   worktree setup hooks (657), and agent session history/hibernation (658); plus enriched
   scheduled automations (226/504) and worktree setup hooks (54). Captured from an Orca feature audit.
+- **deadbranch import (659–671)** — safe stale-_branch_ cleanup extending branch
+  management (323): age-threshold detection (659), merge-aware delete (660),
+  protected/WIP exclusion (661), delete-with-backup + restore (662/663), dry-run
+  (664), local+remote scope (665), health stats (666), and a multi-select cleanup
+  TUI (667); plus personal filter (668), PR-aware staleness (669), JSON/CSV export
+  (670), per-repo config (671). Distinct from worktree GC (48/56). Captured from a
+  deadbranch feature import.
+- **brows release import (672–683)** — cross-forge **release & tag** management, the
+  surface the Z/AT groups were missing: a release browser + detail view (673/674,
+  the brows browsing UX generalized), tag management (675), create/edit/delete +
+  draft/prerelease/latest flags (676/677), assets (678), auto-generated/AI notes
+  (679), version diff/changelog (680), worktree/PR linkage (681), release
+  notifications (682), per-forge config (683). AI-free except the notes narrative.
+  Captured from a brows feature import.
 
 **✔ E. Pinned programs / tiles — complete on the native host (items 57–74).** The
 full config-driven pin/daemon system ships in `superzej-host`: a `PinSupervisor`
@@ -205,7 +221,7 @@ The "magical" layer; mostly composition of what's built.
 - **IDE Tier 2 AQ (525–535)** — DAP/LSP client substrates, debug panels,
   symbol/reference navigation, worktree timeline/history, and layout+task
   templates compose the Phase-1 shell surfaces into deeper IDE workflows.
-- **Multi-forge PR/issue/review + kanban AT (631–653)** — a forge abstraction over
+- **Multi-forge PR/issue/review + kanban + releases AT (631–653, 672–683)** — a forge abstraction over
   **GitHub Z (331–340)** + GitLab/Gitea/Forgejo, Stage-style structured review
   (chapters/narrative/risk/assistant, AI-additive) and project boards; **Linear
   AA (341–348)** becomes one tracker provider behind it
@@ -732,6 +748,25 @@ keeping `lazygit` as the fallback escape hatch._
 - [ ] 604. Rollback/discard window — checkbox tree of changes, optional delete of added files, per-row diff
 - [ ] 605. Plain push/pull/fetch when ahead/behind upstream (non-PR fast path)
 
+_Stale-**branch** lifecycle (distinct from worktree GC 48 / bulk cleanup 56): a
+deliberate import of the **deadbranch** feature set ("clean up stale git branches
+safely") — extends branch management (323) with safe detection, merge-aware
+deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
+
+- [ ] 659. Stale-branch detection — list branches over a configurable age threshold (default 30d) with metadata: age, merge status, author, last-commit date
+- [ ] 660. Merge-aware deletion (default) — only delete merged branches unless explicitly overridden; guard unmerged work
+- [ ] 661. Protected-branch + WIP/draft exclusion — never-delete set (main/master/develop/staging/production) + skip `wip/*`, `draft/*` patterns
+- [ ] 662. Delete-with-backup — record deleted-branch SHAs to a recovery store before removal
+- [ ] 663. Backup management — list / restore / cleanup deleted-branch backups + storage stats
+- [ ] 664. Dry-run preview — show candidate deletions (and why each qualifies) without executing
+- [ ] 665. Local + remote branch scope — operate on local and remote-tracking branches
+- [ ] 666. Repo branch-health stats — aggregate counts (stale / merged / unmerged / total) for the workspace
+- [ ] 667. Interactive multi-select cleanup TUI — vim nav, fuzzy filter, multi-column sort; reuses the sidebar/palette multi-select model (B 26)
+- [ ] 668. Personal/author branch filter — restrict candidates to the current user's branches _(deadbranch roadmap)_
+- [ ] 669. PR-aware staleness — gate deletion on merged/closed PR status _(deadbranch roadmap; via Z 331/336, generalized by AT 638)_
+- [ ] 670. Stale-branch report export — JSON/CSV of detected/deleted branches _(deadbranch roadmap)_
+- [ ] 671. Per-repo cleanup config — thresholds + exclusion patterns in project config _(deadbranch roadmap; rides 186 project-level config)_
+
 ### Z. GitHub
 
 - [x] 331. PR tracking
@@ -1112,7 +1147,7 @@ opportunistically alongside basic git (Phase 1)._
 - [ ] 629. `jj resolve` — external merge-tool flow + conflict materialization/round-trip (extends in-UI conflicts 597)
 - [ ] 630. Advanced history rewriting — `jj parallelize`, `jj simplify-parents`, and other revset-targeted rewrites (extends 594)
 
-### AT. Multi-forge PR/MR, issues, reviews & boards (GitHub/GitLab/Gitea/Forgejo)
+### AT. Multi-forge PR/MR, issues, reviews, boards & releases (GitHub/GitLab/Gitea/Forgejo)
 
 _Does for code-forges what AS does for VCS backends: one provider trait so PR/MR,
 issue, review, comment, board, and CI surfaces work across **GitHub, GitLab,
@@ -1148,6 +1183,30 @@ posture) and degrades to a plain diff when AI is off._
 - [ ] 651. Board card ↔ worktree/PR binding — open a card's branch as a worktree tab; reflect PR/CI state back on the card
 - [ ] 652. Cross-forge notification feed — review-requested / mentioned / CI-failed / merged events into the notification bus (AI 419–430)
 - [ ] 653. CI/checks status across forges — checks, required gates, mergeability per PR/MR (generalizes Z 332)
+
+_Release & tag management — the forge surface the GitHub-only Z group and the
+multi-forge AT group both skip. A deliberate import of the **brows**
+(`rubysolo/brows`) browsing UX ("browse GitHub releases in a TUI"), generalized
+across **GitHub/GitLab/Gitea/Forgejo** behind the same forge backend trait (631)
+and extended from view-only into **full management** (create/edit/delete, tags,
+assets). Mostly **AI-free** — only the release-notes narrative (679) is
+AI-additive via the proxy and degrades to a plain merged-PR/commit list when AI
+is off. Releases flow into the notification bus (AI 419–430) and the worktree/PR
+model, so this rides the existing forge, diff, and notification surfaces rather
+than inventing new ones._
+
+- [ ] 672. Release/tag ops on the forge trait — list/view/create/edit/delete releases + tags across GitHub/GitLab/Gitea/Forgejo (extends 631; GitHub `gh release`/octocrab as the reference impl, generalizing Z)
+- [ ] 673. Release browser — interactive cross-forge release list (tag, title, date, author, draft/prerelease/latest badges), fuzzy filter + version jump (the brows browsing surface, generalized)
+- [ ] 674. Release detail view — rendered markdown notes, target tag/commit, asset list, and "changes since the previous release" (brows-style read view)
+- [ ] 675. Tag management — list / create (lightweight + annotated) / delete tags, tag→commit jump, signed tags (parallels git commit signing 328)
+- [ ] 676. Create release — from an existing or new tag; title, notes, target commit/branch; draft / prerelease / mark-as-latest flags
+- [ ] 677. Edit / delete release — update title/notes/flags, delete release (dirty/confirm guard, like 47/49)
+- [ ] 678. Release assets — list with sizes, download/open, upload/attach build artifacts, remove assets
+- [ ] 679. Auto-generated release notes — forge-native generated notes (e.g. GitHub `generate_release_notes`) plus an AI-authored changelog/narrative via the proxy (AI-additive; falls back to a plain merged-PR/commit list when AI-free; ties to T 266, AT 642)
+- [ ] 680. Version diff / changelog — compare two releases or tags: commit range + PRs/MRs merged between them (reuses the diff Y 319 and PR/MR AT 637/638 surfaces)
+- [ ] 681. Release ↔ worktree/PR linkage — surface a repo's latest/relevant release in the sidebar/panel; cut a release from the current worktree's HEAD or a merged PR (generalizes Z 336, feeds B 28)
+- [ ] 682. Release notifications — published / new-release / pre-release events into the notification bus and the cross-forge feed (AI 419–430, AT 652)
+- [ ] 683. Per-forge release config — default target branch, tag/version naming templates, draft-by-default, asset glob patterns in project config (rides 186)
 
 ### AI-free mode (audience-widener)
 
