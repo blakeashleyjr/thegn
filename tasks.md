@@ -376,10 +376,10 @@ _Tier-2 layout/task templates generalize worktree templates (54) with native
 - [x] 49. Dirty-state warning before destructive ops
 - [ ] 50. Dependency sharing — hardlink/CoW node_modules etc.
 - [~] 51. Per-worktree disk usage
-- [ ] 52. Fork worktree (branch from existing)
-- [ ] 53. Rename worktree/branch
+- [x] 52. Fork worktree (branch from existing) _(`SidebarOutcome::Fork` from the row menu → `begin_worktree_wizard(base_override=Some(branch))` in run.rs)_
+- [x] 53. Rename worktree/branch _(`PromptRename` → `HostInputKind::RenameWorktree` → `superzej_core::worktree::rename` (branch -m + worktree move); tested by `rename_moves_branch_and_checkout`)_
 - [~] 54. Worktree templates — layout+programs+container preset + setup/post-create hooks (deps install, env restore; see 657) _(`NewWorktreeFromTemplate` action wired in run.rs + `[[worktree_templates]]` config; setup/post-create hook depth still partial)_
-- [x] 55. Worktree↔PR mapping _(`pr_branch_cache` keyed by worktree path; `get_pr_branch_cache`/`spawn_pr_cache_refresh` in hydrate.rs)_
+- [x] 55. Worktree↔PR mapping _(`pr_branch_cache` keyed by repo root; `get_open_pr_counts_by_branch`/`spawn_pr_cache_refresh` in hydrate.rs — every worktree resolves its branch's badge)_
 - [x] 56. Bulk worktree cleanup _(sidebar multi-select `Space` + `X` bulk close)_
 
 ### E. Pinned programs / tiles
@@ -431,7 +431,7 @@ launch-or-focus via `Alt-1..9`, restart per policy on PTY exit, and resurrect fr
 - [x] 86. Chorded/sequence binds _(`sequence.rs` `SequenceMatcher` `feed`/`add_sequence`, wired in run.rs)_
 - [x] 87. Which-key hint popup _(`SequenceMatcher::pending_continuations()` → statusbar keyhints)_
 - [x] 88. Vim/emacs presets _(`keymap.rs` `Mode::{VimNormal,VimInsert,Emacs}` + `SwitchMode`)_
-- [ ] 621. IDE keymap presets (VSCode/JetBrains-style) + first-launch keymap picker, per-action overrides
+- [x] 621. IDE keymap presets (VSCode/JetBrains) + first-launch keymap picker, per-action overrides _(`keymap_preset` config → `apply_keymap_preset` overlays IDE chords onto existing actions, applied before user `[keybinds]` so per-action overrides win; one-time `menu::keymap_preset_menu` picker on first launch, choice persisted in `ui_state`)_
 
 ### G. Panes & layouts
 
@@ -899,7 +899,7 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 - [~] 402. Recent files
 - [ ] 403. Bookmarks/marks
 - [ ] 404. Diff-against-branch from file
-- [ ] 606. File management from the tree — new/rename/delete (with confirm), file-type icons, git/VCS-status colors
+- [x] 606. File management from the tree — new/rename/delete (with confirm) + file-type icons via the yazi drawer; git/VCS-status colors via the vendored `git.yazi` plugin, seeded + registered by `yazi.rs::apply_git_status_policy` (`[drawer] git_status`, default on) with `[git]` theme hues _(live color render pending a real-terminal check)_
 
 ### AG. Editor integration
 
@@ -1044,8 +1044,8 @@ groups; existing git, palette, notification, layout, and editor items remain in
 their original groups._
 
 - [~] 516. Test explorer tree — discover and render runnable test targets per worktree _(test discovery in `task.rs`)_
-- [~] 517. Test status rollups — pass/fail/running state in panel, sidebar, and statusbar
-- [~] 518. Run/debug selected test — nearest/file/package/failed-test actions, DAP handoff later
+- [x] 517. Test status rollups — pass/fail/running state in panel, sidebar, and statusbar _(panel Tests section; sidebar alert badge on failures; statusbar `tests` widget `✓pass ✗fail` in `chrome.rs::bottombar_widget`)_
+- [~] 518. Run/debug selected test — selected (`r`) / failed (`f`) / all (`R`) / file (`F`) / package (`p`) scopes in `test_task_for_run` (path for pytest/jest/vitest, module fallback for cargo/go); _cursor-relative "nearest" deferred (viewer hands editing to `$EDITOR`, no in-process cursor — folds into file scope) and DAP debug-run is Tier-2 (525–528)_
 - [x] 519. Problems / diagnostics panel — compiler/linter/config/LSP diagnostics with file:line jumps _(`panel/sections/problems.rs`)_
 - [x] 520. Named task registry — `[[tasks]]` (explicit config) + discovered providers (just, cargo, npm, etc.) and aliases _(`panel/sections/tasks.rs` + `task.rs` discovery)_
 - [x] 521. Task lifecycle controls — run/stop/restart/rerun from palette/panel/keybinds for any task

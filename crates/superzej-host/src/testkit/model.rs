@@ -319,6 +319,33 @@ impl TestPanelState {
             .and_then(|idx| self.nodes.get(*idx))
     }
 
+    /// The package/module/suite that a run-by-package (`p`) targets: the
+    /// selected node itself when it is a Group, else its nearest enclosing
+    /// Group. `None` when the selection isn't inside any group. Used by item
+    /// 518's Package scope (and as the File-scope fallback for id-filter
+    /// runners like cargo that have no file-level selector).
+    pub fn selected_group(&self) -> Option<&TestNode> {
+        let visible = self.visible_indices();
+        let idx = *visible.get(self.cursor)?;
+        let sel = self.nodes.get(idx)?;
+        if sel.kind == TestNodeKind::Group {
+            return Some(sel);
+        }
+        let depth = sel.depth;
+        self.nodes[..idx]
+            .iter()
+            .rev()
+            .find(|n| n.kind == TestNodeKind::Group && n.depth < depth)
+    }
+
+    /// File path of the selected node, for run-by-file (`F`) on path-native
+    /// runners (pytest/jest/vitest). `None` when the node carries no location.
+    pub fn selected_path(&self) -> Option<&str> {
+        self.selected_node()
+            .and_then(|n| n.location.as_ref())
+            .map(|l| l.path.as_str())
+    }
+
     /// Mark cached results as stale (e.g. on a file change). This is the ONLY
     /// thing a file-change/watch path is allowed to do: it never starts a run or
     /// discovery — superzej never auto-runs tests. Pure: keeps task/nodes intact.

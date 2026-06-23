@@ -74,6 +74,9 @@ pub enum MenuChoice {
     ConfirmRedo,
     // generic yes/no confirm — the loop interprets `tag`
     Confirm { tag: &'static str, arg: String },
+    // first-launch keymap picker (item 621): the chosen preset id
+    // ("default" | "vscode" | "jetbrains").
+    SetKeymapPreset(String),
     Dismiss,
 }
 
@@ -91,6 +94,7 @@ pub enum MenuKindTag {
     UndoConfirm,
     RedoConfirm,
     Confirm,
+    KeymapPicker,
 }
 
 /// One selectable row: an optional letter hotkey (rendered as a chip), the
@@ -342,6 +346,36 @@ pub fn confirm_menu(
         vec![yes, item(Some('n'), "cancel", MenuChoice::Dismiss)],
     )
     .with_body(body)
+}
+
+/// First-launch keymap picker (item 621): pick a familiar IDE keymap overlay or
+/// keep superzej's defaults. Each choice resolves to `SetKeymapPreset`.
+pub fn keymap_preset_menu() -> MenuOverlay {
+    MenuOverlay::new(
+        MenuKindTag::KeymapPicker,
+        "Choose a keymap",
+        vec![
+            item(
+                Some('d'),
+                "superzej defaults",
+                MenuChoice::SetKeymapPreset("default".into()),
+            )
+            .note("Alt/Ctrl chords"),
+            item(
+                Some('v'),
+                "VS Code",
+                MenuChoice::SetKeymapPreset("vscode".into()),
+            )
+            .note("Ctrl+P, Ctrl+Shift+P, Ctrl+B"),
+            item(
+                Some('i'),
+                "JetBrains",
+                MenuChoice::SetKeymapPreset("jetbrains".into()),
+            )
+            .note("Ctrl+Shift+A, Ctrl+E"),
+        ],
+    )
+    .with_body("Familiar shortcuts on top of the defaults. Change later with keymap_preset.")
 }
 
 /// Rebase options: continue + skip only while a rebase is conflicted/running.
@@ -1237,6 +1271,28 @@ mod tests {
         assert_eq!(
             m.handle_key(&KeyCode::Char('n'), NONE),
             MenuOutcome::Pick(MenuChoice::Dismiss)
+        );
+    }
+
+    #[test]
+    fn keymap_preset_menu_offers_three_presets() {
+        // Construction asserts hotkeys don't collide / hit reserved j/k/q.
+        let mut m = keymap_preset_menu();
+        assert_eq!(m.tag, MenuKindTag::KeymapPicker);
+        assert_eq!(m.items().len(), 3);
+        assert_eq!(
+            m.handle_key(&KeyCode::Char('v'), NONE),
+            MenuOutcome::Pick(MenuChoice::SetKeymapPreset("vscode".into()))
+        );
+        let mut m2 = keymap_preset_menu();
+        assert_eq!(
+            m2.handle_key(&KeyCode::Char('i'), NONE),
+            MenuOutcome::Pick(MenuChoice::SetKeymapPreset("jetbrains".into()))
+        );
+        let mut m3 = keymap_preset_menu();
+        assert_eq!(
+            m3.handle_key(&KeyCode::Char('d'), NONE),
+            MenuOutcome::Pick(MenuChoice::SetKeymapPreset("default".into()))
         );
     }
 

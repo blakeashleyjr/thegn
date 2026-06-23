@@ -920,7 +920,7 @@ impl Default for BarsConfig {
                 "clock".into(),
             ],
             bottom_left: vec!["keyhints".into()],
-            bottom_right: vec!["pr".into(), "loc".into(), "status".into()],
+            bottom_right: vec!["pr".into(), "tests".into(), "loc".into(), "status".into()],
             date_format: "%a %b %-d".into(),
             clock_format: "%H:%M".into(),
         }
@@ -1626,6 +1626,11 @@ pub struct DrawerConfig {
     pub width: String,
     /// Whether the bundled/private yazi config allows image preview backends.
     pub image_previews: bool,
+    /// Whether the drawer shows git status as a linemode (item 606). When true,
+    /// the bundled `git.yazi` plugin is seeded and registered as a fetcher in the
+    /// private config; false removes the managed block. No effect on a "system"
+    /// `config_home` (superzej never edits the user's own yazi config).
+    pub git_status: bool,
     /// Whether drawer yazi launches should be wrapped in a user systemd scope.
     pub contain: bool,
     /// `MemoryMax` for the drawer scope. Empty = omit this property.
@@ -1648,6 +1653,7 @@ impl Default for DrawerConfig {
             height: "35%".into(),
             width: "full".into(),
             image_previews: false,
+            git_status: true,
             contain: true,
             memory_max: "2G".into(),
             memory_swap_max: "512M".into(),
@@ -1858,6 +1864,16 @@ pub struct PanelConfig {
     pub sections: Vec<String>,
 }
 
+/// Default `keymap_preset` (no IDE overlay). A free function so both the field
+/// default and the `skip_serializing_if` predicate agree.
+fn default_preset() -> String {
+    "default".into()
+}
+
+fn is_default_preset(s: &str) -> bool {
+    s.is_empty() || s == "default"
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct Config {
@@ -1879,6 +1895,12 @@ pub struct Config {
     /// overridden by `SUPERZEJ_PROFILE` / `--profile`.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub profile: String,
+    /// IDE keymap preset overlaid on the built-in defaults (item 621):
+    /// `"default"` (none), `"vscode"`, or `"jetbrains"`. Familiar chords mapped
+    /// to existing host actions; user `[keybinds]` still override it. The
+    /// `vim`/`emacs` mode overlays are separate (see `[profiles]`/`default_mode`).
+    #[serde(skip_serializing_if = "is_default_preset")]
+    pub keymap_preset: String,
     // --- arrays of tables (must serialize before any plain sub-table) ---
     pub agents: Vec<NamedCommand>,
     pub tools: Vec<NamedCommand>,
@@ -1989,6 +2011,7 @@ impl Default for Config {
             keybinds: KeybindConfig::default(),
             actions: Vec::new(),
             profile: String::new(),
+            keymap_preset: default_preset(),
             profiles: std::collections::BTreeMap::new(),
             workspace: std::collections::BTreeMap::new(),
             program_keybinds: std::collections::BTreeMap::new(),
@@ -3294,6 +3317,7 @@ name = "minimal"
         assert_eq!(d.height, "35%");
         assert_eq!(d.width, "full");
         assert!(!d.image_previews);
+        assert!(d.git_status);
         assert!(d.contain);
         assert_eq!(d.memory_max, "2G");
         assert_eq!(d.memory_swap_max, "512M");
@@ -4674,7 +4698,7 @@ forward_agent = false
             vec!["cpu", "mem", "gpu", "net", "battery", "date", "clock"]
         );
         assert_eq!(b.bottom_left, vec!["keyhints"]);
-        assert_eq!(b.bottom_right, vec!["pr", "loc", "status"]);
+        assert_eq!(b.bottom_right, vec!["pr", "tests", "loc", "status"]);
         assert_eq!(b.date_format, "%a %b %-d");
         assert_eq!(b.clock_format, "%H:%M");
     }
