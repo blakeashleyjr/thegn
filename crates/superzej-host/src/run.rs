@@ -176,6 +176,12 @@ fn context_hints(
             hints.extend(exit);
             hints
         }
+        crate::focus::Zone::Drawer => vec![
+            ("↑↓←→".into(), "files".into()),
+            ("Enter".into(), "open".into()),
+            hint("back", "focus-up").unwrap_or_else(|| ("Ctrl-Up".into(), "back".into())),
+            ("Esc/q".into(), "close".into()),
+        ],
         crate::focus::Zone::Masthead => vec![
             hint("back", "focus-down").unwrap_or_else(|| ("Ctrl-Down".into(), "back".into())),
             ("Esc".into(), "back".into()),
@@ -692,6 +698,11 @@ fn compute_chrome(
     sidebar_cols: usize,
     zoom: Option<crate::focus::Zone>,
     supervisor: &crate::pins::PinSupervisor,
+    // Bottom drawer reservation: `drawer_rows` (> 0) carves a slice off the band
+    // bottom; `drawer_full_width` spans the whole width vs. the center column.
+    // Zoom suppresses the drawer along with the rest of the chrome.
+    drawer_rows: usize,
+    drawer_full_width: bool,
 ) -> layout::ChromeLayout {
     use crate::focus::Zone;
     let strip = supervisor.strip_visible() && supervisor.has_strip_panes();
@@ -708,6 +719,8 @@ fn compute_chrome(
             sidebar_cols,
             false,
             0.0,
+            0,
+            false,
         ),
         // Sidebar / panel zoom: the zone takes (nearly) the whole width; a
         // 1-col center keeps the pane math alive.
@@ -722,6 +735,8 @@ fn compute_chrome(
                 sidebar_cols,
                 false,
                 0.0,
+                0,
+                false,
             );
             let w = cols.saturating_sub(2).max(1);
             if let Some(sb) = l.sidebar.as_mut() {
@@ -746,6 +761,8 @@ fn compute_chrome(
                 sidebar_cols,
                 false,
                 0.0,
+                0,
+                false,
             );
             let w = cols.saturating_sub(2).max(1);
             if let Some(pn) = l.panel.as_mut() {
@@ -760,21 +777,58 @@ fn compute_chrome(
             l.strip = None;
             l
         }
-        // The bars are single rows — zooming them makes no sense; fall back
-        // to the normal layout (zoom is never set to a bar zone; this arm
-        // exists for exhaustiveness).
-        Some(Zone::Masthead) | Some(Zone::Statusbar) | None => layout::compute_full(
-            cols,
-            rows,
-            want_sidebar,
-            want_panel,
-            panel_forced,
-            panel_width,
-            sidebar_cols,
-            strip,
-            supervisor.strip_ratio(),
-        ),
+        // The bars are single rows and the drawer is never a zoom target —
+        // zooming them makes no sense; fall back to the normal layout (zoom is
+        // never set to these zones; this arm exists for exhaustiveness).
+        Some(Zone::Masthead) | Some(Zone::Statusbar) | Some(Zone::Drawer) | None => {
+            layout::compute_full(
+                cols,
+                rows,
+                want_sidebar,
+                want_panel,
+                panel_forced,
+                panel_width,
+                sidebar_cols,
+                strip,
+                supervisor.strip_ratio(),
+                drawer_rows,
+                drawer_full_width,
+            )
+        }
     }
+}
+
+/// The rect the drawer WILL occupy if opened now, used to spawn its PTY already
+/// sized to its panel slot. Mirrors the [`compute_chrome`] inputs plus the
+/// config-derived drawer height/width; falls back to the center when the band
+/// is too short to reserve the drawer.
+#[allow(clippy::too_many_arguments)]
+fn prospective_drawer_rect(
+    cols: usize,
+    rows: usize,
+    want_sidebar: bool,
+    want_panel: bool,
+    panel_forced: bool,
+    panel_width: layout::PanelWidth,
+    sidebar_cols: usize,
+    zoom: Option<crate::focus::Zone>,
+    supervisor: &crate::pins::PinSupervisor,
+    cfg: &superzej_core::config::Config,
+) -> Rect {
+    let l = compute_chrome(
+        cols,
+        rows,
+        want_sidebar,
+        want_panel,
+        panel_forced,
+        panel_width,
+        sidebar_cols,
+        zoom,
+        supervisor,
+        resolve_drawer_rows(&cfg.drawer.height, rows),
+        cfg.drawer.width != "center",
+    );
+    l.drawer.unwrap_or(l.center)
 }
 
 /// Working directory for a pin: explicit `cwd`, else the active tab's worktree,
@@ -5312,6 +5366,23 @@ fn apply_layout_to_active_tab(
     Some(focus)
 }
 
+/// Resolve the drawer's reserved height from its config string against the
+/// terminal `rows`: an `"NN%"` ratio of the screen, else a literal row count.
+/// Falls back to a third of the screen on a malformed value (this is what fixes
+/// the old silent 20-row fallback when `"35%"` failed to parse as a `usize`).
+fn resolve_drawer_rows(height: &str, rows: usize) -> usize {
+    let h = height.trim();
+    let resolved = if let Some(pct) = h.strip_suffix('%') {
+        pct.trim()
+            .parse::<f32>()
+            .ok()
+            .map(|p| (rows as f32 * p / 100.0).round() as usize)
+    } else {
+        h.parse::<usize>().ok()
+    };
+    resolved.unwrap_or(rows / 3).min(rows)
+}
+
 fn spawn_yazi_pane(
     panes: &mut Panes,
     cfg: &superzej_core::config::Config,
@@ -5963,6 +6034,12 @@ async fn event_loop<T: Terminal>(
     // pre-render detector keeps this in sync with `panel_ui.width` so every
     // toggle path triggers a chrome recompute.
     let mut panel_width = layout::PanelWidth::Normal;
+    // Bottom drawer geometry, kept in sync at the top of the loop: `drawer_rows`
+    // is the reserved height (0 when the drawer is closed), `drawer_full` whether
+    // it spans the full width (config `[drawer].width`) vs. the center column.
+    // `compute_chrome` reserves the band-bottom slice from these.
+    let mut drawer_rows: usize = 0;
+    let mut drawer_full: bool = keymap.config().drawer.width != "center";
     // Set while the panel was popped up by Ctrl+→ at the center edge; holds
     // the (want_panel, panel_forced) pair to restore when focus leaves it.
     let mut panel_auto_revealed: Option<(bool, bool)> = None;
@@ -6194,6 +6271,8 @@ async fn event_loop<T: Terminal>(
         sidebar_cols,
         zoom,
         &supervisor,
+        drawer_rows,
+        drawer_full,
     );
     sb.rebuild(&mut model, &session);
     // Loop-owned perf tally (wakes, renders, per-source drains, render latency).
@@ -6404,6 +6483,8 @@ async fn event_loop<T: Terminal>(
                 sidebar_cols,
                 zoom,
                 &supervisor,
+                drawer_rows,
+                drawer_full,
             );
             need_relayout = true;
         }
@@ -6460,6 +6541,37 @@ async fn event_loop<T: Terminal>(
             persist_session_layout(&mut session, &panes);
             return Ok(());
         }
+        // Keep the drawer geometry that `compute_chrome` reserves in sync with
+        // the live drawer state. When the reservation changes (any open/close
+        // path — toggle, direct yazi, Esc, or a worktree switch restoring a
+        // saved-open drawer), recompute the cross and relayout so the columns
+        // reflow and the drawer PTY is resized to its rect.
+        let new_drawer_rows = if drawer.is_some() {
+            resolve_drawer_rows(&current_config.drawer.height, rows)
+        } else {
+            0
+        };
+        let new_drawer_full = current_config.drawer.width != "center";
+        if new_drawer_rows != drawer_rows || new_drawer_full != drawer_full {
+            drawer_rows = new_drawer_rows;
+            drawer_full = new_drawer_full;
+            chrome = compute_chrome(
+                cols,
+                rows,
+                want_sidebar,
+                want_panel,
+                panel_forced,
+                panel_width,
+                sidebar_cols,
+                zoom,
+                &supervisor,
+                drawer_rows,
+                drawer_full,
+            );
+            need_relayout = true;
+            full_repaint = true;
+            dirty = true;
+        }
         // Per-workspace keybinds: rebuild when the focused workspace changed.
         if session.id != keymap_workspace {
             keymap = rebuild_keymap(&current_config, &session);
@@ -6486,6 +6598,8 @@ async fn event_loop<T: Terminal>(
                     sidebar_cols,
                     zoom,
                     &supervisor,
+                    drawer_rows,
+                    drawer_full,
                 );
                 need_relayout = true;
                 dirty = true;
@@ -6516,6 +6630,8 @@ async fn event_loop<T: Terminal>(
                 sidebar_cols,
                 zoom,
                 &supervisor,
+                drawer_rows,
+                drawer_full,
             );
             need_relayout = true;
             dirty = true;
@@ -6681,6 +6797,8 @@ async fn event_loop<T: Terminal>(
                 sidebar_cols,
                 zoom,
                 &supervisor,
+                drawer_rows,
+                drawer_full,
             );
             need_relayout = true;
             buf.resize(cols, rows);
@@ -6779,6 +6897,8 @@ async fn event_loop<T: Terminal>(
                 sidebar_cols,
                 zoom,
                 &supervisor,
+                drawer_rows,
+                drawer_full,
             );
             need_relayout = true;
             dirty = true;
@@ -6802,6 +6922,13 @@ async fn event_loop<T: Terminal>(
             relayout(&mut panes, &tree, chrome.center);
             if let Some(strip_rect) = chrome.strip {
                 relayout_strip(&mut panes, &supervisor, strip_rect);
+            }
+            // Size the drawer's PTY to its reserved rect so yazi's grid matches
+            // exactly where it composites (the fix for the mis-sized overlay).
+            if let (Some(id), Some(d)) = (drawer, chrome.drawer)
+                && let Some(p) = panes.table.get_mut(&id)
+            {
+                let _ = p.resize(d.rows as u16, d.cols as u16);
             }
             // Keep the tabbar chips in sync with the live pin set/health.
             let ws = (!session.id.is_empty()).then_some(session.id.as_str());
@@ -8566,22 +8693,13 @@ async fn event_loop<T: Terminal>(
                         |id| panes.table.get(&id).map(|p| p.emulator()),
                     );
                 }
+                // The drawer composites into its reserved rect (carved by the
+                // chrome layout); its divider is drawn with the columns frame.
                 if !app_tile_active
                     && let Some(drawer_id) = drawer
+                    && let Some(rect) = chrome.drawer
                     && let Some(p) = panes.table.get(&drawer_id)
                 {
-                    let height = current_config
-                        .drawer
-                        .height
-                        .parse::<usize>()
-                        .unwrap_or(20)
-                        .min(rows); // cfg.drawer.height equivalent
-                    let rect = Rect {
-                        x: 0,
-                        y: rows.saturating_sub(height),
-                        cols,
-                        rows: height,
-                    };
                     crate::compositor::compose_pane(&mut scratch, p.emulator(), rect);
                 }
             } // end full-compose else (fast_select reuses the prior scratch)
@@ -8678,14 +8796,21 @@ async fn event_loop<T: Terminal>(
                 && !creating.as_ref().is_some_and(|cp| cp.revealed)
             {
                 // The hardware cursor sits in the focused pane's CONTENT rect
-                // (inside its frame ring). With no live focused pane (launch
-                // splash), hide it so nothing blinks over the wordmark.
-                let focused_rect = tree
-                    .layout_framed(chrome.center)
-                    .into_iter()
-                    .find(|(id, _, _)| *id == focused)
-                    .map(|(_, _, content)| content);
-                if let (Some(rect), Some(p)) = (focused_rect, panes.table.get(&focused)) {
+                // (inside its frame ring). When the drawer owns focus it follows
+                // yazi into the drawer rect instead. With no live focused pane
+                // (launch splash), hide it so nothing blinks over the wordmark.
+                let (focused_rect, cursor_pane) = if focus.drawer() {
+                    (chrome.drawer, drawer.unwrap_or(focused))
+                } else {
+                    (
+                        tree.layout_framed(chrome.center)
+                            .into_iter()
+                            .find(|(id, _, _)| *id == focused)
+                            .map(|(_, _, content)| content),
+                        focused,
+                    )
+                };
+                if let (Some(rect), Some(p)) = (focused_rect, panes.table.get(&cursor_pane)) {
                     let (cur_row, cur_col) = p.emulator().cursor();
                     pending.push(Change::CursorVisibility(
                         termwiz::surface::CursorVisibility::Visible,
@@ -10391,6 +10516,8 @@ async fn event_loop<T: Terminal>(
                                         sidebar_cols,
                                         zoom,
                                         &supervisor,
+                                        drawer_rows,
+                                        drawer_full,
                                     );
                                     need_relayout = true;
                                 } else if let Some(issue_id) = key.strip_prefix("issue:") {
@@ -10427,6 +10554,8 @@ async fn event_loop<T: Terminal>(
                                         sidebar_cols,
                                         zoom,
                                         &supervisor,
+                                        drawer_rows,
+                                        drawer_full,
                                     );
                                     need_relayout = true;
                                 } else if let Some(action) = crate::keymap::Action::from_key(&key) {
@@ -10501,7 +10630,9 @@ async fn event_loop<T: Terminal>(
                     }
                     continue;
                 }
-                if drawer.is_some() && drawer_cancel_key(&k.key, k.modifiers) {
+                // Esc / q close the drawer — but only while it owns focus, so
+                // the same keys keep their meaning in the center/sidebar/panel.
+                if drawer.is_some() && focus.drawer() && drawer_cancel_key(&k.key, k.modifiers) {
                     if let Some(cwd) = active_cwd(&session) {
                         hide_drawer_into_pool(
                             &mut drawer,
@@ -10518,6 +10649,7 @@ async fn event_loop<T: Terminal>(
                     } else if let Some(id) = drawer.take() {
                         panes.table.remove(&id);
                     }
+                    focus.zone = crate::focus::Zone::Center;
                     dirty = true;
                     continue;
                 }
@@ -10568,6 +10700,8 @@ async fn event_loop<T: Terminal>(
                                 sidebar_cols,
                                 zoom,
                                 &supervisor,
+                                drawer_rows,
+                                drawer_full,
                             );
                             need_relayout = true;
                             dirty = true;
@@ -12826,6 +12960,10 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::ToggleDrawer => {
+                                // The reserved-geometry reflow + PTY resize are
+                                // owned by the top-of-loop drawer sync; here we
+                                // just open/close the pane (sized to its rect) and
+                                // move focus.
                                 if drawer.is_some() {
                                     // Reap the drawer pane
                                     if let Some(cwd) = active_cwd(&session) {
@@ -12847,11 +12985,29 @@ async fn event_loop<T: Terminal>(
                                     } else if let Some(id) = drawer.take() {
                                         panes.table.remove(&id);
                                     }
+                                    // The bottom slice is relinquished: drop focus
+                                    // back to the center.
+                                    if focus.drawer() {
+                                        focus.zone = crate::focus::Zone::Center;
+                                    }
                                 } else {
                                     // Show the worktree's drawer (pooled pane
-                                    // when pre-warmed — instant).
+                                    // when pre-warmed — instant), spawned already
+                                    // sized to its panel rect.
                                     let cwd = active_cwd(&session);
                                     if let Some(d) = cwd.as_deref() {
+                                        let drect = prospective_drawer_rect(
+                                            cols,
+                                            rows,
+                                            want_sidebar,
+                                            want_panel,
+                                            panel_forced,
+                                            panel_width,
+                                            sidebar_cols,
+                                            zoom,
+                                            &supervisor,
+                                            &current_config,
+                                        );
                                         show_yazi_drawer(
                                             &mut panes,
                                             &mut drawer,
@@ -12859,8 +13015,12 @@ async fn event_loop<T: Terminal>(
                                             &mut drawer_home,
                                             keymap.config(),
                                             d,
-                                            chrome.center,
+                                            drect,
                                         );
+                                        // Auto-focus so yazi is live immediately.
+                                        if drawer.is_some() {
+                                            focus.zone = crate::focus::Zone::Drawer;
+                                        }
                                     }
                                     if let Some(dir) = cwd {
                                         let key =
@@ -12884,6 +13044,8 @@ async fn event_loop<T: Terminal>(
                                     sidebar_cols,
                                     zoom,
                                     &supervisor,
+                                    drawer_rows,
+                                    drawer_full,
                                 );
                                 if !want_sidebar && focus.sidebar() {
                                     focus.zone = crate::focus::Zone::Center;
@@ -12916,6 +13078,8 @@ async fn event_loop<T: Terminal>(
                                     sidebar_cols,
                                     zoom,
                                     &supervisor,
+                                    drawer_rows,
+                                    drawer_full,
                                 );
                                 if !want_panel && focus.panel() {
                                     focus.zone = crate::focus::Zone::Center;
@@ -12935,6 +13099,8 @@ async fn event_loop<T: Terminal>(
                                         sidebar_cols,
                                         zoom,
                                         &supervisor,
+                                        drawer_rows,
+                                        drawer_full,
                                     );
                                     need_relayout = true;
                                 }
@@ -12960,6 +13126,8 @@ async fn event_loop<T: Terminal>(
                                         sidebar_cols,
                                         zoom,
                                         &supervisor,
+                                        drawer_rows,
+                                        drawer_full,
                                     );
                                     need_relayout = true;
                                 }
@@ -12987,6 +13155,8 @@ async fn event_loop<T: Terminal>(
                                             sidebar_cols,
                                             zoom,
                                             &supervisor,
+                                            drawer_rows,
+                                            drawer_full,
                                         );
                                         need_relayout = true;
                                     }
@@ -13241,6 +13411,8 @@ async fn event_loop<T: Terminal>(
                                     sidebar_cols,
                                     zoom,
                                     &supervisor,
+                                    drawer_rows,
+                                    drawer_full,
                                 );
                                 need_relayout = true;
                             }
@@ -13441,6 +13613,7 @@ async fn event_loop<T: Terminal>(
                                     let ctx = crate::focus::RouteCtx {
                                         sidebar_visible: want_sidebar && chrome.sidebar.is_some(),
                                         panel_visible: want_panel && chrome.panel.is_some(),
+                                        drawer_visible: chrome.drawer.is_some(),
                                         layout: &pane_layout,
                                         focused_pane: cur_focused,
                                     };
@@ -13517,6 +13690,8 @@ async fn event_loop<T: Terminal>(
                                                     sidebar_cols,
                                                     zoom,
                                                     &supervisor,
+                                                    drawer_rows,
+                                                    drawer_full,
                                                 );
                                                 need_relayout = true;
                                                 focus.zone = Zone::Panel;
@@ -13886,20 +14061,37 @@ async fn event_loop<T: Terminal>(
                                 // with a fresh, contained yazi pane for the active worktree
                                 // (routed through spawn_yazi_pane so it inherits the same
                                 // systemd-run memory/swap/CPU bound as the toggle path).
+                                // Geometry reflow + PTY resize are owned by the
+                                // top-of-loop drawer sync.
                                 if let Some(id) = drawer.take() {
                                     panes.table.remove(&id);
                                     drawer_home = None;
                                 }
+                                // Spawn already sized to the drawer's panel rect.
+                                let drect = prospective_drawer_rect(
+                                    cols,
+                                    rows,
+                                    want_sidebar,
+                                    want_panel,
+                                    panel_forced,
+                                    panel_width,
+                                    sidebar_cols,
+                                    zoom,
+                                    &supervisor,
+                                    &current_config,
+                                );
                                 let cwd = active_cwd(&session);
                                 if let Some(id) = spawn_yazi_pane(
                                     &mut panes,
                                     keymap.config(),
                                     cwd.as_deref(),
-                                    chrome.center,
+                                    drect,
                                 ) {
                                     drawer = Some(id);
                                     drawer_home = cwd;
+                                    focus.zone = crate::focus::Zone::Drawer;
                                 }
+                                need_relayout = true;
                             }
                             Action::SummonPin(n) => {
                                 let status = summon_pin(
@@ -13924,6 +14116,8 @@ async fn event_loop<T: Terminal>(
                                     sidebar_cols,
                                     zoom,
                                     &supervisor,
+                                    drawer_rows,
+                                    drawer_full,
                                 );
                                 need_relayout = true;
                             }
@@ -13939,6 +14133,8 @@ async fn event_loop<T: Terminal>(
                                     sidebar_cols,
                                     zoom,
                                     &supervisor,
+                                    drawer_rows,
+                                    drawer_full,
                                 );
                                 need_relayout = true;
                             }
@@ -13959,6 +14155,8 @@ async fn event_loop<T: Terminal>(
                                     sidebar_cols,
                                     zoom,
                                     &supervisor,
+                                    drawer_rows,
+                                    drawer_full,
                                 );
                                 need_relayout = true;
                             }
@@ -13998,6 +14196,8 @@ async fn event_loop<T: Terminal>(
                                         sidebar_cols,
                                         zoom,
                                         &supervisor,
+                                        drawer_rows,
+                                        drawer_full,
                                     );
                                     need_relayout = true;
                                 } else {
@@ -14034,6 +14234,8 @@ async fn event_loop<T: Terminal>(
                                         sidebar_cols,
                                         zoom,
                                         &supervisor,
+                                        drawer_rows,
+                                        drawer_full,
                                     );
                                     need_relayout = true;
                                 } else {
@@ -14060,16 +14262,23 @@ async fn event_loop<T: Terminal>(
                 }
                 // Keys the sidebar/panel didn't claim must never leak into the
                 // terminal while one of them owns the keyboard.
-                if !crate::focus::forwards_to_pane(focus.zone, drawer.is_some()) {
+                if !crate::focus::forwards_to_pane(focus.zone) {
                     keymap.reset();
                     dirty = true;
                     continue;
                 }
+                // Route to the drawer's PTY only while the drawer owns focus;
+                // otherwise the focused center pane gets the keys.
+                let pty_target = if focus.drawer() {
+                    drawer.unwrap_or(focused)
+                } else {
+                    focused
+                };
                 // A pane offering a relaunch (resurrected with a remembered
                 // command, or a crashed husk) intercepts the next key: Enter
                 // runs the saved command, Esc dismisses, and any other key
                 // dismisses the overlay and is then delivered normally.
-                let relaunch_target = drawer.unwrap_or(focused);
+                let relaunch_target = pty_target;
                 if panes
                     .table
                     .get(&relaunch_target)
@@ -14113,7 +14322,7 @@ async fn event_loop<T: Terminal>(
                             .flatten()
                             .collect()
                     });
-                let target_pane = drawer.unwrap_or(focused);
+                let target_pane = pty_target;
                 let app_cursor = panes
                     .table
                     .get(&target_pane)
@@ -14188,6 +14397,8 @@ async fn event_loop<T: Terminal>(
                     sidebar_cols,
                     zoom,
                     &supervisor,
+                    drawer_rows,
+                    drawer_full,
                 );
                 need_relayout = true;
                 buf.resize(cols, rows);
@@ -14209,12 +14420,16 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
             }
             Ok(Some(InputEvent::Paste(s))) => {
-                if !crate::focus::forwards_to_pane(focus.zone, drawer.is_some()) {
+                if !crate::focus::forwards_to_pane(focus.zone) {
                     model.status = "Paste ignored (terminal not focused)".into();
                     dirty = true;
                     continue;
                 }
-                let target_pane = drawer.unwrap_or(focused);
+                let target_pane = if focus.drawer() {
+                    drawer.unwrap_or(focused)
+                } else {
+                    focused
+                };
                 if let Some(p) = panes.table.get_mut(&target_pane) {
                     // Honor bracketed paste when the app requested it, so
                     // editors don't auto-indent pasted blocks.

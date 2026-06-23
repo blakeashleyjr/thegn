@@ -18,6 +18,9 @@ pub enum Zone {
     #[default]
     Center,
     Panel,
+    /// The bottom file-manager drawer (yazi). Sits below the center, above the
+    /// statusbar; keys forward to its PTY only while it owns focus.
+    Drawer,
     /// The top bar (brand + stats cluster).
     Masthead,
     /// The bottom bar (hints + status widgets).
@@ -38,6 +41,9 @@ impl FocusState {
     }
     pub fn panel(&self) -> bool {
         self.zone == Zone::Panel
+    }
+    pub fn drawer(&self) -> bool {
+        self.zone == Zone::Drawer
     }
     pub fn center(&self) -> bool {
         self.zone == Zone::Center
@@ -71,6 +77,7 @@ pub enum FocusMove {
 pub struct RouteCtx<'a> {
     pub sidebar_visible: bool,
     pub panel_visible: bool,
+    pub drawer_visible: bool,
     /// The active tab's computed pane layout (content rects are fine — only
     /// relative geometry matters).
     pub layout: &'a [(PaneId, Rect)],
@@ -91,6 +98,8 @@ pub fn route(zone: Zone, dir: Move, ctx: &RouteCtx) -> FocusMove {
                 Move::Left if ctx.sidebar_visible => FocusMove::Enter(Zone::Sidebar),
                 Move::Right if ctx.panel_visible => FocusMove::Enter(Zone::Panel),
                 Move::Up => FocusMove::Enter(Zone::Masthead),
+                // The open drawer sits between the center and the statusbar.
+                Move::Down if ctx.drawer_visible => FocusMove::Enter(Zone::Drawer),
                 Move::Down => FocusMove::Enter(Zone::Statusbar),
                 _ => FocusMove::None,
             }
@@ -107,6 +116,14 @@ pub fn route(zone: Zone, dir: Move, ctx: &RouteCtx) -> FocusMove {
             Move::Down => FocusMove::WithinZone(1),
             Move::Right => FocusMove::None,
         },
+        // The drawer sits below the center, above the statusbar: up returns to
+        // the center, down drops to the statusbar (left/right go to yazi while
+        // focused, so they dead-end the focus graph here).
+        Zone::Drawer => match dir {
+            Move::Up => FocusMove::Enter(Zone::Center),
+            Move::Down => FocusMove::Enter(Zone::Statusbar),
+            _ => FocusMove::None,
+        },
         // The bars sit above/below everything: down/up returns to the center
         // (left/right are reserved for widget selection within the bar).
         Zone::Masthead => match dir {
@@ -114,17 +131,19 @@ pub fn route(zone: Zone, dir: Move, ctx: &RouteCtx) -> FocusMove {
             _ => FocusMove::None,
         },
         Zone::Statusbar => match dir {
+            // Step back up through the drawer when it's open.
+            Move::Up if ctx.drawer_visible => FocusMove::Enter(Zone::Drawer),
             Move::Up => FocusMove::Enter(Zone::Center),
             _ => FocusMove::None,
         },
     }
 }
 
-/// May an unmatched key fall through to the focused PTY? Only when the
-/// center owns the keyboard — or the drawer is open (it steals input from
-/// any zone by design). The Ctrl+g keybind lock short-circuits before this.
-pub fn forwards_to_pane(zone: Zone, drawer_open: bool) -> bool {
-    drawer_open || zone == Zone::Center
+/// May an unmatched key fall through to the focused PTY? Only when a PTY zone
+/// owns the keyboard: the center panes, or the bottom drawer (yazi) while it is
+/// focused. The Ctrl+g keybind lock short-circuits before this.
+pub fn forwards_to_pane(zone: Zone) -> bool {
+    matches!(zone, Zone::Center | Zone::Drawer)
 }
 
 #[cfg(test)]
@@ -149,6 +168,17 @@ mod tests {
         RouteCtx {
             sidebar_visible: sb,
             panel_visible: pn,
+            drawer_visible: false,
+            layout,
+            focused_pane: focused,
+        }
+    }
+
+    fn ctx_drawer(layout: &[(PaneId, Rect)], focused: PaneId) -> RouteCtx<'_> {
+        RouteCtx {
+            sidebar_visible: true,
+            panel_visible: true,
+            drawer_visible: true,
             layout,
             focused_pane: focused,
         }
@@ -300,20 +330,48 @@ mod tests {
 
     #[test]
     fn forwards_to_pane_matrix() {
-        assert!(forwards_to_pane(Zone::Center, false));
-        assert!(!forwards_to_pane(Zone::Sidebar, false));
-        assert!(!forwards_to_pane(Zone::Panel, false));
-        assert!(!forwards_to_pane(Zone::Masthead, false));
-        assert!(!forwards_to_pane(Zone::Statusbar, false));
-        // An open drawer steals input from every zone.
-        for z in [
-            Zone::Center,
-            Zone::Sidebar,
-            Zone::Panel,
-            Zone::Masthead,
-            Zone::Statusbar,
-        ] {
-            assert!(forwards_to_pane(z, true));
-        }
+        // Only the PTY zones forward keys: the center and the focused drawer.
+        assert!(forwards_to_pane(Zone::Center));
+        assert!(forwards_to_pane(Zone::Drawer));
+        assert!(!forwards_to_pane(Zone::Sidebar));
+        assert!(!forwards_to_pane(Zone::Panel));
+        assert!(!forwards_to_pane(Zone::Masthead));
+        assert!(!forwards_to_pane(Zone::Statusbar));
+    }
+
+    #[test]
+    fn drawer_sits_between_center_and_statusbar() {
+        let l = two_panes();
+        // Down from the bottom-edge center pane enters the open drawer instead
+        // of the statusbar; up leaves it back to the center.
+        assert_eq!(
+            route(Zone::Center, Move::Down, &ctx_drawer(&l, 1)),
+            FocusMove::Enter(Zone::Drawer)
+        );
+        assert_eq!(
+            route(Zone::Drawer, Move::Up, &ctx_drawer(&l, 1)),
+            FocusMove::Enter(Zone::Center)
+        );
+        assert_eq!(
+            route(Zone::Drawer, Move::Down, &ctx_drawer(&l, 1)),
+            FocusMove::Enter(Zone::Statusbar)
+        );
+        // Left/right dead-end (those keys drive yazi while focused).
+        assert_eq!(route(Zone::Drawer, Move::Left, &ctx_drawer(&l, 1)), FocusMove::None);
+        assert_eq!(route(Zone::Drawer, Move::Right, &ctx_drawer(&l, 1)), FocusMove::None);
+        // Statusbar steps back up through the drawer when it's open.
+        assert_eq!(
+            route(Zone::Statusbar, Move::Up, &ctx_drawer(&l, 1)),
+            FocusMove::Enter(Zone::Drawer)
+        );
+        // With the drawer closed, down/up skip it (center ↔ statusbar directly).
+        assert_eq!(
+            route(Zone::Center, Move::Down, &ctx(&l, 1, true, true)),
+            FocusMove::Enter(Zone::Statusbar)
+        );
+        assert_eq!(
+            route(Zone::Statusbar, Move::Up, &ctx(&l, 1, true, true)),
+            FocusMove::Enter(Zone::Center)
+        );
     }
 }
