@@ -1651,6 +1651,20 @@ fn sidebar_worktree_order(model: &FrameModel) -> Vec<usize> {
         .collect()
 }
 
+/// The repo paths of the switchable workspaces in **visible sidebar order**
+/// (after pins float / filter hide). Shift+Alt+↑/↓ steps through this so the
+/// motion matches the tree — pinned workspaces are honoured exactly as shown,
+/// mirroring how `sidebar_worktree_order` drives Alt+↑/↓. Operates on the row
+/// slice (not `FrameModel`) so it's directly unit-testable from `build_rows`
+/// output. Live-fallback workspaces (no DB row yet, empty repo path) carry no
+/// `worktree_path` and are skipped: only DB-backed workspaces are switchable.
+fn sidebar_workspace_order(rows: &[crate::sidebar::SidebarRow]) -> Vec<String> {
+    rows.iter()
+        .filter(|r| r.visible && r.kind == crate::sidebar::RowKind::Workspace)
+        .filter_map(|r| r.worktree_path.clone())
+        .collect()
+}
+
 /// The visible-row index of the active row, or 0.
 fn visible_index_of_active(model: &FrameModel) -> usize {
     model
@@ -13079,15 +13093,12 @@ async fn event_loop<T: Terminal>(
                             }
                             Action::NextWorkspace | Action::PrevWorkspace => {
                                 // Switch to the prev/next workspace in the
-                                // sidebar's order (wraps). Only DB-backed
-                                // workspaces (non-empty repo_path) are
-                                // switchable; the active one is always among them.
-                                let switchable: Vec<String> = model
-                                    .sidebar_workspaces
-                                    .iter()
-                                    .filter(|(_, _, _, repo)| !repo.is_empty())
-                                    .map(|(_, _, _, repo)| repo.clone())
-                                    .collect();
+                                // *visible* sidebar order (wraps), so the motion
+                                // matches the tree even when pins float a
+                                // workspace to the top or a filter hides one.
+                                // Only DB-backed workspaces are switchable; the
+                                // active one is always among them.
+                                let switchable = sidebar_workspace_order(&model.sidebar_rows);
                                 let cur = switchable.iter().position(|p| *p == session.id);
                                 if let (n, Some(p)) = (switchable.len(), cur)
                                     && n > 1
@@ -14329,6 +14340,42 @@ mod tests {
             ],
             active: 0,
         }
+    }
+
+    #[test]
+    fn workspace_order_follows_pinned_sidebar_order() {
+        // Two DB-backed workspaces; pinning the second floats it to the top of
+        // the rendered tree. Shift+Alt+↑/↓ must step through *that* order — the
+        // visible one — not the raw DB position order, so a pinned workspace
+        // navigates first just as it renders first.
+        let session = Session {
+            id: "/tmp/app".into(),
+            worktrees: vec![
+                WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/app"),
+                WorktreeGroup::new("lib/home", GroupKind::Home, "/tmp/lib"),
+            ],
+            active: 0,
+        };
+        let workspaces = vec![
+            ("app".into(), "app".into(), "repo".into(), "/tmp/app".into()),
+            ("lib".into(), "lib".into(), "repo".into(), "/tmp/lib".into()),
+        ];
+        let view = crate::sidebar::ViewState {
+            pins: vec!["lib".into()],
+            ..Default::default()
+        };
+        let rows = crate::sidebar::build_rows(
+            &session,
+            &workspaces,
+            &view,
+            &crate::sidebar::SidebarStatus::default(),
+            &[],
+        );
+        // Pinned "lib" workspace floats first; order is by repo path.
+        assert_eq!(
+            sidebar_workspace_order(&rows),
+            vec!["/tmp/lib".to_string(), "/tmp/app".to_string()],
+        );
     }
 
     #[test]
