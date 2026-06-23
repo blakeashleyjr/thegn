@@ -13330,16 +13330,16 @@ mod tests {
         db.put_worktree("app/beta", &repo_s, &beta_s, "beta", None)
             .unwrap();
 
-        // Registered branches come back in creation order (alpha before beta);
-        // home has no registry row, so it sorts last in the raw session vec
-        // (the sidebar floats it first at display time).
+        // home leads the raw vec; registered branches trail it in creation
+        // order (alpha before beta). A newly-registered branch therefore always
+        // appends at the bottom rather than jumping above older worktrees.
         let r = Session::resurrect(&db, &repo_s).unwrap();
         assert_eq!(
             r.worktrees
                 .iter()
                 .map(|g| g.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["app/alpha", "app/beta", "app/home"]
+            vec!["app/home", "app/alpha", "app/beta"]
         );
 
         // A manual reorder (swap positions) survives resurrect: beta now
@@ -13351,7 +13351,7 @@ mod tests {
                 .iter()
                 .map(|g| g.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["app/beta", "app/alpha", "app/home"]
+            vec!["app/home", "app/beta", "app/alpha"]
         );
 
         let _ = std::fs::remove_dir_all(&root);

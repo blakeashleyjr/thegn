@@ -301,13 +301,28 @@ impl Session {
             }
         }
 
-        // Order registered worktrees by their persistent registry `position`
-        // (creation order by default, user-reorderable via Shift+Alt+↑/↓) so
-        // the tree never reshuffles across restart. Groups with no registry row
-        // — `home` (always floated first at display time) and legacy/unregistered
-        // branches — sink to the end; a stable sort keeps them in their prior
-        // (ordinal) order, so legacy layouts resurrect unchanged.
-        worktrees.sort_by_key(|g| positions.get(&g.path).copied().unwrap_or(i64::MAX));
+        // Order worktrees in three tiers so a freshly-created worktree always
+        // lands at the bottom. The bug this guards against: a new worktree gets
+        // a low registry `position` (e.g. 0 on a fresh registry), while a
+        // pre-existing branch that predates position tracking has none — so
+        // ordering naively by position (treating "none" as +∞) floated the new
+        // one *above* the old one. Tiers, stable within each:
+        //   0. `home` — first in the raw vec (the sidebar floats it first at
+        //      display time anyway; keeping it first keeps worktree cycling sane).
+        //   1. legacy/unregistered branches — predate position tracking, so
+        //      they're the oldest; a stable sort preserves their prior order.
+        //   2. registered worktrees, by their persistent registry `position`
+        //      (creation order by default, user-reorderable via Shift+Alt+↑/↓).
+        worktrees.sort_by_key(|g| {
+            if g.kind == GroupKind::Home {
+                (0, 0)
+            } else {
+                match positions.get(&g.path).copied() {
+                    Some(p) => (2, p),
+                    None => (1, 0),
+                }
+            }
+        });
 
         let active = db
             .active_tab(session)?
@@ -852,6 +867,31 @@ mod tests {
     }
 
     #[test]
+    fn new_registered_worktree_resurrects_below_positionless_ones() {
+        let db = temp_db();
+        let sess = "s";
+        let home = WorktreeGroup::new("app/home", GroupKind::Home, "/r");
+        let old = WorktreeGroup::new("app/old", GroupKind::Branch, "/wt/old");
+        let new = WorktreeGroup::new("app/new", GroupKind::Branch, "/wt/new");
+        let session = Session {
+            id: sess.to_string(),
+            worktrees: vec![home, old, new],
+            active: 0,
+        };
+        session.persist(&db, sess, 1234).unwrap();
+        // Only the freshly-created worktree gets a registry row (position 0);
+        // home + the pre-existing "old" branch were never registered.
+        db.put_worktree("app/new", "/r", "/wt/new", "new", None)
+            .unwrap();
+
+        let back = Session::resurrect(&db, sess).unwrap();
+        let names: Vec<&str> = back.worktrees.iter().map(|g| g.name.as_str()).collect();
+        // The new worktree must stay at the BOTTOM, below the pre-existing
+        // (positionless) "old" branch — home leads, registered worktrees trail.
+        assert_eq!(names, vec!["app/home", "app/old", "app/new"]);
+    }
+
+    #[test]
     fn switch_to_workspace_names_home_group_with_canonical_slug() {
         let db = temp_db();
         let mut s = Session {
@@ -892,8 +932,13 @@ mod tests {
 
         let s = Session::resurrect(&db, repo).unwrap();
         let names: Vec<_> = s.worktrees.iter().map(|g| g.name.as_str()).collect();
-        assert_eq!(names, vec!["washu/feat", "washu/home"]);
-        assert_eq!(s.active, 1, "active group survives the rename");
+        // home leads the raw vec; the branch trails it.
+        assert_eq!(names, vec!["washu/home", "washu/feat"]);
+        assert_eq!(
+            s.active_group().unwrap().name,
+            "washu/home",
+            "active group (home) survives the rename"
+        );
     }
 
     #[test]

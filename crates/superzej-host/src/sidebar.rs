@@ -592,6 +592,25 @@ mod tests {
     }
 
     #[test]
+    fn new_worktree_renders_below_current_under_manual_sort() {
+        // home(gi0), feat-a(gi1, current), then add feat-b(gi2) at the end.
+        let mut s = session(
+            vec![tab("app/home", "/wt/home"), tab("app/feat-a", "/wt/a")],
+            1,
+        );
+        s.add_group(tab("app/feat-b", "/wt/b"));
+        let ws = vec![(
+            "app".to_string(),
+            "app".to_string(),
+            "repo".to_string(),
+            String::new(),
+        )];
+        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &[]);
+        let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, vec!["app", "home", "feat-a", "feat-b"]);
+    }
+
+    #[test]
     fn groups_worktrees_under_workspace_with_home_first() {
         let s = session(
             vec![tab("app/feat", "/wt/feat"), tab("app/home", "/wt/home")],
