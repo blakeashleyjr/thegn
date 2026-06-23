@@ -70,6 +70,13 @@ pub enum Invocation {
         floating: bool,
         close_on_exit: bool,
     },
+    /// A user-defined keybind bound to a built-in composite operation
+    /// (`config.toml [[actions]] action = "…"`). The host keymap parses
+    /// `action`/`params` into a typed composite and dispatches it in-process.
+    Builtin {
+        action: String,
+        params: std::collections::BTreeMap<String, String>,
+    },
 }
 
 /// Where the binding lives + where its hint shows.
@@ -743,8 +750,34 @@ pub fn effective(cfg: &Config) -> Vec<Resolved> {
         }
     }
 
-    // [[actions]] — user-defined shell actions (rendered as `Run sh -c`).
+    // [[actions]] — user-defined shell actions (`Shell`) or built-in composite
+    // actions (`Builtin`). Exactly one of `run` / `action` must be set.
     for a in &cfg.actions {
+        let invocation = match (&a.run, &a.action) {
+            (Some(run), None) => Invocation::Shell {
+                run: run.clone(),
+                floating: a.floating,
+                close_on_exit: a.close_on_exit,
+            },
+            (None, Some(action)) => Invocation::Builtin {
+                action: action.clone(),
+                params: a.params.clone(),
+            },
+            (Some(_), Some(_)) => {
+                crate::msg::warn(&format!(
+                    "[[actions]] {}: set exactly one of `run` or `action`; skipped",
+                    a.name
+                ));
+                continue;
+            }
+            (None, None) => {
+                crate::msg::warn(&format!(
+                    "[[actions]] {}: needs a `run` command or an `action`; skipped",
+                    a.name
+                ));
+                continue;
+            }
+        };
         let chords = match Chord::parse_loose(&a.key) {
             Ok(c) => vec![c],
             Err(e) => {
@@ -757,11 +790,7 @@ pub fn effective(cfg: &Config) -> Vec<Resolved> {
             chords,
             menu_label: a.name.clone(),
             hint: a.hint.clone().unwrap_or_else(|| a.name.clone()),
-            invocation: Invocation::Shell {
-                run: a.run.clone(),
-                floating: a.floating,
-                close_on_exit: a.close_on_exit,
-            },
+            invocation,
             scope: Scope::Shared,
             context: Context::Always,
             menu: a.menu,
@@ -897,6 +926,9 @@ fn render_bind(chord: &str, inv: &Invocation) -> String {
             }
             render_block_bind(chord, &format!("MessagePlugin \"{}\"", target.url()), &args)
         }
+        // Built-in composite actions are dispatched in-process by the host and
+        // have no zellij-KDL representation (this renderer is legacy).
+        Invocation::Builtin { .. } => String::new(),
     }
 }
 
@@ -1133,7 +1165,9 @@ mod tests {
         cfg.actions.push(crate::config::CustomAction {
             name: "deploy".into(),
             key: "Alt D".into(),
-            run: "just deploy".into(),
+            run: Some("just deploy".into()),
+            action: None,
+            params: Default::default(),
             menu: true,
             hint: None,
             floating: true,
@@ -1166,7 +1200,9 @@ mod tests {
         cfg.actions.push(crate::config::CustomAction {
             name: "deploy".into(),
             key: "Alt D".into(),
-            run: "echo \"hi\"".into(),
+            run: Some("echo \"hi\"".into()),
+            action: None,
+            params: Default::default(),
             menu: false,
             hint: Some("dep".into()),
             floating: true,
@@ -1186,7 +1222,9 @@ mod tests {
         cfg.actions.push(crate::config::CustomAction {
             name: "broke".into(),
             key: "Wat x".into(), // unknown modifier
-            run: "true".into(),
+            run: Some("true".into()),
+            action: None,
+            params: Default::default(),
             menu: true,
             hint: None,
             floating: false,
@@ -1194,6 +1232,93 @@ mod tests {
         });
         let acts = effective(&cfg);
         assert!(acts.iter().all(|a| a.id != "broke"));
+    }
+
+    #[test]
+    fn builtin_action_yields_builtin_invocation() {
+        let mut cfg = Config::default();
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("sandbox".to_string(), "bwrap".to_string());
+        params.insert("agent".to_string(), "shell".to_string());
+        cfg.actions.push(crate::config::CustomAction {
+            name: "scratch-shell".into(),
+            key: "Alt N".into(),
+            run: None,
+            action: Some("new-worktree".into()),
+            params,
+            menu: true,
+            hint: None,
+            floating: true,
+            close_on_exit: true,
+        });
+        let acts = effective(&cfg);
+        let a = acts
+            .iter()
+            .find(|a| a.id == "scratch-shell")
+            .expect("custom action present");
+        assert!(a.custom && a.menu);
+        match &a.invocation {
+            Invocation::Builtin { action, params } => {
+                assert_eq!(action, "new-worktree");
+                assert_eq!(params.get("sandbox").map(String::as_str), Some("bwrap"));
+                assert_eq!(params.get("agent").map(String::as_str), Some("shell"));
+            }
+            other => panic!("expected Builtin, got {other:?}"),
+        }
+        // A built-in composite still renders nothing in the legacy KDL.
+        let kdl = render_keybinds_kdl(&acts);
+        assert!(!kdl.contains("scratch-shell"));
+    }
+
+    #[test]
+    fn run_form_yields_shell_invocation() {
+        let mut cfg = Config::default();
+        cfg.actions.push(crate::config::CustomAction {
+            name: "deploy".into(),
+            key: "Alt D".into(),
+            run: Some("just deploy".into()),
+            action: None,
+            params: Default::default(),
+            menu: false,
+            hint: None,
+            floating: true,
+            close_on_exit: true,
+        });
+        let acts = effective(&cfg);
+        let a = acts.iter().find(|a| a.id == "deploy").unwrap();
+        assert!(matches!(a.invocation, Invocation::Shell { .. }));
+    }
+
+    #[test]
+    fn action_requires_exactly_one_of_run_or_action() {
+        let mut cfg = Config::default();
+        // Both set -> skipped.
+        cfg.actions.push(crate::config::CustomAction {
+            name: "both".into(),
+            key: "Alt B".into(),
+            run: Some("echo hi".into()),
+            action: Some("new-worktree".into()),
+            params: Default::default(),
+            menu: false,
+            hint: None,
+            floating: true,
+            close_on_exit: true,
+        });
+        // Neither set -> skipped.
+        cfg.actions.push(crate::config::CustomAction {
+            name: "neither".into(),
+            key: "Alt M".into(),
+            run: None,
+            action: None,
+            params: Default::default(),
+            menu: false,
+            hint: None,
+            floating: true,
+            close_on_exit: true,
+        });
+        let acts = effective(&cfg);
+        assert!(acts.iter().all(|a| a.id != "both"));
+        assert!(acts.iter().all(|a| a.id != "neither"));
     }
 
     #[test]
@@ -1369,7 +1494,9 @@ mod tests {
         cfg.actions.push(crate::config::CustomAction {
             name: "plain".into(),
             key: "Alt P".into(),
-            run: "ls".into(),
+            run: Some("ls".into()),
+            action: None,
+            params: Default::default(),
             menu: false,
             hint: None,
             floating: false,
