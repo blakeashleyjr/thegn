@@ -8147,6 +8147,15 @@ async fn event_loop<T: Terminal>(
                         termwiz::surface::CursorVisibility::Hidden,
                     ));
                 }
+            } else {
+                // A modal overlay (wizard / palette / revealed creation
+                // progress) owns the screen and draws its own caret. Park the
+                // hardware cursor as Hidden so the diff renderer's writes for
+                // the still-animating pane underneath don't drag a visible
+                // cursor around the screen.
+                pending.push(Change::CursorVisibility(
+                    termwiz::surface::CursorVisibility::Hidden,
+                ));
             }
             // Keep `front` exactly in sync with what goes on the wire, and
             // trim both change logs (Surface retains them indefinitely).
