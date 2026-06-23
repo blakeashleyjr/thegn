@@ -232,8 +232,12 @@ pub fn compute_full(
 
     // Clamp the surface widths so the center keeps ≥ 1 column after the
     // 1-col separators between sidebar|center and center|panel are reserved.
+    // No upper cap here: the fine-nudge path (`<` / `>`) is already clamped to
+    // SIDEBAR_MAX_WIDTH before it is stored, and the Wide expand intentionally
+    // asks for ~half the window. The `used()` shrink loop below trades width
+    // back so the center keeps its mandatory column.
     let mut left = if show_sidebar {
-        sidebar_cols.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH)
+        sidebar_cols.max(SIDEBAR_MIN_WIDTH)
     } else {
         0
     };
@@ -381,6 +385,24 @@ mod tests {
         assert_eq!(l.center.x, SIDEBAR_COLS + 1);
         assert_eq!(pn.x, 160 - PANEL_COLS);
         assert_eq!(l.center.rows, 36);
+    }
+
+    #[test]
+    fn wide_sidebar_exceeds_the_fine_nudge_cap_and_keeps_the_center() {
+        // The Wide expand (`e`) passes ~half the window as the sidebar width;
+        // it must not be capped at SIDEBAR_MAX_WIDTH, yet the center keeps ≥ 1
+        // column and the panel still tiles the remaining width.
+        let l = compute_with_width(160, 40, true, true, 80);
+        let sb = l.sidebar.unwrap();
+        assert!(
+            sb.cols > SIDEBAR_MAX_WIDTH,
+            "wide sidebar should exceed the fine-nudge cap: {}",
+            sb.cols
+        );
+        assert_eq!(sb.cols, 80);
+        assert!(l.center.cols >= 1, "center keeps its mandatory column");
+        let pn = l.panel.unwrap();
+        assert_eq!(sb.cols + 1 + l.center.cols + 1 + pn.cols, 160);
     }
 
     #[test]
