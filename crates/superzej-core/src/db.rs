@@ -1484,6 +1484,38 @@ impl Db {
         Ok(())
     }
 
+    /// Forget a whole workspace (no disk side effects). Removes the
+    /// `workspaces` row so the sidebar stops listing it. The worktree files on
+    /// disk are intentionally left untouched.
+    pub fn del_workspace(&self, repo_path: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM workspaces WHERE repo_path=?1",
+            params![repo_path],
+        )?;
+        Ok(())
+    }
+
+    /// Forget every registry worktree row owned by a repo (no disk side
+    /// effects). Pairs with [`Self::del_workspace`] so a removed workspace's
+    /// cross-workspace rows neither re-render nor resurrect on the next launch.
+    pub fn del_worktrees_for_repo(&self, repo_path: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM worktrees WHERE repo_path=?1",
+            params![repo_path],
+        )?;
+        Ok(())
+    }
+
+    /// Drop a repo's stable sidebar slug so a removed workspace can't reclaim a
+    /// stale slug if it is reopened later.
+    pub fn del_repo_slug(&self, repo_path: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM repo_slugs WHERE repo_path=?1",
+            params![repo_path],
+        )?;
+        Ok(())
+    }
+
     // --- named pane-layout snapshots (items 99/115) -------------------------
 
     /// Save (or replace) a named layout snapshot. `spec` is a serialized
@@ -2524,6 +2556,36 @@ mod tests {
         assert_eq!(ws[0].name, "repo2");
         assert_eq!(ws[0].kind, "repo");
         assert!(db.is_known_repo("/repo").unwrap());
+    }
+
+    #[test]
+    fn del_workspace_forgets_workspace_and_its_worktrees() {
+        let db = db();
+        db.put_workspace("/repo", "repo", "repo").unwrap();
+        db.put_worktree("repo/main", "/repo", "/repo", "main", None)
+            .unwrap();
+        db.put_worktree("repo/feat", "/repo", "/repo/wt-feat", "feat", None)
+            .unwrap();
+        // A second, unrelated workspace must survive the removal.
+        db.put_workspace("/other", "other", "repo").unwrap();
+        db.put_worktree("other/main", "/other", "/other", "main", None)
+            .unwrap();
+        let slug = db.slug_for_repo("/repo", "repo").unwrap();
+
+        db.del_worktrees_for_repo("/repo").unwrap();
+        db.del_workspace("/repo").unwrap();
+        db.del_repo_slug("/repo").unwrap();
+
+        let ws = db.workspaces().unwrap();
+        assert_eq!(ws.len(), 1);
+        assert_eq!(ws[0].repo_path, "/other");
+        assert!(!db.is_known_repo("/repo").unwrap());
+        // The other repo's worktree row is untouched; the removed repo's are gone.
+        let wts = db.worktrees().unwrap();
+        assert!(wts.iter().all(|w| w.repo_root != "/repo"));
+        assert!(wts.iter().any(|w| w.repo_root == "/other"));
+        // A reopened repo re-derives a fresh slug rather than a stale one.
+        assert_eq!(slug, "repo");
     }
 
     #[test]
