@@ -149,14 +149,17 @@ fn fmt_secs(s: i64) -> String {
     }
 }
 
-/// A dim per-section hint row from (key, label) pairs.
+/// A dim per-section hint row from (key, label) pairs. Hints are de-emphasized
+/// but must stay readable, so they ride the `faint` text tier (the dimmest tier
+/// allowed for text); the `ghost*` tiers below it are structural-only. Only the
+/// ` · ` separators drop to `ghost`.
 fn hint_row(pairs: &[(&str, &str)]) -> PanelRow {
     let mut segs: Vec<Seg> = Vec::new();
     for (i, (k, label)) in pairs.iter().enumerate() {
         if i > 0 {
-            segs.push(seg(g2(), " · "));
+            segs.push(seg(g(), " · "));
         }
-        segs.push(seg(g2(), format!("{k} {label}")));
+        segs.push(seg(f(), format!("{k} {label}")));
     }
     PanelRow::plain(Line::segs(segs))
 }

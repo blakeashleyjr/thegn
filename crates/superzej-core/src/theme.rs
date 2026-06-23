@@ -53,8 +53,12 @@ pub const P_TEXT: &str = "237;240;248"; // #edf0f8
 pub const P_DIM: &str = "198;204;219"; // #c6ccdb (brighter secondary — readable on dark panels)
 pub const P_FAINT: &str = "122;129;151"; // #7a8197
 pub const P_GHOST: &str = "78;85;110"; // #4e556e
-pub const P_GHOST2: &str = "52;58;82"; // #343a52
-pub const P_GHOST3: &str = "35;41;64"; // #232940
+// ghost2/ghost3 are the structural floor (glyph scaffolding, rules, fills), but
+// chrome still tints some metadata with them — the old values (#343a52/#232940)
+// read as grey-on-grey on bg1. Lifted toward `ghost` (kept strictly below it so
+// the contrast ramp still descends) so dim text is legible everywhere at once.
+pub const P_GHOST2: &str = "70;78;102"; // #464e66
+pub const P_GHOST3: &str = "58;65;86"; // #3a4156
 // layer compositing
 pub const P_SHADOW_BG: &str = "5;7;12"; // #05070c
 pub const P_SHADOW_FG: &str = "28;34;51"; // #1c2233
@@ -622,6 +626,66 @@ mod tests {
             for w in dists.windows(2) {
                 assert!(w[0] <= w[1], "{name}: heat ramp {dists:?}");
             }
+        }
+    }
+
+    /// Contract: `text`, `dim`, and `faint` are the tiers the chrome may use for
+    /// readable text. Every one of them must clear a comfortable contrast margin
+    /// against every background surface it can be drawn on — this is the
+    /// machine-checkable "is everything readable?" guard. (`ghost`/`ghost2`/
+    /// `ghost3` are the structural floor — borders, rules, fills, glyph
+    /// scaffolding — and are intentionally exempt; chrome must not render text
+    /// the user needs to read below the `faint` tier.)
+    #[test]
+    fn readable_text_tiers_clear_contrast_on_every_surface() {
+        // lum() sums R+G+B (0..=765); 250 is a generous floor that the dim
+        // grey-on-grey metadata (ghost2/ghost3 ≈ 120–185 distance) failed.
+        const MIN_CONTRAST: u32 = 250;
+        let p = Palette::default();
+        let surfaces = [
+            ("bg0", &p.bg0),
+            ("bg1", &p.bg1),
+            ("panel", &p.panel),
+            ("panel2", &p.panel2),
+        ];
+        let text_tiers = [("text", &p.text), ("dim", &p.dim), ("faint", &p.faint)];
+        for (sname, surf) in surfaces {
+            for (fname, fg) in text_tiers {
+                let contrast = lum(fg).abs_diff(lum(surf));
+                assert!(
+                    contrast >= MIN_CONTRAST,
+                    "text tier `{fname}` on `{sname}` is too low-contrast ({contrast} < {MIN_CONTRAST})"
+                );
+            }
+        }
+    }
+
+    /// The default foreground ramp must descend monotonically in contrast
+    /// (text brightest → ghost3 dimmest). The legacy-preset version of this
+    /// (`extend_derives_every_legacy_preset`) only covers ghost..ghost3 after
+    /// derivation; prism sets every step explicitly, so guard the full ramp.
+    #[test]
+    fn default_fg_ramp_descends_in_contrast() {
+        let p = Palette::default();
+        let bg = lum(&p.bg0);
+        let dist = |s: &str| lum(s).abs_diff(bg);
+        let ramp = [
+            ("text", &p.text),
+            ("dim", &p.dim),
+            ("faint", &p.faint),
+            ("ghost", &p.ghost),
+            ("ghost2", &p.ghost2),
+            ("ghost3", &p.ghost3),
+        ];
+        for pair in ramp.windows(2) {
+            let (hi_name, hi) = pair[0];
+            let (lo_name, lo) = pair[1];
+            assert!(
+                dist(hi) > dist(lo),
+                "fg ramp must descend: `{hi_name}` ({}) should out-contrast `{lo_name}` ({})",
+                dist(hi),
+                dist(lo)
+            );
         }
     }
 

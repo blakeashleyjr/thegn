@@ -11,7 +11,7 @@ use superzej_core::theme::Hue;
 use crate::seg::{Line, Seg, seg, sp};
 
 use super::{
-    PanelHit, PanelRow, Section, SectionCtx, ac, d, g, g2, g3, hint_row, hue, rule, t, two_col,
+    PanelHit, PanelRow, Section, SectionCtx, ac, d, f, g, g3, hint_row, hue, rule, t, two_col,
 };
 
 // ---- helpers -----------------------------------------------------------------
@@ -112,7 +112,7 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
 
     if items.is_empty() {
-        rows.push(PanelRow::plain(Line::segs(vec![seg(g2(), "inbox zero")])));
+        rows.push(PanelRow::plain(Line::segs(vec![seg(f(), "inbox zero")])));
         rows.push(hint_row(&[("/ ", "search"), ("A", "show read")]));
         return rows;
     }
@@ -126,8 +126,10 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
         let msg = truncate(&n.message, msg_budget.max(4));
         let src = truncate(&n.source_ref, 12);
 
+        // Read items dim to `faint` (still legible) so they read as handled
+        // without becoming the grey-on-grey that `ghost*` text would.
         let (glyph_tok, src_tok, msg_tok) = if n.read {
-            (g2(), g2(), g2())
+            (f(), f(), f())
         } else {
             (kind_hue(n.kind), d(), t())
         };
@@ -139,7 +141,7 @@ fn normal_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             seg(g3(), " "),
             seg(msg_tok, msg),
             seg(g3(), " "),
-            seg(g2(), ago),
+            seg(f(), ago),
         ]))
         .with_hit(PanelHit::Row(Section::Notifications, i));
 
@@ -179,7 +181,7 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
 
     if items.is_empty() {
-        rows.push(PanelRow::plain(Line::segs(vec![seg(g2(), "inbox zero")])));
+        rows.push(PanelRow::plain(Line::segs(vec![seg(f(), "inbox zero")])));
         rows.push(hint_row(&[("/ ", "search"), ("A", "show read")]));
         return rows;
     }
@@ -198,7 +200,7 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             .unwrap_or(&n.worktree_path);
 
         let (glyph_tok, src_tok, msg_tok) = if n.read {
-            (g2(), g2(), g2())
+            (f(), f(), f())
         } else {
             (kind_hue(n.kind), d(), t())
         };
@@ -207,17 +209,19 @@ fn half_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             seg(glyph_tok, n.kind.glyph()),
             seg(g3(), " "),
             seg(src_tok, src),
-            seg(g3(), " · "),
+            seg(g(), " · "),
             seg(msg_tok, msg),
             seg(g3(), " "),
-            seg(g2(), ago),
+            seg(f(), ago),
         ]);
 
+        // Secondary metadata line (worktree · kind): `faint` words with a
+        // `ghost` separator — was `ghost3` throughout, which read as invisible.
         let line2 = Line::segs(vec![
             sp(2),
-            seg(g3(), wt_base),
-            seg(g3(), "  ·  "),
-            seg(g3(), n.kind.label()),
+            seg(f(), wt_base),
+            seg(g(), "  ·  "),
+            seg(f(), n.kind.label()),
         ]);
 
         let bg = if i == cursor {
@@ -283,7 +287,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     rows.push(PanelRow::plain(Line::segs(vec![
         seg(d(), "NOTIFICATIONS"),
         seg(
-            g2(),
+            f(),
             format!("  ⚑ {unread} unread / {total}{show_tag}{filt_tag}"),
         ),
     ])));
@@ -294,7 +298,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
 
     if items.is_empty() {
-        rows.push(PanelRow::plain(Line::segs(vec![seg(g2(), "inbox zero")])));
+        rows.push(PanelRow::plain(Line::segs(vec![seg(f(), "inbox zero")])));
         rows.push(hint_row(&[("/ ", "search"), ("A", "show read")]));
         return rows;
     }
@@ -312,7 +316,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             let src_w = list_w.saturating_sub(4 + ago.len() + 1).max(4);
             let src = truncate(&n.source_ref, src_w);
             let (glyph_tok, src_tok) = if n.read {
-                (g2(), g2())
+                (f(), f())
             } else {
                 (kind_hue(n.kind), d())
             };
@@ -322,7 +326,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
                 seg(g3(), " "),
                 seg(src_tok, src),
                 seg(g3(), " "),
-                seg(g2(), ago),
+                seg(f(), ago),
             ]
         })
         .collect();
@@ -331,7 +335,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     let detail_rows: Vec<Vec<Seg>> = if let Some(n) = items.get(cursor) {
         notification_detail_segs(n, now, cols.saturating_sub(list_w + 2))
     } else {
-        vec![vec![seg(g2(), "select a notification")]]
+        vec![vec![seg(f(), "select a notification")]]
     };
 
     let combined = two_col(&list_rows, &detail_rows, list_w, 2);
@@ -364,7 +368,7 @@ fn notification_detail_segs(n: &Notification, now: i64, w: usize) -> Vec<Vec<Seg
 
     // Kind label + read state
     let read_tag = if n.read { "  read" } else { "  unread" };
-    out.push(vec![seg(g2(), n.kind.label()), seg(g3(), read_tag)]);
+    out.push(vec![seg(f(), n.kind.label()), seg(g(), read_tag)]);
 
     // Message
     out.push(vec![seg(t(), truncate(&n.message, w))]);
@@ -372,14 +376,14 @@ fn notification_detail_segs(n: &Notification, now: i64, w: usize) -> Vec<Vec<Seg
     // Worktree path
     if !n.worktree_path.is_empty() {
         out.push(vec![
-            seg(g2(), "worktree  "),
+            seg(f(), "worktree  "),
             seg(g(), truncate(&n.worktree_path, w.saturating_sub(10))),
         ]);
     }
 
     // Age
     let ago = time_ago(now, n.created_at_ms);
-    out.push(vec![seg(g2(), format!("{ago} ago"))]);
+    out.push(vec![seg(f(), format!("{ago} ago"))]);
 
     out
 }

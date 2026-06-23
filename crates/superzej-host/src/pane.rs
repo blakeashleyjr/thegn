@@ -101,6 +101,17 @@ pub fn is_interactive_shell(program: &str) -> bool {
     matches!(program, "sh" | "bash" | "zsh" | "dash" | "fish")
 }
 
+/// Whether a *clean* exit of a pane running `program` is routine noise rather
+/// than a task worth surfacing. Interactive shells qualify (closing a prompt is
+/// not news) and so does an **empty** program name: an empty name means we never
+/// resolved what the pane was running (an internal/transient/placeholder pane,
+/// or a spawn whose argv we couldn't name), so a "process finished" notification
+/// would be meaningless. A non-zero exit is still surfaced as a crash by the
+/// caller regardless of this — only clean exits are suppressed here.
+pub fn is_routine_pane(program: &str) -> bool {
+    program.is_empty() || is_interactive_shell(program)
+}
+
 /// Whether `program` is a sandbox/remote wrapper rather than the user's actual
 /// foreground program — its `/proc` child is the runtime shim, so relaunching it
 /// from the host is meaningless. Used to skip foreground-command capture for
@@ -419,6 +430,19 @@ mod tests {
         }
         for s in ["cargo", "make", "nvim", "lazygit", ""] {
             assert!(!is_interactive_shell(s), "{s} should not be a shell");
+        }
+    }
+
+    #[test]
+    fn is_routine_pane_covers_shells_and_unnamed_panes() {
+        // Shells and unnamed (empty-program) panes are routine: a clean exit is
+        // noise, not a "<x> finished" notification.
+        for s in ["sh", "bash", "zsh", "dash", "fish", ""] {
+            assert!(is_routine_pane(s), "{s:?} should be routine");
+        }
+        // Real, named programs are tasks worth surfacing on a clean exit.
+        for s in ["cargo", "make", "nvim", "lazygit", "yazi"] {
+            assert!(!is_routine_pane(s), "{s} should not be routine");
         }
     }
 
