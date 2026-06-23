@@ -347,6 +347,9 @@ pub enum GitMsg {
     StageLines,
     SelectHunk,
     DiscardLines,
+    /// One-key "revert hunk": discard every changed line of the hunk under the
+    /// cursor, after a confirm (item 602).
+    RevertHunk,
     StageAll,
     // files
     StageToggleFile,
@@ -492,6 +495,7 @@ pub fn context_keys(view: GitView) -> Vec<CtxKey> {
             k("a", "hunk", GitMsg::SelectHunk),
             k("v", "range", GitMsg::ToggleRangeMode),
             k("d", "discard", GitMsg::DiscardLines),
+            k("R", "revert hunk", GitMsg::RevertHunk),
             k("tab", "staged/unstaged", GitMsg::TogglePane),
             k("[", "prev hunk", GitMsg::PrevHunk),
             k("]", "next hunk", GitMsg::NextHunk),

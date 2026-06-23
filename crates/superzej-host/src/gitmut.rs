@@ -53,11 +53,22 @@ pub enum GitOp {
         path: String,
         untracked: bool,
     },
+    /// Batch discard for the rollback window (item 604): each `(path,
+    /// untracked)` is restored (tracked → `checkout --`) or deleted (untracked
+    /// → `clean -f`). One enqueue keeps to the one-mutation-per-worktree rule.
+    DiscardFiles {
+        paths: Vec<(String, bool)>,
+    },
     StageAll,
     UnstageAll,
     // commits
     Commit {
         message: String,
+        /// Skip pre-commit / commit-msg hooks (`--no-verify`) — item 329.
+        no_verify: bool,
+        /// Override commit signing: `Some(true)`→`--gpg-sign`,
+        /// `Some(false)`→`--no-gpg-sign`, `None`→inherit config — item 328.
+        sign: Option<bool>,
     },
     AmendHead,
     Reword {
@@ -225,6 +236,7 @@ impl GitOp {
             GitOp::StageFile { .. } => "unstaging",
             GitOp::IntentToAdd { .. } => "tracking",
             GitOp::DiscardFile { .. } => "discarding",
+            GitOp::DiscardFiles { .. } => "rolling back",
             GitOp::StageAll => "staging all",
             GitOp::UnstageAll => "unstaging all",
             GitOp::Commit { .. } => "committing",
@@ -333,6 +345,12 @@ pub enum GitOpResult {
     },
     /// Captured custom-command output for the popup.
     Output(String),
+    /// A commit was rejected by a pre-commit / commit-msg hook (item 329); the
+    /// hook's combined output is surfaced in the output popup, not just the
+    /// status line, so the user can see *why* it was blocked.
+    HookFailed {
+        output: String,
+    },
     Err(String),
     /// Push failed because the branch has no upstream. The caller can offer
     /// to run `push -u origin <branch>`.
@@ -417,9 +435,49 @@ pub fn execute(op: GitOp, loc: &GitLoc, override_gpg: bool) -> GitOpResult {
         }),
         GitOp::IntentToAdd { path } => done(g.intent_to_add(loc, &path)),
         GitOp::DiscardFile { path, untracked } => done(g.discard_file(loc, &path, untracked)),
+        GitOp::DiscardFiles { paths } => {
+            let n = paths.len();
+            let mut err = None;
+            for (path, untracked) in &paths {
+                if let Err(e) = g.discard_file(loc, path, *untracked) {
+                    err = Some(first_line(&e));
+                    break;
+                }
+            }
+            match err {
+                None => GitOpResult::Ok(Some(format!("rolled back {n} file(s)"))),
+                Some(msg) => GitOpResult::Err(msg),
+            }
+        }
         GitOp::StageAll => done(g.stage_all(loc)),
         GitOp::UnstageAll => done(g.unstage_all(loc)),
-        GitOp::Commit { message } => done(g.commit(loc, &message, false)),
+        GitOp::Commit {
+            message,
+            no_verify,
+            sign,
+        } => match g.commit(loc, &message, no_verify, sign) {
+            Ok(()) => GitOpResult::Ok(None),
+            Err(e) => {
+                // `run_stdin` folds the hook's stdout+stderr into the error, so
+                // a rejected commit carries the hook's own message (item 329) —
+                // route that to the popup. Git's own terse refusals ("nothing
+                // to commit", which is itself multi-line) stay on the status
+                // line; a newline count can't tell the two apart, so we match
+                // the known terse messages and treat everything else as hook
+                // output.
+                let full = format!("{e}");
+                let detail = full.split_once("failed: ").map_or("", |(_, d)| d).trim();
+                let terse = detail.is_empty()
+                    || detail.contains("nothing to commit")
+                    || detail.contains("nothing added to commit")
+                    || detail.contains("no changes added to commit");
+                if terse {
+                    GitOpResult::Err(first_line_str(&full))
+                } else {
+                    GitOpResult::HookFailed { output: full }
+                }
+            }
+        },
         GitOp::AmendHead => done(g.commit_amend(loc, false, override_gpg)),
         GitOp::Reword { sha, message } => done(g.reword(loc, &sha, &message, &opts)),
         GitOp::Squash { oldest, targets } => {
@@ -620,6 +678,8 @@ mod tests {
         match execute(
             GitOp::Commit {
                 message: "msg line\nbody".into(),
+                no_verify: false,
+                sign: Some(false),
             },
             &loc,
             false,
@@ -643,6 +703,31 @@ mod tests {
     }
 
     #[test]
+    fn discard_files_restores_tracked_and_removes_untracked() {
+        // Item 604: batch rollback partitions tracked vs untracked.
+        let dir = tmp_repo("rollback");
+        let loc = GitLoc::Local(dir.clone());
+        // Tracked, modified.
+        std::fs::write(dir.join("f.txt"), "dirty\n").unwrap();
+        // Untracked, new.
+        std::fs::write(dir.join("new.txt"), "scratch\n").unwrap();
+        match execute(
+            GitOp::DiscardFiles {
+                paths: vec![("f.txt".into(), false), ("new.txt".into(), true)],
+            },
+            &loc,
+            false,
+        ) {
+            GitOpResult::Ok(Some(note)) => assert!(note.contains("2 file(s)")),
+            other => panic!("{other:?}"),
+        }
+        // Tracked file restored to HEAD; untracked file deleted.
+        assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "one\n");
+        assert!(!dir.join("new.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn labels_exist_for_every_op_shape() {
         assert_eq!(GitOp::StageAll.label(), "staging all");
         assert!(
@@ -660,9 +745,53 @@ mod tests {
         assert!(GitOp::AmendHead.rewrites_history());
         assert!(
             !GitOp::Commit {
-                message: String::new()
+                message: String::new(),
+                no_verify: false,
+                sign: None,
             }
             .rewrites_history()
         );
+    }
+
+    #[test]
+    fn failing_pre_commit_hook_routes_to_hook_failed_popup() {
+        // Item 329: a rejecting hook's multi-line output lands in HookFailed
+        // (popup), and `no_verify` bypasses to a clean commit.
+        let dir = tmp_repo("hook");
+        let loc = GitLoc::Local(dir.clone());
+        let hook = dir.join(".git/hooks/pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\necho 'LINT FAILED'\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(dir.join("f.txt"), "two\n").unwrap();
+        let _ = execute(GitOp::StageAll, &loc, false);
+        match execute(
+            GitOp::Commit {
+                message: "blocked".into(),
+                no_verify: false,
+                sign: None,
+            },
+            &loc,
+            false,
+        ) {
+            GitOpResult::HookFailed { output } => assert!(output.contains("LINT FAILED")),
+            other => panic!("expected HookFailed, got {other:?}"),
+        }
+        match execute(
+            GitOp::Commit {
+                message: "forced".into(),
+                no_verify: true,
+                sign: None,
+            },
+            &loc,
+            false,
+        ) {
+            GitOpResult::Ok(_) => {}
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

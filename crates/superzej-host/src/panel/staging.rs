@@ -222,6 +222,23 @@ pub fn prev_hunk(doc: &StageDoc, idx: usize) -> Option<usize> {
     (0..=tail).find(|&i| doc.lines[i].hunk == ph && cursorable(doc, i))
 }
 
+/// The `(hunk, line)` pairs for every changed line of the hunk containing
+/// `cursor` — the target for a one-key "revert hunk" discard (item 602).
+/// Headers and context lines are skipped; empty when the cursor isn't on a
+/// hunk body.
+pub fn hunk_revert_indices(doc: &StageDoc, cursor: usize) -> Vec<(usize, usize)> {
+    let Some(range) = hunk_range(doc, cursor) else {
+        return Vec::new();
+    };
+    range
+        .filter(|&i| selectable(doc, i))
+        .map(|i| {
+            let l = &doc.lines[i];
+            (l.hunk, l.line)
+        })
+        .collect()
+}
+
 /// Convert a set of flattened indices into a core [`Selection`] over the
 /// SAME parse (headers, markers, and context are skipped automatically).
 pub fn to_selection(doc: &StageDoc, indices: impl IntoIterator<Item = usize>) -> Selection {
@@ -551,6 +568,23 @@ mod tests {
         let sel = to_selection(&doc, r);
         assert_eq!(sel.len(), 3);
         assert!(sel.contains(1, 1) && sel.contains(1, 2) && sel.contains(1, 3));
+    }
+
+    #[test]
+    fn hunk_revert_indices_targets_the_cursor_hunks_changes() {
+        let doc = fixture();
+        // Cursor anywhere in hunk 0 → exactly hunk 0's changed lines.
+        assert_eq!(
+            hunk_revert_indices(&doc, 3),
+            vec![(0, 1), (0, 2), (0, 3)],
+            "hunk 0: -a2, +A2, +A2b"
+        );
+        // Cursor in hunk 1 → that hunk's changes only (context dropped).
+        assert_eq!(hunk_revert_indices(&doc, 10), vec![(1, 1), (1, 2), (1, 3)]);
+        // A header row still resolves to its hunk's changes.
+        assert_eq!(hunk_revert_indices(&doc, 0), vec![(0, 1), (0, 2), (0, 3)]);
+        // Out-of-range cursor → nothing.
+        assert!(hunk_revert_indices(&doc, 999).is_empty());
     }
 
     #[test]
