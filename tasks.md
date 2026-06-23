@@ -21,12 +21,16 @@ Per-feature statuses below are verified against the current codebase. See
 
 ## Progress summary (as of 2026-06-22)
 
-**Where we are:** **Phase 1** (the AI-free shell) is largely complete — native git
+**Where we are:** **Phase 1** (the AI-free shell) is **essentially complete** — a
+2026-06-22 status audit against the codebase found ~25 items recorded as `[~]`/`[ ]`
+that are in fact shipped and wired (whole keybind and layout subsystems, session
+persistence, most IDE-Tier-1 panels); their markers below are now corrected. Native git
 management, the notification/event bus, and IDE panels (problems/tasks/tests/symbols)
 have landed. **Phase 2's substrate** (sandbox + remote) and, more recently, **the
 proxy** (groups U/V/W) are in. The agent layer (Q–T) and MCP (AL) remain unstarted —
 still by design; the proxy was built and validated standalone, and is the next major
-track's prerequisite.
+track's prerequisite. The audit's remaining Phase-1 tail is small and specific (see
+gaps below).
 
 **Shipped & solid:**
 
@@ -34,7 +38,14 @@ track's prerequisite.
   `CenterTree`); in-process chrome (sidebar/panel/tabbar/statusbar), workspaces (repos)
   - worktrees as tabs, session detach/attach/resurrection. (Zellij/WASM was stripped in
     Phase 0.)
-- **Keybinds** — full registry, KDL splice, conflict detection, cheatsheet feed (`F`).
+- **Keybinds** — full registry, KDL splice, conflict detection, cheatsheet feed (`F`),
+  chorded/sequence binds (`SequenceMatcher`) + which-key hints, vim/emacs modes, and
+  per-profile / per-workspace / per-program bind sets.
+- **Panes & layouts** — split/resize/zoom/float, stacked/tabbed panes
+  (`CenterTree::Stack`), named save/apply layouts, layout import/export, sync-panes
+  input broadcast, responsive auto-collapse by terminal size.
+- **Sessions** — detach/attach, reboot resurrection, per-session snapshots
+  (`tab_groups`/`session_state`), debounced auto-save, palette/sidebar switcher.
 - **Config** — declarative TOML, layering, env/flag overlays, live reload, validation,
   95%-gated core.
 - **Palette** — native iocraft Cmd-K, nucleo fuzzy + embedded ripgrep, file open.
@@ -75,9 +86,16 @@ track's prerequisite.
   420 is a fixed event→notification mapping + urgency thresholds, not yet a
   user-configurable action-rules engine. Still missing: DND/quiet hours (426),
   per-profile routing (427), sound/bell (429), push-to-phone (422/423).
-- **IDE Tier 1 tail** — Search Everywhere aggregation (523) and the agent-side of
-  attention routing remain; git, problems, tasks/tests, and symbols panels have landed.
-- **B.** badge counts per row (28).
+- **IDE Tier 1 tail (small, specific)** — Search Everywhere is missing its tasks/tests/
+  problems providers (523, only files/content/git/symbols today); word-level intra-line
+  diff highlight (601, the visual hunk staging 602 itself is in); file management from the
+  tree (606) + fork/rename worktree (52/53); GUI editor handoff / per-workspace editor
+  override (407/410); IDE keymap presets + first-launch picker (621). Problems, tasks/
+  tests, symbols, and visual staging panels have landed.
+- **B.** badge counts per row (28) — row `unread_count`/`alert_count` render; the
+  PR-count data source is the remaining wiring.
+- **Statusbar AI widgets (148–150, 157)** — correctly gated on the Agent layer / proxy-UI
+  wiring, not Phase-1 shell gaps.
 - **Orca-audit adds (654–658)** — per-line AI/human attribution overlay (654), agent-writable
   worktree status field (655), per-agent account hot-swap chip (656), agent-hook passthrough +
   worktree setup hooks (657), and agent session history/hibernation (658); plus enriched
@@ -325,7 +343,7 @@ close, `<`/`>` width, digits quick-jump._
 - [x] 25. Adjustable/collapsible bar width _(native `<`/`>`; persisted)_
 - [x] 26. Multi-select for bulk actions _(native `Space` mark, `X` bulk close)_
 - [x] 27. Row context menu _(native `m`)_
-- [ ] 28. Badge counts — PRs/unread/alerts per row
+- [~] 28. Badge counts — PRs/unread/alerts per row _(`sidebar.rs` per-row `unread_count`/`alert_count` + `unread_counts`/`alert_counts` maps, rendered in chrome; PR-count source wiring pending)_
 
 ### C. Workspaces (repos)
 
@@ -336,7 +354,7 @@ close, `<`/`>` width, digits quick-jump._
 - [x] 33. Per-workspace default base branch
 - [~] 34. Per-workspace default layout
 - [ ] 35. Per-workspace default program set
-- [~] 36. Per-workspace keybinds
+- [x] 36. Per-workspace keybinds _(`WorkspaceConfig::keybinds`; `[workspace.<name>.keybinds]`)_
 - [x] 37. Non-git directory as workspace _(workspace `kind` repo|dir; insert-only; folder glyph in sidebar)_
 - [ ] 38. Workspace-level env vars _(subsumed by env bundles — AU 684–697; a workspace binds a bundle via `[workspace.<slug>].env_bundle`)_
 - [ ] 39. Workspace icon/color label
@@ -349,7 +367,7 @@ _Tier-2 layout/task templates generalize worktree templates (54) with native
 
 - [x] 41. Create worktree from workspace
 - [x] 42. Pick base branch on create
-- [~] 43. Branch naming templates
+- [x] 43. Branch naming templates _(`config.rs` `branch_prefix` + `NameScheme` enum Words/Numbered)_
 - [x] 44. Nest under workspace in bar
 - [x] 45. Per-worktree branch + status
 - [x] 46. Default layout opens on select
@@ -360,9 +378,9 @@ _Tier-2 layout/task templates generalize worktree templates (54) with native
 - [~] 51. Per-worktree disk usage
 - [ ] 52. Fork worktree (branch from existing)
 - [ ] 53. Rename worktree/branch
-- [ ] 54. Worktree templates — layout+programs+container preset + setup/post-create hooks (deps install, env restore; see 657)
-- [~] 55. Worktree↔PR mapping
-- [~] 56. Bulk worktree cleanup
+- [~] 54. Worktree templates — layout+programs+container preset + setup/post-create hooks (deps install, env restore; see 657) _(`NewWorktreeFromTemplate` action wired in run.rs + `[[worktree_templates]]` config; setup/post-create hook depth still partial)_
+- [x] 55. Worktree↔PR mapping _(`pr_branch_cache` keyed by worktree path; `get_pr_branch_cache`/`spawn_pr_cache_refresh` in hydrate.rs)_
+- [x] 56. Bulk worktree cleanup _(sidebar multi-select `Space` + `X` bulk close)_
 
 ### E. Pinned programs / tiles
 
@@ -400,7 +418,7 @@ launch-or-focus via `Alt-1..9`, restart per policy on PTY exit, and resurrect fr
 ### F. Keybindings
 
 - [x] 75. Launch-or-focus toggle bind
-- [~] 76. Per-program custom binds
+- [x] 76. Per-program custom binds _(`config.rs` `program_keybinds` + `program_remap`)_
 - [x] 77. Leader/prefix layer
 - [x] 78. Modal keymaps (zellij modes)
 - [x] 79. Fully rebindable actions
@@ -408,11 +426,11 @@ launch-or-focus via `Alt-1..9`, restart per policy on PTY exit, and resurrect fr
 - [x] 81. Pane navigation binds
 - [x] 82. Keybind cheatsheet overlay
 - [x] 83. Conflict detection at load
-- [ ] 84. Per-profile keybind sets
-- [~] 85. Per-workspace overrides
-- [ ] 86. Chorded/sequence binds
-- [ ] 87. Which-key hint popup
-- [ ] 88. Vim/emacs presets
+- [x] 84. Per-profile keybind sets _(`config.rs` `profiles: BTreeMap<_,ProfileConfig>`w/ per-profile`keybinds`+`default*mode`)*
+- [x] 85. Per-workspace overrides _(`WorkspaceConfig::keybinds`)_
+- [x] 86. Chorded/sequence binds _(`sequence.rs` `SequenceMatcher` `feed`/`add_sequence`, wired in run.rs)_
+- [x] 87. Which-key hint popup _(`SequenceMatcher::pending_continuations()` → statusbar keyhints)_
+- [x] 88. Vim/emacs presets _(`keymap.rs` `Mode::{VimNormal,VimInsert,Emacs}` + `SwitchMode`)_
 - [ ] 621. IDE keymap presets (VSCode/JetBrains-style) + first-launch keymap picker, per-action overrides
 
 ### G. Panes & layouts
@@ -425,14 +443,14 @@ task registry (AQ 520–522) and worktree templates (54); new work targets
 - [x] 90. Save arrangement as default
 - [x] 91. Split/resize/move/zoom/close
 - [x] 92. Floating panes
-- [~] 93. Stacked/tabbed panes
-- [~] 94. Named switchable layouts
+- [x] 93. Stacked/tabbed panes _(`center.rs` `CenterTree::Stack`)_
+- [x] 94. Named switchable layouts _(`SaveLayout`/`ApplyLayout` actions + db persistence)_
 - [ ] 95. Layout per worktree vs workspace
-- [ ] 96. Sync panes (broadcast input)
+- [x] 96. Sync panes (broadcast input) _(`ToggleSyncPanes` fans input to all panes in run.rs)_
 - [x] 97. Zoom/maximize toggle
 - [ ] 98. Swap pane positions
-- [ ] 99. Layout import/export
-- [~] 100. Auto-layout by terminal size
+- [x] 99. Layout import/export _(`ExportLayout`/`ImportLayout` actions, JSON round-trip)_
+- [x] 100. Auto-layout by terminal size _(responsive sidebar/panel collapse in layout.rs)_
 
 ### H. Profiles & subprofiles
 
@@ -467,11 +485,11 @@ into work/personal (see AM. 479–480, 536–539 below).
 - [x] 111. Detach/attach
 - [x] 112. Resurrection after reboot
 - [x] 113. Restore tree + layouts + pins
-- [~] 114. Per-session snapshots
-- [ ] 115. Named saved sessions
-- [~] 116. Auto-save state
+- [x] 114. Per-session snapshots _(`session.rs` `persist()` → v6 `tab_groups`/`session_state`)_
+- [ ] 115. Named saved sessions _(per-repo `session_name` exists, but no user-named save/load)_
+- [x] 116. Auto-save state _(debounced persist in run.rs on meaningful change)_
 - [ ] 117. Restore agent state where possible
-- [~] 118. Session list/switcher
+- [x] 118. Session list/switcher _(palette + sidebar over persisted worktrees/tabs)_
 - [ ] 119. Export/import session config
 - [ ] 120. Background keep-alive
 
@@ -513,8 +531,8 @@ into work/personal (see AM. 479–480, 536–539 below).
 - [ ] 148. Running agent count + states
 - [ ] 149. Aggregate spend widget
 - [ ] 150. Tokens-per-minute widget
-- [~] 151. System load widget
-- [~] 152. Per-worktree disk widget
+- [x] 151. System load widget _(cpu/mem/gpu stats cluster in `chrome.rs`, `fit_stats_cluster`)_
+- [x] 152. Per-worktree disk widget _(disk size per worktree; cf. 413)_
 - [~] 153. Notification badges _(sidebar + panel inbox badges; statusbar badge pending)_
 - [ ] 154. Now-playing / arbitrary program widget
 - [ ] 155. Next calendar event widget
@@ -536,7 +554,7 @@ tests, symbols, git objects, and worktrees._
 - [x] 164. Run any bound action
 - [x] 165. Recent/MRU commands
 - [x] 166. Fuzzy file open across workspace
-- [~] 167. Action search by description
+- [x] 167. Action search by description _(`PaletteMode` All/Files/Content/Git/Symbols in `search_everywhere.rs`)_
 - [ ] 168. Palette plugins
 - [~] 169. Inline argument prompts
 - [~] 170. Palette preview/themes
@@ -544,12 +562,12 @@ tests, symbols, git objects, and worktrees._
 ### N. Theming & appearance
 
 - [x] 171. OKLCH-based theme system
-- [~] 172. Light/dark/auto
-- [~] 173. Custom color schemes
-- [ ] 174. Per-profile themes
+- [x] 172. Light/dark/auto _(`theme.rs` `PRESETS` incl. hand-tuned `light`; live cycle)_
+- [x] 173. Custom color schemes _(`[theme.colors]` + `[theme.hues]` TOML overrides, hex RGB)_
+- [ ] 174. Per-profile themes _(blocked: profiles (H) not implemented; no override path)_
 - [x] 175. Font family/size config
 - [x] 176. Nerd Font / icon support
-- [~] 177. Border/padding/style config
+- [x] 177. Border/padding/style config _(`ThemeConfig::pane_padding` + border via `[theme.colors]`)_
 - [x] 178. Status bar styling
 - [x] 179. Tree styling
 - [x] 180. Diff color config
@@ -760,13 +778,13 @@ keeping `lazygit` as the fallback escape hatch._
 - [x] 325. Blame view
 - [x] 326. Stash management
 - [x] 327. lazygit pin (fallback)
-- [~] 328. Commit signing _(GPG signing args plumbed through commit/cherry/revert)_
-- [~] 329. Hooks-aware (pre-commit)
+- [x] 328. Commit signing _(GPG signing args plumbed through commit/cherry/revert; commit overlay `^S` cycles inherit→sign→no-sign)_
+- [x] 329. Hooks-aware (pre-commit) _(commit overlay `^N` toggles `--no-verify`; rejected hooks fold stdout+stderr into a `HookFailed` popup, terse git refusals stay on the status line)_
 - [x] 330. Cherry-pick/revert _(+ continue/skip/abort)_
-- [ ] 601. Word-level / intra-line diff highlighting (base vs working copy)
-- [ ] 602. Center-gutter visual hunk stage/revert — "`git add -p`, made visual"
-- [ ] 604. Rollback/discard window — checkbox tree of changes, optional delete of added files, per-row diff
-- [ ] 605. Plain push/pull/fetch when ahead/behind upstream (non-PR fast path)
+- [x] 601. Word-level / intra-line diff highlighting (base vs working copy) _(`diff_highlight::word_diff` + `changed_mask` drive a brighter run-level tint in `diff_cell`; coverage-gated tests in core)_
+- [x] 602. Center-gutter visual hunk stage/revert — "`git add -p`, made visual" _(`panel/staging.rs` `hunk_revert_indices`; `R` → `GitMsg::RevertHunk` → confirmed `DiscardLines` over the cursor hunk)_
+- [x] 604. Rollback/discard window — checkbox tree of changes, optional delete of added files, per-row diff _(`panel/rollback.rs` modal: space/a/c marking, per-row hunk preview, `delete` badge for untracked; Enter enqueues one `DiscardFiles` batch partitioning restore vs delete; palette command `rollback`)_
+- [x] 605. Plain push/pull/fetch when ahead/behind upstream (non-PR fast path) _(`Action::Push`/`Pull`/`Fetch` enqueue directly via `enqueue_git_op`; palette commands `git-push`/`git-pull`/`git-fetch`)_
 
 _Stale-**branch** lifecycle (distinct from worktree GC 48 / bulk cleanup 56): a
 deliberate import of the **deadbranch** feature set ("clean up stale git branches
@@ -1028,19 +1046,19 @@ their original groups._
 - [~] 516. Test explorer tree — discover and render runnable test targets per worktree _(test discovery in `task.rs`)_
 - [~] 517. Test status rollups — pass/fail/running state in panel, sidebar, and statusbar
 - [~] 518. Run/debug selected test — nearest/file/package/failed-test actions, DAP handoff later
-- [~] 519. Problems / diagnostics panel — compiler/linter/config/LSP diagnostics with file:line jumps _(problems panel)_
-- [~] 520. Named task registry — `[[tasks]]` (explicit config) + discovered providers (just, cargo, npm, etc.) and aliases
-- [~] 521. Task lifecycle controls — run/stop/restart/rerun from palette/panel/keybinds for any task
-- [~] 522. Task output capture + problem matching — feed Tests and Problems without polling
-- [ ] 523. Search Everywhere provider aggregation — actions, files, symbols, tasks, tests, problems, git, worktrees
-- [~] 524. Non-agent process attention routing — exited/failed/waiting panes join the attention queue _(`ProcessExited` event + exit classification/policy)_
+- [x] 519. Problems / diagnostics panel — compiler/linter/config/LSP diagnostics with file:line jumps _(`panel/sections/problems.rs`)_
+- [x] 520. Named task registry — `[[tasks]]` (explicit config) + discovered providers (just, cargo, npm, etc.) and aliases _(`panel/sections/tasks.rs` + `task.rs` discovery)_
+- [x] 521. Task lifecycle controls — run/stop/restart/rerun from palette/panel/keybinds for any task
+- [x] 522. Task output capture + problem matching — feed Tests and Problems without polling _(`task.rs` parses rustc/gcc/clang → diagnostics)_
+- [x] 523. Search Everywhere provider aggregation — actions, files, symbols, tasks, tests, problems, git, worktrees _(`PaletteMode` prefixes `!`/`$`/`%` for tasks/problems/tests; filled synchronously from in-memory panel state alongside the async file/content/git/symbol workers)_
+- [x] 524. Non-agent process attention routing — exited/failed/waiting panes join the attention queue _(`ProcessExited` event + exit classification/policy)_
 - [ ] 525. DAP client substrate — debug adapter JSON-RPC service seam in `superzej-svc`
 - [ ] 526. Debug breakpoints and stepping — continue/pause/step controls and breakpoint state
 - [ ] 527. Debug variables/watch/call-stack panel — inspect runtime state in the right panel
 - [ ] 528. Debug launch/attach configurations — task-backed debug profiles per workspace
 - [~] 529. LSP client substrate — language-server JSON-RPC service seam in `superzej-svc`
 - [ ] 530. Go-to-definition and find-references — navigate via `$EDITOR`/panel handoff, not in-place editing
-- [~] 531. Document/workspace symbols — feed Search Everywhere and outline/reference views _(symbols panel)_
+- [x] 531. Document/workspace symbols — feed Search Everywhere and outline/reference views _(`panel/sections/symbols.rs` + LSP/tree-sitter)_
 - [x] 532. Hover/signature/code-action preview — read-only context and previewable actions
 - [ ] 533. Per-worktree local timeline — git/files/tasks/tests/agents/checks activity history
 - [ ] 534. Restore/compare from local timeline — inspect or recover local snapshots where available

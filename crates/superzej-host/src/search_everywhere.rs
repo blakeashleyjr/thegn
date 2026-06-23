@@ -41,6 +41,12 @@ pub enum PaletteMode {
     Content,
     Git,
     Symbols,
+    /// `!` — runnable tasks (item 523).
+    Tasks,
+    /// `$` — diagnostics / problems (item 523).
+    Problems,
+    /// `%` — discovered tests (item 523).
+    Tests,
 }
 
 impl PaletteMode {
@@ -51,6 +57,9 @@ impl PaletteMode {
             Some('/') => (PaletteMode::Content, raw[1..].trim_start()),
             Some('@') => (PaletteMode::Git, raw[1..].trim_start()),
             Some('#') => (PaletteMode::Symbols, raw[1..].trim_start()),
+            Some('!') => (PaletteMode::Tasks, raw[1..].trim_start()),
+            Some('$') => (PaletteMode::Problems, raw[1..].trim_start()),
+            Some('%') => (PaletteMode::Tests, raw[1..].trim_start()),
             _ => (PaletteMode::All, raw),
         }
     }
@@ -62,6 +71,9 @@ impl PaletteMode {
             PaletteMode::Content => "/",
             PaletteMode::Git => "@",
             PaletteMode::Symbols => "#",
+            PaletteMode::Tasks => "!",
+            PaletteMode::Problems => "$",
+            PaletteMode::Tests => "%",
         }
     }
 
@@ -72,7 +84,19 @@ impl PaletteMode {
             PaletteMode::Content => " content ",
             PaletteMode::Git => " git ",
             PaletteMode::Symbols => " symbols ",
+            PaletteMode::Tasks => " tasks ",
+            PaletteMode::Problems => " problems ",
+            PaletteMode::Tests => " tests ",
         }
+    }
+
+    /// Whether this mode's results are filled synchronously from in-memory
+    /// panel state (tasks/tests/problems) rather than via the async workers.
+    pub fn is_local(self) -> bool {
+        matches!(
+            self,
+            PaletteMode::Tasks | PaletteMode::Problems | PaletteMode::Tests
+        )
     }
 
     pub fn cycle(self) -> Self {
@@ -81,9 +105,13 @@ impl PaletteMode {
             PaletteMode::Files => PaletteMode::Content,
             PaletteMode::Content => PaletteMode::Git,
             PaletteMode::Git => PaletteMode::Symbols,
-            PaletteMode::Symbols => PaletteMode::All,
+            PaletteMode::Symbols => PaletteMode::Tasks,
+            PaletteMode::Tasks => PaletteMode::Tests,
+            PaletteMode::Tests => PaletteMode::Problems,
+            PaletteMode::Problems => PaletteMode::All,
         }
     }
+
 }
 
 // ── File index ───────────────────────────────────────────────────────────────
@@ -169,6 +197,35 @@ pub struct SymbolMatch {
     pub kind: Option<String>,
 }
 
+/// A runnable task match (item 523, `!` mode).
+#[derive(Debug, Clone)]
+pub struct TaskMatch {
+    pub name: String,
+    /// Short kind label ("test", "build", …) for the row glyph/context.
+    pub kind: String,
+}
+
+/// A diagnostic match (item 523, `$` mode).
+#[derive(Debug, Clone)]
+pub struct ProblemMatch {
+    pub file: String,
+    pub line: u64,
+    /// "error" | "warning" | "info" | "hint".
+    pub severity: String,
+    pub message: String,
+}
+
+/// A discovered-test match (item 523, `%` mode).
+#[derive(Debug, Clone)]
+pub struct TestMatch {
+    pub label: String,
+    /// File + line to jump to; empty path means "no location" (not jumpable).
+    pub path: String,
+    pub line: u64,
+    /// "pass" | "fail" | "running" | "skip" | "" for the row glyph.
+    pub state: String,
+}
+
 pub enum AsyncSearchResult {
     FileIndexReady {
         sg: u64,
@@ -203,6 +260,10 @@ pub struct AsyncResults {
     pub content_done: bool,
     pub git: Vec<GitRefMatch>,
     pub symbols: Vec<SymbolMatch>,
+    // Synchronous (local) providers — filled from panel state (item 523).
+    pub tasks: Vec<TaskMatch>,
+    pub problems: Vec<ProblemMatch>,
+    pub tests: Vec<TestMatch>,
 }
 
 impl AsyncResults {
@@ -212,6 +273,9 @@ impl AsyncResults {
         self.content_done = false;
         self.git.clear();
         self.symbols.clear();
+        self.tasks.clear();
+        self.problems.clear();
+        self.tests.clear();
     }
 }
 
@@ -283,7 +347,11 @@ impl PaletteSession {
         self.selected = 0;
         self.scroll_offset = 0;
         self.search_gen += 1;
-        self.searching = true;
+        // The spinner is only for the async workers. `All` resolves in-place
+        // here; the local providers (tasks/tests/problems) resolve synchronously
+        // in `kick_palette_search`, which always runs this turn — so neither
+        // should flash a spinner.
+        self.searching = !mode.is_local();
         if mode == PaletteMode::All {
             self.palette.set_query(inner.to_string());
             self.searching = false;
@@ -331,6 +399,9 @@ impl PaletteSession {
             PaletteMode::Content => self.async_results.content.len(),
             PaletteMode::Git => self.async_results.git.len(),
             PaletteMode::Symbols => self.async_results.symbols.len(),
+            PaletteMode::Tasks => self.async_results.tasks.len(),
+            PaletteMode::Problems => self.async_results.problems.len(),
+            PaletteMode::Tests => self.async_results.tests.len(),
         }
     }
 
@@ -365,6 +436,21 @@ impl PaletteSession {
                 .symbols
                 .get(self.selected)
                 .map(|m| format!("open-file:{}:{}", m.path, m.line_no)),
+            PaletteMode::Tasks => self
+                .async_results
+                .tasks
+                .get(self.selected)
+                .map(|m| format!("run-task:{}", m.name)),
+            PaletteMode::Problems => self
+                .async_results
+                .problems
+                .get(self.selected)
+                .map(|m| format!("open-file:{}:{}", m.file, m.line)),
+            PaletteMode::Tests => self.async_results.tests.get(self.selected).and_then(|m| {
+                // Only jumpable tests (with a location) dispatch; others are
+                // inert rows.
+                (!m.path.is_empty()).then(|| format!("open-file:{}:{}", m.path, m.line))
+            }),
         }
     }
 
@@ -615,6 +701,101 @@ impl PaletteSession {
                 }
                 if self.async_results.symbols.is_empty() && !self.searching {
                     let msg = seg(Tok::Slot(S::Ghost2), "No symbols matched");
+                    seg::draw_line(
+                        surface,
+                        inner.x,
+                        row_y,
+                        inner.cols,
+                        &Line::segs(vec![sp(1), msg]),
+                        panel,
+                    );
+                }
+            }
+            PaletteMode::Tasks => {
+                let offset = self.scroll_offset;
+                for (row, m) in self
+                    .async_results
+                    .tasks
+                    .iter()
+                    .enumerate()
+                    .skip(offset)
+                    .take(rows_avail)
+                {
+                    let selected = row == self.selected;
+                    let label = format!("▸ {}  ({})", m.name, m.kind);
+                    draw_single_line_item(surface, inner.x, row_y, inner.cols, &label, selected);
+                    row_y += 1;
+                }
+                if self.async_results.tasks.is_empty() {
+                    let msg = seg(Tok::Slot(S::Ghost2), "No tasks");
+                    seg::draw_line(
+                        surface,
+                        inner.x,
+                        row_y,
+                        inner.cols,
+                        &Line::segs(vec![sp(1), msg]),
+                        panel,
+                    );
+                }
+            }
+            PaletteMode::Problems => {
+                let offset = self.scroll_offset;
+                for (row, m) in self
+                    .async_results
+                    .problems
+                    .iter()
+                    .enumerate()
+                    .skip(offset)
+                    .take(rows_avail)
+                {
+                    let selected = row == self.selected;
+                    let glyph = match m.severity.as_str() {
+                        "error" => "✖ ",
+                        "warning" => "▲ ",
+                        "info" => "ℹ ",
+                        _ => "· ",
+                    };
+                    let msg = m.message.chars().take(48).collect::<String>();
+                    let label = format!("{glyph}{}:{}  {msg}", m.file, m.line);
+                    draw_single_line_item(surface, inner.x, row_y, inner.cols, &label, selected);
+                    row_y += 1;
+                }
+                if self.async_results.problems.is_empty() {
+                    let msg = seg(Tok::Slot(S::Ghost2), "No problems");
+                    seg::draw_line(
+                        surface,
+                        inner.x,
+                        row_y,
+                        inner.cols,
+                        &Line::segs(vec![sp(1), msg]),
+                        panel,
+                    );
+                }
+            }
+            PaletteMode::Tests => {
+                let offset = self.scroll_offset;
+                for (row, m) in self
+                    .async_results
+                    .tests
+                    .iter()
+                    .enumerate()
+                    .skip(offset)
+                    .take(rows_avail)
+                {
+                    let selected = row == self.selected;
+                    let glyph = match m.state.as_str() {
+                        "pass" => "✓ ",
+                        "fail" => "✗ ",
+                        "running" => "… ",
+                        "skip" => "○ ",
+                        _ => "• ",
+                    };
+                    let label = format!("{glyph}{}", m.label);
+                    draw_single_line_item(surface, inner.x, row_y, inner.cols, &label, selected);
+                    row_y += 1;
+                }
+                if self.async_results.tests.is_empty() {
+                    let msg = seg(Tok::Slot(S::Ghost2), "No tests");
                     seg::draw_line(
                         surface,
                         inner.x,
@@ -1220,7 +1401,71 @@ mod tests {
     #[test]
     fn mode_cycle() {
         assert_eq!(PaletteMode::All.cycle(), PaletteMode::Files);
-        assert_eq!(PaletteMode::Symbols.cycle(), PaletteMode::All);
+        // Symbols now leads into the local providers before wrapping to All.
+        assert_eq!(PaletteMode::Symbols.cycle(), PaletteMode::Tasks);
+        assert_eq!(PaletteMode::Tasks.cycle(), PaletteMode::Tests);
+        assert_eq!(PaletteMode::Tests.cycle(), PaletteMode::Problems);
+        assert_eq!(PaletteMode::Problems.cycle(), PaletteMode::All);
+        // The full cycle visits every mode exactly once and returns home.
+        let mut seen = vec![PaletteMode::All];
+        let mut m = PaletteMode::All;
+        for _ in 0..8 {
+            m = m.cycle();
+            seen.push(m);
+        }
+        assert_eq!(seen.first(), seen.last());
+        assert_eq!(seen.len(), 9, "8 modes + wrap");
+    }
+
+    #[test]
+    fn mode_parse_local_providers() {
+        // Item 523: the three new prefixes.
+        assert_eq!(PaletteMode::parse("!build").0, PaletteMode::Tasks);
+        assert_eq!(PaletteMode::parse("!build").1, "build");
+        assert_eq!(PaletteMode::parse("$err").0, PaletteMode::Problems);
+        assert_eq!(PaletteMode::parse("%my_test").0, PaletteMode::Tests);
+        assert!(PaletteMode::Tasks.is_local());
+        assert!(PaletteMode::Problems.is_local());
+        assert!(PaletteMode::Tests.is_local());
+        assert!(!PaletteMode::Files.is_local());
+    }
+
+    #[test]
+    fn selected_key_local_providers() {
+        let mut s = PaletteSession::new(vec![]);
+        s.mode = PaletteMode::Tasks;
+        s.async_results.tasks.push(TaskMatch {
+            name: "test".into(),
+            kind: "test".into(),
+        });
+        assert_eq!(s.selected_key(), Some("run-task:test".into()));
+
+        s.mode = PaletteMode::Problems;
+        s.async_results.problems.push(ProblemMatch {
+            file: "src/a.rs".into(),
+            line: 12,
+            severity: "error".into(),
+            message: "boom".into(),
+        });
+        assert_eq!(s.selected_key(), Some("open-file:src/a.rs:12".into()));
+
+        s.mode = PaletteMode::Tests;
+        s.async_results.tests.push(TestMatch {
+            label: "it_works".into(),
+            path: "tests/x.rs".into(),
+            line: 7,
+            state: "pass".into(),
+        });
+        assert_eq!(s.selected_key(), Some("open-file:tests/x.rs:7".into()));
+        // A test with no location is inert (no dispatch key).
+        s.async_results.tests.clear();
+        s.async_results.tests.push(TestMatch {
+            label: "no_loc".into(),
+            path: String::new(),
+            line: 0,
+            state: "fail".into(),
+        });
+        assert_eq!(s.selected_key(), None);
     }
 
     #[test]

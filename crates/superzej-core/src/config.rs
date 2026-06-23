@@ -2988,7 +2988,8 @@ name = "minimal"
         assert_eq!(s.net_icon, "\u{f06f3}");
         assert_eq!(s.gpu_icon, "\u{f0fb2}");
         assert_eq!(s.battery_icon, "\u{f0079}");
-        assert_eq!(s.battery_charging_icon, "\u{f0084}");
+        // nf-fa-bolt — lightning bolt shown while charging.
+        assert_eq!(s.battery_charging_icon, "\u{f0e7}");
         assert_eq!(s.battery_warn, 25);
         assert_eq!(s.refresh_rates, vec![1.0, 2.0, 5.0, 10.0]);
     }

@@ -471,11 +471,18 @@ pub(crate) fn run_stdin(
         .git_with_stdin(&env, args, stdin)
         .with_context(|| format!("git {}", args.join(" ")))?;
     if !out.status.success() {
-        anyhow::bail!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        // Pre-commit / commit-msg hooks commonly print to stdout, not stderr,
+        // so fold both streams into the error — that's what makes a rejected
+        // commit show *why* (item 329).
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let detail = match (stderr.trim(), stdout.trim()) {
+            ("", "") => String::new(),
+            ("", o) => o.to_string(),
+            (e, "") => e.to_string(),
+            (e, o) => format!("{e}\n{o}"),
+        };
+        anyhow::bail!("git {} failed: {}", args.join(" "), detail);
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }

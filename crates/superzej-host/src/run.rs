@@ -3696,6 +3696,40 @@ fn handle_git_msg(
                 }
             }
         }
+        GitMsg::RevertHunk => {
+            // Item 602: one-key discard of the whole hunk under the cursor
+            // (select-hunk + discard, fused), with a mandatory confirm.
+            if panel_ui.git.focus == GitView::Staging {
+                let cur = panel_ui.git.staging.as_ref().map_or(0, |s| s.cursor);
+                let op = panel_ui.git.stage_doc.as_ref().map(|d| {
+                    (
+                        crate::panel::staging::hunk_revert_indices(&d.doc, cur),
+                        d.path.clone(),
+                        d.diff.clone(),
+                    )
+                });
+                if let Some((indices, path, diff)) = op {
+                    if indices.is_empty() {
+                        model.status = "no hunk under cursor".into();
+                    } else {
+                        confirm_git_op(
+                            ov,
+                            "revert hunk?",
+                            format!(
+                                "discards {} line(s) of {path} — unrecoverable",
+                                indices.len()
+                            ),
+                            true,
+                            GitOp::DiscardLines {
+                                path,
+                                diff,
+                                indices,
+                            },
+                        );
+                    }
+                }
+            }
+        }
         GitMsg::StageAll => {
             // Toggle, lazygit-style: when everything is already staged the
             // same key empties the index instead.
@@ -3763,8 +3797,10 @@ fn handle_git_msg(
             // computed off-thread on the panel model. Editable; empty when there
             // are no entity-level changes.
             let prefill = commit_message_prefill(&model.panel);
+            // Commit overlay carries the signing/hook toggles (Ctrl+S/Ctrl+N,
+            // items 328/329); shown as a badge.
             *ov.input = Some((
-                menu::InputOverlay::new("commit message", prefill),
+                menu::InputOverlay::new_commit("commit message  (^S sign · ^N hooks)", prefill),
                 GitInputKind::Commit,
             ));
         }
@@ -4441,6 +4477,7 @@ fn dispatch_menu_choice(
 fn handle_git_input_submit(
     kind: GitInputKind,
     text: String,
+    commit_toggles: Option<menu::CommitToggles>,
     panel_ui: &mut crate::panel::PanelUi,
     model: &mut FrameModel,
     wires: &GitWires<'_>,
@@ -4469,7 +4506,16 @@ fn handle_git_input_submit(
     match kind {
         GitInputKind::Commit => {
             if !require(model) {
-                enqueue(panel_ui, model, GitOp::Commit { message: text });
+                let t = commit_toggles.unwrap_or_default();
+                enqueue(
+                    panel_ui,
+                    model,
+                    GitOp::Commit {
+                        message: text,
+                        no_verify: t.no_verify,
+                        sign: t.sign,
+                    },
+                );
             }
         }
         GitInputKind::Reword { sha } => {
@@ -5493,6 +5539,42 @@ fn session_cancel_key(
 /// palette mode. All-mode is synchronous (nucleo on pre-built items); the
 /// others spawn a `spawn_blocking` worker and wake the loop on completion.
 #[allow(clippy::too_many_arguments)]
+/// Map a `TaskKind` to the short label shown in the Tasks search rows.
+fn task_kind_str(k: &superzej_core::config::TaskKind) -> &'static str {
+    use superzej_core::config::TaskKind::*;
+    match k {
+        Custom => "custom",
+        Test => "test",
+        Build => "build",
+        Lint => "lint",
+        Run => "run",
+    }
+}
+
+/// Severity → the lowercase tag the Problems search rows key their glyph on.
+fn severity_str(s: crate::panel::Severity) -> &'static str {
+    use crate::panel::Severity::*;
+    match s {
+        Error => "error",
+        Warning => "warning",
+        Info => "info",
+        Hint => "hint",
+    }
+}
+
+/// TestState → the lowercase tag the Tests search rows key their glyph on.
+fn test_state_str(s: &crate::panel::TestState) -> &'static str {
+    use crate::panel::TestState::*;
+    match s {
+        Pass => "pass",
+        Fail => "fail",
+        Skip => "skip",
+        Running => "running",
+        Unknown => "",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn kick_palette_search(
     session: &mut crate::search_everywhere::PaletteSession,
     mode: crate::search_everywhere::PaletteMode,
@@ -5500,6 +5582,8 @@ fn kick_palette_search(
     worktree_root: std::path::PathBuf,
     cfg: &superzej_core::config::Config,
     lsp: std::sync::Arc<crate::lsp::LspInner>,
+    panel: &crate::panel::PanelData,
+    tests: &crate::panel::TestPanelState,
     waker: &termwiz::terminal::TerminalWaker,
 ) {
     use crate::search_everywhere::PaletteMode;
@@ -5575,6 +5659,60 @@ fn kick_palette_search(
                 tx,
                 waker.clone(),
             );
+        }
+        // Local providers (item 523): filtered synchronously from in-memory
+        // panel state — no async worker, no generation tag.
+        PaletteMode::Tasks => {
+            let q = query.to_lowercase();
+            session.async_results.tasks = panel
+                .task_specs
+                .iter()
+                .filter(|t| q.is_empty() || t.name.to_lowercase().contains(&q))
+                .map(|t| crate::search_everywhere::TaskMatch {
+                    name: t.name.clone(),
+                    kind: task_kind_str(&t.kind).to_string(),
+                })
+                .collect();
+        }
+        PaletteMode::Problems => {
+            let q = query.to_lowercase();
+            session.async_results.problems = panel
+                .diagnostics
+                .iter()
+                .filter(|d| {
+                    q.is_empty()
+                        || d.message.to_lowercase().contains(&q)
+                        || d.file.to_lowercase().contains(&q)
+                })
+                .map(|d| crate::search_everywhere::ProblemMatch {
+                    file: d.file.clone(),
+                    line: d.line,
+                    severity: severity_str(d.severity).to_string(),
+                    message: d.message.clone(),
+                })
+                .collect();
+        }
+        PaletteMode::Tests => {
+            let q = query.to_lowercase();
+            session.async_results.tests = tests
+                .nodes
+                .iter()
+                .filter(|n| n.kind == crate::panel::TestNodeKind::Test && !n.placeholder)
+                .filter(|n| q.is_empty() || n.label.to_lowercase().contains(&q))
+                .map(|n| {
+                    let (path, line) = n
+                        .location
+                        .as_ref()
+                        .map(|l| (l.path.clone(), l.line as u64))
+                        .unwrap_or_default();
+                    crate::search_everywhere::TestMatch {
+                        label: n.label.clone(),
+                        path,
+                        line,
+                        state: test_state_str(&n.state).to_string(),
+                    }
+                })
+                .collect();
         }
     }
 }
@@ -5820,6 +5958,10 @@ async fn event_loop<T: Terminal>(
     // the palette (Option, keys first, painted last).
     let mut active_menu: Option<MenuOverlay> = None;
     let mut git_input: Option<(menu::InputOverlay, GitInputKind)> = None;
+    // The rollback / discard window (item 604) — held like the other modals
+    // (Option, keys captured first, painted last). The modal itself is the
+    // destructive op's confirm boundary; Enter enqueues a batch discard.
+    let mut rollback: Option<crate::panel::rollback::RollbackModal> = None;
     let mut host_input: Option<(menu::InputOverlay, HostInputKind)> = None;
     // A live rebase_status read is out (dedupes the safety-net re-kicks).
     let mut rebase_sync_inflight = false;
@@ -7249,6 +7391,13 @@ async fn event_loop<T: Terminal>(
                         active_menu = Some(menu::output_menu("output", &text));
                     }
                 }
+                GitOpResult::HookFailed { output } => {
+                    // Item 329: a pre-commit/commit-msg hook rejected the
+                    // commit — show its full output in the popup (not just a
+                    // truncated status line) so the user sees the why.
+                    model.status = "commit blocked by hook".into();
+                    active_menu = Some(menu::output_menu("pre-commit hook", &output));
+                }
                 GitOpResult::Err(msg) => {
                     model.status = msg;
                     // A refused rewrite (todo changed on disk) — or any
@@ -8343,6 +8492,10 @@ async fn event_loop<T: Terminal>(
             }
             if let Some(m) = &active_menu {
                 m.render(&mut scratch, screen);
+            }
+            if let Some(m) = &rollback {
+                let preview = m.preview_for(&panel_ui.hunks);
+                m.render(&mut scratch, screen, &preview);
             }
             if let Some((inp, _)) = &git_input {
                 inp.render(&mut scratch, screen);
@@ -9471,6 +9624,38 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+                // Modal: the rollback / discard window (item 604) captures all
+                // keys. Enter is the deliberate confirm — it enqueues a single
+                // batch discard partitioning tracked (restore) from untracked
+                // (delete) paths; Esc backs out without touching the tree.
+                if let Some(m) = rollback.as_mut() {
+                    match m.handle_key(&k.key, k.modifiers) {
+                        crate::panel::rollback::RollbackOutcome::Pending => {}
+                        crate::panel::rollback::RollbackOutcome::Cancel => {
+                            rollback = None;
+                            model.status = "rollback cancelled".into();
+                        }
+                        crate::panel::rollback::RollbackOutcome::Confirm => {
+                            let paths = m.marked_paths();
+                            rollback = None;
+                            if paths.is_empty() {
+                                model.status = "rollback: nothing selected".into();
+                            } else {
+                                enqueue_git_op(
+                                    GitOp::DiscardFiles { paths },
+                                    &mut panel_ui.git,
+                                    &mut model.status,
+                                    &session,
+                                    keymap.config().git.override_gpg,
+                                    &gitop_tx,
+                                    &waker,
+                                );
+                            }
+                        }
+                    }
+                    dirty = true;
+                    continue;
+                }
                 // Modal: an open git option/confirm menu captures all keys.
                 if let Some(m) = active_menu.as_mut() {
                     match m.handle_key(&k.key, k.modifiers) {
@@ -9575,7 +9760,10 @@ async fn event_loop<T: Terminal>(
                             model.status = "cancelled".into();
                         }
                         menu::InputOutcome::Submit(text) => {
-                            if let Some((_, kind)) = git_input.take() {
+                            if let Some((overlay, kind)) = git_input.take() {
+                                // The live commit toggles (items 328/329) ride on
+                                // the overlay, not the kind — capture before drop.
+                                let commit_toggles = overlay.commit_toggles();
                                 let wires = GitWires {
                                     session: &session,
                                     cfg: keymap.config(),
@@ -9592,6 +9780,7 @@ async fn event_loop<T: Terminal>(
                                 match handle_git_input_submit(
                                     kind,
                                     text,
+                                    commit_toggles,
                                     &mut panel_ui,
                                     &mut model,
                                     &wires,
@@ -9802,6 +9991,8 @@ async fn event_loop<T: Terminal>(
                                 active_tab_path(&session),
                                 &current_config,
                                 lsp_supervisor.handle(),
+                                &model.panel,
+                                &panel_ui.tests,
                                 &waker,
                             );
                         }
@@ -9950,6 +10141,34 @@ async fn event_loop<T: Terminal>(
                                 } else if let Some(sha) = key.strip_prefix("git-commit:") {
                                     let short = &sha[..sha.len().min(7)];
                                     model.status = format!("Commit {short}");
+                                    palette = None;
+                                    dirty = true;
+                                    continue;
+                                } else if let Some(name) = key.strip_prefix("run-task:") {
+                                    // Item 523: run the selected task by writing its
+                                    // command into the focused pane (same approach as
+                                    // git-branch:/git-stash:).
+                                    if let Some(task) =
+                                        model.panel.task_specs.iter().find(|t| t.name == name)
+                                    {
+                                        let mut cmd = task.command.clone();
+                                        for a in &task.args {
+                                            cmd.push(' ');
+                                            cmd.push_str(a);
+                                        }
+                                        let line = match &task.cwd {
+                                            Some(cwd) if !cwd.is_empty() => {
+                                                format!("cd {cwd} && {cmd}\n")
+                                            }
+                                            _ => format!("{cmd}\n"),
+                                        };
+                                        if let Some(focused_pane) = panes.table.get_mut(&focused) {
+                                            let _ = focused_pane.write_input(line.as_bytes());
+                                        }
+                                        model.status = format!("Running task {name}");
+                                    } else {
+                                        model.status = format!("task {name} not found");
+                                    }
                                     palette = None;
                                     dirty = true;
                                     continue;
@@ -10122,6 +10341,8 @@ async fn event_loop<T: Terminal>(
                                 active_tab_path(&session),
                                 &current_config,
                                 lsp_supervisor.handle(),
+                                &model.panel,
+                                &panel_ui.tests,
                                 &waker,
                             );
                         }
@@ -10134,6 +10355,8 @@ async fn event_loop<T: Terminal>(
                                 active_tab_path(&session),
                                 &current_config,
                                 lsp_supervisor.handle(),
+                                &model.panel,
+                                &panel_ui.tests,
                                 &waker,
                             );
                         }
@@ -13510,6 +13733,40 @@ async fn event_loop<T: Terminal>(
                                     focus.zone = crate::focus::Zone::Center;
                                     refresh_tab_model(&mut model, &session, &mut sb);
                                     need_relayout = true;
+                                }
+                            }
+                            Action::Push | Action::Pull | Action::Fetch => {
+                                // Fast-path remote ops (item 605): enqueue directly
+                                // without navigating the branches panel. The
+                                // ahead/behind cue lives on the git panel header.
+                                let op = match action {
+                                    Action::Push => GitOp::Push {
+                                        force: superzej_svc::git::ForceMode::None,
+                                    },
+                                    Action::Pull => GitOp::Pull,
+                                    _ => GitOp::Fetch,
+                                };
+                                enqueue_git_op(
+                                    op,
+                                    &mut panel_ui.git,
+                                    &mut model.status,
+                                    &session,
+                                    keymap.config().git.override_gpg,
+                                    &gitop_tx,
+                                    &waker,
+                                );
+                            }
+                            Action::Rollback => {
+                                // Open the discard window (item 604) over the
+                                // current working-tree changes. Conflicted rows
+                                // are excluded by the modal builder.
+                                let modal = crate::panel::rollback::RollbackModal::from_changes(
+                                    &model.panel.changes,
+                                );
+                                if modal.is_empty() {
+                                    model.status = "rollback: no changes to discard".into();
+                                } else {
+                                    rollback = Some(modal);
                                 }
                             }
                             Action::Yazi => {

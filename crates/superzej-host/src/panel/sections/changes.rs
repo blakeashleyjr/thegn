@@ -6,7 +6,7 @@ use superzej_core::diff_sbs::{CellKind, SbsCell, SbsFile};
 use superzej_core::theme::Hue;
 
 use crate::panel::docs::{diff_hunk_at, diff_hunk_starts};
-use crate::seg::{Line, Seg, seg, sp};
+use crate::seg::{Line, Seg, Tok, seg, sp};
 
 use crate::seg::seg_width;
 
@@ -252,14 +252,18 @@ fn wrap_preview(tok: crate::seg::Tok, mark: &str, text: &str, cols: usize) -> Ve
 /// row shows the line number, continuations blank the gutter. Returns one entry
 /// per visual row (always at least one), so an absent cell yields a single
 /// blank `w`-cell row.
-fn diff_cell(cell: Option<&SbsCell>, w: usize) -> Vec<Vec<Seg>> {
+fn diff_cell(cell: Option<&SbsCell>, w: usize, mask: Option<&[bool]>) -> Vec<Vec<Seg>> {
     let Some(cell) = cell else {
         return vec![vec![sp(w)]];
     };
-    let (fg, bg) = match cell.kind {
-        CellKind::Context => (t(), None),
-        CellKind::Removed => (hue(Hue::Red), Some(crate::seg::Tok::Sel(Hue::Red, 14))),
-        CellKind::Added => (hue(Hue::Green), Some(crate::seg::Tok::Sel(Hue::Green, 14))),
+    let (fg, hue_kind, bg) = match cell.kind {
+        CellKind::Context => (t(), None, None),
+        CellKind::Removed => (hue(Hue::Red), Some(Hue::Red), Some(Tok::Sel(Hue::Red, 14))),
+        CellKind::Added => (
+            hue(Hue::Green),
+            Some(Hue::Green),
+            Some(Tok::Sel(Hue::Green, 14)),
+        ),
     };
     let text_w = w.saturating_sub(5).max(1);
     let chars: Vec<char> = cell.text.chars().collect();
@@ -268,20 +272,51 @@ fn diff_cell(cell: Option<&SbsCell>, w: usize) -> Vec<Vec<Seg>> {
     let mut first = true;
     loop {
         let end = (i + text_w).min(chars.len());
-        let chunk: String = chars[i..end].iter().collect();
-        let pad = text_w - chunk.chars().count();
+        let pad = text_w - (end - i);
         let no_text = if first {
             format!("{:>4} ", cell.line_no)
         } else {
             "     ".to_string()
         };
         let mut no = seg(g3(), no_text);
-        let mut body = seg(fg, format!("{chunk}{}", " ".repeat(pad)));
         if let Some(bg) = bg {
             no = no.bg(bg);
-            body = body.bg(bg);
         }
-        out.push(vec![no, body]);
+        let mut segs = vec![no];
+        match (mask, bg, hue_kind) {
+            // Word-level emphasis (item 601): split the wrapped chunk into runs
+            // by the changed-mask; changed runs get a brighter tint + bold.
+            (Some(mask), Some(base_bg), Some(kh)) => {
+                let emph_bg = Tok::Sel(kh, 22);
+                let mut j = i;
+                while j < end {
+                    let changed = mask.get(j).copied().unwrap_or(false);
+                    let mut k = j + 1;
+                    while k < end && mask.get(k).copied().unwrap_or(false) == changed {
+                        k += 1;
+                    }
+                    let run: String = chars[j..k].iter().collect();
+                    let mut s = seg(fg, run).bg(if changed { emph_bg } else { base_bg });
+                    if changed {
+                        s = s.bold();
+                    }
+                    segs.push(s);
+                    j = k;
+                }
+                if pad > 0 {
+                    segs.push(seg(fg, " ".repeat(pad)).bg(base_bg));
+                }
+            }
+            _ => {
+                let chunk: String = chars[i..end].iter().collect();
+                let mut body = seg(fg, format!("{chunk}{}", " ".repeat(pad)));
+                if let Some(bg) = bg {
+                    body = body.bg(bg);
+                }
+                segs.push(body);
+            }
+        }
+        out.push(segs);
         first = false;
         i = end;
         if i >= chars.len() {
@@ -289,6 +324,17 @@ fn diff_cell(cell: Option<&SbsCell>, w: usize) -> Vec<Vec<Seg>> {
         }
     }
     out
+}
+
+/// Per-char "changed" mask aligned to a diff side's text — drives the
+/// word-level emphasis in [`diff_cell`] (item 601). Length equals the side's
+/// char count (the `word_diff` segments concatenate to the full text).
+fn changed_mask(segs: &[superzej_core::diff_highlight::WordSeg]) -> Vec<bool> {
+    let mut m = Vec::new();
+    for s in segs {
+        m.extend(std::iter::repeat_n(s.changed, s.text.chars().count()));
+    }
+    m
 }
 
 /// The flattened line at index `at`: a hunk header (one visual row) or an
@@ -314,8 +360,18 @@ fn diff_flat_line(file: &SbsFile, starts: &[usize], at: usize, side: usize) -> V
     let Some(row) = hunk.rows.get(off - 1) else {
         return vec![Line::Blank];
     };
-    let old = diff_cell(row.old.as_ref(), side);
-    let new = diff_cell(row.new.as_ref(), side);
+    // Word-level emphasis (item 601): only when a removed line is paired with
+    // an added line do we diff the two texts and emphasize just the changed
+    // runs. Pure add/del rows have nothing to diff against → no mask.
+    let (old_mask, new_mask) = match (row.old.as_ref(), row.new.as_ref()) {
+        (Some(o), Some(n)) if o.kind == CellKind::Removed && n.kind == CellKind::Added => {
+            let (os, ns) = superzej_core::diff_highlight::word_diff(&o.text, &n.text);
+            (Some(changed_mask(&os)), Some(changed_mask(&ns)))
+        }
+        _ => (None, None),
+    };
+    let old = diff_cell(row.old.as_ref(), side, old_mask.as_deref());
+    let new = diff_cell(row.new.as_ref(), side, new_mask.as_deref());
     let n = old.len().max(new.len());
     let blank = || vec![sp(side)];
     (0..n)
@@ -414,7 +470,7 @@ mod tests {
     fn diff_cell_wraps_long_text_onto_continuation_rows() {
         // side = 15 → text_w = 10. A 25-char line needs 3 rows.
         let c = cell(7, "0123456789abcdefghijklmno", CellKind::Added);
-        let rows = diff_cell(Some(&c), 15);
+        let rows = diff_cell(Some(&c), 15, None);
         assert_eq!(rows.len(), 3);
         // First row carries the line number; continuations blank the gutter.
         assert_eq!(segs_text(&rows[0]), "   7 0123456789");
@@ -429,11 +485,11 @@ mod tests {
     #[test]
     fn diff_cell_short_text_is_a_single_row() {
         let c = cell(3, "hi", CellKind::Context);
-        let rows = diff_cell(Some(&c), 15);
+        let rows = diff_cell(Some(&c), 15, None);
         assert_eq!(rows.len(), 1);
         assert_eq!(segs_text(&rows[0]), "   3 hi        ");
         // Absent cell → one blank row of full width.
-        let blank = diff_cell(None, 15);
+        let blank = diff_cell(None, 15, None);
         assert_eq!(blank.len(), 1);
         assert_eq!(seg_width(&blank[0]), 15);
     }
