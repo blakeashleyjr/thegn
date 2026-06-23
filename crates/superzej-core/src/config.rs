@@ -880,7 +880,7 @@ impl Default for StatsConfig {
             // `[stats] gpu_icon` if yours still disagrees.
             gpu_icon: "\u{f0fb2}".into(),
             battery_icon: "\u{f0079}".into(),
-            battery_charging_icon: "\u{f0084}".into(),
+            battery_charging_icon: "\u{f0e7}".into(), // nf-fa-bolt — lightning bolt
             battery_warn: 25,
             refresh_rates: vec![1.0, 2.0, 5.0, 10.0],
         }
