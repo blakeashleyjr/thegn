@@ -39,7 +39,11 @@ use std::path::PathBuf;
 /// v15: adds `group_tabs.pane_cmds` (per-leaf last foreground command, JSON
 /// `pane id → {argv, cwd}`) so a resurrected pane can offer to relaunch the
 /// program that was running after a crash or full restart.
-const SCHEMA_VERSION: i64 = 15;
+/// v16: adds `workspaces.position` — a persistent per-workspace sort key, the
+/// source of truth for sidebar workspace order (was recency). Backfilled from
+/// the prior `last_active DESC` order so the first launch after upgrade looks
+/// unchanged; thereafter order is manual (Ctrl+Alt+↑/↓) and stable.
+const SCHEMA_VERSION: i64 = 16;
 
 pub struct Db {
     conn: Connection,
@@ -512,6 +516,21 @@ impl Db {
             "UPDATE worktrees SET position = (
                  SELECT COUNT(*) FROM worktrees AS w2
                  WHERE (w2.created_at, w2.worktree) < (worktrees.created_at, worktrees.worktree)
+             ) WHERE position IS NULL",
+            [],
+        );
+        // v16: a persistent per-workspace sort key — the source of truth for
+        // sidebar workspace order (was `last_active DESC`). Additive; backfilled
+        // below.
+        let _ = conn.execute("ALTER TABLE workspaces ADD COLUMN position INTEGER", []);
+        // Backfill from the prior recency order: position 0 = most-recently
+        // active (recency is DESC, hence `>` here vs the worktrees' `<`), with
+        // repo_path as the collision-free tie-breaker. Runs once: after this
+        // every row has a position, and `put_workspace` assigns MAX+1.
+        let _ = conn.execute(
+            "UPDATE workspaces SET position = (
+                 SELECT COUNT(*) FROM workspaces AS w2
+                 WHERE (w2.last_active, w2.repo_path) > (workspaces.last_active, workspaces.repo_path)
              ) WHERE position IS NULL",
             [],
         );
@@ -1312,8 +1331,8 @@ impl Db {
     pub fn put_workspace(&self, repo_path: &str, name: &str, kind: &str) -> Result<()> {
         let now = util::now();
         self.conn.execute(
-            r#"INSERT INTO workspaces(repo_path,name,created_at,last_active,kind)
-               VALUES(?1,?2,?3,?3,?4)
+            r#"INSERT INTO workspaces(repo_path,name,created_at,last_active,kind,position)
+               VALUES(?1,?2,?3,?3,?4,(SELECT COALESCE(MAX(position),-1)+1 FROM workspaces))
                ON CONFLICT(repo_path) DO UPDATE SET name=?2, last_active=?3"#,
             params![repo_path, name, now, kind],
         )?;
@@ -1371,11 +1390,14 @@ impl Db {
         Ok(found != 0)
     }
 
-    /// All registered repos (for the sidebar / `list`), newest-active first.
+    /// All registered repos (for the sidebar / `list`), in manual `position`
+    /// order (seeded from recency at the v16 migration; reorderable via
+    /// `swap_workspace_positions`). The `last_active DESC` tie-break keeps the
+    /// order deterministic if any row's position is somehow NULL.
     pub fn workspaces(&self) -> Result<Vec<WorkspaceRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT repo_path, name, created_at, last_active, kind
-             FROM workspaces ORDER BY last_active DESC",
+             FROM workspaces ORDER BY position, last_active DESC",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(WorkspaceRow {
@@ -1704,6 +1726,40 @@ impl Db {
         self.conn.execute(
             "UPDATE worktrees SET position=?2 WHERE worktree=?1",
             params![wt, position],
+        )?;
+        Ok(())
+    }
+
+    /// Swap the persisted sort positions of two workspaces (by repo_path). The
+    /// workspace analogue of [`swap_worktree_positions`]: the sidebar's manual
+    /// workspace reorder (Ctrl+Alt+↑/↓) picks two adjacent workspaces and this
+    /// exchanges their `position` so the new order survives restart.
+    pub fn swap_workspace_positions(&self, a: &str, b: &str) -> Result<()> {
+        // Read both before writing — a self-referential CASE-UPDATE could
+        // observe its own intermediate write and clobber the swap.
+        let pos = |p: &str| -> Result<Option<i64>> {
+            Ok(self
+                .conn
+                .query_row(
+                    "SELECT position FROM workspaces WHERE repo_path=?1",
+                    params![p],
+                    |r| r.get::<_, Option<i64>>(0),
+                )
+                .optional()?
+                .flatten())
+        };
+        if let (Some(pa), Some(pb)) = (pos(a)?, pos(b)?) {
+            self.set_workspace_position(a, pb)?;
+            self.set_workspace_position(b, pa)?;
+        }
+        Ok(())
+    }
+
+    /// Set one workspace's persisted sort position (repo_path key).
+    pub fn set_workspace_position(&self, repo_path: &str, position: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE workspaces SET position=?2 WHERE repo_path=?1",
+            params![repo_path, position],
         )?;
         Ok(())
     }
@@ -2533,6 +2589,99 @@ mod tests {
         // A later refresh passing "repo" must not downgrade an existing dir.
         db.put_workspace("/d", "d", "repo").unwrap();
         assert_eq!(db.workspaces().unwrap()[0].kind, "dir");
+    }
+
+    #[test]
+    fn workspace_position_default_is_insert_order() {
+        let db = db();
+        // Inserted a, b, c — `workspaces()` returns them in that insert order
+        // (the appending MAX+1 position), independent of last_active.
+        db.put_workspace("/a", "a", "repo").unwrap();
+        db.put_workspace("/b", "b", "repo").unwrap();
+        db.put_workspace("/c", "c", "repo").unwrap();
+        let order: Vec<String> = db
+            .workspaces()
+            .unwrap()
+            .into_iter()
+            .map(|w| w.repo_path)
+            .collect();
+        assert_eq!(order, vec!["/a", "/b", "/c"]);
+
+        // Re-registering an existing workspace (upsert) keeps its position — a
+        // metadata refresh must never reshuffle the sidebar.
+        db.put_workspace("/a", "a-renamed", "repo").unwrap();
+        let order: Vec<String> = db
+            .workspaces()
+            .unwrap()
+            .into_iter()
+            .map(|w| w.repo_path)
+            .collect();
+        assert_eq!(order, vec!["/a", "/b", "/c"], "upsert must preserve position");
+    }
+
+    #[test]
+    fn swap_workspace_positions_reorders() {
+        let db = db();
+        db.put_workspace("/a", "a", "repo").unwrap();
+        db.put_workspace("/b", "b", "repo").unwrap();
+        db.put_workspace("/c", "c", "repo").unwrap();
+
+        // Swap the first two: order becomes b, a, c.
+        db.swap_workspace_positions("/a", "/b").unwrap();
+        let order: Vec<String> = db
+            .workspaces()
+            .unwrap()
+            .into_iter()
+            .map(|w| w.repo_path)
+            .collect();
+        assert_eq!(order, vec!["/b", "/a", "/c"]);
+
+        // set_workspace_position is the persist-side primitive; floating c to a
+        // fresh min puts it first.
+        db.set_workspace_position("/c", -1).unwrap();
+        let first = db.workspaces().unwrap().into_iter().next().unwrap().repo_path;
+        assert_eq!(first, "/c");
+    }
+
+    #[test]
+    fn migrates_workspaces_position_from_recency() {
+        // A pre-v16 `workspaces` table (no `position` column): the migration
+        // ALTERs the column in and backfills it so the most-recently-active
+        // workspace sorts first — preserving the old recency order on the first
+        // launch after upgrade.
+        let dir = std::env::temp_dir().join(format!("sz-db-ws-mig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA user_version = 15;
+                CREATE TABLE workspaces (
+                  repo_path TEXT PRIMARY KEY, name TEXT,
+                  created_at INTEGER, last_active INTEGER);
+                INSERT INTO workspaces(repo_path,name,created_at,last_active) VALUES
+                  ('/old',    'old',    1, 100),
+                  ('/newest', 'newest', 1, 300),
+                  ('/mid',    'mid',    1, 200);
+                "#,
+            )
+            .unwrap();
+        }
+        let db = Db::open_at(&path).unwrap();
+        let order: Vec<String> = db
+            .workspaces()
+            .unwrap()
+            .into_iter()
+            .map(|w| w.repo_path)
+            .collect();
+        assert_eq!(
+            order,
+            vec!["/newest", "/mid", "/old"],
+            "backfill must rank position 0 = most-recently-active"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
