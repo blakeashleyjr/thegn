@@ -14049,9 +14049,11 @@ mod tests {
     }
 
     /// Tests that set `XDG_STATE_HOME` race each other (the env is process
-    /// global); serialize them. Poisoning is fine to ignore — the env is
-    /// re-set by the next holder either way.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// global); serialize them. Crate-wide so `agent`'s sandbox tests (which
+    /// also redirect `XDG_STATE_HOME`) serialize against these too — a
+    /// per-module lock would leave that cross-module race open. Poisoning is
+    /// fine to ignore — the env is re-set by the next holder either way.
+    use crate::testenv::ENV_LOCK;
 
     fn one_tab_session() -> Session {
         Session {

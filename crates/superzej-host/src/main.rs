@@ -51,6 +51,8 @@ mod sidebar;
 mod stats;
 mod task;
 mod telemetry;
+#[cfg(test)]
+mod testenv;
 mod testkit;
 mod toast;
 mod wire;
