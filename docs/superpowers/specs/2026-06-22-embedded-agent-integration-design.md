@@ -10,7 +10,7 @@ superzej's agent subsystem is a **native, embedded coding harness in Rust** —
 `termite-agent` (the `apps/termite-agent` git submodule), which draws its
 decisions from the pi harness (`github.com/earendil-works/pi`) and other strong
 harnesses. This is a deliberate divergence from the original roadmap framing
-(group **R**: adapt to *external* harnesses via ACP/adapters). superzej ships its
+(group **R**: adapt to _external_ harnesses via ACP/adapters). superzej ships its
 own harness first; foreign-harness adapters become an additive, secondary path.
 
 `termite-agent` already exists and is advanced (its own `docs/ROADMAP.md`,
@@ -51,6 +51,7 @@ as the chat tile. `pump()` drains the channel and folds results into the
 transcript.
 
 Known Phase-A limitations (tracked, not blockers):
+
 - No mid-turn cancellation (the blocking provider call isn't abortable); `Esc`
   while idle leaves the tab, while busy it's swallowed.
 - Tool-progress is returned in one batch when the turn completes
@@ -66,7 +67,7 @@ When `[llm_proxy].enabled`, `build_provider` points the OpenAI-compatible base U
 at `http://{llm_proxy.listen}/v1` (the local `szproxy`) and **mints a per-worktree
 scoped virtual key** (`mint_proxy_key` → `db.put_proxy_virtual_key`, scope
 `worktree:<path>`), using it as the provider key — the master key never reaches
-the harness. The proxy authenticates by the bearer token (which *is* the key id;
+the harness. The proxy authenticates by the bearer token (which _is_ the key id;
 `resolve_identity` → `proxy_virtual_key`) and attributes spend to the scope. The
 key is **revoked on tab teardown** (`AppTile::shutdown` → `revoke_proxy_virtual_key`).
 When no model is configured, a stand-in `UnconfiguredProvider` returns a
@@ -113,4 +114,4 @@ truth; richer transcript/fleet views are group-S follow-ons.
 - With `[llm_proxy].enabled` + `szproxy` running and `OPENAI_API_KEY` set, a turn
   crosses the proxy (proxy logs).
 - `cargo test -p superzej-host apps::` and `cargo test -p superzej-core --lib
-  config::tests`.
+config::tests`.

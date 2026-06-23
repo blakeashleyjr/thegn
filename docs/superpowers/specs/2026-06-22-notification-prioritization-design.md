@@ -10,9 +10,9 @@ three ad-hoc mechanisms that disagree:
 
 - **Desktop toasts** gate on `NotificationUrgency` (Low/Normal/Critical) computed
   from `Event` in `event_bus.rs` — independent of the inbox.
-- **Sidebar alert badge** counts a *hardcoded* kind list in SQL
+- **Sidebar alert badge** counts a _hardcoded_ kind list in SQL
   (`db::get_alert_counts_by_worktree`: `test_failed, agent_failed, log_error,
-  process_failed`).
+process_failed`).
 - **Panel header flag** (`panel/sections/mod.rs`, `Section::Notifications` arm)
   renders a red `⚑ {unread}` from `panel.unread_notifications` — the count of **all**
   unread. So an informational `worktree_created` + `process_exited` shows as a red
@@ -29,11 +29,11 @@ coherently drives the red flag, the neutral unread count, and desktop toasts.
 
 ## Model (three tiers)
 
-| Priority | Drives | Default kinds |
-|----------|--------|---------------|
-| **Alert** | red ⚑ flag + Critical desktop toast | `AgentFailed, TestFailed, LogError, ProcessFailed` |
-| **Notice** | neutral unread count, no red flag, Normal toast | `Assigned, Mentioned, StatusChanged, BlockerResolved, PrLinked, Overdue, PrStateChanged, AgentDone` |
-| **Info** | inbox list only — never counted, Low toast (below default threshold) | `WorktreeCreated, ProcessExited` |
+| Priority   | Drives                                                               | Default kinds                                                                                       |
+| ---------- | -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| **Alert**  | red ⚑ flag + Critical desktop toast                                  | `AgentFailed, TestFailed, LogError, ProcessFailed`                                                  |
+| **Notice** | neutral unread count, no red flag, Normal toast                      | `Assigned, Mentioned, StatusChanged, BlockerResolved, PrLinked, Overdue, PrStateChanged, AgentDone` |
+| **Info**   | inbox list only — never counted, Low toast (below default threshold) | `WorktreeCreated, ProcessExited`                                                                    |
 
 Decisions:
 
@@ -67,11 +67,11 @@ bucketing (loses the efficient grouped-by-worktree counts hydrate relies on).
   kind-derived priority agrees with `NotificationUrgency::from_event` for the
   overlapping events.
 - **`superzej-core/src/config.rs`** (`NotificationsConfig`) — `priority:
-  BTreeMap<String,String>`; `priority_of(kind) -> Priority`; helpers
+BTreeMap<String,String>`; `priority_of(kind) -> Priority`; helpers
   `alert_kind_names()` and `counted_unread_kind_names()` (= Alert+Notice, Info
   excluded) that classify `NotificationKind::ALL` via `priority_of`.
 - **`superzej-core/src/db.rs`** — `get_alert_counts_by_worktree(alert_kinds:
-  &[&str])` and `get_unread_counts_by_worktree(counted_kinds: &[&str])` build a
+&[&str])` and `get_unread_counts_by_worktree(counted_kinds: &[&str])` build a
   dynamic `kind IN (?, …)` clause from the passed slice (empty slice → empty map).
 - **`superzej-host/src/hydrate.rs`** — pass the config-derived sets to the two
   queries; compute `panel.alert_notifications` (unread Alert) and
