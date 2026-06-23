@@ -324,7 +324,7 @@ close, `<`/`>` width, digits quick-jump._
 - [ ] 35. Per-workspace default program set
 - [~] 36. Per-workspace keybinds
 - [x] 37. Non-git directory as workspace _(workspace `kind` repo|dir; insert-only; folder glyph in sidebar)_
-- [ ] 38. Workspace-level env vars
+- [ ] 38. Workspace-level env vars _(subsumed by env bundles — AU 684–697; a workspace binds a bundle via `[workspace.<slug>].env_bundle`)_
 - [ ] 39. Workspace icon/color label
 - [x] 40. Recent/favorite workspaces
 
@@ -1207,6 +1207,39 @@ than inventing new ones._
 - [ ] 681. Release ↔ worktree/PR linkage — surface a repo's latest/relevant release in the sidebar/panel; cut a release from the current worktree's HEAD or a merged PR (generalizes Z 336, feeds B 28)
 - [ ] 682. Release notifications — published / new-release / pre-release events into the notification bus and the cross-forge feed (AI 419–430, AT 652)
 - [ ] 683. Per-forge release config — default target branch, tag/version naming templates, draft-by-default, asset glob patterns in project config (rides 186)
+
+### AU. Environment bundles (.env / dotfiles / profiles)
+
+Design approved (2026-06-22): `docs/superpowers/specs/2026-06-22-env-bundles-design.md`.
+The **soft middle** between per-agent account switching (656) and the
+heavyweight process-profile firewall (H 101–110): named **bundles** of env vars
+
+- credential/config-dir redirection + dotfiles + per-provider account selection,
+  **bound at any scope** (global/workspace/worktree) and injected at the pane-spawn
+  seam — so "work vs personal" differs _within one process_ and "multiple Claude
+  profiles" is just a bundle's `accounts.claude` + identity. Generalizes
+  `account.rs` (it becomes a bundle consumer); AI-free track (additive). Locked:
+  **(1)** complementary lighter layer, not a firewall replacement; **(2)** three
+  dotfile tiers — config-dir redirect (default) / materialized dotfiles / synthetic
+  HOME; **(3)** named bundles **+** opt-in, allowlisted `.env`; **(4)** `env:` +
+  pluggable secret resolvers, never persisted. Closes the
+  `spawn_with_env` inherit-everything leak (shared with H's firewall) and fills
+  items 38 (workspace env vars) and the env-restore half of 54/657.
+
+* [ ] 684. `env::compose()` + `ResolvedEnv` — single resolution seam returning overrides/block/mounts; subsumes the account/scoped-key logic in `agent::launch_spec_with_key` (Phase A)
+* [ ] 685. Bundle config schema — `[bundle.<name>]` (env/accounts/config_dirs/dotfiles/home/dotenv/extends) + `[workspace.<slug>].env_bundle` (Phase A)
+* [ ] 686. Per-scope bundle bindings — generalize `account.rs` precedence to `bundle:[ws:|wt:]` over `ui_state` (worktree → workspace cfg → workspace ptr → global) (Phase A)
+* [ ] 687. Tier-1 config-dir redirection — `CLAUDE_CONFIG_DIR`/`CODEX_HOME`/`GIT_CONFIG_GLOBAL`/`GH_CONFIG_DIR`/`GNUPGHOME`, no file ops; the implicit default tier (Phase A)
+* [ ] 688. Shell-pane wiring — route **every** pane spawn (agent _and_ plain shell) through `env::compose`, so shells inherit the bundle identity (Phase A)
+* [ ] 689. Clear-then-allowlist base env in `spawn_with_env` — curated base + bundle on top; closes the inherit-everything cred leak (shared prerequisite with H) (Phase A)
+* [ ] 690. `account.rs` becomes a bundle consumer — account selection is a bundle field; precedence helpers lifted to bundle scopes (Phase A)
+* [ ] 691. Pluggable secret resolvers — `pass:`/`sops:`/`op://`/`agenix:`/`cmd:` over `expand_env_ref`; resolved off-loop at launch, never persisted, graceful degrade (Phase B)
+* [ ] 692. Opt-in `.env` loading — direnv-style discovery gated by `dotenv = true` + per-path content-hash allowlist in `ui_state` (Phase C)
+* [ ] 693. `.env` security boundary — low precedence (never overrides bundle creds) + credential-shaped-key filter (`*_TOKEN`/`*_KEY`/`*_SECRET`/`*_PASSWORD`) (Phase C)
+* [ ] 694. Tier-2 materialized dotfiles — symlink/template a source tree into a managed per-bundle HOME; idempotent, off the event loop (diff-watcher pattern) (Phase D)
+* [ ] 695. Tier-3 synthetic HOME — `home = "managed"` roots panes at the bundle HOME; path-preserving sandbox mount (Phase D)
+* [ ] 696. Bundle switcher UI — status-bar chip (extends the account chip 656) + palette command to bind the active bundle at worktree/workspace/global scope (Phase E)
+* [ ] 697. Multiple Claude profiles (worked example) — `work`/`personal` bundles selecting `accounts.claude` + git identity + proxy endpoint, hot-swapped per scope (consumes 684–696; ties 656, AR virtual keys 287)
 
 ### AI-free mode (audience-widener)
 
