@@ -763,7 +763,9 @@ pub fn run_worker(
     let prep = |backend: &str, wt: &Path| -> anyhow::Result<crate::agent::SandboxOutcome> {
         let wt_s = wt.to_string_lossy();
         let loc = GitLoc::from_db(&wt_s, None);
-        crate::agent::prepare_sandbox(cfg, root, &wt_s, &loc, Some(backend))
+        // The wizard passes the user's fresh, explicit pick — it must win over
+        // the configured default backend, so `choice_is_explicit = true`.
+        crate::agent::prepare_sandbox(cfg, root, &wt_s, &loc, Some(backend), true)
     };
     // The auto chain's host fallback is visible in the step detail; an
     // explicit choice that can't be honored errors instead (no silent host
