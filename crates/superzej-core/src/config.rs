@@ -870,16 +870,19 @@ impl Default for StatsConfig {
             refresh_secs: 2.0,
             // Nerd Font glyphs by default (the bundled alacritty profile ships
             // a Nerd Font); set plain text ("CPU") if your font lacks them.
+            //
+            // All stat icons MUST come from the single-width PUA sets
+            // (U+E000–U+F8FF, e.g. nf-fa-*). The cell math here and in chrome is
+            // `chars().count()` == 1 per glyph, and these glyphs advance exactly
+            // one cell. The plane-15 Material Design Icon set (`nf-md-*`,
+            // U+F0000+) advances TWO cells in most Nerd Fonts, so an MDI icon
+            // shoves its value ~1 cell right and breaks icon/value alignment —
+            // do not use them here.
             cpu_icon: "\u{f4bc}".into(),
             mem_icon: "\u{efc5}".into(),
-            net_icon: "\u{f06f3}".into(),
-            // Material Design "expansion-card-variant" (the canonical GPU
-            // glyph), same MDI family as the net icon so it fills the cell
-            // like its neighbors. The old FA microchip (U+F2DB) rendered
-            // visibly smaller. Glyph metrics are font-specific — override via
-            // `[stats] gpu_icon` if yours still disagrees.
-            gpu_icon: "\u{f0fb2}".into(),
-            battery_icon: "\u{f0079}".into(),
+            net_icon: "\u{f1eb}".into(), // nf-fa-wifi
+            gpu_icon: "\u{f2db}".into(), // nf-fa-microchip
+            battery_icon: "\u{f240}".into(), // nf-fa-battery_full
             battery_charging_icon: "\u{f0e7}".into(), // nf-fa-bolt — lightning bolt
             battery_warn: 25,
             refresh_rates: vec![1.0, 2.0, 5.0, 10.0],
@@ -2982,12 +2985,29 @@ name = "minimal"
     fn stats_defaults() {
         let s = StatsConfig::default();
         assert_eq!(s.refresh_secs, 2.0);
-        // Nerd Font glyphs by default; overridable to plain text.
+        // Nerd Font glyphs by default; overridable to plain text. All must be
+        // single-width PUA glyphs (U+E000–U+F8FF) so the icon sits flush with
+        // its value — plane-15 MDI glyphs (U+F0000+) double-advance and leave a
+        // gap. See StatsConfig::default.
+        for (name, icon) in [
+            ("cpu", &s.cpu_icon),
+            ("mem", &s.mem_icon),
+            ("net", &s.net_icon),
+            ("gpu", &s.gpu_icon),
+            ("battery", &s.battery_icon),
+            ("battery_charging", &s.battery_charging_icon),
+        ] {
+            let cp = icon.chars().next().unwrap() as u32;
+            assert!(
+                (0xE000..=0xF8FF).contains(&cp),
+                "{name} icon U+{cp:04X} must be single-width PUA (U+E000–U+F8FF)"
+            );
+        }
         assert_eq!(s.cpu_icon, "\u{f4bc}");
         assert_eq!(s.mem_icon, "\u{efc5}");
-        assert_eq!(s.net_icon, "\u{f06f3}");
-        assert_eq!(s.gpu_icon, "\u{f0fb2}");
-        assert_eq!(s.battery_icon, "\u{f0079}");
+        assert_eq!(s.net_icon, "\u{f1eb}"); // nf-fa-wifi
+        assert_eq!(s.gpu_icon, "\u{f2db}"); // nf-fa-microchip
+        assert_eq!(s.battery_icon, "\u{f240}"); // nf-fa-battery_full
         // nf-fa-bolt — lightning bolt shown while charging.
         assert_eq!(s.battery_charging_icon, "\u{f0e7}");
         assert_eq!(s.battery_warn, 25);

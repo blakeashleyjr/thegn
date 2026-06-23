@@ -114,11 +114,14 @@ clock_format = "%H:%M"
 # Icons can be text ("CPU") or unicode symbols ("⚡"). GPU shows only if detected.
 [stats]
 refresh-secs = 2           # Polling interval in seconds
-# Icons default to Nerd Font glyphs; set plain text if your font lacks them.
+# Icons default to single-width Nerd Font glyphs; set plain text if your font
+# lacks them. Use single-width PUA glyphs (U+E000–U+F8FF, e.g. nf-fa-*) only —
+# the plane-15 Material Design set (nf-md-*, U+F0000+) advances two cells and
+# leaves a gap between the icon and its value.
 # cpu-icon = "CPU"
 # mem-icon = "MEM"
 # net-icon = "NET"
-# gpu-icon = "GPU"              # default is the MDI expansion-card glyph (override if your font renders it oddly)
+# gpu-icon = "GPU"              # shows only if a GPU is detected
 # battery-icon = "BAT"          # discharging icon
 # battery-charging-icon = "CHG" # shown while charging / on AC
 battery-warn = 25               # red at/below this percent
