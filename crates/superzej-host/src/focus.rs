@@ -357,8 +357,14 @@ mod tests {
             FocusMove::Enter(Zone::Statusbar)
         );
         // Left/right dead-end (those keys drive yazi while focused).
-        assert_eq!(route(Zone::Drawer, Move::Left, &ctx_drawer(&l, 1)), FocusMove::None);
-        assert_eq!(route(Zone::Drawer, Move::Right, &ctx_drawer(&l, 1)), FocusMove::None);
+        assert_eq!(
+            route(Zone::Drawer, Move::Left, &ctx_drawer(&l, 1)),
+            FocusMove::None
+        );
+        assert_eq!(
+            route(Zone::Drawer, Move::Right, &ctx_drawer(&l, 1)),
+            FocusMove::None
+        );
         // Statusbar steps back up through the drawer when it's open.
         assert_eq!(
             route(Zone::Statusbar, Move::Up, &ctx_drawer(&l, 1)),
