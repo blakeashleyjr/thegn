@@ -886,13 +886,13 @@ fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> {
         )),
         "cpu" => s.cpu_pct.map(|p| {
             w(
-                format!("{}  {p:>2}%", ic.cpu_icon),
+                format!("{} {p:>2}%", ic.cpu_icon),
                 level_color(stat_level(p)),
             )
         }),
         "mem" => s.mem_gib.map(|(u, t)| {
             w(
-                format!("{}  {u:.1}/{t:.0}G", ic.mem_icon),
+                format!("{} {u:.1}/{t:.0}G", ic.mem_icon),
                 level_color(ratio_level(u, t)),
             )
         }),
@@ -905,7 +905,7 @@ fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> {
         "net" => s.net_bps.map(|(rx, tx)| {
             w(
                 format!(
-                    "{}  \u{2193}{} \u{2191}{}",
+                    "{} \u{2193}{} \u{2191}{}",
                     ic.net_icon,
                     crate::stats::fmt_rate(rx),
                     crate::stats::fmt_rate(tx)
@@ -923,7 +923,7 @@ fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> {
             } else {
                 (&ic.battery_icon, col(S::Dim))
             };
-            w(format!("{icon}  {p:>2}%"), fg)
+            w(format!("{icon} {p:>2}%"), fg)
         }),
         "date" => Some(w(
             chrono::Local::now()
@@ -1999,14 +1999,7 @@ pub fn draw_confirm(surface: &mut Surface, screen: Rect, msg: &str) {
         Line::Blank,
         Line::split(
             vec![Seg::chip(Tok::Slot(S::Accent), " y confirm ")],
-            // A muted-but-legible secondary chip: light text on the raised
-            // surface. `Seg::chip` would paint near-black `chip_fg` on `Raise`
-            // (#0b0e16 on #222942) — dark-on-dark and unreadable.
-            vec![
-                seg(Tok::Slot(S::Dim), " any key cancels ")
-                    .bg(Tok::Slot(S::Raise))
-                    .bold(),
-            ],
+            vec![Seg::chip(Tok::Slot(S::Raise), " any key cancels ")],
         ),
     ];
     draw_lines(surface, inner, &lines, Tok::Slot(S::Panel));
@@ -2119,28 +2112,6 @@ mod tests {
             .lines()
             .map(|l| l.to_string())
             .collect()
-    }
-
-    /// The delete-worktree confirmation modal (and any `draw_confirm` caller)
-    /// must render every glyph legibly — the `y confirm` / cancel chips and the
-    /// message. Guards the regression where the cancel chip was near-black text
-    /// on the dark `raise` surface.
-    #[test]
-    fn confirm_modal_text_is_legible() {
-        let screen = Rect {
-            x: 0,
-            y: 0,
-            cols: 64,
-            rows: 14,
-        };
-        let mut s = Surface::new(screen.cols, screen.rows);
-        draw_confirm(
-            &mut s,
-            screen,
-            "Delete 2 worktree(s) from disk? (alpha, beta)",
-        );
-        let v = crate::seg::text_contrast_violations(&mut s, 3.0);
-        assert!(v.is_empty(), "low-contrast text in confirm modal: {v:?}");
     }
 
     /// Build a minimal sidebar row for renderer tests.

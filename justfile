@@ -204,6 +204,13 @@ proxy_cov_ignore := 'superzej-proxy/src/(main|lib)\.rs'
 # Coverage gate: core ≥95% lines + proxy ≥88% lines. Writes lcov to target/coverage.
 coverage: _apps
     mkdir -p target/coverage
+    # Wipe stale coverage data first. Leftover .profraw/.profdata from an earlier
+    # run — built under a different crate hash (e.g. after any source edit) —
+    # otherwise merges a dead second instantiation of every generic/macro-expanded
+    # fn (the config_enum! impls especially), whose lines all count as "missed".
+    # That silently drops the reported % below the gate and fails the pre-push
+    # hook even though real coverage is fine. A clean slate makes the gate honest.
+    cargo llvm-cov clean --workspace
     cargo llvm-cov -p superzej-core --lib --fail-under-lines 95 \
       --ignore-filename-regex '{{cov_ignore}}' \
       --lcov --output-path target/coverage/lcov.info
@@ -223,7 +230,7 @@ coverage-html:
 # Comprehensive linting: rust (clippy), bash (shellcheck), yaml (yamllint), toml (taplo).
 lint: _apps
     cargo clippy --workspace --all-targets -- -D warnings
-    shellcheck -x install.sh test/smoke.sh test/pty-smoke.sh test/install-plan.sh test/dev-tui-plan.sh test/sandbox-network.sh test/git-hooks/post-checkout.sh
+    shellcheck -x install.sh test/smoke.sh test/pty-smoke.sh test/install-plan.sh test/dev-tui-plan.sh test/sandbox-network.sh
     yamllint .
     taplo lint
 
@@ -313,7 +320,19 @@ attach: start
 # Build and open the native host in a fresh alacritty window (optimized
 # profile: no decorations, no outer scrollback — the host owns both), with only
 # the instance's isolated XDG state injected.
-start-term name="dev": build
+#
+# Runs the `profiling` build (release-grade speed — ~2.5x faster than debug —
+# with symbols) and turns on the full perf suite, so a `start-term` session is
+# realistic AND fully observable:
+#   - `SUPERZEJ_PERF=1` + `SUPERZEJ_LOG=info,szhost::perf=debug` write the startup
+#     waterfall and the periodic `szhost::perf` rollup (wakes/s, render p50/p99,
+#     per-subsystem CPU, wake-source attribution, wake-storm warnings) to
+#     $XDG_STATE_HOME/superzej/logs/szhost.log — safe for the TUI (file sink only).
+#   - the `profiling` feature arms the SIGUSR2 flamegraph profiler.
+#   - the in-app Telemetry "LOOP" overlay (System tab → Telemetry) is also live.
+# Tail it with: tail -f ~/.superzej-{{name}}/state/superzej/logs/szhost.log
+start-term name="dev": _apps
+    cargo build --profile profiling --features profiling -p superzej-host
     state="$HOME/.superzej-{{name}}/state"; run="$HOME/.superzej-{{name}}/run"; pidfile="$run/szhost.pid"; mkdir -p "$state" "$run"; \
       if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then kill "$(cat "$pidfile")" 2>/dev/null || true; fi; \
       setsid -f alacritty --config-file "$PWD/config/alacritty.toml" -e sh -lc \
@@ -321,7 +340,9 @@ start-term name="dev": build
       sh "$pidfile" \
       "SUPERZEJ_ALACRITTY_CONFIG=$PWD/config/alacritty.toml" \
       "XDG_STATE_HOME=$state" \
-      "$PWD/{{bin}}"
+      "SUPERZEJ_PERF=1" \
+      "SUPERZEJ_LOG=info,szhost::perf=debug" \
+      "$PWD/target/profiling/szhost"
 
 # Install/update the native superzej host onto your PATH (standalone, non-Nix):
 # builds release artifacts, installs `sj` as the dedicated alacritty launcher,
