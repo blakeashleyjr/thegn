@@ -204,6 +204,13 @@ proxy_cov_ignore := 'superzej-proxy/src/(main|lib)\.rs'
 # Coverage gate: core ≥95% lines + proxy ≥88% lines. Writes lcov to target/coverage.
 coverage: _apps
     mkdir -p target/coverage
+    # Wipe stale coverage data first. Leftover .profraw/.profdata from an earlier
+    # run — built under a different crate hash (e.g. after any source edit) —
+    # otherwise merges a dead second instantiation of every generic/macro-expanded
+    # fn (the config_enum! impls especially), whose lines all count as "missed".
+    # That silently drops the reported % below the gate and fails the pre-push
+    # hook even though real coverage is fine. A clean slate makes the gate honest.
+    cargo llvm-cov clean --workspace
     cargo llvm-cov -p superzej-core --lib --fail-under-lines 95 \
       --ignore-filename-regex '{{cov_ignore}}' \
       --lcov --output-path target/coverage/lcov.info
