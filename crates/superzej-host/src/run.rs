@@ -1910,7 +1910,22 @@ fn remove_workspace(
     display: &str,
 ) -> String {
     let db = superzej_core::db::Db::open().ok();
+    remove_workspace_with_db(session, panes, db.as_ref(), repo_path, slug);
+    format!("Removed workspace '{display}' (files kept on disk)")
+}
 
+/// Engine for [`remove_workspace`], split from the process-global `Db::open()`
+/// so tests can inject an isolated DB. Closes the workspace's live groups
+/// (always, reaping their panes) and — when a `db` is present — prunes every DB
+/// trace and persists the trimmed layout. Non-destructive: never touches the
+/// worktree files on disk.
+fn remove_workspace_with_db(
+    session: &mut crate::session::Session,
+    panes: &mut Panes,
+    db: Option<&superzej_core::db::Db>,
+    repo_path: &str,
+    slug: &str,
+) {
     // Close (forget, never delete from disk) the workspace's live groups,
     // highest index first so earlier indices stay valid as groups are removed.
     let mut targets: Vec<usize> = session
@@ -1928,7 +1943,7 @@ fn remove_workspace(
         if gi >= session.worktrees.len() {
             continue;
         }
-        if let Some(db) = &db {
+        if let Some(db) = db {
             forget_worktree_group(db, &session.id, &session.worktrees[gi]);
         }
         for tab in &session.worktrees[gi].tabs {
@@ -1940,7 +1955,7 @@ fn remove_workspace(
         session.close_active_group();
     }
 
-    if let Some(db) = &db {
+    if let Some(db) = db {
         // Prune every DB trace so the workspace doesn't re-render or resurrect.
         let _ = db.del_worktrees_for_repo(repo_path);
         let _ = db.del_workspace(repo_path);
@@ -1952,8 +1967,19 @@ fn remove_workspace(
         // resurrect the closed groups on the next launch (see `delete_groups`).
         let _ = session.persist(db, &session.id, now_secs());
     }
+}
 
-    format!("Removed workspace '{display}' (files kept on disk)")
+/// Drop a just-removed workspace (and the registered-worktree rows its
+/// empty-live-groups branch would re-render) from the cached sidebar lists that
+/// [`refresh_tab_model`] rebuilds from. Without this the row lingers until the
+/// next full hydration re-reads the DB, so [`remove_workspace`] appears to do
+/// nothing. Kept as a free fn so the prune is exercised by the same code the
+/// event loop runs, not a copy.
+fn forget_workspace_in_model(model: &mut FrameModel, slug: &str, repo_path: &str) {
+    model
+        .sidebar_workspaces
+        .retain(|(s, _, _, p)| !(s == slug && p == repo_path));
+    model.sidebar_db_worktrees.retain(|w| w.slug != slug);
 }
 
 /// Remove group `gi` from the session (its dir vanished from disk — deleted
@@ -9551,22 +9577,30 @@ async fn event_loop<T: Terminal>(
                 // Modal: a pending destructive action swallows the next key.
                 if let Some((_, action)) = pending_confirm.take() {
                     if matches!(k.key, KeyCode::Char('y') | KeyCode::Char('Y')) {
-                        model.status = match action {
+                        match action {
                             PendingAction::DeleteWorktrees(targets) => {
-                                delete_groups(&mut session, &mut panes, targets)
+                                model.status =
+                                    delete_groups(&mut session, &mut panes, targets);
                             }
                             PendingAction::RemoveWorkspace {
                                 repo_path,
                                 slug,
                                 display,
-                            } => remove_workspace(
-                                &mut session,
-                                &mut panes,
-                                &repo_path,
-                                &slug,
-                                &display,
-                            ),
-                        };
+                            } => {
+                                model.status = remove_workspace(
+                                    &mut session,
+                                    &mut panes,
+                                    &repo_path,
+                                    &slug,
+                                    &display,
+                                );
+                                // refresh_tab_model rebuilds the workspace list
+                                // from a cached (non-DB) snapshot, so the just-
+                                // pruned workspace would otherwise linger until
+                                // the next full hydration. Drop it now.
+                                forget_workspace_in_model(&mut model, &slug, &repo_path);
+                            }
+                        }
                         sb.marked.clear();
                         refresh_tab_model(&mut model, &session, &mut sb);
                         sb.focus_active_row(&mut model);
@@ -15624,6 +15658,133 @@ mod tests {
             "sidebar should include newly-created worktrees immediately: {:?}",
             sidebar_labels(&model)
         );
+    }
+
+    #[test]
+    fn removing_workspace_drops_its_rows_without_a_hydration() {
+        // Regression: "Remove workspace" pruned the DB + live groups but the
+        // sidebar row lingered, because refresh_tab_model rebuilds the workspace
+        // list from a cached (non-DB) snapshot. The post-confirm handler now
+        // prunes the cached lists synchronously; refresh_tab_model must then
+        // render no trace of the removed workspace.
+        let session = one_tab_session(); // only "app/home" is live
+        let mut model = build_initial_model(&session, None);
+        let mut sb = SidebarState::default();
+
+        // Two DB-backed workspaces in the cached list; "lib" has no live group.
+        model.sidebar_workspaces = vec![
+            ("app".into(), "app".into(), "repo".into(), "/tmp/app".into()),
+            ("lib".into(), "lib".into(), "repo".into(), "/tmp/lib".into()),
+        ];
+        model.sidebar_db_worktrees = vec![crate::sidebar::DbWorktree {
+            slug: "lib".into(),
+            branch: "home".into(),
+            repo_path: "/tmp/lib".into(),
+            tab_name: "lib/home".into(),
+            path: "/tmp/lib".into(),
+        }];
+
+        // The synchronous prune the RemoveWorkspace handler performs (same code).
+        forget_workspace_in_model(&mut model, "lib", "/tmp/lib");
+
+        refresh_tab_model(&mut model, &session, &mut sb);
+
+        assert!(
+            !model
+                .sidebar_rows
+                .iter()
+                .any(|r| r.workspace_slug == "lib"),
+            "removed workspace and its worktrees should vanish: {:?}",
+            sidebar_labels(&model)
+        );
+        assert!(
+            model
+                .sidebar_rows
+                .iter()
+                .any(|r| r.kind == crate::sidebar::RowKind::Workspace
+                    && r.workspace_slug == "app"),
+            "surviving workspace should still render: {:?}",
+            sidebar_labels(&model)
+        );
+    }
+
+    #[test]
+    fn remove_workspace_with_db_prunes_db_and_closes_live_groups() {
+        // The engine behind "Remove workspace": it must close every live group
+        // the workspace owns AND prune its DB rows (workspaces row, worktree
+        // registry, active-workspace pointer) so the workspace neither renders
+        // nor resurrects — while leaving sibling workspaces untouched.
+        let db_path = std::env::temp_dir().join(format!(
+            "sj-host-remove-ws-{}-{}.sqlite",
+            std::process::id(),
+            now_secs()
+        ));
+        let db = superzej_core::db::Db::open_at(&db_path).unwrap();
+        db.put_workspace("/tmp/repo-app", "app", "repo").unwrap();
+        db.put_workspace("/tmp/repo-lib", "lib", "repo").unwrap();
+        db.put_worktree("lib/home", "/tmp/repo-lib", "/tmp/repo-lib", "home", None)
+            .unwrap();
+        db.put_worktree(
+            "lib/feat",
+            "/tmp/repo-lib",
+            "/tmp/repo-lib-feat",
+            "feat",
+            None,
+        )
+        .unwrap();
+        db.put_worktree("app/home", "/tmp/repo-app", "/tmp/repo-app", "home", None)
+            .unwrap();
+        db.set_active_workspace("/tmp/repo-lib").unwrap();
+
+        let mut session = Session {
+            id: "/tmp/repo-lib".into(),
+            worktrees: vec![
+                WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/repo-app"),
+                WorktreeGroup::new("lib/home", GroupKind::Home, "/tmp/repo-lib"),
+                WorktreeGroup::new("lib/feat", GroupKind::Branch, "/tmp/repo-lib-feat"),
+            ],
+            active: 1,
+        };
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(PANE_EVENT_CHANNEL_CAPACITY);
+        let mut panes = Panes::new(tx);
+
+        remove_workspace_with_db(&mut session, &mut panes, Some(&db), "/tmp/repo-lib", "lib");
+
+        // Live groups: every "lib/*" group is closed; the sibling survives.
+        let names: Vec<&str> = session.worktrees.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, vec!["app/home"], "all lib groups closed: {names:?}");
+
+        // DB: the workspace row and its registry rows are gone; app stays.
+        let ws: Vec<String> = db
+            .workspaces()
+            .unwrap()
+            .into_iter()
+            .map(|w| w.repo_path)
+            .collect();
+        assert!(ws.contains(&"/tmp/repo-app".to_string()), "sibling kept: {ws:?}");
+        assert!(
+            !ws.contains(&"/tmp/repo-lib".to_string()),
+            "removed workspace row pruned: {ws:?}"
+        );
+        let wt_roots: Vec<String> = db
+            .worktrees()
+            .unwrap()
+            .into_iter()
+            .map(|w| w.repo_root)
+            .collect();
+        assert!(
+            !wt_roots.iter().any(|p| p == "/tmp/repo-lib"),
+            "registry rows pruned: {wt_roots:?}"
+        );
+        assert!(
+            wt_roots.iter().any(|p| p == "/tmp/repo-app"),
+            "sibling registry row kept: {wt_roots:?}"
+        );
+
+        // The active-workspace pointer (was the removed repo) is cleared.
+        assert_eq!(db.active_workspace().unwrap(), None);
+
+        let _ = std::fs::remove_file(&db_path);
     }
 
     #[test]
