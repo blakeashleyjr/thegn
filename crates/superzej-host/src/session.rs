@@ -411,30 +411,6 @@ impl Session {
         self.active
     }
 
-    /// Rewrite every pane id in the session through `f`, keeping each tab's
-    /// `center` tree, `focused_pane`, and the `pane_cwds` hint map consistent.
-    /// Used to move a cold-resurrected workspace onto a fresh, disjoint id
-    /// range so its persisted ids can't collide with the live panes of other
-    /// resident workspaces (which are no longer reaped on a switch).
-    pub fn remap_pane_ids(&mut self, mut f: impl FnMut(u32) -> u32) {
-        for g in &mut self.worktrees {
-            for tab in &mut g.tabs {
-                tab.center.remap(&mut |id| f(id));
-                tab.focused_pane = f(tab.focused_pane);
-                tab.pane_cwds = tab
-                    .pane_cwds
-                    .iter()
-                    .map(|(id, cwd)| (f(*id), cwd.clone()))
-                    .collect();
-                tab.pane_cmds = tab
-                    .pane_cmds
-                    .iter()
-                    .map(|(id, cmd)| (f(*id), cmd.clone()))
-                    .collect();
-            }
-        }
-    }
-
     /// Focus the group at `idx` (clamped); no-op if empty.
     pub fn switch_to(&mut self, idx: usize) {
         if !self.worktrees.is_empty() {
@@ -804,39 +780,6 @@ mod tests {
         s.switch_to_tab(9, 9);
         assert_eq!(s.active, 0);
         assert_eq!(s.active_group().unwrap().active_tab, 0);
-    }
-
-    #[test]
-    fn remap_pane_ids_rewrites_trees_focus_and_cwds() {
-        let mut s = Session::default();
-        let mut g = group("a");
-        g.tabs[0].center = CenterTree::Split {
-            dir: Dir::Row,
-            children: vec![
-                Branch {
-                    weight: 1.0,
-                    child: CenterTree::Leaf(3),
-                },
-                Branch {
-                    weight: 1.0,
-                    child: CenterTree::Leaf(7),
-                },
-            ],
-        };
-        g.tabs[0].focused_pane = 7;
-        g.tabs[0].pane_cwds.insert(3, "/a".into());
-        g.tabs[0].pane_cwds.insert(7, "/b".into());
-        s.add_group(g);
-
-        // Shift every id by 100.
-        s.remap_pane_ids(|id| id + 100);
-
-        let tab = &s.worktrees[0].tabs[0];
-        assert_eq!(tab.center.pane_ids(), vec![103, 107]);
-        assert_eq!(tab.focused_pane, 107);
-        assert_eq!(tab.pane_cwds.get(&103).map(String::as_str), Some("/a"));
-        assert_eq!(tab.pane_cwds.get(&107).map(String::as_str), Some("/b"));
-        assert!(!tab.pane_cwds.contains_key(&3), "old cwd key remapped");
     }
 
     #[test]
