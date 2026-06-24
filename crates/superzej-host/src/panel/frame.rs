@@ -140,7 +140,7 @@ pub(super) fn header_rows(model: &FrameModel, focused: bool) -> Vec<PanelRow> {
 /// at Normal/Half width too (the Full git frame renders its own richer
 /// status). No timers: the spinner advances on the docs tick the stats
 /// sampler already drives.
-fn flow_chips(ui: &PanelUi) -> Vec<Seg> {
+fn flow_chips(ui: &PanelUi, merge_banner: bool) -> Vec<Seg> {
     use crate::panel::gitui::GitFlow;
     let short = |s: &str| s.chars().take(7).collect::<String>();
     let mut chips: Vec<Seg> = Vec::new();
@@ -168,6 +168,11 @@ fn flow_chips(ui: &PanelUi) -> Vec<Seg> {
             chips.push(sp(1));
         }
         GitFlow::Rebase(_) | GitFlow::None => {}
+        // The header already renders a richer MERGING banner (chip + conflicts +
+        // resolved bar) from the hydrated MERGE_HEAD state; emitting the flow chip
+        // too painted a second amber MERGING box on the same row. Only show the
+        // compact chip as a fallback when that banner isn't present.
+        GitFlow::Merge(_) if merge_banner => {}
         GitFlow::Merge(s) => {
             let label = if s.conflict {
                 " MERGING ⚑ "
@@ -200,8 +205,8 @@ fn flow_chips(ui: &PanelUi) -> Vec<Seg> {
 }
 
 /// Prepend the flow chips to the header's branch row (its right side).
-fn with_flow_chips(mut header: Vec<PanelRow>, ui: &PanelUi) -> Vec<PanelRow> {
-    let chips = flow_chips(ui);
+fn with_flow_chips(mut header: Vec<PanelRow>, ui: &PanelUi, merge_banner: bool) -> Vec<PanelRow> {
+    let chips = flow_chips(ui, merge_banner);
     if chips.is_empty() {
         return header;
     }
@@ -324,7 +329,7 @@ pub fn build_panel(
     let (tab_row, tab_spans) = tab_bar_row(ui, focused);
     let rows_for_body = rows.saturating_sub(1);
 
-    let header = with_flow_chips(header_rows(model, focused), ui);
+    let header = with_flow_chips(header_rows(model, focused), ui, model.panel.merge.is_some());
     let ctx = section_ctx(model, ui, cols, rows_for_body, header.len());
     let content_raw = sections::content(ui.open, &ctx);
     let visible_secs: Vec<_> = ui
@@ -499,7 +504,7 @@ fn build_full(
     let (tab_row, tab_spans) = tab_bar_row(ui, focused);
     let rows_for_body = rows.saturating_sub(1);
 
-    let header = with_flow_chips(header_rows(model, focused), ui);
+    let header = with_flow_chips(header_rows(model, focused), ui, model.panel.merge.is_some());
     let (rail, mut spans) = rail_rows_and_spans(ui, cols);
     let plan = budget::allocate_full(rows_for_body, header.len(), rail.len());
 
@@ -739,6 +744,42 @@ mod tests {
         assert!(all.contains("2 conflicts"), "{all}");
         assert!(all.contains("4"), "resolved 4/6: {all}");
         assert!(all.contains("/6"), "{all}");
+    }
+
+    // Regression: a merge in progress populates BOTH the hydrated header banner
+    // (model.panel.merge) and the UI flow (ui.git.flow == Merge). Both used to
+    // paint an amber MERGING chip on the same header row ("merging twice"). The
+    // richer banner wins; the redundant flow chip is suppressed.
+    #[test]
+    fn merge_banner_and_flow_show_only_one_merging_chip() {
+        use crate::panel::gitui::{GitFlow, SequencerUi};
+        let model = model_with(PanelData {
+            branch: "main".into(),
+            merge: Some(MergeBanner {
+                label: "MERGING".into(),
+                onto: "feature".into(),
+                unresolved: 1,
+                total: Some(3),
+            }),
+            ..Default::default()
+        });
+        let mut ui = PanelUi::default();
+        ui.git.flow = GitFlow::Merge(SequencerUi {
+            onto: "feature".into(),
+            conflict: true,
+        });
+        let frame = build_panel(&model, &ui, 44, 50, false);
+        let all: String = frame
+            .rows
+            .iter()
+            .map(|r| text_of(&r.line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            all.matches("MERGING").count(),
+            1,
+            "exactly one MERGING chip expected, got:\n{all}"
+        );
     }
 
     #[test]

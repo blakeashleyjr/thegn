@@ -290,7 +290,7 @@ pub fn open_layer(surface: &mut Surface, screen: Rect, spec: &LayerSpec) -> Opti
     );
     // Key-chip badge in the top border, right-aligned.
     if let Some(badge) = &spec.badge {
-        let chip = Seg::chip(Tok::Slot(S::Raise), badge.clone());
+        let chip = Seg::key(badge.clone());
         let bl = badge.chars().count();
         if bw > bl + 4 {
             seg::draw_line(
