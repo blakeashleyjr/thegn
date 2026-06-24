@@ -2029,9 +2029,13 @@ fn remap_cold_workspace_ids(session: &mut crate::session::Session, panes: &mut P
                 .enumerate()
                 .map(|(i, &old)| (old, base + i as u32))
                 .collect();
-            
-            tab.center.remap(&mut |id| map.get(&id).copied().unwrap_or(id));
-            tab.focused_pane = map.get(&tab.focused_pane).copied().unwrap_or(tab.focused_pane);
+
+            tab.center
+                .remap(&mut |id| map.get(&id).copied().unwrap_or(id));
+            tab.focused_pane = map
+                .get(&tab.focused_pane)
+                .copied()
+                .unwrap_or(tab.focused_pane);
             tab.pane_cwds = std::mem::take(&mut tab.pane_cwds)
                 .into_iter()
                 .map(|(id, cwd)| (map.get(&id).copied().unwrap_or(id), cwd))
@@ -6139,21 +6143,31 @@ async fn event_loop<T: Terminal>(
     // Pane launch specs resolved off-thread: `launch_spec` walks the sandbox
     // chain (podman ensure can pull an image — seconds to minutes on a cold
     // or wedged runtime) and MUST NOT run on the loop. The loop requests
-    // specs for a (worktree, tab)'s missing leaves, keeps the splash up, and
+    // specs for a (group, tab)'s missing leaves, keeps the splash up, and
     // finishes the spawn (openpty+exec, fast) when they land. Stale results
-    // (worktree/tab changed mid-flight) are dropped on arrival.
+    // (group/tab changed mid-flight) are dropped on arrival.
+    //
+    // The roundtrip is keyed by the group NAME, not its worktree path: names
+    // are unique per session (the `tab_groups` PK plus the resurrect adoption
+    // guard), whereas two groups CAN share a path (the resurrect adoption loop
+    // can adopt two registry rows that point at the same dir under different
+    // tab names). A path key would route a result to the wrong group and let an
+    // active tab and a same-path neighbor both fire for one key. The batch also
+    // carries the path so the spawn (cwd) still lands in the worktree dir.
     type SpecBatch = (
-        String,
-        usize,
+        String, // group name (routing key)
+        String, // worktree path (spawn cwd)
+        usize,  // tab index
         std::result::Result<Vec<(u32, crate::agent::LaunchSpec)>, String>,
     );
     let (spec_tx, mut spec_rx) = tokio_mpsc::unbounded_channel::<SpecBatch>();
     let mut materialize_inflight: Option<(String, usize)> = None;
-    // Active-tab keys whose sandbox probe failed: skip re-probing on the next
-    // tick for the same reason as prewarm_failed. Cleared on worktree switch.
+    // Active-tab keys (group name, tab) whose sandbox probe failed: skip
+    // re-probing on the next tick for the same reason as prewarm_failed.
+    // Cleared on worktree switch.
     let mut materialize_failed: std::collections::HashSet<(String, usize)> =
         std::collections::HashSet::new();
-    // Pre-warm requests that are already in-flight: keyed by (worktree, tab)
+    // Pre-warm requests that are already in-flight: keyed by (group name, tab)
     // so we never fire a second spawn_blocking for the same neighbor tab while
     // one is already resolving — especially important when the sandbox chain
     // keeps failing (all backends unavailable) and every loop tick would
@@ -6398,6 +6412,15 @@ async fn event_loop<T: Terminal>(
     let mut which_key_prefix = String::new();
     let (tx, mut rx) = tokio_mpsc::channel::<PaneEvent>(PANE_EVENT_CHANNEL_CAPACITY);
     let mut panes = Panes::with_waker(tx, waker.clone());
+    // The resurrected session restored each tab's tree with pane ids the
+    // PREVIOUS process allocated (numbered from 1). This process's `next_id`
+    // also starts at 1, so a freshly-spawned pin/drawer/shell could grab an id
+    // a not-yet-materialized tab still holds — `missing_leaves` would then skip
+    // it and leave two trees aliasing one live PtyPane (a worktree mirroring
+    // another). Move the initial session's ids onto a disjoint reserved range up
+    // front, exactly as a cold workspace switch does, so resurrected
+    // placeholders can never collide with the panes we're about to spawn.
+    remap_cold_workspace_ids(&mut session, &mut panes);
     let mut need_relayout = true;
     let mut drawer: Option<u32> = None;
     // Hidden keep-alive yazi panes per worktree (instant drawer toggles).
@@ -6812,8 +6835,8 @@ async fn event_loop<T: Terminal>(
                 &waker,
             );
             // Pre-warm sibling tabs so first focus of a neighbor is instant.
-            for (wt, ti, missing) in prewarm_requests(&panes, &mut session) {
-                let key = (wt.clone(), ti);
+            for (name, wt, ti, missing) in prewarm_requests(&panes, &mut session) {
+                let key = (name.clone(), ti);
                 if prewarm_inflight.contains(&key) || prewarm_failed.contains(&key) {
                     continue; // in-flight or previously failed — skip
                 }
@@ -6825,7 +6848,7 @@ async fn event_loop<T: Terminal>(
                     let specs = crate::agent::launch_spec(&cfg, &wt, None, "shell")
                         .map(|spec| missing.into_iter().map(|id| (id, spec.clone())).collect())
                         .map_err(|e| e.to_string());
-                    if tx.send((wt, ti, specs)).is_ok() {
+                    if tx.send((name, wt, ti, specs)).is_ok() {
                         let _ = wk.wake();
                     }
                 });
@@ -6885,11 +6908,11 @@ async fn event_loop<T: Terminal>(
         // keypress/center click clears `center_dormant` and the next loop turn
         // materializes the shell.
         if !center_dormant && first_frame_logged {
-            let (path, ti) = {
+            let (name, path, ti) = {
                 let g = &mut session.worktrees[session.active];
                 let ti = g.active_tab.min(g.tabs.len().saturating_sub(1));
                 g.active_tab = ti;
-                (g.path.clone(), ti)
+                (g.name.clone(), g.path.clone(), ti)
             };
             // A worktree whose dir vanished (deleted externally) must never
             // crash the loop: prune it from the session + registry, land on
@@ -6923,9 +6946,9 @@ async fn event_loop<T: Terminal>(
                 // Two-phase materialize: request launch specs off-thread (the
                 // sandbox ensure inside `launch_spec` can block on podman for
                 // seconds to minutes), spawn when they land. One request per
-                // (worktree, tab) at a time.
+                // (group, tab) at a time, keyed by the unique group name.
                 let missing = panes.missing_leaves(&session.worktrees[session.active].tabs[ti]);
-                let key = (path.clone(), ti);
+                let key = (name.clone(), ti);
                 if !missing.is_empty()
                     && materialize_inflight.as_ref() != Some(&key)
                     && !materialize_failed.contains(&key)
@@ -6941,11 +6964,12 @@ async fn event_loop<T: Terminal>(
                     let tx = spec_tx.clone();
                     let wk = waker.clone();
                     let wt = path.clone();
+                    let gname = name.clone();
                     task::spawn_blocking(move || {
                         let specs = crate::agent::launch_spec(&cfg, &wt, None, "shell")
                             .map(|spec| missing.into_iter().map(|id| (id, spec.clone())).collect())
                             .map_err(|e| e.to_string());
-                        if tx.send((wt, ti, specs)).is_ok() {
+                        if tx.send((gname, wt, ti, specs)).is_ok() {
                             let _ = wk.wake();
                         }
                     });
@@ -7789,17 +7813,18 @@ async fn event_loop<T: Terminal>(
         }
 
         // Resolved launch specs: finish the deferred materialize (lazy focus
-        // path and pre-warm alike). Results for a worktree/tab that vanished
-        // mid-flight are dropped; `materialize_with_specs` itself skips
-        // leaves that came alive some other way in the meantime.
-        while let Ok((wt, ti, specs)) = spec_rx.try_recv() {
+        // path and pre-warm alike). Routed back to the requesting group by its
+        // unique name (a path can be shared by two groups); results for a group
+        // /tab that vanished mid-flight are dropped, and `materialize_with_specs`
+        // itself skips leaves that came alive some other way in the meantime.
+        while let Ok((name, wt, ti, specs)) = spec_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Spec);
-            if materialize_inflight.as_ref() == Some(&(wt.clone(), ti)) {
+            let tab_key = (name.clone(), ti);
+            if materialize_inflight.as_ref() == Some(&tab_key) {
                 materialize_inflight = None;
             }
-            let tab_key = (wt.clone(), ti);
             prewarm_inflight.remove(&tab_key);
-            let Some(gi) = session.worktrees.iter().position(|g| g.path == wt) else {
+            let Some(gi) = session.worktrees.iter().position(|g| g.name == name) else {
                 continue;
             };
             let is_active = gi == session.active && session.worktrees[gi].active_tab == ti;
@@ -16030,6 +16055,47 @@ mod tests {
                 .get(&new0)
                 .map(String::as_str),
             Some("/x")
+        );
+    }
+
+    #[test]
+    fn initial_resurrect_remap_prevents_fresh_spawns_aliasing_restored_ids() {
+        // Repro of the cross-worktree mirror after a restart: a resurrected
+        // session carries pane ids the PREVIOUS process allocated from 1, while
+        // this process's `Panes` also starts `next_id` at 1. Two different
+        // worktrees here hold low restored ids; without the up-front remap a
+        // freshly-spawned pane would reuse one of them, and `missing_leaves`
+        // would skip the still-unmaterialized tab — aliasing two trees onto one
+        // live PtyPane (the mirror).
+        let mut session = two_worktree_session();
+        session.worktrees[0].tabs[0].center = crate::center::CenterTree::Leaf(1);
+        session.worktrees[0].tabs[0].focused_pane = 1;
+        session.worktrees[1].tabs[0].center = crate::center::CenterTree::Leaf(2);
+        session.worktrees[1].tabs[0].focused_pane = 2;
+
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(16);
+        let mut panes = Panes::new(tx); // fresh registry, next_id == 1
+
+        remap_cold_workspace_ids(&mut session, &mut panes);
+
+        // Every restored leaf id is unique across the whole session.
+        let mut ids: Vec<u32> = session
+            .worktrees
+            .iter()
+            .flat_map(|g| g.tabs.iter())
+            .flat_map(|t| t.center.pane_ids())
+            .collect();
+        let total = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), total, "restored ids are unique: {ids:?}");
+
+        // The next id any future spawn (pin/drawer/shell) will take is past
+        // every restored leaf — so a fresh pane can never alias a tab tree.
+        let next = panes.reserve_ids(1);
+        assert!(
+            ids.iter().all(|&id| id < next),
+            "fresh spawn id {next} is disjoint from restored ids {ids:?}"
         );
     }
 
