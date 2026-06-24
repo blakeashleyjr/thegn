@@ -52,13 +52,15 @@ pub const P_RAISE: &str = "34;41;66"; // #222942
 pub const P_TEXT: &str = "237;240;248"; // #edf0f8
 pub const P_DIM: &str = "198;204;219"; // #c6ccdb (brighter secondary — readable on dark panels)
 pub const P_FAINT: &str = "122;129;151"; // #7a8197
-pub const P_GHOST: &str = "78;85;110"; // #4e556e
-// ghost2/ghost3 are the structural floor (glyph scaffolding, rules, fills), but
-// chrome still tints some metadata with them — the old values (#343a52/#232940)
-// read as grey-on-grey on bg1. Lifted toward `ghost` (kept strictly below it so
-// the contrast ramp still descends) so dim text is legible everywhere at once.
-pub const P_GHOST2: &str = "70;78;102"; // #464e66
-pub const P_GHOST3: &str = "58;65;86"; // #3a4156
+// ghost..ghost3 are the structural floor (glyph scaffolding, rules, fills), but
+// chrome also tints recessive metadata with them (timestamps, counts, empty
+// states, key hints, path prefixes). The earlier values read as grey-on-grey
+// (~2:1 on the panel); the whole tier is now lifted so even ghost3 clears WCAG
+// ~3:1 on bg0/bg1/panel, while staying strictly below `faint` and descending
+// (ghost > ghost2 > ghost3). See `ghost_tier_stays_legible_on_standard_surfaces`.
+pub const P_GHOST: &str = "111;120;142"; // #6f788e
+pub const P_GHOST2: &str = "103;112;132"; // #677084
+pub const P_GHOST3: &str = "96;104;123"; // #60687b
 // layer compositing
 pub const P_SHADOW_BG: &str = "5;7;12"; // #05070c
 pub const P_SHADOW_FG: &str = "28;34;51"; // #1c2233
@@ -459,6 +461,34 @@ pub fn blend(hue: &str, t: f32) -> String {
     blend_over(hue, BG0, t)
 }
 
+/// WCAG 2.x relative luminance of an "R;G;B" fragment (0.0 = black, 1.0 =
+/// white). The perceptual basis for [`contrast_ratio`]; prefer that over the
+/// crude channel-sum heuristics when judging legibility.
+pub fn relative_luminance(rgb: &str) -> f32 {
+    let chan = |c: f32| {
+        let c = c / 255.0;
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let mut it = rgb.split(';').map(|n| n.trim().parse::<f32>().unwrap_or(0.0));
+    let r = chan(it.next().unwrap_or(0.0));
+    let g = chan(it.next().unwrap_or(0.0));
+    let b = chan(it.next().unwrap_or(0.0));
+    0.2126 * r + 0.7152 * g + 0.0722 * b
+}
+
+/// WCAG contrast ratio between two "R;G;B" fragments, `1.0` (identical) ..
+/// `21.0` (black on white). Order-independent. AA wants ≥ 4.5 for body text,
+/// ≥ 3.0 for large/secondary text and UI affordances.
+pub fn contrast_ratio(a: &str, b: &str) -> f32 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
 /// The semantic-hue slot for an agent/tool name. Known names get their
 /// signature hue; unknown ones get a stable hash-picked hue so a custom agent
 /// always looks the same.
@@ -652,25 +682,117 @@ mod tests {
     /// `ghost3` are the structural floor — borders, rules, fills, glyph
     /// scaffolding — and are intentionally exempt; chrome must not render text
     /// the user needs to read below the `faint` tier.)
+    /// The shipped default (prism) is held to a strict WCAG bar: `text`/`dim`
+    /// are body/secondary copy (AA 4.5+, and `text` to AAA 7), `faint` is the
+    /// muted label tier (path prefixes, hints) that must still clear AA-large
+    /// (3.0) on every surface it lands on. The `ghost*` ramp is the structural
+    /// floor (rules, fills, glyph scaffolding) — chrome must not render text the
+    /// user needs to read below `faint`. This is the guard that the directory
+    /// prefix (once `ghost2`, ~2.1:1 on the panel) regressed.
     #[test]
     fn readable_text_tiers_clear_contrast_on_every_surface() {
-        // lum() sums R+G+B (0..=765); 250 is a generous floor that the dim
-        // grey-on-grey metadata (ghost2/ghost3 ≈ 120–185 distance) failed.
-        const MIN_CONTRAST: u32 = 250;
         let p = Palette::default();
         let surfaces = [
             ("bg0", &p.bg0),
             ("bg1", &p.bg1),
             ("panel", &p.panel),
             ("panel2", &p.panel2),
+            ("raise", &p.raise),
         ];
-        let text_tiers = [("text", &p.text), ("dim", &p.dim), ("faint", &p.faint)];
+        // (tier, color, min WCAG ratio)
+        let tiers = [
+            ("text", &p.text, 7.0_f32),
+            ("dim", &p.dim, 4.5),
+            ("faint", &p.faint, 3.0),
+        ];
         for (sname, surf) in surfaces {
-            for (fname, fg) in text_tiers {
-                let contrast = lum(fg).abs_diff(lum(surf));
+            for (fname, fg, min) in tiers {
+                let r = contrast_ratio(fg, surf);
                 assert!(
-                    contrast >= MIN_CONTRAST,
-                    "text tier `{fname}` on `{sname}` is too low-contrast ({contrast} < {MIN_CONTRAST})"
+                    r >= min,
+                    "prism `{fname}` on `{sname}` = {r:.2}:1 (want ≥ {min})"
+                );
+            }
+        }
+    }
+
+    /// The `ghost` floor is the faintest tier chrome still renders text in
+    /// (recessive metadata: timestamps, counts, empty states, key hints, path
+    /// prefixes). It is *below* `faint`, but must still clear WCAG large-text
+    /// (3.0) on the standard backgrounds it lands on — `panel2`/`raise` are
+    /// selection/hover tints where that text rises to a brighter tier. This is
+    /// the guard for the palette-wide lift of the prism floor.
+    #[test]
+    fn ghost_tier_stays_legible_on_standard_surfaces() {
+        let p = Palette::default();
+        let surfaces = [("bg0", &p.bg0), ("bg1", &p.bg1), ("panel", &p.panel)];
+        let floor = [
+            ("ghost", &p.ghost),
+            ("ghost2", &p.ghost2),
+            ("ghost3", &p.ghost3),
+        ];
+        for (sname, surf) in surfaces {
+            for (fname, fg) in floor {
+                let r = contrast_ratio(fg, surf);
+                assert!(r >= 3.0, "prism `{fname}` on `{sname}` = {r:.2}:1 (want ≥ 3.0)");
+            }
+        }
+        // And the floor stays strictly below `faint`, descending.
+        let order = [&p.faint, &p.ghost, &p.ghost2, &p.ghost3];
+        for w in order.windows(2) {
+            assert!(
+                relative_luminance(w[0]) > relative_luminance(w[1]),
+                "fg ramp must descend through the ghost floor"
+            );
+        }
+    }
+
+    /// Every selectable preset must keep its copy legible — looser floors than
+    /// the strict prism bar (light mode's muted labels sit lower on near-white
+    /// paper), but enough to catch a preset whose text tier collapses into its
+    /// surface.
+    #[test]
+    fn every_preset_keeps_copy_legible() {
+        for name in PRESETS {
+            let mut p = preset(name).unwrap();
+            extend_palette(&mut p);
+            let surfaces = [("bg0", &p.bg0), ("bg1", &p.bg1), ("panel", &p.panel)];
+            let tiers = [
+                ("text", &p.text, 4.5_f32),
+                ("dim", &p.dim, 4.0),
+                ("faint", &p.faint, 2.3),
+            ];
+            for (sname, surf) in surfaces {
+                for (fname, fg, min) in tiers {
+                    let r = contrast_ratio(fg, surf);
+                    assert!(
+                        r >= min,
+                        "{name}: `{fname}` on `{sname}` = {r:.2}:1 (want ≥ {min})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A filled chip is `chip_fg` text on a token background (`Seg::chip`); the
+    /// only legitimate chip backgrounds are the accent and the semantic hues.
+    /// `chip_fg` must read on all of them in every preset — this is the class of
+    /// bug behind the unreadable "any key cancels" chip, which had been filled
+    /// with the dark `raise` surface instead of a hue.
+    #[test]
+    fn filled_chip_text_is_legible_on_every_hue() {
+        for name in PRESETS {
+            let mut p = preset(name).unwrap();
+            extend_palette(&mut p);
+            let mut bgs = vec![("accent", p.accent.clone())];
+            for h in Hue::ALL {
+                bgs.push(("hue", p.hue(h).to_string()));
+            }
+            for (label, bg) in bgs {
+                let r = contrast_ratio(&p.chip_fg, &bg);
+                assert!(
+                    r >= 3.5,
+                    "{name}: chip text on {label} `{bg}` = {r:.2}:1 (want ≥ 3.5)"
                 );
             }
         }
@@ -741,6 +863,25 @@ mod tests {
         assert_eq!(p.heat(0), P_HEAT[0]);
         assert_eq!(p.heat(4), P_HEAT[4]);
         assert_eq!(p.heat(99), P_HEAT[4]);
+    }
+
+    #[test]
+    fn wcag_contrast_anchors() {
+        // Black on white is the WCAG maximum (21:1); identical colors are 1:1.
+        assert!((contrast_ratio("0;0;0", "255;255;255") - 21.0).abs() < 0.01);
+        assert!((contrast_ratio("128;128;128", "128;128;128") - 1.0).abs() < 0.001);
+        // Order-independent.
+        assert_eq!(
+            contrast_ratio(&P_TEXT, &P_PANEL),
+            contrast_ratio(&P_PANEL, &P_TEXT)
+        );
+        // Luminance is monotonic and bounded.
+        assert!(relative_luminance("0;0;0") < relative_luminance("128;128;128"));
+        assert!(relative_luminance("255;255;255") <= 1.0 + 1e-6);
+        // The original bug: near-black chip text on the dark `raise` surface is
+        // well under AA; on the teal accent it is comfortably legible.
+        assert!(contrast_ratio(P_BG0, P_RAISE) < 3.0);
+        assert!(contrast_ratio(P_BG0, HUE_TEAL) > 4.5);
     }
 
     #[test]

@@ -35,6 +35,9 @@ fn t() -> Tok {
 fn d() -> Tok {
     Tok::Slot(S::Dim)
 }
+fn f() -> Tok {
+    Tok::Slot(S::Faint)
+}
 fn g() -> Tok {
     Tok::Slot(S::Ghost)
 }
@@ -227,7 +230,9 @@ fn item_row(data: &PanelData, view: GitView, src: usize) -> PanelRow {
                 sp(1),
                 seg(tok, format!("{:>2}", c.status)),
                 sp(1),
-                seg(g2(), c.dir.clone()),
+                // Path prefix is a label, not scaffolding — `faint`, not the
+                // `ghost2` floor (see the changes section).
+                seg(f(), c.dir.clone()),
                 seg(d(), c.name.clone()),
             ]
         }
