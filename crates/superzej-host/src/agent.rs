@@ -140,59 +140,36 @@ pub struct SandboxOutcome {
 /// human-visible fallback warnings; an explicit choice (config or
 /// `backend_choice`) must not silently fall back — it errors instead. Host is
 /// the last fallback for the auto chain only.
-<<<<<<< .merge_file_nMetXR
-/// Which container a sandbox is being prepared for. The interactive shell uses
-/// the worktree's `profile`; the embedded agent uses `agent_profile` and, when
-/// that differs, runs in its own separately-hardened container.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SandboxScope {
-    Shell,
-    Agent,
-}
-
-||||||| .merge_file_hAzTEi
-=======
-///
-/// `choice_is_explicit` distinguishes the two callers of `backend_choice`: the
-/// new-worktree wizard passes the user's *fresh* pick (`true` — always wins
-/// over config), while a relaunch passes the *DB-saved* per-worktree value
-/// (`false` — only overrides when config is "auto", so an explicit config
-/// backend still beats a stale DB entry).
->>>>>>> .merge_file_61j151
 pub fn prepare_sandbox(
     cfg: &Config,
     repo_root: &Path,
     worktree: &str,
     loc: &GitLoc,
     backend_choice: Option<&str>,
-<<<<<<< .merge_file_nMetXR
-    scope: SandboxScope,
-||||||| .merge_file_hAzTEi
-=======
-    choice_is_explicit: bool,
->>>>>>> .merge_file_61j151
 ) -> anyhow::Result<SandboxOutcome> {
     let mut sb = cfg.repo_sandbox(repo_root);
-    // An explicit user choice (new-worktree wizard) always wins over config.
-    // A DB-saved per-worktree value (relaunch) only overrides when config is
-    // "auto" — an explicit config backend (e.g. `backend = "bwrap"`) must beat a
-    // stale DB entry from a previous backend that no longer works. An explicit
-    // choice may itself legitimately be "auto"/"host"/"none", so don't drop those.
+    let mut explicit_backend =
+        sandbox::Backend::from_config(sb.backend).filter(|b| *b != sandbox::Backend::None);
+    // Only let the DB-saved per-worktree backend override when config is "auto".
+    // An explicit config backend (e.g. `backend = "bwrap"`) always wins so that
+    // changing the config actually takes effect instead of being silently trumped
+    // by a stale DB entry from a previous backend that no longer works.
     let config_is_auto = sb.backend == superzej_core::config::SandboxBackend::Auto;
-    if let Some(saved) = backend_choice.map(str::trim)
+    if config_is_auto
+        && let Some(saved) = backend_choice.map(str::trim)
         && !saved.is_empty()
-        && (choice_is_explicit || (config_is_auto && saved != "auto"))
+        && saved != "auto"
         && let Ok(b) = superzej_core::config::SandboxBackend::from_str_validated(saved)
     {
+        explicit_backend =
+            sandbox::Backend::from_config(b).filter(|b| *b != sandbox::Backend::None);
         sb.backend = b;
     }
-    let explicit_backend =
-        sandbox::Backend::from_config(sb.backend).filter(|b| *b != sandbox::Backend::None);
     let explicit_choice = explicit_backend.is_some();
     let auto_choice = sb.backend == superzej_core::config::SandboxBackend::Auto;
     let mut warnings = Vec::new();
     let profile_slug = cfg.profile.trim();
-    let base_cname = sandbox::container_name_with_profile(
+    let cname = sandbox::container_name_with_profile(
         worktree,
         if profile_slug.is_empty() {
             None
@@ -200,21 +177,8 @@ pub fn prepare_sandbox(
             Some(profile_slug)
         },
     );
-    // Pick the hardening preset + container for this scope. The agent gets its
-    // own (more-locked-down) container only when `agent_profile` differs from
-    // the worktree `profile`; otherwise it reuses the worktree container.
-    let agent_separate = scope == SandboxScope::Agent && sb.agent_profile != sb.profile;
-    let hardening = match scope {
-        SandboxScope::Agent => sb.agent_profile,
-        SandboxScope::Shell => sb.profile,
-    };
-    let cname = if agent_separate {
-        sandbox::agent_container_name(&base_cname)
-    } else {
-        base_cname
-    };
     for candidate in sandbox_candidates(&sb) {
-        if let Some(spec) = sandbox::resolve_scoped(&candidate, loc, &cname, hardening) {
+        if let Some(spec) = sandbox::resolve(&candidate, loc, &cname) {
             if spec.backend == sandbox::Backend::None {
                 break;
             }
@@ -402,23 +366,7 @@ pub fn launch_spec_with_key(
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
 
-<<<<<<< .merge_file_nMetXR
-    let mut outcome = prepare_sandbox(
-        cfg,
-        &repo_root,
-        worktree,
-        &loc,
-        saved_backend.as_deref(),
-        SandboxScope::Shell,
-    )?;
-||||||| .merge_file_hAzTEi
     let mut outcome = prepare_sandbox(cfg, &repo_root, worktree, &loc, saved_backend.as_deref())?;
-=======
-    // Relaunch: `saved_backend` is the DB-saved per-worktree value, not a fresh
-    // user pick — config may override it (see `prepare_sandbox`), so `false`.
-    let mut outcome =
-        prepare_sandbox(cfg, &repo_root, worktree, &loc, saved_backend.as_deref(), false)?;
->>>>>>> .merge_file_61j151
     if let Ok(db) = Db::open() {
         let _ = db.set_worktree_sandbox(worktree, &outcome.backend_label);
     }
@@ -694,55 +642,12 @@ mod tests {
         let mut cfg = Config::default();
         cfg.sandbox.backend = superzej_core::config::SandboxBackend::None;
         let loc = GitLoc::from_db("/wt/x", None);
-<<<<<<< .merge_file_nMetXR
-        let out = prepare_sandbox(
-            &cfg,
-            Path::new("/repo"),
-            "/wt/x",
-            &loc,
-            None,
-            SandboxScope::Shell,
-        )
-        .unwrap();
-||||||| .merge_file_hAzTEi
         let out = prepare_sandbox(&cfg, Path::new("/repo"), "/wt/x", &loc, None).unwrap();
-=======
-        let out = prepare_sandbox(&cfg, Path::new("/repo"), "/wt/x", &loc, None, false).unwrap();
->>>>>>> .merge_file_61j151
         assert!(out.spec.is_none());
         assert_eq!(out.backend_label, "host");
         // An explicit "none" choice behaves the same as the configured backend.
-<<<<<<< .merge_file_nMetXR
-        let out = prepare_sandbox(
-            &cfg,
-            Path::new("/repo"),
-            "/wt/x",
-            &loc,
-            Some("none"),
-            SandboxScope::Shell,
-        )
-        .unwrap();
-||||||| .merge_file_hAzTEi
         let out = prepare_sandbox(&cfg, Path::new("/repo"), "/wt/x", &loc, Some("none")).unwrap();
-=======
-        let out =
-            prepare_sandbox(&cfg, Path::new("/repo"), "/wt/x", &loc, Some("none"), true).unwrap();
         assert!(out.spec.is_none());
-    }
-
-    #[test]
-    fn prepare_sandbox_explicit_host_choice_overrides_non_auto_config() {
-        // The new-worktree wizard passes the user's explicit pick; it must win
-        // over a concrete configured default (regression: picking Host with
-        // `default_backend = bwrap` used to silently keep bwrap).
-        let mut cfg = Config::default();
-        cfg.sandbox.backend = superzej_core::config::SandboxBackend::Bwrap;
-        let loc = GitLoc::from_db("/wt/x", None);
-        let out =
-            prepare_sandbox(&cfg, Path::new("/repo"), "/wt/x", &loc, Some("host"), true).unwrap();
->>>>>>> .merge_file_61j151
-        assert!(out.spec.is_none());
-        assert_eq!(out.backend_label, "host");
     }
 
     // H1: E2E launch_spec test — backend="none" → host fallback path.

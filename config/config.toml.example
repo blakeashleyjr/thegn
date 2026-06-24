@@ -63,13 +63,13 @@ undercurl = "auto"
 # panel = "#151a28"     # panel lists
 # panel2 = "#1a2031"    # selection / hover
 # raise = "#222942"     # raised (context menus)
-# border = "#6f788e"    # pane/edge frame lines
+# border = "#4e556e"    # pane/edge frame lines
 # text = "#edf0f8"      # primary text
 # dim = "#aab1c5"       # secondary text
 # faint = "#7a8197"     # tertiary / labels
-# ghost = "#6f788e"     # connectors / disabled (faintest readable tier, ~3:1+)
-# ghost2 = "#677084"    # structural glyphs (below ghost)
-# ghost3 = "#60687b"    # deepest structural fg (rules, bar tracks)
+# ghost = "#4e556e"     # connectors / disabled
+# ghost2 = "#464e66"    # structural glyphs (below ghost)
+# ghost3 = "#3a4156"    # deepest structural fg (rules, bar tracks)
 # shadow_bg = "#05070c" # layer shadow cell background
 # shadow_fg = "#1c2233" # layer shadow cell foreground
 # chip_fg = "#0b0e16"   # text inside inverse chips (defaults to bg0)
@@ -661,25 +661,6 @@ visible = true
 # under a `[sandbox]` table — only the keys you set override these globals.
 [sandbox]
 enabled = true
-
-# ── Hardening preset ─────────────────────────────────────────────────────────
-# A named bundle of OS-isolation knobs applied to the worktree's container.
-# Selectable per level: here (global), per workspace/repo via a `.superzej.toml`
-# overlay, or the SUPERZEJ_SANDBOX_PROFILE env var.
-#   open     — no hardening; pre-preset behavior (escape hatch / back-compat).
-#   hardened — read-only root + no-new-privileges + a process (pids) cap, with
-#              networking and Linux capabilities left intact so interactive dev
-#              (fetch/clone/build, debuggers, ping) keeps working. The default.
-#   sealed   — full lockdown: network=none, read-only root, drop ALL caps,
-#              no-new-privileges, tighter pids cap. For untrusted workloads.
-# (Writable under read-only root: the worktree, build caches, and a tmpfs /tmp.)
-profile = "hardened"
-
-# Hardening preset for the embedded agent's tool container. When it differs from
-# `profile`, the agent runs in its OWN separate, more-locked-down container
-# (named `superzej-<slug>-szagent`); when equal, it reuses the worktree
-# container. Defaults to `sealed` so agent-run commands have no network egress.
-agent_profile = "sealed"
 
 # ── Backend selection ────────────────────────────────────────────────────────
 # Which containment backend to use. "auto" walks backend_chain until one works.

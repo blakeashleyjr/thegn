@@ -31,7 +31,7 @@ mod imp {
     pub fn install() {
         // SAFETY: registering a signal handler that only does a relaxed store.
         unsafe {
-            libc::signal(libc::SIGUSR2, on_sigusr2 as libc::sighandler_t);
+            libc::signal(libc::SIGUSR2, on_sigusr2 as *const () as libc::sighandler_t);
         }
         tracing::info!(
             target: "szhost::startup",
