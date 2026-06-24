@@ -70,10 +70,15 @@
     # ── Tiered gates ──────────────────────────────────────────────────────
     # pre-commit stays fast (formatting + lint + unit tests); the heavier
     # coverage gate runs on pre-push (and in CI via `just ci`).
+    #
+    # git hooks run with GIT_DIR and GIT_INDEX_FILE set. This leaks into the
+    # git subprocesses spawned by `cargo test`, causing spurious failures in
+    # repository manipulation tests. Strip them via `env -u` so tests run in a
+    # clean git environment.
     cargo-test = {
       enable = true;
       name = "cargo test";
-      entry = "cargo test --workspace";
+      entry = "env -u GIT_DIR -u GIT_INDEX_FILE cargo test --workspace";
       language = "system";
       pass_filenames = false;
       stages = ["pre-commit"];
@@ -98,6 +103,19 @@
 
   enterShell = ''
     echo "superzej devenv — cargo build | just smoke | nix fmt"
+
+    # Install the post-checkout hook into the effective (shared) hooks dir so the
+    # prek hooks work in EVERY worktree. prek needs .pre-commit-config.yaml in
+    # each worktree root, but devenv only materializes that gitignored store
+    # symlink in the checkout where the shell is entered; the hook seeds it into
+    # every other worktree on `git worktree add`. Copied (not symlinked) so it
+    # doesn't depend on any one worktree's path, and refreshed on every entry so
+    # it self-heals. See test/git-hooks/post-checkout.sh.
+    hooks_dir=$(git config core.hooksPath 2>/dev/null || true)
+    [ -n "$hooks_dir" ] || hooks_dir=$(git rev-parse --git-common-dir 2>/dev/null)/hooks
+    if [ -d "$hooks_dir" ] && [ -f test/git-hooks/post-checkout.sh ]; then
+      install -m 0755 test/git-hooks/post-checkout.sh "$hooks_dir/post-checkout"
+    fi
   '';
 
   # `devenv test` runs the hooks, then this.
