@@ -886,13 +886,13 @@ fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> {
         )),
         "cpu" => s.cpu_pct.map(|p| {
             w(
-                format!("{} {p:>2}%", ic.cpu_icon),
+                format!("{}  {p:>2}%", ic.cpu_icon),
                 level_color(stat_level(p)),
             )
         }),
         "mem" => s.mem_gib.map(|(u, t)| {
             w(
-                format!("{} {u:.1}/{t:.0}G", ic.mem_icon),
+                format!("{}  {u:.1}/{t:.0}G", ic.mem_icon),
                 level_color(ratio_level(u, t)),
             )
         }),
@@ -905,7 +905,7 @@ fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> {
         "net" => s.net_bps.map(|(rx, tx)| {
             w(
                 format!(
-                    "{} \u{2193}{} \u{2191}{}",
+                    "{}  \u{2193}{} \u{2191}{}",
                     ic.net_icon,
                     crate::stats::fmt_rate(rx),
                     crate::stats::fmt_rate(tx)
@@ -923,7 +923,7 @@ fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> {
             } else {
                 (&ic.battery_icon, col(S::Dim))
             };
-            w(format!("{icon} {p:>2}%"), fg)
+            w(format!("{icon}  {p:>2}%"), fg)
         }),
         "date" => Some(w(
             chrono::Local::now()
