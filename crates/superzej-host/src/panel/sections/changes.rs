@@ -113,7 +113,10 @@ fn change_row(c: &ChangeRow, i: usize, on: bool, deep: bool, cols: usize) -> Pan
         seg(glyph_tok, glyph),
         sp(1),
         seg(status_tok, format!("{:<2}", c.status)).bold(),
-        seg(g2(), dir_display),
+        // The path prefix is a label, not scaffolding: `faint` clears a
+        // readable contrast on the panel surface where `ghost2` (the structural
+        // floor) read as grey-on-grey next to the brighter file name.
+        seg(f(), dir_display),
         name,
     ];
     let mut row = PanelRow::plain(Line::split(l, r)).with_hit(PanelHit::Row(Section::Changes, i));
@@ -548,6 +551,39 @@ mod tests {
             assert_eq!(segs_text(segs), "    ");
         } else {
             panic!("expected Segs");
+        }
+    }
+
+    /// A change row renders the directory prefix and the file name legibly on
+    /// the panel surface it is painted on (see `chrome::draw_panel`). Guards the
+    /// regression where the dir prefix used `ghost2` (the structural floor,
+    /// ~2.1:1 on the panel) and read as grey-on-grey beside the file name.
+    #[test]
+    fn change_row_path_is_legible_on_the_panel() {
+        use termwiz::surface::Surface;
+        let c = ChangeRow {
+            status: "M".into(),
+            stage: Stage::Unstaged,
+            dir: "crates/superzej-host/src/".into(),
+            name: "changes.rs".into(),
+            path: "crates/superzej-host/src/changes.rs".into(),
+            added: 3,
+            deleted: 1,
+        };
+        for on in [false, true] {
+            let row = change_row(&c, 0, on, false, 70);
+            let mut s = Surface::new(70, 1);
+            crate::seg::draw_line(
+                &mut s,
+                0,
+                0,
+                70,
+                &row.line,
+                // The panel pad background `draw_panel` paints rows on.
+                row.bg.unwrap_or(Tok::Slot(crate::chrome::S::Panel)),
+            );
+            let v = crate::seg::text_contrast_violations(&mut s, 3.0);
+            assert!(v.is_empty(), "low-contrast text in change row (on={on}): {v:?}");
         }
     }
 
