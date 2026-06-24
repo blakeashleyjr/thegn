@@ -137,6 +137,7 @@ config_enum! {
         Systemd = "systemd" | "systemd-run",
         Apple = "apple" | "container",
         Wsl = "wsl",
+        Smol = "smol" | "smolvm",
         None = "none" | "host",
     } default = Auto;
 }
@@ -1392,6 +1393,7 @@ impl Default for SandboxConfig {
             backend: SandboxBackend::Auto,
             default_backend: SandboxBackend::Auto,
             backend_chain: [
+                "smolvm",
                 "podman-rootless",
                 "podman-rootful",
                 "docker",
@@ -4506,6 +4508,8 @@ forward_agent = false
             ("apple", SandboxBackend::Apple),
             ("container", SandboxBackend::Apple),
             ("wsl", SandboxBackend::Wsl),
+            ("smol", SandboxBackend::Smol),
+            ("smolvm", SandboxBackend::Smol),
             ("none", SandboxBackend::None),
             ("host", SandboxBackend::None),
         ] {
@@ -4514,6 +4518,7 @@ forward_agent = false
         assert_eq!(SandboxBackend::Systemd.as_str(), "systemd");
         assert_eq!(SandboxBackend::Apple.as_str(), "apple");
         assert_eq!(SandboxBackend::Wsl.as_str(), "wsl");
+        assert_eq!(SandboxBackend::Smol.as_str(), "smol");
         assert_eq!(SandboxBackend::PodmanRootful.as_str(), "podman-rootful");
 
         // Network / OnMissing / RemoteTransport / RemoteMode.
@@ -4800,6 +4805,7 @@ forward_agent = false
         assert_eq!(
             s.backend_chain,
             vec![
+                "smolvm",
                 "podman-rootless",
                 "podman-rootful",
                 "docker",
