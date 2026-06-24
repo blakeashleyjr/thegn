@@ -140,12 +140,22 @@ pub struct SandboxOutcome {
 /// human-visible fallback warnings; an explicit choice (config or
 /// `backend_choice`) must not silently fall back — it errors instead. Host is
 /// the last fallback for the auto chain only.
+/// Which container a sandbox is being prepared for. The interactive shell uses
+/// the worktree's `profile`; the embedded agent uses `agent_profile` and, when
+/// that differs, runs in its own separately-hardened container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxScope {
+    Shell,
+    Agent,
+}
+
 pub fn prepare_sandbox(
     cfg: &Config,
     repo_root: &Path,
     worktree: &str,
     loc: &GitLoc,
     backend_choice: Option<&str>,
+    scope: SandboxScope,
 ) -> anyhow::Result<SandboxOutcome> {
     let mut sb = cfg.repo_sandbox(repo_root);
     let mut explicit_backend =
@@ -169,7 +179,7 @@ pub fn prepare_sandbox(
     let auto_choice = sb.backend == superzej_core::config::SandboxBackend::Auto;
     let mut warnings = Vec::new();
     let profile_slug = cfg.profile.trim();
-    let cname = sandbox::container_name_with_profile(
+    let base_cname = sandbox::container_name_with_profile(
         worktree,
         if profile_slug.is_empty() {
             None
@@ -177,8 +187,21 @@ pub fn prepare_sandbox(
             Some(profile_slug)
         },
     );
+    // Pick the hardening preset + container for this scope. The agent gets its
+    // own (more-locked-down) container only when `agent_profile` differs from
+    // the worktree `profile`; otherwise it reuses the worktree container.
+    let agent_separate = scope == SandboxScope::Agent && sb.agent_profile != sb.profile;
+    let hardening = match scope {
+        SandboxScope::Agent => sb.agent_profile,
+        SandboxScope::Shell => sb.profile,
+    };
+    let cname = if agent_separate {
+        sandbox::agent_container_name(&base_cname)
+    } else {
+        base_cname
+    };
     for candidate in sandbox_candidates(&sb) {
-        if let Some(spec) = sandbox::resolve(&candidate, loc, &cname) {
+        if let Some(spec) = sandbox::resolve_scoped(&candidate, loc, &cname, hardening) {
             if spec.backend == sandbox::Backend::None {
                 break;
             }
@@ -366,7 +389,14 @@ pub fn launch_spec_with_key(
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
 
-    let mut outcome = prepare_sandbox(cfg, &repo_root, worktree, &loc, saved_backend.as_deref())?;
+    let mut outcome = prepare_sandbox(
+        cfg,
+        &repo_root,
+        worktree,
+        &loc,
+        saved_backend.as_deref(),
+        SandboxScope::Shell,
+    )?;
     if let Ok(db) = Db::open() {
         let _ = db.set_worktree_sandbox(worktree, &outcome.backend_label);
     }
@@ -642,11 +672,27 @@ mod tests {
         let mut cfg = Config::default();
         cfg.sandbox.backend = superzej_core::config::SandboxBackend::None;
         let loc = GitLoc::from_db("/wt/x", None);
-        let out = prepare_sandbox(&cfg, Path::new("/repo"), "/wt/x", &loc, None).unwrap();
+        let out = prepare_sandbox(
+            &cfg,
+            Path::new("/repo"),
+            "/wt/x",
+            &loc,
+            None,
+            SandboxScope::Shell,
+        )
+        .unwrap();
         assert!(out.spec.is_none());
         assert_eq!(out.backend_label, "host");
         // An explicit "none" choice behaves the same as the configured backend.
-        let out = prepare_sandbox(&cfg, Path::new("/repo"), "/wt/x", &loc, Some("none")).unwrap();
+        let out = prepare_sandbox(
+            &cfg,
+            Path::new("/repo"),
+            "/wt/x",
+            &loc,
+            Some("none"),
+            SandboxScope::Shell,
+        )
+        .unwrap();
         assert!(out.spec.is_none());
     }
 

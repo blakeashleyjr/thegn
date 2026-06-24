@@ -662,6 +662,25 @@ visible = true
 [sandbox]
 enabled = true
 
+# ── Hardening preset ─────────────────────────────────────────────────────────
+# A named bundle of OS-isolation knobs applied to the worktree's container.
+# Selectable per level: here (global), per workspace/repo via a `.superzej.toml`
+# overlay, or the SUPERZEJ_SANDBOX_PROFILE env var.
+#   open     — no hardening; pre-preset behavior (escape hatch / back-compat).
+#   hardened — read-only root + no-new-privileges + a process (pids) cap, with
+#              networking and Linux capabilities left intact so interactive dev
+#              (fetch/clone/build, debuggers, ping) keeps working. The default.
+#   sealed   — full lockdown: network=none, read-only root, drop ALL caps,
+#              no-new-privileges, tighter pids cap. For untrusted workloads.
+# (Writable under read-only root: the worktree, build caches, and a tmpfs /tmp.)
+profile = "hardened"
+
+# Hardening preset for the embedded agent's tool container. When it differs from
+# `profile`, the agent runs in its OWN separate, more-locked-down container
+# (named `superzej-<slug>-szagent`); when equal, it reuses the worktree
+# container. Defaults to `sealed` so agent-run commands have no network egress.
+agent_profile = "sealed"
+
 # ── Backend selection ────────────────────────────────────────────────────────
 # Which containment backend to use. "auto" walks backend_chain until one works.
 #   auto | podman-rootless | podman-rootful | docker | bwrap | bubblewrap |
