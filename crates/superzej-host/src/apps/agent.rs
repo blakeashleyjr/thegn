@@ -179,6 +179,7 @@ fn resolve_tool_sandbox(cfg: &Config, worktree: &str) -> Option<sandbox::Sandbox
         .map(PathBuf::from)
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
+<<<<<<< .merge_file_jE1X5x
     let mut spec = crate::agent::prepare_sandbox(
         cfg,
         &repo_root,
@@ -189,6 +190,15 @@ fn resolve_tool_sandbox(cfg: &Config, worktree: &str) -> Option<sandbox::Sandbox
     )
     .ok()?
     .spec?;
+||||||| .merge_file_yQYTUl
+    let mut spec = crate::agent::prepare_sandbox(cfg, &repo_root, worktree, &loc, None)
+        .ok()?
+        .spec?;
+=======
+    let mut spec = crate::agent::prepare_sandbox(cfg, &repo_root, worktree, &loc, None, false)
+        .ok()?
+        .spec?;
+>>>>>>> .merge_file_deOvCb
     crate::agent::apply_ssh_config_shim(&mut spec);
     Some(spec)
 }
