@@ -1,12 +1,17 @@
 # superzej — roadmap & progress
 
-661 features across 46 groups (A–AT). The list is really **two tracks joined by
+674 features across 46 groups (A–AT). The list is really **two tracks joined by
 one keystone**: an AI-free _shell_ track and an AI track, bridged by the **proxy**.
-That shape drives the phasing below. The proxy is not just a router — it is the
-**AI control plane**: the single interception point every agent's model traffic
-crosses, so any cross-cutting concern is configured **once and inherited by every
-harness**. The proxy track (**U/V/W**) graduates into a full **AI gateway / context
-fabric** in **AR (541–586)**. Original numbering is preserved; gaps are deliberate
+That shape drives the phasing below. The control plane has **two layers** (see
+`docs/superpowers/specs/2026-06-24-acp-two-layer-control-plane-design.md`): the
+**lower** plane is the **proxy** (**U/V/W → AR**) — the single interception point
+every agent's _model traffic_ crosses, so any cross-cutting concern is configured
+**once and inherited by every harness**; the **upper** plane is **ACP** (group
+**R**), which owns the _agent conversation_ and where superzej acts as Client,
+Agent, and Proxy. The two planes meet at `providers/set` (R 689 → U) and
+MCP-over-ACP (R 696 → AL). The proxy track (**U/V/W**) graduates into a full
+**AI gateway / context fabric** in **AR (541–586)**. Original numbering is
+preserved; gaps are deliberate
 cuts (499, 500, 502, 505, 506, 507, 510 dropped from the moonshot set; web
 dashboard 510 and voice 499 already cut; deadbranch stale-branch cleanup imported
 as 659–671 under Y; brows-style release management imported as 672–683 under AT).
@@ -75,12 +80,14 @@ gaps below).
   `apps/termite-agent` submodule, its own `docs/ROADMAP.md`, currently through its
   Phase 4 autonomous-coding MVP). It is hosted as the **`agent` app tab**
   (`superzej-host/src/apps/agent.rs`, an `sz_kit::AppTile` driving termite-core's
-  `AgentRuntime` on `spawn_blocking`). This makes group **R**'s ACP/native-adapter
-  path **secondary** — superzej runs its own harness first; foreign-harness adapters
-  are additive later. Substrate-first sequencing **all landed**: embedding seam →
-  proxy as model path (per-worktree scoped virtual keys, revoked on teardown) →
-  sandbox/policy boundary (`SandboxTerminalTool` via `enter_argv`) → notifications
-  (`AgentDone`/`AgentFailed`) + live proxy-spend observability. See
+  `AgentRuntime` on `spawn_blocking`). termite stays first-party, but group **R**
+  is no longer "secondary" — it is the **upper control plane** (ACP), co-primary
+  with the proxy's lower plane, where superzej acts as Client/Agent/Proxy (see the
+  R rewrite + `2026-06-24-acp-two-layer-control-plane-design.md`). Substrate-first
+  sequencing **all landed**: embedding seam → proxy as model path (per-worktree
+  scoped virtual keys, revoked on teardown) → sandbox/policy boundary
+  (`SandboxTerminalTool` via `enter_argv`) → notifications (`AgentDone`/`AgentFailed`)
+  + live proxy-spend observability. See
   `docs/superpowers/specs/2026-06-22-embedded-agent-integration-design.md`.
 - **AI. Notification bus polish** — bus, desktop notifications, and inbox are live;
   420 is a fixed event→notification mapping + urgency thresholds, not yet a
@@ -630,21 +637,52 @@ tests, symbols, git objects, and worktrees._
 - [ ] 228. Task priority _(deferred)_
 - [ ] 658. Agent session history + hibernation — list/resume past agent sessions per worktree; hibernate idle sessions to reclaim resources and rehydrate on demand (feeds resource-aware cap 214; history complements S 255/257 + I 117) (Orca)
 
-### R. Agent integration protocols
+### R. Agent integration protocols (ACP — the upper control plane)
 
-_Reframed (2026-06-22): superzej's primary agent is the **embedded first-party
-harness** `termite-agent` (the `agent` app tab). This group — ACP + native adapters
-for **foreign** harnesses — is now an **additive, secondary** path, not the primary
-one. "Primary path" below refers to ACP being the preferred way to integrate an
-external harness, not to ACP being superzej's primary agent._
+_Reframed (2026-06-24): superzej is **one control plane in two layers** (see
+`docs/superpowers/specs/2026-06-24-acp-two-layer-control-plane-design.md`). The
+**lower** plane is `szproxy` (**U/V/W → AR**), which owns model traffic. This
+group is the **upper** plane — the **Agent Client Protocol** (ACP), which owns
+the agent conversation (sessions, tool calls, permissions, diffs, plans, config
+options). ACP is **co-primary**, not "additive/secondary": the embedded
+first-party harness `termite-agent` (the `agent` app tab) stays first-party, but
+superzej participates in ACP in **three roles** — **Client** (R1, consume
+foreign agents), **Agent** (R2, expose termite outward), and **Proxy** (R3,
+realize AR for any ACP agent). The two planes meet at two seams:
+`providers/set` (point any ACP agent's model traffic at `szproxy`) and
+MCP-over-ACP (advertise AR's house tools up to any agent)._
 
-- [ ] 229. ACP client (primary path)
-- [ ] 230. ACP session management
-- [ ] 231. ACP streaming updates
-- [ ] 232. ACP permission requests → UI
-- [ ] 233. ACP diff rendering
-- [ ] 234. ACP plan/tool-call events
-- [ ] 235. ACP Registry integration (install agents)
+**R1 · ACP Client — consume foreign harnesses:**
+
+- [ ] 229. ACP client core — `initialize` + capability negotiation (protocolVersion; advertise `clientCapabilities` fs+terminal+`clientInfo`; parse `agentCapabilities`/`promptCapabilities`/`mcpCapabilities`/`authMethods`/`agentInfo`); `authenticate`/`logout`
+- [ ] 230. ACP session lifecycle — `session/new`, `session/load`, `session/resume` (reconnect, no replay), `session/list`, `session/close`, `session/delete`, `session/fork`, `session_info_update`; map to worktree-tabs + session resurrection + time-travel-replay
+- [ ] 231. ACP streaming updates — full `session/update` set: `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, `available_commands_update`, `usage_update`, `config_option_update`; StopReason handling + `session/cancel`
+- [ ] 232. ACP permission requests → UI — `session/request_permission` (allow_once/allow_always/reject_once/reject_always → optionId|cancelled), remember-choice persistence, native overlay
+- [ ] 233. ACP diff rendering — `tool_call` diff content (`oldText`/`newText`/`path`) into the existing diff/review pane (T 260)
+- [ ] 234. ACP plan/tool-call events — tool kinds (read/edit/delete/move/search/execute/think/fetch/other), status (pending/in_progress/completed/failed), `locations` (path+line) → sidebar/editor follow-along
+- [ ] 235. ACP Registry integration — fetch `registry.json`, parse `agent.json` manifest + icon, one-command install/launch of authenticated agents
+- [ ] 684. Session Config Options surfacing — render `configOptions` (model/mode/thought_level selectors) in palette/statusbar; `session/set_config_option` + `config_option_update` (supersedes Session Modes)
+- [ ] 685. `usage_update` consumption — context-window `used`/`size` + optional `cost{amount,currency}` per session → feeds S 246/249/250 and V 289/290 spend attribution
+- [ ] 686. ACP Elicitation — `elicitation/create` form mode (restricted JSON Schema) + URL mode (OAuth); accept/decline/cancel → native iocraft form UI (shares AL 459)
+- [ ] 687. Client filesystem surface — serve `fs/read_text_file`/`fs/write_text_file`, unsaved-buffer aware, scoped to the worktree
+- [ ] 688. Client terminal surface — serve `terminal/create`/`output`/`wait_for_exit`/`kill`/`release` (env/cwd/outputByteLimit) through our PTY + `sandbox::enter_argv`; embed in tool calls. _We are a terminal multiplexer — this makes us a premier ACP terminal client._
+- [ ] 689. **Configurable LLM Providers** — `providers/list`/`providers/set`/`providers/disable` (id/apiType/baseUrl/headers) to route any ACP agent's model traffic through `szproxy`. **The R↔U bridge** _(connects U 271/287; powers U 283 local upstreams)_
+- [ ] 690. Agent Telemetry Export — inject `OTEL_EXPORTER_OTLP_ENDPOINT` + `params._meta` traceparent into agent subprocs; ingest into the perf/observability suite _(feeds S 254)_
+- [ ] 691. Protocol-version negotiation + `_meta`/extensibility + **v2 readiness** — track the ACP v2 redesign (unified `capabilities`, object-valued markers, item-based `plan_update`, upsert `tool_call`, content chunks) and build v2-shaped
+
+**R2 · ACP Agent — expose superzej / termite outward:**
+
+- [ ] 692. termite-agent as an ACP **agent server** — implement the Agent side so termite is consumable by Zed/other ACP clients; submit to the ACP Registry (distribution play) _(wraps the same `AgentRuntime` as `apps/agent.rs`)_
+- [ ] 693. Emit ACP updates from termite — `plan`/`tool_call`/`tool_call_update`/`usage_update`/`config_option_update` over the ACP channel
+- [ ] 694. superzej house-tools as an ACP agent endpoint — expose house tools/context (rtk, sem, weave) as an ACP agent for foreign clients
+
+**R3 · ACP Proxy — the convergence (AR realized over ACP):**
+
+- [ ] 695. AR gateway as an **ACP proxy** — `proxy/initialize` + `proxy/successor` + conductor so capability injection / prompt layering / tool filtering (AR 541–551) work with **any** ACP agent, not just termite _(upper-layer twin of AR; subsumes AGENTS.md/hooks/plugins)_
+- [ ] 696. **MCP-over-ACP** — expose the central MCP registry over the ACP channel (`mcp/connect`/`mcp/message`/`mcp/disconnect`, `mcpCapabilities.acp`) with brokered creds, no open ports _(transport for AL 455 / AR 541–543)_
+
+**Native adapters — fallback for non-ACP harnesses (ACP-registry-first):**
+
 - [ ] 236. Native adapter: Claude Code (hooks+stream-json+OTEL)
 - [ ] 237. Native adapter: Codex (exec --json)
 - [ ] 238. Native adapter: OpenCode (server API/SSE)
@@ -658,7 +696,10 @@ external harness, not to ACP being superzej's primary agent._
 ### S. Agent observability
 
 _Tier-1 attention routing reuses the lightweight activity-dot model for agents;
-rich token/tool telemetry remains Phase 3 once proxy/adapters exist._
+rich token/tool telemetry remains Phase 3 once proxy/adapters exist. For ACP
+agents the telemetry arrives over standard paths: context-fill (246) and live
+tokens/cost (249/250) from `usage_update` (**R 685**); OTEL ingestion (254) from
+Agent Telemetry Export (**R 690**)._
 
 - [ ] 243. Contextual auto status dots
 - [ ] 244. abtop-style fleet view
@@ -699,6 +740,11 @@ as the agent-specific side of the broader attention queue._
 
 ### U. LLM proxy
 
+_The **lower control plane**. Foreign ACP agents are pointed here via ACP's
+Configurable LLM Providers (`providers/set` with `baseUrl` = `szproxy`) — **R 689**
+is the bridge; 283 (local upstreams) is reachable the same way. Per-agent virtual
+keys (287) are the `providers/set` credential target._
+
 - [x] 271. Dual-protocol proxy — Anthropic + OpenAI _(SSE translation)_
 - [~] 272. Hook up any provider _(configurable upstreams/backends)_
 - [~] 273. Aggregate models — standard/fast/free
@@ -720,6 +766,10 @@ as the agent-specific side of the broader attention queue._
 - [~] 656. Interactive per-agent account/credential switcher — status-bar chip to hot-swap which subscription/account (or virtual key) a harness uses without re-auth; UX layer over the proxy's key load-balancing (280) + per-agent virtual keys (287); running sessions keep their account until restart (Orca hot-swap)
 
 ### V. Cost / limit / budget
+
+_Proxy-side spend (289/290) gains ACP parity: foreign agents report their own
+context size + cost via `usage_update` (consumed by **R 685**, emitted by termite
+via **R 693**), reconciled against proxy-measured spend._
 
 - [x] 289. Per-request cost logging
 - [x] 290. Spend attribution — agent/worktree/workspace
@@ -972,6 +1022,11 @@ non-agent processes and plain task panes._
 
 ### AL. MCP server
 
+_Exposure transport: in addition to stdio/HTTP, the MCP server is advertised over
+the **ACP channel** via MCP-over-ACP (**R 696** — `mcp/connect`/`message`/
+`disconnect`, `mcpCapabilities.acp`), so foreign ACP agents get house tools with
+brokered creds and no open ports. This is what lets AR 541–543 reach any harness._
+
 - [ ] 455. MCP server over core
 - [ ] 456. Tools (action verbs)
 - [ ] 457. Resources (task://, fleet://)
@@ -1069,7 +1124,10 @@ their original groups._
 _The proxy track (**U/V/W**) graduating into an **AI gateway / context fabric**: the
 proxy becomes the **AI control plane** — one interception point all model traffic
 crosses, so any cross-cutting concern is **configured once and inherited by every
-harness**, translated to each harness's format. Appended at the end with the other
+harness**, translated to each harness's format. The capability-injection items
+(541–551) have **two realizations**: in-process for the embedded termite harness,
+and — for **foreign** ACP agents — over the upper plane as an **ACP proxy**
+(**R 695**) with house tools delivered via MCP-over-ACP (**R 696**). Appended at the end with the other
 late groups, but it belongs thematically right after U/V/W. Dependency tags: `[AL]`
 presupposes the **MCP server** (Phase 4), `[AJ]` presupposes the **egress/opsec
 guardrail layer**, `[581]` is gated by the **eval hooks**. Two engineering invariants
