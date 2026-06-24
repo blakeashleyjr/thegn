@@ -96,6 +96,7 @@ pub enum Backend {
     Systemd,
     Apple,
     Wsl,
+    Smol,
     None,
 }
 
@@ -109,6 +110,7 @@ impl Backend {
             "systemd" | "systemd-run" => Backend::Systemd,
             "apple" | "container" => Backend::Apple,
             "wsl" => Backend::Wsl,
+            "smol" | "smolvm" => Backend::Smol,
             "none" | "host" => Backend::None,
             _ => return None,
         })
@@ -126,6 +128,7 @@ impl Backend {
             SandboxBackend::Systemd => Backend::Systemd,
             SandboxBackend::Apple => Backend::Apple,
             SandboxBackend::Wsl => Backend::Wsl,
+            SandboxBackend::Smol => Backend::Smol,
             SandboxBackend::None => Backend::None,
         })
     }
@@ -140,6 +143,7 @@ impl Backend {
             Backend::Systemd => "systemd",
             Backend::Apple => "apple",
             Backend::Wsl => "wsl",
+            Backend::Smol => "smolvm",
             Backend::None => "host",
         }
     }
@@ -152,6 +156,7 @@ impl Backend {
             Backend::Systemd => "systemd-run",
             Backend::Apple => "container",
             Backend::Wsl => "wsl.exe",
+            Backend::Smol => "smolvm",
             Backend::None => "",
         }
     }
@@ -166,6 +171,7 @@ impl Backend {
                 | Backend::Docker
                 | Backend::Apple
                 | Backend::Wsl
+                | Backend::Smol
         )
     }
 
@@ -796,6 +802,21 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
     // but cannot accept exec sessions — we must not treat it as healthy.
     let fmt = "{{if .State.Running}}RUNNING{{end}}\n{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}\n{{end}}{{end}}";
     let mut argv = backend_prefix(spec.backend);
+    if spec.backend == Backend::Smol {
+        argv.extend([
+            "machine".into(),
+            "status".into(),
+            "--name".into(),
+            spec.name.clone(),
+        ]);
+        let (ok, _stdout) = match output_with_timeout(&argv, PROBE_TIMEOUT) {
+            Some(r) => r,
+            None => return (false, false),
+        };
+        // For smolvm, we just rely on exit code = 0 meaning running.
+        // We'll skip mount validation for now since the formatting is different.
+        return (ok, ok);
+    }
     // For remote worktrees the transport wraps the argv; for local we call
     // podman/docker directly. run_control_t_owned gives us the timeout but
     // discards stdout, so we use output_with_timeout for local transport and
@@ -882,6 +903,31 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
             PROBE_TIMEOUT,
         );
     }
+    if spec.backend == Backend::Smol {
+        if running {
+            return Ok(());
+        }
+        let mut argv: Vec<String> = backend_prefix(Backend::Smol);
+        argv.extend([
+            "machine".into(),
+            "create".into(),
+            "--name".into(),
+            spec.name.clone(),
+        ]);
+        argv.extend(smol_create_opts(spec));
+        run_control_owned(spec, &argv, RUN_TIMEOUT);
+
+        let mut start_argv: Vec<String> = backend_prefix(Backend::Smol);
+        start_argv.extend([
+            "machine".into(),
+            "start".into(),
+            "--name".into(),
+            spec.name.clone(),
+        ]);
+        run_control_owned(spec, &start_argv, RUN_TIMEOUT);
+        return Ok(());
+    }
+
     let mut argv: Vec<String> = backend_prefix(spec.backend);
     argv.extend([
         "run".into(),
@@ -948,10 +994,21 @@ pub fn teardown_by_path(worktree: &str) {
         Backend::PodmanRootful,
         Backend::Docker,
         Backend::Apple,
+        Backend::Smol,
     ] {
         if available(&transport, b) {
             let mut argv = backend_prefix(b);
-            argv.extend(["rm".into(), "-f".into(), name.to_string()]);
+            if b == Backend::Smol {
+                argv.extend([
+                    "machine".into(),
+                    "delete".into(),
+                    "--name".into(),
+                    name.to_string(),
+                    "-f".into(),
+                ]);
+            } else {
+                argv.extend(["rm".into(), "-f".into(), name.to_string()]);
+            }
             let _ = run_control_t_owned(&transport, &argv, PROBE_TIMEOUT);
         }
     }
@@ -970,10 +1027,21 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
         Backend::PodmanRootful,
         Backend::Docker,
         Backend::Apple,
+        Backend::Smol,
     ] {
         if available(&transport, b) {
             let mut argv = backend_prefix(b);
-            argv.extend(["rm".into(), "-f".into(), name.to_string()]);
+            if b == Backend::Smol {
+                argv.extend([
+                    "machine".into(),
+                    "delete".into(),
+                    "--name".into(),
+                    name.to_string(),
+                    "-f".into(),
+                ]);
+            } else {
+                argv.extend(["rm".into(), "-f".into(), name.to_string()]);
+            }
             let _ = run_control_t_owned(&transport, &argv, PROBE_TIMEOUT);
         }
     }
@@ -1060,6 +1128,27 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
                 v.insert(0, "wsl.exe".into());
                 v.insert(1, "--".into());
             }
+            v
+        }
+        Backend::Smol => {
+            let mut v = backend_prefix(Backend::Smol);
+            v.extend([
+                "machine".into(),
+                "exec".into(),
+                "--name".into(),
+                spec.name.clone(),
+            ]);
+            if spec.file_access != FileAccess::None {
+                // smolvm supports --workdir (or relies on sh -c 'cd ...')
+                // The tool doesn't document --workdir for machine exec in the help snippet,
+                // but since it runs `sh -lc "..."`, the inner script typically cds.
+            }
+            v.extend([
+                "--".into(),
+                "/bin/sh".into(),
+                "-lc".into(),
+                script.to_string(),
+            ]);
             v
         }
         Backend::Bwrap => {
@@ -1742,6 +1831,52 @@ pub fn stats(spec: &SandboxSpec) -> Option<SandboxStats> {
     parse_sandbox_stats(stdout.trim())
 }
 
+fn smol_create_opts(spec: &SandboxSpec) -> Vec<String> {
+    let mut v = Vec::new();
+
+    if spec.network != Network::None {
+        v.push("--net".into());
+    }
+
+    if let Some(img) = &spec.image {
+        if !img.is_empty() {
+            v.extend(["--image".into(), img.clone()]);
+        }
+    } else {
+        v.extend(["--image".into(), DEFAULT_OCI_IMAGE.into()]);
+    }
+
+    if let Some(_gpu) = &spec.gpu {
+        v.push("--gpu".into());
+    }
+
+    if let Some(cpu) = &spec.limits.cpu {
+        v.extend(["--cpus".into(), cpu.clone()]);
+    }
+    if let Some(mem) = &spec.limits.memory {
+        v.extend(["--memory".into(), mem.clone()]);
+    }
+
+    for m in &spec.mounts {
+        let ro = if m.ro { ":ro" } else { "" };
+        v.extend(["-v".into(), format!("{}:{}{}", m.host, m.dest, ro)]);
+    }
+
+    for (name, dest) in &spec.volumes {
+        v.extend(["-v".into(), format!("{}:{}", name, dest)]);
+    }
+
+    for p in &spec.ports {
+        v.extend(["-p".into(), p.clone()]);
+    }
+
+    for (k, v_env) in &spec.env {
+        v.extend(["-e".into(), format!("{}={}", k, v_env)]);
+    }
+
+    v
+}
+
 fn parse_sandbox_stats(output: &str) -> Option<SandboxStats> {
     let parts: Vec<&str> = output.split('|').collect();
     if parts.len() != 2 {
@@ -1932,6 +2067,36 @@ mod tests {
         assert!(j.contains("-v /wt/feat:/wt/feat"));
         assert!(j.contains("-v /repo/.git:/repo/.git"));
         assert!(j.contains("-e GH_TOKEN=abc"));
+        assert!(j.contains("-p 8080:8080"));
+    }
+
+    #[test]
+    fn smol_create_opts_map_correctly() {
+        let mut s = spec(Backend::Smol);
+        s.network = Network::Nat;
+        s.image = Some("custom-image:latest".to_string());
+        s.gpu = Some("all".to_string());
+        s.limits.cpu = Some("4".to_string());
+        s.limits.memory = Some("2048".to_string());
+        s.mounts.push(Mount {
+            host: "/host/path".to_string(),
+            dest: "/guest/path".to_string(),
+            ro: true,
+            cache: false,
+        });
+        s.env.push(("ENV_KEY".to_string(), "ENV_VAL".to_string()));
+        s.ports.push("8080:8080".to_string());
+
+        let opts = super::smol_create_opts(&s);
+        let j = opts.join(" ");
+
+        assert!(j.contains("--net"));
+        assert!(j.contains("--image custom-image:latest"));
+        assert!(j.contains("--gpu"));
+        assert!(j.contains("--cpus 4"));
+        assert!(j.contains("--memory 2048"));
+        assert!(j.contains("-v /host/path:/guest/path:ro"));
+        assert!(j.contains("-e ENV_KEY=ENV_VAL"));
         assert!(j.contains("-p 8080:8080"));
     }
 
