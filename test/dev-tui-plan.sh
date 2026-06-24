@@ -5,8 +5,8 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo"
 
 start_plan="$(just --dry-run start-term dev 2>&1)"
-[[ $start_plan == *'target/debug/szhost'* ]] || {
-  echo "start-term should launch the native szhost binary" >&2
+[[ $start_plan == *'target/profiling/szhost'* ]] || {
+  echo "start-term should launch the native (profiling-build) szhost binary" >&2
   echo "$start_plan" >&2
   exit 1
 }
