@@ -374,6 +374,15 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let (session, seeded) = load_or_seed_session(&cwd);
+    // Defensive self-heal: strip any stray `core.worktree` that leaked into a
+    // main checkout's shared `.git/config` (which silently retargets every git
+    // read — diff panel included — at another worktree). No-ops on linked
+    // worktrees (whose `.git` is a file). Cheap, runs once per launch over the
+    // launch dir + each worktree group's path.
+    superzej_core::util::heal_main_checkout_worktree(&cwd);
+    for g in &session.worktrees {
+        superzej_core::util::heal_main_checkout_worktree(std::path::Path::new(&g.path));
+    }
     tracing::info!(
         target: "szhost::startup",
         since_start_ms = start.elapsed().as_millis() as u64,
