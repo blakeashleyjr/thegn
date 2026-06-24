@@ -127,3 +127,12 @@ lto = "thin"
 # - `panic = "abort"`: a panic in a PTY reader thread or hydration worker
 #   currently kills only that thread/task — abort would take down the whole
 #   multiplexer with the user's shells in it.
+
+# Release-grade speed WITH symbols, for `just start-term` / `just profile`: the
+# perf suite needs realistic (near-release) timings AND named frames in the
+# SIGUSR2 flamegraphs, so unlike `release` this keeps debug line tables and does
+# not strip. Output lands in target/profiling/.
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = "line-tables-only"
