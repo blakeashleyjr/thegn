@@ -284,14 +284,12 @@ pub fn compute_full(
     // spare it while leaving the columns ≥ STRIP_MIN_ROWS. A center-only drawer
     // (`!drawer_full_width`) leaves the full band to the columns and is carved
     // from the center column further down.
-    let full_drawer_rows = if drawer_rows > 0
-        && drawer_full_width
-        && band_rows >= drawer_rows + 1 + STRIP_MIN_ROWS
-    {
-        drawer_rows
-    } else {
-        0
-    };
+    let full_drawer_rows =
+        if drawer_rows > 0 && drawer_full_width && band_rows >= drawer_rows + 1 + STRIP_MIN_ROWS {
+            drawer_rows
+        } else {
+            0
+        };
     let drawer_reserve = if full_drawer_rows > 0 {
         full_drawer_rows + 1
     } else {
