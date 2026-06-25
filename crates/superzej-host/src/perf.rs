@@ -548,21 +548,6 @@ impl LoopPerf {
         best
     }
 
-    /// Total background (non-`Pty`) messages drained this interval. PTY output
-    /// is foreground/user-driven traffic — relaying a chatty pane (a build
-    /// streaming its log) is not a "storm" — so the wake-storm detector measures
-    /// only background producers, mirroring [`hot_source`](Self::hot_source)'s
-    /// exclusion. Gating the storm on total wakes instead would let foreground
-    /// PTY traffic trip a false alarm blamed on whatever tiny background source
-    /// happens to lead.
-    pub fn background_items(&self) -> u64 {
-        WakeSource::ALL
-            .iter()
-            .filter(|&&s| s != WakeSource::Pty)
-            .map(|&s| self.drain_items[s as usize])
-            .sum()
-    }
-
     /// Per-source message counts in [`WakeSource::ALL`] order.
     #[allow(dead_code)] // consumed by the Telemetry overlay's wake-source breakdown
     pub fn per_source(&self) -> [u64; WakeSource::N] {
@@ -683,17 +668,11 @@ impl LoopPerf {
         }
 
         // Wake storm: loop is essentially idle (doing no real work) yet a
-        // *background* source keeps pulsing the waker — exactly the diff-watcher
-        // `.git/` storm this codebase has hit. PTY output is foreground terminal
-        // traffic (a build streaming its log at tens of chunks/s), so it's
-        // excluded from the gate to match `hot_source`'s attribution — gating on
-        // total `wakes_per_s` would let a chatty pane trip a false alarm blamed
-        // on whatever tiny background source leads. WARN shows at default level.
-        let background_per_s = self.background_items() as f64 / secs;
-        if snap.idle_ratio > 0.95 && background_per_s > wake_storm_limit() {
+        // background source keeps pulsing the waker — exactly the diff-watcher
+        // `.git/` storm this codebase has hit. WARN shows at the default level.
+        if snap.idle_ratio > 0.95 && snap.wakes_per_s > wake_storm_limit() {
             tracing::warn!(
                 target: "szhost::perf",
-                background_per_s,
                 wakes_per_s = snap.wakes_per_s,
                 hot_source = snap.hot_source,
                 hot_items_per_s = snap.hot_items_per_s,
@@ -798,29 +777,6 @@ mod tests {
         assert_eq!(lp.items(WakeSource::Model), 5);
         assert_eq!(lp.hot_source(), WakeSource::Model);
         assert_eq!(lp.items(WakeSource::Pty), 10);
-        set_enabled(false);
-    }
-
-    #[test]
-    fn background_items_excludes_pty_foreground_traffic() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        set_enabled(true);
-        // A chatty pane streaming output (a build's log) drives a flood of PTY
-        // chunks while only the 2s refresh ticker pulses in the background.
-        let mut lp = LoopPerf::new();
-        lp.pty(500, true);
-        lp.tick(WakeSource::Model);
-        lp.tick(WakeSource::Refresh);
-        // The storm gate keys off background volume, not total wakes: foreground
-        // PTY traffic must not count, so a busy terminal can never trip the
-        // false "wake storm while idle" alarm this fix removes.
-        assert_eq!(lp.items(WakeSource::Pty), 500);
-        assert_eq!(lp.background_items(), 2);
-        // A real background storm (the diff-watcher `.git/` loop) still counts.
-        for _ in 0..300 {
-            lp.tick(WakeSource::Watcher);
-        }
-        assert_eq!(lp.background_items(), 302);
         set_enabled(false);
     }
 
