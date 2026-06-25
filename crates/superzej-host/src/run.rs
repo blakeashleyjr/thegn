@@ -535,7 +535,8 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     let (container_tx, container_rx) =
         tokio_mpsc::unbounded_channel::<Vec<superzej_core::sandbox::ContainerInfo>>();
     let (metrics_tx, metrics_rx) = tokio_mpsc::unbounded_channel::<crate::metrics::MetricsState>();
-    let (ai_metrics_tx, mut ai_metrics_rx) = tokio_mpsc::unbounded_channel::<crate::chrome::AiMetrics>();
+    let (ai_metrics_tx, mut ai_metrics_rx) =
+        tokio_mpsc::unbounded_channel::<crate::chrome::AiMetrics>();
     spawn_ai_sidecar(waker.clone(), ai_metrics_tx);
     crate::metrics::spawn_metrics_supervisor(cfg.metrics.clone(), metrics_tx, waker.clone());
     // The stats cadence is user-cyclable at runtime (click the top-right
@@ -8222,13 +8223,13 @@ async fn event_loop<T: Terminal>(
                 model.metrics = state;
                 dirty = true;
             }
-        while let Ok(ai_state) = ai_metrics_rx.try_recv() {
-            loop_perf.tick(crate::perf::WakeSource::Metrics);
-            if model.ai_metrics.as_ref() != Some(&ai_state) {
-                model.ai_metrics = Some(ai_state);
-                dirty = true;
+            while let Ok(ai_state) = ai_metrics_rx.try_recv() {
+                loop_perf.tick(crate::perf::WakeSource::Metrics);
+                if model.ai_metrics.as_ref() != Some(&ai_state) {
+                    model.ai_metrics = Some(ai_state);
+                    dirty = true;
+                }
             }
-        }
         }
 
         // Panel document payloads from the on-entry fetches; stale
@@ -14714,11 +14715,25 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
             }
             Ok(Some(InputEvent::Paste(s))) => {
-                if !crate::focus::forwards_to_pane(focus.zone) {
-                    model.status = "Paste ignored (terminal not focused)".into();
-                    dirty = true;
+                // A chrome text-input is collecting keystrokes (commit message /
+                // rename / new-branch overlay, the search palette, or the git
+                // filter line): a paste belongs to it, not the terminal. We
+                // don't inject into those fields yet, but we must not leak the
+                // paste into the pane sitting behind the overlay either.
+                let chrome_text_input = git_input.is_some()
+                    || host_input.is_some()
+                    || palette.is_some()
+                    || panel_ui.git.filter.as_ref().is_some_and(|f| f.editing);
+                if chrome_text_input {
                     continue;
                 }
+                // Otherwise a paste — including a terminal file drag-and-drop,
+                // which the outer terminal delivers as a bracketed paste — is
+                // terminal-bound. Route it to the focused pane even when the
+                // sidebar or panel holds keyboard focus: a drop is an
+                // unambiguous "into the terminal" gesture and we only learn the
+                // focus zone, never the drop coordinates, so gating on
+                // `forwards_to_pane` would silently swallow drops onto chrome.
                 let target_pane = if focus.drawer() {
                     drawer.unwrap_or(focused)
                 } else {
@@ -16672,11 +16687,14 @@ mod tests {
     }
 }
 
-pub fn spawn_ai_sidecar(waker: termwiz::terminal::TerminalWaker, tx: tokio::sync::mpsc::UnboundedSender<crate::chrome::AiMetrics>) {
+pub fn spawn_ai_sidecar(
+    waker: termwiz::terminal::TerminalWaker,
+    tx: tokio::sync::mpsc::UnboundedSender<crate::chrome::AiMetrics>,
+) {
     tokio::spawn(async move {
-        use tokio::process::Command;
-        use tokio::io::{AsyncBufReadExt, BufReader};
         use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::process::Command;
 
         let mut child = match Command::new("python3")
             .arg("src/sidecar.py")
