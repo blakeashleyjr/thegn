@@ -1,9 +1,8 @@
 # sz-kit
 
-The **superzej embedding contract**. Sibling TUIs (termite-chat,
-termite-agent) implement [`AppTile`] so superzej can host them as top-level
-**app tabs**, while each still ships as a standalone binary via the
-[`standalone::run`] harness.
+The **superzej embedding contract**. Sibling TUIs implement [`AppTile`] so
+superzej can host them as top-level **app tabs**, while each still ships as a
+standalone binary via the [`standalone::run`] harness.
 
 It depends on neither tokio, termwiz, nor `superzej-core`, so a standalone app
 links it without pulling in superzej's stack.

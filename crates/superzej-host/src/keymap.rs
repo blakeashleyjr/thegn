@@ -60,7 +60,6 @@ pub enum Action {
     SwitchWorkspace,
     /// Open the coding-agent account switcher for the focused worktree (item 656).
     SwitchAccount,
-    Dashboard,
     NextTab,
     PrevTab,
     /// Switch to the next worktree (Alt+Down), wrapping WITHIN the active
@@ -291,13 +290,6 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         label: "Switch agent account",
         hint: "account",
         default_chords: &["Ctrl Alt a"],
-        palette: true,
-    },
-    ActionSpec {
-        id: "dashboard",
-        label: "Dashboard",
-        hint: "dashboard",
-        default_chords: &["Alt d"],
         palette: true,
     },
     ActionSpec {
@@ -737,7 +729,6 @@ impl Action {
             Action::CloseWorktree => "close-worktree",
             Action::SwitchWorkspace => "switch-workspace",
             Action::SwitchAccount => "switch-account",
-            Action::Dashboard => "dashboard",
             Action::NextTab => "next-tab",
             Action::PrevTab => "prev-tab",
             Action::NextWorktree => "next-worktree",
@@ -808,7 +799,6 @@ impl Action {
             "close-worktree" => Action::CloseWorktree,
             "switch-workspace" | "switch-repo" => Action::SwitchWorkspace,
             "switch-account" => Action::SwitchAccount,
-            "dashboard" => Action::Dashboard,
             "next-tab" => Action::NextTab,
             "prev-tab" => Action::PrevTab,
             "next-worktree" => Action::NextWorktree,
@@ -1252,7 +1242,6 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Alt x", Action::CloseTab).unwrap();
     map.insert_all("Alt X", Action::CloseWorktree).unwrap();
     map.insert_all("Alt o", Action::SwitchWorkspace).unwrap();
-    map.insert_all("Alt d", Action::Dashboard).unwrap();
     map.insert_all("Alt n", Action::SplitDown).unwrap();
     map.insert_all("Alt N", Action::SplitRight).unwrap();
     map.insert_all("Ctrl w", Action::CloseSplitPane).unwrap();

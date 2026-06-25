@@ -22,7 +22,6 @@ profiling = ["dep:pprof"]
 clap = { workspace = true, features = ["derive"] }
 superzej-core.workspace = true
 superzej-svc.workspace = true
-superzej-dashboard = { path = "../superzej-dashboard" }
 anyhow.workspace = true
 tracing.workspace = true
 serde.workspace = true
@@ -55,13 +54,3 @@ pprof = { version = "0.14", features = ["flamegraph"], optional = true }
 # re-export). The host renders embedded apps' ratatui buffers through
 # `sz_kit::ratatui` so the Buffer type is identical to what the apps produce.
 sz-kit = { path = "../sz-kit" }
-# Embedded app crates (git submodules under apps/, each its own workspace).
-# Path deps resolve the package directly against the submodule's own
-# [workspace]; superzej's `exclude` keeps these out of this workspace. Their
-# sz-kit git-dep is redirected to the in-tree crate by the root [patch].
-# termite-chat's embeddable TUI (the `chat` tab).
-termite-chat = { path = "../../apps/termite-chat" }
-# termite-agent's coding-agent runtime (the `agent` tab). The host owns the
-# `AppTile` (apps/agent.rs) and drives `termite-core`'s blocking `AgentRuntime`
-# on `spawn_blocking`; the submodule stays a clean library dep.
-termite-core = { path = "../../apps/termite-agent/crates/termite-core" }
