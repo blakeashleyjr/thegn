@@ -383,6 +383,22 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     for g in &session.worktrees {
         superzej_core::util::heal_main_checkout_worktree(std::path::Path::new(&g.path));
     }
+    // Also heal the canonical checkout that OWNS the shared `.git`, even when we
+    // launched from a linked worktree (its path is usually not among cwd or the
+    // session worktree paths). `--git-common-dir` resolves to `<canonical>/.git`,
+    // whose parent is the main checkout — which is exactly where a stray
+    // `core.worktree` actually lands. Scrubbed git env so this probe is itself safe.
+    if let Some(common_parent) = superzej_core::util::git_cmd(&cwd)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| std::path::PathBuf::from(s.trim()))
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+    {
+        superzej_core::util::heal_main_checkout_worktree(&common_parent);
+    }
     tracing::info!(
         target: "szhost::startup",
         since_start_ms = start.elapsed().as_millis() as u64,
@@ -535,7 +551,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     let (container_tx, container_rx) =
         tokio_mpsc::unbounded_channel::<Vec<superzej_core::sandbox::ContainerInfo>>();
     let (metrics_tx, metrics_rx) = tokio_mpsc::unbounded_channel::<crate::metrics::MetricsState>();
-    let (ai_metrics_tx, mut ai_metrics_rx) =
+    let (ai_metrics_tx, ai_metrics_rx) =
         tokio_mpsc::unbounded_channel::<crate::chrome::AiMetrics>();
     spawn_ai_sidecar(waker.clone(), ai_metrics_tx);
     crate::metrics::spawn_metrics_supervisor(cfg.metrics.clone(), metrics_tx, waker.clone());
@@ -6118,10 +6134,10 @@ fn sync_drawer_persistence(
 async fn ensure_app_loaded(
     app_host: &mut crate::apps::AppHost,
     target: crate::apps::ActiveApp,
-    app_tx: &tokio_mpsc::UnboundedSender<usize>,
-    waker: &TerminalWaker,
-    current_config: &superzej_core::config::Config,
-    event_bus: &superzej_core::event_bus::EventBus,
+    _app_tx: &tokio_mpsc::UnboundedSender<usize>,
+    _waker: &TerminalWaker,
+    _current_config: &superzej_core::config::Config,
+    _event_bus: &superzej_core::event_bus::EventBus,
 ) -> bool {
     let crate::apps::ActiveApp::Tile(i) = target else {
         return true;
@@ -6129,30 +6145,10 @@ async fn ensure_app_loaded(
     if !matches!(app_host.slots[i].state, crate::apps::SlotState::Unloaded) {
         return true;
     }
-    let hook: sz_kit::ChangeHook = {
-        let tx = app_tx.clone();
-        let wk = waker.clone();
-        std::sync::Arc::new(move || {
-            let _ = tx.send(i);
-            let _ = wk.wake();
-        })
-    };
-    let handle = tokio::runtime::Handle::current();
-    let theme = crate::apps::kit_theme(&current_config.palette());
-    let id = app_host.slots[i].id;
-    let tile = match id {
-        "chat" => crate::apps::chat::build(handle, hook, theme).await,
-        "agent" => {
-            crate::apps::agent::build(handle, hook, theme, current_config, Some(event_bus.clone()))
-                .await
-        }
-        "dashboard" => {
-            crate::apps::dashboard::build(handle, hook, theme, &current_config.dashboard).await
-        }
-        _ => return false,
-    };
-    app_host.slots[i].state = crate::apps::SlotState::Running(tile);
-    true
+    // No embedded app builders are registered today, so a tile target can't be
+    // constructed (`AppHost::from_config` never produces tile slots). When a
+    // builder is added, construct the tile here and store it as `Running`.
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6620,23 +6616,6 @@ async fn event_loop<T: Terminal>(
     .await
     {
         dirty = true;
-    }
-    // Pre-warm the dashboard so switching to it is instant. Its build just
-    // spawns the background data thread (system stats / HN / recent repos) and
-    // returns, so this costs ~nothing at startup but means the dashboard is
-    // already populated — no loading spinner — by the time the user focuses it.
-    if let Some(dash) = app_host.dashboard_target()
-        && app_host.active != dash
-    {
-        let _ = ensure_app_loaded(
-            &mut app_host,
-            dash,
-            &app_tx,
-            &waker,
-            &current_config,
-            &event_bus,
-        )
-        .await;
     }
     // The workspace the keymap was last built for; when the focused workspace
     // changes we rebuild so per-workspace/repo-root keybind layers follow it.
@@ -14080,24 +14059,6 @@ async fn event_loop<T: Terminal>(
                             }
                             Action::DeleteWorkspace => {
                                 begin_delete_workspace_prompt(&mut host_input, &mut model);
-                            }
-                            Action::Dashboard => {
-                                if let Some(target) = app_host.dashboard_target() {
-                                    if app_host.active == target {
-                                        app_host.active = crate::apps::ActiveApp::Work;
-                                    } else if ensure_app_loaded(
-                                        &mut app_host,
-                                        target,
-                                        &app_tx,
-                                        &waker,
-                                        &current_config,
-                                        &event_bus,
-                                    )
-                                    .await
-                                    {
-                                        app_host.active = target;
-                                    }
-                                }
                             }
                             Action::SwitchWorkspace => {
                                 if let Ok(db) = superzej_core::db::Db::open()
