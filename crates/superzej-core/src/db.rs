@@ -3648,6 +3648,187 @@ mod tests {
     }
 
     #[test]
+    fn loc_cache_entry_returns_value_and_timestamp() {
+        let db = db();
+        // Cold cache: both the bare and the timestamped accessor miss.
+        assert!(db.get_loc_cache_entry("/wt").unwrap().is_none());
+        db.put_loc_cache("/wt", 4242).unwrap();
+        let (loc, fetched_at) = db.get_loc_cache_entry("/wt").unwrap().unwrap();
+        assert_eq!(loc, 4242);
+        assert!(fetched_at > 0, "fetch timestamp is stamped for TTL refresh");
+        // A different worktree is isolated.
+        assert!(db.get_loc_cache_entry("/other").unwrap().is_none());
+    }
+
+    #[test]
+    fn set_proxy_budget_limits_creates_and_updates_caps() {
+        let db = db();
+        // No budget row yet.
+        assert!(db.proxy_budget("agent:r").unwrap().is_none());
+
+        // Setting limits creates the row without touching (zero) spend.
+        db.set_proxy_budget_limits("agent:r", "weekly", Some(1_000), Some(2.5), 5000)
+            .unwrap();
+        let b = db.proxy_budget("agent:r").unwrap().unwrap();
+        assert_eq!(b.period, "weekly");
+        assert_eq!(b.limit_tokens, Some(1_000));
+        assert_eq!(b.limit_cost, Some(2.5));
+        assert_eq!(b.reset_ms, 5000);
+        assert_eq!(b.spent_tokens, 0);
+        assert!((b.spent_cost).abs() < 1e-9);
+        assert!(!b.killed);
+
+        // Accumulate spend, then re-set caps: spend must be preserved, caps updated.
+        db.add_proxy_spend("agent:r", 300, 0.9, 100).unwrap();
+        db.set_proxy_budget_limits("agent:r", "monthly", None, None, 9000)
+            .unwrap();
+        let b = db.proxy_budget("agent:r").unwrap().unwrap();
+        assert_eq!(b.period, "monthly");
+        assert_eq!(b.limit_tokens, None, "None means no cap");
+        assert_eq!(b.limit_cost, None);
+        assert_eq!(b.reset_ms, 9000);
+        assert_eq!(b.spent_tokens, 300, "re-setting caps preserves spend");
+        assert!((b.spent_cost - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn put_worktree_records_folder_id_and_remote_location() {
+        let db = db();
+        db.put_workspace("/x/app", "app", "repo").unwrap();
+        let folder = db.create_folder("/x/app", "Features").unwrap();
+
+        // Inserting with a folder_id + remote location persists both.
+        db.put_worktree(
+            "app/feat",
+            "/x/app",
+            "/wt/feat",
+            "sz/feat",
+            Some(r#"{"host":"box"}"#),
+            Some(folder),
+        )
+        .unwrap();
+        assert_eq!(
+            db.location_for("/wt/feat").unwrap().as_deref(),
+            Some(r#"{"host":"box"}"#)
+        );
+
+        // COALESCE(?8, folder_id): a later upsert with folder_id=None keeps the
+        // existing folder association rather than clearing it.
+        db.put_worktree("app/feat", "/x/app", "/wt/feat", "sz/feat", None, None)
+            .unwrap();
+        let fid: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT folder_id FROM worktrees WHERE worktree=?1",
+                params!["/wt/feat"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fid, Some(folder), "upsert with None preserves folder_id");
+    }
+
+    #[test]
+    fn proxy_kill_switch_set_clear_creates_row() {
+        let db = db();
+        // Setting the kill switch on an unknown scope creates the row.
+        db.set_proxy_kill_switch("worktree:/wt", true).unwrap();
+        assert!(db.proxy_budget("worktree:/wt").unwrap().unwrap().killed);
+        // Clearing it flips back.
+        db.set_proxy_kill_switch("worktree:/wt", false).unwrap();
+        assert!(!db.proxy_budget("worktree:/wt").unwrap().unwrap().killed);
+    }
+
+    #[test]
+    fn proxy_virtual_key_upsert_unrevokes() {
+        let db = db();
+        db.put_proxy_virtual_key("vk", "h1", "lbl", "global", None, 1)
+            .unwrap();
+        db.revoke_proxy_virtual_key("vk", 2).unwrap();
+        assert!(db.proxy_virtual_key("vk").unwrap().is_none());
+        // Re-registering the same key id clears the revocation (revoked_at=NULL).
+        db.put_proxy_virtual_key("vk", "h2", "lbl2", "agent:x", Some("kilo"), 3)
+            .unwrap();
+        let got = db.proxy_virtual_key("vk").unwrap().unwrap();
+        assert_eq!(got.0, "agent:x");
+        assert_eq!(got.1.as_deref(), Some("kilo"));
+    }
+
+    #[test]
+    fn migrate_v6_skips_extra_kind_rows_with_empty_name() {
+        // A legacy tab_layout where one row has an empty tab_name (the `continue`
+        // branch) and another session has no recorded active_tab (active_idx
+        // defaults to 0). Exercises the migration's edge branches.
+        let dir = std::env::temp_dir().join(format!("sz-db-mig6e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA user_version = 5;
+                CREATE TABLE tab_layout (
+                  session_name TEXT, tab_name TEXT, kind TEXT, worktree TEXT,
+                  pane_tree TEXT, ordinal INTEGER, focused_pane INTEGER,
+                  PRIMARY KEY (session_name, tab_name));
+                CREATE TABLE session_state (
+                  session_name TEXT PRIMARY KEY, active_tab TEXT, updated_at INTEGER);
+                INSERT INTO tab_layout VALUES
+                  ('/r', '',         'home',     '/r',       '{"leaf":0}', 0, 0),
+                  ('/r', 'app/home', 'home',     '/r',       '{"leaf":1}', 1, 0);
+                "#,
+            )
+            .unwrap();
+        }
+        let db = Db::open_at(&path).unwrap();
+        let groups = db.groups_for_session("/r").unwrap();
+        // Only the named row produced a group; the empty-name row was skipped.
+        assert_eq!(
+            groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(),
+            vec!["app/home"]
+        );
+        // No active marker recorded → group active_tab defaulted to 0.
+        assert_eq!(groups[0].active_tab, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrates_v2_drops_and_recreates_session_tables() {
+        // A pre-v3 DB (user_version < 3) with the old per-session schema: the
+        // v2→v3 remap drops worktrees/workspaces but preserves the `repos`
+        // recents history (the only irreplaceable data).
+        let dir = std::env::temp_dir().join(format!("sz-db-v2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA user_version = 2;
+                CREATE TABLE repos (
+                  path TEXT PRIMARY KEY, name TEXT, first_seen INTEGER,
+                  last_opened INTEGER, open_count INTEGER, seq INTEGER);
+                INSERT INTO repos(path,name,first_seen,last_opened,open_count,seq)
+                  VALUES ('/keep','keep',1,1,1,1);
+                CREATE TABLE worktrees (worktree TEXT PRIMARY KEY, session_name TEXT);
+                CREATE TABLE workspaces (session_name TEXT PRIMARY KEY, name TEXT);
+                INSERT INTO worktrees VALUES ('/old','sess');
+                "#,
+            )
+            .unwrap();
+        }
+        let db = Db::open_at(&path).unwrap();
+        // repos recents survived the remap.
+        assert!(db.is_known_repo("/keep").unwrap());
+        assert_eq!(db.recent_repos(5).unwrap(), vec!["/keep".to_string()]);
+        // The pre-v3 worktrees/workspaces rows were dropped & recreated empty.
+        assert!(db.worktrees().unwrap().is_empty());
+        assert!(db.workspaces().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn proxy_request_audit_insert() {
         let db = db();
         let row = ProxyRequestRow {
