@@ -353,16 +353,17 @@ fn prewarm_targets(active: usize, len: usize, radius: usize) -> Vec<usize> {
 /// per tab on a large session.
 const PREWARM_RADIUS: usize = 1;
 
-/// The (worktree, tab, missing leaf ids) triples a pre-warm pass should
-/// resolve specs for: the tabs adjacent to the active one (within the active
-/// worktree) and the neighboring worktrees' active tabs, so first focus of a
-/// neighbor is instant. Pure enumeration — the caller requests launch specs
-/// off-thread (sandbox ensure can block) and finishes the spawns when they
-/// land, exactly like the lazy materialize path.
+/// The (group name, worktree path, tab, missing leaf ids) tuples a pre-warm
+/// pass should resolve specs for: the tabs adjacent to the active one (within
+/// the active worktree) and the neighboring worktrees' active tabs, so first
+/// focus of a neighbor is instant. Pure enumeration — the caller requests
+/// launch specs off-thread (sandbox ensure can block) and finishes the spawns
+/// when they land, exactly like the lazy materialize path. The group name is
+/// the routing key (unique per session); the path is the spawn cwd.
 pub(crate) fn prewarm_requests(
     panes: &Panes,
     session: &mut crate::session::Session,
-) -> Vec<(String, usize, Vec<u32>)> {
+) -> Vec<(String, String, usize, Vec<u32>)> {
     let mut out = Vec::new();
     if session.worktrees.is_empty() {
         return out;
@@ -372,7 +373,7 @@ pub(crate) fn prewarm_requests(
     for ti in prewarm_targets(g.active_tab, g.tabs.len(), PREWARM_RADIUS) {
         let missing = panes.missing_leaves(&g.tabs[ti]);
         if !missing.is_empty() {
-            out.push((g.path.clone(), ti, missing));
+            out.push((g.name.clone(), g.path.clone(), ti, missing));
         }
     }
     // Neighboring worktrees: their remembered active tab.
@@ -383,7 +384,7 @@ pub(crate) fn prewarm_requests(
         if let Some(tab) = g.tabs.get(at) {
             let missing = panes.missing_leaves(tab);
             if !missing.is_empty() {
-                out.push((g.path.clone(), at, missing));
+                out.push((g.name.clone(), g.path.clone(), at, missing));
             }
         }
     }
@@ -457,6 +458,35 @@ mod tests {
             worktrees: vec![WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/app")],
             active: 0,
         }
+    }
+
+    #[test]
+    fn prewarm_requests_key_by_group_name_so_same_path_groups_stay_distinct() {
+        // Two groups can share a worktree path (the resurrect adoption loop can
+        // adopt two registry rows for one dir under different tab names). The
+        // spec roundtrip must key by the unique group NAME, not the path, or a
+        // result would route to the wrong group and the active tab + a same-path
+        // neighbor would collide on one key. Assert prewarm carries the name.
+        let mut session = Session {
+            id: "s1".into(),
+            worktrees: vec![
+                WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/app"),
+                WorktreeGroup::new("app/dup", GroupKind::Branch, "/tmp/app"),
+            ],
+            active: 0,
+        };
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(16);
+        let panes = Panes::new(tx); // empty table → every leaf is "missing"
+
+        let reqs = prewarm_requests(&panes, &mut session);
+        let neighbor = reqs
+            .iter()
+            .find(|(name, _, _, _)| name == "app/dup")
+            .expect("the same-path neighbor is pre-warmed under its own name");
+        assert_eq!(neighbor.1, "/tmp/app", "the path is carried for the cwd");
+        // The routing key (name, ti) is distinct from the active group's,
+        // despite the shared path.
+        assert_ne!(neighbor.0, "app/home");
     }
 
     #[test]

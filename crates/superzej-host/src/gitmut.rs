@@ -644,9 +644,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let git = |args: &[&str]| {
-            let ok = std::process::Command::new("git")
+            // `git -C dir` with GIT_DIR/GIT_WORK_TREE/etc. scrubbed so this
+            // setup can't write to the OUTER repo's shared config when the
+            // suite runs inside a commit hook (the core.worktree pollution bug).
+            let ok = superzej_core::util::git_cmd(&dir)
                 .args(args)
-                .current_dir(&dir)
                 .env("GIT_AUTHOR_NAME", "t")
                 .env("GIT_AUTHOR_EMAIL", "t@e")
                 .env("GIT_COMMITTER_NAME", "t")

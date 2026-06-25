@@ -140,6 +140,14 @@ pub enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Strip any inherited GIT_DIR/GIT_WORK_TREE/etc. before anything else (and
+    // before the tokio runtime spawns threads — env mutation must be
+    // single-threaded). superzej targets git explicitly with `-C <dir>`, so it
+    // never needs an ambient GIT_DIR; leaving one in place would propagate to
+    // every pane shell, agent, and sandbox we spawn and let a child `git
+    // worktree add` leak `core.worktree` into the shared main `.git/config`.
+    superzej_core::util::scrub_git_env();
+
     let mut cli = Cli::parse();
     if let Some(lvl) = cli.log_level.as_deref() {
         cli.overrides.push(format!("log.level={lvl}"));

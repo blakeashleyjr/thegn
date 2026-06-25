@@ -12,7 +12,6 @@
 //! `~/.gitconfig` is masked as a *directory* in some sandboxes).
 
 use std::path::Path;
-use std::process::Command;
 use superzej_core::remote::GitLoc;
 use tempfile::TempDir;
 
@@ -27,9 +26,10 @@ pub struct GitFixture {
 }
 
 fn git(dir: &Path, args: &[&str], home: &Path, gitconfig: &Path) {
-    let status = Command::new("git")
+    // `git -C dir` with GIT_DIR/GIT_WORK_TREE/etc. scrubbed so the fixture can't
+    // write to an outer repo's shared config (the core.worktree pollution bug).
+    let status = superzej_core::util::git_cmd(dir)
         .args(args)
-        .current_dir(dir)
         .env("HOME", home)
         .env("GIT_CONFIG_GLOBAL", gitconfig)
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
