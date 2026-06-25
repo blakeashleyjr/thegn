@@ -1624,6 +1624,22 @@ mod tests {
     }
 
     #[test]
+    fn runtime_dispatch_matches_alt_w_in_normal_mode() {
+        // The runtime path is keymap.dispatch(mode, Key), NOT map_key. Prove a
+        // parsed Alt+w (what termwiz yields for both legacy ESC-w and kitty
+        // CSI 119;3u) actually triggers NewWorktree through the real matcher.
+        let mut map = default_keymap();
+        let key = Key::modified(KeyCode::Char('w'), Modifiers::ALT);
+        assert!(
+            matches!(
+                map.dispatch(Mode::Normal, key),
+                crate::sequence::MatchResult::Matched(Action::NewWorktree)
+            ),
+            "Alt+w must match NewWorktree via the runtime dispatch path"
+        );
+    }
+
+    #[test]
     fn alt_chords_map_to_lifecycle_actions() {
         assert_eq!(k('w', Modifiers::ALT), Some(Action::NewWorktree));
         assert_eq!(k('W', Modifiers::ALT), Some(Action::NewWorkspace));
