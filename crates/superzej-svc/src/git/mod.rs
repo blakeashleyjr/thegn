@@ -441,6 +441,12 @@ fn run(loc: &GitLoc, args: &[&str]) -> Result<String> {
 /// `GIT_TERMINAL_PROMPT=0` — a credential/gpg prompt must fail fast, never
 /// hang the background thread that mutations run on.
 pub(crate) fn run_w(loc: &GitLoc, envs: &[(&str, &str)], args: &[&str]) -> Result<String> {
+    // Serialize this mutation against other szhost/agent processes on the same
+    // repo (held for the subprocess's lifetime). Remote locs lock on their own
+    // machine, so skip locally. Best-effort — `None` degrades to unlocked.
+    let _lock = (!loc.is_remote())
+        .then(|| superzej_core::util::lock_git_mutations(std::path::Path::new(&loc.path())))
+        .flatten();
     let mut env: Vec<(&str, &str)> = vec![("GIT_TERMINAL_PROMPT", "0")];
     env.extend_from_slice(envs);
     let out = loc
@@ -465,6 +471,9 @@ pub(crate) fn run_stdin(
     args: &[&str],
     stdin: &[u8],
 ) -> Result<String> {
+    let _lock = (!loc.is_remote())
+        .then(|| superzej_core::util::lock_git_mutations(std::path::Path::new(&loc.path())))
+        .flatten();
     let mut env: Vec<(&str, &str)> = vec![("GIT_TERMINAL_PROMPT", "0")];
     env.extend_from_slice(envs);
     let out = loc
@@ -498,6 +507,8 @@ pub(crate) fn gpg_args(override_gpg: bool) -> &'static [&'static str] {
 }
 
 fn run_root(root: &Path, args: &[&str]) -> Result<()> {
+    // `root` is the main checkout; lock the repo's shared `.git` for the op.
+    let _lock = superzej_core::util::lock_git_mutations(root);
     if superzej_core::util::git_ok(root, args) {
         Ok(())
     } else {
@@ -1185,9 +1196,11 @@ mod tests {
         assert!(CliGit.merge_state(&loc).unwrap().is_none());
 
         // A conflicting merge leaves MERGE_HEAD behind (merge itself fails).
-        // Via the scrubbed `git_cmd` helper so an inherited GIT_DIR can't make
+        // Via the scrubbed core `git_cmd` so an inherited GIT_DIR can't make
         // this hit the outer repo's shared config (the core.worktree bug).
-        let _ = git_cmd(&base, &["merge", "feat"]).output();
+        let _ = superzej_core::util::git_cmd(&base)
+            .args(["merge", "feat"])
+            .output();
         let st = CliGit.merge_state(&loc).unwrap().expect("merge detected");
         assert_eq!(st.kind, MergeKind::Merge);
         assert_eq!(st.kind.label(), "MERGING");

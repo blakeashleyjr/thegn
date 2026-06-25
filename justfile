@@ -230,6 +230,10 @@ lint: _apps
     shellcheck -x install.sh test/smoke.sh test/pty-smoke.sh test/install-plan.sh test/dev-tui-plan.sh test/sandbox-network.sh test/git-hooks/post-checkout.sh
     yamllint .
     taplo lint
+    # Guardrail: all git must route through util::git_cmd / GitLoc so GIT_ENV_VARS
+    # is scrubbed (the core.worktree-pollution class). Only the builder in util.rs
+    # may call `git` directly; raw `Command::new("git")` anywhere else is rejected.
+    ! grep -rIn 'Command::new("git")' crates --include='*.rs' | grep -v 'superzej-core/src/util.rs' || (echo 'ERROR: raw Command::new("git") outside util::git_cmd — route through git_cmd/GitLoc to scrub GIT_ENV_VARS' && exit 1)
 
 # Rustdoc must stay warning-clean; public API docs are part of the release gate.
 doc-check:
