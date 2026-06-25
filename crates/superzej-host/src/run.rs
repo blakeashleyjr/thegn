@@ -8634,11 +8634,17 @@ async fn event_loop<T: Terminal>(
                 && toasts.is_empty();
             if fast_select && !clear_on_next_frame {
                 if let Some((sp, sel)) = mouse_sel.as_ref() {
-                    let target = tree
-                        .layout_framed(chrome.center)
-                        .into_iter()
-                        .find(|(id, _, _)| id == sp)
-                        .map(|(_, _, c)| c);
+                    let target = if let Some(d) = drawer
+                        && d == *sp
+                        && let Some(rect) = chrome.drawer
+                    {
+                        Some(rect)
+                    } else {
+                        tree.layout_framed(chrome.center)
+                            .into_iter()
+                            .find(|(id, _, _)| id == sp)
+                            .map(|(_, _, c)| c)
+                    };
                     if let (Some(content), Some(p)) = (target, panes.table.get(sp)) {
                         crate::compositor::compose_pane(&mut scratch, p.emulator(), content);
                         crate::compositor::overlay_selection(
@@ -8651,11 +8657,17 @@ async fn event_loop<T: Terminal>(
                 }
             } else if scroll_fast {
                 if let Some(sp) = scroll_pane {
-                    let target = tree
-                        .layout_framed(chrome.center)
-                        .into_iter()
-                        .find(|(id, _, _)| *id == sp)
-                        .map(|(_, _, c)| c);
+                    let target = if let Some(d) = drawer
+                        && d == sp
+                        && let Some(rect) = chrome.drawer
+                    {
+                        Some(rect)
+                    } else {
+                        tree.layout_framed(chrome.center)
+                            .into_iter()
+                            .find(|(id, _, _)| *id == sp)
+                            .map(|(_, _, c)| c)
+                    };
                     if let (Some(content), Some(p)) = (target, panes.table.get(&sp)) {
                         crate::compositor::compose_pane(&mut scratch, p.emulator(), content);
                     }
@@ -8746,14 +8758,21 @@ async fn event_loop<T: Terminal>(
                 // Mouse-selection highlight, clipped to the anchored pane.
                 if !app_tile_active
                     && let Some((sel_pane, sel)) = &mouse_sel
-                    && let Some((_, _, content)) = tree
-                        .layout_framed(chrome.center)
-                        .iter()
-                        .find(|(id, _, _)| id == sel_pane)
+                    && let Some(content) = if let Some(d) = drawer
+                        && d == *sel_pane
+                        && let Some(rect) = chrome.drawer
+                    {
+                        Some(rect)
+                    } else {
+                        tree.layout_framed(chrome.center)
+                            .iter()
+                            .find(|(id, _, _)| id == sel_pane)
+                            .map(|(_, _, c)| *c)
+                    }
                 {
                     crate::compositor::overlay_selection(
                         &mut scratch,
-                        *content,
+                        content,
                         sel,
                         crate::chrome::col(crate::chrome::S::Panel2),
                     );
@@ -9065,10 +9084,18 @@ async fn event_loop<T: Terminal>(
                     .active_tab()
                     .map(|t| t.center.layout_framed(chrome.center))
                     .unwrap_or_default();
-                let hit_pane = frames
-                    .iter()
-                    .find(|(_, _, c)| contains(*c, mx, my))
-                    .map(|(id, _, c)| (*id, *c));
+                let hit_pane = if app_host.active_tile_mut().is_none()
+                    && let Some(drawer_id) = drawer
+                    && let Some(rect) = chrome.drawer
+                    && contains(rect, mx, my)
+                {
+                    Some((drawer_id, rect))
+                } else {
+                    frames
+                        .iter()
+                        .find(|(_, _, c)| contains(*c, mx, my))
+                        .map(|(id, _, c)| (*id, *c))
+                };
 
                 // Full terminal support: when the app inside the pane asked
                 // for mouse reporting (htop, lazygit, …), forward the event
@@ -9446,7 +9473,17 @@ async fn event_loop<T: Terminal>(
                     let my = (m.y as usize).saturating_sub(1);
                     // Drag: extend the selection, clamped to the anchored pane.
                     if let Some((id, sel)) = mouse_sel.as_mut()
-                        && let Some((_, _, content)) = frames.iter().find(|(fid, _, _)| fid == id)
+                        && let Some(content) = if let Some(d) = drawer
+                            && d == *id
+                            && let Some(rect) = chrome.drawer
+                        {
+                            Some(rect)
+                        } else {
+                            frames
+                                .iter()
+                                .find(|(fid, _, _)| fid == id)
+                                .map(|(_, _, c)| *c)
+                        }
                     {
                         // Autoscroll when the cursor is dragged past the top or bottom edge.
                         let pane_id = *id;
@@ -14099,12 +14136,28 @@ async fn event_loop<T: Terminal>(
                                 // clipboard via OSC 52 (out-of-band to the outer term).
                                 if let Some(p) = panes.table.get(&focused) {
                                     let emu = p.emulator();
-                                    let sel = crate::copymode::whole(emu);
+                                    let sel = mouse_sel
+                                        .as_ref()
+                                        .filter(|(id, _)| *id == focused)
+                                        .map(|(_, sel)| *sel)
+                                        .unwrap_or_else(|| crate::copymode::whole(emu));
                                     let text = crate::copymode::extract(emu, &sel);
-                                    use std::io::Write;
-                                    let mut out = std::io::stdout();
-                                    let _ = out.write_all(&crate::copymode::osc52(&text));
-                                    let _ = out.flush();
+                                    if !text.trim().is_empty() {
+                                        use std::io::Write;
+                                        let mut out = std::io::stdout();
+                                        let _ = out.write_all(&crate::copymode::osc52(&text));
+                                        let _ = out.flush();
+                                        crate::clipboard::copy(&text);
+                                        toasts.success(
+                                            if mouse_sel.is_some() {
+                                                "Selection copied to clipboard"
+                                            } else {
+                                                "Pane copied to clipboard"
+                                            },
+                                            std::time::Instant::now(),
+                                        );
+                                        schedule_toast_clear(&waker);
+                                    }
                                 }
                             }
                             Action::SearchPane => {

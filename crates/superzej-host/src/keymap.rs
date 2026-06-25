@@ -1231,6 +1231,7 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Alt i", Action::ToggleNotifications)
         .unwrap();
     map.insert_all("Ctrl Alt c", Action::CopyPane).unwrap();
+    map.insert_all("Ctrl Shift c", Action::CopyPane).unwrap();
     map.insert_all("Ctrl Alt n", Action::SwitchMode(Mode::Normal))
         .unwrap();
     map.insert_all("Ctrl Alt v", Action::SwitchMode(Mode::VimNormal))
