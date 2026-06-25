@@ -416,6 +416,7 @@ impl Session {
     /// Used to move a cold-resurrected workspace onto a fresh, disjoint id
     /// range so its persisted ids can't collide with the live panes of other
     /// resident workspaces (which are no longer reaped on a switch).
+    #[allow(dead_code)]
     pub fn remap_pane_ids(&mut self, mut f: impl FnMut(u32) -> u32) {
         for g in &mut self.worktrees {
             for tab in &mut g.tabs {
