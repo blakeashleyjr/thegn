@@ -1,7 +1,0 @@
-# Use the system git CLI (with its configured credentials/SSH) to fetch git
-# dependencies. Required because the app submodules depend on sz-kit via a git
-# dependency on this (private) repo; libgit2's built-in fetch can't auth, but
-# the git CLI can. (superzej redirects that git dep to the in-tree crate via
-# [patch] for embedded builds.)
-[net]
-git-fetch-with-cli = true
