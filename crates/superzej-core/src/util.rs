@@ -100,6 +100,41 @@ pub fn which_path(cmd: &str) -> Option<String> {
     None
 }
 
+/// The repo-targeting env vars git exports into hook/child environments. Left
+/// in place they silently retarget any plain `git` invocation at the OUTER
+/// repo — the cause of the `core.worktree` pollution where an agent's
+/// `git worktree add`, run with an inherited GIT_DIR/GIT_WORK_TREE, wrote a
+/// stray `core.worktree` into the shared main `.git/config` and made every
+/// subsequent read target the wrong tree. Scrubbed both per-invocation
+/// ([`git_cmd`]) and process-wide at startup ([`scrub_git_env`]).
+pub const GIT_ENV_VARS: [&str; 7] = [
+    "GIT_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+];
+
+/// Remove every repo-targeting git env var from the CURRENT process, so neither
+/// our own git calls nor anything we spawn (pane shells, agents, sandboxes,
+/// hooks) inherits a poisoned GIT_DIR/GIT_WORK_TREE. superzej always targets
+/// git explicitly with `-C <dir>`, so it never needs an ambient GIT_DIR.
+///
+/// MUST be called at the very top of `main`, before the tokio runtime (or any
+/// other thread) starts: mutating the environment is unsound while other
+/// threads may be reading it.
+///
+/// # Safety
+/// Single-threaded-startup invariant as above; `std::env::remove_var` is
+/// `unsafe` under edition 2024 for exactly that reason.
+pub fn scrub_git_env() {
+    for var in GIT_ENV_VARS {
+        unsafe { std::env::remove_var(var) };
+    }
+}
+
 /// A `git -C <dir>` command with the parent's repo-targeting env scrubbed.
 /// When superzej (or its test suite, via a pre-commit hook) runs inside a git
 /// hook, git exports GIT_DIR/GIT_INDEX_FILE/GIT_WORK_TREE — often as paths
@@ -108,16 +143,77 @@ pub fn which_path(cmd: &str) -> Option<String> {
 pub fn git_cmd(dir: &Path) -> Command {
     let mut c = Command::new("git");
     c.arg("-C").arg(dir);
-    for var in [
-        "GIT_DIR",
-        "GIT_INDEX_FILE",
-        "GIT_WORK_TREE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    ] {
+    for var in GIT_ENV_VARS {
         c.env_remove(var);
     }
     c
+}
+
+/// Defensive self-heal: a non-bare MAIN checkout must never carry
+/// `core.worktree`. A stray GIT_DIR/GIT_WORK_TREE in some child `git`
+/// invocation (an agent shell, a worktree op run inside a git hook) can leak it
+/// into the shared `.git/config`, after which every read — superzej's diff
+/// panel included — targets that other tree. If `root` is a main checkout (its
+/// `.git` is a directory, not a linked-worktree `.git` file, which legitimately
+/// uses core.worktree) and the key is set, strip it. Returns whether it healed.
+pub fn heal_main_checkout_worktree(root: &Path) -> bool {
+    // Only a main checkout has `.git` as a directory; linked worktrees have a
+    // `.git` FILE and their per-worktree config rightly sets core.worktree.
+    let cfg_path = root.join(".git/config");
+    if !root.join(".git").is_dir() || !cfg_path.is_file() {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(&cfg_path) else {
+        return false;
+    };
+    let Some(cleaned) = strip_core_worktree(&text) else {
+        return false; // nothing to do
+    };
+    // git itself can't be used to fix this: it canonicalizes the core.worktree
+    // VALUE on every config read, so a stray entry pointing at a now-missing
+    // path makes `git config --get/--unset/--list` all abort with "Invalid
+    // path". A surgical text edit (drop the `worktree` line inside `[core]`,
+    // everything else byte-for-byte) is the only reliable repair.
+    if std::fs::write(&cfg_path, cleaned).is_ok() {
+        tracing::warn!(
+            target: "szhost::startup",
+            root = %root.display(),
+            "stripped stray core.worktree from main checkout config (was retargeting git at another worktree)"
+        );
+        return true;
+    }
+    false
+}
+
+/// Drop the `worktree = …` entry from the `[core]` section of a git config
+/// file's text, returning the rewritten text — or `None` if there is no such
+/// entry (so the caller can skip the write). Only the `[core]` section is
+/// touched; subsections like `[core "x"]` and every other line are preserved
+/// verbatim. core.worktree is the only key that retargets a checkout's tree.
+fn strip_core_worktree(text: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut in_core = false;
+    let mut removed = false;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix('[') {
+            // Section header: `[core]` enters the section; `[core "sub"]` or any
+            // other header leaves it.
+            let head = rest.split(']').next().unwrap_or("").trim();
+            in_core = head.eq_ignore_ascii_case("core");
+        } else if in_core {
+            // A key line `worktree = …` (git keys are case-insensitive, '=' or
+            // whitespace separated).
+            let key = t.split(['=', ' ', '\t']).next().unwrap_or("").trim();
+            if key.eq_ignore_ascii_case("worktree") {
+                removed = true;
+                continue; // drop this line
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    removed.then_some(out)
 }
 
 /// Run `git -C <dir> <args...>`, returning trimmed stdout on success (None on
@@ -282,5 +378,91 @@ mod tests {
         assert_eq!(age(n), "0s");
         assert_eq!(age(n - 120), "2m");
         assert_eq!(age(n - 7200), "2h");
+    }
+
+    #[test]
+    fn git_env_scrub_list_covers_dir_and_worktree() {
+        // The two vars that actually retarget git at another tree must be in
+        // the scrub set (the rest are belt-and-suspenders).
+        assert!(GIT_ENV_VARS.contains(&"GIT_DIR"));
+        assert!(GIT_ENV_VARS.contains(&"GIT_WORK_TREE"));
+        assert!(GIT_ENV_VARS.contains(&"GIT_COMMON_DIR"));
+    }
+
+    #[test]
+    fn strip_core_worktree_removes_only_the_core_section_key() {
+        // Pollution under [core] is removed; the [core "sub"] subsection and a
+        // legitimate worktree key in another section are preserved.
+        let src = "\
+[core]
+\trepositoryformatversion = 0
+\tbare = false
+\tworktree = /no/such/tree
+[remote \"origin\"]
+\turl = https://example/r.git
+[core \"sub\"]
+\tworktree = keep-me
+";
+        let out = strip_core_worktree(src).expect("a [core].worktree was present");
+        assert!(!out.contains("worktree = /no/such/tree"));
+        assert!(out.contains("worktree = keep-me"), "subsection untouched");
+        assert!(out.contains("bare = false"));
+        assert!(out.contains("url = https://example/r.git"));
+        // No [core].worktree left, and no spurious changes (line count -1).
+        assert_eq!(out.lines().count(), src.lines().count() - 1);
+        // A clean config returns None (caller skips the write).
+        assert!(strip_core_worktree("[core]\n\tbare = false\n").is_none());
+    }
+
+    #[test]
+    fn heal_strips_stray_core_worktree_even_with_a_missing_target() {
+        // Build a real main checkout, then inject the pollution by TEXT — a
+        // missing target path, the worst case where `git config` itself aborts.
+        let dir = std::env::temp_dir().join(format!("sz-heal-strip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(
+            git_cmd(&dir)
+                .args(["init", "-q", "-b", "main"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let cfg = dir.join(".git/config");
+        let mut text = std::fs::read_to_string(&cfg).unwrap();
+        text.push_str("\tworktree = /no/such/tree\n"); // append under [core]
+        std::fs::write(&cfg, &text).unwrap();
+
+        assert!(
+            heal_main_checkout_worktree(&dir),
+            "heal should report a fix"
+        );
+        assert!(
+            !std::fs::read_to_string(&cfg)
+                .unwrap()
+                .contains("worktree ="),
+            "core.worktree line is gone after heal"
+        );
+        // Idempotent: a clean repo is a no-op.
+        assert!(!heal_main_checkout_worktree(&dir));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn heal_leaves_linked_worktrees_untouched() {
+        // A linked worktree's `.git` is a FILE, and its config legitimately
+        // sets core.worktree — heal must never touch those.
+        let dir = std::env::temp_dir().join(format!("sz-heal-linked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".git"), "gitdir: /elsewhere/.git/worktrees/wt\n").unwrap();
+
+        assert!(
+            !heal_main_checkout_worktree(&dir),
+            "a .git FILE (linked worktree) is never healed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
