@@ -68,13 +68,15 @@ futures = "0.3"
 # Minimal feature set: the host needs a multi-thread runtime (the loop blocks on
 # `poll_input(None)`, so `spawn_blocking` work must run on other threads), the
 # `#[tokio::main]` macro, and mpsc channels. svc's octocrab brings its own
-# reqwest/hyper runtime needs. No `time`/net/fs/process here — the refresh ticker
-# is a plain OS thread and subprocess + git I/O go through `spawn_blocking`.
+# reqwest/hyper runtime needs. The AI metrics sidecar streams a child process's
+# stdout (`spawn_ai_sidecar`), so `process` + `io-util` are needed too.
 tokio = { version = "1", features = [
   "rt-multi-thread",
   "macros",
   "sync",
   "signal",
+  "process",
+  "io-util",
 ] }
 portable-pty = "0.9"
 termwiz = "0.23"

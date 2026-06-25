@@ -1185,10 +1185,9 @@ mod tests {
         assert!(CliGit.merge_state(&loc).unwrap().is_none());
 
         // A conflicting merge leaves MERGE_HEAD behind (merge itself fails).
-        let _ = std::process::Command::new("git")
-            .args(["merge", "feat"])
-            .current_dir(&base)
-            .output();
+        // Via the scrubbed `git_cmd` helper so an inherited GIT_DIR can't make
+        // this hit the outer repo's shared config (the core.worktree bug).
+        let _ = git_cmd(&base, &["merge", "feat"]).output();
         let st = CliGit.merge_state(&loc).unwrap().expect("merge detected");
         assert_eq!(st.kind, MergeKind::Merge);
         assert_eq!(st.kind.label(), "MERGING");

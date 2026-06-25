@@ -156,8 +156,14 @@ impl GitLoc {
     pub fn git_command(&self, args: &[&str]) -> Command {
         match self {
             GitLoc::Local(p) => {
-                let mut c = Command::new("git");
-                c.arg("-C").arg(p).args(args);
+                // Via `util::git_cmd` so the parent's repo-targeting env
+                // (GIT_DIR/GIT_WORK_TREE/…) is scrubbed: this is the production
+                // write layer (commits, worktree-adds, rebases), and a leaked
+                // GIT_DIR pointing at the shared `.git` would make a `-C
+                // <worktree>` reinit/config op write a stray `core.worktree`
+                // into the shared config. See [`util::GIT_ENV_VARS`].
+                let mut c = util::git_cmd(p);
+                c.args(args);
                 c
             }
             GitLoc::Remote { ssh, path } => self.ssh_command(ssh, {
@@ -217,8 +223,11 @@ impl GitLoc {
     pub fn git_command_env(&self, envs: &[(&str, &str)], args: &[&str]) -> Command {
         match self {
             GitLoc::Local(p) => {
-                let mut c = Command::new("git");
-                c.arg("-C").arg(p).args(args);
+                // Scrub the parent's repo-targeting env first (see
+                // [`git_command`]); the caller's explicit `envs` are applied
+                // after, so an intentional GIT_* override still takes effect.
+                let mut c = util::git_cmd(p);
+                c.args(args);
                 for (k, v) in envs {
                     c.env(k, v);
                 }
@@ -392,6 +401,27 @@ mod tests {
                 .any(|(k, v)| k.to_string_lossy() == "GIT_EDITOR"
                     && v.is_some_and(|v| v.to_string_lossy() == ":"))
         );
+    }
+
+    #[test]
+    fn local_git_commands_scrub_repo_targeting_env() {
+        // The local svc git layer must strip inherited GIT_DIR/GIT_WORK_TREE/…
+        // so a poisoned ambient env can't make a `-C <worktree>` op write a
+        // stray core.worktree into the shared `.git/config` (the pollution bug).
+        let loc = GitLoc::from_db("/wt/x", None);
+        for builder in [
+            loc.git_command(&["status"]),
+            loc.git_command_env(&[("GIT_EDITOR", ":")], &["rebase", "-i"]),
+        ] {
+            let removed: Vec<String> = builder
+                .get_envs()
+                .filter(|(_, v)| v.is_none())
+                .map(|(k, _)| k.to_string_lossy().into_owned())
+                .collect();
+            for var in crate::util::GIT_ENV_VARS {
+                assert!(removed.contains(&var.to_string()), "{var} not scrubbed");
+            }
+        }
     }
 
     #[test]
