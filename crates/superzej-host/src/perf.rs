@@ -154,13 +154,12 @@ pub enum Subsys {
     Container,
     Metrics,
     Lsp,
-    Dashboard,
     Sandbox,
     Diff,
 }
 
 impl Subsys {
-    pub const ALL: [Subsys; 10] = [
+    pub const ALL: [Subsys; 9] = [
         Subsys::Hydrate,
         Subsys::Pr,
         Subsys::Issues,
@@ -168,7 +167,6 @@ impl Subsys {
         Subsys::Container,
         Subsys::Metrics,
         Subsys::Lsp,
-        Subsys::Dashboard,
         Subsys::Sandbox,
         Subsys::Diff,
     ];
@@ -184,7 +182,6 @@ impl Subsys {
             Subsys::Container => "container",
             Subsys::Metrics => "metrics",
             Subsys::Lsp => "lsp",
-            Subsys::Dashboard => "dashboard",
             Subsys::Sandbox => "sandbox",
             Subsys::Diff => "diff",
         }
@@ -649,7 +646,6 @@ impl LoopPerf {
             cpu_stats_ms = cpu_ms[Subsys::Stats as usize],
             cpu_pr_ms = cpu_ms[Subsys::Pr as usize],
             cpu_metrics_ms = cpu_ms[Subsys::Metrics as usize],
-            cpu_dashboard_ms = cpu_ms[Subsys::Dashboard as usize],
             cpu_diff_ms = cpu_ms[Subsys::Diff as usize],
             "perf rollup"
         );

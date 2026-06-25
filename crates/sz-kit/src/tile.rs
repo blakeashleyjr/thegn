@@ -26,7 +26,7 @@ pub type ChangeHook = std::sync::Arc<dyn Fn() + Send + Sync>;
 /// 0.30 widgets a tile may hold (e.g. a `Block` with a shadow `Effect`) are
 /// themselves `!Send`. Async work is offloaded via the `ChangeHook` instead.
 pub trait AppTile {
-    /// Stable identifier — the tab id and config key (`"chat"`, `"dashboard"`, …).
+    /// Stable identifier — the tab id and config key.
     fn id(&self) -> &'static str;
 
     /// The chip label shown in the masthead app strip. May carry a badge
