@@ -912,7 +912,7 @@ pub fn run_worker(
     match db {
         Ok(db) => {
             let root_s = root.to_string_lossy();
-            if let Err(e) = db.put_worktree(&tab, &root_s, &path_s, &branch, None) {
+            if let Err(e) = db.put_worktree(&tab, &root_s, &path_s, &branch, None, None) {
                 fail(CreateStep::Register, format!("db: {e}"));
                 return;
             }
