@@ -662,7 +662,12 @@ impl HydrateHints {
     }
 }
 
-const COMMIT_CACHE_TTL_SECS: i64 = 30;
+// Short TTL: the Commits list is only built while a commits / expanded-git
+// section is on screen, and a `git log -80` is cheap, so a tight window keeps
+// the list close behind pane-driven commits without re-running git every wake.
+// (Working-tree fields refresh every tick already; commits had lagged a further
+// 30s on top — the most visible half of the "panel out of sync" report.)
+const COMMIT_CACHE_TTL_SECS: i64 = 3;
 
 fn commit_cache_needs_refresh(cache: Option<&(String, i64)>) -> bool {
     let Some((json, fetched_at)) = cache else {
@@ -1421,6 +1426,43 @@ fn in_dot_git(p: &std::path::Path) -> bool {
     p.components().any(|c| c.as_os_str() == ".git")
 }
 
+/// True for the subset of `.git`-internal paths that signal a real *git-state*
+/// change — a commit, checkout, reset, branch/tag move, or a merge / rebase /
+/// cherry-pick / revert progressing. These are the events the panel must react
+/// to even though they live under `.git`.
+///
+/// Deliberately an allowlist, not a blocklist: the high-churn internals —
+/// `index` (hydration's own `git status`/`diff` rewrite its stat cache, the
+/// ~2 Hz feedback loop that once read as a freeze), the object store, lock
+/// files, `COMMIT_EDITMSG` — never match, so they can never drive a refresh
+/// loop no matter what new files git starts writing.
+fn is_git_state_path(p: &std::path::Path) -> bool {
+    let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if name.ends_with(".lock") {
+        // The transient `*.lock` git writes while preparing a ref/HEAD update;
+        // react to the final write that replaces it, not the lock churn.
+        return false;
+    }
+    // `logs/HEAD` (reflog) is appended on commit/checkout/reset/merge/rebase;
+    // `refs/…` + `packed-refs` move on branch/tag updates; the rebase-* dirs
+    // and *_HEAD pseudo-refs track an in-progress sequencer operation.
+    p.components().any(|c| {
+        matches!(
+            c.as_os_str().to_str(),
+            Some("refs") | Some("logs") | Some("rebase-merge") | Some("rebase-apply")
+        )
+    }) || matches!(
+        name,
+        "HEAD"
+            | "packed-refs"
+            | "MERGE_HEAD"
+            | "ORIG_HEAD"
+            | "CHERRY_PICK_HEAD"
+            | "REVERT_HEAD"
+            | "BISECT_LOG"
+    )
+}
+
 pub(crate) fn retarget_diff_watcher(
     session: &crate::session::Session,
     watched: &mut Option<std::path::PathBuf>,
@@ -1451,10 +1493,36 @@ pub(crate) fn retarget_diff_watcher(
     let w = waker.clone();
     std::thread::spawn(move || {
         drop(old);
+
+        // Resolve this worktree's gitdir + common dir. For a *linked* worktree
+        // `<cwd>/.git` is a file pointer, so the HEAD / reflog / refs that
+        // signal a commit live OUTSIDE the watched tree (in the main repo's
+        // `.git/worktrees/<name>` + shared `.git`); we must watch those too or
+        // pane-driven commits never reach the panel. For the main checkout both
+        // resolve back under `cwd` and the recursive root watch already covers
+        // them. `git rev-parse` runs here, off the event loop.
+        let git_dir = superzej_core::util::git_out(
+            &cwd,
+            &["rev-parse", "--path-format=absolute", "--git-dir"],
+        )
+        .map(std::path::PathBuf::from);
+        let common_dir = superzej_core::util::git_out(
+            &cwd,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .map(std::path::PathBuf::from);
+        // Roots used by the event filter to recognise git-internal paths even
+        // for bare/relocated gitdirs whose path has no literal `.git` component.
+        let git_roots: Vec<std::path::PathBuf> = [git_dir.clone(), common_dir.clone()]
+            .into_iter()
+            .flatten()
+            .collect();
+
         let mut last_send = Instant::now()
             .checked_sub(Duration::from_secs(1))
             .unwrap_or_else(Instant::now);
         let wake = w.clone();
+        let roots = git_roots.clone();
         let new_watcher = recommended_watcher(move |res: notify::Result<Event>| {
             if let Ok(ev) = res
                 && matches!(
@@ -1463,16 +1531,22 @@ pub(crate) fn retarget_diff_watcher(
                         | notify::EventKind::Create(_)
                         | notify::EventKind::Remove(_)
                 )
-                // Ignore churn confined to `.git/` (index stat-cache rewrites,
-                // lock files, ref/object updates). Hydration's own `git` reads
-                // rewrite `.git/index`, so reacting to them creates a
-                // self-sustaining ~2 Hz refresh loop — each iteration ~1s of
-                // git work, which pins CPU and feels like a freeze. The diffs
-                // this watcher exists to track are real worktree edits, which
-                // live OUTSIDE `.git`; git-state changes (commits, branch
-                // moves) are covered by the 2s safety-net tick and by the
-                // explicit refresh the mutation runner fires after each op.
-                && (ev.paths.is_empty() || ev.paths.iter().any(|p| !in_dot_git(p)))
+                // React to real worktree edits (the diffs this watcher exists to
+                // track) AND to git-state changes — commits, checkouts, branch
+                // moves, rebase/merge progress — wherever they land. The latter
+                // are gated through `is_git_state_path` so the index stat-cache
+                // that hydration's own `git` reads rewrite (and the object-store
+                // churn on commit/gc) never match: that allowlist is what keeps
+                // the old self-sustaining ~2 Hz refresh loop — which once read
+                // as a freeze — from coming back.
+                && (ev.paths.is_empty()
+                    || ev.paths.iter().any(|p| {
+                        if in_dot_git(p) || roots.iter().any(|r| p.starts_with(r)) {
+                            is_git_state_path(p)
+                        } else {
+                            true
+                        }
+                    }))
                 && last_send.elapsed() > Duration::from_millis(500)
             {
                 if tx.send(RefreshKind::Model).is_ok() {
@@ -1483,9 +1557,28 @@ pub(crate) fn retarget_diff_watcher(
         });
         if let Ok(mut nw) = new_watcher
             && nw.watch(&cwd, RecursiveMode::Recursive).is_ok()
-            && wtx.send((cwd, nw)).is_ok()
         {
-            let _ = w.wake();
+            // Linked worktree: add targeted watches on the external gitdir's
+            // state-bearing subtrees. Non-recursive on the gitdir roots (so we
+            // never descend into `objects/`, which floods on every commit/gc);
+            // `logs/` (reflog) and `refs/` are small and never written by
+            // hydration's read-only git, so a recursive watch there is storm-
+            // safe. Any root already under `cwd` is skipped — the recursive
+            // root watch above covers the main checkout.
+            for root in [git_dir.as_ref(), common_dir.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if root.starts_with(&cwd) {
+                    continue;
+                }
+                let _ = nw.watch(root, RecursiveMode::NonRecursive);
+                let _ = nw.watch(&root.join("logs"), RecursiveMode::Recursive);
+                let _ = nw.watch(&root.join("refs"), RecursiveMode::Recursive);
+            }
+            if wtx.send((cwd, nw)).is_ok() {
+                let _ = w.wake();
+            }
         }
     });
 }
@@ -1644,5 +1737,39 @@ mod tests {
             list[0].3, "/tmp/WASHU",
             "the DB-backed entry (with path) wins"
         );
+    }
+
+    #[test]
+    fn git_state_paths_signal_commits_and_branch_moves() {
+        let yes = |p: &str| is_git_state_path(std::path::Path::new(p));
+        // Main checkout: state files live under `<wt>/.git`.
+        assert!(yes("/repo/.git/HEAD"));
+        assert!(yes("/repo/.git/logs/HEAD")); // reflog — commit/checkout/reset
+        assert!(yes("/repo/.git/refs/heads/main")); // branch move
+        assert!(yes("/repo/.git/packed-refs"));
+        assert!(yes("/repo/.git/MERGE_HEAD"));
+        assert!(yes("/repo/.git/ORIG_HEAD"));
+        assert!(yes("/repo/.git/rebase-merge/done")); // rebase in progress
+        // Linked worktree: state lives in the main repo's external gitdir.
+        assert!(yes("/repo/.git/worktrees/feat/HEAD"));
+        assert!(yes("/repo/.git/worktrees/feat/logs/HEAD"));
+    }
+
+    #[test]
+    fn git_state_path_ignores_churn_that_caused_the_refresh_storm() {
+        let no = |p: &str| !is_git_state_path(std::path::Path::new(p));
+        // The index stat-cache — hydration's own `git status`/`diff` rewrite it,
+        // the ~2 Hz self-sustaining loop the allowlist exists to prevent.
+        assert!(no("/repo/.git/index"));
+        // Object store floods on every commit / gc.
+        assert!(no("/repo/.git/objects/ab/cdef0123"));
+        assert!(no("/repo/.git/objects/pack/pack-deadbeef.pack"));
+        // Transient lock files (react to the final write, not the lock).
+        assert!(no("/repo/.git/index.lock"));
+        assert!(no("/repo/.git/refs/heads/main.lock"));
+        assert!(no("/repo/.git/HEAD.lock"));
+        // Editor scratch + config — not a state change.
+        assert!(no("/repo/.git/COMMIT_EDITMSG"));
+        assert!(no("/repo/.git/config"));
     }
 }
