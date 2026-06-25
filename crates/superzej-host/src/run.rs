@@ -535,7 +535,8 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     let (container_tx, container_rx) =
         tokio_mpsc::unbounded_channel::<Vec<superzej_core::sandbox::ContainerInfo>>();
     let (metrics_tx, metrics_rx) = tokio_mpsc::unbounded_channel::<crate::metrics::MetricsState>();
-    let (ai_metrics_tx, mut ai_metrics_rx) = tokio_mpsc::unbounded_channel::<crate::chrome::AiMetrics>();
+    let (ai_metrics_tx, mut ai_metrics_rx) =
+        tokio_mpsc::unbounded_channel::<crate::chrome::AiMetrics>();
     spawn_ai_sidecar(waker.clone(), ai_metrics_tx);
     crate::metrics::spawn_metrics_supervisor(cfg.metrics.clone(), metrics_tx, waker.clone());
     // The stats cadence is user-cyclable at runtime (click the top-right
@@ -3002,6 +3003,7 @@ enum GitInputKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HostInputKind {
     NewWorkspace,
+    DeleteWorkspaceConfirm,
     /// Rename the worktree group at this session index from its old branch
     /// (item 53). Carries the repo root + old path/branch so the off-thread
     /// rename has everything it needs.
@@ -3160,6 +3162,17 @@ fn begin_new_workspace_prompt(
         HostInputKind::NewWorkspace,
     ));
     model.status = "Create workspace: enter path or URL (Esc cancels)".into();
+}
+
+fn begin_delete_workspace_prompt(
+    host_input: &mut Option<(menu::InputOverlay, HostInputKind)>,
+    model: &mut FrameModel,
+) {
+    *host_input = Some((
+        menu::InputOverlay::new("delete workspace? (type 'yes' to confirm)", ""),
+        HostInputKind::DeleteWorkspaceConfirm,
+    ));
+    model.status = "Delete this workspace? Type 'yes' to confirm (Esc cancels)".into();
 }
 
 fn looks_like_git_url(input: &str) -> bool {
@@ -8222,13 +8235,13 @@ async fn event_loop<T: Terminal>(
                 model.metrics = state;
                 dirty = true;
             }
-        while let Ok(ai_state) = ai_metrics_rx.try_recv() {
-            loop_perf.tick(crate::perf::WakeSource::Metrics);
-            if model.ai_metrics.as_ref() != Some(&ai_state) {
-                model.ai_metrics = Some(ai_state);
-                dirty = true;
+            while let Ok(ai_state) = ai_metrics_rx.try_recv() {
+                loop_perf.tick(crate::perf::WakeSource::Metrics);
+                if model.ai_metrics.as_ref() != Some(&ai_state) {
+                    model.ai_metrics = Some(ai_state);
+                    dirty = true;
+                }
             }
-        }
         }
 
         // Panel document payloads from the on-entry fetches; stale
@@ -9899,6 +9912,54 @@ async fn event_loop<T: Terminal>(
                                                 model.status =
                                                     format!("workspace create failed: {e}");
                                             }
+                                        }
+                                    }
+                                    HostInputKind::DeleteWorkspaceConfirm => {
+                                        if text.trim() == "yes" {
+                                            match superzej_core::db::Db::open() {
+                                                Ok(db) => {
+                                                    let mut switched = false;
+                                                    if let Ok(orphans) =
+                                                        db.delete_workspace(&session.id)
+                                                    {
+                                                        // switch to next available workspace
+                                                        if let Ok(workspaces) = db.workspaces() {
+                                                            if let Some(next) = workspaces.first() {
+                                                                let _ = session
+                                                                    .switch_to_workspace(
+                                                                        &next.repo_path,
+                                                                        &db,
+                                                                    );
+                                                                switched = true;
+                                                            }
+                                                        }
+                                                        if !switched {
+                                                            // Empty workspace fallback
+                                                            session.id.clear();
+                                                            session.worktrees.clear();
+                                                            session.active = 0;
+                                                        }
+                                                        refresh_tab_model(
+                                                            &mut model, &session, &mut sb,
+                                                        );
+                                                        need_relayout = true;
+                                                        if orphans > 0 {
+                                                            model.status = format!(
+                                                                "⚠ Workspace deleted. {} orphaned worktree(s) remain on disk",
+                                                                orphans
+                                                            );
+                                                        } else {
+                                                            model.status =
+                                                                "Workspace deleted".into();
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    model.status = format!("delete failed: {}", e);
+                                                }
+                                            }
+                                        } else {
+                                            model.status = "Delete cancelled".into();
                                         }
                                     }
                                     HostInputKind::RenameWorktree {
@@ -13996,6 +14057,9 @@ async fn event_loop<T: Terminal>(
                             Action::NewWorkspace => {
                                 begin_new_workspace_prompt(&mut host_input, &mut model);
                             }
+                            Action::DeleteWorkspace => {
+                                begin_delete_workspace_prompt(&mut host_input, &mut model);
+                            }
                             Action::Dashboard => {
                                 if let Some(target) = app_host.dashboard_target() {
                                     if app_host.active == target {
@@ -16672,11 +16736,14 @@ mod tests {
     }
 }
 
-pub fn spawn_ai_sidecar(waker: termwiz::terminal::TerminalWaker, tx: tokio::sync::mpsc::UnboundedSender<crate::chrome::AiMetrics>) {
+pub fn spawn_ai_sidecar(
+    waker: termwiz::terminal::TerminalWaker,
+    tx: tokio::sync::mpsc::UnboundedSender<crate::chrome::AiMetrics>,
+) {
     tokio::spawn(async move {
-        use tokio::process::Command;
-        use tokio::io::{AsyncBufReadExt, BufReader};
         use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::process::Command;
 
         let mut child = match Command::new("python3")
             .arg("src/sidecar.py")
