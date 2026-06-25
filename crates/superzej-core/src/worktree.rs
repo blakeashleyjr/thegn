@@ -63,7 +63,13 @@ impl BranchSet {
     }
 
     pub fn taken(&self, branch: &str) -> bool {
-        self.taken.contains(branch)
+        if self.taken.contains(branch) {
+            return true;
+        }
+        let b_slash = format!("{branch}/");
+        self.taken
+            .iter()
+            .any(|t| t.starts_with(&b_slash) || branch.starts_with(&format!("{t}/")))
     }
 
     /// Drop a name from the set — used when renaming a worktree so its own
