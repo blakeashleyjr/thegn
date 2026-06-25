@@ -9202,9 +9202,14 @@ async fn event_loop<T: Terminal>(
         //    config watcher, diff fs-watch, refresh ticker) which returns
         //    `InputEvent::Wake`. No timeout → zero idle CPU; we only wake when
         //    there is work, and render the instant it arrives.
+        let timeout = if dirty || !pending_input.is_empty() {
+            Some(std::time::Duration::from_millis(8))
+        } else {
+            None
+        };
         let polled = match pending_input.pop_front() {
             Some(ev) => Ok(Some(ev)),
-            None => buf.terminal().poll_input(None),
+            None => buf.terminal().poll_input(timeout),
         };
         match polled {
             Ok(Some(InputEvent::Mouse(m))) => {
