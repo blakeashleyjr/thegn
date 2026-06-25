@@ -199,6 +199,9 @@ pub fn add_checked(
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    // Serialize against other szhost/agent git mutations on this repo's shared
+    // `.git` (held until the subprocess returns).
+    let _lock = util::lock_git_mutations(root);
     let out = util::git_cmd(root)
         .args(["worktree", "add", "--quiet", "-b", branch])
         .arg(path)
@@ -219,6 +222,7 @@ pub fn add_checked(
 
 /// Remove a worktree and optionally delete its branch.
 pub fn remove(root: &Path, path: &Path, branch: &str, delete_branch: bool) {
+    let _lock = util::lock_git_mutations(root);
     let removed = util::git_ok(root, &["worktree", "remove", &path.to_string_lossy()])
         || util::git_ok(
             root,

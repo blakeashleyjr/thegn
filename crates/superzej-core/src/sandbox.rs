@@ -331,10 +331,26 @@ pub fn resolve_scoped(
             let g = gc.to_string_lossy().into_owned();
             mounts.push(Mount {
                 host: g.clone(),
-                dest: g,
+                dest: g.clone(),
                 ro: false,
                 cache: false,
             });
+            // Pin the SHARED `.git/config` read-only on top of the writable
+            // `.git`: objects/refs/index (and per-worktree config under
+            // `worktrees/<name>/`) stay writable so commits work, but no
+            // sandboxed process can write a stray `core.worktree`/`user.*` into
+            // the shared config — the structural fix for the pollution class.
+            // Emitted AFTER the parent bind so the sub-path override wins
+            // (bwrap `--ro-bind`, OCI file-level `:ro`).
+            let cfg = format!("{g}/config");
+            if std::path::Path::new(&cfg).exists() {
+                mounts.push(Mount {
+                    host: cfg.clone(),
+                    dest: cfg,
+                    ro: true,
+                    cache: false,
+                });
+            }
         }
     };
     // Inject host toolchain paths (dotfiles, $HOME, /nix/store, etc.) so the
@@ -415,7 +431,14 @@ pub fn resolve_scoped(
         mounts,
         env,
         env_overrides: std::collections::HashMap::new(),
-        env_block: Vec::new(),
+        // Strip the repo-targeting git env inside the sandbox: bwrap/systemd
+        // inherit the host env, so an `unset GIT_DIR …` at the top of the wrapped
+        // script ensures a sandboxed shell/agent can't be misdirected at the
+        // shared `.git` (defense in depth atop the read-only `.git/config` mount).
+        env_block: crate::util::GIT_ENV_VARS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         // A profile with a no-network floor (sealed) overrides the configured
         // network mode; otherwise the worktree's `[sandbox] network` stands.
         network: if profile.forces_no_network() {
@@ -1252,6 +1275,15 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
             }
             if let Some(p) = spec.pids_limit {
                 v.extend(["-p".into(), format!("TasksMax={p}")]);
+            }
+            // systemd doesn't consume `spec.mounts`; translate the read-only
+            // shared `.git/config` mount to a ReadOnlyPaths so it can't be
+            // polluted here either. Match `/config` specifically — host-toolchain
+            // and cache mounts never end in `/config`, so $HOME stays writable.
+            for m in &spec.mounts {
+                if m.ro && m.dest.ends_with("/config") {
+                    v.extend(["-p".into(), format!("ReadOnlyPaths={}", m.dest)]);
+                }
             }
             for (k, val) in &spec.env {
                 v.extend(["--setenv".into(), format!("{k}={val}")]);

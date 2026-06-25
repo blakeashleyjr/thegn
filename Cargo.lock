@@ -4848,6 +4848,7 @@ dependencies = [
  "chrono",
  "clap",
  "criterion",
+ "libc",
  "nucleo-matcher",
  "regex",
  "rusqlite",
