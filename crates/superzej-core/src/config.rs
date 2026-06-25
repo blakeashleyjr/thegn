@@ -133,6 +133,7 @@ config_enum! {
         Podman = "podman" | "podman-rootless" | "rootless-podman",
         PodmanRootful = "podman-rootful" | "rootful-podman",
         Docker = "docker",
+        Smol = "smol" | "smolmachines",
         Bwrap = "bwrap" | "bubblewrap",
         Systemd = "systemd" | "systemd-run",
         Apple = "apple" | "container",
