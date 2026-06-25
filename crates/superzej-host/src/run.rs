@@ -535,6 +535,8 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     let (container_tx, container_rx) =
         tokio_mpsc::unbounded_channel::<Vec<superzej_core::sandbox::ContainerInfo>>();
     let (metrics_tx, metrics_rx) = tokio_mpsc::unbounded_channel::<crate::metrics::MetricsState>();
+    let (ai_metrics_tx, mut ai_metrics_rx) = tokio_mpsc::unbounded_channel::<crate::chrome::AiMetrics>();
+    spawn_ai_sidecar(waker.clone(), ai_metrics_tx);
     crate::metrics::spawn_metrics_supervisor(cfg.metrics.clone(), metrics_tx, waker.clone());
     // The stats cadence is user-cyclable at runtime (click the top-right
     // stats block); the ticker thread reads it per tick.
@@ -632,6 +634,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         stats_rx,
         container_rx,
         metrics_rx,
+        ai_metrics_rx,
         stats_interval_ms,
         stats_live,
         waker,
@@ -6136,6 +6139,7 @@ async fn event_loop<T: Terminal>(
     mut stats_rx: tokio_mpsc::UnboundedReceiver<crate::stats::StatsSnapshot>,
     mut container_rx: tokio_mpsc::UnboundedReceiver<Vec<superzej_core::sandbox::ContainerInfo>>,
     mut metrics_rx: tokio_mpsc::UnboundedReceiver<crate::metrics::MetricsState>,
+    mut ai_metrics_rx: tokio_mpsc::UnboundedReceiver<crate::chrome::AiMetrics>,
     stats_interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stats_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
     waker: TerminalWaker,
@@ -8218,6 +8222,13 @@ async fn event_loop<T: Terminal>(
                 model.metrics = state;
                 dirty = true;
             }
+        while let Ok(ai_state) = ai_metrics_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Metrics);
+            if model.ai_metrics.as_ref() != Some(&ai_state) {
+                model.ai_metrics = Some(ai_state);
+                dirty = true;
+            }
+        }
         }
 
         // Panel document payloads from the on-entry fetches; stale
@@ -16659,4 +16670,34 @@ mod tests {
         assert_eq!(counts[&key_a], 2);
         assert!(!counts.contains_key(&key_b));
     }
+}
+
+pub fn spawn_ai_sidecar(waker: termwiz::terminal::TerminalWaker, tx: tokio::sync::mpsc::UnboundedSender<crate::chrome::AiMetrics>) {
+    tokio::spawn(async move {
+        use tokio::process::Command;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use std::process::Stdio;
+
+        let mut child = match Command::new("python3")
+            .arg("src/sidecar.py")
+            .stdout(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Failed to spawn AI metrics sidecar: {}", e);
+                return;
+            }
+        };
+
+        if let Some(stdout) = child.stdout.take() {
+            let mut reader = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                if let Ok(metrics) = serde_json::from_str::<crate::chrome::AiMetrics>(&line) {
+                    let _ = tx.send(metrics);
+                    let _ = waker.wake();
+                }
+            }
+        }
+    });
 }

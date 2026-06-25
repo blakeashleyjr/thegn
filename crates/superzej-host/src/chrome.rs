@@ -11,6 +11,22 @@ use crate::compositor::{Rect, compose_pane};
 use crate::emulator::PaneEmulator;
 use superzej_core::theme;
 
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+pub struct TokenUsage {
+    pub input: u32,
+    pub output: u32,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+pub struct AiMetrics {
+    pub agent: String,
+    pub session_id: String,
+    pub tokens: TokenUsage,
+    pub cost: f64,
+}
+
 /// The resolved chrome palette. A process-global because every draw helper
 /// needs it and threading it through each call would touch every signature;
 /// the event loop writes it (startup + config reload), render-time code only
@@ -257,6 +273,7 @@ pub struct RowMenuEntry {
 pub struct FrameModel {
     /// The active worktree group's name ("app/feat") — the tabbar's left label.
     pub worktree: String,
+    pub ai_metrics: Option<AiMetrics>,
     /// The active worktree's tab chip titles (tabs live WITHIN a worktree).
     pub tabs: Vec<String>,
     /// Index of the active chip in `tabs`.
@@ -1099,6 +1116,13 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
         r.push(Seg::chip(
             Tok::Hue(superzej_core::theme::Hue::Blue),
             format!(" \u{2709} {} ", model.panel.unread_notifications),
+        ));
+    }
+    if let Some(ref metrics) = model.ai_metrics {
+        r.push(seg(Tok::Slot(S::Text), " "));
+        r.push(Seg::chip(
+            Tok::Hue(superzej_core::theme::Hue::Teal),
+            format!(" 🤖 {}: ${:.2} ({}t) ", metrics.agent, metrics.cost, metrics.tokens.input + metrics.tokens.output),
         ));
     }
     if model.zoomed {
