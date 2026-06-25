@@ -1770,7 +1770,7 @@ impl Db {
         // unloaded-workspace rows and the resurrect adopt loop — is stable;
         // created_at/path are deterministic tie-breakers for any unset row.
         let mut stmt = self.conn.prepare(
-            "SELECT worktree, branch, agent, created_at, repo_path, tab_name, session_name, location, position
+            "SELECT worktree, branch, agent, created_at, repo_path, tab_name, session_name, location, position, sandbox_backend, folder_id
              FROM worktrees ORDER BY position, created_at, worktree",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -1784,8 +1784,8 @@ impl Db {
                 session_name: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
                 location: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
                 position: r.get::<_, Option<i64>>(8)?.unwrap_or(0),
-                folder_id: None,
-                sandbox_backend: None,
+                sandbox_backend: r.get(9)?,
+                folder_id: r.get(10)?,
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
