@@ -1644,6 +1644,8 @@ fn activate_row_target(
     workspace_pool: &mut WorkspacePool,
     cfg: &superzej_core::config::Config,
     center: Rect,
+    need_relayout: &mut bool,
+    clear_on_next_frame: &mut bool,
 ) {
     match target {
         crate::sidebar::RowTarget::Tab(gi, ti) => {
@@ -1667,6 +1669,8 @@ fn activate_row_target(
                 panes,
                 workspace_pool,
                 &db,
+                need_relayout,
+                clear_on_next_frame,
             ) {
                 return;
             }
@@ -2029,9 +2033,13 @@ fn remap_cold_workspace_ids(session: &mut crate::session::Session, panes: &mut P
                 .enumerate()
                 .map(|(i, &old)| (old, base + i as u32))
                 .collect();
-            
-            tab.center.remap(&mut |id| map.get(&id).copied().unwrap_or(id));
-            tab.focused_pane = map.get(&tab.focused_pane).copied().unwrap_or(tab.focused_pane);
+
+            tab.center
+                .remap(&mut |id| map.get(&id).copied().unwrap_or(id));
+            tab.focused_pane = map
+                .get(&tab.focused_pane)
+                .copied()
+                .unwrap_or(tab.focused_pane);
             tab.pane_cwds = std::mem::take(&mut tab.pane_cwds)
                 .into_iter()
                 .map(|(id, cwd)| (map.get(&id).copied().unwrap_or(id), cwd))
@@ -2060,6 +2068,8 @@ fn switch_workspace(
     panes: &mut Panes,
     pool: &mut WorkspacePool,
     db: &superzej_core::db::Db,
+    need_relayout: &mut bool,
+    clear_on_next_frame: &mut bool,
 ) -> bool {
     let land_on = |session: &mut crate::session::Session, group: Option<&str>| {
         if let Some(name) = group
@@ -2073,6 +2083,9 @@ fn switch_workspace(
         land_on(session, group);
         return true;
     }
+
+    *need_relayout = true;
+    *clear_on_next_frame = true;
 
     // Snapshot the workspace we're leaving (fresh cwds) before parking it.
     persist_session_layout(session, panes);
@@ -6374,6 +6387,7 @@ async fn event_loop<T: Terminal>(
     // layout may survive. Tab/worktree switches reuse the same rects and must
     // NOT trigger this: a full repaint flashes the whole center.
     let mut full_repaint = true;
+    let mut clear_on_next_frame = false;
     // Our own Change→escape serializer (undercurl + underline-color capable);
     // `SUPERZEJ_RENDERER=termwiz` falls back to the stock renderer.
     let mut wire_renderer = crate::wire::WireRenderer::new();
@@ -8562,13 +8576,14 @@ async fn event_loop<T: Terminal>(
                     .unwrap_or(crate::center::CenterTree::Leaf(0))
             };
             // Layout changes (panel toggles/expansion, zoom) need NO physical
-            // clear: `front` mirrors the wire exactly, so the diff repaints
+            // explicit clear: `front` mirrors the wire exactly, so the diff repaints
             // precisely the changed cells — clearing here only caused a
             // visible flash. Full repaints remain for real resizes (the
             // terminal scrambles its own content) and scratch re-allocation.
-            if scratch.dimensions() != (cols, rows) {
+            if scratch.dimensions() != (cols, rows) || clear_on_next_frame {
                 scratch = Surface::new(cols, rows);
                 full_repaint = true;
+                clear_on_next_frame = false;
             }
             let app_tile_active = app_host.active_tile_mut().is_some();
             // FAST PATH: a pure selection-drag move only changes the highlighted
@@ -8581,6 +8596,7 @@ async fn event_loop<T: Terminal>(
             // full frame that heals anything deferred during the drag.
             let fast_select = selection_only
                 && !full_repaint
+                && !clear_on_next_frame
                 && !app_tile_active
                 && mouse_sel.is_some()
                 && palette.is_none()
@@ -8602,6 +8618,7 @@ async fn event_loop<T: Terminal>(
             let scroll_fast = scroll_only
                 && !fast_select
                 && !full_repaint
+                && !clear_on_next_frame
                 && !app_tile_active
                 && drawer.is_none()
                 && mouse_sel.is_none()
@@ -8615,7 +8632,7 @@ async fn event_loop<T: Terminal>(
                 && which_key.is_empty()
                 && pending_confirm.is_none()
                 && toasts.is_empty();
-            if fast_select {
+            if fast_select && !clear_on_next_frame {
                 if let Some((sp, sel)) = mouse_sel.as_ref() {
                     let target = tree
                         .layout_framed(chrome.center)
@@ -9298,8 +9315,12 @@ async fn event_loop<T: Terminal>(
                                             &mut workspace_pool,
                                             keymap.config(),
                                             chrome.center,
+                                            &mut need_relayout,
+                                            &mut clear_on_next_frame,
                                         );
-                                        need_relayout = true;
+                                        // row target activations within a single
+                                        // workspace are tab/zoom, not relayout;
+                                        // workspace switch sets it via need_relayout
                                     }
                                 }
                             }
@@ -10536,6 +10557,8 @@ async fn event_loop<T: Terminal>(
                                             &mut panes,
                                             &mut workspace_pool,
                                             &db,
+                                            &mut need_relayout,
+                                            &mut clear_on_next_frame,
                                         )
                                     {
                                         refresh_tab_model(&mut model, &session, &mut sb);
@@ -10559,6 +10582,8 @@ async fn event_loop<T: Terminal>(
                                             &mut panes,
                                             &mut workspace_pool,
                                             &db,
+                                            &mut need_relayout,
+                                            &mut clear_on_next_frame,
                                         )
                                     {
                                         refresh_tab_model(&mut model, &session, &mut sb);
@@ -10817,8 +10842,9 @@ async fn event_loop<T: Terminal>(
                                 &mut workspace_pool,
                                 keymap.config(),
                                 chrome.center,
+                                &mut need_relayout,
+                                &mut clear_on_next_frame,
                             );
-                            need_relayout = true;
                             dirty = true;
                             continue;
                         }
@@ -13386,6 +13412,8 @@ async fn event_loop<T: Terminal>(
                                             &mut panes,
                                             &mut workspace_pool,
                                             &db,
+                                            &mut need_relayout,
+                                            &mut clear_on_next_frame,
                                         )
                                     {
                                         focus.zone = crate::focus::Zone::Center;
@@ -13851,6 +13879,8 @@ async fn event_loop<T: Terminal>(
                                         &mut panes,
                                         &mut workspace_pool,
                                         &db,
+                                        &mut need_relayout,
+                                        &mut clear_on_next_frame,
                                     ) {
                                         refresh_tab_model(&mut model, &session, &mut sb);
                                         need_relayout = true;
