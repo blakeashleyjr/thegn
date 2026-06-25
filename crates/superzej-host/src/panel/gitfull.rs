@@ -935,7 +935,7 @@ pub(super) fn build_git_full(
     rows: usize,
     focused: bool,
 ) -> PanelFrame {
-    let header = super::frame::header_rows(model, focused);
+    let header = super::frame::header_rows(model, focused, cols);
     let mut out: Vec<PanelRow> = Vec::new();
     let keep = if rows >= 16 {
         header.len()
