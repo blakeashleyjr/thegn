@@ -535,7 +535,8 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     let (container_tx, container_rx) =
         tokio_mpsc::unbounded_channel::<Vec<superzej_core::sandbox::ContainerInfo>>();
     let (metrics_tx, metrics_rx) = tokio_mpsc::unbounded_channel::<crate::metrics::MetricsState>();
-    let (ai_metrics_tx, mut ai_metrics_rx) = tokio_mpsc::unbounded_channel::<crate::chrome::AiMetrics>();
+    let (ai_metrics_tx, ai_metrics_rx) =
+        tokio_mpsc::unbounded_channel::<crate::chrome::AiMetrics>();
     spawn_ai_sidecar(waker.clone(), ai_metrics_tx);
     crate::metrics::spawn_metrics_supervisor(cfg.metrics.clone(), metrics_tx, waker.clone());
     // The stats cadence is user-cyclable at runtime (click the top-right
@@ -6084,10 +6085,10 @@ fn sync_drawer_persistence(
 async fn ensure_app_loaded(
     app_host: &mut crate::apps::AppHost,
     target: crate::apps::ActiveApp,
-    app_tx: &tokio_mpsc::UnboundedSender<usize>,
-    waker: &TerminalWaker,
-    current_config: &superzej_core::config::Config,
-    event_bus: &superzej_core::event_bus::EventBus,
+    _app_tx: &tokio_mpsc::UnboundedSender<usize>,
+    _waker: &TerminalWaker,
+    _current_config: &superzej_core::config::Config,
+    _event_bus: &superzej_core::event_bus::EventBus,
 ) -> bool {
     let crate::apps::ActiveApp::Tile(i) = target else {
         return true;
@@ -6095,30 +6096,10 @@ async fn ensure_app_loaded(
     if !matches!(app_host.slots[i].state, crate::apps::SlotState::Unloaded) {
         return true;
     }
-    let hook: sz_kit::ChangeHook = {
-        let tx = app_tx.clone();
-        let wk = waker.clone();
-        std::sync::Arc::new(move || {
-            let _ = tx.send(i);
-            let _ = wk.wake();
-        })
-    };
-    let handle = tokio::runtime::Handle::current();
-    let theme = crate::apps::kit_theme(&current_config.palette());
-    let id = app_host.slots[i].id;
-    let tile = match id {
-        "chat" => crate::apps::chat::build(handle, hook, theme).await,
-        "agent" => {
-            crate::apps::agent::build(handle, hook, theme, current_config, Some(event_bus.clone()))
-                .await
-        }
-        "dashboard" => {
-            crate::apps::dashboard::build(handle, hook, theme, &current_config.dashboard).await
-        }
-        _ => return false,
-    };
-    app_host.slots[i].state = crate::apps::SlotState::Running(tile);
-    true
+    // No embedded app builders are registered today, so a tile target can't be
+    // constructed (`AppHost::from_config` never produces tile slots). When a
+    // builder is added, construct the tile here and store it as `Running`.
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6586,23 +6567,6 @@ async fn event_loop<T: Terminal>(
     .await
     {
         dirty = true;
-    }
-    // Pre-warm the dashboard so switching to it is instant. Its build just
-    // spawns the background data thread (system stats / HN / recent repos) and
-    // returns, so this costs ~nothing at startup but means the dashboard is
-    // already populated — no loading spinner — by the time the user focuses it.
-    if let Some(dash) = app_host.dashboard_target()
-        && app_host.active != dash
-    {
-        let _ = ensure_app_loaded(
-            &mut app_host,
-            dash,
-            &app_tx,
-            &waker,
-            &current_config,
-            &event_bus,
-        )
-        .await;
     }
     // The workspace the keymap was last built for; when the focused workspace
     // changes we rebuild so per-workspace/repo-root keybind layers follow it.
@@ -8222,13 +8186,13 @@ async fn event_loop<T: Terminal>(
                 model.metrics = state;
                 dirty = true;
             }
-        while let Ok(ai_state) = ai_metrics_rx.try_recv() {
-            loop_perf.tick(crate::perf::WakeSource::Metrics);
-            if model.ai_metrics.as_ref() != Some(&ai_state) {
-                model.ai_metrics = Some(ai_state);
-                dirty = true;
+            while let Ok(ai_state) = ai_metrics_rx.try_recv() {
+                loop_perf.tick(crate::perf::WakeSource::Metrics);
+                if model.ai_metrics.as_ref() != Some(&ai_state) {
+                    model.ai_metrics = Some(ai_state);
+                    dirty = true;
+                }
             }
-        }
         }
 
         // Panel document payloads from the on-entry fetches; stale
@@ -13996,24 +13960,6 @@ async fn event_loop<T: Terminal>(
                             Action::NewWorkspace => {
                                 begin_new_workspace_prompt(&mut host_input, &mut model);
                             }
-                            Action::Dashboard => {
-                                if let Some(target) = app_host.dashboard_target() {
-                                    if app_host.active == target {
-                                        app_host.active = crate::apps::ActiveApp::Work;
-                                    } else if ensure_app_loaded(
-                                        &mut app_host,
-                                        target,
-                                        &app_tx,
-                                        &waker,
-                                        &current_config,
-                                        &event_bus,
-                                    )
-                                    .await
-                                    {
-                                        app_host.active = target;
-                                    }
-                                }
-                            }
                             Action::SwitchWorkspace => {
                                 if let Ok(db) = superzej_core::db::Db::open()
                                     && let Some(target) =
@@ -14793,6 +14739,39 @@ fn remap_warmed_tab_ids(tab: &mut crate::session::Tab, focus: u32, pairs: &[(u32
         tab.focused_pane = *map.values().next().unwrap_or(&0);
     }
     true
+}
+
+pub fn spawn_ai_sidecar(
+    waker: termwiz::terminal::TerminalWaker,
+    tx: tokio::sync::mpsc::UnboundedSender<crate::chrome::AiMetrics>,
+) {
+    tokio::spawn(async move {
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::process::Command;
+
+        let mut child = match Command::new("python3")
+            .arg("src/sidecar.py")
+            .stdout(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("failed to spawn AI metrics sidecar: {e}");
+                return;
+            }
+        };
+
+        if let Some(stdout) = child.stdout.take() {
+            let mut reader = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                if let Ok(metrics) = serde_json::from_str::<crate::chrome::AiMetrics>(&line) {
+                    let _ = tx.send(metrics);
+                    let _ = waker.wake();
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -16670,34 +16649,4 @@ mod tests {
         assert_eq!(counts[&key_a], 2);
         assert!(!counts.contains_key(&key_b));
     }
-}
-
-pub fn spawn_ai_sidecar(waker: termwiz::terminal::TerminalWaker, tx: tokio::sync::mpsc::UnboundedSender<crate::chrome::AiMetrics>) {
-    tokio::spawn(async move {
-        use tokio::process::Command;
-        use tokio::io::{AsyncBufReadExt, BufReader};
-        use std::process::Stdio;
-
-        let mut child = match Command::new("python3")
-            .arg("src/sidecar.py")
-            .stdout(Stdio::piped())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("Failed to spawn AI metrics sidecar: {}", e);
-                return;
-            }
-        };
-
-        if let Some(stdout) = child.stdout.take() {
-            let mut reader = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                if let Ok(metrics) = serde_json::from_str::<crate::chrome::AiMetrics>(&line) {
-                    let _ = tx.send(metrics);
-                    let _ = waker.wake();
-                }
-            }
-        }
-    });
 }

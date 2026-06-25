@@ -1,5 +1,6 @@
-//! App tabs — hosting full sibling TUIs (`chat`/`agent`) as top-level
-//! tabs alongside the `work` IDE.
+//! App tabs — a generic framework for hosting full sibling TUIs as top-level
+//! tabs alongside the `work` IDE. No builders are registered today (`work` is
+//! the only tab); the machinery below is kept for future embedded apps.
 //!
 //! Each app implements [`sz_kit::AppTile`] and is driven by the host loop the
 //! same way standalone runs drive it: [`pump`] folds async results delivered
@@ -18,10 +19,7 @@
 //! [`ChangeHook`]: sz_kit::ChangeHook
 #![allow(dead_code)] // wired into run.rs incrementally (Phase 2)
 
-pub mod agent;
 pub mod bridge;
-pub mod chat;
-pub mod dashboard;
 pub mod input;
 
 use superzej_core::theme::Palette;
@@ -60,7 +58,7 @@ impl SlotState {
 
 /// One app tab.
 pub struct AppSlot {
-    /// Stable id / config key (e.g. `"dashboard"`, `"chat"`).
+    /// Stable id / config key for an embedded app tab.
     pub id: &'static str,
     /// Chip label fallback before the tile is running (the running tile's
     /// `title()` takes over, badges included).
@@ -113,19 +111,9 @@ impl AppHost {
 
     pub fn from_config(cfg: &superzej_core::config::Config) -> AppHost {
         let tab_ids = cfg.apps.effective_tab_order();
-        let mut slots = Vec::new();
-        for id in tab_ids.iter().filter(|id| id.as_str() != "work") {
-            let label = id.as_str();
-            slots.push(AppSlot::new(
-                match label {
-                    "dashboard" => "dashboard",
-                    "chat" => "chat",
-                    "agent" => "agent",
-                    _ => continue,
-                },
-                label,
-            ));
-        }
+        // No embedded app tabs are registered today, so `work` is the only tab.
+        // When a builder is added, push an `AppSlot` for its id here.
+        let slots: Vec<AppSlot> = Vec::new();
 
         let mut tab_order = Vec::new();
         for id in tab_ids {
@@ -193,13 +181,6 @@ impl AppHost {
             .unwrap_or(0) as isize;
         let next = (cur + delta).rem_euclid(self.tab_order.len() as isize) as usize;
         self.tab_order[next]
-    }
-
-    pub fn dashboard_target(&self) -> Option<ActiveApp> {
-        self.slots
-            .iter()
-            .position(|slot| slot.id == "dashboard")
-            .map(ActiveApp::Tile)
     }
 
     /// The active tile, if an app tab (not `work`) is focused and running.
@@ -301,28 +282,21 @@ mod tests {
     }
 
     #[test]
-    fn app_host_uses_configured_tab_order_and_default_tab() {
+    fn app_host_with_no_registered_tabs_is_work_only() {
+        // No embedded app builders are registered, so unknown ids are dropped
+        // and `work` is the only tab regardless of what the config requests.
         let mut cfg = superzej_core::config::Config::default();
-        cfg.apps.tab_order = vec![
-            "chat".into(),
-            "work".into(),
-            "dashboard".into(),
-            "agent".into(),
-        ];
-        cfg.apps.default_tab = "dashboard".into();
+        cfg.apps.tab_order = vec!["work".into()];
+        cfg.apps.default_tab = "work".into();
 
         let host = AppHost::from_config(&cfg);
 
-        assert_eq!(
-            host.tab_labels(),
-            vec!["chat", "work", "dashboard", "agent"]
-        );
-        assert_eq!(host.active, ActiveApp::Tile(1));
-        assert_eq!(host.active_tab_index(), 2);
-        assert_eq!(host.tab_target(0), Some(ActiveApp::Tile(0)));
-        assert_eq!(host.tab_target(1), Some(ActiveApp::Work));
-        assert_eq!(host.dashboard_target(), Some(ActiveApp::Tile(1)));
-        // Cycling forward from the last tab (agent) wraps to the first (chat).
-        assert_eq!(host.cycle(ActiveApp::Tile(2), 1), ActiveApp::Tile(0));
+        assert!(host.slots.is_empty());
+        assert_eq!(host.tab_labels(), vec!["work"]);
+        assert_eq!(host.active, ActiveApp::Work);
+        assert_eq!(host.active_tab_index(), 0);
+        assert_eq!(host.tab_target(0), Some(ActiveApp::Work));
+        // Cycling stays on the only tab.
+        assert_eq!(host.cycle(ActiveApp::Work, 1), ActiveApp::Work);
     }
 }
