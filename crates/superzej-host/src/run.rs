@@ -937,12 +937,33 @@ fn collect_window_titles(
         let Some(tab) = g.tabs.get(g.active_tab) else {
             continue;
         };
+
+        // Scan all tabs in the group, preferring the active one, to find a valid window title.
+        // This ensures titles don't disappear from the sidebar when an unfocused worktree
+        // has its title in a tab that happens to not be active.
+        let mut title_found = false;
+
         if let Some(p) = panes.table.get(&tab.focused_pane)
             && let Some(title) = p.emulator().title()
         {
             let title = title.trim();
             if !title.is_empty() {
                 out.insert(g.path.clone(), title.to_string());
+                title_found = true;
+            }
+        }
+
+        if !title_found {
+            for t in &g.tabs {
+                if let Some(p) = panes.table.get(&t.focused_pane)
+                    && let Some(title) = p.emulator().title()
+                {
+                    let title = title.trim();
+                    if !title.is_empty() {
+                        out.insert(g.path.clone(), title.to_string());
+                        break;
+                    }
+                }
             }
         }
     }
