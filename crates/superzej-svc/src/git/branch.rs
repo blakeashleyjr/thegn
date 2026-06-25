@@ -146,9 +146,10 @@ mod tests {
     /// Trimmed stdout of `git` in an arbitrary dir (panics on failure) — for
     /// asserting on the clone/remote repos a `TestRepo` method can't reach.
     fn out_in(dir: &Path, args: &[&str]) -> String {
-        let out = std::process::Command::new("git")
+        // Scrubbed `git -C dir` so it reads the intended repo, not an outer one
+        // leaked via GIT_DIR when the suite runs inside a commit hook.
+        let out = superzej_core::util::git_cmd(dir)
             .args(args)
-            .current_dir(dir)
             .output()
             .unwrap();
         assert!(

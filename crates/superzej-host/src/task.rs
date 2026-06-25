@@ -1396,7 +1396,13 @@ mod tests {
     }
 
     fn git_init(dir: &Path) {
-        let _ = Command::new("git").arg("init").arg("-q").arg(dir).output();
+        // `git -C dir init` with GIT_DIR/GIT_WORK_TREE/etc. scrubbed: a raw
+        // `git init <dir>` inheriting a commit hook's GIT_WORK_TREE writes
+        // core.worktree into the OUTER repo's shared config (the pollution bug).
+        let _ = superzej_core::util::git_cmd(dir)
+            .arg("init")
+            .arg("-q")
+            .output();
     }
 
     /// End-to-end against a REAL cargo project in a REAL git repo: detect the
