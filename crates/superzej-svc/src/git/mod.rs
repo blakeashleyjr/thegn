@@ -849,9 +849,12 @@ pub(crate) mod testutil {
     }
 
     fn git_cmd(dir: &Path, args: &[&str]) -> std::process::Command {
-        let mut c = std::process::Command::new("git");
+        // Route through the canonical helper: `git -C dir` with GIT_DIR/
+        // GIT_WORK_TREE/etc. scrubbed, so a test running inside a commit hook
+        // (where git exports those) can't write to the OUTER repo's shared
+        // config — the core.worktree / bogus-identity pollution bug.
+        let mut c = superzej_core::util::git_cmd(dir);
         c.args(args)
-            .current_dir(dir)
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@e")
             .env("GIT_COMMITTER_NAME", "t")
@@ -994,9 +997,13 @@ mod tests {
 
     /// Run `git` in `dir`, panicking on failure (test setup helper).
     fn git_in(dir: &std::path::Path, args: &[&str]) {
-        let ok = std::process::Command::new("git")
+        // `git -C dir` with GIT_DIR/GIT_WORK_TREE/etc. scrubbed (see git_cmd
+        // above) so the suite can't leak into the outer repo's shared config.
+        // NB: this helper intentionally inherits the user's GLOBAL git config
+        // (unlike git_cmd above) — these tests rely on init.defaultBranch=main
+        // when seeding bare remotes, so do NOT add GIT_CONFIG_GLOBAL=/dev/null.
+        let ok = superzej_core::util::git_cmd(dir)
             .args(args)
-            .current_dir(dir)
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@e")
             .env("GIT_COMMITTER_NAME", "t")
