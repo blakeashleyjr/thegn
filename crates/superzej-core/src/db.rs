@@ -43,7 +43,7 @@ use std::path::PathBuf;
 /// source of truth for sidebar workspace order (was recency). Backfilled from
 /// the prior `last_active DESC` order so the first launch after upgrade looks
 /// unchanged; thereafter order is manual (Ctrl+Alt+↑/↓) and stable.
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 
 pub struct Db {
     conn: Connection,
@@ -534,6 +534,19 @@ impl Db {
              ) WHERE position IS NULL",
             [],
         );
+
+        // v17: folders table and worktrees.folder_id
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS folders (
+                folder_id INTEGER PRIMARY KEY,
+                repo_path TEXT NOT NULL REFERENCES workspaces(repo_path) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+             )",
+            [],
+        );
+        let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN folder_id INTEGER", []);
         // v6: transform any remaining flat v4/v5 `tab_layout` into worktree
         // groups. Keyed on the legacy table's existence (not the version) so
         // it is idempotent and a failed earlier attempt retries next open.
@@ -1256,6 +1269,57 @@ impl Db {
         Ok(())
     }
 
+    // --- FOLDERS ---
+
+    pub fn folders_for_workspace(&self, repo_path: &str) -> Result<Vec<crate::models::FolderRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT folder_id, repo_path, name, position, created_at
+             FROM folders WHERE repo_path = ?1 ORDER BY position",
+        )?;
+        let rows = stmt.query_map(params![repo_path], |r| {
+            Ok(crate::models::FolderRow {
+                folder_id: r.get(0)?,
+                repo_path: r.get(1)?,
+                name: r.get(2)?,
+                position: r.get(3)?,
+                created_at: r.get(4)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn create_folder(&self, repo_path: &str, name: &str) -> Result<i64> {
+        let created_at = crate::util::now();
+        self.conn.execute(
+            "INSERT INTO folders(repo_path, name, position, created_at)
+             VALUES(?1, ?2, (SELECT COALESCE(MAX(position), -1) + 1 FROM folders WHERE repo_path = ?1), ?3)",
+            params![repo_path, name, created_at],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn rename_folder(&self, folder_id: i64, new_name: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE folders SET name = ?1 WHERE folder_id = ?2",
+            params![new_name, folder_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn del_folder(&self, folder_id: i64) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE worktrees SET folder_id = NULL WHERE folder_id = ?1",
+            params![folder_id],
+        )?;
+        tx.execute(
+            "DELETE FROM folders WHERE folder_id = ?1",
+            params![folder_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// The recorded agent for a worktree (for `pick-agent --resume` on restart).
     pub fn worktree_agent(&self, worktree: &str) -> Result<Option<String>> {
         let r = self
@@ -1451,14 +1515,15 @@ impl Db {
         wt: &str,
         branch: &str,
         location: Option<&str>,
+        folder_id: Option<i64>,
     ) -> Result<()> {
-        // New worktrees append at the bottom (MAX+1); an upsert leaves the
+        // Insert unconditionally falls to the end (`MAX+1`), while upsert leaves an
         // existing `position` untouched so a re-register never reshuffles order.
         self.conn.execute(
-            r#"INSERT INTO worktrees(worktree,session_name,tab_name,repo_path,branch,agent,created_at,location,position)
-               VALUES(?1,?2,?3,?4,?5,'',?6,?7,(SELECT COALESCE(MAX(position),-1)+1 FROM worktrees))
-               ON CONFLICT(worktree) DO UPDATE SET branch=?5, tab_name=?3, repo_path=?4, session_name=?2, location=?7"#,
-            params![wt, session(), tab, root, branch, util::now(), location],
+            r#"INSERT INTO worktrees(worktree,session_name,tab_name,repo_path,branch,agent,created_at,location,position,folder_id)
+               VALUES(?1,?2,?3,?4,?5,'',?6,?7,(SELECT COALESCE(MAX(position),-1)+1 FROM worktrees),?8)
+               ON CONFLICT(worktree) DO UPDATE SET branch=?5, tab_name=?3, repo_path=?4, session_name=?2, location=?7, folder_id=COALESCE(?8, folder_id)"#,
+            params![wt, session(), tab, root, branch, util::now(), location, folder_id],
         )?;
         Ok(())
     }
@@ -1719,6 +1784,8 @@ impl Db {
                 session_name: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
                 location: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
                 position: r.get::<_, Option<i64>>(8)?.unwrap_or(0),
+                folder_id: None,
+                sandbox_backend: None,
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -2092,7 +2159,7 @@ impl Db {
 }
 
 /// Split a legacy v4/v5 tab name into its worktree-group base and page number:
-/// `"app/feat ·3"` → `("app/feat", Some(3))`, `"app/feat"` → `("app/feat", None)`.
+/// `"app/feat ·3"` → `("app/feat", Some(3))`, `"app/feat"` → `("app/feat", None, None)`.
 fn split_page_suffix(name: &str) -> (&str, Option<u32>) {
     if let Some((base, page)) = name.rsplit_once(" ·")
         && !base.is_empty()
@@ -2618,13 +2685,13 @@ mod tests {
     fn del_workspace_forgets_workspace_and_its_worktrees() {
         let db = db();
         db.put_workspace("/repo", "repo", "repo").unwrap();
-        db.put_worktree("repo/main", "/repo", "/repo", "main", None)
+        db.put_worktree("repo/main", "/repo", "/repo", "main", None, None)
             .unwrap();
-        db.put_worktree("repo/feat", "/repo", "/repo/wt-feat", "feat", None)
+        db.put_worktree("repo/feat", "/repo", "/repo/wt-feat", "feat", None, None)
             .unwrap();
         // A second, unrelated workspace must survive the removal.
         db.put_workspace("/other", "other", "repo").unwrap();
-        db.put_worktree("other/main", "/other", "/other", "main", None)
+        db.put_worktree("other/main", "/other", "/other", "main", None, None)
             .unwrap();
         let slug = db.slug_for_repo("/repo", "repo").unwrap();
 
@@ -2863,9 +2930,41 @@ mod tests {
     #[test]
     fn worktree_crud() {
         let db = db();
-        db.put_worktree("app/feat", "/x/app", "/wt/feat", "sz/feat", None)
+        db.put_worktree("app/feat", "/x/app", "/wt/feat", "sz/feat", None, None)
             .unwrap();
+    }
 
+    #[test]
+    fn folder_crud() {
+        let db = db();
+        db.put_workspace("/x/app", "app", "repo").unwrap();
+
+        let f1 = db.create_folder("/x/app", "Features").unwrap();
+        let f2 = db.create_folder("/x/app", "Bugs").unwrap();
+
+        let folders = db.folders_for_workspace("/x/app").unwrap();
+        assert_eq!(folders.len(), 2);
+        assert_eq!(folders[0].name, "Features");
+        assert_eq!(folders[0].folder_id, f1);
+        assert_eq!(folders[1].name, "Bugs");
+        assert_eq!(folders[1].folder_id, f2);
+        assert!(folders[0].position < folders[1].position);
+
+        db.rename_folder(f1, "Feat").unwrap();
+        let folders2 = db.folders_for_workspace("/x/app").unwrap();
+        assert_eq!(folders2[0].name, "Feat");
+
+        db.del_folder(f2).unwrap();
+        let folders3 = db.folders_for_workspace("/x/app").unwrap();
+        assert_eq!(folders3.len(), 1);
+        assert_eq!(folders3[0].folder_id, f1);
+    }
+
+    #[test]
+    fn worktree_crud2() {
+        let db = db();
+        db.put_worktree("app/feat", "/x/app", "/wt/feat", "sz/feat", None, None)
+            .unwrap();
         db.set_worktree_sandbox("/wt/feat", "podman").unwrap();
         let sb = db.worktree_sandbox("/wt/feat").unwrap();
         assert_eq!(sb, Some("podman".to_string()));
@@ -2906,6 +3005,7 @@ mod tests {
             "/wt/feat-renamed-on-disk",
             "sz/feat",
             Some("{\"host\":\"box\"}"),
+            None,
         )
         .unwrap();
         db.del_worktree_for_tab("/x/app", "app/feat").unwrap();
@@ -2914,7 +3014,7 @@ mod tests {
             "closing/deleting a worktree group must forget registry rows even if the path changed"
         );
 
-        db.put_worktree("app/other", "/x/app", "/wt/other", "sz/other", None)
+        db.put_worktree("app/other", "/x/app", "/wt/other", "sz/other", None, None)
             .unwrap();
         // delete
         db.del_worktree("/wt/other").unwrap();
@@ -2946,7 +3046,7 @@ mod tests {
     #[test]
     fn rename_worktree_rekeys_path_tab_and_branch() {
         let db = db();
-        db.put_worktree("app/old", "/x/app", "/wt/old", "old", None)
+        db.put_worktree("app/old", "/x/app", "/wt/old", "old", None, None)
             .unwrap();
         db.set_worktree_position("/wt/old", 7).unwrap();
         db.rename_worktree("/wt/old", "/wt/new", "app/new", "new")
@@ -2970,11 +3070,11 @@ mod tests {
         // Inserted a, b, c — `worktrees()` returns them in that creation order
         // regardless of branch name (no alphabetizing), and positions are the
         // dense 0,1,2 the appending MAX+1 insert assigns.
-        db.put_worktree("app/c", "/x/app", "/wt/c", "sz/c", None)
+        db.put_worktree("app/c", "/x/app", "/wt/c", "sz/c", None, None)
             .unwrap();
-        db.put_worktree("app/a", "/x/app", "/wt/a", "sz/a", None)
+        db.put_worktree("app/a", "/x/app", "/wt/a", "sz/a", None, None)
             .unwrap();
-        db.put_worktree("app/b", "/x/app", "/wt/b", "sz/b", None)
+        db.put_worktree("app/b", "/x/app", "/wt/b", "sz/b", None, None)
             .unwrap();
         let order: Vec<_> = db
             .worktrees()
@@ -2993,7 +3093,7 @@ mod tests {
 
         // Re-registering an existing worktree (upsert) keeps its position — a
         // metadata refresh must never reshuffle the list.
-        db.put_worktree("app/c", "/x/app", "/wt/c", "sz/c-renamed", None)
+        db.put_worktree("app/c", "/x/app", "/wt/c", "sz/c-renamed", None, None)
             .unwrap();
         let pos_c = db
             .worktrees()
@@ -3008,11 +3108,11 @@ mod tests {
     #[test]
     fn swap_worktree_positions_reorders() {
         let db = db();
-        db.put_worktree("app/a", "/x/app", "/wt/a", "sz/a", None)
+        db.put_worktree("app/a", "/x/app", "/wt/a", "sz/a", None, None)
             .unwrap();
-        db.put_worktree("app/b", "/x/app", "/wt/b", "sz/b", None)
+        db.put_worktree("app/b", "/x/app", "/wt/b", "sz/b", None, None)
             .unwrap();
-        db.put_worktree("app/c", "/x/app", "/wt/c", "sz/c", None)
+        db.put_worktree("app/c", "/x/app", "/wt/c", "sz/c", None, None)
             .unwrap();
 
         // Swap the first two: order becomes b, a, c.

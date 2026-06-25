@@ -886,8 +886,8 @@ mod tests {
         };
         session.persist(&db, sess, 1234).unwrap();
         // Only the freshly-created worktree gets a registry row (position 0);
-        // home + the pre-existing "old" branch were never registered.
-        db.put_worktree("app/new", "/r", "/wt/new", "new", None)
+        db.put_workspace("/r", "app", "repo").unwrap();
+        db.put_worktree("app/new", "/r", "/wt/new", "new", None, None)
             .unwrap();
 
         let back = Session::resurrect(&db, sess).unwrap();
