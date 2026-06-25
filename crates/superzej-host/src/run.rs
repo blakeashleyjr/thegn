@@ -14703,11 +14703,25 @@ async fn event_loop<T: Terminal>(
                 dirty = true;
             }
             Ok(Some(InputEvent::Paste(s))) => {
-                if !crate::focus::forwards_to_pane(focus.zone) {
-                    model.status = "Paste ignored (terminal not focused)".into();
-                    dirty = true;
+                // A chrome text-input is collecting keystrokes (commit message /
+                // rename / new-branch overlay, the search palette, or the git
+                // filter line): a paste belongs to it, not the terminal. We
+                // don't inject into those fields yet, but we must not leak the
+                // paste into the pane sitting behind the overlay either.
+                let chrome_text_input = git_input.is_some()
+                    || host_input.is_some()
+                    || palette.is_some()
+                    || panel_ui.git.filter.as_ref().is_some_and(|f| f.editing);
+                if chrome_text_input {
                     continue;
                 }
+                // Otherwise a paste — including a terminal file drag-and-drop,
+                // which the outer terminal delivers as a bracketed paste — is
+                // terminal-bound. Route it to the focused pane even when the
+                // sidebar or panel holds keyboard focus: a drop is an
+                // unambiguous "into the terminal" gesture and we only learn the
+                // focus zone, never the drop coordinates, so gating on
+                // `forwards_to_pane` would silently swallow drops onto chrome.
                 let target_pane = if focus.drawer() {
                     drawer.unwrap_or(focused)
                 } else {
