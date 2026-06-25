@@ -1122,7 +1122,12 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
         r.push(seg(Tok::Slot(S::Text), " "));
         r.push(Seg::chip(
             Tok::Hue(superzej_core::theme::Hue::Teal),
-            format!(" 🤖 {}: ${:.2} ({}t) ", metrics.agent, metrics.cost, metrics.tokens.input + metrics.tokens.output),
+            format!(
+                " 🤖 {}: ${:.2} ({}t) ",
+                metrics.agent,
+                metrics.cost,
+                metrics.tokens.input + metrics.tokens.output
+            ),
         ));
     }
     if model.zoomed {
