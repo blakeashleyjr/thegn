@@ -35,6 +35,9 @@ fn t() -> Tok {
 fn d() -> Tok {
     Tok::Slot(S::Dim)
 }
+fn f() -> Tok {
+    Tok::Slot(S::Faint)
+}
 fn g() -> Tok {
     Tok::Slot(S::Ghost)
 }
@@ -139,10 +142,14 @@ fn commit_mark(sha: &str, ui: &PanelUi) -> Seg {
 
 /// Flow chips for the status row: `REBASING`, `MERGING`, `CHERRY-PICK`,
 /// `REVERTING`, `BISECT g/c`, `DIFF vs x`, `PATCH n lines`.
-fn flow_chips(flow: &GitFlow) -> Vec<Seg> {
+fn flow_chips(flow: &GitFlow, merge_banner: bool) -> Vec<Seg> {
     match flow {
         GitFlow::None => Vec::new(),
         GitFlow::Rebase(_) => vec![sp(1), Seg::chip(hue(Hue::Amber), " REBASING ")],
+        // The frame header already carries the richer MERGING banner (from the
+        // hydrated MERGE_HEAD state); repeating it in the STATUS strip painted a
+        // second amber MERGING box. Suppress the strip chip when the banner shows.
+        GitFlow::Merge(_) if merge_banner => Vec::new(),
         GitFlow::Merge(s) => {
             let label = if s.conflict {
                 " MERGING ⚑ "
@@ -206,7 +213,7 @@ fn status_rows(model: &FrameModel, ui: &PanelUi, focused: bool) -> Vec<PanelRow>
         right.push(sp(1));
     }
     let mut l = vec![sp(1), seg(g2(), "1").bold(), sp(1), seg(d(), "STATUS")];
-    l.extend(flow_chips(&ui.git.flow));
+    l.extend(flow_chips(&ui.git.flow, data.merge.is_some()));
     vec![PanelRow::plain(Line::split(l, right))]
 }
 
@@ -227,7 +234,9 @@ fn item_row(data: &PanelData, view: GitView, src: usize) -> PanelRow {
                 sp(1),
                 seg(tok, format!("{:>2}", c.status)),
                 sp(1),
-                seg(g2(), c.dir.clone()),
+                // Path prefix is a label, not scaffolding — `faint`, not the
+                // `ghost2` floor (see the changes section).
+                seg(f(), c.dir.clone()),
                 seg(d(), c.name.clone()),
             ]
         }
@@ -1082,6 +1091,34 @@ mod tests {
         // And the side column still shows every list with its count badge.
         assert!(all.contains("COMMITS 8"), "{all}");
         assert!(all.contains("BRANCHES 2"), "{all}");
+    }
+
+    // Regression: with both the hydrated header banner and the UI merge flow
+    // active, the Full frame must show exactly one amber MERGING chip — the
+    // header banner — not also repeat it in the STATUS strip ("merging twice").
+    #[test]
+    fn full_frame_shows_one_merging_chip_when_banner_and_flow_active() {
+        use crate::panel::MergeBanner;
+        use crate::panel::gitui::SequencerUi;
+        let mut m = model();
+        m.panel.merge = Some(MergeBanner {
+            label: "MERGING".into(),
+            onto: "main".into(),
+            unresolved: 1,
+            total: Some(2),
+        });
+        let mut u = ui(GitView::Files);
+        u.git.flow = GitFlow::Merge(SequencerUi {
+            onto: "main".into(),
+            conflict: true,
+        });
+        let frame = build_git_full(&m, &u, 120, 40, true);
+        let all = all_text(&frame);
+        assert_eq!(
+            all.matches("MERGING").count(),
+            1,
+            "exactly one MERGING chip expected, got:\n{all}"
+        );
     }
 
     #[test]

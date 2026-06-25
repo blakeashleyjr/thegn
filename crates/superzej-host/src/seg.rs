@@ -136,8 +136,20 @@ impl Seg {
 
     /// An inverse chip: bold chip-fg text on a filled token background —
     /// `Seg::chip(Tok::Slot(S::Accent), " N ")` (mockup x-inv*).
+    ///
+    /// Note: `chip_fg` is near-`bg0`, so this only reads on a *bright* token
+    /// (accent or a semantic hue). For a chip on a dark surface (a keycap, a
+    /// badge) use [`Seg::key`] — `chip` there is dark-on-dark and unreadable.
     pub fn chip(bg: Tok, text: impl Into<String>) -> Seg {
         seg(Tok::Slot(S::ChipFg), text).bg(bg).bold()
+    }
+
+    /// A neutral "keycap" chip for dark surfaces: legible bright text on the
+    /// raised surface. The counterpart to [`Seg::chip`] for key hints and
+    /// badges, where the inverse chip's near-black `chip_fg` would vanish into
+    /// the dark `raise` fill.
+    pub fn key(text: impl Into<String>) -> Seg {
+        seg(Tok::Slot(S::Text), text).bg(Tok::Slot(S::Raise)).bold()
     }
 
     fn width(&self) -> usize {
@@ -303,6 +315,66 @@ pub fn draw_lines(surface: &mut Surface, rect: Rect, lines: &[Line], pad_bg: Tok
     }
 }
 
+/// Test-only legibility scanner: walk a rendered surface and return every
+/// *text* cell whose foreground/background contrast (WCAG, via
+/// [`superzej_core::theme::contrast_ratio`]) falls below `min`, as
+/// `(x, y, glyph, ratio)`.
+///
+/// Decorative glyphs — spaces, box-drawing, block/shade elements, braille
+/// (spinners), arrows, and a few geometric markers — are exempt: the contract
+/// is "readable text is readable", not "every separator meets body-text
+/// contrast". Cells whose colors don't resolve to truecolor (terminal
+/// defaults) are skipped; all chrome tokens resolve to truecolor.
+#[cfg(test)]
+pub(crate) fn text_contrast_violations(
+    surface: &mut Surface,
+    min: f32,
+) -> Vec<(usize, usize, String, f32)> {
+    fn rgb(c: ColorAttribute) -> Option<String> {
+        match c {
+            ColorAttribute::TrueColorWithDefaultFallback(t)
+            | ColorAttribute::TrueColorWithPaletteFallback(t, _) => Some(format!(
+                "{};{};{}",
+                (t.0 * 255.0).round() as u8,
+                (t.1 * 255.0).round() as u8,
+                (t.2 * 255.0).round() as u8,
+            )),
+            _ => None,
+        }
+    }
+    fn decorative(s: &str) -> bool {
+        !s.is_empty()
+            && s.chars().all(|c| {
+                c.is_whitespace()
+                    || ('\u{2190}'..='\u{21FF}').contains(&c) // arrows
+                    || ('\u{2500}'..='\u{259F}').contains(&c) // box drawing + blocks/shades
+                    || ('\u{25A0}'..='\u{25FF}').contains(&c) // geometric shapes (● ○ ◆ ◈)
+                    || ('\u{2800}'..='\u{28FF}').contains(&c) // braille (spinners)
+                    || matches!(c, '·' | '•' | '…' | '±' | '↵')
+            })
+    }
+    let mut out = Vec::new();
+    for (y, row) in surface.screen_cells().iter().enumerate() {
+        for (x, cell) in row.iter().enumerate() {
+            let glyph = cell.str();
+            if decorative(glyph) {
+                continue;
+            }
+            let (Some(fg), Some(bg)) = (
+                rgb(cell.attrs().foreground()),
+                rgb(cell.attrs().background()),
+            ) else {
+                continue;
+            };
+            let r = theme::contrast_ratio(&fg, &bg);
+            if r < min {
+                out.push((x, y, glyph.to_string(), r));
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,6 +405,49 @@ mod tests {
         };
         draw_line(&mut s, 0, 0, 6, &line, PAD);
         assert_eq!(row_text(&mut s, 0), "──────");
+    }
+
+    #[test]
+    fn contrast_scanner_flags_dark_on_dark_text_only() {
+        // Readable text on a surface: clean.
+        let mut ok = Surface::new(6, 1);
+        draw_line(
+            &mut ok,
+            0,
+            0,
+            6,
+            &Line::segs(vec![seg(Tok::Slot(S::Text), "hi")]),
+            Tok::Slot(S::Panel),
+        );
+        assert!(text_contrast_violations(&mut ok, 3.0).is_empty());
+
+        // Near-black chip text on the dark `raise` surface — the modal bug.
+        let mut bad = Surface::new(6, 1);
+        draw_line(
+            &mut bad,
+            0,
+            0,
+            6,
+            &Line::segs(vec![Seg::chip(Tok::Slot(S::Raise), "no")]),
+            Tok::Slot(S::Panel),
+        );
+        let v = text_contrast_violations(&mut bad, 3.0);
+        assert_eq!(v.len(), 2, "both glyph cells should be flagged: {v:?}");
+
+        // A box-drawing rule at the same low contrast is decorative — exempt.
+        let mut rule = Surface::new(6, 1);
+        draw_line(
+            &mut rule,
+            0,
+            0,
+            6,
+            &Line::Fill {
+                ch: '─',
+                fg: Tok::Slot(S::Raise),
+            },
+            Tok::Slot(S::Panel),
+        );
+        assert!(text_contrast_violations(&mut rule, 3.0).is_empty());
     }
 
     #[test]
