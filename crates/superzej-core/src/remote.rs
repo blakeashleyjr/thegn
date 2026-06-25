@@ -199,6 +199,12 @@ impl GitLoc {
             GitLoc::Local(p) => {
                 let mut c = Command::new("sh");
                 c.arg("-c").arg(script).current_dir(p);
+                // Custom `[[git_commands]]` scripts run arbitrary git; strip the
+                // repo-targeting env so a stray GIT_DIR can't retarget them at
+                // the shared `.git` (see [`util::GIT_ENV_VARS`]).
+                for var in util::GIT_ENV_VARS {
+                    c.env_remove(var);
+                }
                 c
             }
             GitLoc::Remote { ssh, path } => {

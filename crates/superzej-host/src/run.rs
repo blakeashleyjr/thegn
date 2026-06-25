@@ -2967,18 +2967,14 @@ fn spawn_blame_fetch(
     let tx = tx.clone();
     let wk = waker.clone();
     tokio::task::spawn_blocking(move || {
-        let mut args = vec![
-            "-C".to_string(),
-            wt.to_str().unwrap_or(".").to_string(),
-            "blame".to_string(),
-            "--porcelain".to_string(),
-        ];
+        let mut args = vec!["blame".to_string(), "--porcelain".to_string()];
         if !rev.is_empty() && rev != "HEAD" {
             args.push(rev);
         }
         args.push("--".to_string());
         args.push(path.clone());
-        let output = std::process::Command::new("git")
+        // Via the scrubbed `git_cmd` (supplies `-C wt` + strips GIT_ENV_VARS).
+        let output = superzej_core::util::git_cmd(&wt)
             .args(&args)
             .output()
             .unwrap_or_else(|_| std::process::Output {
@@ -3264,7 +3260,10 @@ fn create_workspace_from_input_with_config(
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("create {}", parent.display()))?;
             }
-            let status = std::process::Command::new("git")
+            // Via the scrubbed git_cmd so a stray GIT_DIR can't redirect the
+            // clone; dest is absolute, so the `-C` only sets the working dir.
+            let cwd = dest.parent().unwrap_or(std::path::Path::new("."));
+            let status = superzej_core::util::git_cmd(cwd)
                 .arg("clone")
                 .arg(input)
                 .arg(&dest)
@@ -6836,6 +6835,26 @@ async fn event_loop<T: Terminal>(
             last_active_worktree = Some(current_worktree.clone());
             // A selection anchored in the previous worktree's pane is stale.
             mouse_sel = None;
+            // Re-heal the canonical checkout's shared `.git/config` off-thread:
+            // another agent committing in a sibling worktree could have leaked a
+            // stray `core.worktree` since launch. Silent unless it strips a key;
+            // off the loop because it shells out (`rev-parse`).
+            {
+                let wt = current_worktree.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Some(common_parent) = superzej_core::util::git_cmd(&wt)
+                        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+                        .output()
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .and_then(|o| String::from_utf8(o.stdout).ok())
+                        .map(|s| std::path::PathBuf::from(s.trim()))
+                        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+                    {
+                        superzej_core::util::heal_main_checkout_worktree(&common_parent);
+                    }
+                });
+            }
             // Load this worktree's cached test state (most-recent status) so the
             // Tests tab shows it instantly; discovery stays lazy (on tab open).
             panel_ui.tests = crate::panel::TestPanelState::default();
@@ -9183,9 +9202,14 @@ async fn event_loop<T: Terminal>(
         //    config watcher, diff fs-watch, refresh ticker) which returns
         //    `InputEvent::Wake`. No timeout → zero idle CPU; we only wake when
         //    there is work, and render the instant it arrives.
+        let timeout = if dirty || !pending_input.is_empty() {
+            Some(std::time::Duration::from_millis(8))
+        } else {
+            None
+        };
         let polled = match pending_input.pop_front() {
             Some(ev) => Ok(Some(ev)),
-            None => buf.terminal().poll_input(None),
+            None => buf.terminal().poll_input(timeout),
         };
         match polled {
             Ok(Some(InputEvent::Mouse(m))) => {
@@ -9923,15 +9947,14 @@ async fn event_loop<T: Terminal>(
                                                         db.delete_workspace(&session.id)
                                                     {
                                                         // switch to next available workspace
-                                                        if let Ok(workspaces) = db.workspaces() {
-                                                            if let Some(next) = workspaces.first() {
-                                                                let _ = session
-                                                                    .switch_to_workspace(
-                                                                        &next.repo_path,
-                                                                        &db,
-                                                                    );
-                                                                switched = true;
-                                                            }
+                                                        if let Ok(workspaces) = db.workspaces()
+                                                            && let Some(next) = workspaces.first()
+                                                        {
+                                                            let _ = session.switch_to_workspace(
+                                                                &next.repo_path,
+                                                                &db,
+                                                            );
+                                                            switched = true;
                                                         }
                                                         if !switched {
                                                             // Empty workspace fallback
@@ -14855,6 +14878,39 @@ fn remap_warmed_tab_ids(tab: &mut crate::session::Tab, focus: u32, pairs: &[(u32
     true
 }
 
+pub fn spawn_ai_sidecar(
+    waker: termwiz::terminal::TerminalWaker,
+    tx: tokio::sync::mpsc::UnboundedSender<crate::chrome::AiMetrics>,
+) {
+    tokio::spawn(async move {
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::process::Command;
+
+        let mut child = match Command::new("python3")
+            .arg("src/sidecar.py")
+            .stdout(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("failed to spawn AI metrics sidecar: {e}");
+                return;
+            }
+        };
+
+        if let Some(stdout) = child.stdout.take() {
+            let mut reader = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                if let Ok(metrics) = serde_json::from_str::<crate::chrome::AiMetrics>(&line) {
+                    let _ = tx.send(metrics);
+                    let _ = waker.wake();
+                }
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -16730,37 +16786,4 @@ mod tests {
         assert_eq!(counts[&key_a], 2);
         assert!(!counts.contains_key(&key_b));
     }
-}
-
-pub fn spawn_ai_sidecar(
-    waker: termwiz::terminal::TerminalWaker,
-    tx: tokio::sync::mpsc::UnboundedSender<crate::chrome::AiMetrics>,
-) {
-    tokio::spawn(async move {
-        use std::process::Stdio;
-        use tokio::io::{AsyncBufReadExt, BufReader};
-        use tokio::process::Command;
-
-        let mut child = match Command::new("python3")
-            .arg("src/sidecar.py")
-            .stdout(Stdio::piped())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("Failed to spawn AI metrics sidecar: {}", e);
-                return;
-            }
-        };
-
-        if let Some(stdout) = child.stdout.take() {
-            let mut reader = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                if let Ok(metrics) = serde_json::from_str::<crate::chrome::AiMetrics>(&line) {
-                    let _ = tx.send(metrics);
-                    let _ = waker.wake();
-                }
-            }
-        }
-    });
 }

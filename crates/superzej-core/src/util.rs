@@ -185,6 +185,82 @@ pub fn heal_main_checkout_worktree(root: &Path) -> bool {
     false
 }
 
+/// Resolve the shared git-common dir (the canonical `.git`) for a worktree,
+/// WITHOUT shelling out. A main checkout's `.git` is a directory; a linked
+/// worktree's `.git` is a file `gitdir: <per-worktree-gitdir>`, whose
+/// `commondir` file points at the shared `.git`. Used to key the per-repo git
+/// lock so every worktree of a repo serializes on the same lock file.
+pub fn git_common_dir(worktree: &Path) -> PathBuf {
+    let dot_git = worktree.join(".git");
+    if dot_git.is_dir() {
+        return dot_git;
+    }
+    if let Ok(text) = std::fs::read_to_string(&dot_git)
+        && let Some(p) = text
+            .lines()
+            .next()
+            .and_then(|l| l.strip_prefix("gitdir:"))
+            .map(str::trim)
+    {
+        let gitdir = if Path::new(p).is_absolute() {
+            PathBuf::from(p)
+        } else {
+            worktree.join(p)
+        };
+        if let Ok(cd) = std::fs::read_to_string(gitdir.join("commondir")) {
+            let cd = cd.trim();
+            return if Path::new(cd).is_absolute() {
+                PathBuf::from(cd)
+            } else {
+                gitdir.join(cd)
+            };
+        }
+        // Fallback: `<gitdir>/../..` is `<canonical>/.git`.
+        if let Some(parent2) = gitdir.parent().and_then(Path::parent) {
+            return parent2.to_path_buf();
+        }
+    }
+    dot_git
+}
+
+/// A held cross-process advisory lock around git MUTATIONS on a shared repo.
+/// Multiple szhost/agent processes operating on the same canonical `.git` would
+/// otherwise race it (concurrent `worktree add`/commit/rebase clobbering the
+/// shared index/refs/config — the corruption behind the core.worktree saga).
+/// `flock` is advisory and tied to the open fd, so the lock auto-releases on
+/// `Drop` AND on process death — there are never stale locks. Reads stay
+/// lock-free; only the svc write runners acquire this.
+#[must_use = "the lock releases as soon as the guard is dropped"]
+pub struct GitLock(std::fs::File);
+
+/// Acquire the per-repo git-mutation lock (blocking) at
+/// `<git-common>/superzej-git.lock`, serializing concurrent mutations on the
+/// same `.git`. Best-effort: returns `None` (degrading to today's unlocked
+/// behavior) if the lock file can't be opened/locked, so a permissions quirk
+/// never wedges the user out of git. Call only on background threads — it blocks.
+pub fn lock_git_mutations(worktree: &Path) -> Option<GitLock> {
+    use std::os::unix::io::AsRawFd;
+    let path = git_common_dir(worktree).join("superzej-git.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .ok()?;
+    // SAFETY: a plain flock(2) on a live fd we own; LOCK_EX blocks until granted.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    (rc == 0).then_some(GitLock(file))
+}
+
+impl Drop for GitLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: same fd we locked; explicit unlock (close would also release).
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 /// Drop the `worktree = …` entry from the `[core]` section of a git config
 /// file's text, returning the rewritten text — or `None` if there is no such
 /// entry (so the caller can skip the write). Only the `[core]` section is
@@ -358,6 +434,45 @@ pub fn git_ok(dir: &Path, args: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_common_dir_resolves_main_and_linked() {
+        let tmp = std::env::temp_dir().join(format!("sz-gcd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        // Main checkout: `.git` is a directory → it IS the common dir.
+        let main = tmp.join("main");
+        std::fs::create_dir_all(main.join(".git")).unwrap();
+        assert_eq!(git_common_dir(&main), main.join(".git"));
+        // Linked worktree: `.git` is a file → per-worktree gitdir → commondir.
+        let wt_gitdir = main.join(".git/worktrees/feat");
+        std::fs::create_dir_all(&wt_gitdir).unwrap();
+        std::fs::write(wt_gitdir.join("commondir"), "../..\n").unwrap();
+        let wt = tmp.join("feat");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", wt_gitdir.display()),
+        )
+        .unwrap();
+        // `../..` from `<main>/.git/worktrees/feat` resolves to `<main>/.git`.
+        assert_eq!(git_common_dir(&wt), wt_gitdir.join("../.."));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn git_lock_acquires_and_re_acquires_after_drop() {
+        let tmp = std::env::temp_dir().join(format!("sz-glock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join(".git")).unwrap();
+        let guard = lock_git_mutations(&tmp);
+        assert!(guard.is_some(), "first acquire succeeds");
+        drop(guard); // releases (flock auto-drops); no stale lock left behind
+        assert!(
+            lock_git_mutations(&tmp).is_some(),
+            "re-acquire after drop succeeds"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn slugify_basic() {
