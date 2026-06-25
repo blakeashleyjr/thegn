@@ -1045,13 +1045,12 @@ pub fn spawn_git_search(
         let q_lower = query.to_ascii_lowercase();
 
         // Branches via `git for-each-ref`
-        if let Ok(out) = std::process::Command::new("git")
+        if let Ok(out) = superzej_core::util::git_cmd(&root)
             .args([
                 "for-each-ref",
                 "--format=%(refname:short) %(objecttype)",
                 "refs/",
             ])
-            .current_dir(&root)
             .output()
         {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
@@ -1084,9 +1083,8 @@ pub fn spawn_git_search(
         }
 
         // Recent commits (last 50)
-        if let Ok(out) = std::process::Command::new("git")
+        if let Ok(out) = superzej_core::util::git_cmd(&root)
             .args(["log", "--oneline", "-50", "--no-decorate"])
-            .current_dir(&root)
             .output()
         {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
@@ -1105,9 +1103,8 @@ pub fn spawn_git_search(
         }
 
         // Stash list
-        if let Ok(out) = std::process::Command::new("git")
+        if let Ok(out) = superzej_core::util::git_cmd(&root)
             .args(["stash", "list"])
-            .current_dir(&root)
             .output()
         {
             for (idx, line) in String::from_utf8_lossy(&out.stdout).lines().enumerate() {

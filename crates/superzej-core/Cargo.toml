@@ -13,6 +13,8 @@ test-utils = []
 # that lives with its domain model). Cheap; keeps core CLI-usable.
 clap.workspace = true
 anyhow.workspace = true
+# `flock(2)` for the cross-process git-mutation lock (util::lock_git_mutations).
+libc.workspace = true
 schemars = "0.8"
 rusqlite.workspace = true
 serde.workspace = true
