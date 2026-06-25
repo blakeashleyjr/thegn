@@ -342,20 +342,31 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     let size = term.get_screen_size().context("screen size")?;
     let (rows, cols) = (size.rows, size.cols);
 
-    // Kitty keyboard protocol, "disambiguate escape codes": Ctrl+h/j/k/l then
-    // arrive as CSI-u sequences (termwiz decodes fixterms) instead of legacy
-    // control bytes that collide with Backspace/Enter. Terminals without the
-    // protocol ignore the sequence and those chords degrade to passthrough —
-    // Ctrl+arrows carry the focus moves everywhere.
+    // Keyboard disambiguation is left to xterm `modifyOtherKeys` (level 2),
+    // which termwiz already pushes in `set_raw_mode` (`CSI > 4 ; 2 m`): Ctrl+h/
+    // j/k/l then arrive as `CSI 27;5;NNN~` / `CSI NNN;5u` (decoded to
+    // `Char('h') + CTRL`, distinct from the 0x08 Backspace collision) instead
+    // of bare control bytes.
     //
-    // Also enable SGR mouse reporting (1002 = button + drag, 1006 = SGR
-    // encoding): clicks focus panes/rows and drags build a per-pane selection
-    // that auto-copies (OSC 52) on release, zellij-style.
+    // We deliberately do NOT push the kitty keyboard protocol (`CSI > 1 u`)
+    // here. termwiz 0.23.3's input parser cannot decode kitty CSI-u sequences
+    // that carry a sub-parameter — event types (`CSI 119;3:1u`), alternate
+    // keys (`CSI 119:87;2u`), or associated text (`CSI 119;3;119u`). Ghostty
+    // emits the event-type form, so every modified chord (Alt+w, Alt+o, …)
+    // decoded to a spill of literal characters (`[`, `1`, `1`, `9`, `;`, …)
+    // that leaked into the focused pane instead of matching a host chord.
+    // Alacritty's older legacy encoding hid this; ghostty surfaced it.
+    // modifyOtherKeys gives us the same disambiguation in a form termwiz
+    // parses correctly, so dropping the kitty push is a strict win here.
+    //
+    // SGR mouse reporting stays on (1002 = button + drag, 1006 = SGR encoding):
+    // clicks focus panes/rows and drags build a per-pane selection that
+    // auto-copies (OSC 52) on release, zellij-style.
     {
         use std::io::Write as _;
         let mut out = std::io::stdout();
         let _ = out
-            .write_all(b"\x1b[>1u\x1b[?1002h\x1b[?1006h")
+            .write_all(b"\x1b[?1002h\x1b[?1006h")
             .and_then(|_| out.flush());
     }
 
@@ -4837,13 +4848,14 @@ fn normalize_key(k: termwiz::input::KeyEvent) -> termwiz::input::KeyEvent {
             modifiers: k.modifiers | Modifiers::CTRL,
         };
     }
-    // The kitty keyboard protocol (we enable `ESC [ >1u` on the parent) reports
-    // modified ASCII control keys in CSI-u form (`ESC [ 9 ; 2 u` = Shift+Tab),
-    // which termwiz decodes to `KeyCode::Char('\t')` rather than the functional
-    // `KeyCode::Tab` it gives for the legacy `ESC [ Z` spelling. Canonicalize
-    // back to the functional keycode so chord matching and byte encoding treat
-    // both spellings identically — otherwise Shift+Tab collapses to a bare Tab
-    // (the SHIFT is silently dropped) and never reaches the pane as back-tab.
+    // Enhanced-keyboard modes (xterm `modifyOtherKeys`, which termwiz enables,
+    // or a kitty-protocol terminal) report modified ASCII control keys in CSI-u
+    // form (`ESC [ 9 ; 2 u` = Shift+Tab), which termwiz decodes to
+    // `KeyCode::Char('\t')` rather than the functional `KeyCode::Tab` it gives
+    // for the legacy `ESC [ Z` spelling. Canonicalize back to the functional
+    // keycode so chord matching and byte encoding treat both spellings
+    // identically — otherwise Shift+Tab collapses to a bare Tab (the SHIFT is
+    // silently dropped) and never reaches the pane as back-tab.
     if let KeyCode::Char(c) = k.key
         && !k.modifiers.is_empty()
     {
