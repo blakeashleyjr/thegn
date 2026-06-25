@@ -113,7 +113,7 @@ impl NewWorktreeWizard {
         NewWorktreeWizard {
             repo_slug: repo::repo_slug(&repo_root),
             prefix,
-            step: WizardStep::Name,
+            step: WizardStep::Agent,
             tail,
             name_edited: false,
             name_checked: false,
@@ -161,20 +161,6 @@ impl NewWorktreeWizard {
         }
     }
 
-    fn rows(&self) -> &[(String, String)] {
-        match self.step {
-            WizardStep::Sandbox => &self.sandbox_rows,
-            _ => &self.agent_rows,
-        }
-    }
-
-    fn sel(&mut self) -> &mut usize {
-        match self.step {
-            WizardStep::Sandbox => &mut self.sandbox_sel,
-            _ => &mut self.agent_sel,
-        }
-    }
-
     pub fn handle_key(&mut self, key: &KeyCode, mods: Modifiers) -> WizardOutcome {
         if mods.contains(Modifiers::CTRL) {
             return match key {
@@ -191,8 +177,37 @@ impl NewWorktreeWizard {
         match self.step {
             WizardStep::Name => {
                 match key {
+                    KeyCode::DownArrow | KeyCode::Char('j') => {
+                        let max = self.agent_rows.len().saturating_sub(1);
+                        self.agent_sel = self.agent_sel.saturating_add(1).min(max);
+                    }
+                    KeyCode::UpArrow | KeyCode::Char('k') => {
+                        if self.agent_sel > 0 {
+                            self.agent_sel -= 1;
+                        }
+                    }
                     KeyCode::Enter if !self.tail.trim().is_empty() => {
-                        self.step = WizardStep::Sandbox;
+                        let backend = self
+                            .sandbox_rows
+                            .iter()
+                            .find(|(k, _)| k == "auto")
+                            .map(|(k, _)| k.clone())
+                            .unwrap_or_else(|| "auto".into());
+                        let agent = self
+                            .agent_rows
+                            .get(self.agent_sel)
+                            .map(|(k, _)| k.clone())
+                            .unwrap_or_else(|| "shell".into());
+                        let name = if self.name_edited {
+                            NameChoice::Human(self.tail.clone())
+                        } else {
+                            NameChoice::Generated
+                        };
+                        return WizardOutcome::Submit(WizardChoices {
+                            name,
+                            sandbox: backend,
+                            agent,
+                        });
                     }
                     KeyCode::Backspace => {
                         // Popping marks the field edited; `|=` keeps an earlier
@@ -207,49 +222,70 @@ impl NewWorktreeWizard {
                 }
                 WizardOutcome::Pending
             }
-            WizardStep::Sandbox | WizardStep::Agent => match key {
+            WizardStep::Sandbox => match key {
                 KeyCode::DownArrow | KeyCode::Char('j') => {
-                    let max = self.rows().len().saturating_sub(1);
-                    let sel = self.sel();
-                    *sel = (*sel + 1).min(max);
+                    let max = self.sandbox_rows.len().saturating_sub(1);
+                    if self.sandbox_sel == max {
+                        self.step = WizardStep::Agent;
+                    } else {
+                        self.sandbox_sel += 1;
+                    }
                     WizardOutcome::Pending
                 }
                 KeyCode::UpArrow | KeyCode::Char('k') => {
-                    let sel = self.sel();
-                    *sel = sel.saturating_sub(1);
+                    if self.sandbox_sel == 0 {
+                        self.step = WizardStep::Name;
+                    } else {
+                        self.sandbox_sel -= 1;
+                    }
                     WizardOutcome::Pending
                 }
                 KeyCode::Enter => {
-                    if self.step == WizardStep::Sandbox {
-                        let backend = self
-                            .sandbox_rows
-                            .get(self.sandbox_sel)
-                            .map(|(k, _)| k.clone())
-                            .unwrap_or_else(|| "auto".into());
-                        self.step = WizardStep::Agent;
-                        WizardOutcome::SandboxChosen(backend)
+                    let backend = self
+                        .sandbox_rows
+                        .get(self.sandbox_sel)
+                        .map(|(k, _)| k.clone())
+                        .unwrap_or_else(|| "auto".into());
+                    self.step = WizardStep::Agent;
+                    WizardOutcome::SandboxChosen(backend)
+                }
+                _ => WizardOutcome::Pending,
+            },
+            WizardStep::Agent => match key {
+                KeyCode::DownArrow | KeyCode::Char('j') => {
+                    let max = self.agent_rows.len().saturating_sub(1);
+                    self.agent_sel = self.agent_sel.saturating_add(1).min(max);
+                    WizardOutcome::Pending
+                }
+                KeyCode::UpArrow | KeyCode::Char('k') => {
+                    if self.agent_sel == 0 {
+                        self.step = WizardStep::Sandbox;
                     } else {
-                        let sandbox = self
-                            .sandbox_rows
-                            .get(self.sandbox_sel)
-                            .map(|(k, _)| k.clone())
-                            .unwrap_or_else(|| "auto".into());
-                        let agent = self
-                            .agent_rows
-                            .get(self.agent_sel)
-                            .map(|(k, _)| k.clone())
-                            .unwrap_or_else(|| "shell".into());
-                        let name = if self.name_edited {
-                            NameChoice::Human(self.tail.clone())
-                        } else {
-                            NameChoice::Generated
-                        };
-                        WizardOutcome::Submit(WizardChoices {
-                            name,
-                            sandbox,
-                            agent,
-                        })
+                        self.agent_sel -= 1;
                     }
+                    WizardOutcome::Pending
+                }
+                KeyCode::Enter => {
+                    let sandbox = self
+                        .sandbox_rows
+                        .get(self.sandbox_sel)
+                        .map(|(k, _)| k.clone())
+                        .unwrap_or_else(|| "auto".into());
+                    let agent = self
+                        .agent_rows
+                        .get(self.agent_sel)
+                        .map(|(k, _)| k.clone())
+                        .unwrap_or_else(|| "shell".into());
+                    let name = if self.name_edited {
+                        NameChoice::Human(self.tail.clone())
+                    } else {
+                        NameChoice::Generated
+                    };
+                    WizardOutcome::Submit(WizardChoices {
+                        name,
+                        sandbox,
+                        agent,
+                    })
                 }
                 _ => WizardOutcome::Pending,
             },
@@ -258,10 +294,15 @@ impl NewWorktreeWizard {
 
     /// Paint as a centered layer: breadcrumb, step body, footer hints.
     pub fn render(&self, surface: &mut Surface, screen: Rect) {
-        let body_rows = match self.step {
-            WizardStep::Name => 2,
-            _ => self.rows().len(),
-        };
+        let body_rows = 1
+            + 1
+            + if self.step == WizardStep::Sandbox {
+                self.sandbox_rows.len()
+            } else if self.step == WizardStep::Agent || self.step == WizardStep::Name {
+                self.agent_rows.len()
+            } else {
+                0
+            };
         let spec = LayerSpec {
             title: format!("new worktree — {}", self.repo_slug),
             badge: Some(" Alt+w ".into()),
@@ -317,72 +358,165 @@ impl NewWorktreeWizard {
             panel,
         );
 
-        let body_y = inner.y + 2;
-        match self.step {
-            WizardStep::Name => {
-                seg::draw_line(
-                    surface,
-                    inner.x,
-                    body_y,
-                    inner.cols,
-                    &Line::segs(vec![
-                        seg(Tok::Slot(S::Accent), "branch ❯ ").bold(),
-                        seg(Tok::Slot(S::Faint), self.prefix.clone()),
-                        seg(Tok::Slot(S::Text), self.tail.clone()),
-                        seg(Tok::Slot(S::Accent), "▏"),
-                    ]),
-                    panel,
-                );
-                if !self.name_checked && !self.name_edited {
-                    seg::draw_line(
-                        surface,
-                        inner.x,
-                        body_y + 1,
-                        inner.cols,
-                        &Line::segs(vec![
-                            sp(9),
-                            seg(Tok::Slot(S::Faint), "checking collisions…".to_string()),
-                        ]),
-                        panel,
-                    );
-                }
-            }
-            WizardStep::Sandbox | WizardStep::Agent => {
-                let selected_row = match self.step {
-                    WizardStep::Sandbox => self.sandbox_sel,
-                    _ => self.agent_sel,
+        let mut y = inner.y + 2;
+
+        // 1. Render Name
+        let name_fg = if self.step == WizardStep::Name {
+            Tok::Slot(S::Accent)
+        } else {
+            Tok::Slot(S::Faint)
+        };
+        let name_label = seg(name_fg, "branch ❯ ".to_string()).bold();
+        seg::draw_line(
+            surface,
+            inner.x,
+            y,
+            inner.cols,
+            &Line::segs(vec![
+                name_label,
+                seg(Tok::Slot(S::Faint), self.prefix.clone()),
+                seg(Tok::Slot(S::Text), self.tail.clone()),
+                if self.step == WizardStep::Name {
+                    seg(Tok::Slot(S::Accent), "▏")
+                } else {
+                    sp(0)
+                },
+            ]),
+            panel,
+        );
+        y += 1;
+        if self.step == WizardStep::Name && !self.name_checked && !self.name_edited {
+            seg::draw_line(
+                surface,
+                inner.x,
+                y,
+                inner.cols,
+                &Line::segs(vec![
+                    sp(9),
+                    seg(Tok::Slot(S::Faint), "checking collisions…".to_string()),
+                ]),
+                panel,
+            );
+            y += 1;
+        }
+
+        // 2. Render Sandbox
+        let sb_label = self
+            .sandbox_rows
+            .get(self.sandbox_sel)
+            .map(|(_, l)| l.as_str())
+            .unwrap_or("auto");
+        if self.step == WizardStep::Sandbox {
+            // Render full list
+            for (row, (_, label)) in self.sandbox_rows.iter().enumerate() {
+                let selected = row == self.sandbox_sel;
+                let pad = if selected { Tok::SelAccent } else { panel };
+                let marker = if selected {
+                    seg(Tok::Slot(S::Accent), "❯ ").bold()
+                } else {
+                    sp(2)
                 };
-                for (row, (_, label)) in self.rows().iter().enumerate().take(inner.rows - 4) {
-                    let selected = row == selected_row;
-                    let pad = if selected { Tok::SelAccent } else { panel };
-                    let marker = if selected {
-                        seg(Tok::Slot(S::Accent), "❯ ").bold()
-                    } else {
-                        sp(2)
-                    };
-                    let label_fg = if selected {
+                let mut l = seg(
+                    if selected {
                         Tok::Slot(S::Text)
                     } else {
                         Tok::Slot(S::Dim)
-                    };
-                    let mut l = seg(label_fg, label.clone());
-                    if selected {
-                        l = l.bold();
-                    }
-                    seg::draw_line(
-                        surface,
-                        inner.x,
-                        body_y + row,
-                        inner.cols,
-                        &Line::segs(vec![marker, l]),
-                        pad,
-                    );
+                    },
+                    label.clone(),
+                );
+                if selected {
+                    l = l.bold();
                 }
+                seg::draw_line(
+                    surface,
+                    inner.x,
+                    y,
+                    inner.cols,
+                    &Line::segs(vec![marker, l]),
+                    pad,
+                );
+                y += 1;
             }
+        } else {
+            // Render single compact row
+            let sb_fg = if self.step == WizardStep::Sandbox {
+                Tok::Slot(S::Accent)
+            } else {
+                Tok::Slot(S::Faint)
+            };
+            seg::draw_line(
+                surface,
+                inner.x,
+                y,
+                inner.cols,
+                &Line::segs(vec![
+                    seg(sb_fg, "sandbox ❯ ".to_string()).bold(),
+                    seg(Tok::Slot(S::Text), sb_label.to_string()),
+                ]),
+                panel,
+            );
+            y += 1;
+        }
+
+        // 3. Render Agent
+        let agent_label = self
+            .agent_rows
+            .get(self.agent_sel)
+            .map(|(_, l)| l.as_str())
+            .unwrap_or("shell");
+        if self.step == WizardStep::Agent || self.step == WizardStep::Name {
+            // Render full list
+            for (row, (_, label)) in self.agent_rows.iter().enumerate() {
+                let selected = row == self.agent_sel;
+                let pad = if selected { Tok::SelAccent } else { panel };
+                let marker = if selected {
+                    seg(Tok::Slot(S::Accent), "❯ ").bold()
+                } else {
+                    sp(2)
+                };
+                let mut l = seg(
+                    if selected {
+                        Tok::Slot(S::Text)
+                    } else {
+                        Tok::Slot(S::Dim)
+                    },
+                    label.clone(),
+                );
+                if selected {
+                    l = l.bold();
+                }
+                seg::draw_line(
+                    surface,
+                    inner.x,
+                    y,
+                    inner.cols,
+                    &Line::segs(vec![marker, l]),
+                    pad,
+                );
+                y += 1;
+            }
+        } else {
+            // Render single compact row
+            let ag_fg = if self.step == WizardStep::Agent {
+                Tok::Slot(S::Accent)
+            } else {
+                Tok::Slot(S::Faint)
+            };
+            seg::draw_line(
+                surface,
+                inner.x,
+                y,
+                inner.cols,
+                &Line::segs(vec![
+                    seg(ag_fg, "agent ❯ ".to_string()).bold(),
+                    seg(Tok::Slot(S::Text), agent_label.to_string()),
+                ]),
+                panel,
+            );
         }
 
         let footer = match self.step {
-            WizardStep::Name => "enter accept · type to rename · esc cancel",
+            WizardStep::Name => "enter create · j/k agent · esc cancel",
             WizardStep::Sandbox => "enter choose · j/k move · esc back",
             WizardStep::Agent => "enter create · j/k move · esc back",
         };
@@ -1035,17 +1169,12 @@ mod tests {
         assert!(w.candidate().starts_with(&cfg.branch_prefix));
         assert!(w.candidate().len() > cfg.branch_prefix.len());
 
-        assert_eq!(key(&mut w, KeyCode::Enter), WizardOutcome::Pending); // → sandbox
-        let chosen = key(&mut w, KeyCode::Enter); // → agent, emits the choice
-        let WizardOutcome::SandboxChosen(backend) = chosen else {
-            panic!("expected SandboxChosen, got {chosen:?}");
-        };
         let submit = key(&mut w, KeyCode::Enter);
         let WizardOutcome::Submit(choices) = submit else {
             panic!("expected Submit, got {submit:?}");
         };
         assert_eq!(choices.name, NameChoice::Generated);
-        assert_eq!(choices.sandbox, backend);
+        assert!(!choices.sandbox.is_empty());
         assert!(!choices.agent.is_empty());
     }
 
@@ -1053,13 +1182,17 @@ mod tests {
     fn typing_marks_edited_and_blocks_suggestion() {
         let cfg = test_cfg();
         let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
+        // Navigate back to the name step
+        key(&mut w, KeyCode::UpArrow);
+        key(&mut w, KeyCode::UpArrow);
+
         key(&mut w, KeyCode::Char('x'));
         let typed = w.candidate();
         w.apply_name_suggestion("sz/other-name");
         assert_eq!(w.candidate(), typed, "typed name never clobbered");
 
-        key(&mut w, KeyCode::Enter);
-        key(&mut w, KeyCode::Enter);
+        key(&mut w, KeyCode::Enter); // Name -> Sandbox
+        key(&mut w, KeyCode::Enter); // Sandbox -> Agent
         let WizardOutcome::Submit(choices) = key(&mut w, KeyCode::Enter) else {
             panic!("expected Submit");
         };
@@ -1078,6 +1211,10 @@ mod tests {
     fn empty_name_refuses_to_advance() {
         let cfg = test_cfg();
         let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
+        // Navigate back to name step
+        key(&mut w, KeyCode::UpArrow);
+        key(&mut w, KeyCode::UpArrow);
+
         for _ in 0..64 {
             key(&mut w, KeyCode::Backspace);
         }
@@ -1089,13 +1226,19 @@ mod tests {
     #[test]
     fn esc_cancels_from_any_step_and_ctrl_c_cancels_anywhere() {
         let cfg = test_cfg();
-        // Escape cancels immediately from the name step.
+        // Escape cancels immediately from the Agent step.
         let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
         assert_eq!(key(&mut w, KeyCode::Escape), WizardOutcome::Cancel);
 
-        // Escape cancels immediately from the sandbox step.
+        // Escape cancels immediately from the Sandbox step.
         let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
-        key(&mut w, KeyCode::Enter); // name → sandbox
+        key(&mut w, KeyCode::UpArrow); // Agent -> Sandbox
+        assert_eq!(key(&mut w, KeyCode::Escape), WizardOutcome::Cancel);
+
+        // Escape cancels immediately from the Name step.
+        let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
+        key(&mut w, KeyCode::UpArrow); // Agent -> Sandbox
+        key(&mut w, KeyCode::UpArrow); // Sandbox -> Name
         assert_eq!(key(&mut w, KeyCode::Escape), WizardOutcome::Cancel);
 
         // Escape cancels immediately from the agent step.
@@ -1270,7 +1413,7 @@ mod tests {
         assert!(frame.contains(" 1 "));
         assert!(frame.contains("name"));
         assert!(frame.contains("branch ❯"));
-        assert!(frame.contains("esc cancel"));
+        assert!(frame.contains("esc back"));
 
         let mut cp = CreationProgress::new(1, "sz/swift-reef".into());
         cp.apply(
