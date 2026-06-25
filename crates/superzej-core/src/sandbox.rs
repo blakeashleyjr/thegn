@@ -17,7 +17,7 @@
 //! layer (mosh preferred / ssh) runs the whole thing on a remote machine.
 
 use crate::config::{
-    FileAccess, Network, OnMissing, RemoteTransport, SandboxBackend, SandboxConfig,
+    FileAccess, Network, OnMissing, RemoteTransport, SandboxBackend, SandboxConfig, SandboxProfile,
 };
 use crate::remote::GitLoc;
 use crate::{msg, util};
@@ -247,6 +247,18 @@ pub struct SandboxSpec {
     pub network_allow: Vec<String>,
     /// Domain block-list for the DNS filter (checked before allow-list).
     pub network_block: Vec<String>,
+    /// Hardening: mount the container root filesystem read-only (writable: the
+    /// worktree, cache binds, and a tmpfs `/tmp`). Resolved from the active
+    /// [`SandboxProfile`](crate::config::SandboxProfile).
+    pub read_only_root: bool,
+    /// Hardening: set `no-new-privileges` so setuid/setgid can't escalate.
+    pub no_new_privileges: bool,
+    /// Hardening: process cap (fork-bomb containment); `None` = unlimited.
+    pub pids_limit: Option<i64>,
+    /// Hardening: Linux capabilities to drop (e.g. `["ALL"]` for `sealed`).
+    pub drop_capabilities: Vec<String>,
+    /// Hardening: capabilities to add back after dropping.
+    pub add_capabilities: Vec<String>,
     pub file_access: FileAccess,
     pub ports: Vec<String>,
     pub gpu: Option<String>,
@@ -267,6 +279,18 @@ pub struct SandboxSpec {
 /// location drives both remote-ness (transport) and how git metadata is probed.
 /// Emits a warning when it falls back per `on_missing`.
 pub fn resolve(cfg: &SandboxConfig, loc: &GitLoc, name: &str) -> Option<SandboxSpec> {
+    resolve_scoped(cfg, loc, name, cfg.profile)
+}
+
+/// Like [`resolve`] but with an explicit hardening [`SandboxProfile`]. Used for
+/// the embedded agent's separate `agent_profile` container, which is sealed
+/// independently of the worktree's interactive `profile`.
+pub fn resolve_scoped(
+    cfg: &SandboxConfig,
+    loc: &GitLoc,
+    name: &str,
+    profile: SandboxProfile,
+) -> Option<SandboxSpec> {
     if !cfg.enabled {
         return None;
     }
@@ -392,9 +416,20 @@ pub fn resolve(cfg: &SandboxConfig, loc: &GitLoc, name: &str) -> Option<SandboxS
         env,
         env_overrides: std::collections::HashMap::new(),
         env_block: Vec::new(),
-        network: cfg.network,
+        // A profile with a no-network floor (sealed) overrides the configured
+        // network mode; otherwise the worktree's `[sandbox] network` stands.
+        network: if profile.forces_no_network() {
+            Network::None
+        } else {
+            cfg.network
+        },
         network_allow: cfg.network_allow.clone(),
         network_block: cfg.network_block.clone(),
+        read_only_root: profile.read_only_root(),
+        no_new_privileges: profile.no_new_privileges(),
+        pids_limit: profile.pids_limit(),
+        drop_capabilities: profile.drop_capabilities(),
+        add_capabilities: profile.add_capabilities(),
         file_access: cfg.file_access,
         ports: cfg.ports.clone(),
         gpu: cfg.gpu.clone(),
@@ -449,6 +484,23 @@ pub fn container_name_with_profile(worktree: &str, profile: Option<&str>) -> Str
         }
         _ => container_name(worktree),
     }
+}
+
+/// Suffix marking the embedded agent's own (separately-hardened) container, used
+/// when `agent_profile` differs from the worktree `profile` so the agent runs in
+/// a more-locked-down container than the interactive shell. Chosen to be
+/// collision-resistant against worktree slugs that happen to end in `-agent`.
+pub const AGENT_CONTAINER_SUFFIX: &str = "-szagent";
+
+/// The agent's container name, derived from the worktree container name `base`.
+pub fn agent_container_name(base: &str) -> String {
+    format!("{base}{AGENT_CONTAINER_SUFFIX}")
+}
+
+/// Strip [`AGENT_CONTAINER_SUFFIX`] so reverse lookups (orphan reconciliation,
+/// event→worktree mapping) treat the agent container as its worktree's.
+pub fn strip_agent_suffix(name: &str) -> &str {
+    name.strip_suffix(AGENT_CONTAINER_SUFFIX).unwrap_or(name)
 }
 
 /// One running container, as listed by the OCI runtime — feeds the panel's
@@ -948,6 +1000,10 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
 /// cleanup when a worktree is closed and only its path is known (no cfg/loc).
 pub fn teardown_by_path(worktree: &str) {
     let name = container_name(worktree);
+    // Also remove the agent's separate container (when `agent_profile` differs
+    // it runs in `superzej-{slug}-szagent`); `rm -f` of a non-existent name is a
+    // harmless no-op.
+    let agent = agent_container_name(&name);
     let transport = Transport::Local;
     for b in [
         Backend::Podman,
@@ -958,7 +1014,7 @@ pub fn teardown_by_path(worktree: &str) {
     ] {
         if available(&transport, b) {
             let mut argv = backend_prefix(b);
-            argv.extend(["rm".into(), "-f".into(), name.to_string()]);
+            argv.extend(["rm".into(), "-f".into(), name.to_string(), agent.clone()]);
             let _ = run_control_t_owned(&transport, &argv, PROBE_TIMEOUT);
         }
     }
@@ -971,6 +1027,10 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
         return;
     }
     let transport = transport_from_loc(cfg, loc);
+    // Remove both the worktree container and the agent's separate container (the
+    // latter only exists when `agent_profile` differs); `rm -f` of a missing
+    // name is a harmless no-op.
+    let agent = agent_container_name(name);
     // Try whichever OCI runtimes are available; the container only exists under one.
     for b in [
         Backend::Podman,
@@ -981,7 +1041,7 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
     ] {
         if available(&transport, b) {
             let mut argv = backend_prefix(b);
-            argv.extend(["rm".into(), "-f".into(), name.to_string()]);
+            argv.extend(["rm".into(), "-f".into(), name.to_string(), agent.clone()]);
             let _ = run_control_t_owned(&transport, &argv, PROBE_TIMEOUT);
         }
     }
@@ -1132,6 +1192,17 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
             if spec.network == Network::None {
                 v.push("--unshare-net".into());
             }
+            // Hardening (bwrap): the root is already assembled read-only from
+            // the --ro-bind substrate above, and unprivileged bwrap sets
+            // no_new_privs implicitly — so honor only explicit capability drops
+            // here. bwrap has no process cap; `pids_limit` is enforced on the
+            // OCI/systemd backends instead.
+            for cap in &spec.drop_capabilities {
+                v.extend(["--cap-drop".into(), cap.clone()]);
+            }
+            for cap in &spec.add_capabilities {
+                v.extend(["--cap-add".into(), cap.clone()]);
+            }
             for (k, val) in &spec.env {
                 v.extend(["--setenv".into(), k.clone(), val.clone()]);
             }
@@ -1156,6 +1227,31 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
             ];
             if spec.network == Network::None {
                 v.extend(["-p".into(), "PrivateNetwork=yes".into()]);
+            }
+            // Hardening (systemd unit properties). ProtectSystem=yes keeps /usr
+            // & /boot read-only while leaving $HOME/etc writable (the OCI path
+            // uses a full read-only root, but systemd runs on the host fs where
+            // that would break $HOME); the worktree stays writable via
+            // ReadWritePaths, and PrivateTmp=yes already gives a writable /tmp.
+            if spec.read_only_root {
+                v.extend(["-p".into(), "ProtectSystem=yes".into()]);
+                v.extend([
+                    "-p".into(),
+                    format!("ReadWritePaths={}", spec.worktree.display()),
+                ]);
+            }
+            if spec.no_new_privileges {
+                v.extend(["-p".into(), "NoNewPrivileges=yes".into()]);
+            }
+            if spec
+                .drop_capabilities
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case("ALL"))
+            {
+                v.extend(["-p".into(), "CapabilityBoundingSet=".into()]);
+            }
+            if let Some(p) = spec.pids_limit {
+                v.extend(["-p".into(), format!("TasksMax={p}")]);
             }
             for (k, val) in &spec.env {
                 v.extend(["--setenv".into(), format!("{k}={val}")]);
@@ -1244,6 +1340,31 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
     }
     if let Some(m) = &spec.limits.memory {
         v.extend(["--memory".into(), m.clone()]);
+    }
+
+    // Hardening knobs (resolved from the active SandboxProfile). Read-only root
+    // needs writable tmpfs scratch for /tmp and /run so the shell and common
+    // tools still work; the worktree + cache binds are already rw.
+    if spec.read_only_root {
+        v.extend([
+            "--read-only".into(),
+            "--tmpfs".into(),
+            "/tmp".into(),
+            "--tmpfs".into(),
+            "/run".into(),
+        ]);
+    }
+    for cap in &spec.drop_capabilities {
+        v.extend(["--cap-drop".into(), cap.clone()]);
+    }
+    for cap in &spec.add_capabilities {
+        v.extend(["--cap-add".into(), cap.clone()]);
+    }
+    if spec.no_new_privileges {
+        v.extend(["--security-opt".into(), "no-new-privileges".into()]);
+    }
+    if let Some(p) = spec.pids_limit {
+        v.extend(["--pids-limit".into(), p.to_string()]);
     }
 
     for p in &spec.ports {
@@ -1769,7 +1890,15 @@ fn parse_sandbox_stats(output: &str) -> Option<SandboxStats> {
 }
 
 pub fn identify_orphans(active_worktrees: &[String], containers: &[String]) -> Vec<String> {
-    let active_names: Vec<String> = active_worktrees.iter().map(|w| container_name(w)).collect();
+    // Each active worktree owns both its container and (when `agent_profile`
+    // differs) the agent's `-szagent` container — neither is an orphan.
+    let active_names: Vec<String> = active_worktrees
+        .iter()
+        .flat_map(|w| {
+            let base = container_name(w);
+            [agent_container_name(&base), base]
+        })
+        .collect();
 
     containers
         .iter()
@@ -1838,6 +1967,11 @@ mod tests {
             network: Network::Nat,
             network_allow: Vec::new(),
             network_block: Vec::new(),
+            read_only_root: false,
+            no_new_privileges: false,
+            pids_limit: None,
+            drop_capabilities: Vec::new(),
+            add_capabilities: Vec::new(),
             ports: vec!["8080:8080".into()],
             gpu: None,
             limits: SandboxLimits::default(),
@@ -2415,5 +2549,74 @@ mod tests {
         assert!(named.starts_with(CONTAINER_PREFIX));
         assert!(named.contains("work"));
         assert!(named != default);
+    }
+
+    #[test]
+    fn sandbox_profile_baselines() {
+        assert!(!SandboxProfile::Open.read_only_root());
+        assert!(SandboxProfile::Hardened.read_only_root());
+        assert!(SandboxProfile::Sealed.read_only_root());
+
+        assert_eq!(SandboxProfile::Open.pids_limit(), None);
+        assert_eq!(SandboxProfile::Hardened.pids_limit(), Some(512));
+        assert_eq!(SandboxProfile::Sealed.pids_limit(), Some(256));
+
+        // Only `sealed` drops caps + forces no-network; `hardened` keeps both so
+        // debuggers/ping/networking still work.
+        assert!(SandboxProfile::Hardened.drop_capabilities().is_empty());
+        assert!(
+            SandboxProfile::Sealed
+                .drop_capabilities()
+                .contains(&"ALL".to_string())
+        );
+        assert!(SandboxProfile::Sealed.forces_no_network());
+        assert!(!SandboxProfile::Hardened.forces_no_network());
+    }
+
+    #[test]
+    fn oci_opts_emit_sealed_hardening() {
+        let mut s = spec(Backend::Podman);
+        s.network = Network::None;
+        s.read_only_root = true;
+        s.no_new_privileges = true;
+        s.pids_limit = Some(256);
+        s.drop_capabilities = vec!["ALL".into()];
+        let j = oci_create_opts(&s).join(" ");
+        assert!(j.contains("--read-only"), "{j}");
+        assert!(j.contains("--tmpfs /tmp"), "{j}");
+        assert!(j.contains("--cap-drop ALL"), "{j}");
+        assert!(j.contains("--security-opt no-new-privileges"), "{j}");
+        assert!(j.contains("--pids-limit 256"), "{j}");
+        assert!(j.contains("--network none"), "{j}");
+    }
+
+    #[test]
+    fn oci_opts_open_profile_adds_no_hardening() {
+        // `open` (all knobs off, as the spec() helper builds) must reproduce
+        // today's argv — none of the hardening flags may appear.
+        let s = spec(Backend::Podman);
+        let j = oci_create_opts(&s).join(" ");
+        assert!(!j.contains("--read-only"), "{j}");
+        assert!(!j.contains("--cap-drop"), "{j}");
+        assert!(!j.contains("--security-opt"), "{j}");
+        assert!(!j.contains("--pids-limit"), "{j}");
+    }
+
+    #[test]
+    fn agent_container_name_roundtrips_and_is_not_orphan() {
+        let base = container_name("/wt/feat");
+        let agent = agent_container_name(&base);
+        assert_ne!(agent, base);
+        assert_eq!(strip_agent_suffix(&agent), base);
+        assert_eq!(strip_agent_suffix(&base), base);
+
+        // An active worktree owns BOTH its container and the agent's; only a
+        // container for a no-longer-active worktree is an orphan.
+        let active = vec!["/wt/feat".to_string()];
+        let containers = vec![base.clone(), agent.clone(), container_name("/wt/dead")];
+        let orphans = identify_orphans(&active, &containers);
+        assert!(!orphans.contains(&base));
+        assert!(!orphans.contains(&agent));
+        assert!(orphans.contains(&container_name("/wt/dead")));
     }
 }

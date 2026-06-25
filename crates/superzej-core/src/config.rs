@@ -148,6 +148,62 @@ config_enum! {
     } default = Nat;
 }
 config_enum! {
+    /// Sandbox hardening preset — a named bundle of OS-isolation knobs
+    /// (read-only root, capability drops, no-new-privileges, a pids cap, and a
+    /// network floor). Selectable per level: global `[sandbox] profile`, per
+    /// workspace/repo via the `.superzej.toml` overlay, or `SUPERZEJ_SANDBOX_PROFILE`.
+    /// The embedded agent gets its own container hardened by `agent_profile`.
+    ///
+    /// - `open`     — no hardening; reproduces pre-preset behavior (back-compat).
+    /// - `hardened` — read-only root + no-new-privileges + pids cap; networking
+    ///                and capabilities left intact so interactive dev (fetch,
+    ///                debuggers, ping) keeps working. The default.
+    /// - `sealed`   — full lockdown: `network=none`, read-only root, drop ALL
+    ///                capabilities, no-new-privileges, tighter pids cap.
+    pub enum SandboxProfile: "sandbox profile" {
+        Open = "open" | "off" | "none",
+        Hardened = "hardened" | "guarded",
+        Sealed = "sealed" | "locked" | "isolated",
+    } default = Hardened;
+}
+
+impl SandboxProfile {
+    /// Mount the container root filesystem read-only (writable: the worktree,
+    /// cache binds, and a tmpfs `/tmp`).
+    pub fn read_only_root(self) -> bool {
+        matches!(self, SandboxProfile::Hardened | SandboxProfile::Sealed)
+    }
+    /// Set `no-new-privileges` so setuid/setgid binaries can't escalate.
+    pub fn no_new_privileges(self) -> bool {
+        matches!(self, SandboxProfile::Hardened | SandboxProfile::Sealed)
+    }
+    /// Cap the number of processes (fork-bomb containment); `None` = unlimited.
+    pub fn pids_limit(self) -> Option<i64> {
+        match self {
+            SandboxProfile::Open => None,
+            SandboxProfile::Hardened => Some(512),
+            SandboxProfile::Sealed => Some(256),
+        }
+    }
+    /// Linux capabilities to drop. `sealed` drops everything; `hardened` leaves
+    /// the runtime's defaults so debuggers (ptrace), `ping` (NET_RAW), and
+    /// low-port binds keep working.
+    pub fn drop_capabilities(self) -> Vec<String> {
+        match self {
+            SandboxProfile::Sealed => vec!["ALL".to_string()],
+            _ => Vec::new(),
+        }
+    }
+    /// Capabilities to add back after dropping (reserved for future tuning).
+    pub fn add_capabilities(self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Force `network=none` regardless of the configured network mode.
+    pub fn forces_no_network(self) -> bool {
+        matches!(self, SandboxProfile::Sealed)
+    }
+}
+config_enum! {
     /// What to do when no sandbox backend is available.
     pub enum OnMissing: "on_missing" {
         Warn = "warn", Prompt = "prompt", Fail = "fail",
@@ -1356,6 +1412,12 @@ pub struct SandboxConfig {
     pub default_backend: SandboxBackend,
     pub backend_chain: Vec<String>, // auto detection order; "host" = host fallback
     pub image: String,              // "" => host-toolchain mode
+    /// Hardening preset for the worktree's interactive container (shell panes).
+    pub profile: SandboxProfile,
+    /// Hardening preset for the embedded agent's tool container. When it differs
+    /// from `profile`, the agent runs in its own separate (more-locked-down)
+    /// container; when equal, it reuses the worktree container.
+    pub agent_profile: SandboxProfile,
     pub network: Network,
     pub file_access: FileAccess,
     pub ports: Vec<String>, // e.g. ["8080:8080"]
@@ -1403,6 +1465,8 @@ impl Default for SandboxConfig {
             .map(|s| s.to_string())
             .collect(),
             image: String::new(),
+            profile: SandboxProfile::Hardened,
+            agent_profile: SandboxProfile::Sealed,
             network: Network::Nat,
             file_access: FileAccess::default(),
             ports: Vec::new(),
@@ -1453,6 +1517,8 @@ pub struct SandboxOverlay {
     pub default_backend: Option<SandboxBackend>,
     pub backend_chain: Option<Vec<String>>,
     pub image: Option<String>,
+    pub profile: Option<SandboxProfile>,
+    pub agent_profile: Option<SandboxProfile>,
     pub network: Option<Network>,
     pub file_access: Option<FileAccess>,
     pub ports: Option<Vec<String>>,
@@ -1500,6 +1566,12 @@ impl SandboxOverlay {
         }
         if let Some(v) = self.image {
             base.image = v;
+        }
+        if let Some(v) = self.profile {
+            base.profile = v;
+        }
+        if let Some(v) = self.agent_profile {
+            base.agent_profile = v;
         }
         if let Some(v) = self.network {
             base.network = v;
@@ -1563,6 +1635,8 @@ impl SandboxOverlay {
             && self.default_backend.is_none()
             && self.backend_chain.is_none()
             && self.image.is_none()
+            && self.profile.is_none()
+            && self.agent_profile.is_none()
             && self.network.is_none()
             && self.env_passthrough.is_none()
             && self.auto_caches.is_none()
@@ -2246,6 +2320,12 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     if let Some(v) = env.get("SUPERZEJ_SANDBOX_NETWORK") {
         o.sandbox.network = Network::from_str_validated(v.trim()).ok();
     }
+    if let Some(v) = env.get("SUPERZEJ_SANDBOX_PROFILE") {
+        o.sandbox.profile = SandboxProfile::from_str_validated(v.trim()).ok();
+    }
+    if let Some(v) = env.get("SUPERZEJ_SANDBOX_AGENT_PROFILE") {
+        o.sandbox.agent_profile = SandboxProfile::from_str_validated(v.trim()).ok();
+    }
     o.sandbox.image = env.get("SUPERZEJ_SANDBOX_IMAGE");
     if let Some(v) = env.get("SUPERZEJ_SANDBOX_ON_MISSING") {
         o.sandbox.on_missing = OnMissing::from_str_validated(v.trim()).ok();
@@ -2772,6 +2852,15 @@ pub fn validate_str(body: &str) -> Vec<String> {
         check(&mut errs, "sandbox.network", sb.get("network"), |s| {
             Network::from_str_validated(s).map(|_| ())
         });
+        check(&mut errs, "sandbox.profile", sb.get("profile"), |s| {
+            SandboxProfile::from_str_validated(s).map(|_| ())
+        });
+        check(
+            &mut errs,
+            "sandbox.agent_profile",
+            sb.get("agent_profile"),
+            |s| SandboxProfile::from_str_validated(s).map(|_| ()),
+        );
         check(&mut errs, "sandbox.on_missing", sb.get("on_missing"), |s| {
             OnMissing::from_str_validated(s).map(|_| ())
         });
@@ -3235,6 +3324,28 @@ name = "minimal"
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
         )
+    }
+
+    #[test]
+    fn sandbox_profile_defaults_and_env_overlay() {
+        // Safe-by-default: the worktree shell is hardened, the embedded agent
+        // gets its own sealed container.
+        let c = SandboxConfig::default();
+        assert_eq!(c.profile, SandboxProfile::Hardened);
+        assert_eq!(c.agent_profile, SandboxProfile::Sealed);
+
+        let o = env_overlay(&map_env(&[
+            ("SUPERZEJ_SANDBOX_PROFILE", "open"),
+            ("SUPERZEJ_SANDBOX_AGENT_PROFILE", "hardened"),
+        ]));
+        assert_eq!(o.sandbox.profile, Some(SandboxProfile::Open));
+        assert_eq!(o.sandbox.agent_profile, Some(SandboxProfile::Hardened));
+
+        // Overlay precedence: a present key overrides the global default.
+        let mut base = SandboxConfig::default();
+        o.sandbox.apply(&mut base);
+        assert_eq!(base.profile, SandboxProfile::Open);
+        assert_eq!(base.agent_profile, SandboxProfile::Hardened);
     }
 
     // The same overlay expressed in each format must produce identical results,
