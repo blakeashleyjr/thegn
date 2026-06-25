@@ -1,0 +1,121 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/superzej-core",
+  "crates/superzej-svc",
+  "crates/superzej-host",
+  "crates/superzej-proxy",
+  "crates/sz-kit",
+]
+# Integrated app repos live under apps/ as git submodules, each with its OWN
+# cargo workspace; keep these out of superzej's workspace so commands run from
+# an arbitrary cwd don't try to absorb them. (superzej-host reaches their
+# crates via explicit path deps — that resolves against each submodule's own
+# [workspace], not this one.)
+# [workspace], not this one.)
+exclude = ["apps", "vendor"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# --- shared domain/runtime deps ---
+clap = { version = "4.5", features = ["derive", "env"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+toml = "0.8"
+walkdir = "2.5"
+anyhow = "1"
+syntect = { version = "5", default-features = false, features = [
+  "default-syntaxes",
+  "default-themes",
+  "regex-fancy",
+] }
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+nvml-wrapper = "0.12"
+libc = "0.2"
+notify = "6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+  "std",
+  "fmt",
+  "ansi",
+  "env-filter",
+  "registry",
+] }
+# --- palette (engine + the legacy iocraft view that still lives in the cli) ---
+iocraft = "0.8.3"
+smol = "2.0.2"
+nucleo = "0.5.0"
+nucleo-matcher = "0.3"
+ignore = "0.4.26"
+grep-searcher = "0.1.16"
+grep-regex = "0.1.14"
+grep-matcher = "0.1.8"
+futures = "0.3"
+# --- native host substrate (Phase 1+) ---
+# NOTE: wezterm-term (the plan's first choice for its built-in sixel/kitty image
+# protocols) is NOT published to crates.io — it is an internal WezTerm workspace
+# crate. We use termwiz (published; outer-terminal render + Surface diff/flush +
+# escape parser) and a pluggable `PaneEmulator` trait. The spike's emulator impl
+# is vt100; high-fidelity/graphics swaps in alacritty_terminal + an escape-
+# interception passthrough layer (or a wezterm-term git dep) without touching the
+# compositor — see the host crate's emulator module.
+# Minimal feature set: the host needs a multi-thread runtime (the loop blocks on
+# `poll_input(None)`, so `spawn_blocking` work must run on other threads), the
+# `#[tokio::main]` macro, and mpsc channels. svc's octocrab brings its own
+# reqwest/hyper runtime needs. No `time`/net/fs/process here — the refresh ticker
+# is a plain OS thread and subprocess + git I/O go through `spawn_blocking`.
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "sync",
+  "signal",
+] }
+portable-pty = "0.9"
+termwiz = "0.23"
+vt100 = "0.16"
+taffy = "0.5"
+# --- native service layer (Phase 4/5) ---
+octocrab = "0.53"
+reqwest = { version = "0.12", default-features = false, features = [
+  "json",
+  "rustls-tls",
+] }
+russh = "0.61"
+# --- LLM proxy (group U/V): the one new HTTP-server dependency. tokio/reqwest
+# are widened with extra features inside the superzej-proxy crate's own manifest
+# (cargo merges them with the workspace base). ---
+axum = "0.8"
+regex = "1"
+gix = "0.84"
+tokei = "12"
+# Semantic git layer (item 309+): tree-sitter entity parsing across languages.
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-python = "0.25"
+tree-sitter-go = "0.25"
+# --- internal crates ---
+superzej-core = { path = "crates/superzej-core" }
+superzej-svc = { path = "crates/superzej-svc" }
+# --- dev/bench tooling ---
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = "thin"
+# Measured and deliberately rejected (`just bench`, 2026-06):
+# - `codegen-units = 1`: warm first frame 52ms -> 59ms (noise; startup is
+#   I/O-bound) for a 6x release build time cost. Revisit only with a render
+#   throughput benchmark that shows a win.
+# - `panic = "abort"`: a panic in a PTY reader thread or hydration worker
+#   currently kills only that thread/task — abort would take down the whole
+#   multiplexer with the user's shells in it.

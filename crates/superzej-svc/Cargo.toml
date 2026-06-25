@@ -1,0 +1,31 @@
+[package]
+name = "superzej-svc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "superzej native service layer: git/GitHub/ssh behind traits with CLI fallbacks"
+
+[dependencies]
+superzej-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+# git reads go native via gix (Phase 2); GitHub via octocrab GraphQL (Phase 4).
+gix.workspace = true
+octocrab.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+base64 = "0.22"
+
+[dev-dependencies]
+criterion.workspace = true
+tempfile.workspace = true
+
+# The per-worktree git hot path (is_dirty / ahead_behind / current_branch) that
+# the 2s model-refresh ticker fans across every worktree — the dominant idle
+# cost. Compares gix-native vs CLI providers over a fixture of N worktrees.
+[[bench]]
+name = "git_hot"
+harness = false

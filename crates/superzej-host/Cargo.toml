@@ -1,0 +1,60 @@
+[package]
+name = "superzej-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "superzej native terminal host: the compositor + in-process chrome"
+
+# The binary is `szhost` in-tree; the Nix package + install.sh install it as
+# `superzej` (with `sj`/`szhost` aliases).
+[[bin]]
+name = "szhost"
+path = "src/main.rs"
+
+[features]
+# In-process sampling profiler (SIGUSR2 → flamegraph dump from the live process,
+# sidestepping ptrace_scope=1). Zero cost when off: the `pprof` dep and the
+# signal handler are only compiled in under this feature. Build with
+# `cargo build --features profiling` (see `just profile`).
+profiling = ["dep:pprof"]
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+superzej-core.workspace = true
+superzej-svc.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# `config show` round-trips the effective config as TOML; `config schema` emits
+# the JSON schema (schemars pinned to core's version).
+toml.workspace = true
+schemars = "0.8"
+# Compositor substrate (Phase 1). Feature set is pinned at the workspace level.
+tokio = { workspace = true }
+portable-pty.workspace = true
+termwiz.workspace = true
+libc.workspace = true
+chrono.workspace = true
+vt100.workspace = true
+nucleo-matcher.workspace = true
+ignore.workspace = true
+grep-searcher.workspace = true
+grep-regex.workspace = true
+grep-matcher.workspace = true
+notify = "6"
+reqwest = { version = "0.12", default-features = false, features = [
+  "blocking",
+  "rustls-tls",
+] }
+# Optional in-process sampling profiler (the `profiling` feature). flamegraph
+# feature emits an SVG directly; protobuf would add pprof output.
+pprof = { version = "0.14", features = ["flamegraph"], optional = true }
+# The app-tab embedding contract (AppTile, shared theme, the pinned ratatui
+# re-export). The host renders embedded apps' ratatui buffers through
+# `sz_kit::ratatui` so the Buffer type is identical to what the apps produce.
+sz-kit = { path = "../sz-kit" }
+# Embedded app crates (git submodules under apps/, each its own workspace).
+# Path deps resolve the package directly against the submodule's own
+# [workspace]; superzej's `exclude` keeps these out of this workspace. Their
+# sz-kit git-dep is redirected to the in-tree crate by the root [patch].

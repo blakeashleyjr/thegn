@@ -1,0 +1,12 @@
+Test project /tmp/tmp.jwQ9Latk4c/c/build
+    Start 1: adds
+1/2 Test #1: adds .............................   Passed    0.01 sec
+    Start 2: breaks
+2/2 Test #2: breaks ...........................***Failed    0.01 sec
+
+50% tests passed, 1 tests failed out of 2
+
+Total Test time (real) =   0.02 sec
+
+The following tests FAILED:
+	  2 - breaks (Failed)
