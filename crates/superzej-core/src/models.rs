@@ -44,6 +44,8 @@ pub struct WorktreeRow {
     /// Persistent sort key for the sidebar (creation order by default,
     /// user-reorderable via Shift+Alt+↑/↓). Lower sorts first.
     pub position: i64,
+    pub sandbox_backend: Option<String>,
+    pub folder_id: Option<i64>,
 }
 
 /// A persisted worktree group (native host, schema v6): one worktree shown in
@@ -98,6 +100,16 @@ pub struct WorktreeView {
     pub exists: bool,
 }
 
+/// A persistent folder in the sidebar.
+#[derive(Debug, Clone)]
+pub struct FolderRow {
+    pub folder_id: i64,
+    pub repo_path: String,
+    pub name: String,
+    pub position: i64,
+    pub created_at: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +155,8 @@ mod tests {
             session_name: "default".into(),
             location: String::new(),
             position: 0,
+            sandbox_backend: None,
+            folder_id: None,
         };
         let _ = format!("{:?}", row.clone());
     }
