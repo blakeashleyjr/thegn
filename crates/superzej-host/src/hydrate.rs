@@ -408,6 +408,7 @@ pub(crate) fn db_worktree_list(db: &superzej_core::db::Db) -> Vec<crate::sidebar
             tab_name: w.tab_name.clone(),
             path: w.worktree.clone(),
             folder_id: w.folder_id,
+            sandbox_backend: w.sandbox_backend.clone(),
         });
     }
     out

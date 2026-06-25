@@ -15843,6 +15843,7 @@ mod tests {
             tab_name: "lib/home".into(),
             path: "/tmp/lib".into(),
             folder_id: None,
+            sandbox_backend: None,
         }];
 
         // The synchronous prune the RemoveWorkspace handler performs (same code).

@@ -441,23 +441,6 @@ fn worktree_parts(model: &FrameModel) -> Option<(String, String)> {
     }
 }
 
-/// Returns `(display_text, is_active)` for the sandbox indicator.
-/// `is_active` = true → green; false → red ("None").
-fn sandbox_indicator(model: &FrameModel) -> (&str, bool) {
-    let b = model.active_sandbox_backend.as_str();
-    if b.is_empty() || b == "none" || b == "host" {
-        ("None", false)
-    } else {
-        (b, true)
-    }
-}
-
-/// Character width of the sandbox indicator (prefix + value, no trailing gap).
-fn sandbox_indicator_width(model: &FrameModel) -> usize {
-    let (val, _) = sandbox_indicator(model);
-    " · Sandbox: ".chars().count() + val.chars().count()
-}
-
 /// Where the right-aligned pin chips begin in the tab strip (the tab chips
 /// must stop before this column).
 fn pin_chips_start(model: &FrameModel, strip: Rect) -> usize {
@@ -487,7 +470,7 @@ fn strip_chip_spans(model: &FrameModel, strip: Rect) -> Vec<(usize, usize, usize
         if !ws.is_empty() {
             x += ws.chars().count() + 3; // "WS ▸ "
         }
-        x += leaf.chars().count() + sandbox_indicator_width(model) + 2; // "leaf" + sandbox + gap
+        x += leaf.chars().count() + 2; // "leaf" + gap
     }
     for (i, title) in model.tabs.iter().enumerate() {
         let w = title.chars().count() + 2; // " {title} "
@@ -751,27 +734,6 @@ fn draw_center_tabs(surface: &mut Surface, strip: Rect, model: &FrameModel) {
                 draw_text(surface, x, strip.y, &badge, col(S::Accent), bg, avail);
                 x += badge.chars().count();
             }
-        }
-        let (sb_val, sb_active) = sandbox_indicator(model);
-        let sb_prefix = " · Sandbox: ";
-        let avail = chips_end.saturating_sub(x);
-        if avail >= sb_prefix.chars().count() + sb_val.chars().count() {
-            draw_text(surface, x, strip.y, sb_prefix, dim, bg, avail);
-            let vx = x + sb_prefix.chars().count();
-            let sb_color = if sb_active {
-                theme_color(theme::GREEN)
-            } else {
-                theme_color(theme::RED)
-            };
-            draw_text(
-                surface,
-                vx,
-                strip.y,
-                sb_val,
-                sb_color,
-                bg,
-                chips_end.saturating_sub(vx),
-            );
         }
     }
 
@@ -1560,6 +1522,12 @@ fn compose_sidebar_row(
     }
 
     // Agent glyph (item 19) sits just after the label.
+    if let Some(backend) = &row.sandbox_backend {
+        if !backend.is_empty() && backend != "none" && backend != "host" {
+            text.push_str(&format!(" ({backend})"));
+        }
+    }
+
     if let Some(agent) = &row.agent {
         text.push(' ');
         text.push_str(&superzej_core::theme::agent_glyph(agent));
@@ -2194,6 +2162,7 @@ mod tests {
             branch: None,
             git: None,
             agent: None,
+            sandbox_backend: None,
             activity: crate::sidebar::ActivityState::None,
             visible: true,
             collapsed: false,
