@@ -92,6 +92,7 @@ pub enum Backend {
     /// Rootful podman via non-interactive sudo (`sudo -n podman`).
     PodmanRootful,
     Docker,
+    Smol,
     Bwrap,
     Systemd,
     Apple,
@@ -105,6 +106,7 @@ impl Backend {
             "podman" | "podman-rootless" | "rootless-podman" => Backend::Podman,
             "podman-rootful" | "rootful-podman" => Backend::PodmanRootful,
             "docker" => Backend::Docker,
+            "smol" | "smolmachines" => Backend::Smol,
             "bwrap" | "bubblewrap" => Backend::Bwrap,
             "systemd" | "systemd-run" => Backend::Systemd,
             "apple" | "container" => Backend::Apple,
@@ -122,6 +124,7 @@ impl Backend {
             SandboxBackend::Podman => Backend::Podman,
             SandboxBackend::PodmanRootful => Backend::PodmanRootful,
             SandboxBackend::Docker => Backend::Docker,
+            SandboxBackend::Smol => Backend::Smol,
             SandboxBackend::Bwrap => Backend::Bwrap,
             SandboxBackend::Systemd => Backend::Systemd,
             SandboxBackend::Apple => Backend::Apple,
@@ -136,6 +139,7 @@ impl Backend {
             Backend::Podman => "podman-rootless",
             Backend::PodmanRootful => "podman-rootful",
             Backend::Docker => "docker",
+            Backend::Smol => "smolmachines",
             Backend::Bwrap => "bwrap",
             Backend::Systemd => "systemd",
             Backend::Apple => "apple",
@@ -148,6 +152,7 @@ impl Backend {
         match self {
             Backend::Podman | Backend::PodmanRootful => "podman",
             Backend::Docker => "docker",
+            Backend::Smol => "smolmachines",
             Backend::Bwrap => "bwrap",
             Backend::Systemd => "systemd-run",
             Backend::Apple => "container",
@@ -164,6 +169,7 @@ impl Backend {
             Backend::Podman
                 | Backend::PodmanRootful
                 | Backend::Docker
+                | Backend::Smol
                 | Backend::Apple
                 | Backend::Wsl
         )
@@ -1003,6 +1009,7 @@ pub fn teardown_by_path(worktree: &str) {
         Backend::Podman,
         Backend::PodmanRootful,
         Backend::Docker,
+        Backend::Smol,
         Backend::Apple,
     ] {
         if available(&transport, b) {
@@ -1029,6 +1036,7 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
         Backend::Podman,
         Backend::PodmanRootful,
         Backend::Docker,
+        Backend::Smol,
         Backend::Apple,
     ] {
         if available(&transport, b) {
@@ -1102,6 +1110,7 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
         Backend::Podman
         | Backend::PodmanRootful
         | Backend::Docker
+        | Backend::Smol
         | Backend::Apple
         | Backend::Wsl => {
             let mut v = backend_prefix(spec.backend);
@@ -1270,7 +1279,7 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
                 v.extend(["--user".into(), format!("{uid}:{gid}")]);
             }
         }
-        Backend::Docker => {
+        Backend::Docker | Backend::Smol => {
             if let (Transport::Local, Some((uid, gid))) = (&spec.transport, local_uid_gid()) {
                 v.extend(["--user".into(), format!("{uid}:{gid}")]);
             }
@@ -1319,7 +1328,7 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
     }
 
     if let Some(gpu) = &spec.gpu {
-        if spec.backend == Backend::Docker {
+        if spec.backend == Backend::Docker || spec.backend == Backend::Smol {
             v.extend(["--gpus".into(), gpu.clone()]);
         } else if spec.backend == Backend::Podman {
             v.extend(["--device".into(), "nvidia.com/gpu=all".into()]);
@@ -1378,7 +1387,7 @@ fn oci_create_opts_with_keep_id(spec: &SandboxSpec, keep_id: bool) -> Vec<String
                 v.extend(["--user".into(), format!("{uid}:{gid}")]);
             }
         }
-        Backend::Docker => {
+        Backend::Docker | Backend::Smol => {
             if let (Transport::Local, Some((uid, gid))) = (&spec.transport, local_uid_gid()) {
                 v.extend(["--user".into(), format!("{uid}:{gid}")]);
             }
@@ -1903,7 +1912,7 @@ pub fn identify_orphans(active_worktrees: &[String], containers: &[String]) -> V
 /// exists in the DB). Returns the names of containers that were removed.
 pub fn run_gc(db_worktrees: &[String]) -> Vec<String> {
     let mut removed = Vec::new();
-    for backend in [Backend::Podman, Backend::Docker] {
+    for backend in [Backend::Podman, Backend::Docker, Backend::Smol] {
         if !crate::util::have(backend.binary()) {
             continue;
         }
