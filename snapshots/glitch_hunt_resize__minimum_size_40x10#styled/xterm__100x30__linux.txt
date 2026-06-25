@@ -1,0 +1,49 @@
+L0|  dashboard 4 work 1 comms 1 chat 22:56
+R0 0 1 fg=default bg=#151a28 attrs=
+R0 1 12 fg=#aab1c5 bg=#151a28 attrs=
+R0 13 6 fg=#6ee7d8 bg=#2e5359 attrs=
+R0 19 20 fg=#aab1c5 bg=#151a28 attrs=
+R0 39 1 fg=default bg=#151a28 attrs=
+L1|────────────────────────────────────────
+R1 0 40 fg=#4e556e bg=#151a28 attrs=
+L2| REGCLAUDE ▸ home · Sandbox: None   1
+R2 0 1 fg=default bg=default attrs=
+R2 1 9 fg=#aab1c5 bg=#0b0e16 attrs=
+R2 10 3 fg=#4e556e bg=#0b0e16 attrs=
+R2 13 4 fg=#6ee7d8 bg=#0b0e16 attrs=
+R2 17 12 fg=#aab1c5 bg=#0b0e16 attrs=
+R2 29 4 fg=#f7768e bg=#0b0e16 attrs=
+R2 33 2 fg=default bg=default attrs=
+R2 35 3 fg=#6ee7d8 bg=#2e5359 attrs=
+L3|╭─ bwrap · home ───────────────────────╮
+R3 0 40 fg=#6ee7d8 bg=#151a28 attrs=
+L4|│blake@ws-3:~/ >                       │
+R4 0 1 fg=#6ee7d8 bg=#151a28 attrs=
+R4 1 38 fg=default bg=#151a28 attrs=
+R4 39 1 fg=#6ee7d8 bg=#151a28 attrs=
+L5|│                                      │
+R5 0 1 fg=#6ee7d8 bg=#151a28 attrs=
+R5 1 38 fg=default bg=#151a28 attrs=
+R5 39 1 fg=#6ee7d8 bg=#151a28 attrs=
+L6|│                                      │
+R6 0 1 fg=#6ee7d8 bg=#151a28 attrs=
+R6 1 38 fg=default bg=#151a28 attrs=
+R6 39 1 fg=#6ee7d8 bg=#151a28 attrs=
+L7|│                                      │
+R7 0 1 fg=#6ee7d8 bg=#151a28 attrs=
+R7 1 38 fg=default bg=#151a28 attrs=
+R7 39 1 fg=#6ee7d8 bg=#151a28 attrs=
+L8|╰──────────────────────────────────────╯
+R8 0 40 fg=#6ee7d8 bg=#151a28 attrs=
+L9|  N   Ctrl-Left pane   Alt-Left … 0 LOC
+R9 0 1 fg=#edf0f8 bg=#151a28 attrs=
+R9 1 3 fg=#0b0e16 bg=#6ee7d8 attrs=BOLD
+R9 4 2 fg=#edf0f8 bg=#151a28 attrs=
+R9 6 9 fg=#7a8197 bg=#151a28 attrs=
+R9 15 5 fg=#4e556e bg=#151a28 attrs=
+R9 20 3 fg=#edf0f8 bg=#151a28 attrs=
+R9 23 8 fg=#7a8197 bg=#151a28 attrs=
+R9 31 2 fg=#4e556e bg=#151a28 attrs=
+R9 33 1 fg=#edf0f8 bg=#151a28 attrs=
+R9 34 5 fg=#aab1c5 bg=#151a28 attrs=
+R9 39 1 fg=#edf0f8 bg=#151a28 attrs=

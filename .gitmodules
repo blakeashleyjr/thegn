@@ -1,0 +1,8 @@
+[submodule "apps/termite-chat"]
+	path = apps/termite-chat
+	url = git@github.com:blakeashleyjr/termite-chat.git
+	branch = main
+[submodule "apps/termite-agent"]
+	path = apps/termite-agent
+	url = git@github.com:blakeashleyjr/termite-agent.git
+	branch = main

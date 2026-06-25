@@ -1,0 +1,128 @@
+name: glitch_hunt_chrome_consistency
+case_tmp_env: XDG_STATE_HOME
+matrix:
+  profiles: [xterm]
+  sizes: ["100x30", "80x24", "160x40"]
+spawn: ["szhost"]
+env:
+  XDG_STATE_HOME: "{case_tmp}"
+  SUPERZEJ_LOG: warn
+  MUSE_READY: "1"
+  TERM: xterm-256color
+sync:
+  quiet_window_ms: 2000
+snapshot_defaults:
+  kind: styled
+  masks:
+    - {rect: [0, 0, 200, 1]}
+  normalize:
+    - {re: "L0\\|.*", replace: "L0|<masthead>"}
+    - {re: "R0 \\d+ \\d+ .*", replace: "R0 <masked>"}
+steps:
+  - begin_step: "startup"
+  - expect_visible: {regex: "szhost|superzej|\\$|>", timeout_ms: 8000}
+  # Exit the dashboard tile to access the Work tab.
+  - key: {key: q}
+  - sleep_ms: 200
+  # ── Chrome must be consistent after every state transition ────────────────────
+  # Test: statusbar always occupies exactly the last row.
+  # We mask everything except the last row and compare across transitions.
+  - begin_step: "statusbar row check — baseline"
+  - snapshot:
+      name: statusbar_baseline
+      kind: text
+      masks:
+        - {rect: [0, 0, 200, 28]}
+  - begin_step: "statusbar after panel open"
+  - key: {key: p, mods: [ctrl, alt]}
+  - sleep_ms: 150
+  - snapshot:
+      name: statusbar_with_panel
+      kind: text
+      masks:
+        - {rect: [0, 0, 200, 28]}
+  - key: {key: p, mods: [ctrl, alt]}
+  - sleep_ms: 80
+  - begin_step: "statusbar after sidebar hidden"
+  - key: {key: s, mods: [ctrl, alt]}
+  - sleep_ms: 80
+  - snapshot:
+      name: statusbar_no_sidebar
+      kind: text
+      masks:
+        - {rect: [0, 0, 200, 28]}
+  - key: {key: s, mods: [ctrl, alt]}
+  - sleep_ms: 80
+  - begin_step: "statusbar after splits"
+  - key: {key: n, mods: [alt]}
+  - sleep_ms: 150
+  - snapshot:
+      name: statusbar_with_split
+      kind: text
+      masks:
+        - {rect: [0, 0, 200, 28]}
+  - begin_step: "statusbar after zoom"
+  - key: {key: z, mods: [ctrl, alt]}
+  - sleep_ms: 80
+  - snapshot:
+      name: statusbar_zoomed
+      kind: text
+      masks:
+        - {rect: [0, 0, 200, 28]}
+  - key: {key: z, mods: [ctrl, alt]}
+  - sleep_ms: 80
+  # ── Tabbar must always occupy its designated rows ─────────────────────────────
+  - begin_step: "tabbar row check — single tab"
+  - snapshot:
+      name: tabbar_single
+      kind: text
+      masks:
+        - {rect: [1, 0, 200, 27]}
+  - begin_step: "tabbar row check — two tabs"
+  - key: {key: t, mods: [alt]}
+  - sleep_ms: 200
+  - snapshot:
+      name: tabbar_two_tabs
+      kind: text
+      masks:
+        - {rect: [1, 0, 200, 27]}
+  - key: {key: x, mods: [alt]}
+  - sleep_ms: 80
+  - key: {key: escape}
+  - sleep_ms: 80
+  # ── Key-lock indicator must appear / disappear correctly ──────────────────────
+  - begin_step: "key-lock indicator check"
+  - key: {key: g, mods: [ctrl]}
+  - sleep_ms: 80
+  - snapshot:
+      name: statusbar_locked
+      kind: styled
+      masks:
+        - {rect: [0, 0, 200, 28]}
+  - key: {key: g, mods: [ctrl]}
+  - sleep_ms: 80
+  - snapshot:
+      name: statusbar_unlocked
+      kind: styled
+      masks:
+        - {rect: [0, 0, 200, 28]}
+  # ── Palette overlay: must not corrupt chrome below ────────────────────────────
+  - begin_step: "palette overlay does not corrupt chrome"
+  - key: {key: " ", mods: [ctrl]}
+  - sleep_ms: 200
+  - snapshot: {name: palette_open_chrome_check}
+  - key: {key: escape}
+  - sleep_ms: 80
+  - snapshot: {name: palette_closed_chrome_restored}
+  # ── After all transitions: chrome must match the baseline ─────────────────────
+  - begin_step: "final chrome integrity check"
+  - snapshot: {name: final_full_frame}
+  - snapshot:
+      name: final_statusbar
+      kind: text
+      masks:
+        - {rect: [0, 0, 200, 28]}
+  - begin_step: "verify no errors"
+  - check_file:
+      path: "{case_tmp}/superzej/logs/szhost.log"
+      reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt|subtract with overflow|index out of bounds"

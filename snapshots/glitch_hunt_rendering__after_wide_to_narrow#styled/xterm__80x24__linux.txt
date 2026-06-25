@@ -1,0 +1,93 @@
+L0|                     │
+R0 0 21 fg=default bg=#151a28 attrs=
+R0 21 1 fg=#6ee7d8 bg=#151a28 attrs=
+R0 22 58 fg=default bg=#151a28 attrs=
+L1|                     │
+R1 0 21 fg=default bg=#151a28 attrs=
+R1 21 1 fg=#6ee7d8 bg=#151a28 attrs=
+R1 22 58 fg=default bg=#151a28 attrs=
+L2|                     │
+R2 0 21 fg=default bg=#151a28 attrs=
+R2 21 1 fg=#6ee7d8 bg=#151a28 attrs=
+R2 22 58 fg=default bg=#151a28 attrs=
+L3|                     │
+R3 0 21 fg=default bg=#151a28 attrs=
+R3 21 1 fg=#6ee7d8 bg=#151a28 attrs=
+R3 22 58 fg=default bg=#151a28 attrs=
+L4|                     │
+R4 0 21 fg=default bg=#151a28 attrs=
+R4 21 1 fg=#6ee7d8 bg=#151a28 attrs=
+R4 22 58 fg=default bg=#151a28 attrs=
+L5|                     │
+R5 0 21 fg=default bg=#151a28 attrs=
+R5 21 1 fg=#6ee7d8 bg=#151a28 attrs=
+R5 22 58 fg=default bg=#151a28 attrs=
+L6|                     │
+R6 0 21 fg=default bg=#151a28 attrs=
+R6 21 1 fg=#6ee7d8 bg=#151a28 attrs=
+R6 22 58 fg=default bg=#151a28 attrs=
+L7|                     │
+R7 0 21 fg=default bg=#151a28 attrs=
+R7 21 1 fg=#6ee7d8 bg=#151a28 attrs=
+R7 22 58 fg=default bg=#151a28 attrs=
+L8|                     │
+R8 0 21 fg=default bg=#151a28 attrs=
+R8 21 1 fg=#6ee7d8 bg=#151a28 attrs=
+R8 22 58 fg=default bg=#151a28 attrs=
+L9|                     │
+R9 0 21 fg=default bg=#151a28 attrs=
+R9 21 1 fg=#6ee7d8 bg=#151a28 attrs=
+R9 22 58 fg=default bg=#151a28 attrs=
+L10|                     │
+R10 0 21 fg=default bg=#151a28 attrs=
+R10 21 1 fg=#6ee7d8 bg=#151a28 attrs=
+R10 22 58 fg=default bg=#151a28 attrs=
+L11|                     │
+R11 0 21 fg=default bg=#151a28 attrs=
+R11 21 1 fg=#6ee7d8 bg=#151a28 attrs=
+R11 22 58 fg=default bg=#151a28 attrs=
+L12|                     │
+R12 0 21 fg=default bg=#151a28 attrs=
+R12 21 1 fg=#6ee7d8 bg=#151a28 attrs=
+R12 22 58 fg=default bg=#151a28 attrs=
+L13|                     │
+R13 0 21 fg=default bg=#151a28 attrs=
+R13 21 1 fg=#6ee7d8 bg=#151a28 attrs=
+R13 22 58 fg=default bg=#151a28 attrs=
+L14|                     │
+R14 0 21 fg=default bg=#151a28 attrs=
+R14 21 1 fg=#6ee7d8 bg=#151a28 attrs=
+R14 22 58 fg=default bg=#151a28 attrs=
+L15|                     │
+R15 0 21 fg=default bg=#151a28 attrs=
+R15 21 1 fg=#6ee7d8 bg=#151a28 attrs=
+R15 22 58 fg=default bg=#151a28 attrs=
+L16|                     │
+R16 0 21 fg=default bg=#151a28 attrs=
+R16 21 1 fg=#6ee7d8 bg=#151a28 attrs=
+R16 22 58 fg=default bg=#151a28 attrs=
+L17|                     │
+R17 0 21 fg=default bg=#151a28 attrs=
+R17 21 1 fg=#6ee7d8 bg=#151a28 attrs=
+R17 22 58 fg=default bg=#151a28 attrs=
+L18|                     │
+R18 0 21 fg=default bg=#151a28 attrs=
+R18 21 1 fg=#6ee7d8 bg=#151a28 attrs=
+R18 22 58 fg=default bg=#151a28 attrs=
+L19|                     │
+R19 0 21 fg=default bg=#151a28 attrs=
+R19 21 1 fg=#6ee7d8 bg=#151a28 attrs=
+R19 22 58 fg=default bg=#151a28 attrs=
+L20|                     │
+R20 0 21 fg=default bg=#151a28 attrs=
+R20 21 1 fg=#6ee7d8 bg=#151a28 attrs=
+R20 22 58 fg=default bg=#151a28 attrs=
+L21|                     │
+R21 0 21 fg=default bg=#151a28 attrs=
+R21 21 1 fg=#6ee7d8 bg=#151a28 attrs=
+R21 22 58 fg=default bg=#151a28 attrs=
+L22|                     ╰──────────────────────────────────────────────────────────
+R22 0 21 fg=default bg=#151a28 attrs=
+R22 21 59 fg=#6ee7d8 bg=#151a28 attrs=
+L23|──────────────────────────────────╯
+R23 0 35 fg=#6ee7d8 bg=#151a28 attrs=

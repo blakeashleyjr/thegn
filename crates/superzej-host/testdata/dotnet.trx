@@ -1,0 +1,63 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="9d155510-e81f-4863-b21f-23ff3a8018fa" name="@ws-3 2026-06-11 11:34:12" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-06-11T11:34:12.1322596-07:00" queuing="2026-06-11T11:34:12.1322596-07:00" start="2026-06-11T11:34:11.2269919-07:00" finish="2026-06-11T11:34:12.1421069-07:00" />
+  <TestSettings name="default" id="d3d56f66-9865-451a-af01-2adb52bf4b47">
+    <Deployment runDeploymentRoot="_ws-3_2026-06-11_11_34_12" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="5084e71c-cb86-4209-84cd-5cb6d217719d" testId="6ad4b774-f9d9-0237-3737-b2d4075c3674" testName="CalcTest.Breaks" computerName="ws-3" duration="00:00:00.0095105" startTime="2026-06-11T11:34:11.9807843-07:00" endTime="2026-06-11T11:34:11.9807999-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Failed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="5084e71c-cb86-4209-84cd-5cb6d217719d">
+      <Output>
+        <ErrorInfo>
+          <Message>Assert.Equal() Failure: Values differ
+Expected: 5
+Actual:   4</Message>
+          <StackTrace>   at CalcTest.Breaks() in /tmp/tmp.77kqVxZKGx/net/CalcTest.cs:line 4
+   at System.RuntimeMethodHandle.InvokeMethod(Object target, Void** arguments, Signature sig, Boolean isConstructor)
+   at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)</StackTrace>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="d41984df-cf8c-4044-81b6-8b0c8f156c82" testId="7f182d4f-cae4-ece1-5196-3852b369f022" testName="CalcTest.Adds" computerName="ws-3" duration="00:00:00.0008738" startTime="2026-06-11T11:34:11.9843756-07:00" endTime="2026-06-11T11:34:11.9843758-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="d41984df-cf8c-4044-81b6-8b0c8f156c82" />
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="CalcTest.Adds" storage="/tmp/tmp.77kqvxzkgx/net/bin/debug/net8.0/szfix.dll" id="7f182d4f-cae4-ece1-5196-3852b369f022">
+      <Execution id="d41984df-cf8c-4044-81b6-8b0c8f156c82" />
+      <TestMethod codeBase="/tmp/tmp.77kqVxZKGx/net/bin/Debug/net8.0/szfix.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="CalcTest" name="Adds" />
+    </UnitTest>
+    <UnitTest name="CalcTest.Breaks" storage="/tmp/tmp.77kqvxzkgx/net/bin/debug/net8.0/szfix.dll" id="6ad4b774-f9d9-0237-3737-b2d4075c3674">
+      <Execution id="5084e71c-cb86-4209-84cd-5cb6d217719d" />
+      <TestMethod codeBase="/tmp/tmp.77kqVxZKGx/net/bin/Debug/net8.0/szfix.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="CalcTest" name="Breaks" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="6ad4b774-f9d9-0237-3737-b2d4075c3674" executionId="5084e71c-cb86-4209-84cd-5cb6d217719d" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="7f182d4f-cae4-ece1-5196-3852b369f022" executionId="d41984df-cf8c-4044-81b6-8b0c8f156c82" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="Results Not in a List" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="All Loaded Results" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Failed">
+    <Counters total="2" executed="2" passed="1" failed="1" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v2.8.2+699d445a1a (64-bit .NET 8.0.27)
+[xUnit.net 00:00:00.11]   Discovering: szfix
+[xUnit.net 00:00:00.17]   Discovered:  szfix
+[xUnit.net 00:00:00.17]   Starting:    szfix
+[xUnit.net 00:00:00.25]       Assert.Equal() Failure: Values differ
+[xUnit.net 00:00:00.25]       Expected: 5
+[xUnit.net 00:00:00.25]       Actual:   4
+[xUnit.net 00:00:00.25]       Stack Trace:
+[xUnit.net 00:00:00.25]         /tmp/tmp.77kqVxZKGx/net/CalcTest.cs(4,0): at CalcTest.Breaks()
+[xUnit.net 00:00:00.25]            at System.RuntimeMethodHandle.InvokeMethod(Object target, Void** arguments, Signature sig, Boolean isConstructor)
+[xUnit.net 00:00:00.25]            at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+[xUnit.net 00:00:00.26]   Finished:    szfix
+</StdOut>
+    </Output>
+    <RunInfos>
+      <RunInfo computerName="ws-3" outcome="Error" timestamp="2026-06-11T11:34:11.9785692-07:00">
+        <Text>[xUnit.net 00:00:00.25]     CalcTest.Breaks [FAIL]</Text>
+      </RunInfo>
+    </RunInfos>
+  </ResultSummary>
+</TestRun>
