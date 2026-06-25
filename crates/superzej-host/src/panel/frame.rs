@@ -37,10 +37,24 @@ fn hue(h: Hue) -> Tok {
     Tok::Hue(h)
 }
 
+/// Clip `s` to at most `budget` columns, appending a trailing `…` when it
+/// overflows. Returns empty when the budget can't fit even one char + ellipsis.
+fn clip_end(s: &str, budget: usize) -> String {
+    if s.chars().count() <= budget {
+        return s.to_string();
+    }
+    if budget < 2 {
+        return String::new();
+    }
+    let mut out: String = s.chars().take(budget - 1).collect();
+    out.push('…');
+    out
+}
+
 /// The header zone: branch + divergence, the merge banner when one is in
 /// progress (chip, conflicts, resolved bar), a dirty summary otherwise,
 /// then the rule. Row count varies (2..=5); the budget gets the real number.
-pub(super) fn header_rows(model: &FrameModel, focused: bool) -> Vec<PanelRow> {
+pub(super) fn header_rows(model: &FrameModel, focused: bool, cols: usize) -> Vec<PanelRow> {
     let data = &model.panel;
     let mut rows: Vec<PanelRow> = Vec::new();
 
@@ -71,19 +85,33 @@ pub(super) fn header_rows(model: &FrameModel, focused: bool) -> Vec<PanelRow> {
 
     match &data.merge {
         Some(m) => {
+            // Zero unresolved is a *good* state (the merge is ready to commit),
+            // so it reads green, not the alarming red used while conflicts remain.
+            let (conf_text, conf_tok) = if m.unresolved == 0 {
+                ("no conflicts".to_string(), hue(Hue::Green))
+            } else {
+                (
+                    format!(
+                        "{} conflict{}",
+                        m.unresolved,
+                        if m.unresolved == 1 { "" } else { "s" }
+                    ),
+                    hue(Hue::Red),
+                )
+            };
             let mut l = vec![sp(1), seg(Tok::Slot(S::Ghost), "merging ")];
             if !m.onto.is_empty() {
-                l.push(seg(Tok::Slot(S::Faint), m.onto.clone()));
-                l.push(seg(Tok::Slot(S::Ghost), " · "));
+                // Clip the branch name, never the conflict count: the count is
+                // the actionable bit, the onto ref is context. Budget = cols −
+                // pad(1) − "merging "(8) − " · "(3) − suffix − trailing(1).
+                let budget = cols.saturating_sub(13 + conf_text.chars().count());
+                let onto = clip_end(&m.onto, budget);
+                if !onto.is_empty() {
+                    l.push(seg(Tok::Slot(S::Faint), onto));
+                    l.push(seg(Tok::Slot(S::Ghost), " · "));
+                }
             }
-            l.push(seg(
-                hue(Hue::Red),
-                format!(
-                    "{} conflict{}",
-                    m.unresolved,
-                    if m.unresolved == 1 { "" } else { "s" }
-                ),
-            ));
+            l.push(seg(conf_tok, conf_text));
             rows.push(PanelRow::plain(Line::segs(l)));
             if let Some(total) = m.total
                 && total > 0
@@ -329,7 +357,11 @@ pub fn build_panel(
     let (tab_row, tab_spans) = tab_bar_row(ui, focused);
     let rows_for_body = rows.saturating_sub(1);
 
-    let header = with_flow_chips(header_rows(model, focused), ui, model.panel.merge.is_some());
+    let header = with_flow_chips(
+        header_rows(model, focused, cols),
+        ui,
+        model.panel.merge.is_some(),
+    );
     let ctx = section_ctx(model, ui, cols, rows_for_body, header.len());
     let content_raw = sections::content(ui.open, &ctx);
     let visible_secs: Vec<_> = ui
@@ -504,7 +536,11 @@ fn build_full(
     let (tab_row, tab_spans) = tab_bar_row(ui, focused);
     let rows_for_body = rows.saturating_sub(1);
 
-    let header = with_flow_chips(header_rows(model, focused), ui, model.panel.merge.is_some());
+    let header = with_flow_chips(
+        header_rows(model, focused, cols),
+        ui,
+        model.panel.merge.is_some(),
+    );
     let (rail, mut spans) = rail_rows_and_spans(ui, cols);
     let plan = budget::allocate_full(rows_for_body, header.len(), rail.len());
 
@@ -779,6 +815,65 @@ mod tests {
             all.matches("MERGING").count(),
             1,
             "exactly one MERGING chip expected, got:\n{all}"
+        );
+    }
+
+    // Zero unresolved conflicts means the merge is ready to commit — a good
+    // state — so the count reads green, not the alarming red used mid-conflict.
+    #[test]
+    fn merge_zero_conflicts_reads_green_not_red() {
+        let model = model_with(PanelData {
+            branch: "main".into(),
+            merge: Some(MergeBanner {
+                label: "MERGING".into(),
+                onto: "feature".into(),
+                unresolved: 0,
+                total: Some(2),
+            }),
+            ..Default::default()
+        });
+        let frame = build_panel(&model, &PanelUi::default(), 44, 50, false);
+        let conf = frame
+            .rows
+            .iter()
+            .find_map(|r| match &r.line {
+                Line::Segs(v) => v.iter().find(|s| s.text == "no conflicts"),
+                _ => None,
+            })
+            .expect("expected a 'no conflicts' segment");
+        assert_eq!(
+            conf.fg,
+            Tok::Hue(Hue::Green),
+            "zero conflicts must be green"
+        );
+    }
+
+    // The conflict count is the actionable bit; a long onto branch name must
+    // never push it off the row. The branch name clips with an ellipsis instead.
+    #[test]
+    fn merge_line_clips_branch_not_conflict_count() {
+        let model = model_with(PanelData {
+            branch: "main".into(),
+            merge: Some(MergeBanner {
+                label: "MERGING".into(),
+                onto: "fix/worktree-pane-mirror".into(),
+                unresolved: 2,
+                total: Some(6),
+            }),
+            ..Default::default()
+        });
+        let frame = build_panel(&model, &PanelUi::default(), 44, 50, false);
+        let all: String = frame
+            .rows
+            .iter()
+            .map(|r| text_of(&r.line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("2 conflicts"), "count must survive: {all}");
+        assert!(all.contains('…'), "branch name should clip: {all}");
+        assert!(
+            !all.contains("fix/worktree-pane-mirror"),
+            "full branch must be clipped: {all}"
         );
     }
 
