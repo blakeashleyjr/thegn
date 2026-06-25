@@ -1,0 +1,27 @@
+name: responsive_breakpoints
+case_tmp_env: XDG_STATE_HOME
+matrix:
+  profiles: [xterm]
+  sizes: ["200x50", "160x40", "100x30", "80x24", "40x12"]
+spawn: ["szhost"]
+env:
+  XDG_STATE_HOME: "{case_tmp}"
+  SUPERZEJ_LOG: warn
+  MUSE_READY: "1"
+  TERM: xterm-256color
+sync:
+  quiet_window_ms: 2000
+  max_settle_ms: 10000
+snapshot_defaults:
+  masks:
+    - {rect: [0, 0, 200, 1]}
+  normalize:
+    - {re: "L0\\|.*", replace: "L0|<masthead>"}
+    - {re: "R0 \\d+ \\d+ .*", replace: "R0 <masked>"}
+steps:
+  - expect_visible: {regex: "szhost|superzej|dashboard|work|\\$|>", timeout_ms: 8000}
+  - snapshot: {name: full_frame, kind: text}
+  - snapshot: {name: full_frame_styled, kind: styled}
+  - check_file:
+      path: "{case_tmp}/superzej/logs/szhost.log"
+      reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt"

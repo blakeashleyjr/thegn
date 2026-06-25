@@ -1,0 +1,40 @@
+ ◆ superzej v0.1.0   dashboard   work   comms   chat                                                            34.1/94G · 󰾲 26% · 󰂄 100% · Fri Jun 19 · 22:56
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ REGCLAUDE ▸ home · Sandbox: None   1                                                                                git  work  system
+╭─ bwrap · home ──────────────────────────────────────────────────────────────────────────────────────────────────╮  —
+│This is the Z Shell configuration function for new users,                                                        │ ────────────────────────────────────────────
+│zsh-newuser-install.                                                                                             │  1 changes                            clean
+│You are seeing this message because you have no zsh startup files                                                │
+│(the files .zshenv, .zprofile, .zshrc, .zlogin in the directory                                                  │   working tree clean
+│~).  This function can help you with a few settings that should                                                  │
+│make your use of the shell easier.                                                                               │  2 commits                                —
+│                                                                                                                 │
+│You can:                                                                                                         │  3 branches                               —
+│                                                                                                                 │
+│(q)  Quit and do nothing.  The function will be run again next time.                                             │  4 stash                                  —
+│                                                                                                                 │
+│(0)  Exit, creating the file ~/.zshrc containing just a comment.                                                 │  5 files                              0 loc
+│     That will prevent this function being run again.                                                            │
+│                                                                                                                 │
+│(1)  Continue to the main menu.                                                                                  │
+│                                                                                                                 │
+│--- Type one of the keys in parentheses ---                                                                      │
+│                                                                                                                 │
+│                                                                                                                 │
+│                                                                                                                 │
+│                                                                                                                 │
+│                                                                                                                 │
+│                                                                                                                 │
+│                                                                                                                 │
+│                                                                                                                 │
+│                                                                                                                 │
+│                                                                                                                 │
+│                                                                                                                 │
+│                                                                                                                 │
+│                                                                                                                 │
+│                                                                                                                 │
+│                                                                                                                 │
+│                                                                                                                 │
+│                                                                                                                 │
+╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+  N   Ctrl-Left pane   Alt-Left tab   Alt-Up worktree   Alt-x close tab   Alt-p smart split   Alt-n split↓   Alt-N split→   Ctrl-Alt-z zoom   Ctrl-Space… 0 LOC

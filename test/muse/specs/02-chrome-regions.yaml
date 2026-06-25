@@ -1,0 +1,51 @@
+name: chrome_regions
+case_tmp_env: XDG_STATE_HOME
+matrix:
+  profiles: [xterm]
+  sizes: ["100x30", "80x24", "160x40", "40x12"]
+spawn: ["szhost"]
+env:
+  XDG_STATE_HOME: "{case_tmp}"
+  SUPERZEJ_LOG: warn
+  MUSE_READY: "1"
+  TERM: xterm-256color
+sync:
+  quiet_window_ms: 2000
+  max_settle_ms: 10000
+snapshot_defaults:
+  # For kind: styled — blank terminal row 0 in canonical format (L and R lines)
+  normalize:
+    - {re: "L0\\|.*", replace: "L0|<masthead>"}
+    - {re: "R0 \\d+ \\d+ .*", replace: "R0 <masked>"}
+steps:
+  - expect_visible: {regex: "szhost|superzej|dashboard|work|\\$|>", timeout_ms: 8000}
+  # Full frame at each size — mask row 0 (masthead has volatile CPU/mem/clock stats)
+  - snapshot:
+      name: full_frame
+      kind: text
+      masks:
+        - {rect: [0, 0, 200, 1]}
+  - snapshot:
+      name: full_frame_styled
+      kind: styled
+      # snapshot_defaults normalize blanks terminal row 0 (L0|/R0 lines)
+  # Top row: masthead / tabbar area — normalize volatile values to fixed replacements
+  - snapshot:
+      name: masthead_row
+      kind: text
+      normalize:
+        - {re: "\\d{2}:\\d{2}", replace: "HH:MM"}
+        - {re: "\\d+(?:\\.\\d+)?/\\d+[KMG]", replace: "NN/NNG"}
+        - {re: "\\d+%", replace: "NN%"}
+        - {re: "[A-Z][a-z]{2} [A-Z][a-z]{2} \\d{1,2}", replace: "Www Mmm DD"}
+      masks:
+        - {rect: [1, 0, 200, 29]}
+  # Bottom row: statusbar
+  - snapshot:
+      name: statusbar_row
+      kind: styled
+      masks:
+        - rect: [0, 0, 200, 28]
+  - check_file:
+      path: "{case_tmp}/superzej/logs/szhost.log"
+      reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt"

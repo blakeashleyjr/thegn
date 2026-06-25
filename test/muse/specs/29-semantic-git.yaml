@@ -1,0 +1,59 @@
+name: semantic_git
+# Semantic git layer (items 309/311/313/317): the changes section shows an
+# entity impact line and per-file entity headers, derived by tree-sitter from a
+# dirty, entity-bearing file. The fixture is built inline in `spawn`: a fresh
+# git repo under the case tmp dir with one committed Rust fn whose body is then
+# edited, before exec'ing szhost in that worktree.
+#
+# Assertion-based (no full-frame snapshot): the masthead carries volatile
+# network/clock/badge counters (see the masthead-volatility fix in a2c90ef), so
+# this spec asserts the exact entity text is on screen rather than diffing the
+# whole frame.
+case_tmp_env: XDG_STATE_HOME
+matrix:
+  profiles: [xterm]
+  sizes: ["120x36"]
+spawn:
+  - sh
+  - -lc
+  - |
+    repo="$XDG_STATE_HOME/wt"
+    mkdir -p "$repo"
+    cd "$repo"
+    git init -q -b main
+    git config user.email t@t.t
+    git config user.name t
+    printf 'fn greet() -> u8 {\n    1\n}\n' > lib.rs
+    git add .
+    git commit -qm init
+    printf 'fn greet() -> u8 {\n    42\n}\n' > lib.rs
+    exec szhost
+env:
+  XDG_STATE_HOME: "{case_tmp}"
+  SUPERZEJ_LOG: warn
+  MUSE_READY: "1"
+  TERM: xterm-256color
+sync:
+  quiet_window_ms: 2500
+  max_settle_ms: 12000
+steps:
+  - expect_visible: {regex: "szhost|superzej|\\$|>", timeout_ms: 8000}
+  # Exit the dashboard tile, open the right panel (Git tab → Changes section),
+  # and give the entity hydration a tick to land.
+  - key: {key: q}
+  - sleep_ms: 300
+  - key: {key: p, mods: [ctrl, alt]}
+  - sleep_ms: 2500
+  # Focus the panel and select the changed file so both the impact line
+  # (item 313) and its per-file entity header (item 311) render.
+  - key: {key: right, mods: [ctrl]}
+  - sleep_ms: 300
+  - key: {key: enter}
+  - sleep_ms: 500
+  # The impact line summarizes the entity-level change (item 313)…
+  - expect_visible: {regex: "across 1 file", timeout_ms: 6000}
+  # …and the selected file shows its touched entity (item 311).
+  - expect_visible: {regex: "fn greet", timeout_ms: 6000}
+  - check_file:
+      path: "{case_tmp}/superzej/logs/szhost.log"
+      reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt"

@@ -1,0 +1,122 @@
+name: glitch_hunt_panel_accordion
+case_tmp_env: XDG_STATE_HOME
+matrix:
+  profiles: [xterm]
+  sizes: ["100x30", "160x40"]
+spawn: ["szhost"]
+env:
+  XDG_STATE_HOME: "{case_tmp}"
+  SUPERZEJ_LOG: warn
+  MUSE_READY: "1"
+  TERM: xterm-256color
+sync:
+  quiet_window_ms: 2000
+snapshot_defaults:
+  kind: styled
+  masks:
+    - {rect: [0, 0, 200, 1]}
+  normalize:
+    - {re: "L0\\|.*", replace: "L0|<masthead>"}
+    - {re: "R0 \\d+ \\d+ .*", replace: "R0 <masked>"}
+steps:
+  - begin_step: "startup"
+  - expect_visible: {regex: "szhost|superzej|\\$|>", timeout_ms: 8000}
+  # Exit the dashboard tile to access the Work tab.
+  - key: {key: q}
+  - sleep_ms: 200
+  # ── Panel tab cycling must not corrupt layout ─────────────────────────────────
+  - begin_step: "panel tab cycling"
+  - key: {key: p, mods: [ctrl, alt]}
+  - sleep_ms: 150
+  - snapshot: {name: panel_tab_1}
+  - key: {key: "1", mods: [alt]}
+  - sleep_ms: 80
+  - snapshot: {name: panel_tab_1_explicit}
+  - key: {key: "2", mods: [alt]}
+  - sleep_ms: 80
+  - snapshot: {name: panel_tab_2}
+  - key: {key: "3", mods: [alt]}
+  - sleep_ms: 80
+  - snapshot: {name: panel_tab_3}
+  # Cycle back to 1 without closing
+  - key: {key: "1", mods: [alt]}
+  - sleep_ms: 80
+  - snapshot: {name: panel_tab_1_again}
+  # ── Panel navigation: section scroll must not overflow ────────────────────────
+  - begin_step: "panel section overflow scroll"
+  - key: {key: "1", mods: [alt]}
+  - sleep_ms: 80
+  # Scroll way past the bottom
+  - key: {key: j}
+  - key: {key: j}
+  - key: {key: j}
+  - key: {key: j}
+  - key: {key: j}
+  - key: {key: j}
+  - key: {key: j}
+  - key: {key: j}
+  - key: {key: j}
+  - key: {key: j}
+  - sleep_ms: 100
+  - snapshot: {name: panel_scrolled_past_bottom}
+  # Scroll back to top
+  - key: {key: g}
+  - sleep_ms: 80
+  - snapshot: {name: panel_scrolled_to_top}
+  # Scroll before top (should clamp)
+  - key: {key: k}
+  - key: {key: k}
+  - key: {key: k}
+  - sleep_ms: 80
+  - snapshot: {name: panel_scroll_before_top}
+  # ── Panel accordion width cycling ────────────────────────────────────────────
+  - begin_step: "panel width cycling"
+  - key: {key: e}
+  - sleep_ms: 80
+  - snapshot: {name: panel_half_width}
+  - key: {key: e}
+  - sleep_ms: 80
+  - snapshot: {name: panel_full_width}
+  - key: {key: e}
+  - sleep_ms: 80
+  - snapshot: {name: panel_normal_width}
+  # ── Panel + pane splits: layout must not overlap ──────────────────────────────
+  - begin_step: "panel with splits"
+  - key: {key: p, mods: [ctrl, alt]}
+  - sleep_ms: 80
+  # Now open panel + add a split
+  - key: {key: p, mods: [ctrl, alt]}
+  - sleep_ms: 120
+  - key: {key: n, mods: [alt]}
+  - sleep_ms: 150
+  - snapshot: {name: panel_with_split}
+  - resize: "80x24"
+  - sleep_ms: 80
+  - snapshot: {name: panel_with_split_narrow}
+  - resize: "100x30"
+  - sleep_ms: 80
+  - key: {key: p, mods: [ctrl, alt]}
+  - sleep_ms: 80
+  # ── Section expand/collapse boundary ─────────────────────────────────────────
+  - begin_step: "section expand collapse"
+  - key: {key: p, mods: [ctrl, alt]}
+  - sleep_ms: 120
+  - key: {key: enter}
+  - sleep_ms: 80
+  - snapshot: {name: section_expanded}
+  - key: {key: enter}
+  - sleep_ms: 80
+  - snapshot: {name: section_collapsed}
+  # Rapid expand/collapse
+  - key: {key: enter}
+  - key: {key: enter}
+  - key: {key: enter}
+  - key: {key: enter}
+  - sleep_ms: 100
+  - snapshot: {name: after_rapid_expand_collapse}
+  - key: {key: p, mods: [ctrl, alt]}
+  - sleep_ms: 80
+  - begin_step: "verify no errors"
+  - check_file:
+      path: "{case_tmp}/superzej/logs/szhost.log"
+      reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt|subtract with overflow|index out of bounds"

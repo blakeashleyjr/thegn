@@ -1,0 +1,45 @@
+name: input_modes
+case_tmp_env: XDG_STATE_HOME
+matrix:
+  profiles: [xterm]
+  sizes: ["100x30"]
+spawn: ["szhost"]
+env:
+  XDG_STATE_HOME: "{case_tmp}"
+  SUPERZEJ_LOG: warn
+  MUSE_READY: "1"
+  TERM: xterm-256color
+sync:
+  quiet_window_ms: 2000
+  max_settle_ms: 10000
+snapshot_defaults:
+  masks:
+    - {rect: [0, 0, 200, 1]}
+  normalize:
+    - {re: "L0\\|.*", replace: "L0|<masthead>"}
+    - {re: "R0 \\d+ \\d+ .*", replace: "R0 <masked>"}
+steps:
+  - expect_visible: {regex: "szhost|superzej|\\$|>", timeout_ms: 8000}
+  # Exit the dashboard tile to access the Work tab.
+  - key: {key: q}
+  - sleep_ms: 200
+  - snapshot: {name: normal_mode, kind: styled}
+  # Key-lock mode (Ctrl+G)
+  - key: {key: g, mods: [ctrl]}
+  - sleep_ms: 100
+  - snapshot: {name: key_locked, kind: styled}
+  # Unlock
+  - key: {key: g, mods: [ctrl]}
+  - sleep_ms: 100
+  - snapshot: {name: key_unlocked, kind: styled}
+  # Emacs mode
+  - key: {key: e, mods: [ctrl, alt]}
+  - sleep_ms: 100
+  - snapshot: {name: emacs_mode, kind: styled}
+  # Back to normal
+  - key: {key: n, mods: [ctrl, alt]}
+  - sleep_ms: 100
+  - snapshot: {name: back_to_normal, kind: styled}
+  - check_file:
+      path: "{case_tmp}/superzej/logs/szhost.log"
+      reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt"

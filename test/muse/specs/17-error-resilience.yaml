@@ -1,0 +1,88 @@
+name: error_resilience
+case_tmp_env: XDG_STATE_HOME
+matrix:
+  profiles: [xterm]
+  sizes: ["100x30"]
+spawn: ["szhost"]
+env:
+  XDG_STATE_HOME: "{case_tmp}"
+  SUPERZEJ_LOG: warn
+  MUSE_READY: "1"
+  TERM: xterm-256color
+sync:
+  quiet_window_ms: 2000
+  max_settle_ms: 10000
+snapshot_defaults:
+  masks:
+    - {rect: [0, 0, 200, 1]}
+  normalize:
+    - {re: "L0\\|.*", replace: "L0|<masthead>"}
+    - {re: "R0 \\d+ \\d+ .*", replace: "R0 <masked>"}
+steps:
+  - expect_visible: {regex: "szhost|superzej|\\$|>", timeout_ms: 8000}
+  # Exit the dashboard tile to access the Work tab.
+  - key: {key: q}
+  - sleep_ms: 200
+  # Rapid resize sequence
+  - resize: "80x24"
+  - sleep_ms: 50
+  - resize: "120x35"
+  - sleep_ms: 50
+  - resize: "60x18"
+  - sleep_ms: 50
+  - resize: "100x30"
+  - sleep_ms: 50
+  - resize: "160x45"
+  - sleep_ms: 50
+  - resize: "100x30"
+  - sleep_ms: 100
+  - snapshot: {name: after_rapid_resize, kind: styled}
+  # Rapid panel open/close
+  - key: {key: p, mods: [ctrl, alt]}
+  - sleep_ms: 80
+  - key: {key: p, mods: [ctrl, alt]}
+  - sleep_ms: 80
+  - key: {key: p, mods: [ctrl, alt]}
+  - sleep_ms: 80
+  - key: {key: p, mods: [ctrl, alt]}
+  - sleep_ms: 80
+  - key: {key: p, mods: [ctrl, alt]}
+  - sleep_ms: 80
+  - key: {key: p, mods: [ctrl, alt]}
+  - sleep_ms: 100
+  - snapshot: {name: after_panel_spam, kind: styled}
+  # Rapid sidebar toggle
+  - key: {key: s, mods: [ctrl, alt]}
+  - sleep_ms: 60
+  - key: {key: s, mods: [ctrl, alt]}
+  - sleep_ms: 60
+  - key: {key: s, mods: [ctrl, alt]}
+  - sleep_ms: 60
+  - key: {key: s, mods: [ctrl, alt]}
+  - sleep_ms: 100
+  - snapshot: {name: after_sidebar_spam, kind: styled}
+  # Mode switches
+  - key: {key: g, mods: [ctrl]}
+  - sleep_ms: 50
+  - key: {key: g, mods: [ctrl]}
+  - sleep_ms: 50
+  - key: {key: e, mods: [ctrl, alt]}
+  - sleep_ms: 50
+  - key: {key: n, mods: [ctrl, alt]}
+  - sleep_ms: 50
+  - snapshot: {name: after_mode_spam, kind: styled}
+  # Open pane, split, zoom, unzoom, close
+  - key: {key: n, mods: [alt]}
+  - sleep_ms: 200
+  - key: {key: n, mods: [alt, shift]}
+  - sleep_ms: 200
+  - key: {key: z, mods: [ctrl, alt]}
+  - sleep_ms: 100
+  - key: {key: z, mods: [ctrl, alt]}
+  - sleep_ms: 100
+  - snapshot: {name: after_pane_stress, kind: styled}
+  # Final clean frame — no errors, no corruption
+  - snapshot: {name: final_clean, kind: styled}
+  - check_file:
+      path: "{case_tmp}/superzej/logs/szhost.log"
+      reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt"

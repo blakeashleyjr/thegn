@@ -1,0 +1,11 @@
+/target
+result
+result-*
+.direnv/
+.devenv/
+.devenv.flake.nix
+devenv.local.nix
+.pre-commit-config.yaml
+__pycache__/
+.opencode/
+.claude/

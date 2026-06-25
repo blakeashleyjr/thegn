@@ -1,0 +1,151 @@
+L0| ◆ superzej   dashboard   work  comms 4 chat 16% · 󰂄 100% · Fri Jun 19 · 22:30
+R0 0 1 fg=default bg=#151a28 attrs=
+R0 1 2 fg=#6ee7d8 bg=#151a28 attrs=
+R0 3 8 fg=#edf0f8 bg=#151a28 attrs=
+R0 11 2 fg=default bg=#151a28 attrs=
+R0 13 11 fg=#6ee7d8 bg=#2e5359 attrs=
+R0 24 1 fg=default bg=#151a28 attrs=
+R0 25 24 fg=#aab1c5 bg=#151a28 attrs=
+R0 49 3 fg=#4e556e bg=#151a28 attrs=
+R0 52 6 fg=#aab1c5 bg=#151a28 attrs=
+R0 58 3 fg=#4e556e bg=#151a28 attrs=
+R0 61 10 fg=#aab1c5 bg=#151a28 attrs=
+R0 71 3 fg=#4e556e bg=#151a28 attrs=
+R0 74 5 fg=#aab1c5 bg=#151a28 attrs=
+R0 79 1 fg=default bg=#151a28 attrs=
+L1|
+L2|┌ System ──────────────────┐┌ Hacker News ─────────────────────────────────────┐
+R2 0 80 fg=#4e556e bg=default attrs=
+L3|│OS:                       ││No HN stories yet (offline or loading).           │
+R3 0 1 fg=#4e556e bg=default attrs=
+R3 1 4 fg=#aab1c5 bg=default attrs=
+R3 5 22 fg=default bg=default attrs=
+R3 27 2 fg=#4e556e bg=default attrs=
+R3 29 39 fg=#7a8197 bg=default attrs=
+R3 68 11 fg=default bg=default attrs=
+R3 79 1 fg=#4e556e bg=default attrs=
+L4|│Uptime: 0s                ││                                                  │
+R4 0 1 fg=#4e556e bg=default attrs=
+R4 1 8 fg=#aab1c5 bg=default attrs=
+R4 9 2 fg=#edf0f8 bg=default attrs=
+R4 11 16 fg=default bg=default attrs=
+R4 27 2 fg=#4e556e bg=default attrs=
+R4 29 50 fg=default bg=default attrs=
+R4 79 1 fg=#4e556e bg=default attrs=
+L5|│Memory: 0.00 GB / 0.00 GB ││                                                  │
+R5 0 1 fg=#4e556e bg=default attrs=
+R5 1 8 fg=#aab1c5 bg=default attrs=
+R5 9 17 fg=#edf0f8 bg=default attrs=
+R5 26 1 fg=default bg=default attrs=
+R5 27 2 fg=#4e556e bg=default attrs=
+R5 29 50 fg=default bg=default attrs=
+R5 79 1 fg=#4e556e bg=default attrs=
+L6|│CPUs: 0                   ││                                                  │
+R6 0 1 fg=#4e556e bg=default attrs=
+R6 1 6 fg=#aab1c5 bg=default attrs=
+R6 7 1 fg=#edf0f8 bg=default attrs=
+R6 8 19 fg=default bg=default attrs=
+R6 27 2 fg=#4e556e bg=default attrs=
+R6 29 50 fg=default bg=default attrs=
+R6 79 1 fg=#4e556e bg=default attrs=
+L7|└──────────────────────────┘│                                                  │
+R7 0 29 fg=#4e556e bg=default attrs=
+R7 29 50 fg=default bg=default attrs=
+R7 79 1 fg=#4e556e bg=default attrs=
+L8|┌ Resources ───────────────┐└──────────────────────────────────────────────────┘
+R8 0 80 fg=#4e556e bg=default attrs=
+L9|│CPU: 0.0%                 │┌ Recent Repos ────────────────────────────────────┐
+R9 0 1 fg=#4e556e bg=default attrs=
+R9 1 5 fg=#aab1c5 bg=default attrs=
+R9 6 4 fg=#7fdca0 bg=default attrs=
+R9 10 17 fg=default bg=default attrs=
+R9 27 53 fg=#4e556e bg=default attrs=
+L10|│Mem: 0.0% (0.0/0.0G)      ││No recent repos.                                  │
+R10 0 1 fg=#4e556e bg=default attrs=
+R10 1 5 fg=#aab1c5 bg=default attrs=
+R10 6 15 fg=#6ee7d8 bg=default attrs=
+R10 21 6 fg=default bg=default attrs=
+R10 27 2 fg=#4e556e bg=default attrs=
+R10 29 16 fg=#7a8197 bg=default attrs=
+R10 45 34 fg=default bg=default attrs=
+R10 79 1 fg=#4e556e bg=default attrs=
+L11|│Load: 0.00                ││                                                  │
+R11 0 1 fg=#4e556e bg=default attrs=
+R11 1 6 fg=#aab1c5 bg=default attrs=
+R11 7 4 fg=#e6c264 bg=default attrs=
+R11 11 16 fg=default bg=default attrs=
+R11 27 2 fg=#4e556e bg=default attrs=
+R11 29 50 fg=default bg=default attrs=
+R11 79 1 fg=#4e556e bg=default attrs=
+L12|│Processes: 0              ││                                                  │
+R12 0 1 fg=#4e556e bg=default attrs=
+R12 1 11 fg=#aab1c5 bg=default attrs=
+R12 12 1 fg=#edf0f8 bg=default attrs=
+R12 13 14 fg=default bg=default attrs=
+R12 27 2 fg=#4e556e bg=default attrs=
+R12 29 50 fg=default bg=default attrs=
+R12 79 1 fg=#4e556e bg=default attrs=
+L13|│                          │└──────────────────────────────────────────────────┘
+R13 0 1 fg=#4e556e bg=default attrs=
+R13 1 26 fg=default bg=default attrs=
+R13 27 53 fg=#4e556e bg=default attrs=
+L14|└──────────────────────────┘┌ Workspaces ──────────────────────────────────────┐
+R14 0 80 fg=#4e556e bg=default attrs=
+L15|┌ Metrics ─────────────────┐│No open workspaces.                               │
+R15 0 29 fg=#4e556e bg=default attrs=
+R15 29 19 fg=#7a8197 bg=default attrs=
+R15 48 31 fg=default bg=default attrs=
+R15 79 1 fg=#4e556e bg=default attrs=
+L16|│No metric targets configur││                                                  │
+R16 0 1 fg=#4e556e bg=default attrs=
+R16 1 26 fg=#7a8197 bg=default attrs=
+R16 27 2 fg=#4e556e bg=default attrs=
+R16 29 50 fg=default bg=default attrs=
+R16 79 1 fg=#4e556e bg=default attrs=
+L17|│                          ││                                                  │
+R17 0 1 fg=#4e556e bg=default attrs=
+R17 1 26 fg=default bg=default attrs=
+R17 27 2 fg=#4e556e bg=default attrs=
+R17 29 50 fg=default bg=default attrs=
+R17 79 1 fg=#4e556e bg=default attrs=
+L18|│                          │└──────────────────────────────────────────────────┘
+R18 0 1 fg=#4e556e bg=default attrs=
+R18 1 26 fg=default bg=default attrs=
+R18 27 53 fg=#4e556e bg=default attrs=
+L19|│                          │┌ Superzej Dashboard ──────────────────────────────┐
+R19 0 1 fg=#4e556e bg=default attrs=
+R19 1 26 fg=default bg=default attrs=
+R19 27 53 fg=#4e556e bg=default attrs=
+L20|│                          ││Last updated: 0  |  Refresh interval: 0s  |  Press│
+R20 0 1 fg=#4e556e bg=default attrs=
+R20 1 26 fg=default bg=default attrs=
+R20 27 2 fg=#4e556e bg=default attrs=
+R20 29 50 fg=#aab1c5 bg=default attrs=
+R20 79 1 fg=#4e556e bg=default attrs=
+L21|│                          ││                                                  │
+R21 0 1 fg=#4e556e bg=default attrs=
+R21 1 26 fg=default bg=default attrs=
+R21 27 2 fg=#4e556e bg=default attrs=
+R21 29 50 fg=#aab1c5 bg=default attrs=
+R21 79 1 fg=#4e556e bg=default attrs=
+L22|└──────────────────────────┘└──────────────────────────────────────────────────┘
+R22 0 80 fg=#4e556e bg=default attrs=
+L23|  N   Ctrl-Left pane   Alt-Left tab   Alt-Up worktree   Alt-x close tab   Alt…
+R23 0 1 fg=#edf0f8 bg=#151a28 attrs=
+R23 1 3 fg=#0b0e16 bg=#6ee7d8 attrs=BOLD
+R23 4 2 fg=#edf0f8 bg=#151a28 attrs=
+R23 6 9 fg=#7a8197 bg=#151a28 attrs=
+R23 15 5 fg=#4e556e bg=#151a28 attrs=
+R23 20 3 fg=#edf0f8 bg=#151a28 attrs=
+R23 23 8 fg=#7a8197 bg=#151a28 attrs=
+R23 31 4 fg=#4e556e bg=#151a28 attrs=
+R23 35 3 fg=#edf0f8 bg=#151a28 attrs=
+R23 38 6 fg=#7a8197 bg=#151a28 attrs=
+R23 44 9 fg=#4e556e bg=#151a28 attrs=
+R23 53 3 fg=#edf0f8 bg=#151a28 attrs=
+R23 56 5 fg=#7a8197 bg=#151a28 attrs=
+R23 61 10 fg=#4e556e bg=#151a28 attrs=
+R23 71 3 fg=#edf0f8 bg=#151a28 attrs=
+R23 74 3 fg=#7a8197 bg=#151a28 attrs=
+R23 77 1 fg=#4e556e bg=#151a28 attrs=
+R23 78 2 fg=#edf0f8 bg=#151a28 attrs=

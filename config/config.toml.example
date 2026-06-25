@@ -1,0 +1,864 @@
+# superzej config — copy to ~/.config/superzej/config.toml and edit.
+# All keys are optional (sane defaults apply). Home-manager users get this
+# generated automatically from programs.superzej.
+
+# Where worktrees live (grouped per repo) and where remote URLs are cloned.
+worktrees_dir = "~/.superzej/worktrees"
+workspaces_dir = "~/code"
+
+# Roots scanned by the workspace repo picker (new-workspace / bare `sj`).
+# Defaults to [workspaces_dir] if omitted.
+repo_roots = ["~/code", "~/src"]
+repo_scan_depth = 5
+
+# Base ref for new worktrees: "auto" = current branch, else the repo default.
+base_branch = "auto"
+branch_prefix = "sz/"
+
+# Picker UI: "auto" | "gum" | "fzf" | "select"
+picker = "auto"
+
+# Worktree location: "global" | "in_repo" (<repo>/.worktrees)
+worktree_mode = "global"
+
+# Auto branch naming: "words" (sz/brisk-otter) | "numbered" (sz/pane-1)
+name_scheme = "words"
+
+# Remove the worktree automatically when its pane closes.
+auto_remove_worktree = false
+# Ask before destructive worktree actions (sidebar delete-from-disk).
+confirm_delete = true
+
+# ── Overriding any setting at runtime ─────────────────────────────────────────
+# Precedence (low → high): built-in defaults < this file < SUPERZEJ_* env vars
+#   < CLI flags. Override any key for one run with SUPERZEJ_<SECTION>_<KEY>, e.g.
+#     SUPERZEJ_PICKER=fzf        SUPERZEJ_SANDBOX_BACKEND=docker
+#     SUPERZEJ_LOG_LEVEL=debug   SUPERZEJ_PR_TTL=10
+# `superzej config show` prints the effective merged config; `superzej config
+# get <dotted.key>` prints one value; `superzej config validate` checks it.
+
+# Visual tuning. The focus accent recolors every superzej surface (plugins,
+# pickers, dashboard). `focus_border` frames whatever owns focus — the focused
+# pane's border ring, the active tab chip, the active worktree row, and the
+# focused chrome edge. Unfocused frames use `colors.border`.
+[theme]
+# Named palette preset: "prism" (default), "storm", "light", "abyss", "ember",
+# "aurora". Cycle live with Ctrl+Alt+t; [theme.colors] / [theme.hues]
+# overrides apply on top.
+preset = "prism"
+accent = "#6ee7d8"
+focus_border = "#6ee7d8"
+# Horizontal breathing room (cells) between a pane's frame and its content.
+pane_padding = 0
+# Curly underlines (conflict squiggles): "auto" sniffs the terminal
+# ($TERM / $TERM_PROGRAM / $VTE_VERSION); "on" / "off" force it. Unsupported
+# terminals degrade to a single underline.
+undercurl = "auto"
+
+# Optional: override any chrome surface/text color (all "#rrggbb"; unset keys
+# keep the preset's palette). Invalid hex warns and keeps the default.
+[theme.colors]
+# bg0 = "#0b0e16"       # deepest background (sidebar)
+# bg1 = "#10141f"       # bars / surfaces (tabbar, statusbar, panel)
+# panel = "#151a28"     # panel lists
+# panel2 = "#1a2031"    # selection / hover
+# raise = "#222942"     # raised (context menus)
+# border = "#6f788e"    # pane/edge frame lines
+# text = "#edf0f8"      # primary text
+# dim = "#aab1c5"       # secondary text
+# faint = "#7a8197"     # tertiary / labels
+# ghost = "#6f788e"     # connectors / disabled (faintest readable tier, ~3:1+)
+# ghost2 = "#677084"    # structural glyphs (below ghost)
+# ghost3 = "#60687b"    # deepest structural fg (rules, bar tracks)
+# shadow_bg = "#05070c" # layer shadow cell background
+# shadow_fg = "#1c2233" # layer shadow cell foreground
+# chip_fg = "#0b0e16"   # text inside inverse chips (defaults to bg0)
+# activity_active = "#edf0f8"   # sidebar dot: agent/worktree working (white)
+# activity_waiting = "#ef6f6f"  # sidebar dot: agent waiting for your input (red)
+
+# Optional: override the eight semantic hues (identity + status colors).
+# Unset keys keep the preset's hues; legacy presets default to the prism set
+# ("light" ships darker, paper-legible hues).
+[theme.hues]
+# teal = "#6ee7d8"
+# magenta = "#ef8fc4"
+# purple = "#b69cf2"
+# green = "#7fdca0"
+# amber = "#e6c264"
+# red = "#ef6f6f"
+# blue = "#7fb4ec"
+# orange = "#f09d6a"
+
+# Resource managers opened from the top-bar stats widget: highlight a stat with
+# Super+Alt+Up, cycle CPU/MEM/Net/GPU with ←/→, press Enter to embed it as a pane.
+# `system` backs the CPU and MEM segments; `gpu` backs the GPU segment.
+[monitor]
+system = "btm"   # CPU/RAM monitor (ClementTsang/bottom); e.g. "htop", "btop"
+gpu = "nvtop"    # GPU monitor
+
+# The customizable widget bars framing the workspace. Each slot is an ordered
+# list of widget ids; unknown ids are skipped. Top-bar widgets: "brand"
+# (superzej + version), "cpu", "mem", "gpu" (NVIDIA only; hidden if absent),
+# "net", "date", "clock". Bottom-bar widgets: "keyhints" (context-dependent
+# keybinds for the focused zone), "pr" (forge + PR number, state-colored),
+# "tests" (✓pass ✗fail rollup of the last test run; green all-pass, red on
+# failure; hidden until a run), "loc" (tokei line count), "status" (transient
+# messages).
+[bars]
+top_left = ["brand"]
+top_right = ["cpu", "mem", "gpu", "net", "battery", "date", "clock"]
+bottom_left = ["keyhints"]
+bottom_right = ["pr", "tests", "loc", "status"]   # "loc" = tokei line count (needs tokei)
+# chrono format strings for the date/clock widgets.
+date_format = "%a %b %-d"
+clock_format = "%H:%M"
+
+# Top-bar stats widget: icons and refresh rate for CPU/RAM/Network/GPU display.
+# Icons can be text ("CPU") or unicode symbols ("⚡"). GPU shows only if detected.
+[stats]
+refresh-secs = 2           # Polling interval in seconds
+# Icons default to single-width Nerd Font glyphs; set plain text if your font
+# lacks them. Use single-width PUA glyphs (U+E000–U+F8FF, e.g. nf-fa-*) only —
+# the plane-15 Material Design set (nf-md-*, U+F0000+) advances two cells and
+# leaves a gap between the icon and its value.
+# cpu-icon = "CPU"
+# mem-icon = "MEM"
+# net-icon = "NET"
+# gpu-icon = "GPU"              # shows only if a GPU is detected
+# battery-icon = "BAT"          # discharging icon
+# battery-charging-icon = "CHG" # shown while charging / on AC
+battery-warn = 25               # red at/below this percent
+refresh-rates = [1, 2, 5, 10]  # Click the top-right stats block to cycle
+
+# Prometheus scrape targets for the sidebar METRICS section. superzej scrapes
+# each /metrics endpoint directly; no Prometheus server is required. Values are
+# filtered by the allowlist below before reaching the UI.
+[metrics]
+interval-secs = 5        # Scrape interval in seconds (SUPERZEJ_METRICS_INTERVAL_SECS)
+timeout-ms = 500         # Request timeout in milliseconds
+max-body-bytes = 1048576 # Max response size (1 MiB)
+
+# Example: monitor a local model-proxy service.
+# [[metrics.targets]]
+# name = "model-proxy"
+# url = "http://127.0.0.1:9091/metrics"
+# metrics = [
+#   "http_requests_total",
+#   "process_resident_memory_bytes",
+#   "model_proxy_active_requests",
+#]
+# labels = { instance = "local" } # optional exact-match labels
+
+# Bottom file-manager drawer (hidden by default; toggle with Ctrl+Alt+f). Runs a
+# pinned, bundled yazi with its own config kept separate from the system.
+[drawer]
+# File manager to run. Empty = the bundled, pinned yazi.
+command = ""
+# yazi config dir (YAZI_CONFIG_HOME). Empty = a private ~/.superzej/yazi, seeded
+# with superzej's bundled config and recolored to match [theme] accent. Use
+# "system" to point at your own ~/.config/yazi instead, or give an explicit path.
+config_home = ""
+# Drawer geometry. height: "35%" or a row count. width: "full" | "center".
+height = "35%"
+width = "full"
+# Image previews are off by default in the bundled/private yazi config. Text/code
+# previews remain on. With config_home = "system", superzej does not rewrite your
+# yazi config, so containment below is still the safety net.
+image_previews = false
+# Show git status as a linemode in the drawer (added/modified/deleted/etc.).
+# Seeds the bundled git.yazi plugin into the private config and registers it as a
+# fetcher; set false to remove it. Ignored with config_home = "system".
+git_status = true
+# Run yazi and preview helper children in a bounded user systemd scope when
+# systemd-run is available. Empty limit strings omit that property.
+contain = true
+memory_max = "2G"
+memory_swap_max = "512M"
+cpu_quota = "200%"
+# Hidden-drawer keepalive: pool_limit caps how many hidden yazi panes are kept
+# warm (oldest evicted past the limit; 0 = hide kills the pane). prewarm spawns a
+# hidden drawer per worktree so the first toggle is instant — off by default so
+# invisible yazi instances never accumulate unbidden.
+pool_limit = 1
+prewarm = false
+
+# GitHub PR data feeding the right panel.
+[pr]
+ttl_secs = 30          # cache TTL before a live `gh` re-fetch (SUPERZEJ_PR_TTL)
+
+# Top-level app tab strip. Defaults make the dashboard the first and focused tab.
+# Valid ids: "dashboard", "work", "chat", "agent".
+# "agent" is the embedded coding-agent harness (termite-agent); it routes its
+# model traffic through [llm_proxy] when that is enabled.
+[apps]
+default_tab = "work" # initial tab (SUPERZEJ_APPS_DEFAULT_TAB); "work" = your worktree
+tab_order = ["work", "dashboard", "chat", "agent"]
+
+# The terminal-native dashboard app.
+[dashboard]
+interval_secs = 4        # refresh cadence (SUPERZEJ_DASHBOARD_INTERVAL)
+hacker_news = true       # poll Hacker News top stories for the HN widget
+hacker_news_limit = 5    # stories fetched/rendered (clamped 1..20)
+
+# The per-session daemon that pushes live diff/PR updates to the panel.
+[watch]
+pr_interval_secs = 20  # PR refresh cadence (SUPERZEJ_WATCH_PR_INTERVAL)
+
+# Git write-operation knobs for the panel's lazygit-style features
+# (line staging, interactive rebase, cherry-pick, bisect, undo, …).
+[git]
+override_gpg = false   # true => history rewrites pass -c commit.gpgSign=false
+                       # -c tag.gpgSign=false, so a gpg passphrase prompt can
+                       # never hang a background operation
+
+# User-defined git commands, surfaced in the git panel's custom-commands menu
+# (`x`). `command` is a template expanded against the current selection — see
+# the list below — then run via `sh -c`. The `| quote` filter shell-quotes a
+# value. Referencing an empty selection is an error, never a silent "".
+#   {{.SelectedCommit.Sha}} / .Short / .Subject / .Author
+#   {{.SelectedBranch.Name}} / .Upstream      (also .SelectedLocalBranch.*)
+#   {{.CheckedOutBranch.Name}} / .Upstream
+#   {{.SelectedFile}}   {{.SelectedStash.Index}} / .Message
+#   {{.WorktreePath}}   {{.Form.<Key>}}        (a prompt response)
+#
+# [[git_commands]]
+# key = "P"                    # hotkey inside the custom-commands menu
+# context = "branches"         # commits | branches | files | stash | global
+# command = "git push --force-with-lease origin {{.SelectedBranch.Name | quote}}"
+# description = "force-push selected branch"
+# output = "popup"             # none | popup | terminal
+# prompts = [{ type = "input", title = "Confirm branch", key = "Branch" }]
+
+# Diagnostics. stderr is always on (level-gated, branded, colored on a TTY); the
+# file sink is opt-in. SUPERZEJ_LOG is a tracing-style filter that refines the
+# level per-module, e.g. SUPERZEJ_LOG=debug,superzej::db=trace
+[log]
+level = "info"            # error | warn | info | debug | trace
+file = false              # mirror to a rotating file under `dir`
+dir = ""                  # "" => $XDG_STATE_HOME/superzej/logs
+rotation_size_mb = 5
+max_files = 5
+format = "text"           # text | json
+
+# ── Keybindings ───────────────────────────────────────────────────────────────
+# superzej owns its keybinds. Inspect with `superzej keys list`; check with
+# `superzej keys validate`.
+#
+# By default, szhost has four modes: Normal, VimNormal, VimInsert, and Emacs.
+# - Normal: The classic `Ctrl` and `Alt` chorded UI.
+# - VimNormal: `h j k l` focus moves, `g g`/`G` scrolling, `i` to insert.
+#   Also features a `Space` leader layer (e.g. `Space p` for panel).
+# - VimInsert: Typing goes to pane. `Esc` back to VimNormal.
+# - Emacs: `Ctrl x` / `Ctrl g` layer.
+# Switch modes: `Ctrl Alt n` (Normal), `Ctrl Alt v` (VimNormal), `Ctrl Alt e` (Emacs).
+#
+# Rebind a built-in by its id (see `superzej keys list` for ids).
+# Flat entries override chords globally.
+# IDE keymap preset overlaid on the built-in defaults: "default" (none),
+# "vscode", or "jetbrains". Maps familiar chords (Ctrl+P quick-open, Ctrl+Shift+P
+# command palette, Ctrl+B sidebar, …) to existing actions; [keybinds] below still
+# override it. On first launch a one-time picker offers these; setting this key
+# explicitly skips the picker. The vim/emacs MODES are separate — see [profiles].
+# keymap_preset = "vscode"
+
+[keybinds]
+# new-worktree = "Ctrl w"
+# toggle-sidebar = "Alt s"
+# switch-font = "Alt f"  # opens the realtime font picker (alacritty profile)
+# Multi-key sequences (a leader chord) are supported: bind a space-separated
+# sequence and a which-key popup lists the next keys after you press the prefix.
+# Use "Space"/"leader" for the space key. Sequences are safest in the modal
+# vim/emacs modes (in the default mode a bare-key prefix would be intercepted
+# before reaching the focused pane), e.g.:
+# [keybinds.vim_normal]
+# new-worktree = "Space g w"   # press Space, then g, then w
+# Sidebar navigation (global):
+#   Alt ↑/↓        navigate worktrees, wrapping WITHIN the current workspace
+#   Shift+Alt ↑/↓  switch to the previous/next *workspace* (a real context switch)
+#   Ctrl+Alt ↑/↓   *reorder* (move) the selected item: the workspace under the
+#                  sidebar cursor if the sidebar is focused, else the active
+#                  worktree within its workspace
+# Workspaces and worktrees keep the order you set; cycle worktree sort modes
+# with `s` while the sidebar is focused.
+# prev-workspace = "Shift Alt Up"
+# next-workspace = "Shift Alt Down"
+# move-item-up = "Ctrl Alt Up"     # (legacy id move-worktree-up still works)
+# move-item-down = "Ctrl Alt Down"
+
+# You can also scope rebinds to a specific mode:
+[keybinds.vim_normal]
+# focus-down = "J"
+
+[keybinds.emacs]
+# quit = "Ctrl x q"
+
+# Define your own actions — a chord bound to either a shell command (`run`) or
+# a built-in composite operation (`action` + `params`). Exactly one of `run` /
+# `action` is required. `menu = true` surfaces it in the Cmd+K palette.
+# [[actions]]
+# name = "deploy"
+# key = "Alt D"
+# run = "just deploy"
+# menu = true
+
+# Composite actions invoke a built-in operation in-process (a shell `run`
+# cannot — superzej is a single session with no IPC). Supported `action`s:
+#
+#   new-worktree — create a worktree non-interactively (the Alt+w wizard,
+#     headless). params: `name` (a tail, or omit/"random" for an adjective-noun
+#     name), `sandbox` (auto | podman-rootless | podman-rootful | docker |
+#     bwrap | host; default = your configured default backend), `agent`
+#     (shell | an [[agents]]/[[tools]] name; default = shell), `base` (source
+#     ref; default = configured/auto base).
+#
+#   new-pane — spawn a pane in the active tab. params: `run` (command via your
+#     shell; omit for an interactive shell), `placement` (down | right; default
+#     right), `cwd` (worktree | active; default active).
+#
+# A scratch worktree on bwrap with a shell, no prompts:
+# [[actions]]
+# name = "scratch-shell"
+# key = "Alt N"
+# action = "new-worktree"
+# params = { sandbox = "bwrap", agent = "shell" }
+# menu = true
+#
+# A pane tailing the dev log, split to the right:
+# [[actions]]
+# name = "logs-pane"
+# key = "Alt L"
+# action = "new-pane"
+# params = { run = "tail -f log/dev.log", placement = "right" }
+
+# Keybind profiles: a named layer selected by `profile = "<name>"` (or the
+# SUPERZEJ_PROFILE env var / --profile flag). Applied *under* [keybinds], so a
+# global rebind still wins. `default_mode` sets the host mode on launch. The
+# names `vim`/`emacs` also start in the matching mode without an explicit
+# default_mode. For the full keybinding cheatsheet, focus the panel and press 9.
+# profile = "vim"
+# [profiles.vim]
+# default_mode = "vim-normal"
+# [profiles.vim.keybinds]
+# focus-down = "j"
+
+# Per-workspace overrides, keyed by repo slug (the workspace tab prefix). Applied
+# above [keybinds] but below a repo-root `.superzej.{toml,yaml,json}` overlay,
+# which may also carry its own [keybinds] table — the most specific layer wins.
+# [workspace.my-repo.keybinds]
+# new-worktree = "Ctrl w"
+
+# Per-program host-action overlays, keyed by the focused pane's program name.
+# These intercept *before* the active mode — useful for binding a host action
+# while a TUI like lazygit is focused.
+# [program_keybinds.lazygit]
+# palette = "Ctrl Alt k"
+
+# Per-program key-injection remaps: rewrite a chord into the program's own keys
+# (the right-hand side is sent to the pane) when it is not claimed as a host
+# action. Single keys only.
+# [program_remap.lazygit]
+# "Ctrl j" = "Enter"
+
+# Coding agents offered in the new-worktree picker.
+# Use "__shell__" for a plain login shell.
+#
+# `provider` (optional) tags an agent for client-side account switching
+# (CODEX_HOME / CLAUDE_CONFIG_DIR). When omitted, the provider is inferred from
+# the command's program basename (e.g. "codex …" → codex, "claude …" → claude).
+[[agents]]
+name = "claude"
+command = "claude"
+
+[[agents]]
+name = "aider"
+command = "aider --model sonnet"
+
+[[agents]]
+name = "shell"
+command = "__shell__"
+
+# Per-worktree tools (also bound to Alt-g/y/e//).
+[[tools]]
+name = "lazygit"
+command = "lazygit"
+
+[[tools]]
+name = "yazi"
+command = "yazi"
+
+# "editor" is special: with the default below, superzej resolves your editor
+# from $VISUAL/$EDITOR (falling back to vi). Graphical editors are detected by
+# name (code, cursor, zed, subl, gvim, …) and launched detached. Set an explicit
+# command here to override, e.g. command = "code ." or command = "hx .".
+[[tools]]
+name = "editor"
+command = "${EDITOR:-vi} ."
+
+[[tools]]
+name = "diff"
+command = "git diff"
+
+# Coding-agent subscription accounts (client-side account switching, item 656).
+# Keep N logins per provider (e.g. personal + work) and pick which one a newly
+# launched agent uses. superzej points the agent's credential-home env var
+# (CODEX_HOME for codex, CLAUDE_CONFIG_DIR for claude) at the chosen account on
+# launch — your real ~/.codex / ~/.claude is never modified, and a switch only
+# affects agents started *after* it (running ones keep their account).
+#
+# Switch with Ctrl+Alt+a (or the "Switch agent account" palette entry). The
+# picker also has "Add <provider> account…", which runs the provider's login in
+# the focused pane against a fresh superzej-managed dir.
+#
+# Omit `dir` to let superzej manage the dir under
+# $XDG_STATE_HOME/superzej/accounts/<provider>/<name>/ (then log in via the
+# picker); set `dir` to adopt an existing login dir.
+#
+# [[accounts]]
+# name = "personal"
+# provider = "codex"
+#
+# [[accounts]]
+# name = "work"
+# provider = "codex"
+# dir = "~/.codex-work"   # adopt an existing CODEX_HOME
+#
+# Make a repo default to an account (resolution: worktree override → this
+# workspace default → global active → the CLI's own default home):
+# [workspace.my-work-repo]
+# accounts = { codex = "work", claude = "work" }
+# Bind extra directories into the sandbox for THIS workspace only (same format
+# as [sandbox] mounts below). These extend the global mounts; the global list is
+# the "all workspaces" scope, this is the "per workspace" scope:
+# sandbox_mounts = ["~/datasets:ro", "/opt/toolchain"]
+
+# General tasks: surfaced in the Tests panel and, later, Problems/Timeline/Search
+# Everywhere. `kind = "test"` makes a task eligible for test discovery/runs.
+#
+# Tasks come from three sources:
+#   1. explicit [[tasks]] entries below;
+#   2. static discovery from existing runners/manifests (Justfile, Makefile,
+#      Taskfile.yml, package.json, Cargo.toml, go.mod, pyproject.toml,
+#      docker-compose.yml/compose.yaml, flake.nix, Procfile);
+#   3. semantic aliases such as dev/test/lint/build/up that resolve to the best
+#      explicit or discovered task in the current workspace/worktree.
+#
+# Discovery parses files only; superzej does not execute arbitrary project code
+# while switching worktrees. Commands run only after an explicit user action.
+#
+# [tasks.discovery]
+# enabled = true
+# providers = [
+#   "just",
+#   "make",
+#   "taskfile",
+#   "package-json",
+#   "cargo",
+#   "go",
+#   "python",
+#   "docker-compose",
+#   "nix",
+#   "procfile",
+# ]
+#
+# [tasks.aliases]
+# dev = ["just:dev", "npm:dev", "vite:dev", "cargo:run", "compose:up"]
+# test = ["just:test", "cargo:test", "npm:test", "pytest", "go:test", "nix:check"]
+# lint = ["just:lint", "cargo:clippy", "npm:lint", "ruff"]
+# build = ["just:build", "cargo:build", "npm:build", "nix:build"]
+# up = ["compose:up", "just:up"]
+# logs = ["compose:logs", "just:logs"]
+#
+# If no test task is configured, superzej falls back to the discovered `test`
+# alias/provider chain instead of requiring manual config.
+# [[tasks]]
+# name = "cargo test"
+# kind = "test"
+# command = "cargo"
+# args = ["test", "--workspace"]
+# cwd = "."
+# scope = "worktree"
+# matcher = "cargo-test"
+
+# [[tasks]]
+# name = "pytest"
+# kind = "test"
+# command = "pytest"
+# matcher = "pytest"
+
+# matcher selects how output is parsed. Built-in matchers:
+#   text:   cargo-test, go-test, pytest, jest, vitest, swift, ctest, elixir, …
+#   json:   nextest, dart, flutter, rspec
+#   report: junit (maven/gradle/sbt/php/deno), trx/nunit (.NET, Pester) — set
+#           report_glob to the file(s), e.g. report_glob = "target/**/*.xml"
+#   tap:    bats, prove (perl), busted (lua), pgTAP, node --test, anything TAP
+# [[tasks]]
+# name = "bats"
+# kind = "test"
+# command = "bats --formatter tap ."
+# matcher = "tap"
+
+# Worktree templates: reusable presets applied when creating a worktree (run
+# "New worktree from template…" from the command palette). A template can set
+# the base branch, branch prefix, sandbox backend, and agent (pre-selected in
+# the wizard), start a set of pins, and lay out the initial panes. The pane
+# layout is either a saved named layout (see "Save layout as…") via `layout`,
+# or the `commands` shorthand (an even row-split running each command; "" = a
+# plain shell). Pins are matched by name against [[pins]].
+# [[worktree_templates]]
+# name = "rust-feature"
+# base = "main"
+# branch_prefix = "feat/"
+# sandbox = "podman"
+# agent = "claude"
+# pins = ["logs"]
+# commands = ["nvim", "cargo watch -x test"]
+
+# Resource ceilings. superzej NEVER auto-runs tests; these only cap an *explicit*
+# run/discovery so a heavy suite can't pin the machine. When `systemd-run` is
+# available, runs go in a transient `--user --scope` with these caps; otherwise
+# they fall back to `nice`. Empty quota/mem = uncapped; test_nice = 0 disables.
+[limits]
+# tool_mem_max = "6G"        # memory cap for floating tool panes
+# tool_mem_swap_max = "1G"
+# test_cpu_quota = "150%"    # 150% = 1.5 cores for a test run; "" = uncapped
+# test_mem_max = "4G"        # memory cap for a test run; "" = uncapped
+# test_nice = 10             # niceness for test runs (0 disables)
+# test_max_parallel = 1      # max concurrent test/discovery jobs across worktrees
+# test_timeout_secs = 1800   # kill a wedged test run after N seconds (0 disables)
+# discover_timeout_secs = 45 # discovery should be instant; cap it so a held
+#                            #   cargo build-lock surfaces an error, not a spinner
+# isolated_target_dir = true # run superzej's cargo under <worktree>/target/superzej
+#                            #   so discovery/tests never block on the user's build lock
+
+# Aggregated notification bus. Events (PR state, agent done/failed, test
+# failures, log errors, worktree created) surface as sidebar badges + the
+# in-app inbox, and optionally as OS desktop notifications.
+#   desktop             — deliver OS toasts (Linux: notify-send, macOS: osascript)
+#   desktop_min_urgency — "low" | "normal" | "critical"; events below this
+#                         urgency stay in the inbox but never pop a toast
+[notifications]
+desktop = true
+desktop_min_urgency = "normal"
+# How non-agent pane exits join the attention model (item 524):
+#   "failures_and_tasks" — crashes/non-zero exits + clean non-shell task panes (default)
+#   "failures"           — only non-zero exits
+#   "all"                — every non-agent exit, including clean interactive shells
+#   "off"                — never route pane exits
+process_exit = "failures_and_tasks"
+
+# Per-kind attention priority. Three tiers drive the badges coherently:
+#   "alert"  — raises the red ⚑ flag (panel header + sidebar + statusbar) and,
+#              mapped to "critical" urgency, a desktop toast
+#   "notice" — counts toward the neutral "N unread" badge, never the red flag
+#   "info"   — inbox history only; never counted toward any badge
+# Defaults: failures (agent_failed, test_failed, log_error, process_failed) are
+# "alert"; lifecycle events (worktree_created, process_exited) are "info";
+# everything else (assigned, mentioned, status_changed, blocker_resolved,
+# pr_linked, overdue, pr_state_changed, agent_done) is "notice". Override any
+# kind below (keys are the snake_case kind names). Unknown keys/values are ignored.
+# [notifications.priority]
+# agent_done = "alert"        # promote: flag me when an agent finishes
+# worktree_created = "notice" # demote less: show in the unread count
+# pr_state_changed = "info"   # silence: inbox-only
+
+# Top pinned-program strip: a horizontal band above the center that renders
+# `location = "strip"` pins side by side (toggle Ctrl+Alt+t; grow/shrink at
+# runtime). `ratio` is the fraction of the center band it occupies.
+[strip]
+ratio = 0.2
+visible = true
+
+# The right accordion panel. Three top-level tabs (git/work/system) group
+# sections by concern; `[` / `]` cycle tabs, Alt+1/2/3 jump directly.
+# `sections` reorders sections across all tabs — any section left out is hidden;
+# an empty/absent list shows every section in the built-in order:
+#   Git tab:    changes · commits · branches · stash · files
+#   Work tab:   pr · issues · jobs · tests
+#   System tab: notifications · logs · sandbox · telemetry · keys
+# The old "prs" and "tasks" keys still work as aliases for "pr" and "jobs".
+# Unknown keys are ignored; reloads apply live.
+[panel]
+# sections = ["changes", "pr", "files", "tests", "telemetry", "keys"]
+
+# Search Everywhere palette (Ctrl+Space). Mode prefixes:
+#   (none) = All (actions + recent files)   > = Files   / = Content
+#   @      = Git refs/commits/stashes       # = Symbols
+# Tab cycles modes; Esc closes.
+[palette]
+# content_max_results = 500    # max grep matches before streaming stops
+# file_max_results    = 200    # max file-path fuzzy results
+# symbol_max_results  = 100    # max symbol grep results
+# content_search_hidden = false  # include dotfiles / .gitignored paths
+
+# Language-server integration: symbol search, go-to-definition, hover, and
+# diagnostics. Servers start lazily on first use and stay warm per worktree.
+# Built-in defaults (used only when found on PATH): rust-analyzer,
+# typescript-language-server, pyright-langserver, gopls. Falls back to the
+# tree-sitter / regex providers when no server is available.
+[lsp]
+# enabled = true               # master switch
+# hover   = true               # show hover / signature previews
+#
+# Per-language server overrides. `lang` is one of rust / typescript / tsx /
+# javascript / python / go. `command = ""` disables that language.
+# [[lsp.servers]]
+# lang    = "rust"
+# command = "rust-analyzer"
+# args    = []
+
+# Pinned programs: summoned from anywhere with Alt-1..9 (in registration order)
+# or the tabbar's pin chips. Pins run on the host (no sandbox) and are managed by
+# a supervisor (eager start, restart policy, health, survive workspace switches).
+#
+#   location = "tab"    opens/focuses a dedicated `pin:<name>` tab (default)
+#   location = "layout" adds a tiled pane to the focused tab's active layout
+#   location = "strip"  renders the pin in the top strip
+#   location = "float"  opens the pin as a floating scratch overlay
+#   scope    = "global" (default) | "workspace"   (workspace = which workspace)
+#   start    = "lazy" (default) | "eager"         (eager = launch at session start)
+#   restart  = "never" (default) | "always" | "on-failure"
+#   singleton = true (default)                    (false = allow multiple instances)
+#
+# Optional: `args` (explicit argv, skips the shell), `env` (per-program vars),
+# `label` (strip/chip text), `ratio` (this pin's weight in the strip). For layout/
+# strip pins, omitted cwd means the focused repo/worktree if resolvable; for tab/
+# float pins, omitted cwd means $HOME.
+# [[pins]]
+# name = "aerc"
+# command = "aerc"
+# location = "float"
+#
+# [[pins]]
+# name = "logs"
+# command = "journalctl -f"
+# location = "strip"
+# start = "eager"
+# restart = "always"
+# label = "syslog"
+# ratio = 1.5
+# cwd = "~"
+# env = { RUST_LOG = "info" }
+
+# ── Sandbox / containers ──────────────────────────────────────────────────────
+# Run each worktree's interactive process (agent/shell/tools) inside a
+# container/sandbox. The git worktree stays on the host and is bind-mounted in
+# at its real path, so the sidebar/panel/PR (which read git host-side) keep
+# working while the agent/shell only sees the worktree and its git metadata.
+#
+# Backend comparison (for NixOS / host-toolchain users):
+#   bwrap           — bubblewrap: no daemon, no image, sub-millisecond spawn.
+#                     Exposes the host filesystem selectively; your Nix-store
+#                     shell and tools are available without any extra mounts.
+#                     Best default for NixOS users who just want containment.
+#   podman-rootless — OCI image (Debian, Ubuntu, custom). Reproducible env,
+#                     persistent named container, but ~50-200 ms per spawn and
+#                     the host shell path (/run/current-system/sw/bin/zsh)
+#                     doesn't exist inside the image — superzej probes for
+#                     zsh/bash/sh at runtime and uses the first one found.
+#   host            — no sandbox; process runs directly in the worktree dir.
+#
+# Per-repo overrides go in `.superzej.{toml,yaml,yml,json}` at the repo root
+# under a `[sandbox]` table — only the keys you set override these globals.
+[sandbox]
+enabled = true
+
+# ── Hardening preset ─────────────────────────────────────────────────────────
+# A named bundle of OS-isolation knobs applied to the worktree's container.
+# Selectable per level: here (global), per workspace/repo via a `.superzej.toml`
+# overlay, or the SUPERZEJ_SANDBOX_PROFILE env var.
+#   open     — no hardening; pre-preset behavior (escape hatch / back-compat).
+#   hardened — read-only root + no-new-privileges + a process (pids) cap, with
+#              networking and Linux capabilities left intact so interactive dev
+#              (fetch/clone/build, debuggers, ping) keeps working. The default.
+#   sealed   — full lockdown: network=none, read-only root, drop ALL caps,
+#              no-new-privileges, tighter pids cap. For untrusted workloads.
+# (Writable under read-only root: the worktree, build caches, and a tmpfs /tmp.)
+profile = "hardened"
+
+# Hardening preset for the embedded agent's tool container. When it differs from
+# `profile`, the agent runs in its OWN separate, more-locked-down container
+# (named `superzej-<slug>-szagent`); when equal, it reuses the worktree
+# container. Defaults to `sealed` so agent-run commands have no network egress.
+agent_profile = "sealed"
+
+# ── Backend selection ────────────────────────────────────────────────────────
+# Which containment backend to use. "auto" walks backend_chain until one works.
+#   auto | podman-rootless | podman-rootful | docker | bwrap | bubblewrap |
+#   systemd | systemd-run | apple | container | wsl | none | host
+# NixOS tip: set "bwrap" here to skip the podman probes and get instant panes.
+backend = "auto"
+
+# Pre-selected backend in the new-worktree picker ("auto" = use backend_chain).
+default_backend = "auto"
+
+# Probe order for "auto". First backend that is installed and usable wins.
+# "none"/"host" anywhere in the list = uncontained fallback from that point on.
+# NixOS users: move "bwrap" first if podman isn't installed.
+backend_chain = ["podman-rootless", "podman-rootful", "docker", "bwrap", "host"]
+
+# ── OCI image (podman / docker only) ────────────────────────────────────────
+# Empty  = superzej's built-in default (debian:stable).
+# Named  = pulled on first use (e.g. "ghcr.io/org/devenv:latest").
+# bwrap / systemd ignore this — they use the host filesystem directly.
+image = ""
+
+# Docker Compose file to bring up before the first pane in a workspace.
+# The named container is expected to be running when panes are spawned.
+# compose = "docker-compose.yml"
+
+# ── Network ──────────────────────────────────────────────────────────────────
+# nat  — egress only, no inbound ports. Required for API-backed agents.
+# host — share the host network stack (no isolation; fastest for local services).
+# none — no network (offline/air-gapped agents).
+network = "nat"
+
+# Host ports to publish from the container: ["host_port:container_port", ...].
+# E.g. expose a dev server started by the agent on port 3000:
+# ports = ["3000:3000", "8080:8080"]
+ports = []
+
+# ── Filesystem ───────────────────────────────────────────────────────────────
+# How much of the host filesystem the sandbox can see:
+#   worktree            — only the worktree dir (most isolated).
+#   worktree_plus_caches — worktree + auto-detected language build caches
+#                          (~/.cargo, ~/.npm, ~/.cache/pip, etc.). Default.
+#   all / host          — entire host filesystem (read-write, least isolated).
+#   none                — no filesystem access beyond the container root.
+#   custom              — only the explicit mounts list below.
+file_access = "worktree_plus_caches"
+
+# Mount common language build caches from the host when file_access is
+# worktree_plus_caches. Disable to get a fully cold cache on every pane.
+auto_caches = true
+
+# Extra bind mounts beyond what file_access provides.
+# Formats: "host_path"              → rw at same path inside container
+#          "host_path:ro"           → read-only at same path
+#          "host_path:dest"         → rw at dest inside container
+#          "host_path:dest:ro"      → read-only at dest
+#          "host_path:dest:cache"   → read-write cache (shown in sandbox summary)
+# ~ is expanded to $HOME.
+# This is the GLOBAL ("all workspaces") scope for default bind dirs. For a
+# single workspace, add `sandbox_mounts` under `[workspace.<slug>]` (see above);
+# those extend this list. A repo-root `.superzej.toml` `[sandbox] mounts` can
+# also override per repo.
+mounts = ["~/.gitconfig:ro"]
+
+# ── GPU passthrough (OCI only) ───────────────────────────────────────────────
+# Expose a GPU device to the container. Values depend on the runtime:
+#   "all"             — all GPUs (--gpus all / --device nvidia.com/gpu=all)
+#   "/dev/dri/card0"  — specific device path
+# Leave commented to disable GPU passthrough.
+# gpu = "all"
+
+# ── Environment ──────────────────────────────────────────────────────────────
+# Host env vars forwarded into the sandbox. Extend this list if your agent
+# needs additional credentials or toolchain vars.
+env_passthrough = [
+  "SSH_AUTH_SOCK",      # SSH key forwarding (needed for git push inside OCI)
+  "GH_TOKEN",           # GitHub CLI auth
+  "GITHUB_TOKEN",       # GitHub Actions / API compat alias
+  "ANTHROPIC_API_KEY",
+  "TERM",
+  "COLORTERM",
+]
+
+# ── Shell ─────────────────────────────────────────────────────────────────────
+# Shell for plain "shell" panes inside the sandbox.
+# ""   = auto: for OCI containers superzej probes zsh → bash → sh at runtime
+#        so it works even when the image doesn't have the host shell installed
+#        (e.g. a Debian image has bash but not /run/current-system/sw/bin/zsh).
+#        For bwrap / host the host's $SHELL path is used directly.
+# Set an explicit name ("bash") or absolute path ("/usr/bin/zsh") to pin one.
+shell = ""
+
+# ── Init script ───────────────────────────────────────────────────────────────
+# POSIX sh snippet run inside the sandbox before each agent/shell starts.
+# Useful for first-run tool installation, env setup, or container git config.
+# init_script = "mise install 2>/dev/null || true"
+init_script = ""
+
+# Wrap the inner command in `devenv shell --`. Auto-enabled if devenv.nix is
+# present in the worktree root and the `devenv` binary is on PATH.
+devenv = false
+
+# ── Missing backend behaviour ─────────────────────────────────────────────────
+# What to do when no backend in backend_chain is available:
+#   warn   — open the pane on the host and show a banner (default).
+#   prompt — ask before falling back to host.
+#   fail   — refuse to open the pane.
+on_missing = "warn"
+
+# ── Resource limits (OCI only) ────────────────────────────────────────────────
+# Cap CPU and memory for the container (Docker/Podman units).
+#   cpu    — fractional cores: "0.5" = half a core, "2" = two cores.
+#   memory — bytes with suffix: "512m", "2g".
+# Both default to unlimited when unset.
+[sandbox.limits]
+# cpu    = "2"
+# memory = "4g"
+
+# ── Named volumes (OCI only) ──────────────────────────────────────────────────
+# Persistent volumes that survive container recreations.
+# Key = volume name (created by podman/docker if absent), value = mount point
+# inside the container. Useful for package caches that shouldn't cold-start
+# on every `just build`.
+# [sandbox.volumes]
+# cargo-registry = "/root/.cargo/registry"
+# node-modules   = "/root/.npm"
+# pip-cache      = "/root/.cache/pip"
+
+# ── Remote worktrees ──────────────────────────────────────────────────────────
+# Run worktrees on a remote machine over SSH. Leave host empty for local use.
+# Control-plane operations (git reads, container lifecycle) always use ssh;
+# the interactive pane uses mosh (resilient to network changes) by default.
+[sandbox.remote]
+# Remote host. Accepts "user@host", bare hostname (uses $USER), or an SSH
+# alias from ~/.ssh/config. Empty = local only (default).
+host = ""
+port = 22
+# mosh — UDP tunnel; survives IP changes and flaky connections. Requires the
+#         mosh package on both the local machine and the remote host.
+# ssh  — plain SSH pty; works everywhere but drops on network interruption.
+transport = "mosh"
+# remote     — worktrees live on the remote host under remote_dir (default).
+# sshfs      — worktrees are sshfs-mounted locally; slower but local toolchain.
+# local_exec — experimental: agent runs locally against the remote filesystem.
+mode = "remote"
+# Where worktrees are stored on the remote host.
+remote_dir = "~/superzej-worktrees"
+# Forward the local SSH agent (ssh -A) so git push uses your local keys.
+# Disable if the remote host has its own deploy key.
+forward_agent = true
+# ── LLM proxy (group U/V) ──────────────────────────────────────────────────
+# The AI-traffic chokepoint daemon (binary `szproxy`). The shell never hard-
+# depends on this — AI is strictly additive — so it is OFF by default. When
+# enabled, the host launches szproxy and agents point OPENAI_BASE_URL /
+# ANTHROPIC_BASE_URL at `listen`.
+[llm_proxy]
+enabled = false
+# Address the daemon binds (and agents target).
+listen = "127.0.0.1:8383"
+# Backend selection: "sequential" (ordered failover, the M1 behavior),
+# "load_balanced", or "speculative" (cascade — reserved for the AR work).
+routing = "sequential"
+# On a budget-cap breach: refuse the request (true) or downgrade to a cheaper
+# tier (false). The kill-switch always refuses regardless of this setting.
+refuse_on_breach = true
+# Path to the proxy's routes document (JSON: { "routes": [ { "name", "backends":
+# [ { "name", "base_url", "model", "api_key_env", "anthropic", "rpm", "burst",
+# "context_limit", "defaults" } ] } ] }). Passed to szproxy as SZPROXY_CONFIG.
+config_path = ""
+# Streaming tunables (seconds). first_byte_timeout: wait for a backend's first
+# usable token before falling through; idle_timeout: kill a stream gone silent
+# this long; heartbeat: keep-alive cadence during upstream silence.
+first_byte_timeout_secs = 45
+idle_timeout_secs = 120
+heartbeat_secs = 10
+# In-flight token reduction: compress noisy tool/command output before it's sent
+# upstream (strip ANSI, fold progress redraws, collapse blank/repeated lines, and
+# at higher levels minify JSON / truncate huge blocks). Off by default — only
+# `tool`-role content is touched, never the system prompt, so prompt caching
+# holds. Levels: off | conservative | balanced | aggressive.
+token_reduction = false
+token_reduction_level = "conservative"

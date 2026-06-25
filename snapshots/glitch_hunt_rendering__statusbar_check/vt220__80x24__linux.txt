@@ -1,0 +1,30 @@
+ ◆ superzej v0.1.0   dashboard   work   comms   chat 34.3/94G · 󰾲 30% · 󰂄 100% · Fri Jun 19 · 22:56
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ WORKSPACES           REGCLAUDE ▸ home · Sandbox: None   git  work  system
+                     ╭─ bwrap · home ─────────────────╮  —
+ ▾ regclaude         │blake@ws-3:~/ >                 │ ────────────────────────────────────────────
+   ● home            │                                │  1 changes                            clean
+                     │                                │
+                     │                                │   working tree clean
+                     │                                │
+                     │                                │  2 commits                                —
+                     │                                │
+                     │                                │  3 branches                               —
+                     │                                │
+                     │                                │  4 stash                                  —
+                     │                                │
+                     ╰────────────────────────────────╯  5 files                              0 loc
+                     ╭─ bwrap · home ─────────────────╮
+                     │n%                              │
+                     │blake@ws-3:~/ > n               │
+                     │                                │
+                     │                                │
+                     │                                │
+                     │                                │
+                     │                                │
+                     │                                │
+                     │                                │
+                     │                                │
+                     │                                │
+                     ╰────────────────────────────────╯
+  N   Ctrl-Left pane   Alt-Left tab   Alt-Up worktree   Alt-x close tab   Alt-p smart split … 0 LOC
