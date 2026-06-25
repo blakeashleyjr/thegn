@@ -749,7 +749,6 @@ fn draw_center_tabs(surface: &mut Surface, strip: Rect, model: &FrameModel) {
             let avail = chips_end.saturating_sub(x);
             if avail >= badge.chars().count() {
                 draw_text(surface, x, strip.y, &badge, col(S::Accent), bg, avail);
-                x += badge.chars().count();
             }
         }
     }
@@ -1551,10 +1550,12 @@ fn compose_sidebar_row(
     }
 
     // Agent glyph (item 19) sits just after the label.
-    if let Some(backend) = &row.sandbox_backend {
-        if !backend.is_empty() && backend != "none" && backend != "host" {
-            text.push_str(&format!(" ({backend})"));
-        }
+    if let Some(backend) = &row.sandbox_backend
+        && !backend.is_empty()
+        && backend != "none"
+        && backend != "host"
+    {
+        text.push_str(&format!(" ({backend})"));
     }
 
     if let Some(agent) = &row.agent {

@@ -1160,7 +1160,7 @@ impl Default for JiraConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct AppsConfig {
-    /// Tab focused on startup. Valid ids: "dashboard", "work", "chat", "agent".
+    /// Tab focused on startup. Valid ids: "work".
     pub default_tab: String,
     /// Ordered top-level tab ids. Unknown ids are ignored; missing built-ins are appended.
     pub tab_order: Vec<String>,
@@ -1170,18 +1170,13 @@ impl Default for AppsConfig {
     fn default() -> Self {
         AppsConfig {
             default_tab: "work".into(),
-            tab_order: vec![
-                "work".into(),
-                "dashboard".into(),
-                "chat".into(),
-                "agent".into(),
-            ],
+            tab_order: vec!["work".into()],
         }
     }
 }
 
 impl AppsConfig {
-    pub const BUILTIN_TABS: [&'static str; 4] = ["dashboard", "work", "chat", "agent"];
+    pub const BUILTIN_TABS: [&'static str; 1] = ["work"];
 
     pub fn effective_tab_order(&self) -> Vec<String> {
         let mut out = Vec::new();
@@ -1208,28 +1203,6 @@ impl AppsConfig {
                 .into_iter()
                 .next()
                 .unwrap_or_else(|| "work".into())
-        }
-    }
-}
-
-/// `[dashboard]` — the dashboard app's live refresh and widgets.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(default)]
-pub struct DashboardConfig {
-    /// Seconds between refreshes of the dashboard app.
-    pub interval_secs: u64,
-    /// Poll Hacker News top stories for the dashboard widget.
-    pub hacker_news: bool,
-    /// Number of Hacker News stories to show/fetch.
-    pub hacker_news_limit: usize,
-}
-
-impl Default for DashboardConfig {
-    fn default() -> Self {
-        DashboardConfig {
-            interval_secs: 4,
-            hacker_news: true,
-            hacker_news_limit: 5,
         }
     }
 }
@@ -2001,7 +1974,6 @@ pub struct Config {
     pub bars: BarsConfig,
     pub pr: PrConfig,
     pub issues: IssuesConfig,
-    pub dashboard: DashboardConfig,
     pub watch: WatchConfig,
     pub log: LogConfig,
     pub sandbox: SandboxConfig,
@@ -2073,7 +2045,6 @@ impl Default for Config {
             bars: BarsConfig::default(),
             pr: PrConfig::default(),
             issues: IssuesConfig::default(),
-            dashboard: DashboardConfig::default(),
             watch: WatchConfig::default(),
             log: LogConfig::default(),
             sandbox: SandboxConfig::default(),
@@ -2142,7 +2113,6 @@ pub struct ConfigOverlay {
     pub focus_border: Option<String>,
     pub frame_border: Option<String>,
     pub pr_ttl_secs: Option<u64>,
-    pub dashboard_interval_secs: Option<u64>,
     pub watch_pr_interval_secs: Option<u64>,
     pub metrics_interval_secs: Option<f64>,
     pub metrics_timeout_ms: Option<u64>,
@@ -2183,7 +2153,6 @@ impl ConfigOverlay {
             base.theme.colors.border = self.frame_border;
         }
         set!(base.pr.ttl_secs, self.pr_ttl_secs);
-        set!(base.dashboard.interval_secs, self.dashboard_interval_secs);
         set!(base.watch.pr_interval_secs, self.watch_pr_interval_secs);
         set!(base.metrics.interval_secs, self.metrics_interval_secs);
         set!(base.metrics.timeout_ms, self.metrics_timeout_ms);
@@ -2265,13 +2234,6 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     } else if let Some(v) = env.get("SZ_PR_TTL") {
         config_warn("SZ_PR_TTL is deprecated; use SUPERZEJ_PR_TTL");
         o.pr_ttl_secs = parse_num(v, "SZ_PR_TTL");
-    }
-    // [dashboard] — SUPERZEJ_DASHBOARD_INTERVAL, deprecated SZ_DASH_INTERVAL.
-    if let Some(v) = env.get("SUPERZEJ_DASHBOARD_INTERVAL") {
-        o.dashboard_interval_secs = parse_num(v, "SUPERZEJ_DASHBOARD_INTERVAL");
-    } else if let Some(v) = env.get("SZ_DASH_INTERVAL") {
-        config_warn("SZ_DASH_INTERVAL is deprecated; use SUPERZEJ_DASHBOARD_INTERVAL");
-        o.dashboard_interval_secs = parse_num(v, "SZ_DASH_INTERVAL");
     }
     if let Some(v) = env.get("SUPERZEJ_WATCH_PR_INTERVAL") {
         o.watch_pr_interval_secs = parse_num(v, "SUPERZEJ_WATCH_PR_INTERVAL");
@@ -2523,8 +2485,6 @@ impl Config {
         self.metrics.interval_secs = self.metrics.interval_secs.max(1.0);
         self.metrics.timeout_ms = self.metrics.timeout_ms.clamp(100, 30_000);
         self.metrics.max_body_bytes = self.metrics.max_body_bytes.max(1);
-        self.dashboard.interval_secs = self.dashboard.interval_secs.max(1);
-        self.dashboard.hacker_news_limit = self.dashboard.hacker_news_limit.clamp(1, 20);
     }
 
     pub fn agent_command(&self, name: &str) -> Option<&str> {
@@ -2788,7 +2748,6 @@ impl Config {
                 slot.clone().unwrap_or_default()
             }
             "pr.ttl_secs" => self.pr.ttl_secs.to_string(),
-            "dashboard.interval_secs" => self.dashboard.interval_secs.to_string(),
             "watch.pr_interval_secs" => self.watch.pr_interval_secs.to_string(),
             "metrics.interval_secs" => self.metrics.interval_secs.to_string(),
             "metrics.timeout_ms" => self.metrics.timeout_ms.to_string(),
@@ -2954,30 +2913,25 @@ mod tests {
     fn app_tab_config_defaults_to_work_first_and_default() {
         let cfg = Config::default();
         assert_eq!(cfg.apps.default_tab, "work");
-        assert_eq!(
-            cfg.apps.effective_tab_order(),
-            vec!["work", "dashboard", "chat", "agent"]
-        );
+        assert_eq!(cfg.apps.effective_tab_order(), vec!["work"]);
     }
 
     #[test]
     fn app_tab_config_honors_file_env_and_cli_order() {
         let mut env = MapEnv::default();
-        // `comms` is no longer a built-in id; it must be filtered out.
+        // Only `work` is a built-in id today; every other requested id is
+        // filtered out.
         env.0.insert(
             "SUPERZEJ_APPS_TAB_ORDER".into(),
-            "chat,work,dashboard,comms".into(),
+            "comms,work,dashboard".into(),
         );
         env.0
-            .insert("SUPERZEJ_APPS_DEFAULT_TAB".into(), "chat".into());
+            .insert("SUPERZEJ_APPS_DEFAULT_TAB".into(), "work".into());
         let flags = vec!["apps.default_tab=work".to_string()];
         let cfg = Config::load_layered(&env, &flags, None);
 
         assert_eq!(cfg.apps.default_tab, "work");
-        assert_eq!(
-            cfg.apps.effective_tab_order(),
-            vec!["chat", "work", "dashboard", "agent"]
-        );
+        assert_eq!(cfg.apps.effective_tab_order(), vec!["work"]);
     }
 
     #[test]
@@ -3965,7 +3919,6 @@ command = "git notes add {{.SelectedCommit.Sha}}"
             ("SUPERZEJ_PROFILE", "vim"),
             ("SUPERZEJ_THEME_ACCENT", "#abcdef"),
             ("SUPERZEJ_PR_TTL", "11"),
-            ("SUPERZEJ_DASHBOARD_INTERVAL", "6"),
             ("SUPERZEJ_WATCH_PR_INTERVAL", "13"),
             ("SUPERZEJ_METRICS_INTERVAL_SECS", "3.5"),
             ("SUPERZEJ_METRICS_TIMEOUT_MS", "750"),
@@ -3996,7 +3949,6 @@ command = "git notes add {{.SelectedCommit.Sha}}"
         assert_eq!(c.profile, "vim");
         assert_eq!(c.theme.accent, "#abcdef");
         assert_eq!(c.pr.ttl_secs, 11);
-        assert_eq!(c.dashboard.interval_secs, 6);
         assert_eq!(c.watch.pr_interval_secs, 13);
         assert_eq!(c.metrics.interval_secs, 3.5);
         assert_eq!(c.metrics.timeout_ms, 750);
@@ -4051,7 +4003,6 @@ command = "git notes add {{.SelectedCommit.Sha}}"
             "repo_roots",
             "theme.accent",
             "pr.ttl_secs",
-            "dashboard.interval_secs",
             "watch.pr_interval_secs",
             "metrics.interval_secs",
             "metrics.timeout_ms",
@@ -4788,14 +4739,9 @@ forward_agent = false
         assert_eq!(PrConfig::default().ttl_secs, 30);
         assert_eq!(WatchConfig::default().pr_interval_secs, 20);
 
-        let d = DashboardConfig::default();
-        assert_eq!(d.interval_secs, 4);
-        assert!(d.hacker_news);
-        assert_eq!(d.hacker_news_limit, 5);
-
         let a = AppsConfig::default();
         assert_eq!(a.default_tab, "work");
-        assert_eq!(a.tab_order, vec!["work", "dashboard", "chat", "agent"]);
+        assert_eq!(a.tab_order, vec!["work"]);
 
         let n = NotificationsConfig::default();
         assert!(n.desktop);
@@ -4993,21 +4939,17 @@ forward_agent = false
     #[test]
     fn effective_tab_order_dedups_and_appends_missing() {
         let a = AppsConfig {
-            // duplicate, an unknown id, and only two of the three built-ins.
-            default_tab: "chat".into(),
+            // duplicates, unknown ids, and a whitespace-padded built-in.
+            default_tab: "work".into(),
             tab_order: vec![
-                "chat".into(),
-                "chat".into(),
                 "bogus".into(),
+                "comms".into(),
                 " work ".into(),
+                "work".into(),
             ],
         };
-        // dedup keeps first occurrence, unknown dropped, trimmed, missing
-        // built-ins (dashboard, agent) appended in BUILTIN_TABS order.
-        assert_eq!(
-            a.effective_tab_order(),
-            vec!["chat", "work", "dashboard", "agent"]
-        );
+        // unknown ids dropped, trimmed, deduped; the only built-in is `work`.
+        assert_eq!(a.effective_tab_order(), vec!["work"]);
     }
 
     #[test]
@@ -5016,25 +4958,22 @@ forward_agent = false
             default_tab: "work".into(),
             tab_order: Vec::new(),
         };
-        assert_eq!(
-            a.effective_tab_order(),
-            vec!["dashboard", "work", "chat", "agent"]
-        );
+        assert_eq!(a.effective_tab_order(), vec!["work"]);
     }
 
     #[test]
     fn normalized_default_tab_present_and_falls_back_to_first() {
         let present = AppsConfig {
-            default_tab: " dashboard ".into(),
-            tab_order: vec!["dashboard".into(), "work".into()],
+            default_tab: " work ".into(),
+            tab_order: vec!["work".into()],
         };
-        assert_eq!(present.normalized_default_tab(), "dashboard");
-        // Unknown default → first of the effective order.
+        assert_eq!(present.normalized_default_tab(), "work");
+        // Unknown default → first of the effective order (`work`).
         let bad = AppsConfig {
             default_tab: "nonexistent".into(),
-            tab_order: vec!["chat".into(), "work".into()],
+            tab_order: vec!["comms".into(), "work".into()],
         };
-        assert_eq!(bad.normalized_default_tab(), "chat");
+        assert_eq!(bad.normalized_default_tab(), "work");
     }
 
     // ---- ConfigOverlay::apply field-by-field ----
@@ -5056,7 +4995,6 @@ forward_agent = false
             focus_border: Some("#222222".into()),
             frame_border: Some("#333333".into()),
             pr_ttl_secs: Some(99),
-            dashboard_interval_secs: Some(42),
             watch_pr_interval_secs: Some(43),
             metrics_interval_secs: Some(11.0),
             metrics_timeout_ms: Some(1234),
@@ -5090,7 +5028,6 @@ forward_agent = false
         assert_eq!(cfg.theme.focus_border, "#222222");
         assert_eq!(cfg.theme.colors.border.as_deref(), Some("#333333"));
         assert_eq!(cfg.pr.ttl_secs, 99);
-        assert_eq!(cfg.dashboard.interval_secs, 42);
         assert_eq!(cfg.watch.pr_interval_secs, 43);
         assert_eq!(cfg.metrics.interval_secs, 11.0);
         assert_eq!(cfg.metrics.timeout_ms, 1234);
@@ -5201,32 +5138,19 @@ forward_agent = false
     // ---- env_overlay: remaining branches ----
 
     #[test]
-    fn env_overlay_apps_tab_order_and_deprecated_dash_interval() {
-        let env = map_env(&[
-            ("SUPERZEJ_APPS_TAB_ORDER", " chat , work ,, dashboard "),
-            ("SZ_DASH_INTERVAL", "8"),
-        ]);
+    fn env_overlay_apps_tab_order_parses_csv() {
+        let env = map_env(&[("SUPERZEJ_APPS_TAB_ORDER", " work , foo ,, bar ")]);
         let o = env_overlay(&env);
-        // parse_list trims and drops empties.
+        // parse_list trims and drops empties (validity filtering happens later
+        // in effective_tab_order).
         assert_eq!(
             o.apps_tab_order,
             Some(vec![
-                "chat".to_string(),
                 "work".to_string(),
-                "dashboard".to_string()
+                "foo".to_string(),
+                "bar".to_string()
             ])
         );
-        // Deprecated SZ_DASH_INTERVAL is honored as a fallback.
-        assert_eq!(o.dashboard_interval_secs, Some(8));
-    }
-
-    #[test]
-    fn env_overlay_canonical_dashboard_interval_wins() {
-        let env = map_env(&[
-            ("SUPERZEJ_DASHBOARD_INTERVAL", "5"),
-            ("SZ_DASH_INTERVAL", "8"),
-        ]);
-        assert_eq!(env_overlay(&env).dashboard_interval_secs, Some(5));
     }
 
     #[test]
@@ -5325,16 +5249,6 @@ forward_agent = false
     }
 
     #[test]
-    fn post_process_keeps_user_agents_and_clamps_dashboard() {
-        let env = map_env(&[("SUPERZEJ_DASHBOARD_INTERVAL", "0")]);
-        let flags = vec!["dashboard.hacker_news_limit=999".to_string()];
-        let c = Config::load_layered(&env, &flags, None);
-        // interval clamped to >=1, hacker_news_limit clamped to <=20.
-        assert_eq!(c.dashboard.interval_secs, 1);
-        assert_eq!(c.dashboard.hacker_news_limit, 20);
-    }
-
-    #[test]
     fn post_process_expands_pin_cwd_tilde() {
         let dir = tmpdir("ppcwd");
         let f = dir.join("c.toml");
@@ -5351,9 +5265,8 @@ forward_agent = false
     #[test]
     fn apply_override_str_apps_tab_order_splits_csv() {
         let mut cfg = Config::default();
-        Config::apply_override_str(&mut cfg, "apps.tab_order", " chat , work ,, dashboard ")
-            .unwrap();
-        assert_eq!(cfg.apps.tab_order, vec!["chat", "work", "dashboard"]);
+        Config::apply_override_str(&mut cfg, "apps.tab_order", " work , foo ,, bar ").unwrap();
+        assert_eq!(cfg.apps.tab_order, vec!["work", "foo", "bar"]);
     }
 
     #[test]

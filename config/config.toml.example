@@ -186,19 +186,12 @@ prewarm = false
 [pr]
 ttl_secs = 30          # cache TTL before a live `gh` re-fetch (SUPERZEJ_PR_TTL)
 
-# Top-level app tab strip. Defaults make the dashboard the first and focused tab.
-# Valid ids: "dashboard", "work", "chat", "agent".
-# "agent" is the embedded coding-agent harness (termite-agent); it routes its
-# model traffic through [llm_proxy] when that is enabled.
+# Top-level app tab strip. Only "work" (your worktree IDE) is available today;
+# unknown ids are ignored.
+# Valid ids: "work".
 [apps]
 default_tab = "work" # initial tab (SUPERZEJ_APPS_DEFAULT_TAB); "work" = your worktree
-tab_order = ["work", "dashboard", "chat", "agent"]
-
-# The terminal-native dashboard app.
-[dashboard]
-interval_secs = 4        # refresh cadence (SUPERZEJ_DASHBOARD_INTERVAL)
-hacker_news = true       # poll Hacker News top stories for the HN widget
-hacker_news_limit = 5    # stories fetched/rendered (clamped 1..20)
+tab_order = ["work"]
 
 # The per-session daemon that pushes live diff/PR updates to the panel.
 [watch]

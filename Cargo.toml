@@ -4,7 +4,6 @@ members = [
   "crates/superzej-core",
   "crates/superzej-svc",
   "crates/superzej-host",
-  "crates/superzej-dashboard",
   "crates/superzej-proxy",
   "crates/sz-kit",
 ]
@@ -14,14 +13,6 @@ members = [
 # crates via explicit path deps — that resolves against each submodule's own
 # [workspace], not this one.)
 exclude = ["apps", "vendor"]
-
-# The app submodules consume sz-kit as a git dependency on THIS repo (so they
-# also build standalone). When building embedded, redirect that git source to
-# the in-tree crate, so one sz-kit/ratatui version compiles across host + apps
-# and no network fetch happens. Standalone app builds (cloned alone) resolve
-# the real git tag instead.
-[patch."ssh://git@github.com/blakeashleyjr/superzej.git"]
-sz-kit = { path = "crates/sz-kit" }
 
 [workspace.package]
 version = "0.1.0"
