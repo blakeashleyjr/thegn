@@ -286,10 +286,17 @@ pub struct FrameModel {
     /// per-worktree git/agent/activity status.
     pub sidebar_workspaces: Vec<(String, String, String, String)>,
     pub sidebar_status: crate::sidebar::SidebarStatus,
+    /// OSC window title per worktree path (the active tab's focused pane).
+    /// Collected on the main loop from the live panes table — NOT on the
+    /// hydration thread, which has no pane access — and used to compose the
+    /// dynamic sidebar row title. Re-filled each frame before rendering.
+    pub sidebar_window_titles: std::collections::BTreeMap<String, String>,
     /// Worktrees registered for workspaces NOT loaded in the session (their
     /// sidebar rows switch workspace on activate).
     pub sidebar_db_worktrees: Vec<crate::sidebar::DbWorktree>,
-    /// Structured Diff/PR/Checks payload for the right panel.
+    /// All folders for loaded workspaces, straight from DB, used by row builder.
+    pub sidebar_db_folders: Vec<superzej_core::models::FolderRow>,
+    /// True if the last input was mouse activity.
     pub panel: crate::panel::PanelData,
     /// True when the right panel currently owns keyboard focus.
     pub panel_focused: bool,
@@ -1293,7 +1300,12 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             draw_text(surface, rect.x, y, "\u{2590}", col(S::Focus), bg, 1);
         }
 
-        let composed = compose_sidebar_row(row);
+        let window_title = row
+            .worktree_path
+            .as_deref()
+            .and_then(|p| model.sidebar_window_titles.get(p))
+            .map(String::as_str);
+        let composed = compose_sidebar_row(row, window_title);
         let fg = if row.active {
             col(S::Focus)
         } else if selected {
@@ -1494,12 +1506,27 @@ struct Badge {
     color: ColorAttribute,
 }
 
-fn compose_sidebar_row(row: &crate::sidebar::SidebarRow) -> ComposedRow {
+fn compose_sidebar_row(
+    row: &crate::sidebar::SidebarRow,
+    window_title: Option<&str>,
+) -> ComposedRow {
     use crate::sidebar::RowKind;
     let mut text = String::new();
     let mut activity_col = None;
 
     match row.kind {
+        RowKind::Folder => {
+            text.push_str("  ");
+            let caret = if row.collapsed {
+                "\u{25b8}"
+            } else {
+                "\u{25be}"
+            };
+            text.push_str(caret);
+            text.push(' ');
+            text.push_str("\u{1f4c2} "); // open folder glyph
+            text.push_str(&row.label);
+        }
         RowKind::Workspace => {
             let caret = if row.collapsed {
                 "\u{25b8}"
@@ -1522,7 +1549,13 @@ fn compose_sidebar_row(row: &crate::sidebar::SidebarRow) -> ComposedRow {
                 activity_col = Some(text.chars().count());
             }
             text.push_str(dot);
-            text.push_str(&row.label);
+            // Dynamic title: `[PR: <n> | <window-title>]`, else the window
+            // title, else the branch (`row.label`). See `compose_row_label`.
+            text.push_str(&crate::sidebar::compose_row_label(
+                row.pr_number,
+                window_title,
+                &row.label,
+            ));
         }
     }
 
@@ -2166,6 +2199,7 @@ mod tests {
             collapsed: false,
             dir: false,
             pr_count: None,
+            pr_number: None,
             unread_count: 0,
             alert_count: 0,
         }

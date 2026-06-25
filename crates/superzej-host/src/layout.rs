@@ -15,7 +15,7 @@ pub const SIDEBAR_MIN_COLS: usize = 76;
 /// Default surface extents.
 pub const MASTHEAD_ROWS: usize = 1;
 pub const STATUSBAR_ROWS: usize = 1;
-pub const SIDEBAR_COLS: usize = 20; // ~12% at 160 cols
+pub const SIDEBAR_COLS: usize = 26; // was 20; ~16% at 160 cols — room for dynamic titles
 pub const PANEL_COLS: usize = 44; // ~27% at 160 cols
 
 /// The strip is suppressed when the band is too short to give it ≥ this many rows

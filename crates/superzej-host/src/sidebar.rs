@@ -16,6 +16,7 @@ use crate::session::Session;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowKind {
     Workspace,
+    Folder,
     Worktree,
 }
 
@@ -149,6 +150,9 @@ pub struct SidebarRow {
     /// Badge: open PR count for this worktree's branch (item 28).
     #[allow(dead_code)]
     pub pr_count: Option<usize>,
+    /// Lowest open PR number for this worktree's branch, used to compose the
+    /// dynamic row title (`[PR: <n> | …]`). `None` when no open PR is cached.
+    pub pr_number: Option<u64>,
     /// Badge: unread notification count for this worktree (item 28).
     #[allow(dead_code)]
     pub unread_count: usize,
@@ -168,6 +172,8 @@ pub struct SidebarStatus {
     pub activity: std::collections::BTreeMap<String, ActivityState>,
     /// Badge: open PR count per worktree (item 28).
     pub pr_counts: std::collections::BTreeMap<String, usize>,
+    /// Lowest open PR number per worktree, for the dynamic row title.
+    pub pr_numbers: std::collections::BTreeMap<String, u64>,
     /// Badge: unread notification count per worktree (item 28).
     pub unread_counts: std::collections::BTreeMap<String, usize>,
     /// Badge: alert count per worktree (item 28).
@@ -214,12 +220,43 @@ pub struct DbWorktree {
     pub tab_name: String,
     /// Worktree dir on disk (status lookups).
     pub path: String,
+    /// Nullable folder assignment
+    pub folder_id: Option<i64>,
 }
 
 /// Split a `{repo}/{branch}` group name into its parts.
 pub fn split_tab(name: &str) -> Option<(String, String)> {
     let (repo, branch) = name.split_once('/')?;
     (!repo.is_empty()).then(|| (repo.to_string(), branch.to_string()))
+}
+
+/// Strip a single trailing shell-prompt sigil (`$` `%` `#` `>`) and surrounding
+/// whitespace from an OSC window title. zsh + starship and friends often append
+/// "… $" to the terminal title, which we don't want bleeding into the sidebar.
+fn strip_prompt_sigil(title: &str) -> String {
+    let t = title.trim();
+    let t = t.strip_suffix(['$', '%', '#', '>']).unwrap_or(t);
+    t.trim_end().to_string()
+}
+
+/// Compose a worktree row's displayed title:
+/// - PR present:     `[PR: <n> | <window-title-or-branch>]`
+/// - title present:  `<window-title>` (sigil-stripped)
+/// - otherwise:      `<branch>`
+pub fn compose_row_label(
+    pr_number: Option<u64>,
+    window_title: Option<&str>,
+    branch: &str,
+) -> String {
+    let title = window_title
+        .map(strip_prompt_sigil)
+        .filter(|t| !t.is_empty());
+    match (pr_number, title) {
+        (Some(n), Some(t)) => format!("[PR: {n} | {t}]"),
+        (Some(n), None) => format!("[PR: {n} | {branch}]"),
+        (None, Some(t)) => t,
+        (None, None) => branch.to_string(),
+    }
 }
 
 /// A workspace's worktree, ready to sort: the branch label plus its session
@@ -229,6 +266,7 @@ struct Group {
     label: String,
     gi: usize,
     activity: ActivityState,
+    folder_id: Option<i64>,
 }
 
 /// Build the full ordered row list for the tree. `workspaces` is the
@@ -243,6 +281,7 @@ pub fn build_rows(
     view: &ViewState,
     status: &SidebarStatus,
     db_worktrees: &[DbWorktree],
+    db_folders: &[superzej_core::models::FolderRow],
 ) -> Vec<SidebarRow> {
     let activity = &status.activity;
     let mut rows = Vec::new();
@@ -269,6 +308,7 @@ pub fn build_rows(
             collapsed,
             dir: kind == "dir",
             pr_count: None,
+            pr_number: None,
             unread_count: 0,
             alert_count: 0,
         });
@@ -286,13 +326,21 @@ pub fn build_rows(
                 label: branch,
                 gi,
                 activity: activity.get(&g.name).copied().unwrap_or_default(),
+                folder_id: db_worktrees
+                    .iter()
+                    .find(|w| w.tab_name == g.name)
+                    .and_then(|w| w.folder_id),
             });
         }
 
         sort_groups(&mut groups, view.sort);
         let live = !groups.is_empty();
 
-        for gr in groups {
+        // Split into unfiled (rendered at root) and filed (rendered under folders).
+        // Unfiled keeps the existing home-first / sort behaviour; filed worktrees
+        // are emitted later under their folder header at depth 2.
+        let loose_groups: Vec<&Group> = groups.iter().filter(|g| g.folder_id.is_none()).collect();
+        for gr in loose_groups {
             let g = &session.worktrees[gr.gi];
             let is_active_group = gr.gi == session.active;
             let wt_path = (!g.path.is_empty()).then(|| g.path.clone());
@@ -305,6 +353,10 @@ pub fn build_rows(
             let pr_count = wt_path
                 .as_deref()
                 .and_then(|p| status.pr_counts.get(p))
+                .copied();
+            let pr_number = wt_path
+                .as_deref()
+                .and_then(|p| status.pr_numbers.get(p))
                 .copied();
             let unread_count = wt_path
                 .as_deref()
@@ -333,9 +385,147 @@ pub fn build_rows(
                 collapsed: false,
                 dir: false,
                 pr_count,
+                pr_number,
                 unread_count,
                 alert_count,
             });
+        }
+
+        // Folders section: home → loose (above) → folders by `position`.
+        // Filed worktrees render at depth 2 under their folder header, in the
+        // order the user arranged them (Move Up/Down on the worktree row will
+        // eventually resequence via `swap_worktree_positions`; for now we
+        // preserve the existing sort for visibility).
+        let mut workspace_folders: Vec<&superzej_core::models::FolderRow> = db_folders
+            .iter()
+            .filter(|f| f.repo_path == *repo_path)
+            .collect();
+        workspace_folders.sort_by_key(|f| f.position);
+
+        // Build a quick lookup from folder_id → worktree rows for this workspace.
+        let filed_in_folders: std::collections::BTreeMap<i64, Vec<&Group>> = {
+            let mut map: std::collections::BTreeMap<i64, Vec<&Group>> =
+                std::collections::BTreeMap::new();
+            for g in groups.iter().filter(|g| g.folder_id.is_some()) {
+                if let Some(fid) = g.folder_id {
+                    map.entry(fid).or_default().push(g);
+                }
+            }
+            map
+        };
+
+        for folder in workspace_folders {
+            let folder_key = format!("{repo_slug}/folder:{}", folder.folder_id);
+            let folder_collapsed = view.collapsed.contains(&folder_key);
+            let mut child_count = 0usize;
+            if let Some(filed) = filed_in_folders.get(&folder.folder_id) {
+                child_count = filed.len();
+            }
+            // Also count DB-registered (unloaded) worktrees filed to this folder
+            // by scanning db_worktrees, so the count stays accurate when the
+            // workspace is dormant.
+            for w in db_worktrees
+                .iter()
+                .filter(|w| w.folder_id == Some(folder.folder_id))
+            {
+                let already_counted = filed_in_folders
+                    .get(&folder.folder_id)
+                    .map(|v| v.iter().any(|g| g.label == w.branch))
+                    .unwrap_or(false);
+                if !already_counted {
+                    child_count += 1;
+                }
+            }
+            rows.push(SidebarRow {
+                kind: RowKind::Folder,
+                depth: 1,
+                label: if child_count > 0 {
+                    format!("{} ({})", folder.name, child_count)
+                } else {
+                    folder.name.clone()
+                },
+                workspace_slug: repo_slug.clone(),
+                tab_target: None,
+                active: false,
+                worktree_path: None,
+                pin_key: folder_key.clone(),
+                branch: None,
+                git: None,
+                agent: None,
+                activity: ActivityState::None,
+                visible: !collapsed,
+                collapsed: folder_collapsed,
+                dir: false,
+                pr_count: None,
+                pr_number: None,
+                unread_count: 0,
+                alert_count: 0,
+            });
+
+            if !folder_collapsed {
+                // Live groups in this folder, in their sort order. We re-derive
+                // the order from the same sort the loose path used by reusing
+                // the position-based comparator on the slice.
+                if let Some(filed) = filed_in_folders.get(&folder.folder_id) {
+                    let mut filed_sorted: Vec<&Group> = filed.clone();
+                    // Note: Instead of a new sort_groups_by_gi fn, we can just use
+                    // the actual `sort` parameter the user requested, since the loose
+                    // branch used the same sort. We can refactor `sort_groups` to take `&mut [&Group]`.
+                    // For now, let's just sort them manually to match `SortMode::Manual`.
+                    filed_sorted.sort_by_key(|a| (a.label != "home", a.gi));
+                    for gr in filed_sorted {
+                        let g = &session.worktrees[gr.gi];
+                        let is_active_group = gr.gi == session.active;
+                        let wt_path = (!g.path.is_empty()).then(|| g.path.clone());
+                        let pin_key =
+                            format!("{repo_slug}/{}/folder:{}", gr.label, folder.folder_id);
+                        let git = wt_path.as_deref().and_then(|p| status.git.get(p)).copied();
+                        let agent = wt_path
+                            .as_deref()
+                            .and_then(|p| status.agent.get(p))
+                            .cloned();
+                        let pr_count = wt_path
+                            .as_deref()
+                            .and_then(|p| status.pr_counts.get(p))
+                            .copied();
+                        let pr_number = wt_path
+                            .as_deref()
+                            .and_then(|p| status.pr_numbers.get(p))
+                            .copied();
+                        let unread_count = wt_path
+                            .as_deref()
+                            .and_then(|p| status.unread_counts.get(p))
+                            .copied()
+                            .unwrap_or(0);
+                        let alert_count = wt_path
+                            .as_deref()
+                            .and_then(|p| status.alert_counts.get(p))
+                            .copied()
+                            .unwrap_or(0);
+                        rows.push(SidebarRow {
+                            kind: RowKind::Worktree,
+                            depth: 2,
+                            label: gr.label.clone(),
+                            workspace_slug: repo_slug.clone(),
+                            tab_target: Some(RowTarget::Tab(gr.gi, g.active_tab)),
+                            active: is_active_group,
+                            worktree_path: wt_path,
+                            pin_key,
+                            branch: Some(gr.label.clone()),
+                            git,
+                            agent,
+                            activity: gr.activity,
+                            visible: !collapsed,
+                            collapsed: false,
+                            dir: false,
+                            pr_count,
+                            pr_number,
+                            unread_count,
+                            alert_count,
+                        });
+                    }
+                }
+            }
         }
 
         // A workspace with no live session groups still shows its home and
@@ -345,6 +535,10 @@ pub fn build_rows(
                 let pr_count = path
                     .as_deref()
                     .and_then(|p| status.pr_counts.get(p))
+                    .copied();
+                let pr_number = path
+                    .as_deref()
+                    .and_then(|p| status.pr_numbers.get(p))
                     .copied();
                 let unread_count = path
                     .as_deref()
@@ -356,6 +550,14 @@ pub fn build_rows(
                     .and_then(|p| status.alert_counts.get(p))
                     .copied()
                     .unwrap_or(0);
+                // Activity dot keyed by tab name (the `group`), same source the
+                // live rows use — so a workspace you switch away from keeps its
+                // last-known activity dot instead of going dark.
+                let act = group
+                    .as_deref()
+                    .and_then(|t| status.activity.get(t))
+                    .copied()
+                    .unwrap_or_default();
                 SidebarRow {
                     kind: RowKind::Worktree,
                     depth: 1,
@@ -371,11 +573,12 @@ pub fn build_rows(
                     branch: Some(label.to_string()),
                     git: path.as_deref().and_then(|p| status.git.get(p)).copied(),
                     agent: path.as_deref().and_then(|p| status.agent.get(p)).cloned(),
-                    activity: ActivityState::None,
+                    activity: act,
                     visible: !collapsed,
                     collapsed: false,
                     dir: false,
                     pr_count,
+                    pr_number,
                     unread_count,
                     alert_count,
                 }
@@ -418,6 +621,7 @@ pub fn build_rows(
             collapsed: false,
             dir: false,
             pr_count: None,
+            pr_number: None,
             unread_count: 0,
             alert_count: 0,
         });
@@ -550,6 +754,7 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
     for i in 0..n {
         match rows[i].kind {
             RowKind::Workspace => last_workspace = Some(i),
+            RowKind::Folder => {}
             RowKind::Worktree => {
                 if keep[i]
                     && let Some(w) = last_workspace
@@ -564,6 +769,7 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
     for i in 0..n {
         match rows[i].kind {
             RowKind::Workspace => reveal_ws = self_match[i],
+            RowKind::Folder => {}
             RowKind::Worktree => {
                 if reveal_ws {
                     keep[i] = true;
@@ -580,6 +786,44 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
 mod tests {
     use super::*;
     use crate::session::{GroupKind, Session, WorktreeGroup};
+
+    #[test]
+    fn strip_prompt_sigil_drops_trailing_prompt_chars() {
+        assert_eq!(strip_prompt_sigil("superzej dev $"), "superzej dev");
+        assert_eq!(strip_prompt_sigil("  build  % "), "build");
+        assert_eq!(strip_prompt_sigil("plain title"), "plain title");
+        assert_eq!(strip_prompt_sigil("root #"), "root");
+        assert_eq!(strip_prompt_sigil(">"), "");
+        // Only one trailing sigil is stripped.
+        assert_eq!(strip_prompt_sigil("a $$"), "a $");
+    }
+
+    #[test]
+    fn compose_row_label_follows_pr_title_branch_rules() {
+        // PR + window title.
+        assert_eq!(
+            compose_row_label(Some(142), Some("superzej dev $"), "feat/x"),
+            "[PR: 142 | superzej dev]"
+        );
+        // PR, no window title → branch inside the brackets.
+        assert_eq!(
+            compose_row_label(Some(7), None, "feat/x"),
+            "[PR: 7 | feat/x]"
+        );
+        // PR with a window title that strips to empty → branch fallback.
+        assert_eq!(
+            compose_row_label(Some(9), Some(" $"), "main"),
+            "[PR: 9 | main]"
+        );
+        // No PR, window title only.
+        assert_eq!(
+            compose_row_label(None, Some("cargo build"), "feat/x"),
+            "cargo build"
+        );
+        // No PR, no title → branch.
+        assert_eq!(compose_row_label(None, None, "feat/x"), "feat/x");
+        assert_eq!(compose_row_label(None, Some("   "), "feat/x"), "feat/x");
+    }
 
     fn tab(name: &str, wt: &str) -> WorktreeGroup {
         WorktreeGroup::new(name, GroupKind::Branch, wt)
@@ -611,7 +855,7 @@ mod tests {
             "repo".to_string(),
             String::new(),
         )];
-        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &[]);
+        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &[], &[]);
         let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
         assert_eq!(labels, vec!["app", "home", "feat-a", "feat-b"]);
     }
@@ -628,7 +872,7 @@ mod tests {
             "repo".to_string(),
             String::new(),
         )];
-        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &[]);
+        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &[], &[]);
         let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
         assert_eq!(labels, vec!["app", "home", "feat"]);
         assert_eq!(rows[0].kind, RowKind::Workspace);
@@ -653,7 +897,7 @@ mod tests {
             "repo".to_string(),
             "/repos/WASHU".to_string(),
         )];
-        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &[]);
+        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &[], &[]);
         let homes: Vec<_> = rows.iter().filter(|r| r.label == "home").collect();
         assert_eq!(homes.len(), 1, "rows: {rows:?}");
         assert!(homes[0].active, "the live home row carries the active flag");
@@ -680,7 +924,7 @@ mod tests {
                 String::new(),
             ),
         ];
-        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &[]);
+        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &[], &[]);
         let repo_row = rows.iter().find(|r| r.label == "repo").unwrap();
         let dir_row = rows.iter().find(|r| r.label == "notes").unwrap();
         assert!(!repo_row.dir, "repo workspace is not a dir");
@@ -712,8 +956,9 @@ mod tests {
             repo_path: "/repos/other".into(),
             tab_name: "other/feat-x".into(),
             path: "/wt/other-feat-x".into(),
+            folder_id: None,
         }];
-        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &dbw);
+        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &dbw, &[]);
         let labels: Vec<(&str, &str)> = rows
             .iter()
             .map(|r| (r.workspace_slug.as_str(), r.label.as_str()))
@@ -751,7 +996,7 @@ mod tests {
         )];
         let mut view = ViewState::default();
         view.collapsed.insert("app".to_string());
-        let rows = build_rows(&s, &ws, &view, &no_activity(), &[]);
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[]);
         assert!(rows[0].visible); // workspace stays
         assert!(!rows[1].visible); // worktree hidden
     }
@@ -770,7 +1015,7 @@ mod tests {
             "repo".to_string(),
             String::new(),
         )];
-        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &[]);
+        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &[], &[]);
         let kinds: Vec<RowKind> = rows.iter().map(|r| r.kind).collect();
         assert_eq!(kinds, vec![RowKind::Workspace, RowKind::Worktree]);
         // The worktree row jumps to the group's remembered active tab.
@@ -794,7 +1039,7 @@ mod tests {
             filter: "feature".into(),
             ..Default::default()
         };
-        let rows = build_rows(&s, &ws, &view, &no_activity(), &[]);
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[]);
         let visible: Vec<&str> = rows
             .iter()
             .filter(|r| r.visible)
@@ -821,7 +1066,7 @@ mod tests {
             pins: vec!["app/feat".into()],
             ..Default::default()
         };
-        let rows = build_rows(&s, &ws, &view, &no_activity(), &[]);
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[]);
         // Workspace block contains all rows (depth>0), so pinning the worktree
         // inside reorders within — feat should precede home.
         let feat = rows.iter().position(|r| r.label == "feat").unwrap();
@@ -848,7 +1093,7 @@ mod tests {
             sort: SortMode::Activity,
             ..Default::default()
         };
-        let rows = build_rows(&s, &ws, &view, &act, &[]);
+        let rows = build_rows(&s, &ws, &view, &act, &[], &[]);
         let busy = rows.iter().position(|r| r.label == "busy").unwrap();
         let home = rows.iter().position(|r| r.label == "home").unwrap();
         assert!(busy < home, "active worktree should sort first");
@@ -875,7 +1120,7 @@ mod tests {
         )];
 
         // Default == Manual: home, then session order (zebra, alpha).
-        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &[]);
+        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &[], &[]);
         let labels: Vec<&str> = rows
             .iter()
             .filter(|r| r.kind == RowKind::Worktree)
@@ -888,7 +1133,7 @@ mod tests {
             sort: SortMode::Name,
             ..Default::default()
         };
-        let rows = build_rows(&s, &ws, &view, &no_activity(), &[]);
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[]);
         let labels: Vec<&str> = rows
             .iter()
             .filter(|r| r.kind == RowKind::Worktree)
@@ -916,6 +1161,7 @@ mod tests {
                 repo_path: "/repos/app".into(),
                 tab_name: "app/zebra".into(),
                 path: "/wt/zebra".into(),
+                folder_id: None,
             },
             DbWorktree {
                 slug: "app".into(),
@@ -923,9 +1169,10 @@ mod tests {
                 repo_path: "/repos/app".into(),
                 tab_name: "app/alpha".into(),
                 path: "/wt/alpha".into(),
+                folder_id: None,
             },
         ];
-        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &dbw);
+        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &dbw, &[]);
         let labels: Vec<&str> = rows
             .iter()
             .filter(|r| r.kind == RowKind::Worktree)

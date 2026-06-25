@@ -916,6 +916,35 @@ fn spawn_pin(
     }
 }
 
+/// Map each live worktree to the OSC window title of its active tab's focused
+/// pane. Main-loop only — reads the live `panes` table, which the background
+/// hydration thread can't touch. Pure in-memory map reads, so it never blocks
+/// the loop. Empty/whitespace titles are skipped so the sidebar falls back to
+/// the branch name.
+fn collect_window_titles(
+    session: &crate::session::Session,
+    panes: &Panes,
+) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for g in &session.worktrees {
+        if g.path.is_empty() {
+            continue;
+        }
+        let Some(tab) = g.tabs.get(g.active_tab) else {
+            continue;
+        };
+        if let Some(p) = panes.table.get(&tab.focused_pane)
+            && let Some(title) = p.emulator().title()
+        {
+            let title = title.trim();
+            if !title.is_empty() {
+                out.insert(g.path.clone(), title.to_string());
+            }
+        }
+    }
+    out
+}
+
 fn refresh_tab_model(
     model: &mut FrameModel,
     session: &crate::session::Session,
@@ -1015,6 +1044,7 @@ impl SidebarState {
             &self.view,
             &model.sidebar_status,
             &model.sidebar_db_worktrees,
+            &model.sidebar_db_folders,
         );
         let visible = Self::visible_len(model);
         // While unfocused, track the active worktree so opening the sidebar
@@ -8626,6 +8656,10 @@ async fn event_loop<T: Terminal>(
         }
         if dirty {
             let frame_t0 = std::time::Instant::now();
+            // Refresh the live OSC window titles from the panes table (main loop
+            // only) so the sidebar's dynamic row titles track the focused pane's
+            // current title. Cheap in-memory map build; never blocks the loop.
+            model.sidebar_window_titles = collect_window_titles(&session, &panes);
             let tree = if zoom == Some(crate::focus::Zone::Center) {
                 crate::center::CenterTree::Leaf(focused)
             } else {
@@ -12632,8 +12666,9 @@ async fn event_loop<T: Terminal>(
                                     // Register the dispatch in the DB.
                                     if let Ok(db) = superzej_core::db::Db::open() {
                                         let root_s = root.to_string_lossy();
-                                        let _ =
-                                            db.put_worktree(&tab, &root_s, &wt_str, &branch, None);
+                                        let _ = db.put_worktree(
+                                            &tab, &root_s, &wt_str, &branch, None, None,
+                                        );
                                         let _ = db.put_agent_dispatch(&issue_id, &wt_str, "claude");
                                         let _ = db.link_issue(&wt_str, &issue_id);
                                     }
@@ -14953,6 +14988,7 @@ mod tests {
             &view,
             &crate::sidebar::SidebarStatus::default(),
             &[],
+            &[],
         );
         // Pinned "lib" workspace floats first; order is by repo path.
         assert_eq!(
@@ -14984,7 +15020,7 @@ mod tests {
             active: 1,
         };
         session.persist(&db, &repo_s, now_secs()).unwrap();
-        db.put_worktree("app/feat", &repo_s, &feat_s, "feat", None)
+        db.put_worktree("app/feat", &repo_s, &feat_s, "feat", None, None)
             .unwrap();
 
         let closing = session.worktrees[1].clone();
@@ -15038,9 +15074,9 @@ mod tests {
         };
         session.persist(&db, &repo_s, now_secs()).unwrap();
         // Register both branches; positions are assigned in call order.
-        db.put_worktree("app/alpha", &repo_s, &alpha_s, "alpha", None)
+        db.put_worktree("app/alpha", &repo_s, &alpha_s, "alpha", None, None)
             .unwrap();
-        db.put_worktree("app/beta", &repo_s, &beta_s, "beta", None)
+        db.put_worktree("app/beta", &repo_s, &beta_s, "beta", None, None)
             .unwrap();
 
         // home leads the raw vec; registered branches trail it in creation
@@ -15806,6 +15842,7 @@ mod tests {
             repo_path: "/tmp/lib".into(),
             tab_name: "lib/home".into(),
             path: "/tmp/lib".into(),
+            folder_id: None,
         }];
 
         // The synchronous prune the RemoveWorkspace handler performs (same code).
@@ -15842,18 +15879,33 @@ mod tests {
         let db = superzej_core::db::Db::open_at(&db_path).unwrap();
         db.put_workspace("/tmp/repo-app", "app", "repo").unwrap();
         db.put_workspace("/tmp/repo-lib", "lib", "repo").unwrap();
-        db.put_worktree("lib/home", "/tmp/repo-lib", "/tmp/repo-lib", "home", None)
-            .unwrap();
+        db.put_worktree(
+            "lib/home",
+            "/tmp/repo-lib",
+            "/tmp/repo-lib",
+            "home",
+            None,
+            None,
+        )
+        .unwrap();
         db.put_worktree(
             "lib/feat",
             "/tmp/repo-lib",
             "/tmp/repo-lib-feat",
             "feat",
             None,
+            None,
         )
         .unwrap();
-        db.put_worktree("app/home", "/tmp/repo-app", "/tmp/repo-app", "home", None)
-            .unwrap();
+        db.put_worktree(
+            "app/home",
+            "/tmp/repo-app",
+            "/tmp/repo-app",
+            "home",
+            None,
+            None,
+        )
+        .unwrap();
         db.set_active_workspace("/tmp/repo-lib").unwrap();
 
         let mut session = Session {
