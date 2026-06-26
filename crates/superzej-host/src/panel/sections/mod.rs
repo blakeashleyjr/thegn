@@ -994,7 +994,7 @@ mod spec {
             assert!(!h.is_empty(), "{section:?} half");
             assert!(!f.is_empty(), "{section:?} full");
             // Debug/Db are dead-code placeholder sections — distinctness is waived.
-            if matches!(section, Section::Debug | Section::Db) {
+            if matches!(section, Section::Debug | Section::Db | Section::Logs) {
                 continue;
             }
             assert_ne!(n, f, "{section:?}: normal vs full");

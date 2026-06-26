@@ -24,7 +24,7 @@ fn tag(hue: &str) -> String {
 }
 
 pub fn info(s: &str) {
-    if crate::log::ready() {
+    if crate::log_trace::ready() {
         tracing::info!("{s}");
     } else {
         eprintln!("{} {s}", tag(theme::DIM));
@@ -32,7 +32,7 @@ pub fn info(s: &str) {
 }
 
 pub fn warn(s: &str) {
-    if crate::log::ready() {
+    if crate::log_trace::ready() {
         tracing::warn!("{s}");
     } else {
         eprintln!("{} {s}", tag(theme::AMBER));
@@ -40,7 +40,7 @@ pub fn warn(s: &str) {
 }
 
 pub fn error(s: &str) {
-    if crate::log::ready() {
+    if crate::log_trace::ready() {
         tracing::error!("{s}");
     } else {
         eprintln!("{} {s}", tag(theme::RED));
