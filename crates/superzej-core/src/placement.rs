@@ -84,7 +84,18 @@ impl SshPlacement {
 
     /// Wrap a backend argv for the interactive pane (mosh or ssh -t).
     fn interactive_wrap(&self, backend_argv: &[String]) -> Vec<String> {
-        let remote_cmd = util::sh_join(backend_argv);
+        // dtach wrappers to preserve network persistence without multiplexer
+        // corruption (allows sixel/kitty inline images over SSH).
+        // -A: attach or create. -E: copy env. -z: no suspend key. -r winch: force redraw.
+        let dtach_prefix = "if command -v dtach >/dev/null 2>&1; then \
+            exec dtach -A /tmp/sz-socket-$(echo $SUPERZEJ_WORKTREE | md5sum | awk '{print $1}') -E -z -r winch ";
+        let dtach_suffix = "; else ";
+        let fallback_suffix = "; fi";
+
+        // Build the remote command: dtach (if present) else raw backend
+        let raw = util::sh_join(backend_argv);
+        let remote_cmd = format!("{dtach_prefix}{raw}{dtach_suffix}exec {raw}{fallback_suffix}");
+
         match self.kind {
             TransportKind::Mosh => {
                 let ssh = util::sh_join(&self.ssh_base(false));
@@ -510,10 +521,38 @@ mod tests {
         assert!(out.contains(&"dev@box".to_string()));
         assert_eq!(out[out.len() - 3], "/bin/sh");
         assert_eq!(out[out.len() - 2], "-lc");
-        assert_eq!(out[out.len() - 1], util::sh_join(&argv));
+
+        let raw = util::sh_join(&argv);
+        let dtach_prefix = "if command -v dtach >/dev/null 2>&1; then \
+            exec dtach -A /tmp/sz-socket-$(echo $SUPERZEJ_WORKTREE | md5sum | awk '{print $1}') -E -z -r winch ";
+        let dtach_suffix = "; else ";
+        let fallback_suffix = "; fi";
+        let expected_cmd = format!("{dtach_prefix}{raw}{dtach_suffix}exec {raw}{fallback_suffix}");
+        assert_eq!(out[out.len() - 1], expected_cmd);
         // Plain target adds no -F/-J/-i.
         assert!(!out.contains(&"-F".to_string()));
         assert!(!out.contains(&"-J".to_string()));
+    }
+
+    #[test]
+    fn interactive_wrap_includes_dtach_fallback() {
+        let p = Placement::Ssh(SshPlacement::plain(
+            "dev@box".into(),
+            22,
+            true,
+            TransportKind::Ssh,
+        ));
+        let argv = vec!["echo".to_string(), "hello".to_string()];
+        let out = p.interactive_argv(&argv);
+        let cmd = out.last().unwrap();
+
+        // Assert the dtach command is well-formed
+        assert!(cmd.contains("if command -v dtach"));
+        assert!(cmd.contains("exec dtach -A /tmp/sz-socket"));
+        assert!(cmd.contains("-E -z -r winch"));
+        // Assert the raw command is in both the dtach execution and the fallback
+        assert!(cmd.contains("exec echo hello"));
+        assert!(cmd.contains("; else exec echo hello; fi"));
     }
 
     #[test]
