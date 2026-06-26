@@ -134,7 +134,7 @@ pub struct SidecarFile {
 }
 
 /// A pure, fully-resolved plan for the sidecar container. Built from a
-/// [`VpnSpec`] (with secrets already dereferenced); executed by [`run_sidecar`].
+/// [`VpnSpec`] (with secrets already dereferenced); executed by `run_sidecar`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidecarPlan {
     pub container: String,

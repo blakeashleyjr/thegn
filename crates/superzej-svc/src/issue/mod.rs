@@ -279,6 +279,7 @@ mod spec {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn single_provider_back_compat() {
         let mut cfg = IssuesConfig::default();
         cfg.provider = IssueProviderKind::Linear;

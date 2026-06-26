@@ -171,6 +171,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn bars_only_tick_is_incremental_not_full() {
         // The idle-residual fix: a stats/clock tick recomposes only the bars.
         let mut d = Damage::default();

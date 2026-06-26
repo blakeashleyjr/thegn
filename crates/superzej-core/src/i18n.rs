@@ -1,6 +1,11 @@
 //! Zero-cost translation layer for the UI.
 
-use fluent_templates::{Loader, static_loader};
+use fluent_templates::static_loader;
+// The `t!` macro calls `.lookup()`/`.lookup_with_args()` (the `Loader` trait); in
+// this module that only happens in the test mod (via `use super::*`), so the lib
+// build doesn't need it — gate it to test to avoid an unused-import warning.
+#[cfg(test)]
+use fluent_templates::Loader;
 use once_cell::sync::OnceCell;
 use unic_langid::LanguageIdentifier;
 

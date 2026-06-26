@@ -654,7 +654,7 @@ pub fn strip_agent_suffix(name: &str) -> &str {
 /// the tunnel's network namespace (the worktree container joins it via
 /// `--network container:<sidecar>`). Deterministic from the worktree container
 /// name so the bring-up (`superzej-svc::vpn`), the `--network` wiring
-/// ([`oci_create_opts`]), and teardown all agree without a registry lookup.
+/// (`oci_create_opts`), and teardown all agree without a registry lookup.
 pub const VPN_SIDECAR_SUFFIX: &str = "-szvpn";
 
 /// The VPN sidecar container name, derived from the worktree container name `base`.

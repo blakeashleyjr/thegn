@@ -5517,6 +5517,7 @@ transport = \"ssh\"
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)] // reassigned twice across asserts
     fn active_providers_back_compat_single() {
         // Legacy single `provider` is honored when `providers` is empty.
         let mut cfg = IssuesConfig::default();
@@ -5528,6 +5529,7 @@ transport = \"ssh\"
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)] // provider set before the plural list
     fn active_providers_multi_wins_and_dedups() {
         let mut cfg = IssuesConfig::default();
         // Single provider is overridden once the plural list is set.
