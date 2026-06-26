@@ -1,0 +1,38 @@
+name: ci
+# First CI in the repo. The Linux job runs the canonical `just ci` gate; the
+# macOS (Apple-silicon) job runs a build/test/lint subset to keep the
+# aarch64-darwin host build — and the Apple `container` backend — green.
+# NOTE: the macOS job is unvalidated until it first runs on GitHub; expect to
+# tune it (toolchain, apps/ path deps, runner image) on the first push.
+on:
+  push:
+    branches: [main]
+  pull_request:
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: just ci
+        run: nix develop --command just ci
+  macos:
+    # macos-14 is the GitHub-hosted Apple-silicon (M1) image. Apple's `container`
+    # runtime needs macOS 26 + Apple silicon; the hosted image cannot exercise it
+    # at runtime, so this job covers the build/unit-test/lint surface only —
+    # end-to-end `apple` backend verification is the on-device checklist (§AV).
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: build + test + lint (macOS subset)
+        run: nix develop --command bash -lc "just build && just test && just lint"

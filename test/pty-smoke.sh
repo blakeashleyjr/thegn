@@ -44,7 +44,17 @@ run_case() {
     'stty cols %q rows %q; env HOME=%q XDG_CONFIG_HOME=%q XDG_STATE_HOME=%q SUPERZEJ_BENCH_FIRST_FRAME_EXIT=1 %q' \
     "$cols" "$rows" "$home" "$config" "$state" "$SZ"
 
-  if timeout 20s script -qec "$cmd" "$log" >/dev/null; then
+  # `script` PTY-wrapping differs by platform: util-linux takes `-c "cmd" file`,
+  # BSD/macOS takes `file cmd...`.
+  local rc
+  if [ "$(uname)" = "Darwin" ]; then
+    timeout 20s script -q "$log" /bin/sh -c "$cmd" >/dev/null
+    rc=$?
+  else
+    timeout 20s script -qec "$cmd" "$log" >/dev/null
+    rc=$?
+  fi
+  if [ "$rc" -eq 0 ]; then
     if grep -Eiq 'panicked at|thread .* panicked|fatal runtime error' "$log"; then
       bad "PTY launch $name (${cols}x${rows}) produced panic text"
       tail -80 "$log" || true

@@ -165,8 +165,139 @@ impl StatsSampler {
             GpuProbe::None => None,
         };
 
+        // macOS has no /proc or /sys, so the reads above all no-op; overlay real
+        // values sampled via sysctl/CLI. NOTE: written without an Apple-silicon
+        // host — verify on device (tasks.md §AV / item 701).
+        #[cfg(target_os = "macos")]
+        self.sample_macos_into(&mut snap);
+
         snap
     }
+}
+
+#[cfg(target_os = "macos")]
+impl StatsSampler {
+    /// Fill CPU/MEM/NET/battery from macOS sources. Runs on the ticker thread
+    /// (off the event loop), so the brief `top -l2` sample latency is acceptable.
+    fn sample_macos_into(&mut self, snap: &mut StatsSnapshot) {
+        snap.cpu_pct = macos_cpu_pct();
+        snap.mem_gib = macos_mem_gib();
+        snap.battery = macos_battery();
+        if let Some((rx, tx)) = macos_net_bytes() {
+            let now = std::time::Instant::now();
+            if let Some((prx, ptx, pt)) = self.prev_net {
+                let dt = now.duration_since(pt).as_secs_f64().max(0.001);
+                snap.net_bps = Some((
+                    ((rx.saturating_sub(prx)) as f64 / dt) as u64,
+                    ((tx.saturating_sub(ptx)) as f64 / dt) as u64,
+                ));
+            }
+            self.prev_net = Some((rx, tx, now));
+        }
+    }
+}
+
+/// `top -l2 -n0` → utilization from the second (delta) "CPU usage:" line:
+/// `CPU usage: 5.0% user, 3.0% sys, 92.0% idle` → 100 − idle.
+#[cfg(target_os = "macos")]
+fn macos_cpu_pct() -> Option<u8> {
+    let out = std::process::Command::new("top")
+        .args(["-l", "2", "-n", "0"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text
+        .lines()
+        .filter(|l| l.contains("CPU usage:"))
+        .next_back()?;
+    let idle = line
+        .split(',')
+        .find(|s| s.contains("idle"))
+        .and_then(|s| s.trim().split('%').next())
+        .and_then(|s| s.trim().parse::<f32>().ok())?;
+    Some((100.0 - idle).clamp(0.0, 100.0) as u8)
+}
+
+/// Total via `sysctl hw.memsize`; used via `vm_stat` (active+wired+compressed).
+#[cfg(target_os = "macos")]
+fn macos_mem_gib() -> Option<(f32, f32)> {
+    let total_bytes: u64 = String::from_utf8_lossy(
+        &std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?
+            .stdout,
+    )
+    .trim()
+    .parse()
+    .ok()?;
+    let vm = String::from_utf8_lossy(&std::process::Command::new("vm_stat").output().ok()?.stdout)
+        .into_owned();
+    // "page size of 16384 bytes" + "Pages active: 12345."
+    let page = vm
+        .split("page size of")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(4096);
+    let pages = |key: &str| -> u64 {
+        vm.lines()
+            .find(|l| l.starts_with(key))
+            .and_then(|l| l.rsplit(':').next())
+            .map(|v| v.trim().trim_end_matches('.'))
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let used =
+        (pages("Pages active") + pages("Pages wired down") + pages("Pages occupied by compressor"))
+            * page;
+    let gib = |b: u64| b as f32 / (1024.0 * 1024.0 * 1024.0);
+    Some((gib(used), gib(total_bytes)))
+}
+
+/// `netstat -ib` → cumulative (rx, tx) bytes across non-loopback interfaces,
+/// counting each interface once (the listing repeats a row per address family).
+#[cfg(target_os = "macos")]
+fn macos_net_bytes() -> Option<(u64, u64)> {
+    let out = std::process::Command::new("netstat")
+        .args(["-ib"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut seen = std::collections::HashSet::new();
+    let (mut rx, mut tx) = (0u64, 0u64);
+    for line in text.lines().skip(1) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        // Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll
+        if f.len() < 10 {
+            continue;
+        }
+        let name = f[0];
+        if name.starts_with("lo") || !seen.insert(name.to_string()) {
+            continue;
+        }
+        rx += f[6].parse::<u64>().unwrap_or(0);
+        tx += f[9].parse::<u64>().unwrap_or(0);
+    }
+    Some((rx, tx))
+}
+
+/// `pmset -g batt` → `... 73%; discharging; ...` → (percent, charging).
+#[cfg(target_os = "macos")]
+fn macos_battery() -> Option<(u8, bool)> {
+    let out = std::process::Command::new("pmset")
+        .args(["-g", "batt"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let pct = text
+        .split('%')
+        .next()
+        .and_then(|s| s.rsplit(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|s| s.parse::<u8>().ok())?;
+    let charging =
+        text.contains("charging") || text.contains("charged") || text.contains("AC Power");
+    Some((pct.min(100), charging))
 }
 
 /// `/proc/stat` first line → (total jiffies, idle jiffies). Idle includes

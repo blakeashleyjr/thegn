@@ -1354,9 +1354,9 @@ Sequenced so each item ships independently; tracks the AB/AC/AD/AE container gro
 - [x] 698. Platform-aware default `backend_chain` — resolve the chain by `target_os` so macOS defaults to `apple → docker → host` instead of dead Linux entries _(config.rs `default_backend_chain()` + test)_
 - [~] 699. Apple `container`-specific backend path — dedicated CLI path in sandbox.rs (image prefetch via `container image pull`, status via `container inspect`, removal via `container delete --force`, split `-i -t` exec, `container list` panel probe); argv unit-tested on Linux. **On-device:** confirm exact flag/JSON specifics
 - [~] 700. Path-preserving worktree mount on Apple `container` — `--mount type=bind,…,readonly` form + undocumented Linux hardening flags omitted for Apple; **on-device:** verify same-abs-path bind keeps host-side git working under the VM
-- [~] 701. macOS host build — `flake.nix` already emits `aarch64-darwin`; `/proc` readers in `pane.rs` `cfg`-split with graceful non-Linux stubs. **On-device:** native `libproc`/`sysctl` impls (pane cwd/foreground, `stats.rs` telemetry) + confirm the workspace compiles on the Mac
-- [ ] 702. macOS CI lane — build + unit tests on Apple silicon; smoke coverage for the `apple` backend
-- [~] 703. Docs + capability gating — README/config/design-spec reconciled to the shipped backend. **Remaining:** add `Apple` to the new-worktree sandbox picker + name the macOS-26 + Apple-silicon requirement in the `available`/`ensure` failure message
+- [~] 701. macOS host build — `flake.nix` already emits `aarch64-darwin`; `pane.rs` `/proc` readers `cfg`-split with native macOS impls (`proc_listpids`/`proc_pidinfo`/`KERN_PROCARGS2` via libc for ppid/cwd/argv); `stats.rs` overlays CPU/mem/net/battery via `top`/`sysctl`/`vm_stat`/`netstat`/`pmset`. **On-device:** compile on the Mac + fix any ABI/format drift
+- [~] 702. macOS CI lane — `.github/workflows/ci.yml` (first CI: ubuntu `just ci` + macos-14 `just build/test/lint`); `pty-smoke.sh` `script` invocation made OS-aware. **On-device/CI:** first GitHub run will need tuning (apps/ path deps, toolchain)
+- [~] 703. Docs + capability gating — README/config/design-spec reconciled; `Apple` added to the new-worktree sandbox picker (macOS-only) and the macOS-26 + Apple-silicon requirement named in the `pick_backend` failure message
 
 ### AI-free mode (audience-widener)
 

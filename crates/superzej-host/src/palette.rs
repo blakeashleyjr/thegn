@@ -426,6 +426,10 @@ pub(crate) fn build_sandbox_palette(
         ("bwrap", "Bubblewrap"),
         ("host", "Host / uncontained"),
     ];
+    // Apple's `container` is only usable on macOS 26 + Apple silicon; offer it in
+    // the picker only there so the Linux list isn't cluttered with a dead option.
+    #[cfg(target_os = "macos")]
+    rows.insert(1, ("apple", "Apple container (macOS 26 · Apple silicon)"));
     rows.sort_by_key(|(k, _)| if *k == def { 0 } else { 1 });
     rows.into_iter()
         .map(|(key, label)| {

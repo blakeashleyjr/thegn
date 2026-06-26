@@ -176,17 +176,161 @@ fn pid_cwd(pid: u32) -> Option<std::path::PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
 
-#[cfg(not(target_os = "linux"))]
+// ── macOS (`libproc`/`sysctl` via libc — no /proc) ───────────────────────────
+// NOTE: written without an Apple-silicon host to compile against; verify on
+// device (tasks.md §AV / item 701). Uses only `libc` (already a dependency); the
+// proc_info / KERN_PROCARGS2 ABI is stable across macOS releases.
+#[cfg(target_os = "macos")]
+fn all_pids() -> Vec<u32> {
+    let probe = unsafe { libc::proc_listpids(libc::PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
+    if probe <= 0 {
+        return Vec::new();
+    }
+    let cap = probe as usize / std::mem::size_of::<u32>() + 32;
+    let mut buf = vec![0u32; cap];
+    let bytes = (buf.len() * std::mem::size_of::<u32>()) as libc::c_int;
+    let n = unsafe {
+        libc::proc_listpids(
+            libc::PROC_ALL_PIDS,
+            0,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            bytes,
+        )
+    };
+    if n <= 0 {
+        return Vec::new();
+    }
+    buf.truncate(n as usize / std::mem::size_of::<u32>());
+    buf.into_iter().filter(|&p| p != 0).collect()
+}
+
+#[cfg(target_os = "macos")]
+fn ppid_of(pid: u32) -> Option<u32> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let sz = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            sz,
+        )
+    };
+    (n >= sz).then_some(info.pbi_ppid)
+}
+
+/// Most-recently-started direct child of `pid`, via `proc_listpids` + each pid's
+/// BSD-info `pbi_ppid` (the macOS analogue of the `/proc/*/stat` walk).
+#[cfg(target_os = "macos")]
+fn newest_child(pid: u32) -> Option<u32> {
+    let mut best: Option<u32> = None;
+    for child in all_pids() {
+        if child != pid && ppid_of(child) == Some(pid) {
+            best = Some(best.map_or(child, |b| b.max(child)));
+        }
+    }
+    best
+}
+
+/// Full argv of `pid` via `sysctl(KERN_PROCARGS2)`. Layout is
+/// `[argc:i32][exec_path\0][\0…padding][argv0\0 argv1\0 …][env…]`.
+#[cfg(target_os = "macos")]
+fn read_cmdline(pid: u32) -> Option<Vec<String>> {
+    let mut argmax: libc::c_int = 0;
+    let mut sz = std::mem::size_of::<libc::c_int>();
+    let mut mib_max = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    unsafe {
+        libc::sysctl(
+            mib_max.as_mut_ptr(),
+            2,
+            &mut argmax as *mut _ as *mut libc::c_void,
+            &mut sz,
+            std::ptr::null_mut(),
+            0,
+        );
+    }
+    if argmax <= 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; argmax as usize];
+    let mut len = buf.len();
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len < 4 {
+        return None;
+    }
+    buf.truncate(len);
+    let argc = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]).max(0) as usize;
+    let mut i = 4;
+    while i < buf.len() && buf[i] != 0 {
+        i += 1; // skip exec_path
+    }
+    while i < buf.len() && buf[i] == 0 {
+        i += 1; // skip NUL padding
+    }
+    let mut argv = Vec::with_capacity(argc);
+    for _ in 0..argc {
+        if i >= buf.len() {
+            break;
+        }
+        let start = i;
+        while i < buf.len() && buf[i] != 0 {
+            i += 1;
+        }
+        if i > start {
+            argv.push(String::from_utf8_lossy(&buf[start..i]).into_owned());
+        }
+        i += 1; // skip NUL
+    }
+    (!argv.is_empty()).then_some(argv)
+}
+
+/// Working directory of `pid` via `proc_pidinfo(PROC_PIDVNODEPATHINFO)`.
+#[cfg(target_os = "macos")]
+fn pid_cwd(pid: u32) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let sz = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            sz,
+        )
+    };
+    if n < sz {
+        return None;
+    }
+    let path = &info.pvi_cdir.vip_path;
+    let bytes = unsafe { std::slice::from_raw_parts(path.as_ptr() as *const u8, path.len()) };
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    (end > 0).then(|| std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&bytes[..end])))
+}
+
+// ── Other targets (superzej does not run here) ───────────────────────────────
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn newest_child(_pid: u32) -> Option<u32> {
     None
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn read_cmdline(_pid: u32) -> Option<Vec<String>> {
     None
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn pid_cwd(_pid: u32) -> Option<std::path::PathBuf> {
     None
 }

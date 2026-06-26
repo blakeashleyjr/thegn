@@ -803,18 +803,25 @@ fn pick_backend(cfg: &SandboxConfig, transport: &Transport) -> Option<Backend> {
         match explicit {
             Backend::None => return Some(Backend::None),
             b if suitable(b) && available(transport, b) => return Some(b),
-            b => on_missing(
-                cfg,
-                &format!(
-                    "sandbox backend '{}' unavailable{}; trying the chain",
-                    cfg.backend,
-                    if suitable(b) {
-                        ""
-                    } else {
-                        " for this image mode"
-                    }
-                ),
-            ),
+            b => {
+                // Name the macOS-26 + Apple-silicon requirement so a failed
+                // `backend = "apple"` selection explains itself rather than
+                // reading as a generic "not installed".
+                let why = if b == Backend::Apple {
+                    " (Apple `container` requires macOS 26 on Apple silicon)"
+                } else if suitable(b) {
+                    ""
+                } else {
+                    " for this image mode"
+                };
+                on_missing(
+                    cfg,
+                    &format!(
+                        "sandbox backend '{}' unavailable{why}; trying the chain",
+                        cfg.backend,
+                    ),
+                );
+            }
         }
     }
 
