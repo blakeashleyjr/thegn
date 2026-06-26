@@ -30,6 +30,7 @@ pub mod i18n;
 pub mod issue;
 pub mod keymap;
 pub mod log;
+pub mod log_trace;
 pub mod log_view;
 pub mod metrics;
 pub mod models;

@@ -1348,6 +1348,22 @@ _The Windows-native workspace shell (AI-free by default), bypassing WSL/MSYS2 fo
 - [ ] 702. Signals mapping — map Unix profiling triggers (`SIGUSR2`) to internal keymaps or named events for Windows flame-graphs
 - [ ] 703. PowerShell / NuShell defaults — default pane spawning to native Windows shells over `cmd.exe`
 
+### AW. Log Analyzer (sz-log)
+
+_A native, zero-IPC structured log viewer providing `hl`-like capabilities for worktree files, containers, and tasks. Integrates heavily with the render plan to ensure high-throughput log streams do not violate the 0% idle / <16ms frame invariants._
+
+- [x] 718. `LogProvider` trait + bounded ring-buffer memory model
+- [x] 719. Zero-copy JSON & logfmt parsers (envelope extraction)
+- [~] 720. Off-thread log ingestion worker + batching waker (wake-storm prevention)
+- [ ] 721. Full-screen center-pane log overlay UI
+- [x] 722. Filter DSL — fuzzy text, severity normalization, exact field matching
+- [ ] 723. Dynamic field projection — hide/show/reorder JSON keys
+- [ ] 724. Tailing vs Paused mode — auto-pause on scroll
+- [~] 725. File tailing provider (`notify` backend)
+- [ ] 726. Container tailing provider (resolves AD 383)
+- [ ] 727. Editor handoff — jump to `file:line` from stacktraces (resolves AG 408)
+- [ ] 728. Field Explorer drawer — surface schema/keys dynamically based on current view
+
 ### AI-free mode (audience-widener)
 
 - [~] 511. AI-free mode — run as a pure terminal workspace/worktree manager, no agents/proxy/LLM
