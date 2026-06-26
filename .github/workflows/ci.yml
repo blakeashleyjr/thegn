@@ -17,6 +17,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
 concurrency:
   group: ci-${{ github.ref }}
@@ -148,3 +149,34 @@ jobs:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
           gc-max-store-size: 8G
       - run: nix develop --command bash -lc "just build && just test"
+  # One-shot baseline generator: muse visual baselines were never committed, so
+  # `e2e` can't pass until they exist. Add the `ci:update-baselines` label to a
+  # PR to (re)generate them IN the CI env (where `e2e` checks them) and commit
+  # them back to the branch. Runs only on the labeling action (not pushes), so
+  # it can't loop. Remove the label afterward.
+  update-baselines:
+    if: github.event.action == 'labeled' && github.event.label.name == 'ci:update-baselines'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          ref: ${{ github.head_ref }}
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      - run: nix develop --command just e2e-update
+      - name: commit regenerated baselines
+        run: |
+          git config user.name "superzej CI"
+          git config user.email ci@superzej.local
+          if [ -n "$(git status --porcelain test/muse/snapshots/)" ]; then
+            git add test/muse/snapshots/
+            git commit -m "test(e2e): generate muse visual baselines in CI"
+            git push origin "HEAD:${{ github.head_ref }}"
+          else
+            echo "no baseline changes to commit"
+          fi
