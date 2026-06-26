@@ -13,6 +13,7 @@ repo_scan_depth = 5
 
 # Base ref for new worktrees: "auto" = current branch, else the repo default.
 base_branch = "auto"
+window_margin = 0
 branch_prefix = "sz/"
 
 # Picker UI: "auto" | "gum" | "fzf" | "select"

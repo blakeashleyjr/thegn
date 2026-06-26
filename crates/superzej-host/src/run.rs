@@ -10476,32 +10476,27 @@ async fn event_loop<T: Terminal>(
                         menu::MenuOutcome::Pick(choice) => {
                             active_menu = None;
                             if let menu::MenuChoice::ConfirmDeleteWorktrees { keep_files } = choice
+                                && let Some(targets) = pending_confirm_delete_worktrees.take()
                             {
-                                if let Some(targets) = pending_confirm_delete_worktrees.take() {
-                                    model.status = delete_groups(
-                                        &mut session,
-                                        &mut panes,
-                                        targets,
-                                        keep_files,
-                                    );
+                                model.status =
+                                    delete_groups(&mut session, &mut panes, targets, keep_files);
 
-                                    // Full sidebar refresh after deletion
-                                    sb.marked.clear();
-                                    refresh_tab_model(&mut model, &session, &mut sb);
-                                    sb.focus_active_row(&mut model);
-                                    need_relayout = true;
-                                    sync_drawer_persistence(
-                                        &session,
-                                        &mut panes,
-                                        &mut drawer,
-                                        &mut drawer_pool,
-                                        &mut drawer_home,
-                                        keymap.config(),
-                                        chrome.center,
-                                    );
-                                    dirty = true;
-                                    continue;
-                                }
+                                // Full sidebar refresh after deletion
+                                sb.marked.clear();
+                                refresh_tab_model(&mut model, &session, &mut sb);
+                                sb.focus_active_row(&mut model);
+                                need_relayout = true;
+                                sync_drawer_persistence(
+                                    &session,
+                                    &mut panes,
+                                    &mut drawer,
+                                    &mut drawer_pool,
+                                    &mut drawer_home,
+                                    keymap.config(),
+                                    chrome.center,
+                                );
+                                dirty = true;
+                                continue;
                             }
                             // First-launch keymap picker (item 621): persist the
                             // choice to ui_state and rebuild the live keymap. Not

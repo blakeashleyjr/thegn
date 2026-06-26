@@ -2618,6 +2618,7 @@ pub struct Config {
     pub worktrees_dir: String,
     pub workspaces_dir: String,
     pub base_branch: String,
+    pub window_margin: usize,
     pub branch_prefix: String,
     pub picker: Picker,
     pub worktree_mode: WorktreeMode,
@@ -2714,6 +2715,7 @@ impl Default for Config {
                 .into_owned(),
             workspaces_dir: home.join("code").to_string_lossy().into_owned(),
             base_branch: "auto".into(),
+            window_margin: 0,
             branch_prefix: "sz/".into(),
             picker: Picker::Auto,
             worktree_mode: WorktreeMode::Global,
@@ -2799,6 +2801,7 @@ pub struct ConfigOverlay {
     pub worktrees_dir: Option<String>,
     pub workspaces_dir: Option<String>,
     pub base_branch: Option<String>,
+    pub window_margin: Option<usize>,
     pub branch_prefix: Option<String>,
     pub picker: Option<Picker>,
     pub worktree_mode: Option<WorktreeMode>,
@@ -2837,6 +2840,7 @@ impl ConfigOverlay {
         set!(base.worktrees_dir, self.worktrees_dir);
         set!(base.workspaces_dir, self.workspaces_dir);
         set!(base.base_branch, self.base_branch);
+        set!(base.window_margin, self.window_margin);
         set!(base.branch_prefix, self.branch_prefix);
         set!(base.picker, self.picker);
         set!(base.worktree_mode, self.worktree_mode);
@@ -6072,6 +6076,7 @@ transport = \"ssh\"
             worktrees_dir: Some("/wt".into()),
             workspaces_dir: Some("/ws".into()),
             base_branch: Some("main".into()),
+            window_margin: Some(1),
             branch_prefix: Some("pfx/".into()),
             picker: Some(Picker::Fzf),
             worktree_mode: Some(WorktreeMode::InRepo),
@@ -6105,6 +6110,7 @@ transport = \"ssh\"
         assert_eq!(cfg.worktrees_dir, "/wt");
         assert_eq!(cfg.workspaces_dir, "/ws");
         assert_eq!(cfg.base_branch, "main");
+        assert_eq!(cfg.window_margin, 1);
         assert_eq!(cfg.branch_prefix, "pfx/");
         assert_eq!(cfg.picker, Picker::Fzf);
         assert_eq!(cfg.worktree_mode, WorktreeMode::InRepo);
