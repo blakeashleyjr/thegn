@@ -12,6 +12,7 @@
 pub mod account;
 pub mod activity;
 pub mod blame;
+pub mod ci;
 pub mod config;
 pub mod custom_cmd;
 pub mod db;
