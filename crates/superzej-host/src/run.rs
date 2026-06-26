@@ -7001,6 +7001,11 @@ async fn event_loop<T: Terminal>(
                 current_config.issues.clone(),
                 Some(waker.clone()),
             );
+            crate::hydrate::spawn_ci_cache_refresh(
+                session.clone(),
+                current_config.ci.clone(),
+                Some(waker.clone()),
+            );
             retarget_diff_watcher(
                 &session,
                 &mut watched_worktree,
@@ -8629,6 +8634,7 @@ async fn event_loop<T: Terminal>(
         let mut want_model_refresh = false;
         let mut want_pr_refresh = false;
         let mut want_issue_refresh = false;
+        let mut want_ci_refresh = false;
         while let Ok(kind) = refresh_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
             match kind {
@@ -8639,6 +8645,10 @@ async fn event_loop<T: Terminal>(
                 }
                 RefreshKind::Issues => {
                     want_issue_refresh = true;
+                    want_model_refresh = true;
+                }
+                RefreshKind::Ci => {
+                    want_ci_refresh = true;
                     want_model_refresh = true;
                 }
             }
@@ -8673,6 +8683,13 @@ async fn event_loop<T: Terminal>(
             crate::hydrate::spawn_my_work_refresh(
                 session.clone(),
                 current_config.issues.clone(),
+                Some(waker.clone()),
+            );
+        }
+        if want_ci_refresh {
+            crate::hydrate::spawn_ci_cache_refresh(
+                session.clone(),
+                current_config.ci.clone(),
                 Some(waker.clone()),
             );
         }
@@ -12197,7 +12214,8 @@ async fn event_loop<T: Terminal>(
                                                 need_relayout = true;
                                             }
                                         }
-                                        Section::Debug
+                                        Section::Ci
+                                        | Section::Debug
                                         | Section::Sandbox
                                         | Section::Db
                                         | Section::Telemetry
@@ -13839,6 +13857,42 @@ async fn event_loop<T: Terminal>(
                                     );
                                     focus.zone = crate::focus::Zone::Panel;
                                 }
+                            }
+                            Action::OpenCi => {
+                                panel_auto_revealed = None;
+                                if chrome.panel.is_none() {
+                                    want_panel = true;
+                                    panel_forced = cols < layout::PANEL_MIN_COLS;
+                                    chrome = compute_chrome(
+                                        cols,
+                                        rows,
+                                        want_sidebar,
+                                        want_panel,
+                                        panel_forced,
+                                        panel_width,
+                                        sidebar_cols,
+                                        zoom,
+                                        &supervisor,
+                                        drawer_rows,
+                                        drawer_full,
+                                    );
+                                    need_relayout = true;
+                                }
+                                panel_ui.switch_tab(crate::panel::PanelTab::Work);
+                                open_panel_section(
+                                    crate::panel::Section::Ci,
+                                    &mut panel_ui,
+                                    &mut hydration_gen,
+                                    &model_tx,
+                                    &session,
+                                    &waker,
+                                    PanelDocsWiring {
+                                        model: &model,
+                                        generation: docs_gen,
+                                        tx: &docs_tx,
+                                    },
+                                );
+                                focus.zone = crate::focus::Zone::Panel;
                             }
                             Action::NextTab => {
                                 session.next_tab();

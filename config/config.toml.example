@@ -215,6 +215,35 @@ move_on_merge = false        # when a worktree's PR merges, move its linked issu
 # api_token = "env:JIRA_API_TOKEN"
 # project_key = ""                # restrict to one project ("" = all)
 
+# Cross-provider CI/CD inspection — run history, jobs/steps, logs (AV group).
+# GitHub Actions reuses the existing `gh`/GH_TOKEN auth (no sub-table needed).
+[ci]
+provider = "auto"          # auto | none | github | gitlab | drone | woodpecker | jenkins | argo
+ttl_secs = 30              # cache TTL before a background re-fetch of run history
+poll_interval_secs = 30    # background poll cadence while a run is in-flight
+max_runs = 50              # how many recent runs to fetch/display
+live_refresh = false       # start the CI view with live refresh on (toggle: ctrl+l)
+log_tail_lines = 2000      # cap on fetched log lines (the tail is kept)
+
+# Per-provider endpoints + tokens. Tokens accept "env:VAR" so secrets stay out
+# of this file. Only the provider you use needs configuring.
+[ci.gitlab]
+host = ""                  # self-hosted base URL; "" = gitlab.com
+token = "env:GITLAB_TOKEN"
+[ci.drone]
+server = "env:DRONE_SERVER"
+token = "env:DRONE_TOKEN"
+[ci.woodpecker]
+server = "env:WOODPECKER_SERVER"
+token = "env:WOODPECKER_TOKEN"
+[ci.jenkins]
+url = ""                   # per-instance Jenkins base URL
+user = ""                  # basic-auth user
+token = "env:JENKINS_TOKEN"
+[ci.argo]
+server = ""                # empty = ambient argo/argocd/kubeconfig context
+token = "env:ARGOCD_TOKEN"
+
 # Top-level app tab strip. Only "work" (your worktree IDE) is available today;
 # unknown ids are ignored.
 # Valid ids: "work".
