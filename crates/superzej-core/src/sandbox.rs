@@ -2013,6 +2013,16 @@ pub fn run_gc(db_worktrees: &[String]) -> Vec<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_win_native_sandboxes_do_not_parse_as_oci() {
+        assert!(!Backend::WinAppContainer.is_oci());
+        assert!(!Backend::WinJobObject.is_oci());
+        assert!(Backend::WinAppContainer.is_host_toolchain());
+        assert!(Backend::WinJobObject.is_host_toolchain());
+        assert_eq!(Backend::WinAppContainer.label(), "appcontainer");
+        assert_eq!(Backend::WinJobObject.label(), "jobobject");
+    }
+
     fn spec(backend: Backend) -> SandboxSpec {
         SandboxSpec {
             backend,

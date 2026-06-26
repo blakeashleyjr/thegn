@@ -685,4 +685,24 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_shell_resolution() {
+        let shell = shell();
+        assert!(
+            shell.ends_with("pwsh.exe")
+                || shell.ends_with("powershell.exe")
+                || shell.ends_with("cmd.exe")
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_xdg_paths() {
+        let config_home = xdg_config_home();
+        assert!(config_home.to_string_lossy().contains("AppData"));
+        let state_home = xdg_state_home();
+        assert!(state_home.to_string_lossy().contains("AppData"));
+    }
 }
