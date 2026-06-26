@@ -14,6 +14,7 @@ use superzej_core::config::Config;
 use superzej_core::db::Db;
 use superzej_core::remote::GitLoc;
 use superzej_core::{account, repo, sandbox};
+use superzej_svc::vpn::VpnProvider;
 
 /// The literal shell sentinel — distinct from any configured agent/tool name.
 const SHELL: &str = "shell";
@@ -201,7 +202,7 @@ pub fn prepare_sandbox(
         base_cname
     };
     for candidate in sandbox_candidates(&sb) {
-        if let Some(spec) = sandbox::resolve_scoped(&candidate, loc, &cname, hardening) {
+        if let Some(mut spec) = sandbox::resolve_scoped(&candidate, loc, &cname, hardening) {
             if spec.backend == sandbox::Backend::None {
                 break;
             }
@@ -213,6 +214,12 @@ pub fn prepare_sandbox(
                     sb.backend,
                     spec.backend.label()
                 );
+            }
+            // Bring the VPN tunnel up BEFORE the worktree container is created
+            // (it joins the sidecar's netns). A tunnel failure must never fall
+            // through to a less-isolated backend, so it bails the whole resolve.
+            if let Err(e) = attach_vpn(&mut spec) {
+                anyhow::bail!("sandbox vpn attach failed for {worktree}: {e}");
             }
             match sandbox::ensure(&spec) {
                 Ok(()) => {
@@ -283,6 +290,111 @@ pub(crate) fn apply_ssh_config_shim(spec: &mut sandbox::SandboxSpec) {
     if home_mounted && let Some(path) = sandbox::prepare_ssh_config() {
         spec.env_overrides
             .insert("GIT_SSH_COMMAND".to_string(), format!("ssh -F {path}"));
+    }
+}
+
+/// Bring up the worktree's VPN tunnel (if `[sandbox.vpn]` requested one) before
+/// the sandbox container is created, and splice the result into `spec`:
+/// userspace (proxy) tunnels get their `ALL_PROXY`/`HTTPS_PROXY` exports added
+/// to `env_overrides`; the `--network container:<sidecar>` wiring is emitted by
+/// `oci_create_opts` from the deterministic sidecar name.
+///
+/// Sidecar/proxy modes require a local OCI backend (the bring-up shells out to
+/// the same container runtime). On other backends the tunnel can't be attached;
+/// per `on_error` this either bails (`fail`), warns-and-continues (`warn`), or
+/// forces the sandbox offline (`offline`). Tunnel bring-up itself runs here on
+/// the (already off-event-loop) sandbox-prepare path.
+fn attach_vpn(spec: &mut sandbox::SandboxSpec) -> anyhow::Result<()> {
+    use superzej_core::config::{VpnMode, VpnOnError};
+    let Some(vpn) = spec.vpn.clone() else {
+        return Ok(());
+    };
+    let on_error = vpn.on_error;
+    let local = matches!(spec.transport, sandbox::Transport::Local);
+    let sidecar_capable =
+        spec.backend.is_oci() && local && matches!(vpn.mode, VpnMode::Sidecar | VpnMode::Proxy);
+
+    // Helper: apply the configured failure policy to an error/condition.
+    let apply_on_error = |spec: &mut sandbox::SandboxSpec, msg: String| -> anyhow::Result<()> {
+        match on_error {
+            VpnOnError::Fail => Err(anyhow::anyhow!(msg)),
+            VpnOnError::Warn => {
+                superzej_core::msg::warn(&format!("{msg}; continuing (on_error=warn)"));
+                Ok(())
+            }
+            VpnOnError::Offline => {
+                superzej_core::msg::warn(&format!(
+                    "{msg}; forcing network=none (on_error=offline)"
+                ));
+                spec.network = superzej_core::config::Network::None;
+                spec.vpn = None;
+                Ok(())
+            }
+        }
+    };
+
+    if !sidecar_capable {
+        return apply_on_error(
+            spec,
+            format!(
+                "vpn: provider '{}' in mode '{}' needs a local OCI backend (got '{}')",
+                vpn.provider,
+                vpn.mode,
+                spec.backend.label()
+            ),
+        );
+    }
+
+    let Some(prefix) = sandbox::oci_runtime_prefix(spec.backend) else {
+        return apply_on_error(spec, "vpn: no OCI runtime for backend".to_string());
+    };
+    let rt = superzej_svc::vpn::OciRuntime::new(prefix);
+    let sidecar = sandbox::vpn_sidecar_name(&spec.name);
+    let provider = superzej_svc::vpn::for_provider(&vpn);
+
+    let attach = match provider.up(&rt, &sidecar) {
+        Ok(a) => a,
+        Err(e) => return apply_on_error(spec, format!("vpn: bring-up failed: {e}")),
+    };
+    if let Err(e) = provider.ready(&rt, &sidecar, vpn.ready_timeout) {
+        return apply_on_error(spec, format!("vpn: {e}"));
+    }
+    // Userspace tunnels: point the inner process at the SOCKS/HTTP proxy.
+    if let Some(proxy) = &attach.proxy {
+        for (k, v) in proxy.env_exports() {
+            spec.env_overrides.insert(k, v);
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort: de-register a worktree's ephemeral VPN node before its sidecar
+/// container is removed (e.g. `tailscale logout`). Called from the worktree-close
+/// teardown thread, which only has the path — so we re-resolve the effective
+/// config. A no-op when no VPN is configured. Ephemeral keys also auto-reap
+/// server-side once the sidecar dies, so this is an optimization, not required.
+pub(crate) fn deregister_vpn(path: &str) {
+    let cfg = Config::load_layered(&superzej_core::config::ProcessEnv, &[], None);
+    let sb = cfg.repo_sandbox(Path::new(path));
+    if !sb.vpn.is_enabled() {
+        return;
+    }
+    let name = sandbox::container_name(path);
+    let Some(vpn) = sandbox::build_vpn_spec(&sb.vpn, &name, sb.profile) else {
+        return;
+    };
+    let sidecar = sandbox::vpn_sidecar_name(&name);
+    let provider = superzej_svc::vpn::for_provider(&vpn);
+    // We don't track which OCI runtime started the sidecar; try the likely ones.
+    // `down` execs the de-register inside the sidecar, so a wrong runtime simply
+    // fails to find the container and is ignored.
+    for prefix in [
+        vec!["podman".to_string()],
+        vec!["docker".to_string()],
+        vec!["sudo".to_string(), "-n".to_string(), "podman".to_string()],
+    ] {
+        let rt = superzej_svc::vpn::OciRuntime::new(prefix);
+        let _ = provider.down(&rt, &sidecar);
     }
 }
 

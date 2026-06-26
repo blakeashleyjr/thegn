@@ -823,6 +823,102 @@ remote_dir = "~/superzej-worktrees"
 # Forward the local SSH agent (ssh -A) so git push uses your local keys.
 # Disable if the remote host has its own deploy key.
 forward_agent = true
+
+# ── Per-sandbox VPN / tunnel ──────────────────────────────────────────────────
+# Attach a worktree's sandbox to its OWN overlay network / tunnel, with its own
+# identity, leaving the host's networking (including any host tailscaled)
+# completely untouched. Off by default (provider = "none").
+#
+# How it works: superzej runs the tunnel daemon as a per-worktree *sidecar* (it
+# never embeds a tunnel datapath in-process, and never touches your host VPN).
+# In the default `sidecar` mode the worktree container joins the sidecar's
+# network namespace, so its ONLY egress is the tunnel and its own capabilities
+# stay untouched (NET_ADMIN / /dev/net/tun live in the sidecar, not the
+# worktree). Bring-up runs off the event loop with a bounded readiness wait.
+[sandbox.vpn]
+# Provider: none | tailscale | headscale | wireguard | openvpn | netbird |
+#           zerotier | custom. `headscale` is `tailscale` pointed at a
+#           self-hosted control server (set tailscale.login_server below).
+provider = "none"
+# Attach mode:
+#   sidecar      — companion container owns the netns; worktree joins via
+#                  `--network container:<sidecar>` (default; best isolation).
+#   proxy        — userspace tunnel exposes a SOCKS5/HTTP proxy; only proxy-aware
+#                  traffic is tunneled (not a containment boundary). The only
+#                  honest option for the bwrap/systemd backends.
+#   in_container — run the VPN client inside the worktree container itself
+#                  (needs NET_ADMIN + /dev/net/tun; weakens `hardened`).
+#   netns        — join a host-prepared named netns (host-toolchain; best-effort).
+mode = "sidecar"
+# Override the provider's default sidecar image. Empty = provider default.
+sidecar_image = ""
+# Seconds to wait for the tunnel to come up before applying on_error.
+ready_timeout_secs = 30
+# When the tunnel can't come up:
+#   fail    — refuse to launch (don't fall back to a less-isolated network).
+#   warn    — launch with the tunnel down (loud warning).
+#   offline — force network=none so nothing leaks onto the host network.
+on_error = "fail"
+# DNS composition:
+#   tunnel       — the overlay owns resolution (MagicDNS / pushed DNS); the
+#                  network_allow/network_block filter is bypassed (default).
+#   filter-front — chain the allow/block DNS filter in front of the tunnel's
+#                  resolver (preserves auditing). NOTE: with a sidecar tunnel the
+#                  filter can't yet reach the sidecar's netns, so this currently
+#                  behaves like `tunnel`; the resolver-chaining seam exists.
+#   filter-only  — ignore the overlay's pushed DNS, keep the filter only.
+dns = "tunnel"
+# Request an ephemeral node identity where supported (Tailscale/Headscale/
+# NetBird) so the device auto-deregisters from the control plane on teardown.
+ephemeral = true
+#
+# Tip: pair `provider` with the `sealed-tunnel` (alias `tunnel-only`) hardening
+# profile for a worktree that is fully cap-dropped AND has no host egress — its
+# only route is the tunnel. Plain `sealed` refuses a VPN (network=none).
+#
+# Secrets: auth keys / configs accept a secrets-ref so they never sit in plain
+# text here — "env:VAR_NAME" reads an env var, "file:~/path" reads a file. The
+# resolved secret is injected into the *sidecar* only, never the worktree, so a
+# coding agent in the worktree can't read it.
+
+# [sandbox.vpn.tailscale]   # provider = "tailscale" or "headscale"
+# auth_key = "env:TS_AUTHKEY"   # prefer an ephemeral, pre-authorized, tagged key
+# login_server = ""             # set to your Headscale URL for provider="headscale"
+# tags = ["tag:dev"]            # ACL tags advertised by this node
+# exit_node = ""                # route egress through this exit node
+# accept_routes = false         # accept subnet routes from the tailnet
+# hostname = ""                 # node name (default: derived from container name)
+# advertise_routes = []         # CIDRs to advertise as subnet routes
+# extra_args = []               # extra `tailscale up` flags
+
+# [sandbox.vpn.wireguard]   # provider = "wireguard"
+# config_path = "/etc/wireguard/wg0.conf"   # a wg-quick .conf, OR:
+# config = "file:~/wg/dev.conf"             # inline body via a secrets-ref
+
+# [sandbox.vpn.openvpn]     # provider = "openvpn"
+# config_path = "~/ovpn/dev.ovpn"
+# auth_user_pass = "file:~/ovpn/creds"      # "user\npass"
+# extra_args = []
+
+# [sandbox.vpn.netbird]     # provider = "netbird"
+# setup_key = "env:NB_SETUP_KEY"
+# management_url = ""                        # self-hosted control plane
+# hostname = ""
+
+# [sandbox.vpn.zerotier]    # provider = "zerotier"
+# network_id = ""                            # 16-hex network id
+# controller_url = ""                        # self-hosted controller/moon
+# api_token = "env:ZT_API_TOKEN"             # to auto-authorize the member
+
+# [sandbox.vpn.custom]      # provider = "custom" — escape hatch for any tunnel
+# up = "..."                                 # establishes the tunnel
+# down = "..."                               # tears it down
+# ready_check = "..."                        # exit-0 means ready (polled)
+# image = ""                                 # sidecar image (mode=sidecar)
+# {name}, {netns}, {worktree} expand in the commands above.
+# [sandbox.vpn.custom.env]
+# FOO = "bar"
+
 # ── LLM proxy (group U/V) ──────────────────────────────────────────────────
 # The AI-traffic chokepoint daemon (binary `szproxy`). The shell never hard-
 # depends on this — AI is strictly additive — so it is OFF by default. When

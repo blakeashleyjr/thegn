@@ -27,12 +27,16 @@ pub struct DnsEvent {
 }
 
 /// Policy for the DNS filter.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct DnsPolicy {
     /// Allow-only these names (empty = allow all except block-listed).
     pub allow: Vec<String>,
     /// Block these names (checked first).
     pub block: Vec<String>,
+    /// Resolver to forward allowed queries to. `None` = the system resolver
+    /// (`/etc/resolv.conf`, else `8.8.8.8`). Set this to chain the filter in
+    /// front of a VPN overlay's resolver (the `filter-front` DNS mode).
+    pub upstream: Option<SocketAddr>,
 }
 
 impl DnsPolicy {
@@ -114,7 +118,7 @@ fn start_server(sock: UdpSocket, policy: DnsPolicy, events: Arc<Mutex<Vec<DnsEve
     std::thread::Builder::new()
         .name("dns-filter".into())
         .spawn(move || {
-            let resolver = find_system_resolver();
+            let resolver = policy.upstream.unwrap_or_else(find_system_resolver);
             let mut buf = [0u8; 512];
             loop {
                 let Ok((n, src)) = sock.recv_from(&mut buf) else {
@@ -226,6 +230,7 @@ mod tests {
         let p = DnsPolicy {
             allow: vec![],
             block: vec![],
+            upstream: None,
         };
         assert!(p.allows("anything.example.com"));
     }
@@ -235,6 +240,7 @@ mod tests {
         let p = DnsPolicy {
             allow: vec![],
             block: vec!["evil.com".into()],
+            upstream: None,
         };
         assert!(p.allows("good.com"));
         assert!(!p.allows("evil.com"));
@@ -246,6 +252,7 @@ mod tests {
         let p = DnsPolicy {
             allow: vec!["api.anthropic.com".into(), "github.com".into()],
             block: vec![],
+            upstream: None,
         };
         assert!(p.allows("api.anthropic.com"));
         assert!(p.allows("sub.github.com"));
@@ -257,6 +264,7 @@ mod tests {
         let p = DnsPolicy {
             allow: vec!["example.com".into()],
             block: vec!["example.com".into()],
+            upstream: None,
         };
         assert!(!p.allows("example.com"));
     }
@@ -266,6 +274,7 @@ mod tests {
         let p = DnsPolicy {
             allow: vec!["*.internal.example.com".into()],
             block: vec![],
+            upstream: None,
         };
         assert!(p.allows("foo.internal.example.com"));
         assert!(!p.allows("internal.example.com")); // wildcard doesn't match root
@@ -343,6 +352,7 @@ mod tests {
         let p = DnsPolicy {
             allow: vec!["example.com".into()],
             block: vec![],
+            upstream: None,
         };
         assert!(p.allows("example.com."));
         assert!(p.allows("sub.example.com."));
@@ -353,6 +363,7 @@ mod tests {
         let p = DnsPolicy {
             allow: vec!["*.example.com".into()],
             block: vec![],
+            upstream: None,
         };
         assert!(p.allows("a.example.com"));
         assert!(!p.allows("example.com"));
@@ -412,6 +423,43 @@ mod tests {
     }
 
     #[test]
+    fn server_forwards_allowed_query_to_configured_upstream() {
+        // A fake upstream resolver that echoes a canned response.
+        let upstream = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let canned: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let canned2 = canned.clone();
+        let up = std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let (_n, src) = upstream.recv_from(&mut buf).unwrap();
+            upstream.send_to(&canned2, src).unwrap();
+        });
+
+        // Start the filter pointed at our fake upstream (not the system resolver).
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let filter_port = sock.local_addr().unwrap().port();
+        let policy = DnsPolicy {
+            allow: vec![],
+            block: vec![],
+            upstream: Some(upstream_addr),
+        };
+        start_server(sock, policy, Arc::new(Mutex::new(Vec::new())));
+
+        // Send an allowed query to the filter; it should forward to our upstream
+        // and relay the canned response back.
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let query = build_query(0x1234, "example.com");
+        client.send_to(&query, ("127.0.0.1", filter_port)).unwrap();
+        let mut resp = [0u8; 512];
+        let (n, _) = client.recv_from(&mut resp).unwrap();
+        assert_eq!(&resp[..n], canned.as_slice());
+        up.join().unwrap();
+    }
+
+    #[test]
     fn forward_query_times_out_when_no_resolver() {
         // An address with nothing listening: send succeeds, recv times out → None.
         let dead = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -453,6 +501,7 @@ mod tests {
         let policy = DnsPolicy {
             allow: vec![],
             block: vec!["blocked.example".into()],
+            upstream: None,
         };
         let port = get_or_start(policy).expect("should bind a loopback port");
 
@@ -460,6 +509,7 @@ mod tests {
         let port2 = get_or_start(DnsPolicy {
             allow: vec!["ignored".into()],
             block: vec![],
+            upstream: None,
         })
         .expect("warm port");
         assert_eq!(port, port2);

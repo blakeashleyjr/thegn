@@ -12,3 +12,4 @@ pub mod git;
 pub mod issue;
 pub mod lsp;
 pub mod ssh;
+pub mod vpn;

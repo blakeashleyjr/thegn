@@ -17,7 +17,9 @@
 //! layer (mosh preferred / ssh) runs the whole thing on a remote machine.
 
 use crate::config::{
-    FileAccess, Network, OnMissing, RemoteTransport, SandboxBackend, SandboxConfig, SandboxProfile,
+    CustomVpnConfig, FileAccess, NetbirdConfig, Network, OnMissing, OpenvpnConfig, RemoteTransport,
+    SandboxBackend, SandboxConfig, SandboxProfile, TailscaleConfig, VpnConfig, VpnDnsMode, VpnMode,
+    VpnOnError, VpnProviderKind, WireguardConfig, ZerotierConfig,
 };
 use crate::remote::GitLoc;
 use crate::{msg, util};
@@ -272,6 +274,95 @@ pub struct SandboxSpec {
     /// rely on `devenv` being on their PATH.
     pub devenv_path: Option<String>,
     pub name: String,
+    /// Resolved VPN/tunnel attachment for this sandbox, or `None` when no tunnel
+    /// is requested (or it was refused by the active profile). Pure data — the
+    /// behavior (bring-up, readiness, teardown) lives in `superzej-svc::vpn`.
+    pub vpn: Option<VpnSpec>,
+}
+
+/// A resolved, identity-bearing VPN attachment request for one sandbox. Pure
+/// data assembled by [`build_vpn_spec`]; secrets-refs in `params` are left
+/// **unresolved** here and dereferenced only at bring-up time in `superzej-svc`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VpnSpec {
+    pub provider: VpnProviderKind,
+    pub mode: VpnMode,
+    pub on_error: VpnOnError,
+    pub dns_mode: VpnDnsMode,
+    pub ready_timeout: Duration,
+    /// Request an ephemeral node identity (auto-deregisters on teardown) where
+    /// the provider supports it.
+    pub ephemeral: bool,
+    /// Sidecar image override; `None` = the provider's default image.
+    pub sidecar_image: Option<String>,
+    /// Node/peer name in the overlay (defaults to the container name).
+    pub hostname: String,
+    /// The selected provider's configuration (still carrying secrets-refs).
+    pub params: VpnParams,
+}
+
+/// Provider-specific VPN parameters, mirroring the `[sandbox.vpn.<provider>]`
+/// sub-tables. Headscale reuses [`VpnParams::Tailscale`] (the `provider` field
+/// on [`VpnSpec`] distinguishes them; Headscale just requires `login_server`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VpnParams {
+    Tailscale(TailscaleConfig),
+    Wireguard(WireguardConfig),
+    Openvpn(OpenvpnConfig),
+    Netbird(NetbirdConfig),
+    Zerotier(ZerotierConfig),
+    Custom(CustomVpnConfig),
+}
+
+/// Resolve a `[sandbox.vpn]` config block into a [`VpnSpec`] for the worktree
+/// container named `name`, reconciling with the hardening `profile`.
+///
+/// Returns `None` when no provider is configured, or when the active profile
+/// refuses a tunnel (plain `sealed`: a tunnel would contradict its no-network /
+/// no-caps contract — the user is told to use `sealed-tunnel` or `hardened`).
+pub fn build_vpn_spec(cfg: &VpnConfig, name: &str, profile: SandboxProfile) -> Option<VpnSpec> {
+    if !cfg.is_enabled() {
+        return None;
+    }
+    if !profile.permits_vpn() {
+        msg::warn(&format!(
+            "sandbox: profile '{profile}' forbids a VPN tunnel (network=none, all \
+             capabilities dropped); ignoring [sandbox.vpn]. Use 'sealed-tunnel' for a \
+             tunnel-only worktree, or 'hardened'.",
+        ));
+        return None;
+    }
+    let params = match cfg.provider {
+        VpnProviderKind::None => return None,
+        VpnProviderKind::Tailscale | VpnProviderKind::Headscale => {
+            VpnParams::Tailscale(cfg.tailscale.clone())
+        }
+        VpnProviderKind::Wireguard => VpnParams::Wireguard(cfg.wireguard.clone()),
+        VpnProviderKind::Openvpn => VpnParams::Openvpn(cfg.openvpn.clone()),
+        VpnProviderKind::Netbird => VpnParams::Netbird(cfg.netbird.clone()),
+        VpnProviderKind::Zerotier => VpnParams::Zerotier(cfg.zerotier.clone()),
+        VpnProviderKind::Custom => VpnParams::Custom(cfg.custom.clone()),
+    };
+    // A per-provider hostname overrides the container-name default.
+    let hostname = match &params {
+        VpnParams::Tailscale(t) if !t.hostname.trim().is_empty() => t.hostname.clone(),
+        VpnParams::Netbird(n) if !n.hostname.trim().is_empty() => n.hostname.clone(),
+        _ => name.to_string(),
+    };
+    Some(VpnSpec {
+        provider: cfg.provider,
+        mode: cfg.mode,
+        on_error: cfg.on_error,
+        dns_mode: cfg.dns,
+        ready_timeout: Duration::from_secs(cfg.ready_timeout_secs),
+        ephemeral: cfg.ephemeral,
+        sidecar_image: {
+            let t = cfg.sidecar_image.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        },
+        hostname,
+        params,
+    })
 }
 
 /// Build the sandbox spec for a worktree (described by its `GitLoc`), or `None`
@@ -481,6 +572,17 @@ pub fn resolve_scoped(
         // (which don't inherit the host PATH) can still exec it directly.
         devenv_path: util::which_path("devenv"),
         name: name.to_string(),
+        vpn: {
+            if cfg.vpn.is_enabled() && cfg.network == Network::Host && !profile.forces_no_network()
+            {
+                msg::warn(
+                    "sandbox: [sandbox] network=host conflicts with a VPN tunnel \
+                     (host networking is what the tunnel isolates from); the worktree \
+                     will join the tunnel instead of sharing the host network.",
+                );
+            }
+            build_vpn_spec(&cfg.vpn, name, profile)
+        },
     })
 }
 
@@ -524,6 +626,24 @@ pub fn agent_container_name(base: &str) -> String {
 /// event→worktree mapping) treat the agent container as its worktree's.
 pub fn strip_agent_suffix(name: &str) -> &str {
     name.strip_suffix(AGENT_CONTAINER_SUFFIX).unwrap_or(name)
+}
+
+/// Suffix marking a worktree's VPN sidecar — the companion container that owns
+/// the tunnel's network namespace (the worktree container joins it via
+/// `--network container:<sidecar>`). Deterministic from the worktree container
+/// name so the bring-up (`superzej-svc::vpn`), the `--network` wiring
+/// ([`oci_create_opts`]), and teardown all agree without a registry lookup.
+pub const VPN_SIDECAR_SUFFIX: &str = "-szvpn";
+
+/// The VPN sidecar container name, derived from the worktree container name `base`.
+pub fn vpn_sidecar_name(base: &str) -> String {
+    format!("{base}{VPN_SIDECAR_SUFFIX}")
+}
+
+/// Strip [`VPN_SIDECAR_SUFFIX`] so orphan reconciliation maps a stray sidecar
+/// back to its worktree.
+pub fn strip_vpn_suffix(name: &str) -> &str {
+    name.strip_suffix(VPN_SIDECAR_SUFFIX).unwrap_or(name)
 }
 
 /// One running container, as listed by the OCI runtime — feeds the panel's
@@ -1027,6 +1147,10 @@ pub fn teardown_by_path(worktree: &str) {
     // it runs in `superzej-{slug}-szagent`); `rm -f` of a non-existent name is a
     // harmless no-op.
     let agent = agent_container_name(&name);
+    // Also remove the VPN sidecar (`superzej-{slug}-szvpn`) when one was started;
+    // `rm -f` of a missing name is a harmless no-op. (Ephemeral node de-register
+    // is the host's job via `superzej-svc::vpn::down` before this runs.)
+    let vpn = vpn_sidecar_name(&name);
     let transport = Transport::Local;
     for b in [
         Backend::Podman,
@@ -1037,7 +1161,13 @@ pub fn teardown_by_path(worktree: &str) {
     ] {
         if available(&transport, b) {
             let mut argv = backend_prefix(b);
-            argv.extend(["rm".into(), "-f".into(), name.to_string(), agent.clone()]);
+            argv.extend([
+                "rm".into(),
+                "-f".into(),
+                name.to_string(),
+                agent.clone(),
+                vpn.clone(),
+            ]);
             let _ = run_control_t_owned(&transport, &argv, PROBE_TIMEOUT);
         }
     }
@@ -1054,6 +1184,7 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
     // latter only exists when `agent_profile` differs); `rm -f` of a missing
     // name is a harmless no-op.
     let agent = agent_container_name(name);
+    let vpn = vpn_sidecar_name(name);
     // Try whichever OCI runtimes are available; the container only exists under one.
     for b in [
         Backend::Podman,
@@ -1064,7 +1195,13 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
     ] {
         if available(&transport, b) {
             let mut argv = backend_prefix(b);
-            argv.extend(["rm".into(), "-f".into(), name.to_string(), agent.clone()]);
+            argv.extend([
+                "rm".into(),
+                "-f".into(),
+                name.to_string(),
+                agent.clone(),
+                vpn.clone(),
+            ]);
             let _ = run_control_t_owned(&transport, &argv, PROBE_TIMEOUT);
         }
     }
@@ -1318,21 +1455,46 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
         }
         _ => {}
     }
-    match spec.network {
-        Network::Host => v.extend(["--network".into(), "host".into()]),
-        Network::None => v.extend(["--network".into(), "none".into()]),
-        Network::Nat => {}
+    // When a VPN sidecar owns the netns (sidecar/proxy mode), the worktree
+    // container joins it and its only egress is the tunnel. `--network
+    // container:` is mutually exclusive with `--dns`/`-p`/other `--network`
+    // flags (podman/docker reject them), so those are suppressed below.
+    let vpn_join = vpn_sidecar_join(spec);
+    if let Some(sidecar) = &vpn_join {
+        v.extend(["--network".into(), format!("container:{sidecar}")]);
+    } else {
+        match spec.network {
+            Network::Host => v.extend(["--network".into(), "host".into()]),
+            Network::None => v.extend(["--network".into(), "none".into()]),
+            Network::Nat => {}
+        }
+    }
+    // `in_container` VPN mode runs the tunnel client inside this very container,
+    // so it needs the tunnel capabilities here (this is the explicit, less-
+    // isolated mode; sidecar mode keeps the worktree's caps untouched).
+    if let Some(vpn) = &spec.vpn
+        && vpn.mode == VpnMode::InContainer
+    {
+        v.extend([
+            "--cap-add".into(),
+            "NET_ADMIN".into(),
+            "--device".into(),
+            "/dev/net/tun".into(),
+        ]);
     }
     // DNS-based domain filtering: start the proxy on first use and point the
-    // container at it. Skip when network is None (DNS unreachable anyway) or
+    // container at it. Skip when network is None (DNS unreachable anyway), when
+    // a VPN sidecar owns DNS (`--dns` is illegal on a container-netns join), or
     // when no filtering is configured.
     if spec.network != Network::None
+        && vpn_join.is_none()
         && (!spec.network_allow.is_empty() || !spec.network_block.is_empty())
         && matches!(spec.transport, Transport::Local)
     {
         let policy = crate::dns_filter::DnsPolicy {
             allow: spec.network_allow.clone(),
             block: spec.network_block.clone(),
+            upstream: None,
         };
         if let Some(port) = crate::dns_filter::get_or_start(policy) {
             v.extend(["--dns".into(), format!("127.0.0.1:{port}")]);
@@ -1399,10 +1561,30 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
         v.extend(["--pids-limit".into(), p.to_string()]);
     }
 
-    for p in &spec.ports {
-        v.extend(["-p".into(), p.clone()]);
+    // Published ports must live on the netns owner. When a VPN sidecar owns the
+    // netns, `-p` is illegal on the joining worktree container (it should be set
+    // on the sidecar instead); warn and skip rather than fail the create.
+    if vpn_join.is_none() {
+        for p in &spec.ports {
+            v.extend(["-p".into(), p.clone()]);
+        }
+    } else if !spec.ports.is_empty() {
+        msg::warn(
+            "sandbox: [sandbox] ports are ignored when a VPN sidecar owns the \
+             network namespace; publish them on the sidecar instead.",
+        );
     }
     v
+}
+
+/// When a VPN sidecar owns this worktree's network namespace (`sidecar`/`proxy`
+/// mode), the worktree OCI container joins it via `--network container:<name>`
+/// and MUST NOT also set `--dns`/`-p`/another `--network` (podman/docker reject
+/// those on a container-netns join). Returns the sidecar name, or `None` when no
+/// sidecar is in play (no VPN, or `in_container`/`netns` mode).
+fn vpn_sidecar_join(spec: &SandboxSpec) -> Option<String> {
+    let vpn = spec.vpn.as_ref()?;
+    matches!(vpn.mode, VpnMode::Sidecar | VpnMode::Proxy).then(|| vpn_sidecar_name(&spec.name))
 }
 
 /// Like [`oci_create_opts`] but lets the caller suppress Podman's
@@ -1486,6 +1668,14 @@ fn backend_prefix(backend: Backend) -> Vec<String> {
         Backend::PodmanRootful => vec!["sudo".into(), "-n".into(), "podman".into()],
         _ => vec![backend.binary().into()],
     }
+}
+
+/// The argv prefix to invoke the container CLI for an OCI `backend`
+/// (`["podman"]`, `["sudo", "-n", "podman"]`, `["docker"]`, …), or `None` for a
+/// non-OCI backend. Lets the host drive a VPN sidecar via the *same* runtime as
+/// the worktree container (so `--network container:` shares a user namespace).
+pub fn oci_runtime_prefix(backend: Backend) -> Option<Vec<String>> {
+    backend.is_oci().then(|| backend_prefix(backend))
 }
 
 fn run_local_output(prefix: &[String], args: &[&str]) -> Option<String> {
@@ -1973,6 +2163,145 @@ pub fn run_gc(db_worktrees: &[String]) -> Vec<String> {
 mod tests {
     use super::*;
 
+    fn vpn_cfg(provider: VpnProviderKind) -> VpnConfig {
+        VpnConfig {
+            provider,
+            ..VpnConfig::default()
+        }
+    }
+
+    #[test]
+    fn build_vpn_spec_none_provider_is_none() {
+        assert!(build_vpn_spec(&VpnConfig::default(), "wt", SandboxProfile::Hardened).is_none());
+    }
+
+    #[test]
+    fn build_vpn_spec_sealed_refuses_but_sealed_tunnel_attaches() {
+        let cfg = vpn_cfg(VpnProviderKind::Tailscale);
+        // Plain sealed refuses a tunnel (returns None).
+        assert!(build_vpn_spec(&cfg, "wt", SandboxProfile::Sealed).is_none());
+        // sealed-tunnel and hardened both attach.
+        assert!(build_vpn_spec(&cfg, "wt", SandboxProfile::SealedTunnel).is_some());
+        assert!(build_vpn_spec(&cfg, "wt", SandboxProfile::Hardened).is_some());
+    }
+
+    #[test]
+    fn build_vpn_spec_maps_each_provider_to_its_params() {
+        for provider in [
+            VpnProviderKind::Tailscale,
+            VpnProviderKind::Headscale,
+            VpnProviderKind::Wireguard,
+            VpnProviderKind::Openvpn,
+            VpnProviderKind::Netbird,
+            VpnProviderKind::Zerotier,
+            VpnProviderKind::Custom,
+        ] {
+            let spec = build_vpn_spec(&vpn_cfg(provider), "wt", SandboxProfile::Hardened).unwrap();
+            assert_eq!(spec.provider, provider);
+            // Headscale reuses the Tailscale params variant.
+            let ok = matches!(
+                (provider, &spec.params),
+                (VpnProviderKind::Tailscale, VpnParams::Tailscale(_))
+                    | (VpnProviderKind::Headscale, VpnParams::Tailscale(_))
+                    | (VpnProviderKind::Wireguard, VpnParams::Wireguard(_))
+                    | (VpnProviderKind::Openvpn, VpnParams::Openvpn(_))
+                    | (VpnProviderKind::Netbird, VpnParams::Netbird(_))
+                    | (VpnProviderKind::Zerotier, VpnParams::Zerotier(_))
+                    | (VpnProviderKind::Custom, VpnParams::Custom(_))
+            );
+            assert!(ok, "{provider:?} mapped to wrong params: {:?}", spec.params);
+        }
+    }
+
+    #[test]
+    fn build_vpn_spec_hostname_defaults_to_name_then_overrides() {
+        // Default: container name.
+        let spec = build_vpn_spec(
+            &vpn_cfg(VpnProviderKind::Tailscale),
+            "superzej-repo-feat",
+            SandboxProfile::Hardened,
+        )
+        .unwrap();
+        assert_eq!(spec.hostname, "superzej-repo-feat");
+
+        // Per-provider hostname wins.
+        let mut cfg = vpn_cfg(VpnProviderKind::Tailscale);
+        cfg.tailscale.hostname = "custom-node".into();
+        let spec = build_vpn_spec(&cfg, "superzej-repo-feat", SandboxProfile::Hardened).unwrap();
+        assert_eq!(spec.hostname, "custom-node");
+    }
+
+    #[test]
+    fn build_vpn_spec_carries_knobs_and_optional_image() {
+        let mut cfg = vpn_cfg(VpnProviderKind::Wireguard);
+        cfg.mode = VpnMode::Proxy;
+        cfg.on_error = VpnOnError::Offline;
+        cfg.dns = VpnDnsMode::FilterFront;
+        cfg.ready_timeout_secs = 7;
+        cfg.ephemeral = false;
+        let spec = build_vpn_spec(&cfg, "wt", SandboxProfile::Hardened).unwrap();
+        assert_eq!(spec.mode, VpnMode::Proxy);
+        assert_eq!(spec.on_error, VpnOnError::Offline);
+        assert_eq!(spec.dns_mode, VpnDnsMode::FilterFront);
+        assert_eq!(spec.ready_timeout, Duration::from_secs(7));
+        assert!(!spec.ephemeral);
+        // Empty sidecar_image -> None; set -> Some.
+        assert!(spec.sidecar_image.is_none());
+        cfg.sidecar_image = "ghcr.io/me/wg:latest".into();
+        let spec = build_vpn_spec(&cfg, "wt", SandboxProfile::Hardened).unwrap();
+        assert_eq!(spec.sidecar_image.as_deref(), Some("ghcr.io/me/wg:latest"));
+    }
+
+    #[test]
+    fn oci_opts_join_vpn_sidecar_netns_and_suppress_dns_ports() {
+        let mut s = spec(Backend::Podman);
+        s.network = Network::Nat;
+        s.network_allow = vec!["example.com".into()]; // would normally add --dns
+        s.ports = vec!["8080:8080".into()]; // would normally add -p
+        s.vpn = build_vpn_spec(
+            &vpn_cfg(VpnProviderKind::Tailscale),
+            &s.name,
+            SandboxProfile::Hardened,
+        );
+        let opts = oci_create_opts(&s);
+        let joined = opts.join(" ");
+        // Joins the sidecar netns...
+        assert!(
+            joined.contains("--network container:superzej-repo-feat-szvpn"),
+            "{joined}"
+        );
+        // ...and suppresses --dns and -p (illegal on a container-netns join).
+        assert!(!opts.iter().any(|o| o == "--dns"), "{joined}");
+        assert!(!opts.iter().any(|o| o == "-p"), "{joined}");
+    }
+
+    #[test]
+    fn oci_opts_in_container_mode_adds_net_admin_and_tun() {
+        let mut s = spec(Backend::Podman);
+        let mut cfg = vpn_cfg(VpnProviderKind::Wireguard);
+        cfg.mode = VpnMode::InContainer;
+        s.vpn = build_vpn_spec(&cfg, &s.name, SandboxProfile::Hardened);
+        let opts = oci_create_opts(&s);
+        let joined = opts.join(" ");
+        // in_container does NOT join a sidecar netns; it keeps normal networking
+        // and adds the tunnel caps to the worktree container itself.
+        assert!(!joined.contains("container:"), "{joined}");
+        assert!(opts.iter().any(|o| o == "NET_ADMIN"), "{joined}");
+        assert!(joined.contains("/dev/net/tun"), "{joined}");
+    }
+
+    #[test]
+    fn oci_opts_without_vpn_keep_normal_network_and_ports() {
+        let mut s = spec(Backend::Podman);
+        s.network = Network::Nat;
+        s.ports = vec!["8080:8080".into()];
+        assert!(s.vpn.is_none());
+        let opts = oci_create_opts(&s);
+        // No container: join; ports published as usual.
+        assert!(!opts.join(" ").contains("container:"));
+        assert!(opts.windows(2).any(|w| w == ["-p", "8080:8080"]));
+    }
+
     fn spec(backend: Backend) -> SandboxSpec {
         SandboxSpec {
             backend,
@@ -2014,6 +2343,7 @@ mod tests {
             devenv: false,
             devenv_path: None,
             name: "superzej-repo-feat".into(),
+            vpn: None,
         }
     }
 
@@ -2632,6 +2962,18 @@ mod tests {
         assert!(!j.contains("--cap-drop"), "{j}");
         assert!(!j.contains("--security-opt"), "{j}");
         assert!(!j.contains("--pids-limit"), "{j}");
+    }
+
+    #[test]
+    fn vpn_sidecar_name_roundtrips() {
+        let base = container_name("/wt/feat");
+        let vpn = vpn_sidecar_name(&base);
+        assert_eq!(vpn, format!("{base}-szvpn"));
+        assert_ne!(vpn, base);
+        assert_eq!(strip_vpn_suffix(&vpn), base);
+        assert_eq!(strip_vpn_suffix(&base), base);
+        // Independent of the agent suffix.
+        assert_eq!(strip_agent_suffix(&vpn), vpn);
     }
 
     #[test]

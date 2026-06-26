@@ -173,8 +173,10 @@ fn process_network_event(json: &str) -> Option<SandboxEventBatch> {
 /// up in the DB — the worktree path was stored when the container was created.
 fn worktree_from_container_name(name: &str) -> Option<String> {
     let db = superzej_core::db::Db::open().ok()?;
-    // Map the agent's `-szagent` container back to its worktree too.
-    let lookup = superzej_core::sandbox::strip_agent_suffix(name);
+    // Map the agent's `-szagent` container and the VPN `-szvpn` sidecar back to
+    // their worktree too (strip whichever suffix applies).
+    let lookup =
+        superzej_core::sandbox::strip_vpn_suffix(superzej_core::sandbox::strip_agent_suffix(name));
     // Linear scan of the worktree list. Fine: there are at most a few dozen.
     let rows = db.worktrees().ok()?;
     rows.into_iter().find_map(|r| {

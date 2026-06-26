@@ -1931,6 +1931,10 @@ fn forget_worktree_group(
     if !group.path.is_empty() {
         let path = group.path.clone();
         std::thread::spawn(move || {
+            // De-register the ephemeral VPN node (if any) before its sidecar is
+            // removed, then tear down the worktree's containers (which `rm -f`s
+            // the `-szvpn` sidecar too).
+            crate::agent::deregister_vpn(&path);
             superzej_core::sandbox::teardown_by_path(&path);
         });
     }

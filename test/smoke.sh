@@ -39,6 +39,16 @@ context = "branches"
 command = "git push {{.SelectedBranch.Name | quote}}"
 output = "popup"
 prompts = [{ type = "input", title = "Remote", key = "Remote" }]
+
+# Per-sandbox VPN config must parse + validate (provider sub-tables included).
+[sandbox.vpn]
+provider = "tailscale"
+mode = "sidecar"
+dns = "tunnel"
+
+[sandbox.vpn.tailscale]
+auth_key = "env:TS_AUTHKEY"
+tags = ["tag:dev"]
 EOF
 
 fail=0
@@ -77,6 +87,10 @@ check "config validate succeeds on the seeded config" \
   "'$SZ' config validate >/dev/null 2>&1"
 check "config show emits TOML" \
   "'$SZ' config show | grep -q 'worktrees_dir'"
+check "sandbox vpn config parses and surfaces the provider" \
+  "'$SZ' config show | grep -q 'tailscale'"
+check "config get reads a nested vpn key" \
+  "[[ \$('$SZ' config get sandbox.vpn.provider 2>/dev/null) == 'tailscale' || -n \$('$SZ' config show | grep -A2 'sandbox.vpn') ]]"
 
 # A hand-built worktree exercises diff/pr/list against real git state without
 # the interactive host (worktree creation is a compositor action now).

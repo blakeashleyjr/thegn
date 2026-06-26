@@ -27,8 +27,13 @@ pub fn config_warn(msg: &str) {
 /// Expand a config value that may be an environment-variable reference.
 ///
 /// A string of the form `"env:VAR_NAME"` is replaced by the value of the
-/// environment variable `VAR_NAME`. Any other non-empty string is returned
-/// as-is. An empty string or a missing environment variable both return `None`.
+/// environment variable `VAR_NAME`. A string of the form `"file:PATH"` is
+/// replaced by the (trimmed) contents of `PATH` — `~` is expanded to `$HOME`.
+/// Any other non-empty string is returned as-is. An empty string, a missing
+/// environment variable, or an unreadable/empty file all return `None`.
+///
+/// Used for secrets-refs (API keys, VPN auth keys) so credentials live in the
+/// environment or an out-of-tree file rather than in plaintext in the config.
 pub fn expand_env_ref(value: &str) -> Option<String> {
     let v = value.trim();
     if v.is_empty() {
@@ -38,9 +43,31 @@ pub fn expand_env_ref(value: &str) -> Option<String> {
         std::env::var(var_name)
             .ok()
             .filter(|s| !s.trim().is_empty())
+    } else if let Some(path) = v.strip_prefix("file:") {
+        let path = expand_tilde(path.trim());
+        std::fs::read_to_string(&path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
     } else {
         Some(v.to_string())
     }
+}
+
+/// Expand a leading `~` / `~/` to `$HOME` (best-effort; returns the input
+/// unchanged when `$HOME` is unset or the path has no leading tilde).
+fn expand_tilde(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return format!("{home}/{rest}");
+    }
+    if path == "~"
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return home;
+    }
+    path.to_string()
 }
 
 /// Declare a string-backed, validated, TOML-friendly enum.
@@ -160,10 +187,18 @@ config_enum! {
     ///                debuggers, ping) keeps working. The default.
     /// - `sealed`   — full lockdown: `network=none`, read-only root, drop ALL
     ///                capabilities, no-new-privileges, tighter pids cap.
+    /// - `sealed-tunnel` — the same lockdown as `sealed` (read-only root, drop
+    ///                ALL capabilities on the worktree, no-new-privileges, tight
+    ///                pids cap) EXCEPT the worktree has no *direct* host egress
+    ///                but is attached to its `[sandbox.vpn]` overlay: its only
+    ///                route is the tunnel (the sidecar holds NET_ADMIN/TUN, not
+    ///                the worktree). With no VPN configured it degrades to
+    ///                `network=none`, i.e. behaves exactly like `sealed`.
     pub enum SandboxProfile: "sandbox profile" {
         Open = "open" | "off" | "none",
         Hardened = "hardened" | "guarded",
         Sealed = "sealed" | "locked" | "isolated",
+        SealedTunnel = "sealed-tunnel" | "tunnel-only" | "vpn-only",
     } default = Hardened;
 }
 
@@ -171,26 +206,34 @@ impl SandboxProfile {
     /// Mount the container root filesystem read-only (writable: the worktree,
     /// cache binds, and a tmpfs `/tmp`).
     pub fn read_only_root(self) -> bool {
-        matches!(self, SandboxProfile::Hardened | SandboxProfile::Sealed)
+        matches!(
+            self,
+            SandboxProfile::Hardened | SandboxProfile::Sealed | SandboxProfile::SealedTunnel
+        )
     }
     /// Set `no-new-privileges` so setuid/setgid binaries can't escalate.
     pub fn no_new_privileges(self) -> bool {
-        matches!(self, SandboxProfile::Hardened | SandboxProfile::Sealed)
+        matches!(
+            self,
+            SandboxProfile::Hardened | SandboxProfile::Sealed | SandboxProfile::SealedTunnel
+        )
     }
     /// Cap the number of processes (fork-bomb containment); `None` = unlimited.
     pub fn pids_limit(self) -> Option<i64> {
         match self {
             SandboxProfile::Open => None,
             SandboxProfile::Hardened => Some(512),
-            SandboxProfile::Sealed => Some(256),
+            SandboxProfile::Sealed | SandboxProfile::SealedTunnel => Some(256),
         }
     }
-    /// Linux capabilities to drop. `sealed` drops everything; `hardened` leaves
-    /// the runtime's defaults so debuggers (ptrace), `ping` (NET_RAW), and
-    /// low-port binds keep working.
+    /// Linux capabilities to drop. `sealed`/`sealed-tunnel` drop everything;
+    /// `hardened` leaves the runtime's defaults so debuggers (ptrace), `ping`
+    /// (NET_RAW), and low-port binds keep working. Under `sealed-tunnel` the
+    /// worktree still drops ALL caps — the tunnel's NET_ADMIN/TUN live in the
+    /// VPN sidecar, never in the worktree container.
     pub fn drop_capabilities(self) -> Vec<String> {
         match self {
-            SandboxProfile::Sealed => vec!["ALL".to_string()],
+            SandboxProfile::Sealed | SandboxProfile::SealedTunnel => vec!["ALL".to_string()],
             _ => Vec::new(),
         }
     }
@@ -198,9 +241,19 @@ impl SandboxProfile {
     pub fn add_capabilities(self) -> Vec<String> {
         Vec::new()
     }
-    /// Force `network=none` regardless of the configured network mode.
+    /// Force `network=none` regardless of the configured network mode. Both
+    /// `sealed` and `sealed-tunnel` impose this floor; for `sealed-tunnel` a
+    /// resolved VPN attachment lifts it back up to a tunnel-only route (handled
+    /// in `sandbox::resolve_scoped`, not here), so with no VPN it stays sealed.
     pub fn forces_no_network(self) -> bool {
-        matches!(self, SandboxProfile::Sealed)
+        matches!(self, SandboxProfile::Sealed | SandboxProfile::SealedTunnel)
+    }
+    /// Whether this profile permits a VPN attachment. Plain `sealed` refuses
+    /// (its contract is "no network, no caps"); `sealed-tunnel` is the explicit
+    /// posture for "locked down, but on its own tunnel". Non-sealed profiles
+    /// permit it freely.
+    pub fn permits_vpn(self) -> bool {
+        !matches!(self, SandboxProfile::Sealed)
     }
 }
 config_enum! {
@@ -1376,6 +1429,230 @@ pub struct SandboxLimits {
     pub memory: Option<String>,
 }
 
+config_enum! {
+    /// `[sandbox.vpn] provider` — which overlay/tunnel a sandbox attaches to.
+    /// `none` (the default) leaves the worktree's network behavior unchanged.
+    /// `headscale` is `tailscale` pointed at a self-hosted control server
+    /// (`[sandbox.vpn.tailscale] login_server`).
+    pub enum VpnProviderKind: "vpn provider" {
+        None = "none" | "off",
+        Tailscale = "tailscale" | "ts",
+        Headscale = "headscale" | "hs",
+        Wireguard = "wireguard" | "wg" | "wg-quick",
+        Openvpn = "openvpn" | "ovpn",
+        Netbird = "netbird" | "nb",
+        Zerotier = "zerotier" | "zt",
+        Custom = "custom" | "command",
+    } default = None;
+}
+config_enum! {
+    /// How the tunnel is realized for the sandbox.
+    ///  - `sidecar` (default): a companion container owns the network namespace;
+    ///    the worktree OCI container joins it via `--network container:<sidecar>`,
+    ///    so its only egress is the tunnel and its capabilities stay untouched
+    ///    (NET_ADMIN/TUN live in the sidecar).
+    ///  - `proxy`: a userspace tunnel exposes a SOCKS5/HTTP proxy; the inner
+    ///    process is pointed at it via `ALL_PROXY`/`HTTPS_PROXY`. No NET_ADMIN or
+    ///    /dev/net/tun needed, but only proxy-aware traffic is tunneled (not a
+    ///    containment boundary). The only honest option for bwrap/systemd.
+    ///  - `in_container`: run the VPN client inside the worktree container itself
+    ///    (needs NET_ADMIN + /dev/net/tun; weakens `hardened`, refused if caps
+    ///    are dropped).
+    ///  - `netns`: join a host-prepared named network namespace (host-toolchain
+    ///    backends; best-effort, needs privilege to set up).
+    pub enum VpnMode: "vpn mode" {
+        Sidecar = "sidecar",
+        Proxy = "proxy",
+        InContainer = "in_container" | "in-container",
+        Netns = "netns",
+    } default = Sidecar;
+}
+config_enum! {
+    /// What to do when the tunnel can't be brought up.
+    ///  - `fail` (default): refuse to launch the sandbox (don't silently fall
+    ///    back to a less-isolated network).
+    ///  - `warn`: launch with the tunnel down (loud warning).
+    ///  - `offline`: force `network=none` so nothing leaks onto the host network.
+    pub enum VpnOnError: "vpn on_error" {
+        Fail = "fail",
+        Warn = "warn",
+        Offline = "offline",
+    } default = Fail;
+}
+config_enum! {
+    /// How DNS resolution inside the sandbox composes with the overlay.
+    ///  - `tunnel` (default): the provider owns resolution (MagicDNS / pushed
+    ///    resolvers); the `network_allow`/`network_block` filter is bypassed.
+    ///  - `filter-front`: chain the allow/block DNS filter in front, forwarding
+    ///    to the tunnel's resolver (preserves auditing).
+    ///  - `filter-only`: ignore the overlay's pushed DNS, keep the filter only.
+    pub enum VpnDnsMode: "vpn dns" {
+        Tunnel = "tunnel",
+        FilterFront = "filter-front" | "filter_front",
+        FilterOnly = "filter-only" | "filter_only",
+    } default = Tunnel;
+}
+
+/// `[sandbox.vpn]` — attach this worktree's sandbox to its own overlay/tunnel
+/// with its own identity, leaving host networking (including any host
+/// `tailscaled`) untouched. Disabled by default (`provider = "none"`). Only the
+/// selected provider's sub-table is consulted.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct VpnConfig {
+    pub provider: VpnProviderKind,
+    pub mode: VpnMode,
+    /// Override the provider's default sidecar image. Empty = provider default.
+    pub sidecar_image: String,
+    /// Seconds to wait for the tunnel's readiness probe before applying
+    /// `on_error`.
+    pub ready_timeout_secs: u64,
+    pub on_error: VpnOnError,
+    pub dns: VpnDnsMode,
+    /// Request an ephemeral node identity where the provider supports it
+    /// (Tailscale/Headscale/NetBird), so the device auto-deregisters on teardown.
+    pub ephemeral: bool,
+    pub tailscale: TailscaleConfig,
+    pub wireguard: WireguardConfig,
+    pub openvpn: OpenvpnConfig,
+    pub netbird: NetbirdConfig,
+    pub zerotier: ZerotierConfig,
+    pub custom: CustomVpnConfig,
+}
+
+impl Default for VpnConfig {
+    fn default() -> Self {
+        VpnConfig {
+            provider: VpnProviderKind::None,
+            mode: VpnMode::Sidecar,
+            sidecar_image: String::new(),
+            ready_timeout_secs: 30,
+            on_error: VpnOnError::Fail,
+            dns: VpnDnsMode::Tunnel,
+            ephemeral: true,
+            tailscale: TailscaleConfig::default(),
+            wireguard: WireguardConfig::default(),
+            openvpn: OpenvpnConfig::default(),
+            netbird: NetbirdConfig::default(),
+            zerotier: ZerotierConfig::default(),
+            custom: CustomVpnConfig::default(),
+        }
+    }
+}
+
+impl VpnConfig {
+    /// Whether a tunnel is requested at all.
+    pub fn is_enabled(&self) -> bool {
+        self.provider != VpnProviderKind::None
+    }
+}
+
+/// `[sandbox.vpn.tailscale]` — Tailscale / Headscale. `login_server` is what
+/// makes it Headscale (a self-hosted control server).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct TailscaleConfig {
+    /// Auth key (secrets-ref: `"env:TS_AUTHKEY"` or `"file:~/.ts/dev.key"`).
+    /// Prefer an ephemeral, pre-authorized, tagged key for dev envs.
+    pub auth_key: String,
+    /// Custom control server, e.g. `"https://headscale.example.com"`.
+    pub login_server: String,
+    /// ACL tags to advertise, e.g. `["tag:dev"]`.
+    pub tags: Vec<String>,
+    /// Route egress through this exit node (hostname or IP). `""` = none.
+    pub exit_node: String,
+    /// Accept subnet routes advertised by the tailnet.
+    pub accept_routes: bool,
+    /// Node name in the tailnet. `""` = derive from the container name.
+    pub hostname: String,
+    /// Advertise these CIDRs as subnet routes from the sandbox.
+    pub advertise_routes: Vec<String>,
+    /// Extra `tailscale up` flags for anything not modeled here.
+    pub extra_args: Vec<String>,
+}
+
+impl Default for TailscaleConfig {
+    fn default() -> Self {
+        TailscaleConfig {
+            auth_key: "env:TS_AUTHKEY".into(),
+            login_server: String::new(),
+            tags: Vec::new(),
+            exit_node: String::new(),
+            accept_routes: false,
+            hostname: String::new(),
+            advertise_routes: Vec::new(),
+            extra_args: Vec::new(),
+        }
+    }
+}
+
+/// `[sandbox.vpn.wireguard]` — a wg-quick tunnel.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct WireguardConfig {
+    /// Path to a wg-quick `.conf` (mounted into the sidecar read-only). Mutually
+    /// exclusive with `config`; `config` wins if both are set.
+    pub config_path: String,
+    /// Inline config body (secrets-ref `"file:..."` recommended to keep keys out
+    /// of the superzej config file).
+    pub config: String,
+}
+
+/// `[sandbox.vpn.openvpn]` — an OpenVPN tunnel.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct OpenvpnConfig {
+    /// Path to a `.ovpn` (mounted into the sidecar read-only).
+    pub config_path: String,
+    /// `user\npass` credentials (secrets-ref `"file:~/.ovpn/creds"`).
+    pub auth_user_pass: String,
+    /// Extra `openvpn` flags.
+    pub extra_args: Vec<String>,
+}
+
+/// `[sandbox.vpn.netbird]` — a NetBird mesh.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct NetbirdConfig {
+    /// Setup key (secrets-ref).
+    pub setup_key: String,
+    /// Self-hosted management URL. `""` = NetBird's hosted control plane.
+    pub management_url: String,
+    /// Peer hostname. `""` = derive from the container name.
+    pub hostname: String,
+}
+
+/// `[sandbox.vpn.zerotier]` — a ZeroTier network.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct ZerotierConfig {
+    /// 16-hex network id to join.
+    pub network_id: String,
+    /// Self-hosted controller/moon URL. `""` = ZeroTier's hosted controller.
+    pub controller_url: String,
+    /// API token (secrets-ref) used to auto-authorize the joining member.
+    pub api_token: String,
+}
+
+/// `[sandbox.vpn.custom]` — the open escape hatch for any tunnel not modeled
+/// above (Nebula, Tinc, a corporate IPsec script, …). The `up`/`down`/
+/// `ready_check` commands run via `sh -c`; the template vars `{name}`,
+/// `{netns}`, and `{worktree}` are expanded before execution.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct CustomVpnConfig {
+    /// Command that establishes the tunnel.
+    pub up: String,
+    /// Command that tears it down (best-effort, run on teardown).
+    pub down: String,
+    /// Command whose exit-0 means "ready" (polled until `ready_timeout_secs`).
+    pub ready_check: String,
+    /// Sidecar image when `mode = "sidecar"`. `""` for proxy/netns modes.
+    pub image: String,
+    /// Extra env passed to the `up`/`ready_check` commands / sidecar.
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct SandboxConfig {
@@ -1419,6 +1696,8 @@ pub struct SandboxConfig {
     pub network_block: Vec<String>,
     /// Log all outbound DNS queries and connection attempts to the audit table.
     pub network_audit: bool,
+    /// `[sandbox.vpn]` — attach the worktree to its own overlay/tunnel.
+    pub vpn: VpnConfig,
 }
 
 impl Default for SandboxConfig {
@@ -1475,6 +1754,7 @@ impl Default for SandboxConfig {
             network_allow: Vec::new(),
             network_block: Vec::new(),
             network_audit: false,
+            vpn: VpnConfig::default(),
         }
     }
 }
@@ -1510,6 +1790,9 @@ pub struct SandboxOverlay {
     pub network_allow: Option<Vec<String>>,
     pub network_block: Option<Vec<String>>,
     pub network_audit: Option<bool>,
+    /// Whole-table replace (matching `remote`/`limits`): a `[sandbox.vpn]` in an
+    /// overlay replaces the global VPN config wholesale rather than field-merging.
+    pub vpn: Option<VpnConfig>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
@@ -1600,6 +1883,9 @@ impl SandboxOverlay {
         if let Some(v) = self.network_audit {
             base.network_audit = v;
         }
+        if let Some(v) = self.vpn {
+            base.vpn = v;
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -1622,6 +1908,7 @@ impl SandboxOverlay {
             && self.network_allow.is_none()
             && self.network_block.is_none()
             && self.network_audit.is_none()
+            && self.vpn.is_none()
     }
 }
 
@@ -5567,5 +5854,168 @@ token_reduction_level = "balanced"
         assert!(t.name.is_empty());
         assert!(t.base.is_none() && t.layout.is_none());
         assert!(t.pins.is_empty() && t.commands.is_empty());
+    }
+
+    #[test]
+    fn vpn_config_defaults_to_disabled() {
+        let cfg = SandboxConfig::default();
+        assert_eq!(cfg.vpn.provider, VpnProviderKind::None);
+        assert!(!cfg.vpn.is_enabled());
+        // Forward-looking defaults the runtime relies on.
+        assert_eq!(cfg.vpn.mode, VpnMode::Sidecar);
+        assert_eq!(cfg.vpn.on_error, VpnOnError::Fail);
+        assert_eq!(cfg.vpn.dns, VpnDnsMode::Tunnel);
+        assert!(cfg.vpn.ephemeral);
+    }
+
+    #[test]
+    fn vpn_provider_kind_aliases_and_default() {
+        assert_eq!(VpnProviderKind::default(), VpnProviderKind::None);
+        for (s, want) in [
+            ("tailscale", VpnProviderKind::Tailscale),
+            ("ts", VpnProviderKind::Tailscale),
+            ("headscale", VpnProviderKind::Headscale),
+            ("hs", VpnProviderKind::Headscale),
+            ("wg-quick", VpnProviderKind::Wireguard),
+            ("ovpn", VpnProviderKind::Openvpn),
+            ("nb", VpnProviderKind::Netbird),
+            ("zt", VpnProviderKind::Zerotier),
+            ("command", VpnProviderKind::Custom),
+            ("off", VpnProviderKind::None),
+        ] {
+            assert_eq!(VpnProviderKind::from_str_validated(s).unwrap(), want, "{s}");
+        }
+        // Unknown values warn and fall back to the default (infallible deser).
+        let k: VpnProviderKind = serde_json::from_str(r#""bogus""#).unwrap();
+        assert_eq!(k, VpnProviderKind::None);
+    }
+
+    #[test]
+    fn vpn_mode_and_dns_aliases() {
+        assert_eq!(
+            VpnMode::from_str_validated("in-container").unwrap(),
+            VpnMode::InContainer
+        );
+        assert_eq!(
+            VpnDnsMode::from_str_validated("filter_front").unwrap(),
+            VpnDnsMode::FilterFront
+        );
+        assert_eq!(
+            VpnOnError::from_str_validated("offline").unwrap(),
+            VpnOnError::Offline
+        );
+    }
+
+    #[test]
+    fn vpn_config_parses_from_toml_subtables() {
+        let cfg: Config = toml::from_str(
+            r#"
+[sandbox.vpn]
+provider = "headscale"
+mode = "proxy"
+dns = "filter-front"
+ready_timeout_secs = 12
+ephemeral = false
+
+[sandbox.vpn.tailscale]
+auth_key = "env:TS_AUTHKEY"
+login_server = "https://headscale.example.com"
+tags = ["tag:dev", "tag:ci"]
+exit_node = "exit-1"
+accept_routes = true
+hostname = "my-node"
+
+[sandbox.vpn.wireguard]
+config_path = "/etc/wireguard/wg0.conf"
+"#,
+        )
+        .unwrap();
+        let v = &cfg.sandbox.vpn;
+        assert_eq!(v.provider, VpnProviderKind::Headscale);
+        assert_eq!(v.mode, VpnMode::Proxy);
+        assert_eq!(v.dns, VpnDnsMode::FilterFront);
+        assert_eq!(v.ready_timeout_secs, 12);
+        assert!(!v.ephemeral);
+        assert_eq!(v.tailscale.login_server, "https://headscale.example.com");
+        assert_eq!(v.tailscale.tags, vec!["tag:dev", "tag:ci"]);
+        assert_eq!(v.tailscale.exit_node, "exit-1");
+        assert!(v.tailscale.accept_routes);
+        assert_eq!(v.tailscale.hostname, "my-node");
+        assert_eq!(v.wireguard.config_path, "/etc/wireguard/wg0.conf");
+    }
+
+    #[test]
+    fn vpn_config_round_trips_through_serialization() {
+        let v = VpnConfig {
+            provider: VpnProviderKind::Zerotier,
+            zerotier: ZerotierConfig {
+                network_id: "8056c2e21c000001".into(),
+                ..ZerotierConfig::default()
+            },
+            ..VpnConfig::default()
+        };
+        let s = toml::to_string(&v).unwrap();
+        let back: VpnConfig = toml::from_str(&s).unwrap();
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn sandbox_overlay_replaces_vpn_wholesale() {
+        let mut base = SandboxConfig::default();
+        base.vpn.provider = VpnProviderKind::Tailscale;
+        base.vpn.tailscale.tags = vec!["tag:base".into()];
+
+        let replacement = VpnConfig {
+            provider: VpnProviderKind::Wireguard,
+            ..VpnConfig::default()
+        };
+        let overlay = SandboxOverlay {
+            vpn: Some(replacement),
+            ..Default::default()
+        };
+        assert!(!overlay.is_empty());
+        overlay.apply(&mut base);
+        // Whole-table replace: the base's tailscale tags are gone, not merged.
+        assert_eq!(base.vpn.provider, VpnProviderKind::Wireguard);
+        assert!(base.vpn.tailscale.tags.is_empty());
+    }
+
+    #[test]
+    fn sandbox_profile_parses_sealed_tunnel() {
+        for s in ["sealed-tunnel", "tunnel-only", "vpn-only"] {
+            assert_eq!(
+                SandboxProfile::from_str_validated(s).unwrap(),
+                SandboxProfile::SealedTunnel,
+                "{s}"
+            );
+        }
+    }
+
+    #[test]
+    fn sealed_tunnel_profile_floors_match_sealed_but_permits_vpn() {
+        let st = SandboxProfile::SealedTunnel;
+        // Same hardening floor as sealed.
+        assert!(st.read_only_root());
+        assert!(st.no_new_privileges());
+        assert_eq!(st.pids_limit(), Some(256));
+        assert_eq!(st.drop_capabilities(), vec!["ALL".to_string()]);
+        assert!(st.forces_no_network());
+        // ...but unlike plain sealed, it permits a tunnel.
+        assert!(st.permits_vpn());
+        assert!(!SandboxProfile::Sealed.permits_vpn());
+        assert!(SandboxProfile::Hardened.permits_vpn());
+        assert!(SandboxProfile::Open.permits_vpn());
+    }
+
+    #[test]
+    fn expand_env_ref_reads_file_prefix() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("sz-vpn-key-{}.txt", std::process::id()));
+        std::fs::write(&path, "  super-secret-key\n").unwrap();
+        let r = expand_env_ref(&format!("file:{}", path.display()));
+        assert_eq!(r.as_deref(), Some("super-secret-key"));
+        std::fs::remove_file(&path).unwrap();
+        // Missing file -> None (not an error).
+        assert_eq!(expand_env_ref("file:/no/such/sz/file"), None);
     }
 }
