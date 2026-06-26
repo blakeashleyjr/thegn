@@ -74,6 +74,8 @@ pub enum MenuChoice {
     ConfirmRedo,
     // generic yes/no confirm — the loop interprets `tag`
     Confirm { tag: &'static str, arg: String },
+    // delete worktree confirm: variant to capture "leave files" intent
+    ConfirmDeleteWorktrees { keep_files: bool },
     // first-launch keymap picker (item 621): the chosen preset id
     // ("default" | "vscode" | "jetbrains").
     SetKeymapPreset(String),
@@ -324,6 +326,29 @@ impl MenuOverlay {
             );
         }
     }
+}
+
+pub fn delete_worktree_menu(targets: usize, names_csv: &str) -> MenuOverlay {
+    let title = format!("Delete {} worktree(s)?", targets);
+    MenuOverlay::new(
+        MenuKindTag::Confirm,
+        title,
+        vec![
+            item(
+                Some('y'),
+                "delete from disk",
+                MenuChoice::ConfirmDeleteWorktrees { keep_files: false },
+            )
+            .danger(),
+            item(
+                Some('k'),
+                "keep files",
+                MenuChoice::ConfirmDeleteWorktrees { keep_files: true },
+            ),
+            item(Some('n'), "cancel", MenuChoice::Dismiss),
+        ],
+    )
+    .with_body(names_csv)
 }
 
 /// A 2-item yes/no confirm built on the same component: `[y]` resolves to
