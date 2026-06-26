@@ -4,11 +4,11 @@ name: ci
 # aarch64-darwin host build — and the Apple `container` backend — green.
 #
 # Both jobs use `nix develop`, whose flake pulls PRIVATE inputs (muse,
-# termite-chat). The GitHub-provided token can't read other private repos, so
-# nix is given `access-tokens` from the NIX_GITHUB_TOKEN secret — a fine-grained
-# PAT with read access to muse + termite-chat (+ this repo). Until that secret is
-# set the token is empty and the private fetches 404; create it under
-# Settings → Secrets and variables → Actions.
+# termite-chat). nix applies `access-tokens` to EVERY github.com fetch, so the
+# NIX_GITHUB_TOKEN secret must read both the private inputs AND the public ones
+# (nixpkgs/flake-utils/rust-overlay, owned by other accounts). That rules out a
+# fine-grained PAT (can't grant cross-owner access) — use a CLASSIC PAT with the
+# `repo` scope. Set it under Settings → Secrets and variables → Actions.
 on:
   push:
     branches: [main]
@@ -27,6 +27,13 @@ jobs:
         with:
           extra-conf: |
             access-tokens = github.com=${{ secrets.NIX_GITHUB_TOKEN }}
+      # Cache /nix/store in GitHub's own Actions cache (no FlakeHub/Cachix
+      # account). Keyed by the lockfiles; restores the latest prior store on a
+      # miss so cold nix builds (esp. the slow macOS job) get warm.
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', '**/Cargo.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
       - name: just ci
         run: nix develop --command just ci
   macos:
@@ -44,5 +51,12 @@ jobs:
         with:
           extra-conf: |
             access-tokens = github.com=${{ secrets.NIX_GITHUB_TOKEN }}
+      # Cache /nix/store in GitHub's own Actions cache (no FlakeHub/Cachix
+      # account). Keyed by the lockfiles; restores the latest prior store on a
+      # miss so cold nix builds (esp. the slow macOS job) get warm.
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', '**/Cargo.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
       - name: build + test (macOS subset)
         run: nix develop --command bash -lc "just build && just test"
