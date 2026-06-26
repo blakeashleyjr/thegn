@@ -2257,7 +2257,7 @@ pub fn render_tab<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::emulator::Vt100Emulator;
+    use crate::emulator::AlacrittyEmulator;
     use crate::layout;
 
     fn lines(s: &Surface) -> Vec<String> {
@@ -2725,7 +2725,7 @@ mod tests {
             cols: 40,
             rows: 6,
         };
-        let emu = Vt100Emulator::new(5, 40, 100);
+        let emu = AlacrittyEmulator::new(5, 40, 100);
         let cells = vec![StripCell {
             pane: 1,
             rect: strip,
@@ -2788,7 +2788,8 @@ mod tests {
         let cols = 160usize;
         let rows = 10usize;
         let chrome = layout::compute(cols, rows, true, true);
-        let mut emu = Vt100Emulator::new(chrome.center.rows as u16, chrome.center.cols as u16, 0);
+        let mut emu =
+            AlacrittyEmulator::new(chrome.center.rows as u16, chrome.center.cols as u16, 0);
         emu.advance(b"CENTER");
         let model = FrameModel {
             worktree: "repo/home".into(),
@@ -2845,9 +2846,9 @@ mod tests {
             ],
         };
         let half = (chrome.center.cols / 2) as u16;
-        let mut left = Vt100Emulator::new(chrome.center.rows as u16, half, 0);
+        let mut left = AlacrittyEmulator::new(chrome.center.rows as u16, half, 0);
         left.advance(b"LEFTPANE");
-        let mut right = Vt100Emulator::new(chrome.center.rows as u16, half, 0);
+        let mut right = AlacrittyEmulator::new(chrome.center.rows as u16, half, 0);
         right.advance(b"RIGHTPANE");
 
         let model = FrameModel {
@@ -2929,7 +2930,8 @@ mod tests {
         let rows = 40usize;
         let chrome = layout::compute(cols, rows, true, true);
 
-        let mut emu = Vt100Emulator::new(chrome.center.rows as u16, chrome.center.cols as u16, 0);
+        let mut emu =
+            AlacrittyEmulator::new(chrome.center.rows as u16, chrome.center.cols as u16, 0);
         emu.advance(b"CENTER-CONTENT");
 
         let model = FrameModel {

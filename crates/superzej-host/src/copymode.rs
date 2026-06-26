@@ -109,7 +109,7 @@ pub fn osc52(text: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::emulator::Vt100Emulator;
+    use crate::emulator::AlacrittyEmulator;
 
     #[test]
     fn base64_matches_known_vectors() {
@@ -129,7 +129,7 @@ mod tests {
 
     #[test]
     fn extract_single_line_respects_column_bounds() {
-        let mut e = Vt100Emulator::new(3, 20, 0);
+        let mut e = AlacrittyEmulator::new(3, 20, 0);
         e.advance(b"hello world");
         // Select columns 6..=10 of row 0 -> "world".
         let sel = Selection {
@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn extract_multiline_takes_partial_first_last_rows() {
-        let mut e = Vt100Emulator::new(3, 20, 0);
+        let mut e = AlacrittyEmulator::new(3, 20, 0);
         e.advance(b"abcdef\r\nghijkl\r\nmnopqr");
         // From row0 col3 to row2 col2: "def" / "ghijkl" / "mno".
         let sel = Selection {
@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn whole_pane_selection_copies_all_visible_rows() {
-        let mut e = Vt100Emulator::new(2, 10, 0);
+        let mut e = AlacrittyEmulator::new(2, 10, 0);
         e.advance(b"top\r\nbottom");
         let txt = extract(&e, &whole(&e));
         assert_eq!(txt, "top\nbottom");
