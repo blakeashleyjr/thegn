@@ -36,7 +36,6 @@ portable-pty.workspace = true
 termwiz.workspace = true
 libc.workspace = true
 chrono.workspace = true
-vt100.workspace = true
 nucleo-matcher.workspace = true
 ignore.workspace = true
 grep-searcher.workspace = true
@@ -55,3 +54,4 @@ pprof = { version = "0.14", features = ["flamegraph"], optional = true }
 # `sz_kit::ratatui` so the Buffer type is identical to what the apps produce.
 sz-kit = { path = "../sz-kit" }
 tokei.workspace = true
+alacritty_terminal = "0.26"
