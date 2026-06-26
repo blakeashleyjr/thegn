@@ -1,0 +1,32 @@
+name: ci-setup
+description: Install nix (private-flake access-tokens) and restore nix + cargo caches.
+inputs:
+  nix-token:
+    description: Classic PAT for private + public github flake fetches.
+    required: false
+    default: ""
+  gc-max-store-size:
+    description: Upper bound for the cached /nix/store before GC.
+    required: false
+    default: 5G
+runs:
+  using: composite
+  steps:
+    - uses: DeterminateSystems/nix-installer-action@main
+      with:
+        extra-conf: |
+          access-tokens = github.com=${{ inputs.nix-token }}
+    - uses: nix-community/cache-nix-action@v6
+      with:
+        primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', '**/Cargo.lock') }}
+        restore-prefixes-first-match: nix-${{ runner.os }}-
+        gc-max-store-size: ${{ inputs.gc-max-store-size }}
+        purge: true
+        purge-prefixes: nix-${{ runner.os }}-
+        purge-created: 0
+        purge-primary-key: never
+    - uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: rust-${{ runner.os }}
+        key: ${{ hashFiles('flake.lock') }}
+        cache-on-failure: true

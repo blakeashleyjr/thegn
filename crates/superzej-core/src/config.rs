@@ -720,7 +720,7 @@ pub struct ProfileConfig {
     #[serde(skip_serializing_if = "KeybindConfig::is_empty")]
     pub keybinds: KeybindConfig,
     /// Sandbox policy overrides for this profile (network_allow, network_block,
-    /// network_audit, env_passthrough, etc.). Applied after the global [sandbox]
+    /// network_audit, env_passthrough, etc.). Applied after the global `[sandbox]`
     /// and before the repo-root overlay, so per-profile restrictions take effect
     /// without touching per-repo config.
     #[serde(skip_serializing_if = "SandboxOverlay::is_empty")]
@@ -1762,7 +1762,7 @@ pub struct NotificationsConfig {
     pub process_exit: String,
     /// Per-kind attention priority overrides: maps a notification kind
     /// (snake_case, e.g. `"agent_done"`) to `"alert"`, `"notice"`, or `"info"`.
-    /// Unset kinds use their built-in [`NotificationKind::default_priority`];
+    /// Unset kinds use their built-in `NotificationKind::default_priority`;
     /// unknown keys/values are ignored. `alert` raises the red flag, `notice`
     /// the neutral unread count, `info` is inbox-only (never counted).
     pub priority: std::collections::BTreeMap<String, String>,

@@ -256,7 +256,7 @@ pub struct SandboxSpec {
     pub network_block: Vec<String>,
     /// Hardening: mount the container root filesystem read-only (writable: the
     /// worktree, cache binds, and a tmpfs `/tmp`). Resolved from the active
-    /// [`SandboxProfile`](crate::config::SandboxProfile).
+    /// [`SandboxProfile`].
     pub read_only_root: bool,
     /// Hardening: set `no-new-privileges` so setuid/setgid can't escalate.
     pub no_new_privileges: bool,
@@ -280,7 +280,7 @@ pub struct SandboxSpec {
     pub devenv_path: Option<String>,
     /// Resolved at spec-build time: expose the host nix daemon inside the bwrap
     /// sandbox (bind its socket + set `NIX_REMOTE=daemon`, store stays read-only).
-    /// See [`SandboxConfig::nix_daemon`](crate::config::SandboxConfig::nix_daemon).
+    /// See `[sandbox] nix_daemon` in the config.
     pub nix_daemon: bool,
     pub name: String,
 }
@@ -1132,7 +1132,7 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
         ));
         let _ = run_control_owned(
             spec,
-            &remove_container_argv(spec.backend, &[spec.name.clone()]),
+            &remove_container_argv(spec.backend, std::slice::from_ref(&spec.name)),
             PROBE_TIMEOUT,
         );
     }

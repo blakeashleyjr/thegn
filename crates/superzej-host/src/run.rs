@@ -1026,7 +1026,7 @@ struct SidebarState {
     /// Adjustable bar width in columns (item 25); `None` = layout default.
     width: Option<usize>,
     /// Wide expand toggle (`e`): mirrors the panel's expand affordance. When
-    /// set, the sidebar claims ~half the window, ignoring [`width`].
+    /// set, the sidebar claims ~half the window, ignoring `width`.
     expanded: bool,
 }
 
@@ -5495,7 +5495,7 @@ fn spawn_worktree_shell_pane(
     panes.spawn(dir, center)
 }
 
-/// Capture the active tab's pane layout as an abstract [`LayoutSpec`] (items
+/// Capture the active tab's pane layout as an abstract `LayoutSpec` (items
 /// 99/115). Each leaf records its program (a plain shell → `None`).
 fn active_tab_layout_spec(
     session: &crate::session::Session,
@@ -5515,7 +5515,7 @@ fn active_tab_layout_spec(
     ))
 }
 
-/// Apply a [`LayoutSpec`] to the active tab: spawn a pane per leaf in `dir`,
+/// Apply a `LayoutSpec` to the active tab: spawn a pane per leaf in `dir`,
 /// swap the tab's `center` to the new tree, drop the old panes, and refocus.
 /// Returns the new focused pane id, or `None` if nothing spawned.
 fn apply_layout_to_active_tab(

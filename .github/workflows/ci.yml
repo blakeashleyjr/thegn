@@ -1,18 +1,13 @@
 name: ci
-# First CI in the repo. The Linux job runs the canonical `just ci` gate; the
-# macOS (Apple-silicon) job runs a trimmed build+test subset to keep the
-# aarch64-darwin host build — and the Apple `container` backend — green.
+# Parallel CI: each `just ci` stage runs as its own job so they execute
+# concurrently (wall-clock = slowest job) and one push surfaces every failure at
+# once instead of fail-fast. Shared setup (nix + caches) lives in the local
+# composite action .github/actions/ci-setup.
 #
-# Both jobs use `nix develop`, whose flake pulls PRIVATE inputs (muse,
-# termite-chat). nix applies `access-tokens` to EVERY github.com fetch, so the
-# NIX_GITHUB_TOKEN secret must read both the private inputs AND the public ones
-# (nixpkgs/flake-utils/rust-overlay, owned by other accounts). That rules out a
-# fine-grained PAT (can't grant cross-owner access) — use a CLASSIC PAT with the
-# `repo` scope. Set it under Settings → Secrets and variables → Actions.
-#
-# Caching: cache-nix-action caches /nix/store (toolchain + flake deps) into
-# GitHub's own Actions cache (no FlakeHub/Cachix); Swatinem/rust-cache caches
-# ~/.cargo + ./target for the cargo build/test that `just` drives.
+# nix `access-tokens` is fed from the NIX_GITHUB_TOKEN secret — it must read the
+# private flake inputs (muse, termite-chat) AND the public ones (nixpkgs/
+# flake-utils/rust-overlay, owned by other accounts), so it has to be a CLASSIC
+# PAT with `repo` scope (fine-grained can't grant cross-owner access).
 on:
   push:
     branches: [main]
@@ -21,63 +16,109 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  linux:
+  fmt:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: ./.github/actions/ci-setup
         with:
-          extra-conf: |
-            access-tokens = github.com=${{ secrets.NIX_GITHUB_TOKEN }}
-      - uses: nix-community/cache-nix-action@v6
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      - run: nix develop --command just fmt-check
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
         with:
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', '**/Cargo.lock') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-
-          # Bound the cached store and evict stale caches so it can't grow forever.
-          gc-max-store-size-linux: 5G
-          purge: true
-          purge-prefixes: nix-${{ runner.os }}-
-          purge-created: 0
-          purge-primary-key: never
-      - uses: Swatinem/rust-cache@v2
+          submodules: recursive
+      - uses: ./.github/actions/ci-setup
         with:
-          prefix-key: rust-${{ runner.os }}
-          # Bust the cargo/target cache when the pinned toolchain (flake.lock) moves.
-          key: ${{ hashFiles('flake.lock') }}
-          cache-on-failure: true
-      - name: just ci
-        run: nix develop --command just ci
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      - run: nix develop --command just lint
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      - run: nix develop --command just test
+  doc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      - run: nix develop --command just doc-check
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      - run: nix develop --command just coverage
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      - run: nix develop --command just smoke
+  sandbox-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      # Container-backed suites skip gracefully when podman is absent.
+      - run: nix develop --command bash -lc "just sandbox-e2e-dns && just sandbox-e2e-db"
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      - run: nix develop --command just e2e
+  nix-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      - run: nix build .#default --print-build-logs
   macos:
-    # macos-14 is the GitHub-hosted Apple-silicon (M1) image. Apple's `container`
-    # runtime needs macOS 26 + Apple silicon; the hosted image cannot exercise it
-    # at runtime, so this job only covers the build + unit-test surface (lint and
-    # the heavier nix-build/coverage/smoke stay on the Linux job) to finish fast
-    # — end-to-end `apple` backend verification is the on-device checklist (§AV).
+    # macos-14 = GitHub-hosted Apple silicon (M1). Apple's `container` runtime
+    # needs macOS 26 + Apple silicon, which the hosted image can't exercise, so
+    # this only covers the aarch64-darwin build + unit tests; end-to-end `apple`
+    # backend verification is the on-device checklist (tasks.md §AV).
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: ./.github/actions/ci-setup
         with:
-          extra-conf: |
-            access-tokens = github.com=${{ secrets.NIX_GITHUB_TOKEN }}
-      - uses: nix-community/cache-nix-action@v6
-        with:
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', '**/Cargo.lock') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-
-          # macOS store is larger (more closures); give it more headroom.
-          gc-max-store-size-macos: 8G
-          purge: true
-          purge-prefixes: nix-${{ runner.os }}-
-          purge-created: 0
-          purge-primary-key: never
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: rust-${{ runner.os }}
-          key: ${{ hashFiles('flake.lock') }}
-          cache-on-failure: true
-      - name: build + test (macOS subset)
-        run: nix develop --command bash -lc "just build && just test"
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+          gc-max-store-size: 8G
+      - run: nix develop --command bash -lc "just build && just test"

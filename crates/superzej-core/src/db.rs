@@ -1846,7 +1846,7 @@ impl Db {
     }
 
     /// Swap the persisted sort positions of two workspaces (by repo_path). The
-    /// workspace analogue of [`swap_worktree_positions`]: the sidebar's manual
+    /// workspace analogue of `swap_worktree_positions`: the sidebar's manual
     /// workspace reorder (Ctrl+Alt+↑/↓) picks two adjacent workspaces and this
     /// exchanges their `position` so the new order survives restart.
     pub fn swap_workspace_positions(&self, a: &str, b: &str) -> Result<()> {
