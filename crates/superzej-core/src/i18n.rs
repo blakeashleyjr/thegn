@@ -1,6 +1,11 @@
 //! Zero-cost translation layer for the UI.
 
-use fluent_templates::{Loader, static_loader};
+// `Loader` provides the `.lookup`/`.lookup_with_args` methods the `t!` macro
+// expands to; it's only "used" at macro call sites (incl. the tests below), so
+// the lib build sees it as unused.
+#[allow(unused_imports)]
+use fluent_templates::Loader;
+use fluent_templates::static_loader;
 use once_cell::sync::OnceCell;
 use unic_langid::LanguageIdentifier;
 

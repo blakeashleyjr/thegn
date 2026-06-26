@@ -1086,3 +1086,39 @@ heartbeat_secs = 10
 # holds. Levels: off | conservative | balanced | aggressive.
 token_reduction = false
 token_reduction_level = "conservative"
+
+# ── Media player control (optional) ────────────────────────────────────────
+# Drive your music/media player from superzej: play/pause, next/previous,
+# shuffle, loop, volume, and a playlist/player picker — plus a now-playing
+# statusbar badge and panel section. The shell never depends on this; it is
+# strictly additive, so it is OFF by default.
+#
+# `backend = "mpris"` speaks the Linux D-Bus standard (org.mpris.MediaPlayer2)
+# and controls nearly any player: Spotify desktop, mpv (with the mpris plugin),
+# ncspot, spotify-player, musikcube, moc, VLC, cmus (plugin), … It uses native
+# zbus and falls back to the `playerctl` CLI if D-Bus access fails — so install
+# `playerctl` if zbus can't reach your session bus. `backend = "mpv"` instead
+# drives a single mpv instance over its JSON IPC socket (see [media.mpv]).
+# `backend = "jellyfin"` is reserved for a future release.
+#
+# Only the selected backend's sub-table is consulted. Turning this off
+# (enabled = false) removes the badge, the panel section, and makes every
+# media-* keybind inert — with zero idle cost.
+[media]
+enabled = false
+backend = "none"            # none | mpris | mpv | jellyfin
+# Preferred players (MPRIS bus-name tails) when several are running at once; the
+# first match wins. Empty = pick whatever is actively playing, else the first.
+players_priority = []        # e.g. ["spotify", "mpv"]
+# Reserved single "media key" action (each transport op already has its own
+# bindable action id: media-play-pause, media-next, …).
+default_action = "play_pause"  # play_pause | next | previous | volume_up | volume_down
+# Volume step (0.0–1.0) for media-volume-up / media-volume-down.
+volume_step = 0.05
+# Fallback poll cadence (seconds) for backends WITHOUT a push stream (mpv IPC /
+# playerctl). The native MPRIS path uses D-Bus PropertiesChanged signals
+# instead, so this never fires for it (the ~0%-idle contract holds).
+poll_interval_secs = 3
+
+# [media.mpv]   # backend = "mpv": launch mpv with --input-ipc-server=<socket>
+# socket = "/tmp/mpvsocket"

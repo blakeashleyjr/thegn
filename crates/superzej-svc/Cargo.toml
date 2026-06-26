@@ -18,6 +18,9 @@ reqwest.workspace = true
 tokio.workspace = true
 chrono.workspace = true
 base64 = "0.22"
+# MPRIS media control over D-Bus (the [media] backend; playerctl is the fallback).
+zbus.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

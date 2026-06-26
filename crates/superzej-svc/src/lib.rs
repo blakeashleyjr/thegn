@@ -12,6 +12,7 @@ pub mod gh;
 pub mod git;
 pub mod issue;
 pub mod lsp;
+pub mod media;
 pub mod provider;
 pub mod ssh;
 pub mod vpn;

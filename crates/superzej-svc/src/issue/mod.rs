@@ -280,8 +280,10 @@ mod spec {
 
     #[test]
     fn single_provider_back_compat() {
-        let mut cfg = IssuesConfig::default();
-        cfg.provider = IssueProviderKind::Linear;
+        let cfg = IssuesConfig {
+            provider: IssueProviderKind::Linear,
+            ..Default::default()
+        };
         let r = IssueRouter::from_config(&cfg);
         assert!(r.is_configured());
         assert_eq!(r.provider_ids(), vec!["linear"]);
