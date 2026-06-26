@@ -24,6 +24,7 @@ fn dns_port() -> u16 {
         get_or_start(DnsPolicy {
             block: vec!["evil.test".into()],
             allow: vec![],
+            upstream: None,
         })
         .expect("dns filter start failed")
     })
@@ -119,10 +120,12 @@ fn a3_singleton_reuses_port() {
     let p1 = get_or_start(DnsPolicy {
         block: vec!["a.test".into()],
         allow: vec![],
+        upstream: None,
     });
     let p2 = get_or_start(DnsPolicy {
         block: vec!["b.test".into()],
         allow: vec![],
+        upstream: None,
     });
     assert!(p1.is_some() && p2.is_some());
     assert_eq!(p1, p2, "second get_or_start must reuse the existing server");

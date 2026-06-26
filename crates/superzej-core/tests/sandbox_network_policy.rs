@@ -52,6 +52,7 @@ fn spec_with_network_block(name: &str, block: Vec<String>) -> SandboxSpec {
         devenv: false,
         devenv_path: None,
         name: name.into(),
+        vpn: None,
     }
 }
 
@@ -121,6 +122,7 @@ fn g3_dns_events_captured() {
     let _ = superzej_core::dns_filter::get_or_start(DnsPolicy {
         block: vec!["blocked.internal".into()],
         allow: vec![],
+        upstream: None,
     });
     drain_events(); // clear prior
     let name = "superzej-e2e-g3";
