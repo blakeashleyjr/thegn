@@ -16,9 +16,9 @@
 
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=test/perf/lib/env.sh
+# shellcheck source=/dev/null
 source "$HERE/lib/env.sh"
-# shellcheck source=test/perf/lib/fixture.sh
+# shellcheck source=/dev/null
 source "$HERE/lib/fixture.sh"
 
 SCENARIO=idle
@@ -26,7 +26,7 @@ BIN="${SZ_PERF_BIN:-target/release/szhost}"
 WORKTREES="${SZ_PERF_WORKTREES:-14}"
 DIRTY="${SZ_PERF_DIRTY:-4}"
 SETTLE_MS=2500
-WINDOW_MS=8000        # long enough to average the dashboard's 4s sysinfo cadence
+WINDOW_MS=8000 # long enough to average the dashboard's 4s sysinfo cadence
 # cores; the encoded 0%-idle guard (FIXED, not baseline-derived). Observed idle
 # on the 14-worktree fixture (release) is ~0.056 cores, dominated by the
 # pre-warmed dashboard collector; a true event-loop spin regression would be
@@ -38,26 +38,62 @@ BASELINE_DIR="$HERE/baselines"
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --scenario) SCENARIO="$2"; shift 2;;
-    --bin) BIN="$2"; shift 2;;
-    --worktrees) WORKTREES="$2"; shift 2;;
-    --dirty) DIRTY="$2"; shift 2;;
-    --settle-ms) SETTLE_MS="$2"; shift 2;;
-    --window-ms) WINDOW_MS="$2"; shift 2;;
-    --ceiling) CEILING="$2"; shift 2;;
-    --record) RECORD=1; shift;;
-    --json) JSON_ONLY=1; shift;;
-    --baseline-dir) BASELINE_DIR="$2"; shift 2;;
-    *) echo "cpu-sample: unknown arg: $1" >&2; exit 1;;
+  --scenario)
+    SCENARIO="$2"
+    shift 2
+    ;;
+  --bin)
+    BIN="$2"
+    shift 2
+    ;;
+  --worktrees)
+    WORKTREES="$2"
+    shift 2
+    ;;
+  --dirty)
+    DIRTY="$2"
+    shift 2
+    ;;
+  --settle-ms)
+    SETTLE_MS="$2"
+    shift 2
+    ;;
+  --window-ms)
+    WINDOW_MS="$2"
+    shift 2
+    ;;
+  --ceiling)
+    CEILING="$2"
+    shift 2
+    ;;
+  --record)
+    RECORD=1
+    shift
+    ;;
+  --json)
+    JSON_ONLY=1
+    shift
+    ;;
+  --baseline-dir)
+    BASELINE_DIR="$2"
+    shift 2
+    ;;
+  *)
+    echo "cpu-sample: unknown arg: $1" >&2
+    exit 1
+    ;;
   esac
 done
 
 BIN_ABS="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
-[ -x "$BIN_ABS" ] || { echo "cpu-sample: binary not executable: $BIN_ABS" >&2; exit 1; }
+[ -x "$BIN_ABS" ] || {
+  echo "cpu-sample: binary not executable: $BIN_ABS" >&2
+  exit 1
+}
 case "$BIN_ABS" in
-  *target/release/*) BUILD=release;;
-  *target/debug/*)   BUILD=debug;;
-  *)                 BUILD=unknown;;
+*target/release/*) BUILD=release ;;
+*target/debug/*) BUILD=debug ;;
+*) BUILD=unknown ;;
 esac
 
 CLK_TCK="$(getconf CLK_TCK 2>/dev/null || echo 100)"
@@ -68,11 +104,14 @@ perf_trap_cleanup
 HOST_TAG="$(perf_host_tag)"
 REPO="$(perf_build_fixture "$WORKTREES" "$DIRTY")"
 
-command -v script >/dev/null 2>&1 || { echo "cpu-sample: script(1) not found" >&2; exit 1; }
+command -v script >/dev/null 2>&1 || {
+  echo "cpu-sample: script(1) not found" >&2
+  exit 1
+}
 
 PIDFILE="$PERF_TMP/szhost.pid"
-RUN_MS=$((SETTLE_MS + WINDOW_MS + 1500))      # generous tail past the sample window
-DEADLINE_S=$(( (RUN_MS / 1000) + 10 ))        # hard safety net
+RUN_MS=$((SETTLE_MS + WINDOW_MS + 1500)) # generous tail past the sample window
+DEADLINE_S=$(((RUN_MS / 1000) + 10))     # hard safety net
 
 # Launch szhost in a PTY. `script -qec` gives termwiz a real terminal (mirrors
 # test/pty-smoke.sh); the inner shell backgrounds szhost and records its PID so
@@ -90,11 +129,15 @@ for _ in $(seq 1 100); do
   sleep 0.05
 done
 PID="$(cat "$PIDFILE" 2>/dev/null || true)"
-[ -n "$PID" ] && [ -d "/proc/$PID" ] || { echo "cpu-sample: szhost did not start" >&2; kill "$LAUNCHER" 2>/dev/null || true; exit 1; }
+[ -n "$PID" ] && [ -d "/proc/$PID" ] || {
+  echo "cpu-sample: szhost did not start" >&2
+  kill "$LAUNCHER" 2>/dev/null || true
+  exit 1
+}
 
 # /proc/<pid>/stat fields 14,15 = utime,stime (in CLK_TCK). The comm field (2)
 # may contain spaces/parens, so split on the LAST ')'.
-proc_jiffies() {  # $1 = pid -> utime+stime
+proc_jiffies() { # $1 = pid -> utime+stime
   awk '{ s=$0; sub(/^.*\) /,"",s); split(s,a," "); print a[12]+a[13] }' "/proc/$1/stat" 2>/dev/null || echo 0
 }
 
@@ -108,9 +151,11 @@ fi
 sleep "$(awk "BEGIN{print $SETTLE_MS/1000}")"
 J0="$(proc_jiffies "$PID")"
 declare -A T0 TN
-for tid in $(ls "/proc/$PID/task" 2>/dev/null); do
-  T0[$tid]="$(awk '{ s=$0; sub(/^.*\) /,"",s); split(s,a," "); print a[12]+a[13] }' "/proc/$PID/task/$tid/stat" 2>/dev/null || echo 0)"
-  TN[$tid]="$(cat "/proc/$PID/task/$tid/comm" 2>/dev/null || echo '?')"
+for tdir in "/proc/$PID/task"/*; do
+  [ -e "$tdir" ] || continue
+  tid="$(basename "$tdir")"
+  T0[$tid]="$(awk '{ s=$0; sub(/^.*\) /,"",s); split(s,a," "); print a[12]+a[13] }' "$tdir/stat" 2>/dev/null || echo 0)"
+  TN[$tid]="$(cat "$tdir/comm" 2>/dev/null || echo '?')"
 done
 sleep "$(awk "BEGIN{print $WINDOW_MS/1000}")"
 J1="$(proc_jiffies "$PID")"
@@ -126,7 +171,7 @@ THREAD_TABLE=""
 for tid in "${!T0[@]}"; do
   t1="$(awk '{ s=$0; sub(/^.*\) /,"",s); split(s,a," "); print a[12]+a[13] }' "/proc/$PID/task/$tid/stat" 2>/dev/null || true)"
   [ -n "$t1" ] || t1="${T0[$tid]}"
-  dj=$(( t1 - ${T0[$tid]} ))
+  dj=$((t1 - ${T0[$tid]}))
   [ "$dj" -gt 0 ] || continue
   c="$(awk "BEGIN{printf \"%.4f\", $dj/($CLK_TCK*$WINDOW_S)}")"
   THREAD_JSON="$THREAD_JSON{\"tid\":$tid,\"comm\":\"${TN[$tid]}\",\"cores\":$c},"
