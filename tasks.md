@@ -1348,7 +1348,23 @@ _The Windows-native workspace shell (AI-free by default), bypassing WSL/MSYS2 fo
 - [ ] 702. Signals mapping — map Unix profiling triggers (`SIGUSR2`) to internal keymaps or named events for Windows flame-graphs
 - [ ] 703. PowerShell / NuShell defaults — default pane spawning to native Windows shells over `cmd.exe`
 
-### AW. macOS / Apple container platform
+### AW. Log Analyzer (sz-log)
+
+_A native, zero-IPC structured log viewer providing `hl`-like capabilities for worktree files, containers, and tasks. Integrates heavily with the render plan to ensure high-throughput log streams do not violate the 0% idle / <16ms frame invariants._
+
+- [x] 718. `LogProvider` trait + bounded ring-buffer memory model
+- [x] 719. Zero-copy JSON & logfmt parsers (envelope extraction)
+- [~] 720. Off-thread log ingestion worker + batching waker (wake-storm prevention)
+- [ ] 721. Full-screen center-pane log overlay UI
+- [x] 722. Filter DSL — fuzzy text, severity normalization, exact field matching
+- [ ] 723. Dynamic field projection — hide/show/reorder JSON keys
+- [ ] 724. Tailing vs Paused mode — auto-pause on scroll
+- [~] 725. File tailing provider (`notify` backend)
+- [ ] 726. Container tailing provider (resolves AD 383)
+- [ ] 727. Editor handoff — jump to `file:line` from stacktraces (resolves AG 408)
+- [ ] 728. Field Explorer drawer — surface schema/keys dynamically based on current view
+
+### AX. macOS / Apple container platform
 
 Promote the `apple` backend from an enumerated stub to a real, tested backend, and
 make superzej build and run as a **host** on Apple-silicon macOS. Today `apple`
@@ -1362,12 +1378,12 @@ falls back to uncontained `host`. The codebase is Linux-biased (`cfg(target_os =
 hardcoded `/nix/store` mounts) and `flake.nix` has no `aarch64-darwin` output.
 Sequenced so each item ships independently; tracks the AB/AC/AD/AE container groups.
 
-- [x] 704. Platform-aware default `backend_chain` — resolve the chain by `target_os` so macOS defaults to `apple → docker → host` instead of dead Linux entries _(config.rs `default_backend_chain()` + test)_
-- [~] 705. Apple `container`-specific backend path — dedicated CLI path in sandbox.rs (image prefetch via `container image pull`, status via `container inspect`, removal via `container delete --force`, split `-i -t` exec, `container list` panel probe); argv unit-tested on Linux. **On-device:** confirm exact flag/JSON specifics
-- [~] 706. Path-preserving worktree mount on Apple `container` — `--mount type=bind,…,readonly` form + undocumented Linux hardening flags omitted for Apple; **on-device:** verify same-abs-path bind keeps host-side git working under the VM
-- [~] 707. macOS host build — `flake.nix` already emits `aarch64-darwin`; `pane.rs` `/proc` readers `cfg`-split with native macOS impls (`proc_listpids`/`proc_pidinfo`/`KERN_PROCARGS2` via libc for ppid/cwd/argv); `stats.rs` overlays CPU/mem/net/battery via `top`/`sysctl`/`vm_stat`/`netstat`/`pmset`. **On-device:** compile on the Mac + fix any ABI/format drift
-- [~] 708. macOS CI lane — `.github/workflows/ci.yml` (parallel per-stage jobs) + `pty-smoke.sh` `script` invocation made OS-aware. **On-device/CI:** macos-14 job validates the aarch64-darwin build
-- [~] 709. Docs + capability gating — README/config/design-spec reconciled; `Apple` added to the new-worktree sandbox picker (macOS-only) and the macOS-26 + Apple-silicon requirement named in the `pick_backend` failure message
+- [x] 729. Platform-aware default `backend_chain` — resolve the chain by `target_os` so macOS defaults to `apple → docker → host` instead of dead Linux entries _(config.rs `default_backend_chain()` + test)_
+- [~] 730. Apple `container`-specific backend path — dedicated CLI path in sandbox.rs (image prefetch via `container image pull`, status via `container inspect`, removal via `container delete --force`, split `-i -t` exec, `container list` panel probe); argv unit-tested on Linux. **On-device:** confirm exact flag/JSON specifics
+- [~] 731. Path-preserving worktree mount on Apple `container` — `--mount type=bind,…,readonly` form + undocumented Linux hardening flags omitted for Apple; **on-device:** verify same-abs-path bind keeps host-side git working under the VM
+- [~] 732. macOS host build — `flake.nix` already emits `aarch64-darwin`; `pane.rs` `/proc` readers `cfg`-split with native macOS impls (`proc_listpids`/`proc_pidinfo`/`KERN_PROCARGS2` via libc for ppid/cwd/argv); `stats.rs` overlays CPU/mem/net/battery via `top`/`sysctl`/`vm_stat`/`netstat`/`pmset`. **On-device:** compile on the Mac + fix any ABI/format drift
+- [~] 733. macOS CI lane — `.github/workflows/ci.yml` (parallel per-stage jobs, opt-in macOS) + `pty-smoke.sh` `script` invocation made OS-aware. **On-device/CI:** macos-14 job validates the aarch64-darwin build
+- [~] 734. Docs + capability gating — README/config/design-spec reconciled; `Apple` added to the new-worktree sandbox picker (macOS-only) and the macOS-26 + Apple-silicon requirement named in the `pick_backend` failure message
 
 ### AI-free mode (audience-widener)
 

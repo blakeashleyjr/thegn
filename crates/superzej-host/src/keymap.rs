@@ -86,6 +86,7 @@ pub enum Action {
     FocusDown,
     ToggleSidebar,
     TogglePanel,
+    ToggleRecorder,
     ToggleDrawer,
     /// Move keyboard focus into the sidebar tree (shows it if hidden).
     FocusSidebar,
@@ -495,14 +496,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         id: "scroll-up",
         label: "Scroll pane up",
         hint: "scroll↑",
-        default_chords: &["Shift PageUp"],
+        default_chords: &["Shift PageUp", "PageUp"],
         palette: true,
     },
     ActionSpec {
         id: "scroll-down",
         label: "Scroll pane down",
         hint: "scroll↓",
-        default_chords: &["Shift PageDown"],
+        default_chords: &["Shift PageDown", "PageDown"],
         palette: true,
     },
     ActionSpec {
@@ -757,6 +758,7 @@ impl Action {
             Action::FocusDown => "focus-down",
             Action::ToggleSidebar => "toggle-sidebar",
             Action::TogglePanel => "toggle-panel",
+            Action::ToggleRecorder => "toggle-recorder",
             Action::ToggleDrawer => "files-drawer",
             Action::FocusSidebar => "focus-sidebar",
             Action::FocusPanel => "focus-panel",
@@ -829,6 +831,7 @@ impl Action {
             "focus-down" => Action::FocusDown,
             "toggle-sidebar" => Action::ToggleSidebar,
             "toggle-panel" => Action::TogglePanel,
+            "toggle-recorder" => Action::ToggleRecorder,
             "files" | "files-drawer" | "toggle-drawer" => Action::ToggleDrawer,
             "focus-sidebar" => Action::FocusSidebar,
             "focus-panel" => Action::FocusPanel,
@@ -1229,6 +1232,8 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl g", Action::ToggleKeyLock).unwrap();
     map.insert_all("Ctrl Alt s", Action::ToggleSidebar).unwrap();
     map.insert_all("Ctrl Alt p", Action::TogglePanel).unwrap();
+    map.insert_all("Ctrl Alt r", Action::ToggleRecorder)
+        .unwrap();
     map.insert_all("Ctrl Alt f", Action::ToggleDrawer).unwrap();
     map.insert_all("Alt s", Action::FocusSidebar).unwrap();
     map.insert_all("Alt .", Action::FocusPanel).unwrap();
@@ -1297,8 +1302,10 @@ pub fn default_keymap() -> KeyMap {
         .unwrap();
 
     map.insert_all("Shift PageUp", Action::ScrollUp).unwrap();
+    map.insert_all("PageUp", Action::ScrollUp).unwrap();
     map.insert_all("Shift PageDown", Action::ScrollDown)
         .unwrap();
+    map.insert_all("PageDown", Action::ScrollDown).unwrap();
 
     // Single key keybinds are prevented by rule. We shouldn't use "/" for SearchPane.
     map.insert_all("Ctrl Alt /", Action::SearchPane).unwrap();
@@ -1804,7 +1811,7 @@ mod tests {
     }
 
     #[test]
-    fn shift_pageup_down_scroll_but_plain_pageup_forwards() {
+    fn shift_pageup_down_scroll() {
         assert_eq!(
             map_key(&KeyCode::PageUp, Modifiers::SHIFT),
             Some(Action::ScrollUp)
@@ -1813,8 +1820,11 @@ mod tests {
             map_key(&KeyCode::PageDown, Modifiers::SHIFT),
             Some(Action::ScrollDown)
         );
-        // Plain PageUp is forwarded to the pane (apps use it).
-        assert_eq!(map_key(&KeyCode::PageUp, Modifiers::NONE), None);
+        // Plain PageUp now scrolls the pane (user requested).
+        assert_eq!(
+            map_key(&KeyCode::PageUp, Modifiers::NONE),
+            Some(Action::ScrollUp)
+        );
     }
 
     #[test]

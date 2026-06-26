@@ -39,6 +39,7 @@ use crate::panes::{
     Panes, prewarm_requests, relayout, relayout_strip, replace_single_dead_center_pane,
     tool_drawer_argv,
 };
+use crate::recorder::Recorder;
 use crate::wizard;
 
 /// Bounded PTY event queue depth. Reader threads use `blocking_send`, so this
@@ -119,6 +120,39 @@ fn apply_mode_status(model: &mut FrameModel, mode: crate::keymap::Mode) {
         crate::keymap::Mode::Emacs => "E",
     }
     .into();
+}
+
+/// Toggles the Asciinema cast recorder. When turned on, a new `.cast` file
+/// is created in `~/.local/state/superzej/recordings/` and every frame pushed
+/// to the terminal is appended to it.
+fn toggle_recorder(
+    recorder: &mut Option<Recorder>,
+    rows: usize,
+    cols: usize,
+    toasts: &mut crate::toast::Toasts,
+) {
+    if let Some(r) = recorder.take() {
+        let p = r.path().display().to_string();
+        toasts.success(format!("Recording saved to {p}"), std::time::Instant::now());
+    } else {
+        match Recorder::new(cols, rows) {
+            Ok(r) => {
+                toasts.success(
+                    "Recording started...".to_string(),
+                    std::time::Instant::now(),
+                );
+                *recorder = Some(r);
+            }
+            Err(e) => {
+                toasts.push(
+                    crate::toast::ToastKind::Info,
+                    format!("Failed to start recording: {e}"),
+                    std::time::Instant::now(),
+                    std::time::Duration::from_secs(5),
+                );
+            }
+        }
+    }
 }
 
 /// The bottom bar's contextual keybind hints — (chord, label) pairs the
@@ -291,8 +325,8 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // When unset no subscriber is installed at all, so every tracing callsite
     // collapses to one atomic load — instrumentation is free in the idle case.
     if std::env::var_os("SUPERZEJ_LOG").is_some() {
-        superzej_core::log::init(
-            superzej_core::log::Role::Host,
+        superzej_core::log_trace::init(
+            superzej_core::log_trace::Role::Host,
             &superzej_core::config::LogConfig {
                 file: true,
                 ..Default::default()
@@ -6213,6 +6247,7 @@ async fn event_loop<T: Terminal>(
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     event_bus: superzej_core::event_bus::EventBus,
 ) -> Result<()> {
+    let mut recorder: Option<Recorder> = None;
     let mut scratch = Surface::new(cols, rows);
     // What the terminal currently shows; the render path diffs scratch
     // against this and sends only the delta (see the flush block).
@@ -6461,6 +6496,10 @@ async fn event_loop<T: Terminal>(
     // The hover/signature/code-action preview overlay (item 532): built off-loop
     // from the language server, dismissed by any key.
     let (hover_tx, mut hover_rx) = tokio_mpsc::unbounded_channel::<crate::hover::HoverPopup>();
+
+    let (logs_tx, mut logs_rx) =
+        tokio_mpsc::unbounded_channel::<Vec<superzej_core::log::parser::ParsedLog>>();
+
     let mut hover_popup: Option<crate::hover::HoverPopup> = None;
     // Transient bottom-anchored notifications ("Text copied to clipboard", …).
     // Each push schedules a one-shot waker pulse so the toast clears on its own
@@ -6754,6 +6793,22 @@ async fn event_loop<T: Terminal>(
             );
         }
     }
+
+    // Start log tailing
+    if let Some(log_path) = current_config.log.dir_path().join("szhost.log").to_str() {
+        let p = superzej_svc::log::provider::FileLogProvider {
+            path: std::path::PathBuf::from(log_path),
+        };
+        let log_w = waker.clone();
+        superzej_svc::log::provider::LogProvider::start_stream(
+            &p,
+            logs_tx.clone(),
+            std::sync::Arc::new(move || {
+                let _ = log_w.wake();
+            }),
+        );
+    }
+
     loop {
         // Perf self-profiler: count the wake, stamp busy-time start, and emit
         // the periodic rollup when due (piggy-backing on this wake — never a
@@ -8801,6 +8856,16 @@ async fn event_loop<T: Terminal>(
             }
         }
 
+        // -- 23. Log streams
+        while let Ok(batch) = logs_rx.try_recv() {
+            model.panel.log_lines_structured.extend(batch);
+            if model.panel.log_lines_structured.len() > 1000 {
+                let overflow = model.panel.log_lines_structured.len() - 1000;
+                model.panel.log_lines_structured.drain(0..overflow);
+            }
+            dirty = true;
+        }
+
         // Expire any toasts whose deadline passed; their scheduled wake lands
         // here even absent other input, so they clear on their own.
         if toasts.prune(std::time::Instant::now()) {
@@ -9309,6 +9374,9 @@ async fn event_loop<T: Terminal>(
             } else {
                 let mut bytes = String::new();
                 wire_renderer.render(&wire, &mut bytes);
+                if let Some(rec) = &mut recorder {
+                    let _ = rec.write_frame(&bytes);
+                }
                 use std::io::Write as _;
                 let mut out = std::io::stdout();
                 out.write_all(bytes.as_bytes()).context("render")?;
@@ -15010,6 +15078,9 @@ async fn event_loop<T: Terminal>(
                                 } else {
                                     model.status = "Unpin: no live pin".into();
                                 }
+                            }
+                            Action::ToggleRecorder => {
+                                toggle_recorder(&mut recorder, rows, cols, &mut toasts);
                             }
                         }
                         dirty = true;

@@ -506,6 +506,8 @@ pub struct PanelData {
     pub notifications: Vec<superzej_core::notification::Notification>,
     /// Last 500 lines of szhost.log, parsed. Empty when SUPERZEJ_LOG is unset.
     pub log_lines: Vec<superzej_core::log_view::LogLine>,
+    /// Structured logs for the sz-log feature.
+    pub log_lines_structured: Vec<superzej_core::log::parser::ParsedLog>,
     /// Configured + auto-discovered task specs for the Tasks section.
     pub task_specs: Vec<superzej_core::config::Task>,
     /// Last-run record per task name (keyed by `Task::name`).

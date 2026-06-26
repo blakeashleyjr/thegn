@@ -1,23 +1,29 @@
 name: ci
-# Parallel CI: each `just ci` stage is its own job, so they run concurrently
-# (wall-clock = slowest job) and one push surfaces every failure at once. Shared
-# setup (nix + caches) lives in the local composite action .github/actions/ci-setup.
+# Push-triggered CI. We trigger on `push` (not `pull_request`) on purpose:
+# `main` is high-velocity, so a PR's merge-ref frequently can't be computed,
+# which silently stops `pull_request` runs from ever scheduling. Push events run
+# against the branch commit directly — independent of merge-ability — so CI is
+# reliable regardless of how far the branch is behind main. Commit-status checks
+# still surface on the PR.
+#
+# Each `just ci` stage is its own job (parallel; one push surfaces every failure
+# at once). Shared setup (nix + caches) is the local composite action
+# .github/actions/ci-setup.
 #
 # Cost control:
-#  - macOS bills at a 10x minute multiplier, so the `macos` job is OPT-IN — it
-#    runs only on manual dispatch or when a PR carries the `ci:macos` label, not
-#    on every PR/main push. (Apple/darwin code is on-device WIP; CI it on demand.)
-#  - concurrency cancels superseded runs; every job has a timeout so nothing can
-#    silently burn minutes; cache-nix-action + rust-cache keep warm runs cheap.
+#  - macOS bills at a 10x minute multiplier, so the `macos` job is OPT-IN —
+#    include `[ci-macos]` in the commit message (or run via dispatch).
+#  - `[gen-baselines]` in the commit message runs the one-shot muse baseline
+#    generator (the visual baselines aren't committed yet).
+#  - concurrency cancels superseded runs; every job has a timeout; caches keep
+#    warm runs cheap.
 #
 # nix `access-tokens` comes from the NIX_GITHUB_TOKEN secret — it must read the
-# private flake inputs (muse, termite-chat) AND public ones (nixpkgs/flake-utils/
-# rust-overlay, other owners), so it must be a CLASSIC PAT with `repo` scope.
+# private flake inputs (muse, termite-chat) AND public ones, so it must be a
+# CLASSIC PAT with `repo` scope.
 on:
   push:
-    branches: [main]
-  pull_request:
-    types: [opened, synchronize, reopened, labeled]
+    branches: [main, sz/quiet-falcon-1]
   workflow_dispatch:
 concurrency:
   group: ci-${{ github.ref }}
@@ -132,12 +138,12 @@ jobs:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
       - run: nix build .#default --print-build-logs
   macos:
-    # OPT-IN (10x minute cost): runs only on manual dispatch or a `ci:macos`
-    # labeled PR — not on ordinary PR/main pushes. macos-14 = GitHub-hosted Apple
-    # silicon; this covers the aarch64-darwin build + unit tests (end-to-end
-    # `apple` backend verification is the on-device checklist, tasks.md §AW).
+    # OPT-IN (10x minute cost): runs only via dispatch or a `[ci-macos]` commit
+    # message marker. macos-14 = GitHub-hosted Apple silicon; covers the
+    # aarch64-darwin build + unit tests (end-to-end `apple` backend verification
+    # is the on-device checklist, tasks.md §AX).
     if: >-
-      github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:macos')
+      github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ci-macos]')
     runs-on: macos-14
     timeout-minutes: 40
     steps:
@@ -150,12 +156,11 @@ jobs:
           gc-max-store-size: 8G
       - run: nix develop --command bash -lc "just build && just test"
   # One-shot baseline generator: muse visual baselines were never committed, so
-  # `e2e` can't pass until they exist. Add the `ci:update-baselines` label to a
-  # PR to (re)generate them IN the CI env (where `e2e` checks them) and commit
-  # them back to the branch. Runs only on the labeling action (not pushes), so
-  # it can't loop. Remove the label afterward.
+  # `e2e` can't pass until they exist. Push a commit whose message contains
+  # `[gen-baselines]` to (re)generate them in the CI env where `e2e` checks them,
+  # and commit them back. The generated commit has no marker, so it can't loop.
   update-baselines:
-    if: github.event.action == 'labeled' && github.event.label.name == 'ci:update-baselines'
+    if: contains(github.event.head_commit.message, '[gen-baselines]')
     runs-on: ubuntu-latest
     timeout-minutes: 40
     permissions:
@@ -164,7 +169,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          ref: ${{ github.head_ref }}
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
@@ -176,7 +180,7 @@ jobs:
           if [ -n "$(git status --porcelain test/muse/snapshots/)" ]; then
             git add test/muse/snapshots/
             git commit -m "test(e2e): generate muse visual baselines in CI"
-            git push origin "HEAD:${{ github.head_ref }}"
+            git push origin "HEAD:${{ github.ref_name }}"
           else
             echo "no baseline changes to commit"
           fi
