@@ -154,16 +154,15 @@ fn context_hints(
     }
 
     for action in resolved {
-        if action
+        if (action
             .contexts
             .contains(&superzej_core::keymap::Context::Global)
-            || action.contexts.contains(&focus_context)
+            || action.contexts.contains(&focus_context))
+            && seen.insert(action.hint.clone())
+            && !action.hint.is_empty()
+            && let Some(chord) = action.chords.first()
         {
-            if seen.insert(action.hint.clone()) && !action.hint.is_empty() {
-                if let Some(chord) = action.chords.first() {
-                    out.push((chord.to_kdl().to_string(), action.hint.clone()));
-                }
-            }
+            out.push((chord.to_kdl().to_string(), action.hint.clone()));
         }
     }
 
@@ -8955,15 +8954,15 @@ async fn event_loop<T: Terminal>(
                     };
                     if let (Some(content), Some(p)) = (target, panes.table.get(&sp)) {
                         crate::compositor::compose_pane(&mut scratch, p.emulator(), content);
-                        if let Some((sel_pane, sel)) = &mouse_sel {
-                            if *sel_pane == sp {
-                                crate::compositor::overlay_selection(
-                                    &mut scratch,
-                                    content,
-                                    sel,
-                                    crate::chrome::col(crate::chrome::S::Panel2),
-                                );
-                            }
+                        if let Some((sel_pane, sel)) = &mouse_sel
+                            && *sel_pane == sp
+                        {
+                            crate::compositor::overlay_selection(
+                                &mut scratch,
+                                content,
+                                sel,
+                                crate::chrome::col(crate::chrome::S::Panel2),
+                            );
                         }
                     }
                 }
