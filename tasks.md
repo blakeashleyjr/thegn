@@ -1337,6 +1337,17 @@ heavyweight process-profile firewall (H 101–110): named **bundles** of env var
 * [ ] 696. Bundle switcher UI — status-bar chip (extends the account chip 656) + palette command to bind the active bundle at worktree/workspace/global scope (Phase E)
 * [ ] 697. Multiple Claude profiles (worked example) — `work`/`personal` bundles selecting `accounts.claude` + git identity + proxy endpoint, hot-swapped per scope (consumes 684–696; ties 656, AR virtual keys 287)
 
+### AV. Native Windows Support
+
+_The Windows-native workspace shell (AI-free by default), bypassing WSL/MSYS2 for a native sub-300ms, zero-IPC experience. Core features (multiplexing, rendering, git) already map cleanly to Windows thanks to the `portable-pty`/`termwiz` foundation._
+
+- [ ] 698. Cross-platform filesystem watching — replace `inotify` with `notify` (`ReadDirectoryChangesW`) for diff watchers
+- [ ] 699. Native Sandboxing: AppContainers — low-integrity process isolation granting read/write ACLs only to the specific worktree path
+- [ ] 700. Native Sandboxing: Job Objects — prevent fork-bombs, block UI popups, and ensure child process trees die instantly on tab close
+- [ ] 701. Standardized paths — migrate from Unix `$XDG_STATE_HOME` to `directories` crate resolving to `%LOCALAPPDATA%\superzej`
+- [ ] 702. Signals mapping — map Unix profiling triggers (`SIGUSR2`) to internal keymaps or named events for Windows flame-graphs
+- [ ] 703. PowerShell / NuShell defaults — default pane spawning to native Windows shells over `cmd.exe`
+
 ### AI-free mode (audience-widener)
 
 - [~] 511. AI-free mode — run as a pure terminal workspace/worktree manager, no agents/proxy/LLM

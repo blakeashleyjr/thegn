@@ -141,6 +141,8 @@ config_enum! {
         Systemd = "systemd" | "systemd-run",
         Apple = "apple" | "container",
         Wsl = "wsl",
+        WinAppContainer = "winappcontainer" | "appcontainer",
+        WinJobObject = "winjobobject" | "jobobject",
         None = "none" | "host",
     } default = Auto;
 }
