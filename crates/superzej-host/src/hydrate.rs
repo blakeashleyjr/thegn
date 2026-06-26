@@ -630,8 +630,10 @@ fn worktree_loc(db: &superzej_core::db::Db, path: &std::path::Path) -> Option<u6
     }
 
     let mut languages = tokei::Languages::new();
-    let mut config = tokei::Config::default();
-    config.treat_doc_strings_as_comments = Some(true);
+    let config = tokei::Config {
+        treat_doc_strings_as_comments: Some(true),
+        ..Default::default()
+    };
     let paths = vec![path.to_path_buf()];
 
     languages.get_statistics(&paths, &[], &config);
