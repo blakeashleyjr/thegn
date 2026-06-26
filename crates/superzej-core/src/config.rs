@@ -671,6 +671,22 @@ pub struct GitCommand {
     pub prompts: Vec<GitPrompt>,
 }
 
+/// UI/Presentation settings (`[ui]`).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct UiConfig {
+    /// Language code (e.g. "en-US", "ja-JP"). "auto" to detect from system.
+    pub language: String,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            language: "auto".to_string(),
+        }
+    }
+}
+
 /// Git behavior knobs for the panel's write operations (`[git]`).
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -2166,6 +2182,8 @@ pub struct Config {
     pub git_commands: Vec<GitCommand>,
     pub plugins: Vec<crate::plugin_api::PluginManifest>,
     // --- sub-tables ---
+    #[serde(default)]
+    pub ui: UiConfig,
     pub git: GitConfig,
     pub theme: ThemeConfig,
     pub monitor: MonitorConfig,
@@ -2233,6 +2251,7 @@ impl Default for Config {
             confirm_delete: true,
             repo_roots: Vec::new(),
             repo_scan_depth: 5,
+            ui: UiConfig::default(),
             agents: Vec::new(),
             tools: Vec::new(),
             accounts: Vec::new(),
