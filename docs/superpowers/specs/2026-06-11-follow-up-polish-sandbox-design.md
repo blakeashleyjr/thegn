@@ -38,6 +38,25 @@ The sandbox backend order is configured by `[sandbox].backend_chain`. The defaul
 
 `backend = "auto"` resolves by walking `backend_chain`. A specific backend bypasses the chain for that worktree, except that if the backend cannot satisfy the configured mount/file-access policy, the resolver may fall back to the next backend in the chain when the worktree was created with `Auto`.
 
+### macOS / Apple `container`
+
+The default chain above is Linux-native (podman/docker/bwrap all assume a Linux
+host). On macOS there is no `bwrap` and no user `systemd-run`, so the chain is
+**platform-aware**: the default on macOS is `apple → docker → host`. The last
+fallback is still `host`, labeled `HOST / UNCONTAINED`.
+
+The `apple` backend uses Apple's [`container`](https://github.com/apple/container)
+CLI, which runs OCI images as **lightweight Linux VMs** (one VM per container). It
+is the macOS analogue of the Linux OCI backends (podman/docker) — **not** a
+host-toolchain sandbox like bwrap. It requires **macOS 26 or later on Apple
+silicon**; where that requirement is unmet, resolution falls through to `docker`
+(if present) and then `host`.
+
+This is a tracked, not-yet-implemented deliverable: today `apple` is parsed and
+routed through the generic OCI argv path with no Apple-specific lifecycle or
+path-preserving mount handling. See `tasks.md` section **AV. macOS / Apple
+container platform** (items 698–703).
+
 ### New worktree sandbox picker
 
 The new-worktree flow gets a sandbox picker with these options:

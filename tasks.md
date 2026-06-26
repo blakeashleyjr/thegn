@@ -1337,6 +1337,27 @@ heavyweight process-profile firewall (H 101–110): named **bundles** of env var
 * [ ] 696. Bundle switcher UI — status-bar chip (extends the account chip 656) + palette command to bind the active bundle at worktree/workspace/global scope (Phase E)
 * [ ] 697. Multiple Claude profiles (worked example) — `work`/`personal` bundles selecting `accounts.claude` + git identity + proxy endpoint, hot-swapped per scope (consumes 684–696; ties 656, AR virtual keys 287)
 
+### AV. macOS / Apple container platform
+
+Promote the `apple` backend from an enumerated stub to a real, tested backend, and
+make superzej build and run as a **host** on Apple-silicon macOS. Today `apple`
+(`crates/superzej-core/src/sandbox.rs`, aliases `apple`/`container`) is parsed and
+routed through the **generic OCI argv path** identically to podman/docker — with no
+awareness of Apple [`container`](https://github.com/apple/container)'s
+VM-per-container model or its **macOS 26 + Apple silicon** requirement. The default
+`backend_chain` (`podman → docker → bwrap → host`) is all Linux, so macOS silently
+falls back to uncontained `host`. The codebase is Linux-biased (`cfg(target_os =
+"linux")`, `/proc` activity scan, `bwrap`/`systemd-run` fallbacks, capability drops,
+hardcoded `/nix/store` mounts) and `flake.nix` has no `aarch64-darwin` output.
+Sequenced so each item ships independently; tracks the AB/AC/AD/AE container groups.
+
+- [ ] 698. Platform-aware default `backend_chain` — resolve the chain by `target_os` so macOS defaults to `apple → docker → host` instead of dead Linux entries
+- [ ] 699. Apple `container`-specific backend path — handle the VM-per-container model, `container` CLI argv/lifecycle, and image/registry semantics distinct from podman/docker (today shares the generic OCI path)
+- [ ] 700. Path-preserving worktree mount on Apple `container` — replicate bind-mount-at-real-path semantics under the VM model so host-side git reads keep working; gated on macOS 26 + Apple silicon
+- [ ] 701. macOS host build — `aarch64-darwin` flake output + non-Linux fallbacks for bwrap/systemd-run/`/proc` activity scan/capability dropping (graceful, labeled `HOST / UNCONTAINED`)
+- [ ] 702. macOS CI lane — build + unit tests on Apple silicon; smoke coverage for the `apple` backend
+- [ ] 703. Docs + capability gating — reconcile README/config claims with reality; surface "requires macOS 26 + Apple silicon" in the sandbox picker and error paths
+
 ### AI-free mode (audience-widener)
 
 - [~] 511. AI-free mode — run as a pure terminal workspace/worktree manager, no agents/proxy/LLM
