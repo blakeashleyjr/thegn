@@ -29,6 +29,8 @@ pub(crate) enum RefreshKind {
     Model,
     Pr,
     Issues,
+    /// CI run-history cache refresh (AV group) — same cadence as `Pr`.
+    Ci,
 }
 
 const CONTAINER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
@@ -82,6 +84,10 @@ pub(crate) fn spawn_refresh_ticker(
                     break; // loop gone
                 }
                 wake = true;
+            }
+            // CI run-history rides the PR cadence (AV group).
+            if ticks.is_multiple_of(pr_every) && tx.send(RefreshKind::Ci).is_err() {
+                break;
             }
             if ticks.is_multiple_of(issue_every) {
                 if tx.send(RefreshKind::Issues).is_err() {
@@ -409,6 +415,7 @@ pub(crate) fn db_worktree_list(db: &superzej_core::db::Db) -> Vec<crate::sidebar
             path: w.worktree.clone(),
             folder_id: w.folder_id,
             sandbox_backend: w.sandbox_backend.clone(),
+            env_name: w.env_name.clone(),
         });
     }
     out
@@ -471,17 +478,36 @@ fn collect_sidebar_status(
     let mut status = crate::sidebar::SidebarStatus::default();
     let t0 = std::time::Instant::now();
 
-    // Advance the activity state machine over the session's managed worktrees,
-    // then read the fresh states (keyed by tab name).
-    let managed: Vec<superzej_core::activity::ManagedWorktree> = session
-        .worktrees
-        .iter()
-        .filter(|g| !g.path.is_empty())
-        .map(|g| superzej_core::activity::ManagedWorktree {
-            worktree: g.path.clone(),
-            tab: g.name.clone(),
-        })
-        .collect();
+    // Advance the activity state machine over ALL registered worktrees,
+    // then read the fresh states (keyed by tab name). This keeps background
+    // agents in other workspaces ticking.
+    let mut managed_map = std::collections::BTreeMap::new();
+    if let Ok(db_wts) = db.worktrees() {
+        for wt in db_wts {
+            if !wt.worktree.is_empty() {
+                managed_map.insert(
+                    wt.worktree.clone(),
+                    superzej_core::activity::ManagedWorktree {
+                        worktree: wt.worktree.clone(),
+                        tab: wt.tab_name.clone(),
+                    },
+                );
+            }
+        }
+    }
+    // Overlay the active session (might have unpersisted fresh worktrees)
+    for g in &session.worktrees {
+        if !g.path.is_empty() {
+            managed_map.insert(
+                g.path.clone(),
+                superzej_core::activity::ManagedWorktree {
+                    worktree: g.path.clone(),
+                    tab: g.name.clone(),
+                },
+            );
+        }
+    }
+    let managed: Vec<_> = managed_map.into_values().collect();
     superzej_core::activity::poll_and_save(&managed);
     status.activity = superzej_core::activity::read_states()
         .into_iter()
@@ -495,6 +521,26 @@ fn collect_sidebar_status(
     status.alert_counts = db
         .get_alert_counts_by_worktree(alert_kinds)
         .unwrap_or_default();
+
+    // Populate agent and PR badges for ALL registered worktrees from the DB.
+    // This ensures non-session workspaces still show their agent/PR status
+    // when they are rendered as collapsed/switchable sidebar rows.
+    if let Ok(db_wts) = db.worktrees() {
+        for wt in db_wts {
+            if !wt.agent.is_empty() {
+                status.agent.insert(wt.worktree.clone(), wt.agent.clone());
+            }
+            if !wt.branch.is_empty() && !wt.repo_root.is_empty() {
+                if let Ok(counts) = db.get_open_pr_counts_by_branch(&wt.repo_root) {
+                    if let Some(&n) = counts.get(&wt.branch) {
+                        if n > 0 {
+                            status.pr_counts.insert(wt.worktree.clone(), n);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // git glyphs + agent + PR badge per distinct worktree path. `is_dirty` does a
     // full `git status` scan (50-150ms), so a serial loop over N worktrees was the
@@ -575,23 +621,22 @@ fn collect_sidebar_status(
 fn worktree_loc(db: &superzej_core::db::Db, path: &std::path::Path) -> Option<u64> {
     const TTL_SECS: i64 = 300;
     let key = path.to_string_lossy().into_owned();
-    if let Ok(Some((loc, fetched_at))) = db.get_loc_cache_entry(&key)
-        && now_secs() - fetched_at < TTL_SECS
-    {
-        return Some(loc as u64);
+    if let Ok(Some((loc, fetched_at))) = db.get_loc_cache_entry(&key) {
+        if now_secs() - fetched_at < TTL_SECS {
+            return Some(loc as u64);
+        }
     }
-    let out = std::process::Command::new("tokei")
-        .args(["--output", "json"])
-        .arg(path)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    let code = v.get("Total")?.get("code")?.as_u64()?;
-    let _ = db.put_loc_cache(&key, code as usize);
-    Some(code)
+
+    let mut languages = tokei::Languages::new();
+    let mut config = tokei::Config::default();
+    config.treat_doc_strings_as_comments = Some(true);
+    let paths = vec![path.to_path_buf()];
+
+    languages.get_statistics(&paths, &[], &config);
+    let code: usize = languages.iter().map(|(_, lang)| lang.code).sum();
+
+    let _ = db.put_loc_cache(&key, code);
+    Some(code as u64)
 }
 
 /// A cheap first-frame model: no git, no diff, no DB recents. It gives the
@@ -646,8 +691,6 @@ pub(crate) fn build_initial_model(
 pub(crate) struct HydrateHints {
     pub open: crate::panel::Section,
     pub expanded: bool,
-    /// The configured issue provider id (`"none"` when disabled, `""` treated as "none").
-    pub issues_provider: String,
     /// Active profile slug for per-profile container naming (empty = default).
     pub profile: String,
 }
@@ -978,6 +1021,13 @@ pub(crate) fn build_panel(
         apply_pr_cache(&mut panel, cached);
     }
 
+    // The CI run-history cache feeds the `Ci` section rollup (AV group).
+    if let Ok(Some((json, _))) = db.get_ci_cache(&loc.path())
+        && let Ok(runs) = serde_json::from_str::<Vec<superzej_core::ci::CiRun>>(&json)
+    {
+        panel.ci_runs = runs;
+    }
+
     panel.files = diff_entries
         .iter()
         .map(|f| crate::panel::DiffFile {
@@ -1077,18 +1127,26 @@ pub(crate) fn build_panel(
         panel.all_files = files;
     }
 
-    // Issue tracker cache — reads directly from the DB (no network;
-    // the background `spawn_issue_cache_refresh` keeps the cache warm).
-    let provider = hints.issues_provider.as_str();
-    if !provider.is_empty() && provider != "none" {
-        if let Ok(Some((json, _))) = db.get_issue_cache(&loc.path(), provider)
-            && let Ok(issues) = serde_json::from_str::<Vec<superzej_core::issue::Issue>>(&json)
-        {
-            panel.tracker_issues = issues;
+    // Issue tracker cache — reads directly from the DB (no network; the
+    // background `spawn_issue_cache_refresh` keeps the cache warm). Loads every
+    // cached provider for this repo and concatenates, so multiple trackers
+    // (e.g. Linear + Jira) aggregate into one list.
+    if let Ok(cached) = db.get_all_issue_cache(&loc.path()) {
+        for (_provider, json) in cached {
+            if let Ok(mut issues) = serde_json::from_str::<Vec<superzej_core::issue::Issue>>(&json)
+            {
+                panel.tracker_issues.append(&mut issues);
+            }
         }
-        if let Ok(links) = db.linked_issues(&cwd.to_string_lossy()) {
-            panel.tracker_links = links;
-        }
+    }
+    if let Ok(links) = db.linked_issues(&cwd.to_string_lossy()) {
+        panel.tracker_links = links;
+    }
+    // Unified "My Work" feed (cross-repo; single global cache row).
+    if let Ok(Some((json, _))) = db.get_my_work_cache()
+        && let Ok(rows) = serde_json::from_str::<Vec<superzej_core::work::WorkRow>>(&json)
+    {
+        panel.my_work = rows;
     }
     // Full notification list for the inbox panel; badge counts are derived from it
     // by effective priority (Info kinds never count; the red flag is Alert-only).
@@ -1239,6 +1297,7 @@ pub(crate) fn spawn_panel_prefetch(
 
 pub(crate) fn spawn_pr_cache_refresh(
     session: crate::session::Session,
+    cfg: superzej_core::config::IssuesConfig,
     waker: Option<TerminalWaker>,
 ) {
     let branch_session = session.clone();
@@ -1285,6 +1344,29 @@ pub(crate) fn spawn_pr_cache_refresh(
             let msg = format!("PR #{} {} → {}", pr.number, old, pr.state);
             let wt = cwd.to_string_lossy();
             let _ = db.put_notification("pr_state_changed", &pr_ref, &msg, &wt);
+
+            // Lifecycle automation: on merge, move this worktree's linked
+            // issue(s) to Done on their tracker (opt-in via `[issues].move_on_merge`).
+            if cfg.move_on_merge
+                && pr.state == "MERGED"
+                && let Ok(linked) = db.linked_issues(&wt)
+                && !linked.is_empty()
+            {
+                let router = superzej_svc::issue::IssueRouter::from_config(&cfg);
+                if router.is_configured()
+                    && let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                {
+                    let patch = superzej_core::issue::IssuePatch {
+                        status: Some(superzej_core::issue::IssueStatus::Done),
+                        ..Default::default()
+                    };
+                    for id in &linked {
+                        let _ = rt.block_on(router.update_issue(id, &patch));
+                    }
+                }
+            }
         }
 
         // PR cache landing should surface via a model rehydrate; pulse the waker
@@ -1364,16 +1446,29 @@ pub(crate) fn spawn_issue_cache_refresh(
             limit: cfg.max_issues,
             ..Default::default()
         };
-        let Ok(issues) = rt.block_on(router.list_issues(&filter)) else {
+        // Fetch every configured provider; cache and diff each under its own
+        // `(repo_root, provider)` key so trackers aggregate without clobbering.
+        let per_provider = rt.block_on(router.list_per_provider(&filter));
+        let Ok(db) = superzej_core::db::Db::open() else {
             return;
         };
-        let Ok(json) = serde_json::to_string(&issues) else {
-            return;
-        };
-        if let Ok(db) = superzej_core::db::Db::open() {
-            // Diff old vs new to emit notifications before overwriting.
+        let repo_key = cwd.to_string_lossy();
+        let linked: std::collections::HashSet<String> = db
+            .linked_issues(&repo_key)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let mut changed = false;
+        for (provider, result) in per_provider {
+            let Ok(issues) = result else {
+                continue; // a failing provider leaves its prior cache intact
+            };
+            let Ok(json) = serde_json::to_string(&issues) else {
+                continue;
+            };
+            // Diff old vs new for this provider to emit notifications first.
             let old_issues: Vec<superzej_core::issue::Issue> = db
-                .get_issue_cache(&cwd.to_string_lossy(), router.provider_id())
+                .get_issue_cache(&repo_key, provider)
                 .ok()
                 .flatten()
                 .and_then(|(j, _)| serde_json::from_str(&j).ok())
@@ -1383,11 +1478,6 @@ pub(crate) fn spawn_issue_cache_refresh(
                     .iter()
                     .map(|i| (i.id.as_str(), &i.status))
                     .collect();
-            let linked: std::collections::HashSet<String> = db
-                .linked_issues(&cwd.to_string_lossy())
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
             for issue in &issues {
                 if let Some(&old_status) = old_map.get(issue.id.as_str())
                     && *old_status != issue.status
@@ -1398,18 +1488,183 @@ pub(crate) fn spawn_issue_cache_refresh(
                         issue.number,
                         issue.status.label()
                     );
-                    let _ = db.put_notification(
-                        "status_changed",
-                        &issue.id,
-                        &msg,
-                        &cwd.to_string_lossy(),
-                    );
+                    let _ = db.put_notification("status_changed", &issue.id, &msg, &repo_key);
                 }
             }
-            let _ = db.put_issue_cache(&cwd.to_string_lossy(), router.provider_id(), &json);
+            let _ = db.put_issue_cache(&repo_key, provider, &json);
+            changed = true;
+        }
+        if changed && let Some(w) = &waker {
+            let _ = w.wake();
+        }
+    });
+}
+
+/// Map an issue's triage priority to a `WorkRow` urgency weight (higher = more
+/// urgent), so the unified feed sorts the same way the Issues section does.
+fn issue_urgency(p: superzej_core::issue::IssuePriority) -> u8 {
+    use superzej_core::issue::IssuePriority as P;
+    match p {
+        P::Urgent => 4,
+        P::High => 3,
+        P::Medium => 2,
+        P::Low => 1,
+        P::None => 0,
+    }
+}
+
+fn pr_search_row(
+    p: superzej_core::github::PrSearchRow,
+    group: superzej_core::work::WorkGroup,
+) -> superzej_core::work::WorkRow {
+    superzej_core::work::WorkRow {
+        group,
+        kind: superzej_core::work::WorkKind::Pr,
+        provider: "github".into(),
+        number: format!("#{}", p.number),
+        title: p.title,
+        repo: p.repository.name_with_owner,
+        url: p.url,
+        urgency: 2,
+        issue_id: None,
+        branch_hint: None,
+        worktree_path: None,
+    }
+}
+
+/// Refresh the unified "My Work" feed: assigned issues across every configured
+/// provider, cross-repo review-requested / authored PRs (`gh search`), and
+/// high-priority unread notifications. Writes a single global `my_work_cache`
+/// row and pulses the waker. Cross-repo by design — not scoped to the active
+/// worktree's repo (it only borrows the cwd for the `gh` invocation context).
+pub(crate) fn spawn_my_work_refresh(
+    session: crate::session::Session,
+    cfg: superzej_core::config::IssuesConfig,
+    waker: Option<TerminalWaker>,
+) {
+    task::spawn_blocking(move || {
+        use superzej_core::work::{WorkGroup, WorkKind, WorkRow};
+
+        let cwd = active_tab_path(&session);
+        if !cwd.is_dir() {
+            return;
+        }
+        let mut rows: Vec<WorkRow> = Vec::new();
+
+        // 1) Issues assigned to me, aggregated across all configured providers.
+        let router = superzej_svc::issue::IssueRouter::from_config(&cfg);
+        if router.is_configured()
+            && let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+        {
+            let filter = superzej_core::issue::IssueFilter::my_open(cfg.max_issues.max(1));
+            if let Ok(issues) = rt.block_on(router.list_issues(&filter)) {
+                for i in issues {
+                    rows.push(WorkRow {
+                        group: WorkGroup::Assigned,
+                        kind: WorkKind::Issue,
+                        provider: i.provider,
+                        number: i.number,
+                        title: i.title,
+                        repo: String::new(),
+                        url: i.url,
+                        urgency: issue_urgency(i.priority),
+                        issue_id: Some(i.id),
+                        branch_hint: i.branch_hint,
+                        worktree_path: None,
+                    });
+                }
+            }
+        }
+
+        // 2) Cross-repo PRs via `gh search`: review-requested of me, and mine.
+        let loc = superzej_core::remote::GitLoc::for_worktree(&cwd);
+        if let Ok(prs) = superzej_core::github::search_prs(&loc, "--review-requested=@me", 30) {
+            rows.extend(
+                prs.into_iter()
+                    .map(|p| pr_search_row(p, WorkGroup::ReviewRequested)),
+            );
+        }
+        if let Ok(prs) = superzej_core::github::search_prs(&loc, "--author=@me", 30) {
+            rows.extend(
+                prs.into_iter()
+                    .map(|p| pr_search_row(p, WorkGroup::NeedsAttention)),
+            );
+        }
+
+        // 3) High-priority unread notifications (mentions / blockers / pr-linked).
+        if let Ok(db) = superzej_core::db::Db::open()
+            && let Ok(notes) = db.get_all_notifications(50)
+        {
+            use superzej_core::notification::NotificationKind as K;
+            for n in notes.into_iter().filter(|n| !n.read) {
+                if matches!(n.kind, K::Mentioned | K::BlockerResolved | K::PrLinked) {
+                    rows.push(WorkRow {
+                        group: WorkGroup::NeedsAttention,
+                        kind: WorkKind::Notification,
+                        title: n.message,
+                        urgency: 1,
+                        worktree_path: if n.worktree_path.is_empty() {
+                            None
+                        } else {
+                            Some(n.worktree_path)
+                        },
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        // Always write — an emptied feed must clear the cache, not keep stale rows.
+        if let Ok(db) = superzej_core::db::Db::open()
+            && let Ok(json) = serde_json::to_string(&rows)
+        {
+            let _ = db.put_my_work_cache(&json);
         }
         if let Some(w) = &waker {
             let _ = w.wake();
+        }
+    });
+}
+
+/// Refresh the CI run-history cache for the active worktree (AV group). Off the
+/// event loop: resolves the provider from `[ci]` config + the git remote,
+/// fetches recent runs for the current branch via the async `CiProvider`, writes
+/// `ci_runs_cache`, and pulses the waker so the panel rehydrates. A missing
+/// provider / unconfigured CI / fetch error simply leaves the cache untouched.
+pub(crate) fn spawn_ci_cache_refresh(
+    session: crate::session::Session,
+    cfg: superzej_core::config::CiConfig,
+    waker: Option<TerminalWaker>,
+) {
+    task::spawn_blocking(move || {
+        let cwd = active_tab_path(&session);
+        if !cwd.is_dir() {
+            return;
+        }
+        let loc = superzej_core::remote::GitLoc::for_worktree(&cwd);
+        let Some(client) = superzej_svc::ci::provider_for(&loc, &cfg) else {
+            return;
+        };
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        let branch = loc
+            .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
+            .filter(|b| !b.is_empty());
+        let runs = rt.block_on(client.runs(&loc, branch.as_deref(), cfg.max_runs));
+        if let Ok(runs) = runs
+            && let Ok(json) = serde_json::to_string(&runs)
+            && let Ok(db) = superzej_core::db::Db::open()
+        {
+            let _ = db.put_ci_cache(&loc.path(), branch.as_deref().unwrap_or(""), &json);
+            if let Some(w) = &waker {
+                let _ = w.wake();
+            }
         }
     });
 }

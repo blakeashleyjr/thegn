@@ -545,7 +545,7 @@ into work/personal (see AM. 479–480, 536–539 below).
 - [ ] 155. Next calendar event widget
 - [~] 156. Remote/network status widget
 - [ ] 157. Proxy upstream health widget
-- [~] 158. CI/PR check status widget
+- [x] 158. CI/PR check status widget — PR check rollup in the panel; statusbar CI badge via AV 707
 - [ ] 159. Composable widget config
 - [ ] 160. Click-through to detail views
 
@@ -1337,7 +1337,18 @@ heavyweight process-profile firewall (H 101–110): named **bundles** of env var
 * [ ] 696. Bundle switcher UI — status-bar chip (extends the account chip 656) + palette command to bind the active bundle at worktree/workspace/global scope (Phase E)
 * [ ] 697. Multiple Claude profiles (worked example) — `work`/`personal` bundles selecting `accounts.claude` + git identity + proxy endpoint, hot-swapped per scope (consumes 684–696; ties 656, AR virtual keys 287)
 
-### AV. macOS / Apple container platform
+### AV. Native Windows Support
+
+_The Windows-native workspace shell (AI-free by default), bypassing WSL/MSYS2 for a native sub-300ms, zero-IPC experience. Core features (multiplexing, rendering, git) already map cleanly to Windows thanks to the `portable-pty`/`termwiz` foundation._
+
+- [ ] 698. Cross-platform filesystem watching — replace `inotify` with `notify` (`ReadDirectoryChangesW`) for diff watchers
+- [ ] 699. Native Sandboxing: AppContainers — low-integrity process isolation granting read/write ACLs only to the specific worktree path
+- [ ] 700. Native Sandboxing: Job Objects — prevent fork-bombs, block UI popups, and ensure child process trees die instantly on tab close
+- [ ] 701. Standardized paths — migrate from Unix `$XDG_STATE_HOME` to `directories` crate resolving to `%LOCALAPPDATA%\superzej`
+- [ ] 702. Signals mapping — map Unix profiling triggers (`SIGUSR2`) to internal keymaps or named events for Windows flame-graphs
+- [ ] 703. PowerShell / NuShell defaults — default pane spawning to native Windows shells over `cmd.exe`
+
+### AW. macOS / Apple container platform
 
 Promote the `apple` backend from an enumerated stub to a real, tested backend, and
 make superzej build and run as a **host** on Apple-silicon macOS. Today `apple`
@@ -1351,12 +1362,12 @@ falls back to uncontained `host`. The codebase is Linux-biased (`cfg(target_os =
 hardcoded `/nix/store` mounts) and `flake.nix` has no `aarch64-darwin` output.
 Sequenced so each item ships independently; tracks the AB/AC/AD/AE container groups.
 
-- [x] 698. Platform-aware default `backend_chain` — resolve the chain by `target_os` so macOS defaults to `apple → docker → host` instead of dead Linux entries _(config.rs `default_backend_chain()` + test)_
-- [~] 699. Apple `container`-specific backend path — dedicated CLI path in sandbox.rs (image prefetch via `container image pull`, status via `container inspect`, removal via `container delete --force`, split `-i -t` exec, `container list` panel probe); argv unit-tested on Linux. **On-device:** confirm exact flag/JSON specifics
-- [~] 700. Path-preserving worktree mount on Apple `container` — `--mount type=bind,…,readonly` form + undocumented Linux hardening flags omitted for Apple; **on-device:** verify same-abs-path bind keeps host-side git working under the VM
-- [~] 701. macOS host build — `flake.nix` already emits `aarch64-darwin`; `pane.rs` `/proc` readers `cfg`-split with native macOS impls (`proc_listpids`/`proc_pidinfo`/`KERN_PROCARGS2` via libc for ppid/cwd/argv); `stats.rs` overlays CPU/mem/net/battery via `top`/`sysctl`/`vm_stat`/`netstat`/`pmset`. **On-device:** compile on the Mac + fix any ABI/format drift
-- [~] 702. macOS CI lane — `.github/workflows/ci.yml` (first CI: ubuntu `just ci` + macos-14 `just build/test/lint`); `pty-smoke.sh` `script` invocation made OS-aware. **On-device/CI:** first GitHub run will need tuning (apps/ path deps, toolchain)
-- [~] 703. Docs + capability gating — README/config/design-spec reconciled; `Apple` added to the new-worktree sandbox picker (macOS-only) and the macOS-26 + Apple-silicon requirement named in the `pick_backend` failure message
+- [x] 704. Platform-aware default `backend_chain` — resolve the chain by `target_os` so macOS defaults to `apple → docker → host` instead of dead Linux entries _(config.rs `default_backend_chain()` + test)_
+- [~] 705. Apple `container`-specific backend path — dedicated CLI path in sandbox.rs (image prefetch via `container image pull`, status via `container inspect`, removal via `container delete --force`, split `-i -t` exec, `container list` panel probe); argv unit-tested on Linux. **On-device:** confirm exact flag/JSON specifics
+- [~] 706. Path-preserving worktree mount on Apple `container` — `--mount type=bind,…,readonly` form + undocumented Linux hardening flags omitted for Apple; **on-device:** verify same-abs-path bind keeps host-side git working under the VM
+- [~] 707. macOS host build — `flake.nix` already emits `aarch64-darwin`; `pane.rs` `/proc` readers `cfg`-split with native macOS impls (`proc_listpids`/`proc_pidinfo`/`KERN_PROCARGS2` via libc for ppid/cwd/argv); `stats.rs` overlays CPU/mem/net/battery via `top`/`sysctl`/`vm_stat`/`netstat`/`pmset`. **On-device:** compile on the Mac + fix any ABI/format drift
+- [~] 708. macOS CI lane — `.github/workflows/ci.yml` (parallel per-stage jobs) + `pty-smoke.sh` `script` invocation made OS-aware. **On-device/CI:** macos-14 job validates the aarch64-darwin build
+- [~] 709. Docs + capability gating — README/config/design-spec reconciled; `Apple` added to the new-worktree sandbox picker (macOS-only) and the macOS-26 + Apple-silicon requirement named in the `pick_backend` failure message
 
 ### AI-free mode (audience-widener)
 
@@ -1365,3 +1376,42 @@ Sequenced so each item ships independently; tracks the AB/AC/AD/AE container gro
 - [ ] 513. Compile-out AI components — feature flag for a lean binary without proxy/agent/MCP layers
 - [~] 514. Graceful degradation — AI panels, dots, cost widgets simply absent; nothing else breaks
 - [x] 515. No-AI privacy posture — zero outbound model traffic, smaller attack surface, fully local
+
+### AV. CI/CD inspection (cross-provider pipelines, runs, jobs, logs)
+
+_A dedicated CI/CD insight layer (inspired by `termkit/gama`), turning the
+GitHub-only PR check rollup (Z 332) from "is my PR green?" into **run history,
+job/step drilldown, log viewing with jump-to-failure, and trigger/rerun/cancel**
+across providers. A `CiProvider` trait is a **sibling** of the AT forge trait
+(631), not a subset: CI is a different axis — GitHub/GitLab/Gitea/Forgejo are
+both forge **and** CI, but **Drone/Woodpecker/Jenkins/Argo/`act`** are CI-only and
+have no PR/MR coupling. A provider-agnostic run→job→step→log model lives in
+superzej-core; providers degrade native-API → CLI → unavailable note like
+`GhNative`→`CliGh`. Surfaced two ways: a panel `Section::Ci` rollup **and** a
+full-screen drilldown view (Runs → Jobs/Steps → Logs, live-refresh toggle).
+Repo-health detects which CI a worktree is configured for (`.github/workflows`,
+`.gitlab-ci.yml`, `.drone.yml`, `.woodpecker.yml`, `Jenkinsfile`, argo manifests).
+**AI-free** — "why did it fail" is log + jump-to-failure, no LLM. Folds in Z 332
+(done) and L 158 (statusbar badge). Validated abstraction-first on GitHub +
+GitLab before breadth grows. Design spec: `docs/superpowers/specs` (to write)._
+
+- [x] 698. `CiProvider` trait + normalized model — `runs`/`run_detail`/`logs`/`workflows`/`trigger`/`rerun`/`cancel`/`capabilities`; `CiRun`→`CiJob`→`CiStep` + `CiLog`/`CiWorkflow` in `superzej-core/src/ci.rs` (+ `CiState` mappers, log failure-scanner, CI-config detection); trait in `superzej-svc/src/ci.rs` w/ native+CLI degradation, capability-gated mutations (Phase A) ✓
+- [x] 699. `ci_runs_cache` table + `[ci]` config — TTL'd JSON cache (mirrors `pr_cache`, db v18), `config_enum!` `CiProviderKind` + per-provider sub-tables (gitlab/drone/woodpecker/jenkins/argo) w/ `env:` tokens, poll interval, live-refresh default, log-tail lines (Phase A) ✓
+- [x] 700. GitHub Actions provider — `gh run list`/`gh run view --json jobs`/`gh run view --log`; run history, jobs/steps, logs; reuses `gh` auth; fixture-tested parsers; deepens Z 332 (Phase A) ✓
+- [x] 701. GitLab CI provider — pipelines→jobs→trace via `glab api`; subgroup-aware project path; fixture-tested parsers (Phase A; also AT 633) ✓
+- [x] 702. Panel `Section::Ci` — Work-tab rollup: recent runs + per-run state glyph + duration, latest run's jobs when deep; summary chip (✓N ✗N ●N) (Phase A) ✓
+- [~] 703. CI drilldown view — `szhost ci view <id>` (run→jobs/steps) + `ci log` + the deep/Full panel section serve the Runs→Jobs→Logs drilldown today; a dedicated full-screen center-pane overlay (live-refresh toggle, filter) is the remaining UI iteration (needs live-terminal verification) (Phase A)
+- [x] 704. `RefreshKind::Ci` + `spawn_ci_cache_refresh` — off-loop poller (`spawn_blocking` + mpsc + `TerminalWaker`), on-switch + PR-cadence interval; writes `ci_runs_cache`; 0% idle preserved (Phase A) ✓
+- [x] 705. CI actions + keymap + palette + CLI — `Action::OpenCi` (+ `ACTION_SPECS`, `palette:true`); full `szhost ci` group: `runs`/`view`/`log`/`rerun`/`trigger`/`cancel`/`detect`; smoke-tested (Phase A) ✓
+- [x] 706. "Why did it fail" — `ci log` applies the `log_tail` cap and prints a `>> first failure at line N` marker via `CiLog::first_failure_line` (`##[error]`/error/exit-code/panic scan, no AI) (Phase A) ✓
+- [x] 707. Statusbar CI badge — closes L 158: red `✗N CI` chip on failures, amber `●N CI` while running, silent when green (Phase A) ✓
+- [ ] 708. Trigger / `workflow_dispatch` — dispatch a workflow with declared inputs (gama's headline; extended-inputs JSON for 10+ inputs); capability-gated (Phase B)
+- [ ] 709. Cancel + rerun across the trait — rerun all/failed/single-job, cancel a run; rerun-failed already exists for GitHub (Z 332) (Phase B)
+- [ ] 710. Live-refresh toggle — gama's `ctrl+l`; bounded-CPU polling while the view is open, configurable interval (Phase B)
+- [ ] 711. Gitea/Forgejo Actions provider — Gitea/Forgejo API / `tea`; GitHub-compatible-ish Actions (Phase C; also AT 634/635)
+- [ ] 712. Drone provider — Drone API + token, per-instance server URL; promote/restart (Phase D)
+- [ ] 713. Woodpecker provider — Woodpecker API (Drone fork); restart (Phase D)
+- [ ] 714. Jenkins provider — Jenkins JSON API + crumb, per-instance URL / basic-auth or token; build with params (Phase D)
+- [ ] 715. Argo provider — Argo Workflows (k8s / `argo` CLI) + Argo CD (`argocd` API); submit/resubmit/sync; k8s-context dependent (Phase D)
+- [ ] 716. Local `act` runner — run `.github/workflows` locally via `act`; stream logs into the run view (Phase E)
+- [ ] 717. Repo-health / CI-config detection — which CI files a worktree has, recent pass-rate, currently-running count; surfaced in the CI view header (Phase E)

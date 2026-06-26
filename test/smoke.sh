@@ -39,6 +39,16 @@ context = "branches"
 command = "git push {{.SelectedBranch.Name | quote}}"
 output = "popup"
 prompts = [{ type = "input", title = "Remote", key = "Remote" }]
+
+# Per-sandbox VPN config must parse + validate (provider sub-tables included).
+[sandbox.vpn]
+provider = "tailscale"
+mode = "sidecar"
+dns = "tunnel"
+
+[sandbox.vpn.tailscale]
+auth_key = "env:TS_AUTHKEY"
+tags = ["tag:dev"]
 EOF
 
 fail=0
@@ -77,6 +87,10 @@ check "config validate succeeds on the seeded config" \
   "'$SZ' config validate >/dev/null 2>&1"
 check "config show emits TOML" \
   "'$SZ' config show | grep -q 'worktrees_dir'"
+check "sandbox vpn config parses and surfaces the provider" \
+  "'$SZ' config show | grep -q 'tailscale'"
+check "config get reads a nested vpn key" \
+  "[[ \$('$SZ' config get sandbox.vpn.provider 2>/dev/null) == 'tailscale' || -n \$('$SZ' config show | grep -A2 'sandbox.vpn') ]]"
 
 # A hand-built worktree exercises diff/pr/list against real git state without
 # the interactive host (worktree creation is a compositor action now).
@@ -96,11 +110,28 @@ check "diff --stat emits without error" \
 check "pr status degrades gracefully (exit 0)" \
   "'$SZ' pr status --worktree '$WT' >/dev/null 2>&1"
 
+# ci (AV group): detection finds a seeded workflow file; runs/detect degrade
+# gracefully with no remote/provider (exit 0, never crash).
+mkdir -p "$WT/.github/workflows"
+echo "on: push" >"$WT/.github/workflows/ci.yml"
+check "ci detect finds the seeded GitHub Actions workflow" \
+  "'$SZ' ci detect --worktree '$WT' | grep -q 'GitHub Actions'"
+check "ci runs degrades gracefully (exit 0)" \
+  "'$SZ' ci runs --worktree '$WT' >/dev/null 2>&1"
+
 # list works against the DB (empty here is fine — must not error).
 check "list runs without error" \
   "'$SZ' list >/dev/null 2>&1"
 check "recent runs without error" \
   "'$SZ' recent >/dev/null 2>&1"
+
+# Named execution environments: list the library and resolve one for a worktree.
+check "env list reports the default env" \
+  "'$SZ' env list | grep -q 'default env:'"
+check "env show resolves an environment for a worktree" \
+  "'$SZ' env show '$WT' | grep -q '^env:'"
+check "env set/show round-trips a selection" \
+  "'$SZ' env set company-k8s '$WT' >/dev/null 2>&1 && '$SZ' env show '$WT' >/dev/null 2>&1"
 
 # v5 → v6 layout migration: seed a legacy flat tab_layout (pages as " ·N" name
 # suffixes) into the state DB, open it once, and assert it transformed into

@@ -48,6 +48,12 @@ _apps:
 build: _apps
     cargo build --workspace
 
+# Debug build of the host with the in-process sampling profiler compiled in
+# (the `profiling` feature → SIGUSR2 flamegraph capture). Same artifact path as
+# `build` (target/debug/szhost), so `start-term` picks it up transparently.
+build-profiling: _apps
+    cargo build --features profiling -p superzej-host
+
 # Release build (the whole cargo workspace).
 release: _apps
     cargo build --workspace --release
@@ -318,18 +324,52 @@ start name="dev": build
 # Alias for `start`.
 attach: start
 
-# Build and open the native host in a fresh alacritty window (optimized
-# profile: no decorations, no outer scrollback — the host owns both), with only
-# the instance's isolated XDG state injected.
-start-term name="dev": build
+# Build and open the native host in a fresh ghostty window with the FULL
+# dev/debug/profiling toolchain wired up. ghostty runs a hermetic, perf-tuned
+# profile (config/ghostty.config: --config-default-files=false keeps your
+# personal ghostty config out): no decorations/scrollback/URL-detection, vsync
+# off for minimum input-to-present latency, and a dedicated single-instance
+# process so the pidfile + `pgrep -n szhost` + SIGUSR2 drill all hit it. Plus:
+#   - binary built with the `profiling` feature → SIGUSR2 flamegraph capture
+#     (kill -USR2 once to start sampling, again to dump);
+#   - every instrumentation channel on: startup waterfall + frame + hydrate +
+#     perf logs land in $XDG_STATE_HOME/superzej/logs/szhost.log, and the
+#     runtime self-profiler rollup is enabled (SUPERZEJ_PERF=1);
+#   - state stays isolated per instance (~/.superzej-<name>).
+# NOTE: this is a DEBUG binary (~2.5x slower than release), so read the
+# flamegraph/perf rollup for structure & relative cost — for absolute timings
+# use the release-grade `just bench` / `just bench-idle` harnesses.
+start-term name="dev": build-profiling
     state="$HOME/.superzej-{{name}}/state"; run="$HOME/.superzej-{{name}}/run"; pidfile="$run/szhost.pid"; mkdir -p "$state" "$run"; \
       if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then kill "$(cat "$pidfile")" 2>/dev/null || true; fi; \
-      setsid -f alacritty --config-file "$PWD/config/alacritty.toml" -e sh -lc \
+      echo "profiler: 'kill -USR2 \$(pgrep -n szhost)' to start sampling, again to dump → $state/superzej/profiles/"; \
+      echo "logs: $state/superzej/logs/szhost.log (startup waterfall + frame/hydrate/perf)"; \
+      setsid -f ghostty --config-default-files=false --config-file="$PWD/config/ghostty.config" -e sh -lc \
       'pidfile="$1"; shift; echo $$ > "$pidfile"; exec env "$@"' \
       sh "$pidfile" \
-      "SUPERZEJ_ALACRITTY_CONFIG=$PWD/config/alacritty.toml" \
       "XDG_STATE_HOME=$state" \
+      "SUPERZEJ_LOG=info,szhost::frame=debug,szhost::hydrate=debug,szhost::perf=debug" \
+      "SUPERZEJ_PERF=1" \
       "$PWD/{{bin}}"
+
+# Same dev/profiling/instrumentation rig as `start-term`, but a RELEASE binary —
+# the daily-driver launcher. `start-term` stays debug for fast `cargo watch`
+# rebuilds (`just dev-tui`); this gets the ~2.5x release speedup while keeping
+# every log channel + the SIGUSR2 flamegraph profiler on, so live perf readings
+# (frame render_ms, the szhost::perf rollup, idle CPU) reflect real shipped cost
+# instead of the debug penalty. Use this to inhabit superzej all day.
+start-term-release name="dev": release-profiling
+    state="$HOME/.superzej-{{name}}/state"; run="$HOME/.superzej-{{name}}/run"; pidfile="$run/szhost.pid"; mkdir -p "$state" "$run"; \
+      if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then kill "$(cat "$pidfile")" 2>/dev/null || true; fi; \
+      echo "profiler: 'kill -USR2 \$(pgrep -n szhost)' to start sampling, again to dump → $state/superzej/profiles/"; \
+      echo "logs: $state/superzej/logs/szhost.log (startup waterfall + frame/hydrate/perf)"; \
+      setsid -f ghostty --config-default-files=false --config-file="$PWD/config/ghostty.config" -e sh -lc \
+      'pidfile="$1"; shift; echo $$ > "$pidfile"; exec env "$@"' \
+      sh "$pidfile" \
+      "XDG_STATE_HOME=$state" \
+      "SUPERZEJ_LOG=info,szhost::frame=debug,szhost::hydrate=debug,szhost::perf=debug" \
+      "SUPERZEJ_PERF=1" \
+      "$PWD/target/release/szhost"
 
 # Install/update the native superzej host onto your PATH (standalone, non-Nix):
 # builds release artifacts, installs `sj` as the dedicated alacritty launcher,

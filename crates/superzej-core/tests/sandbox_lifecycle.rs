@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use superzej_core::config::{FileAccess, Network};
 use superzej_core::sandbox::{
-    Backend, SandboxLimits, SandboxSpec, Transport, container_name, ensure, health_check, run_gc,
+    Backend, SandboxLimits, SandboxSpec, container_name, ensure, health_check, run_gc,
     teardown_by_path,
 };
 
@@ -36,7 +36,7 @@ fn force_rm(name: &str) {
 fn alpine_spec(name: &str, worktree: &str) -> SandboxSpec {
     SandboxSpec {
         backend: Backend::Podman,
-        transport: Transport::Local,
+        placement: superzej_core::placement::Placement::Local,
         image: Some("docker.io/library/alpine:latest".into()),
         worktree: PathBuf::from(worktree),
         mounts: vec![],
@@ -62,6 +62,7 @@ fn alpine_spec(name: &str, worktree: &str) -> SandboxSpec {
         devenv_path: None,
         nix_daemon: false,
         name: name.into(),
+        vpn: None,
     }
 }
 

@@ -237,8 +237,11 @@ pub trait GitBackend: Send + Sync {
     fn add_worktree(&self, root: &Path, branch: &str, base: &str, path: &Path) -> Result<()>;
     fn remove_worktree(&self, root: &Path, path: &Path, delete_branch: bool) -> Result<()>;
 
-    /// A merge/rebase/cherry-pick in progress, or `None`. CLI everywhere —
-    /// probed via `rev-parse --verify` so it works for remote locs too.
+    /// A merge/rebase/cherry-pick in progress, or `None`. Merge/cherry-pick/
+    /// revert are probed via `rev-parse --verify` of their `*_HEAD` pseudo-refs
+    /// (git clears those on commit/abort); rebase is probed via the on-disk
+    /// state dir, since `REBASE_HEAD` survives a completed rebase. Both work for
+    /// remote locs (`rev-parse` over ssh, `read_git_path` cats the file).
     fn merge_state(&self, loc: &GitLoc) -> Result<Option<MergeInfo>> {
         let exists = |what: &str| -> bool {
             loc.git_command(&["rev-parse", "-q", "--verify", what])
@@ -254,9 +257,17 @@ pub trait GitBackend: Send + Sync {
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .unwrap_or_default()
         };
+        // A rebase in progress is marked by the `rebase-merge`/`rebase-apply`
+        // state directory — NOT by `REBASE_HEAD`. git leaves `REBASE_HEAD`
+        // dangling after a conflicted rebase is resolved and `--continue`d to
+        // completion (only the state dir is removed), so probing the ref would
+        // pin the "REBASING" banner on forever. The `onto` file exists for the
+        // duration of a paused rebase; `read_git_path` is remote-safe too.
+        let rebasing = loc.read_git_path("rebase-merge/onto").is_some()
+            || loc.read_git_path("rebase-apply/onto").is_some();
         let kind = if exists("MERGE_HEAD") {
             Some((MergeKind::Merge, "MERGE_HEAD"))
-        } else if exists("REBASE_HEAD") {
+        } else if rebasing {
             Some((MergeKind::Rebase, "REBASE_HEAD"))
         } else if exists("CHERRY_PICK_HEAD") {
             Some((MergeKind::CherryPick, "CHERRY_PICK_HEAD"))
@@ -1211,6 +1222,64 @@ mod tests {
 
         git_in(&base, &["merge", "--abort"]);
         assert!(CliGit.merge_state(&loc).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn merge_state_clears_after_a_conflicted_rebase_is_continued_to_completion() {
+        // Regression: git leaves `REBASE_HEAD` dangling after a conflicted
+        // rebase is resolved and `--continue`d, so detecting rebase via that
+        // ref pinned the "REBASING" banner on forever. Detection must key off
+        // the on-disk rebase state dir, which git removes when the rebase ends.
+        let base = std::env::temp_dir().join(format!("sz-rebase-cont-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        git_in(&base, &["init", "-q", "-b", "main"]);
+        std::fs::write(base.join("f.txt"), "base\n").unwrap();
+        git_in(&base, &["add", "f.txt"]);
+        git_in(&base, &["commit", "-q", "-m", "c0"]);
+        git_in(&base, &["checkout", "-q", "-b", "feat"]);
+        std::fs::write(base.join("f.txt"), "feat\n").unwrap();
+        git_in(&base, &["commit", "-q", "-am", "feat change"]);
+        git_in(&base, &["checkout", "-q", "main"]);
+        std::fs::write(base.join("f.txt"), "main\n").unwrap();
+        git_in(&base, &["commit", "-q", "-am", "main change"]);
+        git_in(&base, &["checkout", "-q", "feat"]);
+
+        let loc = GitLoc::for_worktree(&base);
+
+        // Rebase onto main stops on a conflict — exits non-zero, so go through
+        // the raw scrubbed git_cmd rather than the asserting `git_in` helper.
+        let raw = |args: &[&str]| {
+            superzej_core::util::git_cmd(&base)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@e")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@e")
+                .env("GIT_EDITOR", "true")
+                .output()
+                .unwrap()
+        };
+
+        let _ = raw(&["rebase", "main"]);
+        // Paused mid-rebase: the banner is live.
+        let st = CliGit.merge_state(&loc).unwrap().expect("rebase detected");
+        assert_eq!(st.kind, MergeKind::Rebase);
+        assert_eq!(st.kind.label(), "REBASING");
+
+        // Resolve and continue to completion — REBASE_HEAD survives, the state
+        // dir does not.
+        std::fs::write(base.join("f.txt"), "resolved\n").unwrap();
+        git_in(&base, &["add", "f.txt"]);
+        let cont = raw(&["rebase", "--continue"]);
+        assert!(cont.status.success(), "rebase --continue should finish");
+
+        // The banner must clear even though `REBASE_HEAD` lingers.
+        assert!(
+            CliGit.merge_state(&loc).unwrap().is_none(),
+            "REBASING banner must clear once the rebase state dir is gone"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -321,6 +321,7 @@ pub struct FrameModel {
     /// from the center) — the bar renders raised so the focus is visible.
     pub masthead_focused: bool,
     pub statusbar_focused: bool,
+    pub active_statusbar_widget: usize,
     /// True when the center zone owns keyboard focus (drives the focused
     /// pane's light-blue frame ring; sidebar/panel focus dims every ring).
     pub center_focused: bool,
@@ -442,6 +443,31 @@ impl FrameModel {
         } else {
             &self.accent
         }
+    }
+
+    /// True when a freshly hydrated model carries no render-affecting change
+    /// versus the one on screen — i.e. the 2 s "safety" refresh tick produced
+    /// byte-identical git/db data. The event loop uses this to drain the
+    /// hydration result without repainting, keeping idle CPU at ~0%.
+    ///
+    /// Compares exactly the fields [`crate::hydrate::build_model`] populates
+    /// (plus `status`), and nothing else: stats/metrics/containers/accent/
+    /// bars/pins/app-tabs are owned by other handlers or config and have their
+    /// own dirty triggers, while the session-derived tab/sidebar fields are
+    /// stable during an idle period. KEEP THIS IN SYNC WITH `build_model`.
+    pub fn hydration_eq(&self, other: &Self) -> bool {
+        self.worktree == other.worktree
+            && self.tabs == other.tabs
+            && self.active_tab == other.active_tab
+            && self.sidebar_workspaces == other.sidebar_workspaces
+            && self.sidebar_db_worktrees == other.sidebar_db_worktrees
+            && self.sidebar_status == other.sidebar_status
+            && self.loc == other.loc
+            && self.active_container_name == other.active_container_name
+            && self.active_sandbox_backend == other.active_sandbox_backend
+            && self.container_events == other.container_events
+            && self.status == other.status
+            && self.panel == other.panel
     }
 }
 
@@ -811,7 +837,7 @@ fn draw_pin_chips(
 
 /// A resolved masthead widget: its text plus the color it earned (stats turn
 /// amber/red as they cross pressure thresholds; quiet otherwise).
-struct MastheadWidget {
+pub struct MastheadWidget {
     text: String,
     fg: ColorAttribute,
 }
@@ -941,7 +967,7 @@ fn forge_repo_from_url(url: &str) -> Option<String> {
 }
 
 /// Resolve a BOTTOM-bar widget id to its display text + color.
-fn bottombar_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> {
+pub fn bottombar_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> {
     let w = |text: String, fg: ColorAttribute| MastheadWidget { text, fg };
     match id {
         // "keyhints" is special-cased by draw_statusbar (chip + label segs).
@@ -1101,6 +1127,10 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             r.push(seg(Tok::Slot(S::Ghost3), " \u{2502} "));
         }
         r.push(seg(Tok::Attr(p.fg), p.text));
+
+        if model.statusbar_focused && i == model.active_statusbar_widget {
+            r.push(seg(Tok::Slot(S::Ghost3), " \u{25c4} "));
+        }
     }
     // Red ⚑ flag is reserved for attention (Alert priority); a neutral blue inbox
     // chip carries Notice-priority unread. Info-priority events show in neither.
@@ -1116,6 +1146,38 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             Tok::Hue(superzej_core::theme::Hue::Blue),
             format!(" \u{2709} {} ", model.panel.unread_notifications),
         ));
+    }
+    // CI rollup badge (AV group, item 158): a red ✗ chip when recent runs have
+    // failures, an amber ● chip while runs are in flight; silent when all green
+    // (mirrors the "clean is quiet" notification posture). Only when CI is
+    // configured and the cache is warm (`ci_runs` non-empty).
+    if !model.panel.ci_runs.is_empty() {
+        use superzej_core::ci::CiState;
+        let fail = model
+            .panel
+            .ci_runs
+            .iter()
+            .filter(|r| r.state == CiState::Fail)
+            .count();
+        let running = model
+            .panel
+            .ci_runs
+            .iter()
+            .filter(|r| r.state == CiState::Running)
+            .count();
+        if fail > 0 {
+            r.push(seg(Tok::Slot(S::Text), " "));
+            r.push(Seg::chip(
+                Tok::Hue(superzej_core::theme::Hue::Red),
+                format!(" \u{2717} {fail} CI "),
+            ));
+        } else if running > 0 {
+            r.push(seg(Tok::Slot(S::Text), " "));
+            r.push(Seg::chip(
+                Tok::Hue(superzej_core::theme::Hue::Amber),
+                format!(" \u{25cf} {running} CI "),
+            ));
+        }
     }
     if let Some(ref metrics) = model.ai_metrics {
         r.push(seg(Tok::Slot(S::Text), " "));
@@ -1549,6 +1611,15 @@ fn compose_sidebar_row(
         }
     }
 
+    // A non-default execution environment badges before the backend, so a
+    // worktree pinned to `company-k8s`/`datonya`/etc. is visible at a glance.
+    if let Some(env) = &row.env_name
+        && !env.is_empty()
+        && env != "default"
+    {
+        text.push_str(&format!(" «{env}»"));
+    }
+
     // Agent glyph (item 19) sits just after the label.
     if let Some(backend) = &row.sandbox_backend
         && !backend.is_empty()
@@ -1829,6 +1900,13 @@ pub(crate) fn panel_help_pairs(ui: &crate::panel::PanelUi) -> Vec<(String, Strin
         Section::Changes | Section::Commits | Section::Branches | Section::Stash => {
             unreachable!("git-family sections returned above")
         }
+        Section::Mine => &[
+            ("j/k", "row"),
+            ("↵", "open"),
+            ("b", "branch"),
+            ("o", "browser"),
+            ("R", "refresh"),
+        ],
         Section::Pr => &[
             ("j/k", "row"),
             ("M", "merge"),
@@ -1837,6 +1915,12 @@ pub(crate) fn panel_help_pairs(ui: &crate::panel::PanelUi) -> Vec<(String, Strin
             ("o", "browser"),
         ],
         Section::Tests => &[("r", "run"), ("R", "all"), ("f", "failed"), ("↵", "open")],
+        Section::Ci => &[
+            ("j/k", "row"),
+            ("↵", "view"),
+            ("r", "rerun"),
+            ("o", "browser"),
+        ],
         Section::Files => &[("↵", "open"), ("y", "yazi")],
         Section::Issues => &[
             ("j/k", "row"),
@@ -2075,14 +2159,18 @@ fn draw_relaunch_overlay(surface: &mut Surface, content: Rect, cmd: &str) {
     );
 }
 
+/// Compose the center band: every visible pane's terminal content + the card
+/// border ring (or the loading splash when no pane is live yet). This is the
+/// pane half of a frame; [`draw_chrome`] is the chrome half. They write
+/// disjoint cells (chrome owns the sidebar/panel/bars; this owns the center
+/// interior), so the damage-tracked loop can recompose one without the other.
 #[allow(clippy::too_many_arguments)]
-pub fn render_tab<'a>(
+pub fn render_panes<'a>(
     surface: &mut Surface,
     chrome: &crate::layout::ChromeLayout,
     center: &crate::center::CenterTree,
     focused: crate::center::PaneId,
     model: &FrameModel,
-    panel_ui: &crate::panel::PanelUi,
     lookup: impl Fn(crate::center::PaneId) -> Option<&'a dyn PaneEmulator>,
     title_of: &dyn Fn(crate::center::PaneId) -> String,
     relaunch_of: &dyn Fn(crate::center::PaneId) -> Option<String>,
@@ -2136,6 +2224,33 @@ pub fn render_tab<'a>(
     } else {
         crate::logotype::draw_splash(surface, chrome.center, model);
     }
+}
+
+/// Compose a full frame: the center panes ([`render_panes`]) plus the chrome
+/// ([`draw_chrome`]). The damage-tracked loop calls the two halves separately
+/// for incremental recompose; this wrapper is the full-repaint path + tests.
+#[allow(clippy::too_many_arguments)]
+pub fn render_tab<'a>(
+    surface: &mut Surface,
+    chrome: &crate::layout::ChromeLayout,
+    center: &crate::center::CenterTree,
+    focused: crate::center::PaneId,
+    model: &FrameModel,
+    panel_ui: &crate::panel::PanelUi,
+    lookup: impl Fn(crate::center::PaneId) -> Option<&'a dyn PaneEmulator>,
+    title_of: &dyn Fn(crate::center::PaneId) -> String,
+    relaunch_of: &dyn Fn(crate::center::PaneId) -> Option<String>,
+) {
+    render_panes(
+        surface,
+        chrome,
+        center,
+        focused,
+        model,
+        lookup,
+        title_of,
+        relaunch_of,
+    );
     draw_chrome(surface, chrome, model, panel_ui);
 }
 
@@ -2150,6 +2265,53 @@ mod tests {
             .lines()
             .map(|l| l.to_string())
             .collect()
+    }
+
+    #[test]
+    fn hydration_eq_ignores_non_hydration_fields() {
+        let base = FrameModel::default();
+        // Fields owned by other handlers / config must NOT count as a change,
+        // or the idle guard would still repaint on every safety tick.
+        let mut other = base.clone();
+        other.accent = "ff0000".into();
+        other.pins.push(crate::pins::PinChip {
+            index: 0,
+            label: "p".into(),
+            glyph: '●',
+        });
+        other.stats.cpu_pct = Some(99);
+        other.app_tabs.push("chat".into());
+        other.sidebar_selected = 3;
+        other.center_focused = !base.center_focused;
+        assert!(
+            base.hydration_eq(&other),
+            "non-hydration fields should not trip the idle guard"
+        );
+    }
+
+    #[test]
+    fn hydration_eq_detects_real_changes() {
+        let base = FrameModel::default();
+        let mut panel_changed = base.clone();
+        panel_changed.panel.branch = "feature".into();
+        assert!(
+            !base.hydration_eq(&panel_changed),
+            "panel change must repaint"
+        );
+
+        let mut sidebar_changed = base.clone();
+        sidebar_changed
+            .sidebar_status
+            .activity
+            .insert("tab".into(), crate::sidebar::ActivityState::Active);
+        assert!(
+            !base.hydration_eq(&sidebar_changed),
+            "sidebar status change must repaint"
+        );
+
+        let mut loc_changed = base.clone();
+        loc_changed.loc = Some(42);
+        assert!(!base.hydration_eq(&loc_changed), "loc change must repaint");
     }
 
     /// The delete-worktree confirmation modal (and any `draw_confirm` caller)
@@ -2193,6 +2355,7 @@ mod tests {
             git: None,
             agent: None,
             sandbox_backend: None,
+            env_name: None,
             activity: crate::sidebar::ActivityState::None,
             visible: true,
             collapsed: false,

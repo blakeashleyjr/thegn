@@ -54,3 +54,4 @@ pprof = { version = "0.14", features = ["flamegraph"], optional = true }
 # re-export). The host renders embedded apps' ratatui buffers through
 # `sz_kit::ratatui` so the Buffer type is identical to what the apps produce.
 sz-kit = { path = "../sz-kit" }
+tokei.workspace = true

@@ -17,8 +17,11 @@
 //! layer (mosh preferred / ssh) runs the whole thing on a remote machine.
 
 use crate::config::{
-    FileAccess, Network, OnMissing, RemoteTransport, SandboxBackend, SandboxConfig, SandboxProfile,
+    CustomVpnConfig, FileAccess, NetbirdConfig, Network, OnMissing, OpenvpnConfig, RemoteTransport,
+    SandboxBackend, SandboxConfig, SandboxProfile, TailscaleConfig, VpnConfig, VpnDnsMode, VpnMode,
+    VpnOnError, VpnProviderKind, WireguardConfig, ZerotierConfig,
 };
+use crate::placement::{Placement, SshPlacement, TransportKind};
 use crate::remote::GitLoc;
 use crate::{msg, util};
 use std::path::PathBuf;
@@ -104,6 +107,8 @@ pub enum Backend {
     Systemd,
     Apple,
     Wsl,
+    WinAppContainer,
+    WinJobObject,
     None,
 }
 
@@ -118,6 +123,8 @@ impl Backend {
             "systemd" | "systemd-run" => Backend::Systemd,
             "apple" | "container" => Backend::Apple,
             "wsl" => Backend::Wsl,
+            "winappcontainer" | "appcontainer" => Backend::WinAppContainer,
+            "winjobobject" | "jobobject" => Backend::WinJobObject,
             "none" | "host" => Backend::None,
             _ => return None,
         })
@@ -136,6 +143,8 @@ impl Backend {
             SandboxBackend::Systemd => Backend::Systemd,
             SandboxBackend::Apple => Backend::Apple,
             SandboxBackend::Wsl => Backend::Wsl,
+            SandboxBackend::WinAppContainer => Backend::WinAppContainer,
+            SandboxBackend::WinJobObject => Backend::WinJobObject,
             SandboxBackend::None => Backend::None,
         })
     }
@@ -151,6 +160,8 @@ impl Backend {
             Backend::Systemd => "systemd",
             Backend::Apple => "apple",
             Backend::Wsl => "wsl",
+            Backend::WinAppContainer => "appcontainer",
+            Backend::WinJobObject => "jobobject",
             Backend::None => "host",
         }
     }
@@ -164,6 +175,7 @@ impl Backend {
             Backend::Systemd => "systemd-run",
             Backend::Apple => "container",
             Backend::Wsl => "wsl.exe",
+            Backend::WinAppContainer | Backend::WinJobObject => "", // OS native
             Backend::None => "",
         }
     }
@@ -183,41 +195,16 @@ impl Backend {
     }
 
     fn is_host_toolchain(self) -> bool {
-        matches!(self, Backend::Bwrap | Backend::Systemd)
+        matches!(
+            self,
+            Backend::Bwrap | Backend::Systemd | Backend::WinAppContainer | Backend::WinJobObject
+        )
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransportKind {
-    Ssh,
-    Mosh,
-}
-
-/// A configured remote target. The control plane (detection, `ensure`/`teardown`)
-/// always uses ssh (mosh can't pipe non-interactive commands); the interactive
-/// pane uses mosh when `kind == Mosh`.
-#[derive(Debug, Clone)]
-pub struct Remote {
-    pub host: String,
-    pub port: u16,
-    pub forward_agent: bool,
-    pub kind: TransportKind,
-}
-
-#[derive(Debug, Clone)]
-pub enum Transport {
-    Local,
-    Remote(Remote),
-}
-
-impl Transport {
-    /// The ssh argv prefix (shares the multiplexed base with the `remote`
-    /// git-shim). `batch` distinguishes control-plane calls from the interactive
-    /// pane — see `remote::ssh_base`.
-    fn ssh_base(r: &Remote, batch: bool) -> Vec<String> {
-        crate::remote::ssh_base(r.port, r.forward_agent, batch)
-    }
-}
+// The execution placement (`Local | Ssh | K8s | Provider`) and its exec-wrapping
+// logic now live in `crate::placement`. `SandboxSpec` carries a resolved
+// `Placement`; `enter_argv`/`control_argv` delegate the outer wrap to it.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mount {
@@ -236,7 +223,7 @@ pub struct SandboxLimits {
 #[derive(Debug, Clone)]
 pub struct SandboxSpec {
     pub backend: Backend,
-    pub transport: Transport,
+    pub placement: Placement,
     pub image: Option<String>,
     pub worktree: PathBuf,
     pub mounts: Vec<Mount>,
@@ -283,6 +270,95 @@ pub struct SandboxSpec {
     /// See `[sandbox] nix_daemon` in the config.
     pub nix_daemon: bool,
     pub name: String,
+    /// Resolved VPN/tunnel attachment for this sandbox, or `None` when no tunnel
+    /// is requested (or it was refused by the active profile). Pure data — the
+    /// behavior (bring-up, readiness, teardown) lives in `superzej-svc::vpn`.
+    pub vpn: Option<VpnSpec>,
+}
+
+/// A resolved, identity-bearing VPN attachment request for one sandbox. Pure
+/// data assembled by [`build_vpn_spec`]; secrets-refs in `params` are left
+/// **unresolved** here and dereferenced only at bring-up time in `superzej-svc`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VpnSpec {
+    pub provider: VpnProviderKind,
+    pub mode: VpnMode,
+    pub on_error: VpnOnError,
+    pub dns_mode: VpnDnsMode,
+    pub ready_timeout: Duration,
+    /// Request an ephemeral node identity (auto-deregisters on teardown) where
+    /// the provider supports it.
+    pub ephemeral: bool,
+    /// Sidecar image override; `None` = the provider's default image.
+    pub sidecar_image: Option<String>,
+    /// Node/peer name in the overlay (defaults to the container name).
+    pub hostname: String,
+    /// The selected provider's configuration (still carrying secrets-refs).
+    pub params: VpnParams,
+}
+
+/// Provider-specific VPN parameters, mirroring the `[sandbox.vpn.<provider>]`
+/// sub-tables. Headscale reuses [`VpnParams::Tailscale`] (the `provider` field
+/// on [`VpnSpec`] distinguishes them; Headscale just requires `login_server`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VpnParams {
+    Tailscale(TailscaleConfig),
+    Wireguard(WireguardConfig),
+    Openvpn(OpenvpnConfig),
+    Netbird(NetbirdConfig),
+    Zerotier(ZerotierConfig),
+    Custom(CustomVpnConfig),
+}
+
+/// Resolve a `[sandbox.vpn]` config block into a [`VpnSpec`] for the worktree
+/// container named `name`, reconciling with the hardening `profile`.
+///
+/// Returns `None` when no provider is configured, or when the active profile
+/// refuses a tunnel (plain `sealed`: a tunnel would contradict its no-network /
+/// no-caps contract — the user is told to use `sealed-tunnel` or `hardened`).
+pub fn build_vpn_spec(cfg: &VpnConfig, name: &str, profile: SandboxProfile) -> Option<VpnSpec> {
+    if !cfg.is_enabled() {
+        return None;
+    }
+    if !profile.permits_vpn() {
+        msg::warn(&format!(
+            "sandbox: profile '{profile}' forbids a VPN tunnel (network=none, all \
+             capabilities dropped); ignoring [sandbox.vpn]. Use 'sealed-tunnel' for a \
+             tunnel-only worktree, or 'hardened'.",
+        ));
+        return None;
+    }
+    let params = match cfg.provider {
+        VpnProviderKind::None => return None,
+        VpnProviderKind::Tailscale | VpnProviderKind::Headscale => {
+            VpnParams::Tailscale(cfg.tailscale.clone())
+        }
+        VpnProviderKind::Wireguard => VpnParams::Wireguard(cfg.wireguard.clone()),
+        VpnProviderKind::Openvpn => VpnParams::Openvpn(cfg.openvpn.clone()),
+        VpnProviderKind::Netbird => VpnParams::Netbird(cfg.netbird.clone()),
+        VpnProviderKind::Zerotier => VpnParams::Zerotier(cfg.zerotier.clone()),
+        VpnProviderKind::Custom => VpnParams::Custom(cfg.custom.clone()),
+    };
+    // A per-provider hostname overrides the container-name default.
+    let hostname = match &params {
+        VpnParams::Tailscale(t) if !t.hostname.trim().is_empty() => t.hostname.clone(),
+        VpnParams::Netbird(n) if !n.hostname.trim().is_empty() => n.hostname.clone(),
+        _ => name.to_string(),
+    };
+    Some(VpnSpec {
+        provider: cfg.provider,
+        mode: cfg.mode,
+        on_error: cfg.on_error,
+        dns_mode: cfg.dns,
+        ready_timeout: Duration::from_secs(cfg.ready_timeout_secs),
+        ephemeral: cfg.ephemeral,
+        sidecar_image: {
+            let t = cfg.sidecar_image.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        },
+        hostname,
+        params,
+    })
 }
 
 /// Build the sandbox spec for a worktree (described by its `GitLoc`), or `None`
@@ -302,15 +378,31 @@ pub fn resolve_scoped(
     name: &str,
     profile: SandboxProfile,
 ) -> Option<SandboxSpec> {
+    let placement = placement_from_loc(cfg, loc);
+    resolve_placed(cfg, loc, name, profile, placement)
+}
+
+/// Like [`resolve_scoped`] but with an explicit [`Placement`]. This is the seam
+/// the named-environment layer ([`crate::env`]) drives: it resolves where a
+/// worktree runs (local / ssh / k8s / provider) and hands the placement in,
+/// instead of letting `[sandbox.remote]` + the `GitLoc` decide. The default
+/// callers ([`resolve`]/[`resolve_scoped`]) derive the placement from the loc so
+/// existing behavior is unchanged.
+pub fn resolve_placed(
+    cfg: &SandboxConfig,
+    loc: &GitLoc,
+    name: &str,
+    profile: SandboxProfile,
+    placement: Placement,
+) -> Option<SandboxSpec> {
     if !cfg.enabled {
         return None;
     }
-    let transport = transport_from_loc(cfg, loc);
-    let backend = pick_backend(cfg, &transport)?;
+    let backend = pick_backend(cfg, &placement)?;
     // `none` on a *local* worktree means "run on the host" (caller's plain-shell
-    // fallback). For a *remote* worktree we still need the transport to carry a
-    // bare shell to the remote, so keep building the spec.
-    if backend == Backend::None && matches!(transport, Transport::Local) {
+    // fallback). For a *remote* placement we still need it to carry a bare shell
+    // to the target, so keep building the spec.
+    if backend == Backend::None && placement.is_local() {
         return None;
     }
 
@@ -436,7 +528,7 @@ pub fn resolve_scoped(
 
     Some(SandboxSpec {
         backend,
-        transport,
+        placement,
         image,
         worktree,
         mounts,
@@ -496,6 +588,17 @@ pub fn resolve_scoped(
         // (and its tests) stay pure. False off NixOS-style multi-user nix.
         nix_daemon: cfg.nix_daemon && nix_daemon_socket_present(),
         name: name.to_string(),
+        vpn: {
+            if cfg.vpn.is_enabled() && cfg.network == Network::Host && !profile.forces_no_network()
+            {
+                msg::warn(
+                    "sandbox: [sandbox] network=host conflicts with a VPN tunnel \
+                     (host networking is what the tunnel isolates from); the worktree \
+                     will join the tunnel instead of sharing the host network.",
+                );
+            }
+            build_vpn_spec(&cfg.vpn, name, profile)
+        },
     })
 }
 
@@ -545,6 +648,24 @@ pub fn agent_container_name(base: &str) -> String {
 /// event→worktree mapping) treat the agent container as its worktree's.
 pub fn strip_agent_suffix(name: &str) -> &str {
     name.strip_suffix(AGENT_CONTAINER_SUFFIX).unwrap_or(name)
+}
+
+/// Suffix marking a worktree's VPN sidecar — the companion container that owns
+/// the tunnel's network namespace (the worktree container joins it via
+/// `--network container:<sidecar>`). Deterministic from the worktree container
+/// name so the bring-up (`superzej-svc::vpn`), the `--network` wiring
+/// ([`oci_create_opts`]), and teardown all agree without a registry lookup.
+pub const VPN_SIDECAR_SUFFIX: &str = "-szvpn";
+
+/// The VPN sidecar container name, derived from the worktree container name `base`.
+pub fn vpn_sidecar_name(base: &str) -> String {
+    format!("{base}{VPN_SIDECAR_SUFFIX}")
+}
+
+/// Strip [`VPN_SIDECAR_SUFFIX`] so orphan reconciliation maps a stray sidecar
+/// back to its worktree.
+pub fn strip_vpn_suffix(name: &str) -> &str {
+    name.strip_suffix(VPN_SIDECAR_SUFFIX).unwrap_or(name)
 }
 
 /// One running container, as listed by the OCI runtime — feeds the panel's
@@ -780,35 +901,35 @@ pub fn parse_stats_rows(output: &str) -> Vec<(String, ContainerStat)> {
         .collect()
 }
 
-fn transport_from_loc(cfg: &SandboxConfig, loc: &GitLoc) -> Transport {
+/// Derive the default [`Placement`] from `[sandbox.remote]` + the worktree's
+/// `GitLoc` — `Local`, or an `Ssh` target (a remote worktree's own ssh target
+/// wins over the configured `[sandbox.remote] host`). The named-environment
+/// layer bypasses this with [`resolve_placed`] when an env selects k8s/provider.
+pub fn placement_from_loc(cfg: &SandboxConfig, loc: &GitLoc) -> Placement {
+    let kind = match cfg.remote.transport {
+        RemoteTransport::Ssh => TransportKind::Ssh,
+        RemoteTransport::Mosh => TransportKind::Mosh,
+    };
     if let Some(ssh) = loc.ssh() {
-        let kind = match cfg.remote.transport {
-            RemoteTransport::Ssh => TransportKind::Ssh,
-            RemoteTransport::Mosh => TransportKind::Mosh,
-        };
-        Transport::Remote(Remote {
-            host: ssh.host.clone(),
-            port: ssh.port,
-            forward_agent: ssh.forward_agent,
+        Placement::Ssh(SshPlacement::plain(
+            ssh.host.clone(),
+            ssh.port,
+            ssh.forward_agent,
             kind,
-        })
+        ))
     } else if cfg.remote.is_remote() {
-        let kind = match cfg.remote.transport {
-            RemoteTransport::Ssh => TransportKind::Ssh,
-            RemoteTransport::Mosh => TransportKind::Mosh,
-        };
-        Transport::Remote(Remote {
-            host: cfg.remote.host.clone(),
-            port: cfg.remote.port,
-            forward_agent: cfg.remote.forward_agent,
+        Placement::Ssh(SshPlacement::plain(
+            cfg.remote.host.clone(),
+            cfg.remote.port,
+            cfg.remote.forward_agent,
             kind,
-        })
+        ))
     } else {
-        Transport::Local
+        Placement::Local
     }
 }
 
-fn pick_backend(cfg: &SandboxConfig, transport: &Transport) -> Option<Backend> {
+fn pick_backend(cfg: &SandboxConfig, placement: &Placement) -> Option<Backend> {
     let suitable = |b: Backend| -> bool {
         match b {
             Backend::None => true,
@@ -823,7 +944,7 @@ fn pick_backend(cfg: &SandboxConfig, transport: &Transport) -> Option<Backend> {
     if let Some(explicit) = Backend::from_config(cfg.backend) {
         match explicit {
             Backend::None => return Some(Backend::None),
-            b if suitable(b) && available(transport, b) => return Some(b),
+            b if suitable(b) && available(placement, b) => return Some(b),
             b => {
                 // Name the macOS-26 + Apple-silicon requirement so a failed
                 // `backend = "apple"` selection explains itself rather than
@@ -850,14 +971,17 @@ fn pick_backend(cfg: &SandboxConfig, transport: &Transport) -> Option<Backend> {
         let Some(b) = Backend::parse(name) else {
             continue;
         };
+        let is_win_native = b == Backend::WinAppContainer || b == Backend::WinJobObject;
         if b == Backend::None {
-            on_missing(
-                cfg,
-                "sandbox: no container backend available; running on the host",
-            );
+            if !is_win_native {
+                on_missing(
+                    cfg,
+                    "sandbox: no container backend available; running on the host",
+                );
+            }
             return Some(Backend::None);
         }
-        if suitable(b) && available(transport, b) {
+        if suitable(b) && available(placement, b) {
             return Some(b);
         }
     }
@@ -877,28 +1001,28 @@ fn on_missing(cfg: &SandboxConfig, what: &str) {
     }
 }
 
-/// Is `backend`'s binary present (locally, or on the remote over ssh)?
-fn available(transport: &Transport, backend: Backend) -> bool {
-    let bin = backend.binary();
-    match transport {
-        Transport::Local => match backend {
-            Backend::PodmanRootful => {
-                run_local_output(&backend_prefix(backend), &["version"]).is_some()
-            }
-            _ => util::have(bin),
-        },
-        Transport::Remote(r) => {
-            let mut argv = Transport::ssh_base(r, true);
-            argv.push(r.host.clone());
-            argv.push("--".into());
-            argv.push(format!("command -v {bin} >/dev/null 2>&1"));
-            Command::new(&argv[0])
-                .args(&argv[1..])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-        }
+/// Is `backend`'s binary present in this placement (locally on PATH, or probed
+/// through the placement's control primitive: ssh / kubectl exec / provider)?
+fn available(placement: &Placement, backend: Backend) -> bool {
+    // Rootful podman can't be detected by a bare PATH probe (it needs `sudo -n
+    // podman version`); only meaningful locally.
+    if placement.is_local() && backend == Backend::PodmanRootful {
+        return run_local_output(&backend_prefix(backend), &["version"]).is_some();
     }
+
+    if placement.is_local()
+        && (backend == Backend::WinAppContainer || backend == Backend::WinJobObject)
+    {
+        return cfg!(windows);
+    }
+
+    if !placement.is_local()
+        && (backend == Backend::WinAppContainer || backend == Backend::WinJobObject)
+    {
+        return false;
+    }
+
+    placement.has_binary(backend.binary())
 }
 
 pub const DEFAULT_OCI_IMAGE: &str = "docker.io/library/debian:stable";
@@ -972,7 +1096,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
     // podman/docker directly. run_control_t_owned gives us the timeout but
     // discards stdout, so we use output_with_timeout for local transport and
     // fall back to run_control_owned (exit-code only → assume stale) for remote.
-    if matches!(spec.transport, Transport::Local) {
+    if spec.placement.is_local() {
         argv.extend([
             "container".into(),
             "inspect".into(),
@@ -1065,7 +1189,7 @@ fn apple_prefetch_image(img: &str) -> anyhow::Result<()> {
 fn apple_container_status(spec: &SandboxSpec) -> (bool, bool) {
     let required: Vec<&str> = spec.mounts.iter().map(|m| m.host.as_str()).collect();
     let argv: Vec<String> = vec!["container".into(), "inspect".into(), spec.name.clone()];
-    let (ok, stdout) = if matches!(spec.transport, Transport::Local) {
+    let (ok, stdout) = if spec.placement.is_local() {
         match output_with_timeout(&argv, PROBE_TIMEOUT) {
             Some(r) => r,
             None => return (false, false),
@@ -1200,7 +1324,11 @@ pub fn teardown_by_path(worktree: &str) {
     // it runs in `superzej-{slug}-szagent`); `rm -f` of a non-existent name is a
     // harmless no-op.
     let agent = agent_container_name(&name);
-    let transport = Transport::Local;
+    // Also remove the VPN sidecar (`superzej-{slug}-szvpn`) when one was started;
+    // `rm -f` of a missing name is a harmless no-op. (Ephemeral node de-register
+    // is the host's job via `superzej-svc::vpn::down` before this runs.)
+    let vpn = vpn_sidecar_name(&name);
+    let placement = Placement::Local;
     for b in [
         Backend::Podman,
         Backend::PodmanRootful,
@@ -1208,9 +1336,9 @@ pub fn teardown_by_path(worktree: &str) {
         Backend::Smol,
         Backend::Apple,
     ] {
-        if available(&transport, b) {
-            let argv = remove_container_argv(b, &[name.to_string(), agent.clone()]);
-            let _ = run_control_t_owned(&transport, &argv, PROBE_TIMEOUT);
+        if available(&placement, b) {
+            let argv = remove_container_argv(b, &[name.to_string(), agent.clone(), vpn.clone()]);
+            let _ = run_control_t_owned(&placement, &argv, PROBE_TIMEOUT);
         }
     }
 }
@@ -1221,11 +1349,12 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
     if !cfg.enabled {
         return;
     }
-    let transport = transport_from_loc(cfg, loc);
+    let placement = placement_from_loc(cfg, loc);
     // Remove both the worktree container and the agent's separate container (the
     // latter only exists when `agent_profile` differs); `rm -f` of a missing
     // name is a harmless no-op.
     let agent = agent_container_name(name);
+    let vpn = vpn_sidecar_name(name);
     // Try whichever OCI runtimes are available; the container only exists under one.
     for b in [
         Backend::Podman,
@@ -1234,9 +1363,9 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
         Backend::Smol,
         Backend::Apple,
     ] {
-        if available(&transport, b) {
-            let argv = remove_container_argv(b, &[name.to_string(), agent.clone()]);
-            let _ = run_control_t_owned(&transport, &argv, PROBE_TIMEOUT);
+        if available(&placement, b) {
+            let argv = remove_container_argv(b, &[name.to_string(), agent.clone(), vpn.clone()]);
+            let _ = run_control_t_owned(&placement, &argv, PROBE_TIMEOUT);
         }
     }
 }
@@ -1247,10 +1376,7 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
 pub fn enter_argv(spec: &SandboxSpec, inner: &str) -> Vec<String> {
     let script = wrap_script(spec, inner);
     let backend_argv = backend_enter_argv(spec, &script);
-    match &spec.transport {
-        Transport::Local => backend_argv,
-        Transport::Remote(r) => transport_wrap(r, &backend_argv),
-    }
+    spec.placement.interactive_argv(&backend_argv)
 }
 
 /// Compose init-script + safe.directory + devenv into the `sh -lc` body that the
@@ -1328,6 +1454,24 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
                 // Aspirational: shell out into WSL's distro to run podman there.
                 v.insert(0, "wsl.exe".into());
                 v.insert(1, "--".into());
+            }
+            v
+        }
+        Backend::WinAppContainer | Backend::WinJobObject => {
+            // These native Windows backends run the standard command, optionally
+            // wrapperized by internal logic if requested, but from the process builder
+            // perspective they just exec `sh -lc "script"` (or pwsh equivalent) in cwd.
+            // When spawn_with_env runs it, we could intercept and wrap in a job object.
+            // For argv generation, we just emit the plain shell command since the real
+            // isolation happens in the OS process creation syscalls.
+            let shell = util::shell();
+            let mut v = vec![shell.clone()];
+            if shell.ends_with("pwsh.exe") || shell.ends_with("powershell.exe") {
+                v.extend(["-NoProfile".into(), "-Command".into(), script.to_string()]);
+            } else if shell.ends_with("cmd.exe") {
+                v.extend(["/C".into(), script.to_string()]);
+            } else {
+                v.extend(["-c".into(), script.to_string()]);
             }
             v
         }
@@ -1502,32 +1646,61 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
     match spec.backend {
         Backend::Podman => v.extend(["--userns".into(), "keep-id".into()]),
         Backend::PodmanRootful => {
-            if let (Transport::Local, Some((uid, gid))) = (&spec.transport, local_uid_gid()) {
+            if spec.placement.is_local()
+                && let Some((uid, gid)) = local_uid_gid()
+            {
                 v.extend(["--user".into(), format!("{uid}:{gid}")]);
             }
         }
         Backend::Docker | Backend::Smol => {
-            if let (Transport::Local, Some((uid, gid))) = (&spec.transport, local_uid_gid()) {
+            if spec.placement.is_local()
+                && let Some((uid, gid)) = local_uid_gid()
+            {
                 v.extend(["--user".into(), format!("{uid}:{gid}")]);
             }
         }
         _ => {}
     }
-    match spec.network {
-        Network::Host => v.extend(["--network".into(), "host".into()]),
-        Network::None => v.extend(["--network".into(), "none".into()]),
-        Network::Nat => {}
+    // When a VPN sidecar owns the netns (sidecar/proxy mode), the worktree
+    // container joins it and its only egress is the tunnel. `--network
+    // container:` is mutually exclusive with `--dns`/`-p`/other `--network`
+    // flags (podman/docker reject them), so those are suppressed below.
+    let vpn_join = vpn_sidecar_join(spec);
+    if let Some(sidecar) = &vpn_join {
+        v.extend(["--network".into(), format!("container:{sidecar}")]);
+    } else {
+        match spec.network {
+            Network::Host => v.extend(["--network".into(), "host".into()]),
+            Network::None => v.extend(["--network".into(), "none".into()]),
+            Network::Nat => {}
+        }
+    }
+    // `in_container` VPN mode runs the tunnel client inside this very container,
+    // so it needs the tunnel capabilities here (this is the explicit, less-
+    // isolated mode; sidecar mode keeps the worktree's caps untouched).
+    if let Some(vpn) = &spec.vpn
+        && vpn.mode == VpnMode::InContainer
+    {
+        v.extend([
+            "--cap-add".into(),
+            "NET_ADMIN".into(),
+            "--device".into(),
+            "/dev/net/tun".into(),
+        ]);
     }
     // DNS-based domain filtering: start the proxy on first use and point the
-    // container at it. Skip when network is None (DNS unreachable anyway) or
+    // container at it. Skip when network is None (DNS unreachable anyway), when
+    // a VPN sidecar owns DNS (`--dns` is illegal on a container-netns join), or
     // when no filtering is configured.
     if spec.network != Network::None
+        && vpn_join.is_none()
         && (!spec.network_allow.is_empty() || !spec.network_block.is_empty())
-        && matches!(spec.transport, Transport::Local)
+        && spec.placement.is_local()
     {
         let policy = crate::dns_filter::DnsPolicy {
             allow: spec.network_allow.clone(),
             block: spec.network_block.clone(),
+            upstream: None,
         };
         if let Some(port) = crate::dns_filter::get_or_start(policy) {
             v.extend(["--dns".into(), format!("127.0.0.1:{port}")]);
@@ -1614,10 +1787,30 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
         v.extend(["--pids-limit".into(), p.to_string()]);
     }
 
-    for p in &spec.ports {
-        v.extend(["-p".into(), p.clone()]);
+    // Published ports must live on the netns owner. When a VPN sidecar owns the
+    // netns, `-p` is illegal on the joining worktree container (it should be set
+    // on the sidecar instead); warn and skip rather than fail the create.
+    if vpn_join.is_none() {
+        for p in &spec.ports {
+            v.extend(["-p".into(), p.clone()]);
+        }
+    } else if !spec.ports.is_empty() {
+        msg::warn(
+            "sandbox: [sandbox] ports are ignored when a VPN sidecar owns the \
+             network namespace; publish them on the sidecar instead.",
+        );
     }
     v
+}
+
+/// When a VPN sidecar owns this worktree's network namespace (`sidecar`/`proxy`
+/// mode), the worktree OCI container joins it via `--network container:<name>`
+/// and MUST NOT also set `--dns`/`-p`/another `--network` (podman/docker reject
+/// those on a container-netns join). Returns the sidecar name, or `None` when no
+/// sidecar is in play (no VPN, or `in_container`/`netns` mode).
+fn vpn_sidecar_join(spec: &SandboxSpec) -> Option<String> {
+    let vpn = spec.vpn.as_ref()?;
+    matches!(vpn.mode, VpnMode::Sidecar | VpnMode::Proxy).then(|| vpn_sidecar_name(&spec.name))
 }
 
 /// Like [`oci_create_opts`] but lets the caller suppress Podman's
@@ -1630,12 +1823,16 @@ fn oci_create_opts_with_keep_id(spec: &SandboxSpec, keep_id: bool) -> Vec<String
         }
         Backend::Podman => {}
         Backend::PodmanRootful => {
-            if let (Transport::Local, Some((uid, gid))) = (&spec.transport, local_uid_gid()) {
+            if spec.placement.is_local()
+                && let Some((uid, gid)) = local_uid_gid()
+            {
                 v.extend(["--user".into(), format!("{uid}:{gid}")]);
             }
         }
         Backend::Docker | Backend::Smol => {
-            if let (Transport::Local, Some((uid, gid))) = (&spec.transport, local_uid_gid()) {
+            if spec.placement.is_local()
+                && let Some((uid, gid)) = local_uid_gid()
+            {
                 v.extend(["--user".into(), format!("{uid}:{gid}")]);
             }
         }
@@ -1667,40 +1864,19 @@ fn oci_create_opts_with_keep_id(spec: &SandboxSpec, keep_id: bool) -> Vec<String
     }
 }
 
-/// Wrap a backend argv so it runs on the remote: mosh (interactive) or ssh.
-fn transport_wrap(r: &Remote, backend_argv: &[String]) -> Vec<String> {
-    let remote_cmd = util::sh_join(backend_argv);
-    match r.kind {
-        TransportKind::Mosh => {
-            let ssh = util::sh_join(&Transport::ssh_base(r, false));
-            vec![
-                "mosh".into(),
-                format!("--ssh={ssh}"),
-                r.host.clone(),
-                "--".into(),
-                "/bin/sh".into(),
-                "-lc".into(),
-                remote_cmd,
-            ]
-        }
-        TransportKind::Ssh => {
-            let mut v = Transport::ssh_base(r, false);
-            v.push("-t".into());
-            v.push(r.host.clone());
-            v.push("--".into());
-            v.push("/bin/sh".into());
-            v.push("-lc".into());
-            v.push(remote_cmd);
-            v
-        }
-    }
-}
-
 fn backend_prefix(backend: Backend) -> Vec<String> {
     match backend {
         Backend::PodmanRootful => vec!["sudo".into(), "-n".into(), "podman".into()],
         _ => vec![backend.binary().into()],
     }
+}
+
+/// The argv prefix to invoke the container CLI for an OCI `backend`
+/// (`["podman"]`, `["sudo", "-n", "podman"]`, `["docker"]`, …), or `None` for a
+/// non-OCI backend. Lets the host drive a VPN sidecar via the *same* runtime as
+/// the worktree container (so `--network container:` shares a user namespace).
+pub fn oci_runtime_prefix(backend: Backend) -> Option<Vec<String>> {
+    backend.is_oci().then(|| backend_prefix(backend))
 }
 
 fn run_local_output(prefix: &[String], args: &[&str]) -> Option<String> {
@@ -1716,40 +1892,22 @@ fn run_local_output(prefix: &[String], args: &[&str]) -> Option<String> {
 /// Run a control-plane command (locally, or on the remote over ssh). Returns
 /// whether it succeeded.
 fn run_control_owned(spec: &SandboxSpec, argv: &[String], timeout: Duration) -> Option<bool> {
-    run_control_t_owned(&spec.transport, argv, timeout)
+    run_control_t_owned(&spec.placement, argv, timeout)
 }
 
-fn run_control_t_owned(transport: &Transport, argv: &[String], timeout: Duration) -> Option<bool> {
-    let argv: Vec<String> = match transport {
-        Transport::Local => argv.to_vec(),
-        Transport::Remote(r) => {
-            let mut v = Transport::ssh_base(r, true);
-            v.push(r.host.clone());
-            v.push("--".into());
-            v.push(util::sh_join(argv));
-            v
-        }
-    };
+fn run_control_t_owned(placement: &Placement, argv: &[String], timeout: Duration) -> Option<bool> {
+    let argv = placement.control_argv(argv);
     status_with_timeout(&argv, timeout)
 }
 
-/// Like [`run_control_t_owned`] but also captures stdout. Wraps argv in the
-/// transport for remote specs (ssh for control-plane calls).
+/// Like [`run_control_t_owned`] but also captures stdout. Wraps argv through the
+/// placement's control primitive (ssh batch / kubectl exec / provider).
 fn output_control_owned(
     spec: &SandboxSpec,
     argv: &[String],
     timeout: Duration,
 ) -> Option<(bool, String)> {
-    let full: Vec<String> = match &spec.transport {
-        Transport::Local => argv.to_vec(),
-        Transport::Remote(r) => {
-            let mut v = Transport::ssh_base(r, true);
-            v.push(r.host.clone());
-            v.push("--".into());
-            v.push(util::sh_join(argv));
-            v
-        }
-    };
+    let full: Vec<String> = spec.placement.control_argv(argv);
     output_with_timeout(&full, timeout)
 }
 
@@ -2188,10 +2346,159 @@ pub fn run_gc(db_worktrees: &[String]) -> Vec<String> {
 mod tests {
     use super::*;
 
+    fn vpn_cfg(provider: VpnProviderKind) -> VpnConfig {
+        VpnConfig {
+            provider,
+            ..VpnConfig::default()
+        }
+    }
+
+    #[test]
+    fn build_vpn_spec_none_provider_is_none() {
+        assert!(build_vpn_spec(&VpnConfig::default(), "wt", SandboxProfile::Hardened).is_none());
+    }
+
+    #[test]
+    fn build_vpn_spec_sealed_refuses_but_sealed_tunnel_attaches() {
+        let cfg = vpn_cfg(VpnProviderKind::Tailscale);
+        // Plain sealed refuses a tunnel (returns None).
+        assert!(build_vpn_spec(&cfg, "wt", SandboxProfile::Sealed).is_none());
+        // sealed-tunnel and hardened both attach.
+        assert!(build_vpn_spec(&cfg, "wt", SandboxProfile::SealedTunnel).is_some());
+        assert!(build_vpn_spec(&cfg, "wt", SandboxProfile::Hardened).is_some());
+    }
+
+    #[test]
+    fn build_vpn_spec_maps_each_provider_to_its_params() {
+        for provider in [
+            VpnProviderKind::Tailscale,
+            VpnProviderKind::Headscale,
+            VpnProviderKind::Wireguard,
+            VpnProviderKind::Openvpn,
+            VpnProviderKind::Netbird,
+            VpnProviderKind::Zerotier,
+            VpnProviderKind::Custom,
+        ] {
+            let spec = build_vpn_spec(&vpn_cfg(provider), "wt", SandboxProfile::Hardened).unwrap();
+            assert_eq!(spec.provider, provider);
+            // Headscale reuses the Tailscale params variant.
+            let ok = matches!(
+                (provider, &spec.params),
+                (VpnProviderKind::Tailscale, VpnParams::Tailscale(_))
+                    | (VpnProviderKind::Headscale, VpnParams::Tailscale(_))
+                    | (VpnProviderKind::Wireguard, VpnParams::Wireguard(_))
+                    | (VpnProviderKind::Openvpn, VpnParams::Openvpn(_))
+                    | (VpnProviderKind::Netbird, VpnParams::Netbird(_))
+                    | (VpnProviderKind::Zerotier, VpnParams::Zerotier(_))
+                    | (VpnProviderKind::Custom, VpnParams::Custom(_))
+            );
+            assert!(ok, "{provider:?} mapped to wrong params: {:?}", spec.params);
+        }
+    }
+
+    #[test]
+    fn build_vpn_spec_hostname_defaults_to_name_then_overrides() {
+        // Default: container name.
+        let spec = build_vpn_spec(
+            &vpn_cfg(VpnProviderKind::Tailscale),
+            "superzej-repo-feat",
+            SandboxProfile::Hardened,
+        )
+        .unwrap();
+        assert_eq!(spec.hostname, "superzej-repo-feat");
+
+        // Per-provider hostname wins.
+        let mut cfg = vpn_cfg(VpnProviderKind::Tailscale);
+        cfg.tailscale.hostname = "custom-node".into();
+        let spec = build_vpn_spec(&cfg, "superzej-repo-feat", SandboxProfile::Hardened).unwrap();
+        assert_eq!(spec.hostname, "custom-node");
+    }
+
+    #[test]
+    fn build_vpn_spec_carries_knobs_and_optional_image() {
+        let mut cfg = vpn_cfg(VpnProviderKind::Wireguard);
+        cfg.mode = VpnMode::Proxy;
+        cfg.on_error = VpnOnError::Offline;
+        cfg.dns = VpnDnsMode::FilterFront;
+        cfg.ready_timeout_secs = 7;
+        cfg.ephemeral = false;
+        let spec = build_vpn_spec(&cfg, "wt", SandboxProfile::Hardened).unwrap();
+        assert_eq!(spec.mode, VpnMode::Proxy);
+        assert_eq!(spec.on_error, VpnOnError::Offline);
+        assert_eq!(spec.dns_mode, VpnDnsMode::FilterFront);
+        assert_eq!(spec.ready_timeout, Duration::from_secs(7));
+        assert!(!spec.ephemeral);
+        // Empty sidecar_image -> None; set -> Some.
+        assert!(spec.sidecar_image.is_none());
+        cfg.sidecar_image = "ghcr.io/me/wg:latest".into();
+        let spec = build_vpn_spec(&cfg, "wt", SandboxProfile::Hardened).unwrap();
+        assert_eq!(spec.sidecar_image.as_deref(), Some("ghcr.io/me/wg:latest"));
+    }
+
+    #[test]
+    fn oci_opts_join_vpn_sidecar_netns_and_suppress_dns_ports() {
+        let mut s = spec(Backend::Podman);
+        s.network = Network::Nat;
+        s.network_allow = vec!["example.com".into()]; // would normally add --dns
+        s.ports = vec!["8080:8080".into()]; // would normally add -p
+        s.vpn = build_vpn_spec(
+            &vpn_cfg(VpnProviderKind::Tailscale),
+            &s.name,
+            SandboxProfile::Hardened,
+        );
+        let opts = oci_create_opts(&s);
+        let joined = opts.join(" ");
+        // Joins the sidecar netns...
+        assert!(
+            joined.contains("--network container:superzej-repo-feat-szvpn"),
+            "{joined}"
+        );
+        // ...and suppresses --dns and -p (illegal on a container-netns join).
+        assert!(!opts.iter().any(|o| o == "--dns"), "{joined}");
+        assert!(!opts.iter().any(|o| o == "-p"), "{joined}");
+    }
+
+    #[test]
+    fn oci_opts_in_container_mode_adds_net_admin_and_tun() {
+        let mut s = spec(Backend::Podman);
+        let mut cfg = vpn_cfg(VpnProviderKind::Wireguard);
+        cfg.mode = VpnMode::InContainer;
+        s.vpn = build_vpn_spec(&cfg, &s.name, SandboxProfile::Hardened);
+        let opts = oci_create_opts(&s);
+        let joined = opts.join(" ");
+        // in_container does NOT join a sidecar netns; it keeps normal networking
+        // and adds the tunnel caps to the worktree container itself.
+        assert!(!joined.contains("container:"), "{joined}");
+        assert!(opts.iter().any(|o| o == "NET_ADMIN"), "{joined}");
+        assert!(joined.contains("/dev/net/tun"), "{joined}");
+    }
+
+    #[test]
+    fn oci_opts_without_vpn_keep_normal_network_and_ports() {
+        let mut s = spec(Backend::Podman);
+        s.network = Network::Nat;
+        s.ports = vec!["8080:8080".into()];
+        assert!(s.vpn.is_none());
+        let opts = oci_create_opts(&s);
+        // No container: join; ports published as usual.
+        assert!(!opts.join(" ").contains("container:"));
+        assert!(opts.windows(2).any(|w| w == ["-p", "8080:8080"]));
+    }
+
+    #[test]
+    fn test_win_native_sandboxes_do_not_parse_as_oci() {
+        assert!(!Backend::WinAppContainer.is_oci());
+        assert!(!Backend::WinJobObject.is_oci());
+        assert!(Backend::WinAppContainer.is_host_toolchain());
+        assert!(Backend::WinJobObject.is_host_toolchain());
+        assert_eq!(Backend::WinAppContainer.label(), "appcontainer");
+        assert_eq!(Backend::WinJobObject.label(), "jobobject");
+    }
+
     fn spec(backend: Backend) -> SandboxSpec {
         SandboxSpec {
             backend,
-            transport: Transport::Local,
+            placement: Placement::Local,
             image: Some("img:latest".into()),
             worktree: PathBuf::from("/wt/feat"),
             mounts: vec![
@@ -2230,6 +2537,7 @@ mod tests {
             devenv_path: None,
             nix_daemon: false,
             name: "superzej-repo-feat".into(),
+            vpn: None,
         }
     }
 
@@ -2445,12 +2753,12 @@ mod tests {
     #[test]
     fn mosh_wraps_backend_over_ssh() {
         let mut s = spec(Backend::Podman);
-        s.transport = Transport::Remote(Remote {
-            host: "user@box".into(),
-            port: 2222,
-            forward_agent: true,
-            kind: TransportKind::Mosh,
-        });
+        s.placement = Placement::Ssh(SshPlacement::plain(
+            "user@box".into(),
+            2222,
+            true,
+            TransportKind::Mosh,
+        ));
         let argv = enter_argv(&s, "${SHELL:-/bin/sh} -l");
         assert_eq!(argv[0], "mosh");
         assert!(argv.iter().any(|a| a.starts_with("--ssh=")));
@@ -2464,12 +2772,12 @@ mod tests {
     fn ssh_transport_uses_tty() {
         let mut s = spec(Backend::Bwrap);
         s.image = None;
-        s.transport = Transport::Remote(Remote {
-            host: "box".into(),
-            port: 22,
-            forward_agent: false,
-            kind: TransportKind::Ssh,
-        });
+        s.placement = Placement::Ssh(SshPlacement::plain(
+            "box".into(),
+            22,
+            false,
+            TransportKind::Ssh,
+        ));
         let argv = enter_argv(&s, "claude");
         assert_eq!(argv[0], "ssh");
         assert!(argv.contains(&"-t".to_string()));
@@ -2658,12 +2966,12 @@ mod tests {
         // transport as a bare shell that cd's into the remote worktree.
         let mut s = spec(Backend::None);
         s.image = None;
-        s.transport = Transport::Remote(Remote {
-            host: "box".into(),
-            port: 22,
-            forward_agent: false,
-            kind: TransportKind::Mosh,
-        });
+        s.placement = Placement::Ssh(SshPlacement::plain(
+            "box".into(),
+            22,
+            false,
+            TransportKind::Mosh,
+        ));
         let argv = enter_argv(&s, "${SHELL:-/bin/sh} -l");
         assert_eq!(argv[0], "mosh");
         let body = argv.last().unwrap();
@@ -2859,12 +3167,12 @@ mod tests {
     #[test]
     fn remote_enter_argv_wraps_with_mosh() {
         let mut s = spec(Backend::Podman);
-        s.transport = Transport::Remote(Remote {
-            host: "devbox".into(),
-            port: 22,
-            forward_agent: false,
-            kind: TransportKind::Mosh,
-        });
+        s.placement = Placement::Ssh(SshPlacement::plain(
+            "devbox".into(),
+            22,
+            false,
+            TransportKind::Mosh,
+        ));
         // With a real image + OCI backend on a remote, enter_argv should
         // produce a mosh wrapper.
         let argv = enter_argv(&s, "bash -l");
@@ -2876,12 +3184,12 @@ mod tests {
     #[test]
     fn remote_enter_argv_wraps_with_ssh() {
         let mut s = spec(Backend::Podman);
-        s.transport = Transport::Remote(Remote {
-            host: "devbox".into(),
-            port: 2222,
-            forward_agent: true,
-            kind: TransportKind::Ssh,
-        });
+        s.placement = Placement::Ssh(SshPlacement::plain(
+            "devbox".into(),
+            2222,
+            true,
+            TransportKind::Ssh,
+        ));
         let argv = enter_argv(&s, "bash -l");
         // SSH transport: first arg is ssh, not mosh.
         assert_eq!(argv[0], "ssh", "outer command must be ssh: {argv:?}");
@@ -2957,6 +3265,18 @@ mod tests {
         assert!(!j.contains("--cap-drop"), "{j}");
         assert!(!j.contains("--security-opt"), "{j}");
         assert!(!j.contains("--pids-limit"), "{j}");
+    }
+
+    #[test]
+    fn vpn_sidecar_name_roundtrips() {
+        let base = container_name("/wt/feat");
+        let vpn = vpn_sidecar_name(&base);
+        assert_eq!(vpn, format!("{base}-szvpn"));
+        assert_ne!(vpn, base);
+        assert_eq!(strip_vpn_suffix(&vpn), base);
+        assert_eq!(strip_vpn_suffix(&base), base);
+        // Independent of the agent suffix.
+        assert_eq!(strip_agent_suffix(&vpn), vpn);
     }
 
     #[test]

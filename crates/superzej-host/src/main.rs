@@ -40,6 +40,7 @@ mod pins;
 mod profile;
 mod proxy_daemon;
 mod queries;
+mod render_plan;
 mod run;
 mod sandbox_events;
 mod search;
@@ -97,6 +98,11 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::issue::Action,
     },
+    /// Cross-provider CI/CD inspection: runs, jobs, logs, trigger/rerun/cancel.
+    Ci {
+        #[command(subcommand)]
+        action: cmd::ci::Action,
+    },
     /// Emit a syntax-highlighted diff of a worktree against its branch point.
     Diff {
         #[arg(long)]
@@ -121,6 +127,11 @@ pub enum Command {
     Config {
         #[command(subcommand)]
         action: cmd::config::Action,
+    },
+    /// Inspect and select named execution environments (`[env.<name>]`).
+    Env {
+        #[command(subcommand)]
+        action: cmd::env::Action,
     },
     /// Print the exact sandbox argv for a worktree (for debugging).
     SandboxArgv {
@@ -192,6 +203,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
     match command {
         Command::Pr { action } => cmd::pr::run(action),
         Command::Issue { action } => cmd::issue::run(action),
+        Command::Ci { action } => cmd::ci::run(&cfg, action),
         Command::Diff {
             worktree,
             base,
@@ -202,6 +214,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Repos => cmd::repos::repos(&cfg),
         Command::Recent { count } => cmd::repos::recent(count),
         Command::Config { action } => cmd::config::run(&cfg, action, config_path),
+        Command::Env { action } => cmd::env::run(&cfg, action),
         Command::Notify { action } => cmd::notify::run(action),
         Command::Logs { action } => cmd::logs::run(&cfg, action),
         Command::SandboxArgv { worktree } => {

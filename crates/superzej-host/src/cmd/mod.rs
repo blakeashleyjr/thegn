@@ -9,8 +9,10 @@
 //! Each verb is a thin shell over `superzej-core`; `run.rs` (the compositor) is
 //! the default when no subcommand is given.
 
+pub mod ci;
 pub mod config;
 pub mod diff;
+pub mod env;
 pub mod issue;
 pub mod list;
 pub mod logs;

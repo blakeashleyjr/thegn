@@ -21,6 +21,7 @@ use superzej_core::theme::Hue;
 /// A typed menu outcome the event loop dispatches on.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MenuChoice {
+    LocMetrics,
     // rebase options (m)
     RebaseContinue,
     RebaseAbort,
@@ -74,6 +75,8 @@ pub enum MenuChoice {
     ConfirmRedo,
     // generic yes/no confirm — the loop interprets `tag`
     Confirm { tag: &'static str, arg: String },
+    // delete worktree confirm: variant to capture "leave files" intent
+    ConfirmDeleteWorktrees { keep_files: bool },
     // first-launch keymap picker (item 621): the chosen preset id
     // ("default" | "vscode" | "jetbrains").
     SetKeymapPreset(String),
@@ -326,6 +329,29 @@ impl MenuOverlay {
     }
 }
 
+pub fn delete_worktree_menu(targets: usize, names_csv: &str) -> MenuOverlay {
+    let title = format!("Delete {} worktree(s)?", targets);
+    MenuOverlay::new(
+        MenuKindTag::Confirm,
+        title,
+        vec![
+            item(
+                Some('y'),
+                "delete from disk",
+                MenuChoice::ConfirmDeleteWorktrees { keep_files: false },
+            )
+            .danger(),
+            item(
+                Some('k'),
+                "keep files",
+                MenuChoice::ConfirmDeleteWorktrees { keep_files: true },
+            ),
+            item(Some('n'), "cancel", MenuChoice::Dismiss),
+        ],
+    )
+    .with_body(names_csv)
+}
+
 /// A 2-item yes/no confirm built on the same component: `[y]` resolves to
 /// `Confirm { tag, arg }`, `[n]` to `Dismiss`; `body` is the non-selectable
 /// note row above them.
@@ -350,6 +376,20 @@ pub fn confirm_menu(
 
 /// First-launch keymap picker (item 621): pick a familiar IDE keymap overlay or
 /// keep superzej's defaults. Each choice resolves to `SetKeymapPreset`.
+pub fn loc_metrics_menu(loc: Option<u64>) -> MenuOverlay {
+    let loc_str = loc
+        .map(|l| format!("Total Lines of Code: {}", l))
+        .unwrap_or_else(|| "Total Lines of Code: Unknown".to_string());
+    let items = vec![MenuItem {
+        key: Some('L'),
+        label: loc_str,
+        note: None,
+        choice: MenuChoice::LocMetrics,
+        danger: false,
+    }];
+    MenuOverlay::new(MenuKindTag::CustomCommands, "loc metrics", items)
+}
+
 pub fn keymap_preset_menu() -> MenuOverlay {
     MenuOverlay::new(
         MenuKindTag::KeymapPicker,

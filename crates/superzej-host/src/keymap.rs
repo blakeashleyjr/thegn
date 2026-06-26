@@ -94,6 +94,8 @@ pub enum Action {
     /// Open the right panel to the System ▸ Notifications section and focus it;
     /// pressing it again while already there returns focus to the center.
     ToggleNotifications,
+    /// Open the right panel to the Work ▸ CI section and focus it (AV group).
+    OpenCi,
     OpenPalette,
     Lazygit,
     Yazi,
@@ -417,6 +419,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         label: "Toggle Notifications panel",
         hint: "notifications",
         default_chords: &["Alt i"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "open-ci",
+        label: "Open CI/CD runs panel",
+        hint: "ci",
+        default_chords: &[],
         palette: true,
     },
     ActionSpec {
@@ -751,6 +760,7 @@ impl Action {
             Action::ToggleDrawer => "files-drawer",
             Action::FocusSidebar => "focus-sidebar",
             Action::FocusPanel => "focus-panel",
+            Action::OpenCi => "open-ci",
             Action::ToggleNotifications => "toggle-notifications",
             Action::OpenPalette => "palette",
             Action::Lazygit => "lazygit",
@@ -822,6 +832,7 @@ impl Action {
             "files" | "files-drawer" | "toggle-drawer" => Action::ToggleDrawer,
             "focus-sidebar" => Action::FocusSidebar,
             "focus-panel" => Action::FocusPanel,
+            "open-ci" => Action::OpenCi,
             "toggle-notifications" => Action::ToggleNotifications,
             "palette" | "menu" => Action::OpenPalette,
             "lazygit" | "tool-lazygit" => Action::Lazygit,
@@ -1621,6 +1632,22 @@ mod tests {
 
     fn k(c: char, m: Modifiers) -> Option<Action> {
         map_key(&KeyCode::Char(c), m)
+    }
+
+    #[test]
+    fn runtime_dispatch_matches_alt_w_in_normal_mode() {
+        // The runtime path is keymap.dispatch(mode, Key), NOT map_key. Prove a
+        // parsed Alt+w (what termwiz yields for both legacy ESC-w and kitty
+        // CSI 119;3u) actually triggers NewWorktree through the real matcher.
+        let mut map = default_keymap();
+        let key = Key::modified(KeyCode::Char('w'), Modifiers::ALT);
+        assert!(
+            matches!(
+                map.dispatch(Mode::Normal, key),
+                crate::sequence::MatchResult::Matched(Action::NewWorktree)
+            ),
+            "Alt+w must match NewWorktree via the runtime dispatch path"
+        );
     }
 
     #[test]

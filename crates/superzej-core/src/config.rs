@@ -13,10 +13,13 @@
 //! default (the strict check lives in `superzej config validate`). The
 //! home-manager module renders the file; keys match the serde field names.
 
+use crate::env::Environment;
+use crate::placement::{K8sPlacement, Placement, ProviderPlacement, SshPlacement, TransportKind};
+use crate::remote::GitLoc;
 use crate::util;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Prefix a config diagnostic and emit it as a warning. Centralised so the
 /// validated-enum deserializers and the env/flag layers speak with one voice.
@@ -27,8 +30,13 @@ pub fn config_warn(msg: &str) {
 /// Expand a config value that may be an environment-variable reference.
 ///
 /// A string of the form `"env:VAR_NAME"` is replaced by the value of the
-/// environment variable `VAR_NAME`. Any other non-empty string is returned
-/// as-is. An empty string or a missing environment variable both return `None`.
+/// environment variable `VAR_NAME`. A string of the form `"file:PATH"` is
+/// replaced by the (trimmed) contents of `PATH` — `~` is expanded to `$HOME`.
+/// Any other non-empty string is returned as-is. An empty string, a missing
+/// environment variable, or an unreadable/empty file all return `None`.
+///
+/// Used for secrets-refs (API keys, VPN auth keys) so credentials live in the
+/// environment or an out-of-tree file rather than in plaintext in the config.
 pub fn expand_env_ref(value: &str) -> Option<String> {
     let v = value.trim();
     if v.is_empty() {
@@ -38,9 +46,31 @@ pub fn expand_env_ref(value: &str) -> Option<String> {
         std::env::var(var_name)
             .ok()
             .filter(|s| !s.trim().is_empty())
+    } else if let Some(path) = v.strip_prefix("file:") {
+        let path = expand_tilde(path.trim());
+        std::fs::read_to_string(&path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
     } else {
         Some(v.to_string())
     }
+}
+
+/// Expand a leading `~` / `~/` to `$HOME` (best-effort; returns the input
+/// unchanged when `$HOME` is unset or the path has no leading tilde).
+fn expand_tilde(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return format!("{home}/{rest}");
+    }
+    if path == "~"
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return home;
+    }
+    path.to_string()
 }
 
 /// Declare a string-backed, validated, TOML-friendly enum.
@@ -138,6 +168,8 @@ config_enum! {
         Systemd = "systemd" | "systemd-run",
         Apple = "apple" | "container",
         Wsl = "wsl",
+        WinAppContainer = "winappcontainer" | "appcontainer",
+        WinJobObject = "winjobobject" | "jobobject",
         None = "none" | "host",
     } default = Auto;
 }
@@ -160,10 +192,18 @@ config_enum! {
     ///                debuggers, ping) keeps working. The default.
     /// - `sealed`   — full lockdown: `network=none`, read-only root, drop ALL
     ///                capabilities, no-new-privileges, tighter pids cap.
+    /// - `sealed-tunnel` — the same lockdown as `sealed` (read-only root, drop
+    ///                ALL capabilities on the worktree, no-new-privileges, tight
+    ///                pids cap) EXCEPT the worktree has no *direct* host egress
+    ///                but is attached to its `[sandbox.vpn]` overlay: its only
+    ///                route is the tunnel (the sidecar holds NET_ADMIN/TUN, not
+    ///                the worktree). With no VPN configured it degrades to
+    ///                `network=none`, i.e. behaves exactly like `sealed`.
     pub enum SandboxProfile: "sandbox profile" {
         Open = "open" | "off" | "none",
         Hardened = "hardened" | "guarded",
         Sealed = "sealed" | "locked" | "isolated",
+        SealedTunnel = "sealed-tunnel" | "tunnel-only" | "vpn-only",
     } default = Hardened;
 }
 
@@ -171,26 +211,34 @@ impl SandboxProfile {
     /// Mount the container root filesystem read-only (writable: the worktree,
     /// cache binds, and a tmpfs `/tmp`).
     pub fn read_only_root(self) -> bool {
-        matches!(self, SandboxProfile::Hardened | SandboxProfile::Sealed)
+        matches!(
+            self,
+            SandboxProfile::Hardened | SandboxProfile::Sealed | SandboxProfile::SealedTunnel
+        )
     }
     /// Set `no-new-privileges` so setuid/setgid binaries can't escalate.
     pub fn no_new_privileges(self) -> bool {
-        matches!(self, SandboxProfile::Hardened | SandboxProfile::Sealed)
+        matches!(
+            self,
+            SandboxProfile::Hardened | SandboxProfile::Sealed | SandboxProfile::SealedTunnel
+        )
     }
     /// Cap the number of processes (fork-bomb containment); `None` = unlimited.
     pub fn pids_limit(self) -> Option<i64> {
         match self {
             SandboxProfile::Open => None,
             SandboxProfile::Hardened => Some(512),
-            SandboxProfile::Sealed => Some(256),
+            SandboxProfile::Sealed | SandboxProfile::SealedTunnel => Some(256),
         }
     }
-    /// Linux capabilities to drop. `sealed` drops everything; `hardened` leaves
-    /// the runtime's defaults so debuggers (ptrace), `ping` (NET_RAW), and
-    /// low-port binds keep working.
+    /// Linux capabilities to drop. `sealed`/`sealed-tunnel` drop everything;
+    /// `hardened` leaves the runtime's defaults so debuggers (ptrace), `ping`
+    /// (NET_RAW), and low-port binds keep working. Under `sealed-tunnel` the
+    /// worktree still drops ALL caps — the tunnel's NET_ADMIN/TUN live in the
+    /// VPN sidecar, never in the worktree container.
     pub fn drop_capabilities(self) -> Vec<String> {
         match self {
-            SandboxProfile::Sealed => vec!["ALL".to_string()],
+            SandboxProfile::Sealed | SandboxProfile::SealedTunnel => vec!["ALL".to_string()],
             _ => Vec::new(),
         }
     }
@@ -198,9 +246,19 @@ impl SandboxProfile {
     pub fn add_capabilities(self) -> Vec<String> {
         Vec::new()
     }
-    /// Force `network=none` regardless of the configured network mode.
+    /// Force `network=none` regardless of the configured network mode. Both
+    /// `sealed` and `sealed-tunnel` impose this floor; for `sealed-tunnel` a
+    /// resolved VPN attachment lifts it back up to a tunnel-only route (handled
+    /// in `sandbox::resolve_scoped`, not here), so with no VPN it stays sealed.
     pub fn forces_no_network(self) -> bool {
-        matches!(self, SandboxProfile::Sealed)
+        matches!(self, SandboxProfile::Sealed | SandboxProfile::SealedTunnel)
+    }
+    /// Whether this profile permits a VPN attachment. Plain `sealed` refuses
+    /// (its contract is "no network, no caps"); `sealed-tunnel` is the explicit
+    /// posture for "locked down, but on its own tunnel". Non-sealed profiles
+    /// permit it freely.
+    pub fn permits_vpn(self) -> bool {
+        !matches!(self, SandboxProfile::Sealed)
     }
 }
 config_enum! {
@@ -220,6 +278,29 @@ config_enum! {
     pub enum RemoteMode: "remote mode" {
         Remote = "remote", LocalExec = "local_exec", Sshfs = "sshfs",
     } default = Remote;
+}
+config_enum! {
+    /// Where a named environment's processes run (its [`crate::placement`]).
+    /// `local` runs on the host; `ssh`/`mosh` over ssh; `k8s` inside a pod via
+    /// `kubectl exec`; `provider` through a managed-sandbox provider (Daytona, …).
+    pub enum PlacementMode: "placement" {
+        Local = "local" | "host",
+        Ssh = "ssh" | "mosh" | "remote",
+        K8s = "k8s" | "kubernetes" | "kube",
+        Provider = "provider",
+    } default = Local;
+}
+config_enum! {
+    /// Where an environment's worktree files physically live. `in_env` (the
+    /// default) keeps files where the env runs — on the host for `local`, in the
+    /// pod/sandbox for remote placements (today's behavior). `local_exec` keeps
+    /// files on the host and only execs remotely; `sshfs` mounts the remote tree
+    /// locally. (`local_exec`/`sshfs` lifecycle is wired in the data-mode phase.)
+    pub enum DataMode: "data mode" {
+        InEnv = "in_env" | "remote" | "native",
+        LocalExec = "local_exec" | "local",
+        Sshfs = "sshfs" | "mount",
+    } default = InEnv;
 }
 config_enum! {
     /// Default log verbosity (the `SUPERZEJ_LOG` env filter can refine it
@@ -643,6 +724,22 @@ pub struct GitCommand {
     pub prompts: Vec<GitPrompt>,
 }
 
+/// UI/Presentation settings (`[ui]`).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct UiConfig {
+    /// Language code (e.g. "en-US", "ja-JP"). "auto" to detect from system.
+    pub language: String,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            language: "auto".to_string(),
+        }
+    }
+}
+
 /// Git behavior knobs for the panel's write operations (`[git]`).
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -1060,18 +1157,178 @@ impl Default for PrConfig {
     }
 }
 
+config_enum! {
+    /// Active CI provider for the CI panel/view (AV group). `"auto"` picks the
+    /// provider from the worktree's CI-config files + git remote; `"none"`
+    /// disables. GitHub reuses the existing `gh`/`GH_TOKEN` auth (no sub-table).
+    pub enum CiProviderKind : "ci provider" {
+        Auto       = "auto",
+        None       = "none",
+        Github     = "github",
+        Gitlab     = "gitlab",
+        Drone      = "drone",
+        Woodpecker = "woodpecker",
+        Jenkins    = "jenkins",
+        Argo       = "argo",
+    } default = Auto;
+}
+
+/// `[ci]` — cross-provider CI/CD inspection (AV group). Provider-agnostic knobs
+/// here; per-provider endpoints/tokens in the sub-tables. Tokens accept the
+/// `"env:VAR"` form resolved by [`expand_env_ref`], so secrets stay out of the
+/// file.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct CiConfig {
+    /// Active provider; `"auto"` detects from the worktree.
+    pub provider: CiProviderKind,
+    /// Cache TTL (seconds) before a background re-fetch of run history.
+    pub ttl_secs: u64,
+    /// Background poll cadence (seconds) while a run is in-flight / the CI view
+    /// has live-refresh on.
+    pub poll_interval_secs: u64,
+    /// How many recent runs to fetch and display.
+    pub max_runs: usize,
+    /// Start the full-screen CI view with live refresh enabled (gama `ctrl+l`).
+    pub live_refresh: bool,
+    /// Cap on fetched log lines (the tail is kept) — bounds memory on huge jobs.
+    pub log_tail_lines: usize,
+    pub gitlab: GitLabCiConfig,
+    pub drone: DroneCiConfig,
+    pub woodpecker: WoodpeckerCiConfig,
+    pub jenkins: JenkinsCiConfig,
+    pub argo: ArgoCiConfig,
+}
+
+impl Default for CiConfig {
+    fn default() -> Self {
+        CiConfig {
+            provider: CiProviderKind::Auto,
+            ttl_secs: 30,
+            poll_interval_secs: 30,
+            max_runs: 50,
+            live_refresh: false,
+            log_tail_lines: 2000,
+            gitlab: GitLabCiConfig::default(),
+            drone: DroneCiConfig::default(),
+            woodpecker: WoodpeckerCiConfig::default(),
+            jenkins: JenkinsCiConfig::default(),
+            argo: ArgoCiConfig::default(),
+        }
+    }
+}
+
+/// `[ci.gitlab]` — GitLab CI. `host` empty ⇒ gitlab.com; set it for self-hosted.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct GitLabCiConfig {
+    pub host: String,
+    /// API token. Use `"env:GITLAB_TOKEN"` to read from the environment.
+    pub token: String,
+}
+
+impl Default for GitLabCiConfig {
+    fn default() -> Self {
+        GitLabCiConfig {
+            host: String::new(),
+            token: "env:GITLAB_TOKEN".into(),
+        }
+    }
+}
+
+/// `[ci.drone]` — Drone CI. Requires a server URL + token.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct DroneCiConfig {
+    pub server: String,
+    pub token: String,
+}
+
+impl Default for DroneCiConfig {
+    fn default() -> Self {
+        DroneCiConfig {
+            server: "env:DRONE_SERVER".into(),
+            token: "env:DRONE_TOKEN".into(),
+        }
+    }
+}
+
+/// `[ci.woodpecker]` — Woodpecker CI (Drone fork). Server URL + token.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct WoodpeckerCiConfig {
+    pub server: String,
+    pub token: String,
+}
+
+impl Default for WoodpeckerCiConfig {
+    fn default() -> Self {
+        WoodpeckerCiConfig {
+            server: "env:WOODPECKER_SERVER".into(),
+            token: "env:WOODPECKER_TOKEN".into(),
+        }
+    }
+}
+
+/// `[ci.jenkins]` — Jenkins. Per-instance URL + user/API-token (basic auth).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct JenkinsCiConfig {
+    pub url: String,
+    pub user: String,
+    pub token: String,
+}
+
+impl Default for JenkinsCiConfig {
+    fn default() -> Self {
+        JenkinsCiConfig {
+            url: String::new(),
+            user: String::new(),
+            token: "env:JENKINS_TOKEN".into(),
+        }
+    }
+}
+
+/// `[ci.argo]` — Argo Workflows / Argo CD. Server URL + token (k8s-context
+/// dependent; empty ⇒ use the ambient `argo`/`argocd`/kubeconfig context).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct ArgoCiConfig {
+    pub server: String,
+    pub token: String,
+}
+
+impl Default for ArgoCiConfig {
+    fn default() -> Self {
+        ArgoCiConfig {
+            server: String::new(),
+            token: "env:ARGOCD_TOKEN".into(),
+        }
+    }
+}
+
 /// `[issues]` — issue tracker integration (Linear, GitHub Issues, Jira).
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct IssuesConfig {
-    /// Active provider. `"none"` disables the integration.
+    /// Active provider. `"none"` disables the integration. Kept for back-compat;
+    /// when `providers` is non-empty it takes precedence over this single value.
     pub provider: IssueProviderKind,
+    /// Active providers to aggregate simultaneously, e.g. `["linear", "jira"]`.
+    /// When non-empty this wins over the single `provider`; when empty the lone
+    /// `provider` is used. Lets a developer track Linear *and* Jira at once.
+    #[serde(default)]
+    pub providers: Vec<IssueProviderKind>,
     /// Cache TTL (seconds) before a background re-fetch.
     pub ttl_secs: u64,
     /// Maximum issues to fetch and display.
     pub max_issues: usize,
     /// Pre-filter to issues assigned to the authenticated user.
     pub filter_assignee_me: bool,
+    /// When a worktree's PR merges, move its linked issue to Done on the tracker.
+    /// Off by default — issue lifecycle stays manual unless opted in.
+    #[serde(default)]
+    pub move_on_merge: bool,
     pub linear: LinearConfig,
     pub github_issues: GitHubIssuesConfig,
     pub jira: JiraConfig,
@@ -1081,13 +1338,35 @@ impl Default for IssuesConfig {
     fn default() -> Self {
         IssuesConfig {
             provider: IssueProviderKind::None,
+            providers: Vec::new(),
             ttl_secs: 60,
             max_issues: 100,
             filter_assignee_me: true,
+            move_on_merge: false,
             linear: LinearConfig::default(),
             github_issues: GitHubIssuesConfig::default(),
             jira: JiraConfig::default(),
         }
+    }
+}
+
+impl IssuesConfig {
+    /// The effective set of providers to aggregate, in config order, with `None`
+    /// removed and duplicates collapsed. When `providers` is non-empty it wins;
+    /// otherwise the single legacy `provider` is used (unless it is `None`).
+    pub fn active_providers(&self) -> Vec<IssueProviderKind> {
+        let raw: &[IssueProviderKind] = if self.providers.is_empty() {
+            std::slice::from_ref(&self.provider)
+        } else {
+            &self.providers
+        };
+        let mut out: Vec<IssueProviderKind> = Vec::new();
+        for &p in raw {
+            if p != IssueProviderKind::None && !out.contains(&p) {
+                out.push(p);
+            }
+        }
+        out
     }
 }
 
@@ -1342,6 +1621,164 @@ impl RemoteConfig {
     }
 }
 
+/// `[env.<name>]` — a named, reusable execution environment. Selected per
+/// workspace/repo/worktree (DB `env_name`, repo `.superzej.*` `env =`, or the
+/// global `[sandbox] default_env`) and resolved by [`Config::resolve_env`].
+///
+/// An env bundles *placement* (where it runs), an isolation *overlay* (applied
+/// on top of the base `[sandbox]`), and a *data* mode (where files live), plus
+/// placement-specific `[env.<name>.{ssh,k8s,provider}]` sub-tables.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct EnvConfig {
+    /// Where this env's processes run.
+    pub placement: PlacementMode,
+    /// Where the worktree files live (defaults to "in the env").
+    pub data: DataMode,
+    /// Isolation overlay applied on top of the base `[sandbox]` (+ profile +
+    /// repo overlay). e.g. `backend = "podman"`, `image = "..."`, `profile`.
+    #[serde(skip_serializing_if = "SandboxOverlay::is_empty")]
+    pub sandbox: SandboxOverlay,
+    /// `[env.<name>.ssh]` — SSH/mosh connection knobs (placement = ssh).
+    #[serde(skip_serializing_if = "EnvSshConfig::is_default")]
+    pub ssh: EnvSshConfig,
+    /// `[env.<name>.k8s]` — Kubernetes pod target (placement = k8s).
+    #[serde(skip_serializing_if = "EnvK8sConfig::is_default")]
+    pub k8s: EnvK8sConfig,
+    /// `[env.<name>.provider]` — managed-sandbox provider (placement = provider).
+    #[serde(skip_serializing_if = "EnvProviderConfig::is_default")]
+    pub provider: EnvProviderConfig,
+}
+
+/// `[env.<name>.ssh]` — connection settings for an `ssh`/`mosh` placement. An
+/// empty `host` falls back to the worktree's own remote target (its `GitLoc`)
+/// or the global `[sandbox.remote] host`.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct EnvSshConfig {
+    pub host: String,
+    pub port: u16,
+    pub transport: RemoteTransport,
+    pub forward_agent: bool,
+    /// `ssh -F <path>` — a dedicated ssh config file for this environment.
+    pub ssh_config: String,
+    /// `ssh -J <host>` — a ProxyJump bastion.
+    pub jump_host: String,
+    /// `ssh -i <path>` — an explicit identity file.
+    pub identity: String,
+    /// Extra raw ssh args appended verbatim.
+    pub extra_args: Vec<String>,
+}
+
+impl Default for EnvSshConfig {
+    fn default() -> Self {
+        EnvSshConfig {
+            host: String::new(),
+            port: 22,
+            transport: RemoteTransport::Mosh,
+            forward_agent: true,
+            ssh_config: String::new(),
+            jump_host: String::new(),
+            identity: String::new(),
+            extra_args: Vec::new(),
+        }
+    }
+}
+
+impl EnvSshConfig {
+    fn is_default(&self) -> bool {
+        self.host.is_empty()
+            && self.ssh_config.is_empty()
+            && self.jump_host.is_empty()
+            && self.identity.is_empty()
+            && self.extra_args.is_empty()
+            && self.port == 22
+            && self.forward_agent
+            && self.transport == RemoteTransport::Mosh
+    }
+}
+
+/// `[env.<name>.k8s]` — a Kubernetes pod target for a `k8s` placement.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct EnvK8sConfig {
+    /// kubectl binary (empty ⇒ `kubectl`).
+    pub kubectl: String,
+    /// `--context` (empty ⇒ current kubeconfig context).
+    pub context: String,
+    /// `--namespace` (empty ⇒ default namespace).
+    pub namespace: String,
+    /// Target pod name or selector (e.g. `dev-blake`). Required to exec; the
+    /// pod-template spawn lifecycle resolves it when `pod_template` is set.
+    pub pod: String,
+    /// `-c <container>` within the pod (empty ⇒ default container).
+    pub container: String,
+    /// Path to a pod manifest applied to spawn a custom env (lifecycle phase).
+    pub pod_template: String,
+    /// Image for a template-less spawned pod.
+    pub image: String,
+    /// Enable remote-access features (e.g. `kubectl port-forward`).
+    pub remote_access: bool,
+}
+
+impl EnvK8sConfig {
+    fn is_default(&self) -> bool {
+        self.kubectl.is_empty()
+            && self.context.is_empty()
+            && self.namespace.is_empty()
+            && self.pod.is_empty()
+            && self.container.is_empty()
+            && self.pod_template.is_empty()
+            && self.image.is_empty()
+            && !self.remote_access
+    }
+}
+
+/// `[env.<name>.provider]` — a managed-sandbox provider for a `provider`
+/// placement (Daytona, Codespaces, …). `exec_command` is a static argv template
+/// (`{id}` is substituted with `id`) that runs a command in the sandbox; the
+/// API-driven discover/create lifecycle is layered on in the provider phase.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct EnvProviderConfig {
+    /// Provider id, e.g. `"daytona"`.
+    pub provider: String,
+    /// Opaque sandbox/environment id (static config; or resolved by lifecycle).
+    pub id: String,
+    /// Argv prefix to run a command in the sandbox; `{id}` is substituted.
+    /// e.g. `["daytona", "ssh", "{id}", "--"]`.
+    pub exec_command: Vec<String>,
+    /// Optional PTY-capable prefix for the interactive pane (defaults to
+    /// `exec_command` when empty).
+    pub interactive_command: Vec<String>,
+    /// Optional argv to create/start the sandbox (`superzej env up`); `{id}` is
+    /// substituted. e.g. `["daytona", "create", "--id", "{id}"]`. Empty ⇒ the
+    /// sandbox is assumed pre-created.
+    pub up_command: Vec<String>,
+    /// Optional argv to destroy/stop the sandbox (`superzej env down`).
+    pub down_command: Vec<String>,
+    /// API base URL for an API-driven provider (provider phase).
+    pub api_base: String,
+    /// Env var holding the provider API token.
+    pub api_key_env: String,
+    /// Provider sandbox template/image to create from.
+    pub template: String,
+}
+
+impl EnvProviderConfig {
+    fn is_default(&self) -> bool {
+        self.provider.is_empty()
+            && self.id.is_empty()
+            && self.exec_command.is_empty()
+            && self.interactive_command.is_empty()
+            && self.up_command.is_empty()
+            && self.down_command.is_empty()
+            && self.api_base.is_empty()
+            && self.api_key_env.is_empty()
+            && self.template.is_empty()
+    }
+}
+
 /// `[sandbox]` — containerize/sandbox a worktree's interactive process. On by
 /// default; `backend = "auto"` walks `backend_chain` and falls back to the host
 /// shell (with a warning) when nothing is available.
@@ -1376,6 +1813,230 @@ pub struct SandboxLimits {
     pub memory: Option<String>,
 }
 
+config_enum! {
+    /// `[sandbox.vpn] provider` — which overlay/tunnel a sandbox attaches to.
+    /// `none` (the default) leaves the worktree's network behavior unchanged.
+    /// `headscale` is `tailscale` pointed at a self-hosted control server
+    /// (`[sandbox.vpn.tailscale] login_server`).
+    pub enum VpnProviderKind: "vpn provider" {
+        None = "none" | "off",
+        Tailscale = "tailscale" | "ts",
+        Headscale = "headscale" | "hs",
+        Wireguard = "wireguard" | "wg" | "wg-quick",
+        Openvpn = "openvpn" | "ovpn",
+        Netbird = "netbird" | "nb",
+        Zerotier = "zerotier" | "zt",
+        Custom = "custom" | "command",
+    } default = None;
+}
+config_enum! {
+    /// How the tunnel is realized for the sandbox.
+    ///  - `sidecar` (default): a companion container owns the network namespace;
+    ///    the worktree OCI container joins it via `--network container:<sidecar>`,
+    ///    so its only egress is the tunnel and its capabilities stay untouched
+    ///    (NET_ADMIN/TUN live in the sidecar).
+    ///  - `proxy`: a userspace tunnel exposes a SOCKS5/HTTP proxy; the inner
+    ///    process is pointed at it via `ALL_PROXY`/`HTTPS_PROXY`. No NET_ADMIN or
+    ///    /dev/net/tun needed, but only proxy-aware traffic is tunneled (not a
+    ///    containment boundary). The only honest option for bwrap/systemd.
+    ///  - `in_container`: run the VPN client inside the worktree container itself
+    ///    (needs NET_ADMIN + /dev/net/tun; weakens `hardened`, refused if caps
+    ///    are dropped).
+    ///  - `netns`: join a host-prepared named network namespace (host-toolchain
+    ///    backends; best-effort, needs privilege to set up).
+    pub enum VpnMode: "vpn mode" {
+        Sidecar = "sidecar",
+        Proxy = "proxy",
+        InContainer = "in_container" | "in-container",
+        Netns = "netns",
+    } default = Sidecar;
+}
+config_enum! {
+    /// What to do when the tunnel can't be brought up.
+    ///  - `fail` (default): refuse to launch the sandbox (don't silently fall
+    ///    back to a less-isolated network).
+    ///  - `warn`: launch with the tunnel down (loud warning).
+    ///  - `offline`: force `network=none` so nothing leaks onto the host network.
+    pub enum VpnOnError: "vpn on_error" {
+        Fail = "fail",
+        Warn = "warn",
+        Offline = "offline",
+    } default = Fail;
+}
+config_enum! {
+    /// How DNS resolution inside the sandbox composes with the overlay.
+    ///  - `tunnel` (default): the provider owns resolution (MagicDNS / pushed
+    ///    resolvers); the `network_allow`/`network_block` filter is bypassed.
+    ///  - `filter-front`: chain the allow/block DNS filter in front, forwarding
+    ///    to the tunnel's resolver (preserves auditing).
+    ///  - `filter-only`: ignore the overlay's pushed DNS, keep the filter only.
+    pub enum VpnDnsMode: "vpn dns" {
+        Tunnel = "tunnel",
+        FilterFront = "filter-front" | "filter_front",
+        FilterOnly = "filter-only" | "filter_only",
+    } default = Tunnel;
+}
+
+/// `[sandbox.vpn]` — attach this worktree's sandbox to its own overlay/tunnel
+/// with its own identity, leaving host networking (including any host
+/// `tailscaled`) untouched. Disabled by default (`provider = "none"`). Only the
+/// selected provider's sub-table is consulted.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct VpnConfig {
+    pub provider: VpnProviderKind,
+    pub mode: VpnMode,
+    /// Override the provider's default sidecar image. Empty = provider default.
+    pub sidecar_image: String,
+    /// Seconds to wait for the tunnel's readiness probe before applying
+    /// `on_error`.
+    pub ready_timeout_secs: u64,
+    pub on_error: VpnOnError,
+    pub dns: VpnDnsMode,
+    /// Request an ephemeral node identity where the provider supports it
+    /// (Tailscale/Headscale/NetBird), so the device auto-deregisters on teardown.
+    pub ephemeral: bool,
+    pub tailscale: TailscaleConfig,
+    pub wireguard: WireguardConfig,
+    pub openvpn: OpenvpnConfig,
+    pub netbird: NetbirdConfig,
+    pub zerotier: ZerotierConfig,
+    pub custom: CustomVpnConfig,
+}
+
+impl Default for VpnConfig {
+    fn default() -> Self {
+        VpnConfig {
+            provider: VpnProviderKind::None,
+            mode: VpnMode::Sidecar,
+            sidecar_image: String::new(),
+            ready_timeout_secs: 30,
+            on_error: VpnOnError::Fail,
+            dns: VpnDnsMode::Tunnel,
+            ephemeral: true,
+            tailscale: TailscaleConfig::default(),
+            wireguard: WireguardConfig::default(),
+            openvpn: OpenvpnConfig::default(),
+            netbird: NetbirdConfig::default(),
+            zerotier: ZerotierConfig::default(),
+            custom: CustomVpnConfig::default(),
+        }
+    }
+}
+
+impl VpnConfig {
+    /// Whether a tunnel is requested at all.
+    pub fn is_enabled(&self) -> bool {
+        self.provider != VpnProviderKind::None
+    }
+}
+
+/// `[sandbox.vpn.tailscale]` — Tailscale / Headscale. `login_server` is what
+/// makes it Headscale (a self-hosted control server).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct TailscaleConfig {
+    /// Auth key (secrets-ref: `"env:TS_AUTHKEY"` or `"file:~/.ts/dev.key"`).
+    /// Prefer an ephemeral, pre-authorized, tagged key for dev envs.
+    pub auth_key: String,
+    /// Custom control server, e.g. `"https://headscale.example.com"`.
+    pub login_server: String,
+    /// ACL tags to advertise, e.g. `["tag:dev"]`.
+    pub tags: Vec<String>,
+    /// Route egress through this exit node (hostname or IP). `""` = none.
+    pub exit_node: String,
+    /// Accept subnet routes advertised by the tailnet.
+    pub accept_routes: bool,
+    /// Node name in the tailnet. `""` = derive from the container name.
+    pub hostname: String,
+    /// Advertise these CIDRs as subnet routes from the sandbox.
+    pub advertise_routes: Vec<String>,
+    /// Extra `tailscale up` flags for anything not modeled here.
+    pub extra_args: Vec<String>,
+}
+
+impl Default for TailscaleConfig {
+    fn default() -> Self {
+        TailscaleConfig {
+            auth_key: "env:TS_AUTHKEY".into(),
+            login_server: String::new(),
+            tags: Vec::new(),
+            exit_node: String::new(),
+            accept_routes: false,
+            hostname: String::new(),
+            advertise_routes: Vec::new(),
+            extra_args: Vec::new(),
+        }
+    }
+}
+
+/// `[sandbox.vpn.wireguard]` — a wg-quick tunnel.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct WireguardConfig {
+    /// Path to a wg-quick `.conf` (mounted into the sidecar read-only). Mutually
+    /// exclusive with `config`; `config` wins if both are set.
+    pub config_path: String,
+    /// Inline config body (secrets-ref `"file:..."` recommended to keep keys out
+    /// of the superzej config file).
+    pub config: String,
+}
+
+/// `[sandbox.vpn.openvpn]` — an OpenVPN tunnel.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct OpenvpnConfig {
+    /// Path to a `.ovpn` (mounted into the sidecar read-only).
+    pub config_path: String,
+    /// `user\npass` credentials (secrets-ref `"file:~/.ovpn/creds"`).
+    pub auth_user_pass: String,
+    /// Extra `openvpn` flags.
+    pub extra_args: Vec<String>,
+}
+
+/// `[sandbox.vpn.netbird]` — a NetBird mesh.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct NetbirdConfig {
+    /// Setup key (secrets-ref).
+    pub setup_key: String,
+    /// Self-hosted management URL. `""` = NetBird's hosted control plane.
+    pub management_url: String,
+    /// Peer hostname. `""` = derive from the container name.
+    pub hostname: String,
+}
+
+/// `[sandbox.vpn.zerotier]` — a ZeroTier network.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct ZerotierConfig {
+    /// 16-hex network id to join.
+    pub network_id: String,
+    /// Self-hosted controller/moon URL. `""` = ZeroTier's hosted controller.
+    pub controller_url: String,
+    /// API token (secrets-ref) used to auto-authorize the joining member.
+    pub api_token: String,
+}
+
+/// `[sandbox.vpn.custom]` — the open escape hatch for any tunnel not modeled
+/// above (Nebula, Tinc, a corporate IPsec script, …). The `up`/`down`/
+/// `ready_check` commands run via `sh -c`; the template vars `{name}`,
+/// `{netns}`, and `{worktree}` are expanded before execution.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct CustomVpnConfig {
+    /// Command that establishes the tunnel.
+    pub up: String,
+    /// Command that tears it down (best-effort, run on teardown).
+    pub down: String,
+    /// Command whose exit-0 means "ready" (polled until `ready_timeout_secs`).
+    pub ready_check: String,
+    /// Sidecar image when `mode = "sidecar"`. `""` for proxy/netns modes.
+    pub image: String,
+    /// Extra env passed to the `up`/`ready_check` commands / sidecar.
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct SandboxConfig {
@@ -1383,6 +2044,11 @@ pub struct SandboxConfig {
     pub backend: SandboxBackend,
     /// Default selection for new worktrees; `auto` means use `backend_chain`.
     pub default_backend: SandboxBackend,
+    /// Name of the `[env.<name>]` execution environment to use by default when a
+    /// worktree/workspace/repo hasn't selected one. Empty ⇒ the implicit
+    /// `"default"` env (this `[sandbox]` block + `[sandbox.remote]`, today's
+    /// behavior). See [`Config::resolve_env`].
+    pub default_env: String,
     pub backend_chain: Vec<String>, // auto detection order; "host" = host fallback
     pub image: String,              // "" => host-toolchain mode
     /// Hardening preset for the worktree's interactive container (shell panes).
@@ -1426,6 +2092,8 @@ pub struct SandboxConfig {
     /// false`. No effect off NixOS-style multi-user nix (no socket) or on OCI
     /// backends.
     pub nix_daemon: bool,
+    /// `[sandbox.vpn]` — attach the worktree to its own overlay/tunnel.
+    pub vpn: VpnConfig,
 }
 
 /// The default `backend_chain` for `auto` detection, by host platform.
@@ -1457,6 +2125,7 @@ impl Default for SandboxConfig {
             enabled: true,
             backend: SandboxBackend::Auto,
             default_backend: SandboxBackend::Auto,
+            default_env: String::new(),
             backend_chain: default_backend_chain(),
             image: String::new(),
             profile: SandboxProfile::Hardened,
@@ -1497,6 +2166,7 @@ impl Default for SandboxConfig {
             network_block: Vec::new(),
             network_audit: false,
             nix_daemon: true,
+            vpn: VpnConfig::default(),
         }
     }
 }
@@ -1510,6 +2180,7 @@ pub struct SandboxOverlay {
     pub enabled: Option<bool>,
     pub backend: Option<SandboxBackend>,
     pub default_backend: Option<SandboxBackend>,
+    pub default_env: Option<String>,
     pub backend_chain: Option<Vec<String>>,
     pub image: Option<String>,
     pub profile: Option<SandboxProfile>,
@@ -1533,6 +2204,9 @@ pub struct SandboxOverlay {
     pub network_block: Option<Vec<String>>,
     pub network_audit: Option<bool>,
     pub nix_daemon: Option<bool>,
+    /// Whole-table replace (matching `remote`/`limits`): a `[sandbox.vpn]` in an
+    /// overlay replaces the global VPN config wholesale rather than field-merging.
+    pub vpn: Option<VpnConfig>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
@@ -1556,6 +2230,9 @@ impl SandboxOverlay {
         }
         if let Some(v) = self.default_backend {
             base.default_backend = v;
+        }
+        if let Some(v) = self.default_env {
+            base.default_env = v;
         }
         if let Some(v) = self.backend_chain {
             base.backend_chain = v;
@@ -1626,12 +2303,16 @@ impl SandboxOverlay {
         if let Some(v) = self.nix_daemon {
             base.nix_daemon = v;
         }
+        if let Some(v) = self.vpn {
+            base.vpn = v;
+        }
     }
 
     fn is_empty(&self) -> bool {
         self.enabled.is_none()
             && self.backend.is_none()
             && self.default_backend.is_none()
+            && self.default_env.is_none()
             && self.backend_chain.is_none()
             && self.image.is_none()
             && self.profile.is_none()
@@ -1649,6 +2330,7 @@ impl SandboxOverlay {
             && self.network_block.is_none()
             && self.network_audit.is_none()
             && self.nix_daemon.is_none()
+            && self.vpn.is_none()
     }
 }
 
@@ -1682,6 +2364,10 @@ impl RemoteOverlay {
 struct RepoConfigFile {
     sandbox: SandboxOverlay,
     keybinds: KeybindConfig,
+    /// Selects a named `[env.<name>]` for every worktree of this repo (the
+    /// repo-level layer of env selection). Empty ⇒ inherit the global default.
+    #[serde(default)]
+    env: String,
 }
 
 /// `[drawer]` — the bottom file-manager drawer (hidden by default, toggled with
@@ -1992,6 +2678,8 @@ pub struct Config {
     pub git_commands: Vec<GitCommand>,
     pub plugins: Vec<crate::plugin_api::PluginManifest>,
     // --- sub-tables ---
+    #[serde(default)]
+    pub ui: UiConfig,
     pub git: GitConfig,
     pub theme: ThemeConfig,
     pub monitor: MonitorConfig,
@@ -2001,6 +2689,8 @@ pub struct Config {
     pub bars: BarsConfig,
     pub pr: PrConfig,
     pub issues: IssuesConfig,
+    /// `[ci]` — cross-provider CI/CD inspection (AV group).
+    pub ci: CiConfig,
     pub watch: WatchConfig,
     pub log: LogConfig,
     pub sandbox: SandboxConfig,
@@ -2023,6 +2713,10 @@ pub struct Config {
     /// Per-workspace config keyed by repo slug (`[workspace.<slug>]`).
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub workspace: std::collections::BTreeMap<String, WorkspaceConfig>,
+    /// Named execution environments (`[env.<name>]`) — the reusable library a
+    /// workspace/repo/worktree selects from. See [`Config::resolve_env`].
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, EnvConfig>,
     /// Per-program host-action overlays (`[program_keybinds.<program>]`), keyed
     /// by the focused pane's program name. Consulted before the active mode.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -2055,6 +2749,7 @@ impl Default for Config {
             confirm_delete: true,
             repo_roots: Vec::new(),
             repo_scan_depth: 5,
+            ui: UiConfig::default(),
             agents: Vec::new(),
             tools: Vec::new(),
             accounts: Vec::new(),
@@ -2072,6 +2767,7 @@ impl Default for Config {
             bars: BarsConfig::default(),
             pr: PrConfig::default(),
             issues: IssuesConfig::default(),
+            ci: CiConfig::default(),
             watch: WatchConfig::default(),
             log: LogConfig::default(),
             sandbox: SandboxConfig::default(),
@@ -2090,6 +2786,7 @@ impl Default for Config {
             keymap_preset: default_preset(),
             profiles: std::collections::BTreeMap::new(),
             workspace: std::collections::BTreeMap::new(),
+            env: std::collections::BTreeMap::new(),
             program_keybinds: std::collections::BTreeMap::new(),
             program_remap: std::collections::BTreeMap::new(),
         }
@@ -2646,6 +3343,70 @@ impl Config {
         sb
     }
 
+    /// The name of the env a repo's `.superzej.*` overlay selects (`env = "…"`),
+    /// or empty. The repo-level layer of env selection.
+    pub fn repo_env_name(&self, repo_root: &Path) -> String {
+        load_repo_overlay(repo_root)
+            .map(|r| r.env.trim().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Resolve the full execution [`Environment`] for a worktree.
+    ///
+    /// Env-name precedence (most specific wins): `selected` (the DB worktree/
+    /// workspace `env_name`, or a launch flag) → the repo `.superzej.*` `env =`
+    /// → the global `[sandbox] default_env` → the implicit `"default"`.
+    ///
+    /// The `"default"` env (and any unknown name) reproduces today's behavior
+    /// exactly: the base `[sandbox]` (+ profile + repo overlay + workspace
+    /// mounts) with a placement derived from `[sandbox.remote]` + the `GitLoc`.
+    /// A named env overlays its `[env.<name>] sandbox` onto that base and builds
+    /// its placement from `[env.<name>.{ssh,k8s,provider}]`.
+    pub fn resolve_env(
+        &self,
+        repo_root: &Path,
+        loc: &GitLoc,
+        selected: Option<&str>,
+    ) -> Environment {
+        let base = self.repo_sandbox(repo_root);
+        let pick = |s: &str| {
+            let t = s.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        };
+        let name = selected
+            .and_then(pick)
+            .or_else(|| pick(&self.repo_env_name(repo_root)))
+            .or_else(|| pick(&base.default_env))
+            .unwrap_or_else(|| "default".to_string());
+
+        let Some(envc) = self.env.get(&name) else {
+            // Implicit default env, or a typo'd selection: today's behavior.
+            if name != "default" {
+                config_warn(&format!(
+                    "execution environment {name:?} is not defined under [env.{name}]; using the default"
+                ));
+            }
+            let data = data_mode_from_remote(base.remote.mode);
+            return Environment {
+                name: "default".into(),
+                placement: crate::sandbox::placement_from_loc(&base, loc),
+                sandbox: base,
+                data,
+            };
+        };
+
+        // Named env: overlay its isolation onto the base, build its placement.
+        let mut sb = base;
+        envc.sandbox.clone().apply(&mut sb);
+        let placement = build_env_placement(envc, &sb, loc);
+        Environment {
+            name,
+            placement,
+            sandbox: sb,
+            data: envc.data,
+        }
+    }
+
     /// The accent as a truecolor "R;G;B" fragment; invalid hex falls back to
     /// the default teal.
     pub fn accent_rgb(&self) -> String {
@@ -2913,6 +3674,95 @@ fn load_repo_overlay(repo_root: &std::path::Path) -> Option<RepoConfigFile> {
         };
     }
     None
+}
+
+/// Map the legacy `[sandbox.remote] mode` onto the env [`DataMode`], so the
+/// default env honours an existing `mode = "sshfs"`/`"local_exec"` config.
+fn data_mode_from_remote(mode: RemoteMode) -> DataMode {
+    match mode {
+        RemoteMode::Remote => DataMode::InEnv,
+        RemoteMode::LocalExec => DataMode::LocalExec,
+        RemoteMode::Sshfs => DataMode::Sshfs,
+    }
+}
+
+/// Build the runtime [`Placement`] for a named env from its `[env.<name>]`
+/// placement mode + the matching sub-table. For `ssh`, an empty `[env.*.ssh]
+/// host` falls back to the worktree's own remote target, then `[sandbox.remote]`.
+fn build_env_placement(envc: &EnvConfig, sb: &SandboxConfig, loc: &GitLoc) -> Placement {
+    let opt = |s: &str| {
+        let t = s.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    };
+    match envc.placement {
+        PlacementMode::Local => Placement::Local,
+        PlacementMode::Ssh => {
+            let kind = match envc.ssh.transport {
+                RemoteTransport::Ssh => TransportKind::Ssh,
+                RemoteTransport::Mosh => TransportKind::Mosh,
+            };
+            let (host, port, forward_agent) = if !envc.ssh.host.trim().is_empty() {
+                let port = if envc.ssh.port == 0 {
+                    22
+                } else {
+                    envc.ssh.port
+                };
+                (
+                    envc.ssh.host.trim().to_string(),
+                    port,
+                    envc.ssh.forward_agent,
+                )
+            } else if let Some(t) = loc.ssh() {
+                (t.host.clone(), t.port, t.forward_agent)
+            } else {
+                (
+                    sb.remote.host.clone(),
+                    sb.remote.port,
+                    sb.remote.forward_agent,
+                )
+            };
+            Placement::Ssh(SshPlacement {
+                host,
+                port,
+                forward_agent,
+                kind,
+                ssh_config: opt(&envc.ssh.ssh_config),
+                jump_host: opt(&envc.ssh.jump_host),
+                identity: opt(&envc.ssh.identity),
+                extra_args: envc.ssh.extra_args.clone(),
+            })
+        }
+        PlacementMode::K8s => Placement::K8s(K8sPlacement {
+            kubectl: opt(&envc.k8s.kubectl).unwrap_or_else(|| "kubectl".to_string()),
+            context: opt(&envc.k8s.context),
+            namespace: opt(&envc.k8s.namespace),
+            pod: envc.k8s.pod.trim().to_string(),
+            container: opt(&envc.k8s.container),
+            pod_template: opt(&envc.k8s.pod_template).map(|p| util::expand_tilde(&p)),
+            image: opt(&envc.k8s.image),
+        }),
+        PlacementMode::Provider => {
+            let sub = |tpl: &[String]| {
+                tpl.iter()
+                    .map(|s| s.replace("{id}", envc.provider.id.trim()))
+                    .collect::<Vec<_>>()
+            };
+            let control_prefix = sub(&envc.provider.exec_command);
+            let interactive_prefix = if envc.provider.interactive_command.is_empty() {
+                control_prefix.clone()
+            } else {
+                sub(&envc.provider.interactive_command)
+            };
+            Placement::Provider(ProviderPlacement {
+                provider: envc.provider.provider.trim().to_string(),
+                id: envc.provider.id.trim().to_string(),
+                interactive_prefix,
+                control_prefix,
+                up_command: sub(&envc.provider.up_command),
+                down_command: sub(&envc.provider.down_command),
+            })
+        }
+    }
 }
 
 /// "#rrggbb" / "#rgb" -> "R;G;B".
@@ -4353,6 +5203,197 @@ forward_agent = false
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // --- named execution environments (`[env.<name>]`) -----------------------
+
+    #[test]
+    fn default_env_reproduces_legacy_behavior() {
+        // No [env.*] defined → the implicit "default" env: base [sandbox] +
+        // a placement derived from [sandbox.remote] + the GitLoc (today's path).
+        let cfg = Config::default();
+        let dir = tmpdir("env-default");
+        let loc = GitLoc::Local(dir.clone());
+        let env = cfg.resolve_env(&dir, &loc, None);
+        assert_eq!(env.name, "default");
+        assert!(env.placement.is_local());
+        assert!(!env.is_remote());
+        // The resolved sandbox equals repo_sandbox (modulo identical content).
+        assert_eq!(env.sandbox.backend, cfg.repo_sandbox(&dir).backend);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn named_env_overlays_isolation_and_local_placement() {
+        let cfg: Config = toml::from_str(
+            "\
+[env.local-containers]
+placement = \"local\"
+[env.local-containers.sandbox]
+backend = \"podman\"
+image = \"registry.example.com/dev:latest\"
+profile = \"sealed\"
+",
+        )
+        .unwrap();
+        let dir = tmpdir("env-local");
+        let loc = GitLoc::Local(dir.clone());
+        let env = cfg.resolve_env(&dir, &loc, Some("local-containers"));
+        assert_eq!(env.name, "local-containers");
+        assert!(env.placement.is_local());
+        assert_eq!(env.sandbox.backend, SandboxBackend::Podman);
+        assert_eq!(env.sandbox.image, "registry.example.com/dev:latest");
+        assert_eq!(env.sandbox.profile, SandboxProfile::Sealed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn k8s_env_builds_kubectl_placement() {
+        let cfg: Config = toml::from_str(
+            "\
+[env.company-k8s]
+placement = \"k8s\"
+[env.company-k8s.sandbox]
+backend = \"none\"
+[env.company-k8s.k8s]
+context = \"company-prod\"
+namespace = \"dev-blake\"
+pod = \"sz-dev\"
+",
+        )
+        .unwrap();
+        let dir = tmpdir("env-k8s");
+        let loc = GitLoc::Local(dir.clone());
+        let env = cfg.resolve_env(&dir, &loc, Some("company-k8s"));
+        assert!(env.is_remote());
+        assert_eq!(env.placement.label(), "k8s:dev-blake/sz-dev");
+        // The kubectl exec argv carries the configured context/namespace/pod.
+        let argv = env.placement.interactive_argv(&["true".into()]);
+        assert_eq!(argv[0], "kubectl");
+        assert!(argv.windows(2).any(|w| w == ["--context", "company-prod"]));
+        assert!(argv.windows(2).any(|w| w == ["--namespace", "dev-blake"]));
+        assert!(argv.contains(&"sz-dev".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn provider_env_substitutes_id_into_exec_template() {
+        let cfg: Config = toml::from_str(
+            "\
+[env.daytona]
+placement = \"provider\"
+[env.daytona.provider]
+provider = \"daytona\"
+id = \"sb-42\"
+exec_command = [\"daytona\", \"ssh\", \"{id}\", \"--\"]
+",
+        )
+        .unwrap();
+        let dir = tmpdir("env-prov");
+        let loc = GitLoc::Local(dir.clone());
+        let env = cfg.resolve_env(&dir, &loc, Some("daytona"));
+        assert!(env.is_remote());
+        let argv = env.placement.interactive_argv(&["ls".into()]);
+        assert_eq!(&argv[..4], &["daytona", "ssh", "sb-42", "--"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn provider_env_lifecycle_commands_substitute_id() {
+        let cfg: Config = toml::from_str(
+            "\
+[env.daytona]
+placement = \"provider\"
+[env.daytona.provider]
+provider = \"daytona\"
+id = \"sb-7\"
+exec_command = [\"daytona\", \"ssh\", \"{id}\", \"--\"]
+up_command = [\"daytona\", \"create\", \"--id\", \"{id}\"]
+down_command = [\"daytona\", \"delete\", \"{id}\"]
+",
+        )
+        .unwrap();
+        let dir = tmpdir("env-prov-life");
+        let loc = GitLoc::Local(dir.clone());
+        let env = cfg.resolve_env(&dir, &loc, Some("daytona"));
+        match env.placement {
+            crate::placement::Placement::Provider(p) => {
+                assert_eq!(p.up_command, vec!["daytona", "create", "--id", "sb-7"]);
+                assert_eq!(p.down_command, vec!["daytona", "delete", "sb-7"]);
+            }
+            other => panic!("expected provider placement, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_selection_precedence_repo_over_global_default() {
+        // Global default_env picks "g"; a repo .superzej.toml `env = "r"` wins;
+        // an explicit `selected` beats both.
+        let cfg: Config = toml::from_str(
+            "\
+[sandbox]
+default_env = \"g\"
+[env.g]
+[env.g.sandbox]
+backend = \"bwrap\"
+[env.r]
+[env.r.sandbox]
+backend = \"docker\"
+[env.x]
+[env.x.sandbox]
+backend = \"podman\"
+",
+        )
+        .unwrap();
+        let dir = tmpdir("env-prec");
+        std::fs::write(dir.join(".superzej.toml"), "env = \"r\"\n").unwrap();
+        let loc = GitLoc::Local(dir.clone());
+        // No explicit selection → repo overlay "r" wins over global default "g".
+        assert_eq!(cfg.resolve_env(&dir, &loc, None).name, "r");
+        assert_eq!(
+            cfg.resolve_env(&dir, &loc, None).sandbox.backend,
+            SandboxBackend::Docker
+        );
+        // Explicit selection beats the repo overlay.
+        assert_eq!(cfg.resolve_env(&dir, &loc, Some("x")).name, "x");
+        // Empty/whitespace selection is ignored (falls through to repo).
+        assert_eq!(cfg.resolve_env(&dir, &loc, Some("  ")).name, "r");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_env_name_falls_back_to_default() {
+        let cfg = Config::default();
+        let dir = tmpdir("env-unknown");
+        let loc = GitLoc::Local(dir.clone());
+        let env = cfg.resolve_env(&dir, &loc, Some("does-not-exist"));
+        assert_eq!(env.name, "default");
+        assert!(env.placement.is_local());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ssh_env_falls_back_to_global_remote_host() {
+        // [env.*.ssh] with no host inherits [sandbox.remote] host.
+        let cfg: Config = toml::from_str(
+            "\
+[sandbox.remote]
+host = \"u@devbox\"
+port = 2200
+[env.remote-dev]
+placement = \"ssh\"
+[env.remote-dev.ssh]
+transport = \"ssh\"
+",
+        )
+        .unwrap();
+        let dir = tmpdir("env-ssh");
+        let loc = GitLoc::Local(dir.clone());
+        let env = cfg.resolve_env(&dir, &loc, Some("remote-dev"));
+        assert!(env.is_remote());
+        assert_eq!(env.placement.label(), "ssh:u@devbox");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn process_env_reads_real_vars() {
         // SAFETY: single-threaded test using uniquely-named vars.
@@ -4471,6 +5512,53 @@ forward_agent = false
         assert!(cfg.issues.filter_assignee_me);
         assert_eq!(cfg.issues.linear.api_key, "env:LINEAR_API_KEY");
         assert_eq!(cfg.issues.jira.api_token, "env:JIRA_API_TOKEN");
+        assert!(cfg.issues.providers.is_empty());
+        assert!(cfg.issues.active_providers().is_empty());
+    }
+
+    #[test]
+    fn active_providers_back_compat_single() {
+        // Legacy single `provider` is honored when `providers` is empty.
+        let mut cfg = IssuesConfig::default();
+        cfg.provider = IssueProviderKind::Linear;
+        assert_eq!(cfg.active_providers(), vec![IssueProviderKind::Linear]);
+        // `none` yields an empty set, not a [None] entry.
+        cfg.provider = IssueProviderKind::None;
+        assert!(cfg.active_providers().is_empty());
+    }
+
+    #[test]
+    fn active_providers_multi_wins_and_dedups() {
+        let mut cfg = IssuesConfig::default();
+        // Single provider is overridden once the plural list is set.
+        cfg.provider = IssueProviderKind::Github;
+        cfg.providers = vec![
+            IssueProviderKind::Linear,
+            IssueProviderKind::Jira,
+            IssueProviderKind::Linear, // duplicate collapses
+            IssueProviderKind::None,   // None filtered out
+        ];
+        assert_eq!(
+            cfg.active_providers(),
+            vec![IssueProviderKind::Linear, IssueProviderKind::Jira]
+        );
+    }
+
+    #[test]
+    fn issues_multi_provider_table_parses() {
+        let toml = r#"
+            [issues]
+            providers = ["linear", "jira"]
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.issues.providers,
+            vec![IssueProviderKind::Linear, IssueProviderKind::Jira]
+        );
+        assert_eq!(
+            cfg.issues.active_providers(),
+            vec![IssueProviderKind::Linear, IssueProviderKind::Jira]
+        );
     }
 
     #[test]
@@ -5616,5 +6704,168 @@ token_reduction_level = "balanced"
         assert!(t.name.is_empty());
         assert!(t.base.is_none() && t.layout.is_none());
         assert!(t.pins.is_empty() && t.commands.is_empty());
+    }
+
+    #[test]
+    fn vpn_config_defaults_to_disabled() {
+        let cfg = SandboxConfig::default();
+        assert_eq!(cfg.vpn.provider, VpnProviderKind::None);
+        assert!(!cfg.vpn.is_enabled());
+        // Forward-looking defaults the runtime relies on.
+        assert_eq!(cfg.vpn.mode, VpnMode::Sidecar);
+        assert_eq!(cfg.vpn.on_error, VpnOnError::Fail);
+        assert_eq!(cfg.vpn.dns, VpnDnsMode::Tunnel);
+        assert!(cfg.vpn.ephemeral);
+    }
+
+    #[test]
+    fn vpn_provider_kind_aliases_and_default() {
+        assert_eq!(VpnProviderKind::default(), VpnProviderKind::None);
+        for (s, want) in [
+            ("tailscale", VpnProviderKind::Tailscale),
+            ("ts", VpnProviderKind::Tailscale),
+            ("headscale", VpnProviderKind::Headscale),
+            ("hs", VpnProviderKind::Headscale),
+            ("wg-quick", VpnProviderKind::Wireguard),
+            ("ovpn", VpnProviderKind::Openvpn),
+            ("nb", VpnProviderKind::Netbird),
+            ("zt", VpnProviderKind::Zerotier),
+            ("command", VpnProviderKind::Custom),
+            ("off", VpnProviderKind::None),
+        ] {
+            assert_eq!(VpnProviderKind::from_str_validated(s).unwrap(), want, "{s}");
+        }
+        // Unknown values warn and fall back to the default (infallible deser).
+        let k: VpnProviderKind = serde_json::from_str(r#""bogus""#).unwrap();
+        assert_eq!(k, VpnProviderKind::None);
+    }
+
+    #[test]
+    fn vpn_mode_and_dns_aliases() {
+        assert_eq!(
+            VpnMode::from_str_validated("in-container").unwrap(),
+            VpnMode::InContainer
+        );
+        assert_eq!(
+            VpnDnsMode::from_str_validated("filter_front").unwrap(),
+            VpnDnsMode::FilterFront
+        );
+        assert_eq!(
+            VpnOnError::from_str_validated("offline").unwrap(),
+            VpnOnError::Offline
+        );
+    }
+
+    #[test]
+    fn vpn_config_parses_from_toml_subtables() {
+        let cfg: Config = toml::from_str(
+            r#"
+[sandbox.vpn]
+provider = "headscale"
+mode = "proxy"
+dns = "filter-front"
+ready_timeout_secs = 12
+ephemeral = false
+
+[sandbox.vpn.tailscale]
+auth_key = "env:TS_AUTHKEY"
+login_server = "https://headscale.example.com"
+tags = ["tag:dev", "tag:ci"]
+exit_node = "exit-1"
+accept_routes = true
+hostname = "my-node"
+
+[sandbox.vpn.wireguard]
+config_path = "/etc/wireguard/wg0.conf"
+"#,
+        )
+        .unwrap();
+        let v = &cfg.sandbox.vpn;
+        assert_eq!(v.provider, VpnProviderKind::Headscale);
+        assert_eq!(v.mode, VpnMode::Proxy);
+        assert_eq!(v.dns, VpnDnsMode::FilterFront);
+        assert_eq!(v.ready_timeout_secs, 12);
+        assert!(!v.ephemeral);
+        assert_eq!(v.tailscale.login_server, "https://headscale.example.com");
+        assert_eq!(v.tailscale.tags, vec!["tag:dev", "tag:ci"]);
+        assert_eq!(v.tailscale.exit_node, "exit-1");
+        assert!(v.tailscale.accept_routes);
+        assert_eq!(v.tailscale.hostname, "my-node");
+        assert_eq!(v.wireguard.config_path, "/etc/wireguard/wg0.conf");
+    }
+
+    #[test]
+    fn vpn_config_round_trips_through_serialization() {
+        let v = VpnConfig {
+            provider: VpnProviderKind::Zerotier,
+            zerotier: ZerotierConfig {
+                network_id: "8056c2e21c000001".into(),
+                ..ZerotierConfig::default()
+            },
+            ..VpnConfig::default()
+        };
+        let s = toml::to_string(&v).unwrap();
+        let back: VpnConfig = toml::from_str(&s).unwrap();
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn sandbox_overlay_replaces_vpn_wholesale() {
+        let mut base = SandboxConfig::default();
+        base.vpn.provider = VpnProviderKind::Tailscale;
+        base.vpn.tailscale.tags = vec!["tag:base".into()];
+
+        let replacement = VpnConfig {
+            provider: VpnProviderKind::Wireguard,
+            ..VpnConfig::default()
+        };
+        let overlay = SandboxOverlay {
+            vpn: Some(replacement),
+            ..Default::default()
+        };
+        assert!(!overlay.is_empty());
+        overlay.apply(&mut base);
+        // Whole-table replace: the base's tailscale tags are gone, not merged.
+        assert_eq!(base.vpn.provider, VpnProviderKind::Wireguard);
+        assert!(base.vpn.tailscale.tags.is_empty());
+    }
+
+    #[test]
+    fn sandbox_profile_parses_sealed_tunnel() {
+        for s in ["sealed-tunnel", "tunnel-only", "vpn-only"] {
+            assert_eq!(
+                SandboxProfile::from_str_validated(s).unwrap(),
+                SandboxProfile::SealedTunnel,
+                "{s}"
+            );
+        }
+    }
+
+    #[test]
+    fn sealed_tunnel_profile_floors_match_sealed_but_permits_vpn() {
+        let st = SandboxProfile::SealedTunnel;
+        // Same hardening floor as sealed.
+        assert!(st.read_only_root());
+        assert!(st.no_new_privileges());
+        assert_eq!(st.pids_limit(), Some(256));
+        assert_eq!(st.drop_capabilities(), vec!["ALL".to_string()]);
+        assert!(st.forces_no_network());
+        // ...but unlike plain sealed, it permits a tunnel.
+        assert!(st.permits_vpn());
+        assert!(!SandboxProfile::Sealed.permits_vpn());
+        assert!(SandboxProfile::Hardened.permits_vpn());
+        assert!(SandboxProfile::Open.permits_vpn());
+    }
+
+    #[test]
+    fn expand_env_ref_reads_file_prefix() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("sz-vpn-key-{}.txt", std::process::id()));
+        std::fs::write(&path, "  super-secret-key\n").unwrap();
+        let r = expand_env_ref(&format!("file:{}", path.display()));
+        assert_eq!(r.as_deref(), Some("super-secret-key"));
+        std::fs::remove_file(&path).unwrap();
+        // Missing file -> None (not an error).
+        assert_eq!(expand_env_ref("file:/no/such/sz/file"), None);
     }
 }

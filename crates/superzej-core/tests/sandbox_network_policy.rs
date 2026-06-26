@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use superzej_core::config::{FileAccess, Network};
 use superzej_core::dns_filter::{DnsPolicy, drain_events};
-use superzej_core::sandbox::{Backend, SandboxLimits, SandboxSpec, Transport, ensure, enter_argv};
+use superzej_core::sandbox::{Backend, SandboxLimits, SandboxSpec, ensure, enter_argv};
 
 fn skip() -> bool {
     !superzej_core::util::have("podman")
@@ -27,7 +27,7 @@ fn force_rm(name: &str) {
 fn spec_with_network_block(name: &str, block: Vec<String>) -> SandboxSpec {
     SandboxSpec {
         backend: Backend::Podman,
-        transport: Transport::Local,
+        placement: superzej_core::placement::Placement::Local,
         image: Some("docker.io/library/alpine:latest".into()),
         worktree: PathBuf::from("/tmp/sz-e2e-net"),
         mounts: vec![],
@@ -53,6 +53,7 @@ fn spec_with_network_block(name: &str, block: Vec<String>) -> SandboxSpec {
         devenv_path: None,
         nix_daemon: false,
         name: name.into(),
+        vpn: None,
     }
 }
 
@@ -122,6 +123,7 @@ fn g3_dns_events_captured() {
     let _ = superzej_core::dns_filter::get_or_start(DnsPolicy {
         block: vec!["blocked.internal".into()],
         allow: vec![],
+        upstream: None,
     });
     drain_events(); // clear prior
     let name = "superzej-e2e-g3";

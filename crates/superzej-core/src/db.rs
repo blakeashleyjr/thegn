@@ -43,7 +43,7 @@ use std::path::PathBuf;
 /// source of truth for sidebar workspace order (was recency). Backfilled from
 /// the prior `last_active DESC` order so the first launch after upgrade looks
 /// unchanged; thereafter order is manual (Ctrl+Alt+↑/↓) and stable.
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 
 pub struct Db {
     conn: Connection,
@@ -193,7 +193,8 @@ impl Db {
               repo_path    TEXT PRIMARY KEY,
               name         TEXT,
               created_at   INTEGER,
-              last_active  INTEGER
+              last_active  INTEGER,
+              env_name     TEXT
             );
             CREATE TABLE IF NOT EXISTS worktrees (
               worktree     TEXT PRIMARY KEY,
@@ -204,9 +205,19 @@ impl Db {
               agent        TEXT,
               created_at   INTEGER,
               location     TEXT,
-              sandbox_backend TEXT
+              sandbox_backend TEXT,
+              env_name     TEXT
             );
             CREATE TABLE IF NOT EXISTS pr_cache (
+              worktree   TEXT PRIMARY KEY,
+              branch     TEXT,
+              json       TEXT,
+              fetched_at INTEGER
+            );
+            -- CI run-history cache per worktree (TTL'd JSON `Vec<ci::CiRun>`),
+            -- so the CI panel/view paint instantly from cache then hydrate live
+            -- off the loop — exactly like `pr_cache` (AV group).
+            CREATE TABLE IF NOT EXISTS ci_runs_cache (
               worktree   TEXT PRIMARY KEY,
               branch     TEXT,
               json       TEXT,
@@ -350,6 +361,16 @@ impl Db {
               json       TEXT    NOT NULL,
               fetched_at INTEGER NOT NULL,
               PRIMARY KEY (repo_root, provider)
+            );
+            -- v18: the unified "My Work" feed — a single global row (id=0) of
+            -- `Vec<WorkRow>` JSON aggregating assigned issues (all providers),
+            -- review-requested / authored PRs (cross-repo `gh search`), and
+            -- high-priority notifications. Not per-repo: it spans every repo the
+            -- user touches, refreshed on a background worker.
+            CREATE TABLE IF NOT EXISTS my_work_cache (
+              id         INTEGER PRIMARY KEY CHECK (id = 0),
+              json       TEXT    NOT NULL,
+              fetched_at INTEGER NOT NULL
             );
             -- v11: notification inbox. Rows accumulate from the diff engine;
             -- the panel inbox marks them read.
@@ -547,6 +568,11 @@ impl Db {
             [],
         );
         let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN folder_id INTEGER", []);
+        // v18: the named execution environment selected per workspace/worktree
+        // (`[env.<name>]`). Additive; absent/NULL = inherit the next layer down
+        // (worktree → workspace → repo `.superzej.*` → global default → default).
+        let _ = conn.execute("ALTER TABLE workspaces ADD COLUMN env_name TEXT", []);
+        let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN env_name TEXT", []);
         // v6: transform any remaining flat v4/v5 `tab_layout` into worktree
         // groups. Keyed on the legacy table's existence (not the version) so
         // it is idempotent and a failed earlier attempt retries next open.
@@ -570,6 +596,29 @@ impl Db {
     pub fn put_pr_cache(&self, worktree: &str, branch: &str, json: &str) -> Result<()> {
         self.conn.execute(
             r#"INSERT INTO pr_cache(worktree,branch,json,fetched_at)
+               VALUES(?1,?2,?3,?4)
+               ON CONFLICT(worktree) DO UPDATE SET branch=?2, json=?3, fetched_at=?4"#,
+            params![worktree, branch, json, util::now()],
+        )?;
+        Ok(())
+    }
+
+    // --- CI run-history cache (TTL'd; feeds the CI panel/view) -------------
+    pub fn get_ci_cache(&self, worktree: &str) -> Result<Option<(String, i64)>> {
+        let r = self
+            .conn
+            .query_row(
+                "SELECT json, fetched_at FROM ci_runs_cache WHERE worktree=?1",
+                params![worktree],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .ok();
+        Ok(r)
+    }
+
+    pub fn put_ci_cache(&self, worktree: &str, branch: &str, json: &str) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO ci_runs_cache(worktree,branch,json,fetched_at)
                VALUES(?1,?2,?3,?4)
                ON CONFLICT(worktree) DO UPDATE SET branch=?2, json=?3, fetched_at=?4"#,
             params![worktree, branch, json, util::now()],
@@ -638,12 +687,51 @@ impl Db {
         Ok(r)
     }
 
+    /// All cached provider payloads for a repo, as `(provider, json)` pairs.
+    /// Lets `build_model` load every configured tracker at once for the unified
+    /// (multi-provider) Issues view.
+    pub fn get_all_issue_cache(&self, repo_root: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT provider, json FROM issue_cache WHERE repo_root=?1")?;
+        let rows = stmt.query_map(params![repo_root], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     pub fn put_issue_cache(&self, repo_root: &str, provider: &str, json: &str) -> Result<()> {
         self.conn.execute(
             r#"INSERT INTO issue_cache(repo_root,provider,json,fetched_at)
                VALUES(?1,?2,?3,?4)
                ON CONFLICT(repo_root,provider) DO UPDATE SET json=?3, fetched_at=?4"#,
             params![repo_root, provider, json, util::now()],
+        )?;
+        Ok(())
+    }
+
+    // --- unified "My Work" feed (single global row) -------------------------
+    /// The cached "My Work" payload (`Vec<WorkRow>` JSON) with its fetch time,
+    /// or `None` when never refreshed.
+    pub fn get_my_work_cache(&self) -> Result<Option<(String, i64)>> {
+        let r = self
+            .conn
+            .query_row(
+                "SELECT json, fetched_at FROM my_work_cache WHERE id=0",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .ok();
+        Ok(r)
+    }
+
+    /// Replace the cached "My Work" payload.
+    pub fn put_my_work_cache(&self, json: &str) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO my_work_cache(id,json,fetched_at)
+               VALUES(0,?1,?2)
+               ON CONFLICT(id) DO UPDATE SET json=?1, fetched_at=?2"#,
+            params![json, util::now()],
         )?;
         Ok(())
     }
@@ -1712,6 +1800,66 @@ impl Db {
         }
     }
 
+    /// Select the named execution environment for a worktree (`[env.<name>]`).
+    /// `""` clears it (inherit the workspace/repo/global layer).
+    pub fn set_worktree_env(&self, wt: &str, env: &str) -> Result<()> {
+        let val = (!env.trim().is_empty()).then(|| env.trim().to_string());
+        self.conn.execute(
+            "UPDATE worktrees SET env_name=?2 WHERE worktree=?1",
+            params![wt, val],
+        )?;
+        Ok(())
+    }
+
+    /// The worktree's selected env name, if any (NULL/empty ⇒ inherit).
+    pub fn worktree_env(&self, wt: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT env_name FROM worktrees WHERE worktree=?1")?;
+        let mut rows = stmt.query(params![wt])?;
+        match rows.next()? {
+            Some(row) => Ok(row
+                .get::<_, Option<String>>(0)?
+                .filter(|s| !s.trim().is_empty())),
+            None => Ok(None),
+        }
+    }
+
+    /// Select the default execution environment for a whole workspace. `""`
+    /// clears it.
+    pub fn set_workspace_env(&self, repo_path: &str, env: &str) -> Result<()> {
+        let val = (!env.trim().is_empty()).then(|| env.trim().to_string());
+        self.conn.execute(
+            "UPDATE workspaces SET env_name=?2 WHERE repo_path=?1",
+            params![repo_path, val],
+        )?;
+        Ok(())
+    }
+
+    /// The workspace's default env name, if any (NULL/empty ⇒ inherit).
+    pub fn workspace_env(&self, repo_path: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT env_name FROM workspaces WHERE repo_path=?1")?;
+        let mut rows = stmt.query(params![repo_path])?;
+        match rows.next()? {
+            Some(row) => Ok(row
+                .get::<_, Option<String>>(0)?
+                .filter(|s| !s.trim().is_empty())),
+            None => Ok(None),
+        }
+    }
+
+    /// The effective selected env for a worktree: its own `env_name`, else its
+    /// workspace's `env_name`. (`None` ⇒ fall through to repo `.superzej.*` /
+    /// global default in [`crate::config::Config::resolve_env`].)
+    pub fn effective_env(&self, wt: &str, repo_path: &str) -> Option<String> {
+        self.worktree_env(wt)
+            .ok()
+            .flatten()
+            .or_else(|| self.workspace_env(repo_path).ok().flatten())
+    }
+
     // --- container_events (sandbox audit trail) ------------------------------
 
     /// Record a sandbox event (exec, network, dns, orphan_gc) in the audit log.
@@ -1786,7 +1934,7 @@ impl Db {
         // unloaded-workspace rows and the resurrect adopt loop — is stable;
         // created_at/path are deterministic tie-breakers for any unset row.
         let mut stmt = self.conn.prepare(
-            "SELECT worktree, branch, agent, created_at, repo_path, tab_name, session_name, location, position, sandbox_backend, folder_id
+            "SELECT worktree, branch, agent, created_at, repo_path, tab_name, session_name, location, position, sandbox_backend, folder_id, env_name
              FROM worktrees ORDER BY position, created_at, worktree",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -1802,6 +1950,9 @@ impl Db {
                 position: r.get::<_, Option<i64>>(8)?.unwrap_or(0),
                 sandbox_backend: r.get(9)?,
                 folder_id: r.get(10)?,
+                env_name: r
+                    .get::<_, Option<String>>(11)?
+                    .filter(|s| !s.trim().is_empty()),
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -2336,6 +2487,39 @@ mod tests {
 
     fn db() -> Db {
         Db::open_memory().unwrap()
+    }
+
+    #[test]
+    fn get_all_issue_cache_returns_every_provider_for_a_repo() {
+        let db = db();
+        assert!(db.get_all_issue_cache("/repo").unwrap().is_empty());
+        db.put_issue_cache("/repo", "linear", "[1]").unwrap();
+        db.put_issue_cache("/repo", "jira", "[2]").unwrap();
+        db.put_issue_cache("/other", "github", "[3]").unwrap();
+        let mut got = db.get_all_issue_cache("/repo").unwrap();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("jira".to_string(), "[2]".to_string()),
+                ("linear".to_string(), "[1]".to_string()),
+            ]
+        );
+        // A different repo's providers are not mixed in.
+        assert_eq!(db.get_all_issue_cache("/other").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn my_work_cache_roundtrips_single_row() {
+        let db = db();
+        assert!(db.get_my_work_cache().unwrap().is_none());
+        db.put_my_work_cache(r#"[{"n":1}]"#).unwrap();
+        let (json, fetched) = db.get_my_work_cache().unwrap().unwrap();
+        assert_eq!(json, r#"[{"n":1}]"#);
+        assert!(fetched > 0);
+        // A second put replaces (not appends) — the table holds one global row.
+        db.put_my_work_cache(r#"[{"n":2}]"#).unwrap();
+        assert_eq!(db.get_my_work_cache().unwrap().unwrap().0, r#"[{"n":2}]"#);
     }
 
     #[test]
@@ -2933,6 +3117,18 @@ mod tests {
         assert_eq!(
             db.get_test_cache("/wt").unwrap().unwrap().0,
             "{\"summary\":\"fail\"}"
+        );
+
+        // ci cache: miss → insert → upsert.
+        assert!(db.get_ci_cache("/wt").unwrap().is_none());
+        db.put_ci_cache("/wt", "br", "[{\"id\":\"1\"}]").unwrap();
+        let (cj, cat) = db.get_ci_cache("/wt").unwrap().unwrap();
+        assert_eq!(cj, "[{\"id\":\"1\"}]");
+        assert!(cat > 0);
+        db.put_ci_cache("/wt", "br", "[{\"id\":\"2\"}]").unwrap(); // upsert
+        assert_eq!(
+            db.get_ci_cache("/wt").unwrap().unwrap().0,
+            "[{\"id\":\"2\"}]"
         );
 
         // loc cache: miss → insert → upsert.
@@ -3741,6 +3937,49 @@ mod tests {
             )
             .unwrap();
         assert_eq!(fid, Some(folder), "upsert with None preserves folder_id");
+    }
+
+    #[test]
+    fn env_name_set_get_and_effective_precedence() {
+        let db = db();
+        db.put_workspace("/x/app", "app", "repo").unwrap();
+        db.put_worktree("app/feat", "/x/app", "/wt/feat", "sz/feat", None, None)
+            .unwrap();
+
+        // Unset → None at every level.
+        assert_eq!(db.worktree_env("/wt/feat").unwrap(), None);
+        assert_eq!(db.workspace_env("/x/app").unwrap(), None);
+        assert_eq!(db.effective_env("/wt/feat", "/x/app"), None);
+
+        // Workspace-level selection is the fallback.
+        db.set_workspace_env("/x/app", "company-k8s").unwrap();
+        assert_eq!(
+            db.workspace_env("/x/app").unwrap().as_deref(),
+            Some("company-k8s")
+        );
+        assert_eq!(
+            db.effective_env("/wt/feat", "/x/app").as_deref(),
+            Some("company-k8s")
+        );
+
+        // A worktree-level selection wins over the workspace default.
+        db.set_worktree_env("/wt/feat", "datonya").unwrap();
+        assert_eq!(
+            db.effective_env("/wt/feat", "/x/app").as_deref(),
+            Some("datonya")
+        );
+
+        // Clearing the worktree falls back to the workspace; whitespace clears.
+        db.set_worktree_env("/wt/feat", "   ").unwrap();
+        assert_eq!(db.worktree_env("/wt/feat").unwrap(), None);
+        assert_eq!(
+            db.effective_env("/wt/feat", "/x/app").as_deref(),
+            Some("company-k8s")
+        );
+
+        // Clearing the workspace too → fully unset.
+        db.set_workspace_env("/x/app", "").unwrap();
+        assert_eq!(db.effective_env("/wt/feat", "/x/app"), None);
     }
 
     #[test]
