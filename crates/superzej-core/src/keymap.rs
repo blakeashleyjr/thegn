@@ -88,11 +88,15 @@ pub enum Scope {
     Tab,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Context {
-    Always,
-    WorktreeOnly,
-    NonWorktree,
+    Global,
+    Center,
+    Left,
+    Right,
+    Top,
+    Bottom,
+    TopAndBottom,
 }
 
 /// A registry entry (static builtin form).
@@ -103,7 +107,8 @@ pub struct Action {
     pub hint: &'static str,
     pub invocation: Invocation,
     pub scope: Scope,
-    pub context: Context,
+    pub contexts: &'static [Context],
+    pub priority: u32,
     /// Appears in the Cmd+K palette.
     pub menu: bool,
 }
@@ -117,7 +122,8 @@ pub struct Resolved {
     pub hint: String,
     pub invocation: Invocation,
     pub scope: Scope,
-    pub context: Context,
+    pub contexts: Vec<Context>,
+    pub priority: u32,
     pub menu: bool,
     pub custom: bool,
 }
@@ -290,7 +296,8 @@ pub const BUILTINS: &[Action] = &[
         hint: "worktree",
         invocation: run_float!("new-worktree"),
         scope: Scope::Shared,
-        context: Context::Always,
+        contexts: &[Context::Global],
+        priority: 100,
         menu: true,
     },
     Action {
@@ -300,7 +307,8 @@ pub const BUILTINS: &[Action] = &[
         hint: "close",
         invocation: run_float!("close-worktree"),
         scope: Scope::Shared,
-        context: Context::WorktreeOnly,
+        contexts: &[Context::Global],
+        priority: 100,
         menu: true,
     },
     Action {
@@ -313,7 +321,8 @@ pub const BUILTINS: &[Action] = &[
             name: "superzej_new_tab",
         },
         scope: Scope::Shared,
-        context: Context::Always,
+        contexts: &[Context::Global],
+        priority: 100,
         menu: true,
     },
     Action {
@@ -323,7 +332,8 @@ pub const BUILTINS: &[Action] = &[
         hint: "new repo",
         invocation: run_float!("new-workspace"),
         scope: Scope::Shared,
-        context: Context::NonWorktree,
+        contexts: &[Context::Global],
+        priority: 100,
         menu: true,
     },
     Action {
@@ -340,7 +350,8 @@ pub const BUILTINS: &[Action] = &[
             name: "superzej_toggle_palette",
         },
         scope: Scope::Shared,
-        context: Context::Always,
+        contexts: &[Context::Global],
+        priority: 1000, // Very important
         menu: false,
     },
     Action {
@@ -353,19 +364,21 @@ pub const BUILTINS: &[Action] = &[
         // `superzej_close_files` pipe when already open).
         invocation: run_float!("files"),
         scope: Scope::Shared,
-        context: Context::Always,
+        contexts: &[Context::Global],
+        priority: 100,
         menu: true,
     },
     Action {
         id: "new-panel-native",
         chords: &["Alt n"],
         menu_label: "New panel — split pane",
-        hint: "split",
+        hint: "split↓",
         invocation: Invocation::Native {
             body: "NewPane \"Down\";",
         },
         scope: Scope::Shared,
-        context: Context::Always,
+        contexts: &[Context::Center],
+        priority: 500,
         menu: true,
     },
     Action {
@@ -380,7 +393,8 @@ pub const BUILTINS: &[Action] = &[
             direction: Some("Right"),
         },
         scope: Scope::Shared,
-        context: Context::Always,
+        contexts: &[Context::Center],
+        priority: 500,
         menu: false,
     },
     Action {
@@ -390,7 +404,8 @@ pub const BUILTINS: &[Action] = &[
         hint: "switch repo",
         invocation: run_float!("launch"),
         scope: Scope::Shared,
-        context: Context::NonWorktree,
+        contexts: &[Context::Global],
+        priority: 10,
         menu: true,
     },
     Action {
@@ -400,7 +415,8 @@ pub const BUILTINS: &[Action] = &[
         hint: "dashboard",
         invocation: run!("dashboard"),
         scope: Scope::Shared,
-        context: Context::NonWorktree,
+        contexts: &[Context::Global],
+        priority: 10,
         menu: true,
     },
     Action {
@@ -413,7 +429,8 @@ pub const BUILTINS: &[Action] = &[
             name: "superzej_toggle_sidebar",
         },
         scope: Scope::Shared,
-        context: Context::Always,
+        contexts: &[Context::Global],
+        priority: 50,
         menu: true,
     },
     Action {
@@ -426,7 +443,8 @@ pub const BUILTINS: &[Action] = &[
             name: "superzej_toggle_panel",
         },
         scope: Scope::Shared,
-        context: Context::Always,
+        contexts: &[Context::Global],
+        priority: 50,
         menu: true,
     },
     Action {
@@ -436,7 +454,8 @@ pub const BUILTINS: &[Action] = &[
         hint: "lazygit",
         invocation: run_float!("tool", "lazygit"),
         scope: Scope::Shared,
-        context: Context::WorktreeOnly,
+        contexts: &[Context::Global],
+        priority: 10,
         menu: true,
     },
     Action {
@@ -446,7 +465,8 @@ pub const BUILTINS: &[Action] = &[
         hint: "files",
         invocation: run_float!("tool", "yazi"),
         scope: Scope::Shared,
-        context: Context::WorktreeOnly,
+        contexts: &[Context::Global],
+        priority: 10,
         menu: true,
     },
     Action {
@@ -456,7 +476,8 @@ pub const BUILTINS: &[Action] = &[
         hint: "edit",
         invocation: run_float!("tool", "editor"),
         scope: Scope::Shared,
-        context: Context::WorktreeOnly,
+        contexts: &[Context::Global],
+        priority: 10,
         menu: true,
     },
     Action {
@@ -466,7 +487,8 @@ pub const BUILTINS: &[Action] = &[
         hint: "diff",
         invocation: run_float!("tool", "diff"),
         scope: Scope::Shared,
-        context: Context::WorktreeOnly,
+        contexts: &[Context::Global],
+        priority: 10,
         menu: true,
     },
     Action {
@@ -478,7 +500,8 @@ pub const BUILTINS: &[Action] = &[
             body: "GoToPreviousTab;",
         },
         scope: Scope::Shared,
-        context: Context::Always,
+        contexts: &[Context::Global],
+        priority: 400,
         menu: false,
     },
     Action {
@@ -490,7 +513,8 @@ pub const BUILTINS: &[Action] = &[
             body: "GoToNextTab;",
         },
         scope: Scope::Shared,
-        context: Context::Always,
+        contexts: &[Context::Global],
+        priority: 400,
         menu: false,
     },
     Action {
@@ -502,7 +526,8 @@ pub const BUILTINS: &[Action] = &[
             body: "GoToPreviousTab;",
         },
         scope: Scope::Shared,
-        context: Context::Always,
+        contexts: &[Context::Global],
+        priority: 400,
         menu: false,
     },
     Action {
@@ -514,7 +539,8 @@ pub const BUILTINS: &[Action] = &[
             body: "GoToNextTab;",
         },
         scope: Scope::Shared,
-        context: Context::Always,
+        contexts: &[Context::Global],
+        priority: 400,
         menu: false,
     },
     Action {
@@ -524,7 +550,8 @@ pub const BUILTINS: &[Action] = &[
         hint: "tabs",
         invocation: Invocation::Native { body: "CloseTab;" },
         scope: Scope::Shared,
-        context: Context::Always,
+        contexts: &[Context::Global],
+        priority: 400,
         menu: false,
     },
     Action {
@@ -534,55 +561,60 @@ pub const BUILTINS: &[Action] = &[
         hint: "lock",
         invocation: Invocation::Native { body: ";" },
         scope: Scope::Shared,
-        context: Context::Always,
+        contexts: &[Context::Global],
+        priority: 1000,
         menu: false,
     },
     Action {
         id: "focus-left",
         chords: &["Ctrl Left", "Ctrl h"],
         menu_label: "Focus left (pane → sidebar)",
-        hint: "focus",
+        hint: "←↓↑→",
         invocation: Invocation::Native {
             body: "MoveFocus \"Left\";",
         },
         scope: Scope::Shared,
-        context: Context::Always,
+        contexts: &[Context::Global],
+        priority: 600,
         menu: false,
     },
     Action {
         id: "focus-down",
         chords: &["Ctrl Down", "Ctrl j"],
         menu_label: "Focus down (pane / row / widget)",
-        hint: "focus",
+        hint: "←↓↑→",
         invocation: Invocation::Native {
             body: "MoveFocus \"Down\";",
         },
         scope: Scope::Shared,
-        context: Context::Always,
+        contexts: &[Context::Global],
+        priority: 600,
         menu: false,
     },
     Action {
         id: "focus-up",
         chords: &["Ctrl Up", "Ctrl k"],
         menu_label: "Focus up (pane / row / widget)",
-        hint: "focus",
+        hint: "←↓↑→",
         invocation: Invocation::Native {
             body: "MoveFocus \"Up\";",
         },
         scope: Scope::Shared,
-        context: Context::Always,
+        contexts: &[Context::Global],
+        priority: 600,
         menu: false,
     },
     Action {
         id: "focus-right",
         chords: &["Ctrl Right", "Ctrl l"],
         menu_label: "Focus right (pane → panel)",
-        hint: "focus",
+        hint: "←↓↑→",
         invocation: Invocation::Native {
             body: "MoveFocus \"Right\";",
         },
         scope: Scope::Shared,
-        context: Context::Always,
+        contexts: &[Context::Global],
+        priority: 600,
         menu: false,
     },
     Action {
@@ -596,7 +628,8 @@ pub const BUILTINS: &[Action] = &[
             name: "superzej_select_bottombar",
         },
         scope: Scope::Shared,
-        context: Context::Always,
+        contexts: &[Context::Global],
+        priority: 700,
         menu: false,
     },
     Action {
@@ -610,7 +643,8 @@ pub const BUILTINS: &[Action] = &[
             name: "superzej_select_topbar",
         },
         scope: Scope::Shared,
-        context: Context::Always,
+        contexts: &[Context::Global],
+        priority: 700,
         menu: false,
     },
     // Menu-only actions (no default chord).
@@ -625,7 +659,8 @@ pub const BUILTINS: &[Action] = &[
             payload: "",
         },
         scope: Scope::Shared,
-        context: Context::Always,
+        contexts: &[Context::Center, Context::Right],
+        priority: 500,
         menu: true,
     },
     Action {
@@ -639,7 +674,8 @@ pub const BUILTINS: &[Action] = &[
             payload: "",
         },
         scope: Scope::Shared,
-        context: Context::Always,
+        contexts: &[Context::Center, Context::Left],
+        priority: 500,
         menu: true,
     },
     Action {
@@ -649,7 +685,8 @@ pub const BUILTINS: &[Action] = &[
         hint: "pr",
         invocation: run!("pr", "open"),
         scope: Scope::Shared,
-        context: Context::WorktreeOnly,
+        contexts: &[Context::Global],
+        priority: 5,
         menu: true,
     },
     Action {
@@ -659,7 +696,8 @@ pub const BUILTINS: &[Action] = &[
         hint: "pr",
         invocation: run!("pr", "create", "--web"),
         scope: Scope::Shared,
-        context: Context::WorktreeOnly,
+        contexts: &[Context::Global],
+        priority: 5,
         menu: true,
     },
     // ── Pinned programs — Alt-1..9 launch-or-focus (config `[[pins]]`) ─────────
@@ -694,7 +732,8 @@ const fn pin_action(
             name: pipe,
         },
         scope: Scope::Shared,
-        context: Context::Always,
+        contexts: &[Context::Global],
+        priority: 50,
         menu: false,
     }
 }
@@ -733,7 +772,8 @@ pub fn effective(cfg: &Config) -> Vec<Resolved> {
             hint: a.hint.to_string(),
             invocation: a.invocation.clone(),
             scope: a.scope,
-            context: a.context,
+            contexts: a.contexts.to_vec(),
+            priority: a.priority,
             menu: a.menu,
             custom: false,
         })
@@ -792,7 +832,8 @@ pub fn effective(cfg: &Config) -> Vec<Resolved> {
             hint: a.hint.clone().unwrap_or_else(|| a.name.clone()),
             invocation,
             scope: Scope::Shared,
-            context: Context::Always,
+            contexts: vec![Context::Global],
+            priority: 50,
             menu: a.menu,
             custom: true,
         });
@@ -1416,7 +1457,8 @@ mod tests {
                 payload: "the-payload",
             },
             scope: Scope::Shared,
-            context: Context::Always,
+            contexts: vec![Context::Global],
+            priority: 100,
             menu: false,
             custom: false,
         }];
@@ -1442,7 +1484,8 @@ mod tests {
                     direction: None,
                 },
                 scope: Scope::Tab,
-                context: Context::Always,
+                contexts: vec![Context::Global],
+                priority: 100,
                 menu: false,
                 custom: false,
             },
@@ -1453,7 +1496,8 @@ mod tests {
                 hint: "n".into(),
                 invocation: Invocation::Native { body: "Quit;" },
                 scope: Scope::Shared,
-                context: Context::Always,
+                contexts: vec![Context::Global],
+                priority: 100,
                 menu: false,
                 custom: false,
             },
@@ -1479,7 +1523,8 @@ mod tests {
             hint: "only".into(),
             invocation: Invocation::Native { body: "Quit;" },
             scope: Scope::Shared,
-            context: Context::Always,
+            contexts: vec![Context::Global],
+            priority: 100,
             menu: false,
             custom: false,
         }];
