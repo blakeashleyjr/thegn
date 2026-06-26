@@ -37,8 +37,16 @@ layers; AI is strictly additive.
   `TerminalWaker`**; the loop drains channels on wake and re-renders only when
   dirty. Never put blocking I/O (git, DB, subprocess) on the loop; never add a
   polling timeout.
-- **Rendering** is damage-tracked: compose into a scratch `Surface`, then
-  `BufferedTerminal::draw_from_screen` + `flush()` emits only changed cells.
+- **Rendering** is a damage-region compositor (`src/render_plan.rs` + the
+  `run.rs` render block). The loop tracks three damage channels — `full`
+  (geometry), `chrome` (the master `dirty`: sidebar/panel/bars/overlays/model),
+  and `dirty_panes` (per-pane PTY content) — and the **pure, unit-tested**
+  `render_plan::plan()` maps them to the cheapest correct frame: `Skip` (idle),
+  `Panes` (recompose + **bounded-diff** only the changed panes via
+  `Surface::diff_region`), or `Full` (`render_tab` + whole-screen `diff_screens`).
+  So a streaming-output frame costs ~one `compose_pane` + a one-rect diff, not a
+  full chrome recompose. `render_tab` = `render_panes` (center) + `draw_chrome`,
+  composed separately so each can repaint without the other.
 - **State.** SQLite at `$XDG_STATE_HOME/superzej/superzej.db` (WAL, schema
   versioned via `user_version`): repos, workspaces, worktrees, PR cache,
   tab layouts, session + sidebar UI state. **git is the source of truth** for
@@ -51,6 +59,19 @@ layers; AI is strictly additive.
 ## Performance invariants
 
 "Everything is instant": sub-300ms launch → first frame, <16ms render, 0% idle.
+
+- **The render-decision invariants are ENFORCED in `just ci`** (not just measured).
+  Wall-clock benchmarks are machine-dependent and excluded from CI; instead the
+  render decision is a pure function (`render_plan::plan`) with exhaustive unit
+  tests (`cargo test`, which `ci` runs) that lock the work-shape: an idle wake
+  ⇒ `Skip` (the 0%-idle contract), pane output and nothing else ⇒ `Panes` (never
+  recompose chrome), any chrome/overlay/geometry change ⇒ `Full`. A change that
+  reintroduces a full recompose on pane output fails these tests. **When you
+  touch the render path, keep these invariants and their tests green** — they are
+  the regression gate, not the (advisory) wall-clock benches. The runtime
+  `szhost::perf` rollup also emits a **slow-frame warning** (`render_p50_us` over
+  `SUPERZEJ_FRAME_BUDGET_US`, default 16ms) and `render_busy_ratio`, which catch
+  cost-per-frame regressions the idle-ratio/wake-count storm warning cannot see.
 
 - `SUPERZEJ_LOG=info` writes a **startup waterfall** to
   `$XDG_STATE_HOME/superzej/logs/szhost.log` (`szhost::startup` events with

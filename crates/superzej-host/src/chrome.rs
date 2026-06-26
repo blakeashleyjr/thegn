@@ -443,6 +443,31 @@ impl FrameModel {
             &self.accent
         }
     }
+
+    /// True when a freshly hydrated model carries no render-affecting change
+    /// versus the one on screen — i.e. the 2 s "safety" refresh tick produced
+    /// byte-identical git/db data. The event loop uses this to drain the
+    /// hydration result without repainting, keeping idle CPU at ~0%.
+    ///
+    /// Compares exactly the fields [`crate::hydrate::build_model`] populates
+    /// (plus `status`), and nothing else: stats/metrics/containers/accent/
+    /// bars/pins/app-tabs are owned by other handlers or config and have their
+    /// own dirty triggers, while the session-derived tab/sidebar fields are
+    /// stable during an idle period. KEEP THIS IN SYNC WITH `build_model`.
+    pub fn hydration_eq(&self, other: &Self) -> bool {
+        self.worktree == other.worktree
+            && self.tabs == other.tabs
+            && self.active_tab == other.active_tab
+            && self.sidebar_workspaces == other.sidebar_workspaces
+            && self.sidebar_db_worktrees == other.sidebar_db_worktrees
+            && self.sidebar_status == other.sidebar_status
+            && self.loc == other.loc
+            && self.active_container_name == other.active_container_name
+            && self.active_sandbox_backend == other.active_sandbox_backend
+            && self.container_events == other.container_events
+            && self.status == other.status
+            && self.panel == other.panel
+    }
 }
 
 /// The worktree label parts for the nav row: `(workspace, leaf)`. The
@@ -2084,14 +2109,18 @@ fn draw_relaunch_overlay(surface: &mut Surface, content: Rect, cmd: &str) {
     );
 }
 
+/// Compose the center band: every visible pane's terminal content + the card
+/// border ring (or the loading splash when no pane is live yet). This is the
+/// pane half of a frame; [`draw_chrome`] is the chrome half. They write
+/// disjoint cells (chrome owns the sidebar/panel/bars; this owns the center
+/// interior), so the damage-tracked loop can recompose one without the other.
 #[allow(clippy::too_many_arguments)]
-pub fn render_tab<'a>(
+pub fn render_panes<'a>(
     surface: &mut Surface,
     chrome: &crate::layout::ChromeLayout,
     center: &crate::center::CenterTree,
     focused: crate::center::PaneId,
     model: &FrameModel,
-    panel_ui: &crate::panel::PanelUi,
     lookup: impl Fn(crate::center::PaneId) -> Option<&'a dyn PaneEmulator>,
     title_of: &dyn Fn(crate::center::PaneId) -> String,
     relaunch_of: &dyn Fn(crate::center::PaneId) -> Option<String>,
@@ -2145,6 +2174,33 @@ pub fn render_tab<'a>(
     } else {
         crate::logotype::draw_splash(surface, chrome.center, model);
     }
+}
+
+/// Compose a full frame: the center panes ([`render_panes`]) plus the chrome
+/// ([`draw_chrome`]). The damage-tracked loop calls the two halves separately
+/// for incremental recompose; this wrapper is the full-repaint path + tests.
+#[allow(clippy::too_many_arguments)]
+pub fn render_tab<'a>(
+    surface: &mut Surface,
+    chrome: &crate::layout::ChromeLayout,
+    center: &crate::center::CenterTree,
+    focused: crate::center::PaneId,
+    model: &FrameModel,
+    panel_ui: &crate::panel::PanelUi,
+    lookup: impl Fn(crate::center::PaneId) -> Option<&'a dyn PaneEmulator>,
+    title_of: &dyn Fn(crate::center::PaneId) -> String,
+    relaunch_of: &dyn Fn(crate::center::PaneId) -> Option<String>,
+) {
+    render_panes(
+        surface,
+        chrome,
+        center,
+        focused,
+        model,
+        lookup,
+        title_of,
+        relaunch_of,
+    );
     draw_chrome(surface, chrome, model, panel_ui);
 }
 
@@ -2159,6 +2215,53 @@ mod tests {
             .lines()
             .map(|l| l.to_string())
             .collect()
+    }
+
+    #[test]
+    fn hydration_eq_ignores_non_hydration_fields() {
+        let base = FrameModel::default();
+        // Fields owned by other handlers / config must NOT count as a change,
+        // or the idle guard would still repaint on every safety tick.
+        let mut other = base.clone();
+        other.accent = "ff0000".into();
+        other.pins.push(crate::pins::PinChip {
+            index: 0,
+            label: "p".into(),
+            glyph: '●',
+        });
+        other.stats.cpu_pct = Some(99);
+        other.app_tabs.push("chat".into());
+        other.sidebar_selected = 3;
+        other.center_focused = !base.center_focused;
+        assert!(
+            base.hydration_eq(&other),
+            "non-hydration fields should not trip the idle guard"
+        );
+    }
+
+    #[test]
+    fn hydration_eq_detects_real_changes() {
+        let base = FrameModel::default();
+        let mut panel_changed = base.clone();
+        panel_changed.panel.branch = "feature".into();
+        assert!(
+            !base.hydration_eq(&panel_changed),
+            "panel change must repaint"
+        );
+
+        let mut sidebar_changed = base.clone();
+        sidebar_changed
+            .sidebar_status
+            .activity
+            .insert("tab".into(), crate::sidebar::ActivityState::Active);
+        assert!(
+            !base.hydration_eq(&sidebar_changed),
+            "sidebar status change must repaint"
+        );
+
+        let mut loc_changed = base.clone();
+        loc_changed.loc = Some(42);
+        assert!(!base.hydration_eq(&loc_changed), "loc change must repaint");
     }
 
     /// The delete-worktree confirmation modal (and any `draw_confirm` caller)
