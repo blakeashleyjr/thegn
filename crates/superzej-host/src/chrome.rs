@@ -1179,6 +1179,29 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             ));
         }
     }
+    // Now-playing badge (optional [media] feature): a compact ▶/❚❚ chip with the
+    // current track, green while playing and blue while paused. `badge()` returns
+    // `None` when nothing is loaded, so the chip is silent when idle.
+    if let Some(m) = &model.panel.media
+        && let Some(text) = m.badge()
+    {
+        use superzej_core::media::PlaybackState;
+        let hue = match m.state {
+            PlaybackState::Playing => superzej_core::theme::Hue::Green,
+            _ => superzej_core::theme::Hue::Blue,
+        };
+        let clipped: String = {
+            let max = 30;
+            if text.chars().count() > max {
+                let s: String = text.chars().take(max.saturating_sub(1)).collect();
+                format!("{}\u{2026}", s.trim_end())
+            } else {
+                text
+            }
+        };
+        r.push(seg(Tok::Slot(S::Text), " "));
+        r.push(Seg::chip(Tok::Hue(hue), format!(" {clipped} ")));
+    }
     if let Some(ref metrics) = model.ai_metrics {
         r.push(seg(Tok::Slot(S::Text), " "));
         r.push(Seg::chip(
@@ -1958,6 +1981,13 @@ pub(crate) fn panel_help_pairs(ui: &crate::panel::PanelUi) -> Vec<(String, Strin
             ("h", "hover"),
             ("o", "outline"),
             ("j/k", "select"),
+        ],
+        Section::Media => &[
+            ("space", "play/pause"),
+            ("n/p", "next/prev"),
+            ("s", "shuffle"),
+            ("L", "loop"),
+            ("≡", "playlist"),
         ],
         Section::Debug | Section::Sandbox | Section::Db | Section::Telemetry | Section::Keys => {
             &[("j/k", "row")]

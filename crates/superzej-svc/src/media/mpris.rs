@@ -1,0 +1,436 @@
+//! Native MPRIS backend over D-Bus (`zbus`). Implements [`MediaBackend`] against
+//! the `org.mpris.MediaPlayer2{,.Player,.Playlists}` interfaces every compliant
+//! player exposes, plus a push [`MprisWatch`] built from D-Bus signals so the
+//! host updates on change without polling.
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+use futures::StreamExt;
+use zbus::message::Type as MsgType;
+use zbus::names::InterfaceName;
+use zbus::zvariant::{Array, OwnedObjectPath, OwnedValue, Value};
+use zbus::{Connection, MatchRule, MessageStream};
+
+use super::{MediaBackend, MediaCaps, MediaError};
+use superzej_core::media::{LoopMode, MediaState, PlaybackState, Playlist};
+
+const MPRIS_PREFIX: &str = "org.mpris.MediaPlayer2.";
+const MPRIS_PATH: &str = "/org/mpris/MediaPlayer2";
+const PLAYER_IFACE: &str = "org.mpris.MediaPlayer2.Player";
+const PLAYLISTS_IFACE: &str = "org.mpris.MediaPlayer2.Playlists";
+
+/// A connected MPRIS controller. Holds one session-bus connection; the active
+/// player is re-resolved per call so launching/quitting a player is picked up.
+pub struct MprisZbus {
+    conn: Connection,
+    /// Preferred player tails (e.g. `"spotify"`); first match wins.
+    priority: Vec<String>,
+}
+
+impl MprisZbus {
+    /// Open the D-Bus **session** bus. `Err` ⇒ the caller falls back to
+    /// `playerctl` (or shows nothing).
+    pub async fn connect(priority: Vec<String>) -> Result<Self, MediaError> {
+        let conn = Connection::session()
+            .await
+            .map_err(|e| MediaError::Unavailable(format!("session bus: {e}")))?;
+        Ok(Self { conn, priority })
+    }
+
+    /// All `org.mpris.MediaPlayer2.*` bus names currently on the bus.
+    async fn player_bus_names(&self) -> Result<Vec<String>, MediaError> {
+        let dbus = zbus::fdo::DBusProxy::new(&self.conn)
+            .await
+            .map_err(|e| MediaError::Unavailable(e.to_string()))?;
+        let names = dbus
+            .list_names()
+            .await
+            .map_err(|e| MediaError::Backend(e.to_string()))?;
+        Ok(names
+            .into_iter()
+            .map(|n| n.as_str().to_string())
+            .filter(|n| n.starts_with(MPRIS_PREFIX))
+            .collect())
+    }
+
+    /// The controllable players' short tails (for the picker UI).
+    pub async fn list_players(&self) -> Result<Vec<String>, MediaError> {
+        Ok(self
+            .player_bus_names()
+            .await?
+            .iter()
+            .map(|n| tail(n).to_string())
+            .collect())
+    }
+
+    /// A `Properties` proxy for one player.
+    async fn props_proxy(&self, bus: &str) -> Result<zbus::fdo::PropertiesProxy<'_>, MediaError> {
+        zbus::fdo::PropertiesProxy::builder(&self.conn)
+            .destination(bus.to_string())
+            .map_err(|e| MediaError::Backend(e.to_string()))?
+            .path(MPRIS_PATH)
+            .map_err(|e| MediaError::Backend(e.to_string()))?
+            .build()
+            .await
+            .map_err(|e| MediaError::Backend(e.to_string()))
+    }
+
+    /// All `Player` properties for one player, in one round-trip.
+    async fn player_props(&self, bus: &str) -> Result<HashMap<String, OwnedValue>, MediaError> {
+        let proxy = self.props_proxy(bus).await?;
+        let iface = InterfaceName::try_from(PLAYER_IFACE)
+            .map_err(|e| MediaError::Backend(e.to_string()))?;
+        proxy
+            .get_all(iface)
+            .await
+            .map_err(|e| MediaError::Backend(e.to_string()))
+    }
+
+    /// Resolve which player to control: a `priority` match first, else the first
+    /// that is actively playing, else the first present.
+    async fn active_player(&self) -> Result<Option<String>, MediaError> {
+        let names = self.player_bus_names().await?;
+        if names.is_empty() {
+            return Ok(None);
+        }
+        for p in &self.priority {
+            if let Some(n) = names
+                .iter()
+                .find(|n| tail(n) == p || n.contains(p.as_str()))
+            {
+                return Ok(Some(n.clone()));
+            }
+        }
+        // Prefer a player that is actually playing.
+        for n in &names {
+            if let Ok(props) = self.player_props(n).await
+                && matches!(playback_state(&props), PlaybackState::Playing)
+            {
+                return Ok(Some(n.clone()));
+            }
+        }
+        Ok(names.into_iter().next())
+    }
+
+    /// Invoke a no-argument `Player` method (PlayPause / Next / Previous).
+    async fn player_call(&self, bus: &str, member: &str) -> Result<(), MediaError> {
+        self.conn
+            .call_method(Some(bus), MPRIS_PATH, Some(PLAYER_IFACE), member, &())
+            .await
+            .map(|_| ())
+            .map_err(|e| MediaError::Backend(e.to_string()))
+    }
+
+    /// Set a `Player` property.
+    async fn player_set(&self, bus: &str, prop: &str, value: Value<'_>) -> Result<(), MediaError> {
+        let proxy = self.props_proxy(bus).await?;
+        let iface = InterfaceName::try_from(PLAYER_IFACE)
+            .map_err(|e| MediaError::Backend(e.to_string()))?;
+        proxy
+            .set(iface, prop, value)
+            .await
+            .map_err(|e| MediaError::Backend(e.to_string()))
+    }
+
+    /// Build a push watcher over MPRIS-relevant D-Bus signals.
+    pub async fn watch(&self) -> Result<MprisWatch, MediaError> {
+        let props_rule = MatchRule::builder()
+            .msg_type(MsgType::Signal)
+            .interface("org.freedesktop.DBus.Properties")
+            .and_then(|b| b.member("PropertiesChanged"))
+            .map_err(|e| MediaError::Backend(e.to_string()))?
+            .build();
+        let names_rule = MatchRule::builder()
+            .msg_type(MsgType::Signal)
+            .interface("org.freedesktop.DBus")
+            .and_then(|b| b.member("NameOwnerChanged"))
+            .and_then(|b| b.arg0ns("org.mpris.MediaPlayer2"))
+            .map_err(|e| MediaError::Backend(e.to_string()))?
+            .build();
+        let props = MessageStream::for_match_rule(props_rule, &self.conn, Some(64))
+            .await
+            .map_err(|e| MediaError::Backend(e.to_string()))?;
+        let names = MessageStream::for_match_rule(names_rule, &self.conn, Some(16))
+            .await
+            .map_err(|e| MediaError::Backend(e.to_string()))?;
+        Ok(MprisWatch { props, names })
+    }
+}
+
+impl MediaBackend for MprisZbus {
+    async fn snapshot(&self) -> Result<Option<MediaState>, MediaError> {
+        let Some(bus) = self.active_player().await? else {
+            return Ok(None);
+        };
+        let props = self.player_props(&bus).await?;
+        Ok(Some(parse_state(tail(&bus), &props)))
+    }
+
+    async fn play_pause(&self) -> Result<(), MediaError> {
+        let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+        self.player_call(&bus, "PlayPause").await
+    }
+    async fn next(&self) -> Result<(), MediaError> {
+        let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+        self.player_call(&bus, "Next").await
+    }
+    async fn previous(&self) -> Result<(), MediaError> {
+        let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+        self.player_call(&bus, "Previous").await
+    }
+    async fn set_shuffle(&self, on: bool) -> Result<(), MediaError> {
+        let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+        self.player_set(&bus, "Shuffle", Value::Bool(on)).await
+    }
+    async fn set_loop(&self, mode: LoopMode) -> Result<(), MediaError> {
+        let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+        self.player_set(&bus, "LoopStatus", Value::from(mode.as_mpris()))
+            .await
+    }
+    async fn volume_step(&self, delta: f64) -> Result<(), MediaError> {
+        let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+        let props = self.player_props(&bus).await?;
+        let cur = f64_of(&props, "Volume").unwrap_or(0.5);
+        let next = (cur + delta).clamp(0.0, 1.0);
+        self.player_set(&bus, "Volume", Value::F64(next)).await
+    }
+
+    async fn playlists(&self) -> Result<Vec<Playlist>, MediaError> {
+        let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+        // GetPlaylists(index, max, order, reverse) -> a(oss)
+        let reply = self
+            .conn
+            .call_method(
+                Some(bus.as_str()),
+                MPRIS_PATH,
+                Some(PLAYLISTS_IFACE),
+                "GetPlaylists",
+                &(0u32, 100u32, "Alphabetical", false),
+            )
+            .await
+            .map_err(|e| MediaError::Backend(e.to_string()))?;
+        let lists: Vec<(OwnedObjectPath, String, String)> = reply
+            .body()
+            .deserialize()
+            .map_err(|e| MediaError::Backend(e.to_string()))?;
+        Ok(lists
+            .into_iter()
+            .map(|(path, name, _icon)| Playlist {
+                id: path.as_str().to_string(),
+                name,
+            })
+            .collect())
+    }
+
+    async fn activate_playlist(&self, id: &str) -> Result<(), MediaError> {
+        let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+        let path = OwnedObjectPath::try_from(id).map_err(|e| MediaError::Backend(e.to_string()))?;
+        self.conn
+            .call_method(
+                Some(bus.as_str()),
+                MPRIS_PATH,
+                Some(PLAYLISTS_IFACE),
+                "ActivatePlaylist",
+                &(path,),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| MediaError::Backend(e.to_string()))
+    }
+
+    fn caps(&self) -> MediaCaps {
+        MediaCaps {
+            shuffle: true,
+            loop_mode: true,
+            volume: true,
+            playlists: true,
+            signals: true,
+        }
+    }
+}
+
+/// A live D-Bus signal watcher: resolves whenever a player's playback properties
+/// change or a player appears/disappears. The host re-snapshots on each tick and
+/// only marks the chrome dirty when the [`MediaState`] actually changed — so no
+/// polling timer is needed (the ~0%-idle contract holds).
+pub struct MprisWatch {
+    props: MessageStream,
+    names: MessageStream,
+}
+
+impl MprisWatch {
+    /// Await the next change. Returns `false` when both signal streams have
+    /// ended (the host then stops watching).
+    pub async fn changed(&mut self) -> bool {
+        tokio::select! {
+            m = self.props.next() => m.is_some(),
+            m = self.names.next() => m.is_some(),
+        }
+    }
+}
+
+// === pure decoders =========================================================
+
+/// The tail after the `org.mpris.MediaPlayer2.` prefix (the player's short name).
+fn tail(bus: &str) -> &str {
+    bus.strip_prefix(MPRIS_PREFIX).unwrap_or(bus)
+}
+
+/// Peel any number of nested variant (`v`) layers down to the contained value.
+fn peel<'a>(v: &'a Value<'a>) -> &'a Value<'a> {
+    match v {
+        Value::Value(inner) => peel(inner),
+        other => other,
+    }
+}
+
+fn str_of(map: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
+    match peel(map.get(key)?) {
+        Value::Str(s) => Some(s.as_str().to_string()),
+        _ => None,
+    }
+}
+
+fn bool_of(map: &HashMap<String, OwnedValue>, key: &str) -> Option<bool> {
+    match peel(map.get(key)?) {
+        Value::Bool(b) => Some(*b),
+        _ => None,
+    }
+}
+
+fn f64_of(map: &HashMap<String, OwnedValue>, key: &str) -> Option<f64> {
+    match peel(map.get(key)?) {
+        Value::F64(x) => Some(*x),
+        _ => None,
+    }
+}
+
+/// Read an integer-ish value as `i64`, tolerating the various widths a player
+/// might use for `mpris:length` / `Position` (microseconds).
+fn micros_of(v: &Value<'_>) -> Option<i64> {
+    match peel(v) {
+        Value::I64(n) => Some(*n),
+        Value::U64(n) => Some(*n as i64),
+        Value::I32(n) => Some(*n as i64),
+        Value::U32(n) => Some(*n as i64),
+        Value::I16(n) => Some(*n as i64),
+        Value::U16(n) => Some(*n as i64),
+        _ => None,
+    }
+}
+
+/// `xesam:artist` is normally `as` (a list); some players send a bare string.
+fn artists_of(meta: &HashMap<String, OwnedValue>) -> String {
+    let Some(v) = meta.get("xesam:artist") else {
+        return String::new();
+    };
+    match peel(v) {
+        Value::Array(arr) => collect_strs(arr).join(", "),
+        Value::Str(s) => s.as_str().to_string(),
+        _ => String::new(),
+    }
+}
+
+fn collect_strs(arr: &Array<'_>) -> Vec<String> {
+    arr.iter()
+        .filter_map(|e| match peel(e) {
+            Value::Str(s) => Some(s.as_str().to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn playback_state(props: &HashMap<String, OwnedValue>) -> PlaybackState {
+    str_of(props, "PlaybackStatus")
+        .map(|s| PlaybackState::from_mpris(&s))
+        .unwrap_or(PlaybackState::Stopped)
+}
+
+/// Fold a `Player` property map into a normalized [`MediaState`].
+fn parse_state(player: &str, props: &HashMap<String, OwnedValue>) -> MediaState {
+    let meta: HashMap<String, OwnedValue> = props
+        .get("Metadata")
+        .and_then(|v| HashMap::try_from(v.clone()).ok())
+        .unwrap_or_default();
+
+    let length = meta
+        .get("mpris:length")
+        .and_then(|v| micros_of(v))
+        .filter(|n| *n > 0)
+        .map(|us| Duration::from_micros(us as u64));
+    let position = props
+        .get("Position")
+        .and_then(|v| micros_of(v))
+        .filter(|n| *n >= 0)
+        .map(|us| Duration::from_micros(us as u64));
+
+    MediaState {
+        player: player.to_string(),
+        title: str_of(&meta, "xesam:title").unwrap_or_default(),
+        artist: artists_of(&meta),
+        album: str_of(&meta, "xesam:album").unwrap_or_default(),
+        state: playback_state(props),
+        position,
+        length,
+        shuffle: bool_of(props, "Shuffle"),
+        loop_mode: str_of(props, "LoopStatus").map(|s| LoopMode::from_mpris(&s)),
+        volume: f64_of(props, "Volume").map(|v| (v * 100.0).round().clamp(0.0, 100.0) as u8),
+        can_go_next: bool_of(props, "CanGoNext").unwrap_or(true),
+        can_go_previous: bool_of(props, "CanGoPrevious").unwrap_or(true),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tail_strips_prefix() {
+        assert_eq!(tail("org.mpris.MediaPlayer2.spotify"), "spotify");
+        assert_eq!(
+            tail("org.mpris.MediaPlayer2.mpv.instance123"),
+            "mpv.instance123"
+        );
+        assert_eq!(tail("weird"), "weird");
+    }
+
+    #[test]
+    fn parse_state_from_props() {
+        // Build a Metadata dict the way MPRIS sends it (variant-wrapped values).
+        let mut meta: HashMap<String, OwnedValue> = HashMap::new();
+        meta.insert(
+            "xesam:title".into(),
+            Value::new("Get Lucky").try_to_owned().unwrap(),
+        );
+        meta.insert(
+            "xesam:artist".into(),
+            Value::new(vec!["Daft Punk".to_string()])
+                .try_to_owned()
+                .unwrap(),
+        );
+        meta.insert(
+            "mpris:length".into(),
+            Value::new(248_000_000i64).try_to_owned().unwrap(),
+        );
+
+        let mut props: HashMap<String, OwnedValue> = HashMap::new();
+        props.insert(
+            "PlaybackStatus".into(),
+            Value::new("Playing").try_to_owned().unwrap(),
+        );
+        props.insert("Metadata".into(), Value::new(meta).try_to_owned().unwrap());
+        props.insert("Shuffle".into(), Value::new(true).try_to_owned().unwrap());
+        props.insert("Volume".into(), Value::new(0.8f64).try_to_owned().unwrap());
+
+        let s = parse_state("spotify", &props);
+        assert_eq!(s.player, "spotify");
+        assert_eq!(s.title, "Get Lucky");
+        assert_eq!(s.artist, "Daft Punk");
+        assert_eq!(s.state, PlaybackState::Playing);
+        assert_eq!(s.length, Some(Duration::from_secs(248)));
+        assert_eq!(s.shuffle, Some(true));
+        assert_eq!(s.volume, Some(80));
+        assert_eq!(s.now_playing(), "Daft Punk \u{2014} Get Lucky");
+    }
+}
