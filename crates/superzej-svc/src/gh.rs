@@ -154,9 +154,24 @@ fn check_from_ctx(ctx: &Value) -> CheckRun {
     }
 }
 
+/// Whether a (possibly partial) GraphQL response carries a `pullRequests.nodes`
+/// array — i.e. the PR query resolved far enough to render, even if field-level
+/// `errors` (e.g. a FORBIDDEN `statusCheckRollup` from a token without
+/// "Checks: read") are also present. An empty array is still usable (it means no
+/// PR for the branch → `NoPr`); a null/absent repository (hard auth failure) is
+/// not, and falls back to the CLI path.
+pub fn has_pr_nodes(resp: &Value) -> bool {
+    let data = resp.get("data").unwrap_or(resp);
+    data.pointer("/repository/pullRequests/nodes")
+        .and_then(Value::as_array)
+        .is_some()
+}
+
 /// Parse a GraphQL response (the whole `{data,errors}` body, or just `data`)
 /// into a `PrPanel`. Pure — the network call is elsewhere — so the mapping that
-/// must match the CLI path is unit-tested against a fixture.
+/// must match the CLI path is unit-tested against a fixture. Tolerant of partial
+/// responses: field-level `errors` (e.g. FORBIDDEN check nodes) leave the
+/// affected fields empty rather than discarding the PR.
 pub fn parse_graphql_pr(resp: &Value, worktree: &str, branch: &str, now: i64) -> PrPanel {
     let data = resp.get("data").unwrap_or(resp);
     let nodes = data
@@ -172,10 +187,18 @@ pub fn parse_graphql_pr(resp: &Value, worktree: &str, branch: &str, now: i64) ->
                     .unwrap_or("")
                     .to_string()
             };
+            // Skip `null` context nodes: GitHub emits a null per check the token
+            // couldn't read (FORBIDDEN), and turning those into blank `CheckRun`s
+            // would litter the panel with phantom rows.
             let rollup = node
                 .pointer("/commits/nodes/0/commit/statusCheckRollup/contexts/nodes")
                 .and_then(Value::as_array)
-                .map(|arr| arr.iter().map(check_from_ctx).collect::<Vec<_>>())
+                .map(|arr| {
+                    arr.iter()
+                        .filter(|c| !c.is_null())
+                        .map(check_from_ctx)
+                        .collect::<Vec<_>>()
+                })
                 .unwrap_or_default();
             let mut pr = PrStatus {
                 number: node.get("number").and_then(Value::as_u64).unwrap_or(0),
@@ -289,14 +312,20 @@ impl GhBackend for GhNative {
             "query": PR_QUERY,
             "variables": { "owner": owner, "repo": repo, "head": branch },
         });
-        match client.graphql::<Value>(&body).await {
-            Ok(resp) if resp.get("errors").is_none() => Ok(parse_graphql_pr(
+        // Raw POST rather than `client.graphql()`: octocrab's typed `graphql`
+        // discards `data` whenever the body carries any `errors`, but GitHub
+        // returns *partial* data — the PR fields resolve while only
+        // `statusCheckRollup` is FORBIDDEN for a token lacking "Checks: read"
+        // (or "Actions: read"). We want the PR to still render (checks degrade to
+        // empty) instead of the panel going blank. Only a response with no PR
+        // nodes at all (transport failure / unreadable repo) falls back to the CLI.
+        match client.post::<_, Value>("/graphql", Some(&body)).await {
+            Ok(resp) if has_pr_nodes(&resp) => Ok(parse_graphql_pr(
                 &resp,
                 &loc.path(),
                 &branch,
                 superzej_core::util::now(),
             )),
-            // GraphQL errors or transport failure → CLI fallback (keeps working).
             _ => self.fallback.pr_status(loc).await,
         }
     }
@@ -482,5 +511,50 @@ mod tests {
             other => panic!("expected Pr, got {other:?}"),
         }
         assert_eq!(panel.fetched_at, 7);
+    }
+
+    #[test]
+    fn graphql_partial_errors_still_show_pr_without_phantom_checks() {
+        // A token lacking "Checks: read" gets the PR fields but FORBIDDEN check
+        // nodes (emitted as `null`) plus a top-level `errors` array. The PR must
+        // still render, with the rollup degraded to empty (no blank rows).
+        let resp = serde_json::json!({
+          "data": { "repository": { "pullRequests": { "nodes": [{
+            "number": 9, "title": "macOS / Apple container", "state": "OPEN",
+            "url": "https://github.com/x/y/pull/9", "isDraft": true,
+            "headRefName": "feat", "baseRefName": "main",
+            "mergeable": "MERGEABLE", "mergeStateStatus": "UNSTABLE",
+            "reviewDecision": null,
+            "commits": { "nodes": [{ "commit": { "statusCheckRollup": {
+              "contexts": { "nodes": [null, null, null] }
+            }}}]}
+          }]}}},
+          "errors": [{"type":"FORBIDDEN","message":"Resource not accessible by personal access token"}]
+        });
+        assert!(has_pr_nodes(&resp));
+        match parse_graphql_pr(&resp, "/wt", "feat", 1).state {
+            PanelState::Pr(pr) => {
+                assert_eq!(pr.number, 9);
+                assert!(pr.is_draft);
+                // Forbidden checks degrade to empty, not phantom rows.
+                assert!(pr.status_check_rollup.is_empty());
+                assert_eq!(pr.checks.total, 0);
+            }
+            other => panic!("expected Pr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn has_pr_nodes_distinguishes_usable_from_hard_failure() {
+        // Empty nodes (no PR for branch) is usable → render NoPr, don't fall back.
+        assert!(has_pr_nodes(&serde_json::json!({
+            "data": { "repository": { "pullRequests": { "nodes": [] } } }
+        })));
+        // Null repository (token can't read the repo at all) is a hard failure.
+        assert!(!has_pr_nodes(&serde_json::json!({
+            "data": { "repository": null },
+            "errors": [{"message":"Resource not accessible by personal access token"}]
+        })));
+        assert!(!has_pr_nodes(&serde_json::json!({})));
     }
 }
