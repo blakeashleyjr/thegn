@@ -1022,17 +1022,17 @@ the **ACP channel** via MCP-over-ACP (**R 696** — `mcp/connect`/`message`/
 `disconnect`, `mcpCapabilities.acp`), so foreign ACP agents get house tools with
 brokered creds and no open ports. This is what lets AR 541–543 reach any harness._
 
-- [ ] 455. MCP server over core
-- [ ] 456. Tools (action verbs)
-- [ ] 457. Resources (task://, fleet://)
+- [x] 455. MCP server over core
+- [x] 456. Tools (action verbs)
+- [x] 457. Resources (task://, fleet://)
 - [ ] 458. Prompts (templates)
 - [ ] 459. Elicitation (approve/answer flow)
 - [ ] 460. Sampling (borrow client model)
-- [ ] 461. spawn_subtask (recursive)
+- [x] 461. spawn_subtask (recursive)
 - [ ] 462. get_sibling_state / wait_for_task
 - [ ] 463. Shared blackboard resource
-- [ ] 464. check_my_budget
-- [ ] 465. request_human escalation
+- [x] 464. check_my_budget
+- [x] 465. request_human escalation
 - [ ] 466. Conversational meta-control
 
 ### AM. Daily-driver / non-code tiles
