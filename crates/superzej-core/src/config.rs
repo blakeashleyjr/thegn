@@ -5474,8 +5474,10 @@ transport = \"ssh\"
     #[test]
     fn active_providers_back_compat_single() {
         // Legacy single `provider` is honored when `providers` is empty.
-        let mut cfg = IssuesConfig::default();
-        cfg.provider = IssueProviderKind::Linear;
+        let mut cfg = IssuesConfig {
+            provider: IssueProviderKind::Linear,
+            ..Default::default()
+        };
         assert_eq!(cfg.active_providers(), vec![IssueProviderKind::Linear]);
         // `none` yields an empty set, not a [None] entry.
         cfg.provider = IssueProviderKind::None;
@@ -5484,15 +5486,16 @@ transport = \"ssh\"
 
     #[test]
     fn active_providers_multi_wins_and_dedups() {
-        let mut cfg = IssuesConfig::default();
-        // Single provider is overridden once the plural list is set.
-        cfg.provider = IssueProviderKind::Github;
-        cfg.providers = vec![
-            IssueProviderKind::Linear,
-            IssueProviderKind::Jira,
-            IssueProviderKind::Linear, // duplicate collapses
-            IssueProviderKind::None,   // None filtered out
-        ];
+        let cfg = IssuesConfig {
+            provider: IssueProviderKind::Github,
+            providers: vec![
+                IssueProviderKind::Linear,
+                IssueProviderKind::Jira,
+                IssueProviderKind::Linear, // duplicate collapses
+                IssueProviderKind::None,   // None filtered out
+            ],
+            ..Default::default()
+        };
         assert_eq!(
             cfg.active_providers(),
             vec![IssueProviderKind::Linear, IssueProviderKind::Jira]
