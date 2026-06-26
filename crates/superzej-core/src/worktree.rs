@@ -7,14 +7,36 @@ use crate::util;
 use std::path::{Path, PathBuf};
 
 const ADJ: &[&str] = &[
-    "brisk", "calm", "clever", "bold", "swift", "quiet", "keen", "lucky", "nimble", "warm",
-    "vivid", "amber", "cosmic", "dusty", "eager", "fancy", "gentle", "hardy", "ideal", "jolly",
-    "merry", "noble", "proud",
+    // Original small set + expansion
+    "brisk", "calm", "clever", "bold", "swift", "quiet", "keen", "lucky", "nimble", "warm", "vivid",
+    "amber", "cosmic", "dusty", "eager", "fancy", "gentle", "hardy", "ideal", "jolly", "merry",
+    "noble", "proud", "brave", "bright", "chill", "crisp", "dandy", "dizzy", "fierce", "flaky",
+    "fresh", "frosty", "grand", "great", "happy", "heavy", "jiffy", "juicy", "laser", "light",
+    "lively", "lofty", "magic", "mighty", "neat", "nifty", "plump", "plush", "prime", "quick",
+    "rad", "rapid", "sharp", "shiny", "sleek", "slick", "smart", "snug", "solid", "spark", "spicy",
+    "stout", "sturdy", "sunny", "super", "sweet", "tough", "trusty", "valid", "vast", "wild",
+    "witty", "zesty",
 ];
 const NOUN: &[&str] = &[
+    // Original small set + expansion
     "otter", "falcon", "maple", "cedar", "comet", "harbor", "meadow", "pebble", "willow", "ember",
     "lark", "quartz", "raven", "cobalt", "finch", "grove", "heron", "lotus", "marlin", "onyx",
-    "pine", "reef", "sage",
+    "pine", "reef", "sage", "acorn", "alpine", "anchor", "apple", "armor", "arrow", "badger",
+    "bamboo", "basil", "beacon", "bear", "beech", "bison", "blade", "breeze", "brook", "canyon",
+    "castle", "cherry", "cliff", "cloud", "clover", "coast", "copper", "coral", "crane", "crest",
+    "crown", "crystal", "dagger", "dawn", "delta", "desert", "dragon", "eagle", "echo", "elm",
+    "feather", "fern", "flame", "flint", "forest", "fox", "frost", "galaxy", "garden", "gecko",
+    "glacier", "glade", "glen", "hawk", "hazel", "heart", "hedge", "hollow", "hound", "husky",
+    "island", "ivy", "jade", "jaguar", "jewel", "jungle", "koala", "lake", "leaf", "lemon",
+    "leopard", "lily", "lion", "lizard", "lynx", "mango", "marble", "marsh", "maze", "melon",
+    "meteor", "moon", "moss", "mountain", "nebula", "nectar", "nest", "nova", "oak", "ocean",
+    "olive", "opal", "orbit", "orchid", "owl", "panda", "panther", "parrot", "peak", "pearl",
+    "petal", "pilot", "planet", "plum", "pony", "pool", "pulse", "puma", "radar", "rain", "rhino",
+    "ridge", "river", "robin", "rocket", "rose", "ruby", "shadow", "shark", "shield", "sky",
+    "slate", "snow", "solar", "spark", "sparrow", "sphere", "spider", "spire", "spring", "star",
+    "stone", "storm", "stream", "summit", "sun", "swan", "sword", "tiger", "timber", "topaz",
+    "tower", "trail", "tulip", "tundra", "valley", "velvet", "viper", "vision", "volcano",
+    "walnut", "water", "wave", "whale", "wind", "wing", "wolf", "zebra", "zenith", "zephyr",
 ];
 
 fn branch_exists(root: &Path, branch: &str) -> bool {
