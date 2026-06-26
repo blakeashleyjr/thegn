@@ -39,6 +39,7 @@ use crate::panes::{
     Panes, prewarm_requests, relayout, relayout_strip, replace_single_dead_center_pane,
     tool_drawer_argv,
 };
+use crate::recorder::Recorder;
 use crate::wizard;
 
 /// Bounded PTY event queue depth. Reader threads use `blocking_send`, so this
@@ -121,6 +122,39 @@ fn apply_mode_status(model: &mut FrameModel, mode: crate::keymap::Mode) {
     .into();
 }
 
+/// Toggles the Asciinema cast recorder. When turned on, a new `.cast` file
+/// is created in `~/.local/state/superzej/recordings/` and every frame pushed
+/// to the terminal is appended to it.
+fn toggle_recorder(
+    recorder: &mut Option<Recorder>,
+    rows: usize,
+    cols: usize,
+    toasts: &mut crate::toast::Toasts,
+) {
+    if let Some(r) = recorder.take() {
+        let p = r.path().display().to_string();
+        toasts.success(format!("Recording saved to {p}"), std::time::Instant::now());
+    } else {
+        match Recorder::new(cols, rows) {
+            Ok(r) => {
+                toasts.success(
+                    "Recording started...".to_string(),
+                    std::time::Instant::now(),
+                );
+                *recorder = Some(r);
+            }
+            Err(e) => {
+                toasts.push(
+                    crate::toast::ToastKind::Info,
+                    format!("Failed to start recording: {e}"),
+                    std::time::Instant::now(),
+                    std::time::Duration::from_secs(5),
+                );
+            }
+        }
+    }
+}
+
 /// The bottom bar's contextual keybind hints — (chord, label) pairs the
 /// statusbar renders as key chips + dim labels: what works right now, given
 /// the focused zone (and the panel's view when it owns the keyboard).
@@ -154,16 +188,15 @@ fn context_hints(
     }
 
     for action in resolved {
-        if action
+        if (action
             .contexts
             .contains(&superzej_core::keymap::Context::Global)
-            || action.contexts.contains(&focus_context)
+            || action.contexts.contains(&focus_context))
+            && seen.insert(action.hint.clone())
+            && !action.hint.is_empty()
+            && let Some(chord) = action.chords.first()
         {
-            if seen.insert(action.hint.clone()) && !action.hint.is_empty() {
-                if let Some(chord) = action.chords.first() {
-                    out.push((chord.to_kdl().to_string(), action.hint.clone()));
-                }
-            }
+            out.push((chord.to_kdl().to_string(), action.hint.clone()));
         }
     }
 
@@ -6214,6 +6247,7 @@ async fn event_loop<T: Terminal>(
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     event_bus: superzej_core::event_bus::EventBus,
 ) -> Result<()> {
+    let mut recorder: Option<Recorder> = None;
     let mut scratch = Surface::new(cols, rows);
     // What the terminal currently shows; the render path diffs scratch
     // against this and sends only the delta (see the flush block).
@@ -8955,15 +8989,15 @@ async fn event_loop<T: Terminal>(
                     };
                     if let (Some(content), Some(p)) = (target, panes.table.get(&sp)) {
                         crate::compositor::compose_pane(&mut scratch, p.emulator(), content);
-                        if let Some((sel_pane, sel)) = &mouse_sel {
-                            if *sel_pane == sp {
-                                crate::compositor::overlay_selection(
-                                    &mut scratch,
-                                    content,
-                                    sel,
-                                    crate::chrome::col(crate::chrome::S::Panel2),
-                                );
-                            }
+                        if let Some((sel_pane, sel)) = &mouse_sel
+                            && *sel_pane == sp
+                        {
+                            crate::compositor::overlay_selection(
+                                &mut scratch,
+                                content,
+                                sel,
+                                crate::chrome::col(crate::chrome::S::Panel2),
+                            );
                         }
                     }
                 }
@@ -9310,6 +9344,9 @@ async fn event_loop<T: Terminal>(
             } else {
                 let mut bytes = String::new();
                 wire_renderer.render(&wire, &mut bytes);
+                if let Some(rec) = &mut recorder {
+                    let _ = rec.write_frame(&bytes);
+                }
                 use std::io::Write as _;
                 let mut out = std::io::stdout();
                 out.write_all(bytes.as_bytes()).context("render")?;
@@ -15011,6 +15048,9 @@ async fn event_loop<T: Terminal>(
                                 } else {
                                     model.status = "Unpin: no live pin".into();
                                 }
+                            }
+                            Action::ToggleRecorder => {
+                                toggle_recorder(&mut recorder, rows, cols, &mut toasts);
                             }
                         }
                         dirty = true;

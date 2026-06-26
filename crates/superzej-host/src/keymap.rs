@@ -86,6 +86,7 @@ pub enum Action {
     FocusDown,
     ToggleSidebar,
     TogglePanel,
+    ToggleRecorder,
     ToggleDrawer,
     /// Move keyboard focus into the sidebar tree (shows it if hidden).
     FocusSidebar,
@@ -757,6 +758,7 @@ impl Action {
             Action::FocusDown => "focus-down",
             Action::ToggleSidebar => "toggle-sidebar",
             Action::TogglePanel => "toggle-panel",
+            Action::ToggleRecorder => "toggle-recorder",
             Action::ToggleDrawer => "files-drawer",
             Action::FocusSidebar => "focus-sidebar",
             Action::FocusPanel => "focus-panel",
@@ -829,6 +831,7 @@ impl Action {
             "focus-down" => Action::FocusDown,
             "toggle-sidebar" => Action::ToggleSidebar,
             "toggle-panel" => Action::TogglePanel,
+            "toggle-recorder" => Action::ToggleRecorder,
             "files" | "files-drawer" | "toggle-drawer" => Action::ToggleDrawer,
             "focus-sidebar" => Action::FocusSidebar,
             "focus-panel" => Action::FocusPanel,
@@ -1229,6 +1232,8 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl g", Action::ToggleKeyLock).unwrap();
     map.insert_all("Ctrl Alt s", Action::ToggleSidebar).unwrap();
     map.insert_all("Ctrl Alt p", Action::TogglePanel).unwrap();
+    map.insert_all("Ctrl Alt r", Action::ToggleRecorder)
+        .unwrap();
     map.insert_all("Ctrl Alt f", Action::ToggleDrawer).unwrap();
     map.insert_all("Alt s", Action::FocusSidebar).unwrap();
     map.insert_all("Alt .", Action::FocusPanel).unwrap();
