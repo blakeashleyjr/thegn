@@ -7,6 +7,7 @@
 //!
 //! Phase 0 establishes the seams; impls are filled in their respective phases.
 
+pub mod ci;
 pub mod gh;
 pub mod git;
 pub mod issue;

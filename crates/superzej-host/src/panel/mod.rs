@@ -107,6 +107,8 @@ pub enum Section {
     Stash,
     /// Pull-request state, CI checks, review threads. (Renamed from "git".)
     Pr,
+    /// CI/CD runs across providers (AV group): run history + per-run state.
+    Ci,
     Issues,
     Files,
     /// Compiler / linter / test diagnostics.
@@ -131,12 +133,12 @@ pub enum Section {
 /// The accordion's built-in display order — the default when `[panel]
 /// sections` is unset. Grouped by tab:
 /// - Git (5): Changes, Commits, Branches, Stash, Files
-/// - Work (6): Pr, Issues, Problems, Jobs, Tests, Symbols
+/// - Work (7): Pr, Ci, Issues, Problems, Jobs, Tests, Symbols
 /// - System (5): Notifications, Logs, Sandbox, Telemetry, Keys
 ///
 /// The live order (config-reordered, possibly trimmed) rides on
 /// [`PanelUi::order`]; numbered jump keys index the ACTIVE TAB's slice.
-pub const SECTION_ORDER: [Section; 16] = [
+pub const SECTION_ORDER: [Section; 17] = [
     // Git tab
     Section::Changes,
     Section::Commits,
@@ -145,6 +147,7 @@ pub const SECTION_ORDER: [Section; 16] = [
     Section::Files,
     // Work tab
     Section::Pr,
+    Section::Ci,
     Section::Issues,
     Section::Problems,
     Section::Jobs,
@@ -167,6 +170,7 @@ impl Section {
             Section::Branches => "branches",
             Section::Stash => "stash",
             Section::Pr => "pr",
+            Section::Ci => "ci",
             Section::Files => "files",
             Section::Problems => "problems",
             Section::Jobs => "jobs",
@@ -192,6 +196,7 @@ impl Section {
             | Section::Stash
             | Section::Files => PanelTab::Git,
             Section::Pr
+            | Section::Ci
             | Section::Issues
             | Section::Problems
             | Section::Jobs
@@ -438,6 +443,9 @@ pub struct PanelData {
     /// authenticated", an error). Shown in the git section body.
     pub pr_note: Option<String>,
     pub checks: Vec<CheckLine>,
+    /// Recent CI runs (newest first) for the current branch, from `ci_runs_cache`
+    /// — feeds the `Ci` section rollup (AV group). Empty when CI is off/undetected.
+    pub ci_runs: Vec<superzej_core::ci::CiRun>,
     /// Commits `(ahead, behind)` upstream; `None` without a tracking branch.
     pub ahead_behind: Option<(usize, usize)>,
     /// A merge/rebase/cherry-pick in progress (header zone).
@@ -1039,7 +1047,7 @@ mod tests {
 
     #[test]
     fn section_order_jump_and_cycle() {
-        assert_eq!(SECTION_ORDER.len(), 16);
+        assert_eq!(SECTION_ORDER.len(), 17);
         // Default tab = Git; Changes is in Git tab.
         let ui = PanelUi::default(); // open = Changes, tab = Git
         assert_eq!(ui.next_section(), Section::Commits); // next in Git tab
@@ -1291,9 +1299,14 @@ mod tests {
             accordion_key(&KeyCode::Char('1'), none, &work_ui),
             Some(PanelMsg::Open(Section::Pr))
         );
+        // Work tab order is Pr, Ci, Issues, Problems, … → '2' is Ci, '3' is Issues.
+        assert_eq!(
+            accordion_key(&KeyCode::Char('2'), none, &work_ui),
+            Some(PanelMsg::Open(Section::Ci))
+        );
         assert_eq!(
             accordion_key(&KeyCode::Char('3'), none, &work_ui),
-            Some(PanelMsg::Open(Section::Problems))
+            Some(PanelMsg::Open(Section::Issues))
         );
         // A custom order filters to the tab's sections.
         let trimmed = PanelUi {

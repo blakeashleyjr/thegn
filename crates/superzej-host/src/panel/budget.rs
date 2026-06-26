@@ -136,12 +136,16 @@ mod tests {
 
     #[test]
     fn tall_panel_grants_all_content_with_air() {
-        let p = allocate(50, 4, 12, SECTIONS);
+        // Total sized so the leftover after the fixed overhead (4 + SECTIONS +
+        // OPEN_PADDING) and 12 content rows is at least SECTIONS — the `airy`
+        // threshold — so it stays airy as the section count grows.
+        let total = 4 + SECTIONS + OPEN_PADDING + 12 + SECTIONS;
+        let p = allocate(total, 4, 12, SECTIONS);
         assert_eq!(p.header_rows, 4);
         assert_eq!(p.content_rows, 12);
         assert_eq!(p.overflow, None);
         assert!(p.airy);
-        assert!(consumed(&p) <= 50);
+        assert!(consumed(&p) <= total);
     }
 
     #[test]
@@ -156,7 +160,9 @@ mod tests {
 
     #[test]
     fn exact_fit_has_no_overflow() {
-        let p = allocate(28, 4, 6, SECTIONS);
+        // Exactly the fixed overhead + 6 content rows: no air, no overflow.
+        let total = 4 + SECTIONS + OPEN_PADDING + 6;
+        let p = allocate(total, 4, 6, SECTIONS);
         assert_eq!(p.content_rows, 6);
         assert_eq!(p.overflow, None);
     }

@@ -545,7 +545,7 @@ into work/personal (see AM. 479–480, 536–539 below).
 - [ ] 155. Next calendar event widget
 - [~] 156. Remote/network status widget
 - [ ] 157. Proxy upstream health widget
-- [~] 158. CI/PR check status widget
+- [x] 158. CI/PR check status widget — PR check rollup in the panel; statusbar CI badge via AV 707
 - [ ] 159. Composable widget config
 - [ ] 160. Click-through to detail views
 
@@ -1344,3 +1344,42 @@ heavyweight process-profile firewall (H 101–110): named **bundles** of env var
 - [ ] 513. Compile-out AI components — feature flag for a lean binary without proxy/agent/MCP layers
 - [~] 514. Graceful degradation — AI panels, dots, cost widgets simply absent; nothing else breaks
 - [x] 515. No-AI privacy posture — zero outbound model traffic, smaller attack surface, fully local
+
+### AV. CI/CD inspection (cross-provider pipelines, runs, jobs, logs)
+
+_A dedicated CI/CD insight layer (inspired by `termkit/gama`), turning the
+GitHub-only PR check rollup (Z 332) from "is my PR green?" into **run history,
+job/step drilldown, log viewing with jump-to-failure, and trigger/rerun/cancel**
+across providers. A `CiProvider` trait is a **sibling** of the AT forge trait
+(631), not a subset: CI is a different axis — GitHub/GitLab/Gitea/Forgejo are
+both forge **and** CI, but **Drone/Woodpecker/Jenkins/Argo/`act`** are CI-only and
+have no PR/MR coupling. A provider-agnostic run→job→step→log model lives in
+superzej-core; providers degrade native-API → CLI → unavailable note like
+`GhNative`→`CliGh`. Surfaced two ways: a panel `Section::Ci` rollup **and** a
+full-screen drilldown view (Runs → Jobs/Steps → Logs, live-refresh toggle).
+Repo-health detects which CI a worktree is configured for (`.github/workflows`,
+`.gitlab-ci.yml`, `.drone.yml`, `.woodpecker.yml`, `Jenkinsfile`, argo manifests).
+**AI-free** — "why did it fail" is log + jump-to-failure, no LLM. Folds in Z 332
+(done) and L 158 (statusbar badge). Validated abstraction-first on GitHub +
+GitLab before breadth grows. Design spec: `docs/superpowers/specs` (to write)._
+
+- [x] 698. `CiProvider` trait + normalized model — `runs`/`run_detail`/`logs`/`workflows`/`trigger`/`rerun`/`cancel`/`capabilities`; `CiRun`→`CiJob`→`CiStep` + `CiLog`/`CiWorkflow` in `superzej-core/src/ci.rs` (+ `CiState` mappers, log failure-scanner, CI-config detection); trait in `superzej-svc/src/ci.rs` w/ native+CLI degradation, capability-gated mutations (Phase A) ✓
+- [x] 699. `ci_runs_cache` table + `[ci]` config — TTL'd JSON cache (mirrors `pr_cache`, db v18), `config_enum!` `CiProviderKind` + per-provider sub-tables (gitlab/drone/woodpecker/jenkins/argo) w/ `env:` tokens, poll interval, live-refresh default, log-tail lines (Phase A) ✓
+- [x] 700. GitHub Actions provider — `gh run list`/`gh run view --json jobs`/`gh run view --log`; run history, jobs/steps, logs; reuses `gh` auth; fixture-tested parsers; deepens Z 332 (Phase A) ✓
+- [x] 701. GitLab CI provider — pipelines→jobs→trace via `glab api`; subgroup-aware project path; fixture-tested parsers (Phase A; also AT 633) ✓
+- [x] 702. Panel `Section::Ci` — Work-tab rollup: recent runs + per-run state glyph + duration, latest run's jobs when deep; summary chip (✓N ✗N ●N) (Phase A) ✓
+- [~] 703. CI drilldown view — `szhost ci view <id>` (run→jobs/steps) + `ci log` + the deep/Full panel section serve the Runs→Jobs→Logs drilldown today; a dedicated full-screen center-pane overlay (live-refresh toggle, filter) is the remaining UI iteration (needs live-terminal verification) (Phase A)
+- [x] 704. `RefreshKind::Ci` + `spawn_ci_cache_refresh` — off-loop poller (`spawn_blocking` + mpsc + `TerminalWaker`), on-switch + PR-cadence interval; writes `ci_runs_cache`; 0% idle preserved (Phase A) ✓
+- [x] 705. CI actions + keymap + palette + CLI — `Action::OpenCi` (+ `ACTION_SPECS`, `palette:true`); full `szhost ci` group: `runs`/`view`/`log`/`rerun`/`trigger`/`cancel`/`detect`; smoke-tested (Phase A) ✓
+- [x] 706. "Why did it fail" — `ci log` applies the `log_tail` cap and prints a `>> first failure at line N` marker via `CiLog::first_failure_line` (`##[error]`/error/exit-code/panic scan, no AI) (Phase A) ✓
+- [x] 707. Statusbar CI badge — closes L 158: red `✗N CI` chip on failures, amber `●N CI` while running, silent when green (Phase A) ✓
+- [ ] 708. Trigger / `workflow_dispatch` — dispatch a workflow with declared inputs (gama's headline; extended-inputs JSON for 10+ inputs); capability-gated (Phase B)
+- [ ] 709. Cancel + rerun across the trait — rerun all/failed/single-job, cancel a run; rerun-failed already exists for GitHub (Z 332) (Phase B)
+- [ ] 710. Live-refresh toggle — gama's `ctrl+l`; bounded-CPU polling while the view is open, configurable interval (Phase B)
+- [ ] 711. Gitea/Forgejo Actions provider — Gitea/Forgejo API / `tea`; GitHub-compatible-ish Actions (Phase C; also AT 634/635)
+- [ ] 712. Drone provider — Drone API + token, per-instance server URL; promote/restart (Phase D)
+- [ ] 713. Woodpecker provider — Woodpecker API (Drone fork); restart (Phase D)
+- [ ] 714. Jenkins provider — Jenkins JSON API + crumb, per-instance URL / basic-auth or token; build with params (Phase D)
+- [ ] 715. Argo provider — Argo Workflows (k8s / `argo` CLI) + Argo CD (`argocd` API); submit/resubmit/sync; k8s-context dependent (Phase D)
+- [ ] 716. Local `act` runner — run `.github/workflows` locally via `act`; stream logs into the run view (Phase E)
+- [ ] 717. Repo-health / CI-config detection — which CI files a worktree has, recent pass-rate, currently-running count; surfaced in the CI view header (Phase E)

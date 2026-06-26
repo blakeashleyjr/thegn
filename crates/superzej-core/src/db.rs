@@ -43,7 +43,7 @@ use std::path::PathBuf;
 /// source of truth for sidebar workspace order (was recency). Backfilled from
 /// the prior `last_active DESC` order so the first launch after upgrade looks
 /// unchanged; thereafter order is manual (Ctrl+Alt+↑/↓) and stable.
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 
 pub struct Db {
     conn: Connection,
@@ -207,6 +207,15 @@ impl Db {
               sandbox_backend TEXT
             );
             CREATE TABLE IF NOT EXISTS pr_cache (
+              worktree   TEXT PRIMARY KEY,
+              branch     TEXT,
+              json       TEXT,
+              fetched_at INTEGER
+            );
+            -- CI run-history cache per worktree (TTL'd JSON `Vec<ci::CiRun>`),
+            -- so the CI panel/view paint instantly from cache then hydrate live
+            -- off the loop — exactly like `pr_cache` (AV group).
+            CREATE TABLE IF NOT EXISTS ci_runs_cache (
               worktree   TEXT PRIMARY KEY,
               branch     TEXT,
               json       TEXT,
@@ -570,6 +579,29 @@ impl Db {
     pub fn put_pr_cache(&self, worktree: &str, branch: &str, json: &str) -> Result<()> {
         self.conn.execute(
             r#"INSERT INTO pr_cache(worktree,branch,json,fetched_at)
+               VALUES(?1,?2,?3,?4)
+               ON CONFLICT(worktree) DO UPDATE SET branch=?2, json=?3, fetched_at=?4"#,
+            params![worktree, branch, json, util::now()],
+        )?;
+        Ok(())
+    }
+
+    // --- CI run-history cache (TTL'd; feeds the CI panel/view) -------------
+    pub fn get_ci_cache(&self, worktree: &str) -> Result<Option<(String, i64)>> {
+        let r = self
+            .conn
+            .query_row(
+                "SELECT json, fetched_at FROM ci_runs_cache WHERE worktree=?1",
+                params![worktree],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .ok();
+        Ok(r)
+    }
+
+    pub fn put_ci_cache(&self, worktree: &str, branch: &str, json: &str) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO ci_runs_cache(worktree,branch,json,fetched_at)
                VALUES(?1,?2,?3,?4)
                ON CONFLICT(worktree) DO UPDATE SET branch=?2, json=?3, fetched_at=?4"#,
             params![worktree, branch, json, util::now()],
@@ -2933,6 +2965,18 @@ mod tests {
         assert_eq!(
             db.get_test_cache("/wt").unwrap().unwrap().0,
             "{\"summary\":\"fail\"}"
+        );
+
+        // ci cache: miss → insert → upsert.
+        assert!(db.get_ci_cache("/wt").unwrap().is_none());
+        db.put_ci_cache("/wt", "br", "[{\"id\":\"1\"}]").unwrap();
+        let (cj, cat) = db.get_ci_cache("/wt").unwrap().unwrap();
+        assert_eq!(cj, "[{\"id\":\"1\"}]");
+        assert!(cat > 0);
+        db.put_ci_cache("/wt", "br", "[{\"id\":\"2\"}]").unwrap(); // upsert
+        assert_eq!(
+            db.get_ci_cache("/wt").unwrap().unwrap().0,
+            "[{\"id\":\"2\"}]"
         );
 
         // loc cache: miss → insert → upsert.

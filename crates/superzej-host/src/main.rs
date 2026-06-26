@@ -97,6 +97,11 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::issue::Action,
     },
+    /// Cross-provider CI/CD inspection: runs, jobs, logs, trigger/rerun/cancel.
+    Ci {
+        #[command(subcommand)]
+        action: cmd::ci::Action,
+    },
     /// Emit a syntax-highlighted diff of a worktree against its branch point.
     Diff {
         #[arg(long)]
@@ -192,6 +197,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
     match command {
         Command::Pr { action } => cmd::pr::run(action),
         Command::Issue { action } => cmd::issue::run(action),
+        Command::Ci { action } => cmd::ci::run(&cfg, action),
         Command::Diff {
             worktree,
             base,
