@@ -687,6 +687,10 @@ default_backend = "auto"
 # Probe order for "auto". First backend that is installed and usable wins.
 # "none"/"host" anywhere in the list = uncontained fallback from that point on.
 # NixOS users: move "bwrap" first if podman isn't installed.
+# The built-in default is platform-aware when unset:
+#   Linux : ["podman-rootless", "podman-rootful", "docker", "bwrap", "host"]
+#   macOS : ["apple", "docker", "host"]   (apple = Apple `container`, needs
+#                                           macOS 26 + Apple silicon)
 backend_chain = ["podman-rootless", "podman-rootful", "docker", "bwrap", "host"]
 
 # ── OCI image (podman / docker only) ────────────────────────────────────────

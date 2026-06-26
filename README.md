@@ -185,8 +185,11 @@ while the agent only sees the worktree and its git metadata.
 - **Backends** (`[sandbox] backend`): `auto` walks `backend_chain` and picks the
   first available — `podman` (rootless, preferred) → `docker` → `bwrap`
   (lightweight, reuses host tools, no image) → `none` (plain host, with a
-  warning). `systemd` and `wsl` are also selectable; `apple` (macOS `container`)
-  is _planned_ — see the roadmap (`tasks.md` §AV).
+  warning). `systemd` and `wsl` are also selectable. On **macOS** the default
+  chain is `apple` → `docker` → `host`: `apple` drives Apple's
+  [`container`](https://github.com/apple/container) runtime (OCI images in
+  lightweight VMs) and **requires macOS 26 on Apple silicon** — where that's
+  unmet, selection falls through to `docker` then `host`.
   Setting an `image` switches `auto` to the OCI runtimes; leaving it empty uses
   the host-toolchain sandbox (bwrap/systemd).
 - **Per-repo** — drop a `.superzej.{toml,yaml,yml,json}` at a repo root with a

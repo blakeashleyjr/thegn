@@ -123,9 +123,17 @@ fn is_runtime_wrapper(program: &str) -> bool {
     )
 }
 
+// ── Live process introspection ───────────────────────────────────────────────
+// Linux reads these from `/proc`. macOS has no `/proc`; the real implementation
+// is `libproc` (`proc_listchildpids`, `proc_pidpath`, `PROC_PIDVNODEPATHINFO` for
+// cwd) and is tracked as on-device work (tasks.md §AV / item 701) — until then the
+// non-Linux stubs degrade gracefully (no foreground-command capture / cwd
+// persistence) without breaking the build.
+
 /// The most-recently-started direct child of `pid` (the shell's foreground job),
 /// if any. Walks `/proc/*/stat` for the `ppid` field; ties break to the highest
-/// pid (newest). Linux-only — returns `None` where `/proc` is absent.
+/// pid (newest).
+#[cfg(target_os = "linux")]
 fn newest_child(pid: u32) -> Option<u32> {
     let mut best: Option<u32> = None;
     for ent in std::fs::read_dir("/proc").ok()?.flatten() {
@@ -142,6 +150,7 @@ fn newest_child(pid: u32) -> Option<u32> {
 /// The parent pid from `/proc/<pid>/stat`. The `comm` field (field 2) can itself
 /// contain spaces and parens, so the numeric fields are parsed after the final
 /// `)`: state is the first token, ppid the second.
+#[cfg(target_os = "linux")]
 fn stat_ppid(pid: u32) -> Option<u32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let rest = &stat[stat.rfind(')')? + 1..];
@@ -150,6 +159,7 @@ fn stat_ppid(pid: u32) -> Option<u32> {
 
 /// Parse `/proc/<pid>/cmdline` (NUL-separated argv) into a `Vec`, dropping empty
 /// trailing entries. `None` when unreadable or empty (e.g. a kernel thread).
+#[cfg(target_os = "linux")]
 fn read_cmdline(pid: u32) -> Option<Vec<String>> {
     let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     let argv: Vec<String> = raw
@@ -158,6 +168,27 @@ fn read_cmdline(pid: u32) -> Option<Vec<String>> {
         .map(|s| String::from_utf8_lossy(s).into_owned())
         .collect();
     (!argv.is_empty()).then_some(argv)
+}
+
+/// The working directory of `pid`, read from `/proc/<pid>/cwd`.
+#[cfg(target_os = "linux")]
+fn pid_cwd(pid: u32) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn newest_child(_pid: u32) -> Option<u32> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_cmdline(_pid: u32) -> Option<Vec<String>> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pid_cwd(_pid: u32) -> Option<std::path::PathBuf> {
+    None
 }
 
 impl PtyPane {
@@ -274,7 +305,7 @@ impl PtyPane {
     /// platforms (where superzej does not run) return `None`.
     pub fn cwd(&self) -> Option<std::path::PathBuf> {
         let pid = self.pid?;
-        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+        pid_cwd(pid)
     }
 
     /// The pane's live foreground command (argv + cwd), read from `/proc`: the
@@ -296,9 +327,7 @@ impl PtyPane {
         if name.is_empty() || is_interactive_shell(&name) || is_runtime_wrapper(&name) {
             return None;
         }
-        let cwd = std::fs::read_link(format!("/proc/{child}/cwd"))
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned());
+        let cwd = pid_cwd(child).map(|p| p.to_string_lossy().into_owned());
         Some(crate::session::PaneCmd { argv, cwd })
     }
 

@@ -1421,22 +1421,36 @@ pub struct SandboxConfig {
     pub network_audit: bool,
 }
 
+/// The default `backend_chain` for `auto` detection, by host platform.
+///
+/// Linux ships the full native chain (rootless/rootful podman, docker, the
+/// host-toolchain bwrap sandbox, then the uncontained host fallback). macOS has
+/// no bwrap/systemd, so it leads with Apple's `container` (the macOS OCI runtime,
+/// requires macOS 26 + Apple silicon), then docker, then host. Other platforms
+/// only have docker before the host fallback.
+pub fn default_backend_chain() -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    let chain: &[&str] = &[
+        "podman-rootless",
+        "podman-rootful",
+        "docker",
+        "bwrap",
+        "host",
+    ];
+    #[cfg(target_os = "macos")]
+    let chain: &[&str] = &["apple", "docker", "host"];
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let chain: &[&str] = &["docker", "host"];
+    chain.iter().map(|s| s.to_string()).collect()
+}
+
 impl Default for SandboxConfig {
     fn default() -> Self {
         SandboxConfig {
             enabled: true,
             backend: SandboxBackend::Auto,
             default_backend: SandboxBackend::Auto,
-            backend_chain: [
-                "podman-rootless",
-                "podman-rootful",
-                "docker",
-                "bwrap",
-                "host",
-            ]
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
+            backend_chain: default_backend_chain(),
             image: String::new(),
             profile: SandboxProfile::Hardened,
             agent_profile: SandboxProfile::Sealed,
@@ -2908,6 +2922,28 @@ fn parse_hex_rgb(hex: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_backend_chain_is_platform_aware() {
+        let chain = default_backend_chain();
+        // Every platform ends with the uncontained host fallback.
+        assert_eq!(chain.last().map(String::as_str), Some("host"));
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(chain.first().map(String::as_str), Some("podman-rootless"));
+            assert!(chain.iter().any(|b| b == "bwrap"));
+            assert!(!chain.iter().any(|b| b == "apple"));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // macOS leads with Apple's container runtime; no Linux-only backends.
+            assert_eq!(chain.first().map(String::as_str), Some("apple"));
+            assert!(!chain.iter().any(|b| b == "bwrap"));
+            assert!(!chain.iter().any(|b| b == "podman-rootless"));
+        }
+        // The default config consumes the platform chain verbatim.
+        assert_eq!(SandboxConfig::default().backend_chain, chain);
+    }
 
     #[test]
     fn app_tab_config_defaults_to_work_first_and_default() {

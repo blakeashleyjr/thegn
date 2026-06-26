@@ -595,9 +595,51 @@ pub fn parse_docker_ps(ndjson: &str) -> Vec<ContainerInfo> {
         .collect()
 }
 
+/// Parse `container list --format json` (Apple `container`). The exact field
+/// layout is not a stable contract, so we accept either a JSON array or NDJSON
+/// and probe a handful of plausible name/image/status keys. Confirm field names
+/// against a real device; a miss yields an empty list (the panel just omits
+/// Apple containers) rather than an error.
+pub fn parse_container_ls(json: &str) -> Vec<ContainerInfo> {
+    let rows: Vec<serde_json::Value> = serde_json::from_str::<Vec<serde_json::Value>>(json)
+        .or_else(|_| {
+            json.lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| serde_json::from_str::<serde_json::Value>(l.trim()))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap_or_default();
+    let pick = |r: &serde_json::Value, keys: &[&str]| -> String {
+        for k in keys {
+            if let Some(s) = r.get(*k).and_then(|v| v.as_str()) {
+                return s.to_string();
+            }
+        }
+        String::new()
+    };
+    rows.into_iter()
+        .filter_map(|r| {
+            // Names may be a string or a one-element array (podman-style).
+            let name = match r.get("Names").or_else(|| r.get("names")) {
+                Some(serde_json::Value::Array(a)) => {
+                    a.first().and_then(|v| v.as_str()).unwrap_or("").to_string()
+                }
+                Some(serde_json::Value::String(s)) => s.clone(),
+                _ => pick(&r, &["name", "Name", "id", "ID"]),
+            };
+            if name.is_empty() {
+                return None;
+            }
+            let image = pick(&r, &["Image", "image"]);
+            let status = pick(&r, &["Status", "status", "State", "state"]);
+            Some(container_info(name, image, status, "apple"))
+        })
+        .collect()
+}
+
 /// The running containers, superzej-owned first. Probes rootless podman,
-/// rootful podman, then docker; one fast subprocess on the caller's
-/// (background) thread. Empty when no OCI runtime is installed.
+/// rootful podman, docker, then Apple `container`; one fast subprocess on the
+/// caller's (background) thread. Empty when no OCI runtime is installed.
 pub fn running_containers() -> Vec<ContainerInfo> {
     let mut out = Vec::new();
     if let Some(stdout) = run_local_output(
@@ -628,6 +670,16 @@ pub fn running_containers() -> Vec<ContainerInfo> {
         let mut rows = parse_docker_ps(&stdout);
         apply_stats(&mut rows, &oci_stats(Backend::Docker));
         out.extend(rows);
+    }
+    // Apple `container` (macOS). No `stats --format json` equivalent is wired up
+    // yet, so rows show without live cpu/mem/net until refined on-device.
+    if out.is_empty()
+        && let Some(stdout) = run_local_output(
+            &backend_prefix(Backend::Apple),
+            &["list", "--format", "json"],
+        )
+    {
+        out.extend(parse_container_ls(&stdout));
     }
     out.sort_by_key(|c| (!c.ours, c.name.clone()));
     out
@@ -834,6 +886,11 @@ pub fn prefetch_image(spec: &SandboxSpec) -> anyhow::Result<()> {
         return Ok(());
     }
     let img = effective_image(spec);
+    // Apple `container` has a different image CLI (no `image exists`; pull is
+    // nested under `image`) — handle it separately.
+    if spec.backend == Backend::Apple {
+        return apple_prefetch_image(&img);
+    }
     let rt = spec.backend.binary();
     let exists_argv: Vec<String> = vec![rt.into(), "image".into(), "exists".into(), img.clone()];
     match status_with_timeout(&exists_argv, PROBE_TIMEOUT) {
@@ -869,6 +926,12 @@ pub fn health_check(spec: &SandboxSpec) -> bool {
 /// we can distinguish "container missing / inspect failed" (no sentinel) from
 /// "running but mounts differ".
 fn container_status(spec: &SandboxSpec) -> (bool, bool) {
+    // Apple `container` has no Go-template `--format` (it takes json|table|yaml|
+    // toml), and its binary IS named `container`, so the podman/docker form
+    // `<binary> container inspect` would collide. Use a dedicated path.
+    if spec.backend == Backend::Apple {
+        return apple_container_status(spec);
+    }
     let required: std::collections::HashSet<&str> =
         spec.mounts.iter().map(|m| m.host.as_str()).collect();
 
@@ -927,6 +990,88 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
     }
 }
 
+/// Whether an image reference is already present in `container image list`
+/// output. Apple's `container` has no `image exists` probe, and its list output
+/// columns/format are not contractually stable, so we match loosely: the full
+/// reference, or the registry-stripped repo (plus tag when present), appearing on
+/// any line. Format-tolerant on purpose.
+fn image_ref_present(list_output: &str, img: &str) -> bool {
+    let repo_tag = img.rsplit('/').next().unwrap_or(img); // e.g. "debian:stable"
+    let (repo, tag) = repo_tag.split_once(':').unwrap_or((repo_tag, ""));
+    list_output
+        .lines()
+        .any(|l| l.contains(img) || (l.contains(repo) && (tag.is_empty() || l.contains(tag))))
+}
+
+/// Image prefetch for Apple `container`: probe the local image list, then pull
+/// via the nested `container image pull <ref>` only on a miss.
+fn apple_prefetch_image(img: &str) -> anyhow::Result<()> {
+    let list_argv: Vec<String> = vec!["container".into(), "image".into(), "list".into()];
+    let present = match output_with_timeout(&list_argv, PROBE_TIMEOUT) {
+        Some((ok, stdout)) => ok && image_ref_present(&stdout, img),
+        // The probe wedged: treat the runtime as unhealthy so the chain falls
+        // through rather than trusting a pull to behave.
+        None => anyhow::bail!("container not responding (image list timed out)"),
+    };
+    if !present {
+        let pull_argv: Vec<String> = vec![
+            "container".into(),
+            "image".into(),
+            "pull".into(),
+            img.into(),
+        ];
+        if status_with_timeout(&pull_argv, PULL_TIMEOUT) != Some(true) {
+            anyhow::bail!("container image pull {img} failed or timed out");
+        }
+    }
+    Ok(())
+}
+
+/// `(running, mounts_ok)` for an Apple `container`, via `container inspect <name>`.
+///
+/// Apple emits JSON from `inspect`; rather than bind to exact field names (which
+/// are not a stable contract — confirm on-device), we match tolerantly: the
+/// container is usable when the JSON reports a running state, and mounts are OK
+/// when every required host path appears as a substring (bind sources are
+/// absolute paths, so substring presence is a reliable signal).
+fn apple_container_status(spec: &SandboxSpec) -> (bool, bool) {
+    let required: Vec<&str> = spec.mounts.iter().map(|m| m.host.as_str()).collect();
+    let argv: Vec<String> = vec!["container".into(), "inspect".into(), spec.name.clone()];
+    let (ok, stdout) = if matches!(spec.transport, Transport::Local) {
+        match output_with_timeout(&argv, PROBE_TIMEOUT) {
+            Some(r) => r,
+            None => return (false, false),
+        }
+    } else {
+        match output_control_owned(spec, &argv, PROBE_TIMEOUT) {
+            Some(r) => r,
+            None => return (false, false),
+        }
+    };
+    if !ok && stdout.trim().is_empty() {
+        return (false, false); // container doesn't exist
+    }
+    let running = stdout.to_lowercase().contains("running");
+    if !running {
+        return (false, false);
+    }
+    let mounts_ok = required.iter().all(|h| stdout.contains(*h));
+    (true, mounts_ok)
+}
+
+/// The argv to force-remove one or more containers. Apple `container` spells this
+/// `delete --force`; podman/docker use `rm -f`.
+fn remove_container_argv(backend: Backend, names: &[String]) -> Vec<String> {
+    let mut v = backend_prefix(backend);
+    if backend == Backend::Apple {
+        v.extend(["delete".into(), "--force".into()]);
+    } else {
+        v.extend(["rm".into(), "-f".into()]);
+    }
+    v.extend(names.iter().cloned());
+    v
+}
+
 /// Ensure any persistent state exists (OCI: a keep-alive container we `exec`
 /// into). No-op for host-toolchain backends and `none`.
 pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
@@ -959,7 +1104,7 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
         ));
         let _ = run_control_owned(
             spec,
-            &[rt.to_string(), "rm".into(), "-f".into(), spec.name.clone()],
+            &remove_container_argv(spec.backend, &[spec.name.clone()]),
             PROBE_TIMEOUT,
         );
     }
@@ -1036,8 +1181,7 @@ pub fn teardown_by_path(worktree: &str) {
         Backend::Apple,
     ] {
         if available(&transport, b) {
-            let mut argv = backend_prefix(b);
-            argv.extend(["rm".into(), "-f".into(), name.to_string(), agent.clone()]);
+            let argv = remove_container_argv(b, &[name.to_string(), agent.clone()]);
             let _ = run_control_t_owned(&transport, &argv, PROBE_TIMEOUT);
         }
     }
@@ -1063,8 +1207,7 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
         Backend::Apple,
     ] {
         if available(&transport, b) {
-            let mut argv = backend_prefix(b);
-            argv.extend(["rm".into(), "-f".into(), name.to_string(), agent.clone()]);
+            let argv = remove_container_argv(b, &[name.to_string(), agent.clone()]);
             let _ = run_control_t_owned(&transport, &argv, PROBE_TIMEOUT);
         }
     }
@@ -1137,7 +1280,13 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
         | Backend::Apple
         | Backend::Wsl => {
             let mut v = backend_prefix(spec.backend);
-            v.extend(["exec".into(), "-it".into()]);
+            // Apple's swift-argument-parser CLI takes the interactive/tty flags
+            // separately; podman/docker accept the combined `-it`.
+            if spec.backend == Backend::Apple {
+                v.extend(["exec".into(), "-i".into(), "-t".into()]);
+            } else {
+                v.extend(["exec".into(), "-it".into()]);
+            }
             if spec.file_access != FileAccess::None {
                 v.extend(["--workdir".into(), wt]);
             }
@@ -1339,8 +1488,20 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
         }
     }
     for m in &spec.mounts {
-        let suffix = if m.ro { ":ro" } else { "" };
-        v.extend(["-v".into(), format!("{}:{}{suffix}", m.host, m.dest)]);
+        if spec.backend == Backend::Apple {
+            // Apple documents the explicit `--mount type=bind,…,readonly` form;
+            // the `:ro` suffix on `-v` is not a documented Apple spelling and a
+            // rejected mount would break the path-preserving bind that the whole
+            // feature relies on.
+            let mut mount = format!("type=bind,source={},target={}", m.host, m.dest);
+            if m.ro {
+                mount.push_str(",readonly");
+            }
+            v.extend(["--mount".into(), mount]);
+        } else {
+            let suffix = if m.ro { ":ro" } else { "" };
+            v.extend(["-v".into(), format!("{}:{}{suffix}", m.host, m.dest)]);
+        }
     }
     // When devenv lives in the Nix store, bind-mount /nix read-only so the
     // container can exec the resolved absolute path. Consistent with bwrap
@@ -1377,7 +1538,15 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
     // Hardening knobs (resolved from the active SandboxProfile). Read-only root
     // needs writable tmpfs scratch for /tmp and /run so the shell and common
     // tools still work; the worktree + cache binds are already rw.
-    if spec.read_only_root {
+    // Apple `container` runs each container in its own lightweight VM and does
+    // not document the Linux-container hardening knobs below (`--read-only`,
+    // `--tmpfs`, `--security-opt`, `--pids-limit`); its swift-argument-parser CLI
+    // errors on unknown flags, so emitting them would break `container run`. The
+    // VM boundary already provides strong isolation. `--cap-add/--cap-drop` IS
+    // documented for Apple, so capabilities still apply. Re-enable any of the
+    // others here once confirmed supported on-device.
+    let oci_hardening = spec.backend != Backend::Apple;
+    if oci_hardening && spec.read_only_root {
         v.extend([
             "--read-only".into(),
             "--tmpfs".into(),
@@ -1392,10 +1561,10 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
     for cap in &spec.add_capabilities {
         v.extend(["--cap-add".into(), cap.clone()]);
     }
-    if spec.no_new_privileges {
+    if oci_hardening && spec.no_new_privileges {
         v.extend(["--security-opt".into(), "no-new-privileges".into()]);
     }
-    if let Some(p) = spec.pids_limit {
+    if oci_hardening && let Some(p) = spec.pids_limit {
         v.extend(["--pids-limit".into(), p.to_string()]);
     }
 
@@ -2108,6 +2277,97 @@ mod tests {
         assert!(j.contains("-v /repo/.git:/repo/.git"));
         assert!(j.contains("-e GH_TOKEN=abc"));
         assert!(j.contains("-p 8080:8080"));
+    }
+
+    #[test]
+    fn apple_exec_uses_split_flags_and_preserves_paths() {
+        let argv = enter_argv(&spec(Backend::Apple), "${SHELL:-/bin/sh} -l");
+        // The binary IS `container`; no doubled subcommand, no combined `-it`.
+        assert_eq!(argv[0], "container");
+        assert!(argv.contains(&"exec".to_string()));
+        assert!(argv.contains(&"-i".to_string()) && argv.contains(&"-t".to_string()));
+        assert!(!argv.contains(&"-it".to_string()));
+        let w = argv.iter().position(|a| a == "--workdir").unwrap();
+        assert_eq!(argv[w + 1], "/wt/feat");
+        assert!(argv.contains(&"superzej-repo-feat".to_string()));
+    }
+
+    #[test]
+    fn apple_oci_opts_use_mount_form_and_skip_undocumented_hardening() {
+        let mut s = spec(Backend::Apple);
+        s.read_only_root = true;
+        s.no_new_privileges = true;
+        s.pids_limit = Some(512);
+        s.drop_capabilities = vec!["ALL".into()];
+        let j = oci_create_opts(&s).join(" ");
+        // Path-preserving bind via the documented --mount form, not `-v`.
+        assert!(j.contains("--mount type=bind,source=/wt/feat,target=/wt/feat"));
+        assert!(j.contains("--mount type=bind,source=/repo/.git,target=/repo/.git"));
+        assert!(!j.contains("-v /wt/feat"));
+        // Documented-for-Apple flags stay…
+        assert!(j.contains("--cap-drop ALL"));
+        assert!(j.contains("-e GH_TOKEN=abc"));
+        assert!(j.contains("-p 8080:8080"));
+        // …undocumented Linux-container hardening is omitted (would error on Apple).
+        assert!(!j.contains("--read-only"));
+        assert!(!j.contains("--security-opt"));
+        assert!(!j.contains("--pids-limit"));
+        assert!(!j.contains("--userns"));
+    }
+
+    #[test]
+    fn apple_mount_emits_readonly_key() {
+        let mut s = spec(Backend::Apple);
+        s.mounts[1].ro = true; // /repo/.git read-only pin
+        let j = oci_create_opts(&s).join(" ");
+        assert!(j.contains("--mount type=bind,source=/repo/.git,target=/repo/.git,readonly"));
+    }
+
+    #[test]
+    fn remove_container_argv_per_backend() {
+        let names = vec!["c1".to_string(), "c2".to_string()];
+        assert_eq!(
+            remove_container_argv(Backend::Apple, &names),
+            vec!["container", "delete", "--force", "c1", "c2"]
+        );
+        assert_eq!(
+            remove_container_argv(Backend::Docker, &names),
+            vec!["docker", "rm", "-f", "c1", "c2"]
+        );
+        // Rootful podman keeps its sudo prefix.
+        assert_eq!(
+            remove_container_argv(Backend::PodmanRootful, &names),
+            vec!["sudo", "-n", "podman", "rm", "-f", "c1", "c2"]
+        );
+    }
+
+    #[test]
+    fn image_ref_present_matches_loosely() {
+        let out = "NAME                       TAG\ndocker.io/library/debian   stable\n";
+        assert!(image_ref_present(out, "docker.io/library/debian:stable"));
+        assert!(image_ref_present(
+            "ubuntu:22.04\n",
+            "docker.io/library/ubuntu:22.04"
+        ));
+        assert!(!image_ref_present("alpine   latest\n", "debian:stable"));
+    }
+
+    #[test]
+    fn parse_container_ls_handles_array_and_ndjson() {
+        // JSON array, podman-style Names list.
+        let arr = r#"[{"Names":["superzej-repo-feat"],"Image":"img:latest","Status":"running"}]"#;
+        let rows = parse_container_ls(arr);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "superzej-repo-feat");
+        assert_eq!(rows[0].backend, "apple");
+        assert!(rows[0].ours);
+        // NDJSON, lowercase string fields.
+        let nd = "{\"name\":\"other\",\"image\":\"i\",\"state\":\"stopped\"}\n";
+        let rows = parse_container_ls(nd);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "other");
+        // Garbage is tolerated (empty, not a panic).
+        assert!(parse_container_ls("not json").is_empty());
     }
 
     #[test]

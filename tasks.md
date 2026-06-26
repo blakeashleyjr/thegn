@@ -1351,12 +1351,12 @@ falls back to uncontained `host`. The codebase is Linux-biased (`cfg(target_os =
 hardcoded `/nix/store` mounts) and `flake.nix` has no `aarch64-darwin` output.
 Sequenced so each item ships independently; tracks the AB/AC/AD/AE container groups.
 
-- [ ] 698. Platform-aware default `backend_chain` — resolve the chain by `target_os` so macOS defaults to `apple → docker → host` instead of dead Linux entries
-- [ ] 699. Apple `container`-specific backend path — handle the VM-per-container model, `container` CLI argv/lifecycle, and image/registry semantics distinct from podman/docker (today shares the generic OCI path)
-- [ ] 700. Path-preserving worktree mount on Apple `container` — replicate bind-mount-at-real-path semantics under the VM model so host-side git reads keep working; gated on macOS 26 + Apple silicon
-- [ ] 701. macOS host build — `aarch64-darwin` flake output + non-Linux fallbacks for bwrap/systemd-run/`/proc` activity scan/capability dropping (graceful, labeled `HOST / UNCONTAINED`)
+- [x] 698. Platform-aware default `backend_chain` — resolve the chain by `target_os` so macOS defaults to `apple → docker → host` instead of dead Linux entries _(config.rs `default_backend_chain()` + test)_
+- [~] 699. Apple `container`-specific backend path — dedicated CLI path in sandbox.rs (image prefetch via `container image pull`, status via `container inspect`, removal via `container delete --force`, split `-i -t` exec, `container list` panel probe); argv unit-tested on Linux. **On-device:** confirm exact flag/JSON specifics
+- [~] 700. Path-preserving worktree mount on Apple `container` — `--mount type=bind,…,readonly` form + undocumented Linux hardening flags omitted for Apple; **on-device:** verify same-abs-path bind keeps host-side git working under the VM
+- [~] 701. macOS host build — `flake.nix` already emits `aarch64-darwin`; `/proc` readers in `pane.rs` `cfg`-split with graceful non-Linux stubs. **On-device:** native `libproc`/`sysctl` impls (pane cwd/foreground, `stats.rs` telemetry) + confirm the workspace compiles on the Mac
 - [ ] 702. macOS CI lane — build + unit tests on Apple silicon; smoke coverage for the `apple` backend
-- [ ] 703. Docs + capability gating — reconcile README/config claims with reality; surface "requires macOS 26 + Apple silicon" in the sandbox picker and error paths
+- [~] 703. Docs + capability gating — README/config/design-spec reconciled to the shipped backend. **Remaining:** add `Apple` to the new-worktree sandbox picker + name the macOS-26 + Apple-silicon requirement in the `available`/`ensure` failure message
 
 ### AI-free mode (audience-widener)
 

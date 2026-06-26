@@ -52,10 +52,15 @@ host-toolchain sandbox like bwrap. It requires **macOS 26 or later on Apple
 silicon**; where that requirement is unmet, resolution falls through to `docker`
 (if present) and then `host`.
 
-This is a tracked, not-yet-implemented deliverable: today `apple` is parsed and
-routed through the generic OCI argv path with no Apple-specific lifecycle or
-path-preserving mount handling. See `tasks.md` section **AV. macOS / Apple
-container platform** (items 698–703).
+Implementation status: the Apple backend has a dedicated CLI path in
+`sandbox.rs` (image prefetch via `container image pull`, status via `container
+inspect`, removal via `container delete --force`, exec with split `-i -t`,
+path-preserving binds via `--mount type=bind,…,readonly`, and a `container list`
+probe for the panel). Undocumented Linux-container hardening flags
+(`--read-only`/`--security-opt`/`--pids-limit`) are omitted for Apple since the
+VM boundary provides isolation and its CLI errors on unknown flags. The macOS
+host port and on-device verification are tracked in `tasks.md` section **AV.
+macOS / Apple container platform** (items 698–703).
 
 ### New worktree sandbox picker
 
