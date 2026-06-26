@@ -43,7 +43,7 @@ use std::path::PathBuf;
 /// source of truth for sidebar workspace order (was recency). Backfilled from
 /// the prior `last_active DESC` order so the first launch after upgrade looks
 /// unchanged; thereafter order is manual (Ctrl+Alt+↑/↓) and stable.
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 
 pub struct Db {
     conn: Connection,
@@ -565,6 +565,19 @@ impl Db {
                 position INTEGER NOT NULL,
                 created_at INTEGER NOT NULL
              )",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS terminals (
+              id                INTEGER PRIMARY KEY AUTOINCREMENT,
+              name              TEXT    NOT NULL UNIQUE,
+              kind              TEXT    NOT NULL,
+              connection_string TEXT    NOT NULL,
+              folder_id         INTEGER,
+              created_at        INTEGER NOT NULL,
+              last_active       INTEGER NOT NULL,
+              position          INTEGER NOT NULL DEFAULT 0
+            )",
             [],
         );
         let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN folder_id INTEGER", []);
@@ -1401,10 +1414,73 @@ impl Db {
             params![folder_id],
         )?;
         tx.execute(
+            "UPDATE terminals SET folder_id = NULL WHERE folder_id = ?1",
+            params![folder_id],
+        )?;
+        tx.execute(
             "DELETE FROM folders WHERE folder_id = ?1",
             params![folder_id],
         )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    // --- terminals -----------------------------------------------------------
+
+    pub fn terminals(&self) -> Result<Vec<crate::models::TerminalRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, kind, connection_string, folder_id, created_at, last_active, position
+             FROM terminals ORDER BY position, last_active DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(crate::models::TerminalRow {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                kind: r.get(2)?,
+                connection_string: r.get(3)?,
+                folder_id: r.get(4)?,
+                created_at: r.get(5)?,
+                last_active: r.get(6)?,
+                position: r.get(7)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn put_terminal(
+        &self,
+        name: &str,
+        kind: &str,
+        connection_string: &str,
+        folder_id: Option<i64>,
+    ) -> Result<i64> {
+        let now = util::now();
+        self.conn.execute(
+            r#"INSERT INTO terminals(name, kind, connection_string, folder_id, created_at, last_active, position)
+               VALUES(?1, ?2, ?3, ?4, ?5, ?5, (SELECT COALESCE(MAX(position), -1) + 1 FROM terminals))
+               ON CONFLICT(name) DO UPDATE SET
+                 kind=?2, connection_string=?3, folder_id=COALESCE(?4, folder_id), last_active=?5"#,
+            params![name, kind, connection_string, folder_id, now],
+        )?;
+        let id: i64 = self.conn.query_row(
+            "SELECT id FROM terminals WHERE name=?1",
+            params![name],
+            |r| r.get(0),
+        )?;
+        Ok(id)
+    }
+
+    pub fn del_terminal(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM terminals WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn rename_terminal(&self, id: i64, new_name: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE terminals SET name = ?1 WHERE id = ?2",
+            params![new_name, id],
+        )?;
         Ok(())
     }
 

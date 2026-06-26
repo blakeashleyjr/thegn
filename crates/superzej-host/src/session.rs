@@ -18,6 +18,8 @@ pub enum GroupKind {
     Home,
     /// A branch worktree.
     Branch,
+    /// A terminal connection.
+    Terminal,
 }
 
 impl GroupKind {
@@ -25,11 +27,13 @@ impl GroupKind {
         match self {
             GroupKind::Home => "home",
             GroupKind::Branch => "branch",
+            GroupKind::Terminal => "terminal",
         }
     }
     fn parse(s: &str) -> GroupKind {
         match s {
             "home" => GroupKind::Home,
+            "terminal" => GroupKind::Terminal,
             _ => GroupKind::Branch,
         }
     }
