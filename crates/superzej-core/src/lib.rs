@@ -31,6 +31,7 @@ pub mod issue;
 pub mod keymap;
 pub mod log;
 pub mod log_view;
+pub mod mcp;
 pub mod metrics;
 pub mod models;
 pub mod msg;
