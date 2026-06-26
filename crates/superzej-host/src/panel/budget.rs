@@ -136,12 +136,14 @@ mod tests {
 
     #[test]
     fn tall_panel_grants_all_content_with_air() {
-        let p = allocate(50, 4, 12, SECTIONS);
+        // airy needs leftover ≥ sections after fixed(4)+content(12); the boundary
+        // is rows = 2*SECTIONS + 18 (fixed = 4 + SECTIONS + 2).
+        let p = allocate(2 * SECTIONS + 18, 4, 12, SECTIONS);
         assert_eq!(p.header_rows, 4);
         assert_eq!(p.content_rows, 12);
         assert_eq!(p.overflow, None);
         assert!(p.airy);
-        assert!(consumed(&p) <= 50);
+        assert!(consumed(&p) <= 2 * SECTIONS + 18);
     }
 
     #[test]
@@ -156,7 +158,8 @@ mod tests {
 
     #[test]
     fn exact_fit_has_no_overflow() {
-        let p = allocate(28, 4, 6, SECTIONS);
+        // fixed = 4 (header) + SECTIONS + 2 (rail/rule); + 6 content = exact fit.
+        let p = allocate(SECTIONS + 12, 4, 6, SECTIONS);
         assert_eq!(p.content_rows, 6);
         assert_eq!(p.overflow, None);
     }

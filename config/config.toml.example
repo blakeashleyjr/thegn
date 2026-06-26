@@ -186,6 +186,35 @@ prewarm = false
 [pr]
 ttl_secs = 30          # cache TTL before a live `gh` re-fetch (SUPERZEJ_PR_TTL)
 
+# Issue-tracker integration — surfaces assigned issues in the Work tab's `issues`
+# section. Multiple trackers aggregate into one list, so you can run, say, Linear
+# for product work and Jira for a client at the same time.
+[issues]
+# `providers` aggregates several trackers at once (recommended). When set it wins
+# over the single `provider`. Valid: "linear", "github", "jira".
+#   providers = ["linear", "jira"]
+providers = []
+# `provider` is the legacy single-tracker form, used only when `providers` is empty.
+provider = "none"            # "none" disables the integration
+ttl_secs = 60                # cache TTL before a background re-fetch
+max_issues = 100             # cap on issues fetched/displayed (per provider)
+filter_assignee_me = true    # pre-filter to issues assigned to you
+move_on_merge = false        # when a worktree's PR merges, move its linked issue to Done
+
+# [issues.linear]
+# api_key = "env:LINEAR_API_KEY"  # `env:VAR` reads from the environment
+# team_id = ""                    # restrict to one team ("" = all)
+# workspace_slug = ""             # used for issue URLs (inferred if empty)
+
+# [issues.github_issues]
+# extra_flags = ["--assignee", "@me"]  # extra `gh issue list` flags
+
+# [issues.jira]
+# base_url = "https://myorg.atlassian.net"
+# email = "me@myorg.com"
+# api_token = "env:JIRA_API_TOKEN"
+# project_key = ""                # restrict to one project ("" = all)
+
 # Top-level app tab strip. Only "work" (your worktree IDE) is available today;
 # unknown ids are ignored.
 # Valid ids: "work".
@@ -566,8 +595,10 @@ visible = true
 # `sections` reorders sections across all tabs — any section left out is hidden;
 # an empty/absent list shows every section in the built-in order:
 #   Git tab:    changes · commits · branches · stash · files
-#   Work tab:   pr · issues · jobs · tests
+#   Work tab:   mine · pr · issues · problems · jobs · tests · symbols
 #   System tab: notifications · logs · sandbox · telemetry · keys
+# "mine" is the unified cross-repo "My Work" feed (assigned issues across all
+# trackers + review-requested/authored PRs + high-priority notifications).
 # The old "prs" and "tasks" keys still work as aliases for "pr" and "jobs".
 # Unknown keys are ignored; reloads apply live.
 [panel]
@@ -683,6 +714,11 @@ backend = "auto"
 
 # Pre-selected backend in the new-worktree picker ("auto" = use backend_chain).
 default_backend = "auto"
+
+# The named execution environment (`[env.<name>]`, documented below) every
+# worktree uses by default unless it/its workspace/repo selects another. Empty
+# = the implicit "default" env (this `[sandbox]` block + `[sandbox.remote]`).
+default_env = ""
 
 # Probe order for "auto". First backend that is installed and usable wins.
 # "none"/"host" anywhere in the list = uncontained fallback from that point on.
@@ -919,6 +955,76 @@ ephemeral = true
 # [sandbox.vpn.custom.env]
 # FOO = "bar"
 
+# ── Named execution environments (`[env.<name>]`) ───────────────────────────
+# A reusable *library* of execution environments. Each bundles three orthogonal
+# axes: a PLACEMENT (where processes run — local / ssh / k8s / provider), an
+# isolation OVERLAY on top of `[sandbox]` (`[env.<name>.sandbox]`), and a DATA
+# mode (where the worktree files live). A workspace/repo/worktree then selects
+# one by name. Selection precedence (most specific wins):
+#   worktree `env_name` (DB) → workspace `env_name` (DB) → repo `.superzej.*`
+#   `env = "…"` → global `default_env` (below) → the implicit `"default"`.
+# The `"default"` env is this `[sandbox]` + `[sandbox.remote]` block — so with
+# no `[env.*]` defined, nothing changes. Manage selections with `superzej env`.
+#
+# Pick the default env for every worktree that hasn't chosen one (empty ⇒
+# "default"). Lives under `[sandbox]`; shown here for context.
+# default_env = ""
+#
+# Example 1 — custom local containers (a pinned image, sealed hardening):
+# [env.local-containers]
+# placement = "local"
+# [env.local-containers.sandbox]
+# backend = "podman"
+# image = "registry.example.com/dev:latest"
+# profile = "sealed"
+#
+# Example 2 — a company Kubernetes cluster (exec into a pod via kubectl):
+# [env.company-k8s]
+# placement = "k8s"
+# data = "in_env"            # files live in the pod
+# [env.company-k8s.sandbox]
+# backend = "none"           # the pod IS the isolation boundary
+# [env.company-k8s.k8s]
+# context = "company-prod"
+# namespace = "dev-blake"
+# pod = "sz-dev"             # target pod name (exec'd into)
+# container = ""             # optional `-c <container>`
+# pod_template = "~/.sz/dev-pod.yaml"   # `superzej env up` applies this (spawn custom env)
+# image = "registry.example.com/dev:latest"  # OR template-less `kubectl run`
+# remote_access = true       # `superzej env forward 8080:80` (kubectl port-forward)
+# # `superzej env up` spawns the pod + waits Ready; `env down` deletes it.
+#
+# Example 3 — a hosted agent sandbox provider (e.g. Daytona). Two modes:
+# (a) static/CLI — `exec_command` is an argv template, `{id}` → the sandbox id:
+# [env.datonya]
+# placement = "provider"
+# [env.datonya.provider]
+# provider = "daytona"
+# id = "sb-1234"
+# exec_command = ["daytona", "ssh", "{id}", "--"]
+# up_command = ["daytona", "create", "--id", "{id}"]   # run by `superzej env up`
+# down_command = ["daytona", "delete", "{id}"]         # run by `superzej env down`
+# # (b) API — `superzej env provision` creates a sandbox over Daytona's REST API
+# # (then set `id` to attach); `superzej env deprovision <id>` destroys it:
+# # api_base = "https://app.daytona.io/api"
+# # api_key_env = "DAYTONA_API_KEY"    # env var holding the Bearer token
+# # template = "debian:stable"         # snapshot/image to create from
+#
+# Example 4 — a remote box over ssh/mosh with a dedicated ssh config + bastion:
+# [env.gpu-box]
+# placement = "ssh"
+# data = "in_env"            # in_env (files on the remote) | sshfs (mount locally) | local_exec
+# [env.gpu-box.ssh]
+# host = "user@gpu-box"      # empty ⇒ inherit the worktree's own target / [sandbox.remote]
+# port = 22
+# transport = "mosh"         # mosh | ssh
+# forward_agent = true
+# ssh_config = "~/.ssh/work.config"   # ssh -F
+# jump_host = "bastion.example.com"   # ssh -J
+# identity = "~/.ssh/id_work"         # ssh -i
+# extra_args = []
+# # With data = "sshfs", `superzej env up` sshfs-mounts [sandbox.remote] remote_dir
+# # at <superzej-dir>/mounts/<host-slug> and `env down` unmounts it.
 # ── LLM proxy (group U/V) ──────────────────────────────────────────────────
 # The AI-traffic chokepoint daemon (binary `szproxy`). The shell never hard-
 # depends on this — AI is strictly additive — so it is OFF by default. When

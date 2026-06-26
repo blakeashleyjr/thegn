@@ -11,5 +11,6 @@ pub mod gh;
 pub mod git;
 pub mod issue;
 pub mod lsp;
+pub mod provider;
 pub mod ssh;
 pub mod vpn;

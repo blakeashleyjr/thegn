@@ -352,6 +352,25 @@ start-term name="dev": build-profiling
       "SUPERZEJ_PERF=1" \
       "$PWD/{{bin}}"
 
+# Same dev/profiling/instrumentation rig as `start-term`, but a RELEASE binary —
+# the daily-driver launcher. `start-term` stays debug for fast `cargo watch`
+# rebuilds (`just dev-tui`); this gets the ~2.5x release speedup while keeping
+# every log channel + the SIGUSR2 flamegraph profiler on, so live perf readings
+# (frame render_ms, the szhost::perf rollup, idle CPU) reflect real shipped cost
+# instead of the debug penalty. Use this to inhabit superzej all day.
+start-term-release name="dev": release-profiling
+    state="$HOME/.superzej-{{name}}/state"; run="$HOME/.superzej-{{name}}/run"; pidfile="$run/szhost.pid"; mkdir -p "$state" "$run"; \
+      if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then kill "$(cat "$pidfile")" 2>/dev/null || true; fi; \
+      echo "profiler: 'kill -USR2 \$(pgrep -n szhost)' to start sampling, again to dump → $state/superzej/profiles/"; \
+      echo "logs: $state/superzej/logs/szhost.log (startup waterfall + frame/hydrate/perf)"; \
+      setsid -f ghostty --config-default-files=false --config-file="$PWD/config/ghostty.config" -e sh -lc \
+      'pidfile="$1"; shift; echo $$ > "$pidfile"; exec env "$@"' \
+      sh "$pidfile" \
+      "XDG_STATE_HOME=$state" \
+      "SUPERZEJ_LOG=info,szhost::frame=debug,szhost::hydrate=debug,szhost::perf=debug" \
+      "SUPERZEJ_PERF=1" \
+      "$PWD/target/release/szhost"
+
 # Install/update the native superzej host onto your PATH (standalone, non-Nix):
 # builds release artifacts, installs `sj` as the dedicated alacritty launcher,
 # `sj-tui` for the current terminal window, and direct `superzej`/`szhost`

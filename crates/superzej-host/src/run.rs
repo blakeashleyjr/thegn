@@ -422,6 +422,8 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         &cli.overrides,
         cli.config.clone(),
     );
+    superzej_core::i18n::init(&cfg.ui.language);
+
     tracing::info!(
         target: "szhost::startup",
         since_start_ms = start.elapsed().as_millis() as u64,
@@ -3199,6 +3201,28 @@ fn begin_worktree_preset(
     });
     *creating = Some(cp);
     model.status = "Creating worktree…".into();
+}
+
+/// The branch-name tail for a worktree created from an issue: the provider's
+/// branch hint when present (e.g. Linear's `abc-123-fix-foo`), else a slug of
+/// `<number>-<title>`. Capped and dash-collapsed so it is a valid ref tail.
+fn issue_branch_tail(number: &str, title: &str, hint: Option<&str>) -> String {
+    if let Some(h) = hint.filter(|h| !h.trim().is_empty()) {
+        return h.trim().to_string();
+    }
+    let raw = format!("{number}-{title}");
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for c in raw.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash && !out.is_empty() {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    out.trim_matches('-').chars().take(48).collect()
 }
 
 fn begin_new_workspace_prompt(
@@ -6330,6 +6354,9 @@ async fn event_loop<T: Terminal>(
     // When a worktree is created from a template (item 54), the template is held
     // here until the worktree-ready event applies its layout + starts its pins.
     let mut pending_template: Option<superzej_core::config::WorktreeTemplate> = None;
+    // Branch-from-issue: `(creation generation, issue_id)`. When the matching
+    // `CreateEvent::Done` arrives, the new worktree is linked to this issue.
+    let mut pending_issue_link: Option<(u64, String)> = None;
     let mut create_gen: u64 = 0;
     // Top-level app tabs (chat/agent) hosted as tiles above the worktree
     // IDE. A tile's ChangeHook posts its slot index here and pulses the waker,
@@ -6491,6 +6518,17 @@ async fn event_loop<T: Terminal>(
     // chrome + sibling-pane recompose). `scroll_pane` names the pane to repaint.
     let mut scroll_only = false;
     let mut scroll_pane: Option<u32> = None;
+    // Per-pane content damage: PTY output records the affected (visible) pane
+    // ids here instead of the master `dirty` flag. When a wake touches ONLY
+    // pane content — no chrome/overlay/geometry change set `dirty`/`full_repaint`
+    // — the render block recomposes and bounded-diffs just these panes over the
+    // reused `scratch` (the streaming-output fast path). Cleared after flush.
+    let mut dirty_panes: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    // Bars-only damage: the high-frequency stats tick / live clock / AI metrics
+    // change only the masthead + statusbar. Like `dirty_panes`, this takes the
+    // incremental path (recompose + bounded-diff the two 1-row bar rects) instead
+    // of the master `dirty` full-chrome repaint. Cleared after flush.
+    let mut bars_dirty = false;
     // One zone owns the keyboard at any time; Ctrl+g toggles the keybind lock.
     // `sb.focused` / `model.panel_focused` / `model.center_focused` mirror it.
     let mut focus = crate::focus::FocusState::default();
@@ -6707,7 +6745,6 @@ async fn event_loop<T: Terminal>(
             open: panel_ui.open,
             expanded: panel_ui.width.is_expanded(),
             profile: current_config.profile.clone(),
-            ..Default::default()
         };
         for path in neighbor_worktree_paths(&session) {
             spawn_panel_prefetch(
@@ -6927,7 +6964,6 @@ async fn event_loop<T: Terminal>(
                 open: panel_ui.open,
                 expanded: panel_ui.width.is_expanded(),
                 profile: current_config.profile.clone(),
-                ..Default::default()
             };
             spawn_model_hydration(
                 model_tx.clone(),
@@ -6950,8 +6986,17 @@ async fn event_loop<T: Terminal>(
                     Some(waker.clone()),
                 );
             }
-            spawn_pr_cache_refresh(session.clone(), Some(waker.clone()));
+            spawn_pr_cache_refresh(
+                session.clone(),
+                current_config.issues.clone(),
+                Some(waker.clone()),
+            );
             crate::hydrate::spawn_issue_cache_refresh(
+                session.clone(),
+                current_config.issues.clone(),
+                Some(waker.clone()),
+            );
+            crate::hydrate::spawn_my_work_refresh(
                 session.clone(),
                 current_config.issues.clone(),
                 Some(waker.clone()),
@@ -7221,7 +7266,9 @@ async fn event_loop<T: Terminal>(
                                     let _ = out.flush();
                                 }
                                 if visible.contains(&id) {
-                                    dirty = true;
+                                    // Pane-content-only damage: recompose just
+                                    // this pane, not the chrome (see render_plan).
+                                    dirty_panes.insert(id);
                                 }
                             }
                         }
@@ -7511,9 +7558,10 @@ async fn event_loop<T: Terminal>(
         if disconnected {
             return Ok(());
         }
-        if budget_exhausted {
-            dirty = true;
-        }
+        // A capped chatty pane left more PTY queued. The visible chunks we DID
+        // drain already armed `dirty_panes`, so this frame paints them; the
+        // backlog is drained on a fast re-wake (the poll timeout below), not by
+        // forcing a full-chrome repaint.
         if session.worktrees.is_empty() {
             return Ok(());
         }
@@ -8095,6 +8143,12 @@ async fn event_loop<T: Terminal>(
             if generation != hydration_gen {
                 continue;
             }
+            // Idle guard: the 2s safety tick re-hydrates identical git/db data.
+            // Compute up front (before `model` is mutated) whether this result
+            // carries any render-affecting change; if not, we still apply it
+            // (keeping the model fresh + seeding the switch cache) but skip the
+            // repaint, so an untouched session sits at ~0% CPU.
+            let model_changed = !model.hydration_eq(&next_model);
             // Fresh git data invalidates the inline hunk previews (the 2s
             // safety tick sends identical panels, so only real changes
             // clear); the selected row's preview is refetched immediately so
@@ -8195,7 +8249,9 @@ async fn event_loop<T: Terminal>(
                 panel_ui.logs_cursor = count.saturating_sub(1);
                 panel_ui.cursor = panel_ui.logs_cursor;
             }
-            dirty = true;
+            if model_changed {
+                dirty = true;
+            }
         }
 
         // Neighbor-prefetch results: seed the switch cache only. No repaint —
@@ -8215,9 +8271,16 @@ async fn event_loop<T: Terminal>(
             loop_perf.tick(crate::perf::WakeSource::Stats);
             panel_ui.docs.telemetry.push(&snap);
             panel_ui.docs.tick = panel_ui.docs.tick.wrapping_add(1);
-            if model.stats != snap || telemetry_visible {
+            if telemetry_visible {
+                // The telemetry graphs live in the panel and animate every tick,
+                // so this is a real chrome change → full frame.
                 model.stats = snap;
                 dirty = true;
+            } else if model.stats != snap {
+                // Headline stats changed but only the masthead shows them: take
+                // the cheap bars path, not a full-chrome repaint (~1×/s idle).
+                model.stats = snap;
+                bars_dirty = true;
             }
         }
 
@@ -8274,7 +8337,8 @@ async fn event_loop<T: Terminal>(
                 loop_perf.tick(crate::perf::WakeSource::Metrics);
                 if model.ai_metrics.as_ref() != Some(&ai_state) {
                     model.ai_metrics = Some(ai_state);
-                    dirty = true;
+                    // AI metrics render in the statusbar → bars path, not full.
+                    bars_dirty = true;
                 }
             }
         }
@@ -8379,6 +8443,18 @@ async fn event_loop<T: Terminal>(
                         crate::session::GroupKind::Branch,
                         payload.path.clone(),
                     ));
+                    // Branch-from-issue: link the freshly created worktree to the
+                    // issue it was branched from, so its tab carries the issue badge.
+                    if let Some((g, issue_id)) = pending_issue_link.take() {
+                        if g == generation {
+                            if let Ok(db) = superzej_core::db::Db::open() {
+                                let _ = db.link_issue(&payload.path, &issue_id);
+                            }
+                        } else {
+                            // Not ours — put it back for the matching Done event.
+                            pending_issue_link = Some((g, issue_id));
+                        }
+                    }
                     refresh_tab_model(&mut model, &session, &mut sb);
                     need_relayout = true;
                     // Pane spawn (openpty+exec) is the only loop-side step;
@@ -8578,15 +8654,23 @@ async fn event_loop<T: Terminal>(
                     open: panel_ui.open,
                     expanded: panel_ui.width.is_expanded(),
                     profile: current_config.profile.clone(),
-                    ..Default::default()
                 },
             );
         }
         if want_pr_refresh {
-            spawn_pr_cache_refresh(session.clone(), Some(waker.clone()));
+            spawn_pr_cache_refresh(
+                session.clone(),
+                current_config.issues.clone(),
+                Some(waker.clone()),
+            );
         }
         if want_issue_refresh {
             crate::hydrate::spawn_issue_cache_refresh(
+                session.clone(),
+                current_config.issues.clone(),
+                Some(waker.clone()),
+            );
+            crate::hydrate::spawn_my_work_refresh(
                 session.clone(),
                 current_config.issues.clone(),
                 Some(waker.clone()),
@@ -8707,13 +8791,16 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
 
-        // 2. Render if anything changed (diff-flush): all visible panes of the
-        //    active tab + the chrome, with the hardware cursor in the focused pane.
-        if !dirty {
+        // 2. Render if anything changed (diff-flush): the damaged panes and/or
+        //    chrome, with the hardware cursor in the focused pane. `dirty` is the
+        //    chrome/overlay/geometry channel; `dirty_panes` the per-pane content
+        //    channel — either (or `full_repaint`) means there is a frame to paint.
+        let should_render = dirty || full_repaint || !dirty_panes.is_empty() || bars_dirty;
+        if !should_render {
             // Woke but nothing changed — a wasted wakeup (storm signal).
             loop_perf.render_skip();
         }
-        if dirty {
+        if should_render {
             let frame_t0 = std::time::Instant::now();
             // Refresh the live OSC window titles from the panes table (main loop
             // only) so the sidebar's dynamic row titles track the focused pane's
@@ -8784,6 +8871,35 @@ async fn event_loop<T: Terminal>(
                 && which_key.is_empty()
                 && pending_confirm.is_none()
                 && toasts.is_empty();
+            // The damage-compositor decision (pure, unit-tested in render_plan):
+            // with no chrome/overlay/geometry damage, a wake that touched only
+            // pane content recomposes + bounded-diffs JUST those panes. Any live
+            // overlay that composites over a pane forces a full frame so it is
+            // never erased. `fast_select`/`scroll_fast` above are the older
+            // single-pane interactive paths and take precedence when armed.
+            let overlays = crate::render_plan::Overlays {
+                app_tile: app_tile_active,
+                selection: mouse_sel.is_some(),
+                palette: palette.is_some(),
+                menu: active_menu.is_some(),
+                git_input: git_input.is_some(),
+                host_input: host_input.is_some(),
+                wizard: wizard_ui.is_some(),
+                hover: hover_popup.is_some(),
+                search: search.is_some(),
+                which_key: !which_key.is_empty(),
+                confirm: pending_confirm.is_some(),
+                toasts: !toasts.is_empty(),
+            };
+            let damage = crate::render_plan::Damage {
+                full: full_repaint,
+                chrome: dirty,
+                panes: dirty_panes.clone(),
+                bars: bars_dirty,
+            };
+            let frame_plan = crate::render_plan::plan(&damage, &overlays);
+            // Rects recomposed by the incremental path; drive the bounded diff.
+            let mut pane_diff_rects: Vec<Rect> = Vec::new();
             if fast_select && !clear_on_next_frame {
                 if let Some((sp, sel)) = mouse_sel.as_ref() {
                     let target = if let Some(d) = drawer
@@ -8823,6 +8939,50 @@ async fn event_loop<T: Terminal>(
                     if let (Some(content), Some(p)) = (target, panes.table.get(&sp)) {
                         crate::compositor::compose_pane(&mut scratch, p.emulator(), content);
                     }
+                }
+            } else if let crate::render_plan::RenderPlan::Incremental {
+                panes: ref ids,
+                bars,
+            } = frame_plan
+            {
+                // INCREMENTAL FAST PATH: pane output and/or a bars (stats/clock)
+                // tick, nothing heavier. Reuse the prior frame in `scratch` and
+                // recompose ONLY the damaged regions — never the full chrome (the
+                // dominant per-frame cost). The bounded diff below then scans just
+                // these rects, so a frame's cost tracks what changed, not the
+                // screen size.
+                let frames = tree.layout_framed(chrome.center);
+                for &id in ids {
+                    let content = if let Some(d) = drawer
+                        && d == id
+                        && let Some(rect) = chrome.drawer
+                    {
+                        Some(rect)
+                    } else {
+                        frames
+                            .iter()
+                            .find(|(pid, _, _)| *pid == id)
+                            .map(|(_, _, c)| *c)
+                    };
+                    // A pane awaiting relaunch is a husk with no live process, so
+                    // it never enters `dirty_panes` — no relaunch overlay needed.
+                    if let (Some(content), Some(p)) = (content, panes.table.get(&id)) {
+                        crate::compositor::compose_pane(&mut scratch, p.emulator(), content);
+                        pane_diff_rects.push(content);
+                    }
+                }
+                if bars {
+                    // Stats/clock/AI-metrics changed: recompose just the two 1-row
+                    // bars over the reused scratch. They're rect-contained and
+                    // disjoint from the center/sidebar/panel, so nothing else is
+                    // stomped. Reflect the live app-tab strip first (the masthead
+                    // chips read it; the full path does the same below).
+                    model.app_tabs = app_host.tab_labels();
+                    model.active_app = app_host.active_tab_index();
+                    crate::chrome::draw_masthead(&mut scratch, &chrome, &model);
+                    crate::chrome::draw_statusbar(&mut scratch, chrome.statusbar, &model);
+                    pane_diff_rects.push(chrome.masthead);
+                    pane_diff_rects.push(chrome.statusbar);
                 }
             } else {
                 crate::chrome::clear_frame(&mut scratch);
@@ -9044,7 +9204,23 @@ async fn event_loop<T: Terminal>(
                 wire_renderer.invalidate();
                 full_repaint = false;
             }
-            let mut pending = front.diff_screens(&scratch);
+            // Bounded diff: the incremental path recomposed just a few rects
+            // (changed panes and/or the bars) over the reused `scratch`, so diff
+            // ONLY those rects (`diff_screens` is `diff_region` over the whole
+            // screen). A frame's diff cost then tracks the damage, not the screen
+            // size — the floor that made every frame ≥46ms. Full frames diff all.
+            let mut pending = if matches!(
+                frame_plan,
+                crate::render_plan::RenderPlan::Incremental { .. }
+            ) {
+                let mut changes = Vec::new();
+                for r in &pane_diff_rects {
+                    changes.extend(front.diff_region(r.x, r.y, r.cols, r.rows, &scratch, r.x, r.y));
+                }
+                changes
+            } else {
+                front.diff_screens(&scratch)
+            };
             if app_tile_active {
                 // The app tile owns the band; no host hardware cursor (the tile
                 // draws its own caret if it wants one).
@@ -9113,11 +9289,19 @@ async fn event_loop<T: Terminal>(
                 out.flush().context("terminal flush")?;
             }
             dirty = false;
-            // Record the frame's compose+flush latency (p50/p99 in the rollup).
-            loop_perf.render(frame_t0.elapsed());
+            // Record the frame's compose+flush latency (p50/p99 in the rollup)
+            // and classify it: cheap incremental fast path vs full recompose.
+            let incremental_frame = matches!(
+                frame_plan,
+                crate::render_plan::RenderPlan::Incremental { .. }
+            );
+            loop_perf.render(frame_t0.elapsed(), incremental_frame);
             // Consumed: the next frame is full unless another drag/scroll re-arms it.
             selection_only = false;
             scroll_only = false;
+            // Pane/bars damage is now on screen; an untouched next wake renders nothing.
+            dirty_panes.clear();
+            bars_dirty = false;
             if muse_ready {
                 // Only emit the ready marker when the event queue is
                 // completely drained.  If szhost still has buffered input (e.g.
@@ -9174,6 +9358,7 @@ async fn event_loop<T: Terminal>(
                 target: "szhost::frame",
                 render_ms = frame_t0.elapsed().as_millis() as u64,
                 drain_chunks = drain_stats_chunks,
+                kind = if incremental_frame { "incr" } else { "full" },
                 "frame flushed"
             );
             if !first_frame_logged {
@@ -9218,7 +9403,7 @@ async fn event_loop<T: Terminal>(
         //    config watcher, diff fs-watch, refresh ticker) which returns
         //    `InputEvent::Wake`. No timeout → zero idle CPU; we only wake when
         //    there is work, and render the instant it arrives.
-        let timeout = if dirty || !pending_input.is_empty() {
+        let timeout = if dirty || !pending_input.is_empty() || budget_exhausted {
             Some(std::time::Duration::from_millis(8))
         } else {
             None
@@ -11857,6 +12042,22 @@ async fn event_loop<T: Terminal>(
                                         // Drill handling for the git-family lists
                                         // arrives with the GitMsg dispatch layer.
                                         Section::Commits | Section::Branches | Section::Stash => {}
+                                        Section::Mine => {
+                                            // Enter opens the cursor row in the browser.
+                                            // (Worktree-jump / branch-from-issue arrive
+                                            // with the binding layer.)
+                                            let rows =
+                                                crate::panel::sections::my_work::ordered_rows(
+                                                    &model.panel,
+                                                );
+                                            if let Some(row) = rows.get(panel_ui.cursor)
+                                                && !row.url.is_empty()
+                                            {
+                                                open_url_detached(&row.url);
+                                                model.status =
+                                                    format!("Opened {} in browser", row.number);
+                                            }
+                                        }
                                         Section::Issues => {
                                             // Enter toggles the worktree↔issue link for
                                             // the cursor row.
@@ -12625,6 +12826,94 @@ async fn event_loop<T: Terminal>(
                                 focus.zone = crate::focus::Zone::Center;
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
+                            }
+                            true
+                        }
+                        // -- my work: open URL, refresh the cross-repo feed ---
+                        (Section::Mine, KeyCode::Char('o')) => {
+                            let rows = crate::panel::sections::my_work::ordered_rows(&model.panel);
+                            if let Some(row) = rows.get(panel_ui.cursor)
+                                && !row.url.is_empty()
+                            {
+                                open_url_detached(&row.url);
+                                model.status = format!("Opened {} in browser", row.number);
+                            }
+                            true
+                        }
+                        (Section::Mine, KeyCode::Char('R')) => {
+                            crate::hydrate::spawn_my_work_refresh(
+                                session.clone(),
+                                current_config.issues.clone(),
+                                Some(waker.clone()),
+                            );
+                            model.status = "Refreshing your work…".into();
+                            true
+                        }
+                        // Branch-a-worktree-from-this-issue: the keystone that turns
+                        // the dashboard into a launchpad. Works from My-Work and the
+                        // Issues section; reuses the headless worktree-create preset
+                        // and links the new worktree to the issue on completion.
+                        (Section::Mine | Section::Issues, KeyCode::Char('b')) => {
+                            let fields: Option<(String, String, String, Option<String>)> =
+                                if panel_ui.open == Section::Mine {
+                                    let rows =
+                                        crate::panel::sections::my_work::ordered_rows(&model.panel);
+                                    rows.get(panel_ui.cursor).and_then(|r| {
+                                        r.issue_id.clone().map(|id| {
+                                            (
+                                                id,
+                                                r.number.clone(),
+                                                r.title.clone(),
+                                                r.branch_hint.clone(),
+                                            )
+                                        })
+                                    })
+                                } else {
+                                    model.panel.tracker_issues.get(panel_ui.issues_cursor).map(
+                                        |i| {
+                                            (
+                                                i.id.clone(),
+                                                i.number.clone(),
+                                                i.title.clone(),
+                                                i.branch_hint.clone(),
+                                            )
+                                        },
+                                    )
+                                };
+                            if let Some((issue_id, number, title, hint)) = fields {
+                                let root = session
+                                    .active_group()
+                                    .map(|g| g.path.clone())
+                                    .filter(|p| !p.is_empty())
+                                    .and_then(|p| superzej_core::repo::main_worktree(Path::new(&p)))
+                                    .or_else(|| {
+                                        std::env::current_dir()
+                                            .ok()
+                                            .and_then(|c| superzej_core::repo::main_worktree(&c))
+                                    });
+                                if let Some(root) = root {
+                                    let tail = issue_branch_tail(&number, &title, hint.as_deref());
+                                    begin_worktree_preset(
+                                        root,
+                                        crate::keymap::NameSpec::Fixed(tail),
+                                        None,
+                                        None,
+                                        None,
+                                        keymap.config(),
+                                        &mut create_gen,
+                                        &create_tx,
+                                        &waker,
+                                        &mut creating,
+                                        &mut wizard_cmd_tx,
+                                        &mut wizard_ui,
+                                        &mut model,
+                                    );
+                                    pending_issue_link = Some((create_gen, issue_id));
+                                    model.status = format!("Branching worktree for {number}…");
+                                } else {
+                                    model.status =
+                                        "branch-from-issue: not inside a git repository".into();
+                                }
                             }
                             true
                         }
@@ -14934,6 +15223,25 @@ mod tests {
     use crate::hydrate::build_model;
     use crate::session::{GroupKind, Session, WorktreeGroup};
 
+    #[test]
+    fn issue_branch_tail_prefers_hint_then_slugifies() {
+        // A provider branch hint is used verbatim (trimmed).
+        assert_eq!(
+            issue_branch_tail("ABC-1", "Fix the thing", Some("abc-1-fix-the-thing")),
+            "abc-1-fix-the-thing"
+        );
+        // No hint → slug of number + title, dash-collapsed and lowercased.
+        assert_eq!(
+            issue_branch_tail("42", "Fix: the   Thing!", None),
+            "42-fix-the-thing"
+        );
+        // Empty hint falls back to the slug.
+        assert_eq!(issue_branch_tail("7", "Hi", Some("  ")), "7-hi");
+        // Leading/trailing junk never yields edge dashes.
+        let t = issue_branch_tail("#9", "!!!", None);
+        assert!(!t.starts_with('-') && !t.ends_with('-'), "{t:?}");
+    }
+
     // ---- test-run scope narrowing (item 518) -------------------------------
     fn t_node(
         id: &str,
@@ -15987,6 +16295,7 @@ mod tests {
             path: "/tmp/lib".into(),
             folder_id: None,
             sandbox_backend: None,
+            env_name: None,
         }];
 
         // The synchronous prune the RemoveWorkspace handler performs (same code).

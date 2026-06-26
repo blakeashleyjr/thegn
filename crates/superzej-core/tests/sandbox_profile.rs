@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use superzej_core::config::{FileAccess, Network};
 use superzej_core::sandbox::{
-    Backend, SandboxLimits, SandboxSpec, Transport, container_name, container_name_with_profile,
+    Backend, SandboxLimits, SandboxSpec, container_name, container_name_with_profile,
 };
 
 fn container_running(name: &str) -> bool {
@@ -106,7 +106,7 @@ fn h3_profile_switch_teardown() {
 
     let spec_work = SandboxSpec {
         backend: Backend::Podman,
-        transport: Transport::Local,
+        placement: superzej_core::placement::Placement::Local,
         image: Some("docker.io/library/alpine:latest".into()),
         worktree: PathBuf::from(worktree),
         mounts: vec![],
