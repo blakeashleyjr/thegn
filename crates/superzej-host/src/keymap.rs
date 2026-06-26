@@ -495,14 +495,14 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         id: "scroll-up",
         label: "Scroll pane up",
         hint: "scroll↑",
-        default_chords: &["Shift PageUp"],
+        default_chords: &["Shift PageUp", "PageUp"],
         palette: true,
     },
     ActionSpec {
         id: "scroll-down",
         label: "Scroll pane down",
         hint: "scroll↓",
-        default_chords: &["Shift PageDown"],
+        default_chords: &["Shift PageDown", "PageDown"],
         palette: true,
     },
     ActionSpec {
@@ -1297,8 +1297,10 @@ pub fn default_keymap() -> KeyMap {
         .unwrap();
 
     map.insert_all("Shift PageUp", Action::ScrollUp).unwrap();
+    map.insert_all("PageUp", Action::ScrollUp).unwrap();
     map.insert_all("Shift PageDown", Action::ScrollDown)
         .unwrap();
+    map.insert_all("PageDown", Action::ScrollDown).unwrap();
 
     // Single key keybinds are prevented by rule. We shouldn't use "/" for SearchPane.
     map.insert_all("Ctrl Alt /", Action::SearchPane).unwrap();
@@ -1804,7 +1806,7 @@ mod tests {
     }
 
     #[test]
-    fn shift_pageup_down_scroll_but_plain_pageup_forwards() {
+    fn shift_pageup_down_scroll() {
         assert_eq!(
             map_key(&KeyCode::PageUp, Modifiers::SHIFT),
             Some(Action::ScrollUp)
@@ -1813,8 +1815,11 @@ mod tests {
             map_key(&KeyCode::PageDown, Modifiers::SHIFT),
             Some(Action::ScrollDown)
         );
-        // Plain PageUp is forwarded to the pane (apps use it).
-        assert_eq!(map_key(&KeyCode::PageUp, Modifiers::NONE), None);
+        // Plain PageUp now scrolls the pane (user requested).
+        assert_eq!(
+            map_key(&KeyCode::PageUp, Modifiers::NONE),
+            Some(Action::ScrollUp)
+        );
     }
 
     #[test]
