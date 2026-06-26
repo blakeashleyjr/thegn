@@ -129,69 +129,49 @@ fn context_hints(
     panel_ui: &crate::panel::PanelUi,
     cfg: &superzej_core::config::Config,
 ) -> Vec<(String, String)> {
-    let chord = |id: &str| -> Option<String> { crate::keymap::chord_hint_for(cfg, id) };
-    let hint = |label: &str, id: &str| chord(id).map(|c| (c, label.to_string()));
-    let pair = |c: &str, label: &str| Some((c.to_string(), label.to_string()));
-    if focus.locked {
-        return vec![
-            hint("unlock", "toggle-key-lock").unwrap_or_else(|| ("Ctrl-g".into(), "unlock".into())),
-        ];
-    }
-    match focus.zone {
-        crate::focus::Zone::Center => [
-            hint("pane", "focus-left").or_else(|| chord("focus-right").map(|c| (c, "pane".into()))),
-            hint("tab", "prev-tab").or_else(|| chord("next-tab").map(|c| (c, "tab".into()))),
-            hint("worktree", "prev-worktree")
-                .or_else(|| chord("next-worktree").map(|c| (c, "worktree".into()))),
-            hint("close tab", "close-tab"),
-            hint("smart split", "new-pane"),
-            hint("split↓", "split-down"),
-            hint("split→", "split-right"),
-            hint("zoom", "zoom"),
-            hint("menu", "palette"),
-        ]
-        .into_iter()
-        .flatten()
-        .collect(),
-        crate::focus::Zone::Sidebar => [
-            pair("↑↓", "move"),
-            pair("Enter", "open"),
-            pair("e", "expand"),
-            pair("Space", "mark"),
-            pair("m", "menu"),
-            hint("tab", "prev-tab").or_else(|| chord("next-tab").map(|c| (c, "tab".into()))),
-            pair("Esc", "back"),
-        ]
-        .into_iter()
-        .flatten()
-        .collect(),
-        crate::focus::Zone::Panel => {
-            let mut hints = crate::chrome::panel_help_pairs(panel_ui);
-            // Zone-exit hints trail the section/row-specific ones.
-            let exit: Vec<(String, String)> = [hint("pane", "focus-left")
-                .or_else(|| chord("focus-right").map(|c| (c, "pane".into())))]
-            .into_iter()
-            .flatten()
-            .collect();
-            hints.extend(exit);
-            hints
+    let mut resolved = superzej_core::keymap::effective(cfg);
+    resolved.sort_by_key(|a| std::cmp::Reverse(a.priority));
+
+    let focus_context = match focus.zone {
+        crate::focus::Zone::Center => superzej_core::keymap::Context::Center,
+        crate::focus::Zone::Sidebar => superzej_core::keymap::Context::Left,
+        crate::focus::Zone::Panel => superzej_core::keymap::Context::Right,
+        crate::focus::Zone::Drawer | crate::focus::Zone::Statusbar => {
+            superzej_core::keymap::Context::Bottom
         }
-        crate::focus::Zone::Drawer => vec![
-            ("↑↓←→".into(), "files".into()),
-            ("Enter".into(), "open".into()),
-            hint("back", "focus-up").unwrap_or_else(|| ("Ctrl-Up".into(), "back".into())),
-            ("Esc/q".into(), "close".into()),
-        ],
-        crate::focus::Zone::Masthead => vec![
-            hint("back", "focus-down").unwrap_or_else(|| ("Ctrl-Down".into(), "back".into())),
-            ("Esc".into(), "back".into()),
-        ],
-        crate::focus::Zone::Statusbar => vec![
-            ("Enter".into(), "action".into()),
-            hint("back", "focus-up").unwrap_or_else(|| ("Ctrl-Up".into(), "back".into())),
-            ("Esc".into(), "back".into()),
-        ],
+        crate::focus::Zone::Masthead => superzej_core::keymap::Context::Top,
+    };
+
+    let mut out: Vec<(String, String)> = Vec::new();
+
+    if focus.zone == crate::focus::Zone::Panel {
+        out = crate::chrome::panel_help_pairs(panel_ui);
     }
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (_, hint) in &out {
+        seen.insert(hint.clone());
+    }
+
+    for action in resolved {
+        if action
+            .contexts
+            .contains(&superzej_core::keymap::Context::Global)
+            || action.contexts.contains(&focus_context)
+        {
+            if seen.insert(action.hint.clone()) && !action.hint.is_empty() {
+                if let Some(chord) = action.chords.first() {
+                    out.push((chord.to_kdl().to_string(), action.hint.clone()));
+                }
+            }
+        }
+    }
+
+    if focus.locked {
+        return out.into_iter().filter(|(_, hint)| hint == "lock").collect();
+    }
+
+    out
 }
 
 /// Fetch the git section's heat/velocity/log payload off the loop (skipped
@@ -15740,23 +15720,23 @@ mod tests {
         let hints = context_hints(&focus, &panel, &cfg);
 
         let has = |c: &str, l: &str| hints.iter().any(|(hc, hl)| hc == c && hl == l);
-        assert!(has("Alt-x", "close tab"), "hints were {hints:?}");
-        assert!(has("Alt-p", "smart split"), "hints were {hints:?}");
-        assert!(has("Alt-n", "split↓"), "hints were {hints:?}");
-        assert!(has("Alt-N", "split→"), "hints were {hints:?}");
+        assert!(has("Alt x", "close"), "hints were {hints:?}");
+        assert!(has("Alt n", "split↓"), "hints were {hints:?}");
+        assert!(has("Alt N", "split→"), "hints were {hints:?}");
     }
 
     #[test]
     fn center_context_hints_follow_keybind_overrides() {
         let mut cfg = superzej_core::config::Config::default();
-        cfg.keybinds.insert("close-tab".into(), "Ctrl Alt x".into());
+        cfg.keybinds
+            .insert("close-worktree".into(), "Ctrl Alt x".into());
         let focus = crate::focus::FocusState::default();
         let panel = crate::panel::PanelUi::default();
         let hints = context_hints(&focus, &panel, &cfg);
 
         let has = |c: &str, l: &str| hints.iter().any(|(hc, hl)| hc == c && hl == l);
-        assert!(has("Ctrl-Alt-x", "close tab"), "hints were {hints:?}");
-        assert!(!has("Alt-x", "close tab"), "hints were {hints:?}");
+        assert!(has("Ctrl Alt x", "close"), "hints were {hints:?}");
+        assert!(!has("Alt x", "close"), "hints were {hints:?}");
     }
 
     #[test]
