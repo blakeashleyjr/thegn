@@ -3,7 +3,7 @@
 use serde::Serialize;
 
 /// A sandbox audit event from the `container_events` table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ContainerEvent {
     pub id: i64,
     pub worktree: String,

@@ -166,7 +166,7 @@ pub struct SidebarRow {
 /// the hydration thread, merged onto rows at build time. `git`/`agent` are
 /// keyed by worktree path; `activity` by tab name (matching the `activity`
 /// state machine's TSV keys).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SidebarStatus {
     pub git: std::collections::BTreeMap<String, GitGlyphs>,
     pub agent: std::collections::BTreeMap<String, String>,

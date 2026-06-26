@@ -40,6 +40,7 @@ mod pins;
 mod profile;
 mod proxy_daemon;
 mod queries;
+mod render_plan;
 mod run;
 mod sandbox_events;
 mod search;
