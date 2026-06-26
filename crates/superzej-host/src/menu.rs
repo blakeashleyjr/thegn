@@ -21,6 +21,7 @@ use superzej_core::theme::Hue;
 /// A typed menu outcome the event loop dispatches on.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MenuChoice {
+    LocMetrics,
     // rebase options (m)
     RebaseContinue,
     RebaseAbort,
@@ -350,6 +351,20 @@ pub fn confirm_menu(
 
 /// First-launch keymap picker (item 621): pick a familiar IDE keymap overlay or
 /// keep superzej's defaults. Each choice resolves to `SetKeymapPreset`.
+pub fn loc_metrics_menu(loc: Option<u64>) -> MenuOverlay {
+    let loc_str = loc
+        .map(|l| format!("Total Lines of Code: {}", l))
+        .unwrap_or_else(|| "Total Lines of Code: Unknown".to_string());
+    let items = vec![MenuItem {
+        key: Some('L'),
+        label: loc_str,
+        note: None,
+        choice: MenuChoice::LocMetrics,
+        danger: false,
+    }];
+    MenuOverlay::new(MenuKindTag::CustomCommands, "loc metrics", items)
+}
+
 pub fn keymap_preset_menu() -> MenuOverlay {
     MenuOverlay::new(
         MenuKindTag::KeymapPicker,

@@ -615,23 +615,22 @@ fn collect_sidebar_status(
 fn worktree_loc(db: &superzej_core::db::Db, path: &std::path::Path) -> Option<u64> {
     const TTL_SECS: i64 = 300;
     let key = path.to_string_lossy().into_owned();
-    if let Ok(Some((loc, fetched_at))) = db.get_loc_cache_entry(&key)
-        && now_secs() - fetched_at < TTL_SECS
-    {
-        return Some(loc as u64);
+    if let Ok(Some((loc, fetched_at))) = db.get_loc_cache_entry(&key) {
+        if now_secs() - fetched_at < TTL_SECS {
+            return Some(loc as u64);
+        }
     }
-    let out = std::process::Command::new("tokei")
-        .args(["--output", "json"])
-        .arg(path)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    let code = v.get("Total")?.get("code")?.as_u64()?;
-    let _ = db.put_loc_cache(&key, code as usize);
-    Some(code)
+
+    let mut languages = tokei::Languages::new();
+    let mut config = tokei::Config::default();
+    config.treat_doc_strings_as_comments = Some(true);
+    let paths = vec![path.to_path_buf()];
+
+    languages.get_statistics(&paths, &[], &config);
+    let code: usize = languages.iter().map(|(_, lang)| lang.code).sum();
+
+    let _ = db.put_loc_cache(&key, code);
+    Some(code as u64)
 }
 
 /// A cheap first-frame model: no git, no diff, no DB recents. It gives the
