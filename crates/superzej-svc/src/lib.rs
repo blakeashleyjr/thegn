@@ -11,6 +11,7 @@ pub mod ci;
 pub mod gh;
 pub mod git;
 pub mod issue;
+pub mod log;
 pub mod lsp;
 pub mod provider;
 pub mod ssh;
