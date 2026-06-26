@@ -32,6 +32,7 @@ pub mod keymap;
 pub mod log;
 pub mod log_trace;
 pub mod log_view;
+pub mod media;
 pub mod metrics;
 pub mod models;
 pub mod msg;

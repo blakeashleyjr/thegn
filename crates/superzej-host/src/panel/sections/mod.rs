@@ -19,6 +19,7 @@ mod git;
 mod issues;
 mod keys;
 mod logs;
+mod media;
 mod misc;
 pub(crate) mod my_work;
 mod notifications;
@@ -534,6 +535,21 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
                 vec![seg(g(), n.to_string())]
             }
         }
+        Section::Media => match &model.panel.media {
+            Some(m) => {
+                use superzej_core::media::PlaybackState;
+                let fg = match m.state {
+                    PlaybackState::Playing => hue(Hue::Green),
+                    PlaybackState::Paused => hue(Hue::Amber),
+                    PlaybackState::Stopped => g2(),
+                };
+                vec![
+                    seg(fg, format!("{} ", m.state.glyph())),
+                    seg(g(), truncate_summary(&m.now_playing(), 22)),
+                ]
+            }
+            None => vec![seg(g2(), "—")],
+        },
     }
 }
 
@@ -592,6 +608,7 @@ pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
         Section::Issues => issues::content(ctx),
         Section::Notifications => notifications::content(ctx),
         Section::Logs => logs::content(ctx),
+        Section::Media => media::content(ctx),
     }
 }
 

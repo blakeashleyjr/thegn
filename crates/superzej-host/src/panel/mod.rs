@@ -125,6 +125,9 @@ pub enum Section {
     Logs,
     Sandbox,
     Telemetry,
+    /// Now-playing + transport for the optional `[media]` feature. Hidden unless
+    /// `[media] enabled`.
+    Media,
     Keys,
     // Placeholder sections — kept as dead variants for future use.
     #[allow(dead_code)]
@@ -137,11 +140,11 @@ pub enum Section {
 /// sections` is unset. Grouped by tab:
 /// - Git (5): Changes, Commits, Branches, Stash, Files
 /// - Work (8): Mine, Pr, Ci, Issues, Problems, Jobs, Tests, Symbols
-/// - System (5): Notifications, Logs, Sandbox, Telemetry, Keys
+/// - System (6): Notifications, Logs, Sandbox, Telemetry, Media, Keys
 ///
 /// The live order (config-reordered, possibly trimmed) rides on
 /// [`PanelUi::order`]; numbered jump keys index the ACTIVE TAB's slice.
-pub const SECTION_ORDER: [Section; 18] = [
+pub const SECTION_ORDER: [Section; 19] = [
     // Git tab
     Section::Changes,
     Section::Commits,
@@ -162,6 +165,7 @@ pub const SECTION_ORDER: [Section; 18] = [
     Section::Logs,
     Section::Sandbox,
     Section::Telemetry,
+    Section::Media,
     Section::Keys,
 ];
 
@@ -189,6 +193,7 @@ impl Section {
             Section::Issues => "issues",
             Section::Notifications => "notifications",
             Section::Logs => "logs",
+            Section::Media => "media",
         }
     }
 
@@ -212,6 +217,7 @@ impl Section {
             | Section::Logs
             | Section::Sandbox
             | Section::Telemetry
+            | Section::Media
             | Section::Keys
             | Section::Debug
             | Section::Db => PanelTab::System,
@@ -452,6 +458,9 @@ pub struct PanelData {
     /// Recent CI runs (newest first) for the current branch, from `ci_runs_cache`
     /// — feeds the `Ci` section rollup (AV group). Empty when CI is off/undetected.
     pub ci_runs: Vec<superzej_core::ci::CiRun>,
+    /// Now-playing snapshot for the optional `[media]` feature (`Media` section +
+    /// statusbar badge). `None` when media is disabled or no player is loaded.
+    pub media: Option<superzej_core::media::MediaState>,
     /// Commits `(ahead, behind)` upstream; `None` without a tracking branch.
     pub ahead_behind: Option<(usize, usize)>,
     /// A merge/rebase/cherry-pick in progress (header zone).
@@ -1058,7 +1067,7 @@ mod tests {
 
     #[test]
     fn section_order_jump_and_cycle() {
-        assert_eq!(SECTION_ORDER.len(), 18);
+        assert_eq!(SECTION_ORDER.len(), 19);
         // Default tab = Git; Changes is in Git tab.
         let ui = PanelUi::default(); // open = Changes, tab = Git
         assert_eq!(ui.next_section(), Section::Commits); // next in Git tab
