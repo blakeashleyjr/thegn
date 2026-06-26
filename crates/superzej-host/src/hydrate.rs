@@ -472,17 +472,36 @@ fn collect_sidebar_status(
     let mut status = crate::sidebar::SidebarStatus::default();
     let t0 = std::time::Instant::now();
 
-    // Advance the activity state machine over the session's managed worktrees,
-    // then read the fresh states (keyed by tab name).
-    let managed: Vec<superzej_core::activity::ManagedWorktree> = session
-        .worktrees
-        .iter()
-        .filter(|g| !g.path.is_empty())
-        .map(|g| superzej_core::activity::ManagedWorktree {
-            worktree: g.path.clone(),
-            tab: g.name.clone(),
-        })
-        .collect();
+    // Advance the activity state machine over ALL registered worktrees,
+    // then read the fresh states (keyed by tab name). This keeps background
+    // agents in other workspaces ticking.
+    let mut managed_map = std::collections::BTreeMap::new();
+    if let Ok(db_wts) = db.worktrees() {
+        for wt in db_wts {
+            if !wt.worktree.is_empty() {
+                managed_map.insert(
+                    wt.worktree.clone(),
+                    superzej_core::activity::ManagedWorktree {
+                        worktree: wt.worktree.clone(),
+                        tab: wt.tab_name.clone(),
+                    },
+                );
+            }
+        }
+    }
+    // Overlay the active session (might have unpersisted fresh worktrees)
+    for g in &session.worktrees {
+        if !g.path.is_empty() {
+            managed_map.insert(
+                g.path.clone(),
+                superzej_core::activity::ManagedWorktree {
+                    worktree: g.path.clone(),
+                    tab: g.name.clone(),
+                },
+            );
+        }
+    }
+    let managed: Vec<_> = managed_map.into_values().collect();
     superzej_core::activity::poll_and_save(&managed);
     status.activity = superzej_core::activity::read_states()
         .into_iter()
@@ -496,6 +515,26 @@ fn collect_sidebar_status(
     status.alert_counts = db
         .get_alert_counts_by_worktree(alert_kinds)
         .unwrap_or_default();
+
+    // Populate agent and PR badges for ALL registered worktrees from the DB.
+    // This ensures non-session workspaces still show their agent/PR status
+    // when they are rendered as collapsed/switchable sidebar rows.
+    if let Ok(db_wts) = db.worktrees() {
+        for wt in db_wts {
+            if !wt.agent.is_empty() {
+                status.agent.insert(wt.worktree.clone(), wt.agent.clone());
+            }
+            if !wt.branch.is_empty() && !wt.repo_root.is_empty() {
+                if let Ok(counts) = db.get_open_pr_counts_by_branch(&wt.repo_root) {
+                    if let Some(&n) = counts.get(&wt.branch) {
+                        if n > 0 {
+                            status.pr_counts.insert(wt.worktree.clone(), n);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // git glyphs + agent + PR badge per distinct worktree path. `is_dirty` does a
     // full `git status` scan (50-150ms), so a serial loop over N worktrees was the
