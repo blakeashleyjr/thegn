@@ -105,6 +105,9 @@ pub enum Section {
     Commits,
     Branches,
     Stash,
+    /// Unified cross-repo, cross-tool "My Work" feed: assigned issues (all
+    /// providers), review-requested / authored PRs, high-priority notifications.
+    Mine,
     /// Pull-request state, CI checks, review threads. (Renamed from "git".)
     Pr,
     Issues,
@@ -131,12 +134,12 @@ pub enum Section {
 /// The accordion's built-in display order — the default when `[panel]
 /// sections` is unset. Grouped by tab:
 /// - Git (5): Changes, Commits, Branches, Stash, Files
-/// - Work (6): Pr, Issues, Problems, Jobs, Tests, Symbols
+/// - Work (7): Mine, Pr, Issues, Problems, Jobs, Tests, Symbols
 /// - System (5): Notifications, Logs, Sandbox, Telemetry, Keys
 ///
 /// The live order (config-reordered, possibly trimmed) rides on
 /// [`PanelUi::order`]; numbered jump keys index the ACTIVE TAB's slice.
-pub const SECTION_ORDER: [Section; 16] = [
+pub const SECTION_ORDER: [Section; 17] = [
     // Git tab
     Section::Changes,
     Section::Commits,
@@ -144,6 +147,7 @@ pub const SECTION_ORDER: [Section; 16] = [
     Section::Stash,
     Section::Files,
     // Work tab
+    Section::Mine,
     Section::Pr,
     Section::Issues,
     Section::Problems,
@@ -166,6 +170,7 @@ impl Section {
             Section::Commits => "commits",
             Section::Branches => "branches",
             Section::Stash => "stash",
+            Section::Mine => "mine",
             Section::Pr => "pr",
             Section::Files => "files",
             Section::Problems => "problems",
@@ -191,7 +196,8 @@ impl Section {
             | Section::Branches
             | Section::Stash
             | Section::Files => PanelTab::Git,
-            Section::Pr
+            Section::Mine
+            | Section::Pr
             | Section::Issues
             | Section::Problems
             | Section::Jobs
@@ -480,6 +486,9 @@ pub struct PanelData {
     pub tracker_issues: Vec<superzej_core::issue::Issue>,
     /// Issue ids (in `"<provider>:<key>"` form) linked to the current worktree.
     pub tracker_links: Vec<String>,
+    /// Unified cross-repo "My Work" feed (the `Mine` section), loaded from the
+    /// `my_work_cache` DB row. Spans every repo, not just the active worktree.
+    pub my_work: Vec<superzej_core::work::WorkRow>,
     /// Neutral unread notification count (Alert + Notice priority; Info excluded).
     /// Drives the dim "N unread" badge.
     pub unread_notifications: usize,
@@ -1039,7 +1048,7 @@ mod tests {
 
     #[test]
     fn section_order_jump_and_cycle() {
-        assert_eq!(SECTION_ORDER.len(), 16);
+        assert_eq!(SECTION_ORDER.len(), 17);
         // Default tab = Git; Changes is in Git tab.
         let ui = PanelUi::default(); // open = Changes, tab = Git
         assert_eq!(ui.next_section(), Section::Commits); // next in Git tab
@@ -1281,7 +1290,8 @@ mod tests {
         );
         // A digit past the tab's section count is not an accordion intent.
         assert_eq!(accordion_key(&KeyCode::Char('6'), none, &ui), None);
-        // In Work tab, digits index Work sections (Pr, Issues, Problems, Jobs, Tests).
+        // In Work tab, digits index Work sections (Mine, Pr, Issues, Problems,
+        // Jobs, Tests, Symbols).
         let work_ui = PanelUi {
             tab: PanelTab::Work,
             open: Section::Pr,
@@ -1289,10 +1299,14 @@ mod tests {
         };
         assert_eq!(
             accordion_key(&KeyCode::Char('1'), none, &work_ui),
+            Some(PanelMsg::Open(Section::Mine))
+        );
+        assert_eq!(
+            accordion_key(&KeyCode::Char('2'), none, &work_ui),
             Some(PanelMsg::Open(Section::Pr))
         );
         assert_eq!(
-            accordion_key(&KeyCode::Char('3'), none, &work_ui),
+            accordion_key(&KeyCode::Char('4'), none, &work_ui),
             Some(PanelMsg::Open(Section::Problems))
         );
         // A custom order filters to the tab's sections.

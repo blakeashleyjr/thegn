@@ -40,6 +40,7 @@ mod pins;
 mod profile;
 mod proxy_daemon;
 mod queries;
+mod render_plan;
 mod run;
 mod sandbox_events;
 mod search;
@@ -122,6 +123,11 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::config::Action,
     },
+    /// Inspect and select named execution environments (`[env.<name>]`).
+    Env {
+        #[command(subcommand)]
+        action: cmd::env::Action,
+    },
     /// Print the exact sandbox argv for a worktree (for debugging).
     SandboxArgv {
         /// Path to the worktree (defaults to the current directory).
@@ -202,6 +208,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Repos => cmd::repos::repos(&cfg),
         Command::Recent { count } => cmd::repos::recent(count),
         Command::Config { action } => cmd::config::run(&cfg, action, config_path),
+        Command::Env { action } => cmd::env::run(&cfg, action),
         Command::Notify { action } => cmd::notify::run(action),
         Command::Logs { action } => cmd::logs::run(&cfg, action),
         Command::SandboxArgv { worktree } => {

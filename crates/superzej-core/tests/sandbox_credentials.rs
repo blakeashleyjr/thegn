@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use superzej_core::config::{FileAccess, Network};
-use superzej_core::sandbox::{Backend, SandboxLimits, SandboxSpec, Transport, ensure, enter_argv};
+use superzej_core::sandbox::{Backend, SandboxLimits, SandboxSpec, ensure, enter_argv};
 
 fn skip() -> bool {
     !superzej_core::util::have("podman")
@@ -24,7 +24,7 @@ fn force_rm(name: &str) {
 fn base_spec(name: &str) -> SandboxSpec {
     SandboxSpec {
         backend: Backend::Podman,
-        transport: Transport::Local,
+        placement: superzej_core::placement::Placement::Local,
         image: Some("docker.io/library/alpine:latest".into()),
         worktree: PathBuf::from("/tmp/sz-e2e-cred"),
         mounts: vec![],

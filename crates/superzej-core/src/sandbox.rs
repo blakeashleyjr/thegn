@@ -21,6 +21,7 @@ use crate::config::{
     SandboxBackend, SandboxConfig, SandboxProfile, TailscaleConfig, VpnConfig, VpnDnsMode, VpnMode,
     VpnOnError, VpnProviderKind, WireguardConfig, ZerotierConfig,
 };
+use crate::placement::{Placement, SshPlacement, TransportKind};
 use crate::remote::GitLoc;
 use crate::{msg, util};
 use std::path::PathBuf;
@@ -99,6 +100,8 @@ pub enum Backend {
     Systemd,
     Apple,
     Wsl,
+    WinAppContainer,
+    WinJobObject,
     None,
 }
 
@@ -113,6 +116,8 @@ impl Backend {
             "systemd" | "systemd-run" => Backend::Systemd,
             "apple" | "container" => Backend::Apple,
             "wsl" => Backend::Wsl,
+            "winappcontainer" | "appcontainer" => Backend::WinAppContainer,
+            "winjobobject" | "jobobject" => Backend::WinJobObject,
             "none" | "host" => Backend::None,
             _ => return None,
         })
@@ -131,6 +136,8 @@ impl Backend {
             SandboxBackend::Systemd => Backend::Systemd,
             SandboxBackend::Apple => Backend::Apple,
             SandboxBackend::Wsl => Backend::Wsl,
+            SandboxBackend::WinAppContainer => Backend::WinAppContainer,
+            SandboxBackend::WinJobObject => Backend::WinJobObject,
             SandboxBackend::None => Backend::None,
         })
     }
@@ -146,6 +153,8 @@ impl Backend {
             Backend::Systemd => "systemd",
             Backend::Apple => "apple",
             Backend::Wsl => "wsl",
+            Backend::WinAppContainer => "appcontainer",
+            Backend::WinJobObject => "jobobject",
             Backend::None => "host",
         }
     }
@@ -159,6 +168,7 @@ impl Backend {
             Backend::Systemd => "systemd-run",
             Backend::Apple => "container",
             Backend::Wsl => "wsl.exe",
+            Backend::WinAppContainer | Backend::WinJobObject => "", // OS native
             Backend::None => "",
         }
     }
@@ -178,41 +188,16 @@ impl Backend {
     }
 
     fn is_host_toolchain(self) -> bool {
-        matches!(self, Backend::Bwrap | Backend::Systemd)
+        matches!(
+            self,
+            Backend::Bwrap | Backend::Systemd | Backend::WinAppContainer | Backend::WinJobObject
+        )
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransportKind {
-    Ssh,
-    Mosh,
-}
-
-/// A configured remote target. The control plane (detection, `ensure`/`teardown`)
-/// always uses ssh (mosh can't pipe non-interactive commands); the interactive
-/// pane uses mosh when `kind == Mosh`.
-#[derive(Debug, Clone)]
-pub struct Remote {
-    pub host: String,
-    pub port: u16,
-    pub forward_agent: bool,
-    pub kind: TransportKind,
-}
-
-#[derive(Debug, Clone)]
-pub enum Transport {
-    Local,
-    Remote(Remote),
-}
-
-impl Transport {
-    /// The ssh argv prefix (shares the multiplexed base with the `remote`
-    /// git-shim). `batch` distinguishes control-plane calls from the interactive
-    /// pane — see `remote::ssh_base`.
-    fn ssh_base(r: &Remote, batch: bool) -> Vec<String> {
-        crate::remote::ssh_base(r.port, r.forward_agent, batch)
-    }
-}
+// The execution placement (`Local | Ssh | K8s | Provider`) and its exec-wrapping
+// logic now live in `crate::placement`. `SandboxSpec` carries a resolved
+// `Placement`; `enter_argv`/`control_argv` delegate the outer wrap to it.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mount {
@@ -231,7 +216,7 @@ pub struct SandboxLimits {
 #[derive(Debug, Clone)]
 pub struct SandboxSpec {
     pub backend: Backend,
-    pub transport: Transport,
+    pub placement: Placement,
     pub image: Option<String>,
     pub worktree: PathBuf,
     pub mounts: Vec<Mount>,
@@ -382,15 +367,31 @@ pub fn resolve_scoped(
     name: &str,
     profile: SandboxProfile,
 ) -> Option<SandboxSpec> {
+    let placement = placement_from_loc(cfg, loc);
+    resolve_placed(cfg, loc, name, profile, placement)
+}
+
+/// Like [`resolve_scoped`] but with an explicit [`Placement`]. This is the seam
+/// the named-environment layer ([`crate::env`]) drives: it resolves where a
+/// worktree runs (local / ssh / k8s / provider) and hands the placement in,
+/// instead of letting `[sandbox.remote]` + the `GitLoc` decide. The default
+/// callers ([`resolve`]/[`resolve_scoped`]) derive the placement from the loc so
+/// existing behavior is unchanged.
+pub fn resolve_placed(
+    cfg: &SandboxConfig,
+    loc: &GitLoc,
+    name: &str,
+    profile: SandboxProfile,
+    placement: Placement,
+) -> Option<SandboxSpec> {
     if !cfg.enabled {
         return None;
     }
-    let transport = transport_from_loc(cfg, loc);
-    let backend = pick_backend(cfg, &transport)?;
+    let backend = pick_backend(cfg, &placement)?;
     // `none` on a *local* worktree means "run on the host" (caller's plain-shell
-    // fallback). For a *remote* worktree we still need the transport to carry a
-    // bare shell to the remote, so keep building the spec.
-    if backend == Backend::None && matches!(transport, Transport::Local) {
+    // fallback). For a *remote* placement we still need it to carry a bare shell
+    // to the target, so keep building the spec.
+    if backend == Backend::None && placement.is_local() {
         return None;
     }
 
@@ -516,7 +517,7 @@ pub fn resolve_scoped(
 
     Some(SandboxSpec {
         backend,
-        transport,
+        placement,
         image,
         worktree,
         mounts,
@@ -827,35 +828,35 @@ pub fn parse_stats_rows(output: &str) -> Vec<(String, ContainerStat)> {
         .collect()
 }
 
-fn transport_from_loc(cfg: &SandboxConfig, loc: &GitLoc) -> Transport {
+/// Derive the default [`Placement`] from `[sandbox.remote]` + the worktree's
+/// `GitLoc` — `Local`, or an `Ssh` target (a remote worktree's own ssh target
+/// wins over the configured `[sandbox.remote] host`). The named-environment
+/// layer bypasses this with [`resolve_placed`] when an env selects k8s/provider.
+pub fn placement_from_loc(cfg: &SandboxConfig, loc: &GitLoc) -> Placement {
+    let kind = match cfg.remote.transport {
+        RemoteTransport::Ssh => TransportKind::Ssh,
+        RemoteTransport::Mosh => TransportKind::Mosh,
+    };
     if let Some(ssh) = loc.ssh() {
-        let kind = match cfg.remote.transport {
-            RemoteTransport::Ssh => TransportKind::Ssh,
-            RemoteTransport::Mosh => TransportKind::Mosh,
-        };
-        Transport::Remote(Remote {
-            host: ssh.host.clone(),
-            port: ssh.port,
-            forward_agent: ssh.forward_agent,
+        Placement::Ssh(SshPlacement::plain(
+            ssh.host.clone(),
+            ssh.port,
+            ssh.forward_agent,
             kind,
-        })
+        ))
     } else if cfg.remote.is_remote() {
-        let kind = match cfg.remote.transport {
-            RemoteTransport::Ssh => TransportKind::Ssh,
-            RemoteTransport::Mosh => TransportKind::Mosh,
-        };
-        Transport::Remote(Remote {
-            host: cfg.remote.host.clone(),
-            port: cfg.remote.port,
-            forward_agent: cfg.remote.forward_agent,
+        Placement::Ssh(SshPlacement::plain(
+            cfg.remote.host.clone(),
+            cfg.remote.port,
+            cfg.remote.forward_agent,
             kind,
-        })
+        ))
     } else {
-        Transport::Local
+        Placement::Local
     }
 }
 
-fn pick_backend(cfg: &SandboxConfig, transport: &Transport) -> Option<Backend> {
+fn pick_backend(cfg: &SandboxConfig, placement: &Placement) -> Option<Backend> {
     let suitable = |b: Backend| -> bool {
         match b {
             Backend::None => true,
@@ -870,7 +871,7 @@ fn pick_backend(cfg: &SandboxConfig, transport: &Transport) -> Option<Backend> {
     if let Some(explicit) = Backend::from_config(cfg.backend) {
         match explicit {
             Backend::None => return Some(Backend::None),
-            b if suitable(b) && available(transport, b) => return Some(b),
+            b if suitable(b) && available(placement, b) => return Some(b),
             b => on_missing(
                 cfg,
                 &format!(
@@ -890,14 +891,17 @@ fn pick_backend(cfg: &SandboxConfig, transport: &Transport) -> Option<Backend> {
         let Some(b) = Backend::parse(name) else {
             continue;
         };
+        let is_win_native = b == Backend::WinAppContainer || b == Backend::WinJobObject;
         if b == Backend::None {
-            on_missing(
-                cfg,
-                "sandbox: no container backend available; running on the host",
-            );
+            if !is_win_native {
+                on_missing(
+                    cfg,
+                    "sandbox: no container backend available; running on the host",
+                );
+            }
             return Some(Backend::None);
         }
-        if suitable(b) && available(transport, b) {
+        if suitable(b) && available(placement, b) {
             return Some(b);
         }
     }
@@ -917,28 +921,28 @@ fn on_missing(cfg: &SandboxConfig, what: &str) {
     }
 }
 
-/// Is `backend`'s binary present (locally, or on the remote over ssh)?
-fn available(transport: &Transport, backend: Backend) -> bool {
-    let bin = backend.binary();
-    match transport {
-        Transport::Local => match backend {
-            Backend::PodmanRootful => {
-                run_local_output(&backend_prefix(backend), &["version"]).is_some()
-            }
-            _ => util::have(bin),
-        },
-        Transport::Remote(r) => {
-            let mut argv = Transport::ssh_base(r, true);
-            argv.push(r.host.clone());
-            argv.push("--".into());
-            argv.push(format!("command -v {bin} >/dev/null 2>&1"));
-            Command::new(&argv[0])
-                .args(&argv[1..])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-        }
+/// Is `backend`'s binary present in this placement (locally on PATH, or probed
+/// through the placement's control primitive: ssh / kubectl exec / provider)?
+fn available(placement: &Placement, backend: Backend) -> bool {
+    // Rootful podman can't be detected by a bare PATH probe (it needs `sudo -n
+    // podman version`); only meaningful locally.
+    if placement.is_local() && backend == Backend::PodmanRootful {
+        return run_local_output(&backend_prefix(backend), &["version"]).is_some();
     }
+
+    if placement.is_local()
+        && (backend == Backend::WinAppContainer || backend == Backend::WinJobObject)
+    {
+        return cfg!(windows);
+    }
+
+    if !placement.is_local()
+        && (backend == Backend::WinAppContainer || backend == Backend::WinJobObject)
+    {
+        return false;
+    }
+
+    placement.has_binary(backend.binary())
 }
 
 pub const DEFAULT_OCI_IMAGE: &str = "docker.io/library/debian:stable";
@@ -1001,7 +1005,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
     // podman/docker directly. run_control_t_owned gives us the timeout but
     // discards stdout, so we use output_with_timeout for local transport and
     // fall back to run_control_owned (exit-code only → assume stale) for remote.
-    if matches!(spec.transport, Transport::Local) {
+    if spec.placement.is_local() {
         argv.extend([
             "container".into(),
             "inspect".into(),
@@ -1151,7 +1155,7 @@ pub fn teardown_by_path(worktree: &str) {
     // `rm -f` of a missing name is a harmless no-op. (Ephemeral node de-register
     // is the host's job via `superzej-svc::vpn::down` before this runs.)
     let vpn = vpn_sidecar_name(&name);
-    let transport = Transport::Local;
+    let placement = Placement::Local;
     for b in [
         Backend::Podman,
         Backend::PodmanRootful,
@@ -1159,7 +1163,7 @@ pub fn teardown_by_path(worktree: &str) {
         Backend::Smol,
         Backend::Apple,
     ] {
-        if available(&transport, b) {
+        if available(&placement, b) {
             let mut argv = backend_prefix(b);
             argv.extend([
                 "rm".into(),
@@ -1168,7 +1172,7 @@ pub fn teardown_by_path(worktree: &str) {
                 agent.clone(),
                 vpn.clone(),
             ]);
-            let _ = run_control_t_owned(&transport, &argv, PROBE_TIMEOUT);
+            let _ = run_control_t_owned(&placement, &argv, PROBE_TIMEOUT);
         }
     }
 }
@@ -1179,7 +1183,7 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
     if !cfg.enabled {
         return;
     }
-    let transport = transport_from_loc(cfg, loc);
+    let placement = placement_from_loc(cfg, loc);
     // Remove both the worktree container and the agent's separate container (the
     // latter only exists when `agent_profile` differs); `rm -f` of a missing
     // name is a harmless no-op.
@@ -1193,7 +1197,7 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
         Backend::Smol,
         Backend::Apple,
     ] {
-        if available(&transport, b) {
+        if available(&placement, b) {
             let mut argv = backend_prefix(b);
             argv.extend([
                 "rm".into(),
@@ -1202,7 +1206,7 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
                 agent.clone(),
                 vpn.clone(),
             ]);
-            let _ = run_control_t_owned(&transport, &argv, PROBE_TIMEOUT);
+            let _ = run_control_t_owned(&placement, &argv, PROBE_TIMEOUT);
         }
     }
 }
@@ -1213,10 +1217,7 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
 pub fn enter_argv(spec: &SandboxSpec, inner: &str) -> Vec<String> {
     let script = wrap_script(spec, inner);
     let backend_argv = backend_enter_argv(spec, &script);
-    match &spec.transport {
-        Transport::Local => backend_argv,
-        Transport::Remote(r) => transport_wrap(r, &backend_argv),
-    }
+    spec.placement.interactive_argv(&backend_argv)
 }
 
 /// Compose init-script + safe.directory + devenv into the `sh -lc` body that the
@@ -1288,6 +1289,24 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
                 // Aspirational: shell out into WSL's distro to run podman there.
                 v.insert(0, "wsl.exe".into());
                 v.insert(1, "--".into());
+            }
+            v
+        }
+        Backend::WinAppContainer | Backend::WinJobObject => {
+            // These native Windows backends run the standard command, optionally
+            // wrapperized by internal logic if requested, but from the process builder
+            // perspective they just exec `sh -lc "script"` (or pwsh equivalent) in cwd.
+            // When spawn_with_env runs it, we could intercept and wrap in a job object.
+            // For argv generation, we just emit the plain shell command since the real
+            // isolation happens in the OS process creation syscalls.
+            let shell = util::shell();
+            let mut v = vec![shell.clone()];
+            if shell.ends_with("pwsh.exe") || shell.ends_with("powershell.exe") {
+                v.extend(["-NoProfile".into(), "-Command".into(), script.to_string()]);
+            } else if shell.ends_with("cmd.exe") {
+                v.extend(["/C".into(), script.to_string()]);
+            } else {
+                v.extend(["-c".into(), script.to_string()]);
             }
             v
         }
@@ -1444,12 +1463,16 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
     match spec.backend {
         Backend::Podman => v.extend(["--userns".into(), "keep-id".into()]),
         Backend::PodmanRootful => {
-            if let (Transport::Local, Some((uid, gid))) = (&spec.transport, local_uid_gid()) {
+            if spec.placement.is_local()
+                && let Some((uid, gid)) = local_uid_gid()
+            {
                 v.extend(["--user".into(), format!("{uid}:{gid}")]);
             }
         }
         Backend::Docker | Backend::Smol => {
-            if let (Transport::Local, Some((uid, gid))) = (&spec.transport, local_uid_gid()) {
+            if spec.placement.is_local()
+                && let Some((uid, gid)) = local_uid_gid()
+            {
                 v.extend(["--user".into(), format!("{uid}:{gid}")]);
             }
         }
@@ -1489,7 +1512,7 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
     if spec.network != Network::None
         && vpn_join.is_none()
         && (!spec.network_allow.is_empty() || !spec.network_block.is_empty())
-        && matches!(spec.transport, Transport::Local)
+        && spec.placement.is_local()
     {
         let policy = crate::dns_filter::DnsPolicy {
             allow: spec.network_allow.clone(),
@@ -1597,12 +1620,16 @@ fn oci_create_opts_with_keep_id(spec: &SandboxSpec, keep_id: bool) -> Vec<String
         }
         Backend::Podman => {}
         Backend::PodmanRootful => {
-            if let (Transport::Local, Some((uid, gid))) = (&spec.transport, local_uid_gid()) {
+            if spec.placement.is_local()
+                && let Some((uid, gid)) = local_uid_gid()
+            {
                 v.extend(["--user".into(), format!("{uid}:{gid}")]);
             }
         }
         Backend::Docker | Backend::Smol => {
-            if let (Transport::Local, Some((uid, gid))) = (&spec.transport, local_uid_gid()) {
+            if spec.placement.is_local()
+                && let Some((uid, gid)) = local_uid_gid()
+            {
                 v.extend(["--user".into(), format!("{uid}:{gid}")]);
             }
         }
@@ -1634,35 +1661,6 @@ fn oci_create_opts_with_keep_id(spec: &SandboxSpec, keep_id: bool) -> Vec<String
     }
 }
 
-/// Wrap a backend argv so it runs on the remote: mosh (interactive) or ssh.
-fn transport_wrap(r: &Remote, backend_argv: &[String]) -> Vec<String> {
-    let remote_cmd = util::sh_join(backend_argv);
-    match r.kind {
-        TransportKind::Mosh => {
-            let ssh = util::sh_join(&Transport::ssh_base(r, false));
-            vec![
-                "mosh".into(),
-                format!("--ssh={ssh}"),
-                r.host.clone(),
-                "--".into(),
-                "/bin/sh".into(),
-                "-lc".into(),
-                remote_cmd,
-            ]
-        }
-        TransportKind::Ssh => {
-            let mut v = Transport::ssh_base(r, false);
-            v.push("-t".into());
-            v.push(r.host.clone());
-            v.push("--".into());
-            v.push("/bin/sh".into());
-            v.push("-lc".into());
-            v.push(remote_cmd);
-            v
-        }
-    }
-}
-
 fn backend_prefix(backend: Backend) -> Vec<String> {
     match backend {
         Backend::PodmanRootful => vec!["sudo".into(), "-n".into(), "podman".into()],
@@ -1691,40 +1689,22 @@ fn run_local_output(prefix: &[String], args: &[&str]) -> Option<String> {
 /// Run a control-plane command (locally, or on the remote over ssh). Returns
 /// whether it succeeded.
 fn run_control_owned(spec: &SandboxSpec, argv: &[String], timeout: Duration) -> Option<bool> {
-    run_control_t_owned(&spec.transport, argv, timeout)
+    run_control_t_owned(&spec.placement, argv, timeout)
 }
 
-fn run_control_t_owned(transport: &Transport, argv: &[String], timeout: Duration) -> Option<bool> {
-    let argv: Vec<String> = match transport {
-        Transport::Local => argv.to_vec(),
-        Transport::Remote(r) => {
-            let mut v = Transport::ssh_base(r, true);
-            v.push(r.host.clone());
-            v.push("--".into());
-            v.push(util::sh_join(argv));
-            v
-        }
-    };
+fn run_control_t_owned(placement: &Placement, argv: &[String], timeout: Duration) -> Option<bool> {
+    let argv = placement.control_argv(argv);
     status_with_timeout(&argv, timeout)
 }
 
-/// Like [`run_control_t_owned`] but also captures stdout. Wraps argv in the
-/// transport for remote specs (ssh for control-plane calls).
+/// Like [`run_control_t_owned`] but also captures stdout. Wraps argv through the
+/// placement's control primitive (ssh batch / kubectl exec / provider).
 fn output_control_owned(
     spec: &SandboxSpec,
     argv: &[String],
     timeout: Duration,
 ) -> Option<(bool, String)> {
-    let full: Vec<String> = match &spec.transport {
-        Transport::Local => argv.to_vec(),
-        Transport::Remote(r) => {
-            let mut v = Transport::ssh_base(r, true);
-            v.push(r.host.clone());
-            v.push("--".into());
-            v.push(util::sh_join(argv));
-            v
-        }
-    };
+    let full: Vec<String> = spec.placement.control_argv(argv);
     output_with_timeout(&full, timeout)
 }
 
@@ -2302,10 +2282,20 @@ mod tests {
         assert!(opts.windows(2).any(|w| w == ["-p", "8080:8080"]));
     }
 
+    #[test]
+    fn test_win_native_sandboxes_do_not_parse_as_oci() {
+        assert!(!Backend::WinAppContainer.is_oci());
+        assert!(!Backend::WinJobObject.is_oci());
+        assert!(Backend::WinAppContainer.is_host_toolchain());
+        assert!(Backend::WinJobObject.is_host_toolchain());
+        assert_eq!(Backend::WinAppContainer.label(), "appcontainer");
+        assert_eq!(Backend::WinJobObject.label(), "jobobject");
+    }
+
     fn spec(backend: Backend) -> SandboxSpec {
         SandboxSpec {
             backend,
-            transport: Transport::Local,
+            placement: Placement::Local,
             image: Some("img:latest".into()),
             worktree: PathBuf::from("/wt/feat"),
             mounts: vec![
@@ -2450,12 +2440,12 @@ mod tests {
     #[test]
     fn mosh_wraps_backend_over_ssh() {
         let mut s = spec(Backend::Podman);
-        s.transport = Transport::Remote(Remote {
-            host: "user@box".into(),
-            port: 2222,
-            forward_agent: true,
-            kind: TransportKind::Mosh,
-        });
+        s.placement = Placement::Ssh(SshPlacement::plain(
+            "user@box".into(),
+            2222,
+            true,
+            TransportKind::Mosh,
+        ));
         let argv = enter_argv(&s, "${SHELL:-/bin/sh} -l");
         assert_eq!(argv[0], "mosh");
         assert!(argv.iter().any(|a| a.starts_with("--ssh=")));
@@ -2469,12 +2459,12 @@ mod tests {
     fn ssh_transport_uses_tty() {
         let mut s = spec(Backend::Bwrap);
         s.image = None;
-        s.transport = Transport::Remote(Remote {
-            host: "box".into(),
-            port: 22,
-            forward_agent: false,
-            kind: TransportKind::Ssh,
-        });
+        s.placement = Placement::Ssh(SshPlacement::plain(
+            "box".into(),
+            22,
+            false,
+            TransportKind::Ssh,
+        ));
         let argv = enter_argv(&s, "claude");
         assert_eq!(argv[0], "ssh");
         assert!(argv.contains(&"-t".to_string()));
@@ -2663,12 +2653,12 @@ mod tests {
         // transport as a bare shell that cd's into the remote worktree.
         let mut s = spec(Backend::None);
         s.image = None;
-        s.transport = Transport::Remote(Remote {
-            host: "box".into(),
-            port: 22,
-            forward_agent: false,
-            kind: TransportKind::Mosh,
-        });
+        s.placement = Placement::Ssh(SshPlacement::plain(
+            "box".into(),
+            22,
+            false,
+            TransportKind::Mosh,
+        ));
         let argv = enter_argv(&s, "${SHELL:-/bin/sh} -l");
         assert_eq!(argv[0], "mosh");
         let body = argv.last().unwrap();
@@ -2864,12 +2854,12 @@ mod tests {
     #[test]
     fn remote_enter_argv_wraps_with_mosh() {
         let mut s = spec(Backend::Podman);
-        s.transport = Transport::Remote(Remote {
-            host: "devbox".into(),
-            port: 22,
-            forward_agent: false,
-            kind: TransportKind::Mosh,
-        });
+        s.placement = Placement::Ssh(SshPlacement::plain(
+            "devbox".into(),
+            22,
+            false,
+            TransportKind::Mosh,
+        ));
         // With a real image + OCI backend on a remote, enter_argv should
         // produce a mosh wrapper.
         let argv = enter_argv(&s, "bash -l");
@@ -2881,12 +2871,12 @@ mod tests {
     #[test]
     fn remote_enter_argv_wraps_with_ssh() {
         let mut s = spec(Backend::Podman);
-        s.transport = Transport::Remote(Remote {
-            host: "devbox".into(),
-            port: 2222,
-            forward_agent: true,
-            kind: TransportKind::Ssh,
-        });
+        s.placement = Placement::Ssh(SshPlacement::plain(
+            "devbox".into(),
+            2222,
+            true,
+            TransportKind::Ssh,
+        ));
         let argv = enter_argv(&s, "bash -l");
         // SSH transport: first arg is ssh, not mosh.
         assert_eq!(argv[0], "ssh", "outer command must be ssh: {argv:?}");

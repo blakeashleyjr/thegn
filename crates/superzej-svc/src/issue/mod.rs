@@ -115,16 +115,9 @@ impl RouterInner {
     }
 }
 
-/// Routes issue requests to the configured backend. Returns empty results
-/// (not errors) when no provider is configured — the panel renders
-/// gracefully regardless.
-pub struct IssueRouter {
-    inner: Option<RouterInner>,
-}
-
-impl IssueRouter {
-    pub fn from_config(cfg: &IssuesConfig) -> Self {
-        let inner = match cfg.provider {
+impl RouterInner {
+    fn from_kind(kind: IssueProviderKind, cfg: &IssuesConfig) -> Option<Self> {
+        match kind {
             IssueProviderKind::Linear => {
                 let api_key = expand_env_ref(&cfg.linear.api_key).unwrap_or_default();
                 let team_id = if cfg.linear.team_id.is_empty() {
@@ -153,53 +146,176 @@ impl IssueRouter {
                 )))
             }
             IssueProviderKind::None => None,
-        };
+        }
+    }
+}
+
+/// Routes issue requests across every configured provider. `list`/`search` fan
+/// out and merge; `get`/`update` dispatch by the `"<provider>:"` id prefix.
+/// Returns empty results (not errors) when nothing is configured — the panel
+/// renders gracefully regardless. A single provider failing never breaks the
+/// others: it logs and contributes nothing to the merged result.
+pub struct IssueRouter {
+    inner: Vec<RouterInner>,
+}
+
+impl IssueRouter {
+    pub fn from_config(cfg: &IssuesConfig) -> Self {
+        let inner = cfg
+            .active_providers()
+            .into_iter()
+            .filter_map(|kind| RouterInner::from_kind(kind, cfg))
+            .collect();
         IssueRouter { inner }
     }
 
+    /// The provider id of the first configured backend (`"none"` when empty).
+    /// Retained for callers that only need a representative id.
     pub fn provider_id(&self) -> &'static str {
         self.inner
-            .as_ref()
+            .first()
             .map(|b| b.provider_id())
             .unwrap_or("none")
     }
 
-    pub fn is_configured(&self) -> bool {
-        self.inner.is_some()
+    /// Every configured provider id, in config order.
+    pub fn provider_ids(&self) -> Vec<&'static str> {
+        self.inner.iter().map(|b| b.provider_id()).collect()
     }
 
+    pub fn is_configured(&self) -> bool {
+        !self.inner.is_empty()
+    }
+
+    /// Locate the backend owning an id of the form `"<provider>:<key>"`.
+    fn backend_for_id(&self, id: &str) -> Option<&RouterInner> {
+        let prefix = id.split_once(':').map(|(p, _)| p).unwrap_or(id);
+        self.inner.iter().find(|b| b.provider_id() == prefix)
+    }
+
+    /// List issues across all providers, concatenated. A failing provider logs
+    /// and contributes nothing rather than failing the whole call.
     pub async fn list_issues(&self, filter: &IssueFilter) -> Result<Vec<Issue>, IssueError> {
-        match &self.inner {
-            Some(b) => b.list_issues(filter).await,
-            None => Ok(vec![]),
+        let mut all = Vec::new();
+        for b in &self.inner {
+            match b.list_issues(filter).await {
+                Ok(mut issues) => all.append(&mut issues),
+                Err(e) => {
+                    tracing::warn!(provider = b.provider_id(), error = %e, "issue list failed")
+                }
+            }
         }
+        Ok(all)
+    }
+
+    /// Per-provider results, so callers (the cache refresh) can store and diff
+    /// each provider under its own `(repo_root, provider)` key.
+    pub async fn list_per_provider(
+        &self,
+        filter: &IssueFilter,
+    ) -> Vec<(&'static str, Result<Vec<Issue>, IssueError>)> {
+        let mut out = Vec::with_capacity(self.inner.len());
+        for b in &self.inner {
+            out.push((b.provider_id(), b.list_issues(filter).await));
+        }
+        out
     }
 
     pub async fn get_issue(&self, id: &str) -> Result<IssueDetail, IssueError> {
-        match &self.inner {
+        match self.backend_for_id(id) {
             Some(b) => b.get_issue(id).await,
             None => Err(IssueError::NotConfigured),
         }
     }
 
+    /// Create an issue on the first configured provider.
     pub async fn create_issue(&self, draft: &IssueDraft) -> Result<Issue, IssueError> {
-        match &self.inner {
+        match self.inner.first() {
             Some(b) => b.create_issue(draft).await,
             None => Err(IssueError::NotConfigured),
         }
     }
 
     pub async fn update_issue(&self, id: &str, patch: &IssuePatch) -> Result<Issue, IssueError> {
-        match &self.inner {
+        match self.backend_for_id(id) {
             Some(b) => b.update_issue(id, patch).await,
             None => Err(IssueError::NotConfigured),
         }
     }
 
+    /// Search across all providers, concatenated.
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<Issue>, IssueError> {
-        match &self.inner {
-            Some(b) => b.search(query, limit).await,
-            None => Ok(vec![]),
+        let mut all = Vec::new();
+        for b in &self.inner {
+            match b.search(query, limit).await {
+                Ok(mut issues) => all.append(&mut issues),
+                Err(e) => {
+                    tracing::warn!(provider = b.provider_id(), error = %e, "issue search failed")
+                }
+            }
         }
+        Ok(all)
+    }
+}
+
+#[cfg(test)]
+mod spec {
+    use super::*;
+    use superzej_core::config::IssueProviderKind;
+
+    fn cfg_with(providers: Vec<IssueProviderKind>) -> IssuesConfig {
+        IssuesConfig {
+            providers,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unconfigured_router_is_empty() {
+        let r = IssueRouter::from_config(&IssuesConfig::default());
+        assert!(!r.is_configured());
+        assert!(r.provider_ids().is_empty());
+        assert_eq!(r.provider_id(), "none");
+    }
+
+    #[test]
+    fn single_provider_back_compat() {
+        let mut cfg = IssuesConfig::default();
+        cfg.provider = IssueProviderKind::Linear;
+        let r = IssueRouter::from_config(&cfg);
+        assert!(r.is_configured());
+        assert_eq!(r.provider_ids(), vec!["linear"]);
+    }
+
+    #[test]
+    fn builds_one_backend_per_active_provider() {
+        let r = IssueRouter::from_config(&cfg_with(vec![
+            IssueProviderKind::Linear,
+            IssueProviderKind::Jira,
+            IssueProviderKind::Github,
+        ]));
+        assert_eq!(r.provider_ids(), vec!["linear", "jira", "github"]);
+        // The representative id is the first configured provider.
+        assert_eq!(r.provider_id(), "linear");
+    }
+
+    #[test]
+    fn dispatch_by_id_prefix() {
+        let r = IssueRouter::from_config(&cfg_with(vec![
+            IssueProviderKind::Linear,
+            IssueProviderKind::Jira,
+        ]));
+        assert_eq!(
+            r.backend_for_id("jira:PROJ-1").map(|b| b.provider_id()),
+            Some("jira")
+        );
+        assert_eq!(
+            r.backend_for_id("linear:ABC-9").map(|b| b.provider_id()),
+            Some("linear")
+        );
+        // An id for a provider that isn't configured routes nowhere.
+        assert!(r.backend_for_id("github:42").is_none());
+        // A bare id with no prefix also routes nowhere.
+        assert!(r.backend_for_id("nonsense").is_none());
     }
 }

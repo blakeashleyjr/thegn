@@ -3,7 +3,7 @@
 use serde::Serialize;
 
 /// A sandbox audit event from the `container_events` table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ContainerEvent {
     pub id: i64,
     pub worktree: String,
@@ -46,6 +46,9 @@ pub struct WorktreeRow {
     pub position: i64,
     pub sandbox_backend: Option<String>,
     pub folder_id: Option<i64>,
+    /// Selected execution environment (`[env.<name>]`); `None` = inherit the
+    /// workspace/repo/global layer. See [`crate::config::Config::resolve_env`].
+    pub env_name: Option<String>,
 }
 
 /// A persisted worktree group (native host, schema v6): one worktree shown in
@@ -157,6 +160,7 @@ mod tests {
             position: 0,
             sandbox_backend: None,
             folder_id: None,
+            env_name: None,
         };
         let _ = format!("{:?}", row.clone());
     }
