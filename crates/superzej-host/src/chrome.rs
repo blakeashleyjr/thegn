@@ -321,6 +321,7 @@ pub struct FrameModel {
     /// from the center) — the bar renders raised so the focus is visible.
     pub masthead_focused: bool,
     pub statusbar_focused: bool,
+    pub active_statusbar_widget: usize,
     /// True when the center zone owns keyboard focus (drives the focused
     /// pane's light-blue frame ring; sidebar/panel focus dims every ring).
     pub center_focused: bool,
@@ -836,7 +837,7 @@ fn draw_pin_chips(
 
 /// A resolved masthead widget: its text plus the color it earned (stats turn
 /// amber/red as they cross pressure thresholds; quiet otherwise).
-struct MastheadWidget {
+pub struct MastheadWidget {
     text: String,
     fg: ColorAttribute,
 }
@@ -966,7 +967,7 @@ fn forge_repo_from_url(url: &str) -> Option<String> {
 }
 
 /// Resolve a BOTTOM-bar widget id to its display text + color.
-fn bottombar_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> {
+pub fn bottombar_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> {
     let w = |text: String, fg: ColorAttribute| MastheadWidget { text, fg };
     match id {
         // "keyhints" is special-cased by draw_statusbar (chip + label segs).
@@ -1126,6 +1127,10 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             r.push(seg(Tok::Slot(S::Ghost3), " \u{2502} "));
         }
         r.push(seg(Tok::Attr(p.fg), p.text));
+
+        if model.statusbar_focused && i == model.active_statusbar_widget {
+            r.push(seg(Tok::Slot(S::Ghost3), " \u{25c4} "));
+        }
     }
     // Red ⚑ flag is reserved for attention (Alert priority); a neutral blue inbox
     // chip carries Notice-priority unread. Info-priority events show in neither.

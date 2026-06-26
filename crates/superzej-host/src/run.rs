@@ -187,6 +187,7 @@ fn context_hints(
             ("Esc".into(), "back".into()),
         ],
         crate::focus::Zone::Statusbar => vec![
+            ("Enter".into(), "action".into()),
             hint("back", "focus-up").unwrap_or_else(|| ("Ctrl-Up".into(), "back".into())),
             ("Esc".into(), "back".into()),
         ],
@@ -4504,6 +4505,9 @@ fn dispatch_menu_choice(
         );
     };
     match choice {
+        MenuChoice::LocMetrics => {
+            // Nothing to do for LOC, it's just informational
+        }
         MenuChoice::RebaseContinue => enqueue(panel_ui, model, GitOp::RebaseContinue),
         MenuChoice::RebaseAbort => enqueue(panel_ui, model, GitOp::RebaseAbort),
         MenuChoice::RebaseSkip => enqueue(panel_ui, model, GitOp::RebaseSkip),
@@ -14358,6 +14362,26 @@ async fn event_loop<T: Terminal>(
                                                     sb.cursor = (sb.cursor + 1).min(visible - 1);
                                                 }
                                                 sb.sync(&mut model);
+                                            } else if focus.statusbar() {
+                                                if delta < 0 {
+                                                    model.active_statusbar_widget = model
+                                                        .active_statusbar_widget
+                                                        .saturating_sub(1);
+                                                } else {
+                                                    let count = model
+                                                        .bars
+                                                        .bottom_right
+                                                        .iter()
+                                                        .filter_map(|id| {
+                                                            crate::chrome::bottombar_widget(
+                                                                id, &model,
+                                                            )
+                                                        })
+                                                        .count();
+                                                    model.active_statusbar_widget =
+                                                        (model.active_statusbar_widget + 1)
+                                                            .min(count.saturating_sub(1));
+                                                }
                                             } else if focus.panel() {
                                                 // Row mode walks the open
                                                 // section's rows; section mode
