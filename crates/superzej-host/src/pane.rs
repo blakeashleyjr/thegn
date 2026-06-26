@@ -182,7 +182,10 @@ fn pid_cwd(pid: u32) -> Option<std::path::PathBuf> {
 // proc_info / KERN_PROCARGS2 ABI is stable across macOS releases.
 #[cfg(target_os = "macos")]
 fn all_pids() -> Vec<u32> {
-    let probe = unsafe { libc::proc_listpids(libc::PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
+    // `PROC_ALL_PIDS` (from <sys/proc_info.h>) isn't exported by the `libc`
+    // crate; its value is 1.
+    const PROC_ALL_PIDS: u32 = 1;
+    let probe = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
     if probe <= 0 {
         return Vec::new();
     }
@@ -191,7 +194,7 @@ fn all_pids() -> Vec<u32> {
     let bytes = (buf.len() * std::mem::size_of::<u32>()) as libc::c_int;
     let n = unsafe {
         libc::proc_listpids(
-            libc::PROC_ALL_PIDS,
+            PROC_ALL_PIDS,
             0,
             buf.as_mut_ptr() as *mut libc::c_void,
             bytes,
