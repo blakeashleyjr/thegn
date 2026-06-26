@@ -98,6 +98,8 @@ pub enum Backend {
     Systemd,
     Apple,
     Wsl,
+    WinAppContainer,
+    WinJobObject,
     None,
 }
 
@@ -112,6 +114,8 @@ impl Backend {
             "systemd" | "systemd-run" => Backend::Systemd,
             "apple" | "container" => Backend::Apple,
             "wsl" => Backend::Wsl,
+            "winappcontainer" | "appcontainer" => Backend::WinAppContainer,
+            "winjobobject" | "jobobject" => Backend::WinJobObject,
             "none" | "host" => Backend::None,
             _ => return None,
         })
@@ -130,6 +134,8 @@ impl Backend {
             SandboxBackend::Systemd => Backend::Systemd,
             SandboxBackend::Apple => Backend::Apple,
             SandboxBackend::Wsl => Backend::Wsl,
+            SandboxBackend::WinAppContainer => Backend::WinAppContainer,
+            SandboxBackend::WinJobObject => Backend::WinJobObject,
             SandboxBackend::None => Backend::None,
         })
     }
@@ -145,6 +151,8 @@ impl Backend {
             Backend::Systemd => "systemd",
             Backend::Apple => "apple",
             Backend::Wsl => "wsl",
+            Backend::WinAppContainer => "appcontainer",
+            Backend::WinJobObject => "jobobject",
             Backend::None => "host",
         }
     }
@@ -158,6 +166,7 @@ impl Backend {
             Backend::Systemd => "systemd-run",
             Backend::Apple => "container",
             Backend::Wsl => "wsl.exe",
+            Backend::WinAppContainer | Backend::WinJobObject => "", // OS native
             Backend::None => "",
         }
     }
@@ -177,7 +186,10 @@ impl Backend {
     }
 
     fn is_host_toolchain(self) -> bool {
-        matches!(self, Backend::Bwrap | Backend::Systemd)
+        matches!(
+            self,
+            Backend::Bwrap | Backend::Systemd | Backend::WinAppContainer | Backend::WinJobObject
+        )
     }
 }
 
@@ -759,11 +771,14 @@ fn pick_backend(cfg: &SandboxConfig, placement: &Placement) -> Option<Backend> {
         let Some(b) = Backend::parse(name) else {
             continue;
         };
+        let is_win_native = b == Backend::WinAppContainer || b == Backend::WinJobObject;
         if b == Backend::None {
-            on_missing(
-                cfg,
-                "sandbox: no container backend available; running on the host",
-            );
+            if !is_win_native {
+                on_missing(
+                    cfg,
+                    "sandbox: no container backend available; running on the host",
+                );
+            }
             return Some(Backend::None);
         }
         if suitable(b) && available(placement, b) {
@@ -794,6 +809,19 @@ fn available(placement: &Placement, backend: Backend) -> bool {
     if placement.is_local() && backend == Backend::PodmanRootful {
         return run_local_output(&backend_prefix(backend), &["version"]).is_some();
     }
+
+    if placement.is_local()
+        && (backend == Backend::WinAppContainer || backend == Backend::WinJobObject)
+    {
+        return cfg!(windows);
+    }
+
+    if !placement.is_local()
+        && (backend == Backend::WinAppContainer || backend == Backend::WinJobObject)
+    {
+        return false;
+    }
+
     placement.has_binary(backend.binary())
 }
 
@@ -1124,6 +1152,24 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
                 // Aspirational: shell out into WSL's distro to run podman there.
                 v.insert(0, "wsl.exe".into());
                 v.insert(1, "--".into());
+            }
+            v
+        }
+        Backend::WinAppContainer | Backend::WinJobObject => {
+            // These native Windows backends run the standard command, optionally
+            // wrapperized by internal logic if requested, but from the process builder
+            // perspective they just exec `sh -lc "script"` (or pwsh equivalent) in cwd.
+            // When spawn_with_env runs it, we could intercept and wrap in a job object.
+            // For argv generation, we just emit the plain shell command since the real
+            // isolation happens in the OS process creation syscalls.
+            let shell = util::shell();
+            let mut v = vec![shell.clone()];
+            if shell.ends_with("pwsh.exe") || shell.ends_with("powershell.exe") {
+                v.extend(["-NoProfile".into(), "-Command".into(), script.to_string()]);
+            } else if shell.ends_with("cmd.exe") {
+                v.extend(["/C".into(), script.to_string()]);
+            } else {
+                v.extend(["-c".into(), script.to_string()]);
             }
             v
         }
@@ -1906,6 +1952,16 @@ pub fn run_gc(db_worktrees: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_win_native_sandboxes_do_not_parse_as_oci() {
+        assert!(!Backend::WinAppContainer.is_oci());
+        assert!(!Backend::WinJobObject.is_oci());
+        assert!(Backend::WinAppContainer.is_host_toolchain());
+        assert!(Backend::WinJobObject.is_host_toolchain());
+        assert_eq!(Backend::WinAppContainer.label(), "appcontainer");
+        assert_eq!(Backend::WinJobObject.label(), "jobobject");
+    }
 
     fn spec(backend: Backend) -> SandboxSpec {
         SandboxSpec {

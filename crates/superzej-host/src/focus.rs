@@ -128,12 +128,16 @@ pub fn route(zone: Zone, dir: Move, ctx: &RouteCtx) -> FocusMove {
         // (left/right are reserved for widget selection within the bar).
         Zone::Masthead => match dir {
             Move::Down => FocusMove::Enter(Zone::Center),
+            Move::Right => FocusMove::WithinZone(1),
+            Move::Left => FocusMove::WithinZone(-1),
             _ => FocusMove::None,
         },
         Zone::Statusbar => match dir {
             // Step back up through the drawer when it's open.
             Move::Up if ctx.drawer_visible => FocusMove::Enter(Zone::Drawer),
             Move::Up => FocusMove::Enter(Zone::Center),
+            Move::Right => FocusMove::WithinZone(1),
+            Move::Left => FocusMove::WithinZone(-1),
             _ => FocusMove::None,
         },
     }
@@ -274,12 +278,19 @@ mod tests {
             FocusMove::Enter(Zone::Center)
         );
         assert_eq!(route(Zone::Masthead, Move::Up, &c), FocusMove::None);
-        assert_eq!(route(Zone::Masthead, Move::Left, &c), FocusMove::None);
+        assert_eq!(
+            route(Zone::Masthead, Move::Left, &c),
+            FocusMove::WithinZone(-1)
+        );
         assert_eq!(
             route(Zone::Statusbar, Move::Up, &c),
             FocusMove::Enter(Zone::Center)
         );
         assert_eq!(route(Zone::Statusbar, Move::Down, &c), FocusMove::None);
+        assert_eq!(
+            route(Zone::Statusbar, Move::Right, &c),
+            FocusMove::WithinZone(1)
+        );
     }
 
     #[test]
