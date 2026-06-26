@@ -43,7 +43,7 @@ use std::path::PathBuf;
 /// source of truth for sidebar workspace order (was recency). Backfilled from
 /// the prior `last_active DESC` order so the first launch after upgrade looks
 /// unchanged; thereafter order is manual (Ctrl+Alt+↑/↓) and stable.
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 
 pub struct Db {
     conn: Connection,
@@ -193,7 +193,8 @@ impl Db {
               repo_path    TEXT PRIMARY KEY,
               name         TEXT,
               created_at   INTEGER,
-              last_active  INTEGER
+              last_active  INTEGER,
+              env_name     TEXT
             );
             CREATE TABLE IF NOT EXISTS worktrees (
               worktree     TEXT PRIMARY KEY,
@@ -204,7 +205,8 @@ impl Db {
               agent        TEXT,
               created_at   INTEGER,
               location     TEXT,
-              sandbox_backend TEXT
+              sandbox_backend TEXT,
+              env_name     TEXT
             );
             CREATE TABLE IF NOT EXISTS pr_cache (
               worktree   TEXT PRIMARY KEY,
@@ -547,6 +549,11 @@ impl Db {
             [],
         );
         let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN folder_id INTEGER", []);
+        // v18: the named execution environment selected per workspace/worktree
+        // (`[env.<name>]`). Additive; absent/NULL = inherit the next layer down
+        // (worktree → workspace → repo `.superzej.*` → global default → default).
+        let _ = conn.execute("ALTER TABLE workspaces ADD COLUMN env_name TEXT", []);
+        let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN env_name TEXT", []);
         // v6: transform any remaining flat v4/v5 `tab_layout` into worktree
         // groups. Keyed on the legacy table's existence (not the version) so
         // it is idempotent and a failed earlier attempt retries next open.
@@ -1712,6 +1719,66 @@ impl Db {
         }
     }
 
+    /// Select the named execution environment for a worktree (`[env.<name>]`).
+    /// `""` clears it (inherit the workspace/repo/global layer).
+    pub fn set_worktree_env(&self, wt: &str, env: &str) -> Result<()> {
+        let val = (!env.trim().is_empty()).then(|| env.trim().to_string());
+        self.conn.execute(
+            "UPDATE worktrees SET env_name=?2 WHERE worktree=?1",
+            params![wt, val],
+        )?;
+        Ok(())
+    }
+
+    /// The worktree's selected env name, if any (NULL/empty ⇒ inherit).
+    pub fn worktree_env(&self, wt: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT env_name FROM worktrees WHERE worktree=?1")?;
+        let mut rows = stmt.query(params![wt])?;
+        match rows.next()? {
+            Some(row) => Ok(row
+                .get::<_, Option<String>>(0)?
+                .filter(|s| !s.trim().is_empty())),
+            None => Ok(None),
+        }
+    }
+
+    /// Select the default execution environment for a whole workspace. `""`
+    /// clears it.
+    pub fn set_workspace_env(&self, repo_path: &str, env: &str) -> Result<()> {
+        let val = (!env.trim().is_empty()).then(|| env.trim().to_string());
+        self.conn.execute(
+            "UPDATE workspaces SET env_name=?2 WHERE repo_path=?1",
+            params![repo_path, val],
+        )?;
+        Ok(())
+    }
+
+    /// The workspace's default env name, if any (NULL/empty ⇒ inherit).
+    pub fn workspace_env(&self, repo_path: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT env_name FROM workspaces WHERE repo_path=?1")?;
+        let mut rows = stmt.query(params![repo_path])?;
+        match rows.next()? {
+            Some(row) => Ok(row
+                .get::<_, Option<String>>(0)?
+                .filter(|s| !s.trim().is_empty())),
+            None => Ok(None),
+        }
+    }
+
+    /// The effective selected env for a worktree: its own `env_name`, else its
+    /// workspace's `env_name`. (`None` ⇒ fall through to repo `.superzej.*` /
+    /// global default in [`crate::config::Config::resolve_env`].)
+    pub fn effective_env(&self, wt: &str, repo_path: &str) -> Option<String> {
+        self.worktree_env(wt)
+            .ok()
+            .flatten()
+            .or_else(|| self.workspace_env(repo_path).ok().flatten())
+    }
+
     // --- container_events (sandbox audit trail) ------------------------------
 
     /// Record a sandbox event (exec, network, dns, orphan_gc) in the audit log.
@@ -1786,7 +1853,7 @@ impl Db {
         // unloaded-workspace rows and the resurrect adopt loop — is stable;
         // created_at/path are deterministic tie-breakers for any unset row.
         let mut stmt = self.conn.prepare(
-            "SELECT worktree, branch, agent, created_at, repo_path, tab_name, session_name, location, position, sandbox_backend, folder_id
+            "SELECT worktree, branch, agent, created_at, repo_path, tab_name, session_name, location, position, sandbox_backend, folder_id, env_name
              FROM worktrees ORDER BY position, created_at, worktree",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -1802,6 +1869,9 @@ impl Db {
                 position: r.get::<_, Option<i64>>(8)?.unwrap_or(0),
                 sandbox_backend: r.get(9)?,
                 folder_id: r.get(10)?,
+                env_name: r
+                    .get::<_, Option<String>>(11)?
+                    .filter(|s| !s.trim().is_empty()),
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -3741,6 +3811,49 @@ mod tests {
             )
             .unwrap();
         assert_eq!(fid, Some(folder), "upsert with None preserves folder_id");
+    }
+
+    #[test]
+    fn env_name_set_get_and_effective_precedence() {
+        let db = db();
+        db.put_workspace("/x/app", "app", "repo").unwrap();
+        db.put_worktree("app/feat", "/x/app", "/wt/feat", "sz/feat", None, None)
+            .unwrap();
+
+        // Unset → None at every level.
+        assert_eq!(db.worktree_env("/wt/feat").unwrap(), None);
+        assert_eq!(db.workspace_env("/x/app").unwrap(), None);
+        assert_eq!(db.effective_env("/wt/feat", "/x/app"), None);
+
+        // Workspace-level selection is the fallback.
+        db.set_workspace_env("/x/app", "company-k8s").unwrap();
+        assert_eq!(
+            db.workspace_env("/x/app").unwrap().as_deref(),
+            Some("company-k8s")
+        );
+        assert_eq!(
+            db.effective_env("/wt/feat", "/x/app").as_deref(),
+            Some("company-k8s")
+        );
+
+        // A worktree-level selection wins over the workspace default.
+        db.set_worktree_env("/wt/feat", "datonya").unwrap();
+        assert_eq!(
+            db.effective_env("/wt/feat", "/x/app").as_deref(),
+            Some("datonya")
+        );
+
+        // Clearing the worktree falls back to the workspace; whitespace clears.
+        db.set_worktree_env("/wt/feat", "   ").unwrap();
+        assert_eq!(db.worktree_env("/wt/feat").unwrap(), None);
+        assert_eq!(
+            db.effective_env("/wt/feat", "/x/app").as_deref(),
+            Some("company-k8s")
+        );
+
+        // Clearing the workspace too → fully unset.
+        db.set_workspace_env("/x/app", "").unwrap();
+        assert_eq!(db.effective_env("/wt/feat", "/x/app"), None);
     }
 
     #[test]

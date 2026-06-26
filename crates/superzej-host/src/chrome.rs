@@ -1549,6 +1549,15 @@ fn compose_sidebar_row(
         }
     }
 
+    // A non-default execution environment badges before the backend, so a
+    // worktree pinned to `company-k8s`/`datonya`/etc. is visible at a glance.
+    if let Some(env) = &row.env_name
+        && !env.is_empty()
+        && env != "default"
+    {
+        text.push_str(&format!(" «{env}»"));
+    }
+
     // Agent glyph (item 19) sits just after the label.
     if let Some(backend) = &row.sandbox_backend
         && !backend.is_empty()
@@ -2193,6 +2202,7 @@ mod tests {
             git: None,
             agent: None,
             sandbox_backend: None,
+            env_name: None,
             activity: crate::sidebar::ActivityState::None,
             visible: true,
             collapsed: false,

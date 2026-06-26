@@ -102,6 +102,14 @@ check "list runs without error" \
 check "recent runs without error" \
   "'$SZ' recent >/dev/null 2>&1"
 
+# Named execution environments: list the library and resolve one for a worktree.
+check "env list reports the default env" \
+  "'$SZ' env list | grep -q 'default env:'"
+check "env show resolves an environment for a worktree" \
+  "'$SZ' env show '$WT' | grep -q '^env:'"
+check "env set/show round-trips a selection" \
+  "'$SZ' env set company-k8s '$WT' >/dev/null 2>&1 && '$SZ' env show '$WT' >/dev/null 2>&1"
+
 # v5 → v6 layout migration: seed a legacy flat tab_layout (pages as " ·N" name
 # suffixes) into the state DB, open it once, and assert it transformed into
 # worktree groups (tabs-within-a-worktree) with the legacy table dropped.

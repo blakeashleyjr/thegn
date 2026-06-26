@@ -128,6 +128,11 @@ pub struct SandboxOutcome {
     pub spec: Option<sandbox::SandboxSpec>,
     pub backend_label: String,
     pub warnings: Vec<String>,
+    /// The resolved env's sandbox shell override (`""` ⇒ host `$SHELL`).
+    pub shell: String,
+    /// Whether the env runs off the local host (ssh/k8s/provider). Drives the
+    /// pane cwd: a remote placement has no local working directory.
+    pub is_remote: bool,
 }
 
 /// Resolve and `ensure` the sandbox for `worktree` — the BLOCKING half of a
@@ -157,7 +162,28 @@ pub fn prepare_sandbox(
     backend_choice: Option<&str>,
     scope: SandboxScope,
 ) -> anyhow::Result<SandboxOutcome> {
-    let mut sb = cfg.repo_sandbox(repo_root);
+    prepare_sandbox_env(cfg, repo_root, worktree, loc, backend_choice, scope, None)
+}
+
+/// Like [`prepare_sandbox`] but with an explicitly-selected execution
+/// environment name (the DB worktree/workspace `env_name`, or a `--env` flag).
+/// `None` lets [`Config::resolve_env`] fall through to repo/global selection.
+/// No DB access — the caller resolves the name (which needs the DB).
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_sandbox_env(
+    cfg: &Config,
+    repo_root: &Path,
+    worktree: &str,
+    loc: &GitLoc,
+    backend_choice: Option<&str>,
+    scope: SandboxScope,
+    selected_env: Option<&str>,
+) -> anyhow::Result<SandboxOutcome> {
+    let environment = cfg.resolve_env(repo_root, loc, selected_env);
+    let placement = environment.placement.clone();
+    let env_shell = environment.sandbox.shell.clone();
+    let env_is_remote = environment.is_remote();
+    let mut sb = environment.sandbox;
     let mut explicit_backend =
         sandbox::Backend::from_config(sb.backend).filter(|b| *b != sandbox::Backend::None);
     // Only let the DB-saved per-worktree backend override when config is "auto".
@@ -201,9 +227,25 @@ pub fn prepare_sandbox(
         base_cname
     };
     for candidate in sandbox_candidates(&sb) {
-        if let Some(spec) = sandbox::resolve_scoped(&candidate, loc, &cname, hardening) {
+        if let Some(spec) =
+            sandbox::resolve_placed(&candidate, loc, &cname, hardening, placement.clone())
+        {
             if spec.backend == sandbox::Backend::None {
-                break;
+                // A `none` backend on a *local* placement means "run on the host"
+                // (the plain-shell fallback below). On a *remote* placement
+                // (ssh/k8s/provider) the placement itself is the boundary — the
+                // bare-shell spec carries the worktree into the pod/host, so use
+                // it instead of falling back to a local host shell.
+                if spec.placement.is_local() {
+                    break;
+                }
+                return Ok(SandboxOutcome {
+                    backend_label: spec.backend.label().to_string(),
+                    spec: Some(spec),
+                    warnings,
+                    shell: env_shell,
+                    is_remote: env_is_remote,
+                });
             }
             if let Some(expected) = explicit_backend
                 && spec.backend != expected
@@ -220,6 +262,8 @@ pub fn prepare_sandbox(
                         backend_label: spec.backend.label().to_string(),
                         spec: Some(spec),
                         warnings,
+                        shell: env_shell,
+                        is_remote: env_is_remote,
                     });
                 }
                 Err(e) if explicit_choice => {
@@ -262,6 +306,8 @@ pub fn prepare_sandbox(
         spec: None,
         backend_label: "host".to_string(),
         warnings,
+        shell: env_shell,
+        is_remote: env_is_remote,
     })
 }
 
@@ -297,13 +343,9 @@ pub fn compose_spec(
     loc: &GitLoc,
     sb: &SandboxOutcome,
 ) -> LaunchSpec {
-    // If the sandbox config has an explicit shell override, use it for shell
-    // panes. Empty string = resolve from host $SHELL (the default).
-    let sb_shell = cfg
-        .repo_sandbox(Path::new(worktree))
-        .shell
-        .trim()
-        .to_string();
+    // If the resolved env's sandbox config has an explicit shell override, use
+    // it for shell panes. Empty string = resolve from host $SHELL (the default).
+    let sb_shell = sb.shell.trim().to_string();
     // When running inside an OCI container the host's absolute $SHELL path
     // (e.g. /run/current-system/sw/bin/zsh) does not exist in the container
     // filesystem.  Pass in_oci=true so shell_inner() uses only the basename.
@@ -315,9 +357,10 @@ pub fn compose_spec(
     } else {
         resolve_command(cfg, choice)
     };
-    // Local worktrees run in their own dir; remote worktrees have no local dir
-    // (the transport cd's on the remote), so the pane cwd stays unset.
-    let cwd = (!loc.is_remote()).then(|| PathBuf::from(worktree));
+    // Local worktrees run in their own dir; a remote worktree (its `GitLoc`) or
+    // a remote placement (ssh/k8s/provider env) has no local dir — the placement
+    // cd's on the target — so the pane cwd stays unset.
+    let cwd = (!loc.is_remote() && !sb.is_remote).then(|| PathBuf::from(worktree));
     let env = vec![
         ("SUPERZEJ_WORKTREE".to_string(), worktree.to_string()),
         (
@@ -389,13 +432,20 @@ pub fn launch_spec_with_key(
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
 
-    let mut outcome = prepare_sandbox(
+    // The selected execution environment: the worktree's own `env_name`, else
+    // its workspace's. `resolve_env` falls through to the repo/global default.
+    let selected_env = Db::open()
+        .ok()
+        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+
+    let mut outcome = prepare_sandbox_env(
         cfg,
         &repo_root,
         worktree,
         &loc,
         saved_backend.as_deref(),
         SandboxScope::Shell,
+        selected_env.as_deref(),
     )?;
     if let Ok(db) = Db::open() {
         let _ = db.set_worktree_sandbox(worktree, &outcome.backend_label);
@@ -613,6 +663,8 @@ mod tests {
             spec: None,
             backend_label: "host".into(),
             warnings: vec!["sandbox auto selected host".into()],
+            shell: String::new(),
+            is_remote: false,
         };
         let spec = compose_spec(&cfg, "/wt/x", Some("sz/x"), "claude", &loc, &host);
         assert_eq!(

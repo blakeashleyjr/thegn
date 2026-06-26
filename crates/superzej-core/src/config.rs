@@ -13,10 +13,13 @@
 //! default (the strict check lives in `superzej config validate`). The
 //! home-manager module renders the file; keys match the serde field names.
 
+use crate::env::Environment;
+use crate::placement::{K8sPlacement, Placement, ProviderPlacement, SshPlacement, TransportKind};
+use crate::remote::GitLoc;
 use crate::util;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Prefix a config diagnostic and emit it as a warning. Centralised so the
 /// validated-enum deserializers and the env/flag layers speak with one voice.
@@ -220,6 +223,29 @@ config_enum! {
     pub enum RemoteMode: "remote mode" {
         Remote = "remote", LocalExec = "local_exec", Sshfs = "sshfs",
     } default = Remote;
+}
+config_enum! {
+    /// Where a named environment's processes run (its [`crate::placement`]).
+    /// `local` runs on the host; `ssh`/`mosh` over ssh; `k8s` inside a pod via
+    /// `kubectl exec`; `provider` through a managed-sandbox provider (Daytona, …).
+    pub enum PlacementMode: "placement" {
+        Local = "local" | "host",
+        Ssh = "ssh" | "mosh" | "remote",
+        K8s = "k8s" | "kubernetes" | "kube",
+        Provider = "provider",
+    } default = Local;
+}
+config_enum! {
+    /// Where an environment's worktree files physically live. `in_env` (the
+    /// default) keeps files where the env runs — on the host for `local`, in the
+    /// pod/sandbox for remote placements (today's behavior). `local_exec` keeps
+    /// files on the host and only execs remotely; `sshfs` mounts the remote tree
+    /// locally. (`local_exec`/`sshfs` lifecycle is wired in the data-mode phase.)
+    pub enum DataMode: "data mode" {
+        InEnv = "in_env" | "remote" | "native",
+        LocalExec = "local_exec" | "local",
+        Sshfs = "sshfs" | "mount",
+    } default = InEnv;
 }
 config_enum! {
     /// Default log verbosity (the `SUPERZEJ_LOG` env filter can refine it
@@ -1342,6 +1368,164 @@ impl RemoteConfig {
     }
 }
 
+/// `[env.<name>]` — a named, reusable execution environment. Selected per
+/// workspace/repo/worktree (DB `env_name`, repo `.superzej.*` `env =`, or the
+/// global `[sandbox] default_env`) and resolved by [`Config::resolve_env`].
+///
+/// An env bundles *placement* (where it runs), an isolation *overlay* (applied
+/// on top of the base `[sandbox]`), and a *data* mode (where files live), plus
+/// placement-specific `[env.<name>.{ssh,k8s,provider}]` sub-tables.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct EnvConfig {
+    /// Where this env's processes run.
+    pub placement: PlacementMode,
+    /// Where the worktree files live (defaults to "in the env").
+    pub data: DataMode,
+    /// Isolation overlay applied on top of the base `[sandbox]` (+ profile +
+    /// repo overlay). e.g. `backend = "podman"`, `image = "..."`, `profile`.
+    #[serde(skip_serializing_if = "SandboxOverlay::is_empty")]
+    pub sandbox: SandboxOverlay,
+    /// `[env.<name>.ssh]` — SSH/mosh connection knobs (placement = ssh).
+    #[serde(skip_serializing_if = "EnvSshConfig::is_default")]
+    pub ssh: EnvSshConfig,
+    /// `[env.<name>.k8s]` — Kubernetes pod target (placement = k8s).
+    #[serde(skip_serializing_if = "EnvK8sConfig::is_default")]
+    pub k8s: EnvK8sConfig,
+    /// `[env.<name>.provider]` — managed-sandbox provider (placement = provider).
+    #[serde(skip_serializing_if = "EnvProviderConfig::is_default")]
+    pub provider: EnvProviderConfig,
+}
+
+/// `[env.<name>.ssh]` — connection settings for an `ssh`/`mosh` placement. An
+/// empty `host` falls back to the worktree's own remote target (its `GitLoc`)
+/// or the global `[sandbox.remote] host`.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct EnvSshConfig {
+    pub host: String,
+    pub port: u16,
+    pub transport: RemoteTransport,
+    pub forward_agent: bool,
+    /// `ssh -F <path>` — a dedicated ssh config file for this environment.
+    pub ssh_config: String,
+    /// `ssh -J <host>` — a ProxyJump bastion.
+    pub jump_host: String,
+    /// `ssh -i <path>` — an explicit identity file.
+    pub identity: String,
+    /// Extra raw ssh args appended verbatim.
+    pub extra_args: Vec<String>,
+}
+
+impl Default for EnvSshConfig {
+    fn default() -> Self {
+        EnvSshConfig {
+            host: String::new(),
+            port: 22,
+            transport: RemoteTransport::Mosh,
+            forward_agent: true,
+            ssh_config: String::new(),
+            jump_host: String::new(),
+            identity: String::new(),
+            extra_args: Vec::new(),
+        }
+    }
+}
+
+impl EnvSshConfig {
+    fn is_default(&self) -> bool {
+        self.host.is_empty()
+            && self.ssh_config.is_empty()
+            && self.jump_host.is_empty()
+            && self.identity.is_empty()
+            && self.extra_args.is_empty()
+            && self.port == 22
+            && self.forward_agent
+            && self.transport == RemoteTransport::Mosh
+    }
+}
+
+/// `[env.<name>.k8s]` — a Kubernetes pod target for a `k8s` placement.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct EnvK8sConfig {
+    /// kubectl binary (empty ⇒ `kubectl`).
+    pub kubectl: String,
+    /// `--context` (empty ⇒ current kubeconfig context).
+    pub context: String,
+    /// `--namespace` (empty ⇒ default namespace).
+    pub namespace: String,
+    /// Target pod name or selector (e.g. `dev-blake`). Required to exec; the
+    /// pod-template spawn lifecycle resolves it when `pod_template` is set.
+    pub pod: String,
+    /// `-c <container>` within the pod (empty ⇒ default container).
+    pub container: String,
+    /// Path to a pod manifest applied to spawn a custom env (lifecycle phase).
+    pub pod_template: String,
+    /// Image for a template-less spawned pod.
+    pub image: String,
+    /// Enable remote-access features (e.g. `kubectl port-forward`).
+    pub remote_access: bool,
+}
+
+impl EnvK8sConfig {
+    fn is_default(&self) -> bool {
+        self.kubectl.is_empty()
+            && self.context.is_empty()
+            && self.namespace.is_empty()
+            && self.pod.is_empty()
+            && self.container.is_empty()
+            && self.pod_template.is_empty()
+            && self.image.is_empty()
+            && !self.remote_access
+    }
+}
+
+/// `[env.<name>.provider]` — a managed-sandbox provider for a `provider`
+/// placement (Daytona, Codespaces, …). `exec_command` is a static argv template
+/// (`{id}` is substituted with `id`) that runs a command in the sandbox; the
+/// API-driven discover/create lifecycle is layered on in the provider phase.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct EnvProviderConfig {
+    /// Provider id, e.g. `"daytona"`.
+    pub provider: String,
+    /// Opaque sandbox/environment id (static config; or resolved by lifecycle).
+    pub id: String,
+    /// Argv prefix to run a command in the sandbox; `{id}` is substituted.
+    /// e.g. `["daytona", "ssh", "{id}", "--"]`.
+    pub exec_command: Vec<String>,
+    /// Optional PTY-capable prefix for the interactive pane (defaults to
+    /// `exec_command` when empty).
+    pub interactive_command: Vec<String>,
+    /// Optional argv to create/start the sandbox (`superzej env up`); `{id}` is
+    /// substituted. e.g. `["daytona", "create", "--id", "{id}"]`. Empty ⇒ the
+    /// sandbox is assumed pre-created.
+    pub up_command: Vec<String>,
+    /// Optional argv to destroy/stop the sandbox (`superzej env down`).
+    pub down_command: Vec<String>,
+    /// API base URL for an API-driven provider (provider phase).
+    pub api_base: String,
+    /// Env var holding the provider API token.
+    pub api_key_env: String,
+    /// Provider sandbox template/image to create from.
+    pub template: String,
+}
+
+impl EnvProviderConfig {
+    fn is_default(&self) -> bool {
+        self.provider.is_empty()
+            && self.id.is_empty()
+            && self.exec_command.is_empty()
+            && self.interactive_command.is_empty()
+            && self.up_command.is_empty()
+            && self.down_command.is_empty()
+            && self.api_base.is_empty()
+            && self.api_key_env.is_empty()
+            && self.template.is_empty()
+    }
+}
+
 /// `[sandbox]` — containerize/sandbox a worktree's interactive process. On by
 /// default; `backend = "auto"` walks `backend_chain` and falls back to the host
 /// shell (with a warning) when nothing is available.
@@ -1383,6 +1567,11 @@ pub struct SandboxConfig {
     pub backend: SandboxBackend,
     /// Default selection for new worktrees; `auto` means use `backend_chain`.
     pub default_backend: SandboxBackend,
+    /// Name of the `[env.<name>]` execution environment to use by default when a
+    /// worktree/workspace/repo hasn't selected one. Empty ⇒ the implicit
+    /// `"default"` env (this `[sandbox]` block + `[sandbox.remote]`, today's
+    /// behavior). See [`Config::resolve_env`].
+    pub default_env: String,
     pub backend_chain: Vec<String>, // auto detection order; "host" = host fallback
     pub image: String,              // "" => host-toolchain mode
     /// Hardening preset for the worktree's interactive container (shell panes).
@@ -1427,6 +1616,7 @@ impl Default for SandboxConfig {
             enabled: true,
             backend: SandboxBackend::Auto,
             default_backend: SandboxBackend::Auto,
+            default_env: String::new(),
             backend_chain: [
                 "podman-rootless",
                 "podman-rootful",
@@ -1488,6 +1678,7 @@ pub struct SandboxOverlay {
     pub enabled: Option<bool>,
     pub backend: Option<SandboxBackend>,
     pub default_backend: Option<SandboxBackend>,
+    pub default_env: Option<String>,
     pub backend_chain: Option<Vec<String>>,
     pub image: Option<String>,
     pub profile: Option<SandboxProfile>,
@@ -1533,6 +1724,9 @@ impl SandboxOverlay {
         }
         if let Some(v) = self.default_backend {
             base.default_backend = v;
+        }
+        if let Some(v) = self.default_env {
+            base.default_env = v;
         }
         if let Some(v) = self.backend_chain {
             base.backend_chain = v;
@@ -1606,6 +1800,7 @@ impl SandboxOverlay {
         self.enabled.is_none()
             && self.backend.is_none()
             && self.default_backend.is_none()
+            && self.default_env.is_none()
             && self.backend_chain.is_none()
             && self.image.is_none()
             && self.profile.is_none()
@@ -1655,6 +1850,10 @@ impl RemoteOverlay {
 struct RepoConfigFile {
     sandbox: SandboxOverlay,
     keybinds: KeybindConfig,
+    /// Selects a named `[env.<name>]` for every worktree of this repo (the
+    /// repo-level layer of env selection). Empty ⇒ inherit the global default.
+    #[serde(default)]
+    env: String,
 }
 
 /// `[drawer]` — the bottom file-manager drawer (hidden by default, toggled with
@@ -1996,6 +2195,10 @@ pub struct Config {
     /// Per-workspace config keyed by repo slug (`[workspace.<slug>]`).
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub workspace: std::collections::BTreeMap<String, WorkspaceConfig>,
+    /// Named execution environments (`[env.<name>]`) — the reusable library a
+    /// workspace/repo/worktree selects from. See [`Config::resolve_env`].
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, EnvConfig>,
     /// Per-program host-action overlays (`[program_keybinds.<program>]`), keyed
     /// by the focused pane's program name. Consulted before the active mode.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -2063,6 +2266,7 @@ impl Default for Config {
             keymap_preset: default_preset(),
             profiles: std::collections::BTreeMap::new(),
             workspace: std::collections::BTreeMap::new(),
+            env: std::collections::BTreeMap::new(),
             program_keybinds: std::collections::BTreeMap::new(),
             program_remap: std::collections::BTreeMap::new(),
         }
@@ -2619,6 +2823,70 @@ impl Config {
         sb
     }
 
+    /// The name of the env a repo's `.superzej.*` overlay selects (`env = "…"`),
+    /// or empty. The repo-level layer of env selection.
+    pub fn repo_env_name(&self, repo_root: &Path) -> String {
+        load_repo_overlay(repo_root)
+            .map(|r| r.env.trim().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Resolve the full execution [`Environment`] for a worktree.
+    ///
+    /// Env-name precedence (most specific wins): `selected` (the DB worktree/
+    /// workspace `env_name`, or a launch flag) → the repo `.superzej.*` `env =`
+    /// → the global `[sandbox] default_env` → the implicit `"default"`.
+    ///
+    /// The `"default"` env (and any unknown name) reproduces today's behavior
+    /// exactly: the base `[sandbox]` (+ profile + repo overlay + workspace
+    /// mounts) with a placement derived from `[sandbox.remote]` + the `GitLoc`.
+    /// A named env overlays its `[env.<name>] sandbox` onto that base and builds
+    /// its placement from `[env.<name>.{ssh,k8s,provider}]`.
+    pub fn resolve_env(
+        &self,
+        repo_root: &Path,
+        loc: &GitLoc,
+        selected: Option<&str>,
+    ) -> Environment {
+        let base = self.repo_sandbox(repo_root);
+        let pick = |s: &str| {
+            let t = s.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        };
+        let name = selected
+            .and_then(pick)
+            .or_else(|| pick(&self.repo_env_name(repo_root)))
+            .or_else(|| pick(&base.default_env))
+            .unwrap_or_else(|| "default".to_string());
+
+        let Some(envc) = self.env.get(&name) else {
+            // Implicit default env, or a typo'd selection: today's behavior.
+            if name != "default" {
+                config_warn(&format!(
+                    "execution environment {name:?} is not defined under [env.{name}]; using the default"
+                ));
+            }
+            let data = data_mode_from_remote(base.remote.mode);
+            return Environment {
+                name: "default".into(),
+                placement: crate::sandbox::placement_from_loc(&base, loc),
+                sandbox: base,
+                data,
+            };
+        };
+
+        // Named env: overlay its isolation onto the base, build its placement.
+        let mut sb = base;
+        envc.sandbox.clone().apply(&mut sb);
+        let placement = build_env_placement(envc, &sb, loc);
+        Environment {
+            name,
+            placement,
+            sandbox: sb,
+            data: envc.data,
+        }
+    }
+
     /// The accent as a truecolor "R;G;B" fragment; invalid hex falls back to
     /// the default teal.
     pub fn accent_rgb(&self) -> String {
@@ -2886,6 +3154,95 @@ fn load_repo_overlay(repo_root: &std::path::Path) -> Option<RepoConfigFile> {
         };
     }
     None
+}
+
+/// Map the legacy `[sandbox.remote] mode` onto the env [`DataMode`], so the
+/// default env honours an existing `mode = "sshfs"`/`"local_exec"` config.
+fn data_mode_from_remote(mode: RemoteMode) -> DataMode {
+    match mode {
+        RemoteMode::Remote => DataMode::InEnv,
+        RemoteMode::LocalExec => DataMode::LocalExec,
+        RemoteMode::Sshfs => DataMode::Sshfs,
+    }
+}
+
+/// Build the runtime [`Placement`] for a named env from its `[env.<name>]`
+/// placement mode + the matching sub-table. For `ssh`, an empty `[env.*.ssh]
+/// host` falls back to the worktree's own remote target, then `[sandbox.remote]`.
+fn build_env_placement(envc: &EnvConfig, sb: &SandboxConfig, loc: &GitLoc) -> Placement {
+    let opt = |s: &str| {
+        let t = s.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    };
+    match envc.placement {
+        PlacementMode::Local => Placement::Local,
+        PlacementMode::Ssh => {
+            let kind = match envc.ssh.transport {
+                RemoteTransport::Ssh => TransportKind::Ssh,
+                RemoteTransport::Mosh => TransportKind::Mosh,
+            };
+            let (host, port, forward_agent) = if !envc.ssh.host.trim().is_empty() {
+                let port = if envc.ssh.port == 0 {
+                    22
+                } else {
+                    envc.ssh.port
+                };
+                (
+                    envc.ssh.host.trim().to_string(),
+                    port,
+                    envc.ssh.forward_agent,
+                )
+            } else if let Some(t) = loc.ssh() {
+                (t.host.clone(), t.port, t.forward_agent)
+            } else {
+                (
+                    sb.remote.host.clone(),
+                    sb.remote.port,
+                    sb.remote.forward_agent,
+                )
+            };
+            Placement::Ssh(SshPlacement {
+                host,
+                port,
+                forward_agent,
+                kind,
+                ssh_config: opt(&envc.ssh.ssh_config),
+                jump_host: opt(&envc.ssh.jump_host),
+                identity: opt(&envc.ssh.identity),
+                extra_args: envc.ssh.extra_args.clone(),
+            })
+        }
+        PlacementMode::K8s => Placement::K8s(K8sPlacement {
+            kubectl: opt(&envc.k8s.kubectl).unwrap_or_else(|| "kubectl".to_string()),
+            context: opt(&envc.k8s.context),
+            namespace: opt(&envc.k8s.namespace),
+            pod: envc.k8s.pod.trim().to_string(),
+            container: opt(&envc.k8s.container),
+            pod_template: opt(&envc.k8s.pod_template).map(|p| util::expand_tilde(&p)),
+            image: opt(&envc.k8s.image),
+        }),
+        PlacementMode::Provider => {
+            let sub = |tpl: &[String]| {
+                tpl.iter()
+                    .map(|s| s.replace("{id}", envc.provider.id.trim()))
+                    .collect::<Vec<_>>()
+            };
+            let control_prefix = sub(&envc.provider.exec_command);
+            let interactive_prefix = if envc.provider.interactive_command.is_empty() {
+                control_prefix.clone()
+            } else {
+                sub(&envc.provider.interactive_command)
+            };
+            Placement::Provider(ProviderPlacement {
+                provider: envc.provider.provider.trim().to_string(),
+                id: envc.provider.id.trim().to_string(),
+                interactive_prefix,
+                control_prefix,
+                up_command: sub(&envc.provider.up_command),
+                down_command: sub(&envc.provider.down_command),
+            })
+        }
+    }
 }
 
 /// "#rrggbb" / "#rgb" -> "R;G;B".
@@ -4301,6 +4658,197 @@ forward_agent = false
         assert_eq!(sb.remote.mode, RemoteMode::Sshfs);
         assert_eq!(sb.remote.remote_dir, "/srv/wt");
         assert!(!sb.remote.forward_agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- named execution environments (`[env.<name>]`) -----------------------
+
+    #[test]
+    fn default_env_reproduces_legacy_behavior() {
+        // No [env.*] defined → the implicit "default" env: base [sandbox] +
+        // a placement derived from [sandbox.remote] + the GitLoc (today's path).
+        let cfg = Config::default();
+        let dir = tmpdir("env-default");
+        let loc = GitLoc::Local(dir.clone());
+        let env = cfg.resolve_env(&dir, &loc, None);
+        assert_eq!(env.name, "default");
+        assert!(env.placement.is_local());
+        assert!(!env.is_remote());
+        // The resolved sandbox equals repo_sandbox (modulo identical content).
+        assert_eq!(env.sandbox.backend, cfg.repo_sandbox(&dir).backend);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn named_env_overlays_isolation_and_local_placement() {
+        let cfg: Config = toml::from_str(
+            "\
+[env.local-containers]
+placement = \"local\"
+[env.local-containers.sandbox]
+backend = \"podman\"
+image = \"registry.example.com/dev:latest\"
+profile = \"sealed\"
+",
+        )
+        .unwrap();
+        let dir = tmpdir("env-local");
+        let loc = GitLoc::Local(dir.clone());
+        let env = cfg.resolve_env(&dir, &loc, Some("local-containers"));
+        assert_eq!(env.name, "local-containers");
+        assert!(env.placement.is_local());
+        assert_eq!(env.sandbox.backend, SandboxBackend::Podman);
+        assert_eq!(env.sandbox.image, "registry.example.com/dev:latest");
+        assert_eq!(env.sandbox.profile, SandboxProfile::Sealed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn k8s_env_builds_kubectl_placement() {
+        let cfg: Config = toml::from_str(
+            "\
+[env.company-k8s]
+placement = \"k8s\"
+[env.company-k8s.sandbox]
+backend = \"none\"
+[env.company-k8s.k8s]
+context = \"company-prod\"
+namespace = \"dev-blake\"
+pod = \"sz-dev\"
+",
+        )
+        .unwrap();
+        let dir = tmpdir("env-k8s");
+        let loc = GitLoc::Local(dir.clone());
+        let env = cfg.resolve_env(&dir, &loc, Some("company-k8s"));
+        assert!(env.is_remote());
+        assert_eq!(env.placement.label(), "k8s:dev-blake/sz-dev");
+        // The kubectl exec argv carries the configured context/namespace/pod.
+        let argv = env.placement.interactive_argv(&["true".into()]);
+        assert_eq!(argv[0], "kubectl");
+        assert!(argv.windows(2).any(|w| w == ["--context", "company-prod"]));
+        assert!(argv.windows(2).any(|w| w == ["--namespace", "dev-blake"]));
+        assert!(argv.contains(&"sz-dev".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn provider_env_substitutes_id_into_exec_template() {
+        let cfg: Config = toml::from_str(
+            "\
+[env.daytona]
+placement = \"provider\"
+[env.daytona.provider]
+provider = \"daytona\"
+id = \"sb-42\"
+exec_command = [\"daytona\", \"ssh\", \"{id}\", \"--\"]
+",
+        )
+        .unwrap();
+        let dir = tmpdir("env-prov");
+        let loc = GitLoc::Local(dir.clone());
+        let env = cfg.resolve_env(&dir, &loc, Some("daytona"));
+        assert!(env.is_remote());
+        let argv = env.placement.interactive_argv(&["ls".into()]);
+        assert_eq!(&argv[..4], &["daytona", "ssh", "sb-42", "--"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn provider_env_lifecycle_commands_substitute_id() {
+        let cfg: Config = toml::from_str(
+            "\
+[env.daytona]
+placement = \"provider\"
+[env.daytona.provider]
+provider = \"daytona\"
+id = \"sb-7\"
+exec_command = [\"daytona\", \"ssh\", \"{id}\", \"--\"]
+up_command = [\"daytona\", \"create\", \"--id\", \"{id}\"]
+down_command = [\"daytona\", \"delete\", \"{id}\"]
+",
+        )
+        .unwrap();
+        let dir = tmpdir("env-prov-life");
+        let loc = GitLoc::Local(dir.clone());
+        let env = cfg.resolve_env(&dir, &loc, Some("daytona"));
+        match env.placement {
+            crate::placement::Placement::Provider(p) => {
+                assert_eq!(p.up_command, vec!["daytona", "create", "--id", "sb-7"]);
+                assert_eq!(p.down_command, vec!["daytona", "delete", "sb-7"]);
+            }
+            other => panic!("expected provider placement, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_selection_precedence_repo_over_global_default() {
+        // Global default_env picks "g"; a repo .superzej.toml `env = "r"` wins;
+        // an explicit `selected` beats both.
+        let cfg: Config = toml::from_str(
+            "\
+[sandbox]
+default_env = \"g\"
+[env.g]
+[env.g.sandbox]
+backend = \"bwrap\"
+[env.r]
+[env.r.sandbox]
+backend = \"docker\"
+[env.x]
+[env.x.sandbox]
+backend = \"podman\"
+",
+        )
+        .unwrap();
+        let dir = tmpdir("env-prec");
+        std::fs::write(dir.join(".superzej.toml"), "env = \"r\"\n").unwrap();
+        let loc = GitLoc::Local(dir.clone());
+        // No explicit selection → repo overlay "r" wins over global default "g".
+        assert_eq!(cfg.resolve_env(&dir, &loc, None).name, "r");
+        assert_eq!(
+            cfg.resolve_env(&dir, &loc, None).sandbox.backend,
+            SandboxBackend::Docker
+        );
+        // Explicit selection beats the repo overlay.
+        assert_eq!(cfg.resolve_env(&dir, &loc, Some("x")).name, "x");
+        // Empty/whitespace selection is ignored (falls through to repo).
+        assert_eq!(cfg.resolve_env(&dir, &loc, Some("  ")).name, "r");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_env_name_falls_back_to_default() {
+        let cfg = Config::default();
+        let dir = tmpdir("env-unknown");
+        let loc = GitLoc::Local(dir.clone());
+        let env = cfg.resolve_env(&dir, &loc, Some("does-not-exist"));
+        assert_eq!(env.name, "default");
+        assert!(env.placement.is_local());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ssh_env_falls_back_to_global_remote_host() {
+        // [env.*.ssh] with no host inherits [sandbox.remote] host.
+        let cfg: Config = toml::from_str(
+            "\
+[sandbox.remote]
+host = \"u@devbox\"
+port = 2200
+[env.remote-dev]
+placement = \"ssh\"
+[env.remote-dev.ssh]
+transport = \"ssh\"
+",
+        )
+        .unwrap();
+        let dir = tmpdir("env-ssh");
+        let loc = GitLoc::Local(dir.clone());
+        let env = cfg.resolve_env(&dir, &loc, Some("remote-dev"));
+        assert!(env.is_remote());
+        assert_eq!(env.placement.label(), "ssh:u@devbox");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
