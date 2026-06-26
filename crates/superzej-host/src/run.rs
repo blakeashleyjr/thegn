@@ -8975,6 +8975,16 @@ async fn event_loop<T: Terminal>(
                     };
                     if let (Some(content), Some(p)) = (target, panes.table.get(&sp)) {
                         crate::compositor::compose_pane(&mut scratch, p.emulator(), content);
+                        if let Some((sel_pane, sel)) = &mouse_sel {
+                            if *sel_pane == sp {
+                                crate::compositor::overlay_selection(
+                                    &mut scratch,
+                                    content,
+                                    sel,
+                                    crate::chrome::col(crate::chrome::S::Panel2),
+                                );
+                            }
+                        }
                     }
                 }
             } else if let crate::render_plan::RenderPlan::Incremental {
