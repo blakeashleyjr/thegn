@@ -28,7 +28,7 @@ szhost::perf  perf rollup  wakes_per_s renders_per_s render_skips_per_s
 At `debug`, one `perf source` line per active wake source (`Model`, `Watcher`,
 `Stats`, …). Wake-source attribution works by counting messages at each of the
 ~24 channel-drain sites (the `TerminalWaker` carries no reason), and CPU is the
-*thread's own* `CLOCK_THREAD_CPUTIME_ID` charged per subsystem via RAII
+_thread's own_ `CLOCK_THREAD_CPUTIME_ID` charged per subsystem via RAII
 `perf::measure(Subsys::…)` guards — so an I/O-blocked git fan-out reports the CPU
 it burned, not the wall-clock it waited.
 
@@ -52,11 +52,12 @@ hydration, tokio pool included) for a fixed window, then exits via the existing
 `shutdown` flag + a single waker pulse — honoring the no-poll-timeout invariant.
 
 Recipes:
+
 - `just bench-idle` — asserts idle `cores_total` ≤ a **fixed** ceiling (the 0%-idle
   invariant, finally a test). The ceiling is a constant, not the baseline, so a
   regressed baseline can't raise the bar.
 - `just bench-idle-record` — record this machine's baseline (`test/perf/baselines/
-  <host-tag>.idle.json`; host-tag = arch + cpu-model hash, so machine dependence is
+<host-tag>.idle.json`; host-tag = arch + cpu-model hash, so machine dependence is
   explicit).
 - `just bench-steady` — feeds `test/perf/scenarios/steady-workload.keys`; A/B only.
 
@@ -97,7 +98,7 @@ a second `SIGUSR2` writes a flamegraph SVG to
 daily multiplexer.
 
 **Secondary — external.** `cargo flamegraph --bin szhost` works because szhost is
-then the profiler's *child* (ptrace permits descendants); wrap in `script` for a
+then the profiler's _child_ (ptrace permits descendants); wrap in `script` for a
 PTY. Attaching to an already-running szhost needs `ptrace_scope=0` (don't depend
 on it).
 
