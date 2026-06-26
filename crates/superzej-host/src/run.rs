@@ -1171,8 +1171,6 @@ enum SidebarOutcome {
 
 /// A destructive action awaiting `y`/`Y` confirmation in the loop's modal.
 enum PendingAction {
-    /// Delete these worktree groups from disk (`git worktree remove`).
-    DeleteWorktrees(Vec<usize>),
     /// Forget a workspace (close its groups + prune DB rows); files kept.
     RemoveWorkspace {
         repo_path: String,
@@ -1368,7 +1366,7 @@ impl SidebarState {
             if !is_home {
                 entries.push(("rename", "Rename worktree"));
                 entries.push(("close", "Close worktree"));
-                entries.push(("delete", "Delete worktree (disk)"));
+                entries.push(("delete", "Delete worktree..."));
             }
         }
         Some(crate::chrome::RowMenu {
@@ -1947,6 +1945,7 @@ fn delete_groups(
     session: &mut crate::session::Session,
     panes: &mut Panes,
     mut targets: Vec<usize>,
+    keep_files: bool,
 ) -> String {
     targets.sort_unstable_by(|a, b| b.cmp(a));
     targets.dedup();
@@ -1963,13 +1962,27 @@ fn delete_groups(
         let path = session.worktrees[gi].path.clone();
         if !path.is_empty() {
             if let Some(root) = superzej_core::repo::main_worktree(Path::new(&path)) {
-                superzej_core::worktree::remove(&root, Path::new(&path), "", false);
+                // Remove from git, keeping files if requested.
+                // git worktree remove does both.
+                if keep_files {
+                    // git does not have a "keep files" flag for `worktree remove`.
+                    // We must delete the files ourselves if we don't want them, but if we DO want them,
+                    // we cannot run `git worktree remove` as it destroys the files.
+                    // Instead, we just delete the .git file so it becomes a plain directory.
+                    // We will need to run `git worktree prune` in the main repo to clean up the metadata.
+                    let _ = std::fs::remove_file(Path::new(&path).join(".git"));
+                    superzej_core::util::git_ok(&root, &["worktree", "prune"]);
+                } else {
+                    superzej_core::worktree::remove(&root, Path::new(&path), "", false);
+                }
             }
-            // git is the source of truth, but `git worktree remove` leaves the
-            // dir behind if it ever fails (locked, detached, prune races); a
-            // lingering dir is re-adopted on the next launch and looks like a
-            // failed delete. Make sure the directory is actually gone.
-            let _ = std::fs::remove_dir_all(&path);
+            if !keep_files {
+                // git is the source of truth, but `git worktree remove` leaves the
+                // dir behind if it ever fails (locked, detached, prune races); a
+                // lingering dir is re-adopted on the next launch and looks like a
+                // failed delete. Make sure the directory is actually gone.
+                let _ = std::fs::remove_dir_all(&path);
+            }
         }
         if let Some(db) = &db {
             forget_worktree_group(db, &session.id, &session.worktrees[gi]);
@@ -4746,6 +4759,7 @@ fn dispatch_menu_choice(
         // Handled at the call site (item 621) — it needs the live config + keymap,
         // which this git-scoped dispatcher doesn't carry. Never reaches here.
         MenuChoice::SetKeymapPreset(_) => {}
+        MenuChoice::ConfirmDeleteWorktrees { .. } => {}
     }
     GitAfter::None
 }
@@ -6551,6 +6565,8 @@ async fn event_loop<T: Terminal>(
     let mut mouse_sel: Option<(u32, crate::copymode::Selection)> = None;
     // A destructive delete awaiting its y/N confirmation: (question, targets).
     let mut pending_confirm: Option<(String, PendingAction)> = None;
+    // A delete worktree action from menu awaiting the user choice
+    let mut pending_confirm_delete_worktrees: Option<Vec<usize>> = None;
     // Force a full terminal repaint on the next flush when the chrome
     // GEOMETRY changed (toggles, strip, resize) — nothing from the previous
     // layout may survive. Tab/worktree switches reuse the same rects and must
@@ -9982,9 +9998,6 @@ async fn event_loop<T: Terminal>(
                 if let Some((_, action)) = pending_confirm.take() {
                     if matches!(k.key, KeyCode::Char('y') | KeyCode::Char('Y')) {
                         match action {
-                            PendingAction::DeleteWorktrees(targets) => {
-                                model.status = delete_groups(&mut session, &mut panes, targets);
-                            }
                             PendingAction::RemoveWorkspace {
                                 repo_path,
                                 slug,
@@ -10462,6 +10475,34 @@ async fn event_loop<T: Terminal>(
                         }
                         menu::MenuOutcome::Pick(choice) => {
                             active_menu = None;
+                            if let menu::MenuChoice::ConfirmDeleteWorktrees { keep_files } = choice
+                            {
+                                if let Some(targets) = pending_confirm_delete_worktrees.take() {
+                                    model.status = delete_groups(
+                                        &mut session,
+                                        &mut panes,
+                                        targets,
+                                        keep_files,
+                                    );
+
+                                    // Full sidebar refresh after deletion
+                                    sb.marked.clear();
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    sb.focus_active_row(&mut model);
+                                    need_relayout = true;
+                                    sync_drawer_persistence(
+                                        &session,
+                                        &mut panes,
+                                        &mut drawer,
+                                        &mut drawer_pool,
+                                        &mut drawer_home,
+                                        keymap.config(),
+                                        chrome.center,
+                                    );
+                                    dirty = true;
+                                    continue;
+                                }
+                            }
                             // First-launch keymap picker (item 621): persist the
                             // choice to ui_state and rebuild the live keymap. Not
                             // a git op, so handle it before the git dispatch.
@@ -11320,14 +11361,11 @@ async fn event_loop<T: Terminal>(
                                 continue;
                             }
                             if current_config.confirm_delete {
-                                pending_confirm = Some((
-                                    format!(
-                                        "Delete {} worktree(s) from disk? ({})",
-                                        names.len(),
-                                        names.join(", ")
-                                    ),
-                                    PendingAction::DeleteWorktrees(targets),
+                                active_menu = Some(menu::delete_worktree_menu(
+                                    names.len(),
+                                    &names.join(", "),
                                 ));
+                                pending_confirm_delete_worktrees = Some(targets);
                             } else {
                                 // Capture the active group name to restore focus after indices shift
                                 let active_group_name =
@@ -11336,7 +11374,8 @@ async fn event_loop<T: Terminal>(
                                 // Sort targets descending so deletion doesn't shift upcoming indices
                                 targets.sort_unstable_by(|a, b| b.cmp(a));
 
-                                model.status = delete_groups(&mut session, &mut panes, targets);
+                                model.status =
+                                    delete_groups(&mut session, &mut panes, targets, false);
 
                                 // Restore focus based on stable name
                                 if let Some(target_name) = active_group_name
