@@ -1,4 +1,4 @@
-//! Branded diagnostics. Once [`crate::log::init`] has installed the `tracing`
+//! Branded diagnostics. Once `crate::log::init` has installed the `tracing`
 //! subscriber, `info`/`warn`/`error` route through it (level-filtered, mirrored
 //! to the log file with the same `✦ superzej` look). Before that — and always
 //! for `die` — they print straight to stderr so early config errors and fatals

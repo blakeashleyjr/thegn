@@ -3,7 +3,6 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::Arc;
 use superzej_core::log::parser::ParsedLog;
-use tokio::sync::mpsc;
 
 pub trait LogProvider: Send + Sync {
     /// Start fetching and streaming logs into the provided sender

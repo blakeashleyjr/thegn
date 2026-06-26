@@ -4,16 +4,15 @@
 //!   Normal (narrow): glyph + target (10 cols) + message.
 //!   Half   (medium): timestamp + glyph + target (16 cols) + message; filter bar.
 //!   Full   (wide):   left list + right detail panel side-by-side.
+#![allow(dead_code)] // WIP view helpers, written ahead of wiring (tasks.md §AW 721/723/724)
 
 use superzej_core::log::parser::{LogLevel as ParserLogLevel, ParsedLog};
 use superzej_core::log_view::{LogLevel as ViewLogLevel, LogLine};
 use superzej_core::theme::Hue;
 
-use crate::seg::{Line, Seg, seg};
+use crate::seg::{Line, seg};
 
-use super::{
-    PanelHit, PanelRow, Section, SectionCtx, ac, d, g, g2, g3, hint_row, hue, rule, t, two_col,
-};
+use super::{PanelRow, SectionCtx, ac, d, g, g2, g3, hint_row, hue, rule, t};
 
 // ---- helpers ----------------------------------------------------------------
 
@@ -117,12 +116,12 @@ pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     let mut visible = items.iter().rev().take(body_rows).collect::<Vec<_>>();
     visible.reverse();
 
-    for (i, log) in visible.iter().enumerate() {
+    for log in visible.iter() {
         let ts = log.timestamp.clone();
         let lvl = format!("{:?}", log.level);
         let msg = &log.message;
 
-        let mut text = vec![
+        let text = vec![
             seg(g2(), format!("{ts} ")),
             seg(
                 match log.level {

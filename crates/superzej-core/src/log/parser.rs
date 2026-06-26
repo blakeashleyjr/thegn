@@ -12,6 +12,9 @@ pub enum LogLevel {
 }
 
 impl LogLevel {
+    // Infallible best-effort parse (returns Info on no match), not the fallible
+    // std `FromStr`, so the inherent method name is intentional.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         let lower = s.to_lowercase();
         if lower.contains("fat") {
@@ -46,7 +49,7 @@ pub fn parse_log(line: &str) -> ParsedLog {
     // Fast path: Try parsing as JSON first
     if let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(line) {
         let level = extract_level(&mut map).unwrap_or(LogLevel::Info);
-        let message = extract_message(&mut map).unwrap_or_else(|| "".to_string());
+        let message = extract_message(&mut map).unwrap_or_default();
         let timestamp = extract_timestamp(&mut map).unwrap_or_else(|| Local::now().to_rfc3339());
 
         return ParsedLog {
@@ -80,10 +83,10 @@ pub fn parse_log(line: &str) -> ParsedLog {
 fn extract_level(map: &mut serde_json::Map<String, Value>) -> Option<LogLevel> {
     let keys = ["level", "lvl", "severity"];
     for k in keys {
-        if let Some(v) = map.remove(k) {
-            if let Some(s) = v.as_str() {
-                return Some(LogLevel::from_str(s));
-            }
+        if let Some(v) = map.remove(k)
+            && let Some(s) = v.as_str()
+        {
+            return Some(LogLevel::from_str(s));
         }
     }
     None
@@ -92,10 +95,10 @@ fn extract_level(map: &mut serde_json::Map<String, Value>) -> Option<LogLevel> {
 fn extract_message(map: &mut serde_json::Map<String, Value>) -> Option<String> {
     let keys = ["msg", "message", "text"];
     for k in keys {
-        if let Some(v) = map.remove(k) {
-            if let Some(s) = v.as_str() {
-                return Some(s.to_string());
-            }
+        if let Some(v) = map.remove(k)
+            && let Some(s) = v.as_str()
+        {
+            return Some(s.to_string());
         }
     }
     None
@@ -104,12 +107,11 @@ fn extract_message(map: &mut serde_json::Map<String, Value>) -> Option<String> {
 fn extract_timestamp(map: &mut serde_json::Map<String, Value>) -> Option<String> {
     let keys = ["ts", "time", "timestamp"];
     for k in keys {
-        if let Some(v) = map.remove(k) {
-            if let Some(s) = v.as_str() {
-                if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-                    return Some(dt.with_timezone(&Local).to_rfc3339());
-                }
-            }
+        if let Some(v) = map.remove(k)
+            && let Some(s) = v.as_str()
+            && let Ok(dt) = DateTime::parse_from_rfc3339(s)
+        {
+            return Some(dt.with_timezone(&Local).to_rfc3339());
         }
     }
     None
