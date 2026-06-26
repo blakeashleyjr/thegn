@@ -79,7 +79,7 @@ macro_rules! t {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // use super::*;
     #[cfg(test)]
     use fluent_templates::Loader;
 
