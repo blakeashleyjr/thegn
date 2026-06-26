@@ -18,6 +18,9 @@ reqwest.workspace = true
 tokio.workspace = true
 chrono.workspace = true
 base64 = "0.22"
+tokio-util = { version = "0.7.18", features = ["codec"] }
+futures-channel = "0.3.32"
+futures-util = "0.3.32"
 
 [dev-dependencies]
 criterion.workspace = true

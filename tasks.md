@@ -76,19 +76,19 @@ gaps below).
 **Notable remaining gaps (candidate next work):**
 
 - **Agent layer (Q–T) + MCP (AL)** — now **underway via an embedded first-party
-  harness**, not external-adapter-first. The harness is **`termite-agent`** (the
-  `apps/termite-agent` submodule, its own `docs/ROADMAP.md`, currently through its
-  Phase 4 autonomous-coding MVP). It is hosted as the **`agent` app tab**
-  (`superzej-host/src/apps/agent.rs`, an `sz_kit::AppTile` driving termite-core's
-  `AgentRuntime` on `spawn_blocking`). termite stays first-party, but group **R**
+  harness**, not external-adapter-first. The harness is **`termite-agent`** (recently
+  moved to be a `pi` fork). It runs as an external Node.js CLI speaking ACP, rather
+  than an embedded Rust tab, so it gets pi's rich extensions/templates while staying
+  sandboxed by superzej. termite stays first-party, but group **R**
   is no longer "secondary" — it is the **upper control plane** (ACP), co-primary
   with the proxy's lower plane, where superzej acts as Client/Agent/Proxy (see the
-  R rewrite + `2026-06-24-acp-two-layer-control-plane-design.md`). Substrate-first
+  R rewrite + `2026-06-24-acp-two-layer-control-plane-design.md` and
+  `2026-06-25-pi-fork-agent-integration.md`). Substrate-first
   sequencing **all landed**: embedding seam → proxy as model path (per-worktree
   scoped virtual keys, revoked on teardown) → sandbox/policy boundary
   (`SandboxTerminalTool` via `enter_argv`) → notifications (`AgentDone`/`AgentFailed`)
   - live proxy-spend observability. See
-    `docs/superpowers/specs/2026-06-22-embedded-agent-integration-design.md`.
+    `docs/superpowers/specs/2026-06-22-embedded-agent-integration-design.md` (historical).
 - **AI. Notification bus polish** — bus, desktop notifications, and inbox are live;
   420 is a fixed event→notification mapping + urgency thresholds, not yet a
   user-configurable action-rules engine. Still missing: DND/quiet hours (426),
@@ -240,12 +240,10 @@ orchestrator.
 
 Depends on Phase 1 (shell) + Phase 2 (proxy + containers).
 
-- **Embedded harness first** — the `termite-agent` submodule is superzej's first-party
-  coding agent, hosted as the `agent` app tab. Q/S/T track against **its** roadmap
-  (`apps/termite-agent/docs/ROADMAP.md`) as the source of truth.
+- **First-party harness (pi fork)** — `termite-agent` is superzej's first-party
+  coding agent (now a `pi` fork). Q/S/T track against its execution through ACP.
 - Orchestration core **Q (211–224)** (defer 225–228)
-- **R is now secondary:** ACP client + native adapters **(229–242)** are an _additive_
-  path for running _foreign_ harnesses, not the headline — superzej ships its own.
+- **The Upper Control Plane (R)** — ACP client + agent integration (R 229–235, 684-696) is now the primary path, because our first-party `pi` fork connects over ACP.
 - Observability **S (243–258)** (tokens/cost 249–250 light up because the proxy exists)
 - Review/merge basics **T (259–263, 267–268)**
 - **Milestone:** spawn, monitor, review, and merge agents across worktrees, metered
@@ -645,9 +643,9 @@ _Reframed (2026-06-24): superzej is **one control plane in two layers** (see
 group is the **upper** plane — the **Agent Client Protocol** (ACP), which owns
 the agent conversation (sessions, tool calls, permissions, diffs, plans, config
 options). ACP is **co-primary**, not "additive/secondary": the embedded
-first-party harness `termite-agent` (the `agent` app tab) stays first-party, but
+first-party harness `termite-agent` (now a `pi` fork) stays first-party, but
 superzej participates in ACP in **three roles** — **Client** (R1, consume
-foreign agents), **Agent** (R2, expose termite outward), and **Proxy** (R3,
+foreign agents and our own `pi` fork), **Agent** (R2, expose termite outward), and **Proxy** (R3,
 realize AR for any ACP agent). The two planes meet at two seams:
 `providers/set` (point any ACP agent's model traffic at `szproxy`) and
 MCP-over-ACP (advertise AR's house tools up to any agent)._
@@ -661,20 +659,22 @@ MCP-over-ACP (advertise AR's house tools up to any agent)._
 - [ ] 233. ACP diff rendering — `tool_call` diff content (`oldText`/`newText`/`path`) into the existing diff/review pane (T 260)
 - [ ] 234. ACP plan/tool-call events — tool kinds (read/edit/delete/move/search/execute/think/fetch/other), status (pending/in_progress/completed/failed), `locations` (path+line) → sidebar/editor follow-along
 - [ ] 235. ACP Registry integration — fetch `registry.json`, parse `agent.json` manifest + icon, one-command install/launch of authenticated agents
-- [ ] 684. Session Config Options surfacing — render `configOptions` (model/mode/thought_level selectors) in palette/statusbar; `session/set_config_option` + `config_option_update` (supersedes Session Modes)
-- [ ] 685. `usage_update` consumption — context-window `used`/`size` + optional `cost{amount,currency}` per session → feeds S 246/249/250 and V 289/290 spend attribution
+- [x] 684. Session Config Options surfacing — render `configOptions` (model/mode/thought_level selectors) in palette/statusbar; `session/set_config_option` + `config_option_update` (supersedes Session Modes)
+- [x] 685. `usage_update` consumption — context-window `used`/`size` + optional `cost{amount,currency}` per session → feeds S 246/249/250 and V 289/290 spend attribution
 - [ ] 686. ACP Elicitation — `elicitation/create` form mode (restricted JSON Schema) + URL mode (OAuth); accept/decline/cancel → native iocraft form UI (shares AL 459)
 - [ ] 687. Client filesystem surface — serve `fs/read_text_file`/`fs/write_text_file`, unsaved-buffer aware, scoped to the worktree
 - [ ] 688. Client terminal surface — serve `terminal/create`/`output`/`wait_for_exit`/`kill`/`release` (env/cwd/outputByteLimit) through our PTY + `sandbox::enter_argv`; embed in tool calls. _We are a terminal multiplexer — this makes us a premier ACP terminal client._
-- [ ] 689. **Configurable LLM Providers** — `providers/list`/`providers/set`/`providers/disable` (id/apiType/baseUrl/headers) to route any ACP agent's model traffic through `szproxy`. **The R↔U bridge** _(connects U 271/287; powers U 283 local upstreams)_
-- [ ] 690. Agent Telemetry Export — inject `OTEL_EXPORTER_OTLP_ENDPOINT` + `params._meta` traceparent into agent subprocs; ingest into the perf/observability suite _(feeds S 254)_
+- [x] 689. **Configurable LLM Providers** — `providers/list`/`providers/set`/`providers/disable` (id/apiType/baseUrl/headers) to route any ACP agent's model traffic through `szproxy`. **The R↔U bridge** _(connects U 271/287; powers U 283 local upstreams)_
+- [x] 690. Agent Telemetry Export — inject `OTEL_EXPORTER_OTLP_ENDPOINT` + `params._meta` traceparent into agent subprocs; ingest into the perf/observability suite _(feeds S 254)_
 - [ ] 691. Protocol-version negotiation + `_meta`/extensibility + **v2 readiness** — track the ACP v2 redesign (unified `capabilities`, object-valued markers, item-based `plan_update`, upsert `tool_call`, content chunks) and build v2-shaped
 
 **R2 · ACP Agent — expose superzej / termite outward:**
 
-- [ ] 692. termite-agent as an ACP **agent server** — implement the Agent side so termite is consumable by Zed/other ACP clients; submit to the ACP Registry (distribution play) _(wraps the same `AgentRuntime` as `apps/agent.rs`)_
-- [ ] 693. Emit ACP updates from termite — `plan`/`tool_call`/`tool_call_update`/`usage_update`/`config_option_update` over the ACP channel
-- [ ] 694. superzej house-tools as an ACP agent endpoint — expose house tools/context (rtk, sem, weave) as an ACP agent for foreign clients
+- [x] 692. termite-agent (`pi` fork) as an ACP **agent server** — implement the Agent side so termite is consumable by Zed/other ACP clients; submit to the ACP Registry (distribution play)
+- [x] 693. Emit ACP updates from termite (`pi` fork) — `plan`/`tool_call`/`tool_call_update`/`usage_update`/`config_option_update` over the ACP channel
+- [x] 693b. Abstract `pi` built-ins (`bash`, `read`, `edit`, `write`) to use ACP `terminal/create` and `fs/read_text_file` / `superzej/edit` so execution delegates safely to the host.
+- [x] 694. superzej house-tools as an ACP agent endpoint — expose house tools/context (rtk, sem, weave) as an ACP agent for foreign clients (and our own `pi` fork) via MCP-over-ACP
+- [x] 694b. Host Compositor Integration (Phase 3) — spawn `termite-agent` with dynamic `--acp-port`, seamlessly inject `AcpClient` background thread without blocking `superzej-host` event loop, bridge incoming `AcpInbound` to `EventBus` and trigger `TerminalWaker` for zero-cost idle rendering.
 
 **R3 · ACP Proxy — the convergence (AR realized over ACP):**
 

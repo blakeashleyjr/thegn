@@ -5290,6 +5290,8 @@ dependencies = [
  "base64",
  "chrono",
  "criterion",
+ "futures-channel",
+ "futures-util",
  "gix",
  "octocrab",
  "reqwest",
@@ -5298,6 +5300,7 @@ dependencies = [
  "superzej-core",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

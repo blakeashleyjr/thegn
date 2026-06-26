@@ -77,6 +77,7 @@ impl NotificationUrgency {
                     Self::Low
                 }
             }
+            Event::AcpMessage { .. } => Self::Low,
         }
     }
 }
@@ -291,6 +292,7 @@ impl DesktopNotification {
                 },
                 worktree: worktree.clone(),
             }),
+            Event::AcpMessage { .. } => None,
         }
     }
 }
@@ -318,6 +320,11 @@ pub enum Event {
         worktree: String,
         agent: String,
         success: bool,
+    },
+    /// An ACP JSON-RPC message was received from an agent.
+    AcpMessage {
+        worktree: String,
+        message: crate::acp::types::JsonRpcMessage,
     },
     /// An agent dispatch failed with an error.
     AgentFailed {
@@ -366,6 +373,7 @@ impl Event {
                 }
             }
             Event::ProcessExited { worktree, .. } => Some(worktree),
+            Event::AcpMessage { worktree, .. } => Some(worktree),
         }
     }
 }
