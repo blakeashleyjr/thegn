@@ -119,8 +119,7 @@ jobs:
     # OPT-IN: a few muse specs carry stale `toBeVisible` expectations from main's
     # UI drift (need updating against a live szhost), so e2e isn't in the routine
     # gate. Run on dispatch or a `[ci-e2e]` commit-message marker.
-    if: >-
-      github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ci-e2e]')
+    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ci-e2e]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -147,8 +146,7 @@ jobs:
     # message marker. macos-14 = GitHub-hosted Apple silicon; covers the
     # aarch64-darwin build + unit tests (end-to-end `apple` backend verification
     # is the on-device checklist, tasks.md §AX).
-    if: >-
-      github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ci-macos]')
+    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ci-macos]') }}
     runs-on: macos-14
     timeout-minutes: 40
     steps:
