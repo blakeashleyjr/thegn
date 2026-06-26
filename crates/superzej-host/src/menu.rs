@@ -159,6 +159,15 @@ const RESERVED: [char; 3] = ['j', 'k', 'q'];
 
 impl MenuOverlay {
     pub fn new(tag: MenuKindTag, title: impl Into<String>, items: Vec<MenuItem>) -> Self {
+        Self::new_with_default(tag, title, items, 0)
+    }
+
+    pub fn new_with_default(
+        tag: MenuKindTag,
+        title: impl Into<String>,
+        items: Vec<MenuItem>,
+        selected: usize,
+    ) -> Self {
         #[cfg(debug_assertions)]
         {
             let keys: Vec<char> = items
@@ -178,7 +187,7 @@ impl MenuOverlay {
             tag,
             title: title.into(),
             items,
-            selected: 0,
+            selected,
             body: None,
         }
     }
@@ -331,7 +340,7 @@ impl MenuOverlay {
 
 pub fn delete_worktree_menu(targets: usize, names_csv: &str) -> MenuOverlay {
     let title = format!("Delete {} worktree(s)?", targets);
-    MenuOverlay::new(
+    MenuOverlay::new_with_default(
         MenuKindTag::Confirm,
         title,
         vec![
@@ -348,6 +357,7 @@ pub fn delete_worktree_menu(targets: usize, names_csv: &str) -> MenuOverlay {
             ),
             item(Some('n'), "cancel", MenuChoice::Dismiss),
         ],
+        0,
     )
     .with_body(names_csv)
 }
