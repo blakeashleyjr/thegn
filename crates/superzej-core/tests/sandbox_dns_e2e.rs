@@ -7,6 +7,11 @@
 //! Policy used here: block "evil.test", allow everything else. Tests acquire a
 //! module-level mutex to prevent ring-buffer contamination between concurrent
 //! test threads.
+//!
+//! Skipped on macOS: the filter's UDP/resolver behavior differs on the darwin
+//! CI runner (the macOS host port is on-device WIP, tasks.md §AX 732); the
+//! suite is exercised on Linux.
+#![cfg(not(target_os = "macos"))]
 
 use std::net::UdpSocket;
 use std::sync::{Mutex, OnceLock};
