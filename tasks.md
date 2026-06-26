@@ -1,128 +1,89 @@
 # superzej — roadmap & progress
 
-674 features across 46 groups (A–AT). The list is really **two tracks joined by
-one keystone**: an AI-free _shell_ track and an AI track, bridged by the **proxy**.
-That shape drives the phasing below. The control plane has **two layers** (see
+**725 features across 50 groups (A–AX).** The list is **two tracks joined by one
+keystone**: an AI-free _shell_ track and an AI track, bridged by the **proxy**. The
+control plane has **two layers** (see
 `docs/superpowers/specs/2026-06-24-acp-two-layer-control-plane-design.md`): the
-**lower** plane is the **proxy** (**U/V/W → AR**) — the single interception point
-every agent's _model traffic_ crosses, so any cross-cutting concern is configured
-**once and inherited by every harness**; the **upper** plane is **ACP** (group
-**R**), which owns the _agent conversation_ and where superzej acts as Client,
-Agent, and Proxy. The two planes meet at `providers/set` (R 689 → U) and
-MCP-over-ACP (R 696 → AL). The proxy track (**U/V/W**) graduates into a full
-**AI gateway / context fabric** in **AR (541–586)**. Original numbering is
-preserved; gaps are deliberate
-cuts (499, 500, 502, 505, 506, 507, 510 dropped from the moonshot set; web
-dashboard 510 and voice 499 already cut; deadbranch stale-branch cleanup imported
-as 659–671 under Y; brows-style release management imported as 672–683 under AT).
-The dropped eval harness (505/506)
-resurfaces, scoped, as the gateway's eval hooks (**AR 581**).
+**lower** plane is the **proxy** (**U/V/W → AR**), the single interception point
+every agent's _model traffic_ crosses — configure a cross-cutting concern **once,
+every harness inherits it**; the **upper** plane is **ACP** (group **R**), which owns
+the _agent conversation_ (superzej as Client/Agent/Proxy). The planes meet at
+`providers/set` (R 689 → U) and MCP-over-ACP (R 696 → AL). U/V/W graduates into the
+**AI gateway / context fabric** in **AR (541–586)**.
 
-**Status legend:** `[x]` done · `[~]` in progress / partial · `[ ]` not started.
-Per-feature statuses below are verified against the current codebase. See
-`CLAUDE.md` for architecture.
+Original numbering is preserved (gaps are deliberate cuts: 499/500/502/505/506/507/510;
+deadbranch import 659–671 under Y; brows releases 672–683 under AT; the dropped eval
+harness 505/506 resurfaces scoped as AR 581).
+
+**Status legend:** `[x]` done · `[~]` partial · `[ ]` not started. Statuses are
+verified against the codebase. See `CLAUDE.md` for architecture.
 
 ---
 
-## Progress summary (as of 2026-06-25)
+## Progress summary (as of 2026-06-26)
 
-**Where we are:** **Phase 1** (the AI-free shell) is **essentially complete** — a
-2026-06-25 status audit confirmed that native git management, the notification/event bus,
-and IDE panels (problems/tasks/tests/symbols) have landed. **Phase 2's substrate** (sandbox + remote) and, more recently, **the
-proxy** (groups U/V/W) are in. We have made significant progress on the CI/CD inspection layer (AV), with Phase A
-largely complete, and Log Analyzer (AW) has its parser and DSL wired up. Environment bundles (AU) and the true AI layers (Q-T, AL) are unstarted.
+**Where we are:** **Phase 1** (the AI-free shell) is **essentially complete** — native
+git management, the notification/event bus, and IDE panels (problems/tasks/tests/symbols)
+have all landed. **Phase 2's substrate** (sandbox + remote) and **the proxy** (U/V/W) are
+in. The **CI/CD inspection** layer (AV) has Phase A complete; the **Log Analyzer** (AW) has
+its parser/buffer/DSL wired (UI pending); the headless **MCP server** (AL) ships a tool/
+resource subset. Environment bundles (AU), the true AI layers (Q–T, the rest of AL/R), and
+multi-forge/jujutsu/Windows are unstarted. **Tally: 212 done · 87 partial · 426 not started**
+of 725.
 
 **Shipped & solid:**
 
-- **Shell core** — the native `superzej-host` compositor (termwiz + portable-pty +
-  `CenterTree`); in-process chrome (sidebar/panel/tabbar/statusbar), workspaces (repos)
-  - worktrees as tabs, session detach/attach/resurrection. (Zellij/WASM was stripped in
-    Phase 0.)
-- **Keybinds** — full registry, KDL splice, conflict detection, cheatsheet feed (`F`),
-  chorded/sequence binds (`SequenceMatcher`) + which-key hints, vim/emacs modes, and
-  per-profile / per-workspace / per-program bind sets.
-- **Panes & layouts** — split/resize/zoom/float, stacked/tabbed panes
-  (`CenterTree::Stack`), named save/apply layouts, layout import/export, sync-panes
-  input broadcast, responsive auto-collapse by terminal size.
-- **Sessions** — detach/attach, reboot resurrection, per-session snapshots
-  (`tab_groups`/`session_state`), debounced auto-save, palette/sidebar switcher.
-- **Config** — declarative TOML, layering, env/flag overlays, live reload, validation,
-  95%-gated core.
-- **Palette** — native iocraft Cmd-K, nucleo fuzzy + embedded ripgrep, file open.
-- **Git** — complete native git management (stage/commit, branch, log/graph, blame,
-  stash, merge/rebase sequencer, conflict UI, cherry-pick/revert) + per-worktree diff;
-  **GitHub** PR panel (status/checks/review/create/merge/approve/rerun) via `gh`;
-  lazygit as the fallback.
-- **Files/editor/monitor** — yazi bottom drawer, fuzzy finder + ripgrep search,
-  `$EDITOR` tool, embedded system/GPU monitors, tabbar stats widget.
-- **Activity dots** — host-side `none→active→quiet→acked` state machine (`activity`).
-- **Sandbox + remote (Phase 2 substrate)** — per-worktree podman/docker/bwrap/none
-  backends, bind-mount-at-real-path, remote worktrees over ssh/mosh.
-- **Notification/event bus** — first-class `EventBus` in core (PR/agent/test/log/
-  worktree/process events), urgency thresholds, desktop notifications (`notify-send`),
-  a notifications panel/inbox with Enter-to-expand, sidebar badges.
-- **Proxy (AI substrate, Phase 2)** — `superzej-proxy` crate: dual-protocol relay
-  (Anthropic SSE + OpenAI), ordered failover + load-balanced/speculative routing,
-  limit-exhaustion/reset tracking, per-scope budgets + spend attribution, native
-  in-flight token reduction; host auto-launches it.
-- **IDE panels** — problems/diagnostics, task registry + test discovery, document
-  symbols, and an LSP substrate (hover/signature/code-action preview, item 532).
+- **Shell core** — native `superzej-host` compositor (termwiz + portable-pty +
+  `CenterTree`, `alacritty_terminal` emulator); in-process chrome, workspaces × worktree
+  tabs, session detach/attach/resurrection. (Zellij/WASM stripped in Phase 0.)
+- **Keybinds** — full registry, KDL splice, conflict detection, cheatsheet (`F`), chords/
+  sequences + which-key, vim/emacs modes, IDE presets, per-profile/workspace/program sets.
+- **Panes & layouts** — split/resize/zoom/float, stacked/tabbed (`CenterTree::Stack`),
+  named save/apply, import/export, sync-panes broadcast, responsive auto-collapse.
+- **Sessions** — detach/attach, reboot resurrection, snapshots, debounced auto-save.
+- **Config** — declarative TOML, layering, env/flag overlays, live reload, 95%-gated core.
+- **Palette** — native iocraft Cmd-K, nucleo + embedded ripgrep, Search Everywhere.
+- **Git** — full native management (stage/commit, branch, log/graph, blame, stash, merge/
+  rebase, conflict UI, cherry-pick/revert, signing, visual hunk staging, rollback, push/
+  pull/fetch) + per-worktree diff; GitHub PR panel via `gh`; lazygit fallback.
+- **Files/editor/monitor** — yazi drawer (file mgmt + git colors), fuzzy finder + ripgrep,
+  `$EDITOR`, system/GPU monitors, statusbar stats, activity-dot state machine.
+- **Sandbox + remote** — per-worktree podman/docker/bwrap/none, bind-mount-at-real-path,
+  remote worktrees over ssh/mosh.
+- **Notification/event bus** — first-class `EventBus` (PR/agent/test/log/worktree/process),
+  urgency thresholds, desktop notifications, notifications panel/inbox, sidebar badges.
+- **Proxy** — `superzej-proxy`: dual-protocol relay (Anthropic SSE + OpenAI), failover/
+  load-balanced/speculative routing, limit/reset tracking, per-scope budgets + spend
+  attribution, in-flight token reduction; host auto-launches it.
+- **IDE panels** — problems/diagnostics, task registry + test discovery, symbols, LSP
+  preview substrate (hover/signature/code-action).
+- **CI/CD (AV Phase A)** — `CiProvider` trait + normalized run→job→step model, GitHub
+  Actions + GitLab CI providers, panel `Section::Ci`, off-loop poller, CLI + statusbar
+  badge, first-failure scan.
+- **Pins (E, 57–74)** — config-driven `PinSupervisor` owning daemon panes across tab/
+  workspace switches, top-strip + tabbar chips, eager/lazy, restart/health, promote/unpin,
+  resurrect via `session_state.pin_state`.
 
 **Notable remaining gaps (candidate next work):**
 
-- **Agent layer (Q–T) + MCP (AL)** — now **underway via an embedded first-party
-  harness**, not external-adapter-first. The harness is **`termite-agent`** (the
-  `apps/termite-agent` submodule, its own `docs/ROADMAP.md`, currently through its
-  Phase 4 autonomous-coding MVP). It is hosted as the **`agent` app tab**
-  (`superzej-host/src/apps/agent.rs`, an `sz_kit::AppTile` driving termite-core's
-  `AgentRuntime` on `spawn_blocking`). termite stays first-party, but group **R**
-  is no longer "secondary" — it is the **upper control plane** (ACP), co-primary
-  with the proxy's lower plane, where superzej acts as Client/Agent/Proxy (see the
-  R rewrite + `2026-06-24-acp-two-layer-control-plane-design.md`). Substrate-first
-  sequencing **all landed**: embedding seam → proxy as model path (per-worktree
-  scoped virtual keys, revoked on teardown) → sandbox/policy boundary
-  (`SandboxTerminalTool` via `enter_argv`) → notifications (`AgentDone`/`AgentFailed`)
-  - live proxy-spend observability. See
-    `docs/superpowers/specs/2026-06-22-embedded-agent-integration-design.md`.
-- **AI. Notification bus polish** — bus, desktop notifications, and inbox are live;
-  420 is a fixed event→notification mapping + urgency thresholds, not yet a
-  user-configurable action-rules engine. Still missing: DND/quiet hours (426),
-  per-profile routing (427), sound/bell (429), push-to-phone (422/423).
-- **IDE Tier 1 tail (small, specific)** — Search Everywhere is missing its tasks/tests/
-  problems providers (523, only files/content/git/symbols today); word-level intra-line
-  diff highlight (601, the visual hunk staging 602 itself is in); file management from the
-  tree (606) + fork/rename worktree (52/53); GUI editor handoff / per-workspace editor
-  override (407/410); IDE keymap presets + first-launch picker (621). Problems, tasks/
-  tests, symbols, and visual staging panels have landed.
-- **B.** badge counts per row (28) — row `unread_count`/`alert_count` render; the
-  PR-count data source is the remaining wiring.
-- **Statusbar AI widgets (148–150, 157)** — correctly gated on the Agent layer / proxy-UI
-  wiring, not Phase-1 shell gaps.
-- **Orca-audit adds (654–658)** — per-line AI/human attribution overlay (654), agent-writable
-  worktree status field (655), per-agent account hot-swap chip (656), agent-hook passthrough +
-  worktree setup hooks (657), and agent session history/hibernation (658); plus enriched
-  scheduled automations (226/504) and worktree setup hooks (54). Captured from an Orca feature audit.
-- **deadbranch import (659–671)** — safe stale-_branch_ cleanup extending branch
-  management (323): age-threshold detection (659), merge-aware delete (660),
-  protected/WIP exclusion (661), delete-with-backup + restore (662/663), dry-run
-  (664), local+remote scope (665), health stats (666), and a multi-select cleanup
-  TUI (667); plus personal filter (668), PR-aware staleness (669), JSON/CSV export
-  (670), per-repo config (671). Distinct from worktree GC (48/56). Captured from a
-  deadbranch feature import.
-- **brows release import (672–683)** — cross-forge **release & tag** management, the
-  surface the Z/AT groups were missing: a release browser + detail view (673/674,
-  the brows browsing UX generalized), tag management (675), create/edit/delete +
-  draft/prerelease/latest flags (676/677), assets (678), auto-generated/AI notes
-  (679), version diff/changelog (680), worktree/PR linkage (681), release
-  notifications (682), per-forge config (683). AI-free except the notes narrative.
-  Captured from a brows feature import.
-
-**✔ E. Pinned programs / tiles — complete on the native host (items 57–74).** The
-full config-driven pin/daemon system ships in `superzej-host`: a `PinSupervisor`
-(`crates/superzej-host/src/pins.rs`) owning daemon panes across tab/workspace
-switches, a real top-strip chrome region + tabbar chips, eager/lazy start,
-restart-on-exit + health, singleton dedupe, promote/unpin at runtime, per-program
-env, and resurrect via `session_state.pin_state`. See §E below for the per-item map.
+- **Agent layer (Q–T) + ACP (R) + rest of MCP (AL)** — the headline AI track. Embedded
+  first-party harness path (`termite-agent` as the `agent` app tab driving `AgentRuntime`
+  on `spawn_blocking`); R is the upper control plane (ACP Client/Agent/Proxy). Substrate-
+  first sequencing landed (embedding seam → proxy model path → sandbox boundary →
+  notifications → spend observability); the agent/observability/review surfaces are
+  unstarted. See the embedded-agent + two-layer-control-plane specs.
+- **Notification polish** — user-defined action rules (420), DND/quiet hours (426), per-
+  profile routing (427), sound/bell (429), push-to-phone (422/423).
+- **IDE Tier 1 tail** — GUI editor handoff / per-workspace editor override (407/410);
+  badge PR-count data source (28). Search Everywhere, visual staging, problems/tasks/tests/
+  symbols all landed.
+- **Statusbar AI widgets (148–150, 157)** — gated on the agent/proxy-UI layer.
+- **Imports not yet started** — Orca adds (654–658: AI/human line attribution, worktree
+  status field, account hot-swap chip, hook passthrough, session hibernation), deadbranch
+  stale-branch cleanup (659–671), brows release mgmt (672–683), jujutsu VCS backend (AS),
+  multi-forge (AT), env bundles (AU), native Windows (AX), Log Analyzer UI (AW 721/723–728).
+- **Media player** (AM 476, optional `[media]` feature, off by default) and the headless
+  **MCP server** (AL 455–457/461/464/465) landed since the prior audit.
 
 ---
 
@@ -358,7 +319,7 @@ close, `<`/`>` width, digits quick-jump._
 - [ ] 35. Per-workspace default program set
 - [x] 36. Per-workspace keybinds _(`WorkspaceConfig::keybinds`; `[workspace.<name>.keybinds]`)_
 - [x] 37. Non-git directory as workspace _(workspace `kind` repo|dir; insert-only; folder glyph in sidebar)_
-- [ ] 38. Workspace-level env vars _(subsumed by env bundles — AU 684–697; a workspace binds a bundle via `[workspace.<slug>].env_bundle`)_
+- [ ] 38. Workspace-level env vars _(subsumed by env bundles — AU 735–748; a workspace binds a bundle via `[workspace.<slug>].env_bundle`)_
 - [ ] 39. Workspace icon/color label
 - [x] 40. Recent/favorite workspaces
 
@@ -1046,7 +1007,7 @@ brokered creds and no open ports. This is what lets AR 541–543 reach any harne
 - [ ] 473. Calendar tile (khal/calcurse)
 - [ ] 474. Todo tile (taskwarrior/vit)
 - [ ] 475. Notes tile
-- [ ] 476. Music tile (rmpc/ncmpcpp)
+- [x] 476. Music tile (rmpc/ncmpcpp) _(optional `[media]` feature, off by default: `core::media::MediaState`, MPRIS/mpv-IPC/playerctl backends in `svc::media`, panel `Section::Media`, statusbar badge, Alt-m transport binds + playlist/player pickers)_
 - [~] 477. Files tile (yazi/lf)
 - [ ] 478. Cross-tile actions — email→task, agent→Matrix
 - [ ] 479. Unified comms inbox
@@ -1302,88 +1263,43 @@ than inventing new ones._
 ### AU. Environment bundles (.env / dotfiles / profiles)
 
 Design approved (2026-06-22): `docs/superpowers/specs/2026-06-22-env-bundles-design.md`.
-The **soft middle** between per-agent account switching (656) and the
-heavyweight process-profile firewall (H 101–110): named **bundles** of env vars
+The **soft middle** between per-agent account switching (656) and the heavyweight
+process-profile firewall (H 101–110): named **bundles** of env vars + credential/config-
+dir redirection + dotfiles + per-provider account selection, **bound at any scope**
+(global/workspace/worktree) and injected at the pane-spawn seam — so "work vs personal"
+differs _within one process_. Generalizes `account.rs` (becomes a bundle consumer);
+AI-free track. Locked: **(1)** lighter complement, not a firewall replacement; **(2)**
+three dotfile tiers (config-dir redirect default / materialized dotfiles / synthetic
+HOME); **(3)** named bundles **+** opt-in allowlisted `.env`; **(4)** `env:` + pluggable
+secret resolvers, never persisted. Closes the `spawn_with_env` inherit-everything leak
+(shared with H) and fills item 38 + the env-restore half of 54/657.
 
-- credential/config-dir redirection + dotfiles + per-provider account selection,
-  **bound at any scope** (global/workspace/worktree) and injected at the pane-spawn
-  seam — so "work vs personal" differs _within one process_ and "multiple Claude
-  profiles" is just a bundle's `accounts.claude` + identity. Generalizes
-  `account.rs` (it becomes a bundle consumer); AI-free track (additive). Locked:
-  **(1)** complementary lighter layer, not a firewall replacement; **(2)** three
-  dotfile tiers — config-dir redirect (default) / materialized dotfiles / synthetic
-  HOME; **(3)** named bundles **+** opt-in, allowlisted `.env`; **(4)** `env:` +
-  pluggable secret resolvers, never persisted. Closes the
-  `spawn_with_env` inherit-everything leak (shared with H's firewall) and fills
-  items 38 (workspace env vars) and the env-restore half of 54/657.
-
-* [ ] 684. `env::compose()` + `ResolvedEnv` — single resolution seam returning overrides/block/mounts; subsumes the account/scoped-key logic in `agent::launch_spec_with_key` (Phase A)
-* [ ] 685. Bundle config schema — `[bundle.<name>]` (env/accounts/config_dirs/dotfiles/home/dotenv/extends) + `[workspace.<slug>].env_bundle` (Phase A)
-* [ ] 686. Per-scope bundle bindings — generalize `account.rs` precedence to `bundle:[ws:|wt:]` over `ui_state` (worktree → workspace cfg → workspace ptr → global) (Phase A)
-* [ ] 687. Tier-1 config-dir redirection — `CLAUDE_CONFIG_DIR`/`CODEX_HOME`/`GIT_CONFIG_GLOBAL`/`GH_CONFIG_DIR`/`GNUPGHOME`, no file ops; the implicit default tier (Phase A)
-* [ ] 688. Shell-pane wiring — route **every** pane spawn (agent _and_ plain shell) through `env::compose`, so shells inherit the bundle identity (Phase A)
-* [ ] 689. Clear-then-allowlist base env in `spawn_with_env` — curated base + bundle on top; closes the inherit-everything cred leak (shared prerequisite with H) (Phase A)
-* [ ] 690. `account.rs` becomes a bundle consumer — account selection is a bundle field; precedence helpers lifted to bundle scopes (Phase A)
-* [ ] 691. Pluggable secret resolvers — `pass:`/`sops:`/`op://`/`agenix:`/`cmd:` over `expand_env_ref`; resolved off-loop at launch, never persisted, graceful degrade (Phase B)
-* [ ] 692. Opt-in `.env` loading — direnv-style discovery gated by `dotenv = true` + per-path content-hash allowlist in `ui_state` (Phase C)
-* [ ] 693. `.env` security boundary — low precedence (never overrides bundle creds) + credential-shaped-key filter (`*_TOKEN`/`*_KEY`/`*_SECRET`/`*_PASSWORD`) (Phase C)
-* [ ] 694. Tier-2 materialized dotfiles — symlink/template a source tree into a managed per-bundle HOME; idempotent, off the event loop (diff-watcher pattern) (Phase D)
-* [ ] 695. Tier-3 synthetic HOME — `home = "managed"` roots panes at the bundle HOME; path-preserving sandbox mount (Phase D)
-* [ ] 696. Bundle switcher UI — status-bar chip (extends the account chip 656) + palette command to bind the active bundle at worktree/workspace/global scope (Phase E)
-* [ ] 697. Multiple Claude profiles (worked example) — `work`/`personal` bundles selecting `accounts.claude` + git identity + proxy endpoint, hot-swapped per scope (consumes 684–696; ties 656, AR virtual keys 287)
-
-### AV. Native Windows Support
-
-_The Windows-native workspace shell (AI-free by default), bypassing WSL/MSYS2 for a native sub-300ms, zero-IPC experience. Core features (multiplexing, rendering, git) already map cleanly to Windows thanks to the `portable-pty`/`termwiz` foundation._
-
-- [ ] 698. Cross-platform filesystem watching — replace `inotify` with `notify` (`ReadDirectoryChangesW`) for diff watchers
-- [ ] 699. Native Sandboxing: AppContainers — low-integrity process isolation granting read/write ACLs only to the specific worktree path
-- [ ] 700. Native Sandboxing: Job Objects — prevent fork-bombs, block UI popups, and ensure child process trees die instantly on tab close
-- [ ] 701. Standardized paths — migrate from Unix `$XDG_STATE_HOME` to `directories` crate resolving to `%LOCALAPPDATA%\superzej`
-- [ ] 702. Signals mapping — map Unix profiling triggers (`SIGUSR2`) to internal keymaps or named events for Windows flame-graphs
-- [ ] 703. PowerShell / NuShell defaults — default pane spawning to native Windows shells over `cmd.exe`
-
-### AW. Log Analyzer (sz-log)
-
-_A native, zero-IPC structured log viewer providing `hl`-like capabilities for worktree files, containers, and tasks. Integrates heavily with the render plan to ensure high-throughput log streams do not violate the 0% idle / <16ms frame invariants._
-
-- [x] 718. `LogProvider` trait + bounded ring-buffer memory model
-- [x] 719. Zero-copy JSON & logfmt parsers (envelope extraction)
-- [~] 720. Off-thread log ingestion worker + batching waker (wake-storm prevention)
-- [ ] 721. Full-screen center-pane log overlay UI
-- [x] 722. Filter DSL — fuzzy text, severity normalization, exact field matching
-- [ ] 723. Dynamic field projection — hide/show/reorder JSON keys
-- [ ] 724. Tailing vs Paused mode — auto-pause on scroll
-- [~] 725. File tailing provider (`notify` backend)
-- [ ] 726. Container tailing provider (resolves AD 383)
-- [ ] 727. Editor handoff — jump to `file:line` from stacktraces (resolves AG 408)
-- [ ] 728. Field Explorer drawer — surface schema/keys dynamically based on current view
-
-### AI-free mode (audience-widener)
-
-- [~] 511. AI-free mode — run as a pure terminal workspace/worktree manager, no agents/proxy/LLM
-- [~] 512. All features usable manually — git, worktrees, containers, pins, comms tiles, monitoring with zero AI
-- [ ] 513. Compile-out AI components — feature flag for a lean binary without proxy/agent/MCP layers
-- [~] 514. Graceful degradation — AI panels, dots, cost widgets simply absent; nothing else breaks
-- [x] 515. No-AI privacy posture — zero outbound model traffic, smaller attack surface, fully local
+- [ ] 735. `env::compose()` + `ResolvedEnv` — single resolution seam returning overrides/block/mounts; subsumes the account/scoped-key logic in `agent::launch_spec_with_key` (Phase A)
+- [ ] 736. Bundle config schema — `[bundle.<name>]` (env/accounts/config_dirs/dotfiles/home/dotenv/extends) + `[workspace.<slug>].env_bundle` (Phase A)
+- [ ] 737. Per-scope bundle bindings — generalize `account.rs` precedence to `bundle:[ws:|wt:]` over `ui_state` (worktree → workspace cfg → workspace ptr → global) (Phase A)
+- [ ] 738. Tier-1 config-dir redirection — `CLAUDE_CONFIG_DIR`/`CODEX_HOME`/`GIT_CONFIG_GLOBAL`/`GH_CONFIG_DIR`/`GNUPGHOME`, no file ops; the implicit default tier (Phase A)
+- [ ] 739. Shell-pane wiring — route **every** pane spawn (agent _and_ plain shell) through `env::compose`, so shells inherit the bundle identity (Phase A)
+- [ ] 740. Clear-then-allowlist base env in `spawn_with_env` — curated base + bundle on top; closes the inherit-everything cred leak (shared prerequisite with H) (Phase A)
+- [ ] 741. `account.rs` becomes a bundle consumer — account selection is a bundle field; precedence helpers lifted to bundle scopes (Phase A)
+- [ ] 742. Pluggable secret resolvers — `pass:`/`sops:`/`op://`/`agenix:`/`cmd:` over `expand_env_ref`; resolved off-loop at launch, never persisted, graceful degrade (Phase B)
+- [ ] 743. Opt-in `.env` loading — direnv-style discovery gated by `dotenv = true` + per-path content-hash allowlist in `ui_state` (Phase C)
+- [ ] 744. `.env` security boundary — low precedence (never overrides bundle creds) + credential-shaped-key filter (`*_TOKEN`/`*_KEY`/`*_SECRET`/`*_PASSWORD`) (Phase C)
+- [ ] 745. Tier-2 materialized dotfiles — symlink/template a source tree into a managed per-bundle HOME; idempotent, off the event loop (diff-watcher pattern) (Phase D)
+- [ ] 746. Tier-3 synthetic HOME — `home = "managed"` roots panes at the bundle HOME; path-preserving sandbox mount (Phase D)
+- [ ] 747. Bundle switcher UI — status-bar chip (extends the account chip 656) + palette command to bind the active bundle at worktree/workspace/global scope (Phase E)
+- [ ] 748. Multiple Claude profiles (worked example) — `work`/`personal` bundles selecting `accounts.claude` + git identity + proxy endpoint, hot-swapped per scope (consumes 735–747; ties 656, AR virtual keys 287)
 
 ### AV. CI/CD inspection (cross-provider pipelines, runs, jobs, logs)
 
-_A dedicated CI/CD insight layer (inspired by `termkit/gama`), turning the
-GitHub-only PR check rollup (Z 332) from "is my PR green?" into **run history,
-job/step drilldown, log viewing with jump-to-failure, and trigger/rerun/cancel**
-across providers. A `CiProvider` trait is a **sibling** of the AT forge trait
-(631), not a subset: CI is a different axis — GitHub/GitLab/Gitea/Forgejo are
-both forge **and** CI, but **Drone/Woodpecker/Jenkins/Argo/`act`** are CI-only and
-have no PR/MR coupling. A provider-agnostic run→job→step→log model lives in
-superzej-core; providers degrade native-API → CLI → unavailable note like
-`GhNative`→`CliGh`. Surfaced two ways: a panel `Section::Ci` rollup **and** a
-full-screen drilldown view (Runs → Jobs/Steps → Logs, live-refresh toggle).
-Repo-health detects which CI a worktree is configured for (`.github/workflows`,
-`.gitlab-ci.yml`, `.drone.yml`, `.woodpecker.yml`, `Jenkinsfile`, argo manifests).
-**AI-free** — "why did it fail" is log + jump-to-failure, no LLM. Folds in Z 332
-(done) and L 158 (statusbar badge). Validated abstraction-first on GitHub +
-GitLab before breadth grows. Design spec: `docs/superpowers/specs` (to write)._
+_A CI/CD insight layer (inspired by `termkit/gama`): turns the GitHub-only PR check
+rollup (Z 332) into **run history, job/step drilldown, log viewing with jump-to-failure,
+and trigger/rerun/cancel** across providers. The `CiProvider` trait is a **sibling** of
+the AT forge trait (631), not a subset — CI is a different axis: GitHub/GitLab/Gitea/
+Forgejo are forge **and** CI, but Drone/Woodpecker/Jenkins/Argo/`act` are CI-only. A
+provider-agnostic run→job→step→log model lives in core; providers degrade native-API →
+CLI → unavailable. Surfaced as a panel `Section::Ci` rollup **and** a full-screen
+drilldown (Runs → Jobs/Steps → Logs). **AI-free** — "why did it fail" is log + jump-to-
+failure, no LLM. Folds in Z 332 and L 158. Validated on GitHub + GitLab first._
 
 - [x] 698. `CiProvider` trait + normalized model — `runs`/`run_detail`/`logs`/`workflows`/`trigger`/`rerun`/`cancel`/`capabilities`; `CiRun`→`CiJob`→`CiStep` + `CiLog`/`CiWorkflow` in `superzej-core/src/ci.rs` (+ `CiState` mappers, log failure-scanner, CI-config detection); trait in `superzej-svc/src/ci.rs` w/ native+CLI degradation, capability-gated mutations (Phase A) ✓
 - [x] 699. `ci_runs_cache` table + `[ci]` config — TTL'd JSON cache (mirrors `pr_cache`, db v18), `config_enum!` `CiProviderKind` + per-provider sub-tables (gitlab/drone/woodpecker/jenkins/argo) w/ `env:` tokens, poll interval, live-refresh default, log-tail lines (Phase A) ✓
@@ -1405,3 +1321,38 @@ GitLab before breadth grows. Design spec: `docs/superpowers/specs` (to write)._
 - [ ] 715. Argo provider — Argo Workflows (k8s / `argo` CLI) + Argo CD (`argocd` API); submit/resubmit/sync; k8s-context dependent (Phase D)
 - [ ] 716. Local `act` runner — run `.github/workflows` locally via `act`; stream logs into the run view (Phase E)
 - [ ] 717. Repo-health / CI-config detection — which CI files a worktree has, recent pass-rate, currently-running count; surfaced in the CI view header (Phase E)
+
+### AW. Log Analyzer (sz-log)
+
+_A native, zero-IPC structured log viewer providing `hl`-like capabilities for worktree files, containers, and tasks. Integrates heavily with the render plan to ensure high-throughput log streams do not violate the 0% idle / <16ms frame invariants._
+
+- [x] 718. `LogProvider` trait + bounded ring-buffer memory model
+- [x] 719. Zero-copy JSON & logfmt parsers (envelope extraction)
+- [~] 720. Off-thread log ingestion worker + batching waker (wake-storm prevention)
+- [ ] 721. Full-screen center-pane log overlay UI
+- [x] 722. Filter DSL — fuzzy text, severity normalization, exact field matching
+- [ ] 723. Dynamic field projection — hide/show/reorder JSON keys
+- [ ] 724. Tailing vs Paused mode — auto-pause on scroll
+- [~] 725. File tailing provider (`notify` backend)
+- [ ] 726. Container tailing provider (resolves AD 383)
+- [ ] 727. Editor handoff — jump to `file:line` from stacktraces (resolves AG 408)
+- [ ] 728. Field Explorer drawer — surface schema/keys dynamically based on current view
+
+### AX. Native Windows Support
+
+_The Windows-native workspace shell (AI-free by default), bypassing WSL/MSYS2 for a native sub-300ms, zero-IPC experience. Core features (multiplexing, rendering, git) already map cleanly to Windows thanks to the `portable-pty`/`termwiz` foundation._
+
+- [ ] 729. Cross-platform filesystem watching — replace `inotify` with `notify` (`ReadDirectoryChangesW`) for diff watchers
+- [ ] 730. Native Sandboxing: AppContainers — low-integrity process isolation granting read/write ACLs only to the specific worktree path
+- [ ] 731. Native Sandboxing: Job Objects — prevent fork-bombs, block UI popups, and ensure child process trees die instantly on tab close
+- [ ] 732. Standardized paths — migrate from Unix `$XDG_STATE_HOME` to `directories` crate resolving to `%LOCALAPPDATA%\superzej`
+- [ ] 733. Signals mapping — map Unix profiling triggers (`SIGUSR2`) to internal keymaps or named events for Windows flame-graphs
+- [ ] 734. PowerShell / NuShell defaults — default pane spawning to native Windows shells over `cmd.exe`
+
+### AI-free mode (audience-widener)
+
+- [~] 511. AI-free mode — run as a pure terminal workspace/worktree manager, no agents/proxy/LLM
+- [~] 512. All features usable manually — git, worktrees, containers, pins, comms tiles, monitoring with zero AI
+- [ ] 513. Compile-out AI components — feature flag for a lean binary without proxy/agent/MCP layers
+- [~] 514. Graceful degradation — AI panels, dots, cost widgets simply absent; nothing else breaks
+- [x] 515. No-AI privacy posture — zero outbound model traffic, smaller attack surface, fully local
