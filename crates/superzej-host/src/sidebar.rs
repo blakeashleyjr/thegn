@@ -18,6 +18,8 @@ pub enum RowKind {
     Workspace,
     Folder,
     Worktree,
+    TerminalsHeader,
+    Terminal,
 }
 
 /// Contextual activity, mirrored from the host-side `activity` state machine.
@@ -163,6 +165,8 @@ pub struct SidebarRow {
     /// Badge: alert count (test failures, agent failures, log errors) for this worktree (item 28).
     #[allow(dead_code)]
     pub alert_count: usize,
+    /// Connection string for terminal rows
+    pub terminal_connection: Option<String>,
 }
 
 /// Per-worktree status sourced from the (possibly slow) git/activity scan on
@@ -292,6 +296,7 @@ pub fn build_rows(
     status: &SidebarStatus,
     db_worktrees: &[DbWorktree],
     db_folders: &[superzej_core::models::FolderRow],
+    db_terminals: &[superzej_core::models::TerminalRow],
 ) -> Vec<SidebarRow> {
     let activity = &status.activity;
     let mut rows = Vec::new();
@@ -323,6 +328,7 @@ pub fn build_rows(
             pr_number: None,
             unread_count: 0,
             alert_count: 0,
+            terminal_connection: None,
         });
 
         // This repo's worktree groups, straight from the session model.
@@ -410,6 +416,7 @@ pub fn build_rows(
                 pr_number,
                 unread_count,
                 alert_count,
+                terminal_connection: None,
             });
         }
 
@@ -484,6 +491,7 @@ pub fn build_rows(
                 pr_number: None,
                 unread_count: 0,
                 alert_count: 0,
+                terminal_connection: None,
             });
 
             if !folder_collapsed {
@@ -548,6 +556,7 @@ pub fn build_rows(
                             pr_number,
                             unread_count,
                             alert_count,
+                            terminal_connection: None,
                         });
                     }
                 }
@@ -613,6 +622,7 @@ pub fn build_rows(
                     pr_number,
                     unread_count,
                     alert_count,
+                    terminal_connection: None,
                 }
             };
             rows.push(mk(
@@ -662,7 +672,82 @@ pub fn build_rows(
             pr_number: None,
             unread_count: 0,
             alert_count: 0,
+            terminal_connection: None,
         });
+    }
+
+    if !db_terminals.is_empty() {
+        let slug = "terminals".to_string();
+        let collapsed = view.collapsed.contains(&slug);
+
+        rows.push(SidebarRow {
+            kind: RowKind::TerminalsHeader,
+            depth: 0,
+            label: "Terminals".into(),
+            workspace_slug: slug.clone(),
+            tab_target: None,
+            active: false,
+            worktree_path: None,
+            pin_key: slug.clone(),
+            branch: None,
+            git: None,
+            agent: None,
+            sandbox_backend: None,
+            env_name: None,
+            activity: ActivityState::None,
+            visible: true,
+            collapsed,
+            dir: false,
+            pr_count: None,
+            pr_number: None,
+            unread_count: 0,
+            alert_count: 0,
+            terminal_connection: None,
+        });
+
+        if !collapsed {
+            for t in db_terminals {
+                let active = session
+                    .worktrees
+                    .get(session.active)
+                    .is_some_and(|wt| wt.name == t.name);
+                let target = session
+                    .worktrees
+                    .iter()
+                    .position(|w| w.name == t.name)
+                    .map(|i| RowTarget::Tab(i, 0));
+
+                rows.push(SidebarRow {
+                    kind: RowKind::Terminal,
+                    depth: 1,
+                    label: t.name.clone(),
+                    workspace_slug: slug.clone(),
+                    tab_target: target.or_else(|| {
+                        Some(RowTarget::Workspace {
+                            repo_path: "terminal".into(),
+                            group: Some(t.name.clone()),
+                        })
+                    }),
+                    active,
+                    worktree_path: Some(t.name.clone()),
+                    pin_key: format!("{}/{}", slug, t.name),
+                    branch: None,
+                    git: None,
+                    agent: None,
+                    sandbox_backend: None,
+                    env_name: None,
+                    activity: ActivityState::None,
+                    visible: true,
+                    collapsed: false,
+                    dir: false,
+                    pr_count: None,
+                    pr_number: None,
+                    unread_count: 0,
+                    alert_count: 0,
+                    terminal_connection: Some(t.connection_string.clone()),
+                });
+            }
+        }
     }
 
     apply_pins(&mut rows, &view.pins);
@@ -793,6 +878,18 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
         match rows[i].kind {
             RowKind::Workspace => last_workspace = Some(i),
             RowKind::Folder => {}
+            RowKind::TerminalsHeader => {}
+            RowKind::Terminal => {
+                if keep[i] {
+                    // surface the terminals header
+                    if let Some(h) = rows[0..i]
+                        .iter()
+                        .rposition(|r| matches!(r.kind, RowKind::TerminalsHeader))
+                    {
+                        keep[h] = true;
+                    }
+                }
+            }
             RowKind::Worktree => {
                 if keep[i]
                     && let Some(w) = last_workspace
@@ -808,6 +905,12 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
         match rows[i].kind {
             RowKind::Workspace => reveal_ws = self_match[i],
             RowKind::Folder => {}
+            RowKind::TerminalsHeader => reveal_ws = self_match[i],
+            RowKind::Terminal => {
+                if reveal_ws {
+                    keep[i] = true;
+                }
+            }
             RowKind::Worktree => {
                 if reveal_ws {
                     keep[i] = true;
@@ -893,7 +996,15 @@ mod tests {
             "repo".to_string(),
             String::new(),
         )];
-        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &[], &[]);
+        let rows = build_rows(
+            &s,
+            &ws,
+            &ViewState::default(),
+            &no_activity(),
+            &[],
+            &[],
+            &[],
+        );
         let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
         assert_eq!(labels, vec!["app", "home", "feat-a", "feat-b"]);
     }
@@ -910,7 +1021,15 @@ mod tests {
             "repo".to_string(),
             String::new(),
         )];
-        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &[], &[]);
+        let rows = build_rows(
+            &s,
+            &ws,
+            &ViewState::default(),
+            &no_activity(),
+            &[],
+            &[],
+            &[],
+        );
         let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
         assert_eq!(labels, vec!["app", "home", "feat"]);
         assert_eq!(rows[0].kind, RowKind::Workspace);
@@ -935,7 +1054,15 @@ mod tests {
             "repo".to_string(),
             "/repos/WASHU".to_string(),
         )];
-        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &[], &[]);
+        let rows = build_rows(
+            &s,
+            &ws,
+            &ViewState::default(),
+            &no_activity(),
+            &[],
+            &[],
+            &[],
+        );
         let homes: Vec<_> = rows.iter().filter(|r| r.label == "home").collect();
         assert_eq!(homes.len(), 1, "rows: {rows:?}");
         assert!(homes[0].active, "the live home row carries the active flag");
@@ -962,7 +1089,15 @@ mod tests {
                 String::new(),
             ),
         ];
-        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &[], &[]);
+        let rows = build_rows(
+            &s,
+            &ws,
+            &ViewState::default(),
+            &no_activity(),
+            &[],
+            &[],
+            &[],
+        );
         let repo_row = rows.iter().find(|r| r.label == "repo").unwrap();
         let dir_row = rows.iter().find(|r| r.label == "notes").unwrap();
         assert!(!repo_row.dir, "repo workspace is not a dir");
@@ -998,7 +1133,15 @@ mod tests {
             sandbox_backend: None,
             env_name: Some("company-k8s".into()),
         }];
-        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &dbw, &[]);
+        let rows = build_rows(
+            &s,
+            &ws,
+            &ViewState::default(),
+            &no_activity(),
+            &dbw,
+            &[],
+            &[],
+        );
         // The DB worktree's selected env flows onto its (unloaded-workspace) row.
         let feat = rows
             .iter()
@@ -1042,7 +1185,7 @@ mod tests {
         )];
         let mut view = ViewState::default();
         view.collapsed.insert("app".to_string());
-        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[]);
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[], &[]);
         assert!(rows[0].visible); // workspace stays
         assert!(!rows[1].visible); // worktree hidden
     }
@@ -1061,7 +1204,15 @@ mod tests {
             "repo".to_string(),
             String::new(),
         )];
-        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &[], &[]);
+        let rows = build_rows(
+            &s,
+            &ws,
+            &ViewState::default(),
+            &no_activity(),
+            &[],
+            &[],
+            &[],
+        );
         let kinds: Vec<RowKind> = rows.iter().map(|r| r.kind).collect();
         assert_eq!(kinds, vec![RowKind::Workspace, RowKind::Worktree]);
         // The worktree row jumps to the group's remembered active tab.
@@ -1085,7 +1236,7 @@ mod tests {
             filter: "feature".into(),
             ..Default::default()
         };
-        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[]);
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[], &[]);
         let visible: Vec<&str> = rows
             .iter()
             .filter(|r| r.visible)
@@ -1112,7 +1263,7 @@ mod tests {
             pins: vec!["app/feat".into()],
             ..Default::default()
         };
-        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[]);
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[], &[]);
         // Workspace block contains all rows (depth>0), so pinning the worktree
         // inside reorders within — feat should precede home.
         let feat = rows.iter().position(|r| r.label == "feat").unwrap();
@@ -1139,7 +1290,7 @@ mod tests {
             sort: SortMode::Activity,
             ..Default::default()
         };
-        let rows = build_rows(&s, &ws, &view, &act, &[], &[]);
+        let rows = build_rows(&s, &ws, &view, &act, &[], &[], &[]);
         let busy = rows.iter().position(|r| r.label == "busy").unwrap();
         let home = rows.iter().position(|r| r.label == "home").unwrap();
         assert!(busy < home, "active worktree should sort first");
@@ -1166,7 +1317,15 @@ mod tests {
         )];
 
         // Default == Manual: home, then session order (zebra, alpha).
-        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &[], &[]);
+        let rows = build_rows(
+            &s,
+            &ws,
+            &ViewState::default(),
+            &no_activity(),
+            &[],
+            &[],
+            &[],
+        );
         let labels: Vec<&str> = rows
             .iter()
             .filter(|r| r.kind == RowKind::Worktree)
@@ -1179,7 +1338,7 @@ mod tests {
             sort: SortMode::Name,
             ..Default::default()
         };
-        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[]);
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[], &[]);
         let labels: Vec<&str> = rows
             .iter()
             .filter(|r| r.kind == RowKind::Worktree)
@@ -1222,7 +1381,15 @@ mod tests {
                 env_name: None,
             },
         ];
-        let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &dbw, &[]);
+        let rows = build_rows(
+            &s,
+            &ws,
+            &ViewState::default(),
+            &no_activity(),
+            &dbw,
+            &[],
+            &[],
+        );
         let labels: Vec<&str> = rows
             .iter()
             .filter(|r| r.kind == RowKind::Worktree)

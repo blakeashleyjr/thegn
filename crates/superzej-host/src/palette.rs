@@ -373,6 +373,20 @@ pub(crate) fn build_palette(
         }
     }
 
+    // Terminals: jump directly to an existing terminal session.
+    if let Ok(terms) = db.terminals() {
+        for t in terms {
+            let label = if t.connection_string.starts_with("ssh") {
+                format!("🌐 {}", t.name)
+            } else if t.connection_string.starts_with("mosh") {
+                format!("🚀 {}", t.name)
+            } else {
+                format!("💻 {}", t.name)
+            };
+            items.push(PaletteItem::new(format!("tab:{}", t.name), label));
+        }
+    }
+
     // Add workspaces (repos) for switching
     if let Ok(workspaces) = db.workspaces() {
         for w in workspaces {

@@ -113,6 +113,18 @@ pub struct FolderRow {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerminalRow {
+    pub id: i64,
+    pub name: String,
+    pub kind: String,
+    pub connection_string: String,
+    pub folder_id: Option<i64>,
+    pub created_at: i64,
+    pub last_active: i64,
+    pub position: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

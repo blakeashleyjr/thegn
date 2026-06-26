@@ -313,6 +313,8 @@ pub struct FrameModel {
     pub sidebar_db_worktrees: Vec<crate::sidebar::DbWorktree>,
     /// All folders for loaded workspaces, straight from DB, used by row builder.
     pub sidebar_db_folders: Vec<superzej_core::models::FolderRow>,
+    /// All terminals, straight from DB, used by row builder.
+    pub sidebar_db_terminals: Vec<superzej_core::models::TerminalRow>,
     /// True if the last input was mouse activity.
     pub panel: crate::panel::PanelData,
     /// True when the right panel currently owns keyboard focus.
@@ -1602,7 +1604,7 @@ fn compose_sidebar_row(
             text.push_str("\u{1f4c2} "); // open folder glyph
             text.push_str(&row.label);
         }
-        RowKind::Workspace => {
+        RowKind::Workspace | RowKind::TerminalsHeader => {
             let caret = if row.collapsed {
                 "\u{25b8}"
             } else {
@@ -1614,6 +1616,22 @@ fn compose_sidebar_row(
             // differently from a repo workspace.
             if row.dir {
                 text.push_str("\u{1f4c1} ");
+            }
+            text.push_str(&row.label);
+        }
+        RowKind::Terminal => {
+            text.push_str("  ");
+            // Render terminal with a distinct visual language
+            if let Some(loc) = &row.terminal_connection {
+                if loc.starts_with("ssh") {
+                    text.push_str("🌐 ");
+                } else if loc.starts_with("mosh") {
+                    text.push_str("🚀 ");
+                } else {
+                    text.push_str("💻 ");
+                }
+            } else {
+                text.push_str("💻 ");
             }
             text.push_str(&row.label);
         }
@@ -2394,6 +2412,7 @@ mod tests {
             pr_number: None,
             unread_count: 0,
             alert_count: 0,
+            terminal_connection: None,
         }
     }
 
