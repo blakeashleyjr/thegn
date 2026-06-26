@@ -19,6 +19,7 @@ pub mod logs;
 pub mod notify;
 pub mod pr;
 pub mod repos;
+pub mod theme;
 
 use std::path::PathBuf;
 use std::process::Command;
