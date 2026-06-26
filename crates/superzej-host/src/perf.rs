@@ -76,6 +76,18 @@ pub fn wake_storm_limit() -> f64 {
         .unwrap_or(20.0)
 }
 
+/// Per-frame compose+flush budget in microseconds. A rollup whose median frame
+/// exceeds this warns (the slow-frame guard), independent of wake count — the
+/// signal the old idle-ratio/wake-count storm warning could never see. Default
+/// 16ms (one 60Hz frame); override with `SUPERZEJ_FRAME_BUDGET_US`.
+pub fn frame_budget_us() -> u64 {
+    std::env::var("SUPERZEJ_FRAME_BUDGET_US")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(16_000)
+}
+
 // ---------------------------------------------------------------------------
 // Bench window (SUPERZEJ_BENCH_RUN_MS): run the full loop for a fixed window
 // then exit, so the idle-CPU harness can measure steady state. Honors the
@@ -430,8 +442,17 @@ pub struct LoopPerf {
     drain_items: [u64; WakeSource::N],
     pub wakes: u64,
     pub renders: u64,
+    /// Renders served by the cheap pane-only fast path (incremental compose +
+    /// bounded diff). A healthy streaming workload is dominated by these.
+    pub pane_frames: u64,
+    /// Renders that recomposed chrome + all panes (full/chrome path).
+    pub full_frames: u64,
     pub render_skips: u64,
     pub render_us: Histo,
+    /// Wall-clock spent inside compose+flush this interval — the honest
+    /// "rendering cost" the idle ratio hides (a frame can be 120ms yet the loop
+    /// still reports 85% idle because it blocks between frames).
+    pub render_busy: Duration,
     pub pty_chunks: u64,
     pub pty_budget_hits: u64,
     /// Wall-clock the loop spent awake (not blocked in `poll_input`) this
@@ -446,8 +467,11 @@ impl LoopPerf {
             drain_items: [0; WakeSource::N],
             wakes: 0,
             renders: 0,
+            pane_frames: 0,
+            full_frames: 0,
             render_skips: 0,
             render_us: Histo::new(),
+            render_busy: Duration::ZERO,
             pty_chunks: 0,
             pty_budget_hits: 0,
             busy: Duration::ZERO,
@@ -495,12 +519,20 @@ impl LoopPerf {
         }
     }
 
-    /// A frame was composed + flushed in `dt`.
+    /// A frame was composed + flushed in `dt`. `pane_only` is true when the
+    /// streaming fast path served it (recompose + bounded-diff only the damaged
+    /// panes); false for a full/chrome frame.
     #[inline]
-    pub fn render(&mut self, dt: Duration) {
+    pub fn render(&mut self, dt: Duration, pane_only: bool) {
         if enabled() {
             self.renders += 1;
+            if pane_only {
+                self.pane_frames += 1;
+            } else {
+                self.full_frames += 1;
+            }
             self.render_us.record_us(dt.as_micros() as u64);
+            self.render_busy += dt;
         }
     }
 
@@ -566,8 +598,11 @@ impl LoopPerf {
         self.drain_items = [0; WakeSource::N];
         self.wakes = 0;
         self.renders = 0;
+        self.pane_frames = 0;
+        self.full_frames = 0;
         self.render_skips = 0;
         self.render_us.reset();
+        self.render_busy = Duration::ZERO;
         self.pty_chunks = 0;
         self.pty_budget_hits = 0;
         self.busy = Duration::ZERO;
@@ -589,10 +624,16 @@ pub struct PerfSnapshot {
     pub secs: f64,
     pub wakes_per_s: f64,
     pub renders_per_s: f64,
+    pub pane_frames_per_s: f64,
+    pub full_frames_per_s: f64,
     pub render_skips_per_s: f64,
     pub render_p50_us: u64,
     pub render_p99_us: u64,
     pub idle_ratio: f64,
+    /// Fraction of wall-clock spent composing+flushing frames. Unlike
+    /// `idle_ratio`, this exposes a slow-render cost even when the loop blocks
+    /// most of the time between frames.
+    pub render_busy_ratio: f64,
     pub hot_source: &'static str,
     pub hot_items_per_s: f64,
     pub pty_chunks_per_s: f64,
@@ -620,10 +661,13 @@ impl LoopPerf {
             secs,
             wakes_per_s: self.wakes as f64 / secs,
             renders_per_s: self.renders as f64 / secs,
+            pane_frames_per_s: self.pane_frames as f64 / secs,
+            full_frames_per_s: self.full_frames as f64 / secs,
             render_skips_per_s: self.render_skips as f64 / secs,
             render_p50_us: self.render_us.percentile_us(0.50),
             render_p99_us: self.render_us.percentile_us(0.99),
             idle_ratio: 1.0 - busy_ratio,
+            render_busy_ratio: (self.render_busy.as_secs_f64() / secs).clamp(0.0, 1.0),
             hot_source: hot.label(),
             hot_items_per_s: hot_items as f64 / secs,
             pty_chunks_per_s: self.pty_chunks as f64 / secs,
@@ -634,10 +678,13 @@ impl LoopPerf {
             target: "szhost::perf",
             wakes_per_s = snap.wakes_per_s,
             renders_per_s = snap.renders_per_s,
+            pane_frames_per_s = snap.pane_frames_per_s,
+            full_frames_per_s = snap.full_frames_per_s,
             render_skips_per_s = snap.render_skips_per_s,
             render_p50_us = snap.render_p50_us,
             render_p99_us = snap.render_p99_us,
             idle_ratio = snap.idle_ratio,
+            render_busy_ratio = snap.render_busy_ratio,
             hot_source = snap.hot_source,
             hot_items_per_s = snap.hot_items_per_s,
             pty_chunks_per_s = snap.pty_chunks_per_s,
@@ -674,6 +721,23 @@ impl LoopPerf {
                 hot_items_per_s = snap.hot_items_per_s,
                 "wake storm while idle: {} dominating",
                 snap.hot_source
+            );
+        }
+
+        // Slow-frame guard: the median frame blew the compose+flush budget. Keys
+        // on cost-per-frame, NOT wake count or idle ratio — the condition the
+        // storm warning above is structurally blind to (a 120ms frame fired a
+        // few times a second still reads as "85% idle, 3 wakes/s"). This is the
+        // signal that the damage-compositor regressed back to full recomposes.
+        if self.renders > 0 && snap.render_p50_us > frame_budget_us() {
+            tracing::warn!(
+                target: "szhost::perf",
+                render_p50_us = snap.render_p50_us,
+                render_p99_us = snap.render_p99_us,
+                render_busy_ratio = snap.render_busy_ratio,
+                full_frames_per_s = snap.full_frames_per_s,
+                budget_us = frame_budget_us(),
+                "slow frames: p50 over budget — render path is recomposing too much"
             );
         }
 
@@ -743,7 +807,7 @@ mod tests {
         let mut lp = LoopPerf::new();
         lp.wake();
         lp.tick(WakeSource::Model);
-        lp.render(Duration::from_micros(900));
+        lp.render(Duration::from_micros(900), false);
         assert_eq!(lp.wakes, 0);
         assert_eq!(lp.renders, 0);
         assert_eq!(lp.items(WakeSource::Model), 0);
@@ -763,10 +827,12 @@ mod tests {
         lp.tick(WakeSource::Model);
         lp.tick(WakeSource::Stats);
         lp.pty(10, true);
-        lp.render(Duration::from_micros(900));
+        lp.render(Duration::from_micros(900), true);
         lp.render_skip();
         assert_eq!(lp.wakes, 2);
         assert_eq!(lp.renders, 1);
+        assert_eq!(lp.pane_frames, 1);
+        assert_eq!(lp.full_frames, 0);
         assert_eq!(lp.render_skips, 1);
         assert_eq!(lp.pty_chunks, 10);
         assert_eq!(lp.pty_budget_hits, 1);
