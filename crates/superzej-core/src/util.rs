@@ -2,27 +2,53 @@
 //! and thin subprocess wrappers (git / generic commands).
 
 use crate::msg;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(not(windows))]
+use std::os::unix::process::CommandExt;
+
+#[cfg(not(windows))]
 pub fn home() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
+#[cfg(windows)]
+pub fn home() -> PathBuf {
+    std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("C:\\"))
+}
+
+#[cfg(not(windows))]
 pub fn xdg_config_home() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".config"))
 }
 
+#[cfg(windows)]
+pub fn xdg_config_home() -> PathBuf {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join("AppData").join("Roaming"))
+}
+
+#[cfg(not(windows))]
 pub fn xdg_state_home() -> PathBuf {
     std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".local/state"))
+}
+
+#[cfg(windows)]
+pub fn xdg_state_home() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join("AppData").join("Local"))
 }
 
 /// superzej's own home — config, worktrees, cache, activity all live under here
@@ -238,6 +264,7 @@ pub struct GitLock(std::fs::File);
 /// same `.git`. Best-effort: returns `None` (degrading to today's unlocked
 /// behavior) if the lock file can't be opened/locked, so a permissions quirk
 /// never wedges the user out of git. Call only on background threads — it blocks.
+#[cfg(not(windows))]
 pub fn lock_git_mutations(worktree: &Path) -> Option<GitLock> {
     use std::os::unix::io::AsRawFd;
     let path = git_common_dir(worktree).join("superzej-git.lock");
@@ -253,11 +280,36 @@ pub fn lock_git_mutations(worktree: &Path) -> Option<GitLock> {
     (rc == 0).then_some(GitLock(file))
 }
 
+#[cfg(windows)]
+pub fn lock_git_mutations(worktree: &Path) -> Option<GitLock> {
+    let path = git_common_dir(worktree).join("superzej-git.lock");
+    // On Windows, opening a file with `share_read=false` and `share_write=false`
+    // creates an exclusive lock at the filesystem level.
+    // However, Rust's stdlib doesn't expose sharing modes directly in OpenOptions without `std::os::windows::fs::OpenOptionsExt`.
+    use std::os::windows::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .share_mode(0) // 0 = exclusive lock
+        .open(&path)
+        .ok()?;
+    Some(GitLock(file))
+}
+
+#[cfg(not(windows))]
 impl Drop for GitLock {
     fn drop(&mut self) {
         use std::os::unix::io::AsRawFd;
         // SAFETY: same fd we locked; explicit unlock (close would also release).
         unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[cfg(windows)]
+impl Drop for GitLock {
+    fn drop(&mut self) {
+        // Just closing the file releases the share mode lock on Windows.
     }
 }
 
@@ -308,8 +360,20 @@ pub fn basename(s: &str) -> &str {
     s.rsplit('/').next().unwrap_or(s)
 }
 
+#[cfg(not(windows))]
 pub fn shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
+}
+
+#[cfg(windows)]
+pub fn shell() -> String {
+    if let Ok(pwsh) = which_path("pwsh.exe") {
+        pwsh
+    } else if let Ok(ps) = which_path("powershell.exe") {
+        ps
+    } else {
+        std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into())
+    }
 }
 
 /// The user's preferred editor command (program plus any args), honoring
@@ -381,23 +445,64 @@ pub fn set_terminal_title(title: &str) {
 }
 
 /// Replace this process with an interactive login shell.
+#[cfg(not(windows))]
 pub fn exec_shell() -> ! {
     let sh = shell();
     let err = Command::new(&sh).arg("-l").exec();
     msg::die(&format!("exec {sh} failed: {err}"));
 }
 
-/// Replace this process with `$SHELL -lc <cmd>` (so env/PATH expansions work).
+#[cfg(windows)]
+pub fn exec_shell() -> ! {
+    let sh = shell();
+    let mut cmd = Command::new(&sh);
+    let err = if sh.ends_with("pwsh.exe") || sh.ends_with("powershell.exe") {
+        cmd.arg("-NoLogo").spawn().and_then(|mut c| c.wait())
+    } else {
+        cmd.spawn().and_then(|mut c| c.wait())
+    };
+    msg::die(&format!("exec {sh} failed: {:?}", err));
+}
+
+#[cfg(not(windows))]
 pub fn exec_shell_cmd(cmd: &str) -> ! {
     let sh = shell();
     let err = Command::new(&sh).arg("-lc").arg(cmd).exec();
     msg::die(&format!("exec {sh} failed: {err}"));
 }
 
-/// Replace this process with `prog args...`.
+#[cfg(windows)]
+pub fn exec_shell_cmd(cmd: &str) -> ! {
+    let sh = shell();
+    let mut c = Command::new(&sh);
+    let err = if sh.ends_with("pwsh.exe") || sh.ends_with("powershell.exe") {
+        c.args(["-NoProfile", "-Command", cmd])
+            .spawn()
+            .and_then(|mut proc| proc.wait())
+    } else if sh.ends_with("cmd.exe") {
+        c.args(["/C", cmd]).spawn().and_then(|mut proc| proc.wait())
+    } else {
+        c.arg("-c")
+            .arg(cmd)
+            .spawn()
+            .and_then(|mut proc| proc.wait())
+    };
+    msg::die(&format!("exec {sh} failed: {:?}", err));
+}
+
+#[cfg(not(windows))]
 pub fn exec_command(prog: &str, args: &[&str]) -> ! {
     let err = Command::new(prog).args(args).exec();
     msg::die(&format!("exec {prog} failed: {err}"));
+}
+
+#[cfg(windows)]
+pub fn exec_command(prog: &str, args: &[&str]) -> ! {
+    let err = Command::new(prog)
+        .args(args)
+        .spawn()
+        .and_then(|mut proc| proc.wait());
+    msg::die(&format!("exec {prog} failed: {:?}", err));
 }
 
 /// Single-quote a string for POSIX `sh -c` / ssh remote commands so paths with
