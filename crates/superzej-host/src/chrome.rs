@@ -1117,6 +1117,38 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             format!(" \u{2709} {} ", model.panel.unread_notifications),
         ));
     }
+    // CI rollup badge (AV group, item 158): a red ✗ chip when recent runs have
+    // failures, an amber ● chip while runs are in flight; silent when all green
+    // (mirrors the "clean is quiet" notification posture). Only when CI is
+    // configured and the cache is warm (`ci_runs` non-empty).
+    if !model.panel.ci_runs.is_empty() {
+        use superzej_core::ci::CiState;
+        let fail = model
+            .panel
+            .ci_runs
+            .iter()
+            .filter(|r| r.state == CiState::Fail)
+            .count();
+        let running = model
+            .panel
+            .ci_runs
+            .iter()
+            .filter(|r| r.state == CiState::Running)
+            .count();
+        if fail > 0 {
+            r.push(seg(Tok::Slot(S::Text), " "));
+            r.push(Seg::chip(
+                Tok::Hue(superzej_core::theme::Hue::Red),
+                format!(" \u{2717} {fail} CI "),
+            ));
+        } else if running > 0 {
+            r.push(seg(Tok::Slot(S::Text), " "));
+            r.push(Seg::chip(
+                Tok::Hue(superzej_core::theme::Hue::Amber),
+                format!(" \u{25cf} {running} CI "),
+            ));
+        }
+    }
     if let Some(ref metrics) = model.ai_metrics {
         r.push(seg(Tok::Slot(S::Text), " "));
         r.push(Seg::chip(
@@ -1837,6 +1869,12 @@ pub(crate) fn panel_help_pairs(ui: &crate::panel::PanelUi) -> Vec<(String, Strin
             ("o", "browser"),
         ],
         Section::Tests => &[("r", "run"), ("R", "all"), ("f", "failed"), ("↵", "open")],
+        Section::Ci => &[
+            ("j/k", "row"),
+            ("↵", "view"),
+            ("r", "rerun"),
+            ("o", "browser"),
+        ],
         Section::Files => &[("↵", "open"), ("y", "yazi")],
         Section::Issues => &[
             ("j/k", "row"),

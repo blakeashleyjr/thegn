@@ -192,6 +192,26 @@ impl GitLoc {
         }
     }
 
+    /// A `Command` running `<bin> <args>` with cwd = the worktree — locally, or
+    /// over ssh. The generic sibling of [`Self::gh_command`], for the other CI
+    /// provider CLIs (`glab`, `drone`, `woodpecker-cli`, `argo`, …). Like `gh`,
+    /// these auto-detect the repo/remote from the working directory.
+    pub fn cli_command(&self, bin: &str, args: &[&str]) -> Command {
+        match self {
+            GitLoc::Local(p) => {
+                let mut c = Command::new(bin);
+                c.current_dir(p).args(args);
+                c
+            }
+            GitLoc::Remote { ssh, path } => {
+                let mut argv = vec![bin.to_string()];
+                argv.extend(args.iter().map(|s| s.to_string()));
+                let remote = format!("cd {} && {}", util::sh_quote(path), util::sh_join(&argv));
+                self.ssh_command(ssh, remote)
+            }
+        }
+    }
+
     /// A `Command` running an arbitrary shell script with cwd = the worktree
     /// (the custom-command seam) — `sh -c` locally, `cd … && …` over ssh.
     pub fn sh_command(&self, script: &str) -> Command {

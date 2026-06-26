@@ -13,6 +13,7 @@ use super::{ChangeRow, PanelData, PanelHit, PanelUi, Section, Stage};
 
 mod branches;
 mod changes;
+mod ci;
 pub(crate) mod commits;
 mod git;
 mod issues;
@@ -326,6 +327,33 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
             }
             None => vec![seg(g(), "no pr")],
         },
+        Section::Ci => {
+            use superzej_core::ci::CiState;
+            if data.ci_runs.is_empty() {
+                vec![seg(g2(), "—")]
+            } else {
+                let (mut pass, mut fail, mut run) = (0u32, 0u32, 0u32);
+                for r in &data.ci_runs {
+                    match r.state {
+                        CiState::Pass => pass += 1,
+                        CiState::Fail => fail += 1,
+                        CiState::Running => run += 1,
+                        _ => {}
+                    }
+                }
+                let mut v = vec![ci::state_glyph(data.ci_runs[0].state)];
+                v.push(seg(g(), format!(" {pass}")));
+                if fail > 0 {
+                    v.push(seg(g(), " "));
+                    v.push(seg(hue(Hue::Red), format!("✗{fail}")));
+                }
+                if run > 0 {
+                    v.push(seg(g(), " "));
+                    v.push(seg(hue(Hue::Amber), format!("●{run}")));
+                }
+                v
+            }
+        }
         Section::Files => {
             let loc = model.loc.map(compact_count);
             match (data.file_count, loc) {
@@ -530,6 +558,7 @@ pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
         Section::Branches => branches::content(ctx),
         Section::Stash => stash::content(ctx),
         Section::Pr => git::content(ctx),
+        Section::Ci => ci::content(ctx),
         Section::Files => misc::files(ctx),
         Section::Problems => problems::content(ctx),
         Section::Jobs => tasks::content(ctx),
@@ -596,6 +625,27 @@ mod spec {
             path: "src/lib.rs".into(),
             added: 10,
             deleted: 2,
+        }];
+        m.panel.ci_runs = vec![superzej_core::ci::CiRun {
+            id: "100".into(),
+            name: "CI".into(),
+            event: "push".into(),
+            branch: "feat/views".into(),
+            state: superzej_core::ci::CiState::Fail,
+            started_at: Some("2026-06-25T10:00:00Z".into()),
+            finished_at: Some("2026-06-25T10:02:00Z".into()),
+            jobs: vec![superzej_core::ci::CiJob {
+                id: "1".into(),
+                name: "build".into(),
+                state: superzej_core::ci::CiState::Pass,
+                steps: vec![superzej_core::ci::CiStep {
+                    name: "compile".into(),
+                    state: superzej_core::ci::CiState::Pass,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
         }];
         m.panel.log = vec![superzej_svc::git::LogRow {
             graph: "*".into(),
