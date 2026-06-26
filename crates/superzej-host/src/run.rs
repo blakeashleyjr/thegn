@@ -3199,6 +3199,28 @@ fn begin_worktree_preset(
     model.status = "Creating worktree…".into();
 }
 
+/// The branch-name tail for a worktree created from an issue: the provider's
+/// branch hint when present (e.g. Linear's `abc-123-fix-foo`), else a slug of
+/// `<number>-<title>`. Capped and dash-collapsed so it is a valid ref tail.
+fn issue_branch_tail(number: &str, title: &str, hint: Option<&str>) -> String {
+    if let Some(h) = hint.filter(|h| !h.trim().is_empty()) {
+        return h.trim().to_string();
+    }
+    let raw = format!("{number}-{title}");
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for c in raw.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash && !out.is_empty() {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    out.trim_matches('-').chars().take(48).collect()
+}
+
 fn begin_new_workspace_prompt(
     host_input: &mut Option<(menu::InputOverlay, HostInputKind)>,
     model: &mut FrameModel,
@@ -6328,6 +6350,9 @@ async fn event_loop<T: Terminal>(
     // When a worktree is created from a template (item 54), the template is held
     // here until the worktree-ready event applies its layout + starts its pins.
     let mut pending_template: Option<superzej_core::config::WorktreeTemplate> = None;
+    // Branch-from-issue: `(creation generation, issue_id)`. When the matching
+    // `CreateEvent::Done` arrives, the new worktree is linked to this issue.
+    let mut pending_issue_link: Option<(u64, String)> = None;
     let mut create_gen: u64 = 0;
     // Top-level app tabs (chat/agent) hosted as tiles above the worktree
     // IDE. A tile's ChangeHook posts its slot index here and pulses the waker,
@@ -6716,7 +6741,6 @@ async fn event_loop<T: Terminal>(
             open: panel_ui.open,
             expanded: panel_ui.width.is_expanded(),
             profile: current_config.profile.clone(),
-            ..Default::default()
         };
         for path in neighbor_worktree_paths(&session) {
             spawn_panel_prefetch(
@@ -6936,7 +6960,6 @@ async fn event_loop<T: Terminal>(
                 open: panel_ui.open,
                 expanded: panel_ui.width.is_expanded(),
                 profile: current_config.profile.clone(),
-                ..Default::default()
             };
             spawn_model_hydration(
                 model_tx.clone(),
@@ -6959,8 +6982,17 @@ async fn event_loop<T: Terminal>(
                     Some(waker.clone()),
                 );
             }
-            spawn_pr_cache_refresh(session.clone(), Some(waker.clone()));
+            spawn_pr_cache_refresh(
+                session.clone(),
+                current_config.issues.clone(),
+                Some(waker.clone()),
+            );
             crate::hydrate::spawn_issue_cache_refresh(
+                session.clone(),
+                current_config.issues.clone(),
+                Some(waker.clone()),
+            );
+            crate::hydrate::spawn_my_work_refresh(
                 session.clone(),
                 current_config.issues.clone(),
                 Some(waker.clone()),
@@ -8407,6 +8439,18 @@ async fn event_loop<T: Terminal>(
                         crate::session::GroupKind::Branch,
                         payload.path.clone(),
                     ));
+                    // Branch-from-issue: link the freshly created worktree to the
+                    // issue it was branched from, so its tab carries the issue badge.
+                    if let Some((g, issue_id)) = pending_issue_link.take() {
+                        if g == generation {
+                            if let Ok(db) = superzej_core::db::Db::open() {
+                                let _ = db.link_issue(&payload.path, &issue_id);
+                            }
+                        } else {
+                            // Not ours — put it back for the matching Done event.
+                            pending_issue_link = Some((g, issue_id));
+                        }
+                    }
                     refresh_tab_model(&mut model, &session, &mut sb);
                     need_relayout = true;
                     // Pane spawn (openpty+exec) is the only loop-side step;
@@ -8606,15 +8650,23 @@ async fn event_loop<T: Terminal>(
                     open: panel_ui.open,
                     expanded: panel_ui.width.is_expanded(),
                     profile: current_config.profile.clone(),
-                    ..Default::default()
                 },
             );
         }
         if want_pr_refresh {
-            spawn_pr_cache_refresh(session.clone(), Some(waker.clone()));
+            spawn_pr_cache_refresh(
+                session.clone(),
+                current_config.issues.clone(),
+                Some(waker.clone()),
+            );
         }
         if want_issue_refresh {
             crate::hydrate::spawn_issue_cache_refresh(
+                session.clone(),
+                current_config.issues.clone(),
+                Some(waker.clone()),
+            );
+            crate::hydrate::spawn_my_work_refresh(
                 session.clone(),
                 current_config.issues.clone(),
                 Some(waker.clone()),
@@ -11986,6 +12038,22 @@ async fn event_loop<T: Terminal>(
                                         // Drill handling for the git-family lists
                                         // arrives with the GitMsg dispatch layer.
                                         Section::Commits | Section::Branches | Section::Stash => {}
+                                        Section::Mine => {
+                                            // Enter opens the cursor row in the browser.
+                                            // (Worktree-jump / branch-from-issue arrive
+                                            // with the binding layer.)
+                                            let rows =
+                                                crate::panel::sections::my_work::ordered_rows(
+                                                    &model.panel,
+                                                );
+                                            if let Some(row) = rows.get(panel_ui.cursor)
+                                                && !row.url.is_empty()
+                                            {
+                                                open_url_detached(&row.url);
+                                                model.status =
+                                                    format!("Opened {} in browser", row.number);
+                                            }
+                                        }
                                         Section::Issues => {
                                             // Enter toggles the worktree↔issue link for
                                             // the cursor row.
@@ -12754,6 +12822,94 @@ async fn event_loop<T: Terminal>(
                                 focus.zone = crate::focus::Zone::Center;
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
+                            }
+                            true
+                        }
+                        // -- my work: open URL, refresh the cross-repo feed ---
+                        (Section::Mine, KeyCode::Char('o')) => {
+                            let rows = crate::panel::sections::my_work::ordered_rows(&model.panel);
+                            if let Some(row) = rows.get(panel_ui.cursor)
+                                && !row.url.is_empty()
+                            {
+                                open_url_detached(&row.url);
+                                model.status = format!("Opened {} in browser", row.number);
+                            }
+                            true
+                        }
+                        (Section::Mine, KeyCode::Char('R')) => {
+                            crate::hydrate::spawn_my_work_refresh(
+                                session.clone(),
+                                current_config.issues.clone(),
+                                Some(waker.clone()),
+                            );
+                            model.status = "Refreshing your work…".into();
+                            true
+                        }
+                        // Branch-a-worktree-from-this-issue: the keystone that turns
+                        // the dashboard into a launchpad. Works from My-Work and the
+                        // Issues section; reuses the headless worktree-create preset
+                        // and links the new worktree to the issue on completion.
+                        (Section::Mine | Section::Issues, KeyCode::Char('b')) => {
+                            let fields: Option<(String, String, String, Option<String>)> =
+                                if panel_ui.open == Section::Mine {
+                                    let rows =
+                                        crate::panel::sections::my_work::ordered_rows(&model.panel);
+                                    rows.get(panel_ui.cursor).and_then(|r| {
+                                        r.issue_id.clone().map(|id| {
+                                            (
+                                                id,
+                                                r.number.clone(),
+                                                r.title.clone(),
+                                                r.branch_hint.clone(),
+                                            )
+                                        })
+                                    })
+                                } else {
+                                    model.panel.tracker_issues.get(panel_ui.issues_cursor).map(
+                                        |i| {
+                                            (
+                                                i.id.clone(),
+                                                i.number.clone(),
+                                                i.title.clone(),
+                                                i.branch_hint.clone(),
+                                            )
+                                        },
+                                    )
+                                };
+                            if let Some((issue_id, number, title, hint)) = fields {
+                                let root = session
+                                    .active_group()
+                                    .map(|g| g.path.clone())
+                                    .filter(|p| !p.is_empty())
+                                    .and_then(|p| superzej_core::repo::main_worktree(Path::new(&p)))
+                                    .or_else(|| {
+                                        std::env::current_dir()
+                                            .ok()
+                                            .and_then(|c| superzej_core::repo::main_worktree(&c))
+                                    });
+                                if let Some(root) = root {
+                                    let tail = issue_branch_tail(&number, &title, hint.as_deref());
+                                    begin_worktree_preset(
+                                        root,
+                                        crate::keymap::NameSpec::Fixed(tail),
+                                        None,
+                                        None,
+                                        None,
+                                        keymap.config(),
+                                        &mut create_gen,
+                                        &create_tx,
+                                        &waker,
+                                        &mut creating,
+                                        &mut wizard_cmd_tx,
+                                        &mut wizard_ui,
+                                        &mut model,
+                                    );
+                                    pending_issue_link = Some((create_gen, issue_id));
+                                    model.status = format!("Branching worktree for {number}…");
+                                } else {
+                                    model.status =
+                                        "branch-from-issue: not inside a git repository".into();
+                                }
                             }
                             true
                         }
@@ -15062,6 +15218,25 @@ mod tests {
     use crate::center::CenterTree;
     use crate::hydrate::build_model;
     use crate::session::{GroupKind, Session, WorktreeGroup};
+
+    #[test]
+    fn issue_branch_tail_prefers_hint_then_slugifies() {
+        // A provider branch hint is used verbatim (trimmed).
+        assert_eq!(
+            issue_branch_tail("ABC-1", "Fix the thing", Some("abc-1-fix-the-thing")),
+            "abc-1-fix-the-thing"
+        );
+        // No hint → slug of number + title, dash-collapsed and lowercased.
+        assert_eq!(
+            issue_branch_tail("42", "Fix: the   Thing!", None),
+            "42-fix-the-thing"
+        );
+        // Empty hint falls back to the slug.
+        assert_eq!(issue_branch_tail("7", "Hi", Some("  ")), "7-hi");
+        // Leading/trailing junk never yields edge dashes.
+        let t = issue_branch_tail("#9", "!!!", None);
+        assert!(!t.starts_with('-') && !t.ends_with('-'), "{t:?}");
+    }
 
     // ---- test-run scope narrowing (item 518) -------------------------------
     fn t_node(

@@ -286,11 +286,20 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
     let provider_label = if data.tracker_issues.is_empty() {
         "no provider configured".to_string()
     } else {
-        let provider = data
-            .tracker_issues
-            .first()
-            .map(|i| i.provider.as_str())
-            .unwrap_or("issues");
+        // Distinct providers, in first-seen order, so an aggregated Linear+Jira
+        // list reads as "⬡ ⬢ linear+jira" rather than just the first one.
+        let mut providers: Vec<&str> = Vec::new();
+        for i in &data.tracker_issues {
+            if !providers.contains(&i.provider.as_str()) {
+                providers.push(i.provider.as_str());
+            }
+        }
+        let sigils: String = providers
+            .iter()
+            .map(|p| provider_sigil(p))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let names = providers.join("+");
         let open = issues.iter().filter(|i| i.status.is_active()).count();
         let total = issues.len();
         let filter_tag = ctx
@@ -299,10 +308,7 @@ fn full_view(ctx: &SectionCtx) -> Vec<PanelRow> {
             .as_deref()
             .map(|p| format!(" [{p}]"))
             .unwrap_or_default();
-        format!(
-            "{} {provider}  {open} open / {total}{filter_tag}",
-            provider_sigil(provider)
-        )
+        format!("{sigils} {names}  {open} open / {total}{filter_tag}")
     };
 
     rows.push(PanelRow::plain(Line::segs(vec![

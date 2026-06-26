@@ -51,5 +51,6 @@ pub mod startup;
 pub mod theme;
 pub mod util;
 pub mod viz;
+pub mod work;
 pub mod worktree;
 pub mod yazi;
