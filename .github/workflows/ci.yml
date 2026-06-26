@@ -27,7 +27,6 @@ jobs:
         with:
           extra-conf: |
             access-tokens = github.com=${{ secrets.NIX_GITHUB_TOKEN }}
-      - uses: DeterminateSystems/magic-nix-cache-action@main
       - name: just ci
         run: nix develop --command just ci
   macos:
@@ -45,6 +44,5 @@ jobs:
         with:
           extra-conf: |
             access-tokens = github.com=${{ secrets.NIX_GITHUB_TOKEN }}
-      - uses: DeterminateSystems/magic-nix-cache-action@main
       - name: build + test (macOS subset)
         run: nix develop --command bash -lc "just build && just test"
