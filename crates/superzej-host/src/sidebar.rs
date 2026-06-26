@@ -140,6 +140,9 @@ pub struct SidebarRow {
     pub git: Option<GitGlyphs>,
     pub agent: Option<String>,
     pub sandbox_backend: Option<String>,
+    /// Selected execution environment (`[env.<name>]`); `None`/`"default"` ⇒
+    /// the implicit default (no badge shown).
+    pub env_name: Option<String>,
     pub activity: ActivityState,
     /// Render/navigation visibility: false when hidden by a collapsed parent or
     /// filtered out.
@@ -224,6 +227,9 @@ pub struct DbWorktree {
     /// Nullable folder assignment
     pub folder_id: Option<i64>,
     pub sandbox_backend: Option<String>,
+    /// Selected execution environment (`[env.<name>]`); `None`/`"default"` ⇒
+    /// the implicit default (no badge shown).
+    pub env_name: Option<String>,
 }
 
 /// Split a `{repo}/{branch}` group name into its parts.
@@ -269,6 +275,7 @@ struct Group {
     gi: usize,
     activity: ActivityState,
     sandbox_backend: Option<String>,
+    env_name: Option<String>,
     folder_id: Option<i64>,
 }
 
@@ -307,6 +314,7 @@ pub fn build_rows(
             git: None,
             agent: None,
             sandbox_backend: None,
+            env_name: None,
             activity: ActivityState::None,
             visible: true,
             collapsed,
@@ -333,6 +341,10 @@ pub fn build_rows(
                     .iter()
                     .find(|w| w.tab_name == g.name)
                     .and_then(|w| w.sandbox_backend.clone()),
+                env_name: db_worktrees
+                    .iter()
+                    .find(|w| w.tab_name == g.name)
+                    .and_then(|w| w.env_name.clone()),
                 activity: activity.get(&g.name).copied().unwrap_or_default(),
                 folder_id: db_worktrees
                     .iter()
@@ -389,6 +401,7 @@ pub fn build_rows(
                 git,
                 agent,
                 sandbox_backend: gr.sandbox_backend.clone(),
+                env_name: gr.env_name.clone(),
                 activity: gr.activity,
                 visible: !collapsed,
                 collapsed: false,
@@ -462,6 +475,7 @@ pub fn build_rows(
                 git: None,
                 agent: None,
                 sandbox_backend: None,
+                env_name: None,
                 activity: ActivityState::None,
                 visible: !collapsed,
                 collapsed: folder_collapsed,
@@ -525,6 +539,7 @@ pub fn build_rows(
                             git,
                             agent,
                             sandbox_backend: gr.sandbox_backend.clone(),
+                            env_name: gr.env_name.clone(),
                             activity: gr.activity,
                             visible: !collapsed,
                             collapsed: false,
@@ -545,7 +560,8 @@ pub fn build_rows(
             let mk = |label: &str,
                       group: Option<String>,
                       path: Option<String>,
-                      backend: Option<String>| {
+                      backend: Option<String>,
+                      env: Option<String>| {
                 let pr_count = path
                     .as_deref()
                     .and_then(|p| status.pr_counts.get(p))
@@ -588,6 +604,7 @@ pub fn build_rows(
                     git: path.as_deref().and_then(|p| status.git.get(p)).copied(),
                     agent: path.as_deref().and_then(|p| status.agent.get(p)).cloned(),
                     sandbox_backend: backend,
+                    env_name: env,
                     activity: act,
                     visible: !collapsed,
                     collapsed: false,
@@ -603,6 +620,7 @@ pub fn build_rows(
                 Some(format!("{repo_slug}/home")),
                 Some(repo_path.clone()),
                 None,
+                None,
             ));
             // A registry row for the home checkout would duplicate the
             // synthesized row above — skip it.
@@ -615,6 +633,7 @@ pub fn build_rows(
                     Some(w.tab_name.clone()),
                     Some(w.path.clone()),
                     w.sandbox_backend.clone(),
+                    w.env_name.clone(),
                 ));
             }
         }
@@ -634,6 +653,7 @@ pub fn build_rows(
             git: None,
             agent: None,
             sandbox_backend: None,
+            env_name: None,
             activity: ActivityState::None,
             visible: true,
             collapsed: false,
@@ -976,8 +996,15 @@ mod tests {
             path: "/wt/other-feat-x".into(),
             folder_id: None,
             sandbox_backend: None,
+            env_name: Some("company-k8s".into()),
         }];
         let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &dbw, &[]);
+        // The DB worktree's selected env flows onto its (unloaded-workspace) row.
+        let feat = rows
+            .iter()
+            .find(|r| r.workspace_slug == "other" && r.label == "feat-x")
+            .unwrap();
+        assert_eq!(feat.env_name.as_deref(), Some("company-k8s"));
         let labels: Vec<(&str, &str)> = rows
             .iter()
             .map(|r| (r.workspace_slug.as_str(), r.label.as_str()))
@@ -1182,6 +1209,7 @@ mod tests {
                 path: "/wt/zebra".into(),
                 folder_id: None,
                 sandbox_backend: None,
+                env_name: None,
             },
             DbWorktree {
                 slug: "app".into(),
@@ -1191,6 +1219,7 @@ mod tests {
                 path: "/wt/alpha".into(),
                 folder_id: None,
                 sandbox_backend: None,
+                env_name: None,
             },
         ];
         let rows = build_rows(&s, &ws, &ViewState::default(), &no_activity(), &dbw, &[]);
