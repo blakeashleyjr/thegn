@@ -154,16 +154,15 @@ fn context_hints(
     }
 
     for action in resolved {
-        if action
+        if (action
             .contexts
             .contains(&superzej_core::keymap::Context::Global)
-            || action.contexts.contains(&focus_context)
+            || action.contexts.contains(&focus_context))
+            && seen.insert(action.hint.clone())
+            && !action.hint.is_empty()
+            && let Some(chord) = action.chords.first()
         {
-            if seen.insert(action.hint.clone()) && !action.hint.is_empty() {
-                if let Some(chord) = action.chords.first() {
-                    out.push((chord.to_kdl().to_string(), action.hint.clone()));
-                }
-            }
+            out.push((chord.to_kdl().to_string(), action.hint.clone()));
         }
     }
 
@@ -6174,7 +6173,7 @@ async fn ensure_app_loaded(
     _app_tx: &tokio_mpsc::UnboundedSender<usize>,
     _waker: &TerminalWaker,
     _current_config: &superzej_core::config::Config,
-    _event_bus: &superzej_core::event_bus::EventBus,
+    event_bus: &superzej_core::event_bus::EventBus,
 ) -> bool {
     let crate::apps::ActiveApp::Tile(i) = target else {
         return true;
@@ -6182,6 +6181,15 @@ async fn ensure_app_loaded(
     if !matches!(app_host.slots[i].state, crate::apps::SlotState::Unloaded) {
         return true;
     }
+    let slot = &mut app_host.slots[i];
+    if slot.id == "agent" {
+        let (mcp_transport, _rx) =
+            crate::apps::agent::AgentMcpTransport::new(std::sync::Arc::new(event_bus.clone()));
+        let ui = Box::new(crate::apps::agent::AgentUi { mcp_transport });
+        slot.state = crate::apps::SlotState::Running(ui);
+        return true;
+    }
+
     // No embedded app builders are registered today, so a tile target can't be
     // constructed (`AppHost::from_config` never produces tile slots). When a
     // builder is added, construct the tile here and store it as `Running`.
@@ -8955,15 +8963,15 @@ async fn event_loop<T: Terminal>(
                     };
                     if let (Some(content), Some(p)) = (target, panes.table.get(&sp)) {
                         crate::compositor::compose_pane(&mut scratch, p.emulator(), content);
-                        if let Some((sel_pane, sel)) = &mouse_sel {
-                            if *sel_pane == sp {
-                                crate::compositor::overlay_selection(
-                                    &mut scratch,
-                                    content,
-                                    sel,
-                                    crate::chrome::col(crate::chrome::S::Panel2),
-                                );
-                            }
+                        if let Some((sel_pane, sel)) = &mouse_sel
+                            && *sel_pane == sp
+                        {
+                            crate::compositor::overlay_selection(
+                                &mut scratch,
+                                content,
+                                sel,
+                                crate::chrome::col(crate::chrome::S::Panel2),
+                            );
                         }
                     }
                 }
