@@ -104,6 +104,11 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::ci::Action,
     },
+    /// Theme interactive switcher.
+    Theme {
+        #[command(subcommand)]
+        action: cmd::theme::Action,
+    },
     /// Emit a syntax-highlighted diff of a worktree against its branch point.
     Diff {
         #[arg(long)]
@@ -205,6 +210,10 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Pr { action } => cmd::pr::run(action),
         Command::Issue { action } => cmd::issue::run(action),
         Command::Ci { action } => cmd::ci::run(&cfg, action),
+        Command::Theme { action } => {
+            let p = superzej_core::config::Config::path();
+            cmd::theme::run(&cfg, action, p)
+        }
         Command::Diff {
             worktree,
             base,
