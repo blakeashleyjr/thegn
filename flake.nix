@@ -179,10 +179,9 @@
             treefmtWrapper
             # line-coverage for `just coverage`
             cargo-llvm-cov
-            # linters
+            # linters (taplo/yamlfmt etc. come via fmtPackages below)
             shellcheck
             yamllint
-            taplo
             # startup benchmarks (`just bench`)
             hyperfine
             # pty visual-regression harnesses (test/*.py reconstruct the screen)
@@ -200,7 +199,13 @@
           # The same pinned yazi as the package, so the drawer's preview tools
           # resolve on PATH and `just host` runs the version superzej ships.
           ++ [yaziPinned]
-          ++ yaziDeps;
+          ++ yaziDeps
+          # Every formatter binary directly on PATH (rustfmt/alejandra/shfmt/
+          # taplo/yamlfmt/prettier), not just behind the `treefmt` wrapper. Lets
+          # `treefmt --config-file treefmt.toml` and ad-hoc per-file formatting run
+          # from already-realized store paths — so a read-only-/nix/store sandbox
+          # (e.g. the agent shell) can format without building anything.
+          ++ fmtPackages;
         shellHook = ''
           export PATH="$PWD/target/debug:$PATH"
           # Point dev superzej at the pinned yazi (the package wires this too).
