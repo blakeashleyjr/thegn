@@ -280,7 +280,7 @@ mod spec {
 
     #[test]
     fn single_provider_back_compat() {
-        let cfg = superzej_core::config::IssuesConfig {
+        let cfg = IssuesConfig {
             provider: IssueProviderKind::Linear,
             ..Default::default()
         };
