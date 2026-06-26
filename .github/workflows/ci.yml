@@ -22,10 +22,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          # Check out the branch HEAD on a real ref (not the detached
-          # refs/pull/N/merge), so git self-tests that read the ambient repo see
-          # a normal branch. Falls back to the pushed ref for push events.
-          ref: ${{ github.head_ref || github.ref }}
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
@@ -36,10 +32,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          # Check out the branch HEAD on a real ref (not the detached
-          # refs/pull/N/merge), so git self-tests that read the ambient repo see
-          # a normal branch. Falls back to the pushed ref for push events.
-          ref: ${{ github.head_ref || github.ref }}
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
@@ -50,13 +42,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          # Check out the branch HEAD on a real ref (not the detached
-          # refs/pull/N/merge), so git self-tests that read the ambient repo see
-          # a normal branch. Falls back to the pushed ref for push events.
-          ref: ${{ github.head_ref || github.ref }}
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      # The svc git tests create temp repos; their bare "remote" is made with
+      # `git init --bare` (no -b), so a fresh runner's default `master` breaks
+      # origin/main tracking. Give the runner the `main` default + an identity.
+      - name: git defaults for the svc git tests
+        run: |
+          git config --global init.defaultBranch main
+          git config --global user.email ci@superzej.local
+          git config --global user.name "superzej CI"
       - run: nix develop --command just test
   doc:
     runs-on: ubuntu-latest
@@ -64,10 +60,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          # Check out the branch HEAD on a real ref (not the detached
-          # refs/pull/N/merge), so git self-tests that read the ambient repo see
-          # a normal branch. Falls back to the pushed ref for push events.
-          ref: ${{ github.head_ref || github.ref }}
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
@@ -78,10 +70,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          # Check out the branch HEAD on a real ref (not the detached
-          # refs/pull/N/merge), so git self-tests that read the ambient repo see
-          # a normal branch. Falls back to the pushed ref for push events.
-          ref: ${{ github.head_ref || github.ref }}
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
@@ -92,10 +80,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          # Check out the branch HEAD on a real ref (not the detached
-          # refs/pull/N/merge), so git self-tests that read the ambient repo see
-          # a normal branch. Falls back to the pushed ref for push events.
-          ref: ${{ github.head_ref || github.ref }}
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
@@ -106,10 +90,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          # Check out the branch HEAD on a real ref (not the detached
-          # refs/pull/N/merge), so git self-tests that read the ambient repo see
-          # a normal branch. Falls back to the pushed ref for push events.
-          ref: ${{ github.head_ref || github.ref }}
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
@@ -121,10 +101,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          # Check out the branch HEAD on a real ref (not the detached
-          # refs/pull/N/merge), so git self-tests that read the ambient repo see
-          # a normal branch. Falls back to the pushed ref for push events.
-          ref: ${{ github.head_ref || github.ref }}
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
@@ -135,10 +111,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          # Check out the branch HEAD on a real ref (not the detached
-          # refs/pull/N/merge), so git self-tests that read the ambient repo see
-          # a normal branch. Falls back to the pushed ref for push events.
-          ref: ${{ github.head_ref || github.ref }}
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
@@ -153,10 +125,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          # Check out the branch HEAD on a real ref (not the detached
-          # refs/pull/N/merge), so git self-tests that read the ambient repo see
-          # a normal branch. Falls back to the pushed ref for push events.
-          ref: ${{ github.head_ref || github.ref }}
       - uses: ./.github/actions/ci-setup
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
