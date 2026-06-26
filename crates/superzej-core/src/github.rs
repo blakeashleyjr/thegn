@@ -364,6 +364,56 @@ pub fn pr_list(loc: &GitLoc, limit: usize) -> Result<Vec<PrHeader>, GhError> {
     Ok(parse_pr_headers(&json))
 }
 
+/// One PR from a cross-repo `gh search prs` — the unified "My Work" feed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrSearchRow {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub repository: PrSearchRepo,
+}
+
+/// The `repository` object in a `gh search prs` row.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct PrSearchRepo {
+    #[serde(rename = "nameWithOwner", default)]
+    pub name_with_owner: String,
+}
+
+/// Parse the JSON array from `gh search prs --json …` (empty on mismatch).
+pub fn parse_pr_search(json: &str) -> Vec<PrSearchRow> {
+    serde_json::from_str(json).unwrap_or_default()
+}
+
+/// Cross-repo PR search for the unified work feed. `role_flag` is a single
+/// `gh search prs` selector such as `"--review-requested=@me"` or
+/// `"--author=@me"`; results are restricted to open PRs. Repo-agnostic (uses
+/// `loc` only for the `gh` invocation context).
+pub fn search_prs(
+    loc: &GitLoc,
+    role_flag: &str,
+    limit: usize,
+) -> Result<Vec<PrSearchRow>, GhError> {
+    let limit = limit.to_string();
+    let json = gh_out(
+        loc,
+        &[
+            "search",
+            "prs",
+            role_flag,
+            "--state=open",
+            "--json",
+            "number,title,url,state,repository",
+            "--limit",
+            &limit,
+        ],
+    )?;
+    Ok(parse_pr_search(&json))
+}
+
 /// Open the PR belonging to `branch` in the browser
 /// (`gh pr view <branch> --web`) — the fallback when no cached URL exists.
 pub fn open_pr_for_branch(loc: &GitLoc, branch: &str) -> Result<(), GhError> {
@@ -656,6 +706,23 @@ pub fn describe(e: &GhError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_pr_search_reads_repo_with_owner() {
+        let json = r#"[
+            {"number":42,"title":"Fix bug","url":"https://github.com/acme/widget/pull/42",
+             "state":"OPEN","repository":{"name":"widget","nameWithOwner":"acme/widget"}},
+            {"number":7,"title":"Docs","url":"https://github.com/acme/site/pull/7",
+             "state":"OPEN","repository":{"nameWithOwner":"acme/site"}}
+        ]"#;
+        let rows = parse_pr_search(json);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].number, 42);
+        assert_eq!(rows[0].repository.name_with_owner, "acme/widget");
+        assert_eq!(rows[1].title, "Docs");
+        // Malformed input degrades to empty, never panics.
+        assert!(parse_pr_search("not json").is_empty());
+    }
 
     fn cr(status: &str, conclusion: Option<&str>, state: Option<&str>) -> CheckRun {
         CheckRun {
