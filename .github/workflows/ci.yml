@@ -1,9 +1,14 @@
 name: ci
 # First CI in the repo. The Linux job runs the canonical `just ci` gate; the
-# macOS (Apple-silicon) job runs a build/test/lint subset to keep the
+# macOS (Apple-silicon) job runs a trimmed build+test subset to keep the
 # aarch64-darwin host build — and the Apple `container` backend — green.
-# NOTE: the macOS job is unvalidated until it first runs on GitHub; expect to
-# tune it (toolchain, apps/ path deps, runner image) on the first push.
+#
+# Both jobs use `nix develop`, whose flake pulls PRIVATE inputs (muse,
+# termite-chat). The GitHub-provided token can't read other private repos, so
+# nix is given `access-tokens` from the NIX_GITHUB_TOKEN secret — a fine-grained
+# PAT with read access to muse + termite-chat (+ this repo). Until that secret is
+# set the token is empty and the private fetches 404; create it under
+# Settings → Secrets and variables → Actions.
 on:
   push:
     branches: [main]
@@ -19,20 +24,27 @@ jobs:
         with:
           submodules: recursive
       - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            access-tokens = github.com=${{ secrets.NIX_GITHUB_TOKEN }}
       - uses: DeterminateSystems/magic-nix-cache-action@main
       - name: just ci
         run: nix develop --command just ci
   macos:
     # macos-14 is the GitHub-hosted Apple-silicon (M1) image. Apple's `container`
     # runtime needs macOS 26 + Apple silicon; the hosted image cannot exercise it
-    # at runtime, so this job covers the build/unit-test/lint surface only —
-    # end-to-end `apple` backend verification is the on-device checklist (§AV).
+    # at runtime, so this job only covers the build + unit-test surface (lint and
+    # the heavier nix-build/coverage/smoke stay on the Linux job) to finish fast
+    # — end-to-end `apple` backend verification is the on-device checklist (§AV).
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
       - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            access-tokens = github.com=${{ secrets.NIX_GITHUB_TOKEN }}
       - uses: DeterminateSystems/magic-nix-cache-action@main
-      - name: build + test + lint (macOS subset)
-        run: nix develop --command bash -lc "just build && just test && just lint"
+      - name: build + test (macOS subset)
+        run: nix develop --command bash -lc "just build && just test"
