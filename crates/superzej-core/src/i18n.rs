@@ -1,6 +1,6 @@
 //! Zero-cost translation layer for the UI.
 
-use fluent_templates::{Loader, static_loader};
+use fluent_templates::static_loader;
 use once_cell::sync::OnceCell;
 use unic_langid::LanguageIdentifier;
 
@@ -80,6 +80,8 @@ macro_rules! t {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(test)]
+    use fluent_templates::Loader;
 
     #[test]
     fn test_i18n_fallback() {

@@ -2063,7 +2063,7 @@ fn draw_columns_frame(surface: &mut Surface, chrome: &crate::layout::ChromeLayou
         let line = "\u{2500}".repeat(chrome.divider.cols);
         draw_text(
             surface,
-            0,
+            chrome.divider.x,
             chrome.divider.y,
             &line,
             col(S::Border),
