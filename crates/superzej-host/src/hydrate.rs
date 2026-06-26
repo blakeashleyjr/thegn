@@ -863,6 +863,7 @@ pub(crate) fn build_model(
 
     let sidebar_workspaces = workspace_list(session, Some(db));
     let sidebar_db_worktrees = db_worktree_list(db);
+    let sidebar_db_terminals = db.terminals().unwrap_or_default();
     let sidebar_status = collect_sidebar_status(session, db, &alert_kinds, &counted_kinds);
     let loc_count = worktree_loc(db, &cwd);
 
@@ -884,6 +885,10 @@ pub(crate) fn build_model(
         active_tab,
         sidebar_workspaces,
         sidebar_db_worktrees,
+        sidebar_db_folders: db
+            .folders_for_workspace(&cwd.to_string_lossy())
+            .unwrap_or_default(),
+        sidebar_db_terminals,
         sidebar_status,
         loc: loc_count,
         active_container_name: superzej_core::sandbox::container_name_with_profile(

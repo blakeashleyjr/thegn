@@ -33,6 +33,7 @@ pub enum Action {
     NewWorktree,
     NewWorkspace,
     DeleteWorkspace,
+    NewTerminal,
     NewTab,
     /// Zellij-style smart split: along the focused pane's longer dimension.
     NewPane,
@@ -726,6 +727,7 @@ impl Action {
             Action::NewWorktree => "new-worktree",
             Action::NewWorkspace => "new-workspace",
             Action::DeleteWorkspace => "delete-workspace",
+            Action::NewTerminal => "new-terminal",
             Action::NewTab => "new-tab",
             Action::NewPane => "new-pane",
             Action::ToggleZoom => "zoom",
@@ -799,6 +801,7 @@ impl Action {
             "new-worktree" => Action::NewWorktree,
             "new-workspace" => Action::NewWorkspace,
             "delete-workspace" => Action::DeleteWorkspace,
+            "new-terminal" => Action::NewTerminal,
             "new-tab" => Action::NewTab,
             "new-pane" => Action::NewPane,
             "zoom" | "toggle-zoom" | "fullscreen" => Action::ToggleZoom,
@@ -1252,6 +1255,7 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Alt W", Action::NewWorkspace).unwrap();
     map.insert_all("Alt Shift X", Action::DeleteWorkspace)
         .unwrap();
+    map.insert_all("Alt T", Action::NewTerminal).unwrap();
     map.insert_all("Alt t", Action::NewTab).unwrap();
     map.insert_all("Alt p", Action::NewPane).unwrap();
     map.insert_all("Ctrl Alt z", Action::ToggleZoom).unwrap();
@@ -1354,6 +1358,8 @@ pub fn default_keymap() -> KeyMap {
     map.insert(Mode::VimNormal, "Space W", Action::NewWorkspace)
         .unwrap();
     map.insert(Mode::VimNormal, "Space X", Action::DeleteWorkspace)
+        .unwrap();
+    map.insert(Mode::VimNormal, "Space T", Action::NewTerminal)
         .unwrap();
     map.insert(Mode::VimNormal, "Space t", Action::NewTab)
         .unwrap();

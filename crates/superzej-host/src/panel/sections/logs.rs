@@ -9,14 +9,13 @@ use superzej_core::log::parser::{LogLevel as ParserLogLevel, ParsedLog};
 use superzej_core::log_view::{LogLevel as ViewLogLevel, LogLine};
 use superzej_core::theme::Hue;
 
-use crate::seg::{Line, Seg, seg};
+use crate::seg::{Line, seg};
 
-use super::{
-    PanelHit, PanelRow, Section, SectionCtx, ac, d, g, g2, g3, hint_row, hue, rule, t, two_col,
-};
+use super::{PanelRow, SectionCtx, ac, d, g, g2, g3, hint_row, hue, rule, t};
 
 // ---- helpers ----------------------------------------------------------------
 
+#[allow(dead_code)]
 fn level_hue(l: ViewLogLevel) -> crate::seg::Tok {
     match l {
         ViewLogLevel::Error => hue(Hue::Red),
@@ -27,6 +26,7 @@ fn level_hue(l: ViewLogLevel) -> crate::seg::Tok {
     }
 }
 
+#[allow(dead_code)]
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -36,6 +36,7 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// Lines visible under the current level gate and text filter.
+#[allow(dead_code)]
 fn visible_lines<'a>(ctx: &'a SectionCtx) -> Vec<&'a LogLine> {
     let filter = ctx.ui.logs_filter.to_lowercase();
     ctx.model
@@ -49,6 +50,7 @@ fn visible_lines<'a>(ctx: &'a SectionCtx) -> Vec<&'a LogLine> {
         .collect()
 }
 
+#[allow(dead_code)]
 fn filter_bar(ctx: &SectionCtx) -> PanelRow {
     PanelRow::plain(Line::segs(vec![
         seg(ac(), "❯ "),
@@ -57,6 +59,7 @@ fn filter_bar(ctx: &SectionCtx) -> PanelRow {
     ]))
 }
 
+#[allow(dead_code)]
 fn level_label(level: Option<ViewLogLevel>) -> &'static str {
     match level {
         None => "all",
@@ -70,6 +73,7 @@ fn level_label(level: Option<ViewLogLevel>) -> &'static str {
 
 // ---- empty state ------------------------------------------------------------
 
+#[allow(dead_code)]
 fn empty_view() -> Vec<PanelRow> {
     vec![
         PanelRow::plain(Line::segs(vec![seg(g2(), "no log data")])),
@@ -117,12 +121,12 @@ pub fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     let mut visible = items.iter().rev().take(body_rows).collect::<Vec<_>>();
     visible.reverse();
 
-    for (i, log) in visible.iter().enumerate() {
+    for log in visible.iter() {
         let ts = log.timestamp.clone();
         let lvl = format!("{:?}", log.level);
         let msg = &log.message;
 
-        let mut text = vec![
+        let text = vec![
             seg(g2(), format!("{ts} ")),
             seg(
                 match log.level {

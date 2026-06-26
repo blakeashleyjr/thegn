@@ -75,12 +75,44 @@ fn resolve_pane_shell(shell_env: Option<String>) -> String {
     "/bin/sh".into()
 }
 
-fn pane_shell_argv() -> Vec<String> {
-    let shell = resolve_pane_shell(std::env::var("SHELL").ok());
-    let login = std::env::var("SUPERZEJ_LOGIN_SHELL")
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false);
-    shell_argv_from(&shell, login)
+pub(crate) fn pane_shell_argv(
+    _cfg: &superzej_core::config::Config,
+    terminal_connection: &str,
+) -> (String, Vec<String>) {
+    let raw = if terminal_connection.is_empty() {
+        let shell = resolve_pane_shell(std::env::var("SHELL").ok());
+        let login = std::env::var("SUPERZEJ_LOGIN_SHELL")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false);
+        shell_argv_from(&shell, login)
+    } else {
+        // SSH / Mosh connection
+        let mut v = vec![];
+        if terminal_connection.starts_with("mosh ") {
+            v.push("mosh".to_string());
+            v.push(
+                terminal_connection
+                    .strip_prefix("mosh ")
+                    .unwrap_or("")
+                    .to_string(),
+            );
+        } else {
+            v.push("ssh".to_string());
+            v.push(
+                terminal_connection
+                    .strip_prefix("ssh ")
+                    .unwrap_or(terminal_connection)
+                    .to_string(),
+            );
+        }
+        v
+    };
+    if raw.is_empty() {
+        return ("sh".to_string(), vec![]);
+    }
+    let exe = raw[0].clone();
+    let args = raw.into_iter().skip(1).collect();
+    (exe, args)
 }
 
 pub(crate) fn tool_drawer_argv(command: &str) -> Vec<String> {
@@ -178,8 +210,15 @@ impl Panes {
     }
 
     /// Spawn one shell pane in `cwd`, sized to `center`; returns its id.
-    pub(crate) fn spawn(&mut self, cwd: Option<&std::path::Path>, center: Rect) -> Result<u32> {
-        let argv = pane_shell_argv();
+    pub(crate) fn spawn(
+        &mut self,
+        cfg: &superzej_core::config::Config,
+        cwd: Option<&std::path::Path>,
+        center: Rect,
+    ) -> Result<u32> {
+        let (cmd, args) = pane_shell_argv(cfg, "");
+        let mut argv = vec![cmd];
+        argv.extend(args);
         self.spawn_argv(&argv, cwd, center)
     }
 
@@ -638,7 +677,13 @@ mod tests {
                     panes.table.remove(&id);
                 }
             } else {
-                let p = panes.spawn(None, chrome.center).ok();
+                let p = panes
+                    .spawn(
+                        &superzej_core::config::Config::default(),
+                        None,
+                        chrome.center,
+                    )
+                    .ok();
                 if let Some(id) = p {
                     *drawer = Some(id);
                 }
@@ -726,7 +771,13 @@ mod tests {
         let mut panes = Panes::new(tx);
         let chrome = layout::compute(80, 24, false, false);
 
-        let id = panes.spawn(None, chrome.center).expect("spawn");
+        let id = panes
+            .spawn(
+                &superzej_core::config::Config::default(),
+                None,
+                chrome.center,
+            )
+            .expect("spawn");
 
         // pane_age returns Some(duration) right after spawn.
         let age = panes.pane_age(id);
