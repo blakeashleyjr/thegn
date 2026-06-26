@@ -24,6 +24,7 @@ pub mod github;
 pub mod gitrefs;
 pub mod gitviz;
 pub mod history;
+pub mod i18n;
 pub mod issue;
 pub mod keymap;
 pub mod log;
