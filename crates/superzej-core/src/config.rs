@@ -1064,14 +1064,24 @@ impl Default for PrConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct IssuesConfig {
-    /// Active provider. `"none"` disables the integration.
+    /// Active provider. `"none"` disables the integration. Kept for back-compat;
+    /// when `providers` is non-empty it takes precedence over this single value.
     pub provider: IssueProviderKind,
+    /// Active providers to aggregate simultaneously, e.g. `["linear", "jira"]`.
+    /// When non-empty this wins over the single `provider`; when empty the lone
+    /// `provider` is used. Lets a developer track Linear *and* Jira at once.
+    #[serde(default)]
+    pub providers: Vec<IssueProviderKind>,
     /// Cache TTL (seconds) before a background re-fetch.
     pub ttl_secs: u64,
     /// Maximum issues to fetch and display.
     pub max_issues: usize,
     /// Pre-filter to issues assigned to the authenticated user.
     pub filter_assignee_me: bool,
+    /// When a worktree's PR merges, move its linked issue to Done on the tracker.
+    /// Off by default — issue lifecycle stays manual unless opted in.
+    #[serde(default)]
+    pub move_on_merge: bool,
     pub linear: LinearConfig,
     pub github_issues: GitHubIssuesConfig,
     pub jira: JiraConfig,
@@ -1081,13 +1091,35 @@ impl Default for IssuesConfig {
     fn default() -> Self {
         IssuesConfig {
             provider: IssueProviderKind::None,
+            providers: Vec::new(),
             ttl_secs: 60,
             max_issues: 100,
             filter_assignee_me: true,
+            move_on_merge: false,
             linear: LinearConfig::default(),
             github_issues: GitHubIssuesConfig::default(),
             jira: JiraConfig::default(),
         }
+    }
+}
+
+impl IssuesConfig {
+    /// The effective set of providers to aggregate, in config order, with `None`
+    /// removed and duplicates collapsed. When `providers` is non-empty it wins;
+    /// otherwise the single legacy `provider` is used (unless it is `None`).
+    pub fn active_providers(&self) -> Vec<IssueProviderKind> {
+        let raw: &[IssueProviderKind] = if self.providers.is_empty() {
+            std::slice::from_ref(&self.provider)
+        } else {
+            &self.providers
+        };
+        let mut out: Vec<IssueProviderKind> = Vec::new();
+        for &p in raw {
+            if p != IssueProviderKind::None && !out.contains(&p) {
+                out.push(p);
+            }
+        }
+        out
     }
 }
 
@@ -4422,6 +4454,53 @@ forward_agent = false
         assert!(cfg.issues.filter_assignee_me);
         assert_eq!(cfg.issues.linear.api_key, "env:LINEAR_API_KEY");
         assert_eq!(cfg.issues.jira.api_token, "env:JIRA_API_TOKEN");
+        assert!(cfg.issues.providers.is_empty());
+        assert!(cfg.issues.active_providers().is_empty());
+    }
+
+    #[test]
+    fn active_providers_back_compat_single() {
+        // Legacy single `provider` is honored when `providers` is empty.
+        let mut cfg = IssuesConfig::default();
+        cfg.provider = IssueProviderKind::Linear;
+        assert_eq!(cfg.active_providers(), vec![IssueProviderKind::Linear]);
+        // `none` yields an empty set, not a [None] entry.
+        cfg.provider = IssueProviderKind::None;
+        assert!(cfg.active_providers().is_empty());
+    }
+
+    #[test]
+    fn active_providers_multi_wins_and_dedups() {
+        let mut cfg = IssuesConfig::default();
+        // Single provider is overridden once the plural list is set.
+        cfg.provider = IssueProviderKind::Github;
+        cfg.providers = vec![
+            IssueProviderKind::Linear,
+            IssueProviderKind::Jira,
+            IssueProviderKind::Linear, // duplicate collapses
+            IssueProviderKind::None,   // None filtered out
+        ];
+        assert_eq!(
+            cfg.active_providers(),
+            vec![IssueProviderKind::Linear, IssueProviderKind::Jira]
+        );
+    }
+
+    #[test]
+    fn issues_multi_provider_table_parses() {
+        let toml = r#"
+            [issues]
+            providers = ["linear", "jira"]
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.issues.providers,
+            vec![IssueProviderKind::Linear, IssueProviderKind::Jira]
+        );
+        assert_eq!(
+            cfg.issues.active_providers(),
+            vec![IssueProviderKind::Linear, IssueProviderKind::Jira]
+        );
     }
 
     #[test]

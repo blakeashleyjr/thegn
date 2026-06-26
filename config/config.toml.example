@@ -186,6 +186,35 @@ prewarm = false
 [pr]
 ttl_secs = 30          # cache TTL before a live `gh` re-fetch (SUPERZEJ_PR_TTL)
 
+# Issue-tracker integration — surfaces assigned issues in the Work tab's `issues`
+# section. Multiple trackers aggregate into one list, so you can run, say, Linear
+# for product work and Jira for a client at the same time.
+[issues]
+# `providers` aggregates several trackers at once (recommended). When set it wins
+# over the single `provider`. Valid: "linear", "github", "jira".
+#   providers = ["linear", "jira"]
+providers = []
+# `provider` is the legacy single-tracker form, used only when `providers` is empty.
+provider = "none"            # "none" disables the integration
+ttl_secs = 60                # cache TTL before a background re-fetch
+max_issues = 100             # cap on issues fetched/displayed (per provider)
+filter_assignee_me = true    # pre-filter to issues assigned to you
+move_on_merge = false        # when a worktree's PR merges, move its linked issue to Done
+
+# [issues.linear]
+# api_key = "env:LINEAR_API_KEY"  # `env:VAR` reads from the environment
+# team_id = ""                    # restrict to one team ("" = all)
+# workspace_slug = ""             # used for issue URLs (inferred if empty)
+
+# [issues.github_issues]
+# extra_flags = ["--assignee", "@me"]  # extra `gh issue list` flags
+
+# [issues.jira]
+# base_url = "https://myorg.atlassian.net"
+# email = "me@myorg.com"
+# api_token = "env:JIRA_API_TOKEN"
+# project_key = ""                # restrict to one project ("" = all)
+
 # Top-level app tab strip. Only "work" (your worktree IDE) is available today;
 # unknown ids are ignored.
 # Valid ids: "work".
@@ -566,8 +595,10 @@ visible = true
 # `sections` reorders sections across all tabs — any section left out is hidden;
 # an empty/absent list shows every section in the built-in order:
 #   Git tab:    changes · commits · branches · stash · files
-#   Work tab:   pr · issues · jobs · tests
+#   Work tab:   mine · pr · issues · problems · jobs · tests · symbols
 #   System tab: notifications · logs · sandbox · telemetry · keys
+# "mine" is the unified cross-repo "My Work" feed (assigned issues across all
+# trackers + review-requested/authored PRs + high-priority notifications).
 # The old "prs" and "tasks" keys still work as aliases for "pr" and "jobs".
 # Unknown keys are ignored; reloads apply live.
 [panel]

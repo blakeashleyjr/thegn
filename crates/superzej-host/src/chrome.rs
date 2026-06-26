@@ -1829,6 +1829,13 @@ pub(crate) fn panel_help_pairs(ui: &crate::panel::PanelUi) -> Vec<(String, Strin
         Section::Changes | Section::Commits | Section::Branches | Section::Stash => {
             unreachable!("git-family sections returned above")
         }
+        Section::Mine => &[
+            ("j/k", "row"),
+            ("↵", "open"),
+            ("b", "branch"),
+            ("o", "browser"),
+            ("R", "refresh"),
+        ],
         Section::Pr => &[
             ("j/k", "row"),
             ("M", "merge"),

@@ -19,6 +19,7 @@ mod issues;
 mod keys;
 mod logs;
 mod misc;
+pub(crate) mod my_work;
 mod notifications;
 mod problems;
 mod stash;
@@ -398,6 +399,24 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
             }
         }
         Section::Keys => vec![seg(g2(), "?")],
+        Section::Mine => {
+            let rows = &model.panel.my_work;
+            if rows.is_empty() {
+                vec![seg(g2(), "clear")]
+            } else {
+                use superzej_core::work::WorkGroup;
+                let reviews = rows
+                    .iter()
+                    .filter(|r| r.group == WorkGroup::ReviewRequested)
+                    .count();
+                let mut v = vec![seg(g(), rows.len().to_string())];
+                if reviews > 0 {
+                    v.push(seg(g(), " · "));
+                    v.push(seg(hue(Hue::Amber), format!("⊙{reviews} rev")));
+                }
+                v
+            }
+        }
         Section::Issues => {
             let n = model.panel.tracker_issues.len();
             let open = model
@@ -540,6 +559,7 @@ pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
         Section::Db => misc::db(),
         Section::Telemetry => telemetry::content(ctx),
         Section::Keys => keys::content(ctx),
+        Section::Mine => my_work::content(ctx),
         Section::Issues => issues::content(ctx),
         Section::Notifications => notifications::content(ctx),
         Section::Logs => logs::content(ctx),

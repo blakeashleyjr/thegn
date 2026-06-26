@@ -43,7 +43,7 @@ use std::path::PathBuf;
 /// source of truth for sidebar workspace order (was recency). Backfilled from
 /// the prior `last_active DESC` order so the first launch after upgrade looks
 /// unchanged; thereafter order is manual (Ctrl+Alt+↑/↓) and stable.
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 
 pub struct Db {
     conn: Connection,
@@ -351,6 +351,16 @@ impl Db {
               fetched_at INTEGER NOT NULL,
               PRIMARY KEY (repo_root, provider)
             );
+            -- v18: the unified "My Work" feed — a single global row (id=0) of
+            -- `Vec<WorkRow>` JSON aggregating assigned issues (all providers),
+            -- review-requested / authored PRs (cross-repo `gh search`), and
+            -- high-priority notifications. Not per-repo: it spans every repo the
+            -- user touches, refreshed on a background worker.
+            CREATE TABLE IF NOT EXISTS my_work_cache (
+              id         INTEGER PRIMARY KEY CHECK (id = 0),
+              json       TEXT    NOT NULL,
+              fetched_at INTEGER NOT NULL
+            );
             -- v11: notification inbox. Rows accumulate from the diff engine;
             -- the panel inbox marks them read.
             CREATE TABLE IF NOT EXISTS notifications (
@@ -638,12 +648,51 @@ impl Db {
         Ok(r)
     }
 
+    /// All cached provider payloads for a repo, as `(provider, json)` pairs.
+    /// Lets `build_model` load every configured tracker at once for the unified
+    /// (multi-provider) Issues view.
+    pub fn get_all_issue_cache(&self, repo_root: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT provider, json FROM issue_cache WHERE repo_root=?1")?;
+        let rows = stmt.query_map(params![repo_root], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     pub fn put_issue_cache(&self, repo_root: &str, provider: &str, json: &str) -> Result<()> {
         self.conn.execute(
             r#"INSERT INTO issue_cache(repo_root,provider,json,fetched_at)
                VALUES(?1,?2,?3,?4)
                ON CONFLICT(repo_root,provider) DO UPDATE SET json=?3, fetched_at=?4"#,
             params![repo_root, provider, json, util::now()],
+        )?;
+        Ok(())
+    }
+
+    // --- unified "My Work" feed (single global row) -------------------------
+    /// The cached "My Work" payload (`Vec<WorkRow>` JSON) with its fetch time,
+    /// or `None` when never refreshed.
+    pub fn get_my_work_cache(&self) -> Result<Option<(String, i64)>> {
+        let r = self
+            .conn
+            .query_row(
+                "SELECT json, fetched_at FROM my_work_cache WHERE id=0",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .ok();
+        Ok(r)
+    }
+
+    /// Replace the cached "My Work" payload.
+    pub fn put_my_work_cache(&self, json: &str) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO my_work_cache(id,json,fetched_at)
+               VALUES(0,?1,?2)
+               ON CONFLICT(id) DO UPDATE SET json=?1, fetched_at=?2"#,
+            params![json, util::now()],
         )?;
         Ok(())
     }
@@ -2336,6 +2385,39 @@ mod tests {
 
     fn db() -> Db {
         Db::open_memory().unwrap()
+    }
+
+    #[test]
+    fn get_all_issue_cache_returns_every_provider_for_a_repo() {
+        let db = db();
+        assert!(db.get_all_issue_cache("/repo").unwrap().is_empty());
+        db.put_issue_cache("/repo", "linear", "[1]").unwrap();
+        db.put_issue_cache("/repo", "jira", "[2]").unwrap();
+        db.put_issue_cache("/other", "github", "[3]").unwrap();
+        let mut got = db.get_all_issue_cache("/repo").unwrap();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("jira".to_string(), "[2]".to_string()),
+                ("linear".to_string(), "[1]".to_string()),
+            ]
+        );
+        // A different repo's providers are not mixed in.
+        assert_eq!(db.get_all_issue_cache("/other").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn my_work_cache_roundtrips_single_row() {
+        let db = db();
+        assert!(db.get_my_work_cache().unwrap().is_none());
+        db.put_my_work_cache(r#"[{"n":1}]"#).unwrap();
+        let (json, fetched) = db.get_my_work_cache().unwrap().unwrap();
+        assert_eq!(json, r#"[{"n":1}]"#);
+        assert!(fetched > 0);
+        // A second put replaces (not appends) — the table holds one global row.
+        db.put_my_work_cache(r#"[{"n":2}]"#).unwrap();
+        assert_eq!(db.get_my_work_cache().unwrap().unwrap().0, r#"[{"n":2}]"#);
     }
 
     #[test]
