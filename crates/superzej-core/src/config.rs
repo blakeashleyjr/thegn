@@ -6001,16 +6001,9 @@ transport = \"ssh\"
         assert!(s.enabled);
         assert_eq!(s.backend, SandboxBackend::Auto);
         assert_eq!(s.default_backend, SandboxBackend::Auto);
-        assert_eq!(
-            s.backend_chain,
-            vec![
-                "podman-rootless",
-                "podman-rootful",
-                "docker",
-                "bwrap",
-                "host"
-            ]
-        );
+        // Platform-aware default (Linux: podman/docker/bwrap/host; macOS:
+        // apple/docker/host) — assert against the helper, not a fixed list.
+        assert_eq!(s.backend_chain, default_backend_chain());
         assert!(s.image.is_empty());
         assert!(s.env_passthrough.contains(&"SSH_AUTH_SOCK".to_string()));
         assert!(s.env_passthrough.contains(&"GH_TOKEN".to_string()));

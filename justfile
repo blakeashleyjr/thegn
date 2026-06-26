@@ -10,9 +10,12 @@ bin := "target/debug/szhost"
 # the daily DB. Specs further isolate XDG_STATE_HOME per case via case_tmp_env.
 _e2e_env := '''
 set -euo pipefail
-_tmp="$(mktemp -d)"; trap 'rm -rf "$_tmp"' EXIT
+_tmp="$(mktemp -d)"; trap 'rm -rf "$_tmp" 2>/dev/null || true' EXIT
 export HOME="$_tmp/home" XDG_CONFIG_HOME="$_tmp/config" XDG_STATE_HOME="$_tmp/state"
 export GIT_CONFIG_GLOBAL="$_tmp/gitconfig" GIT_CONFIG_SYSTEM=/dev/null
+# Don't spawn real per-worktree sandboxes during visual tests — podman leaves
+# root/subuid-owned overlay files the cleanup can't remove (and it's slow/flaky).
+export SUPERZEJ_SANDBOX_BACKEND=none
 mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"
 printf '[user]\nname = e2e\nemail = e2e@example.invalid\n' > "$_tmp/gitconfig"
 '''
