@@ -422,6 +422,8 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         &cli.overrides,
         cli.config.clone(),
     );
+    superzej_core::i18n::init(&cfg.ui.language);
+
     tracing::info!(
         target: "szhost::startup",
         since_start_ms = start.elapsed().as_millis() as u64,
