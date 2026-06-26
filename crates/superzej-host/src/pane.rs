@@ -12,7 +12,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use superzej_core::history::{AnsiStripper, HistoryBuffer, feed_bytes_to_history};
 
-use crate::emulator::{PaneEmulator, Vt100Emulator};
+use crate::emulator::{AlacrittyEmulator, PaneEmulator};
 
 /// What a pane's reader thread emits (tagged with the pane id so one shared
 /// channel multiplexes every pane's output to the event loop).
@@ -255,7 +255,7 @@ impl PtyPane {
         Ok(Self {
             master: pair.master,
             writer,
-            emulator: Box::new(Vt100Emulator::new(rows, cols, 10_000)),
+            emulator: Box::new(AlacrittyEmulator::new(rows, cols, 10_000)),
             rows,
             cols,
             program: program_name(argv),

@@ -34,11 +34,8 @@ syntect = { version = "5", default-features = false, features = [
   "default-themes",
   "regex-fancy",
 ] }
-sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-nvml-wrapper = "0.12"
 libc = "0.2"
-notify = "6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = [
   "std",
@@ -47,10 +44,6 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
   "env-filter",
   "registry",
 ] }
-# --- palette (engine + the legacy iocraft view that still lives in the cli) ---
-iocraft = "0.8.3"
-smol = "2.0.2"
-nucleo = "0.5.0"
 nucleo-matcher = "0.3"
 ignore = "0.4.26"
 grep-searcher = "0.1.16"
@@ -80,15 +73,12 @@ tokio = { version = "1", features = [
 ] }
 portable-pty = "0.9"
 termwiz = "0.23"
-vt100 = "0.16"
-taffy = "0.5"
 # --- native service layer (Phase 4/5) ---
 octocrab = "0.53"
 reqwest = { version = "0.12", default-features = false, features = [
   "json",
   "rustls-tls",
 ] }
-russh = "0.61"
 # --- LLM proxy (group U/V): the one new HTTP-server dependency. tokio/reqwest
 # are widened with extra features inside the superzej-proxy crate's own manifest
 # (cargo merges them with the workspace base). ---
