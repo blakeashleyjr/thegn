@@ -79,9 +79,7 @@ macro_rules! t {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    #[cfg(test)]
-    use fluent_templates::Loader;
+    use fluent_templates::Loader; // for the t! macro's `.lookup()` expansion
 
     #[test]
     fn test_i18n_fallback() {
