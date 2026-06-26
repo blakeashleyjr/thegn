@@ -24,18 +24,13 @@ Per-feature statuses below are verified against the current codebase. See
 
 ---
 
-## Progress summary (as of 2026-06-22)
+## Progress summary (as of 2026-06-25)
 
 **Where we are:** **Phase 1** (the AI-free shell) is **essentially complete** — a
-2026-06-22 status audit against the codebase found ~25 items recorded as `[~]`/`[ ]`
-that are in fact shipped and wired (whole keybind and layout subsystems, session
-persistence, most IDE-Tier-1 panels); their markers below are now corrected. Native git
-management, the notification/event bus, and IDE panels (problems/tasks/tests/symbols)
-have landed. **Phase 2's substrate** (sandbox + remote) and, more recently, **the
-proxy** (groups U/V/W) are in. The agent layer (Q–T) and MCP (AL) remain unstarted —
-still by design; the proxy was built and validated standalone, and is the next major
-track's prerequisite. The audit's remaining Phase-1 tail is small and specific (see
-gaps below).
+2026-06-25 status audit confirmed that native git management, the notification/event bus,
+and IDE panels (problems/tasks/tests/symbols) have landed. **Phase 2's substrate** (sandbox + remote) and, more recently, **the
+proxy** (groups U/V/W) are in. We have made significant progress on the CI/CD inspection layer (AV), with Phase A
+largely complete, and Log Analyzer (AW) has its parser and DSL wired up. Environment bundles (AU) and the true AI layers (Q-T, AL) are unstarted.
 
 **Shipped & solid:**
 
