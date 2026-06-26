@@ -1,23 +1,30 @@
 name: ci
-# Parallel CI: each `just ci` stage runs as its own job so they execute
-# concurrently (wall-clock = slowest job) and one push surfaces every failure at
-# once instead of fail-fast. Shared setup (nix + caches) lives in the local
-# composite action .github/actions/ci-setup.
+# Parallel CI: each `just ci` stage is its own job, so they run concurrently
+# (wall-clock = slowest job) and one push surfaces every failure at once. Shared
+# setup (nix + caches) lives in the local composite action .github/actions/ci-setup.
 #
-# nix `access-tokens` is fed from the NIX_GITHUB_TOKEN secret — it must read the
-# private flake inputs (muse, termite-chat) AND the public ones (nixpkgs/
-# flake-utils/rust-overlay, owned by other accounts), so it has to be a CLASSIC
-# PAT with `repo` scope (fine-grained can't grant cross-owner access).
+# Cost control:
+#  - macOS bills at a 10x minute multiplier, so the `macos` job is OPT-IN — it
+#    runs only on manual dispatch or when a PR carries the `ci:macos` label, not
+#    on every PR/main push. (Apple/darwin code is on-device WIP; CI it on demand.)
+#  - concurrency cancels superseded runs; every job has a timeout so nothing can
+#    silently burn minutes; cache-nix-action + rust-cache keep warm runs cheap.
+#
+# nix `access-tokens` comes from the NIX_GITHUB_TOKEN secret — it must read the
+# private flake inputs (muse, termite-chat) AND public ones (nixpkgs/flake-utils/
+# rust-overlay, other owners), so it must be a CLASSIC PAT with `repo` scope.
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 jobs:
   fmt:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,6 +35,7 @@ jobs:
       - run: nix develop --command just fmt-check
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -38,6 +46,7 @@ jobs:
       - run: nix develop --command just lint
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -56,6 +65,7 @@ jobs:
       - run: nix develop --command just test
   doc:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
@@ -66,6 +76,7 @@ jobs:
       - run: nix develop --command just doc-check
   coverage:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -76,6 +87,7 @@ jobs:
       - run: nix develop --command just coverage
   smoke:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -86,6 +98,7 @@ jobs:
       - run: nix develop --command just smoke
   sandbox-e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
@@ -97,6 +110,7 @@ jobs:
       - run: nix develop --command bash -lc "just sandbox-e2e-dns && just sandbox-e2e-db"
   e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -107,6 +121,7 @@ jobs:
       - run: nix develop --command just e2e
   nix-build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -116,11 +131,14 @@ jobs:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
       - run: nix build .#default --print-build-logs
   macos:
-    # macos-14 = GitHub-hosted Apple silicon (M1). Apple's `container` runtime
-    # needs macOS 26 + Apple silicon, which the hosted image can't exercise, so
-    # this only covers the aarch64-darwin build + unit tests; end-to-end `apple`
-    # backend verification is the on-device checklist (tasks.md §AV).
+    # OPT-IN (10x minute cost): runs only on manual dispatch or a `ci:macos`
+    # labeled PR — not on ordinary PR/main pushes. macos-14 = GitHub-hosted Apple
+    # silicon; this covers the aarch64-darwin build + unit tests (end-to-end
+    # `apple` backend verification is the on-device checklist, tasks.md §AW).
+    if: >-
+      github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:macos')
     runs-on: macos-14
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
