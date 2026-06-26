@@ -15,7 +15,22 @@ use termwiz::terminal::TerminalWaker;
 use crate::chrome::{FrameModel, LoadStep};
 use crate::run::now_secs;
 
-const MODEL_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// Sidebar/panel re-hydration cadence — and the fidelity knob for the sidebar's
+/// live status: the activity-dot FSM (`activity::poll_and_save`) and the git
+/// glyphs (dirty / ahead-behind per worktree) are sampled inside this tick, so
+/// they only refresh this often. Default 1s (was 2s); override with
+/// `SUPERZEJ_MODEL_REFRESH_MS`. Clamped to a multiple of the 500ms ticker base,
+/// min 500ms. Lower = snappier dots/glyphs at the cost of more background git
+/// work; a re-hydration that changes nothing is dropped before any repaint by
+/// `FrameModel::hydration_eq`, so a faster cadence does NOT cost idle frames.
+fn model_refresh_interval() -> Duration {
+    let ms = std::env::var("SUPERZEJ_MODEL_REFRESH_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(1000)
+        .max(500);
+    Duration::from_millis((ms / 500) * 500)
+}
 const PR_REFRESH_INTERVAL: Duration = Duration::from_secs(20);
 const ISSUE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -35,8 +50,8 @@ pub(crate) enum RefreshKind {
 
 const CONTAINER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Background ticker: emits a `Model` refresh every `MODEL_REFRESH_INTERVAL` and
-/// a `Pr` refresh every `PR_REFRESH_INTERVAL`, pulsing the waker so an idle loop
+/// Background ticker: emits a `Model` refresh every [`model_refresh_interval`]
+/// and a `Pr` refresh every `PR_REFRESH_INTERVAL`, pulsing the waker so an idle loop
 /// wakes to service it. This is the staleness backstop; fs-watch + on-switch
 /// refresh handle the common, latency-sensitive cases.
 ///
@@ -47,8 +62,8 @@ const CONTAINER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 /// by the main loop blocking a runtime worker in `poll_input(None)` — true even
 /// on a single-core runtime. The thread sleeps in 500ms half-ticks: fine enough
 /// for the Telemetry section's live graphs (`stats_live` set while it's open)
-/// while the model/PR cadences keep their 2s/20s rates as whole multiples of
-/// the half-tick.
+/// while the model/PR cadences (default 1s/20s, model tunable via
+/// `SUPERZEJ_MODEL_REFRESH_MS`) stay whole multiples of the half-tick.
 pub(crate) fn spawn_refresh_ticker(
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     stats_tx: tokio_mpsc::UnboundedSender<crate::stats::StatsSnapshot>,
@@ -60,7 +75,7 @@ pub(crate) fn spawn_refresh_ticker(
     use std::sync::atomic::Ordering;
     std::thread::spawn(move || {
         let tick = Duration::from_millis(500);
-        let model_every = MODEL_REFRESH_INTERVAL.as_millis() as u64 / 500;
+        let model_every = (model_refresh_interval().as_millis() as u64 / 500).max(1);
         let pr_every = PR_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let issue_every = ISSUE_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let container_every = CONTAINER_REFRESH_INTERVAL.as_millis() as u64 / 500;
