@@ -110,6 +110,15 @@ check "diff --stat emits without error" \
 check "pr status degrades gracefully (exit 0)" \
   "'$SZ' pr status --worktree '$WT' >/dev/null 2>&1"
 
+# ci (AV group): detection finds a seeded workflow file; runs/detect degrade
+# gracefully with no remote/provider (exit 0, never crash).
+mkdir -p "$WT/.github/workflows"
+echo "on: push" >"$WT/.github/workflows/ci.yml"
+check "ci detect finds the seeded GitHub Actions workflow" \
+  "'$SZ' ci detect --worktree '$WT' | grep -q 'GitHub Actions'"
+check "ci runs degrades gracefully (exit 0)" \
+  "'$SZ' ci runs --worktree '$WT' >/dev/null 2>&1"
+
 # list works against the DB (empty here is fine — must not error).
 check "list runs without error" \
   "'$SZ' list >/dev/null 2>&1"

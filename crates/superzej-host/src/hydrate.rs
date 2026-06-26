@@ -29,6 +29,8 @@ pub(crate) enum RefreshKind {
     Model,
     Pr,
     Issues,
+    /// CI run-history cache refresh (AV group) — same cadence as `Pr`.
+    Ci,
 }
 
 const CONTAINER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
@@ -82,6 +84,10 @@ pub(crate) fn spawn_refresh_ticker(
                     break; // loop gone
                 }
                 wake = true;
+            }
+            // CI run-history rides the PR cadence (AV group).
+            if ticks.is_multiple_of(pr_every) && tx.send(RefreshKind::Ci).is_err() {
+                break;
             }
             if ticks.is_multiple_of(issue_every) {
                 if tx.send(RefreshKind::Issues).is_err() {
@@ -1016,6 +1022,13 @@ pub(crate) fn build_panel(
         apply_pr_cache(&mut panel, cached);
     }
 
+    // The CI run-history cache feeds the `Ci` section rollup (AV group).
+    if let Ok(Some((json, _))) = db.get_ci_cache(&loc.path())
+        && let Ok(runs) = serde_json::from_str::<Vec<superzej_core::ci::CiRun>>(&json)
+    {
+        panel.ci_runs = runs;
+    }
+
     panel.files = diff_entries
         .iter()
         .map(|f| crate::panel::DiffFile {
@@ -1612,6 +1625,47 @@ pub(crate) fn spawn_my_work_refresh(
         }
         if let Some(w) = &waker {
             let _ = w.wake();
+        }
+    });
+}
+
+/// Refresh the CI run-history cache for the active worktree (AV group). Off the
+/// event loop: resolves the provider from `[ci]` config + the git remote,
+/// fetches recent runs for the current branch via the async `CiProvider`, writes
+/// `ci_runs_cache`, and pulses the waker so the panel rehydrates. A missing
+/// provider / unconfigured CI / fetch error simply leaves the cache untouched.
+pub(crate) fn spawn_ci_cache_refresh(
+    session: crate::session::Session,
+    cfg: superzej_core::config::CiConfig,
+    waker: Option<TerminalWaker>,
+) {
+    task::spawn_blocking(move || {
+        let cwd = active_tab_path(&session);
+        if !cwd.is_dir() {
+            return;
+        }
+        let loc = superzej_core::remote::GitLoc::for_worktree(&cwd);
+        let Some(client) = superzej_svc::ci::provider_for(&loc, &cfg) else {
+            return;
+        };
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        let branch = loc
+            .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
+            .filter(|b| !b.is_empty());
+        let runs = rt.block_on(client.runs(&loc, branch.as_deref(), cfg.max_runs));
+        if let Ok(runs) = runs
+            && let Ok(json) = serde_json::to_string(&runs)
+            && let Ok(db) = superzej_core::db::Db::open()
+        {
+            let _ = db.put_ci_cache(&loc.path(), branch.as_deref().unwrap_or(""), &json);
+            if let Some(w) = &waker {
+                let _ = w.wake();
+            }
         }
     });
 }
