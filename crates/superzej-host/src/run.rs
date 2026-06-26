@@ -6208,6 +6208,153 @@ async fn ensure_app_loaded(
     false
 }
 
+// === media control (optional [media] feature) ==============================
+
+/// A media transport op dispatched from a keybind / palette row.
+#[derive(Debug, Clone, Copy)]
+enum MediaOp {
+    PlayPause,
+    Next,
+    Previous,
+    ShuffleToggle,
+    LoopCycle,
+    VolumeUp,
+    VolumeDown,
+}
+
+/// An async result that opens a secondary media picker palette.
+enum MediaPick {
+    Playlists(Vec<superzej_core::media::Playlist>),
+    Players(Vec<String>),
+}
+
+/// The effective media config: the configured `[media]` with the runtime player
+/// override (the "Select player" pick) floated to the front of the priority list.
+fn media_effective_cfg(
+    base: &superzej_core::config::MediaConfig,
+    player_override: &Option<String>,
+) -> superzej_core::config::MediaConfig {
+    let mut cfg = base.clone();
+    if let Some(p) = player_override {
+        cfg.players_priority.retain(|x| x != p);
+        cfg.players_priority.insert(0, p.clone());
+    }
+    cfg
+}
+
+/// Spawn the now-playing watcher: a push-signal stream on the native MPRIS path,
+/// else a slow poll for backends without signals (mpv / playerctl). Returns the
+/// task handle so the caller can abort it on a config/player change; `None` when
+/// media is disabled.
+fn spawn_media_watch(
+    cfg: superzej_core::config::MediaConfig,
+    tx: tokio_mpsc::UnboundedSender<Option<superzej_core::media::MediaState>>,
+    waker: TerminalWaker,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !cfg.enabled {
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        let Some(client) = superzej_svc::media::client_for(&cfg).await else {
+            return;
+        };
+        let _ = tx.send(client.snapshot().await.unwrap_or(None));
+        let _ = waker.wake();
+        if let Some(mut watch) = client.watch().await {
+            // Push path: re-snapshot on each D-Bus signal (no polling timer).
+            while watch.changed().await {
+                if tx.send(client.snapshot().await.unwrap_or(None)).is_err() {
+                    break;
+                }
+                let _ = waker.wake();
+            }
+        } else {
+            // Poll path: backends without a signal stream.
+            let interval = std::time::Duration::from_secs(cfg.poll_interval_secs.max(1));
+            loop {
+                tokio::time::sleep(interval).await;
+                if tx.send(client.snapshot().await.unwrap_or(None)).is_err() {
+                    break;
+                }
+                let _ = waker.wake();
+            }
+        }
+    }))
+}
+
+/// Abort any running watcher and (re)spawn one for `cfg`. Called at startup, on
+/// config reload (handles enable/disable live), and on a player-override change.
+fn restart_media_watch(
+    handle: &mut Option<tokio::task::JoinHandle<()>>,
+    cfg: superzej_core::config::MediaConfig,
+    tx: &tokio_mpsc::UnboundedSender<Option<superzej_core::media::MediaState>>,
+    waker: &TerminalWaker,
+) {
+    if let Some(h) = handle.take() {
+        h.abort();
+    }
+    *handle = spawn_media_watch(cfg, tx.clone(), waker.clone());
+}
+
+/// Fire a transport op off-thread, then push the resulting snapshot so the badge/
+/// panel update immediately (the signal watcher would also catch it).
+fn spawn_media_op(
+    cfg: superzej_core::config::MediaConfig,
+    op: MediaOp,
+    tx: tokio_mpsc::UnboundedSender<Option<superzej_core::media::MediaState>>,
+    waker: TerminalWaker,
+) {
+    use superzej_core::media::LoopMode;
+    tokio::spawn(async move {
+        let Some(client) = superzej_svc::media::client_for(&cfg).await else {
+            return;
+        };
+        let cur = client.snapshot().await.unwrap_or(None);
+        let _ = match op {
+            MediaOp::PlayPause => client.play_pause().await,
+            MediaOp::Next => client.next().await,
+            MediaOp::Previous => client.previous().await,
+            MediaOp::ShuffleToggle => {
+                let on = cur.as_ref().and_then(|s| s.shuffle).unwrap_or(false);
+                client.set_shuffle(!on).await
+            }
+            MediaOp::LoopCycle => {
+                let next = cur
+                    .as_ref()
+                    .and_then(|s| s.loop_mode)
+                    .unwrap_or(LoopMode::None)
+                    .cycle();
+                client.set_loop(next).await
+            }
+            MediaOp::VolumeUp => client.volume_step(cfg.volume_step).await,
+            MediaOp::VolumeDown => client.volume_step(-cfg.volume_step).await,
+        };
+        let _ = tx.send(client.snapshot().await.unwrap_or(None));
+        let _ = waker.wake();
+    });
+}
+
+/// Fetch the playlist / player list off-thread for the secondary picker.
+fn spawn_media_pick(
+    cfg: superzej_core::config::MediaConfig,
+    players: bool,
+    tx: tokio_mpsc::UnboundedSender<MediaPick>,
+    waker: TerminalWaker,
+) {
+    tokio::spawn(async move {
+        let Some(client) = superzej_svc::media::client_for(&cfg).await else {
+            return;
+        };
+        let pick = if players {
+            MediaPick::Players(client.players().await)
+        } else {
+            MediaPick::Playlists(client.playlists().await.unwrap_or_default())
+        };
+        let _ = tx.send(pick);
+        let _ = waker.wake();
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn event_loop<T: Terminal>(
     buf: &mut BufferedTerminal<T>,
@@ -6592,6 +6739,22 @@ async fn event_loop<T: Terminal>(
     let (docs_tx, mut docs_rx) =
         tokio_mpsc::unbounded_channel::<(u64, crate::panel::docs::DocsPayload)>();
     let mut docs_gen: u64 = 0;
+    // Media (optional [media] feature): the watcher / control ops push now-playing
+    // snapshots; the picker tasks push playlist/player lists. The watcher runs
+    // only while `[media] enabled`; `restart_media_watch` (re)spawns it on config
+    // reload and player-override changes. `media_player_override` is the runtime
+    // "Select player" choice.
+    let (media_tx, mut media_rx) =
+        tokio_mpsc::unbounded_channel::<Option<superzej_core::media::MediaState>>();
+    let (media_pick_tx, mut media_pick_rx) = tokio_mpsc::unbounded_channel::<MediaPick>();
+    let mut media_player_override: Option<String> = None;
+    let mut media_watch: Option<tokio::task::JoinHandle<()>> = None;
+    restart_media_watch(
+        &mut media_watch,
+        media_effective_cfg(&keymap.config().media, &media_player_override),
+        &media_tx,
+        &waker,
+    );
     // The transient which-key popup (set while a multi-key prefix is pending).
     let mut which_key: Vec<crate::keyhint::HintRow> = Vec::new();
     let mut which_key_prefix = String::new();
@@ -8616,6 +8779,52 @@ async fn event_loop<T: Terminal>(
             }
         }
 
+        // Media now-playing snapshots (watcher + control ops). Apply only while
+        // the feature is enabled, so toggling `[media] enabled = false` clears the
+        // badge/section without a restart. Mark dirty only on an actual change.
+        while let Ok(snap) = media_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Refresh);
+            let shown = if current_config.media.enabled {
+                snap
+            } else {
+                None
+            };
+            if model.panel.media != shown {
+                model.panel.media = shown;
+                dirty = true;
+            }
+        }
+        // Media picker results: open a secondary palette of playlists / players.
+        while let Ok(pick) = media_pick_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Refresh);
+            let items: Vec<crate::palette::PaletteItem> = match pick {
+                MediaPick::Playlists(pls) => pls
+                    .into_iter()
+                    .map(|p| {
+                        crate::palette::PaletteItem::new(
+                            format!("media-playlist:{}", p.id),
+                            format!("\u{1f3b5} {}", p.name),
+                        )
+                    })
+                    .collect(),
+                MediaPick::Players(players) => players
+                    .into_iter()
+                    .map(|p| {
+                        crate::palette::PaletteItem::new(
+                            format!("media-player:{p}"),
+                            format!("\u{25b6} {p}"),
+                        )
+                    })
+                    .collect(),
+            };
+            if items.is_empty() {
+                model.status = "Media: nothing to pick".into();
+            } else {
+                palette = Some(crate::search_everywhere::PaletteSession::new(items));
+            }
+            dirty = true;
+        }
+
         while let Ok(cfg_res) = config_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Config);
             match cfg_res {
@@ -8638,6 +8847,14 @@ async fn event_loop<T: Terminal>(
                     panel_ui.set_order(crate::panel::resolve_order(&new_cfg));
                     panel_ui.docs.cfg_keys = crate::keyhint::cheatsheet_groups(&new_cfg);
                     current_config = new_cfg;
+                    // Live media toggle: (re)spawn or stop the watcher to match the
+                    // reloaded `[media]` config.
+                    restart_media_watch(
+                        &mut media_watch,
+                        media_effective_cfg(&current_config.media, &media_player_override),
+                        &media_tx,
+                        &waker,
+                    );
                     need_relayout = true;
                 }
                 Err(e) => {
@@ -8975,15 +9192,15 @@ async fn event_loop<T: Terminal>(
                     };
                     if let (Some(content), Some(p)) = (target, panes.table.get(&sp)) {
                         crate::compositor::compose_pane(&mut scratch, p.emulator(), content);
-                        if let Some((sel_pane, sel)) = &mouse_sel {
-                            if *sel_pane == sp {
-                                crate::compositor::overlay_selection(
-                                    &mut scratch,
-                                    content,
-                                    sel,
-                                    crate::chrome::col(crate::chrome::S::Panel2),
-                                );
-                            }
+                        if let Some((sel_pane, sel)) = &mouse_sel
+                            && *sel_pane == sp
+                        {
+                            crate::compositor::overlay_selection(
+                                &mut scratch,
+                                content,
+                                sel,
+                                crate::chrome::col(crate::chrome::S::Panel2),
+                            );
                         }
                     }
                 }
@@ -10486,32 +10703,27 @@ async fn event_loop<T: Terminal>(
                         menu::MenuOutcome::Pick(choice) => {
                             active_menu = None;
                             if let menu::MenuChoice::ConfirmDeleteWorktrees { keep_files } = choice
+                                && let Some(targets) = pending_confirm_delete_worktrees.take()
                             {
-                                if let Some(targets) = pending_confirm_delete_worktrees.take() {
-                                    model.status = delete_groups(
-                                        &mut session,
-                                        &mut panes,
-                                        targets,
-                                        keep_files,
-                                    );
+                                model.status =
+                                    delete_groups(&mut session, &mut panes, targets, keep_files);
 
-                                    // Full sidebar refresh after deletion
-                                    sb.marked.clear();
-                                    refresh_tab_model(&mut model, &session, &mut sb);
-                                    sb.focus_active_row(&mut model);
-                                    need_relayout = true;
-                                    sync_drawer_persistence(
-                                        &session,
-                                        &mut panes,
-                                        &mut drawer,
-                                        &mut drawer_pool,
-                                        &mut drawer_home,
-                                        keymap.config(),
-                                        chrome.center,
-                                    );
-                                    dirty = true;
-                                    continue;
-                                }
+                                // Full sidebar refresh after deletion
+                                sb.marked.clear();
+                                refresh_tab_model(&mut model, &session, &mut sb);
+                                sb.focus_active_row(&mut model);
+                                need_relayout = true;
+                                sync_drawer_persistence(
+                                    &session,
+                                    &mut panes,
+                                    &mut drawer,
+                                    &mut drawer_pool,
+                                    &mut drawer_home,
+                                    keymap.config(),
+                                    chrome.center,
+                                );
+                                dirty = true;
+                                continue;
                             }
                             // First-launch keymap picker (item 621): persist the
                             // choice to ui_state and rebuild the live keymap. Not
@@ -11185,6 +11397,40 @@ async fn event_loop<T: Terminal>(
                                         drawer_full,
                                     );
                                     need_relayout = true;
+                                } else if let Some(id) = key.strip_prefix("media-playlist:") {
+                                    // Activate the chosen playlist off-thread.
+                                    if current_config.media.enabled {
+                                        let cfg = media_effective_cfg(
+                                            &current_config.media,
+                                            &media_player_override,
+                                        );
+                                        let id = id.to_string();
+                                        let tx = media_tx.clone();
+                                        let w = waker.clone();
+                                        tokio::spawn(async move {
+                                            if let Some(client) =
+                                                superzej_svc::media::client_for(&cfg).await
+                                            {
+                                                let _ = client.activate_playlist(&id).await;
+                                                let _ = tx
+                                                    .send(client.snapshot().await.unwrap_or(None));
+                                                let _ = w.wake();
+                                            }
+                                        });
+                                    }
+                                } else if let Some(p) = key.strip_prefix("media-player:") {
+                                    // Switch which player we control + restart the watcher.
+                                    media_player_override = Some(p.to_string());
+                                    restart_media_watch(
+                                        &mut media_watch,
+                                        media_effective_cfg(
+                                            &current_config.media,
+                                            &media_player_override,
+                                        ),
+                                        &media_tx,
+                                        &waker,
+                                    );
+                                    model.status = format!("Media: controlling {p}");
                                 } else if let Some(action) = crate::keymap::Action::from_key(&key) {
                                     forced_palette_action = Some(action);
                                 } else if let Some(idx) = keymap
@@ -12273,6 +12519,7 @@ async fn event_loop<T: Terminal>(
                                         | Section::Db
                                         | Section::Telemetry
                                         | Section::Keys
+                                        | Section::Media
                                         | Section::Logs => {}
                                     }
                                 } // match panel_ui.open + else
@@ -15035,6 +15282,52 @@ async fn event_loop<T: Terminal>(
                                     need_relayout = true;
                                 } else {
                                     model.status = "Unpin: no live pin".into();
+                                }
+                            }
+                            Action::MediaPlayPause
+                            | Action::MediaNext
+                            | Action::MediaPrevious
+                            | Action::MediaShuffleToggle
+                            | Action::MediaLoopCycle
+                            | Action::MediaVolumeUp
+                            | Action::MediaVolumeDown => {
+                                if current_config.media.enabled {
+                                    let op = match action {
+                                        Action::MediaNext => MediaOp::Next,
+                                        Action::MediaPrevious => MediaOp::Previous,
+                                        Action::MediaShuffleToggle => MediaOp::ShuffleToggle,
+                                        Action::MediaLoopCycle => MediaOp::LoopCycle,
+                                        Action::MediaVolumeUp => MediaOp::VolumeUp,
+                                        Action::MediaVolumeDown => MediaOp::VolumeDown,
+                                        _ => MediaOp::PlayPause,
+                                    };
+                                    spawn_media_op(
+                                        media_effective_cfg(
+                                            &current_config.media,
+                                            &media_player_override,
+                                        ),
+                                        op,
+                                        media_tx.clone(),
+                                        waker.clone(),
+                                    );
+                                } else {
+                                    model.status = "Media is off ([media] enabled = false)".into();
+                                }
+                            }
+                            Action::MediaSelectPlaylist | Action::MediaSelectPlayer => {
+                                if current_config.media.enabled {
+                                    let players = matches!(action, Action::MediaSelectPlayer);
+                                    spawn_media_pick(
+                                        media_effective_cfg(
+                                            &current_config.media,
+                                            &media_player_override,
+                                        ),
+                                        players,
+                                        media_pick_tx.clone(),
+                                        waker.clone(),
+                                    );
+                                } else {
+                                    model.status = "Media is off ([media] enabled = false)".into();
                                 }
                             }
                         }

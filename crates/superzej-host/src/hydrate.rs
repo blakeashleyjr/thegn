@@ -530,14 +530,13 @@ fn collect_sidebar_status(
             if !wt.agent.is_empty() {
                 status.agent.insert(wt.worktree.clone(), wt.agent.clone());
             }
-            if !wt.branch.is_empty() && !wt.repo_root.is_empty() {
-                if let Ok(counts) = db.get_open_pr_counts_by_branch(&wt.repo_root) {
-                    if let Some(&n) = counts.get(&wt.branch) {
-                        if n > 0 {
-                            status.pr_counts.insert(wt.worktree.clone(), n);
-                        }
-                    }
-                }
+            if !wt.branch.is_empty()
+                && !wt.repo_root.is_empty()
+                && let Ok(counts) = db.get_open_pr_counts_by_branch(&wt.repo_root)
+                && let Some(&n) = counts.get(&wt.branch)
+                && n > 0
+            {
+                status.pr_counts.insert(wt.worktree.clone(), n);
             }
         }
     }
@@ -621,19 +620,21 @@ fn collect_sidebar_status(
 fn worktree_loc(db: &superzej_core::db::Db, path: &std::path::Path) -> Option<u64> {
     const TTL_SECS: i64 = 300;
     let key = path.to_string_lossy().into_owned();
-    if let Ok(Some((loc, fetched_at))) = db.get_loc_cache_entry(&key) {
-        if now_secs() - fetched_at < TTL_SECS {
-            return Some(loc as u64);
-        }
+    if let Ok(Some((loc, fetched_at))) = db.get_loc_cache_entry(&key)
+        && now_secs() - fetched_at < TTL_SECS
+    {
+        return Some(loc as u64);
     }
 
     let mut languages = tokei::Languages::new();
-    let mut config = tokei::Config::default();
-    config.treat_doc_strings_as_comments = Some(true);
+    let config = tokei::Config {
+        treat_doc_strings_as_comments: Some(true),
+        ..tokei::Config::default()
+    };
     let paths = vec![path.to_path_buf()];
 
     languages.get_statistics(&paths, &[], &config);
-    let code: usize = languages.iter().map(|(_, lang)| lang.code).sum();
+    let code: usize = languages.values().map(|lang| lang.code).sum();
 
     let _ = db.put_loc_cache(&key, code);
     Some(code as u64)

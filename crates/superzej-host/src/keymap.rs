@@ -133,6 +133,19 @@ pub enum Action {
     PromotePin,
     /// Unpin (stop + remove) the focused strip/float pin.
     Unpin,
+    /// Media transport (optional `[media]` feature). All inert when media is
+    /// disabled. Delegate to the resolved `MediaClient` off-thread.
+    MediaPlayPause,
+    MediaNext,
+    MediaPrevious,
+    MediaShuffleToggle,
+    MediaLoopCycle,
+    MediaVolumeUp,
+    MediaVolumeDown,
+    /// Open the Cmd+K-style picker for the player's playlists.
+    MediaSelectPlaylist,
+    /// Open the picker to choose which player to control.
+    MediaSelectPlayer,
     Quit,
     Custom(u16),
 }
@@ -603,6 +616,71 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         default_chords: &["Ctrl q"],
         palette: true,
     },
+    // Media transport (optional [media] feature). Leader: `Alt m`. All inert when
+    // media is disabled; surfaced in the palette so they're discoverable.
+    ActionSpec {
+        id: "media-play-pause",
+        label: "Media: Play/Pause",
+        hint: "play/pause",
+        default_chords: &["Alt m m"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "media-next",
+        label: "Media: Next track",
+        hint: "next",
+        default_chords: &["Alt m n"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "media-previous",
+        label: "Media: Previous track",
+        hint: "prev",
+        default_chords: &["Alt m p"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "media-shuffle-toggle",
+        label: "Media: Toggle shuffle",
+        hint: "shuffle",
+        default_chords: &["Alt m s"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "media-loop-cycle",
+        label: "Media: Cycle repeat",
+        hint: "loop",
+        default_chords: &["Alt m r"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "media-volume-up",
+        label: "Media: Volume up",
+        hint: "vol+",
+        default_chords: &["Alt m k"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "media-volume-down",
+        label: "Media: Volume down",
+        hint: "vol−",
+        default_chords: &["Alt m j"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "media-select-playlist",
+        label: "Media: Select playlist…",
+        hint: "playlist",
+        default_chords: &["Alt m l"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "media-select-player",
+        label: "Media: Select player…",
+        hint: "player",
+        default_chords: &["Alt m o"],
+        palette: true,
+    },
 ];
 
 pub fn action_specs() -> &'static [ActionSpec] {
@@ -787,6 +865,15 @@ impl Action {
             Action::ShrinkStrip => "shrink-strip",
             Action::PromotePin => "promote-pin",
             Action::Unpin => "unpin",
+            Action::MediaPlayPause => "media-play-pause",
+            Action::MediaNext => "media-next",
+            Action::MediaPrevious => "media-previous",
+            Action::MediaShuffleToggle => "media-shuffle-toggle",
+            Action::MediaLoopCycle => "media-loop-cycle",
+            Action::MediaVolumeUp => "media-volume-up",
+            Action::MediaVolumeDown => "media-volume-down",
+            Action::MediaSelectPlaylist => "media-select-playlist",
+            Action::MediaSelectPlayer => "media-select-player",
             Action::Quit => "quit",
             Action::Custom(_) => "custom-action",
         }
@@ -859,6 +946,15 @@ impl Action {
             "shrink-strip" => Action::ShrinkStrip,
             "promote-pin" => Action::PromotePin,
             "unpin" => Action::Unpin,
+            "media-play-pause" | "media-toggle" => Action::MediaPlayPause,
+            "media-next" => Action::MediaNext,
+            "media-previous" | "media-prev" => Action::MediaPrevious,
+            "media-shuffle-toggle" | "media-shuffle" => Action::MediaShuffleToggle,
+            "media-loop-cycle" | "media-loop" => Action::MediaLoopCycle,
+            "media-volume-up" => Action::MediaVolumeUp,
+            "media-volume-down" => Action::MediaVolumeDown,
+            "media-select-playlist" | "media-playlist" => Action::MediaSelectPlaylist,
+            "media-select-player" | "media-player" => Action::MediaSelectPlayer,
             // `summon-pin-N` / `pin-N` → SummonPin(N) (1..=9).
             other => {
                 let n = other
@@ -1315,6 +1411,21 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl Alt [", Action::ShrinkStrip).unwrap();
     map.insert_all("Ctrl Alt P", Action::PromotePin).unwrap();
     map.insert_all("Ctrl Alt U", Action::Unpin).unwrap();
+
+    // Media transport (optional [media] feature) under the `Alt m` leader. The
+    // bindings are always present but inert unless `[media] enabled`.
+    map.insert_all("Alt m m", Action::MediaPlayPause).unwrap();
+    map.insert_all("Alt m n", Action::MediaNext).unwrap();
+    map.insert_all("Alt m p", Action::MediaPrevious).unwrap();
+    map.insert_all("Alt m s", Action::MediaShuffleToggle)
+        .unwrap();
+    map.insert_all("Alt m r", Action::MediaLoopCycle).unwrap();
+    map.insert_all("Alt m k", Action::MediaVolumeUp).unwrap();
+    map.insert_all("Alt m j", Action::MediaVolumeDown).unwrap();
+    map.insert_all("Alt m l", Action::MediaSelectPlaylist)
+        .unwrap();
+    map.insert_all("Alt m o", Action::MediaSelectPlayer)
+        .unwrap();
 
     // Vim-normal mode: one-key navigation plus leader-like Space sequences.
     map.insert(Mode::VimNormal, "h", Action::FocusLeft).unwrap();

@@ -450,6 +450,92 @@ impl LlmProxyConfig {
     }
 }
 
+config_enum! {
+    /// `[media] backend` — how superzej talks to your player. `"none"` disables
+    /// (the default). `"mpris"` uses the Linux D-Bus standard (native `zbus`,
+    /// `playerctl` CLI fallback) and covers Spotify desktop, mpv, ncspot,
+    /// spotify-player, musikcube, moc, VLC, cmus, … `"mpv"` drives a single mpv
+    /// instance over its JSON IPC socket. `"jellyfin"` is reserved (Phase 2).
+    pub enum MediaBackendKind: "media backend" {
+        None = "none" | "off",
+        Mpris = "mpris" | "dbus" | "playerctl",
+        Mpv = "mpv",
+        Jellyfin = "jellyfin",
+    } default = None;
+}
+
+config_enum! {
+    /// The action bound to a bare "media" key / the play-pause toggle's sibling.
+    /// Mostly informational today (each transport op has its own action id); kept
+    /// so a single configurable "media key" can be wired later.
+    pub enum MediaDefaultAction: "media default action" {
+        PlayPause = "play_pause" | "toggle",
+        Next = "next",
+        Previous = "previous" | "prev",
+        VolumeUp = "volume_up",
+        VolumeDown = "volume_down",
+    } default = PlayPause;
+}
+
+/// `[media]` — optional media-player control. The shell never depends on this;
+/// it is strictly additive, so the default is disabled. When `enabled`, the host
+/// resolves the configured `backend` and surfaces a now-playing statusbar badge,
+/// a panel section, transport keybinds, and playlist/player pickers. Only the
+/// selected backend's sub-table is consulted.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct MediaConfig {
+    /// Master switch. `false` ⇒ no watcher, no badge, no panel section, and all
+    /// `media-*` actions are inert.
+    pub enabled: bool,
+    /// Which control backend to use.
+    pub backend: MediaBackendKind,
+    /// Preferred players (bus-name tails, e.g. `["spotify", "mpv"]`) when several
+    /// expose MPRIS at once; the first match wins. Empty ⇒ pick the first player
+    /// that is actively playing, else the first available.
+    pub players_priority: Vec<String>,
+    /// Reserved single-"media key" action (each transport op already has its own
+    /// bindable action id).
+    pub default_action: MediaDefaultAction,
+    /// Volume step (0.0..=1.0) applied by `media-volume-up`/`-down`.
+    pub volume_step: f64,
+    /// Fallback poll cadence (seconds) for backends without a push-signal stream
+    /// (mpv IPC / `playerctl`). The native MPRIS path uses D-Bus signals instead,
+    /// so this never fires for it (preserving the ~0%-idle contract).
+    pub poll_interval_secs: u64,
+    pub mpv: MpvMediaConfig,
+}
+
+impl Default for MediaConfig {
+    fn default() -> Self {
+        MediaConfig {
+            enabled: false,
+            backend: MediaBackendKind::None,
+            players_priority: Vec::new(),
+            default_action: MediaDefaultAction::PlayPause,
+            volume_step: 0.05,
+            poll_interval_secs: 3,
+            mpv: MpvMediaConfig::default(),
+        }
+    }
+}
+
+/// `[media.mpv]` — mpv JSON-IPC backend. Point `socket` at the path mpv was
+/// launched with via `--input-ipc-server=<path>`.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct MpvMediaConfig {
+    pub socket: String,
+}
+
+impl Default for MpvMediaConfig {
+    fn default() -> Self {
+        MpvMediaConfig {
+            socket: "/tmp/mpvsocket".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct NamedCommand {
     pub name: String,
@@ -2677,6 +2763,8 @@ pub struct Config {
     pub lsp: LspConfig,
     /// The LLM proxy daemon (`[llm_proxy]`). Disabled by default — AI is additive.
     pub llm_proxy: LlmProxyConfig,
+    /// `[media]` — optional media-player control. Disabled by default — additive.
+    pub media: MediaConfig,
     /// Rebind a built-in action by id, e.g. `new-worktree = "Ctrl w"`. The flat
     /// table is the global/default layer; nested mode tables are native-host only.
     pub keybinds: KeybindConfig,
@@ -2753,6 +2841,7 @@ impl Default for Config {
             palette: PaletteConfig::default(),
             lsp: LspConfig::default(),
             llm_proxy: LlmProxyConfig::default(),
+            media: MediaConfig::default(),
             keybinds: KeybindConfig::default(),
             actions: Vec::new(),
             profile: String::new(),
@@ -5470,8 +5559,10 @@ transport = \"ssh\"
     #[test]
     fn active_providers_back_compat_single() {
         // Legacy single `provider` is honored when `providers` is empty.
-        let mut cfg = IssuesConfig::default();
-        cfg.provider = IssueProviderKind::Linear;
+        let mut cfg = IssuesConfig {
+            provider: IssueProviderKind::Linear,
+            ..Default::default()
+        };
         assert_eq!(cfg.active_providers(), vec![IssueProviderKind::Linear]);
         // `none` yields an empty set, not a [None] entry.
         cfg.provider = IssueProviderKind::None;
@@ -5480,15 +5571,17 @@ transport = \"ssh\"
 
     #[test]
     fn active_providers_multi_wins_and_dedups() {
-        let mut cfg = IssuesConfig::default();
         // Single provider is overridden once the plural list is set.
-        cfg.provider = IssueProviderKind::Github;
-        cfg.providers = vec![
-            IssueProviderKind::Linear,
-            IssueProviderKind::Jira,
-            IssueProviderKind::Linear, // duplicate collapses
-            IssueProviderKind::None,   // None filtered out
-        ];
+        let cfg = IssuesConfig {
+            provider: IssueProviderKind::Github,
+            providers: vec![
+                IssueProviderKind::Linear,
+                IssueProviderKind::Jira,
+                IssueProviderKind::Linear, // duplicate collapses
+                IssueProviderKind::None,   // None filtered out
+            ],
+            ..Default::default()
+        };
         assert_eq!(
             cfg.active_providers(),
             vec![IssueProviderKind::Linear, IssueProviderKind::Jira]
@@ -5853,6 +5946,36 @@ transport = \"ssh\"
 
         assert!(PanelConfig::default().sections.is_empty());
         assert!(!GitConfig::default().override_gpg);
+    }
+
+    #[test]
+    fn media_config_defaults_and_enums() {
+        let m = MediaConfig::default();
+        assert!(!m.enabled, "media must default OFF");
+        assert_eq!(m.backend, MediaBackendKind::None);
+        assert!(m.players_priority.is_empty());
+        assert_eq!(m.default_action, MediaDefaultAction::PlayPause);
+        assert_eq!(m.volume_step, 0.05);
+        assert_eq!(m.poll_interval_secs, 3);
+        assert_eq!(m.mpv.socket, "/tmp/mpvsocket");
+
+        // Aliases parse; an unknown value falls back to the default (infallible).
+        assert_eq!(
+            MediaBackendKind::from_str_validated("dbus").unwrap(),
+            MediaBackendKind::Mpris
+        );
+        assert_eq!(
+            MediaBackendKind::from_str_validated("off").unwrap(),
+            MediaBackendKind::None
+        );
+        assert!(MediaBackendKind::from_str_validated("winamp").is_err());
+        assert_eq!(MediaBackendKind::Mpris.as_str(), "mpris");
+
+        // Default Config keeps media disabled and round-trips through TOML.
+        assert!(!Config::default().media.enabled);
+        let toml = toml::to_string(&MediaConfig::default()).unwrap();
+        let back: MediaConfig = toml::from_str(&toml).unwrap();
+        assert_eq!(back.backend, MediaBackendKind::None);
     }
 
     #[test]
