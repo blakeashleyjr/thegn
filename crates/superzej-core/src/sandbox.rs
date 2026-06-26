@@ -37,6 +37,13 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Ceiling for image pulls (network, legitimately slow — but never forever).
 const PULL_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Host nix daemon socket (NixOS-style multi-user nix). When present and
+/// `[sandbox] nix_daemon` is on, the bwrap sandbox binds it (+ `NIX_REMOTE=daemon`)
+/// so `nix build`/`develop`/`fmt` work while `/nix/store` stays read-only.
+const NIX_DAEMON_SOCKET: &str = "/nix/var/nix/daemon-socket/socket";
+/// The directory bind-mounted into bwrap to reach [`NIX_DAEMON_SOCKET`].
+const NIX_DAEMON_SOCKET_DIR: &str = "/nix/var/nix/daemon-socket";
+
 /// Run `argv` for its exit status with a hard deadline, stdio discarded.
 /// `None` on spawn failure or timeout (the child is killed and reaped) — for
 /// callers, indistinguishable from "this backend doesn't work", which is
@@ -271,6 +278,10 @@ pub struct SandboxSpec {
     /// time when `devenv = true`). Used in `wrap_script` so OCI containers don't
     /// rely on `devenv` being on their PATH.
     pub devenv_path: Option<String>,
+    /// Resolved at spec-build time: expose the host nix daemon inside the bwrap
+    /// sandbox (bind its socket + set `NIX_REMOTE=daemon`, store stays read-only).
+    /// See [`SandboxConfig::nix_daemon`](crate::config::SandboxConfig::nix_daemon).
+    pub nix_daemon: bool,
     pub name: String,
 }
 
@@ -480,8 +491,18 @@ pub fn resolve_scoped(
         // Resolve the absolute devenv path at spec-build time so OCI containers
         // (which don't inherit the host PATH) can still exec it directly.
         devenv_path: util::which_path("devenv"),
+        // Expose the nix daemon in bwrap only when the user hasn't opted out AND
+        // the host actually has a daemon socket — resolved here so the argv logic
+        // (and its tests) stay pure. False off NixOS-style multi-user nix.
+        nix_daemon: cfg.nix_daemon && nix_daemon_socket_present(),
         name: name.to_string(),
     })
+}
+
+/// Whether the host exposes a nix daemon socket (NixOS-style multi-user nix).
+/// Used to decide if the bwrap sandbox can delegate store writes to the daemon.
+fn nix_daemon_socket_present() -> bool {
+    std::path::Path::new(NIX_DAEMON_SOCKET).exists()
 }
 
 /// Name prefix for every container superzej creates (per-worktree sandboxes).
@@ -1338,6 +1359,19 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
                         hardcoded_parents.push(path);
                     }
                 }
+                // Bind the nix daemon socket (rw — connecting to it is a write)
+                // so `nix build`/`develop`/`fmt` work inside bwrap; the substrate
+                // /nix/store above stays read-only because the daemon performs all
+                // store writes. `spec.nix_daemon` is already gated on the socket
+                // existing (resolved at spec-build time).
+                if spec.nix_daemon {
+                    v.extend([
+                        "--bind".into(),
+                        NIX_DAEMON_SOCKET_DIR.into(),
+                        NIX_DAEMON_SOCKET_DIR.into(),
+                    ]);
+                    hardcoded_parents.push(NIX_DAEMON_SOCKET_DIR);
+                }
                 v.extend([
                     "--dev".into(),
                     "/dev".into(),
@@ -1381,6 +1415,11 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
             }
             for cap in &spec.add_capabilities {
                 v.extend(["--cap-add".into(), cap.clone()]);
+            }
+            // Route nix through the host daemon (socket bound above, or present
+            // via the `/`-bind in host-access mode) so store writes succeed.
+            if spec.nix_daemon {
+                v.extend(["--setenv".into(), "NIX_REMOTE".into(), "daemon".into()]);
             }
             for (k, val) in &spec.env {
                 v.extend(["--setenv".into(), k.clone(), val.clone()]);
@@ -2189,6 +2228,7 @@ mod tests {
             file_access: FileAccess::Worktree,
             devenv: false,
             devenv_path: None,
+            nix_daemon: false,
             name: "superzej-repo-feat".into(),
         }
     }
@@ -2264,6 +2304,24 @@ mod tests {
         assert!(joined.contains("--bind /repo/.git /repo/.git"));
         assert!(joined.contains("--chdir /wt/feat"));
         assert_eq!(argv.last().unwrap(), "exec claude");
+        // nix_daemon off (default in the test spec) → no daemon socket / NIX_REMOTE.
+        assert!(!joined.contains("daemon-socket"));
+        assert!(!joined.contains("NIX_REMOTE"));
+    }
+
+    #[test]
+    fn bwrap_exposes_nix_daemon_when_resolved() {
+        let mut s = spec(Backend::Bwrap);
+        s.image = None;
+        s.file_access = FileAccess::Worktree;
+        s.nix_daemon = true; // resolved on (host has a daemon socket + not opted out)
+        let joined = enter_argv(&s, "claude").join(" ");
+        // Socket bound read-write so the client can connect; store stays ro.
+        assert!(joined.contains(&format!(
+            "--bind {NIX_DAEMON_SOCKET_DIR} {NIX_DAEMON_SOCKET_DIR}"
+        )));
+        assert!(joined.contains("--ro-bind /nix/store /nix/store"));
+        assert!(joined.contains("--setenv NIX_REMOTE daemon"));
     }
 
     #[test]

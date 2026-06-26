@@ -779,6 +779,14 @@ init_script = ""
 # present in the worktree root and the `devenv` binary is on PATH.
 devenv = false
 
+# Expose the host nix daemon inside the bwrap sandbox so `nix build`/`develop`/
+# `fmt` (and `devenv shell`) work there. When true (default) bwrap binds the
+# nix-daemon socket and sets NIX_REMOTE=daemon; /nix/store stays READ-ONLY (the
+# daemon performs all writes, so the sandbox can't mutate the global store).
+# No effect when there's no daemon socket (single-user nix / non-NixOS) or on
+# OCI backends. Set false to keep bwrap fully offline from the store.
+nix_daemon = true
+
 # ── Missing backend behaviour ─────────────────────────────────────────────────
 # What to do when no backend in backend_chain is available:
 #   warn   — open the pane on the host and show a banner (default).

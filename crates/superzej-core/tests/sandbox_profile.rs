@@ -130,6 +130,7 @@ fn h3_profile_switch_teardown() {
         init_script: None,
         devenv: false,
         devenv_path: None,
+        nix_daemon: false,
         name: name_work.clone(),
     };
     superzej_core::sandbox::ensure(&spec_work).expect("ensure work failed");

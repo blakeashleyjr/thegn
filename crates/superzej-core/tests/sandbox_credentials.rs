@@ -48,6 +48,7 @@ fn base_spec(name: &str) -> SandboxSpec {
         init_script: None,
         devenv: false,
         devenv_path: None,
+        nix_daemon: false,
         name: name.into(),
     }
 }

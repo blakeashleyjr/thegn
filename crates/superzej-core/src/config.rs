@@ -1419,6 +1419,13 @@ pub struct SandboxConfig {
     pub network_block: Vec<String>,
     /// Log all outbound DNS queries and connection attempts to the audit table.
     pub network_audit: bool,
+    /// Expose the host nix daemon inside the **bwrap** sandbox so `nix
+    /// build`/`develop`/`fmt` work there. When on (the default), bwrap binds the
+    /// nix-daemon socket and sets `NIX_REMOTE=daemon`; `/nix/store` stays
+    /// read-only (the daemon performs all writes). Opt out with `nix_daemon =
+    /// false`. No effect off NixOS-style multi-user nix (no socket) or on OCI
+    /// backends.
+    pub nix_daemon: bool,
 }
 
 /// The default `backend_chain` for `auto` detection, by host platform.
@@ -1489,6 +1496,7 @@ impl Default for SandboxConfig {
             network_allow: Vec::new(),
             network_block: Vec::new(),
             network_audit: false,
+            nix_daemon: true,
         }
     }
 }
@@ -1524,6 +1532,7 @@ pub struct SandboxOverlay {
     pub network_allow: Option<Vec<String>>,
     pub network_block: Option<Vec<String>>,
     pub network_audit: Option<bool>,
+    pub nix_daemon: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
@@ -1614,6 +1623,9 @@ impl SandboxOverlay {
         if let Some(v) = self.network_audit {
             base.network_audit = v;
         }
+        if let Some(v) = self.nix_daemon {
+            base.nix_daemon = v;
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -1636,6 +1648,7 @@ impl SandboxOverlay {
             && self.network_allow.is_none()
             && self.network_block.is_none()
             && self.network_audit.is_none()
+            && self.nix_daemon.is_none()
     }
 }
 
