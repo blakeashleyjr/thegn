@@ -3480,23 +3480,6 @@ fn workspace_repo_name_from_url(input: &str) -> String {
     }
 }
 
-#[cfg(test)]
-fn create_workspace_from_input(
-    input: &str,
-    session: &mut crate::session::Session,
-    db: &superzej_core::db::Db,
-) -> Result<std::path::PathBuf> {
-    match create_workspace_from_input_with_config(
-        input,
-        session,
-        db,
-        &superzej_core::config::Config::default(),
-    )? {
-        WorkspaceResolution::Repo(p) => Ok(p),
-        WorkspaceResolution::NotARepo(p) => Ok(p),
-    }
-}
-
 enum WorkspaceResolution {
     Repo(std::path::PathBuf),
     NotARepo(std::path::PathBuf),
