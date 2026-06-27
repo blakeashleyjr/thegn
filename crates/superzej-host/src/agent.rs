@@ -645,6 +645,42 @@ pub fn ensure_remote_bridge(cfg: &Config, env_name: &str, binary: &Path, remote_
     }
 }
 
+/// Provision a fresh provider env's repo on open (8-A.3): clone the local repo's
+/// `origin` into the worktree dir *inside the env* via the control-plane exec
+/// (`GitLoc::sh_command`, which `cd`s into the workdir). Idempotent — the script
+/// no-ops once the dir is a git repo, including after a `data=sync` upload (which
+/// already lands a `.git`). Best-effort + blocking on the off-loop launch path:
+/// the clone is the inherent first-open cost; a failure warns and leaves the env
+/// as-is (the chrome just shows an empty tree until it succeeds). No-op when the
+/// local repo has no `origin`.
+fn provision_provider_repo(repo_root: &Path, loc: &GitLoc, branch: Option<&str>) {
+    let Some(origin) = local_origin(repo_root) else {
+        return;
+    };
+    let script = superzej_core::remote::provision_repo_script(&origin, branch);
+    match loc.sh_command(&script).output() {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => superzej_core::msg::warn(&format!(
+            "provider repo provision failed: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) => superzej_core::msg::warn(&format!("provider repo provision spawn failed: {e}")),
+    }
+}
+
+/// The local repo's `origin` remote URL, or `None` (no remote / not a repo).
+fn local_origin(repo_root: &Path) -> Option<String> {
+    let out = superzej_core::util::git_cmd(repo_root)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!url.is_empty()).then_some(url)
+}
+
 /// `(provider, sandbox_id, workdir)` for a provider env that supports file-sync,
 /// or `None` (unconfigured / no id / no token / provider can't do files).
 fn provider_sync_target(
@@ -841,6 +877,14 @@ pub fn launch_spec_with_key(
     )?;
     if let Ok(db) = Db::open() {
         let _ = db.set_worktree_sandbox(worktree, &outcome.backend_label);
+    }
+
+    // Provision the repo into a fresh provider env on open (8-A.3): clone origin
+    // into the sandbox workdir so the chrome's git/files show real data. `outcome
+    // .location` is set only for a `Placement::Provider` env; idempotent + a
+    // no-op for `data=sync` (whose upload already populated the tree).
+    if outcome.location.is_some() {
+        provision_provider_repo(&repo_root, &loc, branch);
     }
 
     // Apply per-agent credential scoping: when a virtual key is provided,
