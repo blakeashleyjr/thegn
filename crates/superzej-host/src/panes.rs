@@ -115,6 +115,27 @@ pub(crate) fn pane_shell_argv(
     (exe, args)
 }
 
+/// Build a host [`crate::agent::LaunchSpec`] for a terminal connection (local
+/// shell / ssh / mosh). Terminals never run inside a sandbox — a terminal is a
+/// host process that itself reaches out (ssh/mosh) — so this is the shared spec
+/// builder used by both the synchronous creation path and the off-thread
+/// materialize/pre-warm paths, keeping the two from diverging.
+pub(crate) fn terminal_launch_spec(
+    cfg: &superzej_core::config::Config,
+    connection: &str,
+) -> crate::agent::LaunchSpec {
+    let (cmd, args) = pane_shell_argv(cfg, connection);
+    let mut argv = vec![cmd];
+    argv.extend(args);
+    crate::agent::LaunchSpec {
+        argv,
+        cwd: None,
+        env: vec![],
+        backend: "host".to_string(),
+        warnings: vec![],
+    }
+}
+
 pub(crate) fn tool_drawer_argv(command: &str) -> Vec<String> {
     vec![
         superzej_core::util::shell(),
@@ -399,20 +420,25 @@ const PREWARM_RADIUS: usize = 1;
 /// launch specs off-thread (sandbox ensure can block) and finishes the spawns
 /// when they land, exactly like the lazy materialize path. The group name is
 /// the routing key (unique per session); the path is the spawn cwd.
+/// Pre-warm requests as `(group name, worktree path, tab index, missing leaves,
+/// is_terminal)`. The `is_terminal` flag tells the caller's off-thread spec
+/// resolver to build the spec from the terminal's connection (ssh/mosh/local)
+/// rather than `launch_spec` over the — empty, for terminals — worktree path.
 pub(crate) fn prewarm_requests(
     panes: &Panes,
     session: &mut crate::session::Session,
-) -> Vec<(String, String, usize, Vec<u32>)> {
+) -> Vec<(String, String, usize, Vec<u32>, bool)> {
     let mut out = Vec::new();
     if session.worktrees.is_empty() {
         return out;
     }
     // Sibling tabs within the active worktree.
     let g = &session.worktrees[session.active];
+    let is_term = g.kind == crate::session::GroupKind::Terminal;
     for ti in prewarm_targets(g.active_tab, g.tabs.len(), PREWARM_RADIUS) {
         let missing = panes.missing_leaves(&g.tabs[ti]);
         if !missing.is_empty() {
-            out.push((g.name.clone(), g.path.clone(), ti, missing));
+            out.push((g.name.clone(), g.path.clone(), ti, missing, is_term));
         }
     }
     // Neighboring worktrees: their remembered active tab.
@@ -420,10 +446,11 @@ pub(crate) fn prewarm_requests(
         let g = &mut session.worktrees[gi];
         let at = g.active_tab.min(g.tabs.len().saturating_sub(1));
         g.active_tab = at;
+        let is_term = g.kind == crate::session::GroupKind::Terminal;
         if let Some(tab) = g.tabs.get(at) {
             let missing = panes.missing_leaves(tab);
             if !missing.is_empty() {
-                out.push((g.name.clone(), g.path.clone(), at, missing));
+                out.push((g.name.clone(), g.path.clone(), at, missing, is_term));
             }
         }
     }
@@ -520,12 +547,34 @@ mod tests {
         let reqs = prewarm_requests(&panes, &mut session);
         let neighbor = reqs
             .iter()
-            .find(|(name, _, _, _)| name == "app/dup")
+            .find(|(name, _, _, _, _)| name == "app/dup")
             .expect("the same-path neighbor is pre-warmed under its own name");
         assert_eq!(neighbor.1, "/tmp/app", "the path is carried for the cwd");
         // The routing key (name, ti) is distinct from the active group's,
         // despite the shared path.
         assert_ne!(neighbor.0, "app/home");
+    }
+
+    #[test]
+    fn terminal_launch_spec_builds_ssh_mosh_and_local_argv() {
+        let cfg = superzej_core::config::Config::default();
+
+        let ssh = terminal_launch_spec(&cfg, "ssh user@host");
+        assert_eq!(ssh.argv, vec!["ssh".to_string(), "user@host".to_string()]);
+        assert_eq!(ssh.backend, "host");
+        assert!(ssh.cwd.is_none());
+
+        // A bare target (no "ssh " prefix) is still treated as an ssh target.
+        let bare = terminal_launch_spec(&cfg, "user@host");
+        assert_eq!(bare.argv, vec!["ssh".to_string(), "user@host".to_string()]);
+
+        let mosh = terminal_launch_spec(&cfg, "mosh user@host");
+        assert_eq!(mosh.argv, vec!["mosh".to_string(), "user@host".to_string()]);
+
+        // Empty connection → a local interactive shell (argv[0] is env-dependent).
+        let local = terminal_launch_spec(&cfg, "");
+        assert!(!local.argv.is_empty());
+        assert_eq!(local.backend, "host");
     }
 
     #[test]
