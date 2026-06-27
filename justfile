@@ -398,8 +398,9 @@ attach: start
 # `superzej_core::repo::main_worktree`), which every superzej worktree reads.
 #   - `sprites` (a managed-sandbox PROVIDER) → overlay `env = "sprites"`, and the
 #     global `[env.sprites]` block is auto-scaffolded into
-#     $XDG_CONFIG_HOME/superzej/config.toml if missing (needs the `sprite` CLI on
-#     PATH + SPRITES_TOKEN set; both are checked here, fail-fast).
+#     $XDG_CONFIG_HOME/superzej/config.toml if missing. Needs SPRITES_TOKEN set
+#     (fail-fast); the `sprite` CLI is only advisory now — the default exec=auto
+#     attaches the pane over the native WSS exec API with no vendor CLI.
 #   - a real sandbox backend (podman|docker|bwrap|systemd|none) → overlay
 #     `[sandbox] backend = "<x>"`.
 # Empty `backend` is a no-op. Refuses to clobber a hand-authored overlay that
@@ -417,8 +418,8 @@ _apply-backend backend="":
       fi; \
       case "$backend" in \
         sprites) \
-          command -v sprite >/dev/null 2>&1 || { echo "sprite CLI not on PATH — install it before using backend=sprites" >&2; exit 1; }; \
           [ -n "${SPRITES_TOKEN:-}" ] || { echo "SPRITES_TOKEN not set — export it before using backend=sprites" >&2; exit 1; }; \
+          command -v sprite >/dev/null 2>&1 || echo "note: sprite CLI not on PATH — fine for native exec (the default exec=auto attaches over the WSS API with just SPRITES_TOKEN); the CLI is only the fallback transport" >&2; \
           if ! grep -q '^\[env\.sprites\]' "$cfg" 2>/dev/null; then \
             mkdir -p "$(dirname "$cfg")"; \
             printf '\n[env.sprites]\nplacement = "provider"\ndata = "in_env"\n[env.sprites.provider]\nprovider = "sprites"\nid = "superzej"\napi_key_env = "SPRITES_TOKEN"\nexec_command = ["sprite", "exec", "-s", "{id}", "--"]\ninteractive_command = ["sprite", "exec", "-s", "{id}", "--tty", "--"]\nup_command = ["sprite", "create", "{id}", "--skip-console"]\ndown_command = ["sprite", "destroy", "-s", "{id}", "--force"]\n' >> "$cfg"; \

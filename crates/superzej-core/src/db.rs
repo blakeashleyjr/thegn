@@ -45,7 +45,10 @@ use std::path::PathBuf;
 /// unchanged; thereafter order is manual (Ctrl+Alt+↑/↓) and stable.
 /// v20: adds `worktree_disk` (per-worktree size + target/ size cache) backing
 /// the disk-usage badges, the statusbar threshold warning, and `superzej disk`.
-const SCHEMA_VERSION: i64 = 21;
+/// v22: adds `group_tabs.pane_sessions` (per-leaf provider exec session, JSON
+/// `pane id → {provider, id, session}`) so a native-exec (provider WSS) pane
+/// reattaches to its live remote session — replaying scrollback — on restart.
+const SCHEMA_VERSION: i64 = 22;
 
 pub struct Db {
     conn: Connection,
@@ -312,6 +315,7 @@ impl Db {
               focused_pane INTEGER NOT NULL DEFAULT 0,
               pane_cwds    TEXT,
               pane_cmds    TEXT,
+              pane_sessions TEXT,
               PRIMARY KEY (session_name, group_name, ordinal)
             );
             -- v4: which tab (v6: which worktree group) was active at exit.
@@ -553,6 +557,10 @@ impl Db {
         // {argv, cwd}) so a resurrected/crashed pane can offer to relaunch the
         // program it was running. Additive; absent/NULL on pre-v15 rows = none.
         let _ = conn.execute("ALTER TABLE group_tabs ADD COLUMN pane_cmds TEXT", []);
+        // v22: per-leaf provider exec session (JSON map of pane id →
+        // {provider, id, session}) so a native-exec pane reattaches to its live
+        // remote session on restart. Additive; absent/NULL on pre-v22 rows = none.
+        let _ = conn.execute("ALTER TABLE group_tabs ADD COLUMN pane_sessions TEXT", []);
         // Backfill any unset positions deterministically by creation order
         // (path as the tie-breaker), giving pre-v8 worktrees a stable,
         // collision-free order on first launch after upgrade. Runs once: after
@@ -2351,10 +2359,10 @@ impl Db {
     pub fn put_group_tab(&self, session: &str, row: &crate::models::GroupTabRow) -> Result<()> {
         self.conn.execute(
             "INSERT INTO group_tabs
-               (session_name, group_name, ordinal, title, pane_tree, focused_pane, pane_cwds, pane_cmds)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+               (session_name, group_name, ordinal, title, pane_tree, focused_pane, pane_cwds, pane_cmds, pane_sessions)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(session_name, group_name, ordinal) DO UPDATE SET
-               title=?4, pane_tree=?5, focused_pane=?6, pane_cwds=?7, pane_cmds=?8",
+               title=?4, pane_tree=?5, focused_pane=?6, pane_cwds=?7, pane_cmds=?8, pane_sessions=?9",
             params![
                 session,
                 row.group_name,
@@ -2364,6 +2372,7 @@ impl Db {
                 row.focused_pane,
                 row.pane_cwds,
                 row.pane_cmds,
+                row.pane_sessions,
             ],
         )?;
         Ok(())
@@ -2390,7 +2399,7 @@ impl Db {
     /// All persisted tabs for every group in a session, ordered (group, tab).
     pub fn group_tabs_for_session(&self, session: &str) -> Result<Vec<crate::models::GroupTabRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT group_name, ordinal, title, pane_tree, focused_pane, pane_cwds, pane_cmds
+            "SELECT group_name, ordinal, title, pane_tree, focused_pane, pane_cwds, pane_cmds, pane_sessions
                FROM group_tabs WHERE session_name=?1 ORDER BY group_name, ordinal",
         )?;
         let rows = stmt.query_map(params![session], |r| {
@@ -2402,6 +2411,7 @@ impl Db {
                 focused_pane: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
                 pane_cwds: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
                 pane_cmds: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                pane_sessions: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -2952,6 +2962,7 @@ mod tests {
             focused_pane: 0,
             pane_cwds: String::new(),
             pane_cmds: String::new(),
+            pane_sessions: String::new(),
         };
         // Insert out of order; expect ordinal ordering back.
         db.put_tab_group(sess, &mk("app/feat", 1)).unwrap();
@@ -3009,6 +3020,7 @@ mod tests {
                 focused_pane: 0,
                 pane_cwds: r#"{"0":"/home/u/repo"}"#.into(),
                 pane_cmds: r#"{"0":{"argv":["nvim"],"cwd":"/home/u/repo"}}"#.into(),
+                pane_sessions: r#"{"0":{"provider":"sprites","id":"dev","session":"s-9"}}"#.into(),
             },
         )
         .unwrap();
@@ -3019,8 +3031,12 @@ mod tests {
             tabs[0].pane_cmds,
             r#"{"0":{"argv":["nvim"],"cwd":"/home/u/repo"}}"#
         );
+        assert_eq!(
+            tabs[0].pane_sessions,
+            r#"{"0":{"provider":"sprites","id":"dev","session":"s-9"}}"#
+        );
 
-        // An upsert overwrites the cwd + cmd maps (no stale merge).
+        // An upsert overwrites the cwd + cmd + session maps (no stale merge).
         db.put_group_tab(
             sess,
             &GroupTabRow {
@@ -3031,12 +3047,14 @@ mod tests {
                 focused_pane: 0,
                 pane_cwds: String::new(),
                 pane_cmds: String::new(),
+                pane_sessions: String::new(),
             },
         )
         .unwrap();
         let back = db.group_tabs_for_session(sess).unwrap();
         assert_eq!(back[0].pane_cwds, "");
         assert_eq!(back[0].pane_cmds, "");
+        assert_eq!(back[0].pane_sessions, "");
     }
 
     #[test]

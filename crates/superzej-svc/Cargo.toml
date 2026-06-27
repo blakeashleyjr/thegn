@@ -25,6 +25,8 @@ notify = "6"
 tokio-util = { version = "0.7.18", features = ["codec"] }
 futures-channel = "0.3.32"
 futures-util = "0.3.32"
+# Native provider exec transport (Sprites WSS PTY exec — see provider::SpritesProvider).
+tokio-tungstenite.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

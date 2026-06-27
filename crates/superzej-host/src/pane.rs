@@ -1,21 +1,62 @@
-//! A single PTY-backed pane: a child process on a pseudo-terminal, its emulator
-//! grid, and an input writer. The reader runs on a blocking thread that funnels
-//! bytes into a channel (portable-pty masters are blocking file handles — one
-//! reader per pane, never a `select!` over N masters in the event loop).
+//! A single pane: an emulator grid + history fed by a byte stream, plus a way to
+//! send it input. Two transports back a pane, behind [`PaneIo`]:
+//!   - **PTY** — a child process on a pseudo-terminal (the default). A blocking
+//!     reader thread funnels bytes into the shared channel (portable-pty masters
+//!     are blocking file handles — one reader per pane, never a `select!` over N
+//!     masters in the event loop).
+//!   - **Stream** — a managed-sandbox provider's native exec session (PTY over a
+//!     WebSocket; see `superzej_svc::provider`), so an interactive pane attaches
+//!     over the provider API with no vendor CLI. A tokio task relays the session's
+//!     frames into the same channel and forwards stdin/resize back.
+//!
+//! Both feed the identical `PaneEvent` channel + waker, so the event loop, the
+//! emulator, and the render plan are transport-blind.
 
 use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use std::io::Write;
+use std::sync::{Arc, Mutex};
 
 use termwiz::terminal::TerminalWaker;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use superzej_core::history::{AnsiStripper, HistoryBuffer, feed_bytes_to_history};
+use superzej_svc::provider::{ExecControl, ExecFrame, ExecSession, Provider};
 
 use crate::emulator::{AlacrittyEmulator, PaneEmulator};
 
+/// How a pane talks to its process: a local PTY, or a provider exec session.
+enum PaneIo {
+    /// A local child on a pseudo-terminal.
+    Pty {
+        master: Box<dyn MasterPty + Send>,
+        writer: Box<dyn Write + Send>,
+    },
+    /// A native provider exec session: stdin/resize go to the relay task over
+    /// `control`; the task owns the underlying socket. `provider`/`sandbox_id`
+    /// are retained so the pane's live session can be persisted for reattach.
+    Stream {
+        control: tokio_mpsc::Sender<ExecControl>,
+        provider: String,
+        sandbox_id: String,
+    },
+}
+
+/// How a `Stream` pane opens its provider session.
+pub enum ExecOpen {
+    /// Start a fresh exec (the login shell etc.).
+    Open(superzej_svc::provider::ExecSpec),
+    /// Reattach to a persisted session id (the server replays scrollback).
+    Attach {
+        session: String,
+        cols: u16,
+        rows: u16,
+    },
+}
+
 /// What a pane's reader thread emits (tagged with the pane id so one shared
 /// channel multiplexes every pane's output to the event loop).
+#[derive(Debug)]
 pub enum PaneEvent {
     /// PTY output bytes for pane `id`.
     Output(u32, Vec<u8>),
@@ -27,8 +68,7 @@ pub enum PaneEvent {
 }
 
 pub struct PtyPane {
-    master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    io: PaneIo,
     emulator: Box<dyn PaneEmulator>,
     rows: u16,
     cols: u16,
@@ -54,6 +94,10 @@ pub struct PtyPane {
     /// captured command, or when a crashed pane is kept as a husk; cleared once
     /// the user accepts (Enter) or dismisses it. `None` for an ordinary pane.
     pending_relaunch: Option<String>,
+    /// For a `Stream` pane: the provider session id, published by the relay task
+    /// once the server announces it, read at persist time for reattach. `None`
+    /// for a PTY pane (and until the announcement lands).
+    session_cell: Option<Arc<Mutex<Option<String>>>>,
 }
 
 /// Derive a pane's program name from its spawn argv. Handles the common
@@ -253,8 +297,10 @@ impl PtyPane {
         });
 
         Ok(Self {
-            master: pair.master,
-            writer,
+            io: PaneIo::Pty {
+                master: pair.master,
+                writer,
+            },
             emulator: Box::new(AlacrittyEmulator::new(rows, cols, 10_000)),
             rows,
             cols,
@@ -264,7 +310,59 @@ impl PtyPane {
             history_stripper: AnsiStripper::default(),
             pid,
             pending_relaunch: None,
+            session_cell: None,
         })
+    }
+
+    /// Spawn a `Stream` pane backed by a managed-sandbox provider's native exec
+    /// API — the CLI-free interactive pane. Non-blocking: a relay task runs on
+    /// `rt` that opens the session (`open` ⇒ `open_exec`, or a reattach), pumps
+    /// its output into `tx` as [`PaneEvent`]s (pulsing `waker`), forwards
+    /// stdin/resize from the pane's control channel, and publishes the provider
+    /// session id for persistence. A connect/exec failure surfaces as an `Exit`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_stream(
+        id: u32,
+        provider: Provider,
+        provider_name: String,
+        sandbox_id: String,
+        open: ExecOpen,
+        program: String,
+        rows: u16,
+        cols: u16,
+        tx: tokio_mpsc::Sender<PaneEvent>,
+        waker: Option<TerminalWaker>,
+        rt: &tokio::runtime::Handle,
+    ) -> Self {
+        let (ctrl_tx, ctrl_rx) = tokio_mpsc::channel::<ExecControl>(256);
+        let session_cell: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        rt.spawn(relay_exec(
+            id,
+            provider,
+            sandbox_id.clone(),
+            open,
+            tx,
+            waker,
+            ctrl_rx,
+            session_cell.clone(),
+        ));
+        Self {
+            io: PaneIo::Stream {
+                control: ctrl_tx,
+                provider: provider_name,
+                sandbox_id,
+            },
+            emulator: Box::new(AlacrittyEmulator::new(rows, cols, 10_000)),
+            rows,
+            cols,
+            program,
+            history: HistoryBuffer::new(10_000),
+            history_partial: Vec::new(),
+            history_stripper: AnsiStripper::default(),
+            pid: None,
+            pending_relaunch: None,
+            session_cell: Some(session_cell),
+        }
     }
 
     /// The pane's current working directory, read live from `/proc/<pid>/cwd`.
@@ -341,25 +439,90 @@ impl PtyPane {
         if self.emulator.scrollback() > 0 {
             self.emulator.scroll_reset();
         }
-        self.writer.write_all(bytes).context("pty write")?;
-        self.writer.flush().ok();
+        match &mut self.io {
+            PaneIo::Pty { writer, .. } => {
+                writer.write_all(bytes).context("pty write")?;
+                writer.flush().ok();
+            }
+            // Drop on a full/closed control channel rather than blocking the
+            // loop — a dead session will surface its exit on the frames side.
+            PaneIo::Stream { control, .. } => {
+                let _ = control.try_send(ExecControl::Stdin(bytes.to_vec()));
+            }
+        }
         Ok(())
     }
 
-    /// Resize the PTY and the emulator together.
+    /// Resize the transport and the emulator together.
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
-        self.master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .context("pty resize")?;
+        match &self.io {
+            PaneIo::Pty { master, .. } => {
+                master
+                    .resize(PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                    .context("pty resize")?;
+            }
+            PaneIo::Stream { control, .. } => {
+                let _ = control.try_send(ExecControl::Resize { cols, rows });
+            }
+        }
         self.emulator.resize(rows, cols);
         self.rows = rows;
         self.cols = cols;
         Ok(())
+    }
+
+    /// The provider session id for a `Stream` pane, if the server has announced
+    /// it yet (`None` for a PTY pane, or before the announcement).
+    pub fn session_id(&self) -> Option<String> {
+        self.session_cell.as_ref()?.lock().ok()?.clone()
+    }
+
+    /// This pane's persistable provider session (`provider` + sandbox `id` +
+    /// announced `session`), for reattach on restart. `None` for a PTY pane or a
+    /// `Stream` pane whose session id hasn't been announced yet.
+    pub fn provider_session(&self) -> Option<crate::session::ProviderSession> {
+        let PaneIo::Stream {
+            provider,
+            sandbox_id,
+            ..
+        } = &self.io
+        else {
+            return None;
+        };
+        let session = self.session_id()?;
+        Some(crate::session::ProviderSession {
+            provider: provider.clone(),
+            id: sandbox_id.clone(),
+            session,
+        })
+    }
+
+    /// Build a `Stream` pane around a ready control channel, for tests that drive
+    /// the relay directly (no provider/socket).
+    #[cfg(test)]
+    fn test_stream(control: tokio_mpsc::Sender<ExecControl>, rows: u16, cols: u16) -> Self {
+        Self {
+            io: PaneIo::Stream {
+                control,
+                provider: "sprites".into(),
+                sandbox_id: "test".into(),
+            },
+            emulator: Box::new(AlacrittyEmulator::new(rows, cols, 10_000)),
+            rows,
+            cols,
+            program: "shell".into(),
+            history: HistoryBuffer::new(10_000),
+            history_partial: Vec::new(),
+            history_stripper: AnsiStripper::default(),
+            pid: None,
+            pending_relaunch: None,
+            session_cell: Some(Arc::new(Mutex::new(None))),
+        }
     }
 
     #[allow(dead_code)]
@@ -377,6 +540,127 @@ impl PtyPane {
     }
     pub fn scroll_down(&mut self, n: usize) {
         self.emulator.scroll_down(n);
+    }
+}
+
+/// The `Stream` pane's relay task (runs on the host runtime): open or reattach the
+/// provider exec session, then bridge it to the shared `PaneEvent` channel — the
+/// exact contract the PTY reader thread fulfills, so the event loop is blind to
+/// which transport a pane uses. Forwards stdin/resize from `ctrl_rx`, publishes
+/// the announced session id into `session_cell`, and ends on exit/close/drop.
+#[allow(clippy::too_many_arguments)]
+async fn relay_exec(
+    id: u32,
+    provider: Provider,
+    sandbox_id: String,
+    open: ExecOpen,
+    tx: tokio_mpsc::Sender<PaneEvent>,
+    waker: Option<TerminalWaker>,
+    ctrl_rx: tokio_mpsc::Receiver<ExecControl>,
+    session_cell: Arc<Mutex<Option<String>>>,
+) {
+    let wake = || {
+        if let Some(w) = &waker {
+            let _ = w.wake();
+        }
+    };
+    let opened = match open {
+        ExecOpen::Open(spec) => provider.open_exec(&sandbox_id, &spec).await,
+        ExecOpen::Attach {
+            session,
+            cols,
+            rows,
+        } => {
+            provider
+                .attach_exec(&sandbox_id, &session, cols, rows)
+                .await
+        }
+    };
+    let session = match opened {
+        Ok(s) => s,
+        Err(e) => {
+            // Surface the failure in the pane and exit non-zero so the loop's
+            // crash path can offer a fallback/relaunch.
+            let _ = tx
+                .send(PaneEvent::Output(
+                    id,
+                    format!("\r\n[native exec failed: {e}]\r\n").into_bytes(),
+                ))
+                .await;
+            wake();
+            let _ = tx.send(PaneEvent::Exit(id, Some(1))).await;
+            wake();
+            return;
+        }
+    };
+    relay_session(id, session, tx, waker, ctrl_rx, session_cell).await;
+}
+
+/// Bridge an already-open [`ExecSession`] to the pane's `PaneEvent` channel until
+/// it exits/closes or the pane is dropped. Split out from [`relay_exec`] so it's
+/// unit-testable with a hand-built session (no live socket).
+async fn relay_session(
+    id: u32,
+    session: ExecSession,
+    tx: tokio_mpsc::Sender<PaneEvent>,
+    waker: Option<TerminalWaker>,
+    mut ctrl_rx: tokio_mpsc::Receiver<ExecControl>,
+    session_cell: Arc<Mutex<Option<String>>>,
+) {
+    let wake = || {
+        if let Some(w) = &waker {
+            let _ = w.wake();
+        }
+    };
+    let ExecSession {
+        mut frames,
+        control,
+        mut session_id,
+    } = session;
+
+    let mut sid_done = false;
+    loop {
+        tokio::select! {
+            frame = frames.recv() => match frame {
+                Some(ExecFrame::Stdout(b)) => {
+                    if tx.send(PaneEvent::Output(id, b)).await.is_err() {
+                        break;
+                    }
+                    wake();
+                }
+                Some(ExecFrame::Exit(code)) => {
+                    let _ = tx.send(PaneEvent::Exit(id, Some(code))).await;
+                    wake();
+                    break;
+                }
+                None => {
+                    let _ = tx.send(PaneEvent::Exit(id, None)).await;
+                    wake();
+                    break;
+                }
+            },
+            ctrl = ctrl_rx.recv() => match ctrl {
+                Some(c) => {
+                    if control.send(c).await.is_err() {
+                        break; // session driver gone
+                    }
+                }
+                None => break, // pane dropped
+            },
+            res = session_id.changed(), if !sid_done => {
+                match res {
+                    Ok(()) => {
+                        if let Some(sid) = session_id.borrow().clone()
+                            && let Ok(mut cell) = session_cell.lock()
+                        {
+                            *cell = Some(sid);
+                            sid_done = true; // announced once; stop watching
+                        }
+                    }
+                    Err(_) => sid_done = true, // sender gone
+                }
+            }
+        }
     }
 }
 
@@ -497,6 +781,93 @@ mod tests {
                 .map(|r| r.trim_end().to_string()),
             Some("30 100".to_string())
         );
+    }
+
+    #[test]
+    fn stream_pane_relays_frames_input_resize_and_session_id() {
+        use std::time::Duration;
+        use superzej_svc::provider::{ExecControl, ExecFrame, ExecSession};
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // server→loop, provider→relay (frames), pane→relay (control),
+        // relay→provider (control), session-id announce.
+        let (tx, mut rx) = tokio_mpsc::channel::<PaneEvent>(64);
+        let (frames_tx, frames_rx) = tokio_mpsc::channel::<ExecFrame>(64);
+        let (pane_ctrl_tx, pane_ctrl_rx) = tokio_mpsc::channel::<ExecControl>(64);
+        let (prov_ctrl_tx, mut prov_ctrl_rx) = tokio_mpsc::channel::<ExecControl>(64);
+        let (sid_tx, sid_rx) = tokio::sync::watch::channel::<Option<String>>(None);
+        let cell = Arc::new(Mutex::new(None));
+        let session = ExecSession {
+            frames: frames_rx,
+            control: prov_ctrl_tx,
+            session_id: sid_rx,
+        };
+        rt.spawn(relay_session(
+            7,
+            session,
+            tx,
+            None,
+            pane_ctrl_rx,
+            cell.clone(),
+        ));
+
+        // 1. provider stdout → PaneEvent::Output, and it lands in the grid.
+        frames_tx
+            .blocking_send(ExecFrame::Stdout(b"hello-stream".to_vec()))
+            .unwrap();
+        let mut pane = PtyPane::test_stream(pane_ctrl_tx, 24, 80);
+        match rx.blocking_recv() {
+            Some(PaneEvent::Output(7, b)) => {
+                assert_eq!(b, b"hello-stream");
+                pane.feed(&b);
+            }
+            other => panic!("expected Output, got {other:?}"),
+        }
+        assert_eq!(
+            pane.emulator()
+                .row_text(0)
+                .map(|r| r.trim_end().to_string()),
+            Some("hello-stream".to_string())
+        );
+
+        // 2. pane input + resize are forwarded to the provider side.
+        pane.write_input(b"abc").unwrap();
+        assert_eq!(
+            prov_ctrl_rx.blocking_recv(),
+            Some(ExecControl::Stdin(b"abc".to_vec()))
+        );
+        pane.resize(30, 100).unwrap();
+        assert_eq!(
+            prov_ctrl_rx.blocking_recv(),
+            Some(ExecControl::Resize {
+                cols: 100,
+                rows: 30
+            })
+        );
+
+        // 3. the announced session id is published for reattach.
+        sid_tx.send(Some("sess-9".into())).unwrap();
+        let mut got = None;
+        for _ in 0..200 {
+            if let Some(s) = cell.lock().unwrap().clone() {
+                got = Some(s);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(got.as_deref(), Some("sess-9"));
+
+        // 4. provider exit → PaneEvent::Exit with the code.
+        frames_tx.blocking_send(ExecFrame::Exit(0)).unwrap();
+        assert!(matches!(
+            rx.blocking_recv(),
+            Some(PaneEvent::Exit(7, Some(0)))
+        ));
     }
 
     #[test]

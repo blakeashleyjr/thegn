@@ -206,6 +206,10 @@ pub(crate) struct Panes {
     /// pane exits within the threshold it's counted as a crash even if it wrote
     /// output (bwrap prints an error message before dying).
     spawn_times: std::collections::HashMap<u32, std::time::Instant>,
+    /// The host tokio runtime handle, used to drive native-exec (`Stream`) panes'
+    /// relay tasks. Captured at construction (present at runtime); `None` in unit
+    /// tests that build `Panes` outside a runtime.
+    rt: Option<tokio::runtime::Handle>,
 }
 
 impl Panes {
@@ -217,6 +221,7 @@ impl Panes {
             tx,
             waker: None,
             spawn_times: std::collections::HashMap::new(),
+            rt: tokio::runtime::Handle::try_current().ok(),
         }
     }
 
@@ -227,6 +232,7 @@ impl Panes {
             tx,
             waker: Some(waker),
             spawn_times: std::collections::HashMap::new(),
+            rt: tokio::runtime::Handle::try_current().ok(),
         }
     }
 
@@ -280,6 +286,74 @@ impl Panes {
         Ok(id)
     }
 
+    /// Spawn a native provider-exec (`Stream`) pane — the CLI-free interactive
+    /// pane backed by a managed sandbox's exec API. `provider` + `sandbox_id`
+    /// identify the sandbox; `open` is a fresh exec or a reattach. The relay task
+    /// surfaces a connect/exec failure as an error husk + non-zero exit, so the
+    /// caller's fallback path can take over. Needs a runtime handle.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_native(
+        &mut self,
+        provider: superzej_svc::provider::Provider,
+        provider_name: String,
+        sandbox_id: String,
+        open: crate::pane::ExecOpen,
+        program: String,
+        center: Rect,
+    ) -> Result<u32> {
+        let rt = self
+            .rt
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("native exec needs a tokio runtime handle"))?;
+        let id = self.next_id;
+        self.next_id += 1;
+        let pane = PtyPane::spawn_stream(
+            id,
+            provider,
+            provider_name,
+            sandbox_id,
+            open,
+            program,
+            center.rows.max(1) as u16,
+            center.cols.max(1) as u16,
+            self.tx.clone(),
+            self.waker.clone(),
+            &rt,
+        );
+        self.table.insert(id, pane);
+        self.spawn_times.insert(id, std::time::Instant::now());
+        Ok(id)
+    }
+
+    /// Open a CLI-free `Stream` pane from a resolved [`crate::agent::NativeShell`]:
+    /// a fresh login shell inside the sandbox. `session` (when set) reattaches a
+    /// persisted provider session instead — replaying its scrollback.
+    pub(crate) fn spawn_native_shell(
+        &mut self,
+        n: crate::agent::NativeShell,
+        session: Option<String>,
+        center: Rect,
+    ) -> Result<u32> {
+        let cols = center.cols.max(1) as u16;
+        let rows = center.rows.max(1) as u16;
+        let open = match session {
+            Some(session) => crate::pane::ExecOpen::Attach {
+                session,
+                cols,
+                rows,
+            },
+            None => crate::pane::ExecOpen::Open(n.open_spec(cols, rows)),
+        };
+        self.spawn_native(
+            n.provider,
+            n.provider_name,
+            n.sandbox_id,
+            open,
+            "sh".to_string(),
+            center,
+        )
+    }
+
     /// How long the pane has been alive. `None` if the id is unknown.
     /// Used by the crash debounce: exits within 5s of spawn are fast-crashes.
     pub(crate) fn pane_age(&self, id: u32) -> Option<std::time::Duration> {
@@ -321,6 +395,7 @@ impl Panes {
     /// owning group's dir (tabs spawn their shells there).
     pub(crate) fn materialize_with_specs(
         &mut self,
+        cfg: &superzej_core::config::Config,
         tab: &mut crate::session::Tab,
         worktree: &str,
         specs: &[(u32, crate::agent::LaunchSpec)],
@@ -336,6 +411,27 @@ impl Panes {
         for (old, spec) in specs {
             if self.table.contains_key(old) || map.contains_key(old) {
                 continue; // raced a direct spawn; keep the live pane
+            }
+            // Native provider exec (CLI-free): when this worktree's env wants it,
+            // attach the leaf over the provider's WSS exec. A persisted session id
+            // for this leaf reattaches the live remote session (replays
+            // scrollback); otherwise a fresh login shell is opened. The off-thread
+            // `launch_spec` still ran (so the sandbox is provisioned); its CLI argv
+            // is simply unused on this path. Falls through to the PTY path if the
+            // env isn't a native-exec provider or the provider can't be built.
+            if !worktree.is_empty()
+                && let Some(n) = crate::agent::native_shell_exec(cfg, worktree)
+            {
+                let session = tab.pane_sessions.get(old).map(|s| s.session.clone());
+                match self.spawn_native_shell(n, session, center) {
+                    Ok(fresh) => {
+                        map.insert(*old, fresh);
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "szhost::startup", "native exec spawn failed, falling back: {e}");
+                    }
+                }
             }
             // Restore this leaf's last-known cwd when we have one. Only host
             // panes are honored: a sandbox/remote launch wraps the spawn in a
@@ -617,6 +713,7 @@ mod tests {
             .collect();
         panes
             .materialize_with_specs(
+                &cfg,
                 &mut session.worktrees[0].tabs[0],
                 &path,
                 &specs,
@@ -710,6 +807,7 @@ mod tests {
             .collect();
         panes
             .materialize_with_specs(
+                &cfg,
                 &mut session.worktrees[0].tabs[0],
                 &path,
                 &specs,

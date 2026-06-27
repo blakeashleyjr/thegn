@@ -59,6 +59,19 @@ impl PaneCmd {
     }
 }
 
+/// A native-exec pane's live provider session, captured at persist time so a
+/// restart can reattach (`Provider::attach_exec`) and replay the scrollback
+/// instead of starting a fresh shell.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProviderSession {
+    /// The provider name (e.g. `"sprites"`), for routing the reattach.
+    pub provider: String,
+    /// The sandbox id the session runs in.
+    pub id: String,
+    /// The provider-assigned session id to reattach to.
+    pub session: String,
+}
+
 /// One tab inside a worktree group: a pane tree and which leaf has focus.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tab {
@@ -76,6 +89,11 @@ pub struct Tab {
     /// captured at persist time so a resurrected pane can offer to relaunch the
     /// program that was running. Only set for non-shell foreground programs.
     pub pane_cmds: std::collections::BTreeMap<u32, PaneCmd>,
+    /// Native-exec provider session of each leaf pane (`pane id → ProviderSession`),
+    /// captured at persist time so a restart reattaches the live remote session
+    /// (replaying scrollback) instead of spawning fresh. Only set for `Stream`
+    /// panes whose provider has announced a session id.
+    pub pane_sessions: std::collections::BTreeMap<u32, ProviderSession>,
 }
 
 impl Tab {
@@ -86,6 +104,7 @@ impl Tab {
             focused_pane: 0,
             pane_cwds: std::collections::BTreeMap::new(),
             pane_cmds: std::collections::BTreeMap::new(),
+            pane_sessions: std::collections::BTreeMap::new(),
         }
     }
 
@@ -106,6 +125,11 @@ impl Tab {
         } else {
             serde_json::from_str(&row.pane_cmds).unwrap_or_default()
         };
+        let pane_sessions = if row.pane_sessions.is_empty() {
+            std::collections::BTreeMap::new()
+        } else {
+            serde_json::from_str(&row.pane_sessions).unwrap_or_default()
+        };
         Tab {
             title: if row.title.is_empty() {
                 (row.ordinal + 1).to_string()
@@ -116,6 +140,7 @@ impl Tab {
             focused_pane: row.focused_pane.max(0) as u32,
             pane_cwds,
             pane_cmds,
+            pane_sessions,
         }
     }
 
@@ -134,6 +159,11 @@ impl Tab {
             .iter()
             .filter(|(id, _)| ids.contains(id))
             .collect();
+        let live_sessions: std::collections::BTreeMap<&u32, &ProviderSession> = self
+            .pane_sessions
+            .iter()
+            .filter(|(id, _)| ids.contains(id))
+            .collect();
         GroupTabRow {
             group_name: group.to_string(),
             ordinal,
@@ -149,6 +179,11 @@ impl Tab {
                 String::new()
             } else {
                 serde_json::to_string(&live_cmds).unwrap_or_default()
+            },
+            pane_sessions: if live_sessions.is_empty() {
+                String::new()
+            } else {
+                serde_json::to_string(&live_sessions).unwrap_or_default()
             },
         }
     }
@@ -436,6 +471,11 @@ impl Session {
                     .iter()
                     .map(|(id, cmd)| (f(*id), cmd.clone()))
                     .collect();
+                tab.pane_sessions = tab
+                    .pane_sessions
+                    .iter()
+                    .map(|(id, s)| (f(*id), s.clone()))
+                    .collect();
             }
         }
     }
@@ -627,9 +667,40 @@ mod tests {
             focused_pane: 1,
             pane_cwds: std::collections::BTreeMap::new(),
             pane_cmds: std::collections::BTreeMap::new(),
+            pane_sessions: std::collections::BTreeMap::new(),
         };
         let back = Tab::from_row(&tab.to_row("app/feat", 1));
         assert_eq!(tab, back);
+    }
+
+    #[test]
+    fn tab_row_roundtrip_preserves_pane_sessions() {
+        let mut tab = Tab::new("1");
+        tab.center = CenterTree::Leaf(5);
+        tab.focused_pane = 5;
+        tab.pane_sessions.insert(
+            5,
+            ProviderSession {
+                provider: "sprites".into(),
+                id: "dev".into(),
+                session: "sess-42".into(),
+            },
+        );
+        // A stale entry for a leaf no longer in the tree is pruned on serialize.
+        tab.pane_sessions.insert(
+            99,
+            ProviderSession {
+                provider: "sprites".into(),
+                id: "dev".into(),
+                session: "gone".into(),
+            },
+        );
+        let back = Tab::from_row(&tab.to_row("app/feat", 0));
+        assert_eq!(
+            back.pane_sessions.get(&5).map(|s| s.session.as_str()),
+            Some("sess-42")
+        );
+        assert!(back.pane_sessions.get(&99).is_none(), "stale leaf pruned");
     }
 
     #[test]
@@ -709,6 +780,7 @@ mod tests {
             focused_pane: 0,
             pane_cwds: String::new(),
             pane_cmds: String::new(),
+            pane_sessions: String::new(),
         };
         let tab = Tab::from_row(&row);
         assert_eq!(tab.center, CenterTree::Leaf(0));

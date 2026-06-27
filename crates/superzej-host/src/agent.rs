@@ -619,6 +619,96 @@ fn provider_for(
     }
 }
 
+/// A resolved native-exec plan for a worktree's interactive shell: the built
+/// provider, the sandbox id, the inner login-shell command to run inside it, the
+/// in-sandbox working dir, and the pane env. Consumed by the host spawner to open
+/// a CLI-free `Stream` pane (see `Panes::spawn_native`).
+pub struct NativeShell {
+    pub provider: superzej_svc::provider::Provider,
+    /// The provider name (e.g. `"sprites"`), retained for session persistence.
+    pub provider_name: String,
+    pub sandbox_id: String,
+    /// The login shell to exec inside the sandbox (basename form).
+    pub inner: String,
+    /// The worktree's path inside the sandbox (the provider `workdir`).
+    pub workdir: String,
+    pub env: Vec<(String, String)>,
+}
+
+impl NativeShell {
+    /// The [`ExecSpec`](superzej_svc::provider::ExecSpec) to open a fresh login
+    /// shell inside the sandbox: a `/bin/sh -lc` that cd's into the worktree's
+    /// `workdir` then execs the resolved shell, with the pane env passed through.
+    pub fn open_spec(&self, cols: u16, rows: u16) -> superzej_svc::provider::ExecSpec {
+        let script = if self.workdir.is_empty() {
+            self.inner.clone()
+        } else {
+            format!("cd {} 2>/dev/null; exec {}", self.workdir, self.inner)
+        };
+        superzej_svc::provider::ExecSpec {
+            argv: vec!["/bin/sh".to_string(), "-lc".to_string(), script],
+            tty: true,
+            cols,
+            rows,
+            env: self.env.clone(),
+            cwd: (!self.workdir.is_empty()).then(|| self.workdir.clone()),
+        }
+    }
+}
+
+/// Decide whether `worktree`'s interactive shell should attach via a provider's
+/// **native exec API** instead of the CLI/PTY path. `Some` when the resolved env
+/// is a `provider` placement whose provider has a native exec API, whose `exec`
+/// mode isn't `cli`, and whose API token is present; `None` ⇒ use [`launch_spec`].
+///
+/// Resolves the env exactly as [`launch_spec_with_key`] does (DB repo-root +
+/// effective env) so the two paths never disagree about which env is in play.
+pub fn native_shell_exec(cfg: &Config, worktree: &str) -> Option<NativeShell> {
+    use superzej_core::config::ProviderExecMode;
+    let loc = GitLoc::for_worktree(Path::new(worktree));
+    let repo_root: PathBuf = Db::open()
+        .ok()
+        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| repo::main_worktree(Path::new(worktree)))
+        .unwrap_or_else(|| PathBuf::from(worktree));
+    let selected_env = Db::open()
+        .ok()
+        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let environment = cfg.resolve_env(&repo_root, &loc, selected_env.as_deref());
+    let superzej_core::placement::Placement::Provider(p) = &environment.placement else {
+        return None;
+    };
+    let pc = &cfg.env.get(&environment.name)?.provider;
+    if pc.exec == ProviderExecMode::Cli || !superzej_svc::provider::exec_api_by_name(&pc.provider) {
+        return None;
+    }
+    // Token missing ⇒ no provider built ⇒ fall back to the CLI path (which has
+    // its own behavior when unconfigured); don't silently spawn a dead session.
+    let provider = provider_for(pc)?;
+    // The host's absolute $SHELL path won't exist in the sandbox, so use the
+    // basename form (in_oci = true), honoring an explicit env shell override.
+    let sb_shell = environment.sandbox.shell.trim().to_string();
+    let inner = if sb_shell.is_empty() {
+        shell_inner(true)
+    } else {
+        shell_inner_override(&sb_shell)
+    };
+    let env = vec![
+        ("SUPERZEJ_WORKTREE".to_string(), worktree.to_string()),
+        ("SUPERZEJ_BRANCH".to_string(), String::new()),
+    ];
+    Some(NativeShell {
+        provider,
+        provider_name: pc.provider.clone(),
+        sandbox_id: p.id.clone(),
+        inner,
+        workdir: pc.sync_workdir(),
+        env,
+    })
+}
+
 /// Idempotently install the resident bridge binary into a provider env so a
 /// `Placement::Provider` bridge connect finds it at `remote_path`. Content-
 /// addressed handshake (push only on fingerprint mismatch). Best-effort and

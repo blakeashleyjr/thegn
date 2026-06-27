@@ -233,6 +233,11 @@ pub struct GroupTabRow {
     /// (opaque to core). Empty string when unset (pre-v15 rows / idle shell, no
     /// non-shell program was running).
     pub pane_cmds: String,
+    /// Per-leaf provider exec session: a JSON map of `pane id → {provider, id,
+    /// session}` (opaque to core), so a native-exec pane reattaches to its live
+    /// remote session on restart. Empty string when unset (pre-v22 rows / no
+    /// native-exec panes).
+    pub pane_sessions: String,
 }
 
 /// A worktree enriched with live git status, for `list` / `dashboard` output.
