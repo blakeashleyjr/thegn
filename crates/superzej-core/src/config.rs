@@ -816,12 +816,15 @@ pub struct GitCommand {
 pub struct UiConfig {
     /// Language code (e.g. "en-US", "ja-JP"). "auto" to detect from system.
     pub language: String,
+    /// Ask before destructive worktree actions (deleting a worktree from disk via the sidebar).
+    pub confirm_delete_workspace: bool,
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
             language: "auto".to_string(),
+            confirm_delete_workspace: true,
         }
     }
 }

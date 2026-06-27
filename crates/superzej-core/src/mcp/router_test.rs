@@ -1,11 +1,11 @@
 use crate::db::Db;
 use crate::event_bus::{Event, EventBus};
-use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
 use crate::mcp::router::McpRouter;
 use serde_json::json;
 use std::sync::Arc;
 
 #[test]
+#[allow(clippy::arc_with_non_send_sync)]
 fn test_mcp_initialize() {
     let db = Arc::new(Db::open_memory().unwrap());
     let bus = Arc::new(EventBus::new());
@@ -25,6 +25,7 @@ fn test_mcp_initialize() {
 }
 
 #[test]
+#[allow(clippy::arc_with_non_send_sync)]
 fn test_mcp_request_human_emits_event() {
     let db = Arc::new(Db::open_memory().unwrap());
     let bus = Arc::new(EventBus::new());
