@@ -494,6 +494,29 @@ impl GitLoc {
     }
 }
 
+/// The idempotent provisioning script for a fresh provider env (8-A.3): clone the
+/// repo into the worktree dir on first open, no-op once it's a git repo. Designed
+/// to run via [`GitLoc::sh_command`], which already `cd`s into the workdir — so
+/// the clone targets `.` (the cwd). The leading `rev-parse` guard makes re-opens
+/// cheap and makes this safe to run even after a `data=sync` upload (which lands
+/// a `.git`, so the guard skips). When `branch` is set, check it out (creating it
+/// if it doesn't exist on the remote). `origin` is the upstream URL.
+pub fn provision_repo_script(origin: &str, branch: Option<&str>) -> String {
+    let oq = util::sh_quote(origin);
+    // Already a repo → done. Else clone into the cwd, then settle the branch.
+    let mut s =
+        String::from("if git rev-parse --git-dir >/dev/null 2>&1; then exit 0; fi; git clone ");
+    s.push_str(&oq);
+    s.push_str(" .");
+    if let Some(b) = branch.map(str::trim).filter(|b| !b.is_empty()) {
+        let bq = util::sh_quote(b);
+        s.push_str(&format!(
+            " && (git checkout {bq} 2>/dev/null || git checkout -b {bq})"
+        ));
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,6 +526,52 @@ mod tests {
         let loc = GitLoc::from_db("/wt/x", None);
         assert!(!loc.is_remote());
         assert_eq!(loc.path(), "/wt/x");
+    }
+
+    #[test]
+    fn provision_script_is_idempotent_and_quotes() {
+        // Guard first (re-open / post-sync no-op), then clone into the cwd `.`.
+        let s = provision_repo_script("https://github.com/o/r.git", Some("feat/x"));
+        assert!(
+            s.starts_with("if git rev-parse --git-dir"),
+            "guard first: {s}"
+        );
+        // sh_quote passes safe URLs/branch names through unquoted.
+        assert!(
+            s.contains("git clone https://github.com/o/r.git ."),
+            "clone into cwd: {s}"
+        );
+        // Branch checkout falls back to creating it when absent on the remote.
+        assert!(s.contains("git checkout feat/x 2>/dev/null || git checkout -b feat/x"));
+        // A branch with a space gets single-quoted.
+        assert!(provision_repo_script("u", Some("a b")).contains("git checkout 'a b'"));
+        // No branch → no checkout clause.
+        let s2 = provision_repo_script("git@h:o/r", None);
+        assert!(!s2.contains("checkout"), "no branch ⇒ no checkout: {s2}");
+        // Blank branch is treated as no branch.
+        assert!(!provision_repo_script("x", Some("  ")).contains("checkout"));
+    }
+
+    #[test]
+    fn provision_script_runs_in_env_via_sh_command() {
+        // A provider loc wraps the script in its control prefix + the workdir cd,
+        // so the clone runs inside the env at the worktree dir.
+        let loc = GitLoc::provider(
+            vec!["sprite".into(), "exec".into(), "--".into()],
+            "/workspace",
+        );
+        let script = provision_repo_script("https://x/r.git", Some("main"));
+        let cmd = loc.sh_command(&script);
+        let argv: Vec<String> = std::iter::once(cmd.get_program().to_string_lossy().into_owned())
+            .chain(cmd.get_args().map(|a| a.to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(argv[0], "sprite");
+        let joined = argv.join(" ");
+        assert!(
+            joined.contains("cd /workspace &&"),
+            "cd into workdir: {joined}"
+        );
+        assert!(joined.contains("git clone"), "carries the clone: {joined}");
     }
 
     #[test]
