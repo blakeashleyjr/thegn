@@ -1642,22 +1642,6 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    pub fn delete_workspace(&self, repo_path: &str) -> Result<u32> {
-        let count: u32 = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM worktrees WHERE repo_path = ?1",
-                [repo_path],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
-        self.conn
-            .execute("DELETE FROM workspaces WHERE repo_path = ?1", [repo_path])?;
-
-        Ok(count)
-    }
-
     // --- command-palette frecency -----------------------------------------
     /// Record that `key` was just chosen (increment count, stamp last_used).
     pub fn bump_palette_usage(&self, key: &str) -> Result<()> {

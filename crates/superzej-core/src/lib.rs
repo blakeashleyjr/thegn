@@ -16,6 +16,7 @@ pub mod ci;
 pub mod config;
 pub mod custom_cmd;
 pub mod db;
+pub mod devenv;
 pub mod diff_highlight;
 pub mod diff_sbs;
 pub mod dns_filter;
