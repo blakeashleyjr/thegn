@@ -200,7 +200,9 @@ pub(super) fn share(ctx: &SectionCtx) -> Vec<PanelRow> {
                 None if s.failed => (hue(Hue::Red), "failed".to_string()),
                 None => (g2(), "starting…".to_string()),
             };
+            // Reach glyph (🌐 public / 👥 team / 🔗 peer) + port → URL/command.
             PanelRow::plain(Line::segs(vec![
+                seg(g(), format!("{} ", s.reach_glyph())),
                 seg(color, format!("\u{21c5} {} ", s.port)).bold(),
                 seg(g(), status),
             ]))

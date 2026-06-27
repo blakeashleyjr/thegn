@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use superzej_core::config::ShareConfig;
 use superzej_core::share::build_share_spec;
+use superzej_svc::share::ShareProvider;
 use termwiz::terminal::TerminalWaker;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -25,6 +26,7 @@ pub enum ShareEvent {
     Up {
         worktree: String,
         port: u16,
+        provider: &'static str,
         url: String,
     },
     /// The tunnel client exited (clean stop, crash, or `stop()` kill).
@@ -33,6 +35,7 @@ pub enum ShareEvent {
     Failed {
         worktree: String,
         port: u16,
+        provider: &'static str,
         error: String,
     },
 }
@@ -50,20 +53,61 @@ pub enum ShareState {
 pub struct ShareView {
     pub worktree: String,
     pub port: u16,
+    /// The public URL (http(s)…) or, for iroh, the `dumbpipe connect-tcp …`
+    /// consumer command. `None` while starting or on failure.
     pub url: Option<String>,
     pub failed: bool,
+    /// Provider id (`bore`/`frp`/`tailscale`/`iroh`) — drives the panel glyph.
+    pub provider: &'static str,
+    /// Whether the share is reachable from the public internet (safety badge).
+    pub public: bool,
 }
 
-/// Cross-thread handle to one running child: lets [`ShareSupervisor::stop`] /
-/// shutdown signal and SIGTERM a child the supervisor thread is `wait`ing on.
+impl ShareView {
+    /// The reach glyph: 🌐 public, 👥 team (tailscale serve), 🔗 peer (iroh).
+    pub fn reach_glyph(&self) -> char {
+        if self.public {
+            '\u{1f310}' // 🌐
+        } else if self.provider == "iroh" {
+            '\u{1f517}' // 🔗
+        } else {
+            '\u{1f465}' // 👥
+        }
+    }
+}
+
+/// How to tear a sidecar-serve share down (tailscale): the sidecar container +
+/// the plan whose `down_argv` removes the serve. Set by the serve thread.
+#[derive(Clone)]
+struct ServeTeardown {
+    sidecar: String,
+    serve: superzej_svc::share::ServePlan,
+}
+
+/// Cross-thread handle to one running share: lets [`ShareSupervisor::stop`] /
+/// shutdown signal and tear it down. A `Process` share carries a `pid` to
+/// SIGTERM; a `SidecarServe` share carries a `teardown` to run `down_argv`.
 struct Shared {
     shutdown: AtomicBool,
     pid: Mutex<Option<u32>>,
+    teardown: Mutex<Option<ServeTeardown>>,
+}
+
+impl Shared {
+    fn new() -> Arc<Self> {
+        Arc::new(Shared {
+            shutdown: AtomicBool::new(false),
+            pid: Mutex::new(None),
+            teardown: Mutex::new(None),
+        })
+    }
 }
 
 struct ShareInstance {
     worktree: String,
     port: u16,
+    provider: &'static str,
+    public: bool,
     state: ShareState,
     shared: Arc<Shared>,
 }
@@ -76,6 +120,12 @@ impl ShareInstance {
             unsafe {
                 libc::kill(pid as libc::pid_t, libc::SIGTERM);
             }
+        }
+        // Sidecar-serve teardown shells into the VPN sidecar; do it off the loop.
+        if let Some(td) = self.shared.teardown.lock().unwrap().clone() {
+            std::thread::spawn(move || {
+                superzej_svc::share::serve_down(&td.sidecar, &td.serve);
+            });
         }
     }
 }
@@ -112,6 +162,8 @@ impl ShareSupervisor {
                     _ => None,
                 },
                 failed: matches!(i.state, ShareState::Failed(_)),
+                provider: i.provider,
+                public: i.public,
             })
             .collect()
     }
@@ -129,13 +181,19 @@ impl ShareSupervisor {
         if self.has(worktree, port) {
             return Err(format!("already sharing port {port}"));
         }
-        let Some(spec) = build_share_spec(cfg, port) else {
-            return Err("sharing is disabled (set [share] provider = \"bore\")".into());
+        let label = superzej_core::share::label_for(worktree);
+        let Some(spec) = build_share_spec(cfg, &label, port) else {
+            return Err("sharing is disabled (set [share] provider)".into());
         };
-        let shared = Arc::new(Shared {
-            shutdown: AtomicBool::new(false),
-            pid: Mutex::new(None),
-        });
+        let public = spec.visibility == superzej_core::config::ShareVisibility::Public;
+        // Safety guard: never expose to the public internet unless opted in.
+        if public && !cfg.allow_public {
+            return Err(
+                "public sharing is disabled (set [share] allow_public = true to enable)".into(),
+            );
+        }
+        let provider = superzej_svc::share::for_provider(&spec).kind();
+        let shared = Shared::new();
         let t_shared = shared.clone();
         let t_tx = tx.clone();
         let t_waker = waker.clone();
@@ -147,6 +205,8 @@ impl ShareSupervisor {
         self.instances.push(ShareInstance {
             worktree: worktree.to_string(),
             port,
+            provider,
+            public,
             state: ShareState::Starting,
             shared,
         });
@@ -161,6 +221,7 @@ impl ShareSupervisor {
                 worktree,
                 port,
                 url,
+                ..
             } => match self.find_mut(&worktree, port) {
                 Some(i) => {
                     i.state = ShareState::Up(url);
@@ -172,6 +233,7 @@ impl ShareSupervisor {
                 worktree,
                 port,
                 error,
+                ..
             } => match self.find_mut(&worktree, port) {
                 Some(i) => {
                     i.state = ShareState::Failed(error);
@@ -228,49 +290,86 @@ fn supervise(
     waker: TerminalWaker,
     shared: Arc<Shared>,
 ) {
-    use superzej_svc::share::{self, ShareProvider};
+    use superzej_svc::share::{self, ShareLaunch};
 
+    let provider = share::for_provider(&spec).kind();
     let emit = |ev: ShareEvent| {
         let _ = tx.send(ev);
         let _ = waker.wake();
     };
-
-    let plan = match share::for_provider(&spec).plan() {
-        Ok(p) => p,
-        Err(e) => {
-            emit(ShareEvent::Failed {
-                worktree,
-                port,
-                error: e.to_string(),
-            });
-            return;
-        }
+    let fail = |e: String| {
+        let _ = tx.send(ShareEvent::Failed {
+            worktree: worktree.clone(),
+            port,
+            provider,
+            error: e,
+        });
+        let _ = waker.wake();
     };
 
-    match share::start(&plan, spec.ready_timeout) {
-        Ok(running) => {
-            *shared.pid.lock().unwrap() = Some(running.child.id());
-            // Raced with a stop() before the URL arrived: tear down now.
-            if shared.shutdown.load(Ordering::SeqCst) {
-                running.stop();
-                emit(ShareEvent::Down { worktree, port });
-                return;
+    let launch = match share::for_provider(&spec).launch() {
+        Ok(l) => l,
+        Err(e) => return fail(e.to_string()),
+    };
+
+    match launch {
+        // Process providers (bore/frp/dumbpipe): spawn the child, report its URL,
+        // then block on it so we emit `Down` when it exits.
+        ShareLaunch::Process(plan) => {
+            let statedir = share::share_state_dir(&worktree, port);
+            match share::start(&plan, &statedir, spec.ready_timeout) {
+                Ok(running) => {
+                    *shared.pid.lock().unwrap() = Some(running.child.id());
+                    if shared.shutdown.load(Ordering::SeqCst) {
+                        running.stop();
+                        emit(ShareEvent::Down { worktree, port });
+                        return;
+                    }
+                    emit(ShareEvent::Up {
+                        worktree: worktree.clone(),
+                        port,
+                        provider,
+                        url: running.public_url.clone(),
+                    });
+                    let share::RunningShare { mut child, .. } = running;
+                    let _ = child.wait();
+                    *shared.pid.lock().unwrap() = None;
+                    emit(ShareEvent::Down { worktree, port });
+                }
+                Err(e) => fail(e.to_string()),
             }
-            emit(ShareEvent::Up {
-                worktree: worktree.clone(),
-                port,
-                url: running.public_url.clone(),
-            });
-            let share::RunningShare { mut child, .. } = running;
-            let _ = child.wait();
-            *shared.pid.lock().unwrap() = None;
-            emit(ShareEvent::Down { worktree, port });
         }
-        Err(e) => emit(ShareEvent::Failed {
-            worktree,
-            port,
-            error: e.to_string(),
-        }),
+        // tailscale: drive `serve`/`funnel` inside the worktree's VPN sidecar.
+        // There is no child to wait on; the serve persists until `stop`/shutdown
+        // runs `down_argv` (held in `shared.teardown`) or the sidecar dies.
+        ShareLaunch::SidecarServe(serve) => {
+            let sidecar = superzej_core::sandbox::vpn_sidecar_name(
+                &superzej_core::sandbox::container_name(&worktree),
+            );
+            match share::serve_up(&sidecar, &serve) {
+                Ok(url) => {
+                    *shared.teardown.lock().unwrap() = Some(ServeTeardown {
+                        sidecar,
+                        serve: serve.clone(),
+                    });
+                    if shared.shutdown.load(Ordering::SeqCst) {
+                        share::serve_down(
+                            &shared.teardown.lock().unwrap().as_ref().unwrap().sidecar,
+                            &serve,
+                        );
+                        emit(ShareEvent::Down { worktree, port });
+                        return;
+                    }
+                    emit(ShareEvent::Up {
+                        worktree,
+                        port,
+                        provider,
+                        url,
+                    });
+                }
+                Err(e) => fail(e.to_string()),
+            }
+        }
     }
 }
 
@@ -285,16 +384,16 @@ mod tests {
         sup.instances.push(ShareInstance {
             worktree: "/wt".into(),
             port: 3000,
+            provider: "bore",
+            public: true,
             state: ShareState::Starting,
-            shared: Arc::new(Shared {
-                shutdown: AtomicBool::new(false),
-                pid: Mutex::new(None),
-            }),
+            shared: Shared::new(),
         });
         assert!(sup.views("/wt")[0].url.is_none());
         assert!(sup.on_event(ShareEvent::Up {
             worktree: "/wt".into(),
             port: 3000,
+            provider: "bore",
             url: "http://bore.pub:1".into(),
         }));
         let v = sup.views("/wt");
@@ -307,6 +406,7 @@ mod tests {
         assert!(!sup.on_event(ShareEvent::Up {
             worktree: "/other".into(),
             port: 9,
+            provider: "bore",
             url: "x".into(),
         }));
 
@@ -324,15 +424,15 @@ mod tests {
         sup.instances.push(ShareInstance {
             worktree: "/wt".into(),
             port: 8080,
+            provider: "bore",
+            public: true,
             state: ShareState::Starting,
-            shared: Arc::new(Shared {
-                shutdown: AtomicBool::new(false),
-                pid: Mutex::new(None),
-            }),
+            shared: Shared::new(),
         });
         assert!(sup.on_event(ShareEvent::Failed {
             worktree: "/wt".into(),
             port: 8080,
+            provider: "bore",
             error: "boom".into(),
         }));
         let v = sup.views("/wt");

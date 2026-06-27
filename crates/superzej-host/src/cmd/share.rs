@@ -14,7 +14,7 @@ use superzej_core::config::Config;
 use superzej_core::db::Db;
 use superzej_core::outln;
 use superzej_core::share::build_share_spec;
-use superzej_svc::share::{self, ShareProvider};
+use superzej_svc::share::{self, ShareLaunch, ShareProvider};
 
 use crate::cmd::resolve_worktree;
 
@@ -46,46 +46,73 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
 }
 
 fn start(cfg: &Config, port: u16, worktree: Option<String>) -> Result<()> {
-    let Some(spec) = build_share_spec(&cfg.share, port) else {
-        outln!("share: disabled (set [share] provider = \"bore\")");
+    let wt = resolve_worktree(worktree).to_string_lossy().into_owned();
+    let label = superzej_core::share::label_for(&wt);
+    let Some(spec) = build_share_spec(&cfg.share, &label, port) else {
+        outln!("share: disabled (set [share] provider)");
         return Ok(());
     };
+    if spec.visibility == superzej_core::config::ShareVisibility::Public && !cfg.share.allow_public
+    {
+        outln!("share: public sharing is disabled (set [share] allow_public = true)");
+        return Ok(());
+    }
     let provider = share::for_provider(&spec);
     let kind = provider.kind().to_string();
-    let plan = provider.plan()?;
+    let launch = match provider.launch() {
+        Ok(l) => l,
+        Err(e) => return on_error_exit(spec.on_error, e),
+    };
+    let db = Db::open().ok();
 
-    let wt = resolve_worktree(worktree).to_string_lossy().into_owned();
-
-    let running = match share::start(&plan, spec.ready_timeout) {
-        Ok(r) => r,
-        Err(e) => {
-            // Mirror VPN's `on_error`: `fail` surfaces, `warn` notes and exits 0.
-            match spec.on_error {
-                superzej_core::config::ShareOnError::Warn => {
-                    outln!("share: {e} (continuing without a share)");
-                    return Ok(());
-                }
-                superzej_core::config::ShareOnError::Fail => return Err(e),
+    match launch {
+        ShareLaunch::Process(plan) => {
+            let statedir = share::share_state_dir(&wt, port);
+            let running = match share::start(&plan, &statedir, spec.ready_timeout) {
+                Ok(r) => r,
+                Err(e) => return on_error_exit(spec.on_error, e),
+            };
+            outln!("share: 127.0.0.1:{port} → {}", running.public_url);
+            outln!("share: press Ctrl-C to stop");
+            if let Some(db) = &db {
+                let _ = db.upsert_share(&wt, port, &kind, Some(&running.public_url), "up");
+            }
+            // Block until the client exits (Ctrl-C tears down the group).
+            let share::RunningShare { mut child, .. } = running;
+            let _ = child.wait();
+            if let Some(db) = &db {
+                let _ = db.delete_share(&wt, port);
             }
         }
-    };
-
-    outln!("share: 127.0.0.1:{port} → {}", running.public_url);
-    outln!("share: press Ctrl-C to stop");
-
-    let db = Db::open().ok();
-    if let Some(db) = &db {
-        let _ = db.upsert_share(&wt, port, &kind, Some(&running.public_url), "up");
-    }
-
-    // Block until the tunnel client exits (Ctrl-C propagates to the process
-    // group and tears down both). Best-effort cleanup of the DB record after.
-    let share::RunningShare { mut child, .. } = running;
-    let _ = child.wait();
-    if let Some(db) = &db {
-        let _ = db.delete_share(&wt, port);
+        ShareLaunch::SidecarServe(serve) => {
+            // tailscale serve persists in the VPN sidecar (--bg); no process to
+            // hold. Report the URL and exit; `share stop` removes the record.
+            let sidecar = superzej_core::sandbox::vpn_sidecar_name(
+                &superzej_core::sandbox::container_name(&wt),
+            );
+            let url = match share::serve_up(&sidecar, &serve) {
+                Ok(u) => u,
+                Err(e) => return on_error_exit(spec.on_error, e),
+            };
+            outln!("share: 127.0.0.1:{port} → {url}");
+            outln!("share: serve persists in the tailnet; `share stop {port}` to remove");
+            if let Some(db) = &db {
+                let _ = db.upsert_share(&wt, port, &kind, Some(&url), "up");
+            }
+        }
     }
     Ok(())
+}
+
+/// `fail` surfaces the error (non-zero exit); `warn` notes it and exits 0.
+fn on_error_exit(on_error: superzej_core::config::ShareOnError, e: anyhow::Error) -> Result<()> {
+    match on_error {
+        superzej_core::config::ShareOnError::Warn => {
+            outln!("share: {e} (continuing without a share)");
+            Ok(())
+        }
+        superzej_core::config::ShareOnError::Fail => Err(e),
+    }
 }
 
 fn list() -> Result<()> {
