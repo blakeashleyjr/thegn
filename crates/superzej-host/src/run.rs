@@ -376,11 +376,19 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // SGR mouse reporting stays on (1002 = button + drag, 1006 = SGR encoding):
     // clicks focus panes/rows and drags build a per-pane selection that
     // auto-copies (OSC 52) on release, zellij-style.
+    //
+    // Autowrap OFF (DECRST 7): the compositor positions every cell absolutely
+    // and never relies on the cursor wrapping to the next line. With autowrap
+    // left ON (the alt-screen default), writing the bottom-right cell — e.g. a
+    // long statusbar line that reaches the last column — wraps the cursor past
+    // the edge and scrolls the whole alt buffer up one line, dropping the
+    // masthead for a frame until the next absolute repaint heals it. ?7l kills
+    // that scroll for the life of the session (restored on teardown).
     {
         use std::io::Write as _;
         let mut out = std::io::stdout();
         let _ = out
-            .write_all(b"\x1b[?1002h\x1b[?1006h")
+            .write_all(b"\x1b[?1002h\x1b[?1006h\x1b[?7l")
             .and_then(|_| out.flush());
     }
 
@@ -717,7 +725,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         use std::io::Write as _;
         let mut out = std::io::stdout();
         let _ = out
-            .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[<u")
+            .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[<u")
             .and_then(|_| out.flush());
     }
     let _ = buf.terminal().exit_alternate_screen();
