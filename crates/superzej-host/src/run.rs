@@ -3439,12 +3439,20 @@ fn create_workspace_from_input(
     session: &mut crate::session::Session,
     db: &superzej_core::db::Db,
 ) -> Result<std::path::PathBuf> {
-    create_workspace_from_input_with_config(
+    match create_workspace_from_input_with_config(
         input,
         session,
         db,
         &superzej_core::config::Config::default(),
-    )
+    )? {
+        WorkspaceResolution::Repo(p) => Ok(p),
+        WorkspaceResolution::NotARepo(p) => Ok(p),
+    }
+}
+
+enum WorkspaceResolution {
+    Repo(std::path::PathBuf),
+    NotARepo(std::path::PathBuf),
 }
 
 fn create_workspace_from_input_with_config(
@@ -3452,7 +3460,7 @@ fn create_workspace_from_input_with_config(
     session: &mut crate::session::Session,
     db: &superzej_core::db::Db,
     cfg: &superzej_core::config::Config,
-) -> Result<std::path::PathBuf> {
+) -> Result<WorkspaceResolution> {
     let input = input.trim();
     anyhow::ensure!(!input.is_empty(), "no workspace path or URL given");
 
@@ -3498,12 +3506,12 @@ fn create_workspace_from_input_with_config(
     let kind = if superzej_core::repo::main_worktree(&root).is_some() {
         "repo"
     } else {
-        "dir"
+        return Ok(WorkspaceResolution::NotARepo(root));
     };
     db.put_workspace(&root_s, &name, kind)?;
     db.touch_repo(&root_s, &name)?;
     session.switch_to_workspace(&root_s, db)?;
-    Ok(root)
+    Ok(WorkspaceResolution::Repo(root))
 }
 
 /// A follow-up only the loop body can perform (it owns session/panes).
@@ -4913,6 +4921,7 @@ fn dispatch_menu_choice(
         MenuChoice::SetKeymapPreset(_) => {}
         MenuChoice::ConfirmDeleteWorktrees { .. } => {}
         MenuChoice::ConfirmDeleteWorkspace { .. } => {}
+        MenuChoice::ConfirmInitGit { .. } => {}
     }
     GitAfter::None
 }
@@ -10657,7 +10666,7 @@ async fn event_loop<T: Terminal>(
                                                     &current_config,
                                                 )
                                             }) {
-                                            Ok(path) => {
+                                            Ok(WorkspaceResolution::Repo(path)) => {
                                                 workspace_pool.stash(prev_id, snapshot);
                                                 remap_cold_workspace_ids(&mut session, &mut panes);
                                                 focus.zone = crate::focus::Zone::Center;
@@ -10676,6 +10685,11 @@ async fn event_loop<T: Terminal>(
                                                     path.display()
                                                 );
                                                 need_relayout = true;
+                                            }
+                                            Ok(WorkspaceResolution::NotARepo(path)) => {
+                                                active_menu = Some(menu::init_git_menu(
+                                                    path.to_string_lossy().into_owned(),
+                                                ));
                                             }
                                             Err(e) => {
                                                 model.status =
@@ -10970,6 +10984,61 @@ async fn event_loop<T: Terminal>(
                                     keymap.config(),
                                     chrome.center,
                                 );
+                                dirty = true;
+                                continue;
+                            }
+                            if let menu::MenuChoice::ConfirmInitGit { path } = choice {
+                                if superzej_core::util::git_cmd(std::path::Path::new(&path))
+                                    .arg("init")
+                                    .status()
+                                    .map(|s| s.success())
+                                    .unwrap_or(false)
+                                {
+                                    model.status =
+                                        format!("initialized git repository at {}", path);
+
+                                    // Proceed with creating the workspace
+                                    persist_session_layout(&mut session, &panes);
+                                    let prev_id = session.id.clone();
+                                    let snapshot = ResidentWorkspace {
+                                        worktrees: session.worktrees.clone(),
+                                        active: session.active,
+                                    };
+                                    match superzej_core::db::Db::open()
+                                        .context("open superzej db")
+                                        .and_then(|db| {
+                                            create_workspace_from_input_with_config(
+                                                &path,
+                                                &mut session,
+                                                &db,
+                                                &current_config,
+                                            )
+                                        }) {
+                                        Ok(WorkspaceResolution::Repo(_)) => {
+                                            workspace_pool.stash(prev_id, snapshot);
+                                            remap_cold_workspace_ids(&mut session, &mut panes);
+                                            focus.zone = crate::focus::Zone::Center;
+                                            refresh_tab_model(&mut model, &session, &mut sb);
+                                            sync_drawer_persistence(
+                                                &session,
+                                                &mut panes,
+                                                &mut drawer,
+                                                &mut drawer_pool,
+                                                &mut drawer_home,
+                                                keymap.config(),
+                                                chrome.center,
+                                            );
+                                            need_relayout = true;
+                                        }
+                                        _ => {
+                                            model.status =
+                                                "failed to switch to initialized workspace".into();
+                                        }
+                                    }
+                                } else {
+                                    model.status =
+                                        format!("failed to initialize git repository at {}", path);
+                                }
                                 dirty = true;
                                 continue;
                             }
@@ -16417,33 +16486,6 @@ mod tests {
             "status should make shortcut/menu feedback visible: {:?}",
             model.status
         );
-    }
-
-    #[test]
-    fn workspace_input_accepts_existing_directory_workspace() {
-        let db_root = std::env::temp_dir().join(format!(
-            "superzej-test-db-{}-{}",
-            std::process::id(),
-            now_secs()
-        ));
-        let db = superzej_core::db::Db::open_at(&db_root.join("superzej.db")).unwrap();
-        let mut session = crate::session::Session {
-            id: "/old".into(),
-            ..Default::default()
-        };
-        let dir = std::env::temp_dir().join(format!(
-            "superzej-test-ws-{}-{}",
-            std::process::id(),
-            now_secs()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let path = create_workspace_from_input(dir.to_str().unwrap(), &mut session, &db)
-            .expect("plain directory workspaces should be accepted");
-
-        assert_eq!(path, dir);
-        assert_eq!(session.id, dir.to_string_lossy());
-        assert_eq!(db.workspaces().unwrap()[0].kind, "dir");
     }
 
     #[test]
