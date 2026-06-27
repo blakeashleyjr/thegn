@@ -653,6 +653,106 @@ pub fn launch_spec_with_key(
     Ok(spec)
 }
 
+/// Resolve `worktree`'s sandbox and run a one-shot shell command inside it,
+/// returning combined stdout+stderr. Services ACP `terminal/create` so the
+/// agent's shell commands run inside the same policy boundary (container /
+/// bwrap / none) as its interactive pane — superzej is the agent's "hands and
+/// bouncer". BLOCKING (sandbox resolution may ensure a container); callers must
+/// run it off the event loop.
+pub fn run_in_sandbox(cfg: &Config, worktree: &str, command: &str) -> anyhow::Result<String> {
+    let loc = GitLoc::for_worktree(Path::new(worktree));
+    let saved_backend = Db::open()
+        .ok()
+        .and_then(|db| db.worktree_sandbox(worktree).ok().flatten());
+    let repo_root: PathBuf = Db::open()
+        .ok()
+        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| repo::main_worktree(Path::new(worktree)))
+        .unwrap_or_else(|| PathBuf::from(worktree));
+    let selected_env = Db::open()
+        .ok()
+        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+
+    let outcome = prepare_sandbox_env(
+        cfg,
+        &repo_root,
+        worktree,
+        &loc,
+        saved_backend.as_deref(),
+        SandboxScope::Shell,
+        selected_env.as_deref(),
+    )?;
+
+    let argv = match &outcome.spec {
+        Some(spec) => sandbox::enter_argv(spec, command),
+        None => vec![
+            superzej_core::util::shell(),
+            "-lc".to_string(),
+            command.to_string(),
+        ],
+    };
+
+    let mut cmd = std::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    // Local worktree: run from its dir so relative paths resolve as the agent expects.
+    if !loc.is_remote() && !outcome.is_remote {
+        cmd.current_dir(worktree);
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| anyhow::anyhow!("spawn `{}` failed: {e}", argv.join(" ")))?;
+    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !stderr.is_empty() {
+        if !combined.is_empty() && !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+        combined.push_str(&stderr);
+    }
+    Ok(combined)
+}
+
+/// Mint (or refresh) a per-worktree virtual key so the agent's model traffic
+/// routes through `szproxy` scoped to `agent:pi:<worktree>` — the proxy then
+/// attributes spend and enforces budgets per worktree. Returns the bearer token
+/// to hand the agent (best-effort; `None` if the DB is unavailable). Revoke it
+/// with [`revoke_agent_proxy_key`] when the agent disconnects.
+pub fn mint_agent_proxy_key(worktree: &str) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+    let db = Db::open().ok()?;
+    let slug = superzej_core::util::slugify(worktree);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let key = format!("szk-{slug}-{nanos}");
+    // The proxy looks up identity by the token itself; the hash column is stored
+    // for parity with the schema (lookups don't verify it for a local daemon).
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    let token_hash = format!("{:016x}", hasher.finish());
+    let scope = format!("agent:pi:{worktree}");
+    db.put_proxy_virtual_key(
+        &key,
+        &token_hash,
+        &format!("pi agent {worktree}"),
+        &scope,
+        None,
+        superzej_core::util::now(),
+    )
+    .ok()?;
+    Some(key)
+}
+
+/// Revoke a virtual key minted by [`mint_agent_proxy_key`] (best-effort).
+pub fn revoke_agent_proxy_key(key: &str) {
+    if let Ok(db) = Db::open() {
+        let _ = db.revoke_proxy_virtual_key(key, superzej_core::util::now());
+    }
+}
+
 /// Resolve a configured build path: `~`/`~/…` expands to home; a relative path
 /// resolves against the repo root (so a shared `target/` is per-repo).
 fn resolve_build_path(raw: &str, repo_root: &Path) -> String {

@@ -26,7 +26,8 @@ fn kind_hue(k: NotificationKind) -> crate::seg::Tok {
         | NotificationKind::Overdue
         | NotificationKind::LogError
         | NotificationKind::ProcessFailed => hue(Hue::Red),
-        NotificationKind::PrStateChanged
+        NotificationKind::AgentAttention
+        | NotificationKind::PrStateChanged
         | NotificationKind::StatusChanged
         | NotificationKind::PrLinked => hue(Hue::Amber),
         NotificationKind::Assigned | NotificationKind::Mentioned => hue(Hue::Blue),
