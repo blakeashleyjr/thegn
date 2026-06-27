@@ -931,10 +931,33 @@ env_passthrough = [
 shell = ""
 
 # ── Init script ───────────────────────────────────────────────────────────────
-# POSIX sh snippet run inside the sandbox before each agent/shell starts.
-# Useful for first-run tool installation, env setup, or container git config.
+# POSIX sh snippet run INSIDE the sandbox before each agent/shell starts (runs
+# in every pane, before the login shell `exec`s). Useful for first-run tool
+# installation, env setup, or container git config.
 # init_script = "mise install 2>/dev/null || true"
 init_script = ""
+
+# ── Prepare hooks (host-side, one-time per worktree) ──────────────────────────
+# Commands run ON THE HOST (off-loop, via `sh -lc` in the worktree) once when a
+# worktree is created, before its first pane spawns. Unlike `init_script` these
+# run on the host — with the writable Nix store, the Nix daemon, and full
+# network — so they suit heavyweight setup that a sandboxed pane can't do
+# itself. The built-in `direnv` warm (`warm_direnv`, below) runs alongside them.
+# prepare = ["mise install || true", "pnpm install --frozen-lockfile || true"]
+prepare = []
+
+# ── direnv ────────────────────────────────────────────────────────────────────
+# Pre-warm a worktree's `direnv` cache on the HOST so the in-sandbox `direnv`
+# hook actually works. A worktree pane is a login shell, so your rc's `direnv
+# hook` fires inside the sandbox; with `use flake`, a cold nix-direnv cache makes
+# direnv rebuild the devShell — which writes/locks `/nix/store` and fails on the
+# sandbox's read-only store (no daemon). Warming on the host (writable store +
+# daemon) means the in-pane direnv replays the cached env read-only instead.
+#   "auto"         — warm + `direnv allow` the worktree (trusts the repo's own
+#                    .envrc, the same boundary `inject_devshell` already crosses)
+#   "allowed-only" — warm only worktrees you've already `direnv allow`-ed
+#   "off"          — never warm (the in-pane direnv falls back as before)
+warm_direnv = "auto"
 
 # Wrap the inner command in `devenv shell --`. Auto-enabled if devenv.nix is
 # present in the worktree root and the `devenv` binary is on PATH.
