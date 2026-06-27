@@ -48,14 +48,18 @@ _apps:
 build: _apps
     cargo build --workspace
 
-# Cross-platform regression gate: typecheck the metrics crate's per-OS
-# sysinfo/battery code for macOS + Windows on this (Linux) box. The crate is a
-# C-dep-free leaf, so `cargo check --target` needs no cross C toolchain (check
-# never links). Targets are provided by the flake's rust toolchain. Catches the
-# #1 cross-platform breakage — won't-compile — without macOS/Windows runners.
+# Cross-platform regression gate: typecheck the C-dep-free leaf crates' per-OS
+# code for macOS + Windows on this (Linux) box. `superzej-metrics` covers the
+# sysinfo/battery substrate; `superzej-media` covers the per-OS player backends
+# (Linux MPRIS/mpv, Windows SMTC, macOS AppleScript). `cargo check --target`
+# needs no cross C toolchain (check never links). Targets are provided by the
+# flake's rust toolchain. Catches the #1 cross-platform breakage — won't-compile
+# — without macOS/Windows runners.
 check-cross:
     cargo check -p superzej-metrics --target aarch64-apple-darwin
     cargo check -p superzej-metrics --target x86_64-pc-windows-gnu
+    cargo check -p superzej-media --target aarch64-apple-darwin
+    cargo check -p superzej-media --target x86_64-pc-windows-gnu
 
 # Debug build of the host with the in-process sampling profiler compiled in
 # (the `profiling` feature → SIGUSR2 flamegraph capture). Same artifact path as

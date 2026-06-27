@@ -22,7 +22,7 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
         if ctx.deep() {
             rows.push(PanelRow::plain(Line::segs(vec![seg(
                 g2(),
-                "enable [media] and start a player".to_string(),
+                "start a player (Spotify, mpv, VLC…); Alt-m drives transport".to_string(),
             )])));
         }
         return rows;

@@ -121,10 +121,12 @@
       rustToolchain = pkgs.rust-bin.stable.latest.default.override {
         # llvm-tools for `cargo llvm-cov` (just coverage).
         extensions = ["llvm-tools-preview"];
-        # macOS + Windows targets for `just check-cross`: the metrics crate is a
-        # C-dep-free leaf, so `cargo check --target` typechecks the per-OS
-        # sysinfo/battery code on this Linux box without a cross C toolchain
-        # (check never links). This is the cross-platform regression gate.
+        # macOS + Windows targets for `just check-cross`: the metrics + media
+        # crates are C-dep-free leaves, so `cargo check --target` typechecks the
+        # per-OS code (sysinfo/battery; MPRIS/SMTC/mpv/AppleScript players) on
+        # this Linux box without a cross C toolchain (check never links). The
+        # `windows` crate cross-checks fine on -gnu — no -msvc target needed.
+        # This is the cross-platform regression gate.
         targets = [
           "aarch64-apple-darwin"
           "x86_64-pc-windows-gnu"

@@ -9,6 +9,11 @@ description = "superzej substrate-agnostic core: state, git, sandbox, config, th
 test-utils = []
 
 [dependencies]
+# The media model lives in the C-dep-free `superzej-media` leaf (so its per-OS
+# control backends cross-check); core re-exports it via `media.rs` and lowers
+# `MediaConfig` into the leaf's `ResolveOpts`. Pure-Rust dep — does not affect
+# core's own (non-cross-compilable) status.
+superzej-media.workspace = true
 # Only for the `clap::ValueEnum` derive on `github::MergeMethod` (a CLI arg type
 # that lives with its domain model). Cheap; keeps core CLI-usable.
 clap.workspace = true

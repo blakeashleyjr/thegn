@@ -12,8 +12,8 @@ use zbus::names::InterfaceName;
 use zbus::zvariant::{Array, OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, MatchRule, MessageStream};
 
-use super::{MediaBackend, MediaCaps, MediaError};
-use superzej_core::media::{LoopMode, MediaState, PlaybackState, Playlist};
+use crate::model::{LoopMode, MediaState, PlaybackState, Playlist};
+use crate::{MediaBackend, MediaCaps, MediaError, MediaWatch};
 
 const MPRIS_PREFIX: &str = "org.mpris.MediaPlayer2.";
 const MPRIS_PATH: &str = "/org/mpris/MediaPlayer2";
@@ -259,14 +259,16 @@ pub struct MprisWatch {
     names: MessageStream,
 }
 
-impl MprisWatch {
-    /// Await the next change. Returns `false` when both signal streams have
-    /// ended (the host then stops watching).
-    pub async fn changed(&mut self) -> bool {
-        tokio::select! {
-            m = self.props.next() => m.is_some(),
-            m = self.names.next() => m.is_some(),
-        }
+impl MediaWatch for MprisWatch {
+    fn changed(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        Box::pin(async move {
+            tokio::select! {
+                m = self.props.next() => m.is_some(),
+                m = self.names.next() => m.is_some(),
+            }
+        })
     }
 }
 

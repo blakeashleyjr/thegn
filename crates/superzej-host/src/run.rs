@@ -6456,7 +6456,7 @@ fn spawn_media_watch(
         return None;
     }
     Some(tokio::spawn(async move {
-        let Some(client) = superzej_svc::media::client_for(&cfg).await else {
+        let Some(client) = superzej_media::client_for(&cfg.resolve_opts()).await else {
             return;
         };
         let _ = tx.send(client.snapshot().await.unwrap_or(None));
@@ -6507,7 +6507,7 @@ fn spawn_media_op(
 ) {
     use superzej_core::media::LoopMode;
     tokio::spawn(async move {
-        let Some(client) = superzej_svc::media::client_for(&cfg).await else {
+        let Some(client) = superzej_media::client_for(&cfg.resolve_opts()).await else {
             return;
         };
         let cur = client.snapshot().await.unwrap_or(None);
@@ -6543,7 +6543,7 @@ fn spawn_media_pick(
     waker: TerminalWaker,
 ) {
     tokio::spawn(async move {
-        let Some(client) = superzej_svc::media::client_for(&cfg).await else {
+        let Some(client) = superzej_media::client_for(&cfg.resolve_opts()).await else {
             return;
         };
         let pick = if players {
@@ -11780,7 +11780,8 @@ async fn event_loop<T: Terminal>(
                                         let w = waker.clone();
                                         tokio::spawn(async move {
                                             if let Some(client) =
-                                                superzej_svc::media::client_for(&cfg).await
+                                                superzej_media::client_for(&cfg.resolve_opts())
+                                                    .await
                                             {
                                                 let _ = client.activate_playlist(&id).await;
                                                 let _ = tx

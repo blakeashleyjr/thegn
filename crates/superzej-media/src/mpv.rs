@@ -2,15 +2,20 @@
 //! non-MPRIS backend in v1. Newline-delimited JSON: each request carries a
 //! `request_id`; the reply with the matching id carries `data` + `error`.
 //! Interleaved event lines (no `request_id`) are skipped.
+//!
+//! The socket path is a Unix domain socket; on non-Unix targets the backend
+//! compiles but is inert (mpv on Windows uses a named pipe — not wired yet).
 
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::{MediaBackend, MediaCaps, MediaError};
-use superzej_core::media::{LoopMode, MediaState, PlaybackState, Playlist};
+use crate::model::{LoopMode, MediaState, PlaybackState, Playlist};
+use crate::{MediaBackend, MediaCaps, MediaError};
 
 pub struct MpvIpc {
+    // Read only by the `#[cfg(unix)]` IPC path; inert (and unread) elsewhere.
+    #[cfg_attr(not(unix), allow(dead_code))]
     socket: String,
 }
 

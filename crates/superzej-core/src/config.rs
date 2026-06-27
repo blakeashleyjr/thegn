@@ -451,17 +451,24 @@ impl LlmProxyConfig {
 }
 
 config_enum! {
-    /// `[media] backend` — how superzej talks to your player. `"none"` disables
-    /// (the default). `"mpris"` uses the Linux D-Bus standard (native `zbus`,
-    /// `playerctl` CLI fallback) and covers Spotify desktop, mpv, ncspot,
-    /// spotify-player, musikcube, moc, VLC, cmus, … `"mpv"` drives a single mpv
-    /// instance over its JSON IPC socket. `"jellyfin"` is reserved (Phase 2).
+    /// `[media] backend` — how superzej talks to your player. `"auto"` (the
+    /// default) picks the right backend for the current OS: Linux → MPRIS,
+    /// Windows → SMTC, macOS → AppleScript. `"none"` disables. `"mpris"` is the
+    /// Linux D-Bus standard (native `zbus`, `playerctl` CLI fallback) covering
+    /// Spotify desktop, mpv, ncspot, spotify-player, musikcube, moc, VLC, cmus, …
+    /// `"mpv"` drives a single mpv instance over its JSON IPC socket. `"smtc"` is
+    /// the Windows System Media Transport Controls session manager.
+    /// `"applescript"` drives macOS Music.app + Spotify via `osascript`.
+    /// `"jellyfin"` is reserved. A backend selected on the wrong OS is inert.
     pub enum MediaBackendKind: "media backend" {
+        Auto = "auto",
         None = "none" | "off",
         Mpris = "mpris" | "dbus" | "playerctl",
         Mpv = "mpv",
+        Smtc = "smtc" | "windows" | "gsmtc",
+        AppleScript = "applescript" | "macos" | "osascript",
         Jellyfin = "jellyfin",
-    } default = None;
+    } default = Auto;
 }
 
 config_enum! {
@@ -477,11 +484,12 @@ config_enum! {
     } default = PlayPause;
 }
 
-/// `[media]` — optional media-player control. The shell never depends on this;
-/// it is strictly additive, so the default is disabled. When `enabled`, the host
-/// resolves the configured `backend` and surfaces a now-playing statusbar badge,
-/// a panel section, transport keybinds, and playlist/player pickers. Only the
-/// selected backend's sub-table is consulted.
+/// `[media]` — media-player control. The shell never depends on this; it is
+/// strictly additive. Defaults on with the `mpris` backend, which degrades to
+/// inert (no badge, no watcher) wherever D-Bus and `playerctl` are both absent.
+/// When `enabled`, the host resolves the configured `backend` and surfaces a
+/// now-playing statusbar badge, a panel section, transport keybinds, and
+/// playlist/player pickers. Only the selected backend's sub-table is consulted.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct MediaConfig {
@@ -509,13 +517,40 @@ pub struct MediaConfig {
 impl Default for MediaConfig {
     fn default() -> Self {
         MediaConfig {
-            enabled: false,
-            backend: MediaBackendKind::None,
+            enabled: true,
+            backend: MediaBackendKind::Auto,
             players_priority: Vec::new(),
             default_action: MediaDefaultAction::PlayPause,
             volume_step: 0.05,
             poll_interval_secs: 3,
             mpv: MpvMediaConfig::default(),
+        }
+    }
+}
+
+impl MediaConfig {
+    /// Lower this config into the backend-resolution input the `superzej-media`
+    /// leaf consumes (the leaf must not depend on core). When disabled the
+    /// backend maps to `None`, so `superzej_media::client_for` stays inert.
+    pub fn resolve_opts(&self) -> superzej_media::ResolveOpts {
+        use superzej_media::BackendKind;
+        let backend = if !self.enabled {
+            BackendKind::None
+        } else {
+            match self.backend {
+                MediaBackendKind::Auto => BackendKind::Auto,
+                MediaBackendKind::None => BackendKind::None,
+                MediaBackendKind::Mpris => BackendKind::Mpris,
+                MediaBackendKind::Mpv => BackendKind::Mpv,
+                MediaBackendKind::Smtc => BackendKind::Smtc,
+                MediaBackendKind::AppleScript => BackendKind::AppleScript,
+                MediaBackendKind::Jellyfin => BackendKind::Jellyfin,
+            }
+        };
+        superzej_media::ResolveOpts {
+            backend,
+            players_priority: self.players_priority.clone(),
+            mpv_socket: self.mpv.socket.clone(),
         }
     }
 }
@@ -2876,7 +2911,8 @@ pub struct Config {
     pub lsp: LspConfig,
     /// The LLM proxy daemon (`[llm_proxy]`). Disabled by default — AI is additive.
     pub llm_proxy: LlmProxyConfig,
-    /// `[media]` — optional media-player control. Disabled by default — additive.
+    /// `[media]` — media-player control. On by default (`mpris` backend), inert
+    /// where D-Bus/`playerctl` are absent. Additive — the shell never depends on it.
     pub media: MediaConfig,
     /// Rebind a built-in action by id, e.g. `new-worktree = "Ctrl w"`. The flat
     /// table is the global/default layer; nested mode tables are native-host only.
@@ -6144,8 +6180,15 @@ transport = \"ssh\"
     #[test]
     fn media_config_defaults_and_enums() {
         let m = MediaConfig::default();
-        assert!(!m.enabled, "media must default OFF");
-        assert_eq!(m.backend, MediaBackendKind::None);
+        assert!(
+            m.enabled,
+            "media defaults ON (additive; inert without a backend)"
+        );
+        assert_eq!(
+            m.backend,
+            MediaBackendKind::Auto,
+            "media defaults to per-OS auto resolution"
+        );
         assert!(m.players_priority.is_empty());
         assert_eq!(m.default_action, MediaDefaultAction::PlayPause);
         assert_eq!(m.volume_step, 0.05);
@@ -6163,12 +6206,25 @@ transport = \"ssh\"
         );
         assert!(MediaBackendKind::from_str_validated("winamp").is_err());
         assert_eq!(MediaBackendKind::Mpris.as_str(), "mpris");
+        // New cross-platform backends parse (canon + aliases).
+        assert_eq!(
+            MediaBackendKind::from_str_validated("auto").unwrap(),
+            MediaBackendKind::Auto
+        );
+        assert_eq!(
+            MediaBackendKind::from_str_validated("windows").unwrap(),
+            MediaBackendKind::Smtc
+        );
+        assert_eq!(
+            MediaBackendKind::from_str_validated("osascript").unwrap(),
+            MediaBackendKind::AppleScript
+        );
 
-        // Default Config keeps media disabled and round-trips through TOML.
-        assert!(!Config::default().media.enabled);
+        // Default Config keeps media enabled and round-trips through TOML.
+        assert!(Config::default().media.enabled);
         let toml = toml::to_string(&MediaConfig::default()).unwrap();
         let back: MediaConfig = toml::from_str(&toml).unwrap();
-        assert_eq!(back.backend, MediaBackendKind::None);
+        assert_eq!(back.backend, MediaBackendKind::Auto);
     }
 
     #[test]
