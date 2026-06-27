@@ -183,8 +183,12 @@ impl WireRenderer {
                     attrs.set_background(*color);
                     self.dirty = true;
                     self.emit_attrs(out, &attrs);
-                    // ED 2 (erase display) + home.
-                    out.push_str("\u{1b}[2J");
+                    // ED 2 (erase display) + home. Re-assert autowrap OFF
+                    // (DECRST 7): a full repaint resets our baseline after the
+                    // one class of event that could plausibly have reset the
+                    // terminal's modes, so pin ?7l here too — writing the
+                    // bottom-right cell must never scroll the alt buffer.
+                    out.push_str("\u{1b}[2J\u{1b}[?7l");
                     self.emit_cursor(out, 0, 0);
                 }
                 Change::CursorVisibility(v) => {
@@ -364,6 +368,10 @@ mod tests {
             &mut out,
         );
         assert!(out.contains("\u{1b}[2J"), "{out:?}");
+        // A full repaint re-asserts autowrap OFF so writing the bottom-right
+        // cell can never scroll the alt buffer (the "window jumps up then
+        // back down, top bar vanishes" regression).
+        assert!(out.contains("\u{1b}[?7l"), "autowrap re-asserted: {out:?}");
         assert!(out.ends_with("\u{1b}[1;1H"), "{out:?}");
         assert!(
             sgrs(&parse(&out))
