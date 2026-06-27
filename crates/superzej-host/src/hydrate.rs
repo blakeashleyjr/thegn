@@ -84,6 +84,51 @@ pub(crate) fn should_rescan_glyphs(
     }
 }
 
+/// Merge a freshly-attempted git scan against the worktree's last-known-good
+/// row. Pure, so it's unit-tested. A live `gix` read (dirty / ahead-behind /
+/// branch) can return `Err` when it races a concurrent `.git` mutation — the
+/// user committing/fetching in the pane, or hydration's own index rewrite. That
+/// transient failure must NOT collapse a real glyph to zero/clean; each errored
+/// field reuses the prior cached value instead. A genuine `Ok(None)` from
+/// `ahead_behind` (no upstream configured) is the real "no arrows" state and is
+/// kept as `(0, 0)`. The returned `bool` is `true` only when every read
+/// succeeded — a degraded row must not overwrite the cache (else it would poison
+/// background reuse for up to the TTL). `Err` is modelled as `()` so the helper
+/// stays free of the git backend's error type.
+#[allow(clippy::type_complexity)]
+pub(crate) fn merge_glyph_scan(
+    prior: Option<&GlyphRow>,
+    dirty: std::result::Result<bool, ()>,
+    ahead_behind: std::result::Result<Option<(usize, usize)>, ()>,
+    branch: std::result::Result<Option<String>, ()>,
+    repo_root: String,
+) -> (GlyphRow, bool) {
+    let mut clean = true;
+    let dirty = match dirty {
+        Ok(d) => d,
+        Err(()) => {
+            clean = false;
+            prior.map(|p| p.0).unwrap_or(false)
+        }
+    };
+    let (ahead, behind) = match ahead_behind {
+        Ok(Some((a, b))) => (a, b),
+        Ok(None) => (0, 0),
+        Err(()) => {
+            clean = false;
+            prior.map(|p| (p.1, p.2)).unwrap_or((0, 0))
+        }
+    };
+    let branch = match branch {
+        Ok(b) => b,
+        Err(()) => {
+            clean = false;
+            prior.and_then(|p| p.3.clone())
+        }
+    };
+    ((dirty, ahead, behind, branch, repo_root), clean)
+}
+
 /// A refresh request delivered to the event loop. `Model` rehydrates the
 /// sidebar/panel/diff (cheap, gix-backed, off-thread); `Pr` additionally kicks
 /// the GitHub PR-cache refresh; `Issues` kicks the issue-tracker cache refresh.
@@ -666,6 +711,11 @@ fn collect_sidebar_status(
     let now = Instant::now();
     let mut to_scan: Vec<String> = Vec::new();
     let mut reused: Vec<(String, GlyphRow)> = Vec::new();
+    // Last-known-good rows for the paths we're about to rescan, so a scan that
+    // hits a transient gix error can reuse the prior value instead of dropping
+    // the glyph to zero/clean (see `merge_glyph_scan`).
+    let mut prior_for_scan: std::collections::HashMap<String, GlyphRow> =
+        std::collections::HashMap::new();
     {
         let cache = glyph_cache().lock().unwrap();
         for p in &paths {
@@ -673,6 +723,9 @@ fn collect_sidebar_status(
             let cached = cache.get(p);
             let age = cached.map(|(_, ts)| now.saturating_duration_since(*ts));
             if should_rescan_glyphs(is_active, age, ttl) {
+                if let Some((row, _)) = cached {
+                    prior_for_scan.insert(p.clone(), row.clone());
+                }
                 to_scan.push(p.clone());
             } else if let Some((row, _)) = cached {
                 reused.push((p.clone(), row.clone()));
@@ -682,10 +735,13 @@ fn collect_sidebar_status(
         }
     }
 
-    // (path, GlyphRow) — git only, no DB access in the scope. `repo_root` is the
-    // main-worktree root shared by every linked worktree of the repo; it keys
-    // the repo-wide `pr_branch_cache` (item 28).
-    let scanned: Vec<(String, GlyphRow)> = std::thread::scope(|s| {
+    // (path, GlyphRow, clean) — git only, no DB access in the scope. `repo_root`
+    // is the main-worktree root shared by every linked worktree of the repo; it
+    // keys the repo-wide `pr_branch_cache` (item 28). `clean` is false when any
+    // read errored (and reused its prior value) — those rows must not overwrite
+    // the cache. See `merge_glyph_scan`.
+    let prior_for_scan = &prior_for_scan;
+    let scanned: Vec<(String, GlyphRow, bool)> = std::thread::scope(|s| {
         let handles: Vec<_> = to_scan
             .iter()
             .map(|p| {
@@ -693,13 +749,20 @@ fn collect_sidebar_status(
                     let wt = std::path::Path::new(p);
                     let loc = GitLoc::for_worktree(wt);
                     let git = GixGit::new();
-                    let dirty = git.is_dirty(&loc).unwrap_or(false);
-                    let (ahead, behind) = git.ahead_behind(&loc).ok().flatten().unwrap_or((0, 0));
-                    let branch = git.current_branch(&loc).ok();
+                    let dirty = git.is_dirty(&loc).map_err(|_| ());
+                    let ahead_behind = git.ahead_behind(&loc).map_err(|_| ());
+                    let branch = git.current_branch(&loc).map(Some).map_err(|_| ());
                     let repo_root = superzej_core::repo::main_worktree(wt)
                         .map(|r| r.to_string_lossy().into_owned())
                         .unwrap_or_else(|| p.clone());
-                    (p.clone(), (dirty, ahead, behind, branch, repo_root))
+                    let (row, clean) = merge_glyph_scan(
+                        prior_for_scan.get(p),
+                        dirty,
+                        ahead_behind,
+                        branch,
+                        repo_root,
+                    );
+                    (p.clone(), row, clean)
                 })
             })
             .collect();
@@ -707,23 +770,27 @@ fn collect_sidebar_status(
     });
 
     // Refresh the cache with the fresh rows and drop entries for worktrees that
-    // are no longer present (bounds growth across the process lifetime).
+    // are no longer present (bounds growth across the process lifetime). A
+    // degraded row (a transient read error that reused its prior value) is left
+    // out so the existing cache entry is preserved rather than poisoned.
     {
         let mut cache = glyph_cache().lock().unwrap();
-        for (p, row) in &scanned {
-            cache.insert(p.clone(), (row.clone(), now));
+        for (p, row, clean) in &scanned {
+            if *clean {
+                cache.insert(p.clone(), (row.clone(), now));
+            }
         }
         cache.retain(|k, _| paths.iter().any(|p| p == k));
     }
 
     let scanned_n = scanned.len();
-    let git_rows =
-        scanned
-            .into_iter()
-            .chain(reused)
-            .map(|(p, (dirty, ahead, behind, branch, repo_root))| {
-                (p, dirty, ahead, behind, branch, repo_root)
-            });
+    let git_rows = scanned
+        .into_iter()
+        .map(|(p, row, _clean)| (p, row))
+        .chain(reused)
+        .map(|(p, (dirty, ahead, behind, branch, repo_root))| {
+            (p, dirty, ahead, behind, branch, repo_root)
+        });
     for (path, dirty, ahead, behind, branch, repo_root) in git_rows {
         status.git.insert(
             path.clone(),
@@ -2189,6 +2256,72 @@ mod tests {
             Some(Duration::from_millis(1)),
             Duration::ZERO
         ));
+    }
+
+    #[test]
+    fn glyph_scan_clean_read_updates() {
+        // A fully successful read produces the scanned values and is `clean` so
+        // the caller updates the cache.
+        let (row, clean) = merge_glyph_scan(
+            None,
+            Ok(true),
+            Ok(Some((4, 1))),
+            Ok(Some("feat".into())),
+            "/repo".into(),
+        );
+        assert_eq!(row, (true, 4, 1, Some("feat".into()), "/repo".into()));
+        assert!(clean);
+    }
+
+    #[test]
+    fn glyph_scan_no_upstream_is_zero_not_error() {
+        // `Ok(None)` from ahead_behind is the genuine "no upstream" state: zero
+        // arrows, and still a clean read.
+        let prior: GlyphRow = (true, 4, 1, Some("feat".into()), "/repo".into());
+        let (row, clean) = merge_glyph_scan(
+            Some(&prior),
+            Ok(false),
+            Ok(None),
+            Ok(Some("feat".into())),
+            "/repo".into(),
+        );
+        assert_eq!(row, (false, 0, 0, Some("feat".into()), "/repo".into()));
+        assert!(clean);
+    }
+
+    #[test]
+    fn glyph_scan_transient_error_reuses_prior() {
+        // A transient gix error on every read must reuse the prior row, not
+        // collapse to zero/clean, and the row is NOT clean (cache untouched).
+        let prior: GlyphRow = (true, 4, 1, Some("feat".into()), "/repo".into());
+        let (row, clean) =
+            merge_glyph_scan(Some(&prior), Err(()), Err(()), Err(()), "/repo".into());
+        assert_eq!(row, (true, 4, 1, Some("feat".into()), "/repo".into()));
+        assert!(!clean);
+    }
+
+    #[test]
+    fn glyph_scan_partial_error_keeps_only_failed_field() {
+        // ahead_behind errors (reuse prior counts) while dirty succeeds (fresh).
+        let prior: GlyphRow = (true, 4, 1, Some("feat".into()), "/repo".into());
+        let (row, clean) = merge_glyph_scan(
+            Some(&prior),
+            Ok(false),
+            Err(()),
+            Ok(Some("feat".into())),
+            "/repo".into(),
+        );
+        assert_eq!(row, (false, 4, 1, Some("feat".into()), "/repo".into()));
+        assert!(!clean);
+    }
+
+    #[test]
+    fn glyph_scan_error_without_prior_falls_back_to_defaults() {
+        // First-ever scan that errors has no prior to reuse: best-effort zeros,
+        // and not clean so it won't be cached.
+        let (row, clean) = merge_glyph_scan(None, Err(()), Err(()), Err(()), "/repo".into());
+        assert_eq!(row, (false, 0, 0, None, "/repo".into()));
+        assert!(!clean);
     }
 
     /// End-to-end over the I/O seam: a real temp git repo with an edited
