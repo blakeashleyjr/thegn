@@ -3,9 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "superzej's ACP bridge extension for the pi coding agent. Loaded by pi via `pi --extension superzej-acp.ts`; pi transpiles the TS on load (jiti), so these deps only need to be resolvable from this directory — no build step.",
+  "description": "superzej's ACP bridge extension for the pi coding agent. Loaded via `pi --extension superzej-acp.ts`; pi (>=0.80) bundles BOTH deps below (@earendil-works/pi-coding-agent + typebox) and resolves them for the extension at load time, so NO install is required to run. These are declared only for editor type-checking / standalone tooling. Keep the versions matched to the installed pi.",
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.74.0",
-    "@sinclair/typebox": "^0.34.0"
+    "@earendil-works/pi-coding-agent": "^0.80.0",
+    "typebox": "^1.1.38"
   }
 }
