@@ -1400,6 +1400,7 @@ impl SidebarState {
         }
         Some(crate::chrome::RowMenu {
             anchor: self.cursor,
+            target_pin_key: row.pin_key.clone(),
             entries: entries
                 .into_iter()
                 .map(|(id, label)| crate::chrome::RowMenuEntry {
@@ -1455,8 +1456,17 @@ impl SidebarState {
                 }
                 KeyCode::Enter => {
                     let id = menu.entries.get(menu.cursor).map(|e| e.id.clone());
+                    let target_key = menu.target_pin_key.clone();
                     self.menu = None;
                     if let Some(id) = id {
+                        if let Some(idx) = model
+                            .sidebar_rows
+                            .iter()
+                            .filter(|r| r.visible)
+                            .position(|r| r.pin_key == target_key)
+                        {
+                            self.cursor = idx;
+                        }
                         return self.run_menu_action(&id, model, session);
                     }
                 }
