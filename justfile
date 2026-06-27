@@ -48,6 +48,15 @@ _apps:
 build: _apps
     cargo build --workspace
 
+# Cross-platform regression gate: typecheck the metrics crate's per-OS
+# sysinfo/battery code for macOS + Windows on this (Linux) box. The crate is a
+# C-dep-free leaf, so `cargo check --target` needs no cross C toolchain (check
+# never links). Targets are provided by the flake's rust toolchain. Catches the
+# #1 cross-platform breakage — won't-compile — without macOS/Windows runners.
+check-cross:
+    cargo check -p superzej-metrics --target aarch64-apple-darwin
+    cargo check -p superzej-metrics --target x86_64-pc-windows-gnu
+
 # Debug build of the host with the in-process sampling profiler compiled in
 # (the `profiling` feature → SIGUSR2 flamegraph capture). Same artifact path as
 # `build` (target/debug/szhost), so `start-term` picks it up transparently.
@@ -153,7 +162,7 @@ flake-check:
     nix flake check
 
 # The full gate.
-ci: fmt-check lint build test doc-check coverage smoke sandbox-e2e-dns sandbox-e2e-db e2e nix-build
+ci: fmt-check lint build check-cross test doc-check coverage smoke sandbox-e2e-dns sandbox-e2e-db e2e nix-build
     @echo "ci: all green"
 
 # Visual regression suite: run all muse specs against a live szhost binary.

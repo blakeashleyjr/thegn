@@ -51,7 +51,6 @@ mod seg;
 mod sequence;
 mod session;
 mod sidebar;
-mod stats;
 mod task;
 mod telemetry;
 #[cfg(test)]

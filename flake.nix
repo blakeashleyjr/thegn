@@ -116,6 +116,14 @@
       rustToolchain = pkgs.rust-bin.stable.latest.default.override {
         # llvm-tools for `cargo llvm-cov` (just coverage).
         extensions = ["llvm-tools-preview"];
+        # macOS + Windows targets for `just check-cross`: the metrics crate is a
+        # C-dep-free leaf, so `cargo check --target` typechecks the per-OS
+        # sysinfo/battery code on this Linux box without a cross C toolchain
+        # (check never links). This is the cross-platform regression gate.
+        targets = [
+          "aarch64-apple-darwin"
+          "x86_64-pc-windows-gnu"
+        ];
       };
       # The muse e2e harness, built from the pinned source with the same stable
       # toolchain. Pure-Rust (no system libs / git deps), so a vendored
