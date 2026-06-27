@@ -428,15 +428,17 @@ command = "aider --model sonnet"
 # The pi coding agent, bridged into superzej over ACP (the upper control plane).
 # `pi` loads superzej's bundled extension, which opens an ACP server superzej
 # connects to — so pi's shell/file tools run through superzej's sandbox + diff
-# scoping, and (with [llm_proxy].enabled) its model traffic routes through
-# szproxy. Setup: `npm i -g @earendil-works/pi-coding-agent`, then in superzej's
-# `extensions/` dir run your package manager's install so the extension's deps
-# resolve. Point `--extension` at that superzej-acp.ts. superzej injects the ACP
-# port via the `ACP_PORT` env var (the extension reads it), so no port flag is
-# needed here.
+# scoping. Setup: `npm i -g @earendil-works/pi-coding-agent` (pi >=0.80 bundles the
+# extension's deps, so no separate install is needed). Point `--extension` at
+# superzej-acp.ts. superzej injects the ACP port via the `ACP_PORT` env var, and
+# (when [llm_proxy].route_agent) the proxy provider config via SUPERZEJ_PROXY_*;
+# the extension registers a provider named `superzej-proxy` at init. To SELECT it
+# you must pass `--provider superzej-proxy --model <id>` here (pi selects the
+# model at load; env alone registers but doesn't activate it). The `--model` must
+# match [llm_proxy].agent_model.
 [[agents]]
 name = "pi"
-command = "pi --extension /path/to/superzej/extensions/superzej-acp.ts"
+command = "pi --extension /path/to/superzej/extensions/superzej-acp.ts --provider superzej-proxy --model model-proxy/standard"
 
 [[agents]]
 name = "shell"
@@ -1100,6 +1102,18 @@ heartbeat_secs = 10
 # holds. Levels: off | conservative | balanced | aggressive.
 token_reduction = false
 token_reduction_level = "conservative"
+# Route a launched agent's model traffic through the proxy at `listen` by
+# injecting provider config into the agent's environment at spawn. Independent of
+# `enabled` (which launches szproxy): leave `enabled = false` and set this `true`
+# to point the agent at an already-running proxy on `listen` without launching
+# our own. `agent_api` is the pi-side API id for that endpoint — the proxy serves
+# the Anthropic Messages API (/v1/messages), and pi's OpenAI client speaks the
+# Responses API (which the proxy doesn't implement), so keep "anthropic-messages".
+# `agent_model` is the model id the agent requests (the proxy maps it to a real
+# backend, e.g. "model-proxy/standard" / "model-proxy/fast").
+route_agent = false
+agent_api = "anthropic-messages"
+agent_model = "model-proxy/standard"
 
 # ── Media player control (optional) ────────────────────────────────────────
 # Drive your music/media player from superzej: play/pause, next/previous,
