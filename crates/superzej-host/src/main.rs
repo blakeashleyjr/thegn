@@ -7,6 +7,8 @@
 mod agent;
 mod apps;
 mod borders;
+mod bouncer;
+mod bridge_sup;
 mod center;
 mod chrome;
 mod clipboard;
@@ -42,6 +44,7 @@ mod profile;
 mod proxy_daemon;
 mod queries;
 mod recorder;
+mod relay;
 mod render_plan;
 mod run;
 mod sandbox_events;
@@ -50,6 +53,7 @@ mod search_everywhere;
 mod seg;
 mod sequence;
 mod session;
+mod share;
 mod sidebar;
 mod task;
 mod telemetry;
@@ -108,6 +112,11 @@ pub enum Command {
     Theme {
         #[command(subcommand)]
         action: cmd::theme::Action,
+    },
+    /// Expose a worktree-local port at a public URL (`[share]`).
+    Share {
+        #[command(subcommand)]
+        action: cmd::share::Action,
     },
     /// Emit a syntax-highlighted diff of a worktree against its branch point.
     Diff {
@@ -175,6 +184,12 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::logs::Action,
     },
+    /// Hidden: run the resident bridge agent over stdio. The host spawns this
+    /// *inside* a remote env (`ssh … szhost bridge`, `sprite exec … szhost
+    /// bridge`); it speaks the framed bridge protocol (git/fs/proc) on stdin/
+    /// stdout. Not for interactive use — stdout is the protocol channel.
+    #[command(hide = true)]
+    Bridge,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -253,6 +268,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             let p = superzej_core::config::Config::path();
             cmd::theme::run(&cfg, action, p)
         }
+        Command::Share { action } => cmd::share::run(&cfg, action),
         Command::Diff {
             worktree,
             base,
@@ -272,6 +288,12 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Env { action } => cmd::env::run(&cfg, action),
         Command::Notify { action } => cmd::notify::run(action),
         Command::Logs { action } => cmd::logs::run(&cfg, action),
+        Command::Bridge => {
+            // The resident agent: framed protocol over stdio until EOF. stdout is
+            // the protocol channel — nothing else may write to it.
+            superzej_svc::bridge::serve(std::io::stdin().lock(), std::io::stdout());
+            Ok(())
+        }
         Command::SandboxArgv { worktree } => {
             let wt = worktree
                 .or_else(|| std::env::current_dir().ok()?.to_str().map(str::to_string))

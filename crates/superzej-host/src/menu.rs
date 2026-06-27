@@ -84,6 +84,11 @@ pub enum MenuChoice {
     // first-launch keymap picker (item 621): the chosen preset id
     // ("default" | "vscode" | "jetbrains").
     SetKeymapPreset(String),
+    // bouncer tool-approval gate: allow/deny the sealed agent's pending shell /
+    // edit / write tool call. Esc/cancel is treated as deny by the loop.
+    ApproveTool { allow: bool },
+    // share reach picker: the chosen reach (public/team/peer).
+    ShareReach(superzej_core::config::ShareReach),
     Dismiss,
 }
 
@@ -102,6 +107,8 @@ pub enum MenuKindTag {
     RedoConfirm,
     Confirm,
     KeymapPicker,
+    Approval,
+    ShareReach,
 }
 
 /// One selectable row: an optional letter hotkey (rendered as a chip), the
@@ -420,6 +427,22 @@ pub fn confirm_menu(
     .with_body(body)
 }
 
+/// The bouncer's tool-approval gate: a sealed agent wants to `run`/`edit`/`write`
+/// and the user must allow or deny. `[a]` allows, `[d]`/Esc denies. `title` names
+/// the worktree + action (e.g. `pi · run a shell command`); `body` is the
+/// command or path summary. Resolves to `ApproveTool { allow }`.
+pub fn approval_menu(title: impl Into<String>, body: impl Into<String>) -> MenuOverlay {
+    MenuOverlay::new(
+        MenuKindTag::Approval,
+        title,
+        vec![
+            item(Some('a'), "allow", MenuChoice::ApproveTool { allow: true }),
+            item(Some('d'), "deny", MenuChoice::ApproveTool { allow: false }).danger(),
+        ],
+    )
+    .with_body(body)
+}
+
 /// First-launch keymap picker (item 621): pick a familiar IDE keymap overlay or
 /// keep superzej's defaults. Each choice resolves to `SetKeymapPreset`.
 pub fn loc_metrics_menu(loc: Option<u64>) -> MenuOverlay {
@@ -462,6 +485,36 @@ pub fn keymap_preset_menu() -> MenuOverlay {
         ],
     )
     .with_body("Familiar shortcuts on top of the defaults. Change later with keymap_preset.")
+}
+
+/// Share reach picker (`Alt+Shift+S`): pick *who* the share is for; each reach
+/// maps to a provider via `[share] public`/`team`/`peer`. Built from the
+/// worktree's configured reaches; the public option is flagged as a caution.
+pub fn reach_picker(cfg: &superzej_core::config::ShareConfig) -> MenuOverlay {
+    use superzej_core::config::ShareReach;
+    let items = cfg
+        .configured_reaches()
+        .into_iter()
+        .map(|r| {
+            let (glyph, key, desc) = match r {
+                ShareReach::Public => ('\u{1f310}', 'p', "internet — anyone with the link"),
+                ShareReach::Team => ('\u{1f465}', 't', "your tailnet / a teammate"),
+                ShareReach::Peer => ('\u{1f517}', 'r', "a machine you hand a ticket to"),
+            };
+            let it = item(
+                Some(key),
+                format!("{glyph} {} — {desc}", r.as_str()),
+                MenuChoice::ShareReach(r),
+            )
+            .note(cfg.reach_provider(r).as_str());
+            if r == ShareReach::Public {
+                it.danger()
+            } else {
+                it
+            }
+        })
+        .collect();
+    MenuOverlay::new(MenuKindTag::ShareReach, "Share to…", items)
 }
 
 /// Rebase options: continue + skip only while a rebase is conflicted/running.
@@ -926,6 +979,43 @@ mod tests {
             .filter_map(|i| i.key)
             .map(|c| c.to_ascii_lowercase())
             .collect()
+    }
+
+    #[test]
+    fn reach_picker_lists_configured_reaches_and_picks() {
+        use superzej_core::config::{ShareConfig, ShareProviderKind, ShareReach};
+        let cfg = ShareConfig {
+            public: ShareProviderKind::Frp,
+            team: ShareProviderKind::Tailscale,
+            peer: ShareProviderKind::Iroh,
+            ..ShareConfig::default()
+        };
+        let mut m = reach_picker(&cfg);
+        // One item per configured reach, in public/team/peer order with p/t/r keys.
+        assert_eq!(hotkeys(&m), vec!['p', 't', 'r']);
+        // The public item carries its provider as the note and is danger-styled.
+        let public = &m.items()[0];
+        assert_eq!(public.note.as_deref(), Some("frp"));
+        assert!(public.danger, "public reach should be a caution");
+        // Hotkey 't' picks the team reach.
+        assert_eq!(
+            m.handle_key(&KeyCode::Char('t'), NONE),
+            MenuOutcome::Pick(MenuChoice::ShareReach(ShareReach::Team))
+        );
+    }
+
+    #[test]
+    fn reach_picker_omits_public_when_disallowed() {
+        use superzej_core::config::{ShareConfig, ShareProviderKind};
+        let cfg = ShareConfig {
+            public: ShareProviderKind::Frp,
+            peer: ShareProviderKind::Iroh,
+            allow_public: false,
+            ..ShareConfig::default()
+        };
+        let m = reach_picker(&cfg);
+        // public dropped (guard), only peer remains.
+        assert_eq!(hotkeys(&m), vec!['r']);
     }
 
     #[test]
@@ -1394,6 +1484,23 @@ mod tests {
             m.handle_key(&KeyCode::Char('n'), NONE),
             MenuOutcome::Pick(MenuChoice::Dismiss)
         );
+    }
+
+    #[test]
+    fn approval_menu_allows_and_denies() {
+        let mut m = approval_menu("pi · run a shell command", "git status");
+        assert_eq!(m.tag, MenuKindTag::Approval);
+        assert!(m.items()[1].danger, "the deny row is danger-tinted");
+        // [a] allows, [d] denies; Esc is treated as deny by the loop (Cancel).
+        assert_eq!(
+            m.handle_key(&KeyCode::Char('a'), NONE),
+            MenuOutcome::Pick(MenuChoice::ApproveTool { allow: true })
+        );
+        assert_eq!(
+            m.handle_key(&KeyCode::Char('d'), NONE),
+            MenuOutcome::Pick(MenuChoice::ApproveTool { allow: false })
+        );
+        assert_eq!(m.handle_key(&KeyCode::Escape, NONE), MenuOutcome::Cancel);
     }
 
     #[test]

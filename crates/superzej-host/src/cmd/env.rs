@@ -10,6 +10,7 @@ use superzej_core::config::Config;
 use superzej_core::db::Db;
 use superzej_core::remote::GitLoc;
 use superzej_core::{msg, outln, repo};
+use superzej_svc::projection::ProjectionBackend;
 
 #[derive(clap::Subcommand, Clone)]
 pub enum Action {
@@ -43,11 +44,27 @@ pub enum Action {
         spec: String,
         worktree: Option<String>,
     },
-    /// Create a new managed-sandbox via the env's API provider (Daytona) and
-    /// print its id. Requires `[env.<name>.provider] api_base` + `api_key_env`.
+    /// Create a new managed-sandbox via the env's API provider (Daytona/Sprites)
+    /// and print its id. Requires `[env.<name>.provider]` (+ `api_key_env`); on
+    /// create it also applies the env's network allow/block as the sandbox's
+    /// egress policy when the provider supports it.
     Provision { worktree: Option<String> },
     /// Destroy a managed-sandbox by id via the env's API provider.
     Deprovision {
+        id: String,
+        worktree: Option<String>,
+    },
+    /// Create a checkpoint/snapshot of the env's sandbox (providers that support it).
+    Snapshot {
+        worktree: Option<String>,
+        /// Optional label/comment for the checkpoint.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// List the env sandbox's checkpoints.
+    Snapshots { worktree: Option<String> },
+    /// Restore the env's sandbox to a checkpoint id.
+    Restore {
         id: String,
         worktree: Option<String>,
     },
@@ -71,49 +88,76 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         Action::Forward { spec, worktree } => forward(cfg, worktree, &spec),
         Action::Provision { worktree } => provision(cfg, worktree, None),
         Action::Deprovision { id, worktree } => provision(cfg, worktree, Some(id)),
+        Action::Snapshot { worktree, label } => snapshot(cfg, worktree, label),
+        Action::Snapshots { worktree } => snapshots(cfg, worktree),
+        Action::Restore { id, worktree } => restore(cfg, worktree, &id),
     }
 }
 
-/// Build the API provider for a worktree's resolved env, or explain why not.
+/// Build the generic API provider ([`superzej_svc::provider::Provider`]) for a
+/// worktree's resolved env, or explain why not.
 fn api_provider(
     cfg: &Config,
     worktree: Option<String>,
-) -> Result<superzej_svc::provider::DaytonaProvider> {
+) -> Result<superzej_svc::provider::Provider> {
+    use superzej_svc::provider::{DaytonaProvider, Provider, SpritesProvider};
     let env = resolve_for(cfg, worktree);
     let envc = cfg
         .env
         .get(&env.name)
         .ok_or_else(|| anyhow::anyhow!("the default env has no API provider configured"))?;
     let pc = &envc.provider;
-    if pc.provider != "daytona" {
-        anyhow::bail!(
-            "API provisioning currently supports the 'daytona' provider; env {} uses {:?}",
+    match pc.provider.as_str() {
+        "daytona" => {
+            if pc.api_base.trim().is_empty() {
+                anyhow::bail!(
+                    "[env.{}.provider] needs `api_base` (and `api_key_env`) for API provisioning",
+                    env.name
+                );
+            }
+            let token = std::env::var(pc.api_key_env.trim()).map_err(|_| {
+                anyhow::anyhow!(
+                    "the API token env var {:?} (api_key_env) is not set",
+                    pc.api_key_env
+                )
+            })?;
+            Ok(Provider::Daytona(DaytonaProvider::new(
+                &pc.api_base,
+                &token,
+                &pc.template,
+            )))
+        }
+        "sprites" => {
+            // api_base may be empty (the provider uses the documented default);
+            // the token env var defaults to SPRITES_TOKEN when unset.
+            let key_env = if pc.api_key_env.trim().is_empty() {
+                "SPRITES_TOKEN"
+            } else {
+                pc.api_key_env.trim()
+            };
+            let token = std::env::var(key_env).map_err(|_| {
+                anyhow::anyhow!("the Sprites API token env var {key_env:?} is not set")
+            })?;
+            Ok(Provider::Sprites(SpritesProvider::new(
+                &pc.api_base,
+                &token,
+                &pc.id,
+            )))
+        }
+        other => anyhow::bail!(
+            "API provisioning supports 'daytona' and 'sprites'; env {} uses {:?}",
             env.name,
-            pc.provider
-        );
+            other
+        ),
     }
-    if pc.api_base.trim().is_empty() {
-        anyhow::bail!(
-            "[env.{}.provider] needs `api_base` (and `api_key_env`) for API provisioning",
-            env.name
-        );
-    }
-    let token = std::env::var(pc.api_key_env.trim()).map_err(|_| {
-        anyhow::anyhow!(
-            "the API token env var {:?} (api_key_env) is not set",
-            pc.api_key_env
-        )
-    })?;
-    Ok(superzej_svc::provider::DaytonaProvider::new(
-        &pc.api_base,
-        &token,
-        &pc.template,
-    ))
 }
 
 /// Create (id=None) or destroy (id=Some) a managed sandbox via the API provider.
+/// On create, when the provider can translate egress and the env declares a
+/// network allow/block list, lower it to the provider's network policy so the
+/// new sandbox comes up already governed.
 fn provision(cfg: &Config, worktree: Option<String>, id: Option<String>) -> Result<()> {
-    use superzej_svc::provider::RemoteProvider;
+    let env = resolve_for(cfg, worktree.clone());
     let provider = api_provider(cfg, worktree)?;
     let rt = tokio::runtime::Runtime::new()?;
     match id {
@@ -128,6 +172,19 @@ fn provision(cfg: &Config, worktree: Option<String>, id: Option<String>) -> Resu
                     outln!("exec via ssh: {}:{}", t.host, t.port);
                 }
             }
+            // Egress translate: lower the env's allow/block lists onto the sandbox.
+            let allow = &env.sandbox.network_allow;
+            let block = &env.sandbox.network_block;
+            if provider.caps().egress && (!allow.is_empty() || !block.is_empty()) {
+                match rt.block_on(provider.set_network_policy(&handle.id, allow, block)) {
+                    Ok(()) => outln!(
+                        "applied network policy: {} allow, {} block",
+                        allow.len(),
+                        block.len()
+                    ),
+                    Err(e) => msg::warn(&format!("could not apply network policy: {e}")),
+                }
+            }
             outln!(
                 "set `[env.<name>.provider] id = \"{}\"` to attach.",
                 handle.id
@@ -138,6 +195,66 @@ fn provision(cfg: &Config, worktree: Option<String>, id: Option<String>) -> Resu
             outln!("destroyed sandbox: {id}");
         }
     }
+    Ok(())
+}
+
+/// Resolve `(provider, sandbox_id)` for checkpoint ops — the sandbox id is the
+/// env's configured `[env.<name>.provider] id`.
+fn provider_and_id(
+    cfg: &Config,
+    worktree: Option<String>,
+) -> Result<(superzej_svc::provider::Provider, String)> {
+    let env = resolve_for(cfg, worktree.clone());
+    let id = cfg
+        .env
+        .get(&env.name)
+        .map(|e| e.provider.id.trim().to_string())
+        .unwrap_or_default();
+    if id.is_empty() {
+        anyhow::bail!(
+            "set `[env.{}.provider] id` to the sandbox name first",
+            env.name
+        );
+    }
+    let provider = api_provider(cfg, worktree)?;
+    if !provider.caps().checkpoints {
+        anyhow::bail!("this env's provider does not support checkpoints");
+    }
+    Ok((provider, id))
+}
+
+/// Create a checkpoint of the env's sandbox.
+fn snapshot(cfg: &Config, worktree: Option<String>, label: Option<String>) -> Result<()> {
+    let (provider, id) = provider_and_id(cfg, worktree)?;
+    let rt = tokio::runtime::Runtime::new()?;
+    let cp = rt.block_on(provider.checkpoint(&id, label.as_deref()))?;
+    outln!("created checkpoint: {cp}");
+    Ok(())
+}
+
+/// List the env sandbox's checkpoints.
+fn snapshots(cfg: &Config, worktree: Option<String>) -> Result<()> {
+    let (provider, id) = provider_and_id(cfg, worktree)?;
+    let rt = tokio::runtime::Runtime::new()?;
+    let list = rt.block_on(provider.list_checkpoints(&id))?;
+    if list.is_empty() {
+        outln!("no checkpoints for {id}");
+    }
+    for c in list {
+        match c.label {
+            Some(l) => outln!("{}  {l}", c.id),
+            None => outln!("{}", c.id),
+        }
+    }
+    Ok(())
+}
+
+/// Restore the env's sandbox to a checkpoint.
+fn restore(cfg: &Config, worktree: Option<String>, cp: &str) -> Result<()> {
+    let (provider, id) = provider_and_id(cfg, worktree)?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(provider.restore(&id, cp))?;
+    outln!("restored {id} to checkpoint {cp}");
     Ok(())
 }
 
@@ -170,61 +287,28 @@ fn lifecycle(cfg: &Config, worktree: Option<String>, action: Lifecycle) -> Resul
     Ok(())
 }
 
-/// For a `data = "sshfs"` env on an ssh placement, mount (or unmount) the remote
-/// worktree tree at a stable local path under the superzej dir. No-op for any
-/// other data mode / placement.
+/// Project (or unproject) the worktree for the env's data mode. Delegates to the
+/// shared projection layer (`core::projection` plan → `svc::projection` action),
+/// the same code path the pane lifecycle auto-runs. A no-op for non-projecting
+/// data modes (`in_env`/`local_exec`); a misconfigured `sshfs` env reports why.
 fn sshfs(env: &superzej_core::env::Environment, mount: bool) -> Result<()> {
-    use superzej_core::config::DataMode;
-    use superzej_core::placement::{Placement, SshPlacement};
-    if env.data != DataMode::Sshfs {
+    let Some(spec) = superzej_core::projection::for_environment(env) else {
+        if env.data == superzej_core::config::DataMode::Sshfs {
+            anyhow::bail!(
+                "data = \"sshfs\" needs an ssh placement and [sandbox.remote] remote_dir (env {})",
+                env.name
+            );
+        }
         return Ok(());
-    }
-    let Placement::Ssh(s) = &env.placement else {
-        anyhow::bail!(
-            "data = \"sshfs\" requires an ssh placement (env {})",
-            env.name
-        );
     };
-    let remote_path = env.sandbox.remote.remote_dir.trim();
-    if remote_path.is_empty() {
-        anyhow::bail!(
-            "sshfs needs [sandbox.remote] remote_dir set (env {})",
-            env.name
-        );
-    }
-    let mountpoint = sshfs_mountpoint(s, remote_path);
-    let argv = if mount {
-        std::fs::create_dir_all(&mountpoint).ok();
-        s.sshfs_mount_argv(remote_path, &mountpoint)
+    let backend = superzej_svc::projection::for_data_mode(&spec);
+    if mount {
+        outln!("mounting {} -> {}", spec.remote_dir, spec.mountpoint);
+        backend.mount(&spec).map(|_| ())
     } else {
-        SshPlacement::sshfs_unmount_argv(&mountpoint)
-    };
-    outln!(
-        "{}: {}",
-        if mount { "mounting" } else { "unmounting" },
-        argv.join(" ")
-    );
-    let status = std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .status()
-        .map_err(|e| anyhow::anyhow!("could not run {}: {e}", argv[0]))?;
-    if !status.success() {
-        anyhow::bail!(
-            "sshfs {} failed ({status})",
-            if mount { "mount" } else { "unmount" }
-        );
+        outln!("unmounting {}", spec.mountpoint);
+        backend.unmount(&spec)
     }
-    Ok(())
-}
-
-/// A stable local mountpoint for a host+remote_path under `<superzej_dir>/mounts`.
-fn sshfs_mountpoint(s: &superzej_core::placement::SshPlacement, remote_path: &str) -> String {
-    let slug = superzej_core::util::slugify(&format!("{}-{remote_path}", s.host));
-    superzej_core::util::superzej_dir()
-        .join("mounts")
-        .join(slug)
-        .to_string_lossy()
-        .into_owned()
 }
 
 /// Forward a port from the resolved environment to localhost (foreground).

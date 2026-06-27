@@ -894,17 +894,13 @@ pub fn run_worker(
     // --- command loop: the wizard drives the rest.
     let slug = repo::repo_slug(root);
     let mut prepped: Option<(String, crate::agent::SandboxOutcome)> = None;
-    let prep = |backend: &str, wt: &Path| -> anyhow::Result<crate::agent::SandboxOutcome> {
+    let prep = |backend: &str,
+                wt: &Path,
+                scope: crate::agent::SandboxScope|
+     -> anyhow::Result<crate::agent::SandboxOutcome> {
         let wt_s = wt.to_string_lossy();
         let loc = GitLoc::from_db(&wt_s, None);
-        crate::agent::prepare_sandbox(
-            cfg,
-            root,
-            &wt_s,
-            &loc,
-            Some(backend),
-            crate::agent::SandboxScope::Shell,
-        )
+        crate::agent::prepare_sandbox(cfg, root, &wt_s, &loc, Some(backend), scope)
     };
     // The auto chain's host fallback is visible in the step detail; an
     // explicit choice that can't be honored errors instead (no silent host
@@ -935,7 +931,7 @@ pub fn run_worker(
                     continue; // re-entered the step, same choice
                 }
                 step(CreateStep::SandboxPrep, StepState::Running, None);
-                match prep(&backend, &path) {
+                match prep(&backend, &path, crate::agent::SandboxScope::Shell) {
                     Ok(outcome) => {
                         step(
                             CreateStep::SandboxPrep,
@@ -981,7 +977,7 @@ pub fn run_worker(
                         {
                             let backend = backend.clone();
                             step(CreateStep::SandboxPrep, StepState::Running, None);
-                            match prep(&backend, &path) {
+                            match prep(&backend, &path, crate::agent::SandboxScope::Shell) {
                                 Ok(redo) => {
                                     step(
                                         CreateStep::SandboxPrep,
@@ -1019,11 +1015,11 @@ pub fn run_worker(
 
     // Submit without a sandbox prep (defensive — the wizard always emits
     // SandboxChosen before Submit): prepare now with the submitted choice.
-    let (_, sandbox) = match prepped {
+    let (backend_label, mut sandbox) = match prepped {
         Some(p) => p,
         None => {
             step(CreateStep::SandboxPrep, StepState::Running, None);
-            match prep(&choices.sandbox, &path) {
+            match prep(&choices.sandbox, &path, crate::agent::SandboxScope::Shell) {
                 Ok(outcome) => {
                     step(
                         CreateStep::SandboxPrep,
@@ -1041,6 +1037,28 @@ pub fn run_worker(
         }
     };
 
+    // Bouncer (opt-in): the speculative prep above used the worktree shell scope.
+    // Now that the agent is chosen, re-resolve under the sealed `agent_profile`
+    // scope so the agent gets (and ensures) its own hardened container.
+    if crate::agent::launch_scope(cfg, &choices.agent) == crate::agent::SandboxScope::Agent {
+        step(CreateStep::SandboxPrep, StepState::Running, None);
+        match prep(&backend_label, &path, crate::agent::SandboxScope::Agent) {
+            Ok(redo) => {
+                step(
+                    CreateStep::SandboxPrep,
+                    StepState::Done,
+                    Some(format!("{} (sealed agent)", sandbox_detail(&redo))),
+                );
+                sandbox = redo;
+            }
+            Err(e) => {
+                worktree::remove(root, &path, &branch, true);
+                fail(CreateStep::SandboxPrep, e.to_string());
+                return;
+            }
+        }
+    }
+
     // --- register: one DB open for the whole pipeline. put_worktree must
     // precede the sandbox/agent updates (they are bare UPDATEs).
     step(CreateStep::Register, StepState::Running, None);
@@ -1053,7 +1071,10 @@ pub fn run_worker(
     match db {
         Ok(db) => {
             let root_s = root.to_string_lossy();
-            if let Err(e) = db.put_worktree(&tab, &root_s, &path_s, &branch, None, None) {
+            // For a managed-provider env, persist the `GitLoc::Provider` location
+            // so the chrome's git/fs reads route into the sandbox.
+            let location = sandbox.location.as_deref();
+            if let Err(e) = db.put_worktree(&tab, &root_s, &path_s, &branch, location, None) {
                 fail(CreateStep::Register, format!("db: {e}"));
                 return;
             }
@@ -1068,9 +1089,15 @@ pub fn run_worker(
     }
 
     // --- compose the launch spec (pure); the loop does the openpty+exec.
+    // Bouncer env (proxy + tool override) rides the sandbox's env_overrides; a
+    // host fallback gets the proxy vars on the pane env instead.
+    let bouncer = crate::agent::apply_bouncer_launch(cfg, &path_s, &choices.agent, &mut sandbox);
     let loc = GitLoc::from_db(&path_s, None);
-    let spec =
+    let mut spec =
         crate::agent::compose_spec(cfg, &path_s, Some(&branch), &choices.agent, &loc, &sandbox);
+    if sandbox.spec.is_none() {
+        spec.env.extend(bouncer.host_env);
+    }
     tracing::info!(
         target: "szhost::worktree_create",
         since_ms = started.elapsed().as_millis() as u64,

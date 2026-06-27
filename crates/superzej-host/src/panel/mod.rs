@@ -124,6 +124,9 @@ pub enum Section {
     Notifications,
     Logs,
     Sandbox,
+    /// Active ingress shares (`[share]`): the ports this worktree exposes and
+    /// their public URLs.
+    Share,
     Telemetry,
     /// Now-playing + transport for the optional `[media]` feature. Hidden unless
     /// `[media] enabled`.
@@ -140,11 +143,11 @@ pub enum Section {
 /// sections` is unset. Grouped by tab:
 /// - Git (5): Changes, Commits, Branches, Stash, Files
 /// - Work (8): Mine, Pr, Ci, Issues, Problems, Jobs, Tests, Symbols
-/// - System (6): Notifications, Logs, Sandbox, Telemetry, Media, Keys
+/// - System (7): Notifications, Logs, Sandbox, Share, Telemetry, Media, Keys
 ///
 /// The live order (config-reordered, possibly trimmed) rides on
 /// [`PanelUi::order`]; numbered jump keys index the ACTIVE TAB's slice.
-pub const SECTION_ORDER: [Section; 19] = [
+pub const SECTION_ORDER: [Section; 20] = [
     // Git tab
     Section::Changes,
     Section::Commits,
@@ -164,6 +167,7 @@ pub const SECTION_ORDER: [Section; 19] = [
     Section::Notifications,
     Section::Logs,
     Section::Sandbox,
+    Section::Share,
     Section::Telemetry,
     Section::Media,
     Section::Keys,
@@ -194,6 +198,7 @@ impl Section {
             Section::Notifications => "notifications",
             Section::Logs => "logs",
             Section::Media => "media",
+            Section::Share => "share",
         }
     }
 
@@ -216,6 +221,7 @@ impl Section {
             Section::Notifications
             | Section::Logs
             | Section::Sandbox
+            | Section::Share
             | Section::Telemetry
             | Section::Media
             | Section::Keys
@@ -1067,7 +1073,7 @@ mod tests {
 
     #[test]
     fn section_order_jump_and_cycle() {
-        assert_eq!(SECTION_ORDER.len(), 19);
+        assert_eq!(SECTION_ORDER.len(), 20);
         // Default tab = Git; Changes is in Git tab.
         let ui = PanelUi::default(); // open = Changes, tab = Git
         assert_eq!(ui.next_section(), Section::Commits); // next in Git tab

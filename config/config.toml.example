@@ -466,6 +466,26 @@ command = "claude"
 name = "aider"
 command = "aider --model sonnet"
 
+# The pi coding agent, embedded over ACP (the upper control plane). pi runs its
+# own tools natively; superzej is ADDITIVE — it observes activity (the statusbar
+# chip), routes pi's model through the proxy, and exposes its house tools
+# (budget / fleet / worktree status) to pi via MCP-over-ACP. Setup:
+# `npm i -g @earendil-works/pi-coding-agent` (pi >=0.80 bundles the extension's
+# deps, so no separate install is needed).
+#
+# In the command: `--extension` loads superzej's ACP bridge; `--skill` loads the
+# bundled superzej-house skill (teaches the agent the house tools + conventions);
+# `--provider superzej-proxy --model <id>` selects the proxy-routed model (the
+# extension registers `superzej-proxy` at init from the SUPERZEJ_PROXY_* env when
+# [llm_proxy].route_agent is on — env registers it, the CLI flags activate it;
+# `--model` must match [llm_proxy].agent_model). superzej injects the ACP port via
+# the ACP_PORT env var. pi's own extension/skill discovery stays ON, so you can
+# drop your own into ~/.pi/agent/{extensions,skills}/ alongside these, and
+# `pi install npm:…` / `pi install git:…` works for extras (e.g. web search).
+[[agents]]
+name = "pi"
+command = "pi --extension /path/to/superzej/extensions/superzej-acp.ts --skill /path/to/superzej/extensions/skills/superzej-house --provider superzej-proxy --model model-proxy/standard"
+
 [[agents]]
 name = "shell"
 command = "__shell__"
@@ -921,6 +941,16 @@ nix_daemon = false
 #   fail   — refuse to open the pane.
 on_missing = "warn"
 
+# Drive the OCI runtime against a REMOTE daemon instead of SSH-wrapping the whole
+# backend argv (an alternative reach to `[env.<name>] placement = "ssh"`, for when
+# the container daemon — not just the shell — lives on another box). Empty = local.
+#   podman — a connection URL ("ssh://user@host/run/user/1000/podman/podman.sock")
+#            injected as `--url`, or a configured connection name as `--connection`.
+#   docker — a host ("ssh://user@host") injected as `docker -H`.
+# Applies to create/inspect/exec/teardown alike. (Local backend detection still
+# probes the local host; set this only when you know the remote daemon is up.)
+# oci_host = ""
+
 # ── Resource limits (OCI only) ────────────────────────────────────────────────
 # Cap CPU and memory for the container (Docker/Podman units).
 #   cpu    — fractional cores: "0.5" = half a core, "2" = two cores.
@@ -1058,6 +1088,66 @@ ephemeral = true
 # [sandbox.vpn.custom.env]
 # FOO = "bar"
 
+# ── Ingress sharing (`[share]`) ─────────────────────────────────────────────
+# The INBOUND sibling of [sandbox.vpn]. Where the VPN block gives a worktree
+# *egress* through an overlay, [share] exposes a service running *inside* a
+# worktree (a dev server, a PR preview, a webhook/OAuth callback) to the outside.
+# Provider-pluggable; pick the one that matches your reach:
+#   bore      — instant raw-TCP public URL, zero infra (the no-account default)
+#   frp       — self-hosted public HTTPS + subdomains (+ TCP/UDP): demos/webhooks
+#   tailscale — private to your tailnet (`serve`) or public (`funnel`); reuses
+#               the worktree's [sandbox.vpn] tailscale tunnel — NO new auth
+#   iroh      — peer-to-peer (dumbpipe): a teammate connects with a ticket; never
+#               touches the public web, NAT-traversing
+# Disabled by default. Open one with `superzej share start <port>` or Alt+Shift+S.
+[share]
+provider = "none"   # none | bore | frp | tailscale | iroh
+# Requested reach: public | private. Authoritative only where the backend can do
+# both (tailscale serve vs funnel); bore/frp are public-only (private downgrades
+# with a warning), iroh is always peer-private.
+visibility = "public"
+# Safety guard: when false, refuse any share reachable from the PUBLIC INTERNET
+# (frp http(s), tailscale funnel). Private/team/peer shares are unaffected. The
+# statusbar badge renders AMBER while a worktree is publicly exposed.
+allow_public = true
+# Intent-first reach → provider mapping. When ≥2 of these are set, Alt+Shift+S
+# offers a "Share to…" picker (🌐 public / 👥 team / 🔗 peer) instead of using the
+# single `provider` above; pick *who* should reach it and the provider is chosen
+# for you. Each defaults to "none" (no picker). Recommended:
+# public = "frp"        # internet, browser-reachable
+# team   = "tailscale"  # your tailnet / a teammate
+# peer   = "iroh"       # hand a teammate a ticket
+# When the share can't come up: fail (surface the error) | warn (note and skip).
+on_error = "fail"
+# Seconds to wait for the URL to appear before applying on_error.
+ready_timeout_secs = 20
+
+# [share.bore]   # provider = "bore" — https://github.com/ekzhang/bore
+# to = ""                       # relay host running `bore server`; "" = bore.pub
+# secret = "env:BORE_SECRET"    # shared HMAC (secrets-ref); must match the server
+# remote_port = 0               # port to bind on the relay; 0 = relay chooses
+# local_host = "127.0.0.1"      # interface the dev server listens on
+# extra_args = []               # extra `bore local` flags
+
+# [share.frp]    # provider = "frp" — https://github.com/fatedier/frp (self-host)
+# server_addr = "frps.example.com"   # your frps host (required)
+# server_port = 7000                 # frps control port
+# token = "env:FRP_TOKEN"            # shared token (secrets-ref); matches frps
+# proxy_type = "https"               # https | http | tcp | udp
+# subdomain_host = "share.example.com"  # the server's subDomainHost (for the URL)
+# subdomain = ""                     # "" = a stable per-worktree slug <name>-<port>
+# remote_port = 0                    # tcp/udp only; 0 = server chooses
+# vhost_https_port = 443             # server HTTPS vhost port (for the URL suffix)
+# extra = []                         # extra frpc.toml lines (appended to [[proxies]])
+
+# [share.tailscale]   # provider = "tailscale" — needs [sandbox.vpn] = tailscale
+# funnel = false       # false = `tailscale serve` (tailnet-only); true = public
+# https_port = 443     # serve/funnel HTTPS port (funnel: 443/8443/10000 only)
+
+# [share.iroh]    # provider = "iroh" — https://github.com/n0-computer/dumbpipe
+# extra_args = []  # extra `dumbpipe listen-tcp` flags (e.g. a self-hosted relay).
+#                  # The consumer connects with `dumbpipe connect-tcp <ticket>`.
+
 # ── Named execution environments (`[env.<name>]`) ───────────────────────────
 # A reusable *library* of execution environments. Each bundles three orthogonal
 # axes: a PLACEMENT (where processes run — local / ssh / k8s / provider), an
@@ -1116,7 +1206,7 @@ ephemeral = true
 # Example 4 — a remote box over ssh/mosh with a dedicated ssh config + bastion:
 # [env.gpu-box]
 # placement = "ssh"
-# data = "in_env"            # in_env (files on the remote) | sshfs (mount locally) | local_exec
+# data = "in_env"            # in_env (files on the remote) | sshfs | sync | local_exec
 # [env.gpu-box.ssh]
 # host = "user@gpu-box"      # empty ⇒ inherit the worktree's own target / [sandbox.remote]
 # port = 22
@@ -1126,8 +1216,61 @@ ephemeral = true
 # jump_host = "bastion.example.com"   # ssh -J
 # identity = "~/.ssh/id_work"         # ssh -i
 # extra_args = []
-# # With data = "sshfs", `superzej env up` sshfs-mounts [sandbox.remote] remote_dir
-# # at <superzej-dir>/mounts/<host-slug> and `env down` unmounts it.
+# # data = "sshfs" FUSE-mounts [sandbox.remote] remote_dir at
+# # <superzej-dir>/mounts/<host-slug>; data = "sync" keeps a local working copy
+# # there, kept coherent with the remote via an rsync delta. BOTH now mount/sync
+# # AUTOMATICALLY on pane spawn and unmount/push on close (no manual `env up`),
+# # and run the pane LOCALLY at the mountpoint. `superzej env up/down` still works
+# # for an explicit one-off. Intended with `backend = "none"`/host.
+#
+# Example 5 — a managed sandbox provider: Sprites (sprites.dev, Firecracker
+# microVMs with a persistent fs + ~300ms checkpoints). One-time setup:
+#   1. Generate a token at sprites.dev/account; export it (the REST API and the
+#      `sprite` CLI both read it):  export SPRITES_TOKEN="my-org/token-id/secret"
+#   2. Install + auth the CLI (used for the pane exec bridge):
+#        curl -fsSL https://sprites.dev/install.sh | sh
+#        sprite auth setup --token "$SPRITES_TOKEN"
+#   3. Create the sprite once:  superzej env provider create --env sprites
+#      (or `sprite create my-worktree`), then set `id` below to its name.
+# [env.sprites]
+# placement = "provider"
+# data = "in_env"            # in_env: work in the sprite's persistent fs (default)
+#                            # sync:   push the local worktree into the sprite on
+#                            #         pane spawn, pull changes back on close.
+# [env.sprites.provider]
+# provider = "sprites"       # selects the SpritesProvider REST adapter
+# id = "my-worktree"         # the sprite name (created/attached)
+# api_key_env = "SPRITES_TOKEN"        # empty ⇒ defaults to SPRITES_TOKEN
+# # api_base = "https://api.sprites.dev/v1"   # empty ⇒ this default
+# # workdir = "/workspace"   # data = "sync" pushes/pulls the worktree here
+# # auto_provision = false   # create the sprite on first open if missing (8-E
+# #                          #   warm-on-open). Off by default — creating a paid
+# #                          #   sandbox is opt-in; else run `superzej env provision`.
+# # auto_checkpoint = false  # checkpoint the sprite on worktree close (suspend-on-
+# #                          #   close, fast resume). Off by default (storage cost).
+# # Pane exec bridges through the `sprite` CLI (PTY-capable):
+# exec_command = ["sprite", "exec", "-s", "{id}", "--"]
+# interactive_command = ["sprite", "exec", "-s", "{id}", "--tty", "--"]
+# up_command = ["sprite", "create", "{id}", "--skip-console"]
+# down_command = ["sprite", "destroy", "-s", "{id}", "--force"]
+# # Wired axes (capability-gated, generic across providers):
+# #  • EGRESS — [sandbox] network_allow/network_block are lowered to the sprite's
+# #    DNS policy (POST /policy/network {rules:[{domain,action}]}) automatically
+# #    on `superzej env provider create`.
+# #  • SNAPSHOT — `superzej env snapshot [--label]` / `env snapshots` / `env restore <id>`
+# #    (Sprites checkpoints).
+# #  • FILE-SYNC — `data = "sync"` pushes the worktree into `workdir` on spawn and
+# #    pulls it back on close (via the sprite /fs API; `.git` is skipped).
+# #  • DATA PLANE — a provider worktree's git/diff/branches/files resolve INTO the
+# #    sandbox (the chrome shows real state); a fresh sprite is repo-provisioned on
+# #    open (clone for data=in_env, upload for data=sync).
+# #  • RESIDENT BRIDGE — when a static-musl `szhost` is available (build:
+# #    `nix build .#szhost-musl` or `just build-musl`; point SUPERZEJ_BRIDGE_BINARY
+# #    at it), it's pushed into the sprite and run as `szhost bridge`, so git is
+# #    fast (no per-op latency), file edits stream back live (fs.watch), activity
+# #    dots reflect in-env CPU, and tests/jobs run in the sandbox.
+# # The interactive pane still execs through the `sprite` CLI; an API-exec (WSS)
+# # bridge that removes that CLI dependency is a follow-up (needs a WS client dep).
 # ── LLM proxy (group U/V) ──────────────────────────────────────────────────
 # The AI-traffic chokepoint daemon (binary `szproxy`). The shell never hard-
 # depends on this — AI is strictly additive — so it is OFF by default. When
@@ -1160,6 +1303,28 @@ heartbeat_secs = 10
 # holds. Levels: off | conservative | balanced | aggressive.
 token_reduction = false
 token_reduction_level = "conservative"
+# Route a launched agent's model traffic through the proxy at `listen` by
+# injecting provider config into the agent's environment at spawn. Independent of
+# `enabled` (which launches szproxy): leave `enabled = false` and set this `true`
+# to point the agent at an already-running proxy on `listen` without launching
+# our own. `agent_api` is the pi-side API id for that endpoint — the proxy serves
+# the Anthropic Messages API (/v1/messages), and pi's OpenAI client speaks the
+# Responses API (which the proxy doesn't implement), so keep "anthropic-messages".
+# `agent_model` is the model id the agent requests (the proxy maps it to a real
+# backend, e.g. "model-proxy/standard" / "model-proxy/fast").
+route_agent = false
+agent_api = "anthropic-messages"
+agent_model = "model-proxy/standard"
+# "The bouncer" (opt-in). When true, a launched agent runs inside its sealed
+# `[sandbox] agent_profile` container and its built-in bash/read/edit/write tools
+# are routed back through superzej over a bind-mounted unix-socket ACP channel.
+# The consequential ones — shell, edit, write — are gated behind an interactive
+# allow/deny overlay (read is auto-served). If `agent_profile` forces no network
+# (the default `sealed`), the agent's only egress is the proxy, relayed over a
+# unix socket (full exfil seal); a network-permitting profile (e.g. `hardened`)
+# reaches the proxy via the container gateway instead. Off = the additive model:
+# pi runs its own tools in-process and edits auto-apply.
+bouncer = false
 
 # ── Media player control (optional) ────────────────────────────────────────
 # Drive your music/media player from superzej: play/pause, next/previous,
