@@ -174,6 +174,40 @@ superzej shells out to `git fzf gh` (or `gum`); `lazygit yazi delta` are optiona
   install, delete that copy so it re-seeds (and `zellij delete-session superzej`
   if a stale serialized session lingers).
 
+## Terminal compatibility
+
+superzej renders its chrome to whatever terminal it runs in and **degrades
+gracefully** — from bare shells (Linux/BSD console, plain `xterm`, Termux,
+Windows console, `screen`/`tmux`, CI capture, anything honoring `NO_COLOR`) up
+to fully-featured emulators (ghostty, wezterm, kitty, foot, …). It detects what
+the terminal can do and picks the richest _correct_ output; no configuration is
+needed.
+
+- **Color** — truecolor → 256-color → 16-color → monochrome, chosen from
+  `COLORTERM` / `$TERM` / `WT_SESSION`, and forced off by `NO_COLOR`. 24-bit
+  colors are quantized to the nearest palette entry when the terminal can't do
+  truecolor.
+- **Glyphs** — the rounded box-drawing, status dots, arrows, and the splash
+  wordmark fall back to ASCII (`+ - |`, `* o`, `^ v`, plain text) on terminals
+  or fonts without Unicode/box-drawing support (sniffed from the locale).
+- **Underlines, mouse, undercurl** — enabled per terminal; unsupported terminals
+  get a single underline / no mouse, never broken output.
+- **Probe** — at startup superzej briefly asks the terminal who it is (Device
+  Attributes + XTVERSION) to catch modern emulators reached over `ssh`/`tmux`
+  that report a generic `$TERM`. Bounded so it never slows launch.
+
+Override detection in `[theme]` (or the matching env var) when you know better:
+
+```toml
+[theme]
+color  = "auto"   # auto | truecolor | 256 | 16 | none/mono   (SUPERZEJ_THEME_COLOR)
+glyphs = "auto"   # auto | unicode | ascii                    (SUPERZEJ_THEME_GLYPHS)
+```
+
+Run **`superzej doctor`** (add `--json` for scripts) to see the detected
+environment, the resolved capabilities, and exactly which features are enabled
+vs degraded for your terminal.
+
 ## Sandboxing worktrees
 
 By default each worktree's interactive process (agent / shell / tools) runs inside

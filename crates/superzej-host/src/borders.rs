@@ -9,38 +9,22 @@
 use termwiz::cell::AttributeChange;
 use termwiz::color::ColorAttribute;
 use termwiz::surface::{Change, Position, Surface};
+use unicode_width::UnicodeWidthStr;
 
 use crate::center::PaneId;
 use crate::compositor::Rect;
 
-/// Corner glyph set for a box ring.
-pub struct BoxChars {
-    pub tl: &'static str,
-    pub tr: &'static str,
-    pub bl: &'static str,
-    pub br: &'static str,
-}
-
-pub const ROUNDED: BoxChars = BoxChars {
-    tl: "╭",
-    tr: "╮",
-    bl: "╰",
-    br: "╯",
-};
-
-fn draw_box_chars(
-    surface: &mut Surface,
-    rect: Rect,
-    fg: ColorAttribute,
-    bg: ColorAttribute,
-    chars: &BoxChars,
-) {
+/// Draw a box ring. Corner/edge glyphs come from the active terminal glyph set
+/// ([`crate::caps::active_glyphs`]): rounded Unicode (`╭╮╰╯─│`) on capable
+/// terminals, ASCII (`+ - |`) when degraded.
+fn draw_box_chars(surface: &mut Surface, rect: Rect, fg: ColorAttribute, bg: ColorAttribute) {
     if rect.cols < 2 || rect.rows < 2 {
         return;
     }
+    let g = crate::caps::active_glyphs();
     let right = rect.x + rect.cols - 1;
     let bottom = rect.y + rect.rows - 1;
-    let horiz = "─".repeat(rect.cols.saturating_sub(2));
+    let horiz = g.box_h.repeat(rect.cols.saturating_sub(2));
 
     let mut put = |x: usize, y: usize, text: &str| {
         surface.add_change(Change::CursorPosition {
@@ -52,11 +36,11 @@ fn draw_box_chars(
         surface.add_change(Change::Text(text.to_string()));
     };
 
-    put(rect.x, rect.y, &format!("{}{horiz}{}", chars.tl, chars.tr));
-    put(rect.x, bottom, &format!("{}{horiz}{}", chars.bl, chars.br));
+    put(rect.x, rect.y, &format!("{}{horiz}{}", g.box_tl, g.box_tr));
+    put(rect.x, bottom, &format!("{}{horiz}{}", g.box_bl, g.box_br));
     for y in (rect.y + 1)..bottom {
-        put(rect.x, y, "│");
-        put(right, y, "│");
+        put(rect.x, y, g.box_v);
+        put(right, y, g.box_v);
     }
 }
 
@@ -71,7 +55,7 @@ pub struct CardStyle {
 /// `╭─ zsh · feat ──────╮`. The title is skipped (ring only) when it is empty
 /// or the card is too narrow to keep at least a few dashes around it.
 pub fn draw_card(surface: &mut Surface, rect: Rect, title: &str, style: &CardStyle) {
-    draw_box_chars(surface, rect, style.border, style.bg, &ROUNDED);
+    draw_box_chars(surface, rect, style.border, style.bg);
     if title.is_empty() || rect.cols < 10 || rect.rows < 2 {
         return;
     }
@@ -80,8 +64,8 @@ pub fn draw_card(surface: &mut Surface, rect: Rect, title: &str, style: &CardSty
     if avail < 4 {
         return;
     }
-    let shown: String = if title.chars().count() > avail {
-        let mut t: String = title.chars().take(avail - 1).collect();
+    let shown: String = if UnicodeWidthStr::width(title) > avail {
+        let mut t: String = crate::seg::take_cols(title, avail - 1).to_string();
         t.push('…');
         t
     } else {
@@ -168,6 +152,44 @@ mod tests {
             title: ColorAttribute::Default,
             title_focused: ColorAttribute::Default,
         }
+    }
+
+    #[test]
+    fn card_degrades_to_ascii_box() {
+        use superzej_core::termcaps::UnicodeLevel;
+        crate::caps::test_override::with_unicode(UnicodeLevel::Ascii, || {
+            let mut s = Surface::new(20, 4);
+            let r = Rect {
+                x: 0,
+                y: 0,
+                cols: 20,
+                rows: 4,
+            };
+            draw_card(
+                &mut s,
+                r,
+                "zsh",
+                &CardStyle {
+                    border: ColorAttribute::Default,
+                    title: ColorAttribute::Default,
+                    bg: ColorAttribute::Default,
+                },
+            );
+            assert_eq!(cell_text(&mut s, 0, 0), "+");
+            assert_eq!(cell_text(&mut s, 19, 0), "+");
+            assert_eq!(cell_text(&mut s, 0, 3), "+");
+            assert_eq!(cell_text(&mut s, 19, 3), "+");
+            assert_eq!(cell_text(&mut s, 0, 2), "|");
+            assert_eq!(cell_text(&mut s, 19, 2), "|");
+            assert_eq!(cell_text(&mut s, 1, 0), "-"); // dash before the title
+            assert_eq!(cell_text(&mut s, 17, 0), "-"); // trailing dash
+            // No Unicode box glyph anywhere on the top row.
+            let top = row_text(&mut s, 0);
+            assert!(
+                !top.contains('╭') && !top.contains('─'),
+                "ascii only: {top:?}"
+            );
+        });
     }
 
     #[test]
