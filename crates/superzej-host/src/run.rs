@@ -449,6 +449,13 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     if cfg.sandbox.inject_devshell && !session.id.is_empty() {
         superzej_core::devenv::prewarm(std::path::Path::new(&session.id));
     }
+    // Pre-warm the active worktree's `direnv` cache off-thread so the first
+    // pane's in-sandbox direnv hook replays a warm cache instead of failing on
+    // the read-only `/nix/store`. No-op when `warm_direnv = off` or there's no
+    // cold flake-backed `.envrc`. See `superzej_core::direnv`.
+    if !session.id.is_empty() {
+        crate::agent::warm_direnv(&cfg, std::path::Path::new(&session.id));
+    }
     // Auto-launch the LLM-proxy daemon when enabled (disabled by default — AI is
     // additive). Held for the lifetime of `main`; the supervisor thread keeps it
     // alive and `Drop` stops it on graceful return (process-group exit otherwise).
