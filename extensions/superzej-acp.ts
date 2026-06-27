@@ -71,8 +71,18 @@ export default function (pi: ExtensionAPI) {
     // Only start the server once
     if (server) return;
 
-    const portStr = pi.getFlag("acp-port") as string;
+    // superzej hands us the port it already bound. Prefer the --acp-port flag
+    // when explicitly set, otherwise the ACP_PORT env var (the reliable path:
+    // env crosses superzej's `sh -lc` + sandbox wrapping, an appended flag does
+    // not). We MUST bind exactly this port — falling back to 0 (OS-ephemeral)
+    // would make superzej connect to the wrong port.
+    const flagStr = pi.getFlag("acp-port") as string;
+    const portStr = flagStr && flagStr !== "0" ? flagStr : (process.env.ACP_PORT ?? "0");
     const port = parseInt(portStr, 10) || 0;
+    if (port === 0) {
+      ctx.ui.setStatus("acp", "ACP: no port provided (ACP_PORT unset) — not starting server");
+      return;
+    }
 
     server = net.createServer((socket) => {
       activeSocket = socket;

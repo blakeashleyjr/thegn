@@ -425,6 +425,19 @@ command = "claude"
 name = "aider"
 command = "aider --model sonnet"
 
+# The pi coding agent, bridged into superzej over ACP (the upper control plane).
+# `pi` loads superzej's bundled extension, which opens an ACP server superzej
+# connects to — so pi's shell/file tools run through superzej's sandbox + diff
+# scoping, and (with [llm_proxy].enabled) its model traffic routes through
+# szproxy. Setup: `npm i -g @earendil-works/pi-coding-agent`, then in superzej's
+# `extensions/` dir run your package manager's install so the extension's deps
+# resolve. Point `--extension` at that superzej-acp.ts. superzej injects the ACP
+# port via the `ACP_PORT` env var (the extension reads it), so no port flag is
+# needed here.
+[[agents]]
+name = "pi"
+command = "pi --extension /path/to/superzej/extensions/superzej-acp.ts"
+
 [[agents]]
 name = "shell"
 command = "__shell__"

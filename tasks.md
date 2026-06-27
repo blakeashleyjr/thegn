@@ -608,6 +608,21 @@ realize AR for any ACP agent). The two planes meet at two seams:
 `providers/set` (point any ACP agent's model traffic at `szproxy`) and
 MCP-over-ACP (advertise AR's house tools up to any agent)._
 
+_**Landed (2026-06-26, branch `sz/spicy-dragon`, uncommitted):** the R1 client +
+the two convergence seams are functionally working against a `pi` fork: ACP client
+(`initialize`), client-serviced `terminal/create` (sandboxed run-to-completion),
+`fs/read_text_file`, `superzej/edit`+`write` (worktree-scoped), `providers/set`
+routing through `szproxy` with a per-worktree minted virtual key, and a
+per-worktree `session/update` → statusbar **agent chip** (tool + ctx% + connection
+lifecycle). Transport is **TCP + newline-JSON** (the pi extension's server), not
+stdio. **UX decision: the embedded-agent surface stays MINIMAL** — pi's terminal
+pane is the conversation; the chip is the only native reflection. Consequently
+these are **intentional non-goals, not debt**: 233 (native diff/review of agent
+edits — edits AUTO-APPLY by design), 234 (plan/tool-call follow-along beyond the
+chip), a `Section::Agent` panel, the dormant `AppTile` native center surface, a
+multi-worktree fleet view, and `session/prompt` programmatic steering. Revisit
+only if the minimal model proves insufficient._
+
 **R1 · ACP Client — consume foreign harnesses:**
 
 - [ ] 229. ACP client core — `initialize` + capability negotiation (protocolVersion; advertise `clientCapabilities` fs+terminal+`clientInfo`; parse `agentCapabilities`/`promptCapabilities`/`mcpCapabilities`/`authMethods`/`agentInfo`); `authenticate`/`logout`
