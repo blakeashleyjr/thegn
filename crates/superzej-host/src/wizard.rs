@@ -1053,7 +1053,10 @@ pub fn run_worker(
     match db {
         Ok(db) => {
             let root_s = root.to_string_lossy();
-            if let Err(e) = db.put_worktree(&tab, &root_s, &path_s, &branch, None, None) {
+            // For a managed-provider env, persist the `GitLoc::Provider` location
+            // so the chrome's git/fs reads route into the sandbox.
+            let location = sandbox.location.as_deref();
+            if let Err(e) = db.put_worktree(&tab, &root_s, &path_s, &branch, location, None) {
                 fail(CreateStep::Register, format!("db: {e}"));
                 return;
             }
