@@ -29,7 +29,15 @@
     yazi
     delta
     gh
+    # spec-driven development CLI (hermetic, pinned; see nix/openspec.nix).
+    # superzej manages its own development with OpenSpec — `just openspec*`.
+    nodejs
+    (pkgs.callPackage ./nix/openspec.nix {})
   ];
+
+  # OpenSpec: telemetry off by construction (matches the flake dev shell).
+  env.OPENSPEC_TELEMETRY = "0";
+  env.DO_NOT_TRACK = "1";
 
   # Use the nixpkgs toolchain (no channel/rust-overlay) so rustfmt/clippy match
   # the flake's treefmt + checks exactly — avoids formatter version skew.
@@ -115,6 +123,12 @@
     [ -n "$hooks_dir" ] || hooks_dir=$(git rev-parse --git-common-dir 2>/dev/null)/hooks
     if [ -d "$hooks_dir" ] && [ -f test/git-hooks/post-checkout.sh ]; then
       install -m 0755 test/git-hooks/post-checkout.sh "$hooks_dir/post-checkout"
+    fi
+
+    # Seed the gitignored Claude Code /opsx commands + skills if this checkout
+    # lacks them (idempotent; cheap). See "Spec-driven development" in CLAUDE.md.
+    if [ ! -d .claude/commands/opsx ] && [ -f openspec/config.yaml ]; then
+      openspec init --tools claude --profile core --force >/dev/null 2>&1 || true
     fi
   '';
 
