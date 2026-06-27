@@ -1100,6 +1100,15 @@ pub struct StatsConfig {
     pub battery_charging_icon: String,
     /// Battery percentage at/below which the widget turns red.
     pub battery_warn: u8,
+    /// Icon for the disk (free-space) stat.
+    pub disk_icon: String,
+    /// Free-disk percentage at/below which the `disk` widget turns amber.
+    pub disk_free_warn: u8,
+    /// Free-disk percentage at/below which the `disk` widget turns red.
+    pub disk_free_critical: u8,
+    /// Filesystem the `disk` masthead widget measures (any path on it).
+    /// Empty = the filesystem holding `worktrees_dir`. `~` expands to home.
+    pub disk_path: String,
     /// Available refresh rates for keybind cycling (seconds).
     pub refresh_rates: Vec<f64>,
 }
@@ -1125,6 +1134,10 @@ impl Default for StatsConfig {
             battery_icon: "\u{f240}".into(),          // nf-fa-battery_full
             battery_charging_icon: "\u{f0e7}".into(), // nf-fa-bolt — lightning bolt
             battery_warn: 25,
+            disk_icon: "\u{f0a0}".into(), // nf-fa-hdd_o — hard drive
+            disk_free_warn: 15,
+            disk_free_critical: 5,
+            disk_path: String::new(),
             refresh_rates: vec![1.0, 2.0, 5.0, 10.0],
         }
     }
@@ -1156,6 +1169,7 @@ impl Default for BarsConfig {
             top_right: vec![
                 "cpu".into(),
                 "mem".into(),
+                "disk".into(),
                 "gpu".into(),
                 "net".into(),
                 "battery".into(),
@@ -1163,7 +1177,13 @@ impl Default for BarsConfig {
                 "clock".into(),
             ],
             bottom_left: vec!["keyhints".into()],
-            bottom_right: vec!["pr".into(), "tests".into(), "loc".into(), "status".into()],
+            bottom_right: vec![
+                "pr".into(),
+                "tests".into(),
+                "loc".into(),
+                "disk".into(),
+                "status".into(),
+            ],
             date_format: "%a %b %-d".into(),
             clock_format: "%H:%M".into(),
         }
@@ -6104,10 +6124,12 @@ transport = \"ssh\"
         assert_eq!(b.top_left, vec!["brand"]);
         assert_eq!(
             b.top_right,
-            vec!["cpu", "mem", "gpu", "net", "battery", "date", "clock"]
+            vec![
+                "cpu", "mem", "disk", "gpu", "net", "battery", "date", "clock"
+            ]
         );
         assert_eq!(b.bottom_left, vec!["keyhints"]);
-        assert_eq!(b.bottom_right, vec!["pr", "tests", "loc", "status"]);
+        assert_eq!(b.bottom_right, vec!["pr", "tests", "loc", "disk", "status"]);
         assert_eq!(b.date_format, "%a %b %-d");
         assert_eq!(b.clock_format, "%H:%M");
     }
