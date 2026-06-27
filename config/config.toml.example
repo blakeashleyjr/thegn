@@ -46,6 +46,8 @@ language = "auto"
 # "delete worktrees from disk" (a "keep files" choice is offered too). Set false
 # to skip the prompt and delete the worktree dirs from disk immediately.
 confirm_delete_workspace = true
+# Whether to display the full word for the mode chip (e.g., "Normal" instead of "N").
+full_mode_chip = true
 
 # Visual tuning. The focus accent recolors every superzej surface (plugins,
 # pickers, dashboard). `focus_border` frames whatever owns focus — the focused
