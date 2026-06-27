@@ -8,6 +8,7 @@ import {
   ToolExecutionEndEvent
 } from "@earendil-works/pi-coding-agent";
 import * as net from "net";
+import { createRequire } from "module";
 
 export default function (pi: ExtensionAPI) {
   let server: net.Server | null = null;
@@ -27,6 +28,16 @@ export default function (pi: ExtensionAPI) {
   // (api "anthropic-messages"); baseUrl is the host root (pi appends /v1/messages).
   // Selected at session_start (setModel is invalid during the factory — the
   // runtime isn't up yet — but registerProvider IS flushed from here).
+  // Full network seal (B2): under `network=none` the sealed agent has no IP
+  // egress at all. SUPERZEJ_PROXY_UNIX points at a bind-mounted unix socket the
+  // host relays to the model proxy; route every outbound connection through it
+  // (the proxy is the agent's *only* egress, so a global dispatcher is exactly
+  // right). The placeholder baseUrl host is ignored — undici dials the socket.
+  const proxyUnix = process.env.SUPERZEJ_PROXY_UNIX;
+  if (proxyUnix) {
+    installUnixProxyFetch(proxyUnix);
+  }
+
   let proxyModel: string | null = null;
   const proxyBase = process.env.SUPERZEJ_PROXY_BASE_URL;
   if (proxyBase) {
@@ -53,6 +64,21 @@ export default function (pi: ExtensionAPI) {
   // State to track encapsulated MCP requests
   let nextMcpId = 1;
   const pendingMcpRequests = new Map<number, { resolve: (val: any) => void, reject: (err: any) => void }>();
+
+  // Send a JSON-RPC *request* to the host (superzej) and await its reply. Used by
+  // the bouncer tool overrides: the host services the call (inside the sealed
+  // sandbox, behind the approval gate) and replies with the result. Mirrors the
+  // host->extension request path, in the other direction.
+  function sendHostRequest(method: string, params?: any): Promise<any> {
+    return new Promise((resolve, reject) => {
+      if (!activeSocket) {
+        return reject(new Error("No active ACP connection."));
+      }
+      const id = nextRpcId++;
+      pendingRequests.set(id, { resolve, reject });
+      sendAcp(activeSocket, { jsonrpc: "2.0", id, method, params });
+    });
+  }
 
   function sendMcpRequest(connectionId: string, method: string, params?: any): Promise<any> {
     return new Promise((resolve, reject) => {
@@ -132,7 +158,94 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.setStatus("acp", `ACP Server listening on port ${actualPort}`);
       });
     }
+
+    // "The bouncer" (SUPERZEJ_BOUNCER=1): override pi's built-in file/shell tools
+    // so they route back to superzej over ACP. superzej runs them inside the
+    // sealed sandbox and gates the consequential ones (shell/edit/write) behind an
+    // allow/deny overlay — so the sealed agent's "hands" are the host's, behind a
+    // bouncer. Without this env (the additive default) pi keeps its own in-process
+    // tools and edits auto-apply. See run.rs `dispatch_acp_inbound`.
+    if (process.env.SUPERZEJ_BOUNCER === "1") {
+      registerBouncerTools();
+    }
   });
+
+  // Register the bouncer tool overrides (idempotent). Each routes to the host
+  // method `dispatch_acp_inbound` services; a denied gate comes back as a
+  // JSON-RPC error, surfaced to pi as a failed tool call.
+  function registerBouncerTools() {
+    const text = (t: string, isError = false) => ({
+      content: [{ type: "text", text: t }],
+      isError
+    });
+    const fail = (e: any) => text(String(e?.message || e), true);
+
+    pi.registerTool({
+      name: "bash",
+      label: "bash (superzej)",
+      description: "Run a shell command inside the worktree's sealed sandbox (gated).",
+      parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } as any,
+      async execute(_id, params) {
+        try {
+          const r = await sendHostRequest("terminal/create", { command: params.command });
+          return text(r?.output ?? "");
+        } catch (e) { return fail(e); }
+      }
+    });
+    pi.registerTool({
+      name: "read",
+      label: "read (superzej)",
+      description: "Read a worktree file via superzej (scoped to the sandbox).",
+      parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } as any,
+      async execute(_id, params) {
+        try {
+          const r = await sendHostRequest("fs/read_text_file", { path: params.path });
+          return text(r?.text ?? "");
+        } catch (e) { return fail(e); }
+      }
+    });
+    pi.registerTool({
+      name: "edit",
+      label: "edit (superzej)",
+      description: "Edit a worktree file via superzej (gated allow/deny).",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          edits: { type: "array", items: { type: "object" } }
+        },
+        required: ["path", "edits"]
+      } as any,
+      async execute(_id, params) {
+        try {
+          const r = await sendHostRequest("superzej/edit", { path: params.path, edits: params.edits });
+          return text(`edit ${r?.status ?? "applied"}: ${params.path}`);
+        } catch (e) { return fail(e); }
+      }
+    });
+    pi.registerTool({
+      name: "write",
+      label: "write (superzej)",
+      description: "Write a worktree file via superzej (gated allow/deny).",
+      parameters: {
+        type: "object",
+        properties: { path: { type: "string" }, content: { type: "string" } },
+        required: ["path", "content"]
+      } as any,
+      async execute(_id, params) {
+        try {
+          const r = await sendHostRequest("superzej/write", { path: params.path, content: params.content });
+          return text(`write ${r?.status ?? "applied"}: ${params.path}`);
+        } catch (e) { return fail(e); }
+      }
+    });
+
+    // Make the overrides active alongside whatever pi already had.
+    try {
+      const active = pi.getActiveTools();
+      pi.setActiveTools([...new Set([...active, "bash", "read", "edit", "write"])]);
+    } catch { /* getActiveTools/setActiveTools optional across pi versions */ }
+  }
 
   function sendAcp(socket: net.Socket, msg: any) {
     socket.write(JSON.stringify(msg) + "\n");
@@ -409,12 +522,66 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // NOTE: superzej deliberately does NOT override pi's built-in bash/read/edit/
-  // write tools. pi runs them natively (in-process, sandboxed iff its pane is),
-  // which keeps pi's native inline-diff edit UX and avoids a dead host round-trip.
-  // superzej stays additive — observing via session/update, routing the model via
-  // the proxy, and exposing house tools via MCP-over-ACP. The real "bouncer"
-  // (sealed sandbox + a unix-socket ACP transport + a review gate) is a separate,
-  // deferred effort; the host-side terminal/create + fs servicing remain in
-  // run.rs for that future, currently unexercised.
+  // B2 full network seal: route the model proxy over a bind-mounted unix socket.
+  // Under `network=none` the sealed agent has loopback only, so the host relay is
+  // reachable solely as a unix socket. `undici` (the global-fetch impl) isn't a
+  // resolvable module in pi's runtime, but core `node:http` supports `socketPath`,
+  // so we wrap `globalThis.fetch`: requests to the placeholder proxy host go
+  // through the socket; everything else (there is nothing else, under the seal)
+  // falls through. SSE streaming is preserved via `Readable.toWeb`.
+  function installUnixProxyFetch(socketPath: string) {
+    try {
+      const req = createRequire(import.meta.url);
+      const http = req("node:http");
+      const { Readable } = req("node:stream");
+      const PLACEHOLDER = "proxy.superzej.internal";
+      const orig = globalThis.fetch;
+      globalThis.fetch = ((input: any, init: any = {}) => {
+        const raw = typeof input === "string" ? input : (input?.url ?? String(input));
+        let url: URL;
+        try { url = new URL(raw); } catch { return orig(input, init); }
+        if (url.hostname !== PLACEHOLDER) return orig(input, init);
+
+        // Normalize headers (Headers instance | plain object | array) → object.
+        const headers: Record<string, string> = {};
+        const h = init.headers ?? (typeof input === "object" ? input.headers : undefined);
+        if (h) {
+          if (typeof h.forEach === "function" && !Array.isArray(h)) h.forEach((v: string, k: string) => (headers[k] = v));
+          else if (Array.isArray(h)) for (const [k, v] of h) headers[k] = v as string;
+          else for (const k of Object.keys(h)) headers[k] = h[k];
+        }
+        const method = (init.method || (typeof input === "object" ? input.method : "GET") || "GET").toUpperCase();
+        const body = init.body ?? (typeof input === "object" ? input.body : undefined);
+
+        return new Promise((resolve, reject) => {
+          const r = http.request(
+            { socketPath, path: url.pathname + url.search, method, headers },
+            (res: any) => {
+              resolve(new Response(Readable.toWeb(res) as any, {
+                status: res.statusCode || 502,
+                statusText: res.statusMessage || "",
+                headers: res.headers as any,
+              }));
+            }
+          );
+          r.on("error", reject);
+          if (body == null) r.end();
+          else if (typeof body === "string" || body instanceof Uint8Array || Buffer.isBuffer(body)) r.end(body);
+          else if (typeof body.pipe === "function") body.pipe(r);
+          else r.end(String(body));
+        });
+      }) as any;
+    } catch (e) {
+      console.error("superzej: failed to route the model proxy over the unix socket:", e);
+    }
+  }
+
+  // Tool ownership is mode-dependent:
+  //  - Additive (default): superzej does NOT override pi's built-in bash/read/
+  //    edit/write. pi runs them natively (in-process, sandboxed iff its pane is),
+  //    keeping pi's inline-diff edit UX; superzej stays additive (observe via
+  //    session/update, route the model via the proxy, house tools over MCP).
+  //  - Bouncer (SUPERZEJ_BOUNCER=1, see `registerBouncerTools`): those four tools
+  //    are overridden to route over ACP so superzej runs them inside the sealed
+  //    sandbox and gates shell/edit/write behind an allow/deny overlay.
 }
