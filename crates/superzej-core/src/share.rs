@@ -15,7 +15,7 @@
 
 use crate::config::{
     BoreConfig, FrpConfig, IrohShareConfig, ShareConfig, ShareOnError, ShareProviderKind,
-    ShareVisibility, TailscaleShareConfig,
+    ShareReach, ShareVisibility, TailscaleShareConfig,
 };
 use crate::msg;
 use std::time::Duration;
@@ -63,14 +63,21 @@ pub fn label_for(worktree: &str) -> String {
 /// Resolve a `[share]` config block into a [`ShareSpec`] for `local_port` on the
 /// worktree identified by `label` (see [`label_for`]).
 ///
-/// Returns `None` when sharing is disabled (`provider = "none"`). Reconciles the
-/// requested visibility with provider capability (bore/frp are public-only),
-/// warning and downgrading rather than failing.
-pub fn build_share_spec(cfg: &ShareConfig, label: &str, local_port: u16) -> Option<ShareSpec> {
-    if !cfg.is_enabled() {
-        return None;
-    }
-    let params = match cfg.provider {
+/// `reach` selects the provider via the `[share] public`/`team`/`peer` keys
+/// (intent-first); `None` falls back to the single `[share] provider`. Returns
+/// `None` when the resolved provider is `none` (sharing disabled, or that reach
+/// is unset). Reconciles the requested visibility with provider capability.
+pub fn build_share_spec(
+    cfg: &ShareConfig,
+    label: &str,
+    local_port: u16,
+    reach: Option<ShareReach>,
+) -> Option<ShareSpec> {
+    let provider = match reach {
+        Some(r) => cfg.reach_provider(r),
+        None => cfg.provider,
+    };
+    let params = match provider {
         ShareProviderKind::None => return None,
         ShareProviderKind::Bore => ShareParams::Bore(cfg.bore.clone()),
         ShareProviderKind::Frp => ShareParams::Frp(cfg.frp.clone()),
@@ -79,7 +86,7 @@ pub fn build_share_spec(cfg: &ShareConfig, label: &str, local_port: u16) -> Opti
     };
     let visibility = reconcile_visibility(cfg.visibility, &params);
     Some(ShareSpec {
-        provider: cfg.provider,
+        provider,
         label: label.to_string(),
         local_port,
         visibility,
@@ -129,14 +136,14 @@ mod tests {
     #[test]
     fn disabled_provider_yields_none() {
         let cfg = ShareConfig::default(); // provider = none
-        assert!(build_share_spec(&cfg, "wt", 3000).is_none());
+        assert!(build_share_spec(&cfg, "wt", 3000, None).is_none());
     }
 
     #[test]
     fn bore_resolves_with_port_and_timeout() {
         let mut cfg = enabled_cfg();
         cfg.ready_timeout_secs = 7;
-        let spec = build_share_spec(&cfg, "wt", 8080).expect("enabled");
+        let spec = build_share_spec(&cfg, "wt", 8080, None).expect("enabled");
         assert_eq!(spec.provider, ShareProviderKind::Bore);
         assert_eq!(spec.local_port, 8080);
         assert_eq!(spec.ready_timeout, Duration::from_secs(7));
@@ -147,7 +154,7 @@ mod tests {
     fn bore_downgrades_private_to_public() {
         let mut cfg = enabled_cfg();
         cfg.visibility = ShareVisibility::Private;
-        let spec = build_share_spec(&cfg, "wt", 3000).expect("enabled");
+        let spec = build_share_spec(&cfg, "wt", 3000, None).expect("enabled");
         assert_eq!(spec.visibility, ShareVisibility::Public);
     }
 
@@ -155,7 +162,7 @@ mod tests {
     fn bore_keeps_explicit_public() {
         let mut cfg = enabled_cfg();
         cfg.visibility = ShareVisibility::Public;
-        let spec = build_share_spec(&cfg, "wt", 3000).expect("enabled");
+        let spec = build_share_spec(&cfg, "wt", 3000, None).expect("enabled");
         assert_eq!(spec.visibility, ShareVisibility::Public);
     }
 
@@ -194,7 +201,7 @@ mod tests {
         let mut cfg = enabled_cfg();
         cfg.bore.to = "relay.example.com".into();
         cfg.bore.remote_port = 9000;
-        let spec = build_share_spec(&cfg, "wt", 3000).expect("enabled");
+        let spec = build_share_spec(&cfg, "wt", 3000, None).expect("enabled");
         let ShareParams::Bore(b) = spec.params else {
             panic!("expected bore params");
         };
@@ -210,7 +217,7 @@ mod tests {
         };
         cfg.frp.server_addr = "frps.example.com".into();
         cfg.frp.subdomain_host = "share.example.com".into();
-        let spec = build_share_spec(&cfg, "app-feat", 3000).expect("enabled");
+        let spec = build_share_spec(&cfg, "app-feat", 3000, None).expect("enabled");
         assert_eq!(spec.provider, ShareProviderKind::Frp);
         assert_eq!(spec.label, "app-feat");
         let ShareParams::Frp(f) = spec.params else {
@@ -233,13 +240,13 @@ mod tests {
             visibility: ShareVisibility::Public,
             ..ShareConfig::default()
         };
-        let spec = build_share_spec(&cfg, "wt", 3000).expect("enabled");
+        let spec = build_share_spec(&cfg, "wt", 3000, None).expect("enabled");
         assert_eq!(spec.visibility, ShareVisibility::Private);
         assert!(matches!(spec.params, ShareParams::Tailscale(_)));
 
         // funnel ⇒ public.
         cfg.tailscale.funnel = true;
-        let spec = build_share_spec(&cfg, "wt", 3000).expect("enabled");
+        let spec = build_share_spec(&cfg, "wt", 3000, None).expect("enabled");
         assert_eq!(spec.visibility, ShareVisibility::Public);
     }
 
@@ -250,9 +257,57 @@ mod tests {
             visibility: ShareVisibility::Public, // requested public…
             ..ShareConfig::default()
         };
-        let spec = build_share_spec(&cfg, "wt", 3000).expect("enabled");
+        let spec = build_share_spec(&cfg, "wt", 3000, None).expect("enabled");
         assert_eq!(spec.visibility, ShareVisibility::Private); // …resolved private
         assert!(matches!(spec.params, ShareParams::Iroh(_)));
+    }
+
+    #[test]
+    fn reach_round_trip_and_resolution() {
+        assert_eq!(ShareReach::from_str_validated("team"), Ok(ShareReach::Team));
+        assert_eq!(ShareReach::Peer.as_str(), "peer");
+
+        // Reach keys map to providers; an unset reach yields `none`.
+        let cfg = ShareConfig {
+            public: ShareProviderKind::Frp,
+            team: ShareProviderKind::Tailscale,
+            ..ShareConfig::default()
+        };
+        // build with reach=team resolves to tailscale.
+        let mut tcfg = cfg.clone();
+        tcfg.tailscale.funnel = false;
+        let spec = build_share_spec(&tcfg, "wt", 3000, Some(ShareReach::Team)).expect("team");
+        assert_eq!(spec.provider, ShareProviderKind::Tailscale);
+        // peer is unset → no spec.
+        assert!(build_share_spec(&cfg, "wt", 3000, Some(ShareReach::Peer)).is_none());
+        // reach=None falls back to `provider` (none here) → no spec.
+        assert!(build_share_spec(&cfg, "wt", 3000, None).is_none());
+    }
+
+    #[test]
+    fn configured_reaches_orders_and_respects_allow_public() {
+        let mut cfg = ShareConfig {
+            public: ShareProviderKind::Frp,
+            team: ShareProviderKind::Tailscale,
+            peer: ShareProviderKind::Iroh,
+            ..ShareConfig::default()
+        };
+        assert_eq!(
+            cfg.configured_reaches(),
+            vec![ShareReach::Public, ShareReach::Team, ShareReach::Peer]
+        );
+        // allow_public=false drops the public reach (the guard would refuse it).
+        cfg.allow_public = false;
+        assert_eq!(
+            cfg.configured_reaches(),
+            vec![ShareReach::Team, ShareReach::Peer]
+        );
+        // Only `provider` set ⇒ no configured reaches (no picker).
+        let only_provider = ShareConfig {
+            provider: ShareProviderKind::Bore,
+            ..ShareConfig::default()
+        };
+        assert!(only_provider.configured_reaches().is_empty());
     }
 
     #[test]

@@ -214,6 +214,32 @@ EOF
 check "share allow_public guard refuses public shares" \
   "'$SZ' --config '$TMP/share-guard.toml' share start 3000 --worktree '$WT' 2>&1 | grep -q 'public sharing is disabled'"
 
+# Intent-first reach mapping: `--reach peer` resolves to the iroh provider.
+cat >"$TMP/share-reach.toml" <<EOF
+[share]
+public = "frp"
+team   = "tailscale"
+peer   = "iroh"
+[share.frp]
+server_addr = "frps.example.com"
+subdomain_host = "share.example.com"
+EOF
+PATH="$SHBIN:$PATH" "$SZ" --config "$TMP/share-reach.toml" share start 3000 --reach peer \
+  --worktree "$WT" >"$TMP/reach.out" 2>&1 &
+REACH_PID=$!
+for _ in $(seq 1 60); do
+  if grep -q '→' "$TMP/reach.out" 2>/dev/null; then break; fi
+  sleep 0.1
+done
+check "share --reach peer resolves to the iroh provider" \
+  "grep -q 'dumbpipe connect-tcp' '$TMP/reach.out'"
+kill "$REACH_PID" 2>/dev/null || true
+wait "$REACH_PID" 2>/dev/null || true
+
+# An invalid reach is rejected cleanly (exit 0 with a message).
+check "share rejects an invalid --reach value" \
+  "'$SZ' --config '$TMP/share-reach.toml' share start 3000 --reach bogus --worktree '$WT' 2>&1 | grep -q 'reach'"
+
 # v5 → v6 layout migration: seed a legacy flat tab_layout (pages as " ·N" name
 # suffixes) into the state DB, open it once, and assert it transformed into
 # worktree groups (tabs-within-a-worktree) with the legacy table dropped.

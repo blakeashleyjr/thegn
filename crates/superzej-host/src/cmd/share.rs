@@ -26,6 +26,10 @@ pub enum Action {
         port: u16,
         #[arg(long)]
         worktree: Option<String>,
+        /// Reach intent: public | team | peer (maps to `[share] <reach>`).
+        /// Omitted ⇒ the single `[share] provider`.
+        #[arg(long)]
+        reach: Option<String>,
     },
     /// List shares recorded in the DB.
     List,
@@ -39,17 +43,31 @@ pub enum Action {
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
     match action {
-        Action::Start { port, worktree } => start(cfg, port, worktree),
+        Action::Start {
+            port,
+            worktree,
+            reach,
+        } => start(cfg, port, worktree, reach),
         Action::List => list(),
         Action::Stop { port, worktree } => stop(port, worktree),
     }
 }
 
-fn start(cfg: &Config, port: u16, worktree: Option<String>) -> Result<()> {
+fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String>) -> Result<()> {
     let wt = resolve_worktree(worktree).to_string_lossy().into_owned();
     let label = superzej_core::share::label_for(&wt);
-    let Some(spec) = build_share_spec(&cfg.share, &label, port) else {
-        outln!("share: disabled (set [share] provider)");
+    let reach = match reach.as_deref() {
+        Some(s) => match superzej_core::config::ShareReach::from_str_validated(s) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                outln!("share: {e}");
+                return Ok(());
+            }
+        },
+        None => None,
+    };
+    let Some(spec) = build_share_spec(&cfg.share, &label, port, reach) else {
+        outln!("share: disabled (set [share] provider, or that reach)");
         return Ok(());
     };
     if spec.visibility == superzej_core::config::ShareVisibility::Public && !cfg.share.allow_public

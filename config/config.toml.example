@@ -1025,6 +1025,13 @@ visibility = "public"
 # (frp http(s), tailscale funnel). Private/team/peer shares are unaffected. The
 # statusbar badge renders AMBER while a worktree is publicly exposed.
 allow_public = true
+# Intent-first reach → provider mapping. When ≥2 of these are set, Alt+Shift+S
+# offers a "Share to…" picker (🌐 public / 👥 team / 🔗 peer) instead of using the
+# single `provider` above; pick *who* should reach it and the provider is chosen
+# for you. Each defaults to "none" (no picker). Recommended:
+# public = "frp"        # internet, browser-reachable
+# team   = "tailscale"  # your tailnet / a teammate
+# peer   = "iroh"       # hand a teammate a ticket
 # When the share can't come up: fail (surface the error) | warn (note and skip).
 on_error = "fail"
 # Seconds to wait for the URL to appear before applying on_error.

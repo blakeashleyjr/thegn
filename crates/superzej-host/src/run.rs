@@ -3178,8 +3178,11 @@ enum HostInputKind {
     NewWorktreeFromTemplate {
         repo_root: String,
     },
-    /// Expose the typed port from the active worktree (`[share]`).
-    ShareWorktreePort,
+    /// Expose the typed port from the active worktree (`[share]`). `reach`
+    /// carries the picked public/team/peer intent (`None` ⇒ `[share] provider`).
+    ShareWorktreePort {
+        reach: Option<superzej_core::config::ShareReach>,
+    },
 }
 
 /// Launch the new-worktree wizard + speculative-create worker against `root`.
@@ -4850,6 +4853,9 @@ fn dispatch_menu_choice(
         // which this git-scoped dispatcher doesn't carry. Never reaches here.
         MenuChoice::SetKeymapPreset(_) => {}
         MenuChoice::ConfirmDeleteWorktrees { .. } => {}
+        // The reach picker is intercepted at the call site (opens port entry);
+        // never reaches this git-scoped dispatcher.
+        MenuChoice::ShareReach(_) => {}
     }
     GitAfter::None
 }
@@ -6734,6 +6740,7 @@ async fn event_loop<T: Terminal>(
                     &keymap.config().share,
                     &row.worktree,
                     row.local_port,
+                    None, // restore re-resolves via `[share] provider`
                     &share_tx,
                     &waker,
                 );
@@ -10797,7 +10804,7 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                     }
-                                    HostInputKind::ShareWorktreePort => {
+                                    HostInputKind::ShareWorktreePort { reach } => {
                                         match text.trim().parse::<u16>() {
                                             Ok(port) if port > 0 => {
                                                 if let Some(wt) =
@@ -10807,6 +10814,7 @@ async fn event_loop<T: Terminal>(
                                                         &keymap.config().share,
                                                         &wt,
                                                         port,
+                                                        reach,
                                                         &share_tx,
                                                         &waker,
                                                     ) {
@@ -11066,6 +11074,18 @@ async fn event_loop<T: Terminal>(
                                 } else {
                                     format!("Keymap preset: {preset}")
                                 };
+                                dirty = true;
+                                continue;
+                            }
+                            // Reach picker → port entry carrying the chosen reach.
+                            // Not a git op, so handle before the git dispatch.
+                            if let menu::MenuChoice::ShareReach(reach) = choice {
+                                host_input = Some((
+                                    menu::InputOverlay::new("share worktree port (number)", ""),
+                                    HostInputKind::ShareWorktreePort { reach: Some(reach) },
+                                ));
+                                model.status =
+                                    "Share port: enter a port number (Esc cancels)".into();
                                 dirty = true;
                                 continue;
                             }
@@ -14550,12 +14570,23 @@ async fn event_loop<T: Terminal>(
                                 focus.zone = crate::focus::Zone::Panel;
                             }
                             Action::ShareWorktreePort => {
-                                host_input = Some((
-                                    menu::InputOverlay::new("share worktree port (number)", ""),
-                                    HostInputKind::ShareWorktreePort,
-                                ));
-                                model.status =
-                                    "Share port: enter a port number (Esc cancels)".into();
+                                // Intent-first: when ≥2 reaches are configured,
+                                // pick public/team/peer first; otherwise go
+                                // straight to port entry (the single reach, or
+                                // `None` ⇒ `[share] provider`).
+                                let reaches = keymap.config().share.configured_reaches();
+                                if reaches.len() >= 2 {
+                                    active_menu = Some(menu::reach_picker(&keymap.config().share));
+                                    model.status = "Share to… pick a reach (Esc cancels)".into();
+                                } else {
+                                    let reach = reaches.first().copied();
+                                    host_input = Some((
+                                        menu::InputOverlay::new("share worktree port (number)", ""),
+                                        HostInputKind::ShareWorktreePort { reach },
+                                    ));
+                                    model.status =
+                                        "Share port: enter a port number (Esc cancels)".into();
+                                }
                             }
                             Action::StopWorktreeShare => {
                                 if let Some(wt) = session.active_group().map(|g| g.path.clone()) {
