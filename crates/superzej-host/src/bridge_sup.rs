@@ -140,10 +140,35 @@ pub fn disconnect_path(host_path: &str) {
     }
 }
 
-/// Default in-env path the static-musl `szhost` is pushed to (8-B.3). Until the
-/// push lands, a provider connect using this will spawn-fail gracefully.
-fn remote_szhost() -> String {
+/// Default in-env path the static-musl `szhost` is pushed to (8-B.3). The push
+/// (`agent::ensure_remote_bridge`) installs the binary here before connect; if no
+/// local binary is configured the connect spawn-fails gracefully (per-op fallback).
+pub fn remote_szhost() -> String {
     "/workspace/.sz/szhost".to_string()
+}
+
+/// The local static-musl `szhost` to push into a remote env, or `None` to skip
+/// the push (the bridge then falls back to the per-op git path). Resolution:
+/// `SUPERZEJ_BRIDGE_BINARY` env (an explicit artifact path, e.g. set by the nix
+/// wrapper) → else a `szhost-musl` sitting next to the running executable → else
+/// none. We never push the running exe itself: it's likely a glibc/host-arch
+/// build, wrong for the env's musl/Firecracker target.
+pub fn bridge_binary_path() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("SUPERZEJ_BRIDGE_BINARY") {
+        let p = std::path::PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let cand = dir.join("szhost-musl");
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
 }
 
 /// Build the transport command that runs `szhost bridge` *inside* the env for a

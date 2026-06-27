@@ -105,6 +105,29 @@ fn live_end_to_end() {
         let _ = std::fs::remove_dir_all(&tmp);
         let _ = std::fs::remove_dir_all(&back);
 
+        // resident-bridge binary push: idempotent content handshake (8-B.3).
+        // A small fake stands in for the musl szhost — the handshake is what we
+        // verify (push once, no-op on identical bytes, bytes land at the path).
+        let prov =
+            superzej_svc::provider::Provider::Sprites(SpritesProvider::new("", &token, &name));
+        let fake = b"#!/bin/sh\necho fake-szhost\n";
+        let pushed = warm_retry("ensure_executable", || {
+            prov.ensure_executable(&name, "/workspace/.sz/szhost", fake)
+        })
+        .await;
+        assert!(pushed, "first ensure should push");
+        let again = prov
+            .ensure_executable(&name, "/workspace/.sz/szhost", fake)
+            .await
+            .expect("second ensure");
+        assert!(!again, "second ensure (same bytes) should be a no-op");
+        let back_bin = p
+            .read(&name, "/workspace/.sz/szhost")
+            .await
+            .expect("read pushed");
+        assert_eq!(back_bin, fake, "pushed bytes round-trip");
+        println!("bridge binary push idempotent ok");
+
         // checkpoint + list + restore (retry until warm)
         let cp = warm_retry("checkpoint", || p.checkpoint(&name, Some("livetest"))).await;
         println!("checkpoint id: {cp}");

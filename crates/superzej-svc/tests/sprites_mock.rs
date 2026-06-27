@@ -8,6 +8,7 @@
 //!
 //! Run: `cargo test -p superzej-svc --test sprites_mock`.
 
+use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -16,6 +17,13 @@ use std::thread;
 use superzej_svc::provider::{
     Provider, ProviderCheckpoints, ProviderEgress, ProviderFiles, RemoteProvider, SpritesProvider,
 };
+
+/// A tiny stateful fs the mock serves so `/fs/write` → `/fs/read` round-trips
+/// (needed for the content-handshake `ensure_executable`). Keyed by the raw
+/// (still-percent-encoded) `path=` query value — `write` and `read` encode the
+/// same logical path identically (same reqwest serialization), so they match
+/// without decoding.
+type FsState = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 
 #[derive(Clone, Debug)]
 struct Recorded {
@@ -35,11 +43,13 @@ fn start_mock() -> Mock {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let recorded = Arc::new(Mutex::new(Vec::new()));
+    let fs: FsState = Arc::new(Mutex::new(HashMap::new()));
     let rec = recorded.clone();
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let rec = rec.clone();
-            thread::spawn(move || handle(stream, rec));
+            let fs = fs.clone();
+            thread::spawn(move || handle(stream, rec, fs));
         }
     });
     Mock {
@@ -48,7 +58,14 @@ fn start_mock() -> Mock {
     }
 }
 
-fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>) {
+/// The raw (encoded) value of the `path=` query param, if present.
+fn query_path(target: &str) -> Option<String> {
+    let q = target.split('?').nth(1)?;
+    q.split('&')
+        .find_map(|kv| kv.strip_prefix("path=").map(str::to_string))
+}
+
+fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>, fs: FsState) {
     let mut writer = stream.try_clone().unwrap();
     let mut reader = BufReader::new(stream);
     // Request line.
@@ -86,10 +103,28 @@ fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>) {
     rec.lock().unwrap().push(Recorded {
         method: method.clone(),
         path: path.clone(),
-        body,
+        body: body.clone(),
         auth,
     });
-    let (status, ctype, resp) = route(&method, &path);
+    // Stateful fs: writes store by the `path=` query, reads serve them back (404
+    // when absent). Everything else falls to the recorded-response router.
+    let (status, ctype, resp) = if method == "PUT" && path.contains("/fs/write") {
+        if let Some(k) = query_path(&path) {
+            fs.lock().unwrap().insert(k, body);
+        }
+        (
+            "200 OK",
+            "application/json",
+            br#"{"path":"x","size":0,"mode":"644"}"#.to_vec(),
+        )
+    } else if method == "GET" && path.contains("/fs/read") {
+        match query_path(&path).and_then(|k| fs.lock().unwrap().get(&k).cloned()) {
+            Some(b) => ("200 OK", "application/octet-stream", b),
+            None => ("404 Not Found", "text/plain", b"missing".to_vec()),
+        }
+    } else {
+        route(&method, &path)
+    };
     let head = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         resp.len()
@@ -293,4 +328,65 @@ fn provider_enum_dispatch_against_mock() {
         "/workspace",
     ))
     .unwrap_err(); // local dir missing → error, but the dispatch path is exercised
+}
+
+#[test]
+fn write_exec_uses_0755_mode() {
+    let mock = start_mock();
+    let p = SpritesProvider::new(&mock.base_url, "tok", "sztest1");
+    rt().block_on(p.write_exec("sztest1", "/workspace/.sz/szhost", b"ELF"))
+        .unwrap();
+    let reqs = mock.recorded.lock().unwrap().clone();
+    let w = reqs
+        .iter()
+        .find(|r| r.method == "PUT" && r.path.contains("/fs/write"))
+        .expect("a write request");
+    assert!(
+        w.path.contains("mode=0755"),
+        "exec write must be 0755: {}",
+        w.path
+    );
+    assert_eq!(w.body, b"ELF");
+}
+
+#[test]
+fn ensure_executable_pushes_once_then_idempotent() {
+    let mock = start_mock();
+    let prov = Provider::Sprites(SpritesProvider::new(&mock.base_url, "tok", "sztest1"));
+    let rt = rt();
+    let bin = b"fake-szhost-musl-binary";
+    let path = "/workspace/.sz/szhost";
+
+    // First install: no fingerprint stored → pushes the binary + .fp, returns true.
+    assert!(
+        rt.block_on(prov.ensure_executable("sztest1", path, bin))
+            .unwrap(),
+        "first ensure should push"
+    );
+    // Second with identical bytes: the stored .fp matches → no-op, returns false.
+    assert!(
+        !rt.block_on(prov.ensure_executable("sztest1", path, bin))
+            .unwrap(),
+        "second ensure (same bytes) should be a no-op"
+    );
+    // Changed bytes → fingerprint mismatch → re-pushes.
+    assert!(
+        rt.block_on(prov.ensure_executable("sztest1", path, b"different-bytes"))
+            .unwrap(),
+        "changed bytes should re-push"
+    );
+
+    // The 0755 binary write happened exactly twice (first + after change), never
+    // on the idempotent no-op.
+    let reqs = mock.recorded.lock().unwrap().clone();
+    let exec_writes = reqs
+        .iter()
+        .filter(|r| {
+            r.method == "PUT" && r.path.contains("/fs/write") && r.path.contains("mode=0755")
+        })
+        .count();
+    assert_eq!(
+        exec_writes, 2,
+        "binary should push twice, not on the no-op: {reqs:?}"
+    );
 }
