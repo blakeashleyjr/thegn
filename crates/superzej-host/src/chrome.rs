@@ -1009,10 +1009,12 @@ fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> {
                 col(S::Dim),
             )
         }),
-        "battery" => s.battery.map(|(p, charging)| {
-            // Charging wins: bolt glyph + orange text, even when low. Otherwise
-            // the battery glyph, red at/below the warn threshold and quiet above.
-            let (icon, fg) = if charging {
+        "battery" => s.battery.map(|(p, on_ac)| {
+            // On AC wins: bolt glyph + orange text, even when low (this also
+            // covers a charge-capped battery, which sits plugged in not
+            // charging). Otherwise the battery glyph, red at/below the warn
+            // threshold and quiet above.
+            let (icon, fg) = if on_ac {
                 (&ic.battery_charging_icon, theme_color(theme::HUE_ORANGE))
             } else if p <= ic.battery_warn {
                 (&ic.battery_icon, theme_color(theme::RED))
