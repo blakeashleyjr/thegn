@@ -787,8 +787,9 @@ fn sidecar_running(rt: &OciRuntime, container: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// `exec` a command inside the sidecar; returns `(success, stdout)`.
-fn exec_in(rt: &OciRuntime, container: &str, cmd: &[String]) -> Result<(bool, String)> {
+/// `exec` a command inside the sidecar; returns `(success, stdout)`. Public so
+/// the share layer can drive `tailscale serve` inside an existing VPN sidecar.
+pub fn exec_in(rt: &OciRuntime, container: &str, cmd: &[String]) -> Result<(bool, String)> {
     let mut args = vec!["exec".to_string(), container.to_string()];
     args.extend(cmd.iter().cloned());
     let argv = rt.argv(&args.iter().map(|s| s.as_str()).collect::<Vec<_>>());

@@ -73,7 +73,7 @@ pub fn remote_home(ssh: &SshTarget) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
-/// Serialized form stored in `worktrees.location`.
+/// Serialized form stored in `worktrees.location` for an ssh remote.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RemoteLoc {
     host: String,
@@ -83,11 +83,33 @@ struct RemoteLoc {
     path: String,
 }
 
-/// Where a worktree's git data lives — local on disk, or on a remote over ssh.
+/// Serialized form stored in `worktrees.location` for a managed-provider
+/// (e.g. Sprites) worktree: the control-plane exec prefix that runs a command
+/// *inside* the environment, plus the worktree's path inside it. Distinguished
+/// from [`RemoteLoc`] by the required `control_prefix` field (no `host`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProviderLoc {
+    control_prefix: Vec<String>,
+    path: String,
+}
+
+/// Where a worktree's git data lives — local on disk, on a remote over ssh, or
+/// inside a managed-provider sandbox reached via a control-plane exec prefix.
+/// All three drive the same control-plane git/gh/cli/sh reads the chrome shows.
 #[derive(Debug, Clone)]
 pub enum GitLoc {
     Local(PathBuf),
-    Remote { ssh: SshTarget, path: String },
+    Remote {
+        ssh: SshTarget,
+        path: String,
+    },
+    /// `control_prefix` runs a command in the env, e.g.
+    /// `["sprite","exec","-s","<name>","--"]`; `path` is the worktree dir inside
+    /// the env (e.g. `/workspace`). Built from a `Placement::Provider`.
+    Provider {
+        control_prefix: Vec<String>,
+        path: String,
+    },
 }
 
 impl GitLoc {
@@ -101,24 +123,35 @@ impl GitLoc {
         Self::from_db(&p, loc.as_deref())
     }
 
-    /// Build from a worktree path + its DB `location` column value.
+    /// Build from a worktree path + its DB `location` column value. Tries the
+    /// provider blob first (has `control_prefix`), then the ssh blob (has
+    /// `host`), then falls back to local — so existing local/ssh entries are
+    /// unchanged.
     pub fn from_db(path: &str, location: Option<&str>) -> GitLoc {
-        match location
+        let Some(json) = location
             .map(str::trim)
             .filter(|s| !s.is_empty() && *s != "local")
+        else {
+            return GitLoc::Local(PathBuf::from(path));
+        };
+        if let Ok(p) = serde_json::from_str::<ProviderLoc>(json)
+            && !p.control_prefix.is_empty()
         {
-            Some(json) => match serde_json::from_str::<RemoteLoc>(json) {
-                Ok(r) => GitLoc::Remote {
-                    ssh: SshTarget {
-                        host: r.host,
-                        port: r.port,
-                        forward_agent: r.forward_agent,
-                    },
-                    path: r.path,
+            return GitLoc::Provider {
+                control_prefix: p.control_prefix,
+                path: p.path,
+            };
+        }
+        match serde_json::from_str::<RemoteLoc>(json) {
+            Ok(r) => GitLoc::Remote {
+                ssh: SshTarget {
+                    host: r.host,
+                    port: r.port,
+                    forward_agent: r.forward_agent,
                 },
-                Err(_) => GitLoc::Local(PathBuf::from(path)),
+                path: r.path,
             },
-            None => GitLoc::Local(PathBuf::from(path)),
+            Err(_) => GitLoc::Local(PathBuf::from(path)),
         }
     }
 
@@ -133,22 +166,44 @@ impl GitLoc {
         .unwrap_or_default()
     }
 
+    /// The DB `location` string for a managed-provider worktree.
+    pub fn provider_db_string(control_prefix: &[String], path: &str) -> String {
+        serde_json::to_string(&ProviderLoc {
+            control_prefix: control_prefix.to_vec(),
+            path: path.into(),
+        })
+        .unwrap_or_default()
+    }
+
+    /// Construct a provider location directly (the worktree dir lives inside the
+    /// env; `control_prefix` runs a command there).
+    pub fn provider(control_prefix: Vec<String>, path: impl Into<String>) -> GitLoc {
+        GitLoc::Provider {
+            control_prefix,
+            path: path.into(),
+        }
+    }
+
+    /// Whether the worktree's git data lives off the local host (ssh OR provider)
+    /// — i.e. control-plane reads must be wrapped, and gix-native reads delegate
+    /// to the CLI fallback.
     pub fn is_remote(&self) -> bool {
-        matches!(self, GitLoc::Remote { .. })
+        !matches!(self, GitLoc::Local(_))
     }
 
     pub fn ssh(&self) -> Option<&SshTarget> {
         match self {
-            GitLoc::Local(_) => None,
             GitLoc::Remote { ssh, .. } => Some(ssh),
+            GitLoc::Local(_) | GitLoc::Provider { .. } => None,
         }
     }
 
-    /// The worktree path (local or remote absolute path).
+    /// The worktree path (local path, or the absolute path inside the remote/env).
     pub fn path(&self) -> String {
         match self {
             GitLoc::Local(p) => p.to_string_lossy().into_owned(),
             GitLoc::Remote { path, .. } => path.clone(),
+            GitLoc::Provider { path, .. } => path.clone(),
         }
     }
 
@@ -171,6 +226,14 @@ impl GitLoc {
                 git.extend(args.iter().map(|s| s.to_string()));
                 util::sh_join(&git)
             }),
+            GitLoc::Provider {
+                control_prefix,
+                path,
+            } => self.provider_command(control_prefix, {
+                let mut git = vec!["git".to_string(), "-C".into(), path.clone()];
+                git.extend(args.iter().map(|s| s.to_string()));
+                util::sh_join(&git)
+            }),
         }
     }
 
@@ -188,6 +251,15 @@ impl GitLoc {
                 gh.extend(args.iter().map(|s| s.to_string()));
                 let remote = format!("cd {} && {}", util::sh_quote(path), util::sh_join(&gh));
                 self.ssh_command(ssh, remote)
+            }
+            GitLoc::Provider {
+                control_prefix,
+                path,
+            } => {
+                let mut gh = vec!["gh".to_string()];
+                gh.extend(args.iter().map(|s| s.to_string()));
+                let remote = format!("cd {} && {}", util::sh_quote(path), util::sh_join(&gh));
+                self.provider_command(control_prefix, remote)
             }
         }
     }
@@ -208,6 +280,15 @@ impl GitLoc {
                 argv.extend(args.iter().map(|s| s.to_string()));
                 let remote = format!("cd {} && {}", util::sh_quote(path), util::sh_join(&argv));
                 self.ssh_command(ssh, remote)
+            }
+            GitLoc::Provider {
+                control_prefix,
+                path,
+            } => {
+                let mut argv = vec![bin.to_string()];
+                argv.extend(args.iter().map(|s| s.to_string()));
+                let remote = format!("cd {} && {}", util::sh_quote(path), util::sh_join(&argv));
+                self.provider_command(control_prefix, remote)
             }
         }
     }
@@ -230,6 +311,13 @@ impl GitLoc {
             GitLoc::Remote { ssh, path } => {
                 self.ssh_command(ssh, format!("cd {} && {script}", util::sh_quote(path)))
             }
+            GitLoc::Provider {
+                control_prefix,
+                path,
+            } => self.provider_command(
+                control_prefix,
+                format!("cd {} && {script}", util::sh_quote(path)),
+            ),
         }
     }
 
@@ -237,6 +325,19 @@ impl GitLoc {
         let mut argv = ssh_base(ssh.port, ssh.forward_agent, true);
         argv.push(ssh.host.clone());
         argv.push(remote_cmd);
+        let mut c = Command::new(&argv[0]);
+        c.args(&argv[1..]);
+        c
+    }
+
+    /// Wrap a shell script to run *inside* a managed-provider env via its
+    /// control-plane exec prefix, e.g. `sprite exec -s <name> -- /bin/sh -lc
+    /// "<script>"`. The provider/transport-agnostic sibling of [`ssh_command`].
+    fn provider_command(&self, control_prefix: &[String], script: String) -> Command {
+        let mut argv = control_prefix.to_vec();
+        argv.push("/bin/sh".into());
+        argv.push("-lc".into());
+        argv.push(script);
         let mut c = Command::new(&argv[0]);
         c.args(&argv[1..]);
         c
@@ -260,17 +361,27 @@ impl GitLoc {
                 c
             }
             GitLoc::Remote { ssh, path } => {
-                let mut parts = vec!["env".to_string()];
-                for (k, v) in envs {
-                    parts.push(format!("{k}={}", util::sh_quote(v)));
-                }
-                parts.push("git".into());
-                parts.push("-C".into());
-                parts.push(util::sh_quote(path));
-                parts.extend(args.iter().map(|s| util::sh_quote(s)));
-                self.ssh_command(ssh, parts.join(" "))
+                self.ssh_command(ssh, Self::env_git_script(envs, path, args))
             }
+            GitLoc::Provider {
+                control_prefix,
+                path,
+            } => self.provider_command(control_prefix, Self::env_git_script(envs, path, args)),
         }
+    }
+
+    /// `env K=V … git -C <path> <args>` as one sh-quoted shell string (the
+    /// remote/provider form of [`git_command_env`]).
+    fn env_git_script(envs: &[(&str, &str)], path: &str, args: &[&str]) -> String {
+        let mut parts = vec!["env".to_string()];
+        for (k, v) in envs {
+            parts.push(format!("{k}={}", util::sh_quote(v)));
+        }
+        parts.push("git".into());
+        parts.push("-C".into());
+        parts.push(util::sh_quote(path));
+        parts.extend(args.iter().map(|s| util::sh_quote(s)));
+        parts.join(" ")
     }
 
     /// Run git with `stdin` piped in (e.g. `git apply -`, `git commit -F -`),
@@ -320,6 +431,13 @@ impl GitLoc {
                     .ok()?;
                 out.status.success().then_some(out.stdout)
             }
+            GitLoc::Provider { control_prefix, .. } => {
+                let out = self
+                    .provider_command(control_prefix, format!("cat {}", util::sh_quote(&p)))
+                    .output()
+                    .ok()?;
+                out.status.success().then_some(out.stdout)
+            }
         }
     }
 
@@ -328,27 +446,32 @@ impl GitLoc {
         let p = self
             .resolve_git_path(rel)
             .ok_or_else(|| std::io::Error::other(format!("cannot resolve git path {rel:?}")))?;
-        match self {
-            GitLoc::Local(_) => std::fs::write(p, bytes),
-            GitLoc::Remote { ssh, .. } => {
-                use std::io::Write;
-                let mut cmd = self.ssh_command(ssh, format!("cat > {}", util::sh_quote(&p)));
-                cmd.stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null());
-                let mut child = cmd.spawn()?;
-                if let Some(mut sink) = child.stdin.take() {
-                    sink.write_all(bytes)?;
-                }
-                let st = child.wait()?;
-                if st.success() {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::other(format!(
-                        "remote write of {rel:?} failed"
-                    )))
-                }
+        if let GitLoc::Local(_) = self {
+            return std::fs::write(p, bytes);
+        }
+        use std::io::Write;
+        let script = format!("cat > {}", util::sh_quote(&p));
+        let mut cmd = match self {
+            GitLoc::Remote { ssh, .. } => self.ssh_command(ssh, script),
+            GitLoc::Provider { control_prefix, .. } => {
+                self.provider_command(control_prefix, script)
             }
+            GitLoc::Local(_) => unreachable!("handled above"),
+        };
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = cmd.spawn()?;
+        if let Some(mut sink) = child.stdin.take() {
+            sink.write_all(bytes)?;
+        }
+        let st = child.wait()?;
+        if st.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "remote write of {rel:?} failed"
+            )))
         }
     }
 
@@ -371,6 +494,29 @@ impl GitLoc {
     }
 }
 
+/// The idempotent provisioning script for a fresh provider env (8-A.3): clone the
+/// repo into the worktree dir on first open, no-op once it's a git repo. Designed
+/// to run via [`GitLoc::sh_command`], which already `cd`s into the workdir — so
+/// the clone targets `.` (the cwd). The leading `rev-parse` guard makes re-opens
+/// cheap and makes this safe to run even after a `data=sync` upload (which lands
+/// a `.git`, so the guard skips). When `branch` is set, check it out (creating it
+/// if it doesn't exist on the remote). `origin` is the upstream URL.
+pub fn provision_repo_script(origin: &str, branch: Option<&str>) -> String {
+    let oq = util::sh_quote(origin);
+    // Already a repo → done. Else clone into the cwd, then settle the branch.
+    let mut s =
+        String::from("if git rev-parse --git-dir >/dev/null 2>&1; then exit 0; fi; git clone ");
+    s.push_str(&oq);
+    s.push_str(" .");
+    if let Some(b) = branch.map(str::trim).filter(|b| !b.is_empty()) {
+        let bq = util::sh_quote(b);
+        s.push_str(&format!(
+            " && (git checkout {bq} 2>/dev/null || git checkout -b {bq})"
+        ));
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +526,52 @@ mod tests {
         let loc = GitLoc::from_db("/wt/x", None);
         assert!(!loc.is_remote());
         assert_eq!(loc.path(), "/wt/x");
+    }
+
+    #[test]
+    fn provision_script_is_idempotent_and_quotes() {
+        // Guard first (re-open / post-sync no-op), then clone into the cwd `.`.
+        let s = provision_repo_script("https://github.com/o/r.git", Some("feat/x"));
+        assert!(
+            s.starts_with("if git rev-parse --git-dir"),
+            "guard first: {s}"
+        );
+        // sh_quote passes safe URLs/branch names through unquoted.
+        assert!(
+            s.contains("git clone https://github.com/o/r.git ."),
+            "clone into cwd: {s}"
+        );
+        // Branch checkout falls back to creating it when absent on the remote.
+        assert!(s.contains("git checkout feat/x 2>/dev/null || git checkout -b feat/x"));
+        // A branch with a space gets single-quoted.
+        assert!(provision_repo_script("u", Some("a b")).contains("git checkout 'a b'"));
+        // No branch → no checkout clause.
+        let s2 = provision_repo_script("git@h:o/r", None);
+        assert!(!s2.contains("checkout"), "no branch ⇒ no checkout: {s2}");
+        // Blank branch is treated as no branch.
+        assert!(!provision_repo_script("x", Some("  ")).contains("checkout"));
+    }
+
+    #[test]
+    fn provision_script_runs_in_env_via_sh_command() {
+        // A provider loc wraps the script in its control prefix + the workdir cd,
+        // so the clone runs inside the env at the worktree dir.
+        let loc = GitLoc::provider(
+            vec!["sprite".into(), "exec".into(), "--".into()],
+            "/workspace",
+        );
+        let script = provision_repo_script("https://x/r.git", Some("main"));
+        let cmd = loc.sh_command(&script);
+        let argv: Vec<String> = std::iter::once(cmd.get_program().to_string_lossy().into_owned())
+            .chain(cmd.get_args().map(|a| a.to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(argv[0], "sprite");
+        let joined = argv.join(" ");
+        assert!(
+            joined.contains("cd /workspace &&"),
+            "cd into workdir: {joined}"
+        );
+        assert!(joined.contains("git clone"), "carries the clone: {joined}");
     }
 
     #[test]
@@ -400,6 +592,52 @@ mod tests {
             argv.last()
                 .unwrap()
                 .contains("git -C /remote/wt status --short")
+        );
+    }
+
+    #[test]
+    fn provider_roundtrip_and_argv() {
+        // A managed-provider worktree: git runs *inside* the env via the control
+        // prefix (e.g. `sprite exec -s <name> --`), worktree dir = the in-env path.
+        let prefix = vec![
+            "sprite".to_string(),
+            "exec".into(),
+            "-s".into(),
+            "szt".into(),
+            "--".into(),
+        ];
+        let s = GitLoc::provider_db_string(&prefix, "/workspace");
+        let loc = GitLoc::from_db("/ignored-host-path", Some(&s));
+        assert!(loc.is_remote()); // not local → gix delegates to the CLI fallback
+        assert!(loc.ssh().is_none());
+        assert_eq!(loc.path(), "/workspace");
+
+        let cmd = loc.git_command(&["status", "--porcelain"]);
+        let argv: Vec<String> = std::iter::once(cmd.get_program().to_string_lossy().into_owned())
+            .chain(cmd.get_args().map(|a| a.to_string_lossy().into_owned()))
+            .collect();
+        // sprite exec -s szt -- /bin/sh -lc "git -C /workspace status --porcelain"
+        assert_eq!(
+            &argv[..6],
+            &["sprite", "exec", "-s", "szt", "--", "/bin/sh"]
+        );
+        assert_eq!(argv[6], "-lc");
+        assert!(
+            argv[7].contains("git -C /workspace status --porcelain"),
+            "script: {}",
+            argv[7]
+        );
+        // gh/cli/sh commands cd into the worktree first.
+        let gh = loc.gh_command(&["pr", "list"]);
+        let gh_argv: Vec<String> = gh
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            gh_argv
+                .last()
+                .unwrap()
+                .contains("cd /workspace && gh pr list")
         );
     }
 

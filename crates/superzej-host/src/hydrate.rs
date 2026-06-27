@@ -589,7 +589,26 @@ fn collect_sidebar_status(
         }
     }
     let managed: Vec<_> = managed_map.into_values().collect();
-    superzej_core::activity::poll_and_save(&managed);
+    // Remote/provider worktrees: their processes run in the env, not on this
+    // host, so the local /proc scan never sees them. For each that has a live
+    // resident bridge, fetch its in-env jiffies via `proc.list` and inject them
+    // (authoritative, overriding the local scan). Blocking RPC is fine — this is
+    // the hydration thread, never the loop. Empty (zero behaviour change) when
+    // no worktree is remote / no bridge is connected.
+    let mut activity_extra = std::collections::BTreeMap::new();
+    for w in &managed {
+        let loc = GitLoc::for_worktree(std::path::Path::new(&w.worktree));
+        if !loc.is_remote() {
+            continue;
+        }
+        if let Some(bridge) = superzej_svc::bridge::for_loc(&loc) {
+            let workdir = loc.path();
+            if let Ok(m) = bridge.proc_list(std::slice::from_ref(&workdir)) {
+                activity_extra.insert(w.worktree.clone(), m.get(&workdir).copied().unwrap_or(0));
+            }
+        }
+    }
+    superzej_core::activity::poll_and_save_with(&managed, &activity_extra);
     status.activity = superzej_core::activity::read_states()
         .into_iter()
         .map(|(tab, st)| (tab, crate::sidebar::ActivityState::from_str(&st)))
@@ -1030,6 +1049,13 @@ pub(crate) fn build_model(
         // on `podman ps` subprocess calls.
         containers: vec![],
         container_events: db.container_events(&loc.path(), 10).unwrap_or_default(),
+        // Unified timeline: sandbox audit + proxy spend, merged newest-first.
+        // Two small off-loop reads on the hydration thread (never the event loop).
+        timeline: superzej_core::models::merge_timeline(
+            &db.container_events(&loc.path(), 20).unwrap_or_default(),
+            &db.proxy_requests(&loc.path(), 20).unwrap_or_default(),
+            20,
+        ),
         panel,
         panel_focused: false,
         status: format!(

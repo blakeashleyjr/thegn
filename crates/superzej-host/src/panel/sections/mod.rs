@@ -550,6 +550,17 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
             }
             None => vec![seg(g2(), "—")],
         },
+        Section::Share => {
+            let up = model.shares.iter().filter(|s| s.url.is_some()).count();
+            let failed = model.shares.iter().filter(|s| s.failed).count();
+            if up > 0 {
+                vec![seg(hue(Hue::Teal), format!("\u{21c5} {up}"))]
+            } else if failed > 0 {
+                vec![seg(hue(Hue::Red), "✗ failed".to_string())]
+            } else {
+                vec![seg(g2(), "off")]
+            }
+        }
     }
 }
 
@@ -601,6 +612,7 @@ pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
         Section::Symbols => symbols::content(ctx),
         Section::Debug => misc::debug(),
         Section::Sandbox => misc::sandbox(ctx),
+        Section::Share => misc::share(ctx),
         Section::Db => misc::db(),
         Section::Telemetry => telemetry::content(ctx),
         Section::Keys => keys::content(ctx),
@@ -1011,7 +1023,11 @@ mod spec {
             assert!(!h.is_empty(), "{section:?} half");
             assert!(!f.is_empty(), "{section:?} full");
             // Debug/Db are dead-code placeholder sections — distinctness is waived.
-            if matches!(section, Section::Debug | Section::Db | Section::Logs) {
+            // Logs/Share are flat lists with no width-specific full view.
+            if matches!(
+                section,
+                Section::Debug | Section::Db | Section::Logs | Section::Share
+            ) {
                 continue;
             }
             assert_ne!(n, f, "{section:?}: normal vs full");
@@ -1184,11 +1200,11 @@ mod spec {
     }
 
     #[test]
-    fn b6_audit_log_section_in_deep_view() {
+    fn b6_timeline_section_in_deep_view() {
         let mut m = model();
         m.active_container_name = "superzej-wt-feat".into();
         m.containers = vec![container_info("superzej-wt-feat", "Up 5m")];
-        m.container_events = vec![
+        let events = vec![
             superzej_core::models::ContainerEvent {
                 id: 1,
                 worktree: "/wt/feat".into(),
@@ -1214,11 +1230,22 @@ mod spec {
                 exit_code: Some(0),
             },
         ];
+        // A proxy request folds into the same timeline as the sandbox events.
+        let proxy = vec![superzej_core::db::ProxyRequestRow {
+            ts_ms: 2_500_000,
+            backend_model: "claude-opus-4-8".into(),
+            input_tokens: 100,
+            output_tokens: 20,
+            cost_usd: 0.0123,
+            outcome: "ok".into(),
+            ..Default::default()
+        }];
+        m.timeline = superzej_core::models::merge_timeline(&events, &proxy, 20);
         // Half width → deep() == true
         let rendered = sandbox_rows(&m, PanelWidth::Half);
         assert!(
-            rendered.contains("AUDIT LOG"),
-            "expected AUDIT LOG: {rendered}"
+            rendered.contains("TIMELINE"),
+            "expected TIMELINE: {rendered}"
         );
         assert!(rendered.contains("exec"), "expected exec event: {rendered}");
         assert!(
@@ -1226,6 +1253,15 @@ mod spec {
             "expected network event: {rendered}"
         );
         assert!(rendered.contains("die"), "expected die event: {rendered}");
+        // The proxy request is merged in (model + cost visible).
+        assert!(
+            rendered.contains("request"),
+            "expected proxy request row: {rendered}"
+        );
+        assert!(
+            rendered.contains("claude-opus-4-8"),
+            "expected proxy model in detail: {rendered}"
+        );
     }
 
     #[test]

@@ -10,16 +10,16 @@
 
 use anyhow::{Context, Result};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
-use std::path::Path;
 
+use std::path::Path;
 use tokio::sync::mpsc as tokio_mpsc;
-use tokio::task;
 
 use termwiz::caps::Capabilities;
 use termwiz::input::{InputEvent, KeyCode, Modifiers};
 use termwiz::surface::{Change, Position, Surface};
 use termwiz::terminal::buffered::BufferedTerminal;
 use termwiz::terminal::{Terminal, TerminalWaker, new_terminal};
+use tokio::task;
 
 use crate::chrome::{FrameModel, LoadStep, render_tab};
 use crate::compositor::Rect;
@@ -1963,6 +1963,38 @@ fn active_cwd(session: &crate::session::Session) -> Option<std::path::PathBuf> {
     session.active_group().and_then(group_cwd)
 }
 
+/// Render-facing share snapshot for the active worktree (badge + Share panel).
+fn current_share_views(
+    sup: &crate::share::ShareSupervisor,
+    session: &crate::session::Session,
+) -> Vec<crate::share::ShareView> {
+    session
+        .active_group()
+        .map(|g| sup.views(&g.path))
+        .unwrap_or_default()
+}
+
+/// Persist a share lifecycle event to the `shares` table (resurrection layer).
+fn persist_share_event(ev: &crate::share::ShareEvent) {
+    use crate::share::ShareEvent;
+    let Ok(db) = superzej_core::db::Db::open() else {
+        return;
+    };
+    match ev {
+        ShareEvent::Up {
+            worktree,
+            port,
+            provider,
+            url,
+        } => {
+            let _ = db.upsert_share(worktree, *port, provider, Some(url), "up");
+        }
+        ShareEvent::Failed { worktree, port, .. } | ShareEvent::Down { worktree, port } => {
+            let _ = db.delete_share(worktree, *port);
+        }
+    }
+}
+
 /// The active worktree's `(worktree_path, workspace_repo_path)`, or `None` when
 /// there's nothing fileable (no active group, the home tab, a terminal, or no
 /// resolvable repo). The repo path is the DB workspace root so the folder we
@@ -2046,12 +2078,62 @@ fn forget_worktree_group(
         let path = group.path.clone();
         std::thread::spawn(move || {
             // De-register the ephemeral VPN node (if any) before its sidecar is
-            // removed, then tear down the worktree's containers (which `rm -f`s
-            // the `-szvpn` sidecar too).
+            // removed, unmount any worktree projection (sshfs/sync), then tear
+            // down the worktree's containers (which `rm -f`s the `-szvpn`
+            // sidecar too).
             crate::agent::deregister_vpn(&path);
+            crate::agent::deproject(&path);
+            crate::agent::deprovision_sync(&path);
+            // Suspend-on-close: checkpoint the sandbox (8-E) before disconnecting
+            // the bridge + tearing down. No-op unless the env sets auto_checkpoint.
+            crate::agent::checkpoint_on_close(&path);
+            crate::bridge_sup::disconnect_path(&path);
             superzej_core::sandbox::teardown_by_path(&path);
         });
     }
+}
+
+/// Connect a resident bridge for `worktree` if it's a remote/provider env and not
+/// already connected. Resolves the env off the event loop (DB + git/`resolve_env`)
+/// then spawns the agent; a non-remote loc, a miss, or a spawn failure silently
+/// leaves the per-op git path in place.
+fn connect_worktree_bridge(
+    sup: &crate::bridge_sup::BridgeSupervisor,
+    worktree: &std::path::Path,
+    cfg: &superzej_core::config::Config,
+) {
+    let loc = superzej_core::remote::GitLoc::for_worktree(worktree);
+    if !loc.is_remote() || sup.is_connected(&loc) {
+        return;
+    }
+    let sup = sup.clone();
+    let cfg = cfg.clone();
+    let wt = worktree.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let repo_root = superzej_core::repo::main_worktree(&wt).unwrap_or_else(|| wt.clone());
+        let env_name = superzej_core::db::Db::open()
+            .ok()
+            .and_then(|db| db.worktree_env(&wt.to_string_lossy()).ok().flatten());
+        let env = cfg.resolve_env(&repo_root, &loc, env_name.as_deref());
+        // For a managed provider, install the resident bridge binary first (8-B.3,
+        // idempotent content handshake) so the connect below finds it in the env.
+        // No-op when no local binary is configured or the env isn't a provider.
+        if matches!(
+            env.placement,
+            superzej_core::placement::Placement::Provider(_)
+        ) && let Some(bin) = crate::bridge_sup::bridge_binary_path()
+        {
+            crate::agent::ensure_remote_bridge(
+                &cfg,
+                env_name.as_deref().unwrap_or_default(),
+                &bin,
+                &crate::bridge_sup::remote_szhost(),
+            );
+        }
+        if let Some(cmd) = crate::bridge_sup::bridge_command(&env.placement) {
+            sup.connect(&loc, &loc.path(), &wt.to_string_lossy(), cmd);
+        }
+    });
 }
 
 fn delete_groups(
@@ -3260,6 +3342,11 @@ enum HostInputKind {
     NewWorktreeFromTemplate {
         repo_root: String,
     },
+    /// Expose the typed port from the active worktree (`[share]`). `reach`
+    /// carries the picked public/team/peer intent (`None` ⇒ `[share] provider`).
+    ShareWorktreePort {
+        reach: Option<superzej_core::config::ShareReach>,
+    },
     /// File the active worktree into a new folder named by the typed value
     /// (the "＋ New folder…" path of the move-to-folder picker).
     FileWorktreeNewFolder,
@@ -3440,23 +3527,6 @@ fn workspace_repo_name_from_url(input: &str) -> String {
         "workspace".into()
     } else {
         name.to_string()
-    }
-}
-
-#[cfg(test)]
-fn create_workspace_from_input(
-    input: &str,
-    session: &mut crate::session::Session,
-    db: &superzej_core::db::Db,
-) -> Result<std::path::PathBuf> {
-    match create_workspace_from_input_with_config(
-        input,
-        session,
-        db,
-        &superzej_core::config::Config::default(),
-    )? {
-        WorkspaceResolution::Repo(p) => Ok(p),
-        WorkspaceResolution::NotARepo(p) => Ok(p),
     }
 }
 
@@ -4930,8 +5000,14 @@ fn dispatch_menu_choice(
         // which this git-scoped dispatcher doesn't carry. Never reaches here.
         MenuChoice::SetKeymapPreset(_) => {}
         MenuChoice::ConfirmDeleteWorktrees { .. } => {}
+        // The reach picker is intercepted at the call site (opens port entry);
+        // never reaches this git-scoped dispatcher.
+        MenuChoice::ShareReach(_) => {}
         MenuChoice::ConfirmDeleteWorkspace { .. } => {}
         MenuChoice::ConfirmInitGit { .. } => {}
+        // The bouncer approval gate is resolved directly in the loop (it owns the
+        // approval queue + oneshots); it never routes through this git dispatcher.
+        MenuChoice::ApproveTool { .. } => {}
     }
     GitAfter::None
 }
@@ -5270,7 +5346,11 @@ fn spawn_test_run_task(
     tokio::spawn(async move {
         let _permit = sem.acquire_owned().await;
         if let Ok(outcome) = tokio::task::spawn_blocking(move || {
-            crate::task::run_task(worktree, generation, task_spec, &limits)
+            // Resolve the worktree's location off-loop so a remote/provider
+            // worktree runs its tests in the env (via the bridge/control
+            // transport), not on the host. Local worktrees are unchanged.
+            let loc = superzej_core::remote::GitLoc::for_worktree(&worktree);
+            crate::task::run_task(worktree, &loc, generation, task_spec, &limits)
         })
         .await
         {
@@ -5294,7 +5374,8 @@ fn spawn_test_discovery(
     tokio::spawn(async move {
         let _permit = sem.acquire_owned().await;
         if let Ok(result) = tokio::task::spawn_blocking(move || {
-            crate::task::discover_tests(worktree, generation, task_spec, &limits)
+            let loc = superzej_core::remote::GitLoc::for_worktree(&worktree);
+            crate::task::discover_tests(worktree, &loc, generation, task_spec, &limits)
         })
         .await
         {
@@ -6316,18 +6397,153 @@ fn persist_session_layout(session: &mut crate::session::Session, panes: &Panes) 
 /// ran on the wizard worker) into the tab named `tab_name` and point that
 /// tab's center at the live pane so `materialize` won't also spawn a plain
 /// shell. No-op (returns false) if the tab is gone.
+#[allow(clippy::too_many_arguments)]
+/// How superzej reaches a launched agent's ACP server: a TCP loopback port (the
+/// non-sandboxed path) or a bind-mounted unix socket (the sealed-bouncer path,
+/// which crosses the container netns without network). `None` ⇒ no channel was
+/// reserved (the agent runs without ACP servicing).
+enum AgentChannel {
+    Tcp(u16),
+    Unix(std::path::PathBuf),
+    None,
+}
+
+/// Connect to the agent's ACP server over the resolved channel. TCP connects
+/// after a fixed warm-up; the unix socket is created by the in-container pi
+/// extension only once it boots, so we retry until it appears (or time out).
+async fn connect_agent_channel(
+    channel: &AgentChannel,
+) -> anyhow::Result<(
+    superzej_svc::acp::client::AcpClient,
+    tokio::sync::mpsc::Receiver<superzej_svc::acp::client::AcpInbound>,
+)> {
+    use superzej_svc::acp::client::AcpClient;
+    match channel {
+        AgentChannel::Tcp(port) => {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            AcpClient::connect(*port).await
+        }
+        AgentChannel::Unix(path) => {
+            let path_s = path.to_string_lossy().into_owned();
+            // The sealed agent boots pi, then the extension `listen`s on the
+            // bind-mounted socket — which can take a few seconds on a cold image.
+            let mut last = None;
+            for _ in 0..40 {
+                if path.exists() {
+                    match AcpClient::connect_unix(&path_s).await {
+                        Ok(conn) => return Ok(conn),
+                        Err(e) => last = Some(e),
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            Err(last.unwrap_or_else(|| anyhow::anyhow!("agent ACP socket {path_s} never appeared")))
+        }
+        AgentChannel::None => Err(anyhow::anyhow!("no ACP channel reserved")),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn attach_agent_pane(
     session: &mut crate::session::Session,
     panes: &mut Panes,
     tab_name: &str,
     spec: &crate::agent::LaunchSpec,
     center: Rect,
+    cfg: &superzej_core::config::Config,
+    acp_inbound_tx: &tokio_mpsc::UnboundedSender<(String, superzej_svc::acp::client::AcpInbound)>,
+    acp_reg_tx: &tokio_mpsc::UnboundedSender<(
+        String,
+        std::sync::Arc<superzej_svc::acp::client::AcpClient>,
+    )>,
+    acp_status_tx: &tokio_mpsc::UnboundedSender<(String, crate::chrome::AgentConn)>,
+    waker: &TerminalWaker,
 ) -> bool {
     let Some(gi) = session.worktrees.iter().position(|g| g.name == tab_name) else {
         return false;
     };
     let cwd = spec.cwd.clone();
-    match panes.spawn_argv_env(&spec.argv, cwd.as_deref(), &spec.env, center) {
+    let mut env = spec.env.clone();
+    let wt_path = session.worktrees[gi].path.clone();
+
+    // "The bouncer": when on and the agent is sandboxed, the launch path already
+    // injected the proxy + tool-override env (and ACP_SOCKET) into the container's
+    // `env_overrides`, and superzej reaches the agent over a bind-mounted unix
+    // socket (TCP can't cross the sealed netns). Otherwise: the legacy TCP path,
+    // wiring ACP_PORT + the proxy env onto the pane process env here.
+    let bouncer = cfg.llm_proxy.bouncer && spec.backend != "host";
+
+    let acp_channel: AgentChannel = if bouncer {
+        AgentChannel::Unix(crate::bouncer::acp_socket_path(&wt_path))
+    } else {
+        // Reserve a free localhost port and hand it to the agent via `ACP_PORT`.
+        // The brief bind-then-drop is the standard ephemeral-port reservation; pi
+        // re-binds it. Env is the reliable channel: it crosses `sh -lc` wrapping.
+        match std::net::TcpListener::bind("127.0.0.1:0")
+            .ok()
+            .and_then(|l| l.local_addr().ok())
+            .map(|a| a.port())
+            .filter(|p| *p != 0)
+        {
+            Some(port) => {
+                env.push(("ACP_PORT".to_string(), port.to_string()));
+                AgentChannel::Tcp(port)
+            }
+            None => AgentChannel::None,
+        }
+    };
+
+    // Lower plane: route the agent's model through the proxy. In bouncer mode the
+    // proxy env rides `env_overrides` (set at launch) and the key is the stable
+    // per-worktree id; here (TCP path) we mint a fresh key + push the proxy env
+    // onto the pane env. Either way the key is revoked when the agent disconnects.
+    let revoke_key: Option<String> = if bouncer {
+        // Stable id derived deterministically — matches what the launch path minted.
+        cfg.llm_proxy
+            .route_agent
+            .then(|| crate::agent::agent_proxy_key_id(&wt_path))
+    } else if cfg.llm_proxy.route_agent {
+        let key = crate::agent::mint_agent_proxy_key(&wt_path);
+        env.push((
+            "SUPERZEJ_PROXY_BASE_URL".to_string(),
+            format!("http://{}", cfg.llm_proxy.listen),
+        ));
+        env.push((
+            "SUPERZEJ_PROXY_API".to_string(),
+            cfg.llm_proxy.agent_api.clone(),
+        ));
+        env.push((
+            "SUPERZEJ_PROXY_MODEL".to_string(),
+            cfg.llm_proxy.agent_model.clone(),
+        ));
+        if let Some(k) = &key {
+            env.push(("SUPERZEJ_PROXY_KEY".to_string(), k.clone()));
+        }
+        key
+    } else {
+        None
+    };
+
+    // Full network seal (sealed `agent_profile` → `network=none`): the agent's
+    // only egress is a unix-socket relay to the host proxy, bind-mounted into the
+    // container. Started here; torn down when the connection task ends.
+    let relay = (bouncer
+        && cfg.llm_proxy.route_agent
+        && cfg.sandbox.agent_profile.forces_no_network())
+    .then(|| {
+        let sock = crate::bouncer::proxy_socket_path(&wt_path);
+        match crate::relay::spawn(sock, cfg.llm_proxy.listen.clone()) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                tracing::error!(target: "szhost::relay", "proxy relay failed to start: {e}");
+                None
+            }
+        }
+    })
+    .flatten();
+
+    let argv = spec.argv.clone();
+    match panes.spawn_argv_env(&argv, cwd.as_deref(), &env, center) {
         Ok(id) => {
             // Reap any panes the group's active tab already had, then back it
             // with the agent pane.
@@ -6341,6 +6557,83 @@ fn attach_agent_pane(
             }
             tab.center = crate::center::CenterTree::Leaf(id);
             tab.focused_pane = id;
+
+            // Connect to ACP in the background over the resolved channel. The task
+            // registers its client with the loop (so the loop can reply) and then
+            // forwards every inbound message tagged with the worktree path; the
+            // loop owns servicing + replies (see `dispatch_acp_inbound`).
+            if !matches!(acp_channel, AgentChannel::None) {
+                let inbound_tx = acp_inbound_tx.clone();
+                let reg_tx = acp_reg_tx.clone();
+                let waker_clone = waker.clone();
+                let wt_name = g.path.clone();
+                // `revoke_key` (revoked on disconnect) and `relay` (the model
+                // relay, whose `Drop` tears down the socket) are captured by the
+                // `move` task below — they live exactly as long as the connection.
+
+                // Surface lifecycle in the statusbar chip (the only native signal).
+                let emit = {
+                    let status_tx = acp_status_tx.clone();
+                    let waker = waker_clone.clone();
+                    let wt = wt_name.clone();
+                    move |conn: crate::chrome::AgentConn| {
+                        let _ = status_tx.send((wt.clone(), conn));
+                        let _ = waker.wake();
+                    }
+                };
+                emit(crate::chrome::AgentConn::Connecting);
+
+                tokio::spawn(async move {
+                    let _relay = relay; // keep alive until the task returns
+                    let connected = connect_agent_channel(&acp_channel).await;
+                    match connected {
+                        Ok((client, mut rx)) => {
+                            let client = std::sync::Arc::new(client);
+                            // Negotiate capabilities before servicing anything.
+                            if let Err(e) = client.initialize().await {
+                                tracing::error!(target: "szhost::acp", "ACP initialize failed: {e}");
+                                emit(crate::chrome::AgentConn::Error);
+                            }
+                            // Open the MCP-over-ACP bridge so the agent discovers
+                            // and registers superzej's house tools/resources.
+                            if let Err(e) = client.connect_mcp("superzej-house").await {
+                                tracing::warn!(target: "szhost::acp", "mcp/connect failed: {e}");
+                            }
+
+                            // Hand the client to the loop so it can reply to requests.
+                            if reg_tx.send((wt_name.clone(), client.clone())).is_err() {
+                                if let Some(key) = &revoke_key {
+                                    crate::agent::revoke_agent_proxy_key(key);
+                                }
+                                return; // loop gone
+                            }
+                            emit(crate::chrome::AgentConn::Online);
+
+                            // Forward inbound messages to the loop, tagged by worktree.
+                            while let Some(msg) = rx.recv().await {
+                                if inbound_tx.send((wt_name.clone(), msg)).is_err() {
+                                    break; // loop gone
+                                }
+                                let _ = waker_clone.wake();
+                            }
+
+                            // The agent disconnected: surface it + revoke its key.
+                            emit(crate::chrome::AgentConn::Exited);
+                            if let Some(key) = &revoke_key {
+                                crate::agent::revoke_agent_proxy_key(key);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(target: "szhost::acp", "failed to connect to agent ACP channel: {e}");
+                            emit(crate::chrome::AgentConn::Error);
+                            if let Some(key) = &revoke_key {
+                                crate::agent::revoke_agent_proxy_key(key);
+                            }
+                        }
+                    }
+                });
+            }
+
             true
         }
         Err(e) => {
@@ -6348,6 +6641,422 @@ fn attach_agent_pane(
             false
         }
     }
+}
+
+/// Service one inbound ACP message from an agent's `pi` subprocess. Requests are
+/// dispatched OFF the event loop (their replies are `async`; the loop must never
+/// block) via `tokio::spawn` + `spawn_blocking`, using the registered
+/// `AcpClient` to send the reply. Returns whether the frame should be repainted.
+///
+/// The reply shapes match the `superzej-acp.ts` pi extension exactly:
+/// `terminal/create → {output}`, `fs/read_text_file → {text}`,
+/// `superzej/edit`/`superzej/write → {status:"approved"|"rejected"}`. All file
+/// access is scoped to the worktree; shell commands run inside its sandbox.
+///
+/// NOTE: as of the "additive" integration, the extension no longer overrides
+/// pi's built-in bash/read/edit/write — pi runs those natively in-process — so
+/// the terminal/fs/edit arms below are currently UNEXERCISED. They are retained
+/// for the deferred "real bouncer" path (a sealed sandbox reachable via a
+/// unix-socket ACP transport + a review/approval gate), at which point the
+/// extension would re-route the core tools and these arms light up again.
+///
+/// Notifications (`session/update`) are handled by the caller against the
+/// rendered model; this services only requests that need a reply.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_acp_inbound(
+    wt: &str,
+    inbound: superzej_svc::acp::client::AcpInbound,
+    acp_clients: &std::collections::HashMap<
+        String,
+        std::sync::Arc<superzej_svc::acp::client::AcpClient>,
+    >,
+    cfg: &superzej_core::config::Config,
+    event_bus: &superzej_core::event_bus::EventBus,
+    approval_tx: &tokio_mpsc::UnboundedSender<
+        crate::bouncer::ApprovalRequest<tokio::sync::oneshot::Sender<bool>>,
+    >,
+    waker: &TerminalWaker,
+) {
+    use superzej_svc::acp::client::AcpInbound;
+    let client = acp_clients.get(wt).cloned();
+    // In bouncer mode the consequential tools (shell/edit/write) are gated behind
+    // the user's approval; reads + MCP pass through. Off by default.
+    let bouncer = cfg.llm_proxy.bouncer;
+    match inbound {
+        AcpInbound::Initialized(caps) => {
+            tracing::debug!(target: "szhost::acp", worktree = %wt, ?caps, "agent initialized");
+        }
+        // Handled by the loop against the model; defensively ignored here.
+        AcpInbound::SessionUpdate(_) => {}
+        AcpInbound::FsReadRequest { id, path } => {
+            if let Some(client) = client {
+                let wt = wt.to_string();
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || read_scoped_file(&wt, &path))
+                        .await
+                        .unwrap_or_else(|_| Err("read task panicked".to_string()));
+                    let reply = match result {
+                        // The pi `read` tool reads `result.text`.
+                        Ok(text) => {
+                            client
+                                .reply_result(id, serde_json::json!({ "text": text }))
+                                .await
+                        }
+                        Err(e) => client.reply_error(id, -32000, &e).await,
+                    };
+                    if let Err(e) = reply {
+                        tracing::error!(target: "szhost::acp", "fs/read reply failed: {e}");
+                    }
+                });
+            }
+        }
+        AcpInbound::TerminalCreateRequest { id, command, .. } => {
+            if let Some(client) = client {
+                let wt = wt.to_string();
+                let cfg = cfg.clone();
+                let approval_tx = approval_tx.clone();
+                let waker = waker.clone();
+                tokio::spawn(async move {
+                    if !gate_approval(
+                        bouncer,
+                        &wt,
+                        crate::bouncer::ApprovalKind::Shell,
+                        command.clone(),
+                        &approval_tx,
+                        &waker,
+                    )
+                    .await
+                    {
+                        let _ = client
+                            .reply_error(id, -32001, "shell command denied by the superzej bouncer")
+                            .await;
+                        return;
+                    }
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::agent::run_in_sandbox(&cfg, &wt, &command)
+                    })
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("terminal task panicked")));
+                    let reply = match result {
+                        // The pi `bash` tool reads `result.output`.
+                        Ok(output) => {
+                            client
+                                .reply_result(id, serde_json::json!({ "output": output }))
+                                .await
+                        }
+                        Err(e) => client.reply_error(id, -32000, &e.to_string()).await,
+                    };
+                    if let Err(e) = reply {
+                        tracing::error!(target: "szhost::acp", "terminal/create reply failed: {e}");
+                    }
+                });
+            }
+        }
+        AcpInbound::SuperzejWriteRequest { id, path, content } => {
+            if let Some(client) = client {
+                let wt = wt.to_string();
+                let approval_tx = approval_tx.clone();
+                let waker = waker.clone();
+                tokio::spawn(async move {
+                    if !gate_approval(
+                        bouncer,
+                        &wt,
+                        crate::bouncer::ApprovalKind::Write,
+                        path.clone(),
+                        &approval_tx,
+                        &waker,
+                    )
+                    .await
+                    {
+                        let _ = client
+                            .reply_error(id, -32001, "write denied by the superzej bouncer")
+                            .await;
+                        return;
+                    }
+                    let result = tokio::task::spawn_blocking(move || {
+                        write_scoped_file(&wt, &path, &content)
+                    })
+                    .await
+                    .unwrap_or_else(|_| Err("write task panicked".to_string()));
+                    reply_edit_status(&client, id, result).await;
+                });
+            }
+        }
+        AcpInbound::SuperzejEditRequest { id, path, edits } => {
+            if let Some(client) = client {
+                let wt = wt.to_string();
+                let approval_tx = approval_tx.clone();
+                let waker = waker.clone();
+                tokio::spawn(async move {
+                    if !gate_approval(
+                        bouncer,
+                        &wt,
+                        crate::bouncer::ApprovalKind::Edit,
+                        path.clone(),
+                        &approval_tx,
+                        &waker,
+                    )
+                    .await
+                    {
+                        let _ = client
+                            .reply_error(id, -32001, "edit denied by the superzej bouncer")
+                            .await;
+                        return;
+                    }
+                    let result =
+                        tokio::task::spawn_blocking(move || apply_scoped_edits(&wt, &path, &edits))
+                            .await
+                            .unwrap_or_else(|_| Err("edit task panicked".to_string()));
+                    reply_edit_status(&client, id, result).await;
+                });
+            }
+        }
+        // MCP-over-ACP: route the agent's encapsulated MCP request through the
+        // host's McpRouter (budget/fleet/worktree-status/house tools) and reply
+        // with a `mcp/message` notification. Off-loop; the router opens the DB
+        // (`Connection` is !Send, so it's built + used inside spawn_blocking).
+        AcpInbound::McpMessage {
+            connection_id,
+            inner,
+        } => {
+            if let Some(client) = client {
+                let bus = event_bus.clone();
+                let wt_owned = wt.to_string();
+                tokio::spawn(async move {
+                    let resp = tokio::task::spawn_blocking(move || {
+                        let id = inner.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                        match superzej_core::db::Db::open() {
+                            Ok(db) => {
+                                // The Arcs live only on this blocking thread (Db's
+                                // Connection is !Send); McpRouter::new requires Arc.
+                                // Attach the svc-backed git/semantic house tools
+                                // scoped to this connection's worktree.
+                                #[allow(clippy::arc_with_non_send_sync)]
+                                let router = superzej_core::mcp::router::McpRouter::new(
+                                    std::sync::Arc::new(db),
+                                    std::sync::Arc::new(bus),
+                                )
+                                .with_git(
+                                    std::sync::Arc::new(superzej_svc::mcp_git::HouseGitImpl),
+                                    wt_owned.clone(),
+                                )
+                                .with_forge(
+                                    std::sync::Arc::new(superzej_svc::mcp_git::HouseGitImpl),
+                                    wt_owned,
+                                );
+                                router.handle_request(&inner)
+                            }
+                            Err(e) => serde_json::json!({
+                                "jsonrpc": "2.0", "id": id,
+                                "error": { "code": -32603, "message": format!("db open: {e}") }
+                            }),
+                        }
+                    })
+                    .await
+                    .unwrap_or_else(|_| {
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "id": serde_json::Value::Null,
+                            "error": { "code": -32603, "message": "mcp task panicked" }
+                        })
+                    });
+                    if let Err(e) = client
+                        .send_notification(
+                            "mcp/message",
+                            serde_json::json!({ "connectionId": connection_id, "message": resp }),
+                        )
+                        .await
+                    {
+                        tracing::error!(target: "szhost::acp", "mcp/message reply failed: {e}");
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// Build the approval overlay for a pending bouncer request: a 2-item allow/deny
+/// menu titled with the worktree + action, bodied with the command/path summary.
+fn approval_overlay<R>(req: &crate::bouncer::ApprovalRequest<R>) -> MenuOverlay {
+    let wt_name = req
+        .worktree
+        .rsplit('/')
+        .next()
+        .unwrap_or(req.worktree.as_str());
+    let title = format!(
+        "{} {wt_name} · agent wants to {}",
+        req.kind.glyph(),
+        req.kind.verb()
+    );
+    menu::approval_menu(title, crate::bouncer::summary(&req.detail))
+}
+
+/// Ask the bouncer gate for permission to run a consequential tool call (bouncer
+/// mode only). Sends an `ApprovalRequest` to the loop, pulses the waker so the
+/// overlay is raised, and awaits the user's decision. Returns `true` to proceed;
+/// a deny — or a gone loop — returns `false`. A no-op (`true`) when not gating.
+async fn gate_approval(
+    bouncer: bool,
+    wt: &str,
+    kind: crate::bouncer::ApprovalKind,
+    detail: String,
+    approval_tx: &tokio_mpsc::UnboundedSender<
+        crate::bouncer::ApprovalRequest<tokio::sync::oneshot::Sender<bool>>,
+    >,
+    waker: &TerminalWaker,
+) -> bool {
+    if !bouncer {
+        return true;
+    }
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if approval_tx
+        .send(crate::bouncer::ApprovalRequest {
+            worktree: wt.to_string(),
+            kind,
+            detail,
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return false; // loop gone
+    }
+    let _ = waker.wake();
+    reply_rx.await.unwrap_or(false)
+}
+
+/// Fold an ACP `session/update` into a worktree's agent-activity entry: track the
+/// latest tool call + its running state and the context-window usage. Message /
+/// thought / config chunks don't change the chip (a richer follow-along panel is
+/// a future addition), so they're ignored here. The connection lifecycle
+/// (`conn`) is owned by the status channel, not touched here.
+fn apply_agent_session_update(
+    a: &mut crate::chrome::AgentActivity,
+    update: superzej_core::acp::methods::SessionUpdateEvent,
+) {
+    use superzej_core::acp::methods::SessionUpdateEvent as E;
+    match update {
+        E::ToolCall { tool_name, .. } => {
+            a.last_tool = Some(tool_name);
+            a.running = true;
+        }
+        E::ToolCallUpdate { status, .. } => {
+            a.running = matches!(status.as_str(), "pending" | "in_progress");
+        }
+        E::UsageUpdate { used, size } => {
+            a.context_used = used;
+            a.context_size = size;
+        }
+        E::AgentEnd { .. } => {
+            // Turn finished: no tool is running. (Notification is published by
+            // the loop drain, which owns the EventBus.)
+            a.running = false;
+        }
+        E::AgentMessageChunk { .. }
+        | E::AgentThoughtChunk { .. }
+        | E::ConfigOptionUpdate { .. } => {}
+    }
+}
+
+/// Reply to a `superzej/edit` / `superzej/write` request with the
+/// `{status:"approved"}` shape the pi extension expects, or a JSON-RPC error.
+async fn reply_edit_status(
+    client: &superzej_svc::acp::client::AcpClient,
+    id: superzej_core::acp::types::Id,
+    result: Result<(), String>,
+) {
+    let reply = match result {
+        Ok(()) => {
+            client
+                .reply_result(id, serde_json::json!({ "status": "approved" }))
+                .await
+        }
+        Err(e) => client.reply_error(id, -32000, &e).await,
+    };
+    if let Err(e) = reply {
+        tracing::error!(target: "szhost::acp", "edit/write reply failed: {e}");
+    }
+}
+
+/// Read a file requested by an agent over ACP `fs/read_text_file`, scoping the
+/// resolved path to the worktree so the agent cannot read outside its sandbox
+/// mount. Relative paths resolve against the worktree root.
+fn read_scoped_file(worktree: &str, path: &str) -> Result<String, String> {
+    let base = std::path::Path::new(worktree);
+    let req = std::path::Path::new(path);
+    let full = if req.is_absolute() {
+        req.to_path_buf()
+    } else {
+        base.join(req)
+    };
+    let canon = full.canonicalize().map_err(|e| format!("{path}: {e}"))?;
+    let base_canon = base
+        .canonicalize()
+        .map_err(|e| format!("{worktree}: {e}"))?;
+    if !canon.starts_with(&base_canon) {
+        return Err(format!("path escapes worktree: {path}"));
+    }
+    std::fs::read_to_string(&canon).map_err(|e| format!("{path}: {e}"))
+}
+
+/// Resolve a (possibly not-yet-existing) write target against the worktree,
+/// rejecting absolute escapes and any `..` traversal. Used by the agent's
+/// `write`/`edit` tools so they cannot touch files outside their sandbox mount.
+fn scoped_target(worktree: &str, path: &str) -> Result<std::path::PathBuf, String> {
+    use std::path::{Component, Path};
+    let base = Path::new(worktree)
+        .canonicalize()
+        .map_err(|e| format!("{worktree}: {e}"))?;
+    let raw = Path::new(path);
+    let joined = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        base.join(raw)
+    };
+    if joined
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err(format!("path must not contain '..': {path}"));
+    }
+    if !joined.starts_with(&base) {
+        return Err(format!("path escapes worktree: {path}"));
+    }
+    Ok(joined)
+}
+
+/// Write full file contents for an agent's `write` tool, scoped to the worktree.
+fn write_scoped_file(worktree: &str, path: &str, content: &str) -> Result<(), String> {
+    let target = scoped_target(worktree, path)?;
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{path}: {e}"))?;
+    }
+    std::fs::write(&target, content).map_err(|e| format!("{path}: {e}"))
+}
+
+/// Apply an agent `edit` tool's `[{oldText,newText}]` replacements to a file,
+/// scoped to the worktree. Each `oldText` must occur (first match is replaced);
+/// a missing match is an error so the agent can correct itself.
+fn apply_scoped_edits(worktree: &str, path: &str, edits: &serde_json::Value) -> Result<(), String> {
+    let target = scoped_target(worktree, path)?;
+    let mut text = std::fs::read_to_string(&target).map_err(|e| format!("{path}: {e}"))?;
+    let arr = edits.as_array().ok_or("edits must be an array")?;
+    for edit in arr {
+        let old = edit
+            .get("oldText")
+            .and_then(|v| v.as_str())
+            .ok_or("edit missing oldText")?;
+        let new = edit
+            .get("newText")
+            .and_then(|v| v.as_str())
+            .ok_or("edit missing newText")?;
+        match text.find(old) {
+            Some(idx) => text.replace_range(idx..idx + old.len(), new),
+            None => {
+                let preview: String = old.chars().take(40).collect();
+                return Err(format!("oldText not found in {path}: {preview:?}"));
+            }
+        }
+    }
+    std::fs::write(&target, text).map_err(|e| format!("{path}: {e}"))
 }
 
 fn sync_drawer_persistence(
@@ -6800,6 +7509,30 @@ async fn event_loop<T: Terminal>(
     // The pin supervisor owns daemon panes independent of tabs/visibility.
     let mut supervisor = crate::pins::PinSupervisor::from_config(keymap.config());
 
+    // Ingress shares (`[share]`): per-worktree tunnel children supervised off the
+    // loop. Each share's thread reports state on `share_rx` and pulses the waker;
+    // the loop drains it, persists the row, and re-syncs `model.shares`.
+    let mut share_supervisor = crate::share::ShareSupervisor::new();
+    let (share_tx, mut share_rx) = tokio_mpsc::unbounded_channel::<crate::share::ShareEvent>();
+    // Resurrect shares that were live last session (best-effort; a disabled
+    // config or a missing `bore` just leaves the row to be cleaned on next event).
+    if keymap.config().share.is_enabled()
+        && let Ok(db) = superzej_core::db::Db::open()
+    {
+        for row in db.list_shares().unwrap_or_default() {
+            if row.state == "up" {
+                let _ = share_supervisor.start(
+                    &keymap.config().share,
+                    &row.worktree,
+                    row.local_port,
+                    None, // restore re-resolves via `[share] provider`
+                    &share_tx,
+                    &waker,
+                );
+            }
+        }
+    }
+
     // LSP: lazy, warm language servers per worktree. Clients push diagnostics on
     // a std channel; a bridge thread forwards them onto a loop channel and pulses
     // the waker (svc has no waker). `lsp_diags` persists them across model swaps.
@@ -6818,6 +7551,18 @@ async fn event_loop<T: Terminal>(
             }
         });
     }
+    // Resident bridge: for a remote/provider worktree, connect a persistent in-env
+    // agent (git routes through it; fs.watch becomes refreshes). fs.watch events
+    // fire `RefreshKind::Model` + waker, exactly like the LSP diag forwarder above.
+    let bridge_sup = {
+        let rtx = refresh_tx.clone();
+        let bridge_waker = waker.clone();
+        crate::bridge_sup::BridgeSupervisor::new(std::sync::Arc::new(move || {
+            let _ = rtx.send(RefreshKind::Model);
+            let _ = bridge_waker.wake();
+        }))
+    };
+    crate::bridge_sup::set_global(bridge_sup.clone());
     // Symbols section: the fetched outline / references, cached host-side so they
     // survive model-hydration swaps. The displayed list is derived each frame
     // from the active view (outline vs references) — see the pre-render block.
@@ -6973,6 +7718,44 @@ async fn event_loop<T: Terminal>(
     let mut which_key_prefix = String::new();
     let (tx, mut rx) = tokio_mpsc::channel::<PaneEvent>(PANE_EVENT_CHANNEL_CAPACITY);
     let mut panes = Panes::with_waker(tx, waker.clone());
+
+    // ACP (upper control plane) request/reply plumbing. Each agent pane spawns a
+    // background `AcpClient` connect task; once connected it (1) registers its
+    // `Arc<AcpClient>` here so the loop can reply, and (2) forwards every inbound
+    // JSON-RPC message tagged with its worktree. The loop drains both channels on
+    // wake and services requests OFF-loop (replies are async; we never await on
+    // the loop — see `dispatch_acp_inbound`).
+    let (acp_inbound_tx, mut acp_inbound_rx) =
+        tokio_mpsc::unbounded_channel::<(String, superzej_svc::acp::client::AcpInbound)>();
+    let (acp_reg_tx, mut acp_reg_rx) = tokio_mpsc::unbounded_channel::<(
+        String,
+        std::sync::Arc<superzej_svc::acp::client::AcpClient>,
+    )>();
+    let mut acp_clients: std::collections::HashMap<
+        String,
+        std::sync::Arc<superzej_svc::acp::client::AcpClient>,
+    > = std::collections::HashMap::new();
+    // Per-worktree agent activity (the statusbar chip's source of truth) + a
+    // lifecycle-status channel the connect task feeds (connecting/online/exited/
+    // error). The chip is the *only* native agent signal, so it must reflect
+    // both progress (session updates) and connection failures. `model`'s single
+    // `agent_activity` is set from the FOCUSED worktree's entry each turn.
+    let (acp_status_tx, mut acp_status_rx) =
+        tokio_mpsc::unbounded_channel::<(String, crate::chrome::AgentConn)>();
+    let mut acp_activity: std::collections::HashMap<String, crate::chrome::AgentActivity> =
+        std::collections::HashMap::new();
+
+    // The bouncer's tool-approval gate (B1). When the agent runs sealed, its
+    // shell/edit/write tool calls are routed back over ACP and gated here: the
+    // off-loop servicing task sends an `ApprovalRequest` carrying a oneshot, and
+    // awaits the user's allow/deny. The loop drains the channel into a FIFO
+    // `ApprovalQueue`, shows one `approval_menu` overlay at a time, and resolves
+    // each request's oneshot on the pick. (No-op unless `[llm_proxy].bouncer`.)
+    type AcpApproval = crate::bouncer::ApprovalRequest<tokio::sync::oneshot::Sender<bool>>;
+    let (acp_approval_tx, mut acp_approval_rx) = tokio_mpsc::unbounded_channel::<AcpApproval>();
+    let mut acp_approvals: crate::bouncer::ApprovalQueue<tokio::sync::oneshot::Sender<bool>> =
+        crate::bouncer::ApprovalQueue::new();
+
     // The resurrected session restored each tab's tree with pane ids the
     // PREVIOUS process allocated (numbered from 1). This process's `next_id`
     // also starts at 1, so a freshly-spawned pin/drawer/shell could grab an id
@@ -7192,6 +7975,7 @@ async fn event_loop<T: Terminal>(
             return Ok(()); // last worktree closed
         }
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            share_supervisor.shutdown_all();
             persist_session_layout(&mut session, &panes);
             return Ok(());
         }
@@ -7300,6 +8084,10 @@ async fn event_loop<T: Terminal>(
             last_active_worktree = Some(current_worktree.clone());
             // A selection anchored in the previous worktree's pane is stale.
             mouse_sel = None;
+            // For a remote/provider worktree, connect its resident bridge (off
+            // the loop) so git routes through the persistent agent and in-env
+            // file edits stream back as refreshes. No-op for local worktrees.
+            connect_worktree_bridge(&bridge_sup, &current_worktree, keymap.config());
             // Re-heal the canonical checkout's shared `.git/config` off-thread:
             // another agent committing in a sibling worktree could have leaked a
             // stray `core.worktree` since launch. Silent unless it strips a key;
@@ -8631,6 +9419,9 @@ async fn event_loop<T: Terminal>(
             if !lsp_diags.is_empty() {
                 lsp_diags.merge_into(&mut model.panel.diagnostics);
             }
+            // Shares live on the supervisor (loop-local), not in hydration; a
+            // fresh model wouldn't carry them — re-apply for the active worktree.
+            model.shares = current_share_views(&share_supervisor, &session);
             // The Symbols list (outline/refs) is re-derived in the pre-render block.
             // Mirror an externally-started (or externally-finished) rebase
             // into the git flow state, so the TODO view and conflict chrome
@@ -8762,6 +9553,92 @@ async fn event_loop<T: Terminal>(
         }
         if app_signalled {
             app_host.pump_all();
+            dirty = true;
+        }
+
+        // Register newly-connected agent ACP clients so the loop can reply to
+        // their requests (terminal/fs/edit) via `dispatch_acp_inbound`.
+        while let Ok((wt, client)) = acp_reg_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
+            tracing::debug!(target: "szhost::acp", worktree = %wt, "agent ACP client registered");
+            acp_clients.insert(wt, client);
+        }
+
+        // Agent ACP connection lifecycle (connecting/online/exited/error) → the
+        // per-worktree activity entry, so the chip can show failure states.
+        while let Ok((wt, conn)) = acp_status_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
+            acp_activity.entry(wt).or_default().conn = conn;
+            dirty = true;
+        }
+
+        // Service inbound ACP messages from agents. Requests are dispatched
+        // off-loop (their replies are async); session updates fold into the
+        // sending worktree's activity entry and mark the frame dirty.
+        while let Ok((wt, inbound)) = acp_inbound_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
+            match inbound {
+                // Notifications mutate per-worktree activity (the loop owns it);
+                // requests are serviced off-loop with a reply.
+                superzej_svc::acp::client::AcpInbound::SessionUpdate(update) => {
+                    // Agent finished → notification inbox (desktop + Notifications
+                    // panel). Fires for user-driven turns too.
+                    if let superzej_core::acp::methods::SessionUpdateEvent::AgentEnd { success } =
+                        &update
+                    {
+                        let ev = if *success {
+                            superzej_core::event_bus::Event::AgentDone {
+                                worktree: wt.clone(),
+                                agent: "pi".to_string(),
+                                success: true,
+                            }
+                        } else {
+                            superzej_core::event_bus::Event::AgentFailed {
+                                worktree: wt.clone(),
+                                agent: "pi".to_string(),
+                                error: "agent turn failed".to_string(),
+                            }
+                        };
+                        event_bus.publish(&ev);
+                    }
+                    apply_agent_session_update(acp_activity.entry(wt).or_default(), update);
+                    dirty = true;
+                }
+                other => {
+                    dispatch_acp_inbound(
+                        &wt,
+                        other,
+                        &acp_clients,
+                        keymap.config(),
+                        &event_bus,
+                        &acp_approval_tx,
+                        &waker,
+                    );
+                }
+            }
+        }
+
+        // Drain pending bouncer approvals into the FIFO gate. When one becomes
+        // active and no other menu is open, raise the approval overlay (an
+        // overlay forces a Full frame — the render invariant handles repaint).
+        while let Ok(req) = acp_approval_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
+            let became_active = acp_approvals.enqueue(req);
+            if became_active
+                && active_menu.is_none()
+                && let Some(active) = acp_approvals.active()
+            {
+                active_menu = Some(approval_overlay(active));
+                dirty = true;
+            }
+        }
+
+        // The chip tracks the FOCUSED worktree's agent (the map is per-worktree).
+        let focused_activity = session
+            .active_group()
+            .and_then(|g| acp_activity.get(&g.path).cloned());
+        if model.agent_activity != focused_activity {
+            model.agent_activity = focused_activity;
             dirty = true;
         }
 
@@ -8905,6 +9782,11 @@ async fn event_loop<T: Terminal>(
                         &payload.tab,
                         &payload.spec,
                         chrome.center,
+                        keymap.config(),
+                        &acp_inbound_tx,
+                        &acp_reg_tx,
+                        &acp_status_tx,
+                        &waker,
                     ) {
                         focus.zone = crate::focus::Zone::Center;
                         let backend = &payload.spec.backend;
@@ -9321,6 +10203,17 @@ async fn event_loop<T: Terminal>(
                 model.panel.log_lines_structured.drain(0..overflow);
             }
             dirty = true;
+        }
+
+        // Ingress-share state from the supervisor threads: persist the row,
+        // update the supervisor, and re-sync the model so the badge + Share
+        // panel repaint (a chrome change ⇒ Full frame).
+        while let Ok(ev) = share_rx.try_recv() {
+            persist_share_event(&ev);
+            if share_supervisor.on_event(ev) {
+                model.shares = current_share_views(&share_supervisor, &session);
+                dirty = true;
+            }
         }
 
         // Expire any toasts whose deadline passed; their scheduled wake lands
@@ -10779,6 +11672,40 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                     }
+                                    HostInputKind::ShareWorktreePort { reach } => {
+                                        match text.trim().parse::<u16>() {
+                                            Ok(port) if port > 0 => {
+                                                if let Some(wt) =
+                                                    session.active_group().map(|g| g.path.clone())
+                                                {
+                                                    match share_supervisor.start(
+                                                        &keymap.config().share,
+                                                        &wt,
+                                                        port,
+                                                        reach,
+                                                        &share_tx,
+                                                        &waker,
+                                                    ) {
+                                                        Ok(()) => {
+                                                            model.shares = current_share_views(
+                                                                &share_supervisor,
+                                                                &session,
+                                                            );
+                                                            model.status =
+                                                                format!("Sharing port {port}…");
+                                                        }
+                                                        Err(e) => {
+                                                            model.status =
+                                                                format!("Share failed: {e}");
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            _ => {
+                                                model.status = "Share: invalid port number".into();
+                                            }
+                                        }
+                                    }
                                     HostInputKind::SaveLayout => {
                                         let name = text.trim().to_string();
                                         if name.is_empty() {
@@ -10974,21 +11901,42 @@ async fn event_loop<T: Terminal>(
                     match m.handle_key(&k.key, k.modifiers) {
                         menu::MenuOutcome::Pending => {}
                         menu::MenuOutcome::Cancel => {
-                            // Dismissing the first-launch keymap picker (item 621)
-                            // counts as choosing the defaults — persist so it
-                            // never reappears.
-                            if m.tag == menu::MenuKindTag::KeymapPicker
-                                && let Ok(db) = superzej_core::db::Db::open()
-                            {
-                                let _ = db.set_ui_state("", "keymap_preset", "default");
+                            // Esc on the bouncer gate = deny: reject the active
+                            // tool call and advance to the next queued approval.
+                            if m.tag == menu::MenuKindTag::Approval {
+                                if let Some(done) = acp_approvals.resolve() {
+                                    let _ = done.reply.send(false);
+                                }
+                                active_menu = acp_approvals.active().map(approval_overlay);
+                                // (the common `dirty = true` after this match repaints)
+                            } else {
+                                // Dismissing the first-launch keymap picker (item
+                                // 621) counts as choosing the defaults — persist so
+                                // it never reappears.
+                                if m.tag == menu::MenuKindTag::KeymapPicker
+                                    && let Ok(db) = superzej_core::db::Db::open()
+                                {
+                                    let _ = db.set_ui_state("", "keymap_preset", "default");
+                                }
+                                active_menu = None;
+                                pending_confirm_op = None;
+                                pending_undo = None;
+                                pending_delete_workspace = None;
                             }
-                            active_menu = None;
-                            pending_confirm_op = None;
-                            pending_undo = None;
-                            pending_delete_workspace = None;
                         }
                         menu::MenuOutcome::Pick(choice) => {
                             active_menu = None;
+                            // Bouncer gate: send the user's allow/deny to the
+                            // waiting tool-servicing task, then raise the next
+                            // queued approval (if any).
+                            if let menu::MenuChoice::ApproveTool { allow } = choice {
+                                if let Some(done) = acp_approvals.resolve() {
+                                    let _ = done.reply.send(allow);
+                                }
+                                active_menu = acp_approvals.active().map(approval_overlay);
+                                dirty = true;
+                                continue;
+                            }
                             if let menu::MenuChoice::ConfirmDeleteWorktrees { keep_files } = choice
                                 && let Some(targets) = pending_confirm_delete_worktrees.take()
                             {
@@ -11110,6 +12058,18 @@ async fn event_loop<T: Terminal>(
                                 } else {
                                     format!("Keymap preset: {preset}")
                                 };
+                                dirty = true;
+                                continue;
+                            }
+                            // Reach picker → port entry carrying the chosen reach.
+                            // Not a git op, so handle before the git dispatch.
+                            if let menu::MenuChoice::ShareReach(reach) = choice {
+                                host_input = Some((
+                                    menu::InputOverlay::new("share worktree port (number)", ""),
+                                    HostInputKind::ShareWorktreePort { reach: Some(reach) },
+                                ));
+                                model.status =
+                                    "Share port: enter a port number (Esc cancels)".into();
                                 dirty = true;
                                 continue;
                             }
@@ -12861,8 +13821,12 @@ async fn event_loop<T: Terminal>(
                                                 let wk2 = waker.clone();
                                                 let limits2 = keymap.config().limits.clone();
                                                 tokio::task::spawn_blocking(move || {
+                                                    let loc =
+                                                        superzej_core::remote::GitLoc::for_worktree(
+                                                            &wt,
+                                                        );
                                                     let outcome = crate::task::run_task(
-                                                        wt, 0, test_task, &limits2,
+                                                        wt, &loc, 0, test_task, &limits2,
                                                     );
                                                     let _ = tx2.send(outcome);
                                                     let _ = wk2.wake();
@@ -12920,6 +13884,22 @@ async fn event_loop<T: Terminal>(
                                                 focus.zone = crate::focus::Zone::Center;
                                                 refresh_tab_model(&mut model, &session, &mut sb);
                                                 need_relayout = true;
+                                            }
+                                        }
+                                        Section::Share => {
+                                            // Enter copies the focused share's URL.
+                                            if let Some(url) = model
+                                                .shares
+                                                .get(panel_ui.cursor)
+                                                .and_then(|s| s.url.clone())
+                                            {
+                                                use std::io::Write as _;
+                                                let mut out = std::io::stdout();
+                                                let _ = out
+                                                    .write_all(&crate::copymode::osc52(&url))
+                                                    .and_then(|_| out.flush());
+                                                crate::clipboard::copy(&url);
+                                                model.status = format!("Copied {url}");
                                             }
                                         }
                                         Section::Ci
@@ -13300,7 +14280,9 @@ async fn event_loop<T: Terminal>(
                                 let wk2 = waker.clone();
                                 let limits2 = keymap.config().limits.clone();
                                 tokio::task::spawn_blocking(move || {
-                                    let outcome = crate::task::run_task(wt, 0, test_task, &limits2);
+                                    let loc = superzej_core::remote::GitLoc::for_worktree(&wt);
+                                    let outcome =
+                                        crate::task::run_task(wt, &loc, 0, test_task, &limits2);
                                     let _ = tx2.send(outcome);
                                     let _ = wk2.wake();
                                 });
@@ -14625,6 +15607,77 @@ async fn event_loop<T: Terminal>(
                                 panel_ui.switch_tab(crate::panel::PanelTab::Work);
                                 open_panel_section(
                                     crate::panel::Section::Ci,
+                                    &mut panel_ui,
+                                    &mut hydration_gen,
+                                    &model_tx,
+                                    &session,
+                                    &waker,
+                                    PanelDocsWiring {
+                                        model: &model,
+                                        generation: docs_gen,
+                                        tx: &docs_tx,
+                                    },
+                                );
+                                focus.zone = crate::focus::Zone::Panel;
+                            }
+                            Action::ShareWorktreePort => {
+                                // Intent-first: when ≥2 reaches are configured,
+                                // pick public/team/peer first; otherwise go
+                                // straight to port entry (the single reach, or
+                                // `None` ⇒ `[share] provider`).
+                                let reaches = keymap.config().share.configured_reaches();
+                                if reaches.len() >= 2 {
+                                    active_menu = Some(menu::reach_picker(&keymap.config().share));
+                                    model.status = "Share to… pick a reach (Esc cancels)".into();
+                                } else {
+                                    let reach = reaches.first().copied();
+                                    host_input = Some((
+                                        menu::InputOverlay::new("share worktree port (number)", ""),
+                                        HostInputKind::ShareWorktreePort { reach },
+                                    ));
+                                    model.status =
+                                        "Share port: enter a port number (Esc cancels)".into();
+                                }
+                            }
+                            Action::StopWorktreeShare => {
+                                if let Some(wt) = session.active_group().map(|g| g.path.clone()) {
+                                    let n = share_supervisor.stop(&wt, None);
+                                    if let Ok(db) = superzej_core::db::Db::open() {
+                                        for v in &model.shares {
+                                            let _ = db.delete_share(&wt, v.port);
+                                        }
+                                    }
+                                    model.shares = current_share_views(&share_supervisor, &session);
+                                    model.status = if n == 0 {
+                                        "No active shares on this worktree".into()
+                                    } else {
+                                        format!("Stopped {n} share(s)")
+                                    };
+                                }
+                            }
+                            Action::OpenShares => {
+                                panel_auto_revealed = None;
+                                if chrome.panel.is_none() {
+                                    want_panel = true;
+                                    panel_forced = cols < layout::PANEL_MIN_COLS;
+                                    chrome = compute_chrome(
+                                        cols,
+                                        rows,
+                                        want_sidebar,
+                                        want_panel,
+                                        panel_forced,
+                                        panel_width,
+                                        sidebar_cols,
+                                        zoom,
+                                        &supervisor,
+                                        drawer_rows,
+                                        drawer_full,
+                                    );
+                                    need_relayout = true;
+                                }
+                                panel_ui.switch_tab(crate::panel::PanelTab::System);
+                                open_panel_section(
+                                    crate::panel::Section::Share,
                                     &mut panel_ui,
                                     &mut hydration_gen,
                                     &model_tx,
@@ -16157,6 +17210,105 @@ mod tests {
     use crate::center::CenterTree;
     use crate::hydrate::build_model;
     use crate::session::{GroupKind, Session, WorktreeGroup};
+
+    #[test]
+    fn read_scoped_file_reads_inside_and_rejects_escape() {
+        let dir = std::env::temp_dir().join(format!("sz-acp-read-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("hello.txt"), "hi there").unwrap();
+        let wt = dir.to_str().unwrap();
+
+        // Relative path resolves against the worktree root.
+        assert_eq!(read_scoped_file(wt, "hello.txt").unwrap(), "hi there");
+        // Absolute path inside the worktree is allowed.
+        let abs = dir.join("hello.txt");
+        assert_eq!(
+            read_scoped_file(wt, abs.to_str().unwrap()).unwrap(),
+            "hi there"
+        );
+        // A path that escapes the worktree (via ..) is rejected, not read.
+        assert!(
+            read_scoped_file(wt, "../../../etc/passwd").is_err(),
+            "path escape must be rejected"
+        );
+        // A missing file is an error, not a panic.
+        assert!(read_scoped_file(wt, "nope.txt").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scoped_write_and_edit_stay_inside_worktree() {
+        let dir = std::env::temp_dir().join(format!("sz-acp-write-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wt = dir.to_str().unwrap();
+
+        // Write creates the file (and parent dirs) inside the worktree.
+        write_scoped_file(wt, "sub/new.txt", "hello").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("sub/new.txt")).unwrap(),
+            "hello"
+        );
+
+        // Edit applies precise replacements; a missing match errors.
+        let edits = serde_json::json!([{ "oldText": "hello", "newText": "goodbye" }]);
+        apply_scoped_edits(wt, "sub/new.txt", &edits).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("sub/new.txt")).unwrap(),
+            "goodbye"
+        );
+        let bad = serde_json::json!([{ "oldText": "absent", "newText": "x" }]);
+        assert!(apply_scoped_edits(wt, "sub/new.txt", &bad).is_err());
+
+        // Traversal escapes are rejected for both write and edit.
+        assert!(write_scoped_file(wt, "../escape.txt", "x").is_err());
+        assert!(apply_scoped_edits(wt, "../escape.txt", &edits).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agent_session_update_tracks_tool_and_usage() {
+        use crate::chrome::{AgentActivity, AgentConn};
+        use superzej_core::acp::methods::SessionUpdateEvent as E;
+        let mut a = AgentActivity::default();
+
+        // A tool call sets the tool name and marks it running.
+        apply_agent_session_update(
+            &mut a,
+            E::ToolCall {
+                tool_call_id: "1".into(),
+                tool_name: "bash".into(),
+                args: serde_json::json!({}),
+            },
+        );
+        assert_eq!(a.last_tool.as_deref(), Some("bash"));
+        assert!(a.running);
+        // Folding a session update must not disturb the connection lifecycle.
+        assert_eq!(a.conn, AgentConn::Online);
+
+        // A completed update clears the running flag.
+        apply_agent_session_update(
+            &mut a,
+            E::ToolCallUpdate {
+                tool_call_id: "1".into(),
+                status: "completed".into(),
+                result: None,
+            },
+        );
+        assert!(!a.running);
+
+        // Usage updates feed the context-window percentage.
+        apply_agent_session_update(&mut a, E::UsageUpdate { used: 5, size: 20 });
+        assert_eq!((a.context_used, a.context_size), (5, 20));
+        assert_eq!(a.last_tool.as_deref(), Some("bash")); // unchanged
+        assert_eq!(a.conn, AgentConn::Online); // still untouched
+
+        // Agent-end clears running (and is what drives the AgentDone notification).
+        a.running = true;
+        apply_agent_session_update(&mut a, E::AgentEnd { success: true });
+        assert!(!a.running);
+    }
 
     #[test]
     fn issue_branch_tail_prefers_hint_then_slugifies() {

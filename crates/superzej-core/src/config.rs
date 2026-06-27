@@ -294,12 +294,16 @@ config_enum! {
     /// Where an environment's worktree files physically live. `in_env` (the
     /// default) keeps files where the env runs — on the host for `local`, in the
     /// pod/sandbox for remote placements (today's behavior). `local_exec` keeps
-    /// files on the host and only execs remotely; `sshfs` mounts the remote tree
-    /// locally. (`local_exec`/`sshfs` lifecycle is wired in the data-mode phase.)
+    /// files on the host and only execs remotely. `sshfs` FUSE-mounts the remote
+    /// tree locally; `sync` keeps a local working copy kept coherent with the
+    /// remote via a changed-files (rsync) delta. Both `sshfs`/`sync` run the pane
+    /// *locally at the mountpoint* (the placement is used only to project the
+    /// tree); their mount/sync lifecycle is auto-run on pane spawn/close.
     pub enum DataMode: "data mode" {
         InEnv = "in_env" | "remote" | "native",
         LocalExec = "local_exec" | "local",
         Sshfs = "sshfs" | "mount",
+        Sync = "sync" | "rsync",
     } default = InEnv;
 }
 config_enum! {
@@ -389,6 +393,28 @@ pub struct LlmProxyConfig {
     pub token_reduction: bool,
     /// Aggressiveness when `token_reduction` is on.
     pub token_reduction_level: CompressionLevel,
+    /// Route a launched agent's model traffic through the proxy at `listen` by
+    /// injecting provider config into the agent's environment at spawn. Separate
+    /// from `enabled` (which launches `szproxy`): set this to point the agent at
+    /// an already-running proxy without launching our own.
+    pub route_agent: bool,
+    /// The pi-side API id for the proxy endpoint. The proxy serves the Anthropic
+    /// Messages API (`/v1/messages`); pi's OpenAI client speaks the Responses API,
+    /// which the proxy does not implement — so `anthropic-messages` is the default.
+    pub agent_api: String,
+    /// The model id the agent requests from the proxy (the proxy maps it to a
+    /// real backend, e.g. `model-proxy/standard` → its standard route).
+    pub agent_model: String,
+    /// "The bouncer": run a launched agent inside its sealed `agent_profile`
+    /// container, route its built-in `bash`/`read`/`edit`/`write` tools back
+    /// through superzej over a bind-mounted unix-socket ACP channel, and gate
+    /// the consequential ones (shell + edit + write) behind an interactive
+    /// allow/deny overlay. Off by default — the additive integration (pi runs
+    /// its own tools in-process, edits auto-apply) stays the default. When the
+    /// resolved `agent_profile` forces no network (`sealed`), the agent's model
+    /// traffic is relayed to the proxy over a unix socket too (full egress seal);
+    /// otherwise it reaches the proxy via the container gateway.
+    pub bouncer: bool,
 }
 
 impl Default for LlmProxyConfig {
@@ -404,6 +430,10 @@ impl Default for LlmProxyConfig {
             heartbeat_secs: 10,
             token_reduction: false,
             token_reduction_level: CompressionLevel::default(),
+            route_agent: false,
+            agent_api: "anthropic-messages".to_string(),
+            agent_model: "model-proxy/standard".to_string(),
+            bouncer: false,
         }
     }
 }
@@ -1973,6 +2003,17 @@ pub struct EnvProviderConfig {
     pub api_key_env: String,
     /// Provider sandbox template/image to create from.
     pub template: String,
+    /// Working directory inside the sandbox that a `data = "sync"` projection
+    /// pushes the local worktree into (and pulls back from). Empty ⇒ `/workspace`.
+    pub workdir: String,
+    /// Auto-create the sandbox on first open if it doesn't exist yet (API
+    /// providers): the "feels-local" warm-on-open. Off by default — creating a
+    /// paid cloud sandbox should be opt-in; otherwise run `superzej env provision`.
+    pub auto_provision: bool,
+    /// Checkpoint the sandbox on worktree close (API providers that support it):
+    /// "suspend on close" for fast resume. Off by default (each checkpoint may
+    /// incur storage cost).
+    pub auto_checkpoint: bool,
 }
 
 impl EnvProviderConfig {
@@ -1986,6 +2027,19 @@ impl EnvProviderConfig {
             && self.api_base.is_empty()
             && self.api_key_env.is_empty()
             && self.template.is_empty()
+            && self.workdir.is_empty()
+            && !self.auto_provision
+            && !self.auto_checkpoint
+    }
+
+    /// The sandbox working dir for `sync` (config value or the `/workspace` default).
+    pub fn sync_workdir(&self) -> String {
+        let w = self.workdir.trim();
+        if w.is_empty() {
+            "/workspace".to_string()
+        } else {
+            w.to_string()
+        }
     }
 }
 
@@ -2247,6 +2301,251 @@ pub struct CustomVpnConfig {
     pub env: std::collections::BTreeMap<String, String>,
 }
 
+// ── Ingress sharing (`[share]`) ─────────────────────────────────────────────
+// The *inbound* sibling of `[sandbox.vpn]`: expose a service running inside a
+// worktree (a dev server, a PR preview, a webhook/OAuth callback) at a public
+// URL. Like the VPN seam this is provider-pluggable; `bore` is the first
+// backend. Worktree-level, not a sandbox-network attribute, so it lives at the
+// top level rather than under `[sandbox]`.
+
+config_enum! {
+    /// `[share] provider` — which tunnel backend gives a worktree port a URL.
+    /// `none` (default) disables sharing. Future backends (rathole / zrok /
+    /// ngrok / iroh) plug in behind the same `ShareProvider` seam.
+    pub enum ShareProviderKind: "share provider" {
+        None = "none" | "off",
+        Bore = "bore",
+        Frp = "frp",
+        Tailscale = "tailscale" | "ts",
+        Iroh = "iroh" | "dumbpipe",
+    } default = None;
+}
+config_enum! {
+    /// `[share.frp] proxy_type` — how frp exposes the port. `https`/`http` get a
+    /// vhost subdomain URL; `tcp`/`udp` get a `host:port` address.
+    pub enum FrpProxyType: "frp proxy_type" {
+        Https = "https",
+        Http = "http",
+        Tcp = "tcp",
+        Udp = "udp",
+    } default = Https;
+}
+config_enum! {
+    /// `[share] visibility` — who can reach the share. `bore` only does
+    /// `public` (anyone with the URL); `private` (identity-scoped) is reserved
+    /// for the iroh/zrok backends.
+    pub enum ShareVisibility: "share visibility" {
+        Public = "public",
+        Private = "private",
+    } default = Public;
+}
+config_enum! {
+    /// `[share] on_error` — what to do when a share can't be brought up.
+    ///  - `fail` (default): surface the error; the share does not start.
+    ///  - `warn`: log a warning and carry on (no URL).
+    pub enum ShareOnError: "share on_error" {
+        Fail = "fail",
+        Warn = "warn",
+    } default = Fail;
+}
+config_enum! {
+    /// Who a share is for — the intent the reach-picker offers. Each maps to a
+    /// provider via the `[share] public`/`team`/`peer` keys.
+    ///  - `public` — anyone with the link (the internet).
+    ///  - `team`   — your tailnet / a teammate (identity-scoped).
+    ///  - `peer`   — a specific machine you hand a ticket to (P2P).
+    pub enum ShareReach: "share reach" {
+        Public = "public",
+        Team = "team",
+        Peer = "peer",
+    } default = Public;
+}
+
+/// `[share]` — expose a worktree-local port at a public URL. Disabled by
+/// default (`provider = "none"`). Only the selected provider's sub-table is
+/// consulted.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct ShareConfig {
+    pub provider: ShareProviderKind,
+    pub visibility: ShareVisibility,
+    pub on_error: ShareOnError,
+    /// Seconds to wait for the share's URL to appear before applying `on_error`.
+    pub ready_timeout_secs: u64,
+    /// Safety guard: when `false`, refuse any share reachable from the public
+    /// internet (frp http(s), tailscale `funnel`). Private/team/peer shares are
+    /// unaffected. Default `true`.
+    pub allow_public: bool,
+    /// Intent-first reach → provider mapping for the reach picker. Each defaults
+    /// to `none` (unset); when ≥2 are set, `Alt+Shift+S` offers a picker. When
+    /// all are unset, the single `provider` is used (no picker).
+    pub public: ShareProviderKind,
+    pub team: ShareProviderKind,
+    pub peer: ShareProviderKind,
+    pub bore: BoreConfig,
+    pub frp: FrpConfig,
+    pub tailscale: TailscaleShareConfig,
+    pub iroh: IrohShareConfig,
+}
+
+impl Default for ShareConfig {
+    fn default() -> Self {
+        ShareConfig {
+            provider: ShareProviderKind::None,
+            visibility: ShareVisibility::Public,
+            on_error: ShareOnError::Fail,
+            ready_timeout_secs: 20,
+            allow_public: true,
+            public: ShareProviderKind::None,
+            team: ShareProviderKind::None,
+            peer: ShareProviderKind::None,
+            bore: BoreConfig::default(),
+            frp: FrpConfig::default(),
+            tailscale: TailscaleShareConfig::default(),
+            iroh: IrohShareConfig::default(),
+        }
+    }
+}
+
+impl ShareConfig {
+    /// Whether sharing is requested at all (a default `provider` or any reach key).
+    pub fn is_enabled(&self) -> bool {
+        self.provider != ShareProviderKind::None || !self.configured_reaches().is_empty()
+    }
+
+    /// The provider mapped to a reach (`none` if that reach is unset).
+    pub fn reach_provider(&self, reach: ShareReach) -> ShareProviderKind {
+        match reach {
+            ShareReach::Public => self.public,
+            ShareReach::Team => self.team,
+            ShareReach::Peer => self.peer,
+        }
+    }
+
+    /// Reaches that map to a real provider, in public→team→peer order. `Public`
+    /// is omitted when `allow_public` is off, so the picker never offers a
+    /// reach the safety guard would refuse.
+    pub fn configured_reaches(&self) -> Vec<ShareReach> {
+        [ShareReach::Public, ShareReach::Team, ShareReach::Peer]
+            .into_iter()
+            .filter(|&r| self.reach_provider(r) != ShareProviderKind::None)
+            .filter(|&r| r != ShareReach::Public || self.allow_public)
+            .collect()
+    }
+}
+
+/// `[share.bore]` — <https://github.com/ekzhang/bore>, a tiny TCP tunnel. The
+/// client connects out to a relay (`to`) and exposes the local port at
+/// `to:<remote_port>`. Run your own `bore server` and set `to`/`secret`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct BoreConfig {
+    /// Relay server host (the machine running `bore server`). `""` falls back to
+    /// the public `bore.pub` instance (no secret, best-effort).
+    pub to: String,
+    /// Optional shared HMAC secret (secrets-ref `"env:BORE_SECRET"` /
+    /// `"file:~/.bore/secret"`); must match the server's `--secret`.
+    pub secret: String,
+    /// Remote port to bind on the relay. `0` = let the relay choose.
+    pub remote_port: u16,
+    /// Local interface the dev server listens on (forwarded to the relay).
+    pub local_host: String,
+    /// Extra `bore local` flags for anything not modeled here.
+    pub extra_args: Vec<String>,
+}
+
+impl Default for BoreConfig {
+    fn default() -> Self {
+        BoreConfig {
+            to: String::new(),
+            secret: "env:BORE_SECRET".into(),
+            remote_port: 0,
+            local_host: "127.0.0.1".into(),
+            extra_args: Vec::new(),
+        }
+    }
+}
+
+/// `[share.frp]` — <https://github.com/fatedier/frp>, a self-hosted reverse
+/// proxy. The client (`frpc`) connects out to your `frps` server and exposes the
+/// worktree port; `https`/`http` get a vhost subdomain, `tcp`/`udp` a remote
+/// port. The public address is derived from config (frpc never prints it).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct FrpConfig {
+    /// `frps` server host (required). Empty ⇒ the provider errors at start.
+    pub server_addr: String,
+    /// `frps` control port.
+    pub server_port: u16,
+    /// Shared token (secrets-ref `"env:FRP_TOKEN"` / `"file:~/.frp/token"`);
+    /// must match the server's `auth.token`.
+    pub token: String,
+    pub proxy_type: FrpProxyType,
+    /// The base domain the server serves subdomains under (its `subDomainHost`),
+    /// e.g. `share.example.com` — used to derive the `https`/`http` URL.
+    pub subdomain_host: String,
+    /// Subdomain label for `https`/`http`. Empty ⇒ a deterministic per-worktree
+    /// slug (`<worktree>-<port>`), so a worktree's preview URL is stable.
+    pub subdomain: String,
+    /// Remote port for `tcp`/`udp`. `0` = let the server choose.
+    pub remote_port: u16,
+    /// HTTPS vhost port on the server (for the derived URL when not 443).
+    pub vhost_https_port: u16,
+    /// Extra `frpc.toml` lines appended verbatim to the `[[proxies]]` block.
+    pub extra: Vec<String>,
+}
+
+impl Default for FrpConfig {
+    fn default() -> Self {
+        FrpConfig {
+            server_addr: String::new(),
+            server_port: 7000,
+            token: "env:FRP_TOKEN".into(),
+            proxy_type: FrpProxyType::Https,
+            subdomain_host: String::new(),
+            subdomain: String::new(),
+            remote_port: 0,
+            vhost_https_port: 443,
+            extra: Vec::new(),
+        }
+    }
+}
+
+/// `[share.tailscale]` — expose the worktree port over the worktree's existing
+/// `[sandbox.vpn]` tailscale tunnel. `serve` (default) keeps it tailnet-private;
+/// `funnel = true` publishes it to the public internet. Requires
+/// `[sandbox.vpn] provider = "tailscale"` (or `headscale`) on the worktree.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct TailscaleShareConfig {
+    /// `false` (default) ⇒ `tailscale serve` (tailnet-only). `true` ⇒
+    /// `tailscale funnel` (public internet; ports limited to 443/8443/10000).
+    pub funnel: bool,
+    /// HTTPS port to expose on (serve/funnel default 443).
+    pub https_port: u16,
+}
+
+impl Default for TailscaleShareConfig {
+    fn default() -> Self {
+        TailscaleShareConfig {
+            funnel: false,
+            https_port: 443,
+        }
+    }
+}
+
+/// `[share.iroh]` — a peer-to-peer TCP tunnel over iroh via `dumbpipe`
+/// (<https://github.com/n0-computer/dumbpipe>). NAT-traversing, relay-fallback;
+/// the consumer connects with `dumbpipe connect-tcp <ticket>` (not a browser),
+/// so the "address" is a ticket. For a self-hosted `iroh-relay`, pass dumbpipe's
+/// relay flag/env via `extra_args`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct IrohShareConfig {
+    /// Extra `dumbpipe listen-tcp` flags (e.g. a custom relay).
+    pub extra_args: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct SandboxConfig {
@@ -2296,6 +2595,13 @@ pub struct SandboxConfig {
     /// override per workspace via `.superzej.toml`.
     pub shell: String,
     pub on_missing: OnMissing,
+    /// Drive the OCI runtime against a **remote daemon** instead of SSH-wrapping
+    /// the whole backend argv: a podman connection URL/name or a docker host
+    /// (e.g. `ssh://user@host`). Empty ⇒ local daemon (the default). Injected as
+    /// `podman --url`/`--connection` or `docker -H` before every container
+    /// subcommand. An alternative reach to `[env.<name>] placement = "ssh"`,
+    /// useful when the daemon (not just the shell) lives on another box.
+    pub oci_host: String,
     pub remote: RemoteConfig,
     /// Allow-only these hostnames for outbound connections (empty = allow all).
     /// Enforced via a per-container DNS interceptor. Block-list is checked first
@@ -2363,6 +2669,7 @@ impl Default for SandboxConfig {
             nix_daemon: false,
             shell: String::new(),
             on_missing: OnMissing::Warn,
+            oci_host: String::new(),
             remote: RemoteConfig::default(),
             network_allow: Vec::new(),
             network_block: Vec::new(),
@@ -2914,6 +3221,8 @@ pub struct Config {
     /// `[media]` — media-player control. On by default (`mpris` backend), inert
     /// where D-Bus/`playerctl` are absent. Additive — the shell never depends on it.
     pub media: MediaConfig,
+    /// `[share]` — expose a worktree port at a public URL. Disabled by default.
+    pub share: ShareConfig,
     /// Rebind a built-in action by id, e.g. `new-worktree = "Ctrl w"`. The flat
     /// table is the global/default layer; nested mode tables are native-host only.
     pub keybinds: KeybindConfig,
@@ -2993,6 +3302,7 @@ impl Default for Config {
             lsp: LspConfig::default(),
             llm_proxy: LlmProxyConfig::default(),
             media: MediaConfig::default(),
+            share: ShareConfig::default(),
             keybinds: KeybindConfig::default(),
             actions: Vec::new(),
             profile: String::new(),
@@ -5853,10 +6163,16 @@ transport = \"ssh\"
             Priority::Notice
         );
 
-        // Alert set is exactly the four failures; unread set excludes Info.
+        // Alert set is the failures + the agent-attention request; unread excludes Info.
         let alerts = cfg.alert_kind_names();
-        assert_eq!(alerts.len(), 4);
-        for k in ["agent_failed", "test_failed", "log_error", "process_failed"] {
+        assert_eq!(alerts.len(), 5);
+        for k in [
+            "agent_failed",
+            "agent_attention",
+            "test_failed",
+            "log_error",
+            "process_failed",
+        ] {
             assert!(alerts.contains(&k), "missing {k}");
         }
         let counted = cfg.counted_unread_kind_names();
@@ -6995,6 +7311,8 @@ idle_timeout_secs = 20
 heartbeat_secs = 5
 token_reduction = true
 token_reduction_level = "balanced"
+route_agent = true
+bouncer = true
 "#,
         )
         .unwrap();
@@ -7010,6 +7328,19 @@ token_reduction_level = "balanced"
             cfg.llm_proxy.token_reduction_level,
             CompressionLevel::Balanced
         );
+        assert!(cfg.llm_proxy.route_agent);
+        assert!(cfg.llm_proxy.bouncer);
+    }
+
+    #[test]
+    fn llm_proxy_bouncer_off_by_default() {
+        // The bouncer is opt-in: the additive integration (pi runs its own
+        // tools in-process) stays the default.
+        let cfg = LlmProxyConfig::default();
+        assert!(!cfg.bouncer, "bouncer must default off — AI is additive");
+        // A table that omits the key keeps the default.
+        let parsed: Config = toml::from_str("[llm_proxy]\nenabled = true\n").unwrap();
+        assert!(!parsed.llm_proxy.bouncer);
     }
 
     #[test]
