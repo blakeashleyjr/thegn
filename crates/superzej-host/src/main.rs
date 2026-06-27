@@ -7,6 +7,7 @@
 mod agent;
 mod apps;
 mod borders;
+mod bouncer;
 mod center;
 mod chrome;
 mod clipboard;
@@ -42,6 +43,7 @@ mod profile;
 mod proxy_daemon;
 mod queries;
 mod recorder;
+mod relay;
 mod render_plan;
 mod run;
 mod sandbox_events;

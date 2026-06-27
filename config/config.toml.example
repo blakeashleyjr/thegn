@@ -1192,6 +1192,16 @@ token_reduction_level = "conservative"
 route_agent = false
 agent_api = "anthropic-messages"
 agent_model = "model-proxy/standard"
+# "The bouncer" (opt-in). When true, a launched agent runs inside its sealed
+# `[sandbox] agent_profile` container and its built-in bash/read/edit/write tools
+# are routed back through superzej over a bind-mounted unix-socket ACP channel.
+# The consequential ones — shell, edit, write — are gated behind an interactive
+# allow/deny overlay (read is auto-served). If `agent_profile` forces no network
+# (the default `sealed`), the agent's only egress is the proxy, relayed over a
+# unix socket (full exfil seal); a network-permitting profile (e.g. `hardened`)
+# reaches the proxy via the container gateway instead. Off = the additive model:
+# pi runs its own tools in-process and edits auto-apply.
+bouncer = false
 
 # ── Media player control (optional) ────────────────────────────────────────
 # Drive your music/media player from superzej: play/pause, next/previous,
