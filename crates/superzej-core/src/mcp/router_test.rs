@@ -1,6 +1,11 @@
+// `McpRouter::new` takes `Arc<Db>` (its production API). `Db` wraps a rusqlite
+// `Connection`, which is intentionally `!Sync`, so the lint fires on the test's
+// `Arc::new(Db…)` — but the Arc is single-threaded shared ownership here, not a
+// cross-thread share, so it's a false positive.
+#![allow(clippy::arc_with_non_send_sync)]
+
 use crate::db::Db;
 use crate::event_bus::{Event, EventBus};
-use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
 use crate::mcp::router::McpRouter;
 use serde_json::json;
 use std::sync::Arc;

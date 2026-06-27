@@ -335,10 +335,10 @@ _Tier-2 layout/task templates generalize worktree templates (54) with native
 - [x] 45. Per-worktree branch + status
 - [x] 46. Default layout opens on select
 - [x] 47. Delete worktree (dirty guard)
-- [~] 48. Stale worktree GC
+- [x] 48. Stale worktree GC _(auto `cargo clean` of `target/` on PR merge/close via the `pr_branch_cache` feed → `worktree::clean_target`, gated `[disk].auto_clean_on_merge`/`clean_on_pr_closed`; active worktree + running builds skipped)_
 - [x] 49. Dirty-state warning before destructive ops
 - [ ] 50. Dependency sharing — hardlink/CoW node_modules etc.
-- [~] 51. Per-worktree disk usage
+- [x] 51. Per-worktree disk usage _(off-loop `du` scan → `worktree_disk` cache (db v20), sidebar size badge + statusbar `[disk].warn_threshold_gb` chip + `superzej disk`/`clean` CLI; `disk.rs`)_
 - [x] 52. Fork worktree (branch from existing) _(`SidebarOutcome::Fork` from the row menu → `begin_worktree_wizard(base_override=Some(branch))` in run.rs)_
 - [x] 53. Rename worktree/branch _(`PromptRename` → `HostInputKind::RenameWorktree` → `superzej_core::worktree::rename` (branch -m + worktree move); tested by `rename_moves_branch_and_checkout`)_
 - [~] 54. Worktree templates — layout+programs+container preset + setup/post-create hooks (deps install, env restore; see 657) _(`NewWorktreeFromTemplate` action wired in run.rs + `[[worktree_templates]]` config; setup/post-create hook depth still partial)_
@@ -885,8 +885,8 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 - [ ] 385. CoW overlay from base image
 - [ ] 386. Prewarmed pool (fast spawn)
 - [ ] 387. Intelligent resource caching (node/cargo/pip)
-- [ ] 388. Shared cache across worktrees
-- [ ] 389. Auto cache cleanup
+- [x] 388. Shared cache across worktrees _(`[disk].sccache` → `RUSTC_WRAPPER`/`SCCACHE_DIR` + `[disk].shared_target_dir` → `CARGO_TARGET_DIR` injected into pane env at `agent::launch_spec`; shared-target serializes builds, opt-in)_
+- [x] 389. Auto cache cleanup _(see 48: PR-merge/close auto `cargo clean`; manual `superzej clean [--all]`)_
 - [ ] 390. Snapshot/checkpoint (CRIU/commit)
 - [ ] 391. Rollback container state
 - [ ] 392. Image build cache

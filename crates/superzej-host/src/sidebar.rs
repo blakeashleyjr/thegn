@@ -165,6 +165,11 @@ pub struct SidebarRow {
     /// Badge: alert count (test failures, agent failures, log errors) for this worktree (item 28).
     #[allow(dead_code)]
     pub alert_count: usize,
+    /// Disk usage of this worktree's checkout (bytes), from the off-loop scan.
+    pub disk_bytes: Option<u64>,
+    /// Disk usage of this worktree's `target/` subtree (bytes) — the reclaimable
+    /// portion. Drives the amber tint on the size badge when it dominates.
+    pub target_bytes: Option<u64>,
     /// Connection string for terminal rows
     pub terminal_connection: Option<String>,
 }
@@ -186,6 +191,10 @@ pub struct SidebarStatus {
     pub unread_counts: std::collections::BTreeMap<String, usize>,
     /// Badge: alert count per worktree (item 28).
     pub alert_counts: std::collections::BTreeMap<String, usize>,
+    /// Per-worktree disk usage `(total_bytes, target_bytes)` from the
+    /// `worktree_disk` cache (populated off-loop by the disk scan). Drives the
+    /// sidebar size badge and the statusbar total.
+    pub disk_sizes: std::collections::HashMap<String, (i64, i64)>,
 }
 
 /// Persisted + transient view state that shapes the tree (collapse/sort/pins/
@@ -329,6 +338,8 @@ pub fn build_rows(
             unread_count: 0,
             alert_count: 0,
             terminal_connection: None,
+            disk_bytes: None,
+            target_bytes: None,
         });
 
         // This repo's worktree groups, straight from the session model.
@@ -417,6 +428,8 @@ pub fn build_rows(
                 unread_count,
                 alert_count,
                 terminal_connection: None,
+                disk_bytes: None,
+                target_bytes: None,
             });
         }
 
@@ -492,6 +505,8 @@ pub fn build_rows(
                 unread_count: 0,
                 alert_count: 0,
                 terminal_connection: None,
+                disk_bytes: None,
+                target_bytes: None,
             });
 
             if !folder_collapsed {
@@ -557,6 +572,8 @@ pub fn build_rows(
                             unread_count,
                             alert_count,
                             terminal_connection: None,
+                            disk_bytes: None,
+                            target_bytes: None,
                         });
                     }
                 }
@@ -623,6 +640,8 @@ pub fn build_rows(
                     unread_count,
                     alert_count,
                     terminal_connection: None,
+                    disk_bytes: None,
+                    target_bytes: None,
                 }
             };
             rows.push(mk(
@@ -673,6 +692,8 @@ pub fn build_rows(
             unread_count: 0,
             alert_count: 0,
             terminal_connection: None,
+            disk_bytes: None,
+            target_bytes: None,
         });
     }
 
@@ -703,6 +724,8 @@ pub fn build_rows(
             unread_count: 0,
             alert_count: 0,
             terminal_connection: None,
+            disk_bytes: None,
+            target_bytes: None,
         });
 
         if !collapsed {
@@ -745,7 +768,23 @@ pub fn build_rows(
                     unread_count: 0,
                     alert_count: 0,
                     terminal_connection: Some(t.connection_string.clone()),
+                    disk_bytes: None,
+                    target_bytes: None,
                 });
+            }
+        }
+    }
+
+    // Denormalize cached disk sizes onto every worktree row (one pass, keyed by
+    // path), so the badge renderer reads them straight off the row like the
+    // PR/unread/alert counts.
+    if !status.disk_sizes.is_empty() {
+        for row in &mut rows {
+            if let Some(p) = &row.worktree_path
+                && let Some(&(total, target)) = status.disk_sizes.get(p)
+            {
+                row.disk_bytes = Some(total.max(0) as u64);
+                row.target_bytes = Some(target.max(0) as u64);
             }
         }
     }

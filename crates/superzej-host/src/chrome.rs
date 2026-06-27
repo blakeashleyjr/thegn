@@ -315,6 +315,10 @@ pub struct FrameModel {
     pub sidebar_db_folders: Vec<superzej_core::models::FolderRow>,
     /// All terminals, straight from DB, used by row builder.
     pub sidebar_db_terminals: Vec<superzej_core::models::TerminalRow>,
+    /// `[disk].warn_threshold_gb`: the statusbar disk badge trips when the sum
+    /// of all worktree sizes (in `sidebar_status.disk_sizes`) exceeds this many
+    /// GiB. 0 disables the badge. Config-derived, set in `build_model`.
+    pub disk_warn_threshold_gb: u64,
     /// True if the last input was mouse activity.
     pub panel: crate::panel::PanelData,
     /// True when the right panel currently owns keyboard focus.
@@ -470,6 +474,7 @@ impl FrameModel {
             && self.container_events == other.container_events
             && self.status == other.status
             && self.panel == other.panel
+            && self.disk_warn_threshold_gb == other.disk_warn_threshold_gb
     }
 }
 
@@ -1181,6 +1186,33 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             ));
         }
     }
+    // Disk-usage badge: trips when the sum of all worktree sizes crosses
+    // `[disk].warn_threshold_gb` — amber past the threshold, red past 2×. The
+    // 300GB-of-target/ failure mode accrued unnoticed; this is the missing
+    // feedback loop. Silent below the threshold and when it's disabled (0) or
+    // the scan hasn't run (empty `disk_sizes`).
+    if model.disk_warn_threshold_gb > 0 && !model.sidebar_status.disk_sizes.is_empty() {
+        let total: u64 = model
+            .sidebar_status
+            .disk_sizes
+            .values()
+            .map(|&(t, _)| t.max(0) as u64)
+            .sum();
+        let gib = 1024 * 1024 * 1024;
+        let threshold = model.disk_warn_threshold_gb * gib;
+        if total > threshold {
+            let hue = if total > threshold.saturating_mul(2) {
+                superzej_core::theme::Hue::Red
+            } else {
+                superzej_core::theme::Hue::Amber
+            };
+            r.push(seg(Tok::Slot(S::Text), " "));
+            r.push(Seg::chip(
+                Tok::Hue(hue),
+                format!(" \u{26c1} {} ", superzej_core::disk::human(total)),
+            ));
+        }
+    }
     // Now-playing badge (optional [media] feature): a compact ▶/❚❚ chip with the
     // current track, green while playing and blue while paused. `badge()` returns
     // `None` when nothing is loaded, so the chip is silent when idle.
@@ -1725,6 +1757,22 @@ fn compose_badges(row: &crate::sidebar::SidebarRow) -> Vec<Badge> {
         badges.push(Badge {
             text: format!(" \u{26a0}{}", row.alert_count), // ⚠N
             color: theme_color(theme::RED),
+        });
+    }
+    // Disk-size badge (item 152/413): the worktree's size, dim by default and
+    // amber when the reclaimable `target/` dominates (>1 GiB and >half the
+    // total) — a nudge that `superzej clean` would recover real space. Only
+    // populated when the off-loop disk scan has run (i.e. `[disk].show_sizes`).
+    if let Some(total) = row.disk_bytes {
+        let target = row.target_bytes.unwrap_or(0);
+        let heavy = target > 1024 * 1024 * 1024 && target * 2 > total;
+        badges.push(Badge {
+            text: format!(" {}", superzej_core::disk::human(total)),
+            color: if heavy {
+                theme_color(theme::AMBER)
+            } else {
+                theme_color(theme::DIM)
+            },
         });
     }
     badges
@@ -2412,6 +2460,8 @@ mod tests {
             pr_number: None,
             unread_count: 0,
             alert_count: 0,
+            disk_bytes: None,
+            target_bytes: None,
             terminal_connection: None,
         }
     }
@@ -2515,6 +2565,62 @@ mod tests {
         assert!(text.contains('\u{26a0}'), "alert badge glyph ⚠: {text:?}");
         // Counts render alongside the glyphs.
         assert!(text.contains('2') && text.contains('3') && text.contains('1'));
+    }
+
+    #[test]
+    fn sidebar_renders_disk_size_badge() {
+        use crate::sidebar::RowKind;
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 40,
+            rows: 6,
+        };
+        let mut ws = row(RowKind::Workspace, "app");
+        ws.collapsed = false;
+        let mut wt = row(RowKind::Worktree, "feat");
+        wt.disk_bytes = Some(70 * 1024 * 1024 * 1024); // 70G
+        wt.target_bytes = Some(60 * 1024 * 1024 * 1024);
+        let model = FrameModel {
+            sidebar_rows: vec![ws, wt],
+            ..Default::default()
+        };
+        let mut s = Surface::new(40, 6);
+        draw_sidebar(&mut s, rect, &model);
+        let text = s.screen_chars_to_string();
+        assert!(
+            text.contains("70G"),
+            "size badge shows human size: {text:?}"
+        );
+    }
+
+    #[test]
+    fn statusbar_disk_badge_trips_above_threshold_only() {
+        let chrome = layout::compute(160, 10, false, false);
+        let mk = |total_gb: u64, threshold: u64| -> String {
+            let mut sizes = std::collections::HashMap::new();
+            sizes.insert(
+                "/wt/a".to_string(),
+                ((total_gb * 1024 * 1024 * 1024) as i64, 0i64),
+            );
+            let model = FrameModel {
+                disk_warn_threshold_gb: threshold,
+                sidebar_status: crate::sidebar::SidebarStatus {
+                    disk_sizes: sizes,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut s = Surface::new(160, 10);
+            draw_statusbar(&mut s, chrome.statusbar, &model);
+            s.screen_chars_to_string()
+        };
+        // Above threshold → the ⛁ chip with the size appears.
+        assert!(mk(150, 100).contains('\u{26c1}'), "trips above threshold");
+        // Below threshold → silent.
+        assert!(!mk(50, 100).contains('\u{26c1}'), "silent below threshold");
+        // Disabled (0) → silent even when huge.
+        assert!(!mk(500, 0).contains('\u{26c1}'), "silent when disabled");
     }
 
     #[test]
