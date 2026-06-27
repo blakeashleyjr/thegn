@@ -1,0 +1,23 @@
+[package]
+name = "superzej-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cross-platform system metrics substrate for the superzej masthead + telemetry overlay"
+
+# Deliberately a LEAF crate with no SQLite/C build deps, so it can be
+# `cargo check --target <macos|windows>`-ed on a Linux CI box (see the
+# `check-cross` justfile recipe). Keep heavy deps out.
+[dependencies]
+sysinfo.workspace = true
+
+# statvfs for the unix disk-free fast path.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+# Battery on non-Linux (Linux uses our own sysfs reader in battery.rs).
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+starship-battery.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

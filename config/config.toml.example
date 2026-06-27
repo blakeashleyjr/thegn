@@ -107,7 +107,9 @@ gpu = "nvtop"    # GPU monitor
 # messages).
 [bars]
 top_left = ["brand"]
-top_right = ["cpu", "mem", "gpu", "net", "battery", "date", "clock"]
+# Widgets: cpu, mem, gpu, temp (CPU °C), net, swap, freq (CPU GHz),
+# load (1-min load avg, unix only), uptime, disk (free %), battery, date, clock.
+top_right = ["cpu", "mem", "gpu", "temp", "net", "disk", "battery", "date", "clock"]
 bottom_left = ["keyhints"]
 bottom_right = ["pr", "tests", "loc", "status"]   # "loc" = tokei line count (needs tokei)
 # chrono format strings for the date/clock widgets.
@@ -126,6 +128,12 @@ refresh-secs = 2           # Polling interval in seconds
 # mem-icon = "MEM"
 # net-icon = "NET"
 # gpu-icon = "GPU"              # shows only if a GPU is detected
+# temp-icon = "TMP"             # CPU/package temperature
+# swap-icon = "SWP"             # swap usage
+# freq-icon = "FRQ"             # CPU frequency
+# load-icon = "LD"              # load average (unix)
+# uptime-icon = "UP"            # uptime
+# disk-icon = "DSK"             # filesystem free %
 # battery-icon = "BAT"          # discharging icon
 # battery-charging-icon = "CHG" # shown while charging / on AC
 battery-warn = 25               # red at/below this percent

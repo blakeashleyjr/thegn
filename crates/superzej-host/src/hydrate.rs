@@ -116,7 +116,7 @@ const CONTAINER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 /// `SUPERZEJ_MODEL_REFRESH_MS`) stay whole multiples of the half-tick.
 pub(crate) fn spawn_refresh_ticker(
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
-    stats_tx: tokio_mpsc::UnboundedSender<crate::stats::StatsSnapshot>,
+    stats_tx: tokio_mpsc::UnboundedSender<superzej_metrics::StatsSnapshot>,
     container_tx: tokio_mpsc::UnboundedSender<Vec<superzej_core::sandbox::ContainerInfo>>,
     stats_interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stats_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -131,8 +131,10 @@ pub(crate) fn spawn_refresh_ticker(
         let container_every = CONTAINER_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let mut ticks: u64 = 0;
         // System stats for the top bar ride the same thread/cadence — the
-        // /proc reads never touch the event loop.
-        let mut sampler = crate::stats::StatsSampler::new();
+        // sysinfo refreshes never touch the event loop. The disk-free widget
+        // reflects the filesystem holding the working dir (where worktrees live).
+        let disk_path = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+        let mut sampler = superzej_metrics::StatsSampler::new(disk_path);
         let _ = stats_tx.send(sampler.sample()); // prime counters for rate deltas
         let mut last_stats = Instant::now();
         loop {

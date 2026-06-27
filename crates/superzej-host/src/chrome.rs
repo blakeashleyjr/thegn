@@ -342,7 +342,7 @@ pub struct FrameModel {
     /// The input-mode chip letter for the statusbar ("N", "V", "I", "E").
     pub mode_chip: String,
     /// Latest system stats reading for the top bar.
-    pub stats: crate::stats::StatsSnapshot,
+    pub stats: superzej_metrics::StatsSnapshot,
     /// Latest Prometheus scrape state for the sidebar metrics section.
     pub metrics: crate::metrics::MetricsState,
     /// tokei line count for the active worktree (bottom-bar widget).
@@ -567,12 +567,15 @@ fn cluster_width(parts: &[(String, usize)], kept: &[usize]) -> usize {
     kept.iter().map(|&i| parts[i].1).sum::<usize>() + 3 * (kept.len() - 1) + 1
 }
 
-/// Drop right-cluster widgets in priority order — `date` first, then `gpu` —
-/// until the cluster fits `avail` columns. (The brand/logo is the caller's
-/// final sacrifice.) Returns the surviving indices in display order.
+/// Drop right-cluster widgets in priority order until the cluster fits `avail`
+/// columns — softest stats shed first, leaving cpu/mem/net/battery longest.
+/// (The brand/logo is the caller's final sacrifice.) Returns the surviving
+/// indices in display order.
 fn fit_stats_cluster(parts: &[(String, usize)], avail: usize) -> Vec<usize> {
     let mut kept: Vec<usize> = (0..parts.len()).collect();
-    for victim in ["date", "gpu"] {
+    for victim in [
+        "date", "uptime", "load", "freq", "swap", "temp", "disk", "gpu",
+    ] {
         if cluster_width(parts, &kept) <= avail {
             break;
         }
@@ -878,6 +881,41 @@ fn ratio_level(used: f32, total: f32) -> Level {
     }
 }
 
+/// Temperature pressure (°C): ≥85 is critical, ≥70 warns.
+fn temp_level(c: f32) -> Level {
+    if c >= 85.0 {
+        Level::Crit
+    } else if c >= 70.0 {
+        Level::Warn
+    } else {
+        Level::Normal
+    }
+}
+
+/// Disk free-space pressure (inverted — low free is bad): ≤5% critical, ≤15%
+/// warns.
+fn free_level(free: u8) -> Level {
+    if free <= 5 {
+        Level::Crit
+    } else if free <= 15 {
+        Level::Warn
+    } else {
+        Level::Normal
+    }
+}
+
+/// Human uptime: `3d4h`, `4h12m`, or `12m`.
+fn fmt_uptime(secs: u64) -> String {
+    let (d, h, m) = (secs / 86_400, (secs % 86_400) / 3600, (secs % 3600) / 60);
+    if d > 0 {
+        format!("{d}d{h}h")
+    } else if h > 0 {
+        format!("{h}h{m}m")
+    } else {
+        format!("{m}m")
+    }
+}
+
 fn level_color(level: Level) -> ColorAttribute {
     match level {
         Level::Normal => col(S::Dim),
@@ -915,13 +953,46 @@ fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> {
                 level_color(stat_level(p)),
             )
         }),
+        "temp" => s.cpu_temp_c.map(|c| {
+            w(
+                format!("{} {c:.0}\u{00b0}C", ic.temp_icon),
+                level_color(temp_level(c)),
+            )
+        }),
+        "swap" => s.swap_gib.map(|(u, t)| {
+            w(
+                format!("{} {u:.1}/{t:.0}G", ic.swap_icon),
+                level_color(ratio_level(u, t)),
+            )
+        }),
+        "freq" => s.cpu_freq_mhz.map(|mhz| {
+            w(
+                format!("{} {:.1}GHz", ic.freq_icon, mhz as f32 / 1000.0),
+                col(S::Dim),
+            )
+        }),
+        "load" => s
+            .load_avg
+            .map(|(one, _, _)| w(format!("{} {one:.2}", ic.load_icon), col(S::Dim))),
+        "uptime" => s.uptime_secs.map(|secs| {
+            w(
+                format!("{} {}", ic.uptime_icon, fmt_uptime(secs)),
+                col(S::Dim),
+            )
+        }),
+        "disk" => s.disk_free_pct.map(|free| {
+            w(
+                format!("{} {free:>2}%", ic.disk_icon),
+                level_color(free_level(free)),
+            )
+        }),
         "net" => s.net_bps.map(|(rx, tx)| {
             w(
                 format!(
                     "{}  \u{2193}{} \u{2191}{}",
                     ic.net_icon,
-                    crate::stats::fmt_rate(rx),
-                    crate::stats::fmt_rate(tx)
+                    superzej_metrics::fmt_rate(rx),
+                    superzej_metrics::fmt_rate(tx)
                 ),
                 col(S::Dim),
             )
@@ -2739,7 +2810,7 @@ mod tests {
     fn masthead_stats_use_quiet_separators_and_threshold_colors() {
         let chrome = layout::compute(160, 10, false, false);
         let model = FrameModel {
-            stats: crate::stats::StatsSnapshot {
+            stats: superzej_metrics::StatsSnapshot {
                 cpu_pct: Some(95),
                 mem_gib: Some((10.0, 64.0)),
                 ..Default::default()

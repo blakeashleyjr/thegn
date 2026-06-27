@@ -584,7 +584,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // (branch moves, PR cache) and bounds staleness. The loop owns the actual
     // refresh; this thread just pulses a tick + waker on the interval.
     let (refresh_tx, refresh_rx) = tokio_mpsc::unbounded_channel::<RefreshKind>();
-    let (stats_tx, stats_rx) = tokio_mpsc::unbounded_channel::<crate::stats::StatsSnapshot>();
+    let (stats_tx, stats_rx) = tokio_mpsc::unbounded_channel::<superzej_metrics::StatsSnapshot>();
     let (container_tx, container_rx) =
         tokio_mpsc::unbounded_channel::<Vec<superzej_core::sandbox::ContainerInfo>>();
     let (metrics_tx, metrics_rx) = tokio_mpsc::unbounded_channel::<crate::metrics::MetricsState>();
@@ -6455,7 +6455,7 @@ async fn event_loop<T: Terminal>(
     mut config_rx: tokio_mpsc::UnboundedReceiver<Result<superzej_core::config::Config, String>>,
     refresh_tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     mut refresh_rx: tokio_mpsc::UnboundedReceiver<RefreshKind>,
-    mut stats_rx: tokio_mpsc::UnboundedReceiver<crate::stats::StatsSnapshot>,
+    mut stats_rx: tokio_mpsc::UnboundedReceiver<superzej_metrics::StatsSnapshot>,
     mut container_rx: tokio_mpsc::UnboundedReceiver<Vec<superzej_core::sandbox::ContainerInfo>>,
     mut metrics_rx: tokio_mpsc::UnboundedReceiver<crate::metrics::MetricsState>,
     mut ai_metrics_rx: tokio_mpsc::UnboundedReceiver<crate::chrome::AiMetrics>,

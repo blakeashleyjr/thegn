@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 
-use crate::stats::StatsSnapshot;
+use superzej_metrics::StatsSnapshot;
 
 /// Samples retained per series. The widest graph reads 2 values per braille
 /// cell, so 192 covers a 96-cell layer with room to spare.
@@ -34,6 +34,11 @@ fn norm(vals: Vec<f32>) -> Vec<f32> {
     vals.into_iter().map(|v| v / max).collect()
 }
 
+/// Full-scale reference for the temperature graph (°C). Sensors rarely exceed
+/// this, so a fixed scale reads intuitively (axis 0 / 50 / 100) rather than the
+/// jittery window-relative scale a `norm()` would give a slow-moving signal.
+const TEMP_FULL_SCALE_C: f32 = 100.0;
+
 /// Rolling per-metric history, pushed on every stats drain in the loop.
 #[derive(Debug, Clone, Default)]
 pub struct TelemetryHistory {
@@ -45,6 +50,14 @@ pub struct TelemetryHistory {
     rx: VecDeque<f32>,
     /// Raw transmit rate, bytes/s.
     tx: VecDeque<f32>,
+    /// CPU/package temperature, raw °C.
+    temp: VecDeque<f32>,
+    /// Swap used/total 0..=1.
+    swap: VecDeque<f32>,
+    /// Aggregate disk IO (read + write) rate, bytes/s.
+    disk_io: VecDeque<f32>,
+    /// 1-minute load average, raw.
+    load: VecDeque<f32>,
 }
 
 impl TelemetryHistory {
@@ -63,6 +76,20 @@ impl TelemetryHistory {
         let (rx, tx) = snap.net_bps.unwrap_or((0, 0));
         push_cap(&mut self.rx, rx as f32);
         push_cap(&mut self.tx, tx as f32);
+        push_cap(&mut self.temp, snap.cpu_temp_c.unwrap_or(0.0));
+        push_cap(
+            &mut self.swap,
+            snap.swap_gib
+                .filter(|(_, t)| *t > 0.0)
+                .map(|(u, t)| u / t)
+                .unwrap_or(0.0),
+        );
+        let disk_io: u64 = snap.disks.iter().map(|d| d.read_bps + d.write_bps).sum();
+        push_cap(&mut self.disk_io, disk_io as f32);
+        push_cap(
+            &mut self.load,
+            snap.load_avg.map(|(one, _, _)| one).unwrap_or(0.0),
+        );
     }
 
     /// CPU series (0..=1), right-aligned to `n` values.
@@ -91,6 +118,34 @@ impl TelemetryHistory {
             self.rx.back().copied().unwrap_or(0.0) as u64,
             self.tx.back().copied().unwrap_or(0.0) as u64,
         )
+    }
+
+    /// Temperature series scaled to a fixed 0..=1 (0–100 °C), right-aligned.
+    pub fn temp_series(&self, n: usize) -> Vec<f32> {
+        series(&self.temp, n)
+            .into_iter()
+            .map(|c| (c / TEMP_FULL_SCALE_C).clamp(0.0, 1.0))
+            .collect()
+    }
+
+    /// Swap series (0..=1), right-aligned to `n` values.
+    pub fn swap_series(&self, n: usize) -> Vec<f32> {
+        series(&self.swap, n)
+    }
+
+    /// Aggregate disk-IO series normalized by the window's rolling max.
+    pub fn disk_io_series(&self, n: usize) -> Vec<f32> {
+        norm(series(&self.disk_io, n))
+    }
+
+    /// Load-average series normalized by the window's rolling max.
+    pub fn load_series(&self, n: usize) -> Vec<f32> {
+        norm(series(&self.load, n))
+    }
+
+    /// Latest aggregate disk-IO rate in bytes/s, for the headline.
+    pub fn last_disk_io(&self) -> u64 {
+        self.disk_io.back().copied().unwrap_or(0.0) as u64
     }
 }
 

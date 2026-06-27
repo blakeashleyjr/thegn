@@ -1097,6 +1097,18 @@ pub struct StatsConfig {
     pub net_icon: String,
     /// Icon for GPU stat.
     pub gpu_icon: String,
+    /// Icon for the CPU/package temperature stat.
+    pub temp_icon: String,
+    /// Icon for the swap-usage stat.
+    pub swap_icon: String,
+    /// Icon for the CPU-frequency stat.
+    pub freq_icon: String,
+    /// Icon for the load-average stat.
+    pub load_icon: String,
+    /// Icon for the uptime stat.
+    pub uptime_icon: String,
+    /// Icon for the disk free-space stat.
+    pub disk_icon: String,
     /// Icon for the battery stat (discharging).
     pub battery_icon: String,
     /// Icon shown while the battery is charging / on AC.
@@ -1125,6 +1137,12 @@ impl Default for StatsConfig {
             mem_icon: "\u{efc5}".into(),
             net_icon: "\u{f1eb}".into(),              // nf-fa-wifi
             gpu_icon: "\u{f2db}".into(),              // nf-fa-microchip
+            temp_icon: "\u{f2c7}".into(),             // nf-fa-thermometer_full
+            swap_icon: "\u{f0ec}".into(),             // nf-fa-exchange
+            freq_icon: "\u{f0e4}".into(),             // nf-fa-tachometer
+            load_icon: "\u{f201}".into(),             // nf-fa-line_chart
+            uptime_icon: "\u{f017}".into(),           // nf-fa-clock_o
+            disk_icon: "\u{f0a0}".into(),             // nf-fa-hdd_o
             battery_icon: "\u{f240}".into(),          // nf-fa-battery_full
             battery_charging_icon: "\u{f0e7}".into(), // nf-fa-bolt — lightning bolt
             battery_warn: 25,
@@ -1135,10 +1153,11 @@ impl Default for StatsConfig {
 
 /// `[bars]` — the customizable widget bars framing the workspace. Each slot is
 /// an ordered widget-id list; unknown ids warn and are skipped. Built-ins:
-/// `brand` (superzej + version), `cpu`, `mem`, `gpu`, `net`, `battery`,
-/// `date`, `clock` (top bar) and `keyhints` (context-dependent keybinds),
-/// `pr` (forge + PR number/state), `status` (transient messages + the
-/// keybind-lock badge) for the bottom bar.
+/// `brand` (superzej + version), `cpu`, `mem`, `gpu`, `net`, `temp` (CPU °C),
+/// `swap`, `freq` (CPU GHz), `load` (1-min load avg, unix), `uptime`, `disk`
+/// (free %), `battery`, `date`, `clock` (top bar) and `keyhints`
+/// (context-dependent keybinds), `pr` (forge + PR number/state), `status`
+/// (transient messages + the keybind-lock badge) for the bottom bar.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct BarsConfig {
@@ -1160,7 +1179,9 @@ impl Default for BarsConfig {
                 "cpu".into(),
                 "mem".into(),
                 "gpu".into(),
+                "temp".into(),
                 "net".into(),
+                "disk".into(),
                 "battery".into(),
                 "date".into(),
                 "clock".into(),
@@ -4007,6 +4028,12 @@ name = "minimal"
             ("mem", &s.mem_icon),
             ("net", &s.net_icon),
             ("gpu", &s.gpu_icon),
+            ("temp", &s.temp_icon),
+            ("swap", &s.swap_icon),
+            ("freq", &s.freq_icon),
+            ("load", &s.load_icon),
+            ("uptime", &s.uptime_icon),
+            ("disk", &s.disk_icon),
             ("battery", &s.battery_icon),
             ("battery_charging", &s.battery_charging_icon),
         ] {
@@ -5991,7 +6018,9 @@ transport = \"ssh\"
         assert_eq!(b.top_left, vec!["brand"]);
         assert_eq!(
             b.top_right,
-            vec!["cpu", "mem", "gpu", "net", "battery", "date", "clock"]
+            vec![
+                "cpu", "mem", "gpu", "temp", "net", "disk", "battery", "date", "clock"
+            ]
         );
         assert_eq!(b.bottom_left, vec!["keyhints"]);
         assert_eq!(b.bottom_right, vec!["pr", "tests", "loc", "status"]);
