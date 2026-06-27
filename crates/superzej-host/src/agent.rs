@@ -1063,8 +1063,11 @@ mod tests {
             backend: "host".into(),
             warnings: vec![],
         };
-        // SAFETY: single-threaded test; set a known base PATH to assert prepend.
-        unsafe { std::env::set_var("PATH", "/usr/bin:/bin") };
+        // `inject_devshell_host` prepends to the *process* PATH, so set a known
+        // base under the env guard. Without restoring it, `/usr/bin:/bin` would
+        // leak to every later test, dropping git/the toolchain (under /nix/store
+        // in the dev shell) out of PATH and breaking anything that shells out.
+        let _env = crate::testenv::EnvVarGuard::set(&[("PATH", "/usr/bin:/bin")]);
         inject_devshell_host(&mut spec, &dev);
 
         let path = spec.env.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v);
