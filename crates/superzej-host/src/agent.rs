@@ -139,6 +139,10 @@ pub struct SandboxOutcome {
     /// mode projects the tree to a local mountpoint (`sshfs`/`sync`), so the pane
     /// runs locally *at the mountpoint* rather than over the raw placement.
     pub cwd_override: Option<PathBuf>,
+    /// The DB `worktrees.location` blob to persist for this worktree (`None` =>
+    /// local). Set for a `Placement::Provider` env so the chrome's git/fs reads
+    /// route into the sandbox via [`GitLoc::Provider`](superzej_core::remote::GitLoc).
+    pub location: Option<String>,
 }
 
 /// Resolve and `ensure` the sandbox for `worktree` — the BLOCKING half of a
@@ -196,6 +200,24 @@ pub fn prepare_sandbox_env(
     // placement isn't handled by `for_environment`, which is ssh-only).
     let env_data = environment.data;
     let env_name = environment.name.clone();
+    // For a managed-provider env, persist a `GitLoc::Provider` location so the
+    // chrome's git/fs reads route into the sandbox via the control-plane exec
+    // prefix. `None` for local/ssh/k8s (their data plane is unchanged). The
+    // worktree dir inside the env is the provider `workdir` (default /workspace).
+    let location = match &placement {
+        superzej_core::placement::Placement::Provider(p) => {
+            let workdir = cfg
+                .env
+                .get(&env_name)
+                .map(|e| e.provider.sync_workdir())
+                .unwrap_or_else(|| "/workspace".to_string());
+            Some(superzej_core::remote::GitLoc::provider_db_string(
+                &p.control_prefix,
+                &workdir,
+            ))
+        }
+        _ => None,
+    };
     // A data mode that projects the tree to a local mountpoint (sshfs/sync) means
     // the pane runs LOCALLY *at the mountpoint*: the (ssh) placement is used only
     // to establish the projection, while execution is local. So pin the pane cwd
@@ -320,6 +342,7 @@ pub fn prepare_sandbox_env(
                     shell: env_shell,
                     is_remote: env_is_remote,
                     cwd_override,
+                    location,
                 });
             }
             if let Some(expected) = explicit_backend
@@ -346,6 +369,7 @@ pub fn prepare_sandbox_env(
                         shell: env_shell,
                         is_remote: env_is_remote,
                         cwd_override,
+                        location,
                     });
                 }
                 Err(e) if explicit_choice => {
@@ -391,6 +415,7 @@ pub fn prepare_sandbox_env(
         shell: env_shell,
         is_remote: env_is_remote,
         cwd_override,
+        location,
     })
 }
 
@@ -1002,6 +1027,7 @@ mod tests {
             shell: String::new(),
             is_remote: false,
             cwd_override: None,
+            location: None,
         };
         let spec = compose_spec(&cfg, "/wt/x", Some("sz/x"), "claude", &loc, &host);
         assert_eq!(
