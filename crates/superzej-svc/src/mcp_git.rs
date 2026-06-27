@@ -4,7 +4,7 @@
 //! calls, inverting the core→svc layering boundary. Uses the CLI backend
 //! (robust for on-demand agent calls; the gix fast path is for the hot loop).
 
-use crate::git::{CliGit, GitBackend};
+use crate::git::{BranchOps, CliGit, CommitOps, GitBackend};
 use std::path::Path;
 use superzej_core::remote::GitLoc;
 use superzej_core::{patch, semantic};
@@ -14,6 +14,20 @@ pub struct HouseGitImpl;
 impl HouseGitImpl {
     fn loc(worktree: &str) -> GitLoc {
         GitLoc::for_worktree(Path::new(worktree))
+    }
+
+    /// Run the `gh` CLI in the worktree, returning stdout (text) or stderr (err).
+    fn gh(worktree: &str, args: &[&str]) -> Result<String, String> {
+        let out = std::process::Command::new("gh")
+            .args(args)
+            .current_dir(worktree)
+            .output()
+            .map_err(|e| format!("gh: {e}"))?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
     }
 }
 
@@ -113,11 +127,39 @@ impl superzej_core::mcp::HouseGit for HouseGitImpl {
     }
 }
 
+impl superzej_core::mcp::HouseForge for HouseGitImpl {
+    fn pr_status(&self, worktree: &str) -> Result<String, String> {
+        Self::gh(worktree, &["pr", "status"])
+    }
+
+    fn pr_list(&self, worktree: &str) -> Result<String, String> {
+        Self::gh(worktree, &["pr", "list", "--limit", "30"])
+    }
+
+    fn ci_runs(&self, worktree: &str) -> Result<String, String> {
+        Self::gh(worktree, &["run", "list", "--limit", "10"])
+    }
+
+    fn create_branch(&self, worktree: &str, name: &str, base: &str) -> Result<String, String> {
+        CliGit
+            .create_branch(&Self::loc(worktree), name, base)
+            .map(|_| format!("created branch {name} from {base}"))
+            .map_err(|e| e.to_string())
+    }
+
+    fn commit(&self, worktree: &str, message: &str) -> Result<String, String> {
+        CliGit
+            .commit(&Self::loc(worktree), message, false, None)
+            .map(|_| format!("committed: {message}"))
+            .map_err(|e| e.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Command;
-    use superzej_core::mcp::HouseGit;
+    use superzej_core::mcp::{HouseForge, HouseGit};
 
     fn git(dir: &Path, args: &[&str]) {
         let ok = Command::new("git")
@@ -166,6 +208,38 @@ mod tests {
             s.to_lowercase().contains("commit message"),
             "semantic missing commit msg: {s}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn house_forge_branch_and_commit() {
+        let dir = std::env::temp_dir().join(format!("sz-houseforge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wt = dir.to_str().unwrap();
+        git(&dir, &["init", "-q"]);
+        git(&dir, &["config", "user.email", "t@t"]);
+        git(&dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+
+        let h = HouseGitImpl;
+        // create_branch off HEAD, then commit a staged change.
+        h.create_branch(wt, "feature/x", "HEAD").unwrap();
+        std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        git(&dir, &["add", "."]);
+        let out = h.commit(wt, "add line two").unwrap();
+        assert!(out.contains("add line two"), "commit out: {out}");
+        // The commit landed.
+        let log = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["log", "--oneline", "-1"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&log.stdout).contains("add line two"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

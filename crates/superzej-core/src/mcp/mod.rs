@@ -22,3 +22,21 @@ pub trait HouseGit: Send + Sync {
     /// message — superzej's structural-diff intelligence.
     fn semantic_diff(&self, worktree: &str) -> Result<String, String>;
 }
+
+/// Host-provided forge (PR/CI) + git-write capability exposed as house tools.
+/// Like [`HouseGit`], implemented in `superzej-svc` (over `gh`/`glab` + the git
+/// backend) and injected via [`router::McpRouter::with_forge`]. Reads shell the
+/// forge CLI synchronously; writes use the git backend. (In additive mode the
+/// agent already has native shell, so these add structure, not new authority.)
+pub trait HouseForge: Send + Sync {
+    /// PR state for the current branch (`gh pr status`).
+    fn pr_status(&self, worktree: &str) -> Result<String, String>;
+    /// Open PRs in the repo (`gh pr list`).
+    fn pr_list(&self, worktree: &str) -> Result<String, String>;
+    /// Recent CI runs (`gh run list`).
+    fn ci_runs(&self, worktree: &str) -> Result<String, String>;
+    /// Create a branch off `base` in the worktree.
+    fn create_branch(&self, worktree: &str, name: &str, base: &str) -> Result<String, String>;
+    /// Commit staged changes with `message`.
+    fn commit(&self, worktree: &str, message: &str) -> Result<String, String>;
+}

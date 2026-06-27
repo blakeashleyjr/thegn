@@ -9,8 +9,11 @@ pub struct McpRouter {
     /// Host-injected git/semantic provider (svc-backed). When set, the git house
     /// tools are advertised + serviced against `worktree`.
     git: Option<Arc<dyn crate::mcp::HouseGit>>,
-    /// The connection's worktree (the git tools operate here; the agent doesn't
-    /// pass a path, so it can't query other worktrees).
+    /// Host-injected forge (PR/CI) + git-write provider. When set, the forge house
+    /// tools are advertised + serviced against `worktree`.
+    forge: Option<Arc<dyn crate::mcp::HouseForge>>,
+    /// The connection's worktree (the git/forge tools operate here; the agent
+    /// doesn't pass a path, so it can't reach other worktrees).
     worktree: Option<String>,
 }
 
@@ -20,6 +23,7 @@ impl McpRouter {
             db,
             bus,
             git: None,
+            forge: None,
             worktree: None,
         }
     }
@@ -28,6 +32,14 @@ impl McpRouter {
     /// `git_status`/`git_diff`/`git_branches`/`semantic_diff` house tools.
     pub fn with_git(mut self, git: Arc<dyn crate::mcp::HouseGit>, worktree: String) -> Self {
         self.git = Some(git);
+        self.worktree = Some(worktree);
+        self
+    }
+
+    /// Attach the host's forge (PR/CI) + git-write provider scoped to `worktree`,
+    /// enabling `pr_status`/`pr_list`/`ci_runs`/`create_branch`/`commit`.
+    pub fn with_forge(mut self, forge: Arc<dyn crate::mcp::HouseForge>, worktree: String) -> Self {
+        self.forge = Some(forge);
         self.worktree = Some(worktree);
         self
     }
@@ -108,6 +120,20 @@ impl McpRouter {
         } else {
             Vec::new()
         };
+        if self.forge.is_some() {
+            tools.extend([
+                json!({ "name": "pr_status", "description": "Pull-request state for the current branch.",
+                    "inputSchema": { "type": "object", "properties": {} } }),
+                json!({ "name": "pr_list", "description": "Open pull requests in this repo.",
+                    "inputSchema": { "type": "object", "properties": {} } }),
+                json!({ "name": "ci_runs", "description": "Recent CI runs for this repo.",
+                    "inputSchema": { "type": "object", "properties": {} } }),
+                json!({ "name": "create_branch", "description": "Create a git branch off `base` (default HEAD) in this worktree.",
+                    "inputSchema": { "type": "object", "properties": { "name": { "type": "string" }, "base": { "type": "string" } }, "required": ["name"] } }),
+                json!({ "name": "commit", "description": "Commit staged changes in this worktree with a message.",
+                    "inputSchema": { "type": "object", "properties": { "message": { "type": "string" } }, "required": ["message"] } }),
+            ]);
+        }
         let base = json!([
                 {
                     "name": "check_my_budget",
@@ -190,6 +216,40 @@ impl McpRouter {
         })
     }
 
+    /// Dispatch the forge/git-write house tools (these take args). Returns `None`
+    /// when `name` isn't one of them.
+    fn forge_tool(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> Option<Result<serde_json::Value, (i32, String)>> {
+        if !matches!(
+            name,
+            "pr_status" | "pr_list" | "ci_runs" | "create_branch" | "commit"
+        ) {
+            return None;
+        }
+        let (Some(forge), Some(wt)) = (self.forge.as_ref(), self.worktree.as_deref()) else {
+            return Some(Err((-32603, "forge provider not configured".to_string())));
+        };
+        let str_arg = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or_default();
+        let res = match name {
+            "pr_status" => forge.pr_status(wt),
+            "pr_list" => forge.pr_list(wt),
+            "ci_runs" => forge.ci_runs(wt),
+            "create_branch" => {
+                let base = args.get("base").and_then(|v| v.as_str()).unwrap_or("HEAD");
+                forge.create_branch(wt, str_arg("name"), base)
+            }
+            "commit" => forge.commit(wt, str_arg("message")),
+            _ => unreachable!(),
+        };
+        Some(match res {
+            Ok(text) => Ok(json!({ "content": [{ "type": "text", "text": text }] })),
+            Err(e) => Err((-32603, e)),
+        })
+    }
+
     fn handle_tools_call(
         &self,
         params: &serde_json::Value,
@@ -199,6 +259,10 @@ impl McpRouter {
 
         // Git/semantic house tools — no args; operate on the connection worktree.
         if let Some(out) = self.git_tool(name) {
+            return out;
+        }
+        // Forge / git-write house tools (take args).
+        if let Some(out) = self.forge_tool(name, args) {
             return out;
         }
 
@@ -228,33 +292,72 @@ impl McpRouter {
                 let wt = args.get("worktree").and_then(|v| v.as_str()).unwrap_or("");
                 let agent = args.get("agent").and_then(|v| v.as_str()).unwrap_or("");
 
-                self.bus.publish(&crate::event_bus::Event::AgentDone {
-                    worktree: wt.to_string(),
-                    agent: agent.to_string(),
-                    success: true,
-                });
+                // Record a real, tracked dispatch (status 'queued') + notify the
+                // human, who launches it. We deliberately do NOT auto-spawn an agent
+                // from an agent's tool call (runaway/recursion risk) — the human (or
+                // an orchestrator) is the gate. Replaces the old fake AgentDone.
+                let _ = self
+                    .db
+                    .put_agent_dispatch(&format!("subtask:{wt}"), wt, agent);
+                let msg = format!("agent requested a subtask: run `{agent}` in {wt}");
+                let _ = self.db.put_notification(
+                    crate::notification::NotificationKind::AgentAttention.as_str(),
+                    wt,
+                    &msg,
+                    wt,
+                );
+                self.bus.publish_with_notification(
+                    &crate::event_bus::Event::NotificationReceived {
+                        notification: crate::notification::Notification {
+                            id: 0,
+                            kind: crate::notification::NotificationKind::AgentAttention,
+                            source_ref: format!("subtask:{wt}"),
+                            message: msg,
+                            created_at_ms: crate::util::now(),
+                            read: false,
+                            worktree_path: wt.to_string(),
+                        },
+                    },
+                );
 
                 Ok(json!({
                     "content": [{
                         "type": "text",
-                        "text": format!("Subtask requested for {} with agent {}", wt, agent)
+                        "text": format!("Subtask queued: `{agent}` in {wt} (awaiting human launch).")
                     }]
                 }))
             }
             "request_human" => {
-                let wt = args.get("worktree").and_then(|v| v.as_str()).unwrap_or("");
+                let wt = args
+                    .get("worktree")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .or(self.worktree.as_deref())
+                    .unwrap_or("");
                 let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("");
 
-                self.bus.publish(&crate::event_bus::Event::AgentDone {
-                    worktree: wt.to_string(),
-                    agent: "human_request".to_string(),
-                    success: false,
-                });
+                // Real attention notification: persist to the inbox + publish for a
+                // desktop toast (Alert priority). Not a fake AgentDone.
+                let kind = crate::notification::NotificationKind::AgentAttention;
+                let _ = self.db.put_notification(kind.as_str(), wt, reason, wt);
+                self.bus.publish_with_notification(
+                    &crate::event_bus::Event::NotificationReceived {
+                        notification: crate::notification::Notification {
+                            id: 0,
+                            kind,
+                            source_ref: wt.to_string(),
+                            message: reason.to_string(),
+                            created_at_ms: crate::util::now(),
+                            read: false,
+                            worktree_path: wt.to_string(),
+                        },
+                    },
+                );
 
                 Ok(json!({
                     "content": [{
                         "type": "text",
-                        "text": format!("Human requested. Reason: {}", reason)
+                        "text": format!("Flagged for human attention: {reason}")
                     }]
                 }))
             }
