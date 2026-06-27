@@ -152,8 +152,26 @@ path:
 flake-check:
     nix flake check
 
+# --- spec-driven development (OpenSpec) -----------------------------------
+# superzej manages its OWN development with OpenSpec (see openspec/, CLAUDE.md).
+# The `openspec` binary is the hermetic, pinned build from nix/openspec.nix,
+# provided on PATH by `nix develop`. tasks.md stays the roadmap index.
+
+# Passthrough to the pinned openspec CLI (telemetry off). e.g. `just openspec list`.
+openspec *args:
+    OPENSPEC_TELEMETRY=0 DO_NOT_TRACK=1 openspec {{args}}
+
+# (Re)generate the Claude Code /opsx commands + skills under .claude/ (gitignored,
+# so each clone/worktree regenerates them). Run once after a fresh checkout.
+openspec-setup:
+    OPENSPEC_TELEMETRY=0 DO_NOT_TRACK=1 openspec init --tools claude --profile core --force
+
+# Validate every spec and change strictly. Part of `ci`.
+openspec-validate:
+    OPENSPEC_TELEMETRY=0 DO_NOT_TRACK=1 openspec validate --all --strict
+
 # The full gate.
-ci: fmt-check lint build test doc-check coverage smoke sandbox-e2e-dns sandbox-e2e-db e2e nix-build
+ci: fmt-check lint build test doc-check openspec-validate coverage smoke sandbox-e2e-dns sandbox-e2e-db e2e nix-build
     @echo "ci: all green"
 
 # Visual regression suite: run all muse specs against a live szhost binary.
