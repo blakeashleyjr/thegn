@@ -15,5 +15,6 @@ pub mod log;
 pub mod lsp;
 pub mod media;
 pub mod provider;
+pub mod share;
 pub mod ssh;
 pub mod vpn;
