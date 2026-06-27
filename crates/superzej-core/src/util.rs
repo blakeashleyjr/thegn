@@ -610,6 +610,30 @@ mod tests {
     }
 
     #[test]
+    fn git_cmd_marks_every_git_env_var_for_removal() {
+        // Regression guard for the worktree/pre-commit-hook corruption class:
+        // when the test suite (or any tool) is spawned by a git hook, git has
+        // exported GIT_DIR/GIT_INDEX_FILE into the environment. `git_cmd` must
+        // strip *every* GIT_ENV_VARS entry from the child so a `-C <dir>` call
+        // operates on the intended repo, never the outer one. `env_remove`
+        // surfaces in `get_envs()` as `(key, None)`; assert all are present.
+        // (Thread-safe: inspects the Command's env overrides, never mutates the
+        // process environment.)
+        let cmd = git_cmd(std::path::Path::new("/tmp"));
+        let removed: std::collections::HashSet<&std::ffi::OsStr> = cmd
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k)
+            .collect();
+        for var in GIT_ENV_VARS {
+            assert!(
+                removed.contains(std::ffi::OsStr::new(var)),
+                "git_cmd must scrub {var} from the child environment"
+            );
+        }
+    }
+
+    #[test]
     fn strip_core_worktree_removes_only_the_core_section_key() {
         // Pollution under [core] is removed; the [core "sub"] subsection and a
         // legitimate worktree key in another section are preserved.
