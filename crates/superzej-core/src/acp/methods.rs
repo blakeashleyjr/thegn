@@ -69,4 +69,15 @@ pub enum SessionUpdateEvent {
         option_id: String,
         value: serde_json::Value,
     },
+    /// The agent finished all work for the current request (pi `agent_end`).
+    /// Drives the `AgentDone`/`AgentFailed` notification + clears the chip's
+    /// running state. Fires for user-driven turns too (not just superzej prompts).
+    AgentEnd {
+        #[serde(default = "default_true")]
+        success: bool,
+    },
+}
+
+fn default_true() -> bool {
+    true
 }
