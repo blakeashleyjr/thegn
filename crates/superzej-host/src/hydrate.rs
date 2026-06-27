@@ -78,6 +78,7 @@ pub(crate) fn spawn_refresh_ticker(
     container_tx: tokio_mpsc::UnboundedSender<Vec<superzej_core::sandbox::ContainerInfo>>,
     stats_interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stats_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    disk_path: std::path::PathBuf,
     waker: TerminalWaker,
 ) {
     use std::sync::atomic::Ordering;
@@ -91,7 +92,7 @@ pub(crate) fn spawn_refresh_ticker(
         let mut ticks: u64 = 0;
         // System stats for the top bar ride the same thread/cadence — the
         // /proc reads never touch the event loop.
-        let mut sampler = crate::stats::StatsSampler::new();
+        let mut sampler = crate::stats::StatsSampler::new(disk_path);
         let _ = stats_tx.send(sampler.sample()); // prime counters for rate deltas
         let mut last_stats = Instant::now();
         loop {
@@ -906,8 +907,12 @@ pub(crate) fn build_model(
             .folders_for_workspace(&cwd.to_string_lossy())
             .unwrap_or_default(),
         sidebar_db_terminals,
-        sidebar_status,
         disk_warn_threshold_gb: app_cfg.disk.warn_threshold_gb,
+        active_worktree_disk: sidebar_status
+            .disk_sizes
+            .get(cwd.to_string_lossy().as_ref())
+            .map(|&(total, _)| total.max(0) as u64),
+        sidebar_status,
         loc: loc_count,
         active_container_name: superzej_core::sandbox::container_name_with_profile(
             &loc.path(),

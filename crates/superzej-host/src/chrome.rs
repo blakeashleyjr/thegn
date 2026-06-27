@@ -319,6 +319,9 @@ pub struct FrameModel {
     /// of all worktree sizes (in `sidebar_status.disk_sizes`) exceeds this many
     /// GiB. 0 disables the badge. Config-derived, set in `build_model`.
     pub disk_warn_threshold_gb: u64,
+    /// Active worktree's total size (bytes), for the bottom `disk` widget next
+    /// to LOC. From the off-loop scan cache; `None` until first scanned.
+    pub active_worktree_disk: Option<u64>,
     /// True if the last input was mouse activity.
     pub panel: crate::panel::PanelData,
     /// True when the right panel currently owns keyboard focus.
@@ -475,6 +478,7 @@ impl FrameModel {
             && self.status == other.status
             && self.panel == other.panel
             && self.disk_warn_threshold_gb == other.disk_warn_threshold_gb
+            && self.active_worktree_disk == other.active_worktree_disk
     }
 }
 
@@ -869,6 +873,18 @@ fn stat_level(pct: u8) -> Level {
 }
 
 /// Ratio-based pressure (memory): ≥85% warns, ≥95% is critical.
+/// Level for a *free-space* percentage: low free is bad, so the thresholds are
+/// inverted relative to [`stat_level`] (warn ≥ critical).
+fn free_level(free: u8, warn: u8, critical: u8) -> Level {
+    if free <= critical {
+        Level::Crit
+    } else if free <= warn {
+        Level::Warn
+    } else {
+        Level::Normal
+    }
+}
+
 fn ratio_level(used: f32, total: f32) -> Level {
     if total <= 0.0 {
         return Level::Normal;
@@ -904,13 +920,13 @@ fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> {
         )),
         "cpu" => s.cpu_pct.map(|p| {
             w(
-                format!("{}  {p:>2}%", ic.cpu_icon),
+                format!("{} {p:>2}%", ic.cpu_icon),
                 level_color(stat_level(p)),
             )
         }),
         "mem" => s.mem_gib.map(|(u, t)| {
             w(
-                format!("{}  {u:.1}/{t:.0}G", ic.mem_icon),
+                format!("{} {u:.1}/{t:.0}G", ic.mem_icon),
                 level_color(ratio_level(u, t)),
             )
         }),
@@ -920,10 +936,17 @@ fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> {
                 level_color(stat_level(p)),
             )
         }),
+        // Disk shows *free* space, so the sense is inverted: low free is bad.
+        "disk" => s.disk_free_pct.map(|free| {
+            w(
+                format!("{} {free:>2}%", ic.disk_icon),
+                level_color(free_level(free, ic.disk_free_warn, ic.disk_free_critical)),
+            )
+        }),
         "net" => s.net_bps.map(|(rx, tx)| {
             w(
                 format!(
-                    "{}  \u{2193}{} \u{2191}{}",
+                    "{} \u{2193}{} \u{2191}{}",
                     ic.net_icon,
                     crate::stats::fmt_rate(rx),
                     crate::stats::fmt_rate(tx)
@@ -941,7 +964,7 @@ fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> {
             } else {
                 (&ic.battery_icon, col(S::Dim))
             };
-            w(format!("{icon}  {p:>2}%"), fg)
+            w(format!("{icon} {p:>2}%"), fg)
         }),
         "date" => Some(w(
             chrono::Local::now()
@@ -988,6 +1011,14 @@ pub fn bottombar_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> 
                 n.to_string()
             };
             w(format!("{compact} LOC"), col(S::Dim))
+        }),
+        // Active worktree's disk usage (size of its checkout incl. target/),
+        // from the off-loop scan; sits next to LOC. Hidden until first scanned.
+        "disk" => model.active_worktree_disk.map(|b| {
+            w(
+                format!("{} DISK", superzej_core::disk::human(b)),
+                col(S::Dim),
+            )
         }),
         // Forge + PR number, colored by state: open green, draft/queued
         // amber, closed and merged purple. Hidden when no PR exists.
@@ -2591,6 +2622,51 @@ mod tests {
         assert!(
             text.contains("70G"),
             "size badge shows human size: {text:?}"
+        );
+    }
+
+    #[test]
+    fn masthead_disk_widget_shows_free_pct_with_inverted_colors() {
+        let mut model = FrameModel::default();
+        // High free → normal (dim); low free → red; mid → amber. Defaults:
+        // warn 15, critical 5.
+        model.stats.disk_free_pct = Some(72);
+        let hi = masthead_widget("disk", &model).expect("disk widget present");
+        assert!(hi.text.contains("72%"), "shows free %: {:?}", hi.text);
+        assert_eq!(hi.fg, col(S::Dim), "ample free → dim");
+
+        model.stats.disk_free_pct = Some(12);
+        assert_eq!(
+            masthead_widget("disk", &model).unwrap().fg,
+            theme_color(theme::AMBER),
+            "low free → amber"
+        );
+
+        model.stats.disk_free_pct = Some(3);
+        assert_eq!(
+            masthead_widget("disk", &model).unwrap().fg,
+            theme_color(theme::RED),
+            "critically low free → red"
+        );
+
+        // Absent until sampled.
+        model.stats.disk_free_pct = None;
+        assert!(masthead_widget("disk", &model).is_none());
+    }
+
+    #[test]
+    fn bottombar_disk_widget_shows_active_worktree_size() {
+        let mut model = FrameModel::default();
+        assert!(
+            bottombar_widget("disk", &model).is_none(),
+            "hidden until scanned"
+        );
+        model.active_worktree_disk = Some(7 * 1024 * 1024 * 1024); // 7G
+        let wdg = bottombar_widget("disk", &model).expect("disk widget present");
+        assert!(
+            wdg.text.contains("7G") && wdg.text.contains("DISK"),
+            "{:?}",
+            wdg.text
         );
     }
 
