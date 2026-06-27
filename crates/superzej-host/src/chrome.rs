@@ -2098,6 +2098,7 @@ pub fn draw_chrome(
     }
     draw_columns_frame(surface, chrome);
     draw_center_tabs(surface, chrome.center_tabs, model);
+    crate::chrome::draw_drawer(surface, chrome.drawer, chrome.drawer_divider, model);
     draw_masthead(surface, chrome, model);
     draw_statusbar(surface, chrome.statusbar, model);
 }
@@ -2121,20 +2122,31 @@ fn draw_columns_frame(surface: &mut Surface, chrome: &crate::layout::ChromeLayou
     }
     // The bottom drawer's horizontal rule, matching the top divider — the seam
     // that gives the popped-up drawer a real panel edge.
-    if let Some(div) = chrome.drawer_divider
-        && div.rows > 0
-    {
-        let line = "\u{2500}".repeat(div.cols);
-        draw_text(
-            surface,
-            div.x,
-            div.y,
-            &line,
-            col(S::Border),
-            col(S::Panel),
-            div.cols,
-        );
+    #[allow(clippy::collapsible_if)]
+    if let Some(div) = chrome.drawer_divider {
+        if div.rows > 0 {
+            let line = "\u{2500}".repeat(div.cols);
+            draw_text(
+                surface,
+                div.x,
+                div.y,
+                &line,
+                col(S::Border),
+                col(S::Panel),
+                div.cols,
+            );
+        }
     }
+}
+
+pub fn draw_drawer(
+    _surface: &mut Surface,
+    _drawer: Option<Rect>,
+    _drawer_divider: Option<Rect>,
+    _model: &FrameModel,
+) {
+    // Left empty: the terminal well clears its own background, and the PTY
+    // paints the content. The drawer divider is drawn by draw_columns_frame.
 }
 
 /// A centered confirmation modal: `msg` in a summoned layer (dimmed backdrop,
