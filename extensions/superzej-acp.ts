@@ -7,7 +7,7 @@ import {
   ToolExecutionUpdateEvent,
   ToolExecutionEndEvent
 } from "@earendil-works/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import * as net from "net";
 
 export default function (pi: ExtensionAPI) {
