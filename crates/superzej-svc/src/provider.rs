@@ -828,6 +828,17 @@ impl Provider {
         }
     }
 
+    /// Idempotently ensure a sandbox named `name` exists — the warm-on-open
+    /// lifecycle. Returns `true` if it created one, `false` if it already existed.
+    /// (List-then-create; a provider with a truly idempotent create can override.)
+    pub async fn ensure_exists(&self, name: &str) -> Result<bool> {
+        if self.list().await?.iter().any(|n| n == name) {
+            return Ok(false);
+        }
+        self.create().await?;
+        Ok(true)
+    }
+
     /// Lower allow/block lists to the provider's network policy (egress translate).
     pub async fn set_network_policy(
         &self,

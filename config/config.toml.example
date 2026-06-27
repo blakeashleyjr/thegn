@@ -1090,6 +1090,11 @@ ephemeral = true
 # api_key_env = "SPRITES_TOKEN"        # empty ⇒ defaults to SPRITES_TOKEN
 # # api_base = "https://api.sprites.dev/v1"   # empty ⇒ this default
 # # workdir = "/workspace"   # data = "sync" pushes/pulls the worktree here
+# # auto_provision = false   # create the sprite on first open if missing (8-E
+# #                          #   warm-on-open). Off by default — creating a paid
+# #                          #   sandbox is opt-in; else run `superzej env provision`.
+# # auto_checkpoint = false  # checkpoint the sprite on worktree close (suspend-on-
+# #                          #   close, fast resume). Off by default (storage cost).
 # # Pane exec bridges through the `sprite` CLI (PTY-capable):
 # exec_command = ["sprite", "exec", "-s", "{id}", "--"]
 # interactive_command = ["sprite", "exec", "-s", "{id}", "--tty", "--"]
@@ -1103,6 +1108,14 @@ ephemeral = true
 # #    (Sprites checkpoints).
 # #  • FILE-SYNC — `data = "sync"` pushes the worktree into `workdir` on spawn and
 # #    pulls it back on close (via the sprite /fs API; `.git` is skipped).
+# #  • DATA PLANE — a provider worktree's git/diff/branches/files resolve INTO the
+# #    sandbox (the chrome shows real state); a fresh sprite is repo-provisioned on
+# #    open (clone for data=in_env, upload for data=sync).
+# #  • RESIDENT BRIDGE — when a static-musl `szhost` is available (build:
+# #    `nix build .#szhost-musl` or `just build-musl`; point SUPERZEJ_BRIDGE_BINARY
+# #    at it), it's pushed into the sprite and run as `szhost bridge`, so git is
+# #    fast (no per-op latency), file edits stream back live (fs.watch), activity
+# #    dots reflect in-env CPU, and tests/jobs run in the sandbox.
 # # The interactive pane still execs through the `sprite` CLI; an API-exec (WSS)
 # # bridge that removes that CLI dependency is a follow-up (needs a WS client dep).
 # ── LLM proxy (group U/V) ──────────────────────────────────────────────────

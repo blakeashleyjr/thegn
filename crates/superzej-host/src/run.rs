@@ -1994,6 +1994,9 @@ fn forget_worktree_group(
             crate::agent::deregister_vpn(&path);
             crate::agent::deproject(&path);
             crate::agent::deprovision_sync(&path);
+            // Suspend-on-close: checkpoint the sandbox (8-E) before disconnecting
+            // the bridge + tearing down. No-op unless the env sets auto_checkpoint.
+            crate::agent::checkpoint_on_close(&path);
             crate::bridge_sup::disconnect_path(&path);
             superzej_core::sandbox::teardown_by_path(&path);
         });
