@@ -877,6 +877,35 @@ mod tests {
     }
 
     #[test]
+    fn terminal_group_round_trips_through_persist_resurrect() {
+        let db = temp_db();
+        let sess = "s";
+        let mut home = WorktreeGroup::new("app/home", GroupKind::Home, "/r");
+        home.tabs[0].center = CenterTree::Leaf(0);
+        // A terminal group: no worktree path, kind = Terminal. The connection
+        // string lives in the separate `terminals` table (resolved by name at
+        // materialize time), so the group itself only needs kind + name to
+        // survive a restart and respawn its connection.
+        let mut term = WorktreeGroup::new("term-ssh-host", GroupKind::Terminal, "");
+        term.tabs[0].center = CenterTree::Leaf(0);
+        let session = Session {
+            id: sess.to_string(),
+            worktrees: vec![home, term],
+            active: 1,
+        };
+        session.persist(&db, sess, 1234).unwrap();
+
+        let back = Session::resurrect(&db, sess).unwrap();
+        let t = back
+            .worktrees
+            .iter()
+            .find(|g| g.name == "term-ssh-host")
+            .expect("terminal group survives resurrect");
+        assert_eq!(t.kind, GroupKind::Terminal, "terminal kind round-trips");
+        assert_eq!(t.path, "", "terminal carries no worktree path");
+    }
+
+    #[test]
     fn new_registered_worktree_resurrects_below_positionless_ones() {
         let db = temp_db();
         let sess = "s";
