@@ -5510,6 +5510,7 @@ dependencies = [
  "criterion",
  "futures",
  "gix",
+ "notify",
  "octocrab",
  "reqwest",
  "serde",

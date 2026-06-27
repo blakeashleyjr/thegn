@@ -236,7 +236,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Bridge => {
             // The resident agent: framed protocol over stdio until EOF. stdout is
             // the protocol channel — nothing else may write to it.
-            superzej_svc::bridge::serve(std::io::stdin().lock(), std::io::stdout().lock());
+            superzej_svc::bridge::serve(std::io::stdin().lock(), std::io::stdout());
             Ok(())
         }
         Command::SandboxArgv { worktree } => {

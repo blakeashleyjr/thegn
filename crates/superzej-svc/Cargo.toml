@@ -21,6 +21,9 @@ base64 = "0.22"
 # MPRIS media control over D-Bus (the [media] backend; playerctl is the fallback).
 zbus.workspace = true
 futures.workspace = true
+# Resident-bridge `fs.watch`: inotify in the env, streamed to the host. Matches
+# the host's pin so the workspace resolves one version.
+notify = "6"
 
 [dev-dependencies]
 criterion.workspace = true
