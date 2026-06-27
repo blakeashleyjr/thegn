@@ -433,7 +433,31 @@ pub trait GitBackend: Send + Sync {
 /// works for both local and remote locs). The native impl composes over this.
 pub struct CliGit;
 
+/// Run `git -C <path> <args>` over a live resident bridge (the persistent
+/// in-env agent), returning stdout. The CLI output format is unchanged, so every
+/// `CliGit` parser works on the result verbatim.
+fn run_bridge(
+    b: &crate::bridge::BridgeClient,
+    loc: &GitLoc,
+    args: &[&str],
+    env: &[(String, String)],
+) -> Result<String> {
+    let mut argv: Vec<String> = vec!["git".into(), "-C".into(), loc.path()];
+    argv.extend(args.iter().map(|s| s.to_string()));
+    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let r = b.exec(&refs, None, env)?;
+    if r.exit != 0 {
+        anyhow::bail!("git {} failed: {}", args.join(" "), r.stderr.trim());
+    }
+    Ok(r.stdout)
+}
+
 fn run(loc: &GitLoc, args: &[&str]) -> Result<String> {
+    // Route through the resident bridge when one is connected for this worktree
+    // (no-op/None for local locs — see `bridge::for_loc`'s fast path).
+    if let Some(b) = crate::bridge::for_loc(loc) {
+        return run_bridge(&b, loc, args, &[]);
+    }
     let out = loc
         .git_command(args)
         .output()
@@ -452,6 +476,13 @@ fn run(loc: &GitLoc, args: &[&str]) -> Result<String> {
 /// `GIT_TERMINAL_PROMPT=0` — a credential/gpg prompt must fail fast, never
 /// hang the background thread that mutations run on.
 pub(crate) fn run_w(loc: &GitLoc, envs: &[(&str, &str)], args: &[&str]) -> Result<String> {
+    // Route mutations through the resident bridge when connected (it runs in the
+    // env, which owns its own locking — the local lock below is for local locs).
+    if let Some(b) = crate::bridge::for_loc(loc) {
+        let mut env: Vec<(String, String)> = vec![("GIT_TERMINAL_PROMPT".into(), "0".into())];
+        env.extend(envs.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        return run_bridge(&b, loc, args, &env);
+    }
     // Serialize this mutation against other szhost/agent processes on the same
     // repo (held for the subprocess's lifetime). Remote locs lock on their own
     // machine, so skip locally. Best-effort — `None` degrades to unlocked.

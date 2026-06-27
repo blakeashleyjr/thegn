@@ -154,6 +154,12 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::logs::Action,
     },
+    /// Hidden: run the resident bridge agent over stdio. The host spawns this
+    /// *inside* a remote env (`ssh … szhost bridge`, `sprite exec … szhost
+    /// bridge`); it speaks the framed bridge protocol (git/fs/proc) on stdin/
+    /// stdout. Not for interactive use — stdout is the protocol channel.
+    #[command(hide = true)]
+    Bridge,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -227,6 +233,12 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Env { action } => cmd::env::run(&cfg, action),
         Command::Notify { action } => cmd::notify::run(action),
         Command::Logs { action } => cmd::logs::run(&cfg, action),
+        Command::Bridge => {
+            // The resident agent: framed protocol over stdio until EOF. stdout is
+            // the protocol channel — nothing else may write to it.
+            superzej_svc::bridge::serve(std::io::stdin().lock(), std::io::stdout().lock());
+            Ok(())
+        }
         Command::SandboxArgv { worktree } => {
             let wt = worktree
                 .or_else(|| std::env::current_dir().ok()?.to_str().map(str::to_string))
