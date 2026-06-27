@@ -10364,18 +10364,46 @@ async fn event_loop<T: Terminal>(
             let frame_plan = crate::render_plan::plan(&damage, &overlays);
             // Rects recomposed by the incremental path; drive the bounded diff.
             let mut pane_diff_rects: Vec<Rect> = Vec::new();
+            // Card titles: "{title} · {worktree-leaf}" — the OSC window title the
+            // app sets, else the program name derived from the spawn argv. Hoisted
+            // above the if-chain so the partial paths (which repaint a pane's card
+            // after recomposing its content) and the full path share one closure.
+            let title_leaf = model
+                .worktree
+                .rsplit_once('/')
+                .map(|(_, l)| l.to_string())
+                .unwrap_or_else(|| model.worktree.clone());
+            let title_of = |id| {
+                panes
+                    .table
+                    .get(&id)
+                    .map(|p| {
+                        let name = p
+                            .emulator()
+                            .title()
+                            .filter(|t| !t.trim().is_empty())
+                            .unwrap_or_else(|| p.program().to_string());
+                        if title_leaf.is_empty() {
+                            name
+                        } else {
+                            format!("{name} \u{00b7} {title_leaf}")
+                        }
+                    })
+                    .unwrap_or_default()
+            };
             if fast_select && !clear_on_next_frame {
                 if let Some((sp, sel)) = mouse_sel.as_ref() {
+                    let frames = tree.layout_framed(chrome.center);
                     let target = if let Some(d) = drawer
                         && d == *sp
                         && let Some(rect) = chrome.drawer
                     {
                         Some(rect)
                     } else {
-                        tree.layout_framed(chrome.center)
-                            .into_iter()
+                        frames
+                            .iter()
                             .find(|(id, _, _)| id == sp)
-                            .map(|(_, _, c)| c)
+                            .map(|(_, _, c)| *c)
                     };
                     if let (Some(content), Some(p)) = (target, panes.table.get(sp)) {
                         crate::compositor::compose_pane(&mut scratch, p.emulator(), content);
@@ -10385,20 +10413,31 @@ async fn event_loop<T: Terminal>(
                             sel,
                             crate::chrome::col(crate::chrome::S::Panel2),
                         );
+                        // Repaint the pane's card so a wide glyph composed at the
+                        // edge can't leave a gap in its border (drawer → no-op).
+                        crate::chrome::redraw_pane_card(
+                            &mut scratch,
+                            &frames,
+                            *sp,
+                            focused,
+                            &model,
+                            &title_of,
+                        );
                     }
                 }
             } else if scroll_fast {
                 if let Some(sp) = scroll_pane {
+                    let frames = tree.layout_framed(chrome.center);
                     let target = if let Some(d) = drawer
                         && d == sp
                         && let Some(rect) = chrome.drawer
                     {
                         Some(rect)
                     } else {
-                        tree.layout_framed(chrome.center)
-                            .into_iter()
+                        frames
+                            .iter()
                             .find(|(id, _, _)| *id == sp)
-                            .map(|(_, _, c)| c)
+                            .map(|(_, _, c)| *c)
                     };
                     if let (Some(content), Some(p)) = (target, panes.table.get(&sp)) {
                         crate::compositor::compose_pane(&mut scratch, p.emulator(), content);
@@ -10412,6 +10451,18 @@ async fn event_loop<T: Terminal>(
                                 crate::chrome::col(crate::chrome::S::Panel2),
                             );
                         }
+                        // The scrolled content was recomposed over the reused
+                        // frame; repaint this pane's card so its right border `│`
+                        // stays solid (the reported scroll glitch). The flush uses
+                        // a full diff_screens, so no diff-rect bookkeeping needed.
+                        crate::chrome::redraw_pane_card(
+                            &mut scratch,
+                            &frames,
+                            sp,
+                            focused,
+                            &model,
+                            &title_of,
+                        );
                     }
                 }
             } else if let crate::render_plan::RenderPlan::Incremental {
@@ -10427,22 +10478,41 @@ async fn event_loop<T: Terminal>(
                 // screen size.
                 let frames = tree.layout_framed(chrome.center);
                 for &id in ids {
-                    let content = if let Some(d) = drawer
+                    // (rect to compose, rect to diff, has a card ring). A framed
+                    // pane composes its content but diffs the *frame* rect so the
+                    // repainted border ring is scanned; the drawer has no card, so
+                    // it composes + diffs its own reserved rect.
+                    let resolved = if let Some(d) = drawer
                         && d == id
                         && let Some(rect) = chrome.drawer
                     {
-                        Some(rect)
+                        Some((rect, rect, false))
                     } else {
                         frames
                             .iter()
                             .find(|(pid, _, _)| *pid == id)
-                            .map(|(_, _, c)| *c)
+                            .map(|(_, f, c)| (*c, *f, true))
                     };
                     // A pane awaiting relaunch is a husk with no live process, so
                     // it never enters `dirty_panes` — no relaunch overlay needed.
-                    if let (Some(content), Some(p)) = (content, panes.table.get(&id)) {
+                    if let (Some((content, diff_rect, has_card)), Some(p)) =
+                        (resolved, panes.table.get(&id))
+                    {
                         crate::compositor::compose_pane(&mut scratch, p.emulator(), content);
-                        pane_diff_rects.push(content);
+                        if has_card {
+                            // Repaint the card so pane output that lands a wide
+                            // glyph at the edge can't nibble the border `│`; the
+                            // frame rect (pushed below) makes the diff cover it.
+                            crate::chrome::redraw_pane_card(
+                                &mut scratch,
+                                &frames,
+                                id,
+                                focused,
+                                &model,
+                                &title_of,
+                            );
+                        }
+                        pane_diff_rects.push(diff_rect);
                     }
                 }
                 if bars {
@@ -10460,13 +10530,6 @@ async fn event_loop<T: Terminal>(
                 }
             } else {
                 crate::chrome::clear_frame(&mut scratch);
-                // Card titles: "{title} · {worktree-leaf}" — the OSC window title
-                // the app sets, else the program name derived from the spawn argv.
-                let title_leaf = model
-                    .worktree
-                    .rsplit_once('/')
-                    .map(|(_, l)| l.to_string())
-                    .unwrap_or_else(|| model.worktree.clone());
                 // Top-level app tabs: reflect the strip into the model so the
                 // masthead chips render every frame.
                 {
@@ -10512,27 +10575,7 @@ async fn event_loop<T: Terminal>(
                         &model,
                         &panel_ui,
                         |id| panes.table.get(&id).map(|p| p.emulator()),
-                        &|id| {
-                            panes
-                                .table
-                                .get(&id)
-                                .map(|p| {
-                                    // Prefer the OSC window title the app sets (zsh +
-                                    // starship, tmux, etc.); fall back to the program
-                                    // name derived from the spawn argv.
-                                    let name = p
-                                        .emulator()
-                                        .title()
-                                        .filter(|t| !t.trim().is_empty())
-                                        .unwrap_or_else(|| p.program().to_string());
-                                    if title_leaf.is_empty() {
-                                        name
-                                    } else {
-                                        format!("{name} \u{00b7} {title_leaf}")
-                                    }
-                                })
-                                .unwrap_or_default()
-                        },
+                        &title_of,
                         &|id| {
                             panes
                                 .table

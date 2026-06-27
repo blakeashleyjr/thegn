@@ -2493,6 +2493,48 @@ pub fn render_panes<'a>(
     }
 }
 
+/// Repaint a single pane's card ring into `surface`, reusing the exact style the
+/// full path applies in [`render_panes`]. The partial render paths (scroll /
+/// selection drag / incremental pane output) recompose only pane *content*; the
+/// card border lives in the 1-cell frame ring *outside* that content, so without
+/// this the border can be left stale — or, when a wide glyph composes at the last
+/// content column, partially overwritten — producing the gaps reported on the
+/// right edge while scrolling. Drawing only the touched pane keeps the bounded
+/// diff minimal. No-ops when `pane` has no card (e.g. the drawer, which is a
+/// separate reserved rect and never appears in `frames`).
+pub fn redraw_pane_card(
+    surface: &mut Surface,
+    frames: &[(crate::center::PaneId, Rect, Rect)],
+    pane: crate::center::PaneId,
+    focused: crate::center::PaneId,
+    model: &FrameModel,
+    title_of: &dyn Fn(crate::center::PaneId) -> String,
+) {
+    let Some(entry) = frames.iter().find(|(id, _, _)| *id == pane).copied() else {
+        return;
+    };
+    // Same ring rule as render_panes: focus blue while the center owns the
+    // keyboard, white otherwise, so the return target stays obvious.
+    let ring = if model.center_focused {
+        col(S::Focus)
+    } else {
+        col(S::Text)
+    };
+    crate::borders::draw_pane_frames(
+        surface,
+        &[entry],
+        Some(focused),
+        &crate::borders::FrameStyle {
+            border: col(S::Border),
+            focus: ring,
+            bg: col(S::Panel),
+            title: col(S::Dim),
+            title_focused: ring,
+        },
+        title_of,
+    );
+}
+
 /// Compose a full frame: the center panes ([`render_panes`]) plus the chrome
 /// ([`draw_chrome`]). The damage-tracked loop calls the two halves separately
 /// for incremental recompose; this wrapper is the full-repaint path + tests.
@@ -2613,6 +2655,73 @@ mod tests {
             target_bytes: None,
             terminal_connection: None,
         }
+    }
+
+    #[test]
+    fn redraw_pane_card_restores_a_nibbled_border() {
+        use crate::center::CenterTree;
+        let tree = CenterTree::single(1);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            cols: 20,
+            rows: 5,
+        };
+        let frames = tree.layout_framed(area);
+        let (_, _frame, content) = frames[0];
+        let right = area.x + area.cols - 1;
+        let model = FrameModel {
+            center_focused: true,
+            ..Default::default()
+        };
+        let mut s = Surface::new(20, 5);
+        redraw_pane_card(&mut s, &frames, 1, 1, &model, &|_| String::new());
+        assert_eq!(
+            s.screen_cells()[2][right].str(),
+            "\u{2502}",
+            "card border drawn"
+        );
+        // Simulate content overflowing into the border: a wide glyph straddling
+        // the last content column and the border column.
+        s.add_change(Change::CursorPosition {
+            x: Position::Absolute(content.x + content.cols - 1),
+            y: Position::Absolute(2),
+        });
+        s.add_change(Change::Text("\u{6f22}".into()));
+        assert_ne!(
+            s.screen_cells()[2][right].str(),
+            "\u{2502}",
+            "the wide glyph nibbled the border (the bug)"
+        );
+        // Repainting the card heals every interior border row.
+        redraw_pane_card(&mut s, &frames, 1, 1, &model, &|_| String::new());
+        for y in (area.y + 1)..(area.y + area.rows - 1) {
+            assert_eq!(
+                s.screen_cells()[y][right].str(),
+                "\u{2502}",
+                "border solid again at row {y}"
+            );
+        }
+    }
+
+    #[test]
+    fn redraw_pane_card_skips_panes_without_a_card() {
+        use crate::center::CenterTree;
+        let frames = CenterTree::single(1).layout_framed(Rect {
+            x: 0,
+            y: 0,
+            cols: 20,
+            rows: 5,
+        });
+        let mut s = Surface::new(20, 5);
+        // A pane id not in `frames` (e.g. the drawer) is a no-op: nothing drawn.
+        redraw_pane_card(&mut s, &frames, 99, 99, &FrameModel::default(), &|_| {
+            String::new()
+        });
+        assert!(
+            s.screen_chars_to_string().trim().is_empty(),
+            "no card drawn for an absent pane"
+        );
     }
 
     #[test]
