@@ -77,9 +77,18 @@ pub enum MenuChoice {
     Confirm { tag: &'static str, arg: String },
     // delete worktree confirm: variant to capture "leave files" intent
     ConfirmDeleteWorktrees { keep_files: bool },
+    // delete workspace confirm: variant to capture "leave files" intent
+    ConfirmDeleteWorkspace { keep_files: bool },
+    // init git confirm
+    ConfirmInitGit { path: String },
     // first-launch keymap picker (item 621): the chosen preset id
     // ("default" | "vscode" | "jetbrains").
     SetKeymapPreset(String),
+    // bouncer tool-approval gate: allow/deny the sealed agent's pending shell /
+    // edit / write tool call. Esc/cancel is treated as deny by the loop.
+    ApproveTool { allow: bool },
+    // share reach picker: the chosen reach (public/team/peer).
+    ShareReach(superzej_core::config::ShareReach),
     Dismiss,
 }
 
@@ -98,6 +107,8 @@ pub enum MenuKindTag {
     RedoConfirm,
     Confirm,
     KeymapPicker,
+    Approval,
+    ShareReach,
 }
 
 /// One selectable row: an optional letter hotkey (rendered as a chip), the
@@ -351,7 +362,10 @@ pub fn delete_worktree_menu(targets: usize, names_csv: &str) -> MenuOverlay {
             )
             .danger(),
             item(
-                Some('k'),
+                // 'k' is a reserved nav key (cursor-up); use 'f' (files) so the
+                // hotkey is reachable and the debug-assert in `new_with_default`
+                // stays happy.
+                Some('f'),
                 "keep files",
                 MenuChoice::ConfirmDeleteWorktrees { keep_files: true },
             ),
@@ -360,6 +374,35 @@ pub fn delete_worktree_menu(targets: usize, names_csv: &str) -> MenuOverlay {
         0,
     )
     .with_body(names_csv)
+}
+
+/// Confirm removing a workspace. Like `delete_worktree_menu`, the default
+/// (pre-selected, index 0) choice is the destructive "delete from disk", which
+/// removes every worktree directory of the workspace. `[f]` removes the
+/// workspace from superzej only, leaving the files on disk.
+pub fn delete_workspace_menu(display: &str) -> MenuOverlay {
+    let title = format!("Delete workspace '{display}'?");
+    MenuOverlay::new_with_default(
+        MenuKindTag::Confirm,
+        title,
+        vec![
+            item(
+                Some('y'),
+                "delete worktrees from disk",
+                MenuChoice::ConfirmDeleteWorkspace { keep_files: false },
+            )
+            .danger(),
+            item(
+                // 'k' is a reserved nav key (cursor-up); use 'f' (files).
+                Some('f'),
+                "keep files on disk",
+                MenuChoice::ConfirmDeleteWorkspace { keep_files: true },
+            ),
+            item(Some('n'), "cancel", MenuChoice::Dismiss),
+        ],
+        0,
+    )
+    .with_body("the home checkout is kept; branch worktrees are deleted")
 }
 
 /// A 2-item yes/no confirm built on the same component: `[y]` resolves to
@@ -380,6 +423,22 @@ pub fn confirm_menu(
         MenuKindTag::Confirm,
         title,
         vec![yes, item(Some('n'), "cancel", MenuChoice::Dismiss)],
+    )
+    .with_body(body)
+}
+
+/// The bouncer's tool-approval gate: a sealed agent wants to `run`/`edit`/`write`
+/// and the user must allow or deny. `[a]` allows, `[d]`/Esc denies. `title` names
+/// the worktree + action (e.g. `pi · run a shell command`); `body` is the
+/// command or path summary. Resolves to `ApproveTool { allow }`.
+pub fn approval_menu(title: impl Into<String>, body: impl Into<String>) -> MenuOverlay {
+    MenuOverlay::new(
+        MenuKindTag::Approval,
+        title,
+        vec![
+            item(Some('a'), "allow", MenuChoice::ApproveTool { allow: true }),
+            item(Some('d'), "deny", MenuChoice::ApproveTool { allow: false }).danger(),
+        ],
     )
     .with_body(body)
 }
@@ -426,6 +485,36 @@ pub fn keymap_preset_menu() -> MenuOverlay {
         ],
     )
     .with_body("Familiar shortcuts on top of the defaults. Change later with keymap_preset.")
+}
+
+/// Share reach picker (`Alt+Shift+S`): pick *who* the share is for; each reach
+/// maps to a provider via `[share] public`/`team`/`peer`. Built from the
+/// worktree's configured reaches; the public option is flagged as a caution.
+pub fn reach_picker(cfg: &superzej_core::config::ShareConfig) -> MenuOverlay {
+    use superzej_core::config::ShareReach;
+    let items = cfg
+        .configured_reaches()
+        .into_iter()
+        .map(|r| {
+            let (glyph, key, desc) = match r {
+                ShareReach::Public => ('\u{1f310}', 'p', "internet — anyone with the link"),
+                ShareReach::Team => ('\u{1f465}', 't', "your tailnet / a teammate"),
+                ShareReach::Peer => ('\u{1f517}', 'r', "a machine you hand a ticket to"),
+            };
+            let it = item(
+                Some(key),
+                format!("{glyph} {} — {desc}", r.as_str()),
+                MenuChoice::ShareReach(r),
+            )
+            .note(cfg.reach_provider(r).as_str());
+            if r == ShareReach::Public {
+                it.danger()
+            } else {
+                it
+            }
+        })
+        .collect();
+    MenuOverlay::new(MenuKindTag::ShareReach, "Share to…", items)
 }
 
 /// Rebase options: continue + skip only while a rebase is conflicted/running.
@@ -625,6 +714,22 @@ pub fn undo_confirm_menu(body: impl Into<String>, redo: bool) -> MenuOverlay {
         ],
     )
     .with_body(body)
+}
+
+pub fn init_git_menu(path: String) -> MenuOverlay {
+    MenuOverlay::new(
+        MenuKindTag::Confirm,
+        "initialize git repository?".to_string(),
+        vec![
+            item(
+                Some('y'),
+                "initialize git repo",
+                MenuChoice::ConfirmInitGit { path: path.clone() },
+            ),
+            item(Some('n'), "cancel", MenuChoice::Dismiss),
+        ],
+    )
+    .with_body(format!("{} is not a git repository", path))
 }
 
 /// Branch actions including create + merge (the full `m`/`n` menu); merge
@@ -877,6 +982,43 @@ mod tests {
     }
 
     #[test]
+    fn reach_picker_lists_configured_reaches_and_picks() {
+        use superzej_core::config::{ShareConfig, ShareProviderKind, ShareReach};
+        let cfg = ShareConfig {
+            public: ShareProviderKind::Frp,
+            team: ShareProviderKind::Tailscale,
+            peer: ShareProviderKind::Iroh,
+            ..ShareConfig::default()
+        };
+        let mut m = reach_picker(&cfg);
+        // One item per configured reach, in public/team/peer order with p/t/r keys.
+        assert_eq!(hotkeys(&m), vec!['p', 't', 'r']);
+        // The public item carries its provider as the note and is danger-styled.
+        let public = &m.items()[0];
+        assert_eq!(public.note.as_deref(), Some("frp"));
+        assert!(public.danger, "public reach should be a caution");
+        // Hotkey 't' picks the team reach.
+        assert_eq!(
+            m.handle_key(&KeyCode::Char('t'), NONE),
+            MenuOutcome::Pick(MenuChoice::ShareReach(ShareReach::Team))
+        );
+    }
+
+    #[test]
+    fn reach_picker_omits_public_when_disallowed() {
+        use superzej_core::config::{ShareConfig, ShareProviderKind};
+        let cfg = ShareConfig {
+            public: ShareProviderKind::Frp,
+            peer: ShareProviderKind::Iroh,
+            allow_public: false,
+            ..ShareConfig::default()
+        };
+        let m = reach_picker(&cfg);
+        // public dropped (guard), only peer remains.
+        assert_eq!(hotkeys(&m), vec!['r']);
+    }
+
+    #[test]
     fn commit_overlay_toggles_cycle_signing_and_no_verify() {
         // Item 328: the commit overlay carries signing/hook toggles driven by
         // Ctrl+S / Ctrl+N; a plain input overlay has none.
@@ -1066,6 +1208,8 @@ mod tests {
                 "file.rs".into(),
                 true,
             ),
+            delete_worktree_menu(2, "a, b"),
+            delete_workspace_menu("myrepo"),
         ];
         for m in &menus {
             assert!(!m.items().is_empty(), "{:?} menu is empty", m.tag);
@@ -1082,6 +1226,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn delete_workspace_menu_defaults_to_delete_from_disk() {
+        let m = delete_workspace_menu("myrepo");
+        // Default (pre-selected) item is the destructive "delete from disk".
+        assert_eq!(m.selected(), 0);
+        assert_eq!(
+            m.items()[0].choice,
+            MenuChoice::ConfirmDeleteWorkspace { keep_files: false }
+        );
+        assert!(m.items()[0].danger, "delete-from-disk row is danger-marked");
+        assert_eq!(
+            m.items()[1].choice,
+            MenuChoice::ConfirmDeleteWorkspace { keep_files: true }
+        );
+        assert_eq!(m.items()[2].choice, MenuChoice::Dismiss);
+        assert_eq!(hotkeys(&m), vec!['y', 'f', 'n']);
     }
 
     #[test]
@@ -1322,6 +1484,23 @@ mod tests {
             m.handle_key(&KeyCode::Char('n'), NONE),
             MenuOutcome::Pick(MenuChoice::Dismiss)
         );
+    }
+
+    #[test]
+    fn approval_menu_allows_and_denies() {
+        let mut m = approval_menu("pi · run a shell command", "git status");
+        assert_eq!(m.tag, MenuKindTag::Approval);
+        assert!(m.items()[1].danger, "the deny row is danger-tinted");
+        // [a] allows, [d] denies; Esc is treated as deny by the loop (Cancel).
+        assert_eq!(
+            m.handle_key(&KeyCode::Char('a'), NONE),
+            MenuOutcome::Pick(MenuChoice::ApproveTool { allow: true })
+        );
+        assert_eq!(
+            m.handle_key(&KeyCode::Char('d'), NONE),
+            MenuOutcome::Pick(MenuChoice::ApproveTool { allow: false })
+        );
+        assert_eq!(m.handle_key(&KeyCode::Escape, NONE), MenuOutcome::Cancel);
     }
 
     #[test]

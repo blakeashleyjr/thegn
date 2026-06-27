@@ -84,6 +84,11 @@ release_bin_q="$(shell_quote "$release_bin")"
 alacritty_config_q="$(shell_quote "$alacritty_config")"
 sj_tui_q="$(shell_quote "$sj_tui")"
 
+# Remove any existing wrappers first: a leftover dangling symlink (e.g. from a
+# pruned worktree) would make the heredoc redirect below fail with "No such
+# file or directory" as bash follows it to a non-existent target.
+rm -f "$sj_tui" "$bindir/sj"
+
 cat >"$sj_tui" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail

@@ -43,10 +43,24 @@ use std::path::PathBuf;
 /// source of truth for sidebar workspace order (was recency). Backfilled from
 /// the prior `last_active DESC` order so the first launch after upgrade looks
 /// unchanged; thereafter order is manual (Ctrl+Alt+↑/↓) and stable.
-const SCHEMA_VERSION: i64 = 19;
+/// v20: adds `worktree_disk` (per-worktree size + target/ size cache) backing
+/// the disk-usage badges, the statusbar threshold warning, and `superzej disk`.
+const SCHEMA_VERSION: i64 = 21;
 
 pub struct Db {
     conn: Connection,
+}
+
+/// A persisted ingress share (`[share]`) — the resurrection record for a tunnel
+/// the host respawns on restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareRow {
+    pub worktree: String,
+    pub local_port: u16,
+    pub provider: String,
+    pub public_url: Option<String>,
+    pub state: String,
+    pub created_at: i64,
 }
 
 /// A persisted LLM-proxy exhaustion marker (one per backend+model).
@@ -242,6 +256,16 @@ impl Db {
               worktree   TEXT PRIMARY KEY,
               loc        INTEGER,
               fetched_at INTEGER
+            );
+            -- v20: per-worktree disk usage (bytes). `size_bytes` is the whole
+            -- checkout, `target_bytes` the `target/` subtree. Populated by an
+            -- off-loop background scan; the UI paints sizes from this cache so
+            -- the (seconds-long) `du` never touches the event/hydration loop.
+            CREATE TABLE IF NOT EXISTS worktree_disk (
+              worktree     TEXT PRIMARY KEY,
+              size_bytes   INTEGER,
+              target_bytes INTEGER,
+              fetched_at   INTEGER
             );
             -- Latest test-explorer state per worktree. This is a cache, not a
             -- history log: full timelines live in the later activity/audit layer.
@@ -581,6 +605,21 @@ impl Db {
             [],
         );
         let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN folder_id INTEGER", []);
+        // v21: per-worktree ingress shares (`[share]`). A worktree can expose
+        // several ports, so the key is (worktree, local_port). Additive; a row
+        // is the resurrection record for a tunnel the host respawns on restart.
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS shares (
+              worktree   TEXT    NOT NULL,
+              local_port INTEGER NOT NULL,
+              provider   TEXT    NOT NULL,
+              public_url TEXT,
+              state      TEXT    NOT NULL,
+              created_at INTEGER NOT NULL,
+              PRIMARY KEY (worktree, local_port)
+            )",
+            [],
+        );
         // v18: the named execution environment selected per workspace/worktree
         // (`[env.<name>]`). Additive; absent/NULL = inherit the next layer down
         // (worktree → workspace → repo `.superzej.*` → global default → default).
@@ -591,6 +630,67 @@ impl Db {
         // it is idempotent and a failed earlier attempt retries next open.
         migrate_tab_layout_v6(&conn);
         Ok(Db { conn })
+    }
+
+    // --- ingress shares (`[share]`; resurrection layer for tunnels) --------
+    /// Insert or update the share record for `(worktree, local_port)`.
+    pub fn upsert_share(
+        &self,
+        worktree: &str,
+        local_port: u16,
+        provider: &str,
+        public_url: Option<&str>,
+        state: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO shares(worktree,local_port,provider,public_url,state,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(worktree,local_port) DO UPDATE SET
+               provider=excluded.provider,
+               public_url=excluded.public_url,
+               state=excluded.state",
+            params![
+                worktree,
+                local_port as i64,
+                provider,
+                public_url,
+                state,
+                util::now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// All persisted shares, newest first (restore + panel listing).
+    pub fn list_shares(&self) -> Result<Vec<ShareRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT worktree,local_port,provider,public_url,state,created_at \
+             FROM shares ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], Self::map_share_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Remove the share record for `(worktree, local_port)`.
+    pub fn delete_share(&self, worktree: &str, local_port: u16) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM shares WHERE worktree=?1 AND local_port=?2",
+            params![worktree, local_port as i64],
+        )?;
+        Ok(())
+    }
+
+    fn map_share_row(r: &rusqlite::Row) -> rusqlite::Result<ShareRow> {
+        Ok(ShareRow {
+            worktree: r.get(0)?,
+            local_port: r.get::<_, i64>(1)? as u16,
+            provider: r.get(2)?,
+            public_url: r.get(3)?,
+            state: r.get(4)?,
+            created_at: r.get(5)?,
+        })
     }
 
     // --- PR status cache (TTL'd; feeds the right panel) --------------------
@@ -612,6 +712,71 @@ impl Db {
                VALUES(?1,?2,?3,?4)
                ON CONFLICT(worktree) DO UPDATE SET branch=?2, json=?3, fetched_at=?4"#,
             params![worktree, branch, json, util::now()],
+        )?;
+        Ok(())
+    }
+
+    // --- per-worktree disk usage cache (v20) -------------------------------
+    /// `(size_bytes, target_bytes, fetched_at)` for one worktree, or `None`.
+    pub fn get_worktree_disk(&self, worktree: &str) -> Result<Option<(i64, i64, i64)>> {
+        let r = self
+            .conn
+            .query_row(
+                "SELECT size_bytes, target_bytes, fetched_at FROM worktree_disk WHERE worktree=?1",
+                params![worktree],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .ok();
+        Ok(r)
+    }
+
+    pub fn put_worktree_disk(
+        &self,
+        worktree: &str,
+        size_bytes: i64,
+        target_bytes: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO worktree_disk(worktree,size_bytes,target_bytes,fetched_at)
+               VALUES(?1,?2,?3,?4)
+               ON CONFLICT(worktree) DO UPDATE SET size_bytes=?2, target_bytes=?3, fetched_at=?4"#,
+            params![worktree, size_bytes, target_bytes, util::now()],
+        )?;
+        Ok(())
+    }
+
+    /// All cached disk sizes keyed by worktree path → `(size_bytes, target_bytes)`.
+    /// One bulk read for the sidebar/statusbar; never scans.
+    pub fn all_worktree_disk(&self) -> Result<std::collections::HashMap<String, (i64, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT worktree, size_bytes, target_bytes FROM worktree_disk")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?),
+            ))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (k, v) = row?;
+            map.insert(k, v);
+        }
+        Ok(map)
+    }
+
+    /// Drop a worktree's cached size (e.g. right after a `clean`) so the badge
+    /// clears without waiting for the next scan.
+    pub fn delete_worktree_disk(&self, worktree: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM worktree_disk WHERE worktree=?1",
+            params![worktree],
         )?;
         Ok(())
     }
@@ -1472,6 +1637,29 @@ impl Db {
         Ok(())
     }
 
+    /// Find a folder in `repo_path` whose name matches `name`
+    /// (case-insensitive, trimmed) and return its id, creating it if absent.
+    /// This is the find-or-create primitive behind the "file worktree into
+    /// folder" actions, so repeated firing never spawns duplicate folders.
+    pub fn ensure_folder(&self, repo_path: &str, name: &str) -> Result<i64> {
+        let want = name.trim();
+        for f in self.folders_for_workspace(repo_path)? {
+            if f.name.trim().eq_ignore_ascii_case(want) {
+                return Ok(f.folder_id);
+            }
+        }
+        self.create_folder(repo_path, want)
+    }
+
+    /// File (or unfile, with `None`) a single worktree into a folder.
+    pub fn set_worktree_folder(&self, worktree: &str, folder_id: Option<i64>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE worktrees SET folder_id = ?1 WHERE worktree = ?2",
+            params![folder_id, worktree],
+        )?;
+        Ok(())
+    }
+
     // --- terminals -----------------------------------------------------------
 
     pub fn terminals(&self) -> Result<Vec<crate::models::TerminalRow>> {
@@ -1687,22 +1875,6 @@ impl Db {
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
-    }
-
-    pub fn delete_workspace(&self, repo_path: &str) -> Result<u32> {
-        let count: u32 = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM worktrees WHERE repo_path = ?1",
-                [repo_path],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
-        self.conn
-            .execute("DELETE FROM workspaces WHERE repo_path = ?1", [repo_path])?;
-
-        Ok(count)
     }
 
     // --- command-palette frecency -----------------------------------------
@@ -2613,6 +2785,38 @@ mod tests {
     }
 
     #[test]
+    fn shares_upsert_list_and_delete() {
+        let db = db();
+        assert!(db.list_shares().unwrap().is_empty());
+
+        // Insert two shares on one worktree, plus one with no URL yet.
+        db.upsert_share("/wt/a", 3000, "bore", Some("http://bore.pub:1"), "up")
+            .unwrap();
+        db.upsert_share("/wt/a", 8080, "bore", None, "starting")
+            .unwrap();
+        let rows = db.list_shares().unwrap();
+        assert_eq!(rows.len(), 2);
+
+        // Upsert updates state + url in place (no duplicate row).
+        db.upsert_share("/wt/a", 8080, "bore", Some("http://bore.pub:2"), "up")
+            .unwrap();
+        let rows = db.list_shares().unwrap();
+        assert_eq!(rows.len(), 2);
+        let updated = rows
+            .iter()
+            .find(|r| r.local_port == 8080)
+            .expect("port 8080");
+        assert_eq!(updated.public_url.as_deref(), Some("http://bore.pub:2"));
+        assert_eq!(updated.state, "up");
+        assert_eq!(updated.provider, "bore");
+
+        db.delete_share("/wt/a", 3000).unwrap();
+        let rows = db.list_shares().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].local_port, 8080);
+    }
+
+    #[test]
     fn get_all_issue_cache_returns_every_provider_for_a_repo() {
         let db = db();
         assert!(db.get_all_issue_cache("/repo").unwrap().is_empty());
@@ -3171,6 +3375,32 @@ mod tests {
     }
 
     #[test]
+    fn worktree_disk_roundtrip_upsert_bulk_and_delete() {
+        let db = db();
+        assert!(db.get_worktree_disk("/wt/a").unwrap().is_none());
+        assert!(db.all_worktree_disk().unwrap().is_empty());
+
+        db.put_worktree_disk("/wt/a", 5_000, 4_200).unwrap();
+        db.put_worktree_disk("/wt/b", 1_000, 900).unwrap();
+        let (size, target, at) = db.get_worktree_disk("/wt/a").unwrap().unwrap();
+        assert_eq!((size, target), (5_000, 4_200));
+        assert!(at > 0);
+
+        // Upsert overwrites in place.
+        db.put_worktree_disk("/wt/a", 9_000, 8_000).unwrap();
+        assert_eq!(db.get_worktree_disk("/wt/a").unwrap().unwrap().0, 9_000);
+
+        let all = db.all_worktree_disk().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all.get("/wt/a"), Some(&(9_000, 8_000)));
+        assert_eq!(all.get("/wt/b"), Some(&(1_000, 900)));
+
+        db.delete_worktree_disk("/wt/a").unwrap();
+        assert!(db.get_worktree_disk("/wt/a").unwrap().is_none());
+        assert_eq!(db.all_worktree_disk().unwrap().len(), 1);
+    }
+
+    #[test]
     fn open_pr_counts_by_branch_counts_only_open_prs() {
         let db = db();
         // No cache yet → empty map.
@@ -3293,6 +3523,51 @@ mod tests {
         let folders3 = db.folders_for_workspace("/x/app").unwrap();
         assert_eq!(folders3.len(), 1);
         assert_eq!(folders3[0].folder_id, f1);
+    }
+
+    #[test]
+    fn ensure_folder_creates_then_reuses() {
+        let db = db();
+        db.put_workspace("/x/app", "app", "repo").unwrap();
+
+        let a = db.ensure_folder("/x/app", "Ready to merge").unwrap();
+        // Same name (case/whitespace-insensitive) reuses the row, never dups.
+        let b = db.ensure_folder("/x/app", "  ready TO merge ").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(db.folders_for_workspace("/x/app").unwrap().len(), 1);
+
+        // A different name creates a second folder.
+        let c = db.ensure_folder("/x/app", "PRing").unwrap();
+        assert_ne!(a, c);
+        assert_eq!(db.folders_for_workspace("/x/app").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn set_worktree_folder_round_trips() {
+        let db = db();
+        db.put_workspace("/x/app", "app", "repo").unwrap();
+        db.put_worktree("app/feat", "/x/app", "/wt/feat", "sz/feat", None, None)
+            .unwrap();
+        let fid = db.ensure_folder("/x/app", "Ready to merge").unwrap();
+
+        db.set_worktree_folder("/wt/feat", Some(fid)).unwrap();
+        let row = db
+            .worktrees()
+            .unwrap()
+            .into_iter()
+            .find(|w| w.worktree == "/wt/feat")
+            .unwrap();
+        assert_eq!(row.folder_id, Some(fid));
+
+        // Unfiling clears it.
+        db.set_worktree_folder("/wt/feat", None).unwrap();
+        let row = db
+            .worktrees()
+            .unwrap()
+            .into_iter()
+            .find(|w| w.worktree == "/wt/feat")
+            .unwrap();
+        assert_eq!(row.folder_id, None);
     }
 
     #[test]

@@ -321,6 +321,24 @@ pub(crate) fn build_command_palette_items(
     items
 }
 
+/// Picker rows for "Move worktree to folder…": one row per existing folder in
+/// the workspace (`move-to-folder:<name>`) plus a trailing "new folder" row
+/// (`move-to-folder:__new__`) that prompts for a name.
+pub(crate) fn build_move_to_folder_items(
+    db: &superzej_core::db::Db,
+    repo_path: &str,
+) -> Vec<crate::palette::PaletteItem> {
+    use crate::palette::PaletteItem;
+    let mut items: Vec<PaletteItem> = db
+        .folders_for_workspace(repo_path)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|f| PaletteItem::new(format!("move-to-folder:{}", f.name), f.name))
+        .collect();
+    items.push(PaletteItem::new("move-to-folder:__new__", "＋ New folder…"));
+    items
+}
+
 /// Build the palette's item list: the command actions + a nav row per open tab
 /// (`tab:<name>`), ordered by frecency for the empty-query view (the host port
 /// of the old engine's command + nav + frecency sources).

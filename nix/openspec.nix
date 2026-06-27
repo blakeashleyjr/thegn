@@ -1,0 +1,74 @@
+# Hermetic build of the OpenSpec CLI (@fission-ai/openspec) — the spec-driven
+# development tool superzej uses to manage its OWN development (not a runtime
+# dependency of szhost). Pinned and built from source with pnpm so both
+# `nix develop` and `devenv shell` get an identical, offline-reproducible
+# `openspec` with NO global npm install and telemetry off by construction.
+#
+# Bump deliberately: change `version` + `rev`, then re-resolve the two FODs by
+# setting their hashes to lib.fakeHash and reading the expected values from the
+# `nix build .#openspec` error.
+{
+  lib,
+  stdenv,
+  fetchFromGitHub,
+  nodejs,
+  pnpm_9,
+  makeWrapper,
+}:
+stdenv.mkDerivation (finalAttrs: {
+  pname = "openspec";
+  version = "1.4.1";
+
+  src = fetchFromGitHub {
+    owner = "Fission-AI";
+    repo = "OpenSpec";
+    rev = "v${finalAttrs.version}";
+    hash = "sha256-VZZ/ukjciXqiebwei2JizyOnxx0T3IeoowFWElKec4o=";
+  };
+
+  nativeBuildInputs = [
+    nodejs
+    pnpm_9.configHook
+    makeWrapper
+  ];
+
+  # Fixed-output fetch of the full pnpm dependency closure (lockfileVersion 9.0).
+  pnpmDeps = pnpm_9.fetchDeps {
+    inherit (finalAttrs) pname version src;
+    fetcherVersion = 3;
+    hash = "sha256-9s2kdvd7svK4hofnD66HkDc86WTQeayfF5y7L2dmjNg=";
+  };
+
+  # The postinstall script only prints a shell-completions tip; CI=1 +
+  # OPENSPEC_NO_COMPLETIONS=1 keep it silent and offline during the build.
+  env.CI = "1";
+  env.OPENSPEC_NO_COMPLETIONS = "1";
+
+  buildPhase = ''
+    runHook preBuild
+    pnpm run build
+    runHook postBuild
+  '';
+
+  installPhase = ''
+    runHook preInstall
+    mkdir -p $out/lib/openspec
+    # dist + bin + schemas are the runtime payload; node_modules carries the
+    # pnpm virtual store (relative symlinks under node_modules/.pnpm), so the
+    # copied tree is self-contained.
+    cp -r dist bin schemas package.json node_modules $out/lib/openspec/
+    makeWrapper ${nodejs}/bin/node $out/bin/openspec \
+      --add-flags "$out/lib/openspec/bin/openspec.js" \
+      --set OPENSPEC_NO_COMPLETIONS 1 \
+      --set-default OPENSPEC_TELEMETRY 0 \
+      --set-default DO_NOT_TRACK 1
+    runHook postInstall
+  '';
+
+  meta = {
+    description = "Spec-driven development workflow CLI for AI coding agents";
+    homepage = "https://github.com/Fission-AI/OpenSpec";
+    license = lib.licenses.mit;
+    mainProgram = "openspec";
+  };
+})
