@@ -28,6 +28,7 @@ mod layout;
 mod layout_spec;
 mod logotype;
 mod lsp;
+mod mem;
 mod menu;
 mod metrics;
 mod mousefilter;
@@ -178,6 +179,11 @@ pub enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Cap glibc's per-thread arena count before the runtime spawns any threads,
+    // so the host can't sprawl across dozens of never-trimmed arenas (an audit
+    // traced ~2.5 GB RSS to ~131 of them). No-op off glibc. See `mem`.
+    mem::tune_allocator();
+
     // Strip any inherited GIT_DIR/GIT_WORK_TREE/etc. before anything else (and
     // before the tokio runtime spawns threads — env mutation must be
     // single-threaded). superzej targets git explicitly with `-C <dir>`, so it
@@ -201,7 +207,20 @@ fn main() -> anyhow::Result<()> {
     // every in-flight spawn_blocking task, so quitting would wait out whatever
     // hydration is mid-flight (git/tokei/podman subprocesses — easily 100ms+).
     // shutdown_background detaches those; exit is as instant as launch.
-    let rt = tokio::runtime::Runtime::new()?;
+    //
+    // Bounded over the `Runtime::new()` default (which sizes the worker pool to
+    // ncpu and lets the blocking pool grow to 512): the host is I/O-bound, not
+    // compute-bound, so a small worker pool keeps latency snappy, and a tight
+    // blocking cap + short keep-alive stop the on-demand hydration/git threads
+    // from sprawling (each thread is a glibc arena → RSS). Tunable, but these
+    // defaults cut the steady-state thread count from ~60 without hurting feel.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(8)
+        .max_blocking_threads(32)
+        .thread_keep_alive(std::time::Duration::from_secs(3))
+        .thread_name("szhost-rt")
+        .build()?;
     let result = rt.block_on(run::main(cli));
     rt.shutdown_background();
     // termwiz opens /dev/tty without O_CLOEXEC; child pane shells inherit that
