@@ -368,7 +368,12 @@ pub struct FrameModel {
     /// from the center) — the bar renders raised so the focus is visible.
     pub masthead_focused: bool,
     pub statusbar_focused: bool,
-    pub active_statusbar_widget: usize,
+    /// Index of the selected item in the masthead's navigable cluster (when the
+    /// masthead owns focus). Clamped to the visible item count each frame.
+    pub masthead_sel: usize,
+    /// Index of the selected item in the statusbar's navigable right cluster
+    /// (config widgets followed by the always-on badges).
+    pub statusbar_sel: usize,
     /// True when the center zone owns keyboard focus (drives the focused
     /// pane's light-blue frame ring; sidebar/panel focus dims every ring).
     pub center_focused: bool,
@@ -664,31 +669,9 @@ pub fn draw_masthead(
     let accent = theme_color(model.accent_or_default());
     let bg = col(bar_bg);
 
-    // Resolve the right cluster once; pick the widest brand that still lets
-    // the (possibly thinned) cluster fit.
-    let parts: Vec<(String, MastheadWidget)> = model
-        .bars
-        .top_right
-        .iter()
-        .filter_map(|id| masthead_widget(id, model).map(|w| (id.clone(), w)))
-        .collect();
-    let widths: Vec<(String, usize)> = parts
-        .iter()
-        .map(|(id, w)| (id.clone(), w.text.chars().count()))
-        .collect();
-    let mut brand_cols = masthead_brand_cols(rect.cols);
-    let kept = loop {
-        let avail = rect.cols.saturating_sub(brand_cols.max(1));
-        let kept = fit_stats_cluster(&widths, avail);
-        if cluster_width(&widths, &kept) <= avail || brand_cols == 0 {
-            break kept;
-        }
-        brand_cols = if brand_cols >= BRAND_FULL_COLS {
-            BRAND_COMPACT_COLS
-        } else {
-            0
-        };
-    };
+    // Resolve the visible cluster + brand width once (shared with navigation /
+    // hit-testing via `masthead_fit`).
+    let (brand_cols, items) = masthead_fit(model, rect.cols);
 
     if brand_cols > 0 {
         draw_text(surface, rect.x + 1, rect.y, "\u{25c6} ", accent, bg, 2);
@@ -706,13 +689,13 @@ pub fn draw_masthead(
         }
     }
 
-    let cluster: Vec<&MastheadWidget> = kept.iter().map(|&i| &parts[i].1).collect();
     draw_masthead_cluster(
         surface,
         layout.masthead_stats_row(),
-        &cluster,
+        &items,
         brand_cols,
         bg,
+        model,
     );
     // Top-level app tabs sit right after the brand; the masthead-left widgets
     // (breadcrumb/clock/…) start after them.
@@ -902,6 +885,43 @@ fn draw_pin_chips(
 pub struct MastheadWidget {
     text: String,
     fg: ColorAttribute,
+}
+
+/// The stable identity of a navigable bar item — what focus selects, what Enter
+/// (or a click) opens a detail view for, and the key the popup-content mapping
+/// dispatches on. Config widgets carry their `[bars]` id string; the always-on
+/// statusbar badges are their own enumerated kinds (they are NOT in `[bars]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BarItemId {
+    /// A `[bars]` config widget (e.g. "cpu", "mem", "pr", "tests").
+    Widget(String),
+    /// One of the hard-coded statusbar badge blocks.
+    Badge(BarBadge),
+}
+
+/// The statusbar's always-on badges, in render order. Each maps to one of the
+/// imperative badge blocks in [`draw_statusbar`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarBadge {
+    Notifications,
+    Ci,
+    DiskWarn,
+    Ingress,
+    Media,
+    AiCost,
+    Agent,
+    Zoom,
+    Lock,
+    Sync,
+}
+
+impl BarItemId {
+    /// Whether activating this item (Enter / click) opens a detail view. Every
+    /// navigable item has one today; kept as a seam so a future inert item can
+    /// opt out (Enter becomes a no-op rather than an empty modal).
+    pub fn has_detail(&self) -> bool {
+        true
+    }
 }
 
 /// Utilization pressure for threshold coloring.
@@ -1206,86 +1226,195 @@ fn draw_masthead_left(surface: &mut Surface, rect: Rect, model: &FrameModel, bra
     }
 }
 
-/// The pre-fitted right cluster, right-aligned with `·` separators. The
-/// caller has already dropped whatever wouldn't fit (see `draw_masthead`).
+/// The masthead's resolved layout for a width: the brand column count and the
+/// visible right-cluster items (stable id + resolved widget) in display order,
+/// after the graceful width-degradation drop. The single source of truth shared
+/// by [`draw_masthead`] (placement) and [`masthead_item_spans`] (navigation +
+/// hit-testing), so which items show — and in what order — never disagrees.
+fn masthead_fit(model: &FrameModel, cols: usize) -> (usize, Vec<(BarItemId, MastheadWidget)>) {
+    let parts: Vec<(String, MastheadWidget)> = model
+        .bars
+        .top_right
+        .iter()
+        .filter_map(|id| masthead_widget(id, model).map(|w| (id.clone(), w)))
+        .collect();
+    let widths: Vec<(String, usize)> = parts
+        .iter()
+        .map(|(id, w)| (id.clone(), w.text.chars().count()))
+        .collect();
+    let mut brand_cols = masthead_brand_cols(cols);
+    let kept = loop {
+        let avail = cols.saturating_sub(brand_cols.max(1));
+        let kept = fit_stats_cluster(&widths, avail);
+        if cluster_width(&widths, &kept) <= avail || brand_cols == 0 {
+            break kept;
+        }
+        brand_cols = if brand_cols >= BRAND_FULL_COLS {
+            BRAND_COMPACT_COLS
+        } else {
+            0
+        };
+    };
+    let items = kept
+        .into_iter()
+        .map(|i| {
+            let (id, w) = &parts[i];
+            (
+                BarItemId::Widget(id.clone()),
+                MastheadWidget {
+                    text: w.text.clone(),
+                    fg: w.fg,
+                },
+            )
+        })
+        .collect();
+    (brand_cols, items)
+}
+
+/// The right cluster's `(x, width)` cell spans, right-aligned with ` · `
+/// separators. Mirrors [`draw_masthead_cluster`]'s placement exactly (the +1
+/// right margin, the brand floor) so highlight and hit-testing land on the
+/// painted glyphs.
+fn masthead_cluster_spans(widths: &[usize], rect: Rect, brand_cols: usize) -> Vec<(usize, usize)> {
+    if widths.is_empty() {
+        return Vec::new();
+    }
+    let end = rect.x + rect.cols;
+    let total: usize = widths.iter().sum::<usize>() + 3 * (widths.len() - 1) + 1;
+    let mut rx = end
+        .saturating_sub(total)
+        .max(rect.x + brand_cols.max(1) + 1);
+    let mut out = Vec::with_capacity(widths.len());
+    for (i, w) in widths.iter().enumerate() {
+        if i > 0 {
+            rx += 3;
+        }
+        out.push((rx, *w));
+        rx += w;
+    }
+    out
+}
+
+/// The masthead right cluster's absolute `(id, Rect)` spans for the loop's mouse
+/// hit-testing and detail-popup anchoring.
+pub fn masthead_item_spans(
+    model: &FrameModel,
+    layout: &crate::layout::ChromeLayout,
+) -> Vec<(BarItemId, Rect)> {
+    let rect = layout.masthead_stats_row();
+    if rect.rows == 0 || rect.cols == 0 {
+        return Vec::new();
+    }
+    let (brand_cols, items) = masthead_fit(model, rect.cols);
+    let widths: Vec<usize> = items.iter().map(|(_, w)| w.text.chars().count()).collect();
+    masthead_cluster_spans(&widths, rect, brand_cols)
+        .into_iter()
+        .zip(items)
+        .map(|((x, w), (id, _))| {
+            (
+                id,
+                Rect {
+                    x,
+                    y: rect.y,
+                    cols: w,
+                    rows: 1,
+                },
+            )
+        })
+        .collect()
+}
+
+/// The pre-fitted right cluster, right-aligned with `·` separators, with the
+/// focused item drawn as a focus-tinted selection block. The caller has already
+/// dropped whatever wouldn't fit (see `draw_masthead` / `masthead_fit`).
 fn draw_masthead_cluster(
     surface: &mut Surface,
     rect: Rect,
-    parts: &[&MastheadWidget],
+    parts: &[(BarItemId, MastheadWidget)],
     brand_cols: usize,
     bg: ColorAttribute,
+    model: &FrameModel,
 ) {
     if rect.rows == 0 || rect.cols == 0 || parts.is_empty() {
         return;
     }
     let sep = " \u{00b7} ";
-    let end = rect.x + rect.cols;
-    let total: usize =
-        parts.iter().map(|p| p.text.chars().count()).sum::<usize>() + 3 * (parts.len() - 1) + 1;
-    let mut rx = end
-        .saturating_sub(total)
-        .max(rect.x + brand_cols.max(1) + 1);
-    for (i, p) in parts.iter().enumerate() {
+    let widths: Vec<usize> = parts.iter().map(|(_, w)| w.text.chars().count()).collect();
+    let spans = masthead_cluster_spans(&widths, rect, brand_cols);
+    let sel = if model.masthead_focused {
+        Some(model.masthead_sel.min(parts.len().saturating_sub(1)))
+    } else {
+        None
+    };
+    let pill = theme_color(&theme::blend_over(&focus_rgb(), &panel_rgb(), 0.28));
+    let focus_fg = col(S::Focus);
+    for (i, ((_, p), (x, w))) in parts.iter().zip(spans.iter()).enumerate() {
         if i > 0 {
-            draw_text(surface, rx, rect.y, sep, col(S::Ghost), bg, 3);
-            rx += 3;
+            draw_text(
+                surface,
+                x.saturating_sub(3),
+                rect.y,
+                sep,
+                col(S::Ghost),
+                bg,
+                3,
+            );
         }
-        draw_text(
-            surface,
-            rx,
-            rect.y,
-            &p.text,
-            p.fg,
-            bg,
-            end.saturating_sub(rx),
-        );
-        rx += p.text.chars().count();
+        if sel == Some(i) {
+            fill(
+                surface,
+                Rect {
+                    x: *x,
+                    y: rect.y,
+                    cols: *w,
+                    rows: 1,
+                },
+                pill,
+            );
+            draw_text(surface, *x, rect.y, &p.text, focus_fg, pill, *w);
+        } else {
+            draw_text(surface, *x, rect.y, &p.text, p.fg, bg, *w);
+        }
     }
 }
 
-/// The bottom widget bar: mode chip + `[bars] bottom_left` (context keybind
-/// hints as key chips + dim labels) left-aligned, `bottom_right` (PR / LOC /
-/// transient status) right-aligned with `│` rules, and the zoom/lock badges
-/// as inverse chips always outermost-right.
-pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
-    use crate::seg::{Line, Seg, Tok, draw_line, seg, seg_width};
-    if rect.rows == 0 {
-        return;
-    }
+/// The statusbar's ordered navigable right-cluster items — the `bottom_right`
+/// config widgets followed by the always-on badges — each as its stable id plus
+/// the segments that render it (WITHOUT the inter-item separator, which the
+/// layout adds). The single source of truth shared by [`draw_statusbar`]
+/// (placement + highlight), navigation (item count), and
+/// [`statusbar_item_spans`] (mouse + popup anchoring), so they can never drift.
+pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Seg>)> {
+    use crate::seg::{Seg, Tok, seg};
+    let mut items: Vec<(BarItemId, Vec<Seg>)> = Vec::new();
 
-    // Right side: per-widget colors (e.g. the PR state) with `│` rules, then
-    // the zoom/lock badges outermost (the lock badge is safety-critical). Built
-    // first because the right cluster wins space — the left fits in what's left.
-    let mut r: Vec<Seg> = Vec::new();
-    let parts: Vec<MastheadWidget> = model
-        .bars
-        .bottom_right
-        .iter()
-        .filter_map(|id| bottombar_widget(id, model))
-        .collect();
-    for (i, p) in parts.into_iter().enumerate() {
-        if i > 0 {
-            r.push(seg(Tok::Slot(S::Ghost3), " \u{2502} "));
-        }
-        r.push(seg(Tok::Attr(p.fg), p.text));
-
-        if model.statusbar_focused && i == model.active_statusbar_widget {
-            r.push(seg(Tok::Slot(S::Ghost3), " \u{25c4} "));
+    // Config widgets (PR / tests / LOC / disk / transient status).
+    for id in &model.bars.bottom_right {
+        if let Some(p) = bottombar_widget(id, model) {
+            items.push((
+                BarItemId::Widget(id.clone()),
+                vec![seg(Tok::Attr(p.fg), p.text)],
+            ));
         }
     }
+
     // Red ⚑ flag is reserved for attention (Alert priority); a neutral blue inbox
     // chip carries Notice-priority unread. Info-priority events show in neither.
     if model.panel.alert_notifications > 0 {
-        r.push(seg(Tok::Slot(S::Text), " "));
-        r.push(Seg::chip(
-            Tok::Hue(superzej_core::theme::Hue::Red),
-            format!(" \u{2691} {} ", model.panel.alert_notifications),
+        items.push((
+            BarItemId::Badge(BarBadge::Notifications),
+            vec![Seg::chip(
+                Tok::Hue(superzej_core::theme::Hue::Red),
+                format!(" \u{2691} {} ", model.panel.alert_notifications),
+            )],
         ));
     } else if model.panel.unread_notifications > 0 {
-        r.push(seg(Tok::Slot(S::Text), " "));
-        r.push(Seg::chip(
-            Tok::Hue(superzej_core::theme::Hue::Blue),
-            format!(" \u{2709} {} ", model.panel.unread_notifications),
+        items.push((
+            BarItemId::Badge(BarBadge::Notifications),
+            vec![Seg::chip(
+                Tok::Hue(superzej_core::theme::Hue::Blue),
+                format!(" \u{2709} {} ", model.panel.unread_notifications),
+            )],
         ));
     }
     // CI rollup badge (AV group, item 158): a red ✗ chip when recent runs have
@@ -1307,16 +1436,20 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             .filter(|r| r.state == CiState::Running)
             .count();
         if fail > 0 {
-            r.push(seg(Tok::Slot(S::Text), " "));
-            r.push(Seg::chip(
-                Tok::Hue(superzej_core::theme::Hue::Red),
-                format!(" \u{2717} {fail} CI "),
+            items.push((
+                BarItemId::Badge(BarBadge::Ci),
+                vec![Seg::chip(
+                    Tok::Hue(superzej_core::theme::Hue::Red),
+                    format!(" \u{2717} {fail} CI "),
+                )],
             ));
         } else if running > 0 {
-            r.push(seg(Tok::Slot(S::Text), " "));
-            r.push(Seg::chip(
-                Tok::Hue(superzej_core::theme::Hue::Amber),
-                format!(" \u{25cf} {running} CI "),
+            items.push((
+                BarItemId::Badge(BarBadge::Ci),
+                vec![Seg::chip(
+                    Tok::Hue(superzej_core::theme::Hue::Amber),
+                    format!(" \u{25cf} {running} CI "),
+                )],
             ));
         }
     }
@@ -1340,10 +1473,12 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             } else {
                 superzej_core::theme::Hue::Amber
             };
-            r.push(seg(Tok::Slot(S::Text), " "));
-            r.push(Seg::chip(
-                Tok::Hue(hue),
-                format!(" \u{26c1} {} ", superzej_core::disk::human(total)),
+            items.push((
+                BarItemId::Badge(BarBadge::DiskWarn),
+                vec![Seg::chip(
+                    Tok::Hue(hue),
+                    format!(" \u{26c1} {} ", superzej_core::disk::human(total)),
+                )],
             ));
         }
     }
@@ -1369,13 +1504,17 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             } else {
                 superzej_core::theme::Hue::Teal
             };
-            r.push(seg(Tok::Slot(S::Text), " "));
-            r.push(Seg::chip(Tok::Hue(hue), label));
+            items.push((
+                BarItemId::Badge(BarBadge::Ingress),
+                vec![Seg::chip(Tok::Hue(hue), label)],
+            ));
         } else if failed > 0 {
-            r.push(seg(Tok::Slot(S::Text), " "));
-            r.push(Seg::chip(
-                Tok::Hue(superzej_core::theme::Hue::Amber),
-                " \u{21c5} ! ".to_string(),
+            items.push((
+                BarItemId::Badge(BarBadge::Ingress),
+                vec![Seg::chip(
+                    Tok::Hue(superzej_core::theme::Hue::Amber),
+                    " \u{21c5} ! ".to_string(),
+                )],
             ));
         }
     }
@@ -1399,19 +1538,23 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
                 text
             }
         };
-        r.push(seg(Tok::Slot(S::Text), " "));
-        r.push(Seg::chip(Tok::Hue(hue), format!(" {clipped} ")));
+        items.push((
+            BarItemId::Badge(BarBadge::Media),
+            vec![Seg::chip(Tok::Hue(hue), format!(" {clipped} "))],
+        ));
     }
     if let Some(ref metrics) = model.ai_metrics {
-        r.push(seg(Tok::Slot(S::Text), " "));
-        r.push(Seg::chip(
-            Tok::Hue(superzej_core::theme::Hue::Teal),
-            format!(
-                " 🤖 {}: ${:.2} ({}t) ",
-                metrics.agent,
-                metrics.cost,
-                metrics.tokens.input + metrics.tokens.output
-            ),
+        items.push((
+            BarItemId::Badge(BarBadge::AiCost),
+            vec![Seg::chip(
+                Tok::Hue(superzej_core::theme::Hue::Teal),
+                format!(
+                    " 🤖 {}: ${:.2} ({}t) ",
+                    metrics.agent,
+                    metrics.cost,
+                    metrics.tokens.input + metrics.tokens.output
+                ),
+            )],
         ));
     }
     if let Some(ref a) = model.agent_activity {
@@ -1438,31 +1581,159 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
                 (hue, label)
             }
         };
-        r.push(seg(Tok::Slot(S::Text), " "));
-        r.push(Seg::chip(Tok::Hue(hue), label));
+        items.push((
+            BarItemId::Badge(BarBadge::Agent),
+            vec![Seg::chip(Tok::Hue(hue), label)],
+        ));
     }
     if model.zoomed {
-        r.push(seg(Tok::Slot(S::Text), " "));
-        r.push(Seg::chip(
-            Tok::Hue(superzej_core::theme::Hue::Purple),
-            " \u{26f6} ZOOM ",
+        items.push((
+            BarItemId::Badge(BarBadge::Zoom),
+            vec![Seg::chip(
+                Tok::Hue(superzej_core::theme::Hue::Purple),
+                " \u{26f6} ZOOM ",
+            )],
         ));
     }
     if model.key_locked {
-        r.push(seg(Tok::Slot(S::Text), " "));
-        r.push(Seg::chip(
-            Tok::Hue(superzej_core::theme::Hue::Amber),
-            " \u{2301} LOCKED ",
+        items.push((
+            BarItemId::Badge(BarBadge::Lock),
+            vec![Seg::chip(
+                Tok::Hue(superzej_core::theme::Hue::Amber),
+                " \u{2301} LOCKED ",
+            )],
         ));
     }
     if model.sync_panes {
-        r.push(seg(Tok::Slot(S::Text), " "));
-        r.push(Seg::chip(
-            Tok::Hue(superzej_core::theme::Hue::Red),
-            " \u{29c9} SYNC ",
+        items.push((
+            BarItemId::Badge(BarBadge::Sync),
+            vec![Seg::chip(
+                Tok::Hue(superzej_core::theme::Hue::Red),
+                " \u{29c9} SYNC ",
+            )],
         ));
     }
+    items
+}
+
+/// Recolor an item's segments as the focused-selection block: bright focus
+/// foreground over a focus-tinted pill, matching the masthead app-chips' active
+/// look ("reads like a selected tab"). Width is unchanged, so spans are stable.
+fn highlight_segs(
+    segs: &[crate::seg::Seg],
+    pill: ColorAttribute,
+    fg: ColorAttribute,
+) -> Vec<crate::seg::Seg> {
+    use crate::seg::Tok;
+    segs.iter()
+        .map(|s| {
+            let mut h = s.clone();
+            h.fg = Tok::Attr(fg);
+            h.bg = Some(Tok::Attr(pill));
+            h.bold = true;
+            h
+        })
+        .collect()
+}
+
+/// Lay out the statusbar right cluster from [`statusbar_items`]: join items with
+/// separators (` │ ` between adjacent config widgets, a single space before each
+/// badge, trailing space) and, when `sel` is `Some`, highlight that item.
+/// Returns the seg run for [`draw_line`] plus each item's `(id, x_offset, width)`
+/// WITHIN the cluster (offset 0 = the cluster's left cell). Separators add width
+/// but are not items, so offsets account for them.
+fn statusbar_right_layout(
+    items: &[(BarItemId, Vec<crate::seg::Seg>)],
+    sel: Option<(usize, ColorAttribute, ColorAttribute)>,
+) -> (Vec<crate::seg::Seg>, Vec<(BarItemId, usize, usize)>) {
+    use crate::seg::{Seg, Tok, seg, seg_width};
+    let mut r: Vec<Seg> = Vec::new();
+    let mut spans: Vec<(BarItemId, usize, usize)> = Vec::new();
+    let mut off = 0usize;
+    let mut prev_widget = false;
+    for (idx, (id, segs)) in items.iter().enumerate() {
+        let is_widget = matches!(id, BarItemId::Widget(_));
+        // Separator: ` │ ` between two adjacent config widgets, a single space
+        // before any badge (reproduces the historical leading-space per badge).
+        if is_widget {
+            if prev_widget {
+                let s = seg(Tok::Slot(S::Ghost3), " \u{2502} ");
+                off += seg_width(std::slice::from_ref(&s));
+                r.push(s);
+            }
+        } else {
+            r.push(seg(Tok::Slot(S::Text), " "));
+            off += 1;
+        }
+        let drawn = match sel {
+            Some((s, pill, fg)) if s == idx => highlight_segs(segs, pill, fg),
+            _ => segs.clone(),
+        };
+        let w = seg_width(&drawn);
+        spans.push((id.clone(), off, w));
+        off += w;
+        r.extend(drawn);
+        prev_widget = is_widget;
+    }
     r.push(seg(Tok::Slot(S::Text), " "));
+    (r, spans)
+}
+
+/// The statusbar right-cluster items' absolute `(id, Rect)` spans for the given
+/// statusbar rect — mouse hit-testing and detail-popup anchoring. Mirrors
+/// [`draw_statusbar`]'s right-alignment (the cluster hugs the right edge), so a
+/// hit/anchor lands exactly where the item is painted.
+pub fn statusbar_item_spans(model: &FrameModel, rect: Rect) -> Vec<(BarItemId, Rect)> {
+    use crate::seg::seg_width;
+    if rect.rows == 0 || rect.cols == 0 {
+        return Vec::new();
+    }
+    let items = statusbar_items(model);
+    let (r, spans) = statusbar_right_layout(&items, None);
+    let rl = seg_width(&r);
+    // `Line::Split` right-aligns the right cluster: it begins at `cols - rl`.
+    let base = (rect.x + rect.cols).saturating_sub(rl);
+    spans
+        .into_iter()
+        .map(|(id, off, w)| {
+            (
+                id,
+                Rect {
+                    x: base + off,
+                    y: rect.y,
+                    cols: w,
+                    rows: 1,
+                },
+            )
+        })
+        .collect()
+}
+
+/// The bottom widget bar: mode chip + `[bars] bottom_left` (context keybind
+/// hints as key chips + dim labels) left-aligned, `bottom_right` (PR / LOC /
+/// transient status) right-aligned with `│` rules, and the zoom/lock badges
+/// as inverse chips always outermost-right.
+pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
+    use crate::seg::{Line, Seg, Tok, draw_line, seg, seg_width};
+    if rect.rows == 0 {
+        return;
+    }
+
+    // Right side: per-widget colors with `│` rules then the badges, built from
+    // the shared enumerator so navigation/highlight/hit-test stay in lock-step.
+    // The right cluster wins space — the left fits in what's left.
+    let items = statusbar_items(model);
+    let sel = if model.statusbar_focused {
+        let pill = theme_color(&theme::blend_over(&focus_rgb(), &panel_rgb(), 0.28));
+        Some((
+            model.statusbar_sel.min(items.len().saturating_sub(1)),
+            pill,
+            col(S::Focus),
+        ))
+    } else {
+        None
+    };
+    let (r, _spans) = statusbar_right_layout(&items, sel);
 
     // Cells the left cluster gets once the right wins its space — mirrors
     // `Line::split`'s math so keyhints can be trimmed at whole-binding
@@ -2649,6 +2920,69 @@ mod tests {
         assert!(
             !text2.contains('\u{2590}'),
             "no cursor bar when unfocused: {text2:?}"
+        );
+    }
+
+    #[test]
+    fn statusbar_items_includes_badges_so_they_are_navigable() {
+        // The core fix: badges (notifications/agent/…) must be in the same
+        // ordered item list nav steps, after the config widgets — otherwise the
+        // cursor can never reach them (the original bug).
+        let model = FrameModel {
+            bars: superzej_core::config::BarsConfig {
+                bottom_right: vec!["loc".into()],
+                ..Default::default()
+            },
+            loc: Some(1234),
+            panel: crate::panel::PanelData {
+                alert_notifications: 2,
+                ..Default::default()
+            },
+            agent_activity: Some(AgentActivity::default()),
+            zoomed: true,
+            ..Default::default()
+        };
+        let ids: Vec<BarItemId> = statusbar_items(&model)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids[0], BarItemId::Widget("loc".into()), "widgets first");
+        assert!(ids.contains(&BarItemId::Badge(BarBadge::Notifications)));
+        assert!(ids.contains(&BarItemId::Badge(BarBadge::Agent)));
+        assert!(ids.contains(&BarItemId::Badge(BarBadge::Zoom)));
+    }
+
+    #[test]
+    fn masthead_fit_sheds_items_when_narrow() {
+        // Navigation enumerates exactly what draw shows, so the width-degraded
+        // drop must shrink the navigable set too (no cursor on a hidden item).
+        let model = FrameModel {
+            bars: superzej_core::config::BarsConfig {
+                top_right: vec!["cpu".into(), "mem".into(), "swap".into(), "date".into()],
+                ..Default::default()
+            },
+            stats: superzej_metrics::StatsSnapshot {
+                cpu_pct: Some(99),
+                mem_gib: Some((4.0, 16.0)),
+                swap_gib: Some((1.0, 8.0)),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (_, wide) = masthead_fit(&model, 200);
+        let (_, narrow) = masthead_fit(&model, 24);
+        assert_eq!(wide.len(), 4);
+        assert!(
+            narrow.len() < wide.len(),
+            "narrow={} wide={}",
+            narrow.len(),
+            wide.len()
+        );
+        // cpu/mem survive longest (softest stats shed first).
+        assert!(
+            narrow
+                .iter()
+                .any(|(id, _)| *id == BarItemId::Widget("cpu".into()))
         );
     }
 

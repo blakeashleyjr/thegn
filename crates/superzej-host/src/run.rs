@@ -157,6 +157,19 @@ fn toggle_recorder(
 
 /// The bottom bar's contextual keybind hints — (chord, label) pairs the
 /// statusbar renders as key chips + dim labels: what works right now, given
+/// Step a bar's selected-item index by `delta` (-1/+1), clamped to `[0, count)`.
+/// An empty bar stays at 0.
+fn step_bar_sel(sel: usize, delta: i8, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    if delta < 0 {
+        sel.saturating_sub(1)
+    } else {
+        (sel + 1).min(count - 1)
+    }
+}
+
 /// the focused zone (and the panel's view when it owns the keyboard).
 fn context_hints(
     focus: &crate::focus::FocusState,
@@ -7581,6 +7594,9 @@ async fn event_loop<T: Terminal>(
         tokio_mpsc::unbounded_channel::<Vec<superzej_core::log::parser::ParsedLog>>();
 
     let mut hover_popup: Option<crate::hover::HoverPopup> = None;
+    // A bar-item detail popup/modal (CPU history graph, notifications list, …),
+    // opened by Enter or a click on a focused masthead/statusbar item.
+    let mut bar_detail: Option<crate::detail::DetailOverlay> = None;
     // Transient bottom-anchored notifications ("Text copied to clipboard", …).
     // Each push schedules a one-shot waker pulse so the toast clears on its own
     // even with no further input (the loop never polls on a timer).
@@ -10107,6 +10123,13 @@ async fn event_loop<T: Terminal>(
         model.center_focused = focus.center();
         model.masthead_focused = focus.masthead();
         model.statusbar_focused = focus.statusbar();
+        // Keep the per-bar selection valid as items appear/disappear between
+        // frames (a badge turning on/off, a widget gaining data): clamp to the
+        // current item count so the cursor never dangles past the last item.
+        let sb_items = crate::chrome::statusbar_items(&model).len();
+        model.statusbar_sel = model.statusbar_sel.min(sb_items.saturating_sub(1));
+        let mh_items = crate::chrome::masthead_item_spans(&model, &chrome).len();
+        model.masthead_sel = model.masthead_sel.min(mh_items.saturating_sub(1));
         model.key_locked = focus.locked;
         model.zoomed = zoom.is_some();
         model.sync_panes = sync_panes;
@@ -10282,6 +10305,7 @@ async fn event_loop<T: Terminal>(
                 && wizard_ui.is_none()
                 && hover_popup.is_none()
                 && search.is_none()
+                && bar_detail.is_none()
                 && which_key.is_empty()
                 && toasts.is_empty();
             // FAST PATH: a pure mouse-wheel scroll changes only the scrolled
@@ -10304,6 +10328,7 @@ async fn event_loop<T: Terminal>(
                 && wizard_ui.is_none()
                 && hover_popup.is_none()
                 && search.is_none()
+                && bar_detail.is_none()
                 && which_key.is_empty()
                 && toasts.is_empty();
             // The damage-compositor decision (pure, unit-tested in render_plan):
@@ -10324,6 +10349,7 @@ async fn event_loop<T: Terminal>(
                 search: search.is_some(),
                 which_key: !which_key.is_empty(),
                 toasts: !toasts.is_empty(),
+                detail: bar_detail.is_some(),
             };
             let damage = crate::render_plan::Damage {
                 full: full_repaint,
@@ -10607,6 +10633,11 @@ async fn event_loop<T: Terminal>(
             // The hover preview floats above the panel, below modal input.
             if let Some(hp) = &hover_popup {
                 hp.render(&mut scratch, screen);
+            }
+            // A bar-item detail popup/modal sits above the rest of the chrome
+            // overlays but below which-key/toasts (which stay topmost).
+            if let Some(d) = &bar_detail {
+                d.render(&mut scratch, screen);
             }
             let accent = current_config.accent_rgb();
             if !which_key.is_empty() {
@@ -11056,9 +11087,33 @@ async fn event_loop<T: Terminal>(
                         mouse_sel = Some((id, crate::copymode::Selection::new(cell)));
                         mouse_selecting = true;
                     } else if contains(chrome.masthead_stats_row(), mx, my) {
-                        // Click the top-right stats block to cycle its refresh
-                        // rate ([stats] refresh_rates).
-                        if mx >= chrome.masthead.cols / 2 {
+                        // Click a masthead stat item to focus it + open its
+                        // detail view (CPU graph, etc.).
+                        let hit = crate::chrome::masthead_item_spans(&model, &chrome)
+                            .into_iter()
+                            .enumerate()
+                            .find(|(_, (_, r))| contains(*r, mx, my));
+                        if let Some((idx, (id, rect))) = hit {
+                            focus.zone = crate::focus::Zone::Masthead;
+                            model.masthead_sel = idx;
+                            if id.has_detail() {
+                                let screen = Rect {
+                                    x: 0,
+                                    y: 0,
+                                    cols,
+                                    rows,
+                                };
+                                bar_detail = crate::detail::open_detail_for(
+                                    &id,
+                                    rect,
+                                    screen,
+                                    &model,
+                                    &panel_ui.docs.telemetry,
+                                );
+                            }
+                        } else if mx >= chrome.masthead.cols / 2 {
+                            // Click an empty part of the top-right block to cycle
+                            // its refresh rate ([stats] refresh_rates).
                             let rates = &current_config.stats.refresh_rates;
                             if !rates.is_empty() {
                                 use std::sync::atomic::Ordering;
@@ -11075,6 +11130,32 @@ async fn event_loop<T: Terminal>(
                                     std::time::Instant::now(),
                                 );
                                 schedule_toast_clear(&waker);
+                            }
+                        }
+                    } else if contains(chrome.statusbar, mx, my) {
+                        // Click a statusbar item/badge to focus it + open its
+                        // detail (notifications list, agent detail, …).
+                        let hit = crate::chrome::statusbar_item_spans(&model, chrome.statusbar)
+                            .into_iter()
+                            .enumerate()
+                            .find(|(_, (_, r))| contains(*r, mx, my));
+                        if let Some((idx, (id, rect))) = hit {
+                            focus.zone = crate::focus::Zone::Statusbar;
+                            model.statusbar_sel = idx;
+                            if id.has_detail() {
+                                let screen = Rect {
+                                    x: 0,
+                                    y: 0,
+                                    cols,
+                                    rows,
+                                };
+                                bar_detail = crate::detail::open_detail_for(
+                                    &id,
+                                    rect,
+                                    screen,
+                                    &model,
+                                    &panel_ui.docs.telemetry,
+                                );
                             }
                         }
                     } else if contains(chrome.center_tabs, mx, my) {
@@ -11338,6 +11419,17 @@ async fn event_loop<T: Terminal>(
                 // The hover preview is modal-lite: any key dismisses it and is
                 // consumed (so it never also acts on the panel beneath).
                 if hover_popup.take().is_some() {
+                    dirty = true;
+                    continue;
+                }
+                // A bar-item detail overlay is a top-priority modal: it owns
+                // every key while open (Esc/Enter/q close it; arrows scroll a
+                // list), so the bar-nav zone never sees them.
+                if let Some(d) = bar_detail.as_mut() {
+                    match d.handle_key(&k.key, k.modifiers) {
+                        crate::detail::DetailOutcome::Close => bar_detail = None,
+                        crate::detail::DetailOutcome::Pending => {}
+                    }
                     dirty = true;
                     continue;
                 }
@@ -12879,15 +12971,43 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
-                // Bar zones (masthead/statusbar): no widget interaction is
-                // wired yet — Esc returns to the center; everything else is
-                // swallowed (bars never forward to a pane).
+                // Bar zones (masthead/statusbar): ←/→ step items (handled via the
+                // Ctrl chords above), Enter opens the focused item's detail view,
+                // Esc returns to the center; everything else is swallowed (bars
+                // never forward to a pane).
                 if focus.bar()
                     && !k.modifiers.contains(Modifiers::CTRL)
                     && !k.modifiers.contains(Modifiers::ALT)
                 {
                     if crate::input::is_escape_key(&k.key) {
                         focus.zone = crate::focus::Zone::Center;
+                    } else if k.key == KeyCode::Enter {
+                        let hit = if focus.masthead() {
+                            crate::chrome::masthead_item_spans(&model, &chrome)
+                                .into_iter()
+                                .nth(model.masthead_sel)
+                        } else {
+                            crate::chrome::statusbar_item_spans(&model, chrome.statusbar)
+                                .into_iter()
+                                .nth(model.statusbar_sel)
+                        };
+                        if let Some((id, rect)) = hit
+                            && id.has_detail()
+                        {
+                            let screen = Rect {
+                                x: 0,
+                                y: 0,
+                                cols,
+                                rows,
+                            };
+                            bar_detail = crate::detail::open_detail_for(
+                                &id,
+                                rect,
+                                screen,
+                                &model,
+                                &panel_ui.docs.telemetry,
+                            );
+                        }
                     }
                     dirty = true;
                     continue;
@@ -16160,25 +16280,17 @@ async fn event_loop<T: Terminal>(
                                                 }
                                                 sb.sync(&mut model);
                                             } else if focus.statusbar() {
-                                                if delta < 0 {
-                                                    model.active_statusbar_widget = model
-                                                        .active_statusbar_widget
-                                                        .saturating_sub(1);
-                                                } else {
-                                                    let count = model
-                                                        .bars
-                                                        .bottom_right
-                                                        .iter()
-                                                        .filter_map(|id| {
-                                                            crate::chrome::bottombar_widget(
-                                                                id, &model,
-                                                            )
-                                                        })
-                                                        .count();
-                                                    model.active_statusbar_widget =
-                                                        (model.active_statusbar_widget + 1)
-                                                            .min(count.saturating_sub(1));
-                                                }
+                                                let count =
+                                                    crate::chrome::statusbar_items(&model).len();
+                                                model.statusbar_sel =
+                                                    step_bar_sel(model.statusbar_sel, delta, count);
+                                            } else if focus.masthead() {
+                                                let count = crate::chrome::masthead_item_spans(
+                                                    &model, &chrome,
+                                                )
+                                                .len();
+                                                model.masthead_sel =
+                                                    step_bar_sel(model.masthead_sel, delta, count);
                                             } else if focus.panel() {
                                                 // Row mode walks the open
                                                 // section's rows; section mode
