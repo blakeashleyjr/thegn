@@ -1859,6 +1859,14 @@ pub struct EnvProviderConfig {
     /// Working directory inside the sandbox that a `data = "sync"` projection
     /// pushes the local worktree into (and pulls back from). Empty ⇒ `/workspace`.
     pub workdir: String,
+    /// Auto-create the sandbox on first open if it doesn't exist yet (API
+    /// providers): the "feels-local" warm-on-open. Off by default — creating a
+    /// paid cloud sandbox should be opt-in; otherwise run `superzej env provision`.
+    pub auto_provision: bool,
+    /// Checkpoint the sandbox on worktree close (API providers that support it):
+    /// "suspend on close" for fast resume. Off by default (each checkpoint may
+    /// incur storage cost).
+    pub auto_checkpoint: bool,
 }
 
 impl EnvProviderConfig {
@@ -1873,6 +1881,8 @@ impl EnvProviderConfig {
             && self.api_key_env.is_empty()
             && self.template.is_empty()
             && self.workdir.is_empty()
+            && !self.auto_provision
+            && !self.auto_checkpoint
     }
 
     /// The sandbox working dir for `sync` (config value or the `/workspace` default).

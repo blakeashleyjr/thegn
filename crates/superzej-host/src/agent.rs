@@ -282,6 +282,11 @@ pub fn prepare_sandbox_env(
     // for remote placements / `sshfs` it removes the previous need to run
     // `superzej env up` by hand. This runs on the (already off-event-loop)
     // sandbox-prepare path, mirroring the VPN sidecar bring-up below.
+    // Warm-on-open: create the API sandbox first if `auto_provision` is set, so
+    // the subsequent ensure/clone/connect find it live (8-E). No-op otherwise.
+    if matches!(placement, superzej_core::placement::Placement::Provider(_)) {
+        auto_provision_sandbox(cfg, &env_name);
+    }
     if !placement.is_local()
         && let Err(e) = placement.ensure()
     {
@@ -642,6 +647,68 @@ pub fn ensure_remote_bridge(cfg: &Config, env_name: &str, binary: &Path, remote_
         )),
         Ok(false) => {} // already current — no re-push
         Err(e) => superzej_core::msg::warn(&format!("bridge binary push failed: {e}")),
+    }
+}
+
+/// Warm-on-open (8-E): for a provider env with `auto_provision`, create the
+/// sandbox if it doesn't exist yet (API providers — CLI providers use
+/// `up_command`/`placement.ensure`). Best-effort + off-loop; a failure warns and
+/// later steps (clone/connect) degrade as usual. No-op unless `auto_provision`.
+fn auto_provision_sandbox(cfg: &Config, env_name: &str) {
+    let Some(env) = cfg.env.get(env_name) else {
+        return;
+    };
+    let pc = &env.provider;
+    let name = pc.id.trim();
+    if !pc.auto_provision || name.is_empty() {
+        return;
+    }
+    let Some(provider) = provider_for(pc) else {
+        return;
+    };
+    let name = name.to_string();
+    match block_on_provider(|| async { provider.ensure_exists(&name).await }) {
+        Ok(true) => superzej_core::msg::info(&format!("provisioned sandbox {name}")),
+        Ok(false) => {} // already exists
+        Err(e) => superzej_core::msg::warn(&format!("sandbox auto-provision failed: {e}")),
+    }
+}
+
+/// Suspend-on-close (8-E): for a provider env with `auto_checkpoint`, snapshot the
+/// sandbox when the worktree closes (fast resume next open). Called from the
+/// fire-and-forget close thread, which has only the path — so it loads config +
+/// resolves the env itself. Best-effort + off-loop; checkpoints-capable only.
+pub fn checkpoint_on_close(worktree: &str) {
+    let cfg = Config::load_layered(&superzej_core::config::ProcessEnv, &[], None);
+    let Ok(db) = Db::open() else {
+        return;
+    };
+    let repo_root = db
+        .repo_root_for(worktree)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let Some(env_name) = db.effective_env(worktree, &repo_root) else {
+        return;
+    };
+    let Some(env) = cfg.env.get(&env_name) else {
+        return;
+    };
+    let pc = &env.provider;
+    let name = pc.id.trim();
+    if !pc.auto_checkpoint || name.is_empty() {
+        return;
+    }
+    let Some(provider) = provider_for(pc) else {
+        return;
+    };
+    if !provider.caps().checkpoints {
+        return;
+    }
+    let name = name.to_string();
+    match block_on_provider(|| async { provider.checkpoint(&name, Some("auto-close")).await }) {
+        Ok(id) => superzej_core::msg::info(&format!("checkpointed {name} on close: {id}")),
+        Err(e) => superzej_core::msg::warn(&format!("auto-checkpoint on close failed: {e}")),
     }
 }
 

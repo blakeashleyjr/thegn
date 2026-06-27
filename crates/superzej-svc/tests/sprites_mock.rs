@@ -331,6 +331,31 @@ fn provider_enum_dispatch_against_mock() {
 }
 
 #[test]
+fn ensure_exists_skips_when_present_creates_when_absent() {
+    let mock = start_mock();
+    let rt = rt();
+    // The list fixture returns ["sztest1"], so ensure_exists for it is a no-op…
+    let present = Provider::Sprites(SpritesProvider::new(&mock.base_url, "tok", "sztest1"));
+    assert!(
+        !rt.block_on(present.ensure_exists("sztest1")).unwrap(),
+        "present ⇒ no create"
+    );
+    // …and for an unknown name it creates (the create fixture).
+    let absent = Provider::Sprites(SpritesProvider::new(&mock.base_url, "tok", "newone"));
+    assert!(
+        rt.block_on(absent.ensure_exists("newone")).unwrap(),
+        "absent ⇒ create"
+    );
+    // The create endpoint was hit exactly once (only for the absent case).
+    let reqs = mock.recorded.lock().unwrap().clone();
+    let creates = reqs
+        .iter()
+        .filter(|r| r.method == "POST" && r.path == "/v1/sprites")
+        .count();
+    assert_eq!(creates, 1, "create only for the absent sprite: {reqs:?}");
+}
+
+#[test]
 fn write_exec_uses_0755_mode() {
     let mock = start_mock();
     let p = SpritesProvider::new(&mock.base_url, "tok", "sztest1");
