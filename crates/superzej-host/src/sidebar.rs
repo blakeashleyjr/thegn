@@ -23,23 +23,28 @@ pub enum RowKind {
 }
 
 /// Contextual activity, mirrored from the host-side `activity` state machine.
-/// Drives the sidebar dot's color: `Active` (worktree busy / agent working)
-/// renders a white dot; `Quiet` (was active, now idle — the agent is waiting
-/// for the user) renders a red dot; `None`/acked (dormant) render no dot.
+/// Drives the sidebar dot's glyph + color: `Active` (worktree busy / agent
+/// working) is a filled white ●; `Waiting` (was active, now idle — the agent is
+/// stuck waiting for the user, *unread*) is a filled red ●; `Read` (the user has
+/// focused the tab but it is still stuck) is a hollow red ○; `None` (dormant)
+/// renders no dot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ActivityState {
     #[default]
     None,
     Active,
-    Quiet,
+    Waiting,
+    Read,
 }
 
 impl ActivityState {
     pub fn from_str(s: &str) -> Self {
         match s {
             "active" => ActivityState::Active,
-            "quiet" => ActivityState::Quiet,
-            _ => ActivityState::None, // "none" | "acked" | unknown
+            "waiting" => ActivityState::Waiting,
+            "read" => ActivityState::Read,
+            "quiet" => ActivityState::Waiting, // legacy snapshots
+            _ => ActivityState::None,          // "none" | "acked" | unknown
         }
     }
 }
@@ -165,6 +170,11 @@ pub struct SidebarRow {
     /// Badge: alert count (test failures, agent failures, log errors) for this worktree (item 28).
     #[allow(dead_code)]
     pub alert_count: usize,
+    /// Disk usage of this worktree's checkout (bytes), from the off-loop scan.
+    pub disk_bytes: Option<u64>,
+    /// Disk usage of this worktree's `target/` subtree (bytes) — the reclaimable
+    /// portion. Drives the amber tint on the size badge when it dominates.
+    pub target_bytes: Option<u64>,
     /// Connection string for terminal rows
     pub terminal_connection: Option<String>,
 }
@@ -186,6 +196,10 @@ pub struct SidebarStatus {
     pub unread_counts: std::collections::BTreeMap<String, usize>,
     /// Badge: alert count per worktree (item 28).
     pub alert_counts: std::collections::BTreeMap<String, usize>,
+    /// Per-worktree disk usage `(total_bytes, target_bytes)` from the
+    /// `worktree_disk` cache (populated off-loop by the disk scan). Drives the
+    /// sidebar size badge and the statusbar total.
+    pub disk_sizes: std::collections::HashMap<String, (i64, i64)>,
 }
 
 /// Persisted + transient view state that shapes the tree (collapse/sort/pins/
@@ -329,6 +343,8 @@ pub fn build_rows(
             unread_count: 0,
             alert_count: 0,
             terminal_connection: None,
+            disk_bytes: None,
+            target_bytes: None,
         });
 
         // This repo's worktree groups, straight from the session model.
@@ -417,6 +433,8 @@ pub fn build_rows(
                 unread_count,
                 alert_count,
                 terminal_connection: None,
+                disk_bytes: None,
+                target_bytes: None,
             });
         }
 
@@ -492,6 +510,8 @@ pub fn build_rows(
                 unread_count: 0,
                 alert_count: 0,
                 terminal_connection: None,
+                disk_bytes: None,
+                target_bytes: None,
             });
 
             if !folder_collapsed {
@@ -557,6 +577,8 @@ pub fn build_rows(
                             unread_count,
                             alert_count,
                             terminal_connection: None,
+                            disk_bytes: None,
+                            target_bytes: None,
                         });
                     }
                 }
@@ -623,6 +645,8 @@ pub fn build_rows(
                     unread_count,
                     alert_count,
                     terminal_connection: None,
+                    disk_bytes: None,
+                    target_bytes: None,
                 }
             };
             rows.push(mk(
@@ -673,6 +697,8 @@ pub fn build_rows(
             unread_count: 0,
             alert_count: 0,
             terminal_connection: None,
+            disk_bytes: None,
+            target_bytes: None,
         });
     }
 
@@ -703,6 +729,8 @@ pub fn build_rows(
             unread_count: 0,
             alert_count: 0,
             terminal_connection: None,
+            disk_bytes: None,
+            target_bytes: None,
         });
 
         if !collapsed {
@@ -745,7 +773,23 @@ pub fn build_rows(
                     unread_count: 0,
                     alert_count: 0,
                     terminal_connection: Some(t.connection_string.clone()),
+                    disk_bytes: None,
+                    target_bytes: None,
                 });
+            }
+        }
+    }
+
+    // Denormalize cached disk sizes onto every worktree row (one pass, keyed by
+    // path), so the badge renderer reads them straight off the row like the
+    // PR/unread/alert counts.
+    if !status.disk_sizes.is_empty() {
+        for row in &mut rows {
+            if let Some(p) = &row.worktree_path
+                && let Some(&(total, target)) = status.disk_sizes.get(p)
+            {
+                row.disk_bytes = Some(total.max(0) as u64);
+                row.target_bytes = Some(target.max(0) as u64);
             }
         }
     }
@@ -783,11 +827,12 @@ fn sort_groups(groups: &mut [Group], sort: SortMode) {
             });
         }
         SortMode::Activity => {
-            // Active, then quiet, then idle; home first within each tier.
+            // Active, then stuck (waiting/read), then idle; home first per tier.
             let rank = |s: ActivityState| match s {
                 ActivityState::Active => 0,
-                ActivityState::Quiet => 1,
-                ActivityState::None => 2,
+                ActivityState::Waiting => 1,
+                ActivityState::Read => 2,
+                ActivityState::None => 3,
             };
             groups.sort_by(|a, b| {
                 rank(a.activity)

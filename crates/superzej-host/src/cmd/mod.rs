@@ -12,6 +12,7 @@
 pub mod ci;
 pub mod config;
 pub mod diff;
+pub mod disk;
 pub mod env;
 pub mod issue;
 pub mod list;

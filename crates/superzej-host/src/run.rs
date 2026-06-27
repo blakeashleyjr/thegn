@@ -443,6 +443,12 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         since_start_ms = start.elapsed().as_millis() as u64,
         "config loaded"
     );
+    // Warm the active workspace's flake devShell cache off-thread so the first
+    // pane is injected with the project toolchain (Tier A). No-op without a
+    // flake / `nix` / `[sandbox] inject_devshell`. See `superzej_core::devenv`.
+    if cfg.sandbox.inject_devshell && !session.id.is_empty() {
+        superzej_core::devenv::prewarm(std::path::Path::new(&session.id));
+    }
     // Auto-launch the LLM-proxy daemon when enabled (disabled by default — AI is
     // additive). Held for the lifetime of `main`; the supervisor thread keeps it
     // alive and `Drop` stops it on graceful return (process-group exit otherwise).
@@ -600,12 +606,21 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // Set while the telemetry overlay is open: the ticker samples stats at
     // its 500ms half-tick instead of the user-cycled rate.
     let stats_live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Filesystem the `disk` masthead widget measures: the configured path, else
+    // the one holding the worktrees dir. `disk_free_pct` climbs to an existing
+    // ancestor, so a not-yet-created dir still resolves to its parent fs.
+    let disk_fs_path = if cfg.stats.disk_path.trim().is_empty() {
+        std::path::PathBuf::from(&cfg.worktrees_dir)
+    } else {
+        std::path::PathBuf::from(superzej_core::util::expand_tilde(&cfg.stats.disk_path))
+    };
     spawn_refresh_ticker(
         refresh_tx.clone(),
         stats_tx,
         container_tx,
         stats_interval_ms.clone(),
         stats_live.clone(),
+        disk_fs_path,
         waker.clone(),
     );
 
@@ -1193,16 +1208,6 @@ enum SidebarOutcome {
     },
 }
 
-/// A destructive action awaiting `y`/`Y` confirmation in the loop's modal.
-enum PendingAction {
-    /// Forget a workspace (close its groups + prune DB rows); files kept.
-    RemoveWorkspace {
-        repo_path: String,
-        slug: String,
-        display: String,
-    },
-}
-
 impl SidebarState {
     /// Persist a single `ui_state` key for this session's scope.
     fn persist(&self, session_id: &str, key: &str, value: &str) {
@@ -1395,6 +1400,7 @@ impl SidebarState {
         }
         Some(crate::chrome::RowMenu {
             anchor: self.cursor,
+            target_pin_key: row.pin_key.clone(),
             entries: entries
                 .into_iter()
                 .map(|(id, label)| crate::chrome::RowMenuEntry {
@@ -1450,8 +1456,17 @@ impl SidebarState {
                 }
                 KeyCode::Enter => {
                     let id = menu.entries.get(menu.cursor).map(|e| e.id.clone());
+                    let target_key = menu.target_pin_key.clone();
                     self.menu = None;
                     if let Some(id) = id {
+                        if let Some(idx) = model
+                            .sidebar_rows
+                            .iter()
+                            .filter(|r| r.visible)
+                            .position(|r| r.pin_key == target_key)
+                        {
+                            self.cursor = idx;
+                        }
                         return self.run_menu_action(&id, model, session);
                     }
                 }
@@ -1538,7 +1553,8 @@ impl SidebarState {
                 }
             }
             KeyCode::Char('D') => {
-                // On a workspace row, D forgets the workspace (no disk delete).
+                // On a workspace row, D removes the workspace (opens the same
+                // delete-from-disk/keep-files menu as Alt+Shift+X).
                 if let Some(out) = self.remove_workspace_target(model) {
                     return out;
                 }
@@ -1947,6 +1963,48 @@ fn active_cwd(session: &crate::session::Session) -> Option<std::path::PathBuf> {
     session.active_group().and_then(group_cwd)
 }
 
+/// The active worktree's `(worktree_path, workspace_repo_path)`, or `None` when
+/// there's nothing fileable (no active group, the home tab, a terminal, or no
+/// resolvable repo). The repo path is the DB workspace root so the folder we
+/// create lines up with the sidebar's per-workspace folder filter.
+fn active_worktree_repo(session: &crate::session::Session) -> Option<(String, String)> {
+    use crate::session::GroupKind;
+    let g = session.active_group()?;
+    if g.kind != GroupKind::Branch || g.path.is_empty() {
+        return None;
+    }
+    let wt_path = g.path.clone();
+    let db = superzej_core::db::Db::open().ok()?;
+    let repo_path = db
+        .repo_root_for(&wt_path)
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            superzej_core::repo::main_worktree(std::path::Path::new(&wt_path))
+                .map(|p| p.to_string_lossy().into_owned())
+        })?;
+    Some((wt_path, repo_path))
+}
+
+/// File the active worktree into `folder` (created if absent). Returns a status
+/// line on success or a human-readable reason on failure.
+fn file_active_worktree(session: &crate::session::Session, folder: &str) -> Result<String, String> {
+    let folder = folder.trim();
+    if folder.is_empty() {
+        return Err("Folder name is empty".into());
+    }
+    let (wt_path, repo_path) =
+        active_worktree_repo(session).ok_or("No worktree to file into a folder")?;
+    let db = superzej_core::db::Db::open().map_err(|e| format!("DB open failed: {e}"))?;
+    let fid = db
+        .ensure_folder(&repo_path, folder)
+        .map_err(|e| format!("Folder create failed: {e}"))?;
+    db.set_worktree_folder(&wt_path, Some(fid))
+        .map_err(|e| format!("Filing failed: {e}"))?;
+    Ok(format!("Filed worktree into \"{folder}\""))
+}
+
 /// DELETE these worktree groups from disk (`git worktree remove`, branch
 /// kept) and close them. Home groups are never deletable. Returns the status
 /// line summarizing what happened.
@@ -2066,22 +2124,79 @@ fn delete_groups(
     status
 }
 
-/// Forget an entire workspace: close every live worktree group it owns and
-/// prune its DB rows (`workspaces`, the `worktrees` registry, its slug, and the
-/// active-workspace pointer if it pointed here). This is deliberately
-/// non-destructive — unlike [`delete_groups`] it never runs `git worktree
-/// remove` or `fs::remove_dir_all`, so the worktree files stay on disk and the
-/// workspace re-appears if reopened.
+/// Remove a workspace — the single path behind both Alt+Shift+X and the sidebar
+/// "Remove workspace" action. Always closes every live worktree group the
+/// workspace owns and prunes its DB rows (`workspaces`, the `worktrees`
+/// registry, its slug, and the active-workspace pointer). When `keep_files` is
+/// false it *also* deletes the workspace's worktree directories from disk (the
+/// home checkout at `repo_path` is always preserved); when true the files stay
+/// on disk and the workspace re-appears if reopened. If the removed workspace is
+/// the active one, the session switches to the next available workspace (or
+/// empties when none remain).
+/// Worktree directories to delete from disk when removing the workspace at
+/// `repo_path`: every registered worktree whose `repo_root` matches, EXCEPT the
+/// home checkout (its path == `repo_path`, which must never be deleted) and any
+/// empty-path legacy rows. Split out so the safety-critical home-skip guard is
+/// unit-testable without real I/O.
+fn workspace_worktree_dirs(db: &superzej_core::db::Db, repo_path: &str) -> Vec<String> {
+    db.worktrees()
+        .map(|rows| {
+            rows.into_iter()
+                .filter(|w| {
+                    w.repo_root == repo_path && w.worktree != repo_path && !w.worktree.is_empty()
+                })
+                .map(|w| w.worktree)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn remove_workspace(
     session: &mut crate::session::Session,
     panes: &mut Panes,
     repo_path: &str,
     slug: &str,
     display: &str,
+    keep_files: bool,
 ) -> String {
     let db = superzej_core::db::Db::open().ok();
+    let was_active = session.id == repo_path;
+
+    // Destructive: delete the workspace's worktree dirs from disk. Read the
+    // registry BEFORE `remove_workspace_with_db` prunes it. The home checkout
+    // (its path == `repo_path`) is never deleted — only branch worktrees.
+    if !keep_files && let Some(db) = &db {
+        let root = Path::new(repo_path);
+        for path in workspace_worktree_dirs(db, repo_path) {
+            superzej_core::worktree::remove(root, Path::new(&path), "", false);
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+
     remove_workspace_with_db(session, panes, db.as_ref(), repo_path, slug);
-    format!("Removed workspace '{display}' (files kept on disk)")
+
+    // Removing the active workspace leaves the session pointing at nothing;
+    // land on the next available workspace, else empty out.
+    if was_active {
+        let mut switched = false;
+        if let Some(db) = &db
+            && let Ok(workspaces) = db.workspaces()
+            && let Some(next) = workspaces.first()
+        {
+            switched = session.switch_to_workspace(&next.repo_path, db).is_ok();
+        }
+        if !switched {
+            session.id.clear();
+            session.worktrees.clear();
+            session.active = 0;
+        }
+    }
+
+    if keep_files {
+        format!("Removed workspace '{display}' (files kept on disk)")
+    } else {
+        format!("Deleted workspace '{display}' (worktrees removed from disk)")
+    }
 }
 
 /// Engine for [`remove_workspace`], split from the process-global `Db::open()`
@@ -3123,7 +3238,6 @@ enum GitInputKind {
 enum HostInputKind {
     NewWorkspace,
     NewTerminal,
-    DeleteWorkspaceConfirm,
     /// Rename the worktree group at this session index from its old branch
     /// (item 53). Carries the repo root + old path/branch so the off-thread
     /// rename has everything it needs.
@@ -3146,6 +3260,9 @@ enum HostInputKind {
     NewWorktreeFromTemplate {
         repo_root: String,
     },
+    /// File the active worktree into a new folder named by the typed value
+    /// (the "＋ New folder…" path of the move-to-folder picker).
+    FileWorktreeNewFolder,
 }
 
 /// Launch the new-worktree wizard + speculative-create worker against `root`.
@@ -3306,17 +3423,6 @@ fn begin_new_workspace_prompt(
     model.status = "Create workspace: enter path or URL (Esc cancels)".into();
 }
 
-fn begin_delete_workspace_prompt(
-    host_input: &mut Option<(menu::InputOverlay, HostInputKind)>,
-    model: &mut FrameModel,
-) {
-    *host_input = Some((
-        menu::InputOverlay::new("delete workspace? (type 'yes' to confirm)", ""),
-        HostInputKind::DeleteWorkspaceConfirm,
-    ));
-    model.status = "Delete this workspace? Type 'yes' to confirm (Esc cancels)".into();
-}
-
 fn looks_like_git_url(input: &str) -> bool {
     input.starts_with("http://")
         || input.starts_with("https://")
@@ -3343,12 +3449,20 @@ fn create_workspace_from_input(
     session: &mut crate::session::Session,
     db: &superzej_core::db::Db,
 ) -> Result<std::path::PathBuf> {
-    create_workspace_from_input_with_config(
+    match create_workspace_from_input_with_config(
         input,
         session,
         db,
         &superzej_core::config::Config::default(),
-    )
+    )? {
+        WorkspaceResolution::Repo(p) => Ok(p),
+        WorkspaceResolution::NotARepo(p) => Ok(p),
+    }
+}
+
+enum WorkspaceResolution {
+    Repo(std::path::PathBuf),
+    NotARepo(std::path::PathBuf),
 }
 
 fn create_workspace_from_input_with_config(
@@ -3356,7 +3470,7 @@ fn create_workspace_from_input_with_config(
     session: &mut crate::session::Session,
     db: &superzej_core::db::Db,
     cfg: &superzej_core::config::Config,
-) -> Result<std::path::PathBuf> {
+) -> Result<WorkspaceResolution> {
     let input = input.trim();
     anyhow::ensure!(!input.is_empty(), "no workspace path or URL given");
 
@@ -3402,12 +3516,12 @@ fn create_workspace_from_input_with_config(
     let kind = if superzej_core::repo::main_worktree(&root).is_some() {
         "repo"
     } else {
-        "dir"
+        return Ok(WorkspaceResolution::NotARepo(root));
     };
     db.put_workspace(&root_s, &name, kind)?;
     db.touch_repo(&root_s, &name)?;
     session.switch_to_workspace(&root_s, db)?;
-    Ok(root)
+    Ok(WorkspaceResolution::Repo(root))
 }
 
 /// A follow-up only the loop body can perform (it owns session/panes).
@@ -4816,6 +4930,8 @@ fn dispatch_menu_choice(
         // which this git-scoped dispatcher doesn't carry. Never reaches here.
         MenuChoice::SetKeymapPreset(_) => {}
         MenuChoice::ConfirmDeleteWorktrees { .. } => {}
+        MenuChoice::ConfirmDeleteWorkspace { .. } => {}
+        MenuChoice::ConfirmInitGit { .. } => {}
     }
     GitAfter::None
 }
@@ -6806,9 +6922,11 @@ async fn event_loop<T: Terminal>(
     let mut mouse_selecting = false;
     let mut mouse_sel: Option<(u32, crate::copymode::Selection)> = None;
     // A destructive delete awaiting its y/N confirmation: (question, targets).
-    let mut pending_confirm: Option<(String, PendingAction)> = None;
     // A delete worktree action from menu awaiting the user choice
     let mut pending_confirm_delete_worktrees: Option<Vec<usize>> = None;
+    // The workspace (repo_path, slug, display) targeted by an open
+    // delete-workspace menu, awaiting the user's keep-files/delete choice.
+    let mut pending_delete_workspace: Option<(String, String, String)> = None;
     // Force a full terminal repaint on the next flush when the chrome
     // GEOMETRY changed (toggles, strip, resize) — nothing from the previous
     // layout may survive. Tab/worktree switches reuse the same rects and must
@@ -7283,6 +7401,7 @@ async fn event_loop<T: Terminal>(
             spawn_pr_cache_refresh(
                 session.clone(),
                 current_config.issues.clone(),
+                current_config.disk.clone(),
                 Some(waker.clone()),
             );
             crate::hydrate::spawn_issue_cache_refresh(
@@ -9004,6 +9123,7 @@ async fn event_loop<T: Terminal>(
         let mut want_pr_refresh = false;
         let mut want_issue_refresh = false;
         let mut want_ci_refresh = false;
+        let mut want_disk_refresh = false;
         while let Ok(kind) = refresh_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
             match kind {
@@ -9020,6 +9140,9 @@ async fn event_loop<T: Terminal>(
                     want_ci_refresh = true;
                     want_model_refresh = true;
                 }
+                // The scan only writes the size cache off-thread; sizes land on
+                // the next model hydrate, so this does NOT force one here.
+                RefreshKind::Disk => want_disk_refresh = true,
             }
         }
         if want_model_refresh {
@@ -9040,6 +9163,7 @@ async fn event_loop<T: Terminal>(
             spawn_pr_cache_refresh(
                 session.clone(),
                 current_config.issues.clone(),
+                current_config.disk.clone(),
                 Some(waker.clone()),
             );
         }
@@ -9062,15 +9186,33 @@ async fn event_loop<T: Terminal>(
                 Some(waker.clone()),
             );
         }
+        if want_disk_refresh {
+            crate::hydrate::spawn_disk_scan(current_config.disk.clone(), Some(waker.clone()));
+        }
 
-        // Ack the focused worktree's activity so its "look at me" dot clears
-        // once the user is actually on it. Idempotent; off-thread so the
-        // file write never stalls the loop.
+        // Mark the focused worktree's "stuck" dot as read: a filled-red
+        // `Waiting` dot turns hollow-red `Read` once the user is on the tab —
+        // even if the agent went stuck while the tab was already focused. Gated
+        // on the dot actually being `Waiting` so this is a no-op (no thread
+        // dispatch) the rest of the time; the ack itself is idempotent and runs
+        // off-thread so the file write never stalls the loop. The
+        // `last_acked_tab` guard only suppresses the redundant re-spawn in the
+        // ~1s before hydration reflects the new `Read` state back into the model.
         if let Some(name) = session.active_group().map(|g| g.name.clone())
+            && model.sidebar_status.activity.get(&name)
+                == Some(&crate::sidebar::ActivityState::Waiting)
             && last_acked_tab.as_deref() != Some(name.as_str())
         {
             last_acked_tab = Some(name.clone());
             task::spawn_blocking(move || superzej_core::activity::ack(&name));
+        } else if let Some(g) = session.active_group()
+            && model.sidebar_status.activity.get(&g.name)
+                != Some(&crate::sidebar::ActivityState::Waiting)
+            && last_acked_tab.as_deref() == Some(g.name.as_str())
+        {
+            // The dot left `Waiting` (acked through, or work resumed): re-arm so
+            // a future stuck episode on this same focused tab acks again.
+            last_acked_tab = None;
         }
 
         // Mirror the focus zone into the render model RIGHT BEFORE rendering —
@@ -9248,7 +9390,6 @@ async fn event_loop<T: Terminal>(
                 && hover_popup.is_none()
                 && search.is_none()
                 && which_key.is_empty()
-                && pending_confirm.is_none()
                 && toasts.is_empty();
             // FAST PATH: a pure mouse-wheel scroll changes only the scrolled
             // pane's content. Same reuse-the-prior-`scratch` trick as the
@@ -9271,7 +9412,6 @@ async fn event_loop<T: Terminal>(
                 && hover_popup.is_none()
                 && search.is_none()
                 && which_key.is_empty()
-                && pending_confirm.is_none()
                 && toasts.is_empty();
             // The damage-compositor decision (pure, unit-tested in render_plan):
             // with no chrome/overlay/geometry damage, a wake that touched only
@@ -9290,7 +9430,6 @@ async fn event_loop<T: Terminal>(
                 hover: hover_popup.is_some(),
                 search: search.is_some(),
                 which_key: !which_key.is_empty(),
-                confirm: pending_confirm.is_some(),
                 toasts: !toasts.is_empty(),
             };
             let damage = crate::render_plan::Damage {
@@ -9585,9 +9724,6 @@ async fn event_loop<T: Terminal>(
                     &which_key,
                     &accent,
                 );
-            }
-            if let Some((question, _)) = &pending_confirm {
-                crate::chrome::draw_confirm(&mut scratch, screen, question);
             }
             // Toasts float above everything else — last in, top of the stack.
             toasts.render(&mut scratch, screen);
@@ -10372,48 +10508,6 @@ async fn event_loop<T: Terminal>(
                         continue;
                     }
                 }
-                // Modal: a pending destructive action swallows the next key.
-                if let Some((_, action)) = pending_confirm.take() {
-                    if matches!(k.key, KeyCode::Char('y') | KeyCode::Char('Y')) {
-                        match action {
-                            PendingAction::RemoveWorkspace {
-                                repo_path,
-                                slug,
-                                display,
-                            } => {
-                                model.status = remove_workspace(
-                                    &mut session,
-                                    &mut panes,
-                                    &repo_path,
-                                    &slug,
-                                    &display,
-                                );
-                                // refresh_tab_model rebuilds the workspace list
-                                // from a cached (non-DB) snapshot, so the just-
-                                // pruned workspace would otherwise linger until
-                                // the next full hydration. Drop it now.
-                                forget_workspace_in_model(&mut model, &slug, &repo_path);
-                            }
-                        }
-                        sb.marked.clear();
-                        refresh_tab_model(&mut model, &session, &mut sb);
-                        sb.focus_active_row(&mut model);
-                        need_relayout = true;
-                        sync_drawer_persistence(
-                            &session,
-                            &mut panes,
-                            &mut drawer,
-                            &mut drawer_pool,
-                            &mut drawer_home,
-                            keymap.config(),
-                            chrome.center,
-                        );
-                    } else {
-                        model.status = "Cancelled".into();
-                    }
-                    dirty = true;
-                    continue;
-                }
                 let mut forced_palette_action: Option<crate::keymap::Action> = None;
                 // Modal: the revealed worktree-creation progress overlay
                 // swallows every key. Esc hides it while work continues (a
@@ -10597,7 +10691,7 @@ async fn event_loop<T: Terminal>(
                                                     &current_config,
                                                 )
                                             }) {
-                                            Ok(path) => {
+                                            Ok(WorkspaceResolution::Repo(path)) => {
                                                 workspace_pool.stash(prev_id, snapshot);
                                                 remap_cold_workspace_ids(&mut session, &mut panes);
                                                 focus.zone = crate::focus::Zone::Center;
@@ -10617,6 +10711,11 @@ async fn event_loop<T: Terminal>(
                                                 );
                                                 need_relayout = true;
                                             }
+                                            Ok(WorkspaceResolution::NotARepo(path)) => {
+                                                active_menu = Some(menu::init_git_menu(
+                                                    path.to_string_lossy().into_owned(),
+                                                ));
+                                            }
                                             Err(e) => {
                                                 model.status =
                                                     format!("workspace create failed: {e}");
@@ -10624,53 +10723,6 @@ async fn event_loop<T: Terminal>(
                                         }
                                     }
 
-                                    HostInputKind::DeleteWorkspaceConfirm => {
-                                        if text.trim() == "yes" {
-                                            match superzej_core::db::Db::open() {
-                                                Ok(db) => {
-                                                    let mut switched = false;
-                                                    if let Ok(orphans) =
-                                                        db.delete_workspace(&session.id)
-                                                    {
-                                                        // switch to next available workspace
-                                                        if let Ok(workspaces) = db.workspaces()
-                                                            && let Some(next) = workspaces.first()
-                                                        {
-                                                            let _ = session.switch_to_workspace(
-                                                                &next.repo_path,
-                                                                &db,
-                                                            );
-                                                            switched = true;
-                                                        }
-                                                        if !switched {
-                                                            // Empty workspace fallback
-                                                            session.id.clear();
-                                                            session.worktrees.clear();
-                                                            session.active = 0;
-                                                        }
-                                                        refresh_tab_model(
-                                                            &mut model, &session, &mut sb,
-                                                        );
-                                                        need_relayout = true;
-                                                        if orphans > 0 {
-                                                            model.status = format!(
-                                                                "⚠ Workspace deleted. {} orphaned worktree(s) remain on disk",
-                                                                orphans
-                                                            );
-                                                        } else {
-                                                            model.status =
-                                                                "Workspace deleted".into();
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    model.status = format!("delete failed: {}", e);
-                                                }
-                                            }
-                                        } else {
-                                            model.status = "Delete cancelled".into();
-                                        }
-                                    }
                                     HostInputKind::RenameWorktree {
                                         gi,
                                         repo_root,
@@ -10868,6 +10920,16 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                     }
+                                    HostInputKind::FileWorktreeNewFolder => {
+                                        match file_active_worktree(&session, &text) {
+                                            Ok(msg) => {
+                                                model.status = msg;
+                                                let _ = refresh_tx
+                                                    .send(crate::hydrate::RefreshKind::Model);
+                                            }
+                                            Err(e) => model.status = e,
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -10923,6 +10985,7 @@ async fn event_loop<T: Terminal>(
                             active_menu = None;
                             pending_confirm_op = None;
                             pending_undo = None;
+                            pending_delete_workspace = None;
                         }
                         menu::MenuOutcome::Pick(choice) => {
                             active_menu = None;
@@ -10933,6 +10996,90 @@ async fn event_loop<T: Terminal>(
                                     delete_groups(&mut session, &mut panes, targets, keep_files);
 
                                 // Full sidebar refresh after deletion
+                                sb.marked.clear();
+                                refresh_tab_model(&mut model, &session, &mut sb);
+                                sb.focus_active_row(&mut model);
+                                need_relayout = true;
+                                sync_drawer_persistence(
+                                    &session,
+                                    &mut panes,
+                                    &mut drawer,
+                                    &mut drawer_pool,
+                                    &mut drawer_home,
+                                    keymap.config(),
+                                    chrome.center,
+                                );
+                                dirty = true;
+                                continue;
+                            }
+                            if let menu::MenuChoice::ConfirmInitGit { path } = choice {
+                                if superzej_core::util::git_cmd(std::path::Path::new(&path))
+                                    .arg("init")
+                                    .status()
+                                    .map(|s| s.success())
+                                    .unwrap_or(false)
+                                {
+                                    model.status =
+                                        format!("initialized git repository at {}", path);
+
+                                    // Proceed with creating the workspace
+                                    persist_session_layout(&mut session, &panes);
+                                    let prev_id = session.id.clone();
+                                    let snapshot = ResidentWorkspace {
+                                        worktrees: session.worktrees.clone(),
+                                        active: session.active,
+                                    };
+                                    match superzej_core::db::Db::open()
+                                        .context("open superzej db")
+                                        .and_then(|db| {
+                                            create_workspace_from_input_with_config(
+                                                &path,
+                                                &mut session,
+                                                &db,
+                                                &current_config,
+                                            )
+                                        }) {
+                                        Ok(WorkspaceResolution::Repo(_)) => {
+                                            workspace_pool.stash(prev_id, snapshot);
+                                            remap_cold_workspace_ids(&mut session, &mut panes);
+                                            focus.zone = crate::focus::Zone::Center;
+                                            refresh_tab_model(&mut model, &session, &mut sb);
+                                            sync_drawer_persistence(
+                                                &session,
+                                                &mut panes,
+                                                &mut drawer,
+                                                &mut drawer_pool,
+                                                &mut drawer_home,
+                                                keymap.config(),
+                                                chrome.center,
+                                            );
+                                            need_relayout = true;
+                                        }
+                                        _ => {
+                                            model.status =
+                                                "failed to switch to initialized workspace".into();
+                                        }
+                                    }
+                                } else {
+                                    model.status =
+                                        format!("failed to initialize git repository at {}", path);
+                                }
+                                dirty = true;
+                                continue;
+                            }
+                            if let menu::MenuChoice::ConfirmDeleteWorkspace { keep_files } = choice
+                                && let Some((repo_path, slug, display)) =
+                                    pending_delete_workspace.take()
+                            {
+                                model.status = remove_workspace(
+                                    &mut session,
+                                    &mut panes,
+                                    &repo_path,
+                                    &slug,
+                                    &display,
+                                    keep_files,
+                                );
+                                forget_workspace_in_model(&mut model, &slug, &repo_path);
                                 sb.marked.clear();
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 sb.focus_active_row(&mut model);
@@ -11655,6 +11802,27 @@ async fn event_loop<T: Terminal>(
                                         &waker,
                                     );
                                     model.status = format!("Media: controlling {p}");
+                                } else if let Some(rest) = key.strip_prefix("move-to-folder:") {
+                                    if rest == "__new__" {
+                                        host_input = Some((
+                                            menu::InputOverlay::new(
+                                                "new folder".to_string(),
+                                                String::new(),
+                                            ),
+                                            HostInputKind::FileWorktreeNewFolder,
+                                        ));
+                                        model.status =
+                                            "New folder: type a name (Esc cancels)".into();
+                                    } else {
+                                        match file_active_worktree(&session, rest) {
+                                            Ok(msg) => {
+                                                model.status = msg;
+                                                let _ = refresh_tx
+                                                    .send(crate::hydrate::RefreshKind::Model);
+                                            }
+                                            Err(e) => model.status = e,
+                                        }
+                                    }
                                 } else if let Some(action) = crate::keymap::Action::from_key(&key) {
                                     forced_palette_action = Some(action);
                                 } else if let Some(idx) = keymap
@@ -11887,18 +12055,12 @@ async fn event_loop<T: Terminal>(
                             slug,
                             display,
                         } => {
+                            // Same modal + path as Alt+Shift+X: the menu defaults
+                            // to "delete worktrees from disk" (keep-files is the
+                            // opt-out). Resolved in the menu Pick handler.
                             if current_config.ui.confirm_delete_workspace {
-                                pending_confirm = Some((
-                                    format!(
-                                        "Remove workspace '{display}' from superzej? \
-                                         (worktree files are kept on disk)"
-                                    ),
-                                    PendingAction::RemoveWorkspace {
-                                        repo_path,
-                                        slug,
-                                        display,
-                                    },
-                                ));
+                                active_menu = Some(menu::delete_workspace_menu(&display));
+                                pending_delete_workspace = Some((repo_path, slug, display));
                             } else {
                                 model.status = remove_workspace(
                                     &mut session,
@@ -11906,10 +12068,22 @@ async fn event_loop<T: Terminal>(
                                     &repo_path,
                                     &slug,
                                     &display,
+                                    false,
                                 );
                                 forget_workspace_in_model(&mut model, &slug, &repo_path);
                                 sb.marked.clear();
                                 refresh_tab_model(&mut model, &session, &mut sb);
+                                sb.focus_active_row(&mut model);
+                                need_relayout = true;
+                                sync_drawer_persistence(
+                                    &session,
+                                    &mut panes,
+                                    &mut drawer,
+                                    &mut drawer_pool,
+                                    &mut drawer_home,
+                                    keymap.config(),
+                                    chrome.center,
+                                );
                             }
                             dirty = true;
                             continue;
@@ -14137,8 +14311,41 @@ async fn event_loop<T: Terminal>(
                                                 }
                                             }
                                         }
+                                        crate::keymap::CompositeAction::FileWorktree { folder } => {
+                                            match file_active_worktree(&session, &folder) {
+                                                Ok(msg) => {
+                                                    model.status = msg;
+                                                    let _ = refresh_tx
+                                                        .send(crate::hydrate::RefreshKind::Model);
+                                                }
+                                                Err(e) => model.status = e,
+                                            }
+                                        }
                                     },
                                     None => {}
+                                }
+                            }
+                            Action::MoveWorktreeToFolder => {
+                                // Open the folder picker for the active worktree's
+                                // workspace; the chosen row files via the
+                                // `move-to-folder:` palette-dispatch arm.
+                                match active_worktree_repo(&session) {
+                                    Some((_, repo_path)) => match superzej_core::db::Db::open() {
+                                        Ok(db) => {
+                                            let items = crate::palette::build_move_to_folder_items(
+                                                &db, &repo_path,
+                                            );
+                                            palette = Some(
+                                                crate::search_everywhere::PaletteSession::new(
+                                                    items,
+                                                ),
+                                            );
+                                        }
+                                        Err(e) => model.status = format!("DB open failed: {e}"),
+                                    },
+                                    None => {
+                                        model.status = "No worktree to file into a folder".into();
+                                    }
                                 }
                             }
                             Action::Quit => {
@@ -15009,7 +15216,60 @@ async fn event_loop<T: Terminal>(
                                 begin_new_workspace_prompt(&mut host_input, &mut model);
                             }
                             Action::DeleteWorkspace => {
-                                begin_delete_workspace_prompt(&mut host_input, &mut model);
+                                // Remove the *active* workspace. Same modal + path
+                                // as the sidebar "Remove workspace" action.
+                                if session.id.is_empty() {
+                                    model.status = "No workspace to delete".into();
+                                    dirty = true;
+                                    continue;
+                                }
+                                let repo_path = session.id.clone();
+                                let display = Path::new(&repo_path)
+                                    .file_name()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| "workspace".into());
+                                // Derive the slug from the active group's own name
+                                // so it matches the `{slug}/…` prefix that
+                                // `remove_workspace_with_db` filters live groups on.
+                                let slug = session
+                                    .active_group()
+                                    .and_then(|g| crate::sidebar::split_tab(&g.name))
+                                    .map(|(repo, _)| repo)
+                                    .unwrap_or_else(|| {
+                                        superzej_core::repo::repo_slug(Path::new(&repo_path))
+                                    });
+                                if current_config.ui.confirm_delete_workspace {
+                                    // Default (pre-selected) choice is "delete from
+                                    // disk"; resolved in the menu Pick handler.
+                                    active_menu = Some(menu::delete_workspace_menu(&display));
+                                    pending_delete_workspace = Some((repo_path, slug, display));
+                                } else {
+                                    // Confirmation disabled: delete from disk now.
+                                    model.status = remove_workspace(
+                                        &mut session,
+                                        &mut panes,
+                                        &repo_path,
+                                        &slug,
+                                        &display,
+                                        false,
+                                    );
+                                    forget_workspace_in_model(&mut model, &slug, &repo_path);
+                                    sb.marked.clear();
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    sb.focus_active_row(&mut model);
+                                    need_relayout = true;
+                                    sync_drawer_persistence(
+                                        &session,
+                                        &mut panes,
+                                        &mut drawer,
+                                        &mut drawer_pool,
+                                        &mut drawer_home,
+                                        keymap.config(),
+                                        chrome.center,
+                                    );
+                                }
+                                dirty = true;
+                                continue;
                             }
                             Action::SwitchWorkspace => {
                                 if let Ok(db) = superzej_core::db::Db::open()
@@ -16254,33 +16514,6 @@ mod tests {
     }
 
     #[test]
-    fn workspace_input_accepts_existing_directory_workspace() {
-        let db_root = std::env::temp_dir().join(format!(
-            "superzej-test-db-{}-{}",
-            std::process::id(),
-            now_secs()
-        ));
-        let db = superzej_core::db::Db::open_at(&db_root.join("superzej.db")).unwrap();
-        let mut session = crate::session::Session {
-            id: "/old".into(),
-            ..Default::default()
-        };
-        let dir = std::env::temp_dir().join(format!(
-            "superzej-test-ws-{}-{}",
-            std::process::id(),
-            now_secs()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let path = create_workspace_from_input(dir.to_str().unwrap(), &mut session, &db)
-            .expect("plain directory workspaces should be accepted");
-
-        assert_eq!(path, dir);
-        assert_eq!(session.id, dir.to_string_lossy());
-        assert_eq!(db.workspaces().unwrap()[0].kind, "dir");
-    }
-
-    #[test]
     fn center_context_hints_include_close_tab_and_split_controls() {
         let cfg = superzej_core::config::Config::default();
         let focus = crate::focus::FocusState::default();
@@ -16991,6 +17224,70 @@ mod tests {
             "surviving workspace should still render: {:?}",
             sidebar_labels(&model)
         );
+    }
+
+    #[test]
+    fn workspace_worktree_dirs_skips_home_and_other_workspaces() {
+        // The destructive "delete from disk" selection MUST exclude the home
+        // checkout (path == repo_path — deleting it would nuke the main repo)
+        // and any sibling workspace's worktrees. Only this workspace's branch
+        // worktree dirs are returned.
+        let db_path = std::env::temp_dir().join(format!(
+            "sj-host-wtdirs-{}-{}.sqlite",
+            std::process::id(),
+            now_secs()
+        ));
+        let db = superzej_core::db::Db::open_at(&db_path).unwrap();
+        // home checkout (path == repo_path) + two branch worktrees.
+        db.put_worktree(
+            "lib/home",
+            "/tmp/repo-lib",
+            "/tmp/repo-lib",
+            "home",
+            None,
+            None,
+        )
+        .unwrap();
+        db.put_worktree(
+            "lib/feat",
+            "/tmp/repo-lib",
+            "/tmp/repo-lib-feat",
+            "feat",
+            None,
+            None,
+        )
+        .unwrap();
+        db.put_worktree(
+            "lib/fix",
+            "/tmp/repo-lib",
+            "/tmp/repo-lib-fix",
+            "fix",
+            None,
+            None,
+        )
+        .unwrap();
+        // A sibling workspace's worktree must not be touched.
+        db.put_worktree(
+            "app/feat",
+            "/tmp/repo-app",
+            "/tmp/repo-app-feat",
+            "feat",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut dirs = workspace_worktree_dirs(&db, "/tmp/repo-lib");
+        dirs.sort();
+        assert_eq!(
+            dirs,
+            vec![
+                "/tmp/repo-lib-feat".to_string(),
+                "/tmp/repo-lib-fix".to_string()
+            ],
+            "only this workspace's branch worktrees, never home or siblings"
+        );
+        let _ = std::fs::remove_file(&db_path);
     }
 
     #[test]

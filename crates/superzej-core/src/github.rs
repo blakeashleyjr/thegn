@@ -364,6 +364,16 @@ pub fn pr_list(loc: &GitLoc, limit: usize) -> Result<Vec<PrHeader>, GhError> {
     Ok(parse_pr_headers(&json))
 }
 
+/// The state (`OPEN`/`MERGED`/`CLOSED`) of the PR for `branch`, via
+/// `gh pr view <branch> --json state`. `None` when there's no PR or `gh`
+/// fails. Used by the on-merge auto-clean to resolve the precise outcome when a
+/// branch drops out of the open-PR set (merged vs closed-without-merge).
+pub fn pr_state_for_branch(loc: &GitLoc, branch: &str) -> Option<String> {
+    let json = gh_out(loc, &["pr", "view", branch, "--json", "state"]).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&json).ok()?;
+    v.get("state")?.as_str().map(str::to_string)
+}
+
 /// One PR from a cross-repo `gh search prs` — the unified "My Work" feed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PrSearchRow {

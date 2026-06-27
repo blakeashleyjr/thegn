@@ -112,6 +112,11 @@
         inherit yaziDeps;
       };
 
+      # The OpenSpec CLI superzej uses for spec-driven development of itself.
+      # A hermetic, pinned build (see nix/openspec.nix) — no global npm install,
+      # telemetry off — shared by the dev shell and `just openspec*`.
+      openspec = pkgs.callPackage ./nix/openspec.nix {};
+
       # One rust-overlay toolchain (clippy/rustfmt/rust-analyzer included).
       rustToolchain = pkgs.rust-bin.stable.latest.default.override {
         # llvm-tools for `cargo llvm-cov` (just coverage).
@@ -148,6 +153,8 @@
       packages.yazi = yaziPinned;
       # The muse e2e harness (`nix run .#muse`, also on the dev-shell PATH).
       packages.muse = musePkg;
+      # The OpenSpec CLI for spec-driven development (`nix run .#openspec`).
+      packages.openspec = openspec;
 
       # `nix fmt` formats every tracked file via treefmt.toml.
       formatter = treefmtWrapper;
@@ -204,6 +211,8 @@
             gh
             # visual-regression e2e harness (`just e2e`)
             musePkg
+            # spec-driven development CLI (`openspec`, `just openspec*`)
+            openspec
           ]
           # The same pinned yazi as the package, so the drawer's preview tools
           # resolve on PATH and `just host` runs the version superzej ships.
@@ -213,7 +222,14 @@
           export PATH="$PWD/target/debug:$PATH"
           # Point dev superzej at the pinned yazi (the package wires this too).
           export SUPERZEJ_YAZI_BIN="${yaziPinned}/bin/yazi"
-          echo "superzej dev shell — 'cargo build', 'just host', 'just smoke', 'nix fmt'"
+          # Spec-driven development (OpenSpec): telemetry off, no host writes.
+          export OPENSPEC_TELEMETRY=0 DO_NOT_TRACK=1
+          # Seed the Claude Code /opsx commands (gitignored, regenerable) if a
+          # fresh worktree lacks them. Cheap; idempotent.
+          if [ ! -d .claude/commands/opsx ] && [ -f openspec/config.yaml ]; then
+            openspec init --tools claude --profile core --force >/dev/null 2>&1 || true
+          fi
+          echo "superzej dev shell — 'cargo build', 'just host', 'just smoke', 'nix fmt', 'just openspec'"
         '';
       };
     })

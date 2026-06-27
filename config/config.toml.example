@@ -38,6 +38,15 @@ confirm_delete = true
 # `superzej config show` prints the effective merged config; `superzej config
 # get <dotted.key>` prints one value; `superzej config validate` checks it.
 
+[ui]
+# UI language: a BCP-47 code (e.g. "en-US", "ja-JP") or "auto" to detect.
+language = "auto"
+# Ask before deleting a workspace (Alt+Shift+X, or the sidebar "Remove
+# workspace" action — both share one modal). The confirm modal pre-selects
+# "delete worktrees from disk" (a "keep files" choice is offered too). Set false
+# to skip the prompt and delete the worktree dirs from disk immediately.
+confirm_delete_workspace = true
+
 # Visual tuning. The focus accent recolors every superzej surface (plugins,
 # pickers, dashboard). `focus_border` frames whatever owns focus — the focused
 # pane's border ring, the active tab chip, the active worktree row, and the
@@ -99,19 +108,20 @@ gpu = "nvtop"    # GPU monitor
 
 # The customizable widget bars framing the workspace. Each slot is an ordered
 # list of widget ids; unknown ids are skipped. Top-bar widgets: "brand"
-# (superzej + version), "cpu", "mem", "gpu" (NVIDIA only; hidden if absent),
-# "net", "date", "clock". Bottom-bar widgets: "keyhints" (context-dependent
-# keybinds for the focused zone), "pr" (forge + PR number, state-colored),
-# "tests" (✓pass ✗fail rollup of the last test run; green all-pass, red on
-# failure; hidden until a run), "loc" (tokei line count), "status" (transient
-# messages).
+# (superzej + version), "cpu", "mem", "disk" (free space on the worktrees' fs,
+# color-coded; see [stats]), "gpu" (NVIDIA only; hidden if absent), "net",
+# "date", "clock". Bottom-bar widgets: "keyhints" (context-dependent keybinds
+# for the focused zone), "pr" (forge + PR number, state-colored), "tests"
+# (✓pass ✗fail rollup of the last test run; green all-pass, red on failure;
+# hidden until a run), "loc" (tokei line count), "disk" (the active worktree's
+# size, incl. target/), "status" (transient messages).
 [bars]
 top_left = ["brand"]
-# Widgets: cpu, mem, gpu, temp (CPU °C), net, swap, freq (CPU GHz),
-# load (1-min load avg, unix only), uptime, disk (free %), battery, date, clock.
-top_right = ["cpu", "mem", "gpu", "temp", "net", "disk", "battery", "date", "clock"]
+# Widgets: cpu, mem, disk (free %), gpu, temp (CPU °C), net, swap, freq (CPU
+# GHz), load (1-min load avg, unix only), uptime, battery, date, clock.
+top_right = ["cpu", "mem", "disk", "gpu", "temp", "net", "battery", "date", "clock"]
 bottom_left = ["keyhints"]
-bottom_right = ["pr", "tests", "loc", "status"]   # "loc" = tokei line count (needs tokei)
+bottom_right = ["pr", "tests", "loc", "disk", "status"]   # "loc"=tokei line count; "disk"=worktree size
 # chrono format strings for the date/clock widgets.
 date_format = "%a %b %-d"
 clock_format = "%H:%M"
@@ -133,10 +143,13 @@ refresh-secs = 2           # Polling interval in seconds
 # freq-icon = "FRQ"             # CPU frequency
 # load-icon = "LD"              # load average (unix)
 # uptime-icon = "UP"            # uptime
-# disk-icon = "DSK"             # filesystem free %
 # battery-icon = "BAT"          # discharging icon
 # battery-charging-icon = "CHG" # shown while charging / on AC
 battery-warn = 25               # red at/below this percent
+# disk-icon = "DSK"             # icon for the "disk" free-space widget
+disk-free-warn = 15             # disk widget turns amber at/below this free %
+disk-free-critical = 5          # disk widget turns red at/below this free %
+# disk-path = "~/projects"      # fs the disk widget measures; "" = worktrees_dir's fs
 refresh-rates = [1, 2, 5, 10]  # Click the top-right stats block to cycle
 
 # Prometheus scrape targets for the sidebar METRICS section. superzej scrapes
@@ -375,6 +388,12 @@ format = "text"           # text | json
 #     shell; omit for an interactive shell), `placement` (down | right; default
 #     right), `cwd` (worktree | active; default active).
 #
+#   file-worktree — move the active worktree into a sidebar folder, creating the
+#     folder if it doesn't exist yet. params: `folder` (required, the folder
+#     name). Bind one per folder you sort into; firing again files into the same
+#     folder (no duplicates). The interactive picker is `move-worktree-to-folder`
+#     (bindable / in the palette) when you'd rather choose or name a folder.
+#
 # A scratch worktree on bwrap with a shell, no prompts:
 # [[actions]]
 # name = "scratch-shell"
@@ -389,6 +408,20 @@ format = "text"           # text | json
 # key = "Alt L"
 # action = "new-pane"
 # params = { run = "tail -f log/dev.log", placement = "right" }
+#
+# File the active worktree into a named folder (leader: Alt-m-f, then a letter):
+# [[actions]]
+# name = "File: Ready to merge"
+# key = "Alt m f r"
+# action = "file-worktree"
+# params = { folder = "Ready to merge" }
+# menu = true
+# [[actions]]
+# name = "File: PRing"
+# key = "Alt m f p"
+# action = "file-worktree"
+# params = { folder = "PRing" }
+# menu = true
 
 # Keybind profiles: a named layer selected by `profile = "<name>"` (or the
 # SUPERZEJ_PROFILE env var / --profile flag). Applied *under* [keybinds], so a
@@ -589,6 +622,24 @@ command = "git diff"
 #                            #   cargo build-lock surfaces an error, not a spinner
 # isolated_target_dir = true # run superzej's cargo under <worktree>/target/superzej
 #                            #   so discovery/tests never block on the user's build lock
+
+# Per-worktree disk-usage visibility, cleanup, and shared build caches. Each
+# worktree's `target/` is the dominant disk cost when developing across many
+# worktrees; these surface it, reclaim it on merge, and dedup compilation.
+[disk]
+# show_sizes = true            # per-worktree size badges in the sidebar + statusbar total
+# warn_threshold_gb = 100      # statusbar warns (amber, red at 2x) above this total; 0 = off
+# scan_interval_secs = 45      # background size-scan cadence (runs off the event loop, cached)
+# auto_clean_on_merge = true   # `cargo clean` a worktree's target/ when its PR merges
+#                              #   (checkout kept; active worktree + running builds skipped)
+# clean_on_pr_closed = false   # also clean when a PR is closed without merging
+# sccache = false              # inject RUSTC_WRAPPER=sccache into panes (no-op if not on PATH);
+#                              #   shares dependency compilation across worktrees
+# sccache_dir = ""             # SCCACHE_DIR ("" = sccache default); ~ and repo-relative paths ok
+# shared_target_dir = ""       # one CARGO_TARGET_DIR shared across a repo's worktrees.
+#                              #   Biggest disk win, BUT cargo's per-target build lock
+#                              #   SERIALIZES concurrent builds across worktrees — opt-in.
+#                              #   "" = off; ~ expands to home; relative paths resolve to the repo root.
 
 # Aggregated notification bus. Events (PR state, agent done/failed, test
 # failures, log errors, worktree created) surface as sidebar badges + the
@@ -848,6 +899,20 @@ init_script = ""
 # Wrap the inner command in `devenv shell --`. Auto-enabled if devenv.nix is
 # present in the worktree root and the `devenv` binary is on PATH.
 devenv = false
+
+# ── Nix devShell tooling ──────────────────────────────────────────────────────
+# Tier A (read-only, safe): inject the repo's Nix flake `devShell` toolchain
+# (its PATH + safe exported vars) into worktree panes. superzej resolves the
+# devShell on the HOST (writable store + daemon) via `nix print-dev-env`, caches
+# it under $XDG_STATE_HOME/superzej/devenv/, and prepends it to the pane's PATH —
+# so a sandboxed pane that can't reach the Nix daemon still gets the project's
+# linters/formatters/tools out of the box. No-op for repos without a devShell.
+inject_devshell = true
+# Tier B (opt-in): bind-mount the host Nix daemon socket into the sandbox so full
+# `nix develop`/`build`/`fmt` run INSIDE it. Off by default — it relaxes the
+# isolation the hardening profiles provide. `inject_devshell` already covers
+# read-only tool access without this. Ignored if the host has no Nix daemon.
+nix_daemon = false
 
 # ── Missing backend behaviour ─────────────────────────────────────────────────
 # What to do when no backend in backend_chain is available:

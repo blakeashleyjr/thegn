@@ -1107,14 +1107,21 @@ pub struct StatsConfig {
     pub load_icon: String,
     /// Icon for the uptime stat.
     pub uptime_icon: String,
-    /// Icon for the disk free-space stat.
-    pub disk_icon: String,
     /// Icon for the battery stat (discharging).
     pub battery_icon: String,
     /// Icon shown while the battery is charging / on AC.
     pub battery_charging_icon: String,
     /// Battery percentage at/below which the widget turns red.
     pub battery_warn: u8,
+    /// Icon for the disk (free-space) stat.
+    pub disk_icon: String,
+    /// Free-disk percentage at/below which the `disk` widget turns amber.
+    pub disk_free_warn: u8,
+    /// Free-disk percentage at/below which the `disk` widget turns red.
+    pub disk_free_critical: u8,
+    /// Filesystem the `disk` masthead widget measures (any path on it).
+    /// Empty = the filesystem holding `worktrees_dir`. `~` expands to home.
+    pub disk_path: String,
     /// Available refresh rates for keybind cycling (seconds).
     pub refresh_rates: Vec<f64>,
 }
@@ -1142,10 +1149,13 @@ impl Default for StatsConfig {
             freq_icon: "\u{f0e4}".into(),             // nf-fa-tachometer
             load_icon: "\u{f201}".into(),             // nf-fa-line_chart
             uptime_icon: "\u{f017}".into(),           // nf-fa-clock_o
-            disk_icon: "\u{f0a0}".into(),             // nf-fa-hdd_o
             battery_icon: "\u{f240}".into(),          // nf-fa-battery_full
             battery_charging_icon: "\u{f0e7}".into(), // nf-fa-bolt — lightning bolt
             battery_warn: 25,
+            disk_icon: "\u{f0a0}".into(), // nf-fa-hdd_o — hard drive
+            disk_free_warn: 15,
+            disk_free_critical: 5,
+            disk_path: String::new(),
             refresh_rates: vec![1.0, 2.0, 5.0, 10.0],
         }
     }
@@ -1153,7 +1163,7 @@ impl Default for StatsConfig {
 
 /// `[bars]` — the customizable widget bars framing the workspace. Each slot is
 /// an ordered widget-id list; unknown ids warn and are skipped. Built-ins:
-/// `brand` (superzej + version), `cpu`, `mem`, `gpu`, `net`, `temp` (CPU °C),
+/// `brand` (superzej + version), `cpu`, `mem`, `gpu`, `temp` (CPU °C), `net`,
 /// `swap`, `freq` (CPU GHz), `load` (1-min load avg, unix), `uptime`, `disk`
 /// (free %), `battery`, `date`, `clock` (top bar) and `keyhints`
 /// (context-dependent keybinds), `pr` (forge + PR number/state), `status`
@@ -1178,16 +1188,22 @@ impl Default for BarsConfig {
             top_right: vec![
                 "cpu".into(),
                 "mem".into(),
+                "disk".into(),
                 "gpu".into(),
                 "temp".into(),
                 "net".into(),
-                "disk".into(),
                 "battery".into(),
                 "date".into(),
                 "clock".into(),
             ],
             bottom_left: vec!["keyhints".into()],
-            bottom_right: vec!["pr".into(), "tests".into(), "loc".into(), "status".into()],
+            bottom_right: vec![
+                "pr".into(),
+                "tests".into(),
+                "loc".into(),
+                "disk".into(),
+                "status".into(),
+            ],
             date_format: "%a %b %-d".into(),
             clock_format: "%H:%M".into(),
         }
@@ -1249,6 +1265,55 @@ impl Default for LimitsConfig {
             test_timeout_secs: 1800,
             discover_timeout_secs: 45,
             isolated_target_dir: true,
+        }
+    }
+}
+
+/// `[disk]` — per-worktree disk-usage visibility, cleanup, and shared
+/// build-cache knobs. Per-worktree `target/` dirs are the dominant disk cost
+/// when developing across many worktrees; these surface it, reclaim it, and
+/// dedup compilation. All off by default except visibility.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct DiskConfig {
+    /// Show per-worktree size badges in the sidebar and the statusbar total.
+    pub show_sizes: bool,
+    /// Statusbar warns (amber, then red at 2×) once total worktree disk exceeds
+    /// this many GiB. 0 disables the warning badge.
+    pub warn_threshold_gb: u64,
+    /// Cadence (seconds) of the background disk scan that refreshes sizes. The
+    /// scan runs off the event loop (never blocks it) and is cached in the DB.
+    pub scan_interval_secs: u64,
+    /// Automatically `cargo clean` a worktree's `target/` when its branch is
+    /// merged (PR → MERGED). The checkout is kept; only build artifacts go. The
+    /// active worktree and any with a running build are never touched.
+    pub auto_clean_on_merge: bool,
+    /// Also auto-clean when a PR is closed without merging (open → CLOSED).
+    pub clean_on_pr_closed: bool,
+    /// Inject `RUSTC_WRAPPER=sccache` into interactive panes so dependency
+    /// compilation is shared across worktrees. No-op if `sccache` isn't on PATH.
+    pub sccache: bool,
+    /// `SCCACHE_DIR` for the shared cache. Empty = sccache's own default.
+    /// `~` expands to home; a relative path resolves against the repo root.
+    pub sccache_dir: String,
+    /// Share one `CARGO_TARGET_DIR` across all worktrees of a repo (injected
+    /// into interactive panes). Biggest disk win, but cargo's per-target build
+    /// lock serializes concurrent builds across worktrees — opt-in. Empty = off.
+    /// `~` expands to home; a relative path resolves against the repo root.
+    pub shared_target_dir: String,
+}
+
+impl Default for DiskConfig {
+    fn default() -> Self {
+        DiskConfig {
+            show_sizes: true,
+            warn_threshold_gb: 100,
+            scan_interval_secs: 45,
+            auto_clean_on_merge: true,
+            clean_on_pr_closed: false,
+            sccache: false,
+            sccache_dir: String::new(),
+            shared_target_dir: String::new(),
         }
     }
 }
@@ -2180,6 +2245,17 @@ pub struct SandboxConfig {
     pub mounts: Vec<String>, // extra binds ("host:dest[:ro|rw|cache]" or "host"); suffix allowed
     pub init_script: String, // runs inside before the agent/shell
     pub devenv: bool,        // wrap inner cmd with `devenv shell --`
+    /// Inject the repo's Nix flake `devShell` toolchain (its `PATH` + safe
+    /// exported vars) into worktree panes — resolved on the host (writable
+    /// store + daemon) and cached, so a sandboxed pane that can't reach the Nix
+    /// daemon still gets the project linters/formatters/tools out of the box.
+    /// No-op for repos without a flake `devShell`. See [`crate::devenv`].
+    pub inject_devshell: bool,
+    /// Bind-mount the host Nix daemon socket into the sandbox so full
+    /// `nix develop`/`build`/`fmt` work *inside* it. Off by default: it relaxes
+    /// the isolation the hardening profiles provide (Tier A `inject_devshell`
+    /// already covers read-only tool access without this).
+    pub nix_daemon: bool,
     /// Shell to use inside the sandbox. `""` = resolve from the host's `$SHELL`
     /// at pane-spawn time. Set to an absolute path or name (e.g. `"zsh"`) to
     /// override per workspace via `.superzej.toml`.
@@ -2248,6 +2324,8 @@ impl Default for SandboxConfig {
             ],
             init_script: String::new(),
             devenv: false,
+            inject_devshell: true,
+            nix_daemon: false,
             shell: String::new(),
             on_missing: OnMissing::Warn,
             remote: RemoteConfig::default(),
@@ -2285,6 +2363,8 @@ pub struct SandboxOverlay {
     pub mounts: Option<Vec<String>>,
     pub init_script: Option<String>,
     pub devenv: Option<bool>,
+    pub inject_devshell: Option<bool>,
+    pub nix_daemon: Option<bool>,
     pub shell: Option<String>,
     pub on_missing: Option<OnMissing>,
     pub remote: Option<RemoteOverlay>,
@@ -2368,6 +2448,12 @@ impl SandboxOverlay {
         }
         if let Some(v) = self.devenv {
             base.devenv = v;
+        }
+        if let Some(v) = self.inject_devshell {
+            base.inject_devshell = v;
+        }
+        if let Some(v) = self.nix_daemon {
+            base.nix_daemon = v;
         }
         if let Some(v) = self.shell {
             base.shell = v;
@@ -2779,6 +2865,8 @@ pub struct Config {
     pub log: LogConfig,
     pub sandbox: SandboxConfig,
     pub limits: LimitsConfig,
+    /// `[disk]` — disk-usage visibility, cleanup, and shared build caches.
+    pub disk: DiskConfig,
     pub drawer: DrawerConfig,
     pub notifications: NotificationsConfig,
     pub strip: StripConfig,
@@ -2859,6 +2947,7 @@ impl Default for Config {
             log: LogConfig::default(),
             sandbox: SandboxConfig::default(),
             limits: LimitsConfig::default(),
+            disk: DiskConfig::default(),
             drawer: DrawerConfig::default(),
             notifications: NotificationsConfig::default(),
             strip: StripConfig::default(),
@@ -2938,6 +3027,14 @@ pub struct ConfigOverlay {
     pub log_rotation_size_mb: Option<u64>,
     pub log_max_files: Option<usize>,
     pub log_format: Option<LogFormat>,
+    pub disk_show_sizes: Option<bool>,
+    pub disk_warn_threshold_gb: Option<u64>,
+    pub disk_scan_interval_secs: Option<u64>,
+    pub disk_auto_clean_on_merge: Option<bool>,
+    pub disk_clean_on_pr_closed: Option<bool>,
+    pub disk_sccache: Option<bool>,
+    pub disk_sccache_dir: Option<String>,
+    pub disk_shared_target_dir: Option<String>,
     pub sandbox: SandboxOverlay,
 }
 
@@ -2979,6 +3076,14 @@ impl ConfigOverlay {
         set!(base.log.rotation_size_mb, self.log_rotation_size_mb);
         set!(base.log.max_files, self.log_max_files);
         set!(base.log.format, self.log_format);
+        set!(base.disk.show_sizes, self.disk_show_sizes);
+        set!(base.disk.warn_threshold_gb, self.disk_warn_threshold_gb);
+        set!(base.disk.scan_interval_secs, self.disk_scan_interval_secs);
+        set!(base.disk.auto_clean_on_merge, self.disk_auto_clean_on_merge);
+        set!(base.disk.clean_on_pr_closed, self.disk_clean_on_pr_closed);
+        set!(base.disk.sccache, self.disk_sccache);
+        set!(base.disk.sccache_dir, self.disk_sccache_dir);
+        set!(base.disk.shared_target_dir, self.disk_shared_target_dir);
         if !self.sandbox.is_empty() {
             self.sandbox.apply(&mut base.sandbox);
         }
@@ -3089,6 +3194,28 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
         o.log_format = LogFormat::from_str_validated(v.trim()).ok();
     }
 
+    // [disk]
+    if let Some(v) = env.get("SUPERZEJ_DISK_SHOW_SIZES") {
+        o.disk_show_sizes = parse_bool(&v, "SUPERZEJ_DISK_SHOW_SIZES");
+    }
+    if let Some(v) = env.get("SUPERZEJ_DISK_WARN_THRESHOLD_GB") {
+        o.disk_warn_threshold_gb = parse_num(v, "SUPERZEJ_DISK_WARN_THRESHOLD_GB");
+    }
+    if let Some(v) = env.get("SUPERZEJ_DISK_SCAN_INTERVAL_SECS") {
+        o.disk_scan_interval_secs = parse_num(v, "SUPERZEJ_DISK_SCAN_INTERVAL_SECS");
+    }
+    if let Some(v) = env.get("SUPERZEJ_DISK_AUTO_CLEAN_ON_MERGE") {
+        o.disk_auto_clean_on_merge = parse_bool(&v, "SUPERZEJ_DISK_AUTO_CLEAN_ON_MERGE");
+    }
+    if let Some(v) = env.get("SUPERZEJ_DISK_CLEAN_ON_PR_CLOSED") {
+        o.disk_clean_on_pr_closed = parse_bool(&v, "SUPERZEJ_DISK_CLEAN_ON_PR_CLOSED");
+    }
+    if let Some(v) = env.get("SUPERZEJ_DISK_SCCACHE") {
+        o.disk_sccache = parse_bool(&v, "SUPERZEJ_DISK_SCCACHE");
+    }
+    o.disk_sccache_dir = env.get("SUPERZEJ_DISK_SCCACHE_DIR");
+    o.disk_shared_target_dir = env.get("SUPERZEJ_DISK_SHARED_TARGET_DIR");
+
     // [sandbox]
     if let Some(v) = env.get("SUPERZEJ_SANDBOX_BACKEND") {
         o.sandbox.backend = SandboxBackend::from_str_validated(v.trim()).ok();
@@ -3108,6 +3235,12 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     }
     if let Some(v) = env.get("SUPERZEJ_SANDBOX_ENABLED") {
         o.sandbox.enabled = parse_bool(&v, "SUPERZEJ_SANDBOX_ENABLED");
+    }
+    if let Some(v) = env.get("SUPERZEJ_SANDBOX_INJECT_DEVSHELL") {
+        o.sandbox.inject_devshell = parse_bool(&v, "SUPERZEJ_SANDBOX_INJECT_DEVSHELL");
+    }
+    if let Some(v) = env.get("SUPERZEJ_SANDBOX_NIX_DAEMON") {
+        o.sandbox.nix_daemon = parse_bool(&v, "SUPERZEJ_SANDBOX_NIX_DAEMON");
     }
     if let Some(host) = env.get("SUPERZEJ_SANDBOX_REMOTE_HOST") {
         o.sandbox.remote = Some(RemoteOverlay {
@@ -3899,6 +4032,32 @@ mod tests {
 
         assert_eq!(cfg.apps.default_tab, "work");
         assert_eq!(cfg.apps.effective_tab_order(), vec!["work"]);
+    }
+
+    #[test]
+    fn disk_config_defaults_and_env_override() {
+        let cfg = Config::default();
+        assert!(cfg.disk.show_sizes);
+        assert_eq!(cfg.disk.warn_threshold_gb, 100);
+        assert_eq!(cfg.disk.scan_interval_secs, 45);
+        assert!(cfg.disk.auto_clean_on_merge);
+        assert!(!cfg.disk.clean_on_pr_closed);
+        assert!(!cfg.disk.sccache);
+        assert!(cfg.disk.sccache_dir.is_empty());
+        assert!(cfg.disk.shared_target_dir.is_empty());
+
+        let mut env = MapEnv::default();
+        env.0.insert("SUPERZEJ_DISK_SCCACHE".into(), "true".into());
+        env.0
+            .insert("SUPERZEJ_DISK_WARN_THRESHOLD_GB".into(), "250".into());
+        env.0.insert(
+            "SUPERZEJ_DISK_SHARED_TARGET_DIR".into(),
+            "/tmp/shared".into(),
+        );
+        let cfg = Config::load_layered(&env, &[], None);
+        assert!(cfg.disk.sccache);
+        assert_eq!(cfg.disk.warn_threshold_gb, 250);
+        assert_eq!(cfg.disk.shared_target_dir, "/tmp/shared");
     }
 
     #[test]
@@ -6019,11 +6178,11 @@ transport = \"ssh\"
         assert_eq!(
             b.top_right,
             vec![
-                "cpu", "mem", "gpu", "temp", "net", "disk", "battery", "date", "clock"
+                "cpu", "mem", "disk", "gpu", "temp", "net", "battery", "date", "clock"
             ]
         );
         assert_eq!(b.bottom_left, vec!["keyhints"]);
-        assert_eq!(b.bottom_right, vec!["pr", "tests", "loc", "status"]);
+        assert_eq!(b.bottom_right, vec!["pr", "tests", "loc", "disk", "status"]);
         assert_eq!(b.date_format, "%a %b %-d");
         assert_eq!(b.clock_format, "%H:%M");
     }
@@ -6255,6 +6414,14 @@ transport = \"ssh\"
             log_rotation_size_mb: Some(12),
             log_max_files: Some(3),
             log_format: Some(LogFormat::Json),
+            disk_show_sizes: Some(false),
+            disk_warn_threshold_gb: Some(250),
+            disk_scan_interval_secs: Some(90),
+            disk_auto_clean_on_merge: Some(false),
+            disk_clean_on_pr_closed: Some(true),
+            disk_sccache: Some(true),
+            disk_sccache_dir: Some("/cache/sccache".into()),
+            disk_shared_target_dir: Some("/cache/target".into()),
             sandbox: SandboxOverlay {
                 enabled: Some(false),
                 ..Default::default()
@@ -6289,6 +6456,14 @@ transport = \"ssh\"
         assert_eq!(cfg.log.rotation_size_mb, 12);
         assert_eq!(cfg.log.max_files, 3);
         assert_eq!(cfg.log.format, LogFormat::Json);
+        assert!(!cfg.disk.show_sizes);
+        assert_eq!(cfg.disk.warn_threshold_gb, 250);
+        assert_eq!(cfg.disk.scan_interval_secs, 90);
+        assert!(!cfg.disk.auto_clean_on_merge);
+        assert!(cfg.disk.clean_on_pr_closed);
+        assert!(cfg.disk.sccache);
+        assert_eq!(cfg.disk.sccache_dir, "/cache/sccache");
+        assert_eq!(cfg.disk.shared_target_dir, "/cache/target");
         assert!(!cfg.sandbox.enabled);
     }
 
