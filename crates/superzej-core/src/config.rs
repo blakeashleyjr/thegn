@@ -226,6 +226,26 @@ config_enum! {
         SealedTunnel = "sealed-tunnel" | "tunnel-only" | "vpn-only",
     } default = Hardened;
 }
+config_enum! {
+    /// Whether superzej pre-warms a worktree's `direnv` cache **on the host** so
+    /// the in-sandbox `direnv` hook works against the read-only `/nix/store`.
+    /// A cold `nix-direnv` (`use flake`) cache makes the in-pane direnv try to
+    /// rebuild the devShell, which fails on the read-only store + no daemon;
+    /// warming on the host (writable store + daemon) lets the pane replay the
+    /// cached env read-only. See [`crate::direnv`].
+    ///
+    /// - `auto`         — warm + `direnv allow` the worktree (trusts the repo's
+    ///                    own `.envrc`, the same boundary `inject_devshell`
+    ///                    already crosses). The default.
+    /// - `allowed-only` — warm only worktrees the user has already
+    ///                    `direnv allow`-ed; never auto-allows.
+    /// - `off`          — never warm (the in-pane direnv falls back as before).
+    pub enum WarmDirenv: "warm_direnv" {
+        Auto = "auto" | "on" | "true",
+        AllowedOnly = "allowed-only" | "allowed_only" | "allowed",
+        Off = "off" | "false" | "none" | "no",
+    } default = Auto;
+}
 
 impl SandboxProfile {
     /// Mount the container root filesystem read-only (writable: the worktree,
@@ -2608,7 +2628,17 @@ pub struct SandboxConfig {
     pub auto_caches: bool,
     pub mounts: Vec<String>, // extra binds ("host:dest[:ro|rw|cache]" or "host"); suffix allowed
     pub init_script: String, // runs inside before the agent/shell
-    pub devenv: bool,        // wrap inner cmd with `devenv shell --`
+    /// Host-side setup commands run (off-loop, via `sh -lc` in the worktree)
+    /// once when a worktree is created, before its first pane spawns — for
+    /// heavyweight prep that benefits from the host's writable store/daemon and
+    /// network (e.g. `mise install`, a cache warm). The built-in `direnv` warm
+    /// (`warm_direnv`) runs alongside these.
+    pub prepare: Vec<String>,
+    /// Pre-warm a worktree's `direnv` cache on the host so the in-sandbox
+    /// `direnv` hook works against the read-only `/nix/store`. See
+    /// [`crate::direnv`] and [`WarmDirenv`].
+    pub warm_direnv: WarmDirenv,
+    pub devenv: bool, // wrap inner cmd with `devenv shell --`
     /// Inject the repo's Nix flake `devShell` toolchain (its `PATH` + safe
     /// exported vars) into worktree panes — resolved on the host (writable
     /// store + daemon) and cached, so a sandboxed pane that can't reach the Nix
@@ -2694,6 +2724,8 @@ impl Default for SandboxConfig {
                 "/run/user".into(),
             ],
             init_script: String::new(),
+            prepare: Vec::new(),
+            warm_direnv: WarmDirenv::Auto,
             devenv: false,
             inject_devshell: true,
             nix_daemon: false,
@@ -2734,6 +2766,8 @@ pub struct SandboxOverlay {
     pub auto_caches: Option<bool>,
     pub mounts: Option<Vec<String>>,
     pub init_script: Option<String>,
+    pub prepare: Option<Vec<String>>,
+    pub warm_direnv: Option<WarmDirenv>,
     pub devenv: Option<bool>,
     pub inject_devshell: Option<bool>,
     pub nix_daemon: Option<bool>,
@@ -2818,6 +2852,12 @@ impl SandboxOverlay {
         if let Some(v) = self.init_script {
             base.init_script = v;
         }
+        if let Some(v) = self.prepare {
+            base.prepare = v;
+        }
+        if let Some(v) = self.warm_direnv {
+            base.warm_direnv = v;
+        }
         if let Some(v) = self.devenv {
             base.devenv = v;
         }
@@ -2864,6 +2904,8 @@ impl SandboxOverlay {
             && self.auto_caches.is_none()
             && self.mounts.is_none()
             && self.init_script.is_none()
+            && self.prepare.is_none()
+            && self.warm_direnv.is_none()
             && self.devenv.is_none()
             && self.shell.is_none()
             && self.on_missing.is_none()
@@ -3627,6 +3669,9 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     }
     if let Some(v) = env.get("SUPERZEJ_SANDBOX_NIX_DAEMON") {
         o.sandbox.nix_daemon = parse_bool(&v, "SUPERZEJ_SANDBOX_NIX_DAEMON");
+    }
+    if let Some(v) = env.get("SUPERZEJ_SANDBOX_WARM_DIRENV") {
+        o.sandbox.warm_direnv = WarmDirenv::from_str_validated(v.trim()).ok();
     }
     if let Some(host) = env.get("SUPERZEJ_SANDBOX_REMOTE_HOST") {
         o.sandbox.remote = Some(RemoteOverlay {
@@ -6764,6 +6809,33 @@ transport = \"ssh\"
             toml::from_str("[sandbox.limits]\ncpu = \"2\"\nmemory = \"4G\"\n").unwrap();
         assert_eq!(cfg.sandbox.limits.cpu.as_deref(), Some("2"));
         assert_eq!(cfg.sandbox.limits.memory.as_deref(), Some("4G"));
+    }
+
+    #[test]
+    fn sandbox_warm_direnv_and_prepare_parse() {
+        // Default: warm on, no prepare hooks.
+        let d = SandboxConfig::default();
+        assert_eq!(d.warm_direnv, WarmDirenv::Auto);
+        assert!(d.prepare.is_empty());
+        // Round-trips from a `[sandbox]` table, and the overlay layers them.
+        let cfg: Config = toml::from_str(
+            "[sandbox]\nwarm_direnv = \"allowed-only\"\nprepare = [\"mise install\", \"echo hi\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.sandbox.warm_direnv, WarmDirenv::AllowedOnly);
+        assert_eq!(cfg.sandbox.prepare, vec!["mise install", "echo hi"]);
+        // Unknown value warns and falls back to the default (infallible enum).
+        let cfg2: Config = toml::from_str("[sandbox]\nwarm_direnv = \"bogus\"\n").unwrap();
+        assert_eq!(cfg2.sandbox.warm_direnv, WarmDirenv::Auto);
+        // `off` aliases.
+        assert_eq!(
+            WarmDirenv::from_str_validated("off").unwrap(),
+            WarmDirenv::Off
+        );
+        assert_eq!(
+            WarmDirenv::from_str_validated("false").unwrap(),
+            WarmDirenv::Off
+        );
     }
 
     // ---- launch_spec full env coverage ----
