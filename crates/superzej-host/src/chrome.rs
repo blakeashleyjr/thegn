@@ -322,7 +322,8 @@ pub struct FrameModel {
     /// Selection cursor: an index into the *visible* rows of `sidebar_rows`.
     pub sidebar_selected: usize,
     /// True when the sidebar currently owns keyboard focus (drives the
-    /// focus indicator + per-row digit hints in [`draw_sidebar`]).
+    /// focus indicator in [`draw_sidebar`]; the Ctrl+1..9 workspace digit hints
+    /// are always shown, regardless of focus).
     pub sidebar_focused: bool,
     /// Active fuzzy-filter query echoed in the header (empty = none).
     pub sidebar_filter: String,
@@ -1556,6 +1557,25 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
     let visible: Vec<&crate::sidebar::SidebarRow> =
         model.sidebar_rows.iter().filter(|r| r.visible).collect();
 
+    // Pre-compute the Ctrl+1..9 quick-jump slot for each visible row, matching
+    // `sidebar_workspace_order` exactly: only switchable (DB-backed, has a
+    // `worktree_path`) workspace rows count, in visible order, slots 1..=9.
+    let workspace_slots: Vec<Option<u8>> = {
+        let mut next: u8 = 1;
+        visible
+            .iter()
+            .map(|r| {
+                if r.kind == crate::sidebar::RowKind::Workspace && r.worktree_path.is_some() {
+                    let slot = (next <= 9).then_some(next);
+                    next += 1;
+                    slot
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+
     let metrics_rows = if rect.rows > 10 && !model.metrics.targets.is_empty() {
         6.min(rect.rows.saturating_sub(4))
     } else {
@@ -1607,7 +1627,7 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             .as_deref()
             .and_then(|p| model.sidebar_window_titles.get(p))
             .map(String::as_str);
-        let composed = compose_sidebar_row(row, window_title);
+        let composed = compose_sidebar_row(row, window_title, workspace_slots[i]);
         let fg = if row.active {
             col(S::Focus)
         } else if selected {
@@ -1811,10 +1831,20 @@ struct Badge {
 fn compose_sidebar_row(
     row: &crate::sidebar::SidebarRow,
     window_title: Option<&str>,
+    workspace_slot: Option<u8>,
 ) -> ComposedRow {
     use crate::sidebar::RowKind;
     let mut text = String::new();
     let mut activity_col = None;
+
+    // Quick-jump digit on a switchable workspace row (Ctrl+1..9). Prepended
+    // before the caret so the later char-offset bookkeeping (status/badge
+    // columns) folds it in automatically.
+    if row.kind == RowKind::Workspace
+        && let Some(n) = workspace_slot
+    {
+        text.push_str(&format!("{n} "));
+    }
 
     match row.kind {
         RowKind::Folder => {
@@ -2638,8 +2668,6 @@ mod tests {
         let text = s.screen_chars_to_string();
         // The cursor's left-edge accent bar appears only while focused.
         assert!(text.contains('\u{2590}'), "focused cursor bar: {text:?}");
-        // No quick-jump digits in the labels (flat look).
-        assert!(!text.contains("1 app"), "no digit hints: {text:?}");
 
         let mut unfocused = model.clone();
         unfocused.sidebar_focused = false;
@@ -2649,6 +2677,88 @@ mod tests {
         assert!(
             !text2.contains('\u{2590}'),
             "no cursor bar when unfocused: {text2:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_slot_digits_skip_unswitchable_and_count_in_order() {
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 24,
+            rows: 10,
+        };
+        use crate::sidebar::RowKind;
+        // a: switchable → slot 1. b: live-fallback (no path) → no slot.
+        // c: switchable → slot 2 (the counter skips b, matching
+        // sidebar_workspace_order's filter_map).
+        let mut a = row(RowKind::Workspace, "alpha");
+        a.worktree_path = Some("/repo/alpha".into());
+        let b = row(RowKind::Workspace, "bravo"); // worktree_path: None
+        let mut c = row(RowKind::Workspace, "charlie");
+        c.worktree_path = Some("/repo/charlie".into());
+        let model = FrameModel {
+            sidebar_rows: vec![a, b, c],
+            ..Default::default()
+        };
+        let mut s = Surface::new(24, 10);
+        draw_sidebar(&mut s, rect, &model);
+        let text = s.screen_chars_to_string();
+        assert!(
+            text.contains("1 \u{25be} alpha"),
+            "alpha is slot 1: {text:?}"
+        );
+        // bravo gets no digit (unswitchable) — only its bare caret + label.
+        assert!(text.contains("\u{25be} bravo"), "bravo present: {text:?}");
+        assert!(
+            !text.contains("2 \u{25be} bravo") && !text.contains("1 \u{25be} bravo"),
+            "bravo has no slot digit: {text:?}"
+        );
+        assert!(
+            text.contains("2 \u{25be} charlie"),
+            "charlie is slot 2 (bravo skipped): {text:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_rows_show_quick_jump_digits_regardless_of_focus() {
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 24,
+            rows: 6,
+        };
+        use crate::sidebar::RowKind;
+        // A switchable workspace carries a `worktree_path`; an unswitchable
+        // (live-fallback) one does not and so gets no slot — mirroring
+        // `sidebar_workspace_order`.
+        let mut ws = row(RowKind::Workspace, "app");
+        ws.worktree_path = Some("/repo/app".into());
+        let model = FrameModel {
+            sidebar_rows: vec![ws, row(RowKind::Worktree, "home")],
+            sidebar_selected: 1,
+            sidebar_focused: true,
+            ..Default::default()
+        };
+        let mut s = Surface::new(24, 6);
+        draw_sidebar(&mut s, rect, &model);
+        let focused = s.screen_chars_to_string();
+        // Slot "1" is painted before the caret on the first switchable workspace.
+        assert!(
+            focused.contains("1 \u{25be} app"),
+            "digit hint on workspace row: {focused:?}"
+        );
+
+        // The digit persists when the sidebar is not focused (user chose
+        // always-on hints, unlike the focus-only cursor bar).
+        let mut unfocused = model.clone();
+        unfocused.sidebar_focused = false;
+        let mut s2 = Surface::new(24, 6);
+        draw_sidebar(&mut s2, rect, &unfocused);
+        let text2 = s2.screen_chars_to_string();
+        assert!(
+            text2.contains("1 \u{25be} app"),
+            "digit hint shown unfocused too: {text2:?}"
         );
     }
 
