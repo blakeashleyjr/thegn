@@ -294,12 +294,16 @@ config_enum! {
     /// Where an environment's worktree files physically live. `in_env` (the
     /// default) keeps files where the env runs — on the host for `local`, in the
     /// pod/sandbox for remote placements (today's behavior). `local_exec` keeps
-    /// files on the host and only execs remotely; `sshfs` mounts the remote tree
-    /// locally. (`local_exec`/`sshfs` lifecycle is wired in the data-mode phase.)
+    /// files on the host and only execs remotely. `sshfs` FUSE-mounts the remote
+    /// tree locally; `sync` keeps a local working copy kept coherent with the
+    /// remote via a changed-files (rsync) delta. Both `sshfs`/`sync` run the pane
+    /// *locally at the mountpoint* (the placement is used only to project the
+    /// tree); their mount/sync lifecycle is auto-run on pane spawn/close.
     pub enum DataMode: "data mode" {
         InEnv = "in_env" | "remote" | "native",
         LocalExec = "local_exec" | "local",
         Sshfs = "sshfs" | "mount",
+        Sync = "sync" | "rsync",
     } default = InEnv;
 }
 config_enum! {
@@ -1852,6 +1856,9 @@ pub struct EnvProviderConfig {
     pub api_key_env: String,
     /// Provider sandbox template/image to create from.
     pub template: String,
+    /// Working directory inside the sandbox that a `data = "sync"` projection
+    /// pushes the local worktree into (and pulls back from). Empty ⇒ `/workspace`.
+    pub workdir: String,
 }
 
 impl EnvProviderConfig {
@@ -1865,6 +1872,17 @@ impl EnvProviderConfig {
             && self.api_base.is_empty()
             && self.api_key_env.is_empty()
             && self.template.is_empty()
+            && self.workdir.is_empty()
+    }
+
+    /// The sandbox working dir for `sync` (config value or the `/workspace` default).
+    pub fn sync_workdir(&self) -> String {
+        let w = self.workdir.trim();
+        if w.is_empty() {
+            "/workspace".to_string()
+        } else {
+            w.to_string()
+        }
     }
 }
 
@@ -2164,6 +2182,13 @@ pub struct SandboxConfig {
     /// override per workspace via `.superzej.toml`.
     pub shell: String,
     pub on_missing: OnMissing,
+    /// Drive the OCI runtime against a **remote daemon** instead of SSH-wrapping
+    /// the whole backend argv: a podman connection URL/name or a docker host
+    /// (e.g. `ssh://user@host`). Empty ⇒ local daemon (the default). Injected as
+    /// `podman --url`/`--connection` or `docker -H` before every container
+    /// subcommand. An alternative reach to `[env.<name>] placement = "ssh"`,
+    /// useful when the daemon (not just the shell) lives on another box.
+    pub oci_host: String,
     pub remote: RemoteConfig,
     /// Allow-only these hostnames for outbound connections (empty = allow all).
     /// Enforced via a per-container DNS interceptor. Block-list is checked first
@@ -2229,6 +2254,7 @@ impl Default for SandboxConfig {
             devenv: false,
             shell: String::new(),
             on_missing: OnMissing::Warn,
+            oci_host: String::new(),
             remote: RemoteConfig::default(),
             network_allow: Vec::new(),
             network_block: Vec::new(),

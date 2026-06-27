@@ -50,6 +50,7 @@ fn base_spec(name: &str) -> SandboxSpec {
         devenv_path: None,
         name: name.into(),
         vpn: None,
+        oci_host: None,
     }
 }
 

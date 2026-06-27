@@ -485,6 +485,45 @@ pub(super) fn debug() -> Vec<PanelRow> {
     ]
 }
 
+/// Render the unified activity timeline (sandbox audit + LLM-proxy spend) for the
+/// active worktree, newest first. Shared by the OCI and non-OCI branches of the
+/// sandbox section. Empty input ⇒ no rows (no header).
+fn timeline_section(events: &[superzej_core::models::TimelineEvent]) -> Vec<PanelRow> {
+    use superzej_core::models::TimelineSource;
+    let mut rows: Vec<PanelRow> = Vec::new();
+    if events.is_empty() {
+        return rows;
+    }
+    rows.push(PanelRow::blank());
+    rows.push(PanelRow::plain(Line::segs(vec![
+        seg(g2(), "TIMELINE").bold(),
+    ])));
+    for ev in events {
+        let kind_col = match ev.kind.as_str() {
+            "network" => hue(Hue::Amber),
+            "die" | "error" => hue(Hue::Red),
+            "request" => hue(Hue::Green),
+            _ => g(),
+        };
+        let src = match ev.source {
+            TimelineSource::Sandbox => "sbx",
+            TimelineSource::Proxy => "llm",
+        };
+        let detail = if ev.detail.is_empty() {
+            "—".to_string()
+        } else {
+            ev.detail.clone()
+        };
+        rows.push(PanelRow::plain(Line::segs(vec![
+            sp(2),
+            seg(g2(), format!("{src} ")),
+            seg(kind_col, format!("{:<8}", ev.kind)),
+            seg(d(), detail),
+        ])));
+    }
+    rows
+}
+
 pub(super) fn sandbox(ctx: &SectionCtx) -> Vec<PanelRow> {
     let (model, deep, full) = (ctx.model, ctx.deep(), ctx.full());
     let mut rows: Vec<PanelRow> = Vec::new();
@@ -540,24 +579,8 @@ pub(super) fn sandbox(ctx: &SectionCtx) -> Vec<PanelRow> {
                     seg(f(), c.mounts.clone()),
                 ])));
             }
-            if deep && !model.container_events.is_empty() {
-                rows.push(PanelRow::blank());
-                rows.push(PanelRow::plain(Line::segs(vec![
-                    seg(g2(), "AUDIT LOG").bold(),
-                ])));
-                for ev in &model.container_events {
-                    let kind_col = match ev.kind.as_str() {
-                        "network" => hue(Hue::Amber),
-                        "die" => hue(Hue::Red),
-                        _ => g(),
-                    };
-                    let detail = ev.detail.as_deref().unwrap_or("—");
-                    rows.push(PanelRow::plain(Line::segs(vec![
-                        sp(2),
-                        seg(kind_col, format!("{:<8}", ev.kind)),
-                        seg(d(), detail.to_string()),
-                    ])));
-                }
+            if deep {
+                rows.extend(timeline_section(&model.timeline));
             }
         }
         None => {
@@ -582,6 +605,11 @@ pub(super) fn sandbox(ctx: &SectionCtx) -> Vec<PanelRow> {
                     g(),
                     format!("{} other container(s) running", model.containers.len()),
                 )])));
+            }
+            // Non-OCI backends create no container, but proxy spend (and any
+            // host-synthesized pane events) still belong to this worktree.
+            if deep {
+                rows.extend(timeline_section(&model.timeline));
             }
         }
     }
