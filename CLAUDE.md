@@ -119,10 +119,39 @@ just lint            # clippy -D warnings + shellcheck + yamllint + taplo
 just coverage        # cargo llvm-cov, gated at 95% lines on the core
 just bench           # startup benchmarks (hyperfine; not part of ci)
 just start name=dev  # run the host with an isolated XDG_STATE_HOME
-just ci              # fmt-check + lint + build + test + coverage + smoke + nix-build
+just ci              # fmt-check + lint + build + test + openspec-validate + coverage + smoke + nix-build
 ```
 
 Nix: `nix profile install .#default`; `nix develop` for the dev shell.
+
+## Spec-driven development (OpenSpec)
+
+superzej's **own development** is managed with [OpenSpec](https://github.com/Fission-AI/OpenSpec)
+(spec-driven development for AI agents). This is a dev-process tool — it is **not**
+part of the shipped `szhost` binary.
+
+- **Source of truth:** `openspec/specs/<capability>/spec.md` describes how the
+  system behaves _today_ (behavior-first: `### Requirement:` with SHALL/MUST +
+  `#### Scenario:` WHEN/THEN). `openspec/config.yaml` holds the schema + the
+  project context injected into every artifact the AI generates.
+- **In-flight work:** each change is a self-contained folder under
+  `openspec/changes/<name>/` (proposal.md, design.md, tasks.md, and delta specs
+  using `## ADDED/MODIFIED/REMOVED Requirements`). On completion, deltas merge
+  into `openspec/specs/` and the change is archived.
+- **Workflow (Claude Code slash commands):** `/opsx:explore` → `/opsx:propose`
+  → `/opsx:apply` → `/opsx:sync` → `/opsx:archive`. The `.claude/` commands +
+  skills are gitignored; regenerate them per checkout with `just openspec-setup`
+  (the dev shell also seeds them on first entry).
+- **tasks.md stays the roadmap index** (groups A–AX, phased). When starting work,
+  link the `tasks.md` item(s) to the openspec change (cite group letter + number
+  in the proposal's Impact). OpenSpec owns per-change detail; tasks.md owns the
+  map. Older narrative docs live in `docs/superpowers/{plans,specs}/`.
+- **Tooling is hermetic:** the `openspec` CLI is a pinned Nix build
+  (`nix/openspec.nix`, `nix run .#openspec`), on PATH in `nix develop`; telemetry
+  is off by construction. `just openspec <args>` is a passthrough;
+  `just openspec-validate` (`openspec validate --all --strict`) runs in `just ci`.
+- **`.hermes/plans/` is deprecated** in favor of `/opsx` — see
+  `.hermes/plans/DEPRECATED.md`. Existing files are kept for history only.
 
 ## Conventions & gotchas
 

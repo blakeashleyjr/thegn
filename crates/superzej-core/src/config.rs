@@ -389,6 +389,18 @@ pub struct LlmProxyConfig {
     pub token_reduction: bool,
     /// Aggressiveness when `token_reduction` is on.
     pub token_reduction_level: CompressionLevel,
+    /// Route a launched agent's model traffic through the proxy at `listen` by
+    /// injecting provider config into the agent's environment at spawn. Separate
+    /// from `enabled` (which launches `szproxy`): set this to point the agent at
+    /// an already-running proxy without launching our own.
+    pub route_agent: bool,
+    /// The pi-side API id for the proxy endpoint. The proxy serves the Anthropic
+    /// Messages API (`/v1/messages`); pi's OpenAI client speaks the Responses API,
+    /// which the proxy does not implement — so `anthropic-messages` is the default.
+    pub agent_api: String,
+    /// The model id the agent requests from the proxy (the proxy maps it to a
+    /// real backend, e.g. `model-proxy/standard` → its standard route).
+    pub agent_model: String,
 }
 
 impl Default for LlmProxyConfig {
@@ -404,6 +416,9 @@ impl Default for LlmProxyConfig {
             heartbeat_secs: 10,
             token_reduction: false,
             token_reduction_level: CompressionLevel::default(),
+            route_agent: false,
+            agent_api: "anthropic-messages".to_string(),
+            agent_model: "model-proxy/standard".to_string(),
         }
     }
 }
@@ -1097,12 +1112,31 @@ pub struct StatsConfig {
     pub net_icon: String,
     /// Icon for GPU stat.
     pub gpu_icon: String,
+    /// Icon for the CPU/package temperature stat.
+    pub temp_icon: String,
+    /// Icon for the swap-usage stat.
+    pub swap_icon: String,
+    /// Icon for the CPU-frequency stat.
+    pub freq_icon: String,
+    /// Icon for the load-average stat.
+    pub load_icon: String,
+    /// Icon for the uptime stat.
+    pub uptime_icon: String,
     /// Icon for the battery stat (discharging).
     pub battery_icon: String,
     /// Icon shown while the battery is charging / on AC.
     pub battery_charging_icon: String,
     /// Battery percentage at/below which the widget turns red.
     pub battery_warn: u8,
+    /// Icon for the disk (free-space) stat.
+    pub disk_icon: String,
+    /// Free-disk percentage at/below which the `disk` widget turns amber.
+    pub disk_free_warn: u8,
+    /// Free-disk percentage at/below which the `disk` widget turns red.
+    pub disk_free_critical: u8,
+    /// Filesystem the `disk` masthead widget measures (any path on it).
+    /// Empty = the filesystem holding `worktrees_dir`. `~` expands to home.
+    pub disk_path: String,
     /// Available refresh rates for keybind cycling (seconds).
     pub refresh_rates: Vec<f64>,
 }
@@ -1125,9 +1159,18 @@ impl Default for StatsConfig {
             mem_icon: "\u{efc5}".into(),
             net_icon: "\u{f1eb}".into(),              // nf-fa-wifi
             gpu_icon: "\u{f2db}".into(),              // nf-fa-microchip
+            temp_icon: "\u{f2c7}".into(),             // nf-fa-thermometer_full
+            swap_icon: "\u{f0ec}".into(),             // nf-fa-exchange
+            freq_icon: "\u{f0e4}".into(),             // nf-fa-tachometer
+            load_icon: "\u{f201}".into(),             // nf-fa-line_chart
+            uptime_icon: "\u{f017}".into(),           // nf-fa-clock_o
             battery_icon: "\u{f240}".into(),          // nf-fa-battery_full
             battery_charging_icon: "\u{f0e7}".into(), // nf-fa-bolt — lightning bolt
             battery_warn: 25,
+            disk_icon: "\u{f0a0}".into(), // nf-fa-hdd_o — hard drive
+            disk_free_warn: 15,
+            disk_free_critical: 5,
+            disk_path: String::new(),
             refresh_rates: vec![1.0, 2.0, 5.0, 10.0],
         }
     }
@@ -1135,10 +1178,11 @@ impl Default for StatsConfig {
 
 /// `[bars]` — the customizable widget bars framing the workspace. Each slot is
 /// an ordered widget-id list; unknown ids warn and are skipped. Built-ins:
-/// `brand` (superzej + version), `cpu`, `mem`, `gpu`, `net`, `battery`,
-/// `date`, `clock` (top bar) and `keyhints` (context-dependent keybinds),
-/// `pr` (forge + PR number/state), `status` (transient messages + the
-/// keybind-lock badge) for the bottom bar.
+/// `brand` (superzej + version), `cpu`, `mem`, `gpu`, `temp` (CPU °C), `net`,
+/// `swap`, `freq` (CPU GHz), `load` (1-min load avg, unix), `uptime`, `disk`
+/// (free %), `battery`, `date`, `clock` (top bar) and `keyhints`
+/// (context-dependent keybinds), `pr` (forge + PR number/state), `status`
+/// (transient messages + the keybind-lock badge) for the bottom bar.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct BarsConfig {
@@ -1159,14 +1203,22 @@ impl Default for BarsConfig {
             top_right: vec![
                 "cpu".into(),
                 "mem".into(),
+                "disk".into(),
                 "gpu".into(),
+                "temp".into(),
                 "net".into(),
                 "battery".into(),
                 "date".into(),
                 "clock".into(),
             ],
             bottom_left: vec!["keyhints".into()],
-            bottom_right: vec!["pr".into(), "tests".into(), "loc".into(), "status".into()],
+            bottom_right: vec![
+                "pr".into(),
+                "tests".into(),
+                "loc".into(),
+                "disk".into(),
+                "status".into(),
+            ],
             date_format: "%a %b %-d".into(),
             clock_format: "%H:%M".into(),
         }
@@ -2453,6 +2505,17 @@ pub struct SandboxConfig {
     pub mounts: Vec<String>, // extra binds ("host:dest[:ro|rw|cache]" or "host"); suffix allowed
     pub init_script: String, // runs inside before the agent/shell
     pub devenv: bool,        // wrap inner cmd with `devenv shell --`
+    /// Inject the repo's Nix flake `devShell` toolchain (its `PATH` + safe
+    /// exported vars) into worktree panes — resolved on the host (writable
+    /// store + daemon) and cached, so a sandboxed pane that can't reach the Nix
+    /// daemon still gets the project linters/formatters/tools out of the box.
+    /// No-op for repos without a flake `devShell`. See [`crate::devenv`].
+    pub inject_devshell: bool,
+    /// Bind-mount the host Nix daemon socket into the sandbox so full
+    /// `nix develop`/`build`/`fmt` work *inside* it. Off by default: it relaxes
+    /// the isolation the hardening profiles provide (Tier A `inject_devshell`
+    /// already covers read-only tool access without this).
+    pub nix_daemon: bool,
     /// Shell to use inside the sandbox. `""` = resolve from the host's `$SHELL`
     /// at pane-spawn time. Set to an absolute path or name (e.g. `"zsh"`) to
     /// override per workspace via `.superzej.toml`.
@@ -2521,6 +2584,8 @@ impl Default for SandboxConfig {
             ],
             init_script: String::new(),
             devenv: false,
+            inject_devshell: true,
+            nix_daemon: false,
             shell: String::new(),
             on_missing: OnMissing::Warn,
             remote: RemoteConfig::default(),
@@ -2558,6 +2623,8 @@ pub struct SandboxOverlay {
     pub mounts: Option<Vec<String>>,
     pub init_script: Option<String>,
     pub devenv: Option<bool>,
+    pub inject_devshell: Option<bool>,
+    pub nix_daemon: Option<bool>,
     pub shell: Option<String>,
     pub on_missing: Option<OnMissing>,
     pub remote: Option<RemoteOverlay>,
@@ -2641,6 +2708,12 @@ impl SandboxOverlay {
         }
         if let Some(v) = self.devenv {
             base.devenv = v;
+        }
+        if let Some(v) = self.inject_devshell {
+            base.inject_devshell = v;
+        }
+        if let Some(v) = self.nix_daemon {
+            base.nix_daemon = v;
         }
         if let Some(v) = self.shell {
             base.shell = v;
@@ -3425,6 +3498,12 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     }
     if let Some(v) = env.get("SUPERZEJ_SANDBOX_ENABLED") {
         o.sandbox.enabled = parse_bool(&v, "SUPERZEJ_SANDBOX_ENABLED");
+    }
+    if let Some(v) = env.get("SUPERZEJ_SANDBOX_INJECT_DEVSHELL") {
+        o.sandbox.inject_devshell = parse_bool(&v, "SUPERZEJ_SANDBOX_INJECT_DEVSHELL");
+    }
+    if let Some(v) = env.get("SUPERZEJ_SANDBOX_NIX_DAEMON") {
+        o.sandbox.nix_daemon = parse_bool(&v, "SUPERZEJ_SANDBOX_NIX_DAEMON");
     }
     if let Some(host) = env.get("SUPERZEJ_SANDBOX_REMOTE_HOST") {
         o.sandbox.remote = Some(RemoteOverlay {
@@ -4371,6 +4450,12 @@ name = "minimal"
             ("mem", &s.mem_icon),
             ("net", &s.net_icon),
             ("gpu", &s.gpu_icon),
+            ("temp", &s.temp_icon),
+            ("swap", &s.swap_icon),
+            ("freq", &s.freq_icon),
+            ("load", &s.load_icon),
+            ("uptime", &s.uptime_icon),
+            ("disk", &s.disk_icon),
             ("battery", &s.battery_icon),
             ("battery_charging", &s.battery_charging_icon),
         ] {
@@ -5995,10 +6080,16 @@ transport = \"ssh\"
             Priority::Notice
         );
 
-        // Alert set is exactly the four failures; unread set excludes Info.
+        // Alert set is the failures + the agent-attention request; unread excludes Info.
         let alerts = cfg.alert_kind_names();
-        assert_eq!(alerts.len(), 4);
-        for k in ["agent_failed", "test_failed", "log_error", "process_failed"] {
+        assert_eq!(alerts.len(), 5);
+        for k in [
+            "agent_failed",
+            "agent_attention",
+            "test_failed",
+            "log_error",
+            "process_failed",
+        ] {
             assert!(alerts.contains(&k), "missing {k}");
         }
         let counted = cfg.counted_unread_kind_names();
@@ -6355,10 +6446,12 @@ transport = \"ssh\"
         assert_eq!(b.top_left, vec!["brand"]);
         assert_eq!(
             b.top_right,
-            vec!["cpu", "mem", "gpu", "net", "battery", "date", "clock"]
+            vec![
+                "cpu", "mem", "disk", "gpu", "temp", "net", "battery", "date", "clock"
+            ]
         );
         assert_eq!(b.bottom_left, vec!["keyhints"]);
-        assert_eq!(b.bottom_right, vec!["pr", "tests", "loc", "status"]);
+        assert_eq!(b.bottom_right, vec!["pr", "tests", "loc", "disk", "status"]);
         assert_eq!(b.date_format, "%a %b %-d");
         assert_eq!(b.clock_format, "%H:%M");
     }

@@ -70,7 +70,6 @@ pub struct Overlays {
     pub hover: bool,
     pub search: bool,
     pub which_key: bool,
-    pub confirm: bool,
     pub toasts: bool,
 }
 
@@ -87,7 +86,6 @@ impl Overlays {
             || self.hover
             || self.search
             || self.which_key
-            || self.confirm
             || self.toasts
     }
 }
@@ -257,10 +255,6 @@ mod tests {
             },
             Overlays {
                 which_key: true,
-                ..Default::default()
-            },
-            Overlays {
-                confirm: true,
                 ..Default::default()
             },
             Overlays {

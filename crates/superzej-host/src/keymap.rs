@@ -78,6 +78,10 @@ pub enum Action {
     MoveItemUp,
     /// Reorder the selected item down (Ctrl+Alt+Down).
     MoveItemDown,
+    /// File the active worktree into a sidebar folder, chosen interactively
+    /// (existing folders + "new folder…"). The config presets bind
+    /// `file-worktree` composites instead, for a fixed folder per keybind.
+    MoveWorktreeToFolder,
     SplitDown,
     SplitRight,
     CloseSplitPane,
@@ -370,6 +374,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         label: "Move down (workspace/worktree)",
         hint: "move↓",
         default_chords: &["Ctrl Alt Down"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "move-worktree-to-folder",
+        label: "Move worktree to folder…",
+        hint: "file worktree",
+        default_chords: &[],
         palette: true,
     },
     ActionSpec {
@@ -856,6 +867,7 @@ impl Action {
             Action::PrevWorkspace => "prev-workspace",
             Action::MoveItemUp => "move-item-up",
             Action::MoveItemDown => "move-item-down",
+            Action::MoveWorktreeToFolder => "move-worktree-to-folder",
             Action::SplitDown => "split-down",
             Action::SplitRight => "split-right",
             Action::CloseSplitPane => "close-pane",
@@ -942,6 +954,7 @@ impl Action {
             "prev-workspace" => Action::PrevWorkspace,
             "move-item-up" | "move-worktree-up" => Action::MoveItemUp,
             "move-item-down" | "move-worktree-down" => Action::MoveItemDown,
+            "move-worktree-to-folder" => Action::MoveWorktreeToFolder,
             "split-down" | "new-panel-native" => Action::SplitDown,
             "split-right" | "new-panel" => Action::SplitRight,
             "close-pane" => Action::CloseSplitPane,
@@ -1054,6 +1067,12 @@ pub enum CompositeAction {
         run: Option<String>,
         placement: PanePlacement,
         cwd: PaneCwd,
+    },
+    /// File the active worktree into a named sidebar folder, creating the
+    /// folder if it doesn't exist yet.
+    FileWorktree {
+        /// Target folder name (e.g. "Ready to merge").
+        folder: String,
     },
 }
 
@@ -1174,9 +1193,20 @@ fn parse_composite(
                 cwd,
             })
         }
+        "file-worktree" => {
+            warn_unknown(&["folder"]);
+            let folder = params.get("folder").map(|f| f.trim()).unwrap_or("");
+            if folder.is_empty() {
+                warn("missing required param \"folder\"");
+                return None;
+            }
+            Some(CompositeAction::FileWorktree {
+                folder: folder.to_string(),
+            })
+        }
         other => {
             warn(&format!(
-                "unknown action {other:?} (expected new-worktree|new-pane)"
+                "unknown action {other:?} (expected new-worktree|new-pane|file-worktree)"
             ));
             None
         }
@@ -2503,6 +2533,70 @@ mod tests {
             }
             other => panic!("expected NewPane composite, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn file_worktree_preset_leader_chord_routes() {
+        // The shipped preset shape: a `file-worktree` composite on an
+        // `Alt m f r` leader. Prove the 3-key sequence routes to the custom
+        // action and the composite carries the folder name.
+        let mut cfg = superzej_core::config::Config::default();
+        cfg.actions.push(superzej_core::config::CustomAction {
+            name: "File: Ready to merge".into(),
+            key: "Alt m f r".into(),
+            run: None,
+            action: Some("file-worktree".into()),
+            params: [("folder".to_string(), "Ready to merge".to_string())]
+                .into_iter()
+                .collect(),
+            menu: true,
+            hint: None,
+            floating: true,
+            close_on_exit: true,
+        });
+        let mut map = default_keymap_for(&cfg, None, None);
+        let alt_m = Key::modified(KeyCode::Char('m'), Modifiers::ALT);
+        let f = Key::char('f');
+        let r = Key::char('r');
+        assert_eq!(map.dispatch(Mode::Normal, alt_m), MatchResult::Pending);
+        assert_eq!(map.dispatch(Mode::Normal, f), MatchResult::Pending);
+        assert_eq!(
+            map.dispatch(Mode::Normal, r),
+            MatchResult::Matched(Action::Custom(0)),
+            "the full Alt-m-f-r leader fires the custom action"
+        );
+        match &map.custom_actions()[0] {
+            HostCustomAction::Composite {
+                action: CompositeAction::FileWorktree { folder },
+                ..
+            } => assert_eq!(folder, "Ready to merge"),
+            other => panic!("expected FileWorktree composite, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn composite_file_worktree_parses_folder() {
+        let cfg = cfg_with_composite("file-worktree", &[("folder", "  Ready to merge ")]);
+        let map = default_keymap_for(&cfg, None, None);
+        match &map.custom_actions()[0] {
+            HostCustomAction::Composite {
+                action: CompositeAction::FileWorktree { folder },
+                ..
+            } => assert_eq!(folder, "Ready to merge"),
+            other => panic!("expected FileWorktree composite, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn composite_file_worktree_without_folder_is_skipped() {
+        let map = default_keymap_for(&cfg_with_composite("file-worktree", &[]), None, None);
+        assert!(map.custom_actions().is_empty(), "missing folder skips it");
+        let map = default_keymap_for(
+            &cfg_with_composite("file-worktree", &[("folder", "  ")]),
+            None,
+            None,
+        );
+        assert!(map.custom_actions().is_empty(), "blank folder skips it");
     }
 
     #[test]

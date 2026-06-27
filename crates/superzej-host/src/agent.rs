@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use superzej_core::config::Config;
 use superzej_core::db::Db;
 use superzej_core::remote::GitLoc;
-use superzej_core::{account, repo, sandbox};
+use superzej_core::{account, devenv, repo, sandbox};
 use superzej_svc::vpn::VpnProvider;
 
 /// The literal shell sentinel — distinct from any configured agent/tool name.
@@ -617,6 +617,24 @@ pub fn launch_spec_with_key(
         }
     }
 
+    // Tier A: inject the repo's flake `devShell` toolchain (PATH + safe vars) so
+    // the pane gets the project's linters/formatters/compilers out of the box —
+    // crucial inside a sandbox, which can't reach the Nix daemon to `nix develop`
+    // itself. Resolved on the host + cached; a cold cache kicks a background
+    // resolve the next launch picks up. Local worktrees only (remote panes run
+    // where the host store isn't mounted). See [`devenv`].
+    let devshell = (cfg.sandbox.inject_devshell && !loc.is_remote() && !outcome.is_remote)
+        .then(|| devenv::cached(&repo_root))
+        .flatten();
+    match (&devshell, outcome.spec.as_mut()) {
+        (Some(dev), Some(spec)) => inject_devshell_sandbox(spec, dev),
+        // No cache yet — warm it in the background for the next launch.
+        (None, _) if cfg.sandbox.inject_devshell && !loc.is_remote() && !outcome.is_remote => {
+            devenv::prewarm(&repo_root);
+        }
+        _ => {}
+    }
+
     let mut spec = compose_spec(cfg, worktree, branch, choice, &loc, &outcome);
     // On the host path (no sandbox spec) the credential home + build env ride
     // the pane env.
@@ -626,7 +644,113 @@ pub fn launch_spec_with_key(
         }
         spec.env.extend(build_env);
     }
+    // Host (no-sandbox) devShell injection rides the pane env directly.
+    if outcome.spec.is_none()
+        && let Some(dev) = &devshell
+    {
+        inject_devshell_host(&mut spec, dev);
+    }
     Ok(spec)
+}
+
+/// Resolve `worktree`'s sandbox and run a one-shot shell command inside it,
+/// returning combined stdout+stderr. Services ACP `terminal/create` so the
+/// agent's shell commands run inside the same policy boundary (container /
+/// bwrap / none) as its interactive pane — superzej is the agent's "hands and
+/// bouncer". BLOCKING (sandbox resolution may ensure a container); callers must
+/// run it off the event loop.
+pub fn run_in_sandbox(cfg: &Config, worktree: &str, command: &str) -> anyhow::Result<String> {
+    let loc = GitLoc::for_worktree(Path::new(worktree));
+    let saved_backend = Db::open()
+        .ok()
+        .and_then(|db| db.worktree_sandbox(worktree).ok().flatten());
+    let repo_root: PathBuf = Db::open()
+        .ok()
+        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| repo::main_worktree(Path::new(worktree)))
+        .unwrap_or_else(|| PathBuf::from(worktree));
+    let selected_env = Db::open()
+        .ok()
+        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+
+    let outcome = prepare_sandbox_env(
+        cfg,
+        &repo_root,
+        worktree,
+        &loc,
+        saved_backend.as_deref(),
+        SandboxScope::Shell,
+        selected_env.as_deref(),
+    )?;
+
+    let argv = match &outcome.spec {
+        Some(spec) => sandbox::enter_argv(spec, command),
+        None => vec![
+            superzej_core::util::shell(),
+            "-lc".to_string(),
+            command.to_string(),
+        ],
+    };
+
+    let mut cmd = std::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    // Local worktree: run from its dir so relative paths resolve as the agent expects.
+    if !loc.is_remote() && !outcome.is_remote {
+        cmd.current_dir(worktree);
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| anyhow::anyhow!("spawn `{}` failed: {e}", argv.join(" ")))?;
+    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !stderr.is_empty() {
+        if !combined.is_empty() && !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+        combined.push_str(&stderr);
+    }
+    Ok(combined)
+}
+
+/// Mint (or refresh) a per-worktree virtual key so the agent's model traffic
+/// routes through `szproxy` scoped to `agent:pi:<worktree>` — the proxy then
+/// attributes spend and enforces budgets per worktree. Returns the bearer token
+/// to hand the agent (best-effort; `None` if the DB is unavailable). Revoke it
+/// with [`revoke_agent_proxy_key`] when the agent disconnects.
+pub fn mint_agent_proxy_key(worktree: &str) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+    let db = Db::open().ok()?;
+    let slug = superzej_core::util::slugify(worktree);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let key = format!("szk-{slug}-{nanos}");
+    // The proxy looks up identity by the token itself; the hash column is stored
+    // for parity with the schema (lookups don't verify it for a local daemon).
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    let token_hash = format!("{:016x}", hasher.finish());
+    let scope = format!("agent:pi:{worktree}");
+    db.put_proxy_virtual_key(
+        &key,
+        &token_hash,
+        &format!("pi agent {worktree}"),
+        &scope,
+        None,
+        superzej_core::util::now(),
+    )
+    .ok()?;
+    Some(key)
+}
+
+/// Revoke a virtual key minted by [`mint_agent_proxy_key`] (best-effort).
+pub fn revoke_agent_proxy_key(key: &str) {
+    if let Ok(db) = Db::open() {
+        let _ = db.revoke_proxy_virtual_key(key, superzej_core::util::now());
+    }
 }
 
 /// Resolve a configured build path: `~`/`~/…` expands to home; a relative path
@@ -663,6 +787,47 @@ fn build_env_vars(cfg: &Config, repo_root: &Path) -> Vec<(String, String)> {
         ));
     }
     out
+}
+
+/// Tier A inject for a sandboxed pane: prepend the devShell `PATH` via a raw
+/// `init_script` line — `$PATH` expands to the sandbox's *own* base PATH, so it
+/// works for OCI and bwrap alike without the host knowing the in-sandbox PATH —
+/// and set other safe exported vars as overrides (never clobbering one the user
+/// already pinned).
+fn inject_devshell_sandbox(spec: &mut sandbox::SandboxSpec, dev: &devenv::Devshell) {
+    if let Some(path) = &dev.path {
+        let line = format!("export PATH=\"{path}:$PATH\"\n");
+        spec.init_script = Some(match spec.init_script.take() {
+            Some(existing) => format!("{line}{existing}"),
+            None => line,
+        });
+    }
+    for (k, v) in &dev.vars {
+        spec.env_overrides
+            .entry(k.clone())
+            .or_insert_with(|| v.clone());
+    }
+}
+
+/// Tier A inject for the host (no-sandbox) path: prepend the devShell `PATH` to
+/// the pane env (base = the host's current `PATH`) and add other safe vars that
+/// aren't already set on the spec.
+fn inject_devshell_host(spec: &mut LaunchSpec, dev: &devenv::Devshell) {
+    if let Some(path) = &dev.path {
+        let base = std::env::var("PATH").unwrap_or_default();
+        let merged = if base.is_empty() {
+            path.clone()
+        } else {
+            format!("{path}:{base}")
+        };
+        spec.env.retain(|(k, _)| k != "PATH");
+        spec.env.push(("PATH".to_string(), merged));
+    }
+    for (k, v) in &dev.vars {
+        if !spec.env.iter().any(|(ek, _)| ek == k) {
+            spec.env.push((k.clone(), v.clone()));
+        }
+    }
 }
 
 /// The persisted slug for a repo root (for per-workspace account defaults), or
@@ -979,5 +1144,55 @@ mod tests {
             // exercised without a running container.
             assert_eq!(spec.backend, "host");
         });
+    }
+
+    #[test]
+    fn inject_devshell_host_prepends_path_and_merges_vars() {
+        let dev = devenv::Devshell {
+            path: Some("/nix/store/tools/bin".into()),
+            vars: vec![
+                ("SUPERZEJ_YAZI_BIN".into(), "/nix/store/yz/bin/yazi".into()),
+                // A var the user already set on the pane must NOT be clobbered.
+                ("KEEP_ME".into(), "from-devshell".into()),
+            ],
+        };
+        let mut spec = LaunchSpec {
+            argv: vec!["sh".into()],
+            cwd: None,
+            env: vec![("KEEP_ME".to_string(), "user-set".to_string())],
+            backend: "host".into(),
+            warnings: vec![],
+        };
+        // `inject_devshell_host` prepends to the *process* PATH, so set a known
+        // base under the env guard. Without restoring it, `/usr/bin:/bin` would
+        // leak to every later test, dropping git/the toolchain (under /nix/store
+        // in the dev shell) out of PATH and breaking anything that shells out.
+        let _env = crate::testenv::EnvVarGuard::set(&[("PATH", "/usr/bin:/bin")]);
+        inject_devshell_host(&mut spec, &dev);
+
+        let path = spec.env.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v);
+        assert_eq!(
+            path.map(String::as_str),
+            Some("/nix/store/tools/bin:/usr/bin:/bin"),
+            "devShell PATH must be prepended to the existing PATH"
+        );
+        // Only one PATH entry (any prior was replaced, not duplicated).
+        assert_eq!(spec.env.iter().filter(|(k, _)| k == "PATH").count(), 1);
+        // New var injected; pre-existing var preserved (not overwritten).
+        assert_eq!(
+            spec.env
+                .iter()
+                .find(|(k, _)| k == "SUPERZEJ_YAZI_BIN")
+                .map(|(_, v)| v.as_str()),
+            Some("/nix/store/yz/bin/yazi")
+        );
+        assert_eq!(
+            spec.env
+                .iter()
+                .find(|(k, _)| k == "KEEP_ME")
+                .map(|(_, v)| v.as_str()),
+            Some("user-set"),
+            "a var the user already set must not be clobbered"
+        );
     }
 }
