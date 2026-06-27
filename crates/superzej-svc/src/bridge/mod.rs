@@ -24,6 +24,8 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+
 use crate::lsp::framing::{self, FrameDecoder};
 use superzej_core::remote::GitLoc;
 
@@ -125,64 +127,6 @@ pub enum ProcEvent {
     Out { stream: String, data: Vec<u8> },
     /// The process exited with this code (`-1` if killed/unknown).
     Exit { code: i32 },
-}
-
-/// Dependency-free base64 (standard alphabet) — bridge payloads are JSON strings,
-/// so streamed binary (PTY) bytes are base64'd. Small + self-contained on purpose.
-pub(crate) fn b64_encode(data: &[u8]) -> String {
-    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(A[(n >> 18 & 63) as usize] as char);
-        out.push(A[(n >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            A[(n >> 6 & 63) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            A[(n & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
-pub(crate) fn b64_decode(s: &str) -> Vec<u8> {
-    fn val(c: u8) -> Option<u32> {
-        match c {
-            b'A'..=b'Z' => Some((c - b'A') as u32),
-            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
-            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None, // skips '=' padding and whitespace
-        }
-    }
-    let syms: Vec<u32> = s.bytes().filter_map(val).collect();
-    let mut out = Vec::with_capacity(syms.len() / 4 * 3);
-    for chunk in syms.chunks(4) {
-        if chunk.len() < 2 {
-            break;
-        }
-        let n = (chunk[0] << 18)
-            | (chunk[1] << 12)
-            | (chunk.get(2).copied().unwrap_or(0) << 6)
-            | chunk.get(3).copied().unwrap_or(0);
-        out.push((n >> 16) as u8);
-        if chunk.len() > 2 {
-            out.push((n >> 8) as u8);
-        }
-        if chunk.len() > 3 {
-            out.push(n as u8);
-        }
-    }
-    out
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -376,7 +320,7 @@ impl BridgeClient {
     pub fn proc_stdin(&self, chan: u64, data: &[u8]) -> Result<()> {
         let params = serde_json::to_value(ChanData {
             chan,
-            data: b64_encode(data),
+            data: B64.encode(data),
         })?;
         self.call("proc.stdin", params)?;
         Ok(())
@@ -482,7 +426,7 @@ fn reader_loop(mut reader: impl Read, pending: Pending, subs: Subs, procs: Procs
                     {
                         let _ = tx.send(ProcEvent::Out {
                             stream: note.stream,
-                            data: b64_decode(&note.data),
+                            data: B64.decode(&note.data).unwrap_or_default(),
                         });
                     }
                     continue;
@@ -651,7 +595,7 @@ fn spawn_stream_relay(
                             "params": ProcOutNote {
                                 chan,
                                 stream: stream.to_string(),
-                                data: b64_encode(&buf[..n]),
+                                data: B64.encode(&buf[..n]),
                             },
                         });
                         write_frame(&writer, &note);
@@ -671,7 +615,7 @@ fn proc_stdin_response(req: &Request, procs: &ProcRegistry) -> Response {
     let Some(stdin) = stdin else {
         return resp_err(req.id, format!("no such channel {}", p.chan));
     };
-    let data = b64_decode(&p.data);
+    let data = B64.decode(&p.data).unwrap_or_default();
     let mut g = stdin.lock().unwrap();
     match g.write_all(&data).and_then(|_| g.flush()) {
         Ok(()) => resp_ok(req.id, serde_json::json!({})),
@@ -979,23 +923,6 @@ mod tests {
             ev.paths
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn b64_roundtrips_binary() {
-        for case in [
-            &b""[..],
-            b"a",
-            b"ab",
-            b"abc",
-            b"abcd",
-            &[0u8, 255, 1, 254, 128],
-        ] {
-            assert_eq!(b64_decode(&b64_encode(case)), case, "roundtrip {case:?}");
-        }
-        // Known vector.
-        assert_eq!(b64_encode(b"hello"), "aGVsbG8=");
-        assert_eq!(b64_decode("aGVsbG8="), b"hello");
     }
 
     #[test]
