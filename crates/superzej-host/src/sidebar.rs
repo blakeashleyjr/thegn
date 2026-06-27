@@ -23,23 +23,28 @@ pub enum RowKind {
 }
 
 /// Contextual activity, mirrored from the host-side `activity` state machine.
-/// Drives the sidebar dot's color: `Active` (worktree busy / agent working)
-/// renders a white dot; `Quiet` (was active, now idle — the agent is waiting
-/// for the user) renders a red dot; `None`/acked (dormant) render no dot.
+/// Drives the sidebar dot's glyph + color: `Active` (worktree busy / agent
+/// working) is a filled white ●; `Waiting` (was active, now idle — the agent is
+/// stuck waiting for the user, *unread*) is a filled red ●; `Read` (the user has
+/// focused the tab but it is still stuck) is a hollow red ○; `None` (dormant)
+/// renders no dot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ActivityState {
     #[default]
     None,
     Active,
-    Quiet,
+    Waiting,
+    Read,
 }
 
 impl ActivityState {
     pub fn from_str(s: &str) -> Self {
         match s {
             "active" => ActivityState::Active,
-            "quiet" => ActivityState::Quiet,
-            _ => ActivityState::None, // "none" | "acked" | unknown
+            "waiting" => ActivityState::Waiting,
+            "read" => ActivityState::Read,
+            "quiet" => ActivityState::Waiting, // legacy snapshots
+            _ => ActivityState::None,          // "none" | "acked" | unknown
         }
     }
 }
@@ -822,11 +827,12 @@ fn sort_groups(groups: &mut [Group], sort: SortMode) {
             });
         }
         SortMode::Activity => {
-            // Active, then quiet, then idle; home first within each tier.
+            // Active, then stuck (waiting/read), then idle; home first per tier.
             let rank = |s: ActivityState| match s {
                 ActivityState::Active => 0,
-                ActivityState::Quiet => 1,
-                ActivityState::None => 2,
+                ActivityState::Waiting => 1,
+                ActivityState::Read => 2,
+                ActivityState::None => 3,
             };
             groups.sort_by(|a, b| {
                 rank(a.activity)

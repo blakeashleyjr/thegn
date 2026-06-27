@@ -1811,24 +1811,27 @@ fn compose_badges(row: &crate::sidebar::SidebarRow) -> Vec<Badge> {
 
 /// The activity dot prefix for a worktree row (item 20), recolored at render by
 /// [`activity_dot_color`]: `Active` (worktree busy / agent working) is a filled
-/// white ●; `Quiet` (was active, now idle — the agent is waiting for the user)
-/// is a hollow red ○; dormant (`None`/acked) shows nothing.
+/// white ●; `Waiting` (idle — agent stuck, unread) is a filled red ●; `Read`
+/// (the user has seen it but it is still stuck) is a hollow red ○; dormant
+/// (`None`) shows nothing.
 fn activity_dot(state: crate::sidebar::ActivityState) -> &'static str {
     use crate::sidebar::ActivityState::*;
     match state {
-        Active => "\u{25cf} ", // ●
-        Quiet => "\u{25cb} ",  // ○
+        Active => "\u{25cf} ",  // ●
+        Waiting => "\u{25cf} ", // ●
+        Read => "\u{25cb} ",    // ○
         None => "",
     }
 }
 
 /// The color the activity dot is over-painted in, per state (configurable via
-/// `[theme.colors] activity_active` / `activity_waiting`). `None` never draws.
+/// `[theme.colors] activity_active` / `activity_waiting`). Both red states share
+/// the `activity_waiting` slot — filled vs hollow is glyph-only. `None` never draws.
 fn activity_dot_color(state: crate::sidebar::ActivityState) -> ColorAttribute {
     use crate::sidebar::ActivityState::*;
     match state {
         Active => col(S::ActivityActive),
-        Quiet => col(S::ActivityWaiting),
+        Waiting | Read => col(S::ActivityWaiting),
         None => col(S::Dim),
     }
 }

@@ -9180,14 +9180,29 @@ async fn event_loop<T: Terminal>(
             crate::hydrate::spawn_disk_scan(current_config.disk.clone(), Some(waker.clone()));
         }
 
-        // Ack the focused worktree's activity so its "look at me" dot clears
-        // once the user is actually on it. Idempotent; off-thread so the
-        // file write never stalls the loop.
+        // Mark the focused worktree's "stuck" dot as read: a filled-red
+        // `Waiting` dot turns hollow-red `Read` once the user is on the tab —
+        // even if the agent went stuck while the tab was already focused. Gated
+        // on the dot actually being `Waiting` so this is a no-op (no thread
+        // dispatch) the rest of the time; the ack itself is idempotent and runs
+        // off-thread so the file write never stalls the loop. The
+        // `last_acked_tab` guard only suppresses the redundant re-spawn in the
+        // ~1s before hydration reflects the new `Read` state back into the model.
         if let Some(name) = session.active_group().map(|g| g.name.clone())
+            && model.sidebar_status.activity.get(&name)
+                == Some(&crate::sidebar::ActivityState::Waiting)
             && last_acked_tab.as_deref() != Some(name.as_str())
         {
             last_acked_tab = Some(name.clone());
             task::spawn_blocking(move || superzej_core::activity::ack(&name));
+        } else if let Some(g) = session.active_group()
+            && model.sidebar_status.activity.get(&g.name)
+                != Some(&crate::sidebar::ActivityState::Waiting)
+            && last_acked_tab.as_deref() == Some(g.name.as_str())
+        {
+            // The dot left `Waiting` (acked through, or work resumed): re-arm so
+            // a future stuck episode on this same focused tab acks again.
+            last_acked_tab = None;
         }
 
         // Mirror the focus zone into the render model RIGHT BEFORE rendering —
