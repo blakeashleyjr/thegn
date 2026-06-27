@@ -1502,6 +1502,29 @@ impl Db {
         Ok(())
     }
 
+    /// Find a folder in `repo_path` whose name matches `name`
+    /// (case-insensitive, trimmed) and return its id, creating it if absent.
+    /// This is the find-or-create primitive behind the "file worktree into
+    /// folder" actions, so repeated firing never spawns duplicate folders.
+    pub fn ensure_folder(&self, repo_path: &str, name: &str) -> Result<i64> {
+        let want = name.trim();
+        for f in self.folders_for_workspace(repo_path)? {
+            if f.name.trim().eq_ignore_ascii_case(want) {
+                return Ok(f.folder_id);
+            }
+        }
+        self.create_folder(repo_path, want)
+    }
+
+    /// File (or unfile, with `None`) a single worktree into a folder.
+    pub fn set_worktree_folder(&self, worktree: &str, folder_id: Option<i64>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE worktrees SET folder_id = ?1 WHERE worktree = ?2",
+            params![folder_id, worktree],
+        )?;
+        Ok(())
+    }
+
     // --- terminals -----------------------------------------------------------
 
     pub fn terminals(&self) -> Result<Vec<crate::models::TerminalRow>> {
@@ -3333,6 +3356,51 @@ mod tests {
         let folders3 = db.folders_for_workspace("/x/app").unwrap();
         assert_eq!(folders3.len(), 1);
         assert_eq!(folders3[0].folder_id, f1);
+    }
+
+    #[test]
+    fn ensure_folder_creates_then_reuses() {
+        let db = db();
+        db.put_workspace("/x/app", "app", "repo").unwrap();
+
+        let a = db.ensure_folder("/x/app", "Ready to merge").unwrap();
+        // Same name (case/whitespace-insensitive) reuses the row, never dups.
+        let b = db.ensure_folder("/x/app", "  ready TO merge ").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(db.folders_for_workspace("/x/app").unwrap().len(), 1);
+
+        // A different name creates a second folder.
+        let c = db.ensure_folder("/x/app", "PRing").unwrap();
+        assert_ne!(a, c);
+        assert_eq!(db.folders_for_workspace("/x/app").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn set_worktree_folder_round_trips() {
+        let db = db();
+        db.put_workspace("/x/app", "app", "repo").unwrap();
+        db.put_worktree("app/feat", "/x/app", "/wt/feat", "sz/feat", None, None)
+            .unwrap();
+        let fid = db.ensure_folder("/x/app", "Ready to merge").unwrap();
+
+        db.set_worktree_folder("/wt/feat", Some(fid)).unwrap();
+        let row = db
+            .worktrees()
+            .unwrap()
+            .into_iter()
+            .find(|w| w.worktree == "/wt/feat")
+            .unwrap();
+        assert_eq!(row.folder_id, Some(fid));
+
+        // Unfiling clears it.
+        db.set_worktree_folder("/wt/feat", None).unwrap();
+        let row = db
+            .worktrees()
+            .unwrap()
+            .into_iter()
+            .find(|w| w.worktree == "/wt/feat")
+            .unwrap();
+        assert_eq!(row.folder_id, None);
     }
 
     #[test]
