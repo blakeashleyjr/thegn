@@ -7,7 +7,6 @@ import {
   ToolExecutionUpdateEvent,
   ToolExecutionEndEvent
 } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
 import * as net from "net";
 
 export default function (pi: ExtensionAPI) {
@@ -54,17 +53,6 @@ export default function (pi: ExtensionAPI) {
   // State to track encapsulated MCP requests
   let nextMcpId = 1;
   const pendingMcpRequests = new Map<number, { resolve: (val: any) => void, reject: (err: any) => void }>();
-
-  function sendRpcRequest(method: string, params: any): Promise<any> {
-    return new Promise((resolve, reject) => {
-      if (!activeSocket) {
-        return reject(new Error("No active ACP connection to superzej."));
-      }
-      const id = nextRpcId++;
-      pendingRequests.set(id, { resolve, reject });
-      sendAcp(activeSocket, { jsonrpc: "2.0", id, method, params });
-    });
-  }
 
   function sendMcpRequest(connectionId: string, method: string, params?: any): Promise<any> {
     return new Promise((resolve, reject) => {
@@ -294,7 +282,7 @@ export default function (pi: ExtensionAPI) {
   // --- Map Pi Events to ACP Streaming Updates ---
 
   pi.on("message_update", (event: MessageUpdateEvent, ctx: ExtensionContext) => {
-    if (!activeSocket || !currentPromptId) return;
+    if (!activeSocket) return;
 
     if (event.assistantMessageEvent.type === "text") {
       sendAcp(activeSocket, {
@@ -320,7 +308,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_execution_start", (event: ToolExecutionStartEvent) => {
-    if (!activeSocket || !currentPromptId) return;
+    if (!activeSocket) return;
     
     sendAcp(activeSocket, {
       jsonrpc: "2.0",
@@ -336,7 +324,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_execution_end", (event: ToolExecutionEndEvent) => {
-    if (!activeSocket || !currentPromptId) return;
+    if (!activeSocket) return;
     
     sendAcp(activeSocket, {
       jsonrpc: "2.0",
@@ -352,7 +340,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("turn_end", (event, ctx) => {
-    if (!activeSocket || !currentPromptId) return;
+    if (!activeSocket) return;
 
     // Report context usage back to superzej for live tracking
     const usage = ctx.getContextUsage();
@@ -371,7 +359,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("thinking_level_select", (event) => {
-    if (!activeSocket || !currentPromptId) return;
+    if (!activeSocket) return;
     sendAcp(activeSocket, {
       jsonrpc: "2.0",
       method: "session/update",
@@ -385,18 +373,25 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_end", (event: AgentEndEvent, ctx: ExtensionContext) => {
-    if (!activeSocket || !currentPromptId) return;
+    if (!activeSocket) return;
 
-    // Send final completion for the prompt
+    // Lifecycle: notify superzej the agent finished (fires for user-driven turns
+    // too) → AgentDone/AgentFailed notification + clears the chip's running state.
     sendAcp(activeSocket, {
       jsonrpc: "2.0",
-      id: currentPromptId,
-      result: {
-        stopReason: "end_turn"
-      }
+      method: "session/update",
+      params: { id: currentPromptId, type: "agent_end", success: true }
     });
 
-    currentPromptId = null;
+    // If superzej drove this turn via session/prompt, send its final response.
+    if (currentPromptId) {
+      sendAcp(activeSocket, {
+        jsonrpc: "2.0",
+        id: currentPromptId,
+        result: { stopReason: "end_turn" }
+      });
+      currentPromptId = null;
+    }
   });
 
   pi.on("session_shutdown", () => {
@@ -406,96 +401,12 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // --- Abstract Built-in Tools over ACP ---
-  
-  pi.registerTool({
-    name: "bash",
-    label: "Bash",
-    description: "Run a bash command via superzej ACP",
-    parameters: Type.Object({ command: Type.String() }),
-    async execute(toolCallId, params, signal, onUpdate, ctx) {
-      // 1. We send terminal/create over ACP to superzej.
-      // 2. superzej executes it in the podman sandbox.
-      
-      const env: Record<string, string> = {};
-      if (activeTraceparent) {
-        env["TRACEPARENT"] = activeTraceparent;
-        // The host's OTLP endpoint would typically be injected here as well.
-      }
-
-      const result = await sendRpcRequest("terminal/create", {
-        command: params.command,
-        cwd: ctx.cwd,
-        env
-      });
-      // We assume superzej replies with the completed stdout/stderr for now (simplified)
-      // If we need to stream it, we'd handle `terminal/output` notifications.
-      return {
-        content: [{ type: "text", text: result.output }],
-        details: result
-      };
-    }
-  });
-
-  pi.registerTool({
-    name: "edit",
-    label: "Edit File",
-    description: "Make a precise text replacement via superzej diff pane",
-    parameters: Type.Object({
-      path: Type.String(),
-      edits: Type.Array(Type.Object({
-        oldText: Type.String(),
-        newText: Type.String()
-      }))
-    }),
-    async execute(toolCallId, params, signal, onUpdate, ctx) {
-      // We send acp_tool_execute or a custom method to pipe it to superzej's native diff pane.
-      const result = await sendRpcRequest("superzej/edit", {
-        path: params.path,
-        edits: params.edits
-      });
-      return {
-        content: [{ type: "text", text: result.status === "approved" ? "Edits applied successfully." : "Edits rejected by user." }],
-        details: result
-      };
-    }
-  });
-
-  pi.registerTool({
-    name: "read",
-    label: "Read File",
-    description: "Read file contents via ACP",
-    parameters: Type.Object({
-      path: Type.String()
-    }),
-    async execute(toolCallId, params, signal, onUpdate, ctx) {
-      const result = await sendRpcRequest("fs/read_text_file", {
-        path: params.path
-      });
-      return {
-        content: [{ type: "text", text: result.text }],
-        details: result
-      };
-    }
-  });
-
-  pi.registerTool({
-    name: "write",
-    label: "Write File",
-    description: "Write full file contents via ACP",
-    parameters: Type.Object({
-      path: Type.String(),
-      content: Type.String()
-    }),
-    async execute(toolCallId, params, signal, onUpdate, ctx) {
-      const result = await sendRpcRequest("superzej/write", {
-        path: params.path,
-        content: params.content
-      });
-      return {
-        content: [{ type: "text", text: result.status === "approved" ? "File written successfully." : "Write rejected by user." }],
-        details: result
-      };
-    }
-  });
+  // NOTE: superzej deliberately does NOT override pi's built-in bash/read/edit/
+  // write tools. pi runs them natively (in-process, sandboxed iff its pane is),
+  // which keeps pi's native inline-diff edit UX and avoids a dead host round-trip.
+  // superzej stays additive — observing via session/update, routing the model via
+  // the proxy, and exposing house tools via MCP-over-ACP. The real "bouncer"
+  // (sealed sandbox + a unix-socket ACP transport + a review gate) is a separate,
+  // deferred effort; the host-side terminal/create + fs servicing remain in
+  // run.rs for that future, currently unexercised.
 }

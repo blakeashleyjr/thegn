@@ -425,20 +425,25 @@ command = "claude"
 name = "aider"
 command = "aider --model sonnet"
 
-# The pi coding agent, bridged into superzej over ACP (the upper control plane).
-# `pi` loads superzej's bundled extension, which opens an ACP server superzej
-# connects to — so pi's shell/file tools run through superzej's sandbox + diff
-# scoping. Setup: `npm i -g @earendil-works/pi-coding-agent` (pi >=0.80 bundles the
-# extension's deps, so no separate install is needed). Point `--extension` at
-# superzej-acp.ts. superzej injects the ACP port via the `ACP_PORT` env var, and
-# (when [llm_proxy].route_agent) the proxy provider config via SUPERZEJ_PROXY_*;
-# the extension registers a provider named `superzej-proxy` at init. To SELECT it
-# you must pass `--provider superzej-proxy --model <id>` here (pi selects the
-# model at load; env alone registers but doesn't activate it). The `--model` must
-# match [llm_proxy].agent_model.
+# The pi coding agent, embedded over ACP (the upper control plane). pi runs its
+# own tools natively; superzej is ADDITIVE — it observes activity (the statusbar
+# chip), routes pi's model through the proxy, and exposes its house tools
+# (budget / fleet / worktree status) to pi via MCP-over-ACP. Setup:
+# `npm i -g @earendil-works/pi-coding-agent` (pi >=0.80 bundles the extension's
+# deps, so no separate install is needed).
+#
+# In the command: `--extension` loads superzej's ACP bridge; `--skill` loads the
+# bundled superzej-house skill (teaches the agent the house tools + conventions);
+# `--provider superzej-proxy --model <id>` selects the proxy-routed model (the
+# extension registers `superzej-proxy` at init from the SUPERZEJ_PROXY_* env when
+# [llm_proxy].route_agent is on — env registers it, the CLI flags activate it;
+# `--model` must match [llm_proxy].agent_model). superzej injects the ACP port via
+# the ACP_PORT env var. pi's own extension/skill discovery stays ON, so you can
+# drop your own into ~/.pi/agent/{extensions,skills}/ alongside these, and
+# `pi install npm:…` / `pi install git:…` works for extras (e.g. web search).
 [[agents]]
 name = "pi"
-command = "pi --extension /path/to/superzej/extensions/superzej-acp.ts --provider superzej-proxy --model model-proxy/standard"
+command = "pi --extension /path/to/superzej/extensions/superzej-acp.ts --skill /path/to/superzej/extensions/skills/superzej-house --provider superzej-proxy --model model-proxy/standard"
 
 [[agents]]
 name = "shell"

@@ -11,7 +11,7 @@ use superzej_core::acp::methods::{
     InitializeRequest, InitializeResponse, ProvidersSetParams, SessionUpdateEvent,
 };
 use superzej_core::acp::types::{
-    Id, JsonRpcError, JsonRpcMessage, Request, ResponseError, ResponseResult,
+    Id, JsonRpcError, JsonRpcMessage, Notification, Request, ResponseError, ResponseResult,
 };
 use tokio::sync::{Mutex, mpsc};
 
@@ -38,6 +38,14 @@ pub enum AcpInbound {
         id: Id,
         path: String,
         content: String,
+    },
+    /// An encapsulated MCP request from the agent (MCP-over-ACP): the agent's
+    /// `mcp/message` notification carrying an inner JSON-RPC MCP request
+    /// (`tools/list`, `tools/call`, `resources/*`). The host routes `inner`
+    /// through its `McpRouter` and replies with a `mcp/message` notification.
+    McpMessage {
+        connection_id: String,
+        inner: Value,
     },
 }
 
@@ -138,17 +146,38 @@ impl AcpClient {
                                 )));
                             }
                         }
-                        JsonRpcMessage::Notification(notif) => {
-                            if notif.method == "session/update"
-                                && let Some(params) = notif.params
-                                && let Ok(update_event) =
-                                    serde_json::from_value::<SessionUpdateEvent>(params)
-                            {
-                                let _ = tx_inbound_clone
-                                    .send(AcpInbound::SessionUpdate(update_event))
-                                    .await;
+                        JsonRpcMessage::Notification(notif) => match notif.method.as_str() {
+                            "session/update" => {
+                                if let Some(params) = notif.params
+                                    && let Ok(update_event) =
+                                        serde_json::from_value::<SessionUpdateEvent>(params)
+                                {
+                                    let _ = tx_inbound_clone
+                                        .send(AcpInbound::SessionUpdate(update_event))
+                                        .await;
+                                }
                             }
-                        }
+                            // MCP-over-ACP: the agent encapsulates an inner MCP
+                            // JSON-RPC request inside `mcp/message`.
+                            "mcp/message" => {
+                                if let Some(params) = notif.params {
+                                    let connection_id = params
+                                        .get("connectionId")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string();
+                                    if let Some(inner) = params.get("message").cloned() {
+                                        let _ = tx_inbound_clone
+                                            .send(AcpInbound::McpMessage {
+                                                connection_id,
+                                                inner,
+                                            })
+                                            .await;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        },
                         JsonRpcMessage::Request(req) => {
                             if let Some(inbound) = parse_client_request(req) {
                                 let _ = tx_inbound_clone.send(inbound).await;
@@ -221,6 +250,30 @@ impl AcpClient {
     pub async fn set_provider(&self, params: ProvidersSetParams) -> Result<()> {
         self.request("providers/set", serde_json::to_value(params).ok())
             .await?;
+        Ok(())
+    }
+
+    /// Open an MCP-over-ACP connection so the agent discovers + registers the
+    /// host's MCP tools/resources. The extension replies `{}` and bootstraps
+    /// `tools/list` (which arrives back as `AcpInbound::McpMessage`).
+    pub async fn connect_mcp(&self, connection_id: &str) -> Result<()> {
+        self.request(
+            "mcp/connect",
+            Some(serde_json::json!({ "connectionId": connection_id })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Send a fire-and-forget JSON-RPC notification (no id, no reply). Used to
+    /// return encapsulated MCP responses via `mcp/message`.
+    pub async fn send_notification(&self, method: &str, params: Value) -> Result<()> {
+        let msg = JsonRpcMessage::Notification(Notification {
+            jsonrpc: "2.0".to_string(),
+            method: method.to_string(),
+            params: Some(params),
+        });
+        self.tx_outbound.send(msg).await?;
         Ok(())
     }
 

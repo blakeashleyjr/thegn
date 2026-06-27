@@ -6325,6 +6325,11 @@ fn attach_agent_pane(
                                 tracing::error!(target: "szhost::acp", "ACP initialize failed: {e}");
                                 emit(crate::chrome::AgentConn::Error);
                             }
+                            // Open the MCP-over-ACP bridge so the agent discovers
+                            // and registers superzej's house tools/resources.
+                            if let Err(e) = client.connect_mcp("superzej-house").await {
+                                tracing::warn!(target: "szhost::acp", "mcp/connect failed: {e}");
+                            }
 
                             // Hand the client to the loop so it can reply to requests.
                             if reg_tx.send((wt_name.clone(), client.clone())).is_err() {
@@ -6379,6 +6384,13 @@ fn attach_agent_pane(
 /// `superzej/edit`/`superzej/write → {status:"approved"|"rejected"}`. All file
 /// access is scoped to the worktree; shell commands run inside its sandbox.
 ///
+/// NOTE: as of the "additive" integration, the extension no longer overrides
+/// pi's built-in bash/read/edit/write — pi runs those natively in-process — so
+/// the terminal/fs/edit arms below are currently UNEXERCISED. They are retained
+/// for the deferred "real bouncer" path (a sealed sandbox reachable via a
+/// unix-socket ACP transport + a review/approval gate), at which point the
+/// extension would re-route the core tools and these arms light up again.
+///
 /// Notifications (`session/update`) are handled by the caller against the
 /// rendered model; this services only requests that need a reply.
 fn dispatch_acp_inbound(
@@ -6389,6 +6401,7 @@ fn dispatch_acp_inbound(
         std::sync::Arc<superzej_svc::acp::client::AcpClient>,
     >,
     cfg: &superzej_core::config::Config,
+    event_bus: &superzej_core::event_bus::EventBus,
 ) {
     use superzej_svc::acp::client::AcpInbound;
     let client = acp_clients.get(wt).cloned();
@@ -6470,6 +6483,55 @@ fn dispatch_acp_inbound(
                 });
             }
         }
+        // MCP-over-ACP: route the agent's encapsulated MCP request through the
+        // host's McpRouter (budget/fleet/worktree-status/house tools) and reply
+        // with a `mcp/message` notification. Off-loop; the router opens the DB
+        // (`Connection` is !Send, so it's built + used inside spawn_blocking).
+        AcpInbound::McpMessage {
+            connection_id,
+            inner,
+        } => {
+            if let Some(client) = client {
+                let bus = event_bus.clone();
+                tokio::spawn(async move {
+                    let resp = tokio::task::spawn_blocking(move || {
+                        let id = inner.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                        match superzej_core::db::Db::open() {
+                            Ok(db) => {
+                                // The Arcs live only on this blocking thread (Db's
+                                // Connection is !Send); McpRouter::new requires Arc.
+                                #[allow(clippy::arc_with_non_send_sync)]
+                                let router = superzej_core::mcp::router::McpRouter::new(
+                                    std::sync::Arc::new(db),
+                                    std::sync::Arc::new(bus),
+                                );
+                                router.handle_request(&inner)
+                            }
+                            Err(e) => serde_json::json!({
+                                "jsonrpc": "2.0", "id": id,
+                                "error": { "code": -32603, "message": format!("db open: {e}") }
+                            }),
+                        }
+                    })
+                    .await
+                    .unwrap_or_else(|_| {
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "id": serde_json::Value::Null,
+                            "error": { "code": -32603, "message": "mcp task panicked" }
+                        })
+                    });
+                    if let Err(e) = client
+                        .send_notification(
+                            "mcp/message",
+                            serde_json::json!({ "connectionId": connection_id, "message": resp }),
+                        )
+                        .await
+                    {
+                        tracing::error!(target: "szhost::acp", "mcp/message reply failed: {e}");
+                    }
+                });
+            }
+        }
     }
 }
 
@@ -6494,6 +6556,11 @@ fn apply_agent_session_update(
         E::UsageUpdate { used, size } => {
             a.context_used = used;
             a.context_size = size;
+        }
+        E::AgentEnd { .. } => {
+            // Turn finished: no tool is running. (Notification is published by
+            // the loop drain, which owns the EventBus.)
+            a.running = false;
         }
         E::AgentMessageChunk { .. }
         | E::AgentThoughtChunk { .. }
@@ -9063,11 +9130,31 @@ async fn event_loop<T: Terminal>(
                 // Notifications mutate per-worktree activity (the loop owns it);
                 // requests are serviced off-loop with a reply.
                 superzej_svc::acp::client::AcpInbound::SessionUpdate(update) => {
+                    // Agent finished → notification inbox (desktop + Notifications
+                    // panel). Fires for user-driven turns too.
+                    if let superzej_core::acp::methods::SessionUpdateEvent::AgentEnd { success } =
+                        &update
+                    {
+                        let ev = if *success {
+                            superzej_core::event_bus::Event::AgentDone {
+                                worktree: wt.clone(),
+                                agent: "pi".to_string(),
+                                success: true,
+                            }
+                        } else {
+                            superzej_core::event_bus::Event::AgentFailed {
+                                worktree: wt.clone(),
+                                agent: "pi".to_string(),
+                                error: "agent turn failed".to_string(),
+                            }
+                        };
+                        event_bus.publish(&ev);
+                    }
                     apply_agent_session_update(acp_activity.entry(wt).or_default(), update);
                     dirty = true;
                 }
                 other => {
-                    dispatch_acp_inbound(&wt, other, &acp_clients, keymap.config());
+                    dispatch_acp_inbound(&wt, other, &acp_clients, keymap.config(), &event_bus);
                 }
             }
         }
@@ -16423,6 +16510,11 @@ mod tests {
         assert_eq!((a.context_used, a.context_size), (5, 20));
         assert_eq!(a.last_tool.as_deref(), Some("bash")); // unchanged
         assert_eq!(a.conn, AgentConn::Online); // still untouched
+
+        // Agent-end clears running (and is what drives the AgentDone notification).
+        a.running = true;
+        apply_agent_session_update(&mut a, E::AgentEnd { success: true });
+        assert!(!a.running);
     }
 
     #[test]
