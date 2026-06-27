@@ -367,6 +367,12 @@ format = "text"           # text | json
 #     shell; omit for an interactive shell), `placement` (down | right; default
 #     right), `cwd` (worktree | active; default active).
 #
+#   file-worktree — move the active worktree into a sidebar folder, creating the
+#     folder if it doesn't exist yet. params: `folder` (required, the folder
+#     name). Bind one per folder you sort into; firing again files into the same
+#     folder (no duplicates). The interactive picker is `move-worktree-to-folder`
+#     (bindable / in the palette) when you'd rather choose or name a folder.
+#
 # A scratch worktree on bwrap with a shell, no prompts:
 # [[actions]]
 # name = "scratch-shell"
@@ -381,6 +387,20 @@ format = "text"           # text | json
 # key = "Alt L"
 # action = "new-pane"
 # params = { run = "tail -f log/dev.log", placement = "right" }
+#
+# File the active worktree into a named folder (leader: Alt-m-f, then a letter):
+# [[actions]]
+# name = "File: Ready to merge"
+# key = "Alt m f r"
+# action = "file-worktree"
+# params = { folder = "Ready to merge" }
+# menu = true
+# [[actions]]
+# name = "File: PRing"
+# key = "Alt m f p"
+# action = "file-worktree"
+# params = { folder = "PRing" }
+# menu = true
 
 # Keybind profiles: a named layer selected by `profile = "<name>"` (or the
 # SUPERZEJ_PROFILE env var / --profile flag). Applied *under* [keybinds], so a

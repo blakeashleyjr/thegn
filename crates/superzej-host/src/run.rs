@@ -1947,6 +1947,48 @@ fn active_cwd(session: &crate::session::Session) -> Option<std::path::PathBuf> {
     session.active_group().and_then(group_cwd)
 }
 
+/// The active worktree's `(worktree_path, workspace_repo_path)`, or `None` when
+/// there's nothing fileable (no active group, the home tab, a terminal, or no
+/// resolvable repo). The repo path is the DB workspace root so the folder we
+/// create lines up with the sidebar's per-workspace folder filter.
+fn active_worktree_repo(session: &crate::session::Session) -> Option<(String, String)> {
+    use crate::session::GroupKind;
+    let g = session.active_group()?;
+    if g.kind != GroupKind::Branch || g.path.is_empty() {
+        return None;
+    }
+    let wt_path = g.path.clone();
+    let db = superzej_core::db::Db::open().ok()?;
+    let repo_path = db
+        .repo_root_for(&wt_path)
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            superzej_core::repo::main_worktree(std::path::Path::new(&wt_path))
+                .map(|p| p.to_string_lossy().into_owned())
+        })?;
+    Some((wt_path, repo_path))
+}
+
+/// File the active worktree into `folder` (created if absent). Returns a status
+/// line on success or a human-readable reason on failure.
+fn file_active_worktree(session: &crate::session::Session, folder: &str) -> Result<String, String> {
+    let folder = folder.trim();
+    if folder.is_empty() {
+        return Err("Folder name is empty".into());
+    }
+    let (wt_path, repo_path) =
+        active_worktree_repo(session).ok_or("No worktree to file into a folder")?;
+    let db = superzej_core::db::Db::open().map_err(|e| format!("DB open failed: {e}"))?;
+    let fid = db
+        .ensure_folder(&repo_path, folder)
+        .map_err(|e| format!("Folder create failed: {e}"))?;
+    db.set_worktree_folder(&wt_path, Some(fid))
+        .map_err(|e| format!("Filing failed: {e}"))?;
+    Ok(format!("Filed worktree into \"{folder}\""))
+}
+
 /// DELETE these worktree groups from disk (`git worktree remove`, branch
 /// kept) and close them. Home groups are never deletable. Returns the status
 /// line summarizing what happened.
@@ -3146,6 +3188,9 @@ enum HostInputKind {
     NewWorktreeFromTemplate {
         repo_root: String,
     },
+    /// File the active worktree into a new folder named by the typed value
+    /// (the "＋ New folder…" path of the move-to-folder picker).
+    FileWorktreeNewFolder,
 }
 
 /// Launch the new-worktree wizard + speculative-create worker against `root`.
@@ -10866,6 +10911,16 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                     }
+                                    HostInputKind::FileWorktreeNewFolder => {
+                                        match file_active_worktree(&session, &text) {
+                                            Ok(msg) => {
+                                                model.status = msg;
+                                                let _ = refresh_tx
+                                                    .send(crate::hydrate::RefreshKind::Model);
+                                            }
+                                            Err(e) => model.status = e,
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -11653,6 +11708,27 @@ async fn event_loop<T: Terminal>(
                                         &waker,
                                     );
                                     model.status = format!("Media: controlling {p}");
+                                } else if let Some(rest) = key.strip_prefix("move-to-folder:") {
+                                    if rest == "__new__" {
+                                        host_input = Some((
+                                            menu::InputOverlay::new(
+                                                "new folder".to_string(),
+                                                String::new(),
+                                            ),
+                                            HostInputKind::FileWorktreeNewFolder,
+                                        ));
+                                        model.status =
+                                            "New folder: type a name (Esc cancels)".into();
+                                    } else {
+                                        match file_active_worktree(&session, rest) {
+                                            Ok(msg) => {
+                                                model.status = msg;
+                                                let _ = refresh_tx
+                                                    .send(crate::hydrate::RefreshKind::Model);
+                                            }
+                                            Err(e) => model.status = e,
+                                        }
+                                    }
                                 } else if let Some(action) = crate::keymap::Action::from_key(&key) {
                                     forced_palette_action = Some(action);
                                 } else if let Some(idx) = keymap
@@ -14135,8 +14211,41 @@ async fn event_loop<T: Terminal>(
                                                 }
                                             }
                                         }
+                                        crate::keymap::CompositeAction::FileWorktree { folder } => {
+                                            match file_active_worktree(&session, &folder) {
+                                                Ok(msg) => {
+                                                    model.status = msg;
+                                                    let _ = refresh_tx
+                                                        .send(crate::hydrate::RefreshKind::Model);
+                                                }
+                                                Err(e) => model.status = e,
+                                            }
+                                        }
                                     },
                                     None => {}
+                                }
+                            }
+                            Action::MoveWorktreeToFolder => {
+                                // Open the folder picker for the active worktree's
+                                // workspace; the chosen row files via the
+                                // `move-to-folder:` palette-dispatch arm.
+                                match active_worktree_repo(&session) {
+                                    Some((_, repo_path)) => match superzej_core::db::Db::open() {
+                                        Ok(db) => {
+                                            let items = crate::palette::build_move_to_folder_items(
+                                                &db, &repo_path,
+                                            );
+                                            palette = Some(
+                                                crate::search_everywhere::PaletteSession::new(
+                                                    items,
+                                                ),
+                                            );
+                                        }
+                                        Err(e) => model.status = format!("DB open failed: {e}"),
+                                    },
+                                    None => {
+                                        model.status = "No worktree to file into a folder".into();
+                                    }
                                 }
                             }
                             Action::Quit => {
