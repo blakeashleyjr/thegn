@@ -1229,6 +1229,55 @@ impl Default for LimitsConfig {
     }
 }
 
+/// `[disk]` — per-worktree disk-usage visibility, cleanup, and shared
+/// build-cache knobs. Per-worktree `target/` dirs are the dominant disk cost
+/// when developing across many worktrees; these surface it, reclaim it, and
+/// dedup compilation. All off by default except visibility.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct DiskConfig {
+    /// Show per-worktree size badges in the sidebar and the statusbar total.
+    pub show_sizes: bool,
+    /// Statusbar warns (amber, then red at 2×) once total worktree disk exceeds
+    /// this many GiB. 0 disables the warning badge.
+    pub warn_threshold_gb: u64,
+    /// Cadence (seconds) of the background disk scan that refreshes sizes. The
+    /// scan runs off the event loop (never blocks it) and is cached in the DB.
+    pub scan_interval_secs: u64,
+    /// Automatically `cargo clean` a worktree's `target/` when its branch is
+    /// merged (PR → MERGED). The checkout is kept; only build artifacts go. The
+    /// active worktree and any with a running build are never touched.
+    pub auto_clean_on_merge: bool,
+    /// Also auto-clean when a PR is closed without merging (open → CLOSED).
+    pub clean_on_pr_closed: bool,
+    /// Inject `RUSTC_WRAPPER=sccache` into interactive panes so dependency
+    /// compilation is shared across worktrees. No-op if `sccache` isn't on PATH.
+    pub sccache: bool,
+    /// `SCCACHE_DIR` for the shared cache. Empty = sccache's own default.
+    /// `~` expands to home; a relative path resolves against the repo root.
+    pub sccache_dir: String,
+    /// Share one `CARGO_TARGET_DIR` across all worktrees of a repo (injected
+    /// into interactive panes). Biggest disk win, but cargo's per-target build
+    /// lock serializes concurrent builds across worktrees — opt-in. Empty = off.
+    /// `~` expands to home; a relative path resolves against the repo root.
+    pub shared_target_dir: String,
+}
+
+impl Default for DiskConfig {
+    fn default() -> Self {
+        DiskConfig {
+            show_sizes: true,
+            warn_threshold_gb: 100,
+            scan_interval_secs: 45,
+            auto_clean_on_merge: true,
+            clean_on_pr_closed: false,
+            sccache: false,
+            sccache_dir: String::new(),
+            shared_target_dir: String::new(),
+        }
+    }
+}
+
 /// `[pr]` — GitHub PR data feeding the right panel.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -2755,6 +2804,8 @@ pub struct Config {
     pub log: LogConfig,
     pub sandbox: SandboxConfig,
     pub limits: LimitsConfig,
+    /// `[disk]` — disk-usage visibility, cleanup, and shared build caches.
+    pub disk: DiskConfig,
     pub drawer: DrawerConfig,
     pub notifications: NotificationsConfig,
     pub strip: StripConfig,
@@ -2835,6 +2886,7 @@ impl Default for Config {
             log: LogConfig::default(),
             sandbox: SandboxConfig::default(),
             limits: LimitsConfig::default(),
+            disk: DiskConfig::default(),
             drawer: DrawerConfig::default(),
             notifications: NotificationsConfig::default(),
             strip: StripConfig::default(),
@@ -2914,6 +2966,14 @@ pub struct ConfigOverlay {
     pub log_rotation_size_mb: Option<u64>,
     pub log_max_files: Option<usize>,
     pub log_format: Option<LogFormat>,
+    pub disk_show_sizes: Option<bool>,
+    pub disk_warn_threshold_gb: Option<u64>,
+    pub disk_scan_interval_secs: Option<u64>,
+    pub disk_auto_clean_on_merge: Option<bool>,
+    pub disk_clean_on_pr_closed: Option<bool>,
+    pub disk_sccache: Option<bool>,
+    pub disk_sccache_dir: Option<String>,
+    pub disk_shared_target_dir: Option<String>,
     pub sandbox: SandboxOverlay,
 }
 
@@ -2955,6 +3015,14 @@ impl ConfigOverlay {
         set!(base.log.rotation_size_mb, self.log_rotation_size_mb);
         set!(base.log.max_files, self.log_max_files);
         set!(base.log.format, self.log_format);
+        set!(base.disk.show_sizes, self.disk_show_sizes);
+        set!(base.disk.warn_threshold_gb, self.disk_warn_threshold_gb);
+        set!(base.disk.scan_interval_secs, self.disk_scan_interval_secs);
+        set!(base.disk.auto_clean_on_merge, self.disk_auto_clean_on_merge);
+        set!(base.disk.clean_on_pr_closed, self.disk_clean_on_pr_closed);
+        set!(base.disk.sccache, self.disk_sccache);
+        set!(base.disk.sccache_dir, self.disk_sccache_dir);
+        set!(base.disk.shared_target_dir, self.disk_shared_target_dir);
         if !self.sandbox.is_empty() {
             self.sandbox.apply(&mut base.sandbox);
         }
@@ -3064,6 +3132,28 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     if let Some(v) = env.get("SUPERZEJ_LOG_FORMAT") {
         o.log_format = LogFormat::from_str_validated(v.trim()).ok();
     }
+
+    // [disk]
+    if let Some(v) = env.get("SUPERZEJ_DISK_SHOW_SIZES") {
+        o.disk_show_sizes = parse_bool(&v, "SUPERZEJ_DISK_SHOW_SIZES");
+    }
+    if let Some(v) = env.get("SUPERZEJ_DISK_WARN_THRESHOLD_GB") {
+        o.disk_warn_threshold_gb = parse_num(v, "SUPERZEJ_DISK_WARN_THRESHOLD_GB");
+    }
+    if let Some(v) = env.get("SUPERZEJ_DISK_SCAN_INTERVAL_SECS") {
+        o.disk_scan_interval_secs = parse_num(v, "SUPERZEJ_DISK_SCAN_INTERVAL_SECS");
+    }
+    if let Some(v) = env.get("SUPERZEJ_DISK_AUTO_CLEAN_ON_MERGE") {
+        o.disk_auto_clean_on_merge = parse_bool(&v, "SUPERZEJ_DISK_AUTO_CLEAN_ON_MERGE");
+    }
+    if let Some(v) = env.get("SUPERZEJ_DISK_CLEAN_ON_PR_CLOSED") {
+        o.disk_clean_on_pr_closed = parse_bool(&v, "SUPERZEJ_DISK_CLEAN_ON_PR_CLOSED");
+    }
+    if let Some(v) = env.get("SUPERZEJ_DISK_SCCACHE") {
+        o.disk_sccache = parse_bool(&v, "SUPERZEJ_DISK_SCCACHE");
+    }
+    o.disk_sccache_dir = env.get("SUPERZEJ_DISK_SCCACHE_DIR");
+    o.disk_shared_target_dir = env.get("SUPERZEJ_DISK_SHARED_TARGET_DIR");
 
     // [sandbox]
     if let Some(v) = env.get("SUPERZEJ_SANDBOX_BACKEND") {
@@ -3875,6 +3965,32 @@ mod tests {
 
         assert_eq!(cfg.apps.default_tab, "work");
         assert_eq!(cfg.apps.effective_tab_order(), vec!["work"]);
+    }
+
+    #[test]
+    fn disk_config_defaults_and_env_override() {
+        let cfg = Config::default();
+        assert!(cfg.disk.show_sizes);
+        assert_eq!(cfg.disk.warn_threshold_gb, 100);
+        assert_eq!(cfg.disk.scan_interval_secs, 45);
+        assert!(cfg.disk.auto_clean_on_merge);
+        assert!(!cfg.disk.clean_on_pr_closed);
+        assert!(!cfg.disk.sccache);
+        assert!(cfg.disk.sccache_dir.is_empty());
+        assert!(cfg.disk.shared_target_dir.is_empty());
+
+        let mut env = MapEnv::default();
+        env.0.insert("SUPERZEJ_DISK_SCCACHE".into(), "true".into());
+        env.0
+            .insert("SUPERZEJ_DISK_WARN_THRESHOLD_GB".into(), "250".into());
+        env.0.insert(
+            "SUPERZEJ_DISK_SHARED_TARGET_DIR".into(),
+            "/tmp/shared".into(),
+        );
+        let cfg = Config::load_layered(&env, &[], None);
+        assert!(cfg.disk.sccache);
+        assert_eq!(cfg.disk.warn_threshold_gb, 250);
+        assert_eq!(cfg.disk.shared_target_dir, "/tmp/shared");
     }
 
     #[test]
@@ -6223,6 +6339,14 @@ transport = \"ssh\"
             log_rotation_size_mb: Some(12),
             log_max_files: Some(3),
             log_format: Some(LogFormat::Json),
+            disk_show_sizes: Some(false),
+            disk_warn_threshold_gb: Some(250),
+            disk_scan_interval_secs: Some(90),
+            disk_auto_clean_on_merge: Some(false),
+            disk_clean_on_pr_closed: Some(true),
+            disk_sccache: Some(true),
+            disk_sccache_dir: Some("/cache/sccache".into()),
+            disk_shared_target_dir: Some("/cache/target".into()),
             sandbox: SandboxOverlay {
                 enabled: Some(false),
                 ..Default::default()
@@ -6257,6 +6381,14 @@ transport = \"ssh\"
         assert_eq!(cfg.log.rotation_size_mb, 12);
         assert_eq!(cfg.log.max_files, 3);
         assert_eq!(cfg.log.format, LogFormat::Json);
+        assert!(!cfg.disk.show_sizes);
+        assert_eq!(cfg.disk.warn_threshold_gb, 250);
+        assert_eq!(cfg.disk.scan_interval_secs, 90);
+        assert!(!cfg.disk.auto_clean_on_merge);
+        assert!(cfg.disk.clean_on_pr_closed);
+        assert!(cfg.disk.sccache);
+        assert_eq!(cfg.disk.sccache_dir, "/cache/sccache");
+        assert_eq!(cfg.disk.shared_target_dir, "/cache/target");
         assert!(!cfg.sandbox.enabled);
     }
 

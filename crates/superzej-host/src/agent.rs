@@ -602,18 +602,67 @@ pub fn launch_spec_with_key(
         }
     }
 
+    // Shared build env (sccache / CARGO_TARGET_DIR) from `[disk]`, so an
+    // interactive `cargo build` dedups compilation / shares a target across
+    // worktrees. Inside a sandbox it must ride the container env (overrides +
+    // unblock); on the host it rides the pane env below.
+    let build_env = build_env_vars(cfg, &repo_root);
+
     if let Some(spec) = outcome.spec.as_mut() {
         apply_ssh_config_shim(spec);
+        // `env_overrides` exports these inside the sandbox shell (env_block would
+        // *unset* them — wrong direction).
+        for (k, v) in &build_env {
+            spec.env_overrides.insert(k.clone(), v.clone());
+        }
     }
 
     let mut spec = compose_spec(cfg, worktree, branch, choice, &loc, &outcome);
-    // On the host path (no sandbox spec) the credential home rides the pane env.
-    if outcome.spec.is_none()
-        && let Some((var, dir)) = account_env
-    {
-        spec.env.push((var, dir.to_string_lossy().into_owned()));
+    // On the host path (no sandbox spec) the credential home + build env ride
+    // the pane env.
+    if outcome.spec.is_none() {
+        if let Some((var, dir)) = account_env {
+            spec.env.push((var, dir.to_string_lossy().into_owned()));
+        }
+        spec.env.extend(build_env);
     }
     Ok(spec)
+}
+
+/// Resolve a configured build path: `~`/`~/…` expands to home; a relative path
+/// resolves against the repo root (so a shared `target/` is per-repo).
+fn resolve_build_path(raw: &str, repo_root: &Path) -> String {
+    let expanded = superzej_core::util::expand_tilde(raw);
+    let p = Path::new(&expanded);
+    if p.is_absolute() {
+        expanded
+    } else {
+        repo_root.join(p).to_string_lossy().into_owned()
+    }
+}
+
+/// Build-tooling env injected into interactive panes from `[disk]`: a shared
+/// `sccache` compile cache and/or a shared `CARGO_TARGET_DIR`. Empty when both
+/// are off (the common case), so panes are untouched unless opted in.
+fn build_env_vars(cfg: &Config, repo_root: &Path) -> Vec<(String, String)> {
+    let d = &cfg.disk;
+    let mut out = Vec::new();
+    if d.sccache && superzej_core::util::have("sccache") {
+        out.push(("RUSTC_WRAPPER".to_string(), "sccache".to_string()));
+        if !d.sccache_dir.is_empty() {
+            out.push((
+                "SCCACHE_DIR".to_string(),
+                resolve_build_path(&d.sccache_dir, repo_root),
+            ));
+        }
+    }
+    if !d.shared_target_dir.is_empty() {
+        out.push((
+            "CARGO_TARGET_DIR".to_string(),
+            resolve_build_path(&d.shared_target_dir, repo_root),
+        ));
+    }
+    out
 }
 
 /// The persisted slug for a repo root (for per-workspace account defaults), or
@@ -663,6 +712,34 @@ mod tests {
         cfg.agents = agents.iter().map(mk).collect();
         cfg.tools = tools.iter().map(mk).collect();
         cfg
+    }
+
+    #[test]
+    fn build_env_vars_off_by_default() {
+        let cfg = Config::default();
+        assert!(
+            build_env_vars(&cfg, Path::new("/repo")).is_empty(),
+            "no build env injected unless opted in"
+        );
+    }
+
+    #[test]
+    fn build_env_vars_injects_sccache_and_shared_target() {
+        let mut cfg = Config::default();
+        cfg.disk.shared_target_dir = "shared-target".into();
+        let env = build_env_vars(&cfg, Path::new("/repo"));
+        // shared_target_dir present → CARGO_TARGET_DIR resolved against repo root.
+        assert!(env.contains(&(
+            "CARGO_TARGET_DIR".to_string(),
+            "/repo/shared-target".to_string()
+        )));
+        // sccache off → no RUSTC_WRAPPER regardless of PATH.
+        assert!(!env.iter().any(|(k, _)| k == "RUSTC_WRAPPER"));
+
+        // An absolute shared dir is used verbatim.
+        cfg.disk.shared_target_dir = "/abs/target".into();
+        let env = build_env_vars(&cfg, Path::new("/repo"));
+        assert!(env.contains(&("CARGO_TARGET_DIR".to_string(), "/abs/target".to_string())));
     }
 
     #[test]

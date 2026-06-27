@@ -7226,6 +7226,7 @@ async fn event_loop<T: Terminal>(
             spawn_pr_cache_refresh(
                 session.clone(),
                 current_config.issues.clone(),
+                current_config.disk.clone(),
                 Some(waker.clone()),
             );
             crate::hydrate::spawn_issue_cache_refresh(
@@ -8928,6 +8929,7 @@ async fn event_loop<T: Terminal>(
         let mut want_pr_refresh = false;
         let mut want_issue_refresh = false;
         let mut want_ci_refresh = false;
+        let mut want_disk_refresh = false;
         while let Ok(kind) = refresh_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
             match kind {
@@ -8944,6 +8946,9 @@ async fn event_loop<T: Terminal>(
                     want_ci_refresh = true;
                     want_model_refresh = true;
                 }
+                // The scan only writes the size cache off-thread; sizes land on
+                // the next model hydrate, so this does NOT force one here.
+                RefreshKind::Disk => want_disk_refresh = true,
             }
         }
         if want_model_refresh {
@@ -8964,6 +8969,7 @@ async fn event_loop<T: Terminal>(
             spawn_pr_cache_refresh(
                 session.clone(),
                 current_config.issues.clone(),
+                current_config.disk.clone(),
                 Some(waker.clone()),
             );
         }
@@ -8985,6 +8991,9 @@ async fn event_loop<T: Terminal>(
                 current_config.ci.clone(),
                 Some(waker.clone()),
             );
+        }
+        if want_disk_refresh {
+            crate::hydrate::spawn_disk_scan(current_config.disk.clone(), Some(waker.clone()));
         }
 
         // Ack the focused worktree's activity so its "look at me" dot clears

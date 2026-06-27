@@ -582,6 +582,24 @@ command = "git diff"
 # isolated_target_dir = true # run superzej's cargo under <worktree>/target/superzej
 #                            #   so discovery/tests never block on the user's build lock
 
+# Per-worktree disk-usage visibility, cleanup, and shared build caches. Each
+# worktree's `target/` is the dominant disk cost when developing across many
+# worktrees; these surface it, reclaim it on merge, and dedup compilation.
+[disk]
+# show_sizes = true            # per-worktree size badges in the sidebar + statusbar total
+# warn_threshold_gb = 100      # statusbar warns (amber, red at 2x) above this total; 0 = off
+# scan_interval_secs = 45      # background size-scan cadence (runs off the event loop, cached)
+# auto_clean_on_merge = true   # `cargo clean` a worktree's target/ when its PR merges
+#                              #   (checkout kept; active worktree + running builds skipped)
+# clean_on_pr_closed = false   # also clean when a PR is closed without merging
+# sccache = false              # inject RUSTC_WRAPPER=sccache into panes (no-op if not on PATH);
+#                              #   shares dependency compilation across worktrees
+# sccache_dir = ""             # SCCACHE_DIR ("" = sccache default); ~ and repo-relative paths ok
+# shared_target_dir = ""       # one CARGO_TARGET_DIR shared across a repo's worktrees.
+#                              #   Biggest disk win, BUT cargo's per-target build lock
+#                              #   SERIALIZES concurrent builds across worktrees — opt-in.
+#                              #   "" = off; ~ expands to home; relative paths resolve to the repo root.
+
 # Aggregated notification bus. Events (PR state, agent done/failed, test
 # failures, log errors, worktree created) surface as sidebar badges + the
 # in-app inbox, and optionally as OS desktop notifications.
