@@ -11805,20 +11805,30 @@ async fn event_loop<T: Terminal>(
                             slug,
                             display,
                         } => {
-                            // Always confirmed (unlike worktree delete, which is
-                            // gated on `confirm_delete`) — and it never touches
-                            // the worktree files on disk.
-                            pending_confirm = Some((
-                                format!(
-                                    "Remove workspace '{display}' from superzej? \
-                                     (worktree files are kept on disk)"
-                                ),
-                                PendingAction::RemoveWorkspace {
-                                    repo_path,
-                                    slug,
-                                    display,
-                                },
-                            ));
+                            if current_config.ui.confirm_delete_workspace {
+                                pending_confirm = Some((
+                                    format!(
+                                        "Remove workspace '{display}' from superzej? \
+                                         (worktree files are kept on disk)"
+                                    ),
+                                    PendingAction::RemoveWorkspace {
+                                        repo_path,
+                                        slug,
+                                        display,
+                                    },
+                                ));
+                            } else {
+                                model.status = remove_workspace(
+                                    &mut session,
+                                    &mut panes,
+                                    &repo_path,
+                                    &slug,
+                                    &display,
+                                );
+                                forget_workspace_in_model(&mut model, &slug, &repo_path);
+                                sb.marked.clear();
+                                refresh_tab_model(&mut model, &session, &mut sb);
+                            }
                             dirty = true;
                             continue;
                         }

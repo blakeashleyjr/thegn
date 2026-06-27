@@ -177,8 +177,10 @@ impl AlacrittyEmulator {
             cols: cols as usize,
             rows: rows as usize,
         };
-        let mut config = Config::default();
-        config.scrolling_history = scrollback as usize;
+        let config = Config {
+            scrolling_history: scrollback,
+            ..Default::default()
+        };
 
         let term = Term::new(config, &size, EventProxy);
         Self {
