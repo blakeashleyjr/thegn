@@ -106,6 +106,59 @@ fn resolve_undercurl(cfg: &superzej_core::config::Config) -> bool {
     }
 }
 
+/// Resolve the outer terminal's capabilities: env detection
+/// ([`superzej_core::termcaps::detect`]) with `[theme]` config overrides folded
+/// on top (`color` / `glyphs` / `undercurl` = auto|explicit). The async probe
+/// later refines this in place via [`crate::caps::install`].
+pub(crate) fn resolve_termcaps(
+    cfg: &superzej_core::config::Config,
+) -> superzej_core::termcaps::TermCaps {
+    use superzej_core::config::{ColorMode, GlyphMode};
+    use superzej_core::termcaps::{ColorDepth, UnicodeLevel};
+
+    let env = superzej_core::termcaps::TermEnv::from_env();
+    let mut caps = superzej_core::termcaps::detect(&env);
+
+    // `[theme] color`: "auto" keeps detection; an explicit depth overrides it.
+    caps.color = match cfg.theme.color {
+        ColorMode::Auto => caps.color,
+        ColorMode::Truecolor => ColorDepth::Truecolor,
+        ColorMode::Ansi256 => ColorDepth::Ansi256,
+        ColorMode::Ansi16 => ColorDepth::Ansi16,
+        ColorMode::None => ColorDepth::None,
+    };
+    // `[theme] glyphs`: "auto" keeps detection; explicit forces unicode/ascii.
+    caps.unicode = match cfg.theme.glyphs {
+        GlyphMode::Auto => caps.unicode,
+        GlyphMode::Unicode => UnicodeLevel::Full,
+        GlyphMode::Ascii => UnicodeLevel::Ascii,
+    };
+    // `[theme] undercurl` keeps its dedicated on/off/auto knob.
+    caps.undercurl = resolve_undercurl(cfg);
+    caps
+}
+
+/// [`resolve_termcaps`] refined by an outer-terminal probe (if any). The probe
+/// only *upgrades* fields whose config knob is `auto`; explicit `[theme]` values
+/// always win. Used once at startup, where the probe is available.
+fn resolve_termcaps_with_probe(
+    cfg: &superzej_core::config::Config,
+    probe: Option<&superzej_core::termcaps::ProbeResult>,
+) -> superzej_core::termcaps::TermCaps {
+    use superzej_core::config::{ColorMode, GlyphMode, UndercurlMode};
+    let caps = resolve_termcaps(cfg);
+    match probe {
+        Some(p) => superzej_core::termcaps::apply_probe(
+            caps,
+            p,
+            cfg.theme.color == ColorMode::Auto,
+            cfg.theme.glyphs == GlyphMode::Auto,
+            cfg.theme.undercurl == UndercurlMode::Auto,
+        ),
+        None => caps,
+    }
+}
+
 fn apply_mode_status(model: &mut FrameModel, mode: crate::keymap::Mode) {
     // The bottom bar carries the contextual keybind hints; the status slot
     // only flags a non-default input mode. The mode chip always shows.
@@ -384,6 +437,23 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
             .and_then(|_| out.flush());
     }
 
+    // Probe the outer terminal (DA + XTVERSION) while we still own the raw tty —
+    // termwiz's reader thread starts at `BufferedTerminal::new` below and can't
+    // surface these replies. The result refines env detection at the caps
+    // install site (see `resolve_termcaps` + `apply_probe`). Bounded so a
+    // non-responding terminal never stalls launch; `None` ⇒ env-only.
+    let term_probe = crate::probe::probe_outer_terminal();
+    if let Some(p) = &term_probe {
+        tracing::info!(
+            target: "szhost::startup",
+            since_start_ms = start.elapsed().as_millis() as u64,
+            responded = p.responded,
+            terminal = p.terminal_name.as_deref().unwrap_or(""),
+            modern = p.modern,
+            "outer-terminal probe"
+        );
+    }
+
     let mut buf = BufferedTerminal::new(term).context("buffered terminal")?;
 
     // Grab the waker after `BufferedTerminal` takes ownership of the terminal.
@@ -477,6 +547,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // the first frame; the config fs-watch re-resolves it live.
     crate::chrome::set_palette(cfg.palette());
     crate::seg::set_undercurl_supported(resolve_undercurl(&cfg));
+    crate::caps::install(resolve_termcaps_with_probe(&cfg, term_probe.as_ref()));
     crate::center::PANE_HPAD.store(
         cfg.theme.pane_padding as usize,
         std::sync::atomic::Ordering::Relaxed,
@@ -7681,6 +7752,7 @@ async fn event_loop<T: Terminal>(
     // Our own Change→escape serializer (undercurl + underline-color capable);
     // `SUPERZEJ_RENDERER=termwiz` falls back to the stock renderer.
     let mut wire_renderer = crate::wire::WireRenderer::new();
+    wire_renderer.set_depth(crate::caps::color_depth());
     let use_termwiz_renderer = crate::wire::use_termwiz_renderer();
     let mut palette: Option<crate::search_everywhere::PaletteSession> = None;
     // Per-worktree file index for the `>` search mode. Invalidated by the
@@ -9968,6 +10040,8 @@ async fn event_loop<T: Terminal>(
                     // Live theme reload: colors apply on the next repaint.
                     crate::chrome::set_palette(new_cfg.palette());
                     crate::seg::set_undercurl_supported(resolve_undercurl(&new_cfg));
+                    crate::caps::install(resolve_termcaps(&new_cfg));
+                    wire_renderer.set_depth(crate::caps::color_depth());
                     crate::center::PANE_HPAD.store(
                         new_cfg.theme.pane_padding as usize,
                         std::sync::atomic::Ordering::Relaxed,

@@ -185,7 +185,7 @@ pub fn draw_text_bold(
     surface.add_change(Change::Attribute(AttributeChange::Intensity(
         termwiz::cell::Intensity::Bold,
     )));
-    let clipped: String = text.chars().take(max_cols).collect();
+    let clipped: String = crate::seg::take_cols(text, max_cols).to_string();
     surface.add_change(Change::Text(clipped));
     surface.add_change(Change::Attribute(AttributeChange::Intensity(
         termwiz::cell::Intensity::Normal,
@@ -209,7 +209,7 @@ pub fn draw_text(
     });
     surface.add_change(Change::Attribute(AttributeChange::Foreground(fg)));
     surface.add_change(Change::Attribute(AttributeChange::Background(bg)));
-    let clipped: String = text.chars().take(max_cols).collect();
+    let clipped: String = crate::seg::take_cols(text, max_cols).to_string();
     surface.add_change(Change::Text(clipped));
 }
 
@@ -691,7 +691,15 @@ pub fn draw_masthead(
     };
 
     if brand_cols > 0 {
-        draw_text(surface, rect.x + 1, rect.y, "\u{25c6} ", accent, bg, 2);
+        draw_text(
+            surface,
+            rect.x + 1,
+            rect.y,
+            &format!("{} ", crate::caps::active_glyphs().diamond_filled),
+            accent,
+            bg,
+            2,
+        );
         draw_text(surface, rect.x + 3, rect.y, "superzej", col(S::Text), bg, 8);
         if brand_cols >= BRAND_FULL_COLS {
             draw_text(
@@ -1047,9 +1055,11 @@ fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> {
         "net" => s.net_bps.map(|(rx, tx)| {
             w(
                 format!(
-                    "{} \u{2193}{} \u{2191}{}",
+                    "{} {}{} {}{}",
                     ic.net_icon,
+                    crate::caps::active_glyphs().arrow_down,
                     superzej_metrics::fmt_rate(rx),
+                    crate::caps::active_glyphs().arrow_up,
                     superzej_metrics::fmt_rate(tx)
                 ),
                 col(S::Dim),
@@ -1154,10 +1164,11 @@ pub fn bottombar_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> 
             } else {
                 theme_color(theme::GREEN)
             };
+            let g = crate::caps::active_glyphs();
             let text = if t.failed > 0 {
-                format!("\u{2713}{} \u{2717}{}", t.passed, t.failed)
+                format!("{}{} {}{}", g.check, t.passed, g.cross, t.failed)
             } else {
-                format!("\u{2713}{}", t.passed)
+                format!("{}{}", g.check, t.passed)
             };
             Some(w(text, fg))
         }),
@@ -1310,13 +1321,13 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             r.push(seg(Tok::Slot(S::Text), " "));
             r.push(Seg::chip(
                 Tok::Hue(superzej_core::theme::Hue::Red),
-                format!(" \u{2717} {fail} CI "),
+                format!(" {} {fail} CI ", crate::caps::active_glyphs().cross),
             ));
         } else if running > 0 {
             r.push(seg(Tok::Slot(S::Text), " "));
             r.push(Seg::chip(
                 Tok::Hue(superzej_core::theme::Hue::Amber),
-                format!(" \u{25cf} {running} CI "),
+                format!(" {} {running} CI ", crate::caps::active_glyphs().dot_filled),
             ));
         }
     }
@@ -1392,9 +1403,10 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
         };
         let clipped: String = {
             let max = 30;
-            if text.chars().count() > max {
-                let s: String = text.chars().take(max.saturating_sub(1)).collect();
-                format!("{}\u{2026}", s.trim_end())
+            if crate::seg::take_cols(&text, max) != text.as_str() {
+                let g = crate::caps::active_glyphs();
+                let body = crate::seg::take_cols(&text, max.saturating_sub(3));
+                format!("{}{}", body.trim_end(), g.ellipsis)
             } else {
                 text
             }
@@ -1729,10 +1741,11 @@ fn draw_metrics_section(surface: &mut Surface, rect: Rect, model: &FrameModel) {
         if y >= max_y {
             break;
         }
+        let gl = crate::caps::active_glyphs();
         let (dot, dot_fg, health) = match target.health {
-            crate::metrics::MetricHealth::Up => ("\u{25cf}", theme_color(theme::GREEN), "up"),
-            crate::metrics::MetricHealth::Stale => ("\u{25cb}", col(S::Dim), "stale"),
-            crate::metrics::MetricHealth::Error => ("\u{25cb}", theme_color(theme::RED), "err"),
+            crate::metrics::MetricHealth::Up => (gl.dot_filled, theme_color(theme::GREEN), "up"),
+            crate::metrics::MetricHealth::Stale => (gl.dot_hollow, col(S::Dim), "stale"),
+            crate::metrics::MetricHealth::Error => (gl.dot_hollow, theme_color(theme::RED), "err"),
         };
         draw_text(surface, rect.x + 1, y, dot, dot_fg, col(S::Panel), 1);
         let label = format!("{} {}", target.name, health);
@@ -1867,6 +1880,9 @@ fn compose_sidebar_row(
                 activity_col = Some(text.chars().count());
             }
             text.push_str(dot);
+            if !dot.is_empty() {
+                text.push(' ');
+            }
             // Dynamic title: `[PR: <n> | <window-title>]`, else the window
             // title, else the branch (`row.label`). See `compose_row_label`.
             text.push_str(&crate::sidebar::compose_row_label(
@@ -1902,15 +1918,17 @@ fn compose_sidebar_row(
 
     // Git glyphs (item 18) form the recolored status tail.
     let status = row.git.map(|g| {
+        let gl = crate::caps::active_glyphs();
         let mut s = String::new();
         if g.dirty {
-            s.push_str(" \u{25cf}"); // ●
+            s.push(' ');
+            s.push_str(gl.dot_filled); // ● / *
         }
         if g.ahead > 0 {
-            s.push_str(&format!(" \u{2191}{}", g.ahead)); // ↑N
+            s.push_str(&format!(" {}{}", gl.arrow_up, g.ahead)); // ↑N / ^N
         }
         if g.behind > 0 {
-            s.push_str(&format!(" \u{2193}{}", g.behind)); // ↓N
+            s.push_str(&format!(" {}{}", gl.arrow_down, g.behind)); // ↓N / vN
         }
         s
     });
@@ -1978,10 +1996,11 @@ fn compose_badges(row: &crate::sidebar::SidebarRow) -> Vec<Badge> {
 /// (`None`) shows nothing.
 fn activity_dot(state: crate::sidebar::ActivityState) -> &'static str {
     use crate::sidebar::ActivityState::*;
+    let g = crate::caps::active_glyphs();
     match state {
-        Active => "\u{25cf} ",  // ●
-        Waiting => "\u{25cf} ", // ●
-        Read => "\u{25cb} ",    // ○
+        Active => g.dot_filled,  // ● / *
+        Waiting => g.dot_filled, // ● / *
+        Read => g.dot_hollow,    // ○ / o
         None => "",
     }
 }

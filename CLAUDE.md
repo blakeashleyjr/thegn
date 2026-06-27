@@ -47,6 +47,19 @@ layers; AI is strictly additive.
   So a streaming-output frame costs ~one `compose_pane` + a one-rect diff, not a
   full chrome recompose. `render_tab` = `render_panes` (center) + `draw_chrome`,
   composed separately so each can repaint without the other.
+- **Terminal compatibility / graceful degradation.** The outer terminal's
+  capabilities (`superzej_core::termcaps`: color depth, glyph level, undercurl,
+  mouse) are detected purely from the environment (with an optional startup
+  DA/XTVERSION probe, `src/probe.rs`), folded with `[theme] color`/`glyphs`
+  config, and installed into a render-time holder (`src/caps.rs`, same pattern as
+  the undercurl atomic / chrome `PALETTE`). The frame is always composed in
+  truecolor + Unicode; degradation happens at the edges — **color** quantizes
+  truecolor→256→16→mono (or drops, for `NO_COLOR`) at the single `wire.rs`
+  `color_spec` chokepoint, and **glyphs** swap Unicode↔ASCII via
+  `caps::active_glyphs()` at the borders/chrome/pins/logotype call sites. Chrome
+  layout widths use display width (`unicode-width`), not char count. `superzej
+doctor` prints the resolved capabilities. Detection logic is pure + unit-tested
+  in core; never assume truecolor/Unicode at a draw site — go through `caps`.
 - **State.** SQLite at `$XDG_STATE_HOME/superzej/superzej.db` (WAL, schema
   versioned via `user_version`): repos, workspaces, worktrees, PR cache,
   tab layouts, session + sidebar UI state. **git is the source of truth** for
