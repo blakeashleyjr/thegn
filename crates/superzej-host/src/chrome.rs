@@ -257,6 +257,8 @@ pub struct RowMenu {
     pub anchor: usize,
     pub entries: Vec<RowMenuEntry>,
     pub cursor: usize,
+    /// The stable pin_key of the row this menu was opened for.
+    pub target_pin_key: String,
 }
 
 #[derive(Debug, Clone)]
