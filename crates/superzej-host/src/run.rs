@@ -600,12 +600,21 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // Set while the telemetry overlay is open: the ticker samples stats at
     // its 500ms half-tick instead of the user-cycled rate.
     let stats_live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Filesystem the `disk` masthead widget measures: the configured path, else
+    // the one holding the worktrees dir. `disk_free_pct` climbs to an existing
+    // ancestor, so a not-yet-created dir still resolves to its parent fs.
+    let disk_fs_path = if cfg.stats.disk_path.trim().is_empty() {
+        std::path::PathBuf::from(&cfg.worktrees_dir)
+    } else {
+        std::path::PathBuf::from(superzej_core::util::expand_tilde(&cfg.stats.disk_path))
+    };
     spawn_refresh_ticker(
         refresh_tx.clone(),
         stats_tx,
         container_tx,
         stats_interval_ms.clone(),
         stats_live.clone(),
+        disk_fs_path,
         waker.clone(),
     );
 

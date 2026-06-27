@@ -99,17 +99,18 @@ gpu = "nvtop"    # GPU monitor
 
 # The customizable widget bars framing the workspace. Each slot is an ordered
 # list of widget ids; unknown ids are skipped. Top-bar widgets: "brand"
-# (superzej + version), "cpu", "mem", "gpu" (NVIDIA only; hidden if absent),
-# "net", "date", "clock". Bottom-bar widgets: "keyhints" (context-dependent
-# keybinds for the focused zone), "pr" (forge + PR number, state-colored),
-# "tests" (✓pass ✗fail rollup of the last test run; green all-pass, red on
-# failure; hidden until a run), "loc" (tokei line count), "status" (transient
-# messages).
+# (superzej + version), "cpu", "mem", "disk" (free space on the worktrees' fs,
+# color-coded; see [stats]), "gpu" (NVIDIA only; hidden if absent), "net",
+# "date", "clock". Bottom-bar widgets: "keyhints" (context-dependent keybinds
+# for the focused zone), "pr" (forge + PR number, state-colored), "tests"
+# (✓pass ✗fail rollup of the last test run; green all-pass, red on failure;
+# hidden until a run), "loc" (tokei line count), "disk" (the active worktree's
+# size, incl. target/), "status" (transient messages).
 [bars]
 top_left = ["brand"]
-top_right = ["cpu", "mem", "gpu", "net", "battery", "date", "clock"]
+top_right = ["cpu", "mem", "disk", "gpu", "net", "battery", "date", "clock"]
 bottom_left = ["keyhints"]
-bottom_right = ["pr", "tests", "loc", "status"]   # "loc" = tokei line count (needs tokei)
+bottom_right = ["pr", "tests", "loc", "disk", "status"]   # "loc"=tokei line count; "disk"=worktree size
 # chrono format strings for the date/clock widgets.
 date_format = "%a %b %-d"
 clock_format = "%H:%M"
@@ -129,6 +130,10 @@ refresh-secs = 2           # Polling interval in seconds
 # battery-icon = "BAT"          # discharging icon
 # battery-charging-icon = "CHG" # shown while charging / on AC
 battery-warn = 25               # red at/below this percent
+# disk-icon = "DSK"             # icon for the "disk" free-space widget
+disk-free-warn = 15             # disk widget turns amber at/below this free %
+disk-free-critical = 5          # disk widget turns red at/below this free %
+# disk-path = "~/projects"      # fs the disk widget measures; "" = worktrees_dir's fs
 refresh-rates = [1, 2, 5, 10]  # Click the top-right stats block to cycle
 
 # Prometheus scrape targets for the sidebar METRICS section. superzej scrapes
