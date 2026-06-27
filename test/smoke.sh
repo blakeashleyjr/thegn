@@ -49,6 +49,18 @@ dns = "tunnel"
 [sandbox.vpn.tailscale]
 auth_key = "env:TS_AUTHKEY"
 tags = ["tag:dev"]
+
+# Ingress sharing config must parse + validate (all provider sub-tables).
+[share]
+provider = "bore"
+allow_public = true
+
+[share.frp]
+server_addr = "frps.example.com"
+subdomain_host = "share.example.com"
+
+[share.tailscale]
+funnel = false
 EOF
 
 fail=0
@@ -132,6 +144,75 @@ check "env show resolves an environment for a worktree" \
   "'$SZ' env show '$WT' | grep -q '^env:'"
 check "env set/show round-trips a selection" \
   "'$SZ' env set company-k8s '$WT' >/dev/null 2>&1 && '$SZ' env show '$WT' >/dev/null 2>&1"
+
+# ── ingress sharing (`[share]`) ──────────────────────────────────────────────
+# The config parses (all provider sub-tables, exercised by validate above).
+check "share config round-trips through config show" \
+  "'$SZ' config show | grep -q 'allow_public'"
+check "share list runs without error" \
+  "'$SZ' share list >/dev/null 2>&1"
+
+# Stubbed providers exercise the subprocess seam: `frpc`/`dumbpipe` on a private
+# PATH stand in for the real binaries (each prints its line, then idles).
+SHBIN="$TMP/shbin"
+mkdir -p "$SHBIN"
+cat >"$SHBIN/frpc" <<'STUB'
+#!/usr/bin/env bash
+echo "frpc started: $*"; sleep 30
+STUB
+cat >"$SHBIN/dumbpipe" <<'STUB'
+#!/usr/bin/env bash
+echo "to connect, use: dumbpipe connect-tcp TICKET123" >&2; sleep 30
+STUB
+chmod +x "$SHBIN/frpc" "$SHBIN/dumbpipe"
+
+# frp: config-derived https subdomain URL + a materialized frpc.toml.
+cat >"$TMP/share-frp.toml" <<EOF
+[share]
+provider = "frp"
+[share.frp]
+server_addr = "frps.example.com"
+subdomain_host = "share.example.com"
+EOF
+PATH="$SHBIN:$PATH" "$SZ" --config "$TMP/share-frp.toml" share start 3000 --worktree "$WT" \
+  >"$TMP/frp.out" 2>&1 &
+FRP_PID=$!
+for _ in $(seq 1 60); do
+  if grep -q '→' "$TMP/frp.out" 2>/dev/null; then break; fi
+  sleep 0.1
+done
+check "share frp derives the per-worktree https URL" \
+  "grep -q 'https://feature-3000.share.example.com' '$TMP/frp.out'"
+check "share frp materializes frpc.toml in the state dir" \
+  "ls $XDG_STATE_HOME/superzej/share/*-3000/frpc.toml >/dev/null 2>&1"
+kill "$FRP_PID" 2>/dev/null || true
+wait "$FRP_PID" 2>/dev/null || true
+
+# iroh: scrape the dumbpipe ticket into a copyable connect command.
+printf '[share]\nprovider = "iroh"\n' >"$TMP/share-iroh.toml"
+PATH="$SHBIN:$PATH" "$SZ" --config "$TMP/share-iroh.toml" share start 3000 --worktree "$WT" \
+  >"$TMP/iroh.out" 2>&1 &
+IROH_PID=$!
+for _ in $(seq 1 60); do
+  if grep -q '→' "$TMP/iroh.out" 2>/dev/null; then break; fi
+  sleep 0.1
+done
+check "share iroh scrapes the dumbpipe ticket into a connect command" \
+  "grep -q 'dumbpipe connect-tcp TICKET123' '$TMP/iroh.out'"
+kill "$IROH_PID" 2>/dev/null || true
+wait "$IROH_PID" 2>/dev/null || true
+
+# allow_public safety guard: a public share is refused unless opted in.
+cat >"$TMP/share-guard.toml" <<EOF
+[share]
+provider = "frp"
+allow_public = false
+[share.frp]
+server_addr = "x"
+subdomain_host = "y"
+EOF
+check "share allow_public guard refuses public shares" \
+  "'$SZ' --config '$TMP/share-guard.toml' share start 3000 --worktree '$WT' 2>&1 | grep -q 'public sharing is disabled'"
 
 # v5 → v6 layout migration: seed a legacy flat tab_layout (pages as " ·N" name
 # suffixes) into the state DB, open it once, and assert it transformed into

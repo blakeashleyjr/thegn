@@ -224,4 +224,58 @@ mod tests {
         assert_eq!(label_for("/home/u/code/app/Feat_1"), "feat-1");
         assert_eq!(label_for("plain"), "plain");
     }
+
+    #[test]
+    fn tailscale_visibility_follows_serve_vs_funnel() {
+        // serve ⇒ private (tailnet), regardless of requested visibility.
+        let mut cfg = ShareConfig {
+            provider: ShareProviderKind::Tailscale,
+            visibility: ShareVisibility::Public,
+            ..ShareConfig::default()
+        };
+        let spec = build_share_spec(&cfg, "wt", 3000).expect("enabled");
+        assert_eq!(spec.visibility, ShareVisibility::Private);
+        assert!(matches!(spec.params, ShareParams::Tailscale(_)));
+
+        // funnel ⇒ public.
+        cfg.tailscale.funnel = true;
+        let spec = build_share_spec(&cfg, "wt", 3000).expect("enabled");
+        assert_eq!(spec.visibility, ShareVisibility::Public);
+    }
+
+    #[test]
+    fn iroh_is_always_peer_private() {
+        let cfg = ShareConfig {
+            provider: ShareProviderKind::Iroh,
+            visibility: ShareVisibility::Public, // requested public…
+            ..ShareConfig::default()
+        };
+        let spec = build_share_spec(&cfg, "wt", 3000).expect("enabled");
+        assert_eq!(spec.visibility, ShareVisibility::Private); // …resolved private
+        assert!(matches!(spec.params, ShareParams::Iroh(_)));
+    }
+
+    #[test]
+    fn new_share_enums_round_trip() {
+        use crate::config::FrpProxyType;
+        assert_eq!(
+            ShareProviderKind::from_str_validated("frp"),
+            Ok(ShareProviderKind::Frp)
+        );
+        assert_eq!(
+            ShareProviderKind::from_str_validated("ts"),
+            Ok(ShareProviderKind::Tailscale)
+        );
+        assert_eq!(
+            ShareProviderKind::from_str_validated("dumbpipe"),
+            Ok(ShareProviderKind::Iroh)
+        );
+        assert_eq!(ShareProviderKind::Frp.as_str(), "frp");
+        assert_eq!(
+            FrpProxyType::from_str_validated("tcp"),
+            Ok(FrpProxyType::Tcp)
+        );
+        assert_eq!(FrpProxyType::Https.as_str(), "https");
+        assert!(FrpProxyType::from_str_validated("nope").is_err());
+    }
 }
