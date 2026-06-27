@@ -3610,8 +3610,6 @@ enum GitAfter {
     /// Spawn this command into a fresh center tab (custom-command
     /// `output = "terminal"`).
     Terminal(String),
-    /// Execute the confirmed worktree-group close.
-    CloseWorktreeGroup,
     /// Open a file in the configured editor in a new center tab (used for
     /// conflict-file resolution — the user resolves markers, saves, then
     /// stages the file normally).
@@ -4993,12 +4991,6 @@ fn dispatch_menu_choice(
             if let Some(op) = ov.confirm_op.take() {
                 enqueue(panel_ui, model, op);
             }
-        }
-        MenuChoice::Confirm {
-            tag: "close-worktree",
-            ..
-        } => {
-            return GitAfter::CloseWorktreeGroup;
         }
         MenuChoice::Confirm { .. } | MenuChoice::Dismiss => {
             *ov.confirm_op = None;
@@ -12158,24 +12150,6 @@ async fn event_loop<T: Terminal>(
                                     refresh_tab_model(&mut model, &session, &mut sb);
                                     need_relayout = true;
                                 }
-                                GitAfter::CloseWorktreeGroup => {
-                                    if let Some(g) = session.active_group() {
-                                        for tab in &g.tabs {
-                                            for id in tab.center.pane_ids() {
-                                                panes.table.remove(&id);
-                                            }
-                                        }
-                                    }
-                                    if let Some(g) = session.close_active_group()
-                                        && let Ok(db) = superzej_core::db::Db::open()
-                                    {
-                                        forget_worktree_group(&db, &session.id, &g);
-                                    }
-                                    persist_session_layout(&mut session, &panes);
-                                    focus.zone = crate::focus::Zone::Center;
-                                    refresh_tab_model(&mut model, &session, &mut sb);
-                                    need_relayout = true;
-                                }
                             }
                         }
                     }
@@ -12224,7 +12198,7 @@ async fn event_loop<T: Terminal>(
                                     &wires,
                                     &mut ov,
                                 ) {
-                                    GitAfter::None | GitAfter::CloseWorktreeGroup => {}
+                                    GitAfter::None => {}
                                     GitAfter::NewWorktree => {
                                         forced_palette_action =
                                             Some(crate::keymap::Action::NewWorktree);
@@ -13334,7 +13308,7 @@ async fn event_loop<T: Terminal>(
                         custom_cmds: &mut custom_menu_cmds,
                     };
                     match handle_git_msg(msg, &mut panel_ui, &mut model, &wires, &mut ov) {
-                        GitAfter::None | GitAfter::CloseWorktreeGroup => {}
+                        GitAfter::None => {}
                         GitAfter::NewWorktree => {
                             forced_palette_action = Some(crate::keymap::Action::NewWorktree);
                         }
@@ -16560,13 +16534,14 @@ async fn event_loop<T: Terminal>(
                                 need_relayout = true;
                             }
                             Action::CloseWorktree => {
-                                // Close the active worktree group; never close the root/home checkout.
-                                if session
-                                    .active_group()
-                                    .map(|g| g.kind == crate::session::GroupKind::Home)
-                                    .unwrap_or(false)
-                                {
-                                    model.status = "Root workspace cannot be closed".into();
+                                // Remove the active worktree group via the same menu +
+                                // disk-removal path as the sidebar `D` delete: the menu
+                                // defaults to "delete from disk" (keep-files / cancel are
+                                // reachable by moving). Never remove the root/home checkout.
+                                let (targets, _skipped) =
+                                    deletable_group_targets(&session, vec![session.active]);
+                                if targets.is_empty() {
+                                    model.status = "Root workspace cannot be removed".into();
                                     dirty = true;
                                     continue;
                                 }
@@ -16574,13 +16549,29 @@ async fn event_loop<T: Terminal>(
                                     .active_group()
                                     .map(|g| g.name.clone())
                                     .unwrap_or_else(|| "worktree".into());
-                                active_menu = Some(menu::confirm_menu(
-                                    "Close worktree?",
-                                    format!("Remove '{name}' from this session?"),
-                                    "close-worktree",
-                                    name,
-                                    true,
-                                ));
+                                if current_config.confirm_delete {
+                                    active_menu =
+                                        Some(menu::delete_worktree_menu(targets.len(), &name));
+                                    pending_confirm_delete_worktrees = Some(targets);
+                                } else {
+                                    // confirm disabled — remove from disk immediately,
+                                    // mirroring the sidebar's no-confirm branch.
+                                    model.status =
+                                        delete_groups(&mut session, &mut panes, targets, false);
+                                    sb.marked.clear();
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    sb.focus_active_row(&mut model);
+                                    need_relayout = true;
+                                    sync_drawer_persistence(
+                                        &session,
+                                        &mut panes,
+                                        &mut drawer,
+                                        &mut drawer_pool,
+                                        &mut drawer_home,
+                                        keymap.config(),
+                                        chrome.center,
+                                    );
+                                }
                                 dirty = true;
                                 continue;
                             }

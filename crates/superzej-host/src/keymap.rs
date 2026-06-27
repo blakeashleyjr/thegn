@@ -301,8 +301,8 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     },
     ActionSpec {
         id: "close-worktree",
-        label: "Close worktree",
-        hint: "close worktree",
+        label: "Remove worktree",
+        hint: "remove worktree (from disk)",
         default_chords: &["Alt X"],
         palette: true,
     },
