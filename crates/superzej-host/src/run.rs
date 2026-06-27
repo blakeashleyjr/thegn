@@ -1778,11 +1778,16 @@ fn activate_row_target(
     center: Rect,
     need_relayout: &mut bool,
     clear_on_next_frame: &mut bool,
-) {
+) -> bool {
+    // Set when this activation switched to a different workspace, so the caller
+    // can kick an immediate model hydration (the new workspace's worktree paths
+    // aren't in `model.sidebar_status` yet — without this the git glyphs blank
+    // out until the ~1s refresh ticker fires).
+    let mut workspace_switched = false;
     match target {
         crate::sidebar::RowTarget::Tab(gi, ti) => {
             if gi >= session.worktrees.len() {
-                return;
+                return false;
             }
             session.switch_to_tab(gi, ti);
         }
@@ -1794,7 +1799,7 @@ fn activate_row_target(
         // the materialize path, which resolves the connection by name.
         crate::sidebar::RowTarget::Workspace { repo_path, group } if repo_path == "terminal" => {
             let Some(name) = group else {
-                return;
+                return false;
             };
             if let Some(gi) = session.worktrees.iter().position(|w| w.name == name) {
                 session.switch_to_tab(gi, 0);
@@ -1819,7 +1824,7 @@ fn activate_row_target(
         }
         crate::sidebar::RowTarget::Workspace { repo_path, group } => {
             let Ok(db) = superzej_core::db::Db::open() else {
-                return;
+                return false;
             };
             // Park the outgoing workspace's panes (kept alive) and restore the
             // target's — no reaping, so an editor/server keeps running across
@@ -1835,8 +1840,9 @@ fn activate_row_target(
                 need_relayout,
                 clear_on_next_frame,
             ) {
-                return;
+                return false;
             }
+            workspace_switched = true;
         }
     }
     // When activating a tab via the sidebar, focus the leftmost visible pane
@@ -1855,6 +1861,7 @@ fn activate_row_target(
     // (the Workspace arm already persisted via switch_to_workspace; this also
     // covers the in-workspace Tab arm and is cheap/idempotent).
     persist_session_layout(session, panes);
+    workspace_switched
 }
 
 /// Worktree group indices in the order the sidebar DISPLAYS them (home-first
@@ -7862,6 +7869,29 @@ async fn event_loop<T: Terminal>(
     // in `run()` used 0, which this initial value accepts.
     let mut hydration_gen: u64 = 0;
 
+    // Kick an immediate model hydration for the CURRENT session. Used after a
+    // workspace switch: `refresh_tab_model` rebuilds the sidebar from the stale
+    // `model.sidebar_status` (keyed by the *outgoing* workspace's paths), so the
+    // new workspace's git glyphs render blank until something repopulates them.
+    // Without this they only return when the ~1s refresh ticker fires. Mirrors
+    // the inline spawns used by the panel refresh/notification handlers.
+    macro_rules! kick_model_hydration {
+        () => {{
+            hydration_gen += 1;
+            crate::hydrate::spawn_model_hydration(
+                model_tx.clone(),
+                hydration_gen,
+                session.clone(),
+                Some(waker.clone()),
+                crate::hydrate::HydrateHints {
+                    open: panel_ui.open,
+                    expanded: panel_ui.width.is_expanded(),
+                    ..Default::default()
+                },
+            );
+        }};
+    }
+
     // Launch eager pins + resurrect previously-running pins for this workspace.
     {
         let ws = (!session.id.is_empty()).then(|| session.id.clone());
@@ -11115,8 +11145,11 @@ async fn event_loop<T: Terminal>(
                                     sb.sync(&mut model);
                                 } else {
                                     sb.sync(&mut model);
-                                    if let Some(t) = sb.cursor_target(&model) {
-                                        activate_row_target(
+                                    // row target activations within a single
+                                    // workspace are tab/zoom, not relayout;
+                                    // workspace switch sets it via need_relayout
+                                    if let Some(t) = sb.cursor_target(&model)
+                                        && activate_row_target(
                                             t,
                                             &mut session,
                                             &mut model,
@@ -11130,10 +11163,9 @@ async fn event_loop<T: Terminal>(
                                             chrome.center,
                                             &mut need_relayout,
                                             &mut clear_on_next_frame,
-                                        );
-                                        // row target activations within a single
-                                        // workspace are tab/zoom, not relayout;
-                                        // workspace switch sets it via need_relayout
+                                        )
+                                    {
+                                        kick_model_hydration!();
                                     }
                                 }
                             }
@@ -12610,6 +12642,7 @@ async fn event_loop<T: Terminal>(
                                         )
                                     {
                                         refresh_tab_model(&mut model, &session, &mut sb);
+                                        kick_model_hydration!();
                                         need_relayout = true;
                                         sync_drawer_persistence(
                                             &session,
@@ -12635,6 +12668,7 @@ async fn event_loop<T: Terminal>(
                                         )
                                     {
                                         refresh_tab_model(&mut model, &session, &mut sb);
+                                        kick_model_hydration!();
                                         need_relayout = true;
                                         sync_drawer_persistence(
                                             &session,
@@ -12934,7 +12968,7 @@ async fn event_loop<T: Terminal>(
                             continue;
                         }
                         SidebarOutcome::Activate(target) => {
-                            activate_row_target(
+                            if activate_row_target(
                                 target,
                                 &mut session,
                                 &mut model,
@@ -12948,7 +12982,9 @@ async fn event_loop<T: Terminal>(
                                 chrome.center,
                                 &mut need_relayout,
                                 &mut clear_on_next_frame,
-                            );
+                            ) {
+                                kick_model_hydration!();
+                            }
                             dirty = true;
                             continue;
                         }
@@ -15807,6 +15843,7 @@ async fn event_loop<T: Terminal>(
                                     {
                                         focus.zone = crate::focus::Zone::Center;
                                         refresh_tab_model(&mut model, &session, &mut sb);
+                                        kick_model_hydration!();
                                         need_relayout = true;
                                         sync_drawer_persistence(
                                             &session,
@@ -16343,6 +16380,7 @@ async fn event_loop<T: Terminal>(
                                         &mut clear_on_next_frame,
                                     ) {
                                         refresh_tab_model(&mut model, &session, &mut sb);
+                                        kick_model_hydration!();
                                         need_relayout = true;
                                         sync_drawer_persistence(
                                             &session,
