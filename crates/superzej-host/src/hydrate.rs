@@ -34,6 +34,56 @@ fn model_refresh_interval() -> Duration {
 const PR_REFRESH_INTERVAL: Duration = Duration::from_secs(20);
 const ISSUE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Cached git-glyph row for one worktree: `(dirty, ahead, behind, branch,
+/// repo_root)`. Computing it runs a full `git status` (50-150ms), so only the
+/// *active* worktree pays that every Model tick; background worktrees reuse the
+/// last value until it goes stale (see [`should_rescan_glyphs`]).
+pub(crate) type GlyphRow = (bool, usize, usize, Option<String>, String);
+
+/// Process-global staleness cache for background-worktree git glyphs. Mirrors
+/// the global-state pattern of the sibling `activity` subsystem, so it needs no
+/// threading through `spawn_model_hydration`'s ~dozen call sites. The `Mutex`
+/// covers the (rare) case of overlapping hydrations; it's just a cache, so a
+/// racing miss only costs a redundant scan.
+fn glyph_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, (GlyphRow, Instant)>>
+{
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (GlyphRow, Instant)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Staleness window for background-worktree git glyphs. The active worktree is
+/// always rescanned; others reuse the cache until this elapses. Default 5s,
+/// override with `SUPERZEJ_BG_MODEL_REFRESH_MS` (`0` = always rescan, i.e. the
+/// old every-worktree-every-tick behavior).
+fn bg_glyph_ttl() -> Duration {
+    let ms = std::env::var("SUPERZEJ_BG_MODEL_REFRESH_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(5000);
+    Duration::from_millis(ms)
+}
+
+/// Decide whether a worktree's git glyphs must be rescanned now, or can be
+/// served from cache. Pure, so it's unit-tested. The active worktree always
+/// rescans (the user is looking at it, and its diff fs-watcher already forces
+/// immediate refreshes); a background worktree rescans only when it has no
+/// cached row yet or the cached row is older than `ttl`.
+pub(crate) fn should_rescan_glyphs(
+    is_active: bool,
+    cached_age: Option<Duration>,
+    ttl: Duration,
+) -> bool {
+    if is_active {
+        return true;
+    }
+    match cached_age {
+        None => true,
+        Some(age) => age >= ttl,
+    }
+}
+
 /// A refresh request delivered to the event loop. `Model` rehydrates the
 /// sidebar/panel/diff (cheap, gix-backed, off-thread); `Pr` additionally kicks
 /// the GitHub PR-cache refresh; `Issues` kicks the issue-tracker cache refresh.
@@ -557,11 +607,13 @@ fn collect_sidebar_status(
     }
 
     // git glyphs + agent + PR badge per distinct worktree path. `is_dirty` does a
-    // full `git status` scan (50-150ms), so a serial loop over N worktrees was the
-    // dominant hydration cost. Fan the per-worktree git reads (dirty, ahead/behind,
-    // current branch — independent and read-only) out across scoped threads, then
-    // do the DB-keyed inserts (agent, PR counts) on this thread, since `Db` isn't
-    // `Send`. Wall-clock collapses from N×scan to ~one scan.
+    // full `git status` scan (50-150ms), so scanning every worktree every Model
+    // tick was the dominant hydration cost (cpu_hydrate scaled with worktree
+    // count). Tier it: the *active* worktree always rescans (and its diff
+    // fs-watcher forces immediate refreshes), while background worktrees reuse a
+    // cached glyph row until it goes stale. The remaining scans still fan out
+    // across scoped threads; DB-keyed inserts (agent, PR counts) stay on this
+    // thread since `Db` isn't `Send`.
     let mut seen = std::collections::HashSet::new();
     let paths: Vec<String> = session
         .worktrees
@@ -571,32 +623,70 @@ fn collect_sidebar_status(
         .filter(|p| seen.insert(p.clone()) && std::path::Path::new(p).is_dir())
         .collect();
 
-    // (path, dirty, ahead, behind, branch, repo_root) — git only, no DB access
-    // in the scope. `repo_root` is the main-worktree root shared by every linked
-    // worktree of the repo; it keys the repo-wide `pr_branch_cache` (item 28).
-    let git_rows: Vec<(String, bool, usize, usize, Option<String>, String)> =
-        std::thread::scope(|s| {
-            let handles: Vec<_> = paths
-                .iter()
-                .map(|p| {
-                    s.spawn(move || {
-                        let wt = std::path::Path::new(p);
-                        let loc = GitLoc::for_worktree(wt);
-                        let git = GixGit::new();
-                        let dirty = git.is_dirty(&loc).unwrap_or(false);
-                        let (ahead, behind) =
-                            git.ahead_behind(&loc).ok().flatten().unwrap_or((0, 0));
-                        let branch = git.current_branch(&loc).ok();
-                        let repo_root = superzej_core::repo::main_worktree(wt)
-                            .map(|r| r.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| p.clone());
-                        (p.clone(), dirty, ahead, behind, branch, repo_root)
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
+    // Partition into paths that must be rescanned now vs. served from cache.
+    let active_path: Option<String> = session.active_group().map(|g| g.path.clone());
+    let ttl = bg_glyph_ttl();
+    let now = Instant::now();
+    let mut to_scan: Vec<String> = Vec::new();
+    let mut reused: Vec<(String, GlyphRow)> = Vec::new();
+    {
+        let cache = glyph_cache().lock().unwrap();
+        for p in &paths {
+            let is_active = active_path.as_deref() == Some(p.as_str());
+            let cached = cache.get(p);
+            let age = cached.map(|(_, ts)| now.saturating_duration_since(*ts));
+            if should_rescan_glyphs(is_active, age, ttl) {
+                to_scan.push(p.clone());
+            } else if let Some((row, _)) = cached {
+                reused.push((p.clone(), row.clone()));
+            } else {
+                to_scan.push(p.clone());
+            }
+        }
+    }
 
+    // (path, GlyphRow) — git only, no DB access in the scope. `repo_root` is the
+    // main-worktree root shared by every linked worktree of the repo; it keys
+    // the repo-wide `pr_branch_cache` (item 28).
+    let scanned: Vec<(String, GlyphRow)> = std::thread::scope(|s| {
+        let handles: Vec<_> = to_scan
+            .iter()
+            .map(|p| {
+                s.spawn(move || {
+                    let wt = std::path::Path::new(p);
+                    let loc = GitLoc::for_worktree(wt);
+                    let git = GixGit::new();
+                    let dirty = git.is_dirty(&loc).unwrap_or(false);
+                    let (ahead, behind) = git.ahead_behind(&loc).ok().flatten().unwrap_or((0, 0));
+                    let branch = git.current_branch(&loc).ok();
+                    let repo_root = superzej_core::repo::main_worktree(wt)
+                        .map(|r| r.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| p.clone());
+                    (p.clone(), (dirty, ahead, behind, branch, repo_root))
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    // Refresh the cache with the fresh rows and drop entries for worktrees that
+    // are no longer present (bounds growth across the process lifetime).
+    {
+        let mut cache = glyph_cache().lock().unwrap();
+        for (p, row) in &scanned {
+            cache.insert(p.clone(), (row.clone(), now));
+        }
+        cache.retain(|k, _| paths.iter().any(|p| p == k));
+    }
+
+    let scanned_n = scanned.len();
+    let git_rows =
+        scanned
+            .into_iter()
+            .chain(reused)
+            .map(|(p, (dirty, ahead, behind, branch, repo_root))| {
+                (p, dirty, ahead, behind, branch, repo_root)
+            });
     for (path, dirty, ahead, behind, branch, repo_root) in git_rows {
         status.git.insert(
             path.clone(),
@@ -624,6 +714,8 @@ fn collect_sidebar_status(
         target: "szhost::hydrate",
         status_ms = t0.elapsed().as_millis() as u64,
         worktrees = paths.len(),
+        scanned = scanned_n,
+        cached = paths.len().saturating_sub(scanned_n),
         "sidebar status collected"
     );
     status
@@ -1870,6 +1962,34 @@ mod tests {
             worktrees: vec![WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/app")],
             active: 0,
         }
+    }
+
+    #[test]
+    fn glyph_rescan_tiering() {
+        let ttl = Duration::from_secs(5);
+        // The active worktree always rescans, regardless of cache freshness.
+        assert!(should_rescan_glyphs(true, Some(Duration::ZERO), ttl));
+        assert!(should_rescan_glyphs(true, None, ttl));
+        // A background worktree with no cached row must scan once to populate.
+        assert!(should_rescan_glyphs(false, None, ttl));
+        // A background worktree with a fresh cached row is served from cache.
+        assert!(!should_rescan_glyphs(
+            false,
+            Some(Duration::from_secs(2)),
+            ttl
+        ));
+        // ...and rescans once the cached row ages past the TTL.
+        assert!(should_rescan_glyphs(
+            false,
+            Some(Duration::from_secs(6)),
+            ttl
+        ));
+        // TTL of 0 (the env opt-out) reverts to always-rescan for background too.
+        assert!(should_rescan_glyphs(
+            false,
+            Some(Duration::from_millis(1)),
+            Duration::ZERO
+        ));
     }
 
     /// End-to-end over the I/O seam: a real temp git repo with an edited

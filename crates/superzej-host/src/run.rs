@@ -6757,6 +6757,11 @@ async fn event_loop<T: Terminal>(
     // Stamped at each loop-top when perf is on; the span until the blocking
     // poll is the loop's "busy" time (drives the idle ratio).
     let mut iter_t0 = std::time::Instant::now();
+    // Idle-memory bookkeeping: `last_activity` is bumped on every frame that
+    // actually renders; once it ages past the idle threshold a wake hands freed
+    // glibc arena pages back to the OS (throttled via `last_trim`). See `mem`.
+    let mut last_activity = std::time::Instant::now();
+    let mut last_trim = std::time::Instant::now();
     // Telemetry-panel "Loop" sub-block: while the section is open we force perf
     // accounting on (restoring the prior state on close) and roll up faster so
     // the live graphs move. `perf_was_on` remembers the pre-open state.
@@ -9190,8 +9195,14 @@ async fn event_loop<T: Terminal>(
         if !should_render {
             // Woke but nothing changed — a wasted wakeup (storm signal).
             loop_perf.render_skip();
+            // An idle wake is the right moment to return freed arena pages to
+            // the OS (self-throttled; no-op until the loop has been idle a
+            // while). Keeps RSS receding after a build/test burst.
+            crate::mem::trim_if_idle(last_activity, &mut last_trim);
         }
         if should_render {
+            // A real frame: the loop is active, so defer any idle trim.
+            last_activity = std::time::Instant::now();
             let frame_t0 = std::time::Instant::now();
             // Refresh the live OSC window titles from the panes table (main loop
             // only) so the sidebar's dynamic row titles track the focused pane's
