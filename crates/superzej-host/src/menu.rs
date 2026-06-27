@@ -80,6 +80,8 @@ pub enum MenuChoice {
     // first-launch keymap picker (item 621): the chosen preset id
     // ("default" | "vscode" | "jetbrains").
     SetKeymapPreset(String),
+    // share reach picker: the chosen reach (public/team/peer).
+    ShareReach(superzej_core::config::ShareReach),
     Dismiss,
 }
 
@@ -98,6 +100,7 @@ pub enum MenuKindTag {
     RedoConfirm,
     Confirm,
     KeymapPicker,
+    ShareReach,
 }
 
 /// One selectable row: an optional letter hotkey (rendered as a chip), the
@@ -426,6 +429,36 @@ pub fn keymap_preset_menu() -> MenuOverlay {
         ],
     )
     .with_body("Familiar shortcuts on top of the defaults. Change later with keymap_preset.")
+}
+
+/// Share reach picker (`Alt+Shift+S`): pick *who* the share is for; each reach
+/// maps to a provider via `[share] public`/`team`/`peer`. Built from the
+/// worktree's configured reaches; the public option is flagged as a caution.
+pub fn reach_picker(cfg: &superzej_core::config::ShareConfig) -> MenuOverlay {
+    use superzej_core::config::ShareReach;
+    let items = cfg
+        .configured_reaches()
+        .into_iter()
+        .map(|r| {
+            let (glyph, key, desc) = match r {
+                ShareReach::Public => ('\u{1f310}', 'p', "internet — anyone with the link"),
+                ShareReach::Team => ('\u{1f465}', 't', "your tailnet / a teammate"),
+                ShareReach::Peer => ('\u{1f517}', 'r', "a machine you hand a ticket to"),
+            };
+            let it = item(
+                Some(key),
+                format!("{glyph} {} — {desc}", r.as_str()),
+                MenuChoice::ShareReach(r),
+            )
+            .note(cfg.reach_provider(r).as_str());
+            if r == ShareReach::Public {
+                it.danger()
+            } else {
+                it
+            }
+        })
+        .collect();
+    MenuOverlay::new(MenuKindTag::ShareReach, "Share to…", items)
 }
 
 /// Rebase options: continue + skip only while a rebase is conflicted/running.
@@ -874,6 +907,43 @@ mod tests {
             .filter_map(|i| i.key)
             .map(|c| c.to_ascii_lowercase())
             .collect()
+    }
+
+    #[test]
+    fn reach_picker_lists_configured_reaches_and_picks() {
+        use superzej_core::config::{ShareConfig, ShareProviderKind, ShareReach};
+        let cfg = ShareConfig {
+            public: ShareProviderKind::Frp,
+            team: ShareProviderKind::Tailscale,
+            peer: ShareProviderKind::Iroh,
+            ..ShareConfig::default()
+        };
+        let mut m = reach_picker(&cfg);
+        // One item per configured reach, in public/team/peer order with p/t/r keys.
+        assert_eq!(hotkeys(&m), vec!['p', 't', 'r']);
+        // The public item carries its provider as the note and is danger-styled.
+        let public = &m.items()[0];
+        assert_eq!(public.note.as_deref(), Some("frp"));
+        assert!(public.danger, "public reach should be a caution");
+        // Hotkey 't' picks the team reach.
+        assert_eq!(
+            m.handle_key(&KeyCode::Char('t'), NONE),
+            MenuOutcome::Pick(MenuChoice::ShareReach(ShareReach::Team))
+        );
+    }
+
+    #[test]
+    fn reach_picker_omits_public_when_disallowed() {
+        use superzej_core::config::{ShareConfig, ShareProviderKind};
+        let cfg = ShareConfig {
+            public: ShareProviderKind::Frp,
+            peer: ShareProviderKind::Iroh,
+            allow_public: false,
+            ..ShareConfig::default()
+        };
+        let m = reach_picker(&cfg);
+        // public dropped (guard), only peer remains.
+        assert_eq!(hotkeys(&m), vec!['r']);
     }
 
     #[test]

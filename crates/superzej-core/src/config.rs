@@ -2222,6 +2222,18 @@ config_enum! {
         Warn = "warn",
     } default = Fail;
 }
+config_enum! {
+    /// Who a share is for — the intent the reach-picker offers. Each maps to a
+    /// provider via the `[share] public`/`team`/`peer` keys.
+    ///  - `public` — anyone with the link (the internet).
+    ///  - `team`   — your tailnet / a teammate (identity-scoped).
+    ///  - `peer`   — a specific machine you hand a ticket to (P2P).
+    pub enum ShareReach: "share reach" {
+        Public = "public",
+        Team = "team",
+        Peer = "peer",
+    } default = Public;
+}
 
 /// `[share]` — expose a worktree-local port at a public URL. Disabled by
 /// default (`provider = "none"`). Only the selected provider's sub-table is
@@ -2238,6 +2250,12 @@ pub struct ShareConfig {
     /// internet (frp http(s), tailscale `funnel`). Private/team/peer shares are
     /// unaffected. Default `true`.
     pub allow_public: bool,
+    /// Intent-first reach → provider mapping for the reach picker. Each defaults
+    /// to `none` (unset); when ≥2 are set, `Alt+Shift+S` offers a picker. When
+    /// all are unset, the single `provider` is used (no picker).
+    pub public: ShareProviderKind,
+    pub team: ShareProviderKind,
+    pub peer: ShareProviderKind,
     pub bore: BoreConfig,
     pub frp: FrpConfig,
     pub tailscale: TailscaleShareConfig,
@@ -2252,6 +2270,9 @@ impl Default for ShareConfig {
             on_error: ShareOnError::Fail,
             ready_timeout_secs: 20,
             allow_public: true,
+            public: ShareProviderKind::None,
+            team: ShareProviderKind::None,
+            peer: ShareProviderKind::None,
             bore: BoreConfig::default(),
             frp: FrpConfig::default(),
             tailscale: TailscaleShareConfig::default(),
@@ -2261,9 +2282,29 @@ impl Default for ShareConfig {
 }
 
 impl ShareConfig {
-    /// Whether sharing is requested at all.
+    /// Whether sharing is requested at all (a default `provider` or any reach key).
     pub fn is_enabled(&self) -> bool {
-        self.provider != ShareProviderKind::None
+        self.provider != ShareProviderKind::None || !self.configured_reaches().is_empty()
+    }
+
+    /// The provider mapped to a reach (`none` if that reach is unset).
+    pub fn reach_provider(&self, reach: ShareReach) -> ShareProviderKind {
+        match reach {
+            ShareReach::Public => self.public,
+            ShareReach::Team => self.team,
+            ShareReach::Peer => self.peer,
+        }
+    }
+
+    /// Reaches that map to a real provider, in public→team→peer order. `Public`
+    /// is omitted when `allow_public` is off, so the picker never offers a
+    /// reach the safety guard would refuse.
+    pub fn configured_reaches(&self) -> Vec<ShareReach> {
+        [ShareReach::Public, ShareReach::Team, ShareReach::Peer]
+            .into_iter()
+            .filter(|&r| self.reach_provider(r) != ShareProviderKind::None)
+            .filter(|&r| r != ShareReach::Public || self.allow_public)
+            .collect()
     }
 }
 

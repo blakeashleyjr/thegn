@@ -175,6 +175,7 @@ impl ShareSupervisor {
         cfg: &ShareConfig,
         worktree: &str,
         port: u16,
+        reach: Option<superzej_core::config::ShareReach>,
         tx: &UnboundedSender<ShareEvent>,
         waker: &TerminalWaker,
     ) -> Result<(), String> {
@@ -182,8 +183,8 @@ impl ShareSupervisor {
             return Err(format!("already sharing port {port}"));
         }
         let label = superzej_core::share::label_for(worktree);
-        let Some(spec) = build_share_spec(cfg, &label, port) else {
-            return Err("sharing is disabled (set [share] provider)".into());
+        let Some(spec) = build_share_spec(cfg, &label, port, reach) else {
+            return Err("sharing is disabled (set [share] provider, or that reach)".into());
         };
         let public = spec.visibility == superzej_core::config::ShareVisibility::Public;
         // Safety guard: never expose to the public internet unless opted in.

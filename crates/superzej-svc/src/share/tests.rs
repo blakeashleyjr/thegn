@@ -8,7 +8,7 @@ fn spec_with(bore: BoreConfig, port: u16) -> ShareSpec {
         bore,
         ..ShareConfig::default()
     };
-    build_share_spec(&cfg, "wt", port).expect("enabled")
+    build_share_spec(&cfg, "wt", port, None).expect("enabled")
 }
 
 fn frp_spec(frp: FrpConfig, label: &str, port: u16) -> ShareSpec {
@@ -17,7 +17,7 @@ fn frp_spec(frp: FrpConfig, label: &str, port: u16) -> ShareSpec {
         frp,
         ..ShareConfig::default()
     };
-    build_share_spec(&cfg, label, port).expect("enabled")
+    build_share_spec(&cfg, label, port, None).expect("enabled")
 }
 
 /// The `Process` plan for a spec (panics if the provider is a sidecar-serve one).
@@ -225,7 +225,7 @@ fn serve_plan(ts: superzej_core::config::TailscaleShareConfig, port: u16) -> Ser
         tailscale: ts,
         ..ShareConfig::default()
     };
-    let spec = build_share_spec(&cfg, "wt", port).expect("enabled");
+    let spec = build_share_spec(&cfg, "wt", port, None).expect("enabled");
     match for_provider(&spec).launch().expect("launch") {
         ShareLaunch::SidecarServe(s) => s,
         ShareLaunch::Process(_) => panic!("expected a SidecarServe launch"),
@@ -254,7 +254,7 @@ fn iroh_listens_and_scrapes_ticket_into_connect_command() {
         provider: ShareProviderKind::Iroh,
         ..ShareConfig::default()
     };
-    let spec = build_share_spec(&cfg, "wt", 3000).expect("enabled");
+    let spec = build_share_spec(&cfg, "wt", 3000, None).expect("enabled");
     assert_eq!(for_provider(&spec).kind(), "iroh");
     let plan = process_plan(&spec);
     assert_eq!(plan.program, "dumbpipe");
