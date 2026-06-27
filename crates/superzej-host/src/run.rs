@@ -5201,7 +5201,11 @@ fn spawn_test_run_task(
     tokio::spawn(async move {
         let _permit = sem.acquire_owned().await;
         if let Ok(outcome) = tokio::task::spawn_blocking(move || {
-            crate::task::run_task(worktree, generation, task_spec, &limits)
+            // Resolve the worktree's location off-loop so a remote/provider
+            // worktree runs its tests in the env (via the bridge/control
+            // transport), not on the host. Local worktrees are unchanged.
+            let loc = superzej_core::remote::GitLoc::for_worktree(&worktree);
+            crate::task::run_task(worktree, &loc, generation, task_spec, &limits)
         })
         .await
         {
@@ -5225,7 +5229,8 @@ fn spawn_test_discovery(
     tokio::spawn(async move {
         let _permit = sem.acquire_owned().await;
         if let Ok(result) = tokio::task::spawn_blocking(move || {
-            crate::task::discover_tests(worktree, generation, task_spec, &limits)
+            let loc = superzej_core::remote::GitLoc::for_worktree(&worktree);
+            crate::task::discover_tests(worktree, &loc, generation, task_spec, &limits)
         })
         .await
         {
@@ -12738,8 +12743,12 @@ async fn event_loop<T: Terminal>(
                                                 let wk2 = waker.clone();
                                                 let limits2 = keymap.config().limits.clone();
                                                 tokio::task::spawn_blocking(move || {
+                                                    let loc =
+                                                        superzej_core::remote::GitLoc::for_worktree(
+                                                            &wt,
+                                                        );
                                                     let outcome = crate::task::run_task(
-                                                        wt, 0, test_task, &limits2,
+                                                        wt, &loc, 0, test_task, &limits2,
                                                     );
                                                     let _ = tx2.send(outcome);
                                                     let _ = wk2.wake();
@@ -13177,7 +13186,9 @@ async fn event_loop<T: Terminal>(
                                 let wk2 = waker.clone();
                                 let limits2 = keymap.config().limits.clone();
                                 tokio::task::spawn_blocking(move || {
-                                    let outcome = crate::task::run_task(wt, 0, test_task, &limits2);
+                                    let loc = superzej_core::remote::GitLoc::for_worktree(&wt);
+                                    let outcome =
+                                        crate::task::run_task(wt, &loc, 0, test_task, &limits2);
                                     let _ = tx2.send(outcome);
                                     let _ = wk2.wake();
                                 });
