@@ -267,6 +267,45 @@ pub fn remove(root: &Path, path: &Path, branch: &str, delete_branch: bool) {
     }
 }
 
+/// Reclaim a worktree's build artifacts (`target/`) while keeping the checkout
+/// intact. Distinct from [`remove`], which deletes the whole worktree via `git
+/// worktree remove`. Returns the bytes reclaimed.
+///
+/// Prefers `cargo clean` when a `Cargo.toml` and `cargo` are present: it
+/// acquires cargo's build-directory lock, so a concurrent build *serializes*
+/// (blocks) rather than racing a half-deleted tree. Falls back to removing
+/// `target/` directly for non-cargo projects or when `cargo` is absent. A
+/// missing `target/` is a no-op returning 0.
+///
+/// Callers are responsible for the safety guards (never the active worktree,
+/// never one with a running build) — this function only does the reclaim.
+pub fn clean_target(path: &Path) -> std::io::Result<u64> {
+    let target = path.join("target");
+    if !target.is_dir() {
+        return Ok(0);
+    }
+    let before = crate::disk::measure_worktree(path).target_bytes;
+
+    let has_cargo = path.join("Cargo.toml").is_file();
+    let cleaned = if has_cargo && util::have("cargo") {
+        // `cargo clean` takes the build lock, so it can't corrupt a concurrent
+        // build — it waits. Fall back to rm if cargo errors (e.g. no toolchain).
+        std::process::Command::new("cargo")
+            .arg("clean")
+            .current_dir(path)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    if !cleaned && target.is_dir() {
+        std::fs::remove_dir_all(&target)?;
+    }
+    Ok(before)
+}
+
 /// Rename a worktree's branch (`git branch -m`) and move its checkout to the
 /// path implied by the new branch name (`git worktree move`). Returns the new
 /// on-disk path on success, or the reason it failed (the caller keeps the old
@@ -403,9 +442,35 @@ mod tests {
     }
 
     #[test]
+    fn clean_target_removes_artifacts_keeps_source() {
+        // A non-cargo dir so clean_target takes the rm fallback (no toolchain
+        // dependency in the test). cargo-clean path is exercised by smoke/CI.
+        let dir = std::env::temp_dir().join(format!("sz-clean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("target/debug")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), b"fn main(){}").unwrap();
+        std::fs::write(dir.join("target/debug/bin"), vec![0u8; 4096]).unwrap();
+
+        let reclaimed = clean_target(&dir).unwrap();
+        assert!(reclaimed >= 4096, "reports bytes reclaimed");
+        assert!(!dir.join("target").exists(), "target/ removed");
+        assert!(dir.join("src/main.rs").exists(), "source kept");
+
+        // No target/ → no-op, returns 0.
+        assert_eq!(clean_target(&dir).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn rename_moves_branch_and_checkout() {
         let repo = temp_repo("rename");
-        let cfg = Config::default();
+        // Keep worktrees inside the temp repo so nothing leaks into the real
+        // `~/.superzej/worktrees` (the default `worktrees_dir`).
+        let cfg = Config {
+            worktrees_dir: repo.join(".wt").to_string_lossy().into_owned(),
+            ..Default::default()
+        };
         let old_branch = "old-feat";
         let path = worktree_path(&repo, old_branch, &cfg);
         add_checked(&repo, old_branch, "main", &path, &cfg).unwrap();
@@ -425,7 +490,11 @@ mod tests {
     #[test]
     fn rename_to_same_name_is_a_noop() {
         let repo = temp_repo("rename-noop");
-        let cfg = Config::default();
+        // Keep worktrees inside the temp repo (see rename_moves_branch_and_checkout).
+        let cfg = Config {
+            worktrees_dir: repo.join(".wt").to_string_lossy().into_owned(),
+            ..Default::default()
+        };
         let path = worktree_path(&repo, "keep", &cfg);
         add_checked(&repo, "keep", "main", &path, &cfg).unwrap();
         let same = rename(&repo, &path, "keep", "keep", &cfg).unwrap();

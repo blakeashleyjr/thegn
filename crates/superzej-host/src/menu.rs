@@ -77,6 +77,10 @@ pub enum MenuChoice {
     Confirm { tag: &'static str, arg: String },
     // delete worktree confirm: variant to capture "leave files" intent
     ConfirmDeleteWorktrees { keep_files: bool },
+    // delete workspace confirm: variant to capture "leave files" intent
+    ConfirmDeleteWorkspace { keep_files: bool },
+    // init git confirm
+    ConfirmInitGit { path: String },
     // first-launch keymap picker (item 621): the chosen preset id
     // ("default" | "vscode" | "jetbrains").
     SetKeymapPreset(String),
@@ -351,7 +355,10 @@ pub fn delete_worktree_menu(targets: usize, names_csv: &str) -> MenuOverlay {
             )
             .danger(),
             item(
-                Some('k'),
+                // 'k' is a reserved nav key (cursor-up); use 'f' (files) so the
+                // hotkey is reachable and the debug-assert in `new_with_default`
+                // stays happy.
+                Some('f'),
                 "keep files",
                 MenuChoice::ConfirmDeleteWorktrees { keep_files: true },
             ),
@@ -360,6 +367,35 @@ pub fn delete_worktree_menu(targets: usize, names_csv: &str) -> MenuOverlay {
         0,
     )
     .with_body(names_csv)
+}
+
+/// Confirm removing a workspace. Like `delete_worktree_menu`, the default
+/// (pre-selected, index 0) choice is the destructive "delete from disk", which
+/// removes every worktree directory of the workspace. `[f]` removes the
+/// workspace from superzej only, leaving the files on disk.
+pub fn delete_workspace_menu(display: &str) -> MenuOverlay {
+    let title = format!("Delete workspace '{display}'?");
+    MenuOverlay::new_with_default(
+        MenuKindTag::Confirm,
+        title,
+        vec![
+            item(
+                Some('y'),
+                "delete worktrees from disk",
+                MenuChoice::ConfirmDeleteWorkspace { keep_files: false },
+            )
+            .danger(),
+            item(
+                // 'k' is a reserved nav key (cursor-up); use 'f' (files).
+                Some('f'),
+                "keep files on disk",
+                MenuChoice::ConfirmDeleteWorkspace { keep_files: true },
+            ),
+            item(Some('n'), "cancel", MenuChoice::Dismiss),
+        ],
+        0,
+    )
+    .with_body("the home checkout is kept; branch worktrees are deleted")
 }
 
 /// A 2-item yes/no confirm built on the same component: `[y]` resolves to
@@ -625,6 +661,22 @@ pub fn undo_confirm_menu(body: impl Into<String>, redo: bool) -> MenuOverlay {
         ],
     )
     .with_body(body)
+}
+
+pub fn init_git_menu(path: String) -> MenuOverlay {
+    MenuOverlay::new(
+        MenuKindTag::Confirm,
+        "initialize git repository?".to_string(),
+        vec![
+            item(
+                Some('y'),
+                "initialize git repo",
+                MenuChoice::ConfirmInitGit { path: path.clone() },
+            ),
+            item(Some('n'), "cancel", MenuChoice::Dismiss),
+        ],
+    )
+    .with_body(format!("{} is not a git repository", path))
 }
 
 /// Branch actions including create + merge (the full `m`/`n` menu); merge
@@ -1066,6 +1118,8 @@ mod tests {
                 "file.rs".into(),
                 true,
             ),
+            delete_worktree_menu(2, "a, b"),
+            delete_workspace_menu("myrepo"),
         ];
         for m in &menus {
             assert!(!m.items().is_empty(), "{:?} menu is empty", m.tag);
@@ -1082,6 +1136,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn delete_workspace_menu_defaults_to_delete_from_disk() {
+        let m = delete_workspace_menu("myrepo");
+        // Default (pre-selected) item is the destructive "delete from disk".
+        assert_eq!(m.selected(), 0);
+        assert_eq!(
+            m.items()[0].choice,
+            MenuChoice::ConfirmDeleteWorkspace { keep_files: false }
+        );
+        assert!(m.items()[0].danger, "delete-from-disk row is danger-marked");
+        assert_eq!(
+            m.items()[1].choice,
+            MenuChoice::ConfirmDeleteWorkspace { keep_files: true }
+        );
+        assert_eq!(m.items()[2].choice, MenuChoice::Dismiss);
+        assert_eq!(hotkeys(&m), vec!['y', 'f', 'n']);
     }
 
     #[test]

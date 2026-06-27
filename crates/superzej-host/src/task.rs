@@ -134,6 +134,20 @@ pub fn cancel_slot(slot: &str) {
     }
 }
 
+/// True if a superzej-spawned `cargo` job (test run or discovery) is currently
+/// registered for `worktree` — the cleanup guard that keeps an auto/manual
+/// `clean` from yanking `target/` out from under a build this process started.
+/// (An *external* `cargo build` in a pane is covered separately: `clean_target`
+/// prefers `cargo clean`, which takes the build lock and serializes.)
+pub fn slot_active(worktree: &std::path::Path) -> bool {
+    let run = format!("{}:run", worktree.display());
+    let disc = format!("{}:disc", worktree.display());
+    registry()
+        .lock()
+        .map(|m| m.contains_key(&run) || m.contains_key(&disc))
+        .unwrap_or(false)
+}
+
 /// Outcome of one capped child run.
 struct CapOutput {
     exit_code: Option<i32>,
@@ -2431,6 +2445,18 @@ mod discovery_tests {
         let output = line.repeat(5);
         let diags = extract_diagnostics(&output, "cargo");
         assert_eq!(diags.len(), 1, "should deduplicate: {diags:?}");
+    }
+
+    #[test]
+    fn slot_active_reflects_registry() {
+        let wt = temp_dir2("slot");
+        assert!(!slot_active(&wt), "no slot registered yet");
+        let slot = format!("{}:run", wt.display());
+        registry().lock().unwrap().insert(slot.clone(), (1, 4242));
+        assert!(slot_active(&wt), "active while a run slot is registered");
+        registry().lock().unwrap().remove(&slot);
+        assert!(!slot_active(&wt), "inactive after the slot clears");
+        let _ = std::fs::remove_dir_all(wt);
     }
 
     #[test]
