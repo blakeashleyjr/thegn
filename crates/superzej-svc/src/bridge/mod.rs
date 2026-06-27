@@ -13,14 +13,16 @@
 //! plus `proc.list` and the streaming `fs.watch` (added next).
 
 use anyhow::{Context, Result, anyhow, bail};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::lsp::framing::{self, FrameDecoder};
 use superzej_core::remote::GitLoc;
@@ -46,6 +48,35 @@ pub struct ExecResult {
     pub exit: i32,
 }
 
+/// A filesystem change streamed from an `fs.watch` subscription.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsEvent {
+    pub paths: Vec<String>,
+    /// Coarse kind: `"create"` | `"modify"` | `"remove"`.
+    pub kind: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WatchParams {
+    path: String,
+    watch_id: u64,
+}
+#[derive(Serialize, Deserialize)]
+struct ProcParams {
+    paths: Vec<String>,
+}
+#[derive(Serialize, Deserialize)]
+struct ProcResult {
+    jiffies: BTreeMap<String, u64>,
+}
+/// The params of an `fs.event` server→client notification.
+#[derive(Serialize, Deserialize)]
+struct FsEventNote {
+    watch_id: u64,
+    paths: Vec<String>,
+    kind: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct Request {
     id: u64,
@@ -63,6 +94,8 @@ struct Response {
 }
 
 type Pending = Arc<Mutex<HashMap<u64, Sender<std::result::Result<serde_json::Value, String>>>>>;
+/// Active `fs.watch` subscriptions: watch_id → the channel delivering its events.
+type Subs = Arc<Mutex<HashMap<u64, Sender<FsEvent>>>>;
 
 /// The host side of the bridge: spawn-over-transport happens by the caller (it
 /// hands us the connected stream's reader+writer), then `exec()` issues blocking
@@ -73,6 +106,8 @@ pub struct BridgeClient {
     pending: Pending,
     timeout: Duration,
     _reader: std::thread::JoinHandle<()>,
+    subs: Subs,
+    next_watch: AtomicU64,
     /// The spawned agent process, owned so it's killed when the client drops
     /// (subprocess transports). `None` for a caller-provided stream (tests).
     child: Mutex<Option<Child>>,
@@ -106,10 +141,12 @@ impl BridgeClient {
         child: Option<Child>,
     ) -> BridgeClient {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let subs: Subs = Arc::new(Mutex::new(HashMap::new()));
         let reader_pending = pending.clone();
+        let reader_subs = subs.clone();
         let handle = std::thread::Builder::new()
             .name("bridge-reader".into())
-            .spawn(move || reader_loop(reader, reader_pending))
+            .spawn(move || reader_loop(reader, reader_pending, reader_subs))
             .expect("spawn bridge reader");
         BridgeClient {
             writer: Arc::new(Mutex::new(Box::new(writer))),
@@ -117,6 +154,8 @@ impl BridgeClient {
             pending,
             timeout: Duration::from_secs(120),
             _reader: handle,
+            subs,
+            next_watch: AtomicU64::new(1),
             child: Mutex::new(child),
         }
     }
@@ -160,6 +199,32 @@ impl BridgeClient {
             env: env.to_vec(),
         })?;
         Ok(serde_json::from_value(self.call("exec", params)?)?)
+    }
+
+    /// Sum of CPU jiffies per path for processes in the env whose cwd is under it
+    /// (feeds the activity FSM with the *env's* processes).
+    pub fn proc_list(&self, paths: &[String]) -> Result<BTreeMap<String, u64>> {
+        let params = serde_json::to_value(ProcParams {
+            paths: paths.to_vec(),
+        })?;
+        let r: ProcResult = serde_json::from_value(self.call("proc.list", params)?)?;
+        Ok(r.jiffies)
+    }
+
+    /// Subscribe to filesystem changes under `path` in the env. The agent streams
+    /// `fs.event` notifications; they arrive on the returned receiver until the
+    /// client (and thus the connection) drops.
+    pub fn watch(&self, path: &str) -> Result<Receiver<FsEvent>> {
+        let (tx, rx) = channel();
+        let watch_id = self.next_watch.fetch_add(1, Ordering::SeqCst);
+        // Register before the request so an immediate event can't race the insert.
+        self.subs.lock().unwrap().insert(watch_id, tx);
+        let params = serde_json::json!({ "path": path, "watch_id": watch_id });
+        if let Err(e) = self.call("fs.watch", params) {
+            self.subs.lock().unwrap().remove(&watch_id);
+            return Err(e);
+        }
+        Ok(rx)
     }
 }
 
@@ -216,7 +281,7 @@ pub fn for_loc(loc: &GitLoc) -> Option<Arc<BridgeClient>> {
     registry().lock().unwrap().get(&key).cloned()
 }
 
-fn reader_loop(mut reader: impl Read, pending: Pending) {
+fn reader_loop(mut reader: impl Read, pending: Pending, subs: Subs) {
     let mut dec = FrameDecoder::new();
     let mut buf = [0u8; 8192];
     loop {
@@ -226,7 +291,26 @@ fn reader_loop(mut reader: impl Read, pending: Pending) {
         };
         dec.push(&buf[..n]);
         while let Some(body) = dec.next_message() {
-            if let Ok(resp) = serde_json::from_str::<Response>(&body)
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
+                continue;
+            };
+            // A server→client notification (no `id`): route `fs.event` to its sub.
+            if v.get("method").and_then(|m| m.as_str()) == Some("fs.event") {
+                if let Some(note) = v
+                    .get("params")
+                    .cloned()
+                    .and_then(|p| serde_json::from_value::<FsEventNote>(p).ok())
+                    && let Some(tx) = subs.lock().unwrap().get(&note.watch_id)
+                {
+                    let _ = tx.send(FsEvent {
+                        paths: note.paths,
+                        kind: note.kind,
+                    });
+                }
+                continue;
+            }
+            // Otherwise a response to a pending request.
+            if let Ok(resp) = serde_json::from_value::<Response>(v)
                 && let Some(tx) = pending.lock().unwrap().remove(&resp.id)
             {
                 let payload = match resp.err {
@@ -247,7 +331,14 @@ fn reader_loop(mut reader: impl Read, pending: Pending) {
 /// them, write framed responses to `writer`, until the stream closes. Runs
 /// *inside* the env. Blocking/synchronous (one request at a time is fine — the
 /// host issues sequentially per connection; concurrency rides separate threads).
-pub fn serve(mut reader: impl Read, mut writer: impl Write) {
+/// A writer shared between the request loop and the `fs.watch` background watcher
+/// threads (which push `fs.event` notifications).
+type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
+
+pub fn serve(mut reader: impl Read, writer: impl Write + Send + 'static) {
+    let writer: SharedWriter = Arc::new(Mutex::new(Box::new(writer)));
+    // Live fs.watch watchers, kept alive for the connection's lifetime.
+    let mut watchers: Vec<RecommendedWatcher> = Vec::new();
     let mut dec = FrameDecoder::new();
     let mut buf = [0u8; 8192];
     loop {
@@ -260,46 +351,145 @@ pub fn serve(mut reader: impl Read, mut writer: impl Write) {
             let Ok(req) = serde_json::from_str::<Request>(&body) else {
                 continue;
             };
-            let resp = handle(&req);
-            let s = match serde_json::to_string(&resp) {
-                Ok(s) => s,
-                Err(_) => continue,
+            let resp = match req.method.as_str() {
+                "exec" => exec_response(&req),
+                "proc.list" => proc_response(&req),
+                "fs.watch" => watch_response(&req, &writer, &mut watchers),
+                other => resp_err(req.id, format!("unknown method: {other}")),
             };
-            if writer
-                .write_all(&framing::encode(&s))
-                .and_then(|_| writer.flush())
-                .is_err()
-            {
-                return;
-            }
+            write_frame(&writer, &resp);
         }
     }
 }
 
-fn handle(req: &Request) -> Response {
-    let ok = |v: serde_json::Value| Response {
-        id: req.id,
-        ok: Some(v),
-        err: None,
-    };
-    let err = |e: String| Response {
-        id: req.id,
-        ok: None,
-        err: Some(e),
-    };
-    match req.method.as_str() {
-        "exec" => match serde_json::from_value::<ExecParams>(req.params.clone()) {
-            Ok(p) => match do_exec(&p) {
-                Ok(r) => match serde_json::to_value(r) {
-                    Ok(v) => ok(v),
-                    Err(e) => err(e.to_string()),
-                },
-                Err(e) => err(e.to_string()),
-            },
-            Err(e) => err(format!("bad exec params: {e}")),
+fn resp_ok(id: u64, v: impl Serialize) -> Response {
+    match serde_json::to_value(v) {
+        Ok(v) => Response {
+            id,
+            ok: Some(v),
+            err: None,
         },
-        other => err(format!("unknown method: {other}")),
+        Err(e) => resp_err(id, e.to_string()),
     }
+}
+
+fn resp_err(id: u64, msg: String) -> Response {
+    Response {
+        id,
+        ok: None,
+        err: Some(msg),
+    }
+}
+
+/// Frame + write any serializable message (Response or a notification).
+fn write_frame(w: &SharedWriter, msg: &impl Serialize) {
+    let Ok(s) = serde_json::to_string(msg) else {
+        return;
+    };
+    if let Ok(mut g) = w.lock() {
+        let _ = g.write_all(&framing::encode(&s)).and_then(|_| g.flush());
+    }
+}
+
+fn exec_response(req: &Request) -> Response {
+    match serde_json::from_value::<ExecParams>(req.params.clone()) {
+        Ok(p) => match do_exec(&p) {
+            Ok(r) => resp_ok(req.id, r),
+            Err(e) => resp_err(req.id, e.to_string()),
+        },
+        Err(e) => resp_err(req.id, format!("bad exec params: {e}")),
+    }
+}
+
+fn proc_response(req: &Request) -> Response {
+    match serde_json::from_value::<ProcParams>(req.params.clone()) {
+        Ok(p) => resp_ok(
+            req.id,
+            ProcResult {
+                jiffies: superzej_core::activity::cpu_jiffies_by_path(&p.paths),
+            },
+        ),
+        Err(e) => resp_err(req.id, format!("bad proc.list params: {e}")),
+    }
+}
+
+fn watch_response(
+    req: &Request,
+    writer: &SharedWriter,
+    watchers: &mut Vec<RecommendedWatcher>,
+) -> Response {
+    let p: WatchParams = match serde_json::from_value(req.params.clone()) {
+        Ok(p) => p,
+        Err(e) => return resp_err(req.id, format!("bad fs.watch params: {e}")),
+    };
+    match start_watch(&p.path, p.watch_id, writer.clone()) {
+        Ok(w) => {
+            watchers.push(w);
+            resp_ok(req.id, serde_json::json!({}))
+        }
+        Err(e) => resp_err(req.id, format!("fs.watch failed: {e}")),
+    }
+}
+
+/// Spawn an inotify watcher on `path` that streams `fs.event` notifications
+/// (Create/Modify/Remove only, 500 ms debounce, git-internal churn filtered).
+fn start_watch(
+    path: &str,
+    watch_id: u64,
+    writer: SharedWriter,
+) -> notify::Result<RecommendedWatcher> {
+    let mut last = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        let Ok(ev) = res else {
+            return;
+        };
+        let kind = match ev.kind {
+            EventKind::Create(_) => "create",
+            EventKind::Modify(_) => "modify",
+            EventKind::Remove(_) => "remove",
+            _ => return,
+        };
+        let paths: Vec<String> = ev
+            .paths
+            .iter()
+            .filter(|p| relevant_fs_path(p))
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        if paths.is_empty() || last.elapsed() < Duration::from_millis(500) {
+            return;
+        }
+        last = Instant::now();
+        let note = serde_json::json!({
+            "method": "fs.event",
+            "params": FsEventNote { watch_id, paths, kind: kind.to_string() },
+        });
+        write_frame(&writer, &note);
+    })?;
+    watcher.watch(Path::new(path), RecursiveMode::Recursive)?;
+    Ok(watcher)
+}
+
+/// Whether a changed path should refresh the chrome — real worktree edits, plus
+/// git *state* (refs/logs/rebase/merge/HEAD), but never the index/`*.lock`/object
+/// churn that hydration's own git reads cause (which would self-sustain a refresh
+/// loop). Mirrors `host/src/hydrate.rs::is_git_state_path`.
+fn relevant_fs_path(p: &Path) -> bool {
+    let s = p.to_string_lossy();
+    let Some(i) = s.find("/.git/") else {
+        return true; // an ordinary worktree file
+    };
+    let rest = &s[i + 6..];
+    if rest.ends_with(".lock") || rest == "index" || rest.starts_with("objects/") {
+        return false;
+    }
+    rest.starts_with("refs/")
+        || rest.starts_with("logs/")
+        || rest.starts_with("rebase")
+        || rest.starts_with("MERGE")
+        || rest.starts_with("HEAD")
+        || rest.starts_with("ORIG_HEAD")
 }
 
 fn do_exec(p: &ExecParams) -> Result<ExecResult> {
@@ -427,5 +617,50 @@ mod tests {
         drop_key(&key);
         assert!(for_loc(&loc).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proc_list_includes_this_process_cwd() {
+        let c = connect();
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let map = c.proc_list(std::slice::from_ref(&cwd)).unwrap();
+        // The test process's own cwd is under the requested path → it's counted.
+        assert!(map.contains_key(&cwd), "expected {cwd} in {map:?}");
+    }
+
+    #[test]
+    fn fs_watch_streams_create_events_and_filters_git_churn() {
+        let c = connect();
+        let dir = std::env::temp_dir().join(format!("sz-bridge-watch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        let rx = c.watch(&dir.to_string_lossy()).unwrap();
+        // Let the inotify watch initialize before mutating.
+        std::thread::sleep(Duration::from_millis(200));
+
+        std::fs::write(dir.join("hello.rs"), b"fn main(){}").unwrap();
+        let ev = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("an fs.event for the new file");
+        assert!(
+            ev.paths.iter().any(|p| p.ends_with("hello.rs")),
+            "event paths: {:?}",
+            ev.paths
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_churn_paths_are_filtered() {
+        // Pure predicate: index/lock/objects churn never refreshes; refs/logs do.
+        assert!(!relevant_fs_path(Path::new("/w/.git/index")));
+        assert!(!relevant_fs_path(Path::new("/w/.git/index.lock")));
+        assert!(!relevant_fs_path(Path::new("/w/.git/objects/ab/cd")));
+        assert!(relevant_fs_path(Path::new("/w/.git/refs/heads/main")));
+        assert!(relevant_fs_path(Path::new("/w/.git/logs/HEAD")));
+        assert!(relevant_fs_path(Path::new("/w/src/main.rs")));
     }
 }

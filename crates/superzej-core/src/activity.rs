@@ -173,6 +173,19 @@ fn poll(snap: &mut Snapshot, managed: &[ManagedWorktree], now: f64) {
     snap.worktrees = next; // worktrees gone from the caller are pruned here
 }
 
+/// Sum utime+stime jiffies for every process whose cwd is under each path —
+/// the reusable core of the activity scan. Also served over the resident bridge
+/// (`proc.list`) so a remote env's *own* processes drive the activity dots.
+/// Longest-prefix wins (a nested worktree over its repo root). Empty off Linux.
+pub fn cpu_jiffies_by_path(paths: &[String]) -> BTreeMap<String, u64> {
+    let mut targets: Vec<(PathBuf, String)> = paths
+        .iter()
+        .map(|p| (PathBuf::from(p), p.clone()))
+        .collect();
+    targets.sort_by_key(|(p, _)| std::cmp::Reverse(p.as_os_str().len()));
+    scan_proc(&targets)
+}
+
 /// Sum utime+stime jiffies per managed worktree for every process whose cwd is
 /// under it. Unreadable PIDs (races, permissions) are skipped silently.
 #[cfg(target_os = "linux")]
