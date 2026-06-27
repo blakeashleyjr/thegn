@@ -79,6 +79,8 @@ pub enum MenuChoice {
     ConfirmDeleteWorktrees { keep_files: bool },
     // delete workspace confirm: variant to capture "leave files" intent
     ConfirmDeleteWorkspace { keep_files: bool },
+    // init git confirm
+    ConfirmInitGit { path: String },
     // first-launch keymap picker (item 621): the chosen preset id
     // ("default" | "vscode" | "jetbrains").
     SetKeymapPreset(String),
@@ -659,6 +661,22 @@ pub fn undo_confirm_menu(body: impl Into<String>, redo: bool) -> MenuOverlay {
         ],
     )
     .with_body(body)
+}
+
+pub fn init_git_menu(path: String) -> MenuOverlay {
+    MenuOverlay::new(
+        MenuKindTag::Confirm,
+        format!("initialize git repository?"),
+        vec![
+            item(
+                Some('y'),
+                "initialize git repo",
+                MenuChoice::ConfirmInitGit { path: path.clone() },
+            ),
+            item(Some('n'), "cancel", MenuChoice::Dismiss),
+        ],
+    )
+    .with_body(format!("{} is not a git repository", path))
 }
 
 /// Branch actions including create + merge (the full `m`/`n` menu); merge
