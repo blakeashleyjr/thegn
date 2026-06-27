@@ -335,6 +335,12 @@ pub struct FrameModel {
     /// When `Some`, an open row context menu: (anchor visible-row index,
     /// entries, menu cursor).
     pub sidebar_menu: Option<RowMenu>,
+    /// Top visible-row index of the scroll window (clamped by `build_sidebar`
+    /// so the cursor stays in view). Mirrors `SidebarState::scroll`.
+    pub sidebar_scroll: usize,
+    /// True when the sidebar is in its slim collapsed rail mode (activity dots
+    /// + initials only); false renders the full panel.
+    pub sidebar_rail: bool,
     /// Data carriers populated by the hydration thread and consumed by the
     /// event loop to (re)derive `sidebar_rows`. The `(slug, display, kind)`
     /// workspace list in display order (`kind` = "repo" | "dir"), and
@@ -1525,6 +1531,15 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
 
 pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
     fill(surface, rect, col(S::Panel));
+    if rect.cols == 0 || rect.rows == 0 {
+        return;
+    }
+    // The slim rail is its own compact language (activity dot + initial); the
+    // full panel renders the header, the laid-out rows, metrics, and menu.
+    if model.sidebar_rail {
+        draw_sidebar_rail(surface, rect, model);
+        return;
+    }
     let accent = theme_color(model.accent_or_default());
 
     // Header: the live filter input, or the "WORKSPACES" section title — in
@@ -1552,130 +1567,29 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
         );
     }
 
-    // Only visible rows are listed; the selection index is into that subset.
-    let visible: Vec<&crate::sidebar::SidebarRow> =
-        model.sidebar_rows.iter().filter(|r| r.visible).collect();
-
-    let metrics_rows = if rect.rows > 10 && !model.metrics.targets.is_empty() {
-        6.min(rect.rows.saturating_sub(4))
-    } else {
-        0
-    };
-    let list_bottom = rect.y + rect.rows.saturating_sub(metrics_rows);
-
-    for (i, row) in visible.iter().enumerate() {
-        // +2: header row, then one blank breathing-room row.
-        let y = rect.y + 2 + i;
-        if y >= list_bottom {
-            break;
-        }
-        let selected = i == model.sidebar_selected;
-        let marked = model.sidebar_marked.contains(&i);
-        // The active worktree/tab row carries the focus-tint pill (same
-        // highlight language as the masthead's active chip), blended over the
-        // zone's panel tint so it never punches a dark hole in the surface.
-        let pill = theme_color(&theme::blend_over(&focus_rgb(), &panel_rgb(), 0.16));
-        let bg = if selected {
-            col(S::Panel2)
-        } else if row.active {
-            pill
-        } else if marked {
-            col(S::Raise)
-        } else {
-            col(S::Panel)
-        };
-        if selected || marked || row.active {
-            fill(
-                surface,
-                Rect {
-                    x: rect.x,
-                    y,
-                    cols: rect.cols,
-                    rows: 1,
-                },
-                bg,
-            );
-        }
+    // One layout pass: the renderer and the click hit-test (`sidebar_hits`)
+    // both derive geometry from `build_sidebar`, so paint and clicks can never
+    // drift apart (the same contract the panel uses via `build_panel`).
+    let frame = build_sidebar(model, rect, model.sidebar_scroll);
+    for p in &frame.rows {
+        // `draw_lines` fills the placement's full width in `bg`; every composed
+        // line begins with a 1-col gutter so the cursor bar can overpaint col 0
+        // without clobbering content.
+        crate::seg::draw_lines(
+            surface,
+            Rect {
+                x: rect.x,
+                y: p.y,
+                cols: rect.cols,
+                rows: p.height,
+            },
+            &p.lines,
+            p.bg,
+        );
         // Left-edge accent bar marks the cursor only while focused, so a stale
         // selection isn't mistaken for focus.
-        if selected && model.sidebar_focused {
-            draw_text(surface, rect.x, y, "\u{2590}", col(S::Focus), bg, 1);
-        }
-
-        let window_title = row
-            .worktree_path
-            .as_deref()
-            .and_then(|p| model.sidebar_window_titles.get(p))
-            .map(String::as_str);
-        let composed = compose_sidebar_row(row, window_title);
-        let fg = if row.active {
-            col(S::Focus)
-        } else if selected {
-            col(S::Text)
-        } else {
-            col(S::Dim)
-        };
-        draw_text(
-            surface,
-            rect.x + 1,
-            y,
-            &composed.text,
-            fg,
-            bg,
-            rect.cols.saturating_sub(1),
-        );
-        // Recolor the activity dot (item 20) in its own state color: white while
-        // the worktree is working, red when its agent is waiting for input. The
-        // dormant state draws no dot, so `activity_col` is None and we skip.
-        if let Some(dc) = composed.activity_col {
-            let dx = rect.x + 1 + dc;
-            if dx < rect.x + rect.cols {
-                draw_text(
-                    surface,
-                    dx,
-                    y,
-                    activity_dot(row.activity).trim_end(),
-                    activity_dot_color(row.activity),
-                    bg,
-                    (rect.x + rect.cols).saturating_sub(dx),
-                );
-            }
-        }
-        // Overpaint the status segment (git/agent/activity) in its own colors,
-        // right after the label, when there's room. Track the running column so
-        // badges paint after the status tail.
-        let mut col_off = composed.status_col;
-        if let Some(seg) = &composed.status {
-            let sx = rect.x + 1 + col_off;
-            if sx < rect.x + rect.cols {
-                draw_text(
-                    surface,
-                    sx,
-                    y,
-                    seg,
-                    status_seg_color(row),
-                    bg,
-                    (rect.x + rect.cols).saturating_sub(sx),
-                );
-            }
-            col_off += seg.chars().count();
-        }
-        // Badges (item 28): PR / unread / alert counts, each in its own color.
-        for badge in &composed.badges {
-            let sx = rect.x + 1 + col_off;
-            if sx >= rect.x + rect.cols {
-                break;
-            }
-            draw_text(
-                surface,
-                sx,
-                y,
-                &badge.text,
-                badge.color,
-                bg,
-                (rect.x + rect.cols).saturating_sub(sx),
-            );
-            col_off += badge.text.chars().count();
+        if p.cursor_bar {
+            draw_text(surface, rect.x, p.y, "\u{2590}", col(S::Focus), tok_col(p.bg), 1);
         }
     }
 
@@ -1684,18 +1598,218 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
         draw_row_menu(surface, rect, menu, accent);
     }
 
-    if metrics_rows > 0 {
-        draw_metrics_section(
+    if let Some(mrect) = frame.metrics {
+        draw_metrics_section(surface, mrect, model);
+    }
+}
+
+/// The slim collapsed rail: one row per visible worktree, an activity dot in
+/// its state color plus the first letter of the label — enough to spot a
+/// waiting agent at a glance without the full panel open. Headers render a
+/// faint dividing dot. `model.sidebar_scroll` keeps the cursor in view.
+fn draw_sidebar_rail(surface: &mut Surface, rect: Rect, model: &FrameModel) {
+    let frame = build_sidebar(model, rect, model.sidebar_scroll);
+    for p in &frame.rows {
+        crate::seg::draw_lines(
             surface,
             Rect {
                 x: rect.x,
-                y: rect.y + rect.rows - metrics_rows,
+                y: p.y,
                 cols: rect.cols,
-                rows: metrics_rows,
+                rows: p.height,
             },
-            model,
+            &p.lines,
+            p.bg,
         );
     }
+}
+
+/// A laid-out sidebar row: which visible-row it is, where it sits, how tall it
+/// is, and the composed line(s) + background to paint. The cursor row may be
+/// two lines tall (the expanded detail tier).
+pub(crate) struct SidebarPlacement {
+    pub visible_index: usize,
+    pub y: usize,
+    pub height: usize,
+    pub lines: Vec<crate::seg::Line>,
+    pub bg: crate::seg::Tok,
+    pub cursor_bar: bool,
+}
+
+/// The result of one sidebar layout pass: the on-screen row placements, the
+/// (clamped) scroll offset actually used, and the metrics section rect (full
+/// mode only). Pure — the renderer paints it and the mouse path hit-tests it.
+pub(crate) struct SidebarFrame {
+    pub rows: Vec<SidebarPlacement>,
+    pub scroll: usize,
+    pub metrics: Option<Rect>,
+}
+
+/// Lay out the sidebar rows for `rect`, starting from `desired_scroll` (clamped
+/// so the cursor row stays fully visible). Variable row heights (the cursor's
+/// two-tier expansion) are resolved here so render and click share one source.
+pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usize) -> SidebarFrame {
+    let rail = model.sidebar_rail;
+    let visible: Vec<&crate::sidebar::SidebarRow> =
+        model.sidebar_rows.iter().filter(|r| r.visible).collect();
+
+    // The full panel reserves a header + blank row at the top and a metrics
+    // section at the bottom; the rail uses the whole column.
+    let (head_rows, metrics_rows) = if rail {
+        (0, 0)
+    } else {
+        let m = if rect.rows > 10 && !model.metrics.targets.is_empty() {
+            6.min(rect.rows.saturating_sub(4))
+        } else {
+            0
+        };
+        (2, m)
+    };
+    let metrics = (metrics_rows > 0).then_some(Rect {
+        x: rect.x,
+        y: rect.y + rect.rows - metrics_rows,
+        cols: rect.cols,
+        rows: metrics_rows,
+    });
+    let list_y = rect.y + head_rows;
+    let list_rows = rect.rows.saturating_sub(head_rows + metrics_rows);
+    let cursor = if visible.is_empty() {
+        0
+    } else {
+        model.sidebar_selected.min(visible.len() - 1)
+    };
+
+    // Compose every visible row's line(s) + background once; the cursor row
+    // expands to a detail line when it has secondary metadata.
+    let mut composed: Vec<(Vec<crate::seg::Line>, crate::seg::Tok, bool)> =
+        Vec::with_capacity(visible.len());
+    for (i, row) in visible.iter().enumerate() {
+        let is_cursor = i == cursor;
+        // A row is the last child at its depth when the next visible row steps
+        // back up the tree (or there is none) — drives the └ vs ├ connector.
+        let is_last = visible.get(i + 1).is_none_or(|n| n.depth < row.depth);
+        let lines = if rail {
+            vec![compose_rail_line(row)]
+        } else {
+            let wt = row
+                .worktree_path
+                .as_deref()
+                .and_then(|p| model.sidebar_window_titles.get(p))
+                .map(String::as_str);
+            compose_row_lines(row, wt, is_cursor, is_last)
+        };
+        let bg = row_bg(row, i, cursor, model);
+        let cursor_bar = !rail && is_cursor && model.sidebar_focused;
+        composed.push((lines, bg, cursor_bar));
+    }
+    let heights: Vec<usize> = composed.iter().map(|(l, _, _)| l.len().max(1)).collect();
+    let scroll = clamp_sidebar_scroll(&heights, cursor, list_rows, desired_scroll);
+
+    let mut rows = Vec::new();
+    let mut y = list_y;
+    let bottom = list_y + list_rows;
+    for (i, (lines, bg, cursor_bar)) in composed.into_iter().enumerate().skip(scroll) {
+        if y >= bottom {
+            break;
+        }
+        let height = heights[i].min(bottom - y); // clip a partly-fitting tail row
+        rows.push(SidebarPlacement {
+            visible_index: i,
+            y,
+            height,
+            lines,
+            bg,
+            cursor_bar,
+        });
+        y += heights[i];
+    }
+    SidebarFrame {
+        rows,
+        scroll,
+        metrics,
+    }
+}
+
+/// Pick `scroll` (top visible-row index) so the cursor row fits fully within
+/// `list_rows`, honoring `desired` where possible. Heights are per-row (the
+/// cursor row may be 2). O(n·window) but `n` is the worktree count — tiny.
+fn clamp_sidebar_scroll(
+    heights: &[usize],
+    cursor: usize,
+    list_rows: usize,
+    desired: usize,
+) -> usize {
+    let n = heights.len();
+    if n == 0 || list_rows == 0 {
+        return 0;
+    }
+    let cursor = cursor.min(n - 1);
+    // Never scroll past the cursor (it must be at least the top row).
+    let mut scroll = desired.min(cursor);
+    loop {
+        // Walk from `scroll`; does the cursor row's last line fit in the window?
+        let mut used = 0usize;
+        let mut fits = false;
+        for (i, h) in heights.iter().enumerate().skip(scroll) {
+            if i == cursor {
+                fits = used + h <= list_rows;
+                break;
+            }
+            used += h;
+            if used >= list_rows {
+                break;
+            }
+        }
+        if fits || scroll >= cursor {
+            break;
+        }
+        scroll += 1;
+    }
+    scroll
+}
+
+/// Background token for a row: cursor selection > active worktree > multi-select
+/// mark > a recessed band for header rows (workspace/folder/terminals) > the
+/// plain panel tint for worktrees.
+fn row_bg(
+    row: &crate::sidebar::SidebarRow,
+    i: usize,
+    cursor: usize,
+    model: &FrameModel,
+) -> crate::seg::Tok {
+    use crate::seg::Tok;
+    use crate::sidebar::RowKind;
+    let header = matches!(
+        row.kind,
+        RowKind::Workspace | RowKind::TerminalsHeader | RowKind::Folder
+    );
+    if i == cursor {
+        Tok::Slot(S::Panel2)
+    } else if row.active {
+        Tok::SelAccent
+    } else if model.sidebar_marked.contains(&i) {
+        Tok::Slot(S::Raise)
+    } else if header {
+        Tok::Slot(S::Bg0)
+    } else {
+        Tok::Slot(S::Panel)
+    }
+}
+
+/// Resolve a seg color token to a concrete color (for the focus bar's bg).
+fn tok_col(t: crate::seg::Tok) -> ColorAttribute {
+    with_palette(|p| t.resolve(p))
+}
+
+/// The `(visible_index, y, height)` of each rendered sidebar row — the same
+/// `build_sidebar` pass the renderer painted, so a click resolves against
+/// what is on screen. Pure; the mouse path calls it on demand.
+pub(crate) fn sidebar_hits(model: &FrameModel, rect: Rect) -> Vec<(usize, usize, usize)> {
+    build_sidebar(model, rect, model.sidebar_scroll)
+        .rows
+        .iter()
+        .map(|p| (p.visible_index, p.y, p.height))
+        .collect()
 }
 
 fn draw_metrics_section(surface: &mut Surface, rect: Rect, model: &FrameModel) {
@@ -1787,224 +1901,229 @@ fn draw_metrics_section(surface: &mut Surface, rect: Rect, model: &FrameModel) {
     }
 }
 
-/// The text composed for a row plus where its status segment begins (so the
-/// renderer can recolor it). `text` already includes caret/connector/label and
-/// a trailing space before the status; `status` is the git/agent/activity tail.
-struct ComposedRow {
-    text: String,
-    status: Option<String>,
-    status_col: usize,
-    /// Char column of the activity dot within `text`, when the row renders one
-    /// (item 20). The renderer over-paints just this glyph in its state color.
-    activity_col: Option<usize>,
-    /// Badge segments (item 28): PR / unread / alert counts, each with its own
-    /// color, drawn after the git status tail.
-    badges: Vec<Badge>,
+/// The indent + connector segments for a tree row at `depth` (worktree = 1,
+/// folder child = 2). Two cells of indent per ancestor level, then a `└`/`├`
+/// connector in a ghost tone so the nesting is visible at a glance.
+fn tree_lead(depth: u8, is_last: bool) -> Vec<crate::seg::Seg> {
+    use crate::seg::{seg, sp, Tok};
+    let indent = (depth.saturating_sub(1)) as usize * 2;
+    let conn = if is_last { "\u{2514} " } else { "\u{251c} " }; // └ / ├
+    vec![sp(indent), seg(Tok::Slot(S::Ghost2), conn)]
 }
 
-/// A single sidebar badge segment with its own color.
-struct Badge {
-    text: String,
-    color: ColorAttribute,
+/// The activity dot glyph for a worktree row (item 20): filled `●` while active
+/// or waiting, hollow `○` once read-but-still-stuck. `None` renders nothing.
+fn activity_dot_glyph(state: crate::sidebar::ActivityState) -> &'static str {
+    use crate::sidebar::ActivityState::*;
+    match state {
+        Active | Waiting => "\u{25cf}", // ●
+        Read => "\u{25cb}",             // ○
+        None => "",
+    }
 }
 
-fn compose_sidebar_row(
+/// The activity dot color token, per state (`[theme.colors] activity_active` /
+/// `activity_waiting`). Both red states share the waiting slot — filled vs
+/// hollow is glyph-only.
+fn activity_dot_tok(state: crate::sidebar::ActivityState) -> crate::seg::Tok {
+    use crate::sidebar::ActivityState::*;
+    crate::seg::Tok::Slot(match state {
+        Active => S::ActivityActive,
+        Waiting | Read => S::ActivityWaiting,
+        None => S::Dim,
+    })
+}
+
+/// Compose the on-screen line(s) for one visible row. Headers (workspace /
+/// folder / terminals) are a single bold styled line; worktrees are a
+/// name/status split, and the cursor row (`expanded`) grows a second detail
+/// line carrying the secondary metadata (env / backend / PR / unread / disk).
+/// Every line starts with a 1-col gutter so the focus bar can overpaint col 0.
+fn compose_row_lines(
     row: &crate::sidebar::SidebarRow,
     window_title: Option<&str>,
-) -> ComposedRow {
-    use crate::sidebar::RowKind;
-    let mut text = String::new();
-    let mut activity_col = None;
+    expanded: bool,
+    is_last: bool,
+) -> Vec<crate::seg::Line> {
+    use crate::seg::{seg, sp, Line, Seg, Tok};
+    use crate::sidebar::{ActivityState, RowKind};
+    let caret = |collapsed: bool| {
+        if collapsed {
+            "\u{25b8}" // ▸
+        } else {
+            "\u{25be}" // ▾
+        }
+    };
 
     match row.kind {
-        RowKind::Folder => {
-            text.push_str("  ");
-            let caret = if row.collapsed {
-                "\u{25b8}"
-            } else {
-                "\u{25be}"
-            };
-            text.push_str(caret);
-            text.push(' ');
-            text.push_str("\u{1f4c2} "); // open folder glyph
-            text.push_str(&row.label);
-        }
         RowKind::Workspace | RowKind::TerminalsHeader => {
-            let caret = if row.collapsed {
-                "\u{25b8}"
-            } else {
-                "\u{25be}"
-            };
-            text.push_str(caret);
-            text.push(' ');
+            let mut l = vec![
+                sp(1),
+                seg(Tok::Slot(S::Faint), caret(row.collapsed)),
+                sp(1),
+            ];
             // A non-git "dir" workspace gets a folder glyph so it reads
             // differently from a repo workspace.
             if row.dir {
-                text.push_str("\u{1f4c1} ");
+                l.push(seg(Tok::Slot(S::Text), "\u{1f4c1} "));
             }
-            text.push_str(&row.label);
+            l.push(seg(Tok::Slot(S::Text), row.label.clone()).bold());
+            vec![Line::Segs(l)]
         }
+        RowKind::Folder => vec![Line::Segs(vec![
+            sp(1),
+            sp(2),
+            seg(Tok::Slot(S::Faint), caret(row.collapsed)),
+            sp(1),
+            seg(Tok::Slot(S::Dim), "\u{1f4c2} "), // 📂
+            seg(Tok::Slot(S::Text), row.label.clone()).bold(),
+        ])],
         RowKind::Terminal => {
-            text.push_str("  ");
-            // Render terminal with a distinct visual language
-            if let Some(loc) = &row.terminal_connection {
-                if loc.starts_with("ssh") {
-                    text.push_str("🌐 ");
-                } else if loc.starts_with("mosh") {
-                    text.push_str("🚀 ");
-                } else {
-                    text.push_str("💻 ");
-                }
-            } else {
-                text.push_str("💻 ");
-            }
-            text.push_str(&row.label);
+            let glyph = match row.terminal_connection.as_deref() {
+                Some(c) if c.starts_with("ssh") => "\u{1f310} ", // 🌐
+                Some(c) if c.starts_with("mosh") => "\u{1f680} ", // 🚀
+                _ => "\u{1f4bb} ",                               // 💻
+            };
+            let mut l = vec![sp(1)];
+            l.extend(tree_lead(row.depth, is_last));
+            l.push(seg(Tok::Slot(S::Dim), glyph));
+            l.push(seg(Tok::Slot(S::Dim), row.label.clone()));
+            vec![Line::Segs(l)]
         }
         RowKind::Worktree => {
-            text.push_str("  ");
-            let dot = activity_dot(row.activity);
-            if !dot.is_empty() {
-                activity_col = Some(text.chars().count());
+            // Left cluster: gutter, tree connector, activity dot (own color),
+            // the dynamic name, then the agent glyph.
+            let mut left = vec![sp(1)];
+            left.extend(tree_lead(row.depth, is_last));
+            if matches!(row.activity, ActivityState::None) {
+                left.push(sp(2)); // keep names aligned with dotted rows
+            } else {
+                left.push(seg(activity_dot_tok(row.activity), activity_dot_glyph(row.activity)));
+                left.push(sp(1));
             }
-            text.push_str(dot);
-            // Dynamic title: `[PR: <n> | <window-title>]`, else the window
-            // title, else the branch (`row.label`). See `compose_row_label`.
-            text.push_str(&crate::sidebar::compose_row_label(
-                row.pr_number,
-                window_title,
-                &row.label,
-            ));
+            let name_fg = if row.active {
+                Tok::Slot(S::Focus)
+            } else if expanded {
+                Tok::Slot(S::Text)
+            } else {
+                Tok::Slot(S::Dim)
+            };
+            let label =
+                crate::sidebar::compose_row_label(row.pr_number, window_title, &row.label);
+            left.push(seg(name_fg, label));
+            if let Some(agent) = &row.agent {
+                left.push(seg(
+                    Tok::Hue(theme::Hue::Teal),
+                    format!(" {}", superzej_core::theme::agent_glyph(agent)),
+                ));
+            }
+
+            // Right cluster (always-on): git status + the alert badge. PR /
+            // unread / disk move to the expanded detail line to de-crowd.
+            let mut right: Vec<Seg> = Vec::new();
+            let push_sp = |v: &mut Vec<Seg>| {
+                if !v.is_empty() {
+                    v.push(sp(1));
+                }
+            };
+            if let Some(g) = row.git {
+                if g.dirty {
+                    right.push(seg(Tok::Hue(theme::Hue::Amber), "\u{25cf}")); // ●
+                }
+                if g.ahead > 0 {
+                    push_sp(&mut right);
+                    right.push(seg(Tok::Slot(S::Dim), format!("\u{2191}{}", g.ahead))); // ↑N
+                }
+                if g.behind > 0 {
+                    push_sp(&mut right);
+                    right.push(seg(Tok::Slot(S::Dim), format!("\u{2193}{}", g.behind))); // ↓N
+                }
+            }
+            if row.alert_count > 0 {
+                push_sp(&mut right);
+                right.push(seg(Tok::Hue(theme::Hue::Red), format!("\u{26a0}{}", row.alert_count)));
+                // ⚠N
+            }
+
+            let mut lines = vec![if right.is_empty() {
+                Line::Segs(left)
+            } else {
+                Line::Split { l: left, r: right }
+            }];
+            if expanded
+                && let Some(detail) = compose_detail_line(row)
+            {
+                lines.push(detail);
+            }
+            lines
         }
     }
+}
 
-    // A non-default execution environment badges before the backend, so a
-    // worktree pinned to `company-k8s`/`datonya`/etc. is visible at a glance.
+/// The expanded cursor row's second line: the secondary metadata that would
+/// crowd the always-on row — execution env, sandbox backend, open PRs, unread
+/// notifications, and disk size. `None` when the row has nothing extra to show.
+fn compose_detail_line(row: &crate::sidebar::SidebarRow) -> Option<crate::seg::Line> {
+    use crate::seg::{seg, sp, Line, Seg, Tok};
+    // Gutter + indent so the detail reads as hanging under the name.
+    let mut segs: Vec<Seg> = vec![sp(5)];
+    let start = segs.len();
+
     if let Some(env) = &row.env_name
         && !env.is_empty()
         && env != "default"
     {
-        text.push_str(&format!(" «{env}»"));
+        segs.push(seg(Tok::Slot(S::Faint), format!("\u{ab}{env}\u{bb} ")));
     }
-
-    // Agent glyph (item 19) sits just after the label.
     if let Some(backend) = &row.sandbox_backend
         && !backend.is_empty()
         && backend != "none"
         && backend != "host"
     {
-        text.push_str(&format!(" ({backend})"));
+        segs.push(seg(Tok::Slot(S::Faint), format!("({backend}) ")));
     }
-
-    if let Some(agent) = &row.agent {
-        text.push(' ');
-        text.push_str(&superzej_core::theme::agent_glyph(agent));
-    }
-
-    // Git glyphs (item 18) form the recolored status tail.
-    let status = row.git.map(|g| {
-        let mut s = String::new();
-        if g.dirty {
-            s.push_str(" \u{25cf}"); // ●
-        }
-        if g.ahead > 0 {
-            s.push_str(&format!(" \u{2191}{}", g.ahead)); // ↑N
-        }
-        if g.behind > 0 {
-            s.push_str(&format!(" \u{2193}{}", g.behind)); // ↓N
-        }
-        s
-    });
-    let status = status.filter(|s| !s.is_empty());
-    let status_col = text.chars().count();
-    let badges = compose_badges(row);
-    ComposedRow {
-        text,
-        status,
-        status_col,
-        activity_col,
-        badges,
-    }
-}
-
-/// Build the per-row badge segments (item 28): open PRs, unread notifications,
-/// and alerts. Only non-zero counts render. Each badge is a glyph + count and
-/// carries its own color so the renderer can paint them distinctly.
-fn compose_badges(row: &crate::sidebar::SidebarRow) -> Vec<Badge> {
-    let mut badges = Vec::new();
-    // PR badge: open PRs for this worktree's branch (green = good state).
     if let Some(pr) = row.pr_count.filter(|&c| c > 0) {
-        badges.push(Badge {
-            text: format!(" \u{2b21}{pr}"), // ⬡N
-            color: theme_color(theme::GREEN),
-        });
+        segs.push(seg(Tok::Hue(theme::Hue::Green), format!("\u{2b21}{pr} "))); // ⬡N
     }
-    // Unread badge: unread notifications (blue = informational).
     if row.unread_count > 0 {
-        badges.push(Badge {
-            text: format!(" \u{2709}{}", row.unread_count), // ✉N
-            color: theme_color(theme::BLUE),
-        });
+        segs.push(seg(Tok::Hue(theme::Hue::Blue), format!("\u{2709}{} ", row.unread_count)));
+        // ✉N
     }
-    // Alert badge: test failures, agent failures, log errors (red = action).
-    if row.alert_count > 0 {
-        badges.push(Badge {
-            text: format!(" \u{26a0}{}", row.alert_count), // ⚠N
-            color: theme_color(theme::RED),
-        });
-    }
-    // Disk-size badge (item 152/413): the worktree's size, dim by default and
-    // amber when the reclaimable `target/` dominates (>1 GiB and >half the
-    // total) — a nudge that `superzej clean` would recover real space. Only
-    // populated when the off-loop disk scan has run (i.e. `[disk].show_sizes`).
     if let Some(total) = row.disk_bytes {
         let target = row.target_bytes.unwrap_or(0);
         let heavy = target > 1024 * 1024 * 1024 && target * 2 > total;
-        badges.push(Badge {
-            text: format!(" {}", superzej_core::disk::human(total)),
-            color: if heavy {
-                theme_color(theme::AMBER)
+        let fg = if heavy {
+            Tok::Hue(theme::Hue::Amber)
+        } else {
+            Tok::Slot(S::Dim)
+        };
+        segs.push(seg(fg, superzej_core::disk::human(total)));
+    }
+
+    (segs.len() > start).then_some(Line::Segs(segs))
+}
+
+/// The slim-rail line for one row: a colored activity dot (or a faint marker
+/// for headers) plus the label's first letter, fitted to the rail's ~4 cols.
+fn compose_rail_line(row: &crate::sidebar::SidebarRow) -> crate::seg::Line {
+    use crate::seg::{seg, sp, Line, Tok};
+    use crate::sidebar::{ActivityState, RowKind};
+    match row.kind {
+        RowKind::Worktree => {
+            let dot = if matches!(row.activity, ActivityState::None) {
+                seg(Tok::Slot(S::Ghost2), "\u{00b7}") // · placeholder keeps the column
             } else {
-                theme_color(theme::DIM)
-            },
-        });
-    }
-    badges
-}
-
-/// The activity dot prefix for a worktree row (item 20), recolored at render by
-/// [`activity_dot_color`]: `Active` (worktree busy / agent working) is a filled
-/// white ●; `Waiting` (idle — agent stuck, unread) is a filled red ●; `Read`
-/// (the user has seen it but it is still stuck) is a hollow red ○; dormant
-/// (`None`) shows nothing.
-fn activity_dot(state: crate::sidebar::ActivityState) -> &'static str {
-    use crate::sidebar::ActivityState::*;
-    match state {
-        Active => "\u{25cf} ",  // ●
-        Waiting => "\u{25cf} ", // ●
-        Read => "\u{25cb} ",    // ○
-        None => "",
-    }
-}
-
-/// The color the activity dot is over-painted in, per state (configurable via
-/// `[theme.colors] activity_active` / `activity_waiting`). Both red states share
-/// the `activity_waiting` slot — filled vs hollow is glyph-only. `None` never draws.
-fn activity_dot_color(state: crate::sidebar::ActivityState) -> ColorAttribute {
-    use crate::sidebar::ActivityState::*;
-    match state {
-        Active => col(S::ActivityActive),
-        Waiting | Read => col(S::ActivityWaiting),
-        None => col(S::Dim),
-    }
-}
-
-fn status_seg_color(row: &crate::sidebar::SidebarRow) -> ColorAttribute {
-    // Dirty dominates the tail color; otherwise neutral-dim and the ↑↓ read
-    // fine. (Per-glyph coloring is a later refinement.)
-    match row.git {
-        Some(g) if g.dirty => theme_color(theme::AMBER),
-        Some(g) if g.ahead > 0 || g.behind > 0 => col(S::Dim),
-        _ => col(S::Dim),
+                seg(activity_dot_tok(row.activity), activity_dot_glyph(row.activity))
+            };
+            let initial: String = row.label.chars().next().map(|c| c.to_string()).unwrap_or_default();
+            let fg = if row.active {
+                Tok::Slot(S::Focus)
+            } else {
+                Tok::Slot(S::Dim)
+            };
+            Line::Segs(vec![sp(1), dot, sp(1), seg(fg, initial)])
+        }
+        _ => Line::Segs(vec![sp(1), seg(Tok::Slot(S::Faint), "\u{2500}")]), // ─ header marker
     }
 }
 
@@ -2704,6 +2823,9 @@ mod tests {
         wt.alert_count = 1;
         let model = FrameModel {
             sidebar_rows: vec![ws, wt],
+            // Select the worktree so its two-tier detail line (PR/unread)
+            // expands; the alert badge is always-on on the primary line.
+            sidebar_selected: 1,
             ..Default::default()
         };
         let mut s = Surface::new(40, 6);
@@ -2732,6 +2854,8 @@ mod tests {
         wt.target_bytes = Some(60 * 1024 * 1024 * 1024);
         let model = FrameModel {
             sidebar_rows: vec![ws, wt],
+            // The disk size rides the expanded detail line of the selected row.
+            sidebar_selected: 1,
             ..Default::default()
         };
         let mut s = Surface::new(40, 6);
@@ -2877,6 +3001,128 @@ mod tests {
         // The dir workspace carries the folder glyph; the repo one does not.
         assert!(text.contains('\u{1f4c1}'), "dir folder glyph 📁: {text:?}");
         assert!(text.contains("scratch") && text.contains("repo-ws"));
+    }
+
+    /// A tall sidebar with one workspace + several worktrees; `n` rows total.
+    fn many_rows(n: usize) -> Vec<crate::sidebar::SidebarRow> {
+        use crate::sidebar::RowKind;
+        let mut rows = vec![row(RowKind::Workspace, "app")];
+        for i in 0..n {
+            rows.push(row(RowKind::Worktree, &format!("wt{i}")));
+        }
+        rows
+    }
+
+    #[test]
+    fn build_sidebar_and_click_hit_test_round_trip() {
+        // Every rendered row's [y, y+height) maps back to its own visible index
+        // via `sidebar_hits` — the contract that keeps clicks aligned with paint
+        // even when the cursor row expands to two lines.
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 40,
+            rows: 12,
+        };
+        let mut rows = many_rows(4);
+        // Give the selected worktree (visible index 2) secondary metadata so it
+        // expands to a 2-row placement.
+        rows[2].disk_bytes = Some(1024);
+        let model = FrameModel {
+            sidebar_rows: rows,
+            sidebar_selected: 2,
+            sidebar_focused: true,
+            ..Default::default()
+        };
+        let frame = build_sidebar(&model, rect, model.sidebar_scroll);
+        // The cursor row is two lines tall; every other row is one.
+        let cursor_row = frame.rows.iter().find(|p| p.visible_index == 2).unwrap();
+        assert_eq!(cursor_row.height, 2, "selected row with detail expands");
+        assert!(cursor_row.cursor_bar, "focused cursor draws the bar");
+
+        let hits = sidebar_hits(&model, rect);
+        for p in &frame.rows {
+            for dy in 0..p.height {
+                let found = hits
+                    .iter()
+                    .find(|(_, y, h)| (p.y + dy) >= *y && (p.y + dy) < *y + *h)
+                    .map(|(i, _, _)| *i);
+                assert_eq!(
+                    found,
+                    Some(p.visible_index),
+                    "click on row {} line {dy} resolves to itself",
+                    p.visible_index
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_sidebar_scrolls_to_keep_cursor_visible() {
+        // More rows than fit: the selected row must always be laid out, no
+        // matter how far down it is (the old renderer left it unreachable).
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 30,
+            rows: 6, // header + blank leaves ~4 list rows
+        };
+        let rows = many_rows(20);
+        for sel in [0usize, 5, 12, 20] {
+            let model = FrameModel {
+                sidebar_rows: rows.clone(),
+                sidebar_selected: sel,
+                ..Default::default()
+            };
+            let frame = build_sidebar(&model, rect, model.sidebar_scroll);
+            assert!(
+                frame.rows.iter().any(|p| p.visible_index == sel),
+                "selected row {sel} is rendered (scroll={})",
+                frame.scroll
+            );
+        }
+    }
+
+    #[test]
+    fn clamp_sidebar_scroll_keeps_cursor_in_window() {
+        // Uniform 1-row heights, a 4-row window.
+        let heights = vec![1usize; 10];
+        // Cursor at top → no scroll.
+        assert_eq!(clamp_sidebar_scroll(&heights, 0, 4, 0), 0);
+        // Cursor below the window → scroll just enough to show it at the bottom.
+        assert_eq!(clamp_sidebar_scroll(&heights, 6, 4, 0), 3);
+        // A desired scroll above the cursor is pulled back so the cursor shows.
+        assert_eq!(clamp_sidebar_scroll(&heights, 2, 4, 8), 2);
+        // Degenerate inputs never panic.
+        assert_eq!(clamp_sidebar_scroll(&[], 0, 4, 0), 0);
+        assert_eq!(clamp_sidebar_scroll(&heights, 0, 0, 0), 0);
+    }
+
+    #[test]
+    fn rail_mode_renders_dots_not_full_rows() {
+        use crate::sidebar::{ActivityState, RowKind};
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 4,
+            rows: 8,
+        };
+        let mut wt = row(RowKind::Worktree, "feature");
+        wt.activity = ActivityState::Active;
+        let model = FrameModel {
+            sidebar_rows: vec![row(RowKind::Workspace, "app"), wt],
+            sidebar_rail: true,
+            ..Default::default()
+        };
+        let mut s = Surface::new(4, 8);
+        draw_sidebar(&mut s, rect, &model);
+        let text = s.screen_chars_to_string();
+        // The rail shows the activity dot + the worktree's initial, but not the
+        // full label or the "WORKSPACES" header.
+        assert!(text.contains('\u{25cf}'), "rail activity dot ●: {text:?}");
+        assert!(text.contains('f'), "rail worktree initial: {text:?}");
+        assert!(!text.contains("WORKSPACES"), "rail omits the header: {text:?}");
+        assert!(!text.contains("feature"), "rail omits full labels: {text:?}");
     }
 
     #[test]
