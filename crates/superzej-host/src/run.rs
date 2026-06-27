@@ -10,16 +10,17 @@
 
 use anyhow::{Context, Result};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
-use std::path::Path;
+use superzej_core::acp::methods::SessionUpdateEvent;
 
+use std::path::Path;
 use tokio::sync::mpsc as tokio_mpsc;
-use tokio::task;
 
 use termwiz::caps::Capabilities;
 use termwiz::input::{InputEvent, KeyCode, Modifiers};
 use termwiz::surface::{Change, Position, Surface};
 use termwiz::terminal::buffered::BufferedTerminal;
 use termwiz::terminal::{Terminal, TerminalWaker, new_terminal};
+use tokio::task;
 
 use crate::chrome::{FrameModel, LoadStep, render_tab};
 use crate::compositor::Rect;
@@ -619,6 +620,8 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // panel audit log re-renders.
     let _ = sandbox_event_rx; // placeholder until wired into event_loop
 
+    let (acp_tx, mut acp_rx) = tokio_mpsc::unbounded_channel::<superzej_core::event_bus::Event>();
+
     // Notification event bus (items 420/421/430): aggregates git/agent/test/log
     // events and feeds desktop notifications + the in-app inbox + sidebar badges.
     // The desktop dispatcher reads the bus' desktop channel on its own thread.
@@ -689,6 +692,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         container_rx,
         metrics_rx,
         ai_metrics_rx,
+        acp_rx,
         stats_interval_ms,
         stats_live,
         waker,
@@ -6206,12 +6210,40 @@ fn attach_agent_pane(
     tab_name: &str,
     spec: &crate::agent::LaunchSpec,
     center: Rect,
+    event_bus: &superzej_core::event_bus::EventBus,
+    waker: &TerminalWaker,
 ) -> bool {
     let Some(gi) = session.worktrees.iter().position(|g| g.name == tab_name) else {
         return false;
     };
     let cwd = spec.cwd.clone();
-    match panes.spawn_argv_env(&spec.argv, cwd.as_deref(), &spec.env, center) {
+    let mut env = spec.env.clone();
+
+    // Attempt to bind an ephemeral port for ACP
+    let acp_port = match std::net::TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => {
+            let port = listener.local_addr().map(|addr| addr.port()).unwrap_or(0);
+            if port > 0 {
+                // The pi fork extension will look for this flag in argv or env
+                env.push(("ACP_PORT".to_string(), port.to_string()));
+                Some(port)
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    };
+
+    // If pi is spawned, we'll append --acp-port=PORT to argv
+    let mut argv = spec.argv.clone();
+    if let Some(port) = acp_port {
+        // Find if this is pi and add the flag
+        if argv.iter().any(|arg| arg.contains("pi")) {
+            argv.push(format!("--acp-port={}", port));
+        }
+    }
+
+    match panes.spawn_argv_env(&argv, cwd.as_deref(), &env, center) {
         Ok(id) => {
             // Reap any panes the group's active tab already had, then back it
             // with the agent pane.
@@ -6225,6 +6257,90 @@ fn attach_agent_pane(
             }
             tab.center = crate::center::CenterTree::Leaf(id);
             tab.focused_pane = id;
+
+            // Connect to ACP in the background if a port was assigned
+            if let Some(port) = acp_port {
+                let bus_clone = event_bus.clone();
+                let waker_clone = waker.clone();
+                let wt_name = g.path.clone();
+
+                tokio::spawn(async move {
+                    // Give the agent a moment to bind its ACP server
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+                    match superzej_svc::acp::client::AcpClient::connect(port).await {
+                        Ok((client, mut rx)) => {
+                            let client = std::sync::Arc::new(client);
+                            // Negotiate capabilities immediately
+                            if let Err(e) = client.initialize().await {
+                                tracing::error!("ACP initialize failed: {}", e);
+                            }
+
+                            // Listen for agent streaming updates and pipe them to the EventBus
+                            while let Some(msg) = rx.recv().await {
+                                // TODO: Match on the msg enum and convert it to JsonRpcMessage for AcpMessage
+                                // or define a more specific Event type.
+                                match msg {
+                                    superzej_svc::acp::client::AcpInbound::SessionUpdate(update) => {
+                                        // Package it in a dummy notification for now or extend EventBus
+                                        let dummy = superzej_core::acp::types::JsonRpcMessage::Notification(
+                                            superzej_core::acp::types::Notification {
+                                                jsonrpc: "2.0".into(),
+                                                method: "session/update".into(),
+                                                params: serde_json::to_value(update).ok(),
+                                            }
+                                        );
+                                        bus_clone.publish(&superzej_core::event_bus::Event::AcpMessage {
+                                            worktree: wt_name.clone(),
+                                            message: dummy,
+                                        });
+                                    }
+                                    superzej_svc::acp::client::AcpInbound::TerminalCreateRequest { id, command, cwd, env } => {
+                                        // Send the request down the event bus
+                                        let dummy = superzej_core::acp::types::JsonRpcMessage::Request(
+                                            superzej_core::acp::types::Request {
+                                                jsonrpc: "2.0".into(),
+                                                id,
+                                                method: "terminal/create".into(),
+                                                params: serde_json::to_value(serde_json::json!({
+                                                    "command": command,
+                                                    "cwd": cwd,
+                                                    "env": env
+                                                })).ok(),
+                                            }
+                                        );
+                                        bus_clone.publish(&superzej_core::event_bus::Event::AcpMessage {
+                                            worktree: wt_name.clone(),
+                                            message: dummy,
+                                        });
+                                    }
+                                    superzej_svc::acp::client::AcpInbound::FsReadRequest { id, path } => {
+                                        // Send down event bus
+                                        let dummy = superzej_core::acp::types::JsonRpcMessage::Request(
+                                            superzej_core::acp::types::Request {
+                                                jsonrpc: "2.0".into(),
+                                                id,
+                                                method: "fs/read_text_file".into(),
+                                                params: serde_json::to_value(serde_json::json!({ "path": path })).ok(),
+                                            }
+                                        );
+                                        bus_clone.publish(&superzej_core::event_bus::Event::AcpMessage {
+                                            worktree: wt_name.clone(),
+                                            message: dummy,
+                                        });
+                                    }
+                                    _ => {}
+                                }
+                                let _ = waker_clone.wake();
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to connect to agent ACP port {}: {}", port, e);
+                        }
+                    }
+                });
+            }
+
             true
         }
         Err(e) => {
@@ -6459,6 +6575,7 @@ async fn event_loop<T: Terminal>(
     mut container_rx: tokio_mpsc::UnboundedReceiver<Vec<superzej_core::sandbox::ContainerInfo>>,
     mut metrics_rx: tokio_mpsc::UnboundedReceiver<crate::metrics::MetricsState>,
     mut ai_metrics_rx: tokio_mpsc::UnboundedReceiver<crate::chrome::AiMetrics>,
+    mut acp_rx: tokio_mpsc::UnboundedReceiver<superzej_core::event_bus::Event>,
     stats_interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stats_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
     waker: TerminalWaker,
@@ -8641,6 +8758,13 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
 
+        // Consume inbound ACP JSON-RPC messages and events from agents
+        while let Ok(event) = acp_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
+            event_bus.publish(&event);
+            dirty = true;
+        }
+
         // Fresh metrics readings from the scrape supervisor (sidebar section).
         while let Ok(state) = metrics_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Metrics);
@@ -8781,6 +8905,8 @@ async fn event_loop<T: Terminal>(
                         &payload.tab,
                         &payload.spec,
                         chrome.center,
+                        &event_bus,
+                        &waker,
                     ) {
                         focus.zone = crate::focus::Zone::Center;
                         let backend = &payload.spec.backend;
