@@ -24,6 +24,10 @@ futures.workspace = true
 # Resident-bridge `fs.watch`: inotify in the env, streamed to the host. Matches
 # the host's pin so the workspace resolves one version.
 notify = "6"
+# ACP client transport (newline-JSON over TCP) + request/reply plumbing.
+tokio-util = { version = "0.7.18", features = ["codec"] }
+futures-channel = "0.3.32"
+futures-util = "0.3.32"
 
 [dev-dependencies]
 criterion.workspace = true

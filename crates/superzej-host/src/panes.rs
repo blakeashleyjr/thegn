@@ -596,8 +596,8 @@ mod tests {
 
     #[test]
     fn relayout_skips_panes_hidden_behind_a_fullscreen_panel() {
-        // SAFETY: single-threaded test setup.
-        unsafe { std::env::set_var("SHELL", "/bin/sh") };
+        // Spawned panes read SHELL; pin it to one that exists, restored on drop.
+        let _env = crate::testenv::EnvVarGuard::set(&[("SHELL", "/bin/sh")]);
         let mut session = one_tab_session();
         let chrome = layout::compute(160, 40, true, true);
         let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
@@ -685,9 +685,9 @@ mod tests {
 
     #[test]
     fn toggle_drawer_spawns_and_closes_drawer_pane() {
-        // The test spawns a drawer, which reads SHELL. Force it to something that exists.
-        // SAFETY: single-threaded test setup.
-        unsafe { std::env::set_var("SHELL", "/bin/sh") };
+        // The test spawns a drawer, which reads SHELL. Pin it to one that
+        // exists, under the env guard so it's restored on drop.
+        let _env = crate::testenv::EnvVarGuard::set(&[("SHELL", "/bin/sh")]);
         let mut session = one_tab_session();
         let chrome = layout::compute(160, 40, true, true);
 
@@ -814,8 +814,8 @@ mod tests {
 
     #[test]
     fn spawn_records_time_and_forget_clears_it() {
-        // SAFETY: single-threaded test.
-        unsafe { std::env::set_var("SHELL", "/bin/sh") };
+        // Spawned panes read SHELL; pin it to one that exists, restored on drop.
+        let _env = crate::testenv::EnvVarGuard::set(&[("SHELL", "/bin/sh")]);
         let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
         let mut panes = Panes::new(tx);
         let chrome = layout::compute(80, 24, false, false);

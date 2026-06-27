@@ -1,0 +1,15 @@
+{
+  "name": "superzej-acp-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "superzej's pi package: the ACP bridge extension (superzej-acp.ts) + the superzej-house skill. pi (>=0.80) bundles @earendil-works/pi-coding-agent and resolves it for the extension at load time, so NO install is required to run; the dependency is declared only for editor type-checking. By default the extension is additive — it observes via session/update, routes the model via the proxy, and exposes superzej's house tools via MCP-over-ACP, leaving pi's built-in tools in-process. Under SUPERZEJ_BOUNCER=1 it also overrides bash/read/edit/write to route over ACP so superzej runs them in a sealed sandbox behind an allow/deny gate, and (when SUPERZEJ_PROXY_UNIX is set) routes the model proxy over a bind-mounted unix socket for a full network seal.",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./superzej-acp.ts"],
+    "skills": ["./skills"]
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.0"
+  }
+}

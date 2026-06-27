@@ -76,6 +76,63 @@ pub fn wake_storm_limit() -> f64 {
         .unwrap_or(20.0)
 }
 
+/// PTY chunks/sec above which a *foreground* wake storm (a pane flooding the
+/// loop with output) is worth a distinct warning. Set high relative to
+/// [`wake_storm_limit`] because steady terminal output is normal and expected;
+/// only a genuinely runaway pane should trip it (`SUPERZEJ_PERF_PTY_LIMIT`,
+/// default 200).
+pub fn pty_storm_limit() -> f64 {
+    std::env::var("SUPERZEJ_PERF_PTY_LIMIT")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(200.0)
+}
+
+/// How a wake storm is attributed, so the rollup can warn accurately instead of
+/// blaming whichever *background* source happened to rank highest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeStorm {
+    /// Loop is doing real work, or the wake rate is within budget — no warning.
+    None,
+    /// A background producer keeps pulsing an idle loop (the diff-watcher
+    /// `.git/` storm class). Attributed to `hot_source`.
+    Background,
+    /// Foreground pane output is flooding the loop (a runaway pane), past the
+    /// PTY-specific limit. Not the same problem as a background storm.
+    Pty,
+}
+
+/// Classify the wake-storm condition for the rollup warning. Pure (so it is
+/// unit-tested), keyed on the same idle gate as before but PTY-aware:
+/// [`LoopPerf::hot_source`] deliberately ignores PTY (it answers "which
+/// *background* producer is loudest"), so warning on it alone misattributes
+/// pure terminal output to the runner-up. Here we compare the foreground PTY
+/// traffic against the top background source and only treat PTY as a storm when
+/// it genuinely dominates *and* exceeds the (high) PTY limit.
+pub fn classify_wake_storm(
+    idle_ratio: f64,
+    wakes_per_s: f64,
+    pty_chunks_per_s: f64,
+    hot_items_per_s: f64,
+    wake_limit: f64,
+    pty_limit: f64,
+) -> WakeStorm {
+    if idle_ratio <= 0.95 || wakes_per_s <= wake_limit {
+        return WakeStorm::None;
+    }
+    if pty_chunks_per_s >= hot_items_per_s {
+        // PTY is the real driver: steady output is fine, only flag a runaway.
+        if pty_chunks_per_s > pty_limit {
+            WakeStorm::Pty
+        } else {
+            WakeStorm::None
+        }
+    } else {
+        WakeStorm::Background
+    }
+}
+
 /// Per-frame compose+flush budget in microseconds. A rollup whose median frame
 /// exceeds this warns (the slow-frame guard), independent of wake count — the
 /// signal the old idle-ratio/wake-count storm warning could never see. Default
@@ -710,18 +767,36 @@ impl LoopPerf {
             }
         }
 
-        // Wake storm: loop is essentially idle (doing no real work) yet a
-        // background source keeps pulsing the waker — exactly the diff-watcher
-        // `.git/` storm this codebase has hit. WARN shows at the default level.
-        if snap.idle_ratio > 0.95 && snap.wakes_per_s > wake_storm_limit() {
-            tracing::warn!(
+        // Wake storm: loop is essentially idle (doing no real work) yet the
+        // waker keeps pulsing. Attribute it honestly — a background producer
+        // (the diff-watcher `.git/` storm class) versus a pane flooding the loop
+        // with output — instead of always blaming the top background source.
+        // `pty_chunks_per_s` is included in both lines so the picture is never
+        // ambiguous. WARN shows at the default level.
+        match classify_wake_storm(
+            snap.idle_ratio,
+            snap.wakes_per_s,
+            snap.pty_chunks_per_s,
+            snap.hot_items_per_s,
+            wake_storm_limit(),
+            pty_storm_limit(),
+        ) {
+            WakeStorm::Background => tracing::warn!(
                 target: "szhost::perf",
                 wakes_per_s = snap.wakes_per_s,
+                pty_chunks_per_s = snap.pty_chunks_per_s,
                 hot_source = snap.hot_source,
                 hot_items_per_s = snap.hot_items_per_s,
                 "wake storm while idle: {} dominating",
                 snap.hot_source
-            );
+            ),
+            WakeStorm::Pty => tracing::warn!(
+                target: "szhost::perf",
+                wakes_per_s = snap.wakes_per_s,
+                pty_chunks_per_s = snap.pty_chunks_per_s,
+                "wake storm: pane output flooding the loop"
+            ),
+            WakeStorm::None => {}
         }
 
         // Slow-frame guard: the median frame blew the compose+flush budget. Keys
@@ -753,6 +828,58 @@ mod tests {
     // The master switch is process-global; serialize the two tests that flip it
     // so cargo's parallel test threads don't clobber each other's state.
     static TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // Fixed limits matching the production defaults so the cases read clearly.
+    const WAKE: f64 = 20.0;
+    const PTY: f64 = 200.0;
+
+    #[test]
+    fn busy_loop_never_storms() {
+        // High wakes but the loop is actually working (low idle_ratio) ⇒ no warn.
+        assert_eq!(
+            classify_wake_storm(0.50, 80.0, 80.0, 1.0, WAKE, PTY),
+            WakeStorm::None
+        );
+    }
+
+    #[test]
+    fn pty_driven_idle_wakes_are_not_a_background_storm() {
+        // The real-world false positive: ~76 wakes/s, idle, but PTY output is the
+        // driver (pty_chunks ≈ wakes) and the top background source is tiny. This
+        // must NOT warn as "Refresh/Model dominating", and ~76/s is below the
+        // (high) PTY runaway limit, so it must not warn at all.
+        assert_eq!(
+            classify_wake_storm(0.97, 76.0, 76.0, 1.2, WAKE, PTY),
+            WakeStorm::None
+        );
+    }
+
+    #[test]
+    fn runaway_pane_trips_the_pty_storm() {
+        // A pane truly flooding the loop (past the PTY limit) is still surfaced,
+        // but labeled as PTY — not blamed on a background source.
+        assert_eq!(
+            classify_wake_storm(0.97, 350.0, 350.0, 2.0, WAKE, PTY),
+            WakeStorm::Pty
+        );
+    }
+
+    #[test]
+    fn genuine_background_storm_still_warns_with_correct_source() {
+        // The diff-watcher `.git/` storm: background source dominates, PTY quiet.
+        assert_eq!(
+            classify_wake_storm(0.99, 60.0, 0.5, 55.0, WAKE, PTY),
+            WakeStorm::Background
+        );
+    }
+
+    #[test]
+    fn wake_rate_within_budget_never_storms() {
+        assert_eq!(
+            classify_wake_storm(0.99, 10.0, 0.0, 9.0, WAKE, PTY),
+            WakeStorm::None
+        );
+    }
 
     #[test]
     fn histo_percentiles_are_monotonic_and_bounded() {

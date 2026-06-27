@@ -393,6 +393,28 @@ pub struct LlmProxyConfig {
     pub token_reduction: bool,
     /// Aggressiveness when `token_reduction` is on.
     pub token_reduction_level: CompressionLevel,
+    /// Route a launched agent's model traffic through the proxy at `listen` by
+    /// injecting provider config into the agent's environment at spawn. Separate
+    /// from `enabled` (which launches `szproxy`): set this to point the agent at
+    /// an already-running proxy without launching our own.
+    pub route_agent: bool,
+    /// The pi-side API id for the proxy endpoint. The proxy serves the Anthropic
+    /// Messages API (`/v1/messages`); pi's OpenAI client speaks the Responses API,
+    /// which the proxy does not implement — so `anthropic-messages` is the default.
+    pub agent_api: String,
+    /// The model id the agent requests from the proxy (the proxy maps it to a
+    /// real backend, e.g. `model-proxy/standard` → its standard route).
+    pub agent_model: String,
+    /// "The bouncer": run a launched agent inside its sealed `agent_profile`
+    /// container, route its built-in `bash`/`read`/`edit`/`write` tools back
+    /// through superzej over a bind-mounted unix-socket ACP channel, and gate
+    /// the consequential ones (shell + edit + write) behind an interactive
+    /// allow/deny overlay. Off by default — the additive integration (pi runs
+    /// its own tools in-process, edits auto-apply) stays the default. When the
+    /// resolved `agent_profile` forces no network (`sealed`), the agent's model
+    /// traffic is relayed to the proxy over a unix socket too (full egress seal);
+    /// otherwise it reaches the proxy via the container gateway.
+    pub bouncer: bool,
 }
 
 impl Default for LlmProxyConfig {
@@ -408,6 +430,10 @@ impl Default for LlmProxyConfig {
             heartbeat_secs: 10,
             token_reduction: false,
             token_reduction_level: CompressionLevel::default(),
+            route_agent: false,
+            agent_api: "anthropic-messages".to_string(),
+            agent_model: "model-proxy/standard".to_string(),
+            bouncer: false,
         }
     }
 }
@@ -1101,12 +1127,31 @@ pub struct StatsConfig {
     pub net_icon: String,
     /// Icon for GPU stat.
     pub gpu_icon: String,
+    /// Icon for the CPU/package temperature stat.
+    pub temp_icon: String,
+    /// Icon for the swap-usage stat.
+    pub swap_icon: String,
+    /// Icon for the CPU-frequency stat.
+    pub freq_icon: String,
+    /// Icon for the load-average stat.
+    pub load_icon: String,
+    /// Icon for the uptime stat.
+    pub uptime_icon: String,
     /// Icon for the battery stat (discharging).
     pub battery_icon: String,
     /// Icon shown while the battery is charging / on AC.
     pub battery_charging_icon: String,
     /// Battery percentage at/below which the widget turns red.
     pub battery_warn: u8,
+    /// Icon for the disk (free-space) stat.
+    pub disk_icon: String,
+    /// Free-disk percentage at/below which the `disk` widget turns amber.
+    pub disk_free_warn: u8,
+    /// Free-disk percentage at/below which the `disk` widget turns red.
+    pub disk_free_critical: u8,
+    /// Filesystem the `disk` masthead widget measures (any path on it).
+    /// Empty = the filesystem holding `worktrees_dir`. `~` expands to home.
+    pub disk_path: String,
     /// Available refresh rates for keybind cycling (seconds).
     pub refresh_rates: Vec<f64>,
 }
@@ -1129,9 +1174,18 @@ impl Default for StatsConfig {
             mem_icon: "\u{efc5}".into(),
             net_icon: "\u{f1eb}".into(),              // nf-fa-wifi
             gpu_icon: "\u{f2db}".into(),              // nf-fa-microchip
+            temp_icon: "\u{f2c7}".into(),             // nf-fa-thermometer_full
+            swap_icon: "\u{f0ec}".into(),             // nf-fa-exchange
+            freq_icon: "\u{f0e4}".into(),             // nf-fa-tachometer
+            load_icon: "\u{f201}".into(),             // nf-fa-line_chart
+            uptime_icon: "\u{f017}".into(),           // nf-fa-clock_o
             battery_icon: "\u{f240}".into(),          // nf-fa-battery_full
             battery_charging_icon: "\u{f0e7}".into(), // nf-fa-bolt — lightning bolt
             battery_warn: 25,
+            disk_icon: "\u{f0a0}".into(), // nf-fa-hdd_o — hard drive
+            disk_free_warn: 15,
+            disk_free_critical: 5,
+            disk_path: String::new(),
             refresh_rates: vec![1.0, 2.0, 5.0, 10.0],
         }
     }
@@ -1139,10 +1193,11 @@ impl Default for StatsConfig {
 
 /// `[bars]` — the customizable widget bars framing the workspace. Each slot is
 /// an ordered widget-id list; unknown ids warn and are skipped. Built-ins:
-/// `brand` (superzej + version), `cpu`, `mem`, `gpu`, `net`, `battery`,
-/// `date`, `clock` (top bar) and `keyhints` (context-dependent keybinds),
-/// `pr` (forge + PR number/state), `status` (transient messages + the
-/// keybind-lock badge) for the bottom bar.
+/// `brand` (superzej + version), `cpu`, `mem`, `gpu`, `temp` (CPU °C), `net`,
+/// `swap`, `freq` (CPU GHz), `load` (1-min load avg, unix), `uptime`, `disk`
+/// (free %), `battery`, `date`, `clock` (top bar) and `keyhints`
+/// (context-dependent keybinds), `pr` (forge + PR number/state), `status`
+/// (transient messages + the keybind-lock badge) for the bottom bar.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct BarsConfig {
@@ -1163,14 +1218,22 @@ impl Default for BarsConfig {
             top_right: vec![
                 "cpu".into(),
                 "mem".into(),
+                "disk".into(),
                 "gpu".into(),
+                "temp".into(),
                 "net".into(),
                 "battery".into(),
                 "date".into(),
                 "clock".into(),
             ],
             bottom_left: vec!["keyhints".into()],
-            bottom_right: vec!["pr".into(), "tests".into(), "loc".into(), "status".into()],
+            bottom_right: vec![
+                "pr".into(),
+                "tests".into(),
+                "loc".into(),
+                "disk".into(),
+                "status".into(),
+            ],
             date_format: "%a %b %-d".into(),
             clock_format: "%H:%M".into(),
         }
@@ -1232,6 +1295,55 @@ impl Default for LimitsConfig {
             test_timeout_secs: 1800,
             discover_timeout_secs: 45,
             isolated_target_dir: true,
+        }
+    }
+}
+
+/// `[disk]` — per-worktree disk-usage visibility, cleanup, and shared
+/// build-cache knobs. Per-worktree `target/` dirs are the dominant disk cost
+/// when developing across many worktrees; these surface it, reclaim it, and
+/// dedup compilation. All off by default except visibility.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct DiskConfig {
+    /// Show per-worktree size badges in the sidebar and the statusbar total.
+    pub show_sizes: bool,
+    /// Statusbar warns (amber, then red at 2×) once total worktree disk exceeds
+    /// this many GiB. 0 disables the warning badge.
+    pub warn_threshold_gb: u64,
+    /// Cadence (seconds) of the background disk scan that refreshes sizes. The
+    /// scan runs off the event loop (never blocks it) and is cached in the DB.
+    pub scan_interval_secs: u64,
+    /// Automatically `cargo clean` a worktree's `target/` when its branch is
+    /// merged (PR → MERGED). The checkout is kept; only build artifacts go. The
+    /// active worktree and any with a running build are never touched.
+    pub auto_clean_on_merge: bool,
+    /// Also auto-clean when a PR is closed without merging (open → CLOSED).
+    pub clean_on_pr_closed: bool,
+    /// Inject `RUSTC_WRAPPER=sccache` into interactive panes so dependency
+    /// compilation is shared across worktrees. No-op if `sccache` isn't on PATH.
+    pub sccache: bool,
+    /// `SCCACHE_DIR` for the shared cache. Empty = sccache's own default.
+    /// `~` expands to home; a relative path resolves against the repo root.
+    pub sccache_dir: String,
+    /// Share one `CARGO_TARGET_DIR` across all worktrees of a repo (injected
+    /// into interactive panes). Biggest disk win, but cargo's per-target build
+    /// lock serializes concurrent builds across worktrees — opt-in. Empty = off.
+    /// `~` expands to home; a relative path resolves against the repo root.
+    pub shared_target_dir: String,
+}
+
+impl Default for DiskConfig {
+    fn default() -> Self {
+        DiskConfig {
+            show_sizes: true,
+            warn_threshold_gb: 100,
+            scan_interval_secs: 45,
+            auto_clean_on_merge: true,
+            clean_on_pr_closed: false,
+            sccache: false,
+            sccache_dir: String::new(),
+            shared_target_dir: String::new(),
         }
     }
 }
@@ -2154,6 +2266,251 @@ pub struct CustomVpnConfig {
     pub env: std::collections::BTreeMap<String, String>,
 }
 
+// ── Ingress sharing (`[share]`) ─────────────────────────────────────────────
+// The *inbound* sibling of `[sandbox.vpn]`: expose a service running inside a
+// worktree (a dev server, a PR preview, a webhook/OAuth callback) at a public
+// URL. Like the VPN seam this is provider-pluggable; `bore` is the first
+// backend. Worktree-level, not a sandbox-network attribute, so it lives at the
+// top level rather than under `[sandbox]`.
+
+config_enum! {
+    /// `[share] provider` — which tunnel backend gives a worktree port a URL.
+    /// `none` (default) disables sharing. Future backends (rathole / zrok /
+    /// ngrok / iroh) plug in behind the same `ShareProvider` seam.
+    pub enum ShareProviderKind: "share provider" {
+        None = "none" | "off",
+        Bore = "bore",
+        Frp = "frp",
+        Tailscale = "tailscale" | "ts",
+        Iroh = "iroh" | "dumbpipe",
+    } default = None;
+}
+config_enum! {
+    /// `[share.frp] proxy_type` — how frp exposes the port. `https`/`http` get a
+    /// vhost subdomain URL; `tcp`/`udp` get a `host:port` address.
+    pub enum FrpProxyType: "frp proxy_type" {
+        Https = "https",
+        Http = "http",
+        Tcp = "tcp",
+        Udp = "udp",
+    } default = Https;
+}
+config_enum! {
+    /// `[share] visibility` — who can reach the share. `bore` only does
+    /// `public` (anyone with the URL); `private` (identity-scoped) is reserved
+    /// for the iroh/zrok backends.
+    pub enum ShareVisibility: "share visibility" {
+        Public = "public",
+        Private = "private",
+    } default = Public;
+}
+config_enum! {
+    /// `[share] on_error` — what to do when a share can't be brought up.
+    ///  - `fail` (default): surface the error; the share does not start.
+    ///  - `warn`: log a warning and carry on (no URL).
+    pub enum ShareOnError: "share on_error" {
+        Fail = "fail",
+        Warn = "warn",
+    } default = Fail;
+}
+config_enum! {
+    /// Who a share is for — the intent the reach-picker offers. Each maps to a
+    /// provider via the `[share] public`/`team`/`peer` keys.
+    ///  - `public` — anyone with the link (the internet).
+    ///  - `team`   — your tailnet / a teammate (identity-scoped).
+    ///  - `peer`   — a specific machine you hand a ticket to (P2P).
+    pub enum ShareReach: "share reach" {
+        Public = "public",
+        Team = "team",
+        Peer = "peer",
+    } default = Public;
+}
+
+/// `[share]` — expose a worktree-local port at a public URL. Disabled by
+/// default (`provider = "none"`). Only the selected provider's sub-table is
+/// consulted.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct ShareConfig {
+    pub provider: ShareProviderKind,
+    pub visibility: ShareVisibility,
+    pub on_error: ShareOnError,
+    /// Seconds to wait for the share's URL to appear before applying `on_error`.
+    pub ready_timeout_secs: u64,
+    /// Safety guard: when `false`, refuse any share reachable from the public
+    /// internet (frp http(s), tailscale `funnel`). Private/team/peer shares are
+    /// unaffected. Default `true`.
+    pub allow_public: bool,
+    /// Intent-first reach → provider mapping for the reach picker. Each defaults
+    /// to `none` (unset); when ≥2 are set, `Alt+Shift+S` offers a picker. When
+    /// all are unset, the single `provider` is used (no picker).
+    pub public: ShareProviderKind,
+    pub team: ShareProviderKind,
+    pub peer: ShareProviderKind,
+    pub bore: BoreConfig,
+    pub frp: FrpConfig,
+    pub tailscale: TailscaleShareConfig,
+    pub iroh: IrohShareConfig,
+}
+
+impl Default for ShareConfig {
+    fn default() -> Self {
+        ShareConfig {
+            provider: ShareProviderKind::None,
+            visibility: ShareVisibility::Public,
+            on_error: ShareOnError::Fail,
+            ready_timeout_secs: 20,
+            allow_public: true,
+            public: ShareProviderKind::None,
+            team: ShareProviderKind::None,
+            peer: ShareProviderKind::None,
+            bore: BoreConfig::default(),
+            frp: FrpConfig::default(),
+            tailscale: TailscaleShareConfig::default(),
+            iroh: IrohShareConfig::default(),
+        }
+    }
+}
+
+impl ShareConfig {
+    /// Whether sharing is requested at all (a default `provider` or any reach key).
+    pub fn is_enabled(&self) -> bool {
+        self.provider != ShareProviderKind::None || !self.configured_reaches().is_empty()
+    }
+
+    /// The provider mapped to a reach (`none` if that reach is unset).
+    pub fn reach_provider(&self, reach: ShareReach) -> ShareProviderKind {
+        match reach {
+            ShareReach::Public => self.public,
+            ShareReach::Team => self.team,
+            ShareReach::Peer => self.peer,
+        }
+    }
+
+    /// Reaches that map to a real provider, in public→team→peer order. `Public`
+    /// is omitted when `allow_public` is off, so the picker never offers a
+    /// reach the safety guard would refuse.
+    pub fn configured_reaches(&self) -> Vec<ShareReach> {
+        [ShareReach::Public, ShareReach::Team, ShareReach::Peer]
+            .into_iter()
+            .filter(|&r| self.reach_provider(r) != ShareProviderKind::None)
+            .filter(|&r| r != ShareReach::Public || self.allow_public)
+            .collect()
+    }
+}
+
+/// `[share.bore]` — <https://github.com/ekzhang/bore>, a tiny TCP tunnel. The
+/// client connects out to a relay (`to`) and exposes the local port at
+/// `to:<remote_port>`. Run your own `bore server` and set `to`/`secret`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct BoreConfig {
+    /// Relay server host (the machine running `bore server`). `""` falls back to
+    /// the public `bore.pub` instance (no secret, best-effort).
+    pub to: String,
+    /// Optional shared HMAC secret (secrets-ref `"env:BORE_SECRET"` /
+    /// `"file:~/.bore/secret"`); must match the server's `--secret`.
+    pub secret: String,
+    /// Remote port to bind on the relay. `0` = let the relay choose.
+    pub remote_port: u16,
+    /// Local interface the dev server listens on (forwarded to the relay).
+    pub local_host: String,
+    /// Extra `bore local` flags for anything not modeled here.
+    pub extra_args: Vec<String>,
+}
+
+impl Default for BoreConfig {
+    fn default() -> Self {
+        BoreConfig {
+            to: String::new(),
+            secret: "env:BORE_SECRET".into(),
+            remote_port: 0,
+            local_host: "127.0.0.1".into(),
+            extra_args: Vec::new(),
+        }
+    }
+}
+
+/// `[share.frp]` — <https://github.com/fatedier/frp>, a self-hosted reverse
+/// proxy. The client (`frpc`) connects out to your `frps` server and exposes the
+/// worktree port; `https`/`http` get a vhost subdomain, `tcp`/`udp` a remote
+/// port. The public address is derived from config (frpc never prints it).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct FrpConfig {
+    /// `frps` server host (required). Empty ⇒ the provider errors at start.
+    pub server_addr: String,
+    /// `frps` control port.
+    pub server_port: u16,
+    /// Shared token (secrets-ref `"env:FRP_TOKEN"` / `"file:~/.frp/token"`);
+    /// must match the server's `auth.token`.
+    pub token: String,
+    pub proxy_type: FrpProxyType,
+    /// The base domain the server serves subdomains under (its `subDomainHost`),
+    /// e.g. `share.example.com` — used to derive the `https`/`http` URL.
+    pub subdomain_host: String,
+    /// Subdomain label for `https`/`http`. Empty ⇒ a deterministic per-worktree
+    /// slug (`<worktree>-<port>`), so a worktree's preview URL is stable.
+    pub subdomain: String,
+    /// Remote port for `tcp`/`udp`. `0` = let the server choose.
+    pub remote_port: u16,
+    /// HTTPS vhost port on the server (for the derived URL when not 443).
+    pub vhost_https_port: u16,
+    /// Extra `frpc.toml` lines appended verbatim to the `[[proxies]]` block.
+    pub extra: Vec<String>,
+}
+
+impl Default for FrpConfig {
+    fn default() -> Self {
+        FrpConfig {
+            server_addr: String::new(),
+            server_port: 7000,
+            token: "env:FRP_TOKEN".into(),
+            proxy_type: FrpProxyType::Https,
+            subdomain_host: String::new(),
+            subdomain: String::new(),
+            remote_port: 0,
+            vhost_https_port: 443,
+            extra: Vec::new(),
+        }
+    }
+}
+
+/// `[share.tailscale]` — expose the worktree port over the worktree's existing
+/// `[sandbox.vpn]` tailscale tunnel. `serve` (default) keeps it tailnet-private;
+/// `funnel = true` publishes it to the public internet. Requires
+/// `[sandbox.vpn] provider = "tailscale"` (or `headscale`) on the worktree.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct TailscaleShareConfig {
+    /// `false` (default) ⇒ `tailscale serve` (tailnet-only). `true` ⇒
+    /// `tailscale funnel` (public internet; ports limited to 443/8443/10000).
+    pub funnel: bool,
+    /// HTTPS port to expose on (serve/funnel default 443).
+    pub https_port: u16,
+}
+
+impl Default for TailscaleShareConfig {
+    fn default() -> Self {
+        TailscaleShareConfig {
+            funnel: false,
+            https_port: 443,
+        }
+    }
+}
+
+/// `[share.iroh]` — a peer-to-peer TCP tunnel over iroh via `dumbpipe`
+/// (<https://github.com/n0-computer/dumbpipe>). NAT-traversing, relay-fallback;
+/// the consumer connects with `dumbpipe connect-tcp <ticket>` (not a browser),
+/// so the "address" is a ticket. For a self-hosted `iroh-relay`, pass dumbpipe's
+/// relay flag/env via `extra_args`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct IrohShareConfig {
+    /// Extra `dumbpipe listen-tcp` flags (e.g. a custom relay).
+    pub extra_args: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct SandboxConfig {
@@ -2187,6 +2544,17 @@ pub struct SandboxConfig {
     pub mounts: Vec<String>, // extra binds ("host:dest[:ro|rw|cache]" or "host"); suffix allowed
     pub init_script: String, // runs inside before the agent/shell
     pub devenv: bool,        // wrap inner cmd with `devenv shell --`
+    /// Inject the repo's Nix flake `devShell` toolchain (its `PATH` + safe
+    /// exported vars) into worktree panes — resolved on the host (writable
+    /// store + daemon) and cached, so a sandboxed pane that can't reach the Nix
+    /// daemon still gets the project linters/formatters/tools out of the box.
+    /// No-op for repos without a flake `devShell`. See [`crate::devenv`].
+    pub inject_devshell: bool,
+    /// Bind-mount the host Nix daemon socket into the sandbox so full
+    /// `nix develop`/`build`/`fmt` work *inside* it. Off by default: it relaxes
+    /// the isolation the hardening profiles provide (Tier A `inject_devshell`
+    /// already covers read-only tool access without this).
+    pub nix_daemon: bool,
     /// Shell to use inside the sandbox. `""` = resolve from the host's `$SHELL`
     /// at pane-spawn time. Set to an absolute path or name (e.g. `"zsh"`) to
     /// override per workspace via `.superzej.toml`.
@@ -2262,6 +2630,8 @@ impl Default for SandboxConfig {
             ],
             init_script: String::new(),
             devenv: false,
+            inject_devshell: true,
+            nix_daemon: false,
             shell: String::new(),
             on_missing: OnMissing::Warn,
             oci_host: String::new(),
@@ -2300,6 +2670,8 @@ pub struct SandboxOverlay {
     pub mounts: Option<Vec<String>>,
     pub init_script: Option<String>,
     pub devenv: Option<bool>,
+    pub inject_devshell: Option<bool>,
+    pub nix_daemon: Option<bool>,
     pub shell: Option<String>,
     pub on_missing: Option<OnMissing>,
     pub remote: Option<RemoteOverlay>,
@@ -2383,6 +2755,12 @@ impl SandboxOverlay {
         }
         if let Some(v) = self.devenv {
             base.devenv = v;
+        }
+        if let Some(v) = self.inject_devshell {
+            base.inject_devshell = v;
+        }
+        if let Some(v) = self.nix_daemon {
+            base.nix_daemon = v;
         }
         if let Some(v) = self.shell {
             base.shell = v;
@@ -2794,6 +3172,8 @@ pub struct Config {
     pub log: LogConfig,
     pub sandbox: SandboxConfig,
     pub limits: LimitsConfig,
+    /// `[disk]` — disk-usage visibility, cleanup, and shared build caches.
+    pub disk: DiskConfig,
     pub drawer: DrawerConfig,
     pub notifications: NotificationsConfig,
     pub strip: StripConfig,
@@ -2805,6 +3185,8 @@ pub struct Config {
     pub llm_proxy: LlmProxyConfig,
     /// `[media]` — optional media-player control. Disabled by default — additive.
     pub media: MediaConfig,
+    /// `[share]` — expose a worktree port at a public URL. Disabled by default.
+    pub share: ShareConfig,
     /// Rebind a built-in action by id, e.g. `new-worktree = "Ctrl w"`. The flat
     /// table is the global/default layer; nested mode tables are native-host only.
     pub keybinds: KeybindConfig,
@@ -2874,6 +3256,7 @@ impl Default for Config {
             log: LogConfig::default(),
             sandbox: SandboxConfig::default(),
             limits: LimitsConfig::default(),
+            disk: DiskConfig::default(),
             drawer: DrawerConfig::default(),
             notifications: NotificationsConfig::default(),
             strip: StripConfig::default(),
@@ -2883,6 +3266,7 @@ impl Default for Config {
             lsp: LspConfig::default(),
             llm_proxy: LlmProxyConfig::default(),
             media: MediaConfig::default(),
+            share: ShareConfig::default(),
             keybinds: KeybindConfig::default(),
             actions: Vec::new(),
             profile: String::new(),
@@ -2953,6 +3337,14 @@ pub struct ConfigOverlay {
     pub log_rotation_size_mb: Option<u64>,
     pub log_max_files: Option<usize>,
     pub log_format: Option<LogFormat>,
+    pub disk_show_sizes: Option<bool>,
+    pub disk_warn_threshold_gb: Option<u64>,
+    pub disk_scan_interval_secs: Option<u64>,
+    pub disk_auto_clean_on_merge: Option<bool>,
+    pub disk_clean_on_pr_closed: Option<bool>,
+    pub disk_sccache: Option<bool>,
+    pub disk_sccache_dir: Option<String>,
+    pub disk_shared_target_dir: Option<String>,
     pub sandbox: SandboxOverlay,
 }
 
@@ -2994,6 +3386,14 @@ impl ConfigOverlay {
         set!(base.log.rotation_size_mb, self.log_rotation_size_mb);
         set!(base.log.max_files, self.log_max_files);
         set!(base.log.format, self.log_format);
+        set!(base.disk.show_sizes, self.disk_show_sizes);
+        set!(base.disk.warn_threshold_gb, self.disk_warn_threshold_gb);
+        set!(base.disk.scan_interval_secs, self.disk_scan_interval_secs);
+        set!(base.disk.auto_clean_on_merge, self.disk_auto_clean_on_merge);
+        set!(base.disk.clean_on_pr_closed, self.disk_clean_on_pr_closed);
+        set!(base.disk.sccache, self.disk_sccache);
+        set!(base.disk.sccache_dir, self.disk_sccache_dir);
+        set!(base.disk.shared_target_dir, self.disk_shared_target_dir);
         if !self.sandbox.is_empty() {
             self.sandbox.apply(&mut base.sandbox);
         }
@@ -3104,6 +3504,28 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
         o.log_format = LogFormat::from_str_validated(v.trim()).ok();
     }
 
+    // [disk]
+    if let Some(v) = env.get("SUPERZEJ_DISK_SHOW_SIZES") {
+        o.disk_show_sizes = parse_bool(&v, "SUPERZEJ_DISK_SHOW_SIZES");
+    }
+    if let Some(v) = env.get("SUPERZEJ_DISK_WARN_THRESHOLD_GB") {
+        o.disk_warn_threshold_gb = parse_num(v, "SUPERZEJ_DISK_WARN_THRESHOLD_GB");
+    }
+    if let Some(v) = env.get("SUPERZEJ_DISK_SCAN_INTERVAL_SECS") {
+        o.disk_scan_interval_secs = parse_num(v, "SUPERZEJ_DISK_SCAN_INTERVAL_SECS");
+    }
+    if let Some(v) = env.get("SUPERZEJ_DISK_AUTO_CLEAN_ON_MERGE") {
+        o.disk_auto_clean_on_merge = parse_bool(&v, "SUPERZEJ_DISK_AUTO_CLEAN_ON_MERGE");
+    }
+    if let Some(v) = env.get("SUPERZEJ_DISK_CLEAN_ON_PR_CLOSED") {
+        o.disk_clean_on_pr_closed = parse_bool(&v, "SUPERZEJ_DISK_CLEAN_ON_PR_CLOSED");
+    }
+    if let Some(v) = env.get("SUPERZEJ_DISK_SCCACHE") {
+        o.disk_sccache = parse_bool(&v, "SUPERZEJ_DISK_SCCACHE");
+    }
+    o.disk_sccache_dir = env.get("SUPERZEJ_DISK_SCCACHE_DIR");
+    o.disk_shared_target_dir = env.get("SUPERZEJ_DISK_SHARED_TARGET_DIR");
+
     // [sandbox]
     if let Some(v) = env.get("SUPERZEJ_SANDBOX_BACKEND") {
         o.sandbox.backend = SandboxBackend::from_str_validated(v.trim()).ok();
@@ -3123,6 +3545,12 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     }
     if let Some(v) = env.get("SUPERZEJ_SANDBOX_ENABLED") {
         o.sandbox.enabled = parse_bool(&v, "SUPERZEJ_SANDBOX_ENABLED");
+    }
+    if let Some(v) = env.get("SUPERZEJ_SANDBOX_INJECT_DEVSHELL") {
+        o.sandbox.inject_devshell = parse_bool(&v, "SUPERZEJ_SANDBOX_INJECT_DEVSHELL");
+    }
+    if let Some(v) = env.get("SUPERZEJ_SANDBOX_NIX_DAEMON") {
+        o.sandbox.nix_daemon = parse_bool(&v, "SUPERZEJ_SANDBOX_NIX_DAEMON");
     }
     if let Some(host) = env.get("SUPERZEJ_SANDBOX_REMOTE_HOST") {
         o.sandbox.remote = Some(RemoteOverlay {
@@ -3917,6 +4345,32 @@ mod tests {
     }
 
     #[test]
+    fn disk_config_defaults_and_env_override() {
+        let cfg = Config::default();
+        assert!(cfg.disk.show_sizes);
+        assert_eq!(cfg.disk.warn_threshold_gb, 100);
+        assert_eq!(cfg.disk.scan_interval_secs, 45);
+        assert!(cfg.disk.auto_clean_on_merge);
+        assert!(!cfg.disk.clean_on_pr_closed);
+        assert!(!cfg.disk.sccache);
+        assert!(cfg.disk.sccache_dir.is_empty());
+        assert!(cfg.disk.shared_target_dir.is_empty());
+
+        let mut env = MapEnv::default();
+        env.0.insert("SUPERZEJ_DISK_SCCACHE".into(), "true".into());
+        env.0
+            .insert("SUPERZEJ_DISK_WARN_THRESHOLD_GB".into(), "250".into());
+        env.0.insert(
+            "SUPERZEJ_DISK_SHARED_TARGET_DIR".into(),
+            "/tmp/shared".into(),
+        );
+        let cfg = Config::load_layered(&env, &[], None);
+        assert!(cfg.disk.sccache);
+        assert_eq!(cfg.disk.warn_threshold_gb, 250);
+        assert_eq!(cfg.disk.shared_target_dir, "/tmp/shared");
+    }
+
+    #[test]
     fn try_load_layered_handles_overrides_and_invalid_overrides() {
         let env = MapEnv::default();
         let cli_overrides = vec![
@@ -4043,6 +4497,12 @@ name = "minimal"
             ("mem", &s.mem_icon),
             ("net", &s.net_icon),
             ("gpu", &s.gpu_icon),
+            ("temp", &s.temp_icon),
+            ("swap", &s.swap_icon),
+            ("freq", &s.freq_icon),
+            ("load", &s.load_icon),
+            ("uptime", &s.uptime_icon),
+            ("disk", &s.disk_icon),
             ("battery", &s.battery_icon),
             ("battery_charging", &s.battery_charging_icon),
         ] {
@@ -5667,10 +6127,16 @@ transport = \"ssh\"
             Priority::Notice
         );
 
-        // Alert set is exactly the four failures; unread set excludes Info.
+        // Alert set is the failures + the agent-attention request; unread excludes Info.
         let alerts = cfg.alert_kind_names();
-        assert_eq!(alerts.len(), 4);
-        for k in ["agent_failed", "test_failed", "log_error", "process_failed"] {
+        assert_eq!(alerts.len(), 5);
+        for k in [
+            "agent_failed",
+            "agent_attention",
+            "test_failed",
+            "log_error",
+            "process_failed",
+        ] {
             assert!(alerts.contains(&k), "missing {k}");
         }
         let counted = cfg.counted_unread_kind_names();
@@ -6027,10 +6493,12 @@ transport = \"ssh\"
         assert_eq!(b.top_left, vec!["brand"]);
         assert_eq!(
             b.top_right,
-            vec!["cpu", "mem", "gpu", "net", "battery", "date", "clock"]
+            vec![
+                "cpu", "mem", "disk", "gpu", "temp", "net", "battery", "date", "clock"
+            ]
         );
         assert_eq!(b.bottom_left, vec!["keyhints"]);
-        assert_eq!(b.bottom_right, vec!["pr", "tests", "loc", "status"]);
+        assert_eq!(b.bottom_right, vec!["pr", "tests", "loc", "disk", "status"]);
         assert_eq!(b.date_format, "%a %b %-d");
         assert_eq!(b.clock_format, "%H:%M");
     }
@@ -6262,6 +6730,14 @@ transport = \"ssh\"
             log_rotation_size_mb: Some(12),
             log_max_files: Some(3),
             log_format: Some(LogFormat::Json),
+            disk_show_sizes: Some(false),
+            disk_warn_threshold_gb: Some(250),
+            disk_scan_interval_secs: Some(90),
+            disk_auto_clean_on_merge: Some(false),
+            disk_clean_on_pr_closed: Some(true),
+            disk_sccache: Some(true),
+            disk_sccache_dir: Some("/cache/sccache".into()),
+            disk_shared_target_dir: Some("/cache/target".into()),
             sandbox: SandboxOverlay {
                 enabled: Some(false),
                 ..Default::default()
@@ -6296,6 +6772,14 @@ transport = \"ssh\"
         assert_eq!(cfg.log.rotation_size_mb, 12);
         assert_eq!(cfg.log.max_files, 3);
         assert_eq!(cfg.log.format, LogFormat::Json);
+        assert!(!cfg.disk.show_sizes);
+        assert_eq!(cfg.disk.warn_threshold_gb, 250);
+        assert_eq!(cfg.disk.scan_interval_secs, 90);
+        assert!(!cfg.disk.auto_clean_on_merge);
+        assert!(cfg.disk.clean_on_pr_closed);
+        assert!(cfg.disk.sccache);
+        assert_eq!(cfg.disk.sccache_dir, "/cache/sccache");
+        assert_eq!(cfg.disk.shared_target_dir, "/cache/target");
         assert!(!cfg.sandbox.enabled);
     }
 
@@ -6771,6 +7255,8 @@ idle_timeout_secs = 20
 heartbeat_secs = 5
 token_reduction = true
 token_reduction_level = "balanced"
+route_agent = true
+bouncer = true
 "#,
         )
         .unwrap();
@@ -6786,6 +7272,19 @@ token_reduction_level = "balanced"
             cfg.llm_proxy.token_reduction_level,
             CompressionLevel::Balanced
         );
+        assert!(cfg.llm_proxy.route_agent);
+        assert!(cfg.llm_proxy.bouncer);
+    }
+
+    #[test]
+    fn llm_proxy_bouncer_off_by_default() {
+        // The bouncer is opt-in: the additive integration (pi runs its own
+        // tools in-process) stays the default.
+        let cfg = LlmProxyConfig::default();
+        assert!(!cfg.bouncer, "bouncer must default off — AI is additive");
+        // A table that omits the key keeps the default.
+        let parsed: Config = toml::from_str("[llm_proxy]\nenabled = true\n").unwrap();
+        assert!(!parsed.llm_proxy.bouncer);
     }
 
     #[test]

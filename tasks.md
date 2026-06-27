@@ -335,10 +335,10 @@ _Tier-2 layout/task templates generalize worktree templates (54) with native
 - [x] 45. Per-worktree branch + status
 - [x] 46. Default layout opens on select
 - [x] 47. Delete worktree (dirty guard)
-- [~] 48. Stale worktree GC
+- [x] 48. Stale worktree GC _(auto `cargo clean` of `target/` on PR merge/close via the `pr_branch_cache` feed → `worktree::clean_target`, gated `[disk].auto_clean_on_merge`/`clean_on_pr_closed`; active worktree + running builds skipped)_
 - [x] 49. Dirty-state warning before destructive ops
 - [ ] 50. Dependency sharing — hardlink/CoW node_modules etc.
-- [~] 51. Per-worktree disk usage
+- [x] 51. Per-worktree disk usage _(off-loop `du` scan → `worktree_disk` cache (db v20), sidebar size badge + statusbar `[disk].warn_threshold_gb` chip + `superzej disk`/`clean` CLI; `disk.rs`)_
 - [x] 52. Fork worktree (branch from existing) _(`SidebarOutcome::Fork` from the row menu → `begin_worktree_wizard(base_override=Some(branch))` in run.rs)_
 - [x] 53. Rename worktree/branch _(`PromptRename` → `HostInputKind::RenameWorktree` → `superzej_core::worktree::rename` (branch -m + worktree move); tested by `rename_moves_branch_and_checkout`)_
 - [~] 54. Worktree templates — layout+programs+container preset + setup/post-create hooks (deps install, env restore; see 657) _(`NewWorktreeFromTemplate` action wired in run.rs + `[[worktree_templates]]` config; setup/post-create hook depth still partial)_
@@ -607,6 +607,21 @@ foreign agents), **Agent** (R2, expose termite outward), and **Proxy** (R3,
 realize AR for any ACP agent). The two planes meet at two seams:
 `providers/set` (point any ACP agent's model traffic at `szproxy`) and
 MCP-over-ACP (advertise AR's house tools up to any agent)._
+
+_**Landed (2026-06-26, branch `sz/spicy-dragon`, uncommitted):** the R1 client +
+the two convergence seams are functionally working against a `pi` fork: ACP client
+(`initialize`), client-serviced `terminal/create` (sandboxed run-to-completion),
+`fs/read_text_file`, `superzej/edit`+`write` (worktree-scoped), `providers/set`
+routing through `szproxy` with a per-worktree minted virtual key, and a
+per-worktree `session/update` → statusbar **agent chip** (tool + ctx% + connection
+lifecycle). Transport is **TCP + newline-JSON** (the pi extension's server), not
+stdio. **UX decision: the embedded-agent surface stays MINIMAL** — pi's terminal
+pane is the conversation; the chip is the only native reflection. Consequently
+these are **intentional non-goals, not debt**: 233 (native diff/review of agent
+edits — edits AUTO-APPLY by design), 234 (plan/tool-call follow-along beyond the
+chip), a `Section::Agent` panel, the dormant `AppTile` native center surface, a
+multi-worktree fleet view, and `session/prompt` programmatic steering. Revisit
+only if the minimal model proves insufficient._
 
 **R1 · ACP Client — consume foreign harnesses:**
 
@@ -885,8 +900,8 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 - [ ] 385. CoW overlay from base image
 - [ ] 386. Prewarmed pool (fast spawn)
 - [ ] 387. Intelligent resource caching (node/cargo/pip)
-- [ ] 388. Shared cache across worktrees
-- [ ] 389. Auto cache cleanup
+- [x] 388. Shared cache across worktrees _(`[disk].sccache` → `RUSTC_WRAPPER`/`SCCACHE_DIR` + `[disk].shared_target_dir` → `CARGO_TARGET_DIR` injected into pane env at `agent::launch_spec`; shared-target serializes builds, opt-in)_
+- [x] 389. Auto cache cleanup _(see 48: PR-merge/close auto `cargo clean`; manual `superzej clean [--all]`)_
 - [ ] 390. Snapshot/checkpoint (CRIU/commit)
 - [ ] 391. Rollback container state
 - [ ] 392. Image build cache

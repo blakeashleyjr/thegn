@@ -12,6 +12,7 @@
 pub mod ci;
 pub mod config;
 pub mod diff;
+pub mod disk;
 pub mod env;
 pub mod issue;
 pub mod list;
@@ -19,6 +20,7 @@ pub mod logs;
 pub mod notify;
 pub mod pr;
 pub mod repos;
+pub mod share;
 pub mod theme;
 
 use std::path::PathBuf;

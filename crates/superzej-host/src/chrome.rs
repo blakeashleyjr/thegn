@@ -27,6 +27,40 @@ pub struct AiMetrics {
     pub cost: f64,
 }
 
+/// The embedded agent's ACP connection state, surfaced in the statusbar chip so
+/// a connect/proxy failure is visible (the chip is the *only* native signal — pi
+/// owns the conversation in its terminal pane, by design).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AgentConn {
+    /// ACP server spawned; client not connected/initialized yet.
+    Connecting,
+    /// Connected + initialized (+ provider routed when the proxy is enabled).
+    #[default]
+    Online,
+    /// The ACP socket dropped (agent likely went away).
+    Exited,
+    /// Connect / initialize / provider-routing failed.
+    Error,
+}
+
+/// Live activity of the embedded `pi` agent, streamed over ACP `session/update`
+/// (tool calls + context-window usage) plus its connection lifecycle. Distinct
+/// from [`AiMetrics`], which is proxy-side spend; this is the agent's own
+/// progress, rendered as a statusbar chip so the user sees what the agent is
+/// doing without leaving their pane.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AgentActivity {
+    /// Connection lifecycle (drives the offline/error chip states).
+    pub conn: AgentConn,
+    /// The most recent tool the agent invoked (e.g. "bash", "edit").
+    pub last_tool: Option<String>,
+    /// Whether that tool is still running (vs. completed/failed).
+    pub running: bool,
+    /// Context-window tokens used / total, from `usage_update` (0 = unknown).
+    pub context_used: i64,
+    pub context_size: i64,
+}
+
 /// The resolved chrome palette. A process-global because every draw helper
 /// needs it and threading it through each call would touch every signature;
 /// the event loop writes it (startup + config reload), render-time code only
@@ -257,6 +291,8 @@ pub struct RowMenu {
     pub anchor: usize,
     pub entries: Vec<RowMenuEntry>,
     pub cursor: usize,
+    /// The stable pin_key of the row this menu was opened for.
+    pub target_pin_key: String,
 }
 
 #[derive(Debug, Clone)]
@@ -274,6 +310,8 @@ pub struct FrameModel {
     /// The active worktree group's name ("app/feat") — the tabbar's left label.
     pub worktree: String,
     pub ai_metrics: Option<AiMetrics>,
+    /// Live embedded-agent activity (ACP `session/update`), shown as a chip.
+    pub agent_activity: Option<AgentActivity>,
     /// The active worktree's tab chip titles (tabs live WITHIN a worktree).
     pub tabs: Vec<String>,
     /// Index of the active chip in `tabs`.
@@ -315,6 +353,13 @@ pub struct FrameModel {
     pub sidebar_db_folders: Vec<superzej_core::models::FolderRow>,
     /// All terminals, straight from DB, used by row builder.
     pub sidebar_db_terminals: Vec<superzej_core::models::TerminalRow>,
+    /// `[disk].warn_threshold_gb`: the statusbar disk badge trips when the sum
+    /// of all worktree sizes (in `sidebar_status.disk_sizes`) exceeds this many
+    /// GiB. 0 disables the badge. Config-derived, set in `build_model`.
+    pub disk_warn_threshold_gb: u64,
+    /// Active worktree's total size (bytes), for the bottom `disk` widget next
+    /// to LOC. From the off-loop scan cache; `None` until first scanned.
+    pub active_worktree_disk: Option<u64>,
     /// True if the last input was mouse activity.
     pub panel: crate::panel::PanelData,
     /// True when the right panel currently owns keyboard focus.
@@ -342,7 +387,7 @@ pub struct FrameModel {
     /// The input-mode chip letter for the statusbar ("N", "V", "I", "E").
     pub mode_chip: String,
     /// Latest system stats reading for the top bar.
-    pub stats: crate::stats::StatsSnapshot,
+    pub stats: superzej_metrics::StatsSnapshot,
     /// Latest Prometheus scrape state for the sidebar metrics section.
     pub metrics: crate::metrics::MetricsState,
     /// tokei line count for the active worktree (bottom-bar widget).
@@ -353,6 +398,10 @@ pub struct FrameModel {
     pub accent: String,
     /// Pin chips for the tabbar (label + status glyph), in `Alt-N` order.
     pub pins: Vec<crate::pins::PinChip>,
+    /// Active ingress shares (`[share]`) for the current worktree — feeds the
+    /// statusbar badge + the System ▸ Share panel section. Synced from the
+    /// `ShareSupervisor` (loop-local), not from hydration.
+    pub shares: Vec<crate::share::ShareView>,
     /// Deterministic container name for the active worktree path. The sandbox
     /// panel uses this to show the sandbox for the selected worktree instead of
     /// the first superzej-owned container on the machine.
@@ -476,6 +525,8 @@ impl FrameModel {
             && self.timeline == other.timeline
             && self.status == other.status
             && self.panel == other.panel
+            && self.disk_warn_threshold_gb == other.disk_warn_threshold_gb
+            && self.active_worktree_disk == other.active_worktree_disk
     }
 }
 
@@ -573,12 +624,15 @@ fn cluster_width(parts: &[(String, usize)], kept: &[usize]) -> usize {
     kept.iter().map(|&i| parts[i].1).sum::<usize>() + 3 * (kept.len() - 1) + 1
 }
 
-/// Drop right-cluster widgets in priority order — `date` first, then `gpu` —
-/// until the cluster fits `avail` columns. (The brand/logo is the caller's
-/// final sacrifice.) Returns the surviving indices in display order.
+/// Drop right-cluster widgets in priority order until the cluster fits `avail`
+/// columns — softest stats shed first, leaving cpu/mem/net/battery longest.
+/// (The brand/logo is the caller's final sacrifice.) Returns the surviving
+/// indices in display order.
 fn fit_stats_cluster(parts: &[(String, usize)], avail: usize) -> Vec<usize> {
     let mut kept: Vec<usize> = (0..parts.len()).collect();
-    for victim in ["date", "gpu"] {
+    for victim in [
+        "date", "uptime", "load", "freq", "swap", "temp", "disk", "gpu",
+    ] {
         if cluster_width(parts, &kept) <= avail {
             break;
         }
@@ -870,6 +924,18 @@ fn stat_level(pct: u8) -> Level {
 }
 
 /// Ratio-based pressure (memory): ≥85% warns, ≥95% is critical.
+/// Level for a *free-space* percentage: low free is bad, so the thresholds are
+/// inverted relative to [`stat_level`] (warn ≥ critical).
+fn free_level(free: u8, warn: u8, critical: u8) -> Level {
+    if free <= critical {
+        Level::Crit
+    } else if free <= warn {
+        Level::Warn
+    } else {
+        Level::Normal
+    }
+}
+
 fn ratio_level(used: f32, total: f32) -> Level {
     if total <= 0.0 {
         return Level::Normal;
@@ -881,6 +947,29 @@ fn ratio_level(used: f32, total: f32) -> Level {
         Level::Warn
     } else {
         Level::Normal
+    }
+}
+
+/// Temperature pressure (°C): ≥85 is critical, ≥70 warns.
+fn temp_level(c: f32) -> Level {
+    if c >= 85.0 {
+        Level::Crit
+    } else if c >= 70.0 {
+        Level::Warn
+    } else {
+        Level::Normal
+    }
+}
+
+/// Human uptime: `3d4h`, `4h12m`, or `12m`.
+fn fmt_uptime(secs: u64) -> String {
+    let (d, h, m) = (secs / 86_400, (secs % 86_400) / 3600, (secs % 3600) / 60);
+    if d > 0 {
+        format!("{d}d{h}h")
+    } else if h > 0 {
+        format!("{h}h{m}m")
+    } else {
+        format!("{m}m")
     }
 }
 
@@ -905,13 +994,13 @@ fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> {
         )),
         "cpu" => s.cpu_pct.map(|p| {
             w(
-                format!("{}  {p:>2}%", ic.cpu_icon),
+                format!("{} {p:>2}%", ic.cpu_icon),
                 level_color(stat_level(p)),
             )
         }),
         "mem" => s.mem_gib.map(|(u, t)| {
             w(
-                format!("{}  {u:.1}/{t:.0}G", ic.mem_icon),
+                format!("{} {u:.1}/{t:.0}G", ic.mem_icon),
                 level_color(ratio_level(u, t)),
             )
         }),
@@ -921,28 +1010,64 @@ fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> {
                 level_color(stat_level(p)),
             )
         }),
+        "temp" => s.cpu_temp_c.map(|c| {
+            w(
+                format!("{} {c:.0}\u{00b0}C", ic.temp_icon),
+                level_color(temp_level(c)),
+            )
+        }),
+        "swap" => s.swap_gib.map(|(u, t)| {
+            w(
+                format!("{} {u:.1}/{t:.0}G", ic.swap_icon),
+                level_color(ratio_level(u, t)),
+            )
+        }),
+        "freq" => s.cpu_freq_mhz.map(|mhz| {
+            w(
+                format!("{} {:.1}GHz", ic.freq_icon, mhz as f32 / 1000.0),
+                col(S::Dim),
+            )
+        }),
+        "load" => s
+            .load_avg
+            .map(|(one, _, _)| w(format!("{} {one:.2}", ic.load_icon), col(S::Dim))),
+        "uptime" => s.uptime_secs.map(|secs| {
+            w(
+                format!("{} {}", ic.uptime_icon, fmt_uptime(secs)),
+                col(S::Dim),
+            )
+        }),
+        // Disk shows *free* space, so the sense is inverted: low free is bad.
+        "disk" => s.disk_free_pct.map(|free| {
+            w(
+                format!("{} {free:>2}%", ic.disk_icon),
+                level_color(free_level(free, ic.disk_free_warn, ic.disk_free_critical)),
+            )
+        }),
         "net" => s.net_bps.map(|(rx, tx)| {
             w(
                 format!(
-                    "{}  \u{2193}{} \u{2191}{}",
+                    "{} \u{2193}{} \u{2191}{}",
                     ic.net_icon,
-                    crate::stats::fmt_rate(rx),
-                    crate::stats::fmt_rate(tx)
+                    superzej_metrics::fmt_rate(rx),
+                    superzej_metrics::fmt_rate(tx)
                 ),
                 col(S::Dim),
             )
         }),
-        "battery" => s.battery.map(|(p, charging)| {
-            // Charging wins: bolt glyph + orange text, even when low. Otherwise
-            // the battery glyph, red at/below the warn threshold and quiet above.
-            let (icon, fg) = if charging {
+        "battery" => s.battery.map(|(p, on_ac)| {
+            // On AC wins: bolt glyph + orange text, even when low (this also
+            // covers a charge-capped battery, which sits plugged in not
+            // charging). Otherwise the battery glyph, red at/below the warn
+            // threshold and quiet above.
+            let (icon, fg) = if on_ac {
                 (&ic.battery_charging_icon, theme_color(theme::HUE_ORANGE))
             } else if p <= ic.battery_warn {
                 (&ic.battery_icon, theme_color(theme::RED))
             } else {
                 (&ic.battery_icon, col(S::Dim))
             };
-            w(format!("{icon}  {p:>2}%"), fg)
+            w(format!("{icon} {p:>2}%"), fg)
         }),
         "date" => Some(w(
             chrono::Local::now()
@@ -989,6 +1114,14 @@ pub fn bottombar_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> 
                 n.to_string()
             };
             w(format!("{compact} LOC"), col(S::Dim))
+        }),
+        // Active worktree's disk usage (size of its checkout incl. target/),
+        // from the off-loop scan; sits next to LOC. Hidden until first scanned.
+        "disk" => model.active_worktree_disk.map(|b| {
+            w(
+                format!("{} DISK", superzej_core::disk::human(b)),
+                col(S::Dim),
+            )
         }),
         // Forge + PR number, colored by state: open green, draft/queued
         // amber, closed and merged purple. Hidden when no PR exists.
@@ -1187,6 +1320,65 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             ));
         }
     }
+    // Disk-usage badge: trips when the sum of all worktree sizes crosses
+    // `[disk].warn_threshold_gb` — amber past the threshold, red past 2×. The
+    // 300GB-of-target/ failure mode accrued unnoticed; this is the missing
+    // feedback loop. Silent below the threshold and when it's disabled (0) or
+    // the scan hasn't run (empty `disk_sizes`).
+    if model.disk_warn_threshold_gb > 0 && !model.sidebar_status.disk_sizes.is_empty() {
+        let total: u64 = model
+            .sidebar_status
+            .disk_sizes
+            .values()
+            .map(|&(t, _)| t.max(0) as u64)
+            .sum();
+        let gib = 1024 * 1024 * 1024;
+        let threshold = model.disk_warn_threshold_gb * gib;
+        if total > threshold {
+            let hue = if total > threshold.saturating_mul(2) {
+                superzej_core::theme::Hue::Red
+            } else {
+                superzej_core::theme::Hue::Amber
+            };
+            r.push(seg(Tok::Slot(S::Text), " "));
+            r.push(Seg::chip(
+                Tok::Hue(hue),
+                format!(" \u{26c1} {} ", superzej_core::disk::human(total)),
+            ));
+        }
+    }
+    // Ingress-share badge (`[share]`): a ⇅ chip showing how many ports the
+    // current worktree exposes. Coloured by reach as a safety affordance — a
+    // worktree exposed to the public internet renders AMBER (caution), private
+    // team/peer shares render teal. A failed share also shows amber.
+    {
+        let up = model.shares.iter().filter(|s| s.url.is_some()).count();
+        let any_public = model.shares.iter().any(|s| s.public && s.url.is_some());
+        let failed = model.shares.iter().filter(|s| s.failed).count();
+        if up > 0 {
+            let label = if up == 1 {
+                match model.shares.iter().find(|s| s.url.is_some()) {
+                    Some(s) => format!(" \u{21c5} {} ", s.port),
+                    None => " \u{21c5} ".to_string(),
+                }
+            } else {
+                format!(" \u{21c5} {up} ")
+            };
+            let hue = if any_public {
+                superzej_core::theme::Hue::Amber
+            } else {
+                superzej_core::theme::Hue::Teal
+            };
+            r.push(seg(Tok::Slot(S::Text), " "));
+            r.push(Seg::chip(Tok::Hue(hue), label));
+        } else if failed > 0 {
+            r.push(seg(Tok::Slot(S::Text), " "));
+            r.push(Seg::chip(
+                Tok::Hue(superzej_core::theme::Hue::Amber),
+                " \u{21c5} ! ".to_string(),
+            ));
+        }
+    }
     // Now-playing badge (optional [media] feature): a compact ▶/❚❚ chip with the
     // current track, green while playing and blue while paused. `badge()` returns
     // `None` when nothing is loaded, so the chip is silent when idle.
@@ -1221,6 +1413,33 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
                 metrics.tokens.input + metrics.tokens.output
             ),
         ));
+    }
+    if let Some(ref a) = model.agent_activity {
+        use superzej_core::theme::Hue;
+        // The chip is the only native signal, so it must show failure states too.
+        let (hue, label) = match a.conn {
+            AgentConn::Error => (Hue::Red, " ⚠ agent error ".to_string()),
+            AgentConn::Exited => (Hue::Orange, " ⚠ agent offline ".to_string()),
+            AgentConn::Connecting => (Hue::Blue, " 🤖 agent connecting… ".to_string()),
+            AgentConn::Online => {
+                let tool = match (&a.last_tool, a.running) {
+                    (Some(t), true) => format!("🛠 {t}…"),
+                    (Some(t), false) => format!("🛠 {t}"),
+                    (None, _) => "🤖 agent".to_string(),
+                };
+                // Append context-window usage as a percentage when reported.
+                let label = if a.context_size > 0 {
+                    let pct = (a.context_used * 100 / a.context_size).clamp(0, 100);
+                    format!(" {tool} · {pct}% ctx ")
+                } else {
+                    format!(" {tool} ")
+                };
+                let hue = if a.running { Hue::Amber } else { Hue::Teal };
+                (hue, label)
+            }
+        };
+        r.push(seg(Tok::Slot(S::Text), " "));
+        r.push(Seg::chip(Tok::Hue(hue), label));
     }
     if model.zoomed {
         r.push(seg(Tok::Slot(S::Text), " "));
@@ -1733,29 +1952,48 @@ fn compose_badges(row: &crate::sidebar::SidebarRow) -> Vec<Badge> {
             color: theme_color(theme::RED),
         });
     }
+    // Disk-size badge (item 152/413): the worktree's size, dim by default and
+    // amber when the reclaimable `target/` dominates (>1 GiB and >half the
+    // total) — a nudge that `superzej clean` would recover real space. Only
+    // populated when the off-loop disk scan has run (i.e. `[disk].show_sizes`).
+    if let Some(total) = row.disk_bytes {
+        let target = row.target_bytes.unwrap_or(0);
+        let heavy = target > 1024 * 1024 * 1024 && target * 2 > total;
+        badges.push(Badge {
+            text: format!(" {}", superzej_core::disk::human(total)),
+            color: if heavy {
+                theme_color(theme::AMBER)
+            } else {
+                theme_color(theme::DIM)
+            },
+        });
+    }
     badges
 }
 
 /// The activity dot prefix for a worktree row (item 20), recolored at render by
 /// [`activity_dot_color`]: `Active` (worktree busy / agent working) is a filled
-/// white ●; `Quiet` (was active, now idle — the agent is waiting for the user)
-/// is a hollow red ○; dormant (`None`/acked) shows nothing.
+/// white ●; `Waiting` (idle — agent stuck, unread) is a filled red ●; `Read`
+/// (the user has seen it but it is still stuck) is a hollow red ○; dormant
+/// (`None`) shows nothing.
 fn activity_dot(state: crate::sidebar::ActivityState) -> &'static str {
     use crate::sidebar::ActivityState::*;
     match state {
-        Active => "\u{25cf} ", // ●
-        Quiet => "\u{25cb} ",  // ○
+        Active => "\u{25cf} ",  // ●
+        Waiting => "\u{25cf} ", // ●
+        Read => "\u{25cb} ",    // ○
         None => "",
     }
 }
 
 /// The color the activity dot is over-painted in, per state (configurable via
-/// `[theme.colors] activity_active` / `activity_waiting`). `None` never draws.
+/// `[theme.colors] activity_active` / `activity_waiting`). Both red states share
+/// the `activity_waiting` slot — filled vs hollow is glyph-only. `None` never draws.
 fn activity_dot_color(state: crate::sidebar::ActivityState) -> ColorAttribute {
     use crate::sidebar::ActivityState::*;
     match state {
         Active => col(S::ActivityActive),
-        Quiet => col(S::ActivityWaiting),
+        Waiting | Read => col(S::ActivityWaiting),
         None => col(S::Dim),
     }
 }
@@ -2013,6 +2251,7 @@ pub(crate) fn panel_help_pairs(ui: &crate::panel::PanelUi) -> Vec<(String, Strin
             ("L", "loop"),
             ("≡", "playlist"),
         ],
+        Section::Share => &[("j/k", "row"), ("↵", "copy url")],
         Section::Debug | Section::Sandbox | Section::Db | Section::Telemetry | Section::Keys => {
             &[("j/k", "row")]
         }
@@ -2104,6 +2343,7 @@ pub fn draw_chrome(
     }
     draw_columns_frame(surface, chrome);
     draw_center_tabs(surface, chrome.center_tabs, model);
+    crate::chrome::draw_drawer(surface, chrome.drawer, chrome.drawer_divider, model);
     draw_masthead(surface, chrome, model);
     draw_statusbar(surface, chrome.statusbar, model);
 }
@@ -2127,58 +2367,31 @@ fn draw_columns_frame(surface: &mut Surface, chrome: &crate::layout::ChromeLayou
     }
     // The bottom drawer's horizontal rule, matching the top divider — the seam
     // that gives the popped-up drawer a real panel edge.
-    if let Some(div) = chrome.drawer_divider
-        && div.rows > 0
-    {
-        let line = "\u{2500}".repeat(div.cols);
-        draw_text(
-            surface,
-            div.x,
-            div.y,
-            &line,
-            col(S::Border),
-            col(S::Panel),
-            div.cols,
-        );
+    #[allow(clippy::collapsible_if)]
+    if let Some(div) = chrome.drawer_divider {
+        if div.rows > 0 {
+            let line = "\u{2500}".repeat(div.cols);
+            draw_text(
+                surface,
+                div.x,
+                div.y,
+                &line,
+                col(S::Border),
+                col(S::Panel),
+                div.cols,
+            );
+        }
     }
 }
 
-/// A centered confirmation modal: `msg` in a summoned layer (dimmed backdrop,
-/// cast shadow) with chip affordances. Drawn above everything while a
-/// destructive action awaits its answer.
-pub fn draw_confirm(surface: &mut Surface, screen: Rect, msg: &str) {
-    use crate::layer::{LayerSpec, open_layer};
-    use crate::seg::{Line, Seg, Tok, draw_lines, seg};
-    if screen.rows < 5 || screen.cols < 12 {
-        return;
-    }
-    let cols = msg.chars().count().clamp(16, screen.cols.saturating_sub(8));
-    let spec = LayerSpec {
-        title: "confirm".into(),
-        cols,
-        rows: 3,
-        border: Tok::Slot(S::Focus),
-        ..LayerSpec::default()
-    };
-    let Some(inner) = open_layer(surface, screen, &spec) else {
-        return;
-    };
-    let lines = [
-        Line::segs(vec![seg(Tok::Slot(S::Text), msg)]),
-        Line::Blank,
-        Line::split(
-            vec![Seg::chip(Tok::Slot(S::Accent), " y confirm ")],
-            // A muted-but-legible secondary chip: light text on the raised
-            // surface. `Seg::chip` would paint near-black `chip_fg` on `Raise`
-            // (#0b0e16 on #222942) — dark-on-dark and unreadable.
-            vec![
-                seg(Tok::Slot(S::Dim), " any key cancels ")
-                    .bg(Tok::Slot(S::Raise))
-                    .bold(),
-            ],
-        ),
-    ];
-    draw_lines(surface, inner, &lines, Tok::Slot(S::Panel));
+pub fn draw_drawer(
+    _surface: &mut Surface,
+    _drawer: Option<Rect>,
+    _drawer_divider: Option<Rect>,
+    _model: &FrameModel,
+) {
+    // Left empty: the terminal well clears its own background, and the PTY
+    // paints the content. The drawer divider is drawn by draw_columns_frame.
 }
 
 /// Compose a multi-pane tab: lay the `center` tree out within `chrome.center`
@@ -2368,28 +2581,6 @@ mod tests {
         assert!(!base.hydration_eq(&loc_changed), "loc change must repaint");
     }
 
-    /// The delete-worktree confirmation modal (and any `draw_confirm` caller)
-    /// must render every glyph legibly — the `y confirm` / cancel chips and the
-    /// message. Guards the regression where the cancel chip was near-black text
-    /// on the dark `raise` surface.
-    #[test]
-    fn confirm_modal_text_is_legible() {
-        let screen = Rect {
-            x: 0,
-            y: 0,
-            cols: 64,
-            rows: 14,
-        };
-        let mut s = Surface::new(screen.cols, screen.rows);
-        draw_confirm(
-            &mut s,
-            screen,
-            "Delete 2 worktree(s) from disk? (alpha, beta)",
-        );
-        let v = crate::seg::text_contrast_violations(&mut s, 3.0);
-        assert!(v.is_empty(), "low-contrast text in confirm modal: {v:?}");
-    }
-
     /// Build a minimal sidebar row for renderer tests.
     fn row(kind: crate::sidebar::RowKind, label: &str) -> crate::sidebar::SidebarRow {
         crate::sidebar::SidebarRow {
@@ -2418,6 +2609,8 @@ mod tests {
             pr_number: None,
             unread_count: 0,
             alert_count: 0,
+            disk_bytes: None,
+            target_bytes: None,
             terminal_connection: None,
         }
     }
@@ -2521,6 +2714,107 @@ mod tests {
         assert!(text.contains('\u{26a0}'), "alert badge glyph ⚠: {text:?}");
         // Counts render alongside the glyphs.
         assert!(text.contains('2') && text.contains('3') && text.contains('1'));
+    }
+
+    #[test]
+    fn sidebar_renders_disk_size_badge() {
+        use crate::sidebar::RowKind;
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 40,
+            rows: 6,
+        };
+        let mut ws = row(RowKind::Workspace, "app");
+        ws.collapsed = false;
+        let mut wt = row(RowKind::Worktree, "feat");
+        wt.disk_bytes = Some(70 * 1024 * 1024 * 1024); // 70G
+        wt.target_bytes = Some(60 * 1024 * 1024 * 1024);
+        let model = FrameModel {
+            sidebar_rows: vec![ws, wt],
+            ..Default::default()
+        };
+        let mut s = Surface::new(40, 6);
+        draw_sidebar(&mut s, rect, &model);
+        let text = s.screen_chars_to_string();
+        assert!(
+            text.contains("70G"),
+            "size badge shows human size: {text:?}"
+        );
+    }
+
+    #[test]
+    fn masthead_disk_widget_shows_free_pct_with_inverted_colors() {
+        let mut model = FrameModel::default();
+        // High free → normal (dim); low free → red; mid → amber. Defaults:
+        // warn 15, critical 5.
+        model.stats.disk_free_pct = Some(72);
+        let hi = masthead_widget("disk", &model).expect("disk widget present");
+        assert!(hi.text.contains("72%"), "shows free %: {:?}", hi.text);
+        assert_eq!(hi.fg, col(S::Dim), "ample free → dim");
+
+        model.stats.disk_free_pct = Some(12);
+        assert_eq!(
+            masthead_widget("disk", &model).unwrap().fg,
+            theme_color(theme::AMBER),
+            "low free → amber"
+        );
+
+        model.stats.disk_free_pct = Some(3);
+        assert_eq!(
+            masthead_widget("disk", &model).unwrap().fg,
+            theme_color(theme::RED),
+            "critically low free → red"
+        );
+
+        // Absent until sampled.
+        model.stats.disk_free_pct = None;
+        assert!(masthead_widget("disk", &model).is_none());
+    }
+
+    #[test]
+    fn bottombar_disk_widget_shows_active_worktree_size() {
+        let mut model = FrameModel::default();
+        assert!(
+            bottombar_widget("disk", &model).is_none(),
+            "hidden until scanned"
+        );
+        model.active_worktree_disk = Some(7 * 1024 * 1024 * 1024); // 7G
+        let wdg = bottombar_widget("disk", &model).expect("disk widget present");
+        assert!(
+            wdg.text.contains("7G") && wdg.text.contains("DISK"),
+            "{:?}",
+            wdg.text
+        );
+    }
+
+    #[test]
+    fn statusbar_disk_badge_trips_above_threshold_only() {
+        let chrome = layout::compute(160, 10, false, false);
+        let mk = |total_gb: u64, threshold: u64| -> String {
+            let mut sizes = std::collections::HashMap::new();
+            sizes.insert(
+                "/wt/a".to_string(),
+                ((total_gb * 1024 * 1024 * 1024) as i64, 0i64),
+            );
+            let model = FrameModel {
+                disk_warn_threshold_gb: threshold,
+                sidebar_status: crate::sidebar::SidebarStatus {
+                    disk_sizes: sizes,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut s = Surface::new(160, 10);
+            draw_statusbar(&mut s, chrome.statusbar, &model);
+            s.screen_chars_to_string()
+        };
+        // Above threshold → the ⛁ chip with the size appears.
+        assert!(mk(150, 100).contains('\u{26c1}'), "trips above threshold");
+        // Below threshold → silent.
+        assert!(!mk(50, 100).contains('\u{26c1}'), "silent below threshold");
+        // Disabled (0) → silent even when huge.
+        assert!(!mk(500, 0).contains('\u{26c1}'), "silent when disabled");
     }
 
     #[test]
@@ -2733,7 +3027,7 @@ mod tests {
     fn masthead_stats_use_quiet_separators_and_threshold_colors() {
         let chrome = layout::compute(160, 10, false, false);
         let model = FrameModel {
-            stats: crate::stats::StatsSnapshot {
+            stats: superzej_metrics::StatsSnapshot {
                 cpu_pct: Some(95),
                 mem_gib: Some((10.0, 64.0)),
                 ..Default::default()

@@ -522,11 +522,36 @@ pub fn resolve_placed(
         }
     }
 
-    let env = cfg
+    let mut env: Vec<(String, String)> = cfg
         .env_passthrough
         .iter()
         .filter_map(|k| std::env::var(k).ok().map(|v| (k.clone(), v)))
         .collect();
+
+    // Tier B (opt-in): expose the host Nix daemon inside the sandbox so full
+    // `nix develop`/`build`/`fmt` work there (Tier A only gives read-only tools
+    // on PATH). Path-preserving bind of the daemon-socket dir + `NIX_REMOTE`;
+    // the daemon mediates store writes, so the read-only `/nix/store` mount is
+    // fine. Only when the host actually has a daemon — otherwise we'd wire a
+    // half-broken nix, so we warn and leave it off (Tier A still stands).
+    if cfg.nix_daemon {
+        const SOCK_DIR: &str = "/nix/var/nix/daemon-socket";
+        if std::path::Path::new(SOCK_DIR).join("socket").exists() {
+            mounts.push(Mount {
+                host: SOCK_DIR.to_string(),
+                dest: SOCK_DIR.to_string(),
+                ro: true,
+                cache: false,
+            });
+            env.push(("NIX_REMOTE".to_string(), "daemon".to_string()));
+        } else {
+            msg::warn(
+                "sandbox: [sandbox] nix_daemon is on but no host Nix daemon socket was \
+                 found (/nix/var/nix/daemon-socket/socket); leaving it off. Tier A \
+                 (inject_devshell) still provides the devShell tools read-only.",
+            );
+        }
+    }
 
     Some(SandboxSpec {
         backend,

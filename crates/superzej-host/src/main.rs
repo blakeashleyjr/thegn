@@ -7,6 +7,7 @@
 mod agent;
 mod apps;
 mod borders;
+mod bouncer;
 mod bridge_sup;
 mod center;
 mod chrome;
@@ -29,6 +30,7 @@ mod layout;
 mod layout_spec;
 mod logotype;
 mod lsp;
+mod mem;
 mod menu;
 mod metrics;
 mod mousefilter;
@@ -42,6 +44,7 @@ mod profile;
 mod proxy_daemon;
 mod queries;
 mod recorder;
+mod relay;
 mod render_plan;
 mod run;
 mod sandbox_events;
@@ -50,8 +53,8 @@ mod search_everywhere;
 mod seg;
 mod sequence;
 mod session;
+mod share;
 mod sidebar;
-mod stats;
 mod task;
 mod telemetry;
 #[cfg(test)]
@@ -110,6 +113,11 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::theme::Action,
     },
+    /// Expose a worktree-local port at a public URL (`[share]`).
+    Share {
+        #[command(subcommand)]
+        action: cmd::share::Action,
+    },
     /// Emit a syntax-highlighted diff of a worktree against its branch point.
     Diff {
         #[arg(long)]
@@ -126,6 +134,27 @@ pub enum Command {
     },
     /// List managed worktrees.
     List,
+    /// Report per-worktree disk usage (checkout + reclaimable `target/`).
+    Disk {
+        /// Scan only this worktree (defaults to all known worktrees).
+        #[arg(long)]
+        worktree: Option<String>,
+        /// Scan every known worktree (the default when no `--worktree` is given).
+        #[arg(long)]
+        all: bool,
+    },
+    /// Reclaim a worktree's `target/` build artifacts (keeps the checkout).
+    Clean {
+        /// Clean this worktree (defaults to the current one).
+        #[arg(long)]
+        worktree: Option<String>,
+        /// Clean every known worktree (except the active one).
+        #[arg(long)]
+        all: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        force: bool,
+    },
     /// List git repos discovered under repo_roots.
     Repos,
     /// List recently opened repos (history).
@@ -164,6 +193,11 @@ pub enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Cap glibc's per-thread arena count before the runtime spawns any threads,
+    // so the host can't sprawl across dozens of never-trimmed arenas (an audit
+    // traced ~2.5 GB RSS to ~131 of them). No-op off glibc. See `mem`.
+    mem::tune_allocator();
+
     // Strip any inherited GIT_DIR/GIT_WORK_TREE/etc. before anything else (and
     // before the tokio runtime spawns threads — env mutation must be
     // single-threaded). superzej targets git explicitly with `-C <dir>`, so it
@@ -187,7 +221,20 @@ fn main() -> anyhow::Result<()> {
     // every in-flight spawn_blocking task, so quitting would wait out whatever
     // hydration is mid-flight (git/tokei/podman subprocesses — easily 100ms+).
     // shutdown_background detaches those; exit is as instant as launch.
-    let rt = tokio::runtime::Runtime::new()?;
+    //
+    // Bounded over the `Runtime::new()` default (which sizes the worker pool to
+    // ncpu and lets the blocking pool grow to 512): the host is I/O-bound, not
+    // compute-bound, so a small worker pool keeps latency snappy, and a tight
+    // blocking cap + short keep-alive stop the on-demand hydration/git threads
+    // from sprawling (each thread is a glibc arena → RSS). Tunable, but these
+    // defaults cut the steady-state thread count from ~60 without hurting feel.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(8)
+        .max_blocking_threads(32)
+        .thread_keep_alive(std::time::Duration::from_secs(3))
+        .thread_name("szhost-rt")
+        .build()?;
     let result = rt.block_on(run::main(cli));
     rt.shutdown_background();
     // termwiz opens /dev/tty without O_CLOEXEC; child pane shells inherit that
@@ -221,6 +268,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             let p = superzej_core::config::Config::path();
             cmd::theme::run(&cfg, action, p)
         }
+        Command::Share { action } => cmd::share::run(&cfg, action),
         Command::Diff {
             worktree,
             base,
@@ -228,6 +276,12 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             file,
         } => cmd::diff::run(worktree, base, stat, file),
         Command::List => cmd::list::run(&cfg),
+        Command::Disk { worktree, all } => cmd::disk::disk(&cfg, worktree, all),
+        Command::Clean {
+            worktree,
+            all,
+            force,
+        } => cmd::disk::clean(&cfg, worktree, all, force),
         Command::Repos => cmd::repos::repos(&cfg),
         Command::Recent { count } => cmd::repos::recent(count),
         Command::Config { action } => cmd::config::run(&cfg, action, config_path),
