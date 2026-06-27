@@ -46,6 +46,8 @@ language = "auto"
 # "delete worktrees from disk" (a "keep files" choice is offered too). Set false
 # to skip the prompt and delete the worktree dirs from disk immediately.
 confirm_delete_workspace = true
+# Whether to display the full word for the mode chip (e.g., "Normal" instead of "N").
+full_mode_chip = true
 
 # Visual tuning. The focus accent recolors every superzej surface (plugins,
 # pickers, dashboard). `focus_border` frames whatever owns focus — the focused
@@ -348,6 +350,9 @@ format = "text"           # text | json
 # Sidebar navigation (global):
 #   Alt ↑/↓        navigate worktrees, wrapping WITHIN the current workspace
 #   Shift+Alt ↑/↓  switch to the previous/next *workspace* (a real context switch)
+#   Ctrl+1..9      jump straight to the workspace at that slot — the digit shown
+#                  on each workspace row in the sidebar (and in the Ctrl+K menu);
+#                  slots follow the visible sidebar order
 #   Ctrl+Alt ↑/↓   *reorder* (move) the selected item: the workspace under the
 #                  sidebar cursor if the sidebar is focused, else the active
 #                  worktree within its workspace
@@ -355,6 +360,7 @@ format = "text"           # text | json
 # with `s` while the sidebar is focused.
 # prev-workspace = "Shift Alt Up"
 # next-workspace = "Shift Alt Down"
+# summon-workspace-1 = "Ctrl 1"    # …through summon-workspace-9 = "Ctrl 9"
 # move-item-up = "Ctrl Alt Up"     # (legacy id move-worktree-up still works)
 # move-item-down = "Ctrl Alt Down"
 
