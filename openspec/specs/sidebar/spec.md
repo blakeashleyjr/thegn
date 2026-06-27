@@ -37,3 +37,31 @@ The sidebar SHALL surface per-row activity (e.g. activity dots) driven by the ho
 
 - **WHEN** a non-focused worktree produces activity
 - **THEN** its sidebar row reflects that activity state
+
+### Requirement: Worktrees nest their tabs (pages) in the tree
+
+A worktree MAY own multiple tabs (pages); the sidebar SHALL nest page rows under their worktree and MUST show them only when a worktree has more than one tab, with the main checkout presented as an explicit `home` worktree row that is a sibling of the branch worktrees.
+
+#### Scenario: Single-tab worktree shows no page rows
+
+- **WHEN** a worktree has exactly one tab
+- **THEN** no page child rows are shown under it
+
+#### Scenario: Multi-tab worktree shows page rows
+
+- **WHEN** a worktree has more than one tab
+- **THEN** its pages appear as child rows nested under that worktree
+
+### Requirement: Worktrees default to stable creation order
+
+Within a workspace, worktrees SHALL default to a stable creation-order arrangement and MUST support explicit manual reordering that persists, so the worktree list never reshuffles implicitly by activity.
+
+#### Scenario: Default order is creation order
+
+- **WHEN** worktrees are listed without any manual reordering
+- **THEN** they appear in stable creation order
+
+#### Scenario: Manual worktree reorder persists
+
+- **WHEN** the user reorders worktrees
+- **THEN** the new order persists across restarts
