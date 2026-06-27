@@ -1250,10 +1250,13 @@ ready_timeout_secs = 20
 # # api_base = "https://api.sprites.dev/v1"   # empty ⇒ this default
 # # workdir = "/workspace"   # data = "sync" pushes/pulls the worktree here
 # # auto_provision = false   # create the sprite on first open if missing (8-E
-# #                          #   warm-on-open). Off by default — creating a paid
-# #                          #   sandbox is opt-in; else run `superzej env provision`.
+# #                          #   warm-on-open) — over the REST API, so creation is
+# #                          #   CLI-free (no `up_command`). Off by default —
+# #                          #   creating a paid sandbox is opt-in. (The
+# #                          #   `backend=sprites` launcher scaffolds it `true`.)
 # # auto_checkpoint = false  # checkpoint the sprite on worktree close (suspend-on-
-# #                          #   close, fast resume). Off by default (storage cost).
+# #                          #   close, fast resume) — over the API, CLI-free. Off
+# #                          #   by default (storage cost). Launcher scaffolds `true`.
 # # exec = "auto"            # how the interactive pane attaches:
 # #                          #   auto — native API exec (PTY-over-WebSocket, NO
 # #                          #          `sprite` CLI) when the provider supports it
