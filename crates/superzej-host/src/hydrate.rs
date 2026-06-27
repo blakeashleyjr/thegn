@@ -879,6 +879,14 @@ pub(crate) fn build_model(
     let counted_kinds = app_cfg.notifications.counted_unread_kind_names();
 
     let sidebar_workspaces = workspace_list(session, Some(db));
+    // Folders for every workspace shown in the sidebar (not just the active
+    // tab's): the sidebar filters this list per-workspace by `repo_path`, so a
+    // worktree filed into a folder stays visible whichever tab is active.
+    let sidebar_db_folders: Vec<superzej_core::models::FolderRow> = sidebar_workspaces
+        .iter()
+        .filter(|(_, _, _, repo)| !repo.is_empty())
+        .flat_map(|(_, _, _, repo)| db.folders_for_workspace(repo).unwrap_or_default())
+        .collect();
     let sidebar_db_worktrees = db_worktree_list(db);
     let sidebar_db_terminals = db.terminals().unwrap_or_default();
     let sidebar_status = collect_sidebar_status(session, db, &alert_kinds, &counted_kinds);
@@ -902,9 +910,7 @@ pub(crate) fn build_model(
         active_tab,
         sidebar_workspaces,
         sidebar_db_worktrees,
-        sidebar_db_folders: db
-            .folders_for_workspace(&cwd.to_string_lossy())
-            .unwrap_or_default(),
+        sidebar_db_folders,
         sidebar_db_terminals,
         sidebar_status,
         disk_warn_threshold_gb: app_cfg.disk.warn_threshold_gb,
