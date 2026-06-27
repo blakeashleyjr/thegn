@@ -49,6 +49,7 @@ mod search_everywhere;
 mod seg;
 mod sequence;
 mod session;
+mod share;
 mod sidebar;
 mod stats;
 mod task;
@@ -108,6 +109,11 @@ pub enum Command {
     Theme {
         #[command(subcommand)]
         action: cmd::theme::Action,
+    },
+    /// Expose a worktree-local port at a public URL (`[share]`).
+    Share {
+        #[command(subcommand)]
+        action: cmd::share::Action,
     },
     /// Emit a syntax-highlighted diff of a worktree against its branch point.
     Diff {
@@ -235,6 +241,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             let p = superzej_core::config::Config::path();
             cmd::theme::run(&cfg, action, p)
         }
+        Command::Share { action } => cmd::share::run(&cfg, action),
         Command::Diff {
             worktree,
             base,

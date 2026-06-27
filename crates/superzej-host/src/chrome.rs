@@ -357,6 +357,10 @@ pub struct FrameModel {
     pub accent: String,
     /// Pin chips for the tabbar (label + status glyph), in `Alt-N` order.
     pub pins: Vec<crate::pins::PinChip>,
+    /// Active ingress shares (`[share]`) for the current worktree — feeds the
+    /// statusbar badge + the System ▸ Share panel section. Synced from the
+    /// `ShareSupervisor` (loop-local), not from hydration.
+    pub shares: Vec<crate::share::ShareView>,
     /// Deterministic container name for the active worktree path. The sandbox
     /// panel uses this to show the sandbox for the selected worktree instead of
     /// the first superzej-owned container on the machine.
@@ -1213,6 +1217,31 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             ));
         }
     }
+    // Ingress-share badge (`[share]`): a cyan ⇅ chip showing how many ports the
+    // current worktree exposes (the first port when there's exactly one). Silent
+    // when nothing is shared; an amber chip flags a share that failed to come up.
+    {
+        let up = model.shares.iter().filter(|s| s.url.is_some()).count();
+        let failed = model.shares.iter().filter(|s| s.failed).count();
+        if up > 0 {
+            let label = if up == 1 {
+                match model.shares.iter().find(|s| s.url.is_some()) {
+                    Some(s) => format!(" \u{21c5} {} ", s.port),
+                    None => " \u{21c5} ".to_string(),
+                }
+            } else {
+                format!(" \u{21c5} {up} ")
+            };
+            r.push(seg(Tok::Slot(S::Text), " "));
+            r.push(Seg::chip(Tok::Hue(superzej_core::theme::Hue::Teal), label));
+        } else if failed > 0 {
+            r.push(seg(Tok::Slot(S::Text), " "));
+            r.push(Seg::chip(
+                Tok::Hue(superzej_core::theme::Hue::Amber),
+                " \u{21c5} ! ".to_string(),
+            ));
+        }
+    }
     // Now-playing badge (optional [media] feature): a compact ▶/❚❚ chip with the
     // current track, green while playing and blue while paused. `badge()` returns
     // `None` when nothing is loaded, so the chip is silent when idle.
@@ -2055,6 +2084,7 @@ pub(crate) fn panel_help_pairs(ui: &crate::panel::PanelUi) -> Vec<(String, Strin
             ("L", "loop"),
             ("≡", "playlist"),
         ],
+        Section::Share => &[("j/k", "row"), ("↵", "copy url")],
         Section::Debug | Section::Sandbox | Section::Db | Section::Telemetry | Section::Keys => {
             &[("j/k", "row")]
         }

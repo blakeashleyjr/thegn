@@ -181,6 +181,33 @@ fn file_preview_rows(fp: &crate::panel::FilePreview, cols: usize, rows: usize) -
     out
 }
 
+/// `[share]` ingress shares for the active worktree: one row per exposed port
+/// with its public URL (or starting/failed state). Pure — the supervisor owns
+/// lifecycle; `model.shares` is the synced snapshot.
+pub(super) fn share(ctx: &SectionCtx) -> Vec<PanelRow> {
+    let shares = &ctx.model.shares;
+    if shares.is_empty() {
+        return vec![PanelRow::plain(Line::segs(vec![seg(
+            g(),
+            "no shares — Alt+Shift+S to share a port".to_string(),
+        )]))];
+    }
+    shares
+        .iter()
+        .map(|s| {
+            let (color, status) = match &s.url {
+                Some(url) => (hue(Hue::Teal), url.clone()),
+                None if s.failed => (hue(Hue::Red), "failed".to_string()),
+                None => (g2(), "starting…".to_string()),
+            };
+            PanelRow::plain(Line::segs(vec![
+                seg(color, format!("\u{21c5} {} ", s.port)).bold(),
+                seg(g(), status),
+            ]))
+        })
+        .collect()
+}
+
 // ---- tests ------------------------------------------------------------------
 
 pub(super) fn tests(ctx: &SectionCtx) -> Vec<PanelRow> {

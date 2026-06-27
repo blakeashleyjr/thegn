@@ -1003,6 +1003,32 @@ ephemeral = true
 # [sandbox.vpn.custom.env]
 # FOO = "bar"
 
+# ── Ingress sharing (`[share]`) ─────────────────────────────────────────────
+# The INBOUND sibling of [sandbox.vpn]. Where the VPN block gives a worktree
+# *egress* through an overlay, [share] exposes a service running *inside* a
+# worktree (a dev server, a PR preview, a webhook/OAuth callback) at a public
+# URL. Provider-pluggable like the VPN seam; `bore` is the first backend.
+# Disabled by default. Use `superzej share start <port>` to open a share.
+[share]
+# Provider: none | bore. `none` (default) disables sharing. (rathole / zrok /
+# ngrok / iroh backends plug in behind the same seam later.)
+provider = "none"
+# Who can reach the share: public | private. `bore` is public-only; `private`
+# (identity-scoped) is reserved for the future iroh/zrok backends and is
+# downgraded to `public` with a warning under `bore`.
+visibility = "public"
+# When the share can't come up: fail (surface the error) | warn (note and skip).
+on_error = "fail"
+# Seconds to wait for the public URL to appear before applying on_error.
+ready_timeout_secs = 20
+
+# [share.bore]   # provider = "bore" — https://github.com/ekzhang/bore
+# to = ""                       # relay host running `bore server`; "" = bore.pub
+# secret = "env:BORE_SECRET"    # shared HMAC (secrets-ref); must match the server
+# remote_port = 0               # port to bind on the relay; 0 = relay chooses
+# local_host = "127.0.0.1"      # interface the dev server listens on
+# extra_args = []               # extra `bore local` flags
+
 # ── Named execution environments (`[env.<name>]`) ───────────────────────────
 # A reusable *library* of execution environments. Each bundles three orthogonal
 # axes: a PLACEMENT (where processes run — local / ssh / k8s / provider), an

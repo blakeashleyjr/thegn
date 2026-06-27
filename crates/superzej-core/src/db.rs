@@ -45,10 +45,22 @@ use std::path::PathBuf;
 /// unchanged; thereafter order is manual (Ctrl+Alt+↑/↓) and stable.
 /// v20: adds `worktree_disk` (per-worktree size + target/ size cache) backing
 /// the disk-usage badges, the statusbar threshold warning, and `superzej disk`.
-const SCHEMA_VERSION: i64 = 20;
+const SCHEMA_VERSION: i64 = 21;
 
 pub struct Db {
     conn: Connection,
+}
+
+/// A persisted ingress share (`[share]`) — the resurrection record for a tunnel
+/// the host respawns on restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareRow {
+    pub worktree: String,
+    pub local_port: u16,
+    pub provider: String,
+    pub public_url: Option<String>,
+    pub state: String,
+    pub created_at: i64,
 }
 
 /// A persisted LLM-proxy exhaustion marker (one per backend+model).
@@ -593,6 +605,21 @@ impl Db {
             [],
         );
         let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN folder_id INTEGER", []);
+        // v21: per-worktree ingress shares (`[share]`). A worktree can expose
+        // several ports, so the key is (worktree, local_port). Additive; a row
+        // is the resurrection record for a tunnel the host respawns on restart.
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS shares (
+              worktree   TEXT    NOT NULL,
+              local_port INTEGER NOT NULL,
+              provider   TEXT    NOT NULL,
+              public_url TEXT,
+              state      TEXT    NOT NULL,
+              created_at INTEGER NOT NULL,
+              PRIMARY KEY (worktree, local_port)
+            )",
+            [],
+        );
         // v18: the named execution environment selected per workspace/worktree
         // (`[env.<name>]`). Additive; absent/NULL = inherit the next layer down
         // (worktree → workspace → repo `.superzej.*` → global default → default).
@@ -603,6 +630,67 @@ impl Db {
         // it is idempotent and a failed earlier attempt retries next open.
         migrate_tab_layout_v6(&conn);
         Ok(Db { conn })
+    }
+
+    // --- ingress shares (`[share]`; resurrection layer for tunnels) --------
+    /// Insert or update the share record for `(worktree, local_port)`.
+    pub fn upsert_share(
+        &self,
+        worktree: &str,
+        local_port: u16,
+        provider: &str,
+        public_url: Option<&str>,
+        state: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO shares(worktree,local_port,provider,public_url,state,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(worktree,local_port) DO UPDATE SET
+               provider=excluded.provider,
+               public_url=excluded.public_url,
+               state=excluded.state",
+            params![
+                worktree,
+                local_port as i64,
+                provider,
+                public_url,
+                state,
+                util::now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// All persisted shares, newest first (restore + panel listing).
+    pub fn list_shares(&self) -> Result<Vec<ShareRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT worktree,local_port,provider,public_url,state,created_at \
+             FROM shares ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], Self::map_share_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Remove the share record for `(worktree, local_port)`.
+    pub fn delete_share(&self, worktree: &str, local_port: u16) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM shares WHERE worktree=?1 AND local_port=?2",
+            params![worktree, local_port as i64],
+        )?;
+        Ok(())
+    }
+
+    fn map_share_row(r: &rusqlite::Row) -> rusqlite::Result<ShareRow> {
+        Ok(ShareRow {
+            worktree: r.get(0)?,
+            local_port: r.get::<_, i64>(1)? as u16,
+            provider: r.get(2)?,
+            public_url: r.get(3)?,
+            state: r.get(4)?,
+            created_at: r.get(5)?,
+        })
     }
 
     // --- PR status cache (TTL'd; feeds the right panel) --------------------
@@ -2640,6 +2728,38 @@ mod tests {
 
     fn db() -> Db {
         Db::open_memory().unwrap()
+    }
+
+    #[test]
+    fn shares_upsert_list_and_delete() {
+        let db = db();
+        assert!(db.list_shares().unwrap().is_empty());
+
+        // Insert two shares on one worktree, plus one with no URL yet.
+        db.upsert_share("/wt/a", 3000, "bore", Some("http://bore.pub:1"), "up")
+            .unwrap();
+        db.upsert_share("/wt/a", 8080, "bore", None, "starting")
+            .unwrap();
+        let rows = db.list_shares().unwrap();
+        assert_eq!(rows.len(), 2);
+
+        // Upsert updates state + url in place (no duplicate row).
+        db.upsert_share("/wt/a", 8080, "bore", Some("http://bore.pub:2"), "up")
+            .unwrap();
+        let rows = db.list_shares().unwrap();
+        assert_eq!(rows.len(), 2);
+        let updated = rows
+            .iter()
+            .find(|r| r.local_port == 8080)
+            .expect("port 8080");
+        assert_eq!(updated.public_url.as_deref(), Some("http://bore.pub:2"));
+        assert_eq!(updated.state, "up");
+        assert_eq!(updated.provider, "bore");
+
+        db.delete_share("/wt/a", 3000).unwrap();
+        let rows = db.list_shares().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].local_port, 8080);
     }
 
     #[test]

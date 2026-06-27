@@ -52,6 +52,7 @@ pub mod repo;
 pub mod sandbox;
 pub mod search;
 pub mod semantic;
+pub mod share;
 pub mod startup;
 pub mod theme;
 pub mod util;

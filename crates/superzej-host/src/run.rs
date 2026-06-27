@@ -1947,6 +1947,37 @@ fn active_cwd(session: &crate::session::Session) -> Option<std::path::PathBuf> {
     session.active_group().and_then(group_cwd)
 }
 
+/// Render-facing share snapshot for the active worktree (badge + Share panel).
+fn current_share_views(
+    sup: &crate::share::ShareSupervisor,
+    session: &crate::session::Session,
+) -> Vec<crate::share::ShareView> {
+    session
+        .active_group()
+        .map(|g| sup.views(&g.path))
+        .unwrap_or_default()
+}
+
+/// Persist a share lifecycle event to the `shares` table (resurrection layer).
+fn persist_share_event(ev: &crate::share::ShareEvent) {
+    use crate::share::ShareEvent;
+    let Ok(db) = superzej_core::db::Db::open() else {
+        return;
+    };
+    match ev {
+        ShareEvent::Up {
+            worktree,
+            port,
+            url,
+        } => {
+            let _ = db.upsert_share(worktree, *port, "bore", Some(url), "up");
+        }
+        ShareEvent::Failed { worktree, port, .. } | ShareEvent::Down { worktree, port } => {
+            let _ = db.delete_share(worktree, *port);
+        }
+    }
+}
+
 /// DELETE these worktree groups from disk (`git worktree remove`, branch
 /// kept) and close them. Home groups are never deletable. Returns the status
 /// line summarizing what happened.
@@ -3146,6 +3177,8 @@ enum HostInputKind {
     NewWorktreeFromTemplate {
         repo_root: String,
     },
+    /// Expose the typed port from the active worktree (`[share]`).
+    ShareWorktreePort,
 }
 
 /// Launch the new-worktree wizard + speculative-create worker against `root`.
@@ -6684,6 +6717,29 @@ async fn event_loop<T: Terminal>(
     // The pin supervisor owns daemon panes independent of tabs/visibility.
     let mut supervisor = crate::pins::PinSupervisor::from_config(keymap.config());
 
+    // Ingress shares (`[share]`): per-worktree tunnel children supervised off the
+    // loop. Each share's thread reports state on `share_rx` and pulses the waker;
+    // the loop drains it, persists the row, and re-syncs `model.shares`.
+    let mut share_supervisor = crate::share::ShareSupervisor::new();
+    let (share_tx, mut share_rx) = tokio_mpsc::unbounded_channel::<crate::share::ShareEvent>();
+    // Resurrect shares that were live last session (best-effort; a disabled
+    // config or a missing `bore` just leaves the row to be cleaned on next event).
+    if keymap.config().share.is_enabled()
+        && let Ok(db) = superzej_core::db::Db::open()
+    {
+        for row in db.list_shares().unwrap_or_default() {
+            if row.state == "up" {
+                let _ = share_supervisor.start(
+                    &keymap.config().share,
+                    &row.worktree,
+                    row.local_port,
+                    &share_tx,
+                    &waker,
+                );
+            }
+        }
+    }
+
     // LSP: lazy, warm language servers per worktree. Clients push diagnostics on
     // a std channel; a bridge thread forwards them onto a loop channel and pulses
     // the waker (svc has no waker). `lsp_diags` persists them across model swaps.
@@ -7069,6 +7125,7 @@ async fn event_loop<T: Terminal>(
             return Ok(()); // last worktree closed
         }
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            share_supervisor.shutdown_all();
             persist_session_layout(&mut session, &panes);
             return Ok(());
         }
@@ -8508,6 +8565,9 @@ async fn event_loop<T: Terminal>(
             if !lsp_diags.is_empty() {
                 lsp_diags.merge_into(&mut model.panel.diagnostics);
             }
+            // Shares live on the supervisor (loop-local), not in hydration; a
+            // fresh model wouldn't carry them — re-apply for the active worktree.
+            model.shares = current_share_views(&share_supervisor, &session);
             // The Symbols list (outline/refs) is re-derived in the pre-render block.
             // Mirror an externally-started (or externally-finished) rebase
             // into the git flow state, so the TODO view and conflict chrome
@@ -9183,6 +9243,17 @@ async fn event_loop<T: Terminal>(
                 model.panel.log_lines_structured.drain(0..overflow);
             }
             dirty = true;
+        }
+
+        // Ingress-share state from the supervisor threads: persist the row,
+        // update the supervisor, and re-sync the model so the badge + Share
+        // panel repaint (a chrome change ⇒ Full frame).
+        while let Ok(ev) = share_rx.try_recv() {
+            persist_share_event(&ev);
+            if share_supervisor.on_event(ev) {
+                model.shares = current_share_views(&share_supervisor, &session);
+                dirty = true;
+            }
         }
 
         // Expire any toasts whose deadline passed; their scheduled wake lands
@@ -10722,6 +10793,39 @@ async fn event_loop<T: Terminal>(
                                             }
                                             Err(why) => {
                                                 model.status = format!("rename failed: {why}");
+                                            }
+                                        }
+                                    }
+                                    HostInputKind::ShareWorktreePort => {
+                                        match text.trim().parse::<u16>() {
+                                            Ok(port) if port > 0 => {
+                                                if let Some(wt) =
+                                                    session.active_group().map(|g| g.path.clone())
+                                                {
+                                                    match share_supervisor.start(
+                                                        &keymap.config().share,
+                                                        &wt,
+                                                        port,
+                                                        &share_tx,
+                                                        &waker,
+                                                    ) {
+                                                        Ok(()) => {
+                                                            model.shares = current_share_views(
+                                                                &share_supervisor,
+                                                                &session,
+                                                            );
+                                                            model.status =
+                                                                format!("Sharing port {port}…");
+                                                        }
+                                                        Err(e) => {
+                                                            model.status =
+                                                                format!("Share failed: {e}");
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            _ => {
+                                                model.status = "Share: invalid port number".into();
                                             }
                                         }
                                     }
@@ -12745,6 +12849,22 @@ async fn event_loop<T: Terminal>(
                                                 need_relayout = true;
                                             }
                                         }
+                                        Section::Share => {
+                                            // Enter copies the focused share's URL.
+                                            if let Some(url) = model
+                                                .shares
+                                                .get(panel_ui.cursor)
+                                                .and_then(|s| s.url.clone())
+                                            {
+                                                use std::io::Write as _;
+                                                let mut out = std::io::stdout();
+                                                let _ = out
+                                                    .write_all(&crate::copymode::osc52(&url))
+                                                    .and_then(|_| out.flush());
+                                                crate::clipboard::copy(&url);
+                                                model.status = format!("Copied {url}");
+                                            }
+                                        }
                                         Section::Ci
                                         | Section::Debug
                                         | Section::Sandbox
@@ -14415,6 +14535,66 @@ async fn event_loop<T: Terminal>(
                                 panel_ui.switch_tab(crate::panel::PanelTab::Work);
                                 open_panel_section(
                                     crate::panel::Section::Ci,
+                                    &mut panel_ui,
+                                    &mut hydration_gen,
+                                    &model_tx,
+                                    &session,
+                                    &waker,
+                                    PanelDocsWiring {
+                                        model: &model,
+                                        generation: docs_gen,
+                                        tx: &docs_tx,
+                                    },
+                                );
+                                focus.zone = crate::focus::Zone::Panel;
+                            }
+                            Action::ShareWorktreePort => {
+                                host_input = Some((
+                                    menu::InputOverlay::new("share worktree port (number)", ""),
+                                    HostInputKind::ShareWorktreePort,
+                                ));
+                                model.status =
+                                    "Share port: enter a port number (Esc cancels)".into();
+                            }
+                            Action::StopWorktreeShare => {
+                                if let Some(wt) = session.active_group().map(|g| g.path.clone()) {
+                                    let n = share_supervisor.stop(&wt, None);
+                                    if let Ok(db) = superzej_core::db::Db::open() {
+                                        for v in &model.shares {
+                                            let _ = db.delete_share(&wt, v.port);
+                                        }
+                                    }
+                                    model.shares = current_share_views(&share_supervisor, &session);
+                                    model.status = if n == 0 {
+                                        "No active shares on this worktree".into()
+                                    } else {
+                                        format!("Stopped {n} share(s)")
+                                    };
+                                }
+                            }
+                            Action::OpenShares => {
+                                panel_auto_revealed = None;
+                                if chrome.panel.is_none() {
+                                    want_panel = true;
+                                    panel_forced = cols < layout::PANEL_MIN_COLS;
+                                    chrome = compute_chrome(
+                                        cols,
+                                        rows,
+                                        want_sidebar,
+                                        want_panel,
+                                        panel_forced,
+                                        panel_width,
+                                        sidebar_cols,
+                                        zoom,
+                                        &supervisor,
+                                        drawer_rows,
+                                        drawer_full,
+                                    );
+                                    need_relayout = true;
+                                }
+                                panel_ui.switch_tab(crate::panel::PanelTab::System);
+                                open_panel_section(
+                                    crate::panel::Section::Share,
                                     &mut panel_ui,
                                     &mut hydration_gen,
                                     &model_tx,

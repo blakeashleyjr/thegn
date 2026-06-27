@@ -550,6 +550,17 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
             }
             None => vec![seg(g2(), "—")],
         },
+        Section::Share => {
+            let up = model.shares.iter().filter(|s| s.url.is_some()).count();
+            let failed = model.shares.iter().filter(|s| s.failed).count();
+            if up > 0 {
+                vec![seg(hue(Hue::Teal), format!("\u{21c5} {up}"))]
+            } else if failed > 0 {
+                vec![seg(hue(Hue::Red), "✗ failed".to_string())]
+            } else {
+                vec![seg(g2(), "off")]
+            }
+        }
     }
 }
 
@@ -601,6 +612,7 @@ pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
         Section::Symbols => symbols::content(ctx),
         Section::Debug => misc::debug(),
         Section::Sandbox => misc::sandbox(ctx),
+        Section::Share => misc::share(ctx),
         Section::Db => misc::db(),
         Section::Telemetry => telemetry::content(ctx),
         Section::Keys => keys::content(ctx),
@@ -1011,7 +1023,11 @@ mod spec {
             assert!(!h.is_empty(), "{section:?} half");
             assert!(!f.is_empty(), "{section:?} full");
             // Debug/Db are dead-code placeholder sections — distinctness is waived.
-            if matches!(section, Section::Debug | Section::Db | Section::Logs) {
+            // Logs/Share are flat lists with no width-specific full view.
+            if matches!(
+                section,
+                Section::Debug | Section::Db | Section::Logs | Section::Share
+            ) {
                 continue;
             }
             assert_ne!(n, f, "{section:?}: normal vs full");

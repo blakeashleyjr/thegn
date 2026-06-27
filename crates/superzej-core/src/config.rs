@@ -2175,6 +2175,106 @@ pub struct CustomVpnConfig {
     pub env: std::collections::BTreeMap<String, String>,
 }
 
+// ── Ingress sharing (`[share]`) ─────────────────────────────────────────────
+// The *inbound* sibling of `[sandbox.vpn]`: expose a service running inside a
+// worktree (a dev server, a PR preview, a webhook/OAuth callback) at a public
+// URL. Like the VPN seam this is provider-pluggable; `bore` is the first
+// backend. Worktree-level, not a sandbox-network attribute, so it lives at the
+// top level rather than under `[sandbox]`.
+
+config_enum! {
+    /// `[share] provider` — which tunnel backend gives a worktree port a URL.
+    /// `none` (default) disables sharing. Future backends (rathole / zrok /
+    /// ngrok / iroh) plug in behind the same `ShareProvider` seam.
+    pub enum ShareProviderKind: "share provider" {
+        None = "none" | "off",
+        Bore = "bore",
+    } default = None;
+}
+config_enum! {
+    /// `[share] visibility` — who can reach the share. `bore` only does
+    /// `public` (anyone with the URL); `private` (identity-scoped) is reserved
+    /// for the iroh/zrok backends.
+    pub enum ShareVisibility: "share visibility" {
+        Public = "public",
+        Private = "private",
+    } default = Public;
+}
+config_enum! {
+    /// `[share] on_error` — what to do when a share can't be brought up.
+    ///  - `fail` (default): surface the error; the share does not start.
+    ///  - `warn`: log a warning and carry on (no URL).
+    pub enum ShareOnError: "share on_error" {
+        Fail = "fail",
+        Warn = "warn",
+    } default = Fail;
+}
+
+/// `[share]` — expose a worktree-local port at a public URL. Disabled by
+/// default (`provider = "none"`). Only the selected provider's sub-table is
+/// consulted.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct ShareConfig {
+    pub provider: ShareProviderKind,
+    pub visibility: ShareVisibility,
+    pub on_error: ShareOnError,
+    /// Seconds to wait for the share's URL to appear before applying `on_error`.
+    pub ready_timeout_secs: u64,
+    pub bore: BoreConfig,
+}
+
+impl Default for ShareConfig {
+    fn default() -> Self {
+        ShareConfig {
+            provider: ShareProviderKind::None,
+            visibility: ShareVisibility::Public,
+            on_error: ShareOnError::Fail,
+            ready_timeout_secs: 20,
+            bore: BoreConfig::default(),
+        }
+    }
+}
+
+impl ShareConfig {
+    /// Whether sharing is requested at all.
+    pub fn is_enabled(&self) -> bool {
+        self.provider != ShareProviderKind::None
+    }
+}
+
+/// `[share.bore]` — <https://github.com/ekzhang/bore>, a tiny TCP tunnel. The
+/// client connects out to a relay (`to`) and exposes the local port at
+/// `to:<remote_port>`. Run your own `bore server` and set `to`/`secret`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct BoreConfig {
+    /// Relay server host (the machine running `bore server`). `""` falls back to
+    /// the public `bore.pub` instance (no secret, best-effort).
+    pub to: String,
+    /// Optional shared HMAC secret (secrets-ref `"env:BORE_SECRET"` /
+    /// `"file:~/.bore/secret"`); must match the server's `--secret`.
+    pub secret: String,
+    /// Remote port to bind on the relay. `0` = let the relay choose.
+    pub remote_port: u16,
+    /// Local interface the dev server listens on (forwarded to the relay).
+    pub local_host: String,
+    /// Extra `bore local` flags for anything not modeled here.
+    pub extra_args: Vec<String>,
+}
+
+impl Default for BoreConfig {
+    fn default() -> Self {
+        BoreConfig {
+            to: String::new(),
+            secret: "env:BORE_SECRET".into(),
+            remote_port: 0,
+            local_host: "127.0.0.1".into(),
+            extra_args: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct SandboxConfig {
@@ -2820,6 +2920,8 @@ pub struct Config {
     pub llm_proxy: LlmProxyConfig,
     /// `[media]` — optional media-player control. Disabled by default — additive.
     pub media: MediaConfig,
+    /// `[share]` — expose a worktree port at a public URL. Disabled by default.
+    pub share: ShareConfig,
     /// Rebind a built-in action by id, e.g. `new-worktree = "Ctrl w"`. The flat
     /// table is the global/default layer; nested mode tables are native-host only.
     pub keybinds: KeybindConfig,
@@ -2899,6 +3001,7 @@ impl Default for Config {
             lsp: LspConfig::default(),
             llm_proxy: LlmProxyConfig::default(),
             media: MediaConfig::default(),
+            share: ShareConfig::default(),
             keybinds: KeybindConfig::default(),
             actions: Vec::new(),
             profile: String::new(),

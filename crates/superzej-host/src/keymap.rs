@@ -98,6 +98,12 @@ pub enum Action {
     ToggleNotifications,
     /// Open the right panel to the Work ▸ CI section and focus it (AV group).
     OpenCi,
+    /// Prompt for a port and expose it from the active worktree (`[share]`).
+    ShareWorktreePort,
+    /// Stop all ingress shares on the active worktree.
+    StopWorktreeShare,
+    /// Open the right panel to the System ▸ Share section and focus it.
+    OpenShares,
     OpenPalette,
     Lazygit,
     Yazi,
@@ -440,6 +446,27 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         id: "open-ci",
         label: "Open CI/CD runs panel",
         hint: "ci",
+        default_chords: &[],
+        palette: true,
+    },
+    ActionSpec {
+        id: "share-worktree-port",
+        label: "Share worktree port",
+        hint: "share",
+        default_chords: &["Alt Shift S"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "stop-worktree-share",
+        label: "Stop worktree shares",
+        hint: "unshare",
+        default_chords: &[],
+        palette: true,
+    },
+    ActionSpec {
+        id: "open-shares",
+        label: "Open shares panel",
+        hint: "shares",
         default_chords: &[],
         palette: true,
     },
@@ -843,6 +870,9 @@ impl Action {
             Action::FocusSidebar => "focus-sidebar",
             Action::FocusPanel => "focus-panel",
             Action::OpenCi => "open-ci",
+            Action::ShareWorktreePort => "share-worktree-port",
+            Action::StopWorktreeShare => "stop-worktree-share",
+            Action::OpenShares => "open-shares",
             Action::ToggleNotifications => "toggle-notifications",
             Action::OpenPalette => "palette",
             Action::Lazygit => "lazygit",
@@ -926,6 +956,9 @@ impl Action {
             "focus-sidebar" => Action::FocusSidebar,
             "focus-panel" => Action::FocusPanel,
             "open-ci" => Action::OpenCi,
+            "share-worktree-port" => Action::ShareWorktreePort,
+            "stop-worktree-share" => Action::StopWorktreeShare,
+            "open-shares" => Action::OpenShares,
             "toggle-notifications" => Action::ToggleNotifications,
             "palette" | "menu" => Action::OpenPalette,
             "lazygit" | "tool-lazygit" => Action::Lazygit,
@@ -1337,6 +1370,8 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Alt s", Action::FocusSidebar).unwrap();
     map.insert_all("Alt .", Action::FocusPanel).unwrap();
     map.insert_all("Alt i", Action::ToggleNotifications)
+        .unwrap();
+    map.insert_all("Alt Shift S", Action::ShareWorktreePort)
         .unwrap();
     map.insert_all("Ctrl Alt c", Action::CopyPane).unwrap();
     map.insert_all("Ctrl Shift c", Action::CopyPane).unwrap();
