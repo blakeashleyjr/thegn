@@ -1563,11 +1563,32 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
     };
     let list_bottom = rect.y + rect.rows.saturating_sub(metrics_rows);
 
+    // Rows advance a running `y` (not `rect.y + 2 + i`) so a first-class
+    // section banner can claim a blank breathing line above itself; text,
+    // highlight, and badge overpaint all derive from this same `y`.
+    let mut y = rect.y + 2;
     for (i, row) in visible.iter().enumerate() {
-        // +2: header row, then one blank breathing-room row.
-        let y = rect.y + 2 + i;
+        if row.kind == crate::sidebar::RowKind::SectionHeading && i > 0 {
+            y += 1; // breathing gap above the banner
+        }
         if y >= list_bottom {
             break;
+        }
+        // A section banner renders like the "WORKSPACES" title — bold, in the
+        // Text color, no selection pill / status tail / badges.
+        if row.kind == crate::sidebar::RowKind::SectionHeading {
+            let composed = compose_sidebar_row(row, None);
+            draw_text_bold(
+                surface,
+                rect.x,
+                y,
+                &format!(" {}", composed.text),
+                col(S::Text),
+                col(S::Panel),
+                rect.cols,
+            );
+            y += 1;
+            continue;
         }
         let selected = i == model.sidebar_selected;
         let marked = model.sidebar_marked.contains(&i);
@@ -1677,6 +1698,7 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             );
             col_off += badge.text.chars().count();
         }
+        y += 1;
     }
 
     // Row context menu overlay (item 27).
@@ -1829,7 +1851,12 @@ fn compose_sidebar_row(
             text.push_str("\u{1f4c2} "); // open folder glyph
             text.push_str(&row.label);
         }
-        RowKind::Workspace | RowKind::TerminalsHeader => {
+        RowKind::SectionHeading => {
+            // Bold-banner styling (matching the "WORKSPACES" title) is applied
+            // by the draw loop; here we only carry the label text.
+            text.push_str(&row.label);
+        }
+        RowKind::Workspace | RowKind::TerminalHost => {
             let caret = if row.collapsed {
                 "\u{25b8}"
             } else {
@@ -1837,9 +1864,18 @@ fn compose_sidebar_row(
             };
             text.push_str(caret);
             text.push(' ');
-            // A non-git "dir" workspace gets a folder glyph so it reads
-            // differently from a repo workspace.
-            if row.dir {
+            if row.kind == RowKind::TerminalHost {
+                // Host group glyph: 💻 local vs 🌐 remote, keyed off the
+                // representative connection set in `build_rows`.
+                let local = row
+                    .terminal_connection
+                    .as_deref()
+                    .map(str::is_empty)
+                    .unwrap_or(true);
+                text.push_str(if local { "💻 " } else { "🌐 " });
+            } else if row.dir {
+                // A non-git "dir" workspace gets a folder glyph so it reads
+                // differently from a repo workspace.
                 text.push_str("\u{1f4c1} ");
             }
             text.push_str(&row.label);

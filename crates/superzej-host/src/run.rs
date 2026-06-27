@@ -1061,6 +1061,15 @@ fn refresh_tab_model(
     sb.rebuild(model, session);
 }
 
+/// Rows that toggle collapse on Enter/Space/`h`/`l`: workspaces and terminal
+/// host groups (both keyed by `workspace_slug` in the collapse set).
+fn is_collapsible(kind: crate::sidebar::RowKind) -> bool {
+    matches!(
+        kind,
+        crate::sidebar::RowKind::Workspace | crate::sidebar::RowKind::TerminalHost
+    )
+}
+
 /// Interaction + persisted view state for the workspace tree (items 16–27).
 /// The single source of truth the event loop mutates; [`SidebarState::rebuild`]
 /// derives `FrameModel`'s sidebar fields from it plus the model's data carriers.
@@ -1372,10 +1381,12 @@ impl SidebarState {
         if row.tab_target.is_some() {
             entries.push(("open", "Open"));
         }
-        if row.kind == RowKind::Workspace {
+        if is_collapsible(row.kind) {
             entries.push(("toggle", "Collapse/expand"));
         }
-        entries.push(("pin", "Pin / unpin"));
+        if !row.pin_key.is_empty() {
+            entries.push(("pin", "Pin / unpin"));
+        }
         // A workspace can be forgotten (no disk deletion); needs a DB row,
         // carried as the workspace row's `worktree_path`.
         if row.kind == RowKind::Workspace && row.worktree_path.is_some() {
@@ -1489,9 +1500,10 @@ impl SidebarState {
                 self.cursor = self.cursor.saturating_sub(1);
             }
             KeyCode::Enter => {
-                // On a workspace row, Enter toggles collapse; elsewhere opens.
+                // On a collapsible header (workspace or terminal host), Enter
+                // toggles collapse; elsewhere it opens the row.
                 if let Some(row) = self.selected_row(model) {
-                    if row.kind == crate::sidebar::RowKind::Workspace {
+                    if is_collapsible(row.kind) {
                         return self.toggle_collapse(model, session);
                     }
                     if let Some(t) = row.tab_target.clone() {
@@ -1500,18 +1512,18 @@ impl SidebarState {
                 }
             }
             KeyCode::Char('l') | KeyCode::RightArrow => {
-                // Expand a collapsed workspace.
+                // Expand a collapsed header.
                 if let Some(row) = self.selected_row(model)
-                    && row.kind == crate::sidebar::RowKind::Workspace
+                    && is_collapsible(row.kind)
                     && row.collapsed
                 {
                     return self.toggle_collapse(model, session);
                 }
             }
             KeyCode::Char('h') | KeyCode::LeftArrow => {
-                // Collapse an expanded workspace.
+                // Collapse an expanded header.
                 if let Some(row) = self.selected_row(model)
-                    && row.kind == crate::sidebar::RowKind::Workspace
+                    && is_collapsible(row.kind)
                     && !row.collapsed
                 {
                     return self.toggle_collapse(model, session);
@@ -1528,9 +1540,9 @@ impl SidebarState {
             }
             KeyCode::Char('p') => return self.toggle_pin(model, session),
             KeyCode::Char(' ') => {
-                // Multi-select toggle (item 26); on workspace rows, collapse.
+                // Multi-select toggle (item 26); on collapsible headers, collapse.
                 if let Some(row) = self.selected_row(model)
-                    && row.kind == crate::sidebar::RowKind::Workspace
+                    && is_collapsible(row.kind)
                 {
                     return self.toggle_collapse(model, session);
                 }
