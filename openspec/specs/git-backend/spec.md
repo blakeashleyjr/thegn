@@ -42,3 +42,49 @@ The set of worktrees SHALL be derived from git, and the SQLite DB MUST act only 
 
 - **WHEN** the DB's cached worktree list differs from git's actual worktrees
 - **THEN** git's view wins and the cache is reconciled to match
+
+### Requirement: All git invocations run with a scrubbed git environment
+
+Every git invocation SHALL go through the `util::git_cmd`/`GitLoc` builders that `env_remove` the `GIT_ENV_VARS` (e.g. `GIT_DIR`/`GIT_WORK_TREE`) on each call, and raw `Command::new("git")` MUST NOT be used outside that single builder (enforced by `just lint`).
+
+#### Scenario: Inherited GIT_DIR does not leak
+
+- **WHEN** a git command runs in a process whose environment carries
+  `GIT_DIR`/`GIT_WORK_TREE`
+- **THEN** the builder strips them so the command operates on its `-C <dir>`
+  target rather than the inherited shared `.git`
+
+#### Scenario: Raw git is rejected
+
+- **WHEN** code invokes git outside the `git_cmd`/`GitLoc` builder
+- **THEN** `just lint` fails on the grep guardrail
+
+### Requirement: Self-heal shared .git/config pollution
+
+superzej SHALL surgically strip a stray `core.worktree` from a main checkout's shared `.git/config` at startup and again on each worktree switch, so a poisoned shared config never retargets repo-wide git operations at the wrong worktree.
+
+#### Scenario: Stray core.worktree at startup
+
+- **WHEN** a main checkout's `.git/config` contains an invalid `core.worktree`
+- **THEN** superzej removes it (text edit) across cwd, session worktrees, and the
+  `--git-common-dir` parent before serving git reads
+
+#### Scenario: Mid-session pollution heals
+
+- **WHEN** another process writes a stray `core.worktree` while superzej runs
+- **THEN** the next worktree switch heals it off-thread
+
+### Requirement: Serialize concurrent git mutations with a cross-process lock
+
+Mutating git operations SHALL take an advisory `flock` on `<git-common>/superzej-git.lock` so concurrent szhost/agent processes on the same repo serialize their writes, while reads remain lock-free.
+
+#### Scenario: Two writers serialize
+
+- **WHEN** two processes attempt git mutations on the same repo at once
+- **THEN** they acquire the lock in turn rather than clobbering the shared
+  index/refs
+
+#### Scenario: Reads are not blocked
+
+- **WHEN** a git read runs concurrently with a mutation
+- **THEN** the read proceeds without taking the lock
