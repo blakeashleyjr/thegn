@@ -6239,6 +6239,37 @@ fn attach_agent_pane(
         Err(_) => None,
     };
 
+    // Lower plane: route the agent's model through the proxy. The pi extension
+    // registers the provider AT INIT from these env vars (pi flushes provider
+    // registrations before the session starts, so a runtime `providers/set` is
+    // too late). Gated on `route_agent` — independent of `enabled` (which launches
+    // szproxy) — so it can target an already-running proxy at `listen`. baseUrl is
+    // the host root (the Anthropic Messages API the proxy serves; pi appends
+    // `/v1/messages`). Mint a per-worktree virtual key for spend attribution;
+    // revoked when the agent disconnects.
+    let proxy_key = if cfg.llm_proxy.route_agent {
+        let wt = session.worktrees[gi].path.clone();
+        let key = crate::agent::mint_agent_proxy_key(&wt);
+        env.push((
+            "SUPERZEJ_PROXY_BASE_URL".to_string(),
+            format!("http://{}", cfg.llm_proxy.listen),
+        ));
+        env.push((
+            "SUPERZEJ_PROXY_API".to_string(),
+            cfg.llm_proxy.agent_api.clone(),
+        ));
+        env.push((
+            "SUPERZEJ_PROXY_MODEL".to_string(),
+            cfg.llm_proxy.agent_model.clone(),
+        ));
+        if let Some(k) = &key {
+            env.push(("SUPERZEJ_PROXY_KEY".to_string(), k.clone()));
+        }
+        key
+    } else {
+        None
+    };
+
     let argv = spec.argv.clone();
     match panes.spawn_argv_env(&argv, cwd.as_deref(), &env, center) {
         Ok(id) => {
@@ -6264,14 +6295,10 @@ fn attach_agent_pane(
                 let reg_tx = acp_reg_tx.clone();
                 let waker_clone = waker.clone();
                 let wt_name = g.path.clone();
-
-                // Lower plane: when the LLM proxy is enabled, mint a per-worktree
-                // virtual key and point the agent at szproxy over ACP. The key is
-                // revoked when the agent disconnects.
-                let proxy_route = cfg.llm_proxy.enabled.then(|| {
-                    let base_url = format!("http://{}/v1", cfg.llm_proxy.listen);
-                    (crate::agent::mint_agent_proxy_key(&wt_name), base_url)
-                });
+                // Per-worktree virtual key minted above (when routing). Revoked when
+                // the agent disconnects. The model provider itself is configured at
+                // pi-init via the SUPERZEJ_PROXY_* env (not a runtime providers/set).
+                let minted_key = proxy_key;
 
                 // Surface lifecycle in the statusbar chip (the only native signal).
                 // Emits to the loop's per-worktree activity map + pulses the waker.
@@ -6297,24 +6324,6 @@ fn attach_agent_pane(
                             if let Err(e) = client.initialize().await {
                                 tracing::error!(target: "szhost::acp", "ACP initialize failed: {e}");
                                 emit(crate::chrome::AgentConn::Error);
-                            }
-
-                            // Route model traffic through szproxy with the minted key.
-                            let mut minted_key: Option<String> = None;
-                            if let Some((Some(key), base_url)) = proxy_route {
-                                let params = superzej_core::acp::methods::ProvidersSetParams {
-                                    id: "szproxy".to_string(),
-                                    base_url,
-                                    api_type: Some("openai".to_string()),
-                                    headers: Some(serde_json::json!({
-                                        "Authorization": format!("Bearer {key}")
-                                    })),
-                                };
-                                if let Err(e) = client.set_provider(params).await {
-                                    tracing::error!(target: "szhost::acp", "providers/set failed: {e}");
-                                    emit(crate::chrome::AgentConn::Error);
-                                }
-                                minted_key = Some(key);
                             }
 
                             // Hand the client to the loop so it can reply to requests.
@@ -6343,7 +6352,7 @@ fn attach_agent_pane(
                         Err(e) => {
                             tracing::error!(target: "szhost::acp", "failed to connect to agent ACP port {port}: {e}");
                             emit(crate::chrome::AgentConn::Error);
-                            if let Some((Some(key), _)) = &proxy_route {
+                            if let Some(key) = &minted_key {
                                 crate::agent::revoke_agent_proxy_key(key);
                             }
                         }

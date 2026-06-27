@@ -389,6 +389,18 @@ pub struct LlmProxyConfig {
     pub token_reduction: bool,
     /// Aggressiveness when `token_reduction` is on.
     pub token_reduction_level: CompressionLevel,
+    /// Route a launched agent's model traffic through the proxy at `listen` by
+    /// injecting provider config into the agent's environment at spawn. Separate
+    /// from `enabled` (which launches `szproxy`): set this to point the agent at
+    /// an already-running proxy without launching our own.
+    pub route_agent: bool,
+    /// The pi-side API id for the proxy endpoint. The proxy serves the Anthropic
+    /// Messages API (`/v1/messages`); pi's OpenAI client speaks the Responses API,
+    /// which the proxy does not implement — so `anthropic-messages` is the default.
+    pub agent_api: String,
+    /// The model id the agent requests from the proxy (the proxy maps it to a
+    /// real backend, e.g. `model-proxy/standard` → its standard route).
+    pub agent_model: String,
 }
 
 impl Default for LlmProxyConfig {
@@ -404,6 +416,9 @@ impl Default for LlmProxyConfig {
             heartbeat_secs: 10,
             token_reduction: false,
             token_reduction_level: CompressionLevel::default(),
+            route_agent: false,
+            agent_api: "anthropic-messages".to_string(),
+            agent_model: "model-proxy/standard".to_string(),
         }
     }
 }

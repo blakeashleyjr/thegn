@@ -21,6 +21,31 @@ export default function (pi: ExtensionAPI) {
     default: "0" // 0 means pick an ephemeral port, but user can override
   });
 
+  // Lower plane: route the model through superzej's proxy. pi flushes provider
+  // registrations at startup (before session_start), so this MUST happen here in
+  // the factory — not at runtime via providers/set. superzej hands us the proxy
+  // config via env at spawn. The proxy speaks the Anthropic Messages API
+  // (api "anthropic-messages"); baseUrl is the host root (pi appends /v1/messages).
+  // Selected at session_start (setModel is invalid during the factory — the
+  // runtime isn't up yet — but registerProvider IS flushed from here).
+  let proxyModel: string | null = null;
+  const proxyBase = process.env.SUPERZEJ_PROXY_BASE_URL;
+  if (proxyBase) {
+    const api = process.env.SUPERZEJ_PROXY_API || "anthropic-messages";
+    proxyModel = process.env.SUPERZEJ_PROXY_MODEL || "model-proxy/standard";
+    const apiKey = process.env.SUPERZEJ_PROXY_KEY || "sk-superzej";
+    pi.registerProvider("superzej-proxy", {
+      baseUrl: proxyBase,
+      api,
+      apiKey,
+      models: [{
+        id: proxyModel, name: proxyModel, reasoning: false, input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 200000, maxTokens: 8192
+      }]
+    } as any);
+  }
+
   // State to track active ACP requests
   let currentPromptId: string | null = null;
   let nextRpcId = 1;
@@ -162,10 +187,10 @@ export default function (pi: ExtensionAPI) {
       if (msg.params._meta?.traceparent) {
         activeTraceparent = msg.params._meta.traceparent;
       }
-      // Dispatch the user's prompt into pi
+      // Dispatch the user's prompt into pi. `sendUserMessage` lives on the
+      // ExtensionAPI (`pi`), not on `ctx.ui` — it always triggers a turn.
       const promptText = msg.params.prompt;
-      // In interactive mode, this visually sends the message and triggers the agent
-      ctx.ui.sendUserMessage(promptText, { deliverAs: "steer" });
+      pi.sendUserMessage(promptText, { deliverAs: "steer" });
       
       // We don't send the result yet; we stream updates and send the result on agent_end
     } else if (msg.method === "session/close") {
