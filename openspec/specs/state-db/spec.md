@@ -38,3 +38,12 @@ Any test or benchmark that opens the DB or spawns the host SHALL isolate `XDG_ST
 - **WHEN** a test that touches the DB runs while a live superzej session exists
 - **THEN** it uses an isolated `XDG_STATE_HOME` and leaves the real database
   unchanged
+
+### Requirement: Tabs persist within worktree groups
+
+The persisted layout SHALL model tabs as belonging to worktree groups (one group per worktree, each with at least one tab and its own active tab) rather than a flat tab list, and resurrection MUST restore each group's active tab.
+
+#### Scenario: Resurrect worktree groups
+
+- **WHEN** the host restarts with multiple worktrees each holding multiple tabs
+- **THEN** each worktree group and its previously active tab are restored
