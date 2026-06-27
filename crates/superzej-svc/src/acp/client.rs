@@ -106,10 +106,24 @@ pub struct AcpClient {
 }
 
 impl AcpClient {
+    /// Connect to the agent's ACP server over TCP loopback (non-sandboxed).
     pub async fn connect(port: u16) -> Result<(Self, mpsc::Receiver<AcpInbound>)> {
         let addr = format!("127.0.0.1:{}", port);
-        let (mut transport_reader, mut transport_writer) = AcpTransport::connect(&addr).await?;
+        let (r, w) = AcpTransport::connect(&addr).await?;
+        Ok(Self::from_transport(r, w))
+    }
 
+    /// Connect over a unix-domain socket (a bind-mounted socket from a sealed
+    /// sandbox, or a host socket path). Same protocol; different transport.
+    pub async fn connect_unix(path: &str) -> Result<(Self, mpsc::Receiver<AcpInbound>)> {
+        let (r, w) = AcpTransport::connect_unix(path).await?;
+        Ok(Self::from_transport(r, w))
+    }
+
+    fn from_transport(
+        mut transport_reader: crate::acp::transport::AcpReader,
+        mut transport_writer: crate::acp::transport::AcpWriter,
+    ) -> (Self, mpsc::Receiver<AcpInbound>) {
         let (tx_outbound, mut rx_outbound) = mpsc::channel::<JsonRpcMessage>(100);
         let (tx_inbound, rx_inbound) = mpsc::channel::<AcpInbound>(100);
 
@@ -196,7 +210,7 @@ impl AcpClient {
             tx_outbound,
         };
 
-        Ok((client, rx_inbound))
+        (client, rx_inbound)
     }
 
     /// Send a JSON-RPC request to the agent and await its result. Allocates a
