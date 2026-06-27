@@ -10,16 +10,16 @@
 
 use anyhow::{Context, Result};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
-use std::path::Path;
 
+use std::path::Path;
 use tokio::sync::mpsc as tokio_mpsc;
-use tokio::task;
 
 use termwiz::caps::Capabilities;
 use termwiz::input::{InputEvent, KeyCode, Modifiers};
 use termwiz::surface::{Change, Position, Surface};
 use termwiz::terminal::buffered::BufferedTerminal;
 use termwiz::terminal::{Terminal, TerminalWaker, new_terminal};
+use tokio::task;
 
 use crate::chrome::{FrameModel, LoadStep, render_tab};
 use crate::compositor::Rect;
@@ -443,6 +443,12 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         since_start_ms = start.elapsed().as_millis() as u64,
         "config loaded"
     );
+    // Warm the active workspace's flake devShell cache off-thread so the first
+    // pane is injected with the project toolchain (Tier A). No-op without a
+    // flake / `nix` / `[sandbox] inject_devshell`. See `superzej_core::devenv`.
+    if cfg.sandbox.inject_devshell && !session.id.is_empty() {
+        superzej_core::devenv::prewarm(std::path::Path::new(&session.id));
+    }
     // Auto-launch the LLM-proxy daemon when enabled (disabled by default — AI is
     // additive). Held for the lifetime of `main`; the supervisor thread keeps it
     // alive and `Drop` stops it on graceful return (process-group exit otherwise).
@@ -584,7 +590,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // (branch moves, PR cache) and bounds staleness. The loop owns the actual
     // refresh; this thread just pulses a tick + waker on the interval.
     let (refresh_tx, refresh_rx) = tokio_mpsc::unbounded_channel::<RefreshKind>();
-    let (stats_tx, stats_rx) = tokio_mpsc::unbounded_channel::<crate::stats::StatsSnapshot>();
+    let (stats_tx, stats_rx) = tokio_mpsc::unbounded_channel::<superzej_metrics::StatsSnapshot>();
     let (container_tx, container_rx) =
         tokio_mpsc::unbounded_channel::<Vec<superzej_core::sandbox::ContainerInfo>>();
     let (metrics_tx, metrics_rx) = tokio_mpsc::unbounded_channel::<crate::metrics::MetricsState>();
@@ -600,12 +606,21 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // Set while the telemetry overlay is open: the ticker samples stats at
     // its 500ms half-tick instead of the user-cycled rate.
     let stats_live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Filesystem the `disk` masthead widget measures: the configured path, else
+    // the one holding the worktrees dir. `disk_free_pct` climbs to an existing
+    // ancestor, so a not-yet-created dir still resolves to its parent fs.
+    let disk_fs_path = if cfg.stats.disk_path.trim().is_empty() {
+        std::path::PathBuf::from(&cfg.worktrees_dir)
+    } else {
+        std::path::PathBuf::from(superzej_core::util::expand_tilde(&cfg.stats.disk_path))
+    };
     spawn_refresh_ticker(
         refresh_tx.clone(),
         stats_tx,
         container_tx,
         stats_interval_ms.clone(),
         stats_live.clone(),
+        disk_fs_path,
         waker.clone(),
     );
 
@@ -1193,16 +1208,6 @@ enum SidebarOutcome {
     },
 }
 
-/// A destructive action awaiting `y`/`Y` confirmation in the loop's modal.
-enum PendingAction {
-    /// Forget a workspace (close its groups + prune DB rows); files kept.
-    RemoveWorkspace {
-        repo_path: String,
-        slug: String,
-        display: String,
-    },
-}
-
 impl SidebarState {
     /// Persist a single `ui_state` key for this session's scope.
     fn persist(&self, session_id: &str, key: &str, value: &str) {
@@ -1395,6 +1400,7 @@ impl SidebarState {
         }
         Some(crate::chrome::RowMenu {
             anchor: self.cursor,
+            target_pin_key: row.pin_key.clone(),
             entries: entries
                 .into_iter()
                 .map(|(id, label)| crate::chrome::RowMenuEntry {
@@ -1450,8 +1456,17 @@ impl SidebarState {
                 }
                 KeyCode::Enter => {
                     let id = menu.entries.get(menu.cursor).map(|e| e.id.clone());
+                    let target_key = menu.target_pin_key.clone();
                     self.menu = None;
                     if let Some(id) = id {
+                        if let Some(idx) = model
+                            .sidebar_rows
+                            .iter()
+                            .filter(|r| r.visible)
+                            .position(|r| r.pin_key == target_key)
+                        {
+                            self.cursor = idx;
+                        }
                         return self.run_menu_action(&id, model, session);
                     }
                 }
@@ -1538,7 +1553,8 @@ impl SidebarState {
                 }
             }
             KeyCode::Char('D') => {
-                // On a workspace row, D forgets the workspace (no disk delete).
+                // On a workspace row, D removes the workspace (opens the same
+                // delete-from-disk/keep-files menu as Alt+Shift+X).
                 if let Some(out) = self.remove_workspace_target(model) {
                     return out;
                 }
@@ -1979,6 +1995,48 @@ fn persist_share_event(ev: &crate::share::ShareEvent) {
     }
 }
 
+/// The active worktree's `(worktree_path, workspace_repo_path)`, or `None` when
+/// there's nothing fileable (no active group, the home tab, a terminal, or no
+/// resolvable repo). The repo path is the DB workspace root so the folder we
+/// create lines up with the sidebar's per-workspace folder filter.
+fn active_worktree_repo(session: &crate::session::Session) -> Option<(String, String)> {
+    use crate::session::GroupKind;
+    let g = session.active_group()?;
+    if g.kind != GroupKind::Branch || g.path.is_empty() {
+        return None;
+    }
+    let wt_path = g.path.clone();
+    let db = superzej_core::db::Db::open().ok()?;
+    let repo_path = db
+        .repo_root_for(&wt_path)
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            superzej_core::repo::main_worktree(std::path::Path::new(&wt_path))
+                .map(|p| p.to_string_lossy().into_owned())
+        })?;
+    Some((wt_path, repo_path))
+}
+
+/// File the active worktree into `folder` (created if absent). Returns a status
+/// line on success or a human-readable reason on failure.
+fn file_active_worktree(session: &crate::session::Session, folder: &str) -> Result<String, String> {
+    let folder = folder.trim();
+    if folder.is_empty() {
+        return Err("Folder name is empty".into());
+    }
+    let (wt_path, repo_path) =
+        active_worktree_repo(session).ok_or("No worktree to file into a folder")?;
+    let db = superzej_core::db::Db::open().map_err(|e| format!("DB open failed: {e}"))?;
+    let fid = db
+        .ensure_folder(&repo_path, folder)
+        .map_err(|e| format!("Folder create failed: {e}"))?;
+    db.set_worktree_folder(&wt_path, Some(fid))
+        .map_err(|e| format!("Filing failed: {e}"))?;
+    Ok(format!("Filed worktree into \"{folder}\""))
+}
+
 /// DELETE these worktree groups from disk (`git worktree remove`, branch
 /// kept) and close them. Home groups are never deletable. Returns the status
 /// line summarizing what happened.
@@ -2098,22 +2156,79 @@ fn delete_groups(
     status
 }
 
-/// Forget an entire workspace: close every live worktree group it owns and
-/// prune its DB rows (`workspaces`, the `worktrees` registry, its slug, and the
-/// active-workspace pointer if it pointed here). This is deliberately
-/// non-destructive — unlike [`delete_groups`] it never runs `git worktree
-/// remove` or `fs::remove_dir_all`, so the worktree files stay on disk and the
-/// workspace re-appears if reopened.
+/// Remove a workspace — the single path behind both Alt+Shift+X and the sidebar
+/// "Remove workspace" action. Always closes every live worktree group the
+/// workspace owns and prunes its DB rows (`workspaces`, the `worktrees`
+/// registry, its slug, and the active-workspace pointer). When `keep_files` is
+/// false it *also* deletes the workspace's worktree directories from disk (the
+/// home checkout at `repo_path` is always preserved); when true the files stay
+/// on disk and the workspace re-appears if reopened. If the removed workspace is
+/// the active one, the session switches to the next available workspace (or
+/// empties when none remain).
+/// Worktree directories to delete from disk when removing the workspace at
+/// `repo_path`: every registered worktree whose `repo_root` matches, EXCEPT the
+/// home checkout (its path == `repo_path`, which must never be deleted) and any
+/// empty-path legacy rows. Split out so the safety-critical home-skip guard is
+/// unit-testable without real I/O.
+fn workspace_worktree_dirs(db: &superzej_core::db::Db, repo_path: &str) -> Vec<String> {
+    db.worktrees()
+        .map(|rows| {
+            rows.into_iter()
+                .filter(|w| {
+                    w.repo_root == repo_path && w.worktree != repo_path && !w.worktree.is_empty()
+                })
+                .map(|w| w.worktree)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn remove_workspace(
     session: &mut crate::session::Session,
     panes: &mut Panes,
     repo_path: &str,
     slug: &str,
     display: &str,
+    keep_files: bool,
 ) -> String {
     let db = superzej_core::db::Db::open().ok();
+    let was_active = session.id == repo_path;
+
+    // Destructive: delete the workspace's worktree dirs from disk. Read the
+    // registry BEFORE `remove_workspace_with_db` prunes it. The home checkout
+    // (its path == `repo_path`) is never deleted — only branch worktrees.
+    if !keep_files && let Some(db) = &db {
+        let root = Path::new(repo_path);
+        for path in workspace_worktree_dirs(db, repo_path) {
+            superzej_core::worktree::remove(root, Path::new(&path), "", false);
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+
     remove_workspace_with_db(session, panes, db.as_ref(), repo_path, slug);
-    format!("Removed workspace '{display}' (files kept on disk)")
+
+    // Removing the active workspace leaves the session pointing at nothing;
+    // land on the next available workspace, else empty out.
+    if was_active {
+        let mut switched = false;
+        if let Some(db) = &db
+            && let Ok(workspaces) = db.workspaces()
+            && let Some(next) = workspaces.first()
+        {
+            switched = session.switch_to_workspace(&next.repo_path, db).is_ok();
+        }
+        if !switched {
+            session.id.clear();
+            session.worktrees.clear();
+            session.active = 0;
+        }
+    }
+
+    if keep_files {
+        format!("Removed workspace '{display}' (files kept on disk)")
+    } else {
+        format!("Deleted workspace '{display}' (worktrees removed from disk)")
+    }
 }
 
 /// Engine for [`remove_workspace`], split from the process-global `Db::open()`
@@ -3155,7 +3270,6 @@ enum GitInputKind {
 enum HostInputKind {
     NewWorkspace,
     NewTerminal,
-    DeleteWorkspaceConfirm,
     /// Rename the worktree group at this session index from its old branch
     /// (item 53). Carries the repo root + old path/branch so the off-thread
     /// rename has everything it needs.
@@ -3183,6 +3297,9 @@ enum HostInputKind {
     ShareWorktreePort {
         reach: Option<superzej_core::config::ShareReach>,
     },
+    /// File the active worktree into a new folder named by the typed value
+    /// (the "＋ New folder…" path of the move-to-folder picker).
+    FileWorktreeNewFolder,
 }
 
 /// Launch the new-worktree wizard + speculative-create worker against `root`.
@@ -3343,17 +3460,6 @@ fn begin_new_workspace_prompt(
     model.status = "Create workspace: enter path or URL (Esc cancels)".into();
 }
 
-fn begin_delete_workspace_prompt(
-    host_input: &mut Option<(menu::InputOverlay, HostInputKind)>,
-    model: &mut FrameModel,
-) {
-    *host_input = Some((
-        menu::InputOverlay::new("delete workspace? (type 'yes' to confirm)", ""),
-        HostInputKind::DeleteWorkspaceConfirm,
-    ));
-    model.status = "Delete this workspace? Type 'yes' to confirm (Esc cancels)".into();
-}
-
 fn looks_like_git_url(input: &str) -> bool {
     input.starts_with("http://")
         || input.starts_with("https://")
@@ -3380,12 +3486,20 @@ fn create_workspace_from_input(
     session: &mut crate::session::Session,
     db: &superzej_core::db::Db,
 ) -> Result<std::path::PathBuf> {
-    create_workspace_from_input_with_config(
+    match create_workspace_from_input_with_config(
         input,
         session,
         db,
         &superzej_core::config::Config::default(),
-    )
+    )? {
+        WorkspaceResolution::Repo(p) => Ok(p),
+        WorkspaceResolution::NotARepo(p) => Ok(p),
+    }
+}
+
+enum WorkspaceResolution {
+    Repo(std::path::PathBuf),
+    NotARepo(std::path::PathBuf),
 }
 
 fn create_workspace_from_input_with_config(
@@ -3393,7 +3507,7 @@ fn create_workspace_from_input_with_config(
     session: &mut crate::session::Session,
     db: &superzej_core::db::Db,
     cfg: &superzej_core::config::Config,
-) -> Result<std::path::PathBuf> {
+) -> Result<WorkspaceResolution> {
     let input = input.trim();
     anyhow::ensure!(!input.is_empty(), "no workspace path or URL given");
 
@@ -3439,12 +3553,12 @@ fn create_workspace_from_input_with_config(
     let kind = if superzej_core::repo::main_worktree(&root).is_some() {
         "repo"
     } else {
-        "dir"
+        return Ok(WorkspaceResolution::NotARepo(root));
     };
     db.put_workspace(&root_s, &name, kind)?;
     db.touch_repo(&root_s, &name)?;
     session.switch_to_workspace(&root_s, db)?;
-    Ok(root)
+    Ok(WorkspaceResolution::Repo(root))
 }
 
 /// A follow-up only the loop body can perform (it owns session/panes).
@@ -4856,6 +4970,8 @@ fn dispatch_menu_choice(
         // The reach picker is intercepted at the call site (opens port entry);
         // never reaches this git-scoped dispatcher.
         MenuChoice::ShareReach(_) => {}
+        MenuChoice::ConfirmDeleteWorkspace { .. } => {}
+        MenuChoice::ConfirmInitGit { .. } => {}
     }
     GitAfter::None
 }
@@ -6240,18 +6356,78 @@ fn persist_session_layout(session: &mut crate::session::Session, panes: &Panes) 
 /// ran on the wizard worker) into the tab named `tab_name` and point that
 /// tab's center at the live pane so `materialize` won't also spawn a plain
 /// shell. No-op (returns false) if the tab is gone.
+#[allow(clippy::too_many_arguments)]
 fn attach_agent_pane(
     session: &mut crate::session::Session,
     panes: &mut Panes,
     tab_name: &str,
     spec: &crate::agent::LaunchSpec,
     center: Rect,
+    cfg: &superzej_core::config::Config,
+    acp_inbound_tx: &tokio_mpsc::UnboundedSender<(String, superzej_svc::acp::client::AcpInbound)>,
+    acp_reg_tx: &tokio_mpsc::UnboundedSender<(
+        String,
+        std::sync::Arc<superzej_svc::acp::client::AcpClient>,
+    )>,
+    acp_status_tx: &tokio_mpsc::UnboundedSender<(String, crate::chrome::AgentConn)>,
+    waker: &TerminalWaker,
 ) -> bool {
     let Some(gi) = session.worktrees.iter().position(|g| g.name == tab_name) else {
         return false;
     };
     let cwd = spec.cwd.clone();
-    match panes.spawn_argv_env(&spec.argv, cwd.as_deref(), &spec.env, center) {
+    let mut env = spec.env.clone();
+
+    // Reserve a free localhost port and hand it to the agent via the `ACP_PORT`
+    // env var — the pi extension binds exactly this port and superzej connects to
+    // it. Env is the reliable channel: it crosses superzej's `sh -lc` (and, later,
+    // sandbox) wrapping. (A `--acp-port` flag appended to the wrapped argv would
+    // land as a positional arg to `sh`, never reaching pi.) The brief
+    // bind-then-drop is the standard ephemeral-port reservation; pi re-binds it.
+    let acp_port = match std::net::TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => match listener.local_addr().map(|addr| addr.port()).unwrap_or(0) {
+            0 => None,
+            port => {
+                env.push(("ACP_PORT".to_string(), port.to_string()));
+                Some(port)
+            }
+        },
+        Err(_) => None,
+    };
+
+    // Lower plane: route the agent's model through the proxy. The pi extension
+    // registers the provider AT INIT from these env vars (pi flushes provider
+    // registrations before the session starts, so a runtime `providers/set` is
+    // too late). Gated on `route_agent` — independent of `enabled` (which launches
+    // szproxy) — so it can target an already-running proxy at `listen`. baseUrl is
+    // the host root (the Anthropic Messages API the proxy serves; pi appends
+    // `/v1/messages`). Mint a per-worktree virtual key for spend attribution;
+    // revoked when the agent disconnects.
+    let proxy_key = if cfg.llm_proxy.route_agent {
+        let wt = session.worktrees[gi].path.clone();
+        let key = crate::agent::mint_agent_proxy_key(&wt);
+        env.push((
+            "SUPERZEJ_PROXY_BASE_URL".to_string(),
+            format!("http://{}", cfg.llm_proxy.listen),
+        ));
+        env.push((
+            "SUPERZEJ_PROXY_API".to_string(),
+            cfg.llm_proxy.agent_api.clone(),
+        ));
+        env.push((
+            "SUPERZEJ_PROXY_MODEL".to_string(),
+            cfg.llm_proxy.agent_model.clone(),
+        ));
+        if let Some(k) = &key {
+            env.push(("SUPERZEJ_PROXY_KEY".to_string(), k.clone()));
+        }
+        key
+    } else {
+        None
+    };
+
+    let argv = spec.argv.clone();
+    match panes.spawn_argv_env(&argv, cwd.as_deref(), &env, center) {
         Ok(id) => {
             // Reap any panes the group's active tab already had, then back it
             // with the agent pane.
@@ -6265,6 +6441,86 @@ fn attach_agent_pane(
             }
             tab.center = crate::center::CenterTree::Leaf(id);
             tab.focused_pane = id;
+
+            // Connect to ACP in the background if a port was assigned. The task
+            // registers its client with the loop (so the loop can reply) and then
+            // forwards every inbound message tagged with the worktree path; the
+            // loop owns servicing + replies (see `dispatch_acp_inbound`).
+            if let Some(port) = acp_port {
+                let inbound_tx = acp_inbound_tx.clone();
+                let reg_tx = acp_reg_tx.clone();
+                let waker_clone = waker.clone();
+                let wt_name = g.path.clone();
+                // Per-worktree virtual key minted above (when routing). Revoked when
+                // the agent disconnects. The model provider itself is configured at
+                // pi-init via the SUPERZEJ_PROXY_* env (not a runtime providers/set).
+                let minted_key = proxy_key;
+
+                // Surface lifecycle in the statusbar chip (the only native signal).
+                // Emits to the loop's per-worktree activity map + pulses the waker.
+                let emit = {
+                    let status_tx = acp_status_tx.clone();
+                    let waker = waker_clone.clone();
+                    let wt = wt_name.clone();
+                    move |conn: crate::chrome::AgentConn| {
+                        let _ = status_tx.send((wt.clone(), conn));
+                        let _ = waker.wake();
+                    }
+                };
+                emit(crate::chrome::AgentConn::Connecting);
+
+                tokio::spawn(async move {
+                    // Give the agent a moment to bind its ACP server.
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+                    match superzej_svc::acp::client::AcpClient::connect(port).await {
+                        Ok((client, mut rx)) => {
+                            let client = std::sync::Arc::new(client);
+                            // Negotiate capabilities before servicing anything.
+                            if let Err(e) = client.initialize().await {
+                                tracing::error!(target: "szhost::acp", "ACP initialize failed: {e}");
+                                emit(crate::chrome::AgentConn::Error);
+                            }
+                            // Open the MCP-over-ACP bridge so the agent discovers
+                            // and registers superzej's house tools/resources.
+                            if let Err(e) = client.connect_mcp("superzej-house").await {
+                                tracing::warn!(target: "szhost::acp", "mcp/connect failed: {e}");
+                            }
+
+                            // Hand the client to the loop so it can reply to requests.
+                            if reg_tx.send((wt_name.clone(), client.clone())).is_err() {
+                                if let Some(key) = &minted_key {
+                                    crate::agent::revoke_agent_proxy_key(key);
+                                }
+                                return; // loop gone
+                            }
+                            emit(crate::chrome::AgentConn::Online);
+
+                            // Forward inbound messages to the loop, tagged by worktree.
+                            while let Some(msg) = rx.recv().await {
+                                if inbound_tx.send((wt_name.clone(), msg)).is_err() {
+                                    break; // loop gone
+                                }
+                                let _ = waker_clone.wake();
+                            }
+
+                            // The agent disconnected: surface it + revoke its key.
+                            emit(crate::chrome::AgentConn::Exited);
+                            if let Some(key) = &minted_key {
+                                crate::agent::revoke_agent_proxy_key(key);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(target: "szhost::acp", "failed to connect to agent ACP port {port}: {e}");
+                            emit(crate::chrome::AgentConn::Error);
+                            if let Some(key) = &minted_key {
+                                crate::agent::revoke_agent_proxy_key(key);
+                            }
+                        }
+                    }
+                });
+            }
+
             true
         }
         Err(e) => {
@@ -6272,6 +6528,314 @@ fn attach_agent_pane(
             false
         }
     }
+}
+
+/// Service one inbound ACP message from an agent's `pi` subprocess. Requests are
+/// dispatched OFF the event loop (their replies are `async`; the loop must never
+/// block) via `tokio::spawn` + `spawn_blocking`, using the registered
+/// `AcpClient` to send the reply. Returns whether the frame should be repainted.
+///
+/// The reply shapes match the `superzej-acp.ts` pi extension exactly:
+/// `terminal/create → {output}`, `fs/read_text_file → {text}`,
+/// `superzej/edit`/`superzej/write → {status:"approved"|"rejected"}`. All file
+/// access is scoped to the worktree; shell commands run inside its sandbox.
+///
+/// NOTE: as of the "additive" integration, the extension no longer overrides
+/// pi's built-in bash/read/edit/write — pi runs those natively in-process — so
+/// the terminal/fs/edit arms below are currently UNEXERCISED. They are retained
+/// for the deferred "real bouncer" path (a sealed sandbox reachable via a
+/// unix-socket ACP transport + a review/approval gate), at which point the
+/// extension would re-route the core tools and these arms light up again.
+///
+/// Notifications (`session/update`) are handled by the caller against the
+/// rendered model; this services only requests that need a reply.
+fn dispatch_acp_inbound(
+    wt: &str,
+    inbound: superzej_svc::acp::client::AcpInbound,
+    acp_clients: &std::collections::HashMap<
+        String,
+        std::sync::Arc<superzej_svc::acp::client::AcpClient>,
+    >,
+    cfg: &superzej_core::config::Config,
+    event_bus: &superzej_core::event_bus::EventBus,
+) {
+    use superzej_svc::acp::client::AcpInbound;
+    let client = acp_clients.get(wt).cloned();
+    match inbound {
+        AcpInbound::Initialized(caps) => {
+            tracing::debug!(target: "szhost::acp", worktree = %wt, ?caps, "agent initialized");
+        }
+        // Handled by the loop against the model; defensively ignored here.
+        AcpInbound::SessionUpdate(_) => {}
+        AcpInbound::FsReadRequest { id, path } => {
+            if let Some(client) = client {
+                let wt = wt.to_string();
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || read_scoped_file(&wt, &path))
+                        .await
+                        .unwrap_or_else(|_| Err("read task panicked".to_string()));
+                    let reply = match result {
+                        // The pi `read` tool reads `result.text`.
+                        Ok(text) => {
+                            client
+                                .reply_result(id, serde_json::json!({ "text": text }))
+                                .await
+                        }
+                        Err(e) => client.reply_error(id, -32000, &e).await,
+                    };
+                    if let Err(e) = reply {
+                        tracing::error!(target: "szhost::acp", "fs/read reply failed: {e}");
+                    }
+                });
+            }
+        }
+        AcpInbound::TerminalCreateRequest { id, command, .. } => {
+            if let Some(client) = client {
+                let wt = wt.to_string();
+                let cfg = cfg.clone();
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::agent::run_in_sandbox(&cfg, &wt, &command)
+                    })
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("terminal task panicked")));
+                    let reply = match result {
+                        // The pi `bash` tool reads `result.output`.
+                        Ok(output) => {
+                            client
+                                .reply_result(id, serde_json::json!({ "output": output }))
+                                .await
+                        }
+                        Err(e) => client.reply_error(id, -32000, &e.to_string()).await,
+                    };
+                    if let Err(e) = reply {
+                        tracing::error!(target: "szhost::acp", "terminal/create reply failed: {e}");
+                    }
+                });
+            }
+        }
+        AcpInbound::SuperzejWriteRequest { id, path, content } => {
+            if let Some(client) = client {
+                let wt = wt.to_string();
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        write_scoped_file(&wt, &path, &content)
+                    })
+                    .await
+                    .unwrap_or_else(|_| Err("write task panicked".to_string()));
+                    reply_edit_status(&client, id, result).await;
+                });
+            }
+        }
+        AcpInbound::SuperzejEditRequest { id, path, edits } => {
+            if let Some(client) = client {
+                let wt = wt.to_string();
+                tokio::spawn(async move {
+                    let result =
+                        tokio::task::spawn_blocking(move || apply_scoped_edits(&wt, &path, &edits))
+                            .await
+                            .unwrap_or_else(|_| Err("edit task panicked".to_string()));
+                    reply_edit_status(&client, id, result).await;
+                });
+            }
+        }
+        // MCP-over-ACP: route the agent's encapsulated MCP request through the
+        // host's McpRouter (budget/fleet/worktree-status/house tools) and reply
+        // with a `mcp/message` notification. Off-loop; the router opens the DB
+        // (`Connection` is !Send, so it's built + used inside spawn_blocking).
+        AcpInbound::McpMessage {
+            connection_id,
+            inner,
+        } => {
+            if let Some(client) = client {
+                let bus = event_bus.clone();
+                let wt_owned = wt.to_string();
+                tokio::spawn(async move {
+                    let resp = tokio::task::spawn_blocking(move || {
+                        let id = inner.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                        match superzej_core::db::Db::open() {
+                            Ok(db) => {
+                                // The Arcs live only on this blocking thread (Db's
+                                // Connection is !Send); McpRouter::new requires Arc.
+                                // Attach the svc-backed git/semantic house tools
+                                // scoped to this connection's worktree.
+                                #[allow(clippy::arc_with_non_send_sync)]
+                                let router = superzej_core::mcp::router::McpRouter::new(
+                                    std::sync::Arc::new(db),
+                                    std::sync::Arc::new(bus),
+                                )
+                                .with_git(
+                                    std::sync::Arc::new(superzej_svc::mcp_git::HouseGitImpl),
+                                    wt_owned.clone(),
+                                )
+                                .with_forge(
+                                    std::sync::Arc::new(superzej_svc::mcp_git::HouseGitImpl),
+                                    wt_owned,
+                                );
+                                router.handle_request(&inner)
+                            }
+                            Err(e) => serde_json::json!({
+                                "jsonrpc": "2.0", "id": id,
+                                "error": { "code": -32603, "message": format!("db open: {e}") }
+                            }),
+                        }
+                    })
+                    .await
+                    .unwrap_or_else(|_| {
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "id": serde_json::Value::Null,
+                            "error": { "code": -32603, "message": "mcp task panicked" }
+                        })
+                    });
+                    if let Err(e) = client
+                        .send_notification(
+                            "mcp/message",
+                            serde_json::json!({ "connectionId": connection_id, "message": resp }),
+                        )
+                        .await
+                    {
+                        tracing::error!(target: "szhost::acp", "mcp/message reply failed: {e}");
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// Fold an ACP `session/update` into a worktree's agent-activity entry: track the
+/// latest tool call + its running state and the context-window usage. Message /
+/// thought / config chunks don't change the chip (a richer follow-along panel is
+/// a future addition), so they're ignored here. The connection lifecycle
+/// (`conn`) is owned by the status channel, not touched here.
+fn apply_agent_session_update(
+    a: &mut crate::chrome::AgentActivity,
+    update: superzej_core::acp::methods::SessionUpdateEvent,
+) {
+    use superzej_core::acp::methods::SessionUpdateEvent as E;
+    match update {
+        E::ToolCall { tool_name, .. } => {
+            a.last_tool = Some(tool_name);
+            a.running = true;
+        }
+        E::ToolCallUpdate { status, .. } => {
+            a.running = matches!(status.as_str(), "pending" | "in_progress");
+        }
+        E::UsageUpdate { used, size } => {
+            a.context_used = used;
+            a.context_size = size;
+        }
+        E::AgentEnd { .. } => {
+            // Turn finished: no tool is running. (Notification is published by
+            // the loop drain, which owns the EventBus.)
+            a.running = false;
+        }
+        E::AgentMessageChunk { .. }
+        | E::AgentThoughtChunk { .. }
+        | E::ConfigOptionUpdate { .. } => {}
+    }
+}
+
+/// Reply to a `superzej/edit` / `superzej/write` request with the
+/// `{status:"approved"}` shape the pi extension expects, or a JSON-RPC error.
+async fn reply_edit_status(
+    client: &superzej_svc::acp::client::AcpClient,
+    id: superzej_core::acp::types::Id,
+    result: Result<(), String>,
+) {
+    let reply = match result {
+        Ok(()) => {
+            client
+                .reply_result(id, serde_json::json!({ "status": "approved" }))
+                .await
+        }
+        Err(e) => client.reply_error(id, -32000, &e).await,
+    };
+    if let Err(e) = reply {
+        tracing::error!(target: "szhost::acp", "edit/write reply failed: {e}");
+    }
+}
+
+/// Read a file requested by an agent over ACP `fs/read_text_file`, scoping the
+/// resolved path to the worktree so the agent cannot read outside its sandbox
+/// mount. Relative paths resolve against the worktree root.
+fn read_scoped_file(worktree: &str, path: &str) -> Result<String, String> {
+    let base = std::path::Path::new(worktree);
+    let req = std::path::Path::new(path);
+    let full = if req.is_absolute() {
+        req.to_path_buf()
+    } else {
+        base.join(req)
+    };
+    let canon = full.canonicalize().map_err(|e| format!("{path}: {e}"))?;
+    let base_canon = base
+        .canonicalize()
+        .map_err(|e| format!("{worktree}: {e}"))?;
+    if !canon.starts_with(&base_canon) {
+        return Err(format!("path escapes worktree: {path}"));
+    }
+    std::fs::read_to_string(&canon).map_err(|e| format!("{path}: {e}"))
+}
+
+/// Resolve a (possibly not-yet-existing) write target against the worktree,
+/// rejecting absolute escapes and any `..` traversal. Used by the agent's
+/// `write`/`edit` tools so they cannot touch files outside their sandbox mount.
+fn scoped_target(worktree: &str, path: &str) -> Result<std::path::PathBuf, String> {
+    use std::path::{Component, Path};
+    let base = Path::new(worktree)
+        .canonicalize()
+        .map_err(|e| format!("{worktree}: {e}"))?;
+    let raw = Path::new(path);
+    let joined = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        base.join(raw)
+    };
+    if joined
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err(format!("path must not contain '..': {path}"));
+    }
+    if !joined.starts_with(&base) {
+        return Err(format!("path escapes worktree: {path}"));
+    }
+    Ok(joined)
+}
+
+/// Write full file contents for an agent's `write` tool, scoped to the worktree.
+fn write_scoped_file(worktree: &str, path: &str, content: &str) -> Result<(), String> {
+    let target = scoped_target(worktree, path)?;
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{path}: {e}"))?;
+    }
+    std::fs::write(&target, content).map_err(|e| format!("{path}: {e}"))
+}
+
+/// Apply an agent `edit` tool's `[{oldText,newText}]` replacements to a file,
+/// scoped to the worktree. Each `oldText` must occur (first match is replaced);
+/// a missing match is an error so the agent can correct itself.
+fn apply_scoped_edits(worktree: &str, path: &str, edits: &serde_json::Value) -> Result<(), String> {
+    let target = scoped_target(worktree, path)?;
+    let mut text = std::fs::read_to_string(&target).map_err(|e| format!("{path}: {e}"))?;
+    let arr = edits.as_array().ok_or("edits must be an array")?;
+    for edit in arr {
+        let old = edit
+            .get("oldText")
+            .and_then(|v| v.as_str())
+            .ok_or("edit missing oldText")?;
+        let new = edit
+            .get("newText")
+            .and_then(|v| v.as_str())
+            .ok_or("edit missing newText")?;
+        match text.find(old) {
+            Some(idx) => text.replace_range(idx..idx + old.len(), new),
+            None => {
+                let preview: String = old.chars().take(40).collect();
+                return Err(format!("oldText not found in {path}: {preview:?}"));
+            }
+        }
+    }
+    std::fs::write(&target, text).map_err(|e| format!("{path}: {e}"))
 }
 
 fn sync_drawer_persistence(
@@ -6495,7 +7059,7 @@ async fn event_loop<T: Terminal>(
     mut config_rx: tokio_mpsc::UnboundedReceiver<Result<superzej_core::config::Config, String>>,
     refresh_tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     mut refresh_rx: tokio_mpsc::UnboundedReceiver<RefreshKind>,
-    mut stats_rx: tokio_mpsc::UnboundedReceiver<crate::stats::StatsSnapshot>,
+    mut stats_rx: tokio_mpsc::UnboundedReceiver<superzej_metrics::StatsSnapshot>,
     mut container_rx: tokio_mpsc::UnboundedReceiver<Vec<superzej_core::sandbox::ContainerInfo>>,
     mut metrics_rx: tokio_mpsc::UnboundedReceiver<crate::metrics::MetricsState>,
     mut ai_metrics_rx: tokio_mpsc::UnboundedReceiver<crate::chrome::AiMetrics>,
@@ -6821,6 +7385,11 @@ async fn event_loop<T: Terminal>(
     // Stamped at each loop-top when perf is on; the span until the blocking
     // poll is the loop's "busy" time (drives the idle ratio).
     let mut iter_t0 = std::time::Instant::now();
+    // Idle-memory bookkeeping: `last_activity` is bumped on every frame that
+    // actually renders; once it ages past the idle threshold a wake hands freed
+    // glibc arena pages back to the OS (throttled via `last_trim`). See `mem`.
+    let mut last_activity = std::time::Instant::now();
+    let mut last_trim = std::time::Instant::now();
     // Telemetry-panel "Loop" sub-block: while the section is open we force perf
     // accounting on (restoring the prior state on close) and roll up faster so
     // the live graphs move. `perf_was_on` remembers the pre-open state.
@@ -6865,9 +7434,11 @@ async fn event_loop<T: Terminal>(
     let mut mouse_selecting = false;
     let mut mouse_sel: Option<(u32, crate::copymode::Selection)> = None;
     // A destructive delete awaiting its y/N confirmation: (question, targets).
-    let mut pending_confirm: Option<(String, PendingAction)> = None;
     // A delete worktree action from menu awaiting the user choice
     let mut pending_confirm_delete_worktrees: Option<Vec<usize>> = None;
+    // The workspace (repo_path, slug, display) targeted by an open
+    // delete-workspace menu, awaiting the user's keep-files/delete choice.
+    let mut pending_delete_workspace: Option<(String, String, String)> = None;
     // Force a full terminal repaint on the next flush when the chrome
     // GEOMETRY changed (toggles, strip, resize) — nothing from the previous
     // layout may survive. Tab/worktree switches reuse the same rects and must
@@ -6914,6 +7485,33 @@ async fn event_loop<T: Terminal>(
     let mut which_key_prefix = String::new();
     let (tx, mut rx) = tokio_mpsc::channel::<PaneEvent>(PANE_EVENT_CHANNEL_CAPACITY);
     let mut panes = Panes::with_waker(tx, waker.clone());
+
+    // ACP (upper control plane) request/reply plumbing. Each agent pane spawns a
+    // background `AcpClient` connect task; once connected it (1) registers its
+    // `Arc<AcpClient>` here so the loop can reply, and (2) forwards every inbound
+    // JSON-RPC message tagged with its worktree. The loop drains both channels on
+    // wake and services requests OFF-loop (replies are async; we never await on
+    // the loop — see `dispatch_acp_inbound`).
+    let (acp_inbound_tx, mut acp_inbound_rx) =
+        tokio_mpsc::unbounded_channel::<(String, superzej_svc::acp::client::AcpInbound)>();
+    let (acp_reg_tx, mut acp_reg_rx) = tokio_mpsc::unbounded_channel::<(
+        String,
+        std::sync::Arc<superzej_svc::acp::client::AcpClient>,
+    )>();
+    let mut acp_clients: std::collections::HashMap<
+        String,
+        std::sync::Arc<superzej_svc::acp::client::AcpClient>,
+    > = std::collections::HashMap::new();
+    // Per-worktree agent activity (the statusbar chip's source of truth) + a
+    // lifecycle-status channel the connect task feeds (connecting/online/exited/
+    // error). The chip is the *only* native agent signal, so it must reflect
+    // both progress (session updates) and connection failures. `model`'s single
+    // `agent_activity` is set from the FOCUSED worktree's entry each turn.
+    let (acp_status_tx, mut acp_status_rx) =
+        tokio_mpsc::unbounded_channel::<(String, crate::chrome::AgentConn)>();
+    let mut acp_activity: std::collections::HashMap<String, crate::chrome::AgentActivity> =
+        std::collections::HashMap::new();
+
     // The resurrected session restored each tab's tree with pane ids the
     // PREVIOUS process allocated (numbered from 1). This process's `next_id`
     // also starts at 1, so a freshly-spawned pin/drawer/shell could grab an id
@@ -8710,6 +9308,69 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
 
+        // Register newly-connected agent ACP clients so the loop can reply to
+        // their requests (terminal/fs/edit) via `dispatch_acp_inbound`.
+        while let Ok((wt, client)) = acp_reg_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
+            tracing::debug!(target: "szhost::acp", worktree = %wt, "agent ACP client registered");
+            acp_clients.insert(wt, client);
+        }
+
+        // Agent ACP connection lifecycle (connecting/online/exited/error) → the
+        // per-worktree activity entry, so the chip can show failure states.
+        while let Ok((wt, conn)) = acp_status_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
+            acp_activity.entry(wt).or_default().conn = conn;
+            dirty = true;
+        }
+
+        // Service inbound ACP messages from agents. Requests are dispatched
+        // off-loop (their replies are async); session updates fold into the
+        // sending worktree's activity entry and mark the frame dirty.
+        while let Ok((wt, inbound)) = acp_inbound_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
+            match inbound {
+                // Notifications mutate per-worktree activity (the loop owns it);
+                // requests are serviced off-loop with a reply.
+                superzej_svc::acp::client::AcpInbound::SessionUpdate(update) => {
+                    // Agent finished → notification inbox (desktop + Notifications
+                    // panel). Fires for user-driven turns too.
+                    if let superzej_core::acp::methods::SessionUpdateEvent::AgentEnd { success } =
+                        &update
+                    {
+                        let ev = if *success {
+                            superzej_core::event_bus::Event::AgentDone {
+                                worktree: wt.clone(),
+                                agent: "pi".to_string(),
+                                success: true,
+                            }
+                        } else {
+                            superzej_core::event_bus::Event::AgentFailed {
+                                worktree: wt.clone(),
+                                agent: "pi".to_string(),
+                                error: "agent turn failed".to_string(),
+                            }
+                        };
+                        event_bus.publish(&ev);
+                    }
+                    apply_agent_session_update(acp_activity.entry(wt).or_default(), update);
+                    dirty = true;
+                }
+                other => {
+                    dispatch_acp_inbound(&wt, other, &acp_clients, keymap.config(), &event_bus);
+                }
+            }
+        }
+
+        // The chip tracks the FOCUSED worktree's agent (the map is per-worktree).
+        let focused_activity = session
+            .active_group()
+            .and_then(|g| acp_activity.get(&g.path).cloned());
+        if model.agent_activity != focused_activity {
+            model.agent_activity = focused_activity;
+            dirty = true;
+        }
+
         // Fresh metrics readings from the scrape supervisor (sidebar section).
         while let Ok(state) = metrics_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Metrics);
@@ -8850,6 +9511,11 @@ async fn event_loop<T: Terminal>(
                         &payload.tab,
                         &payload.spec,
                         chrome.center,
+                        keymap.config(),
+                        &acp_inbound_tx,
+                        &acp_reg_tx,
+                        &acp_status_tx,
+                        &waker,
                     ) {
                         focus.zone = crate::focus::Zone::Center;
                         let backend = &payload.spec.backend;
@@ -9135,14 +9801,29 @@ async fn event_loop<T: Terminal>(
             crate::hydrate::spawn_disk_scan(current_config.disk.clone(), Some(waker.clone()));
         }
 
-        // Ack the focused worktree's activity so its "look at me" dot clears
-        // once the user is actually on it. Idempotent; off-thread so the
-        // file write never stalls the loop.
+        // Mark the focused worktree's "stuck" dot as read: a filled-red
+        // `Waiting` dot turns hollow-red `Read` once the user is on the tab —
+        // even if the agent went stuck while the tab was already focused. Gated
+        // on the dot actually being `Waiting` so this is a no-op (no thread
+        // dispatch) the rest of the time; the ack itself is idempotent and runs
+        // off-thread so the file write never stalls the loop. The
+        // `last_acked_tab` guard only suppresses the redundant re-spawn in the
+        // ~1s before hydration reflects the new `Read` state back into the model.
         if let Some(name) = session.active_group().map(|g| g.name.clone())
+            && model.sidebar_status.activity.get(&name)
+                == Some(&crate::sidebar::ActivityState::Waiting)
             && last_acked_tab.as_deref() != Some(name.as_str())
         {
             last_acked_tab = Some(name.clone());
             task::spawn_blocking(move || superzej_core::activity::ack(&name));
+        } else if let Some(g) = session.active_group()
+            && model.sidebar_status.activity.get(&g.name)
+                != Some(&crate::sidebar::ActivityState::Waiting)
+            && last_acked_tab.as_deref() == Some(g.name.as_str())
+        {
+            // The dot left `Waiting` (acked through, or work resumed): re-arm so
+            // a future stuck episode on this same focused tab acks again.
+            last_acked_tab = None;
         }
 
         // Mirror the focus zone into the render model RIGHT BEFORE rendering —
@@ -9278,8 +9959,14 @@ async fn event_loop<T: Terminal>(
         if !should_render {
             // Woke but nothing changed — a wasted wakeup (storm signal).
             loop_perf.render_skip();
+            // An idle wake is the right moment to return freed arena pages to
+            // the OS (self-throttled; no-op until the loop has been idle a
+            // while). Keeps RSS receding after a build/test burst.
+            crate::mem::trim_if_idle(last_activity, &mut last_trim);
         }
         if should_render {
+            // A real frame: the loop is active, so defer any idle trim.
+            last_activity = std::time::Instant::now();
             let frame_t0 = std::time::Instant::now();
             // Refresh the live OSC window titles from the panes table (main loop
             // only) so the sidebar's dynamic row titles track the focused pane's
@@ -9325,7 +10012,6 @@ async fn event_loop<T: Terminal>(
                 && hover_popup.is_none()
                 && search.is_none()
                 && which_key.is_empty()
-                && pending_confirm.is_none()
                 && toasts.is_empty();
             // FAST PATH: a pure mouse-wheel scroll changes only the scrolled
             // pane's content. Same reuse-the-prior-`scratch` trick as the
@@ -9348,7 +10034,6 @@ async fn event_loop<T: Terminal>(
                 && hover_popup.is_none()
                 && search.is_none()
                 && which_key.is_empty()
-                && pending_confirm.is_none()
                 && toasts.is_empty();
             // The damage-compositor decision (pure, unit-tested in render_plan):
             // with no chrome/overlay/geometry damage, a wake that touched only
@@ -9367,7 +10052,6 @@ async fn event_loop<T: Terminal>(
                 hover: hover_popup.is_some(),
                 search: search.is_some(),
                 which_key: !which_key.is_empty(),
-                confirm: pending_confirm.is_some(),
                 toasts: !toasts.is_empty(),
             };
             let damage = crate::render_plan::Damage {
@@ -9662,9 +10346,6 @@ async fn event_loop<T: Terminal>(
                     &which_key,
                     &accent,
                 );
-            }
-            if let Some((question, _)) = &pending_confirm {
-                crate::chrome::draw_confirm(&mut scratch, screen, question);
             }
             // Toasts float above everything else — last in, top of the stack.
             toasts.render(&mut scratch, screen);
@@ -10449,48 +11130,6 @@ async fn event_loop<T: Terminal>(
                         continue;
                     }
                 }
-                // Modal: a pending destructive action swallows the next key.
-                if let Some((_, action)) = pending_confirm.take() {
-                    if matches!(k.key, KeyCode::Char('y') | KeyCode::Char('Y')) {
-                        match action {
-                            PendingAction::RemoveWorkspace {
-                                repo_path,
-                                slug,
-                                display,
-                            } => {
-                                model.status = remove_workspace(
-                                    &mut session,
-                                    &mut panes,
-                                    &repo_path,
-                                    &slug,
-                                    &display,
-                                );
-                                // refresh_tab_model rebuilds the workspace list
-                                // from a cached (non-DB) snapshot, so the just-
-                                // pruned workspace would otherwise linger until
-                                // the next full hydration. Drop it now.
-                                forget_workspace_in_model(&mut model, &slug, &repo_path);
-                            }
-                        }
-                        sb.marked.clear();
-                        refresh_tab_model(&mut model, &session, &mut sb);
-                        sb.focus_active_row(&mut model);
-                        need_relayout = true;
-                        sync_drawer_persistence(
-                            &session,
-                            &mut panes,
-                            &mut drawer,
-                            &mut drawer_pool,
-                            &mut drawer_home,
-                            keymap.config(),
-                            chrome.center,
-                        );
-                    } else {
-                        model.status = "Cancelled".into();
-                    }
-                    dirty = true;
-                    continue;
-                }
                 let mut forced_palette_action: Option<crate::keymap::Action> = None;
                 // Modal: the revealed worktree-creation progress overlay
                 // swallows every key. Esc hides it while work continues (a
@@ -10674,7 +11313,7 @@ async fn event_loop<T: Terminal>(
                                                     &current_config,
                                                 )
                                             }) {
-                                            Ok(path) => {
+                                            Ok(WorkspaceResolution::Repo(path)) => {
                                                 workspace_pool.stash(prev_id, snapshot);
                                                 remap_cold_workspace_ids(&mut session, &mut panes);
                                                 focus.zone = crate::focus::Zone::Center;
@@ -10694,6 +11333,11 @@ async fn event_loop<T: Terminal>(
                                                 );
                                                 need_relayout = true;
                                             }
+                                            Ok(WorkspaceResolution::NotARepo(path)) => {
+                                                active_menu = Some(menu::init_git_menu(
+                                                    path.to_string_lossy().into_owned(),
+                                                ));
+                                            }
                                             Err(e) => {
                                                 model.status =
                                                     format!("workspace create failed: {e}");
@@ -10701,53 +11345,6 @@ async fn event_loop<T: Terminal>(
                                         }
                                     }
 
-                                    HostInputKind::DeleteWorkspaceConfirm => {
-                                        if text.trim() == "yes" {
-                                            match superzej_core::db::Db::open() {
-                                                Ok(db) => {
-                                                    let mut switched = false;
-                                                    if let Ok(orphans) =
-                                                        db.delete_workspace(&session.id)
-                                                    {
-                                                        // switch to next available workspace
-                                                        if let Ok(workspaces) = db.workspaces()
-                                                            && let Some(next) = workspaces.first()
-                                                        {
-                                                            let _ = session.switch_to_workspace(
-                                                                &next.repo_path,
-                                                                &db,
-                                                            );
-                                                            switched = true;
-                                                        }
-                                                        if !switched {
-                                                            // Empty workspace fallback
-                                                            session.id.clear();
-                                                            session.worktrees.clear();
-                                                            session.active = 0;
-                                                        }
-                                                        refresh_tab_model(
-                                                            &mut model, &session, &mut sb,
-                                                        );
-                                                        need_relayout = true;
-                                                        if orphans > 0 {
-                                                            model.status = format!(
-                                                                "⚠ Workspace deleted. {} orphaned worktree(s) remain on disk",
-                                                                orphans
-                                                            );
-                                                        } else {
-                                                            model.status =
-                                                                "Workspace deleted".into();
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    model.status = format!("delete failed: {}", e);
-                                                }
-                                            }
-                                        } else {
-                                            model.status = "Delete cancelled".into();
-                                        }
-                                    }
                                     HostInputKind::RenameWorktree {
                                         gi,
                                         repo_root,
@@ -10979,6 +11576,16 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                     }
+                                    HostInputKind::FileWorktreeNewFolder => {
+                                        match file_active_worktree(&session, &text) {
+                                            Ok(msg) => {
+                                                model.status = msg;
+                                                let _ = refresh_tx
+                                                    .send(crate::hydrate::RefreshKind::Model);
+                                            }
+                                            Err(e) => model.status = e,
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -11034,6 +11641,7 @@ async fn event_loop<T: Terminal>(
                             active_menu = None;
                             pending_confirm_op = None;
                             pending_undo = None;
+                            pending_delete_workspace = None;
                         }
                         menu::MenuOutcome::Pick(choice) => {
                             active_menu = None;
@@ -11044,6 +11652,90 @@ async fn event_loop<T: Terminal>(
                                     delete_groups(&mut session, &mut panes, targets, keep_files);
 
                                 // Full sidebar refresh after deletion
+                                sb.marked.clear();
+                                refresh_tab_model(&mut model, &session, &mut sb);
+                                sb.focus_active_row(&mut model);
+                                need_relayout = true;
+                                sync_drawer_persistence(
+                                    &session,
+                                    &mut panes,
+                                    &mut drawer,
+                                    &mut drawer_pool,
+                                    &mut drawer_home,
+                                    keymap.config(),
+                                    chrome.center,
+                                );
+                                dirty = true;
+                                continue;
+                            }
+                            if let menu::MenuChoice::ConfirmInitGit { path } = choice {
+                                if superzej_core::util::git_cmd(std::path::Path::new(&path))
+                                    .arg("init")
+                                    .status()
+                                    .map(|s| s.success())
+                                    .unwrap_or(false)
+                                {
+                                    model.status =
+                                        format!("initialized git repository at {}", path);
+
+                                    // Proceed with creating the workspace
+                                    persist_session_layout(&mut session, &panes);
+                                    let prev_id = session.id.clone();
+                                    let snapshot = ResidentWorkspace {
+                                        worktrees: session.worktrees.clone(),
+                                        active: session.active,
+                                    };
+                                    match superzej_core::db::Db::open()
+                                        .context("open superzej db")
+                                        .and_then(|db| {
+                                            create_workspace_from_input_with_config(
+                                                &path,
+                                                &mut session,
+                                                &db,
+                                                &current_config,
+                                            )
+                                        }) {
+                                        Ok(WorkspaceResolution::Repo(_)) => {
+                                            workspace_pool.stash(prev_id, snapshot);
+                                            remap_cold_workspace_ids(&mut session, &mut panes);
+                                            focus.zone = crate::focus::Zone::Center;
+                                            refresh_tab_model(&mut model, &session, &mut sb);
+                                            sync_drawer_persistence(
+                                                &session,
+                                                &mut panes,
+                                                &mut drawer,
+                                                &mut drawer_pool,
+                                                &mut drawer_home,
+                                                keymap.config(),
+                                                chrome.center,
+                                            );
+                                            need_relayout = true;
+                                        }
+                                        _ => {
+                                            model.status =
+                                                "failed to switch to initialized workspace".into();
+                                        }
+                                    }
+                                } else {
+                                    model.status =
+                                        format!("failed to initialize git repository at {}", path);
+                                }
+                                dirty = true;
+                                continue;
+                            }
+                            if let menu::MenuChoice::ConfirmDeleteWorkspace { keep_files } = choice
+                                && let Some((repo_path, slug, display)) =
+                                    pending_delete_workspace.take()
+                            {
+                                model.status = remove_workspace(
+                                    &mut session,
+                                    &mut panes,
+                                    &repo_path,
+                                    &slug,
+                                    &display,
+                                    keep_files,
+                                );
+                                forget_workspace_in_model(&mut model, &slug, &repo_path);
                                 sb.marked.clear();
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 sb.focus_active_row(&mut model);
@@ -11778,6 +12470,27 @@ async fn event_loop<T: Terminal>(
                                         &waker,
                                     );
                                     model.status = format!("Media: controlling {p}");
+                                } else if let Some(rest) = key.strip_prefix("move-to-folder:") {
+                                    if rest == "__new__" {
+                                        host_input = Some((
+                                            menu::InputOverlay::new(
+                                                "new folder".to_string(),
+                                                String::new(),
+                                            ),
+                                            HostInputKind::FileWorktreeNewFolder,
+                                        ));
+                                        model.status =
+                                            "New folder: type a name (Esc cancels)".into();
+                                    } else {
+                                        match file_active_worktree(&session, rest) {
+                                            Ok(msg) => {
+                                                model.status = msg;
+                                                let _ = refresh_tx
+                                                    .send(crate::hydrate::RefreshKind::Model);
+                                            }
+                                            Err(e) => model.status = e,
+                                        }
+                                    }
                                 } else if let Some(action) = crate::keymap::Action::from_key(&key) {
                                     forced_palette_action = Some(action);
                                 } else if let Some(idx) = keymap
@@ -12010,18 +12723,12 @@ async fn event_loop<T: Terminal>(
                             slug,
                             display,
                         } => {
+                            // Same modal + path as Alt+Shift+X: the menu defaults
+                            // to "delete worktrees from disk" (keep-files is the
+                            // opt-out). Resolved in the menu Pick handler.
                             if current_config.ui.confirm_delete_workspace {
-                                pending_confirm = Some((
-                                    format!(
-                                        "Remove workspace '{display}' from superzej? \
-                                         (worktree files are kept on disk)"
-                                    ),
-                                    PendingAction::RemoveWorkspace {
-                                        repo_path,
-                                        slug,
-                                        display,
-                                    },
-                                ));
+                                active_menu = Some(menu::delete_workspace_menu(&display));
+                                pending_delete_workspace = Some((repo_path, slug, display));
                             } else {
                                 model.status = remove_workspace(
                                     &mut session,
@@ -12029,10 +12736,22 @@ async fn event_loop<T: Terminal>(
                                     &repo_path,
                                     &slug,
                                     &display,
+                                    false,
                                 );
                                 forget_workspace_in_model(&mut model, &slug, &repo_path);
                                 sb.marked.clear();
                                 refresh_tab_model(&mut model, &session, &mut sb);
+                                sb.focus_active_row(&mut model);
+                                need_relayout = true;
+                                sync_drawer_persistence(
+                                    &session,
+                                    &mut panes,
+                                    &mut drawer,
+                                    &mut drawer_pool,
+                                    &mut drawer_home,
+                                    keymap.config(),
+                                    chrome.center,
+                                );
                             }
                             dirty = true;
                             continue;
@@ -14276,8 +14995,41 @@ async fn event_loop<T: Terminal>(
                                                 }
                                             }
                                         }
+                                        crate::keymap::CompositeAction::FileWorktree { folder } => {
+                                            match file_active_worktree(&session, &folder) {
+                                                Ok(msg) => {
+                                                    model.status = msg;
+                                                    let _ = refresh_tx
+                                                        .send(crate::hydrate::RefreshKind::Model);
+                                                }
+                                                Err(e) => model.status = e,
+                                            }
+                                        }
                                     },
                                     None => {}
+                                }
+                            }
+                            Action::MoveWorktreeToFolder => {
+                                // Open the folder picker for the active worktree's
+                                // workspace; the chosen row files via the
+                                // `move-to-folder:` palette-dispatch arm.
+                                match active_worktree_repo(&session) {
+                                    Some((_, repo_path)) => match superzej_core::db::Db::open() {
+                                        Ok(db) => {
+                                            let items = crate::palette::build_move_to_folder_items(
+                                                &db, &repo_path,
+                                            );
+                                            palette = Some(
+                                                crate::search_everywhere::PaletteSession::new(
+                                                    items,
+                                                ),
+                                            );
+                                        }
+                                        Err(e) => model.status = format!("DB open failed: {e}"),
+                                    },
+                                    None => {
+                                        model.status = "No worktree to file into a folder".into();
+                                    }
                                 }
                             }
                             Action::Quit => {
@@ -15219,7 +15971,60 @@ async fn event_loop<T: Terminal>(
                                 begin_new_workspace_prompt(&mut host_input, &mut model);
                             }
                             Action::DeleteWorkspace => {
-                                begin_delete_workspace_prompt(&mut host_input, &mut model);
+                                // Remove the *active* workspace. Same modal + path
+                                // as the sidebar "Remove workspace" action.
+                                if session.id.is_empty() {
+                                    model.status = "No workspace to delete".into();
+                                    dirty = true;
+                                    continue;
+                                }
+                                let repo_path = session.id.clone();
+                                let display = Path::new(&repo_path)
+                                    .file_name()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| "workspace".into());
+                                // Derive the slug from the active group's own name
+                                // so it matches the `{slug}/…` prefix that
+                                // `remove_workspace_with_db` filters live groups on.
+                                let slug = session
+                                    .active_group()
+                                    .and_then(|g| crate::sidebar::split_tab(&g.name))
+                                    .map(|(repo, _)| repo)
+                                    .unwrap_or_else(|| {
+                                        superzej_core::repo::repo_slug(Path::new(&repo_path))
+                                    });
+                                if current_config.ui.confirm_delete_workspace {
+                                    // Default (pre-selected) choice is "delete from
+                                    // disk"; resolved in the menu Pick handler.
+                                    active_menu = Some(menu::delete_workspace_menu(&display));
+                                    pending_delete_workspace = Some((repo_path, slug, display));
+                                } else {
+                                    // Confirmation disabled: delete from disk now.
+                                    model.status = remove_workspace(
+                                        &mut session,
+                                        &mut panes,
+                                        &repo_path,
+                                        &slug,
+                                        &display,
+                                        false,
+                                    );
+                                    forget_workspace_in_model(&mut model, &slug, &repo_path);
+                                    sb.marked.clear();
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    sb.focus_active_row(&mut model);
+                                    need_relayout = true;
+                                    sync_drawer_persistence(
+                                        &session,
+                                        &mut panes,
+                                        &mut drawer,
+                                        &mut drawer_pool,
+                                        &mut drawer_home,
+                                        keymap.config(),
+                                        chrome.center,
+                                    );
+                                }
+                                dirty = true;
+                                continue;
                             }
                             Action::SwitchWorkspace => {
                                 if let Ok(db) = superzej_core::db::Db::open()
@@ -16108,6 +16913,105 @@ mod tests {
     use crate::session::{GroupKind, Session, WorktreeGroup};
 
     #[test]
+    fn read_scoped_file_reads_inside_and_rejects_escape() {
+        let dir = std::env::temp_dir().join(format!("sz-acp-read-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("hello.txt"), "hi there").unwrap();
+        let wt = dir.to_str().unwrap();
+
+        // Relative path resolves against the worktree root.
+        assert_eq!(read_scoped_file(wt, "hello.txt").unwrap(), "hi there");
+        // Absolute path inside the worktree is allowed.
+        let abs = dir.join("hello.txt");
+        assert_eq!(
+            read_scoped_file(wt, abs.to_str().unwrap()).unwrap(),
+            "hi there"
+        );
+        // A path that escapes the worktree (via ..) is rejected, not read.
+        assert!(
+            read_scoped_file(wt, "../../../etc/passwd").is_err(),
+            "path escape must be rejected"
+        );
+        // A missing file is an error, not a panic.
+        assert!(read_scoped_file(wt, "nope.txt").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scoped_write_and_edit_stay_inside_worktree() {
+        let dir = std::env::temp_dir().join(format!("sz-acp-write-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wt = dir.to_str().unwrap();
+
+        // Write creates the file (and parent dirs) inside the worktree.
+        write_scoped_file(wt, "sub/new.txt", "hello").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("sub/new.txt")).unwrap(),
+            "hello"
+        );
+
+        // Edit applies precise replacements; a missing match errors.
+        let edits = serde_json::json!([{ "oldText": "hello", "newText": "goodbye" }]);
+        apply_scoped_edits(wt, "sub/new.txt", &edits).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("sub/new.txt")).unwrap(),
+            "goodbye"
+        );
+        let bad = serde_json::json!([{ "oldText": "absent", "newText": "x" }]);
+        assert!(apply_scoped_edits(wt, "sub/new.txt", &bad).is_err());
+
+        // Traversal escapes are rejected for both write and edit.
+        assert!(write_scoped_file(wt, "../escape.txt", "x").is_err());
+        assert!(apply_scoped_edits(wt, "../escape.txt", &edits).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agent_session_update_tracks_tool_and_usage() {
+        use crate::chrome::{AgentActivity, AgentConn};
+        use superzej_core::acp::methods::SessionUpdateEvent as E;
+        let mut a = AgentActivity::default();
+
+        // A tool call sets the tool name and marks it running.
+        apply_agent_session_update(
+            &mut a,
+            E::ToolCall {
+                tool_call_id: "1".into(),
+                tool_name: "bash".into(),
+                args: serde_json::json!({}),
+            },
+        );
+        assert_eq!(a.last_tool.as_deref(), Some("bash"));
+        assert!(a.running);
+        // Folding a session update must not disturb the connection lifecycle.
+        assert_eq!(a.conn, AgentConn::Online);
+
+        // A completed update clears the running flag.
+        apply_agent_session_update(
+            &mut a,
+            E::ToolCallUpdate {
+                tool_call_id: "1".into(),
+                status: "completed".into(),
+                result: None,
+            },
+        );
+        assert!(!a.running);
+
+        // Usage updates feed the context-window percentage.
+        apply_agent_session_update(&mut a, E::UsageUpdate { used: 5, size: 20 });
+        assert_eq!((a.context_used, a.context_size), (5, 20));
+        assert_eq!(a.last_tool.as_deref(), Some("bash")); // unchanged
+        assert_eq!(a.conn, AgentConn::Online); // still untouched
+
+        // Agent-end clears running (and is what drives the AgentDone notification).
+        a.running = true;
+        apply_agent_session_update(&mut a, E::AgentEnd { success: true });
+        assert!(!a.running);
+    }
+
+    #[test]
     fn issue_branch_tail_prefers_hint_then_slugifies() {
         // A provider branch hint is used verbatim (trimmed).
         assert_eq!(
@@ -16461,33 +17365,6 @@ mod tests {
             "status should make shortcut/menu feedback visible: {:?}",
             model.status
         );
-    }
-
-    #[test]
-    fn workspace_input_accepts_existing_directory_workspace() {
-        let db_root = std::env::temp_dir().join(format!(
-            "superzej-test-db-{}-{}",
-            std::process::id(),
-            now_secs()
-        ));
-        let db = superzej_core::db::Db::open_at(&db_root.join("superzej.db")).unwrap();
-        let mut session = crate::session::Session {
-            id: "/old".into(),
-            ..Default::default()
-        };
-        let dir = std::env::temp_dir().join(format!(
-            "superzej-test-ws-{}-{}",
-            std::process::id(),
-            now_secs()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let path = create_workspace_from_input(dir.to_str().unwrap(), &mut session, &db)
-            .expect("plain directory workspaces should be accepted");
-
-        assert_eq!(path, dir);
-        assert_eq!(session.id, dir.to_string_lossy());
-        assert_eq!(db.workspaces().unwrap()[0].kind, "dir");
     }
 
     #[test]
@@ -17201,6 +18078,70 @@ mod tests {
             "surviving workspace should still render: {:?}",
             sidebar_labels(&model)
         );
+    }
+
+    #[test]
+    fn workspace_worktree_dirs_skips_home_and_other_workspaces() {
+        // The destructive "delete from disk" selection MUST exclude the home
+        // checkout (path == repo_path — deleting it would nuke the main repo)
+        // and any sibling workspace's worktrees. Only this workspace's branch
+        // worktree dirs are returned.
+        let db_path = std::env::temp_dir().join(format!(
+            "sj-host-wtdirs-{}-{}.sqlite",
+            std::process::id(),
+            now_secs()
+        ));
+        let db = superzej_core::db::Db::open_at(&db_path).unwrap();
+        // home checkout (path == repo_path) + two branch worktrees.
+        db.put_worktree(
+            "lib/home",
+            "/tmp/repo-lib",
+            "/tmp/repo-lib",
+            "home",
+            None,
+            None,
+        )
+        .unwrap();
+        db.put_worktree(
+            "lib/feat",
+            "/tmp/repo-lib",
+            "/tmp/repo-lib-feat",
+            "feat",
+            None,
+            None,
+        )
+        .unwrap();
+        db.put_worktree(
+            "lib/fix",
+            "/tmp/repo-lib",
+            "/tmp/repo-lib-fix",
+            "fix",
+            None,
+            None,
+        )
+        .unwrap();
+        // A sibling workspace's worktree must not be touched.
+        db.put_worktree(
+            "app/feat",
+            "/tmp/repo-app",
+            "/tmp/repo-app-feat",
+            "feat",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut dirs = workspace_worktree_dirs(&db, "/tmp/repo-lib");
+        dirs.sort();
+        assert_eq!(
+            dirs,
+            vec![
+                "/tmp/repo-lib-feat".to_string(),
+                "/tmp/repo-lib-fix".to_string()
+            ],
+            "only this workspace's branch worktrees, never home or siblings"
+        );
+        let _ = std::fs::remove_file(&db_path);
     }
 
     #[test]

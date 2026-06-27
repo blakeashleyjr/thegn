@@ -22,6 +22,7 @@ profiling = ["dep:pprof"]
 clap = { workspace = true, features = ["derive"] }
 superzej-core.workspace = true
 superzej-svc.workspace = true
+superzej-metrics.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 serde.workspace = true

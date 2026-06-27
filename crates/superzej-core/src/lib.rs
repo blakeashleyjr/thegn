@@ -10,12 +10,14 @@
 //! owns terminal chord→Action routing.
 
 pub mod account;
+pub mod acp;
 pub mod activity;
 pub mod blame;
 pub mod ci;
 pub mod config;
 pub mod custom_cmd;
 pub mod db;
+pub mod devenv;
 pub mod diff_highlight;
 pub mod diff_sbs;
 pub mod disk;

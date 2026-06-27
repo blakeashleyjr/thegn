@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/superzej-core",
   "crates/superzej-svc",
+  "crates/superzej-metrics",
   "crates/superzej-host",
   "crates/superzej-proxy",
   "crates/sz-kit",
@@ -97,9 +98,24 @@ tree-sitter-typescript = "0.23"
 tree-sitter-javascript = "0.25"
 tree-sitter-python = "0.25"
 tree-sitter-go = "0.25"
+# --- cross-platform system metrics (masthead + telemetry substrate) ---
+# Feature-gated to the subsystems we sample; processes live under `system` but
+# are never refreshed on the hot path. sysinfo does no background work — cost is
+# only paid on our ticker tick, preserving the ~0%-idle invariant.
+sysinfo = { version = "0.39", default-features = false, features = [
+  "system",
+  "disk",
+  "network",
+  "component",
+  "multithread",
+] }
+# Battery is the one metric sysinfo does not cover. Linux keeps our native sysfs
+# reader (+ adapter `online` flag); other platforms use this cross-platform crate.
+starship-battery = "0.11"
 # --- internal crates ---
 superzej-core = { path = "crates/superzej-core" }
 superzej-svc = { path = "crates/superzej-svc" }
+superzej-metrics = { path = "crates/superzej-metrics" }
 # --- dev/bench tooling ---
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
