@@ -119,23 +119,35 @@ pub fn key_hint(key: &Key) -> String {
     parts.join("-")
 }
 
-/// A short human label for an action in the which-key popup.
-fn action_label(action: &crate::keymap::Action) -> String {
+/// A short human label for an action in the which-key popup. `custom` is the
+/// host's parsed custom-action list, used to resolve `Action::Custom(idx)` to
+/// the action's configured name (e.g. "File: Ready to merge").
+fn action_label(
+    action: &crate::keymap::Action,
+    custom: &[crate::keymap::HostCustomAction],
+) -> String {
     use crate::keymap::Action;
     match action {
         Action::SwitchMode(m) => format!("→ {} mode", m.as_str()),
-        Action::Custom(_) => "custom action".to_string(),
+        Action::Custom(idx) => custom
+            .get(*idx as usize)
+            .map(|a| a.name().to_string())
+            .unwrap_or_else(|| "custom action".to_string()),
         other => other.key().replace('-', " "),
     }
 }
 
-/// Which-key rows for the live continuations (next key → action label).
-pub fn which_key_rows(continuations: &[(Key, crate::keymap::Action)]) -> Vec<HintRow> {
+/// Which-key rows for the live continuations (next key → action label). `custom`
+/// supplies the host's custom actions so `Action::Custom` rows show their name.
+pub fn which_key_rows(
+    continuations: &[(Key, crate::keymap::Action)],
+    custom: &[crate::keymap::HostCustomAction],
+) -> Vec<HintRow> {
     continuations
         .iter()
         .map(|(k, a)| HintRow {
             chord: key_hint(k),
-            label: action_label(a),
+            label: action_label(a, custom),
         })
         .collect()
 }
@@ -257,10 +269,27 @@ mod tests {
             (Key::char('p'), crate::keymap::Action::TogglePanel),
             (Key::char('s'), crate::keymap::Action::ToggleSidebar),
         ];
-        let rows = which_key_rows(&cont);
+        let rows = which_key_rows(&cont, &[]);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].chord, "p");
         assert_eq!(rows[1].chord, "s");
+    }
+
+    #[test]
+    fn which_key_rows_resolve_custom_action_name() {
+        use crate::keymap::{Action, CompositeAction, HostCustomAction};
+        let custom = vec![HostCustomAction::Composite {
+            name: "File: Ready to merge".to_string(),
+            action: CompositeAction::FileWorktree {
+                folder: "Ready to merge".to_string(),
+            },
+        }];
+        let rows = which_key_rows(&[(Key::char('r'), Action::Custom(0))], &custom);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "File: Ready to merge");
+        // Out-of-range index falls back to the generic label.
+        let rows = which_key_rows(&[(Key::char('x'), Action::Custom(9))], &custom);
+        assert_eq!(rows[0].label, "custom action");
     }
 
     #[test]

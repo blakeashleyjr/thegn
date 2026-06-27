@@ -106,20 +106,88 @@ fn resolve_undercurl(cfg: &superzej_core::config::Config) -> bool {
     }
 }
 
-fn apply_mode_status(model: &mut FrameModel, mode: crate::keymap::Mode) {
+/// Resolve the outer terminal's capabilities: env detection
+/// ([`superzej_core::termcaps::detect`]) with `[theme]` config overrides folded
+/// on top (`color` / `glyphs` / `undercurl` = auto|explicit). The async probe
+/// later refines this in place via [`crate::caps::install`].
+pub(crate) fn resolve_termcaps(
+    cfg: &superzej_core::config::Config,
+) -> superzej_core::termcaps::TermCaps {
+    use superzej_core::config::{ColorMode, GlyphMode};
+    use superzej_core::termcaps::{ColorDepth, UnicodeLevel};
+
+    let env = superzej_core::termcaps::TermEnv::from_env();
+    let mut caps = superzej_core::termcaps::detect(&env);
+
+    // `[theme] color`: "auto" keeps detection; an explicit depth overrides it.
+    caps.color = match cfg.theme.color {
+        ColorMode::Auto => caps.color,
+        ColorMode::Truecolor => ColorDepth::Truecolor,
+        ColorMode::Ansi256 => ColorDepth::Ansi256,
+        ColorMode::Ansi16 => ColorDepth::Ansi16,
+        ColorMode::None => ColorDepth::None,
+    };
+    // `[theme] glyphs`: "auto" keeps detection; explicit forces unicode/ascii.
+    caps.unicode = match cfg.theme.glyphs {
+        GlyphMode::Auto => caps.unicode,
+        GlyphMode::Unicode => UnicodeLevel::Full,
+        GlyphMode::Ascii => UnicodeLevel::Ascii,
+    };
+    // `[theme] undercurl` keeps its dedicated on/off/auto knob.
+    caps.undercurl = resolve_undercurl(cfg);
+    caps
+}
+
+/// [`resolve_termcaps`] refined by an outer-terminal probe (if any). The probe
+/// only *upgrades* fields whose config knob is `auto`; explicit `[theme]` values
+/// always win. Used once at startup, where the probe is available.
+fn resolve_termcaps_with_probe(
+    cfg: &superzej_core::config::Config,
+    probe: Option<&superzej_core::termcaps::ProbeResult>,
+) -> superzej_core::termcaps::TermCaps {
+    use superzej_core::config::{ColorMode, GlyphMode, UndercurlMode};
+    let caps = resolve_termcaps(cfg);
+    match probe {
+        Some(p) => superzej_core::termcaps::apply_probe(
+            caps,
+            p,
+            cfg.theme.color == ColorMode::Auto,
+            cfg.theme.glyphs == GlyphMode::Auto,
+            cfg.theme.undercurl == UndercurlMode::Auto,
+        ),
+        None => caps,
+    }
+}
+
+fn apply_mode_status(
+    model: &mut FrameModel,
+    mode: crate::keymap::Mode,
+    config: &superzej_core::config::Config,
+) {
     // The bottom bar carries the contextual keybind hints; the status slot
     // only flags a non-default input mode. The mode chip always shows.
     model.status = match mode {
         crate::keymap::Mode::Normal => String::new(),
         m => format!("{} mode", m.as_str()),
     };
-    model.mode_chip = match mode {
-        crate::keymap::Mode::Normal => "N",
-        crate::keymap::Mode::VimNormal => "V",
-        crate::keymap::Mode::VimInsert => "I",
-        crate::keymap::Mode::Emacs => "E",
+
+    if config.ui.full_mode_chip {
+        model.mode_chip = match mode {
+            crate::keymap::Mode::Normal => "NORMAL",
+            crate::keymap::Mode::VimNormal => "VIM NORMAL",
+            crate::keymap::Mode::VimInsert => "VIM INSERT",
+            crate::keymap::Mode::Emacs => "EMACS",
+        }
+        .into();
+    } else {
+        model.mode_chip = match mode {
+            crate::keymap::Mode::Normal => "N",
+            crate::keymap::Mode::VimNormal => "V",
+            crate::keymap::Mode::VimInsert => "I",
+            crate::keymap::Mode::Emacs => "E",
+        }
+        .into();
     }
-    .into();
 }
 
 /// Toggles the Asciinema cast recorder. When turned on, a new `.cast` file
@@ -157,6 +225,19 @@ fn toggle_recorder(
 
 /// The bottom bar's contextual keybind hints — (chord, label) pairs the
 /// statusbar renders as key chips + dim labels: what works right now, given
+/// Step a bar's selected-item index by `delta` (-1/+1), clamped to `[0, count)`.
+/// An empty bar stays at 0.
+fn step_bar_sel(sel: usize, delta: i8, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    if delta < 0 {
+        sel.saturating_sub(1)
+    } else {
+        (sel + 1).min(count - 1)
+    }
+}
+
 /// the focused zone (and the panel's view when it owns the keyboard).
 fn context_hints(
     focus: &crate::focus::FocusState,
@@ -376,12 +457,37 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // SGR mouse reporting stays on (1002 = button + drag, 1006 = SGR encoding):
     // clicks focus panes/rows and drags build a per-pane selection that
     // auto-copies (OSC 52) on release, zellij-style.
+    //
+    // Autowrap OFF (DECRST 7): the compositor positions every cell absolutely
+    // and never relies on the cursor wrapping to the next line. With autowrap
+    // left ON (the alt-screen default), writing the bottom-right cell — e.g. a
+    // long statusbar line that reaches the last column — wraps the cursor past
+    // the edge and scrolls the whole alt buffer up one line, dropping the
+    // masthead for a frame until the next absolute repaint heals it. ?7l kills
+    // that scroll for the life of the session (restored on teardown).
     {
         use std::io::Write as _;
         let mut out = std::io::stdout();
         let _ = out
-            .write_all(b"\x1b[?1002h\x1b[?1006h")
+            .write_all(b"\x1b[?1002h\x1b[?1006h\x1b[?7l")
             .and_then(|_| out.flush());
+    }
+
+    // Probe the outer terminal (DA + XTVERSION) while we still own the raw tty —
+    // termwiz's reader thread starts at `BufferedTerminal::new` below and can't
+    // surface these replies. The result refines env detection at the caps
+    // install site (see `resolve_termcaps` + `apply_probe`). Bounded so a
+    // non-responding terminal never stalls launch; `None` ⇒ env-only.
+    let term_probe = crate::probe::probe_outer_terminal();
+    if let Some(p) = &term_probe {
+        tracing::info!(
+            target: "szhost::startup",
+            since_start_ms = start.elapsed().as_millis() as u64,
+            responded = p.responded,
+            terminal = p.terminal_name.as_deref().unwrap_or(""),
+            modern = p.modern,
+            "outer-terminal probe"
+        );
     }
 
     let mut buf = BufferedTerminal::new(term).context("buffered terminal")?;
@@ -477,6 +583,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // the first frame; the config fs-watch re-resolves it live.
     crate::chrome::set_palette(cfg.palette());
     crate::seg::set_undercurl_supported(resolve_undercurl(&cfg));
+    crate::caps::install(resolve_termcaps_with_probe(&cfg, term_probe.as_ref()));
     crate::center::PANE_HPAD.store(
         cfg.theme.pane_padding as usize,
         std::sync::atomic::Ordering::Relaxed,
@@ -498,7 +605,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     }
     let mut model = build_initial_model(&session, startup_db.as_ref());
     model.accent = cfg.accent_rgb();
-    apply_mode_status(&mut model, mode);
+    apply_mode_status(&mut model, mode, &cfg);
     // Surface keybind conflicts at launch (non-fatal — the shell always opens).
     if let Some(summary) = keybind_conflict_summary(&cfg) {
         model.status = summary;
@@ -717,7 +824,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         use std::io::Write as _;
         let mut out = std::io::stdout();
         let _ = out
-            .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[<u")
+            .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[<u")
             .and_then(|_| out.flush());
     }
     let _ = buf.terminal().exit_alternate_screen();
@@ -1061,6 +1168,15 @@ fn refresh_tab_model(
     sb.rebuild(model, session);
 }
 
+/// Rows that toggle collapse on Enter/Space/`h`/`l`: workspaces and terminal
+/// host groups (both keyed by `workspace_slug` in the collapse set).
+fn is_collapsible(kind: crate::sidebar::RowKind) -> bool {
+    matches!(
+        kind,
+        crate::sidebar::RowKind::Workspace | crate::sidebar::RowKind::TerminalHost
+    )
+}
+
 /// Interaction + persisted view state for the workspace tree (items 16–27).
 /// The single source of truth the event loop mutates; [`SidebarState::rebuild`]
 /// derives `FrameModel`'s sidebar fields from it plus the model's data carriers.
@@ -1372,10 +1488,12 @@ impl SidebarState {
         if row.tab_target.is_some() {
             entries.push(("open", "Open"));
         }
-        if row.kind == RowKind::Workspace {
+        if is_collapsible(row.kind) {
             entries.push(("toggle", "Collapse/expand"));
         }
-        entries.push(("pin", "Pin / unpin"));
+        if !row.pin_key.is_empty() {
+            entries.push(("pin", "Pin / unpin"));
+        }
         // A workspace can be forgotten (no disk deletion); needs a DB row,
         // carried as the workspace row's `worktree_path`.
         if row.kind == RowKind::Workspace && row.worktree_path.is_some() {
@@ -1489,9 +1607,10 @@ impl SidebarState {
                 self.cursor = self.cursor.saturating_sub(1);
             }
             KeyCode::Enter => {
-                // On a workspace row, Enter toggles collapse; elsewhere opens.
+                // On a collapsible header (workspace or terminal host), Enter
+                // toggles collapse; elsewhere it opens the row.
                 if let Some(row) = self.selected_row(model) {
-                    if row.kind == crate::sidebar::RowKind::Workspace {
+                    if is_collapsible(row.kind) {
                         return self.toggle_collapse(model, session);
                     }
                     if let Some(t) = row.tab_target.clone() {
@@ -1500,18 +1619,18 @@ impl SidebarState {
                 }
             }
             KeyCode::Char('l') | KeyCode::RightArrow => {
-                // Expand a collapsed workspace.
+                // Expand a collapsed header.
                 if let Some(row) = self.selected_row(model)
-                    && row.kind == crate::sidebar::RowKind::Workspace
+                    && is_collapsible(row.kind)
                     && row.collapsed
                 {
                     return self.toggle_collapse(model, session);
                 }
             }
             KeyCode::Char('h') | KeyCode::LeftArrow => {
-                // Collapse an expanded workspace.
+                // Collapse an expanded header.
                 if let Some(row) = self.selected_row(model)
-                    && row.kind == crate::sidebar::RowKind::Workspace
+                    && is_collapsible(row.kind)
                     && !row.collapsed
                 {
                     return self.toggle_collapse(model, session);
@@ -1528,9 +1647,9 @@ impl SidebarState {
             }
             KeyCode::Char('p') => return self.toggle_pin(model, session),
             KeyCode::Char(' ') => {
-                // Multi-select toggle (item 26); on workspace rows, collapse.
+                // Multi-select toggle (item 26); on collapsible headers, collapse.
                 if let Some(row) = self.selected_row(model)
-                    && row.kind == crate::sidebar::RowKind::Workspace
+                    && is_collapsible(row.kind)
                 {
                     return self.toggle_collapse(model, session);
                 }
@@ -1891,6 +2010,22 @@ fn sidebar_workspace_order(rows: &[crate::sidebar::SidebarRow]) -> Vec<String> {
         .filter(|r| r.visible && r.kind == crate::sidebar::RowKind::Workspace)
         .filter_map(|r| r.worktree_path.clone())
         .collect()
+}
+
+/// The repo path a `Ctrl+N` jump (`Action::SummonWorkspace(n)`) should switch
+/// to, given the visible sidebar rows and the active workspace id. `None` when
+/// `n` is 0, past the last switchable workspace, or already the active one (all
+/// no-ops). The slot order is exactly `sidebar_workspace_order` so it matches
+/// the digit hints painted on the rows and the palette entry numbers.
+fn summon_workspace_target(
+    rows: &[crate::sidebar::SidebarRow],
+    n: u8,
+    active_id: &str,
+) -> Option<String> {
+    sidebar_workspace_order(rows)
+        .get((n as usize).checked_sub(1)?)
+        .filter(|target| target.as_str() != active_id)
+        .cloned()
 }
 
 /// The visible-row index of the active row, or 0.
@@ -3610,8 +3745,6 @@ enum GitAfter {
     /// Spawn this command into a fresh center tab (custom-command
     /// `output = "terminal"`).
     Terminal(String),
-    /// Execute the confirmed worktree-group close.
-    CloseWorktreeGroup,
     /// Open a file in the configured editor in a new center tab (used for
     /// conflict-file resolution — the user resolves markers, saves, then
     /// stages the file normally).
@@ -4993,12 +5126,6 @@ fn dispatch_menu_choice(
             if let Some(op) = ov.confirm_op.take() {
                 enqueue(panel_ui, model, op);
             }
-        }
-        MenuChoice::Confirm {
-            tag: "close-worktree",
-            ..
-        } => {
-            return GitAfter::CloseWorktreeGroup;
         }
         MenuChoice::Confirm { .. } | MenuChoice::Dismiss => {
             *ov.confirm_op = None;
@@ -7588,6 +7715,9 @@ async fn event_loop<T: Terminal>(
         tokio_mpsc::unbounded_channel::<Vec<superzej_core::log::parser::ParsedLog>>();
 
     let mut hover_popup: Option<crate::hover::HoverPopup> = None;
+    // A bar-item detail popup/modal (CPU history graph, notifications list, …),
+    // opened by Enter or a click on a focused masthead/statusbar item.
+    let mut bar_detail: Option<crate::detail::DetailOverlay> = None;
     // Transient bottom-anchored notifications ("Text copied to clipboard", …).
     // Each push schedules a one-shot waker pulse so the toast clears on its own
     // even with no further input (the loop never polls on a timer).
@@ -7688,6 +7818,7 @@ async fn event_loop<T: Terminal>(
     // Our own Change→escape serializer (undercurl + underline-color capable);
     // `SUPERZEJ_RENDERER=termwiz` falls back to the stock renderer.
     let mut wire_renderer = crate::wire::WireRenderer::new();
+    wire_renderer.set_depth(crate::caps::color_depth());
     let use_termwiz_renderer = crate::wire::use_termwiz_renderer();
     let mut palette: Option<crate::search_everywhere::PaletteSession> = None;
     // Per-worktree file index for the `>` search mode. Invalidated by the
@@ -9488,7 +9619,7 @@ async fn event_loop<T: Terminal>(
                 }
             }
             refresh_tab_model(&mut model, &session, &mut sb);
-            apply_mode_status(&mut model, mode);
+            apply_mode_status(&mut model, mode, &current_config);
             model.accent = current_config.accent_rgb();
             model.bars = current_config.bars.clone();
             model.stats_icons = current_config.stats.clone();
@@ -9998,6 +10129,8 @@ async fn event_loop<T: Terminal>(
                     // Live theme reload: colors apply on the next repaint.
                     crate::chrome::set_palette(new_cfg.palette());
                     crate::seg::set_undercurl_supported(resolve_undercurl(&new_cfg));
+                    crate::caps::install(resolve_termcaps(&new_cfg));
+                    wire_renderer.set_depth(crate::caps::color_depth());
                     crate::center::PANE_HPAD.store(
                         new_cfg.theme.pane_padding as usize,
                         std::sync::atomic::Ordering::Relaxed,
@@ -10137,6 +10270,13 @@ async fn event_loop<T: Terminal>(
         model.center_focused = focus.center();
         model.masthead_focused = focus.masthead();
         model.statusbar_focused = focus.statusbar();
+        // Keep the per-bar selection valid as items appear/disappear between
+        // frames (a badge turning on/off, a widget gaining data): clamp to the
+        // current item count so the cursor never dangles past the last item.
+        let sb_items = crate::chrome::statusbar_items(&model).len();
+        model.statusbar_sel = model.statusbar_sel.min(sb_items.saturating_sub(1));
+        let mh_items = crate::chrome::masthead_item_spans(&model, &chrome).len();
+        model.masthead_sel = model.masthead_sel.min(mh_items.saturating_sub(1));
         model.key_locked = focus.locked;
         model.zoomed = zoom.is_some();
         model.sync_panes = sync_panes;
@@ -10312,6 +10452,7 @@ async fn event_loop<T: Terminal>(
                 && wizard_ui.is_none()
                 && hover_popup.is_none()
                 && search.is_none()
+                && bar_detail.is_none()
                 && which_key.is_empty()
                 && toasts.is_empty();
             // FAST PATH: a pure mouse-wheel scroll changes only the scrolled
@@ -10334,6 +10475,7 @@ async fn event_loop<T: Terminal>(
                 && wizard_ui.is_none()
                 && hover_popup.is_none()
                 && search.is_none()
+                && bar_detail.is_none()
                 && which_key.is_empty()
                 && toasts.is_empty();
             // The damage-compositor decision (pure, unit-tested in render_plan):
@@ -10354,6 +10496,7 @@ async fn event_loop<T: Terminal>(
                 search: search.is_some(),
                 which_key: !which_key.is_empty(),
                 toasts: !toasts.is_empty(),
+                detail: bar_detail.is_some(),
             };
             let damage = crate::render_plan::Damage {
                 full: full_repaint,
@@ -10680,6 +10823,11 @@ async fn event_loop<T: Terminal>(
             // The hover preview floats above the panel, below modal input.
             if let Some(hp) = &hover_popup {
                 hp.render(&mut scratch, screen);
+            }
+            // A bar-item detail popup/modal sits above the rest of the chrome
+            // overlays but below which-key/toasts (which stay topmost).
+            if let Some(d) = &bar_detail {
+                d.render(&mut scratch, screen);
             }
             let accent = current_config.accent_rgb();
             if !which_key.is_empty() {
@@ -11129,9 +11277,33 @@ async fn event_loop<T: Terminal>(
                         mouse_sel = Some((id, crate::copymode::Selection::new(cell)));
                         mouse_selecting = true;
                     } else if contains(chrome.masthead_stats_row(), mx, my) {
-                        // Click the top-right stats block to cycle its refresh
-                        // rate ([stats] refresh_rates).
-                        if mx >= chrome.masthead.cols / 2 {
+                        // Click a masthead stat item to focus it + open its
+                        // detail view (CPU graph, etc.).
+                        let hit = crate::chrome::masthead_item_spans(&model, &chrome)
+                            .into_iter()
+                            .enumerate()
+                            .find(|(_, (_, r))| contains(*r, mx, my));
+                        if let Some((idx, (id, rect))) = hit {
+                            focus.zone = crate::focus::Zone::Masthead;
+                            model.masthead_sel = idx;
+                            if id.has_detail() {
+                                let screen = Rect {
+                                    x: 0,
+                                    y: 0,
+                                    cols,
+                                    rows,
+                                };
+                                bar_detail = crate::detail::open_detail_for(
+                                    &id,
+                                    rect,
+                                    screen,
+                                    &model,
+                                    &panel_ui.docs.telemetry,
+                                );
+                            }
+                        } else if mx >= chrome.masthead.cols / 2 {
+                            // Click an empty part of the top-right block to cycle
+                            // its refresh rate ([stats] refresh_rates).
                             let rates = &current_config.stats.refresh_rates;
                             if !rates.is_empty() {
                                 use std::sync::atomic::Ordering;
@@ -11148,6 +11320,32 @@ async fn event_loop<T: Terminal>(
                                     std::time::Instant::now(),
                                 );
                                 schedule_toast_clear(&waker);
+                            }
+                        }
+                    } else if contains(chrome.statusbar, mx, my) {
+                        // Click a statusbar item/badge to focus it + open its
+                        // detail (notifications list, agent detail, …).
+                        let hit = crate::chrome::statusbar_item_spans(&model, chrome.statusbar)
+                            .into_iter()
+                            .enumerate()
+                            .find(|(_, (_, r))| contains(*r, mx, my));
+                        if let Some((idx, (id, rect))) = hit {
+                            focus.zone = crate::focus::Zone::Statusbar;
+                            model.statusbar_sel = idx;
+                            if id.has_detail() {
+                                let screen = Rect {
+                                    x: 0,
+                                    y: 0,
+                                    cols,
+                                    rows,
+                                };
+                                bar_detail = crate::detail::open_detail_for(
+                                    &id,
+                                    rect,
+                                    screen,
+                                    &model,
+                                    &panel_ui.docs.telemetry,
+                                );
                             }
                         }
                     } else if contains(chrome.center_tabs, mx, my) {
@@ -11413,6 +11611,17 @@ async fn event_loop<T: Terminal>(
                 // The hover preview is modal-lite: any key dismisses it and is
                 // consumed (so it never also acts on the panel beneath).
                 if hover_popup.take().is_some() {
+                    dirty = true;
+                    continue;
+                }
+                // A bar-item detail overlay is a top-priority modal: it owns
+                // every key while open (Esc/Enter/q close it; arrows scroll a
+                // list), so the bar-nav zone never sees them.
+                if let Some(d) = bar_detail.as_mut() {
+                    match d.handle_key(&k.key, k.modifiers) {
+                        crate::detail::DetailOutcome::Close => bar_detail = None,
+                        crate::detail::DetailOutcome::Pending => {}
+                    }
                     dirty = true;
                     continue;
                 }
@@ -12201,24 +12410,6 @@ async fn event_loop<T: Terminal>(
                                     refresh_tab_model(&mut model, &session, &mut sb);
                                     need_relayout = true;
                                 }
-                                GitAfter::CloseWorktreeGroup => {
-                                    if let Some(g) = session.active_group() {
-                                        for tab in &g.tabs {
-                                            for id in tab.center.pane_ids() {
-                                                panes.table.remove(&id);
-                                            }
-                                        }
-                                    }
-                                    if let Some(g) = session.close_active_group()
-                                        && let Ok(db) = superzej_core::db::Db::open()
-                                    {
-                                        forget_worktree_group(&db, &session.id, &g);
-                                    }
-                                    persist_session_layout(&mut session, &panes);
-                                    focus.zone = crate::focus::Zone::Center;
-                                    refresh_tab_model(&mut model, &session, &mut sb);
-                                    need_relayout = true;
-                                }
                             }
                         }
                     }
@@ -12267,7 +12458,7 @@ async fn event_loop<T: Terminal>(
                                     &wires,
                                     &mut ov,
                                 ) {
-                                    GitAfter::None | GitAfter::CloseWorktreeGroup => {}
+                                    GitAfter::None => {}
                                     GitAfter::NewWorktree => {
                                         forced_palette_action =
                                             Some(crate::keymap::Action::NewWorktree);
@@ -12956,15 +13147,43 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
-                // Bar zones (masthead/statusbar): no widget interaction is
-                // wired yet — Esc returns to the center; everything else is
-                // swallowed (bars never forward to a pane).
+                // Bar zones (masthead/statusbar): ←/→ step items (handled via the
+                // Ctrl chords above), Enter opens the focused item's detail view,
+                // Esc returns to the center; everything else is swallowed (bars
+                // never forward to a pane).
                 if focus.bar()
                     && !k.modifiers.contains(Modifiers::CTRL)
                     && !k.modifiers.contains(Modifiers::ALT)
                 {
                     if crate::input::is_escape_key(&k.key) {
                         focus.zone = crate::focus::Zone::Center;
+                    } else if k.key == KeyCode::Enter {
+                        let hit = if focus.masthead() {
+                            crate::chrome::masthead_item_spans(&model, &chrome)
+                                .into_iter()
+                                .nth(model.masthead_sel)
+                        } else {
+                            crate::chrome::statusbar_item_spans(&model, chrome.statusbar)
+                                .into_iter()
+                                .nth(model.statusbar_sel)
+                        };
+                        if let Some((id, rect)) = hit
+                            && id.has_detail()
+                        {
+                            let screen = Rect {
+                                x: 0,
+                                y: 0,
+                                cols,
+                                rows,
+                            };
+                            bar_detail = crate::detail::open_detail_for(
+                                &id,
+                                rect,
+                                screen,
+                                &model,
+                                &panel_ui.docs.telemetry,
+                            );
+                        }
                     }
                     dirty = true;
                     continue;
@@ -13377,7 +13596,7 @@ async fn event_loop<T: Terminal>(
                         custom_cmds: &mut custom_menu_cmds,
                     };
                     match handle_git_msg(msg, &mut panel_ui, &mut model, &wires, &mut ov) {
-                        GitAfter::None | GitAfter::CloseWorktreeGroup => {}
+                        GitAfter::None => {}
                         GitAfter::NewWorktree => {
                             forced_palette_action = Some(crate::keymap::Action::NewWorktree);
                         }
@@ -15210,7 +15429,7 @@ async fn event_loop<T: Terminal>(
                             Action::SwitchMode(next) => {
                                 mode = next;
                                 keymap.reset();
-                                apply_mode_status(&mut model, mode);
+                                apply_mode_status(&mut model, mode, &current_config);
                             }
                             Action::ToggleKeyLock => {
                                 focus.locked = true;
@@ -15395,7 +15614,9 @@ async fn event_loop<T: Terminal>(
                                     Some((_, repo_path)) => match superzej_core::db::Db::open() {
                                         Ok(db) => {
                                             let items = crate::palette::build_move_to_folder_items(
-                                                &db, &repo_path,
+                                                &db,
+                                                &repo_path,
+                                                &keymap.file_worktree_folders(),
                                             );
                                             palette = Some(
                                                 crate::search_everywhere::PaletteSession::new(
@@ -15434,6 +15655,7 @@ async fn event_loop<T: Terminal>(
                                             &db,
                                             &current_config,
                                             &model.panel.tracker_issues,
+                                            &sidebar_workspace_order(&model.sidebar_rows),
                                         ),
                                     ));
                                 }
@@ -15900,6 +16122,40 @@ async fn event_loop<T: Terminal>(
                                     }
                                 }
                             }
+                            Action::SummonWorkspace(n) => {
+                                // Ctrl+1..9: jump directly to the workspace at
+                                // slot N in the *visible* sidebar order — the
+                                // same order Shift+Alt+↑/↓ walks and the digit
+                                // hints paint. Out-of-range N or already-active
+                                // target is a no-op.
+                                if let Some(target) =
+                                    summon_workspace_target(&model.sidebar_rows, n, &session.id)
+                                    && let Ok(db) = superzej_core::db::Db::open()
+                                    && switch_workspace(
+                                        &target,
+                                        None,
+                                        &mut session,
+                                        &mut panes,
+                                        &mut workspace_pool,
+                                        &db,
+                                        &mut need_relayout,
+                                        &mut clear_on_next_frame,
+                                    )
+                                {
+                                    focus.zone = crate::focus::Zone::Center;
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    need_relayout = true;
+                                    sync_drawer_persistence(
+                                        &session,
+                                        &mut panes,
+                                        &mut drawer,
+                                        &mut drawer_pool,
+                                        &mut drawer_home,
+                                        keymap.config(),
+                                        chrome.center,
+                                    );
+                                }
+                            }
                             Action::MoveItemUp | Action::MoveItemDown => {
                                 // Reorder the selected item: the workspace under
                                 // the sidebar cursor if the sidebar is focused on
@@ -16240,25 +16496,17 @@ async fn event_loop<T: Terminal>(
                                                 }
                                                 sb.sync(&mut model);
                                             } else if focus.statusbar() {
-                                                if delta < 0 {
-                                                    model.active_statusbar_widget = model
-                                                        .active_statusbar_widget
-                                                        .saturating_sub(1);
-                                                } else {
-                                                    let count = model
-                                                        .bars
-                                                        .bottom_right
-                                                        .iter()
-                                                        .filter_map(|id| {
-                                                            crate::chrome::bottombar_widget(
-                                                                id, &model,
-                                                            )
-                                                        })
-                                                        .count();
-                                                    model.active_statusbar_widget =
-                                                        (model.active_statusbar_widget + 1)
-                                                            .min(count.saturating_sub(1));
-                                                }
+                                                let count =
+                                                    crate::chrome::statusbar_items(&model).len();
+                                                model.statusbar_sel =
+                                                    step_bar_sel(model.statusbar_sel, delta, count);
+                                            } else if focus.masthead() {
+                                                let count = crate::chrome::masthead_item_spans(
+                                                    &model, &chrome,
+                                                )
+                                                .len();
+                                                model.masthead_sel =
+                                                    step_bar_sel(model.masthead_sel, delta, count);
                                             } else if focus.panel() {
                                                 // Row mode walks the open
                                                 // section's rows; section mode
@@ -16603,13 +16851,14 @@ async fn event_loop<T: Terminal>(
                                 need_relayout = true;
                             }
                             Action::CloseWorktree => {
-                                // Close the active worktree group; never close the root/home checkout.
-                                if session
-                                    .active_group()
-                                    .map(|g| g.kind == crate::session::GroupKind::Home)
-                                    .unwrap_or(false)
-                                {
-                                    model.status = "Root workspace cannot be closed".into();
+                                // Remove the active worktree group via the same menu +
+                                // disk-removal path as the sidebar `D` delete: the menu
+                                // defaults to "delete from disk" (keep-files / cancel are
+                                // reachable by moving). Never remove the root/home checkout.
+                                let (targets, _skipped) =
+                                    deletable_group_targets(&session, vec![session.active]);
+                                if targets.is_empty() {
+                                    model.status = "Root workspace cannot be removed".into();
                                     dirty = true;
                                     continue;
                                 }
@@ -16617,13 +16866,29 @@ async fn event_loop<T: Terminal>(
                                     .active_group()
                                     .map(|g| g.name.clone())
                                     .unwrap_or_else(|| "worktree".into());
-                                active_menu = Some(menu::confirm_menu(
-                                    "Close worktree?",
-                                    format!("Remove '{name}' from this session?"),
-                                    "close-worktree",
-                                    name,
-                                    true,
-                                ));
+                                if current_config.confirm_delete {
+                                    active_menu =
+                                        Some(menu::delete_worktree_menu(targets.len(), &name));
+                                    pending_confirm_delete_worktrees = Some(targets);
+                                } else {
+                                    // confirm disabled — remove from disk immediately,
+                                    // mirroring the sidebar's no-confirm branch.
+                                    model.status =
+                                        delete_groups(&mut session, &mut panes, targets, false);
+                                    sb.marked.clear();
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    sb.focus_active_row(&mut model);
+                                    need_relayout = true;
+                                    sync_drawer_persistence(
+                                        &session,
+                                        &mut panes,
+                                        &mut drawer,
+                                        &mut drawer_pool,
+                                        &mut drawer_home,
+                                        keymap.config(),
+                                        chrome.center,
+                                    );
+                                }
                                 dirty = true;
                                 continue;
                             }
@@ -16986,8 +17251,10 @@ async fn event_loop<T: Terminal>(
                     crate::sequence::MatchResult::Pending => {
                         // Show the which-key popup of next-key candidates.
                         which_key_prefix = crate::keyhint::key_hint(&input_key);
-                        which_key =
-                            crate::keyhint::which_key_rows(&keymap.pending_continuations(mode));
+                        which_key = crate::keyhint::which_key_rows(
+                            &keymap.pending_continuations(mode),
+                            keymap.custom_actions(),
+                        );
                         model.status = format!("{} mode   awaiting next key…", mode.as_str());
                         dirty = true;
                         continue;
@@ -17615,6 +17882,54 @@ mod tests {
             sidebar_workspace_order(&rows),
             vec!["/tmp/lib".to_string(), "/tmp/app".to_string()],
         );
+    }
+
+    #[test]
+    fn summon_workspace_target_picks_nth_visible_workspace() {
+        // Same pinned layout: visible order is [lib, app] (Ctrl+1 → lib,
+        // Ctrl+2 → app). The active workspace is "/tmp/app".
+        let session = Session {
+            id: "/tmp/app".into(),
+            worktrees: vec![
+                WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/app"),
+                WorktreeGroup::new("lib/home", GroupKind::Home, "/tmp/lib"),
+            ],
+            active: 0,
+        };
+        let workspaces = vec![
+            ("app".into(), "app".into(), "repo".into(), "/tmp/app".into()),
+            ("lib".into(), "lib".into(), "repo".into(), "/tmp/lib".into()),
+        ];
+        let view = crate::sidebar::ViewState {
+            pins: vec!["lib".into()],
+            ..Default::default()
+        };
+        let rows = crate::sidebar::build_rows(
+            &session,
+            &workspaces,
+            &view,
+            &crate::sidebar::SidebarStatus::default(),
+            &[],
+            &[],
+            &[],
+        );
+        let active = &session.id;
+        // Ctrl+1 → the first visible (pinned) workspace, "lib".
+        assert_eq!(
+            summon_workspace_target(&rows, 1, active),
+            Some("/tmp/lib".to_string()),
+        );
+        // Ctrl+2 → "app", which IS the active one → no-op (None).
+        assert_eq!(summon_workspace_target(&rows, 2, active), None);
+        // Ctrl+2 from a different active workspace → switches to "app".
+        assert_eq!(
+            summon_workspace_target(&rows, 2, "/tmp/other"),
+            Some("/tmp/app".to_string()),
+        );
+        // n=0 and out-of-range are no-ops.
+        assert_eq!(summon_workspace_target(&rows, 0, active), None);
+        assert_eq!(summon_workspace_target(&rows, 3, active), None);
+        assert_eq!(summon_workspace_target(&rows, 9, active), None);
     }
 
     #[test]
@@ -18619,6 +18934,72 @@ mod tests {
         assert_eq!(db.active_workspace().unwrap(), None);
 
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// End-to-end input path for the Ctrl+1..9 workspace jump: raw terminal
+    /// bytes → termwiz parse → `normalize_key` → keymap dispatch → action. This
+    /// is the link the unit tests above can't cover — it proves a real
+    /// `modifyOtherKeys`/CSI-u terminal report for Ctrl+digit actually reaches
+    /// `Action::SummonWorkspace(n)` rather than collapsing to a control byte.
+    fn dispatch_bytes(bytes: &[u8]) -> crate::sequence::MatchResult {
+        let mut parser = termwiz::input::InputParser::new();
+        let evs = parser.parse_as_vec(bytes, false);
+        let key = evs
+            .into_iter()
+            .find_map(|e| match e {
+                InputEvent::Key(k) => Some(k),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no key event decoded from {bytes:?}"));
+        let k = normalize_key(key);
+        let input_key = crate::sequence::Key::modified(k.key, k.modifiers);
+        crate::keymap::default_keymap().dispatch(crate::keymap::Mode::Normal, input_key)
+    }
+
+    #[test]
+    fn ctrl_digit_csi_u_bytes_reach_summon_workspace() {
+        use crate::keymap::Action;
+        use crate::sequence::MatchResult::Matched;
+        // The CSI-u form a modifyOtherKeys/kitty terminal sends for Ctrl+<digit>
+        // (`ESC [ <ascii> ; 5 u`, 5 = 1+ctrl-bit). 49/50/57 = '1'/'2'/'9'.
+        assert_eq!(
+            dispatch_bytes(b"\x1b[49;5u"),
+            Matched(Action::SummonWorkspace(1)),
+            "Ctrl+1 (CSI 49;5u) must reach SummonWorkspace(1)"
+        );
+        assert_eq!(
+            dispatch_bytes(b"\x1b[50;5u"),
+            Matched(Action::SummonWorkspace(2)),
+            "Ctrl+2 (CSI 50;5u) must reach SummonWorkspace(2)"
+        );
+        assert_eq!(
+            dispatch_bytes(b"\x1b[57;5u"),
+            Matched(Action::SummonWorkspace(9)),
+            "Ctrl+9 (CSI 57;5u) must reach SummonWorkspace(9)"
+        );
+        // The fixterms / modifyOtherKeys=2 alternate spelling (`CSI 27;5;<n>~`)
+        // must decode the same way.
+        assert_eq!(
+            dispatch_bytes(b"\x1b[27;5;50~"),
+            Matched(Action::SummonWorkspace(2)),
+            "Ctrl+2 (CSI 27;5;50~) must reach SummonWorkspace(2)"
+        );
+    }
+
+    #[test]
+    fn legacy_nul_byte_does_not_trigger_summon_workspace() {
+        use crate::keymap::Action;
+        use crate::sequence::MatchResult;
+        // Without modifyOtherKeys a terminal sends Ctrl+2 as a bare NUL, which
+        // is ambiguous with Ctrl+Space — `normalize_key` resolves it to
+        // Ctrl+Space, NOT SummonWorkspace. This documents why szhost relies on
+        // the CSI-u report (and why the digit is the discoverable affordance).
+        let r = dispatch_bytes(b"\x00");
+        assert_ne!(
+            r,
+            MatchResult::Matched(Action::SummonWorkspace(2)),
+            "a bare NUL must not be read as Ctrl+2 → SummonWorkspace"
+        );
     }
 
     #[test]

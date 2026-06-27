@@ -18,7 +18,12 @@ pub enum RowKind {
     Workspace,
     Folder,
     Worktree,
-    TerminalsHeader,
+    /// A static, first-class category banner (e.g. "TERMINALS"), rendered like
+    /// the "WORKSPACES" title. Never collapses, never a navigation target.
+    SectionHeading,
+    /// A collapsible host group under the TERMINALS banner. Behaves like a
+    /// `Workspace` for collapse purposes (keyed by `workspace_slug`).
+    TerminalHost,
     Terminal,
 }
 
@@ -295,6 +300,27 @@ struct Group {
     sandbox_backend: Option<String>,
     env_name: Option<String>,
     folder_id: Option<i64>,
+}
+
+/// Map a terminal's connection to its host group: `(collapse-key, display
+/// label, is_local)`. Local terminals (empty connection, or the literal
+/// `local`/`shell`) all collapse into one `local` group. Remote terminals group
+/// by host: the `ssh `/`mosh ` prefix is stripped, then the portion after the
+/// last `@` is the host — so `dave@prod` and `root@prod` fold into one `prod`
+/// section. The collapse-key is lowercased so casing never splits a group.
+pub(crate) fn terminal_host(conn: &str, kind: &str) -> (String, String, bool) {
+    let c = conn.trim();
+    if c.is_empty() || c == "local" || c == "shell" || kind == "local" {
+        return ("local".into(), "local".into(), true);
+    }
+    let target = c
+        .strip_prefix("ssh ")
+        .or_else(|| c.strip_prefix("mosh "))
+        .unwrap_or(c)
+        .trim();
+    let host = target.rsplit('@').next().unwrap_or(target).trim();
+    let host = if host.is_empty() { target } else { host };
+    (host.to_lowercase(), host.to_string(), false)
 }
 
 /// Build the full ordered row list for the tree. `workspaces` is the
@@ -703,18 +729,17 @@ pub fn build_rows(
     }
 
     if !db_terminals.is_empty() {
-        let slug = "terminals".to_string();
-        let collapsed = view.collapsed.contains(&slug);
-
+        // TERMINALS is a first-class, static category banner (a peer of the
+        // "WORKSPACES" title), never collapsible and never a nav target.
         rows.push(SidebarRow {
-            kind: RowKind::TerminalsHeader,
+            kind: RowKind::SectionHeading,
             depth: 0,
-            label: "Terminals".into(),
-            workspace_slug: slug.clone(),
+            label: "TERMINALS".into(),
+            workspace_slug: "terminals".into(),
             tab_target: None,
             active: false,
             worktree_path: None,
-            pin_key: slug.clone(),
+            pin_key: String::new(),
             branch: None,
             git: None,
             agent: None,
@@ -722,7 +747,7 @@ pub fn build_rows(
             env_name: None,
             activity: ActivityState::None,
             visible: true,
-            collapsed,
+            collapsed: false,
             dir: false,
             pr_count: None,
             pr_number: None,
@@ -733,8 +758,72 @@ pub fn build_rows(
             target_bytes: None,
         });
 
-        if !collapsed {
-            for t in db_terminals {
+        // Under the banner, terminals divide into collapsible sections by host,
+        // `local` first, then remote hosts in stable label order. Group order is
+        // derived from `db_terminals` (already ordered by position/last_active).
+        let mut host_order: Vec<(String, String, bool)> = Vec::new();
+        let mut groups: std::collections::HashMap<
+            String,
+            Vec<&superzej_core::models::TerminalRow>,
+        > = std::collections::HashMap::new();
+        for t in db_terminals {
+            let (key, label, local) = terminal_host(&t.connection_string, &t.kind);
+            if !groups.contains_key(&key) {
+                host_order.push((key.clone(), label, local));
+            }
+            groups.entry(key).or_default().push(t);
+        }
+        // `local` sorts first; the rest by label, case-insensitively.
+        host_order.sort_by(|a, b| {
+            b.2.cmp(&a.2) // local (true) before remote (false)
+                .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
+        });
+
+        for (key, label, local) in &host_order {
+            let slug = format!("terminals/host:{key}");
+            let collapsed = view.collapsed.contains(&slug);
+            // A representative connection drives the host glyph (💻 vs 🌐).
+            let rep_conn = if *local {
+                String::new()
+            } else {
+                groups
+                    .get(key)
+                    .and_then(|g| g.first())
+                    .map(|t| t.connection_string.clone())
+                    .unwrap_or_default()
+            };
+
+            rows.push(SidebarRow {
+                kind: RowKind::TerminalHost,
+                depth: 1,
+                label: label.clone(),
+                workspace_slug: slug.clone(),
+                tab_target: None,
+                active: false,
+                worktree_path: None,
+                pin_key: String::new(),
+                branch: None,
+                git: None,
+                agent: None,
+                sandbox_backend: None,
+                env_name: None,
+                activity: ActivityState::None,
+                visible: true,
+                collapsed,
+                dir: false,
+                pr_count: None,
+                pr_number: None,
+                unread_count: 0,
+                alert_count: 0,
+                terminal_connection: Some(rep_conn),
+                disk_bytes: None,
+                target_bytes: None,
+            });
+
+            if collapsed {
+                continue;
+            }
+            for t in groups.get(key).into_iter().flatten() {
                 let active = session
                     .worktrees
                     .get(session.active)
@@ -747,7 +836,7 @@ pub fn build_rows(
 
                 rows.push(SidebarRow {
                     kind: RowKind::Terminal,
-                    depth: 1,
+                    depth: 2,
                     label: t.name.clone(),
                     workspace_slug: slug.clone(),
                     tab_target: target.or_else(|| {
@@ -758,7 +847,7 @@ pub fn build_rows(
                     }),
                     active,
                     worktree_path: Some(t.name.clone()),
-                    pin_key: format!("{}/{}", slug, t.name),
+                    pin_key: format!("terminals/{}", t.name),
                     branch: None,
                     git: None,
                     agent: None,
@@ -916,22 +1005,32 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
         .collect();
 
     let mut keep = self_match.clone();
-    // A worktree match surfaces its parent repo header; a workspace that
+    // A worktree match surfaces its parent repo header; a terminal match
+    // surfaces both its host group and the TERMINALS banner; a header that
     // itself matched reveals its whole subtree.
     let mut last_workspace: Option<usize> = None;
+    let mut last_section: Option<usize> = None;
+    let mut last_host: Option<usize> = None;
     for i in 0..n {
         match rows[i].kind {
             RowKind::Workspace => last_workspace = Some(i),
             RowKind::Folder => {}
-            RowKind::TerminalsHeader => {}
+            RowKind::SectionHeading => last_section = Some(i),
+            RowKind::TerminalHost => {
+                last_host = Some(i);
+                if keep[i]
+                    && let Some(s) = last_section
+                {
+                    keep[s] = true; // surface the TERMINALS banner
+                }
+            }
             RowKind::Terminal => {
                 if keep[i] {
-                    // surface the terminals header
-                    if let Some(h) = rows[0..i]
-                        .iter()
-                        .rposition(|r| matches!(r.kind, RowKind::TerminalsHeader))
-                    {
-                        keep[h] = true;
+                    if let Some(h) = last_host {
+                        keep[h] = true; // surface the host group
+                    }
+                    if let Some(s) = last_section {
+                        keep[s] = true; // surface the TERMINALS banner
                     }
                 }
             }
@@ -944,15 +1043,23 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
             }
         }
     }
-    // Reveal worktrees only for workspaces that matched on their own label.
+    // Reveal children only for headers/groups that matched on their own label.
     let mut reveal_ws = false; // inside a self-matched workspace
+    let mut reveal_section = false; // inside a self-matched TERMINALS banner
+    let mut reveal_host = false; // inside a self-matched host group
     for i in 0..n {
         match rows[i].kind {
             RowKind::Workspace => reveal_ws = self_match[i],
             RowKind::Folder => {}
-            RowKind::TerminalsHeader => reveal_ws = self_match[i],
+            RowKind::SectionHeading => reveal_section = self_match[i],
+            RowKind::TerminalHost => {
+                reveal_host = self_match[i] || reveal_section;
+                if reveal_section {
+                    keep[i] = true;
+                }
+            }
             RowKind::Terminal => {
-                if reveal_ws {
+                if reveal_host {
                     keep[i] = true;
                 }
             }
@@ -1442,5 +1549,146 @@ mod tests {
             .collect();
         // home synthesized first, then the DB order (not alphabetized).
         assert_eq!(labels, vec!["home", "zebra", "alpha"]);
+    }
+
+    fn term(name: &str, kind: &str, conn: &str) -> superzej_core::models::TerminalRow {
+        superzej_core::models::TerminalRow {
+            id: 0,
+            name: name.into(),
+            kind: kind.into(),
+            connection_string: conn.into(),
+            folder_id: None,
+            created_at: 0,
+            last_active: 0,
+            position: 0,
+        }
+    }
+
+    #[test]
+    fn terminal_host_derives_group() {
+        assert_eq!(
+            terminal_host("", "local"),
+            ("local".into(), "local".into(), true)
+        );
+        assert_eq!(
+            terminal_host("local", ""),
+            ("local".into(), "local".into(), true)
+        );
+        assert_eq!(
+            terminal_host("shell", ""),
+            ("local".into(), "local".into(), true)
+        );
+        // ssh/mosh strip the prefix and group by the host after the last '@'.
+        assert_eq!(
+            terminal_host("ssh dave@prod", "remote"),
+            ("prod".into(), "prod".into(), false)
+        );
+        assert_eq!(
+            terminal_host("mosh root@prod", "remote"),
+            ("prod".into(), "prod".into(), false)
+        );
+        // A bare host with no user/prefix is used as-is (lowercased key).
+        assert_eq!(
+            terminal_host("Box1.internal", "remote"),
+            ("box1.internal".into(), "Box1.internal".into(), false)
+        );
+    }
+
+    #[test]
+    fn terminals_render_under_banner_grouped_by_host_local_first() {
+        let s = session(vec![], 0);
+        let ws: Vec<(String, String, String, String)> = vec![];
+        let terms = vec![
+            term("term-ssh-dave-prod", "remote", "ssh dave@prod"),
+            term("local", "local", ""),
+            term("term-ssh-root-prod", "remote", "ssh root@prod"),
+        ];
+        let rows = build_rows(
+            &s,
+            &ws,
+            &ViewState::default(),
+            &no_activity(),
+            &[],
+            &[],
+            &terms,
+        );
+        // One static banner.
+        let banners: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.kind == RowKind::SectionHeading)
+            .map(|r| r.label.as_str())
+            .collect();
+        assert_eq!(banners, vec!["TERMINALS"]);
+        // Host groups: local first, then `prod` (both ssh-to-prod terminals fold
+        // into one group).
+        let hosts: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.kind == RowKind::TerminalHost)
+            .map(|r| r.label.as_str())
+            .collect();
+        assert_eq!(hosts, vec!["local", "prod"]);
+        // The two prod terminals live under the prod host group.
+        let term_labels: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.kind == RowKind::Terminal)
+            .map(|r| r.label.as_str())
+            .collect();
+        assert_eq!(
+            term_labels,
+            vec!["local", "term-ssh-dave-prod", "term-ssh-root-prod"]
+        );
+    }
+
+    #[test]
+    fn collapsed_host_hides_its_terminals() {
+        let s = session(vec![], 0);
+        let ws: Vec<(String, String, String, String)> = vec![];
+        let terms = vec![term("local", "local", ""), term("t1", "remote", "ssh prod")];
+        let view = ViewState {
+            collapsed: ["terminals/host:prod".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[], &terms);
+        // The prod host row is present but its terminal `t1` is not.
+        assert!(
+            rows.iter()
+                .any(|r| r.kind == RowKind::TerminalHost && r.label == "prod")
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.kind == RowKind::Terminal && r.label == "t1")
+        );
+        // The local group is still expanded.
+        assert!(
+            rows.iter()
+                .any(|r| r.kind == RowKind::Terminal && r.label == "local")
+        );
+    }
+
+    #[test]
+    fn filter_surfaces_host_group_and_banner() {
+        let s = session(vec![], 0);
+        let ws: Vec<(String, String, String, String)> = vec![];
+        let terms = vec![
+            term("local", "local", ""),
+            term("web-prod", "remote", "ssh prod"),
+        ];
+        let view = ViewState {
+            filter: "web-prod".into(),
+            ..Default::default()
+        };
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[], &terms);
+        let visible: Vec<(&RowKind, &str)> = rows
+            .iter()
+            .filter(|r| r.visible)
+            .map(|r| (&r.kind, r.label.as_str()))
+            .collect();
+        // The matched terminal, its host group, and the banner stay visible; the
+        // unrelated `local` group is filtered out.
+        assert!(visible.contains(&(&RowKind::SectionHeading, "TERMINALS")));
+        assert!(visible.contains(&(&RowKind::TerminalHost, "prod")));
+        assert!(visible.contains(&(&RowKind::Terminal, "web-prod")));
+        assert!(!visible.iter().any(|(_, l)| *l == "local"));
     }
 }

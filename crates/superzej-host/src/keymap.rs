@@ -135,6 +135,9 @@ pub enum Action {
     SwitchMode(Mode),
     /// Launch-or-focus the pin at 1-based index N (the `Alt-1..9` mapping).
     SummonPin(u8),
+    /// Jump to the workspace at 1-based slot N in visible sidebar order (the
+    /// `Ctrl-1..9` mapping). Out-of-range N is a no-op.
+    SummonWorkspace(u8),
     /// Show/hide the top pinned-program strip.
     ToggleStrip,
     /// Grow the top strip (more rows).
@@ -301,8 +304,8 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
     },
     ActionSpec {
         id: "close-worktree",
-        label: "Close worktree",
-        hint: "close worktree",
+        label: "Remove worktree",
+        hint: "remove worktree (from disk)",
         default_chords: &["Alt X"],
         palette: true,
     },
@@ -906,6 +909,7 @@ impl Action {
             Action::SwitchMode(Mode::VimInsert) => "mode-vim-insert",
             Action::SwitchMode(Mode::Emacs) => "mode-emacs",
             Action::SummonPin(_) => "summon-pin",
+            Action::SummonWorkspace(_) => "summon-workspace",
             Action::ToggleStrip => "toggle-strip",
             Action::GrowStrip => "grow-strip",
             Action::ShrinkStrip => "shrink-strip",
@@ -1007,8 +1011,17 @@ impl Action {
             "media-volume-down" => Action::MediaVolumeDown,
             "media-select-playlist" | "media-playlist" => Action::MediaSelectPlaylist,
             "media-select-player" | "media-player" => Action::MediaSelectPlayer,
-            // `summon-pin-N` / `pin-N` → SummonPin(N) (1..=9).
+            // `summon-pin-N` / `pin-N` → SummonPin(N) (1..=9);
+            // `summon-workspace-N` / `workspace-N` → SummonWorkspace(N) (1..=9).
             other => {
+                if let Some(n) = other
+                    .strip_prefix("summon-workspace-")
+                    .or_else(|| other.strip_prefix("workspace-"))
+                    .and_then(|s| s.parse::<u8>().ok())
+                    .filter(|n| (1..=9).contains(n))
+                {
+                    return Some(Action::SummonWorkspace(n));
+                }
                 let n = other
                     .strip_prefix("summon-pin-")
                     .or_else(|| other.strip_prefix("pin-"))
@@ -1325,6 +1338,31 @@ impl KeyMap {
     pub fn custom_actions(&self) -> &[HostCustomAction] {
         &self.custom_actions
     }
+
+    /// Folder names declared by `file-worktree` custom actions, in config
+    /// order, de-duplicated case-insensitively (matching `ensure_folder`'s
+    /// collation). Lets configured destinations surface in the folder picker /
+    /// palette before any worktree has actually been filed into them.
+    pub fn file_worktree_folders(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for action in &self.custom_actions {
+            if let HostCustomAction::Composite {
+                action: CompositeAction::FileWorktree { folder },
+                ..
+            } = action
+            {
+                let folder = folder.trim();
+                if folder.is_empty() {
+                    continue;
+                }
+                if out.iter().any(|f| f.eq_ignore_ascii_case(folder)) {
+                    continue;
+                }
+                out.push(folder.to_string());
+            }
+        }
+        out
+    }
 }
 
 const ALL_MODES: [Mode; 4] = [Mode::Normal, Mode::VimNormal, Mode::VimInsert, Mode::Emacs];
@@ -1480,6 +1518,12 @@ pub fn default_keymap() -> KeyMap {
     // strip visibility/sizing and promote/unpin hang off Ctrl-Alt chords.
     for n in 1u8..=9 {
         map.insert_all(&format!("Alt {n}"), Action::SummonPin(n))
+            .unwrap();
+    }
+    // Workspaces: Ctrl-1..9 jump directly to the workspace at that slot in the
+    // visible sidebar order (matches the digit hints painted on workspace rows).
+    for n in 1u8..=9 {
+        map.insert_all(&format!("Ctrl {n}"), Action::SummonWorkspace(n))
             .unwrap();
     }
     map.insert_all("Ctrl Alt b", Action::ToggleStrip).unwrap();
@@ -2161,6 +2205,54 @@ mod tests {
     }
 
     #[test]
+    fn default_keymap_binds_ctrl_digits_to_summon_workspace() {
+        let mut map = default_keymap();
+        assert_eq!(
+            map.dispatch(
+                Mode::Normal,
+                Key::modified(KeyCode::Char('1'), Modifiers::CTRL)
+            ),
+            MatchResult::Matched(Action::SummonWorkspace(1))
+        );
+        assert_eq!(
+            map.dispatch(
+                Mode::Normal,
+                Key::modified(KeyCode::Char('9'), Modifiers::CTRL)
+            ),
+            MatchResult::Matched(Action::SummonWorkspace(9))
+        );
+        // The binding lands in the modal modes too (insert_all), so it works
+        // from vim-normal as well.
+        assert_eq!(
+            map.dispatch(
+                Mode::VimNormal,
+                Key::modified(KeyCode::Char('2'), Modifiers::CTRL)
+            ),
+            MatchResult::Matched(Action::SummonWorkspace(2))
+        );
+    }
+
+    #[test]
+    fn summon_workspace_round_trips_through_keys() {
+        assert_eq!(Action::SummonWorkspace(4).key(), "summon-workspace");
+        // Parses both `summon-workspace-N` and `workspace-N`, 1..=9 only.
+        assert_eq!(
+            Action::from_key("summon-workspace-3"),
+            Some(Action::SummonWorkspace(3))
+        );
+        assert_eq!(
+            Action::from_key("workspace-1"),
+            Some(Action::SummonWorkspace(1))
+        );
+        assert_eq!(
+            Action::from_key("workspace-9"),
+            Some(Action::SummonWorkspace(9))
+        );
+        assert_eq!(Action::from_key("workspace-0"), None);
+        assert_eq!(Action::from_key("workspace-10"), None);
+    }
+
+    #[test]
     fn keymap_dispatches_sequences_by_mode() {
         let mut map = KeyMap::new();
         map.insert(Mode::VimNormal, "g g", Action::ScrollUp)
@@ -2585,6 +2677,33 @@ mod tests {
             } => assert_eq!(folder, "Ready to merge"),
             other => panic!("expected FileWorktree composite, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn file_worktree_folders_collects_and_dedups() {
+        let mk = |name: &str, key: &str, folder: &str| superzej_core::config::CustomAction {
+            name: name.into(),
+            key: key.into(),
+            run: None,
+            action: Some("file-worktree".into()),
+            params: [("folder".to_string(), folder.to_string())]
+                .into_iter()
+                .collect(),
+            menu: true,
+            hint: None,
+            floating: true,
+            close_on_exit: true,
+        };
+        let mut cfg = superzej_core::config::Config::default();
+        cfg.actions.push(mk("a", "Alt m f r", "Ready to merge"));
+        cfg.actions.push(mk("b", "Alt m f p", "PRing"));
+        // Case-only duplicate of the first folder is dropped.
+        cfg.actions.push(mk("c", "Alt m f m", "ready to MERGE"));
+        let map = default_keymap_for(&cfg, None, None);
+        assert_eq!(
+            map.file_worktree_folders(),
+            vec!["Ready to merge".to_string(), "PRing".to_string()]
+        );
     }
 
     #[test]

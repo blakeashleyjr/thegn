@@ -144,6 +144,26 @@ config_enum! {
     } default = Auto;
 }
 config_enum! {
+    /// Color fidelity sent to the outer terminal. "auto" sniffs the terminal
+    /// (COLORTERM / $TERM / WT_SESSION / NO_COLOR) and degrades truecolor →
+    /// 256 → 16 → mono; the explicit values pin a depth.
+    pub enum ColorMode: "color mode" {
+        Auto = "auto",
+        Truecolor = "truecolor" | "24bit",
+        Ansi256 = "256",
+        Ansi16 = "16",
+        None = "none" | "mono",
+    } default = Auto;
+}
+config_enum! {
+    /// Glyph fidelity for chrome (box drawing, dots, arrows, logotype). "auto"
+    /// sniffs the locale + terminal; "ascii" forces 7-bit fallbacks for bare
+    /// terminals/fonts.
+    pub enum GlyphMode: "glyph mode" {
+        Auto = "auto", Unicode = "unicode", Ascii = "ascii",
+    } default = Auto;
+}
+config_enum! {
     /// Where worktrees live on disk.
     pub enum WorktreeMode: "worktree_mode" {
         Global = "global", InRepo = "in_repo",
@@ -883,6 +903,8 @@ pub struct UiConfig {
     pub language: String,
     /// Ask before destructive worktree actions (deleting a worktree from disk via the sidebar).
     pub confirm_delete_workspace: bool,
+    /// Whether to display the full word for the mode chip (e.g., "Normal" instead of "N").
+    pub full_mode_chip: bool,
 }
 
 impl Default for UiConfig {
@@ -890,6 +912,7 @@ impl Default for UiConfig {
         Self {
             language: "auto".to_string(),
             confirm_delete_workspace: true,
+            full_mode_chip: true,
         }
     }
 }
@@ -1024,6 +1047,11 @@ pub struct ThemeConfig {
     pub pane_padding: u16,
     /// Curly-underline support: "auto" (sniff the terminal), "on", "off".
     pub undercurl: UndercurlMode,
+    /// Color fidelity: "auto" (sniff + degrade), "truecolor", "256", "16",
+    /// "none"/"mono". `NO_COLOR` forces "none" unless an explicit value is set.
+    pub color: ColorMode,
+    /// Glyph fidelity: "auto" (sniff locale/terminal), "unicode", "ascii".
+    pub glyphs: GlyphMode,
     /// Optional overrides for every chrome surface/text color.
     pub colors: ThemeColors,
     /// Optional overrides for the eight semantic hues.
@@ -1038,6 +1066,8 @@ impl Default for ThemeConfig {
             focus_border: "#6ee7d8".into(),
             pane_padding: 0,
             undercurl: UndercurlMode::Auto,
+            color: ColorMode::Auto,
+            glyphs: GlyphMode::Auto,
             colors: ThemeColors::default(),
             hues: ThemeHues::default(),
         }
@@ -3360,6 +3390,8 @@ pub struct ConfigOverlay {
     pub accent: Option<String>,
     pub focus_border: Option<String>,
     pub frame_border: Option<String>,
+    pub theme_color: Option<ColorMode>,
+    pub theme_glyphs: Option<GlyphMode>,
     pub pr_ttl_secs: Option<u64>,
     pub watch_pr_interval_secs: Option<u64>,
     pub metrics_interval_secs: Option<f64>,
@@ -3406,6 +3438,8 @@ impl ConfigOverlay {
         set!(base.profile, self.profile);
         set!(base.theme.accent, self.accent);
         set!(base.theme.focus_border, self.focus_border);
+        set!(base.theme.color, self.theme_color);
+        set!(base.theme.glyphs, self.theme_glyphs);
         if self.frame_border.is_some() {
             base.theme.colors.border = self.frame_border;
         }
@@ -3492,6 +3526,12 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     o.accent = env.get("SUPERZEJ_THEME_ACCENT");
     o.focus_border = env.get("SUPERZEJ_THEME_FOCUS_BORDER");
     o.frame_border = env.get("SUPERZEJ_THEME_BORDER");
+    if let Some(v) = env.get("SUPERZEJ_THEME_COLOR") {
+        o.theme_color = ColorMode::from_str_validated(v.trim()).ok();
+    }
+    if let Some(v) = env.get("SUPERZEJ_THEME_GLYPHS") {
+        o.theme_glyphs = GlyphMode::from_str_validated(v.trim()).ok();
+    }
 
     // [pr] — SUPERZEJ_PR_TTL, with deprecated SZ_PR_TTL fallback.
     if let Some(v) = env.get("SUPERZEJ_PR_TTL") {
@@ -6589,6 +6629,55 @@ transport = \"ssh\"
         assert_eq!(t.focus_border, "#6ee7d8");
         assert_eq!(t.pane_padding, 0);
         assert_eq!(t.undercurl, UndercurlMode::Auto);
+        assert_eq!(t.color, ColorMode::Auto);
+        assert_eq!(t.glyphs, GlyphMode::Auto);
+    }
+
+    #[test]
+    fn color_and_glyph_modes_parse_with_aliases() {
+        assert_eq!(
+            ColorMode::from_str_validated("auto").unwrap(),
+            ColorMode::Auto
+        );
+        assert_eq!(
+            ColorMode::from_str_validated("24bit").unwrap(),
+            ColorMode::Truecolor
+        );
+        assert_eq!(
+            ColorMode::from_str_validated("256").unwrap(),
+            ColorMode::Ansi256
+        );
+        assert_eq!(
+            ColorMode::from_str_validated("MONO").unwrap(),
+            ColorMode::None
+        );
+        assert!(ColorMode::from_str_validated("16bit").is_err());
+
+        assert_eq!(
+            GlyphMode::from_str_validated("ascii").unwrap(),
+            GlyphMode::Ascii
+        );
+        assert_eq!(
+            GlyphMode::from_str_validated("unicode").unwrap(),
+            GlyphMode::Unicode
+        );
+        assert!(GlyphMode::from_str_validated("nerd").is_err());
+    }
+
+    #[test]
+    fn theme_color_glyph_env_overrides_apply() {
+        let mut env = MapEnv::default();
+        env.0
+            .insert("SUPERZEJ_THEME_COLOR".to_string(), "16".to_string());
+        env.0
+            .insert("SUPERZEJ_THEME_GLYPHS".to_string(), "ascii".to_string());
+        let o = env_overlay(&env);
+        assert_eq!(o.theme_color, Some(ColorMode::Ansi16));
+        assert_eq!(o.theme_glyphs, Some(GlyphMode::Ascii));
+        let mut cfg = Config::default();
+        o.apply(&mut cfg);
+        assert_eq!(cfg.theme.color, ColorMode::Ansi16);
+        assert_eq!(cfg.theme.glyphs, GlyphMode::Ascii);
     }
 
     #[test]
@@ -6773,6 +6862,8 @@ transport = \"ssh\"
             accent: Some("#111111".into()),
             focus_border: Some("#222222".into()),
             frame_border: Some("#333333".into()),
+            theme_color: Some(ColorMode::Ansi256),
+            theme_glyphs: Some(GlyphMode::Unicode),
             pr_ttl_secs: Some(99),
             watch_pr_interval_secs: Some(43),
             metrics_interval_secs: Some(11.0),

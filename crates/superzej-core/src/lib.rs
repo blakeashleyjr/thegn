@@ -58,6 +58,7 @@ pub mod search;
 pub mod semantic;
 pub mod share;
 pub mod startup;
+pub mod termcaps;
 pub mod theme;
 pub mod util;
 pub mod viz;
