@@ -2189,7 +2189,20 @@ config_enum! {
     pub enum ShareProviderKind: "share provider" {
         None = "none" | "off",
         Bore = "bore",
+        Frp = "frp",
+        Tailscale = "tailscale" | "ts",
+        Iroh = "iroh" | "dumbpipe",
     } default = None;
+}
+config_enum! {
+    /// `[share.frp] proxy_type` — how frp exposes the port. `https`/`http` get a
+    /// vhost subdomain URL; `tcp`/`udp` get a `host:port` address.
+    pub enum FrpProxyType: "frp proxy_type" {
+        Https = "https",
+        Http = "http",
+        Tcp = "tcp",
+        Udp = "udp",
+    } default = Https;
 }
 config_enum! {
     /// `[share] visibility` — who can reach the share. `bore` only does
@@ -2221,7 +2234,14 @@ pub struct ShareConfig {
     pub on_error: ShareOnError,
     /// Seconds to wait for the share's URL to appear before applying `on_error`.
     pub ready_timeout_secs: u64,
+    /// Safety guard: when `false`, refuse any share reachable from the public
+    /// internet (frp http(s), tailscale `funnel`). Private/team/peer shares are
+    /// unaffected. Default `true`.
+    pub allow_public: bool,
     pub bore: BoreConfig,
+    pub frp: FrpConfig,
+    pub tailscale: TailscaleShareConfig,
+    pub iroh: IrohShareConfig,
 }
 
 impl Default for ShareConfig {
@@ -2231,7 +2251,11 @@ impl Default for ShareConfig {
             visibility: ShareVisibility::Public,
             on_error: ShareOnError::Fail,
             ready_timeout_secs: 20,
+            allow_public: true,
             bore: BoreConfig::default(),
+            frp: FrpConfig::default(),
+            tailscale: TailscaleShareConfig::default(),
+            iroh: IrohShareConfig::default(),
         }
     }
 }
@@ -2273,6 +2297,86 @@ impl Default for BoreConfig {
             extra_args: Vec::new(),
         }
     }
+}
+
+/// `[share.frp]` — <https://github.com/fatedier/frp>, a self-hosted reverse
+/// proxy. The client (`frpc`) connects out to your `frps` server and exposes the
+/// worktree port; `https`/`http` get a vhost subdomain, `tcp`/`udp` a remote
+/// port. The public address is derived from config (frpc never prints it).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct FrpConfig {
+    /// `frps` server host (required). Empty ⇒ the provider errors at start.
+    pub server_addr: String,
+    /// `frps` control port.
+    pub server_port: u16,
+    /// Shared token (secrets-ref `"env:FRP_TOKEN"` / `"file:~/.frp/token"`);
+    /// must match the server's `auth.token`.
+    pub token: String,
+    pub proxy_type: FrpProxyType,
+    /// The base domain the server serves subdomains under (its `subDomainHost`),
+    /// e.g. `share.example.com` — used to derive the `https`/`http` URL.
+    pub subdomain_host: String,
+    /// Subdomain label for `https`/`http`. Empty ⇒ a deterministic per-worktree
+    /// slug (`<worktree>-<port>`), so a worktree's preview URL is stable.
+    pub subdomain: String,
+    /// Remote port for `tcp`/`udp`. `0` = let the server choose.
+    pub remote_port: u16,
+    /// HTTPS vhost port on the server (for the derived URL when not 443).
+    pub vhost_https_port: u16,
+    /// Extra `frpc.toml` lines appended verbatim to the `[[proxies]]` block.
+    pub extra: Vec<String>,
+}
+
+impl Default for FrpConfig {
+    fn default() -> Self {
+        FrpConfig {
+            server_addr: String::new(),
+            server_port: 7000,
+            token: "env:FRP_TOKEN".into(),
+            proxy_type: FrpProxyType::Https,
+            subdomain_host: String::new(),
+            subdomain: String::new(),
+            remote_port: 0,
+            vhost_https_port: 443,
+            extra: Vec::new(),
+        }
+    }
+}
+
+/// `[share.tailscale]` — expose the worktree port over the worktree's existing
+/// `[sandbox.vpn]` tailscale tunnel. `serve` (default) keeps it tailnet-private;
+/// `funnel = true` publishes it to the public internet. Requires
+/// `[sandbox.vpn] provider = "tailscale"` (or `headscale`) on the worktree.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct TailscaleShareConfig {
+    /// `false` (default) ⇒ `tailscale serve` (tailnet-only). `true` ⇒
+    /// `tailscale funnel` (public internet; ports limited to 443/8443/10000).
+    pub funnel: bool,
+    /// HTTPS port to expose on (serve/funnel default 443).
+    pub https_port: u16,
+}
+
+impl Default for TailscaleShareConfig {
+    fn default() -> Self {
+        TailscaleShareConfig {
+            funnel: false,
+            https_port: 443,
+        }
+    }
+}
+
+/// `[share.iroh]` — a peer-to-peer TCP tunnel over iroh via `dumbpipe`
+/// (<https://github.com/n0-computer/dumbpipe>). NAT-traversing, relay-fallback;
+/// the consumer connects with `dumbpipe connect-tcp <ticket>` (not a browser),
+/// so the "address" is a ticket. For a self-hosted `iroh-relay`, pass dumbpipe's
+/// relay flag/env via `extra_args`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct IrohShareConfig {
+    /// Extra `dumbpipe listen-tcp` flags (e.g. a custom relay).
+    pub extra_args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]

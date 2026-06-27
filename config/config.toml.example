@@ -1006,20 +1006,28 @@ ephemeral = true
 # ── Ingress sharing (`[share]`) ─────────────────────────────────────────────
 # The INBOUND sibling of [sandbox.vpn]. Where the VPN block gives a worktree
 # *egress* through an overlay, [share] exposes a service running *inside* a
-# worktree (a dev server, a PR preview, a webhook/OAuth callback) at a public
-# URL. Provider-pluggable like the VPN seam; `bore` is the first backend.
-# Disabled by default. Use `superzej share start <port>` to open a share.
+# worktree (a dev server, a PR preview, a webhook/OAuth callback) to the outside.
+# Provider-pluggable; pick the one that matches your reach:
+#   bore      — instant raw-TCP public URL, zero infra (the no-account default)
+#   frp       — self-hosted public HTTPS + subdomains (+ TCP/UDP): demos/webhooks
+#   tailscale — private to your tailnet (`serve`) or public (`funnel`); reuses
+#               the worktree's [sandbox.vpn] tailscale tunnel — NO new auth
+#   iroh      — peer-to-peer (dumbpipe): a teammate connects with a ticket; never
+#               touches the public web, NAT-traversing
+# Disabled by default. Open one with `superzej share start <port>` or Alt+Shift+S.
 [share]
-# Provider: none | bore. `none` (default) disables sharing. (rathole / zrok /
-# ngrok / iroh backends plug in behind the same seam later.)
-provider = "none"
-# Who can reach the share: public | private. `bore` is public-only; `private`
-# (identity-scoped) is reserved for the future iroh/zrok backends and is
-# downgraded to `public` with a warning under `bore`.
+provider = "none"   # none | bore | frp | tailscale | iroh
+# Requested reach: public | private. Authoritative only where the backend can do
+# both (tailscale serve vs funnel); bore/frp are public-only (private downgrades
+# with a warning), iroh is always peer-private.
 visibility = "public"
+# Safety guard: when false, refuse any share reachable from the PUBLIC INTERNET
+# (frp http(s), tailscale funnel). Private/team/peer shares are unaffected. The
+# statusbar badge renders AMBER while a worktree is publicly exposed.
+allow_public = true
 # When the share can't come up: fail (surface the error) | warn (note and skip).
 on_error = "fail"
-# Seconds to wait for the public URL to appear before applying on_error.
+# Seconds to wait for the URL to appear before applying on_error.
 ready_timeout_secs = 20
 
 # [share.bore]   # provider = "bore" — https://github.com/ekzhang/bore
@@ -1028,6 +1036,25 @@ ready_timeout_secs = 20
 # remote_port = 0               # port to bind on the relay; 0 = relay chooses
 # local_host = "127.0.0.1"      # interface the dev server listens on
 # extra_args = []               # extra `bore local` flags
+
+# [share.frp]    # provider = "frp" — https://github.com/fatedier/frp (self-host)
+# server_addr = "frps.example.com"   # your frps host (required)
+# server_port = 7000                 # frps control port
+# token = "env:FRP_TOKEN"            # shared token (secrets-ref); matches frps
+# proxy_type = "https"               # https | http | tcp | udp
+# subdomain_host = "share.example.com"  # the server's subDomainHost (for the URL)
+# subdomain = ""                     # "" = a stable per-worktree slug <name>-<port>
+# remote_port = 0                    # tcp/udp only; 0 = server chooses
+# vhost_https_port = 443             # server HTTPS vhost port (for the URL suffix)
+# extra = []                         # extra frpc.toml lines (appended to [[proxies]])
+
+# [share.tailscale]   # provider = "tailscale" — needs [sandbox.vpn] = tailscale
+# funnel = false       # false = `tailscale serve` (tailnet-only); true = public
+# https_port = 443     # serve/funnel HTTPS port (funnel: 443/8443/10000 only)
+
+# [share.iroh]    # provider = "iroh" — https://github.com/n0-computer/dumbpipe
+# extra_args = []  # extra `dumbpipe listen-tcp` flags (e.g. a self-hosted relay).
+#                  # The consumer connects with `dumbpipe connect-tcp <ticket>`.
 
 # ── Named execution environments (`[env.<name>]`) ───────────────────────────
 # A reusable *library* of execution environments. Each bundles three orthogonal

@@ -1217,11 +1217,13 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             ));
         }
     }
-    // Ingress-share badge (`[share]`): a cyan ⇅ chip showing how many ports the
-    // current worktree exposes (the first port when there's exactly one). Silent
-    // when nothing is shared; an amber chip flags a share that failed to come up.
+    // Ingress-share badge (`[share]`): a ⇅ chip showing how many ports the
+    // current worktree exposes. Coloured by reach as a safety affordance — a
+    // worktree exposed to the public internet renders AMBER (caution), private
+    // team/peer shares render teal. A failed share also shows amber.
     {
         let up = model.shares.iter().filter(|s| s.url.is_some()).count();
+        let any_public = model.shares.iter().any(|s| s.public && s.url.is_some());
         let failed = model.shares.iter().filter(|s| s.failed).count();
         if up > 0 {
             let label = if up == 1 {
@@ -1232,8 +1234,13 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             } else {
                 format!(" \u{21c5} {up} ")
             };
+            let hue = if any_public {
+                superzej_core::theme::Hue::Amber
+            } else {
+                superzej_core::theme::Hue::Teal
+            };
             r.push(seg(Tok::Slot(S::Text), " "));
-            r.push(Seg::chip(Tok::Hue(superzej_core::theme::Hue::Teal), label));
+            r.push(Seg::chip(Tok::Hue(hue), label));
         } else if failed > 0 {
             r.push(seg(Tok::Slot(S::Text), " "));
             r.push(Seg::chip(

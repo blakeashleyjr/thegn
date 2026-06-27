@@ -1968,9 +1968,10 @@ fn persist_share_event(ev: &crate::share::ShareEvent) {
         ShareEvent::Up {
             worktree,
             port,
+            provider,
             url,
         } => {
-            let _ = db.upsert_share(worktree, *port, "bore", Some(url), "up");
+            let _ = db.upsert_share(worktree, *port, provider, Some(url), "up");
         }
         ShareEvent::Failed { worktree, port, .. } | ShareEvent::Down { worktree, port } => {
             let _ = db.delete_share(worktree, *port);
