@@ -9,6 +9,7 @@ mod apps;
 mod borders;
 mod bouncer;
 mod bridge_sup;
+mod caps;
 mod center;
 mod chrome;
 mod clipboard;
@@ -16,6 +17,7 @@ mod cmd;
 mod compositor;
 mod copymode;
 mod desktop_notify;
+mod detail;
 mod emulator;
 mod focus;
 mod font;
@@ -40,6 +42,7 @@ mod panel;
 mod panes;
 mod perf;
 mod pins;
+mod probe;
 mod profile;
 mod proxy_daemon;
 mod queries;
@@ -184,6 +187,13 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::logs::Action,
     },
+    /// Report detected terminal capabilities and the resulting feature
+    /// degradation (color depth, glyphs, undercurl, mouse).
+    Doctor {
+        /// Emit machine-readable JSON instead of the text report.
+        #[arg(long)]
+        json: bool,
+    },
     /// Hidden: run the resident bridge agent over stdio. The host spawns this
     /// *inside* a remote env (`ssh … szhost bridge`, `sprite exec … szhost
     /// bridge`); it speaks the framed bridge protocol (git/fs/proc) on stdin/
@@ -288,6 +298,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Env { action } => cmd::env::run(&cfg, action),
         Command::Notify { action } => cmd::notify::run(action),
         Command::Logs { action } => cmd::logs::run(&cfg, action),
+        Command::Doctor { json } => cmd::doctor::run(&cfg, json),
         Command::Bridge => {
             // The resident agent: framed protocol over stdio until EOF. stdout is
             // the protocol channel — nothing else may write to it.

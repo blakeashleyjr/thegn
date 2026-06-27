@@ -46,6 +46,8 @@ language = "auto"
 # "delete worktrees from disk" (a "keep files" choice is offered too). Set false
 # to skip the prompt and delete the worktree dirs from disk immediately.
 confirm_delete_workspace = true
+# Whether to display the full word for the mode chip (e.g., "Normal" instead of "N").
+full_mode_chip = true
 
 # Visual tuning. The focus accent recolors every superzej surface (plugins,
 # pickers, dashboard). `focus_border` frames whatever owns focus — the focused
@@ -64,6 +66,17 @@ pane_padding = 0
 # ($TERM / $TERM_PROGRAM / $VTE_VERSION); "on" / "off" force it. Unsupported
 # terminals degrade to a single underline.
 undercurl = "auto"
+# Color fidelity. "auto" sniffs the terminal (COLORTERM / $TERM / WT_SESSION /
+# NO_COLOR) and degrades truecolor -> 256 -> 16 -> mono as needed; pin a level
+# with "truecolor", "256", "16", or "none"/"mono". The NO_COLOR env var forces
+# "none" unless you set an explicit value here. (env: SUPERZEJ_THEME_COLOR)
+color = "auto"
+# Glyph fidelity for chrome (box drawing, status dots, arrows, the logotype).
+# "auto" sniffs the locale (UTF-8?) and terminal; "unicode" forces the rounded
+# Unicode look; "ascii" forces 7-bit fallbacks (+ - | * o ^ v) for bare
+# terminals / fonts without box-drawing glyphs. Run `superzej doctor` to see
+# what your terminal resolves to. (env: SUPERZEJ_THEME_GLYPHS)
+glyphs = "auto"
 
 # Optional: override any chrome surface/text color (all "#rrggbb"; unset keys
 # keep the preset's palette). Invalid hex warns and keeps the default.
@@ -348,6 +361,9 @@ format = "text"           # text | json
 # Sidebar navigation (global):
 #   Alt ↑/↓        navigate worktrees, wrapping WITHIN the current workspace
 #   Shift+Alt ↑/↓  switch to the previous/next *workspace* (a real context switch)
+#   Ctrl+1..9      jump straight to the workspace at that slot — the digit shown
+#                  on each workspace row in the sidebar (and in the Ctrl+K menu);
+#                  slots follow the visible sidebar order
 #   Ctrl+Alt ↑/↓   *reorder* (move) the selected item: the workspace under the
 #                  sidebar cursor if the sidebar is focused, else the active
 #                  worktree within its workspace
@@ -355,6 +371,7 @@ format = "text"           # text | json
 # with `s` while the sidebar is focused.
 # prev-workspace = "Shift Alt Up"
 # next-workspace = "Shift Alt Down"
+# summon-workspace-1 = "Ctrl 1"    # …through summon-workspace-9 = "Ctrl 9"
 # move-item-up = "Ctrl Alt Up"     # (legacy id move-worktree-up still works)
 # move-item-down = "Ctrl Alt Down"
 
