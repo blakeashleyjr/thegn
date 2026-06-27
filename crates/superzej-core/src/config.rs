@@ -401,6 +401,16 @@ pub struct LlmProxyConfig {
     /// The model id the agent requests from the proxy (the proxy maps it to a
     /// real backend, e.g. `model-proxy/standard` → its standard route).
     pub agent_model: String,
+    /// "The bouncer": run a launched agent inside its sealed `agent_profile`
+    /// container, route its built-in `bash`/`read`/`edit`/`write` tools back
+    /// through superzej over a bind-mounted unix-socket ACP channel, and gate
+    /// the consequential ones (shell + edit + write) behind an interactive
+    /// allow/deny overlay. Off by default — the additive integration (pi runs
+    /// its own tools in-process, edits auto-apply) stays the default. When the
+    /// resolved `agent_profile` forces no network (`sealed`), the agent's model
+    /// traffic is relayed to the proxy over a unix socket too (full egress seal);
+    /// otherwise it reaches the proxy via the container gateway.
+    pub bouncer: bool,
 }
 
 impl Default for LlmProxyConfig {
@@ -419,6 +429,7 @@ impl Default for LlmProxyConfig {
             route_agent: false,
             agent_api: "anthropic-messages".to_string(),
             agent_model: "model-proxy/standard".to_string(),
+            bouncer: false,
         }
     }
 }
@@ -6960,6 +6971,8 @@ idle_timeout_secs = 20
 heartbeat_secs = 5
 token_reduction = true
 token_reduction_level = "balanced"
+route_agent = true
+bouncer = true
 "#,
         )
         .unwrap();
@@ -6975,6 +6988,19 @@ token_reduction_level = "balanced"
             cfg.llm_proxy.token_reduction_level,
             CompressionLevel::Balanced
         );
+        assert!(cfg.llm_proxy.route_agent);
+        assert!(cfg.llm_proxy.bouncer);
+    }
+
+    #[test]
+    fn llm_proxy_bouncer_off_by_default() {
+        // The bouncer is opt-in: the additive integration (pi runs its own
+        // tools in-process) stays the default.
+        let cfg = LlmProxyConfig::default();
+        assert!(!cfg.bouncer, "bouncer must default off — AI is additive");
+        // A table that omits the key keeps the default.
+        let parsed: Config = toml::from_str("[llm_proxy]\nenabled = true\n").unwrap();
+        assert!(!parsed.llm_proxy.bouncer);
     }
 
     #[test]

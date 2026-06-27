@@ -84,6 +84,9 @@ pub enum MenuChoice {
     // first-launch keymap picker (item 621): the chosen preset id
     // ("default" | "vscode" | "jetbrains").
     SetKeymapPreset(String),
+    // bouncer tool-approval gate: allow/deny the sealed agent's pending shell /
+    // edit / write tool call. Esc/cancel is treated as deny by the loop.
+    ApproveTool { allow: bool },
     Dismiss,
 }
 
@@ -102,6 +105,7 @@ pub enum MenuKindTag {
     RedoConfirm,
     Confirm,
     KeymapPicker,
+    Approval,
 }
 
 /// One selectable row: an optional letter hotkey (rendered as a chip), the
@@ -416,6 +420,22 @@ pub fn confirm_menu(
         MenuKindTag::Confirm,
         title,
         vec![yes, item(Some('n'), "cancel", MenuChoice::Dismiss)],
+    )
+    .with_body(body)
+}
+
+/// The bouncer's tool-approval gate: a sealed agent wants to `run`/`edit`/`write`
+/// and the user must allow or deny. `[a]` allows, `[d]`/Esc denies. `title` names
+/// the worktree + action (e.g. `pi · run a shell command`); `body` is the
+/// command or path summary. Resolves to `ApproveTool { allow }`.
+pub fn approval_menu(title: impl Into<String>, body: impl Into<String>) -> MenuOverlay {
+    MenuOverlay::new(
+        MenuKindTag::Approval,
+        title,
+        vec![
+            item(Some('a'), "allow", MenuChoice::ApproveTool { allow: true }),
+            item(Some('d'), "deny", MenuChoice::ApproveTool { allow: false }).danger(),
+        ],
     )
     .with_body(body)
 }
@@ -1394,6 +1414,23 @@ mod tests {
             m.handle_key(&KeyCode::Char('n'), NONE),
             MenuOutcome::Pick(MenuChoice::Dismiss)
         );
+    }
+
+    #[test]
+    fn approval_menu_allows_and_denies() {
+        let mut m = approval_menu("pi · run a shell command", "git status");
+        assert_eq!(m.tag, MenuKindTag::Approval);
+        assert!(m.items()[1].danger, "the deny row is danger-tinted");
+        // [a] allows, [d] denies; Esc is treated as deny by the loop (Cancel).
+        assert_eq!(
+            m.handle_key(&KeyCode::Char('a'), NONE),
+            MenuOutcome::Pick(MenuChoice::ApproveTool { allow: true })
+        );
+        assert_eq!(
+            m.handle_key(&KeyCode::Char('d'), NONE),
+            MenuOutcome::Pick(MenuChoice::ApproveTool { allow: false })
+        );
+        assert_eq!(m.handle_key(&KeyCode::Escape, NONE), MenuOutcome::Cancel);
     }
 
     #[test]

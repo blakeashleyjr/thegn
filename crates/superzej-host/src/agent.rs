@@ -556,12 +556,17 @@ pub fn launch_spec_with_key(
         worktree,
         &loc,
         saved_backend.as_deref(),
-        SandboxScope::Shell,
+        launch_scope(cfg, choice),
         selected_env.as_deref(),
     )?;
     if let Ok(db) = Db::open() {
         let _ = db.set_worktree_sandbox(worktree, &outcome.backend_label);
     }
+
+    // Bouncer (opt-in): inject the agent's proxy + tool-override env into the
+    // sealed container's `env_overrides` (+ the control-socket mounts) before the
+    // argv is composed. No-op unless bouncer is on and `choice` is an agent.
+    let bouncer = apply_bouncer_launch(cfg, worktree, choice, &mut outcome);
 
     // Apply per-agent credential scoping: when a virtual key is provided,
     // inject it as an override and mask the master key so it's never forwarded.
@@ -643,6 +648,9 @@ pub fn launch_spec_with_key(
             spec.env.push((var, dir.to_string_lossy().into_owned()));
         }
         spec.env.extend(build_env);
+        // Host fallback under bouncer: the override is inert but proxy vars ride
+        // the pane env (sandboxed agents already got them via env_overrides).
+        spec.env.extend(bouncer.host_env);
     }
     // Host (no-sandbox) devShell injection rides the pane env directly.
     if outcome.spec.is_none()
@@ -675,13 +683,21 @@ pub fn run_in_sandbox(cfg: &Config, worktree: &str, command: &str) -> anyhow::Re
         .ok()
         .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
 
+    // In bouncer mode the command came from the *sealed agent* — run it inside the
+    // agent's own (`agent_profile`) container, the same boundary its interactive
+    // pane runs in, not the worktree shell. Otherwise the worktree shell scope.
+    let scope = if cfg.llm_proxy.bouncer {
+        SandboxScope::Agent
+    } else {
+        SandboxScope::Shell
+    };
     let outcome = prepare_sandbox_env(
         cfg,
         &repo_root,
         worktree,
         &loc,
         saved_backend.as_deref(),
-        SandboxScope::Shell,
+        scope,
         selected_env.as_deref(),
     )?;
 
@@ -718,24 +734,44 @@ pub fn run_in_sandbox(cfg: &Config, worktree: &str, command: &str) -> anyhow::Re
 /// routes through `szproxy` scoped to `agent:pi:<worktree>` — the proxy then
 /// attributes spend and enforces budgets per worktree. Returns the bearer token
 /// to hand the agent (best-effort; `None` if the DB is unavailable). Revoke it
-/// with [`revoke_agent_proxy_key`] when the agent disconnects.
+/// with [`revoke_agent_proxy_key`] when the agent disconnects. Used by the
+/// non-bouncer (TCP) path, which holds the minted token in scope for revocation.
 pub fn mint_agent_proxy_key(worktree: &str) -> Option<String> {
-    use std::hash::{Hash, Hasher};
-    let db = Db::open().ok()?;
     let slug = superzej_core::util::slugify(worktree);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let key = format!("szk-{slug}-{nanos}");
-    // The proxy looks up identity by the token itself; the hash column is stored
-    // for parity with the schema (lookups don't verify it for a local daemon).
+    put_proxy_key(worktree, &format!("szk-{slug}-{nanos}"))
+}
+
+/// The **stable** virtual-key id for a worktree's bouncer agent. Deterministic
+/// (slug-only, no timestamp) so the launch path (which injects it into the
+/// sealed container's env before the agent connects) and the disconnect path
+/// (which revokes it) derive the same token without threading it through.
+pub fn agent_proxy_key_id(worktree: &str) -> String {
+    format!("szk-{}", superzej_core::util::slugify(worktree))
+}
+
+/// Mint the [`agent_proxy_key_id`] for `worktree` (best-effort). Upserts the
+/// row, so relaunching the same worktree's agent reuses the one key.
+pub fn mint_stable_proxy_key(worktree: &str) -> Option<String> {
+    let key = agent_proxy_key_id(worktree);
+    put_proxy_key(worktree, &key)
+}
+
+/// Persist a virtual key row for `worktree` and return the token. The proxy
+/// looks up identity by the token itself; the hash column is stored for parity
+/// with the schema (lookups don't verify it for a local daemon).
+fn put_proxy_key(worktree: &str, key: &str) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+    let db = Db::open().ok()?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     key.hash(&mut hasher);
     let token_hash = format!("{:016x}", hasher.finish());
     let scope = format!("agent:pi:{worktree}");
     db.put_proxy_virtual_key(
-        &key,
+        key,
         &token_hash,
         &format!("pi agent {worktree}"),
         &scope,
@@ -743,13 +779,70 @@ pub fn mint_agent_proxy_key(worktree: &str) -> Option<String> {
         superzej_core::util::now(),
     )
     .ok()?;
-    Some(key)
+    Some(key.to_string())
 }
 
 /// Revoke a virtual key minted by [`mint_agent_proxy_key`] (best-effort).
 pub fn revoke_agent_proxy_key(key: &str) {
     if let Ok(db) = Db::open() {
         let _ = db.revoke_proxy_virtual_key(key, superzej_core::util::now());
+    }
+}
+
+/// The sandbox scope for launching `choice`: the sealed `agent_profile` when the
+/// bouncer is on and `choice` is a configured agent (so the agent runs in its
+/// own hardened container), else the worktree's interactive shell scope.
+pub fn launch_scope(cfg: &Config, choice: &str) -> SandboxScope {
+    if cfg.llm_proxy.bouncer && cfg.agent_command(choice).is_some() {
+        SandboxScope::Agent
+    } else {
+        SandboxScope::Shell
+    }
+}
+
+/// What a bouncer launch produced for the caller to carry forward.
+#[derive(Debug, Default)]
+pub struct BouncerLaunch {
+    /// Env vars for a **host** (non-sandboxed) agent pane — already injected into
+    /// the sandbox spec's `env_overrides` when sandboxed, so empty in that case.
+    pub host_env: Vec<(String, String)>,
+}
+
+/// In bouncer mode, inject the agent's proxy + tool-override env (and the
+/// control-socket mounts) into the resolved sandbox `outcome` before its argv is
+/// composed, minting the stable per-worktree proxy key. No-op unless the bouncer
+/// is on and `choice` is a configured agent. Sandbox env rides `env_overrides`
+/// (exported inside the container); a host fallback returns the vars to ride the
+/// pane env. See [`crate::bouncer::agent_env_plan`].
+pub fn apply_bouncer_launch(
+    cfg: &Config,
+    worktree: &str,
+    choice: &str,
+    outcome: &mut SandboxOutcome,
+) -> BouncerLaunch {
+    if !(cfg.llm_proxy.bouncer && cfg.agent_command(choice).is_some()) {
+        return BouncerLaunch::default();
+    }
+    let key = cfg
+        .llm_proxy
+        .route_agent
+        .then(|| mint_stable_proxy_key(worktree))
+        .flatten();
+    let sandbox = outcome.spec.as_ref().map(|s| (s.backend, s.network));
+    let plan = crate::bouncer::agent_env_plan(cfg, worktree, sandbox, key.as_deref());
+    match outcome.spec.as_mut() {
+        Some(spec) => {
+            for (k, v) in plan.vars {
+                spec.env_overrides.insert(k, v);
+            }
+            spec.mounts.extend(plan.mounts);
+            BouncerLaunch::default()
+        }
+        // Host fallback (no isolation): the bouncer override is inert, but the
+        // proxy vars still ride the pane env.
+        None => BouncerLaunch {
+            host_env: plan.vars,
+        },
     }
 }
 

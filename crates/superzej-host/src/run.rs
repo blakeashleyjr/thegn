@@ -4932,6 +4932,9 @@ fn dispatch_menu_choice(
         MenuChoice::ConfirmDeleteWorktrees { .. } => {}
         MenuChoice::ConfirmDeleteWorkspace { .. } => {}
         MenuChoice::ConfirmInitGit { .. } => {}
+        // The bouncer approval gate is resolved directly in the loop (it owns the
+        // approval queue + oneshots); it never routes through this git dispatcher.
+        MenuChoice::ApproveTool { .. } => {}
     }
     GitAfter::None
 }
@@ -6317,6 +6320,52 @@ fn persist_session_layout(session: &mut crate::session::Session, panes: &Panes) 
 /// tab's center at the live pane so `materialize` won't also spawn a plain
 /// shell. No-op (returns false) if the tab is gone.
 #[allow(clippy::too_many_arguments)]
+/// How superzej reaches a launched agent's ACP server: a TCP loopback port (the
+/// non-sandboxed path) or a bind-mounted unix socket (the sealed-bouncer path,
+/// which crosses the container netns without network). `None` ⇒ no channel was
+/// reserved (the agent runs without ACP servicing).
+enum AgentChannel {
+    Tcp(u16),
+    Unix(std::path::PathBuf),
+    None,
+}
+
+/// Connect to the agent's ACP server over the resolved channel. TCP connects
+/// after a fixed warm-up; the unix socket is created by the in-container pi
+/// extension only once it boots, so we retry until it appears (or time out).
+async fn connect_agent_channel(
+    channel: &AgentChannel,
+) -> anyhow::Result<(
+    superzej_svc::acp::client::AcpClient,
+    tokio::sync::mpsc::Receiver<superzej_svc::acp::client::AcpInbound>,
+)> {
+    use superzej_svc::acp::client::AcpClient;
+    match channel {
+        AgentChannel::Tcp(port) => {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            AcpClient::connect(*port).await
+        }
+        AgentChannel::Unix(path) => {
+            let path_s = path.to_string_lossy().into_owned();
+            // The sealed agent boots pi, then the extension `listen`s on the
+            // bind-mounted socket — which can take a few seconds on a cold image.
+            let mut last = None;
+            for _ in 0..40 {
+                if path.exists() {
+                    match AcpClient::connect_unix(&path_s).await {
+                        Ok(conn) => return Ok(conn),
+                        Err(e) => last = Some(e),
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            Err(last.unwrap_or_else(|| anyhow::anyhow!("agent ACP socket {path_s} never appeared")))
+        }
+        AgentChannel::None => Err(anyhow::anyhow!("no ACP channel reserved")),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn attach_agent_pane(
     session: &mut crate::session::Session,
     panes: &mut Panes,
@@ -6337,35 +6386,46 @@ fn attach_agent_pane(
     };
     let cwd = spec.cwd.clone();
     let mut env = spec.env.clone();
+    let wt_path = session.worktrees[gi].path.clone();
 
-    // Reserve a free localhost port and hand it to the agent via the `ACP_PORT`
-    // env var — the pi extension binds exactly this port and superzej connects to
-    // it. Env is the reliable channel: it crosses superzej's `sh -lc` (and, later,
-    // sandbox) wrapping. (A `--acp-port` flag appended to the wrapped argv would
-    // land as a positional arg to `sh`, never reaching pi.) The brief
-    // bind-then-drop is the standard ephemeral-port reservation; pi re-binds it.
-    let acp_port = match std::net::TcpListener::bind("127.0.0.1:0") {
-        Ok(listener) => match listener.local_addr().map(|addr| addr.port()).unwrap_or(0) {
-            0 => None,
-            port => {
+    // "The bouncer": when on and the agent is sandboxed, the launch path already
+    // injected the proxy + tool-override env (and ACP_SOCKET) into the container's
+    // `env_overrides`, and superzej reaches the agent over a bind-mounted unix
+    // socket (TCP can't cross the sealed netns). Otherwise: the legacy TCP path,
+    // wiring ACP_PORT + the proxy env onto the pane process env here.
+    let bouncer = cfg.llm_proxy.bouncer && spec.backend != "host";
+
+    let acp_channel: AgentChannel = if bouncer {
+        AgentChannel::Unix(crate::bouncer::acp_socket_path(&wt_path))
+    } else {
+        // Reserve a free localhost port and hand it to the agent via `ACP_PORT`.
+        // The brief bind-then-drop is the standard ephemeral-port reservation; pi
+        // re-binds it. Env is the reliable channel: it crosses `sh -lc` wrapping.
+        match std::net::TcpListener::bind("127.0.0.1:0")
+            .ok()
+            .and_then(|l| l.local_addr().ok())
+            .map(|a| a.port())
+            .filter(|p| *p != 0)
+        {
+            Some(port) => {
                 env.push(("ACP_PORT".to_string(), port.to_string()));
-                Some(port)
+                AgentChannel::Tcp(port)
             }
-        },
-        Err(_) => None,
+            None => AgentChannel::None,
+        }
     };
 
-    // Lower plane: route the agent's model through the proxy. The pi extension
-    // registers the provider AT INIT from these env vars (pi flushes provider
-    // registrations before the session starts, so a runtime `providers/set` is
-    // too late). Gated on `route_agent` — independent of `enabled` (which launches
-    // szproxy) — so it can target an already-running proxy at `listen`. baseUrl is
-    // the host root (the Anthropic Messages API the proxy serves; pi appends
-    // `/v1/messages`). Mint a per-worktree virtual key for spend attribution;
-    // revoked when the agent disconnects.
-    let proxy_key = if cfg.llm_proxy.route_agent {
-        let wt = session.worktrees[gi].path.clone();
-        let key = crate::agent::mint_agent_proxy_key(&wt);
+    // Lower plane: route the agent's model through the proxy. In bouncer mode the
+    // proxy env rides `env_overrides` (set at launch) and the key is the stable
+    // per-worktree id; here (TCP path) we mint a fresh key + push the proxy env
+    // onto the pane env. Either way the key is revoked when the agent disconnects.
+    let revoke_key: Option<String> = if bouncer {
+        // Stable id derived deterministically — matches what the launch path minted.
+        cfg.llm_proxy
+            .route_agent
+            .then(|| crate::agent::agent_proxy_key_id(&wt_path))
+    } else if cfg.llm_proxy.route_agent {
+        let key = crate::agent::mint_agent_proxy_key(&wt_path);
         env.push((
             "SUPERZEJ_PROXY_BASE_URL".to_string(),
             format!("http://{}", cfg.llm_proxy.listen),
@@ -6386,6 +6446,24 @@ fn attach_agent_pane(
         None
     };
 
+    // Full network seal (sealed `agent_profile` → `network=none`): the agent's
+    // only egress is a unix-socket relay to the host proxy, bind-mounted into the
+    // container. Started here; torn down when the connection task ends.
+    let relay = (bouncer
+        && cfg.llm_proxy.route_agent
+        && cfg.sandbox.agent_profile.forces_no_network())
+    .then(|| {
+        let sock = crate::bouncer::proxy_socket_path(&wt_path);
+        match crate::relay::spawn(sock, cfg.llm_proxy.listen.clone()) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                tracing::error!(target: "szhost::relay", "proxy relay failed to start: {e}");
+                None
+            }
+        }
+    })
+    .flatten();
+
     let argv = spec.argv.clone();
     match panes.spawn_argv_env(&argv, cwd.as_deref(), &env, center) {
         Ok(id) => {
@@ -6402,22 +6480,20 @@ fn attach_agent_pane(
             tab.center = crate::center::CenterTree::Leaf(id);
             tab.focused_pane = id;
 
-            // Connect to ACP in the background if a port was assigned. The task
+            // Connect to ACP in the background over the resolved channel. The task
             // registers its client with the loop (so the loop can reply) and then
             // forwards every inbound message tagged with the worktree path; the
             // loop owns servicing + replies (see `dispatch_acp_inbound`).
-            if let Some(port) = acp_port {
+            if !matches!(acp_channel, AgentChannel::None) {
                 let inbound_tx = acp_inbound_tx.clone();
                 let reg_tx = acp_reg_tx.clone();
                 let waker_clone = waker.clone();
                 let wt_name = g.path.clone();
-                // Per-worktree virtual key minted above (when routing). Revoked when
-                // the agent disconnects. The model provider itself is configured at
-                // pi-init via the SUPERZEJ_PROXY_* env (not a runtime providers/set).
-                let minted_key = proxy_key;
+                // `revoke_key` (revoked on disconnect) and `relay` (the model
+                // relay, whose `Drop` tears down the socket) are captured by the
+                // `move` task below — they live exactly as long as the connection.
 
                 // Surface lifecycle in the statusbar chip (the only native signal).
-                // Emits to the loop's per-worktree activity map + pulses the waker.
                 let emit = {
                     let status_tx = acp_status_tx.clone();
                     let waker = waker_clone.clone();
@@ -6430,10 +6506,9 @@ fn attach_agent_pane(
                 emit(crate::chrome::AgentConn::Connecting);
 
                 tokio::spawn(async move {
-                    // Give the agent a moment to bind its ACP server.
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-                    match superzej_svc::acp::client::AcpClient::connect(port).await {
+                    let _relay = relay; // keep alive until the task returns
+                    let connected = connect_agent_channel(&acp_channel).await;
+                    match connected {
                         Ok((client, mut rx)) => {
                             let client = std::sync::Arc::new(client);
                             // Negotiate capabilities before servicing anything.
@@ -6449,7 +6524,7 @@ fn attach_agent_pane(
 
                             // Hand the client to the loop so it can reply to requests.
                             if reg_tx.send((wt_name.clone(), client.clone())).is_err() {
-                                if let Some(key) = &minted_key {
+                                if let Some(key) = &revoke_key {
                                     crate::agent::revoke_agent_proxy_key(key);
                                 }
                                 return; // loop gone
@@ -6466,14 +6541,14 @@ fn attach_agent_pane(
 
                             // The agent disconnected: surface it + revoke its key.
                             emit(crate::chrome::AgentConn::Exited);
-                            if let Some(key) = &minted_key {
+                            if let Some(key) = &revoke_key {
                                 crate::agent::revoke_agent_proxy_key(key);
                             }
                         }
                         Err(e) => {
-                            tracing::error!(target: "szhost::acp", "failed to connect to agent ACP port {port}: {e}");
+                            tracing::error!(target: "szhost::acp", "failed to connect to agent ACP channel: {e}");
                             emit(crate::chrome::AgentConn::Error);
-                            if let Some(key) = &minted_key {
+                            if let Some(key) = &revoke_key {
                                 crate::agent::revoke_agent_proxy_key(key);
                             }
                         }
@@ -6509,6 +6584,7 @@ fn attach_agent_pane(
 ///
 /// Notifications (`session/update`) are handled by the caller against the
 /// rendered model; this services only requests that need a reply.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_acp_inbound(
     wt: &str,
     inbound: superzej_svc::acp::client::AcpInbound,
@@ -6518,9 +6594,16 @@ fn dispatch_acp_inbound(
     >,
     cfg: &superzej_core::config::Config,
     event_bus: &superzej_core::event_bus::EventBus,
+    approval_tx: &tokio_mpsc::UnboundedSender<
+        crate::bouncer::ApprovalRequest<tokio::sync::oneshot::Sender<bool>>,
+    >,
+    waker: &TerminalWaker,
 ) {
     use superzej_svc::acp::client::AcpInbound;
     let client = acp_clients.get(wt).cloned();
+    // In bouncer mode the consequential tools (shell/edit/write) are gated behind
+    // the user's approval; reads + MCP pass through. Off by default.
+    let bouncer = cfg.llm_proxy.bouncer;
     match inbound {
         AcpInbound::Initialized(caps) => {
             tracing::debug!(target: "szhost::acp", worktree = %wt, ?caps, "agent initialized");
@@ -6553,7 +6636,24 @@ fn dispatch_acp_inbound(
             if let Some(client) = client {
                 let wt = wt.to_string();
                 let cfg = cfg.clone();
+                let approval_tx = approval_tx.clone();
+                let waker = waker.clone();
                 tokio::spawn(async move {
+                    if !gate_approval(
+                        bouncer,
+                        &wt,
+                        crate::bouncer::ApprovalKind::Shell,
+                        command.clone(),
+                        &approval_tx,
+                        &waker,
+                    )
+                    .await
+                    {
+                        let _ = client
+                            .reply_error(id, -32001, "shell command denied by the superzej bouncer")
+                            .await;
+                        return;
+                    }
                     let result = tokio::task::spawn_blocking(move || {
                         crate::agent::run_in_sandbox(&cfg, &wt, &command)
                     })
@@ -6577,7 +6677,24 @@ fn dispatch_acp_inbound(
         AcpInbound::SuperzejWriteRequest { id, path, content } => {
             if let Some(client) = client {
                 let wt = wt.to_string();
+                let approval_tx = approval_tx.clone();
+                let waker = waker.clone();
                 tokio::spawn(async move {
+                    if !gate_approval(
+                        bouncer,
+                        &wt,
+                        crate::bouncer::ApprovalKind::Write,
+                        path.clone(),
+                        &approval_tx,
+                        &waker,
+                    )
+                    .await
+                    {
+                        let _ = client
+                            .reply_error(id, -32001, "write denied by the superzej bouncer")
+                            .await;
+                        return;
+                    }
                     let result = tokio::task::spawn_blocking(move || {
                         write_scoped_file(&wt, &path, &content)
                     })
@@ -6590,7 +6707,24 @@ fn dispatch_acp_inbound(
         AcpInbound::SuperzejEditRequest { id, path, edits } => {
             if let Some(client) = client {
                 let wt = wt.to_string();
+                let approval_tx = approval_tx.clone();
+                let waker = waker.clone();
                 tokio::spawn(async move {
+                    if !gate_approval(
+                        bouncer,
+                        &wt,
+                        crate::bouncer::ApprovalKind::Edit,
+                        path.clone(),
+                        &approval_tx,
+                        &waker,
+                    )
+                    .await
+                    {
+                        let _ = client
+                            .reply_error(id, -32001, "edit denied by the superzej bouncer")
+                            .await;
+                        return;
+                    }
                     let result =
                         tokio::task::spawn_blocking(move || apply_scoped_edits(&wt, &path, &edits))
                             .await
@@ -6660,6 +6794,55 @@ fn dispatch_acp_inbound(
             }
         }
     }
+}
+
+/// Build the approval overlay for a pending bouncer request: a 2-item allow/deny
+/// menu titled with the worktree + action, bodied with the command/path summary.
+fn approval_overlay<R>(req: &crate::bouncer::ApprovalRequest<R>) -> MenuOverlay {
+    let wt_name = req
+        .worktree
+        .rsplit('/')
+        .next()
+        .unwrap_or(req.worktree.as_str());
+    let title = format!(
+        "{} {wt_name} · agent wants to {}",
+        req.kind.glyph(),
+        req.kind.verb()
+    );
+    menu::approval_menu(title, crate::bouncer::summary(&req.detail))
+}
+
+/// Ask the bouncer gate for permission to run a consequential tool call (bouncer
+/// mode only). Sends an `ApprovalRequest` to the loop, pulses the waker so the
+/// overlay is raised, and awaits the user's decision. Returns `true` to proceed;
+/// a deny — or a gone loop — returns `false`. A no-op (`true`) when not gating.
+async fn gate_approval(
+    bouncer: bool,
+    wt: &str,
+    kind: crate::bouncer::ApprovalKind,
+    detail: String,
+    approval_tx: &tokio_mpsc::UnboundedSender<
+        crate::bouncer::ApprovalRequest<tokio::sync::oneshot::Sender<bool>>,
+    >,
+    waker: &TerminalWaker,
+) -> bool {
+    if !bouncer {
+        return true;
+    }
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if approval_tx
+        .send(crate::bouncer::ApprovalRequest {
+            worktree: wt.to_string(),
+            kind,
+            detail,
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return false; // loop gone
+    }
+    let _ = waker.wake();
+    reply_rx.await.unwrap_or(false)
 }
 
 /// Fold an ACP `session/update` into a worktree's agent-activity entry: track the
@@ -7447,6 +7630,17 @@ async fn event_loop<T: Terminal>(
         tokio_mpsc::unbounded_channel::<(String, crate::chrome::AgentConn)>();
     let mut acp_activity: std::collections::HashMap<String, crate::chrome::AgentActivity> =
         std::collections::HashMap::new();
+
+    // The bouncer's tool-approval gate (B1). When the agent runs sealed, its
+    // shell/edit/write tool calls are routed back over ACP and gated here: the
+    // off-loop servicing task sends an `ApprovalRequest` carrying a oneshot, and
+    // awaits the user's allow/deny. The loop drains the channel into a FIFO
+    // `ApprovalQueue`, shows one `approval_menu` overlay at a time, and resolves
+    // each request's oneshot on the pick. (No-op unless `[llm_proxy].bouncer`.)
+    type AcpApproval = crate::bouncer::ApprovalRequest<tokio::sync::oneshot::Sender<bool>>;
+    let (acp_approval_tx, mut acp_approval_rx) = tokio_mpsc::unbounded_channel::<AcpApproval>();
+    let mut acp_approvals: crate::bouncer::ApprovalQueue<tokio::sync::oneshot::Sender<bool>> =
+        crate::bouncer::ApprovalQueue::new();
 
     // The resurrected session restored each tab's tree with pane ids the
     // PREVIOUS process allocated (numbered from 1). This process's `next_id`
@@ -9289,8 +9483,31 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                 }
                 other => {
-                    dispatch_acp_inbound(&wt, other, &acp_clients, keymap.config(), &event_bus);
+                    dispatch_acp_inbound(
+                        &wt,
+                        other,
+                        &acp_clients,
+                        keymap.config(),
+                        &event_bus,
+                        &acp_approval_tx,
+                        &waker,
+                    );
                 }
+            }
+        }
+
+        // Drain pending bouncer approvals into the FIFO gate. When one becomes
+        // active and no other menu is open, raise the approval overlay (an
+        // overlay forces a Full frame — the render invariant handles repaint).
+        while let Ok(req) = acp_approval_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
+            let became_active = acp_approvals.enqueue(req);
+            if became_active
+                && active_menu.is_none()
+                && let Some(active) = acp_approvals.active()
+            {
+                active_menu = Some(approval_overlay(active));
+                dirty = true;
             }
         }
 
@@ -11517,21 +11734,42 @@ async fn event_loop<T: Terminal>(
                     match m.handle_key(&k.key, k.modifiers) {
                         menu::MenuOutcome::Pending => {}
                         menu::MenuOutcome::Cancel => {
-                            // Dismissing the first-launch keymap picker (item 621)
-                            // counts as choosing the defaults — persist so it
-                            // never reappears.
-                            if m.tag == menu::MenuKindTag::KeymapPicker
-                                && let Ok(db) = superzej_core::db::Db::open()
-                            {
-                                let _ = db.set_ui_state("", "keymap_preset", "default");
+                            // Esc on the bouncer gate = deny: reject the active
+                            // tool call and advance to the next queued approval.
+                            if m.tag == menu::MenuKindTag::Approval {
+                                if let Some(done) = acp_approvals.resolve() {
+                                    let _ = done.reply.send(false);
+                                }
+                                active_menu = acp_approvals.active().map(approval_overlay);
+                                // (the common `dirty = true` after this match repaints)
+                            } else {
+                                // Dismissing the first-launch keymap picker (item
+                                // 621) counts as choosing the defaults — persist so
+                                // it never reappears.
+                                if m.tag == menu::MenuKindTag::KeymapPicker
+                                    && let Ok(db) = superzej_core::db::Db::open()
+                                {
+                                    let _ = db.set_ui_state("", "keymap_preset", "default");
+                                }
+                                active_menu = None;
+                                pending_confirm_op = None;
+                                pending_undo = None;
+                                pending_delete_workspace = None;
                             }
-                            active_menu = None;
-                            pending_confirm_op = None;
-                            pending_undo = None;
-                            pending_delete_workspace = None;
                         }
                         menu::MenuOutcome::Pick(choice) => {
                             active_menu = None;
+                            // Bouncer gate: send the user's allow/deny to the
+                            // waiting tool-servicing task, then raise the next
+                            // queued approval (if any).
+                            if let menu::MenuChoice::ApproveTool { allow } = choice {
+                                if let Some(done) = acp_approvals.resolve() {
+                                    let _ = done.reply.send(allow);
+                                }
+                                active_menu = acp_approvals.active().map(approval_overlay);
+                                dirty = true;
+                                continue;
+                            }
                             if let menu::MenuChoice::ConfirmDeleteWorktrees { keep_files } = choice
                                 && let Some(targets) = pending_confirm_delete_worktrees.take()
                             {
