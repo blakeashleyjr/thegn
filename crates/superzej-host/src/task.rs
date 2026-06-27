@@ -189,6 +189,38 @@ fn run_capped(
     run_capped_argv(&inner, worktree, limits, slot, generation, timeout)
 }
 
+/// Build the (unspawned) command for a capped job: program + args, the worktree
+/// cwd, piped stdio, an isolated `CARGO_TARGET_DIR`, its own process group, and a
+/// **scrubbed git environment**.
+///
+/// The git scrub is the important bit: a user job (a build, a test suite, a
+/// script) shelling out to `git` must operate on the worktree via the job's own
+/// `-C`/cwd, never on whatever `GIT_DIR`/`GIT_INDEX_FILE` happened to be in the
+/// environment. `main()` already scrubs process-wide, so this is defense in
+/// depth — but it makes the guarantee local and explicit (mirrors
+/// `util::git_cmd`), so running a job through superzej is a safer place to run
+/// commands than a raw shell, and stays correct even if some future code sets a
+/// `GIT_*` var in-process.
+fn build_capped_command(argv: &[String], worktree: &Path, limits: &LimitsConfig) -> Command {
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..])
+        .current_dir(worktree)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for var in superzej_core::util::GIT_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    if let Some(target) = isolated_cargo_target(worktree, limits) {
+        cmd.env("CARGO_TARGET_DIR", target);
+    }
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
+    cmd
+}
+
 /// Like [`run_capped`] but runs a prebuilt argv directly (no shell), so callers
 /// passing user/pattern data — e.g. the ripgrep source scan — never have to
 /// shell-quote. `inner[0]` is the program; the cap wrapper is prepended.
@@ -205,19 +237,7 @@ fn run_capped_argv(
     // Supersede any older job in this slot.
     cancel_slot(slot);
 
-    let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..])
-        .current_dir(worktree)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(target) = isolated_cargo_target(worktree, limits) {
-        cmd.env("CARGO_TARGET_DIR", target);
-    }
-    #[cfg(unix)]
-    {
-        cmd.process_group(0);
-    }
+    let mut cmd = build_capped_command(&argv, worktree, limits);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -1205,6 +1225,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn build_capped_command_scrubs_git_env_and_sets_cwd() {
+        // A user job must run with a clean git environment so its own git calls
+        // (e.g. a test suite) can't be misdirected at superzej's repo by an
+        // inherited GIT_DIR/GIT_INDEX_FILE. `env_remove` shows up in get_envs as
+        // (key, None). Thread-safe: inspects the Command, never mutates env.
+        let wt = temp_dir("capped-cmd");
+        let cmd = build_capped_command(
+            &["true".to_string()],
+            &wt,
+            &superzej_core::config::LimitsConfig::default(),
+        );
+        let removed: std::collections::HashSet<&std::ffi::OsStr> = cmd
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k)
+            .collect();
+        for var in superzej_core::util::GIT_ENV_VARS {
+            assert!(
+                removed.contains(std::ffi::OsStr::new(var)),
+                "capped job command must scrub {var}"
+            );
+        }
+        assert_eq!(cmd.get_current_dir(), Some(wt.as_path()));
+        let _ = std::fs::remove_dir_all(&wt);
     }
 
     /// Caps fully disabled → runs bare, so e2e is deterministic and doesn't
