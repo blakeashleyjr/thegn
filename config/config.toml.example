@@ -393,6 +393,9 @@ format = "text"           # text | json
 #     name). Bind one per folder you sort into; firing again files into the same
 #     folder (no duplicates). The interactive picker is `move-worktree-to-folder`
 #     (bindable / in the palette) when you'd rather choose or name a folder.
+#     Every folder named by a file-worktree action surfaces automatically as a
+#     destination — in that picker, in the Cmd-K palette ("File into: <name>"),
+#     and in the which-key popup — even before anything has been filed there.
 #
 # A scratch worktree on bwrap with a shell, no prompts:
 # [[actions]]
