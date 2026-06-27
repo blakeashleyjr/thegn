@@ -15,19 +15,32 @@ use termwiz::terminal::TerminalWaker;
 use crate::chrome::{FrameModel, LoadStep};
 use crate::run::now_secs;
 
-/// Sidebar/panel re-hydration cadence — and the fidelity knob for the sidebar's
-/// live status: the activity-dot FSM (`activity::poll_and_save`) and the git
-/// glyphs (dirty / ahead-behind per worktree) are sampled inside this tick, so
-/// they only refresh this often. Default 1s (was 2s); override with
-/// `SUPERZEJ_MODEL_REFRESH_MS`. Clamped to a multiple of the 500ms ticker base,
-/// min 500ms. Lower = snappier dots/glyphs at the cost of more background git
-/// work; a re-hydration that changes nothing is dropped before any repaint by
-/// `FrameModel::hydration_eq`, so a faster cadence does NOT cost idle frames.
+/// Default for [`model_refresh_interval`]. Matches `bg_glyph_ttl`'s 5s default
+/// (the ticker's only job is refreshing background glyphs + the activity FSM);
+/// must stay a multiple of the 500ms base that divides `PR_REFRESH_INTERVAL` so
+/// the ticker keeps emitting `RefreshKind::Pr` (see the cadence-invariant test).
+const DEFAULT_MODEL_REFRESH_MS: u64 = 5000;
+
+/// Safety-net cadence for the background model re-hydration ticker. The *active*
+/// worktree's panel + git glyphs already update in real time off the diff
+/// fs-watcher (`retarget_diff_watcher`), so this tick exists only to (a) refresh
+/// *background* worktrees' sidebar glyphs — themselves capped to the
+/// `bg_glyph_ttl` (5s) staleness window, so ticking faster does no extra git
+/// work — and (b) advance the activity-dot FSM (`activity::poll_and_save`, which
+/// is wall-normalized and so stays correct at any cadence; dots just react up to
+/// one tick later). The default therefore matches that 5s TTL.
+///
+/// It was 1s, which rebuilt the whole model — a ~0.3-0.4s `git` fan-out — every
+/// second even when fully idle. `FrameModel::hydration_eq` drops the idle
+/// *frame*, but NOT the wasted *build CPU*; on this thread that redundant rebuild
+/// was the dominant idle/agent-active hydration cost. Override with
+/// `SUPERZEJ_MODEL_REFRESH_MS` (lower = snappier dots/glyphs, more background git
+/// work). Clamped to a multiple of the 500ms ticker base, min 500ms.
 fn model_refresh_interval() -> Duration {
     let ms = std::env::var("SUPERZEJ_MODEL_REFRESH_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(1000)
+        .unwrap_or(DEFAULT_MODEL_REFRESH_MS)
         .max(500);
     Duration::from_millis((ms / 500) * 500)
 }
@@ -2097,6 +2110,34 @@ fn is_git_state_path(p: &std::path::Path) -> bool {
     )
 }
 
+/// Whether a single diff-watcher event path should drive a model re-hydration.
+/// Three cases, in precedence order:
+/// 1. `.git`-internal paths (inside a `.git` component, or under the resolved
+///    gitdir/common-dir `roots`) refresh ONLY for real git-state changes —
+///    commits, checkouts, branch/tag moves, in-progress merge/rebase — gated by
+///    [`is_git_state_path`] so index/object-store churn can't drive a loop.
+/// 2. Otherwise, gitignored worktree paths (build artifacts like `target/`)
+///    never refresh: they can't appear in `git diff HEAD`, so a rebuild would be
+///    pure waste — and a cargo/agent running in the tree churns them constantly.
+/// 3. Everything else (real edits to tracked/untracked source files) refreshes.
+///
+/// Pure (given a prebuilt matcher), so the precedence is unit-tested.
+fn watcher_path_triggers_refresh(
+    p: &std::path::Path,
+    roots: &[std::path::PathBuf],
+    ignore: &ignore::gitignore::Gitignore,
+) -> bool {
+    if in_dot_git(p) || roots.iter().any(|r| p.starts_with(r)) {
+        is_git_state_path(p)
+    } else {
+        // Case 2 vs 3: gitignored build churn is dropped; everything else (real
+        // source edits) refreshes.
+        !ignore
+            .matched_path_or_any_parents(p, p.is_dir())
+            .is_ignore()
+    }
+}
+
 pub(crate) fn retarget_diff_watcher(
     session: &crate::session::Session,
     watched: &mut Option<std::path::PathBuf>,
@@ -2157,6 +2198,25 @@ pub(crate) fn retarget_diff_watcher(
             .unwrap_or_else(Instant::now);
         let wake = w.clone();
         let roots = git_roots.clone();
+        // Drop watcher events for gitignored paths (`target/`, `node_modules/`,
+        // build outputs): a change to an ignored file can never alter
+        // `git diff HEAD`, so firing a model rebuild for it is pure waste — yet a
+        // cargo/sccache/agent running inside the worktree churns these constantly,
+        // which was the dominant source of redundant ~Hz hydrations. Built once
+        // per retarget from the worktree's root `.gitignore` (nested `.gitignore`s
+        // are rare for the high-churn dirs we care about; revisit only if
+        // profiling shows residual churn). A missing/unreadable `.gitignore`
+        // yields an empty matcher → every path passes → unchanged behavior, so
+        // remote/provider worktrees with no local `.gitignore` are unaffected.
+        // NOTE: a force-added (`git add -f`) or negate-pattern (`!keep`) ignored
+        // file *can* appear in the diff and would be dropped here; that's rare,
+        // and the safety-net ticker still rebuilds the panel within a few seconds.
+        let ignore = {
+            let mut b = ignore::gitignore::GitignoreBuilder::new(&cwd);
+            let _ = b.add(".gitignore");
+            b.build()
+                .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty())
+        };
         let new_watcher = recommended_watcher(move |res: notify::Result<Event>| {
             if let Ok(ev) = res
                 && matches!(
@@ -2174,13 +2234,10 @@ pub(crate) fn retarget_diff_watcher(
                 // the old self-sustaining ~2 Hz refresh loop — which once read
                 // as a freeze — from coming back.
                 && (ev.paths.is_empty()
-                    || ev.paths.iter().any(|p| {
-                        if in_dot_git(p) || roots.iter().any(|r| p.starts_with(r)) {
-                            is_git_state_path(p)
-                        } else {
-                            true
-                        }
-                    }))
+                    || ev
+                        .paths
+                        .iter()
+                        .any(|p| watcher_path_triggers_refresh(p, &roots, &ignore)))
                 && last_send.elapsed() > Duration::from_millis(500)
             {
                 if tx.send(RefreshKind::Model).is_ok() {
@@ -2499,5 +2556,74 @@ mod tests {
         // Editor scratch + config — not a state change.
         assert!(no("/repo/.git/COMMIT_EDITMSG"));
         assert!(no("/repo/.git/config"));
+    }
+
+    #[test]
+    fn watcher_drops_gitignored_churn_but_keeps_source_and_git_state() {
+        use std::path::{Path, PathBuf};
+        // Matcher built like the live watcher, but from inline patterns so the
+        // test needs no temp `.gitignore` on disk.
+        let mut b = ignore::gitignore::GitignoreBuilder::new("/repo");
+        // `/target` is the ROOT-ANCHORED form this repo's own `.gitignore` uses —
+        // the fix hinges on the anchored pattern matching via parent lookup.
+        b.add_line(None, "/target").unwrap();
+        b.add_line(None, "*.log").unwrap();
+        let ig = b.build().unwrap();
+        let roots: Vec<PathBuf> = vec![PathBuf::from("/repo/.git")];
+        let fires = |p: &str| watcher_path_triggers_refresh(Path::new(p), &roots, &ig);
+
+        // Gitignored build churn — the storm this filter exists to kill.
+        assert!(!fires("/repo/target/debug/szhost"));
+        assert!(!fires("/repo/target/debug/.fingerprint/x"));
+        assert!(!fires("/repo/run.log"));
+        // Real source edits still refresh the panel.
+        assert!(fires("/repo/src/main.rs"));
+        assert!(fires("/repo/crates/foo/Cargo.toml"));
+        // Git-state changes still refresh (the `.git` branch wins; the gitignore
+        // matcher never even sees these).
+        assert!(fires("/repo/.git/HEAD"));
+        assert!(fires("/repo/.git/refs/heads/main"));
+        // Git-internal churn stays dropped (index/objects).
+        assert!(!fires("/repo/.git/index"));
+        assert!(!fires("/repo/.git/objects/ab/cdef"));
+    }
+
+    #[test]
+    fn empty_gitignore_matcher_passes_every_worktree_edit() {
+        // Remote/provider worktrees (no local `.gitignore`) build an empty
+        // matcher; it must not drop any edit — unchanged pre-filter behavior.
+        use std::path::{Path, PathBuf};
+        let ig = ignore::gitignore::Gitignore::empty();
+        let roots: Vec<PathBuf> = vec![];
+        assert!(watcher_path_triggers_refresh(
+            Path::new("/wt/target/x"),
+            &roots,
+            &ig
+        ));
+        assert!(watcher_path_triggers_refresh(
+            Path::new("/wt/src/main.rs"),
+            &roots,
+            &ig
+        ));
+    }
+
+    #[test]
+    fn ticker_pr_cadence_is_a_multiple_of_the_model_cadence() {
+        // The ticker emits `RefreshKind::Pr` only from inside the `model_every`
+        // block, so PR auto-refresh silently stops unless model_every divides
+        // pr_every. Lock that for the shipped defaults.
+        let base_ms = 500u64;
+        assert_eq!(
+            DEFAULT_MODEL_REFRESH_MS % base_ms,
+            0,
+            "must align to base tick"
+        );
+        let model_every = (DEFAULT_MODEL_REFRESH_MS / base_ms).max(1);
+        let pr_every = PR_REFRESH_INTERVAL.as_millis() as u64 / base_ms;
+        assert_eq!(
+            pr_every % model_every,
+            0,
+            "pr_every={pr_every} not a multiple of model_every={model_every}"
+        );
     }
 }
