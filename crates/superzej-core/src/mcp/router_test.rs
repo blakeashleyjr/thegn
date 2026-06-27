@@ -49,16 +49,40 @@ fn test_mcp_request_human_emits_event() {
     assert_eq!(res["jsonrpc"], "2.0");
 
     let event = rx.try_recv().unwrap();
-    if let Event::AgentDone {
-        worktree,
-        agent,
-        success,
-    } = event
-    {
-        assert_eq!(worktree, "sz/foo");
-        assert_eq!(agent, "human_request");
-        assert!(!success);
+    if let Event::NotificationReceived { notification } = event {
+        assert_eq!(
+            notification.kind,
+            crate::notification::NotificationKind::AgentAttention
+        );
+        assert_eq!(notification.worktree_path, "sz/foo");
+        assert_eq!(notification.message, "i need help");
     } else {
-        panic!("Wrong event type emitted");
+        panic!("Wrong event type emitted: {event:?}");
     }
+}
+
+#[test]
+#[allow(clippy::arc_with_non_send_sync)]
+fn test_mcp_spawn_subtask_queues_dispatch_and_notifies() {
+    let db = Arc::new(Db::open_memory().unwrap());
+    let bus = Arc::new(EventBus::new());
+    let router = McpRouter::new(db.clone(), bus.clone());
+    let rx = bus.subscribe();
+
+    let req = json!({
+        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": { "name": "spawn_subtask", "arguments": { "worktree": "/wt/x", "agent": "pi" } }
+    });
+    let res = router.handle_request(&req);
+    assert_eq!(res["jsonrpc"], "2.0");
+    assert!(res["error"].is_null(), "unexpected error: {res}");
+
+    // Publishes a human-attention notification (not a fake AgentDone)...
+    let event = rx.try_recv().unwrap();
+    assert!(
+        matches!(event, Event::NotificationReceived { .. }),
+        "expected NotificationReceived, got {event:?}"
+    );
+    // ...and records a tracked (queued) dispatch row.
+    assert!(db.dispatch_for_worktree("/wt/x").unwrap().is_some());
 }

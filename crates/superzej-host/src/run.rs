@@ -6510,6 +6510,10 @@ fn dispatch_acp_inbound(
                                 )
                                 .with_git(
                                     std::sync::Arc::new(superzej_svc::mcp_git::HouseGitImpl),
+                                    wt_owned.clone(),
+                                )
+                                .with_forge(
+                                    std::sync::Arc::new(superzej_svc::mcp_git::HouseGitImpl),
                                     wt_owned,
                                 );
                                 router.handle_request(&inner)

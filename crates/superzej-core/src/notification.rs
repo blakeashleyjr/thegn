@@ -52,6 +52,8 @@ pub enum NotificationKind {
     AgentDone,
     /// An agent dispatch exited with a failure or crash.
     AgentFailed,
+    /// An agent explicitly asked for human attention/input (MCP `request_human`).
+    AgentAttention,
     /// A test run ended with one or more failures.
     TestFailed,
     /// A new worktree was created.
@@ -107,7 +109,7 @@ impl NotificationKind {
     /// Every notification kind, for exhaustive iteration (config classification,
     /// SQL `IN` set construction, tests). Kept in sync with the enum by the
     /// `notification_kind_*` tests, which loop over this.
-    pub const ALL: [NotificationKind; 14] = [
+    pub const ALL: [NotificationKind; 15] = [
         Self::Assigned,
         Self::Mentioned,
         Self::StatusChanged,
@@ -117,6 +119,7 @@ impl NotificationKind {
         Self::PrStateChanged,
         Self::AgentDone,
         Self::AgentFailed,
+        Self::AgentAttention,
         Self::TestFailed,
         Self::WorktreeCreated,
         Self::LogError,
@@ -138,6 +141,7 @@ impl NotificationKind {
             Self::PrStateChanged => "pr_state_changed",
             Self::AgentDone => "agent_done",
             Self::AgentFailed => "agent_failed",
+            Self::AgentAttention => "agent_attention",
             Self::TestFailed => "test_failed",
             Self::WorktreeCreated => "worktree_created",
             Self::LogError => "log_error",
@@ -151,9 +155,11 @@ impl NotificationKind {
     /// `ProcessExited`) are `Info`; everything else is `Notice`.
     pub fn default_priority(self) -> Priority {
         match self {
-            Self::AgentFailed | Self::TestFailed | Self::LogError | Self::ProcessFailed => {
-                Priority::Alert
-            }
+            Self::AgentFailed
+            | Self::AgentAttention
+            | Self::TestFailed
+            | Self::LogError
+            | Self::ProcessFailed => Priority::Alert,
             Self::WorktreeCreated | Self::ProcessExited => Priority::Info,
             Self::Assigned
             | Self::Mentioned
@@ -177,6 +183,7 @@ impl NotificationKind {
             Self::PrStateChanged => "⑂",
             Self::AgentDone => "◉",
             Self::AgentFailed => "◎",
+            Self::AgentAttention => "⚠",
             Self::TestFailed => "✗",
             Self::WorktreeCreated => "+",
             Self::LogError => "✗",
@@ -196,6 +203,7 @@ impl NotificationKind {
             Self::PrStateChanged => "pr state changed",
             Self::AgentDone => "agent done",
             Self::AgentFailed => "agent failed",
+            Self::AgentAttention => "agent needs attention",
             Self::TestFailed => "tests failed",
             Self::WorktreeCreated => "worktree created",
             Self::LogError => "log error",
@@ -237,7 +245,7 @@ mod tests {
             assert_eq!(kind.as_str(), serde_name, "{kind:?}");
             assert!(seen.insert(kind), "{kind:?} duplicated in ALL");
         }
-        assert_eq!(seen.len(), 14, "ALL is missing kinds");
+        assert_eq!(seen.len(), 15, "ALL is missing kinds");
     }
 
     #[test]
@@ -250,6 +258,7 @@ mod tests {
             let expect_alert = matches!(
                 kind,
                 NotificationKind::AgentFailed
+                    | NotificationKind::AgentAttention
                     | NotificationKind::TestFailed
                     | NotificationKind::LogError
                     | NotificationKind::ProcessFailed
