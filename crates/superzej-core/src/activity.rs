@@ -2,20 +2,23 @@
 //!
 //! Activity is measured by scanning `/proc` for processes whose cwd sits under
 //! a managed worktree and summing their CPU time. A worktree whose CPU is
-//! advancing is `active` (pulsing dot); one that was active and has gone quiet
-//! is `quiet` (steady dot — "done, look at me"); focusing its tab acks it back
-//! to neutral via [`ack`].
+//! advancing is `active` (filled white dot — working); one that was active and
+//! has gone idle is `waiting` (filled **red** dot — "stuck, look at me", an
+//! *unread* alert); focusing its tab marks it `read` (hollow red dot — seen but
+//! still stuck) via [`ack`]. A red worktree is **sticky**: it only leaves red
+//! when work *genuinely resumes* — sustained CPU over [`RESUME_GRACE_SECS`], not
+//! a one-window blip from a spinner redraw or a stray watcher.
 //!
-//!   none ── cpu delta ≥ threshold ──▶ active
-//!   active ── quiet ≥ grace ────────▶ quiet
-//!   quiet ── new activity ──────────▶ active
-//!   quiet ── ack(tab) ──────────────▶ acked   (renders like none; re-arms)
+//!   none ─── cpu delta ≥ threshold ─────────▶ active
+//!   active ─ idle ≥ QUIET_GRACE_SECS ───────▶ waiting   (filled red, unread)
+//!   waiting ─ ack(tab) ─────────────────────▶ read      (hollow red, seen)
+//!   waiting/read ─ busy ≥ RESUME_GRACE_SECS ▶ active     (work resumed)
 //!
 //! State persists in `~/.superzej/activity.json` (ephemeral, self-healing; kept
 //! out of the SQLite DB so frequent polling never contends on the WAL). This
 //! used to be the `superzej activity` CLI command; the native host now owns the
 //! FSM in-process. Never errors on scan problems — a partial/empty scan just
-//! trends quiet.
+//! holds the current state (a stuck worktree stays red).
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -26,8 +29,13 @@ use std::path::{Path, PathBuf};
 /// shell prompt. (CLK_TCK hardcoded to the Linux default of 100.)
 const ACTIVE_JIFFIES_PER_SEC: f64 = 3.0;
 /// An `active` worktree must stay below the threshold this long before it turns
-/// `quiet` — damps flapping from scheduling gaps between close polls.
+/// `waiting` — damps flapping from scheduling gaps between close polls.
 const QUIET_GRACE_SECS: f64 = 5.0;
+/// A red (`waiting`/`read`) worktree must stay *continuously* busy this long
+/// before it flips back to `active`. Without this, a single spinner redraw or
+/// stray watcher blip over the CPU threshold would clear the "stuck" dot a
+/// fraction of a second after it appeared — the over-resetting this FSM fixes.
+const RESUME_GRACE_SECS: f64 = 3.0;
 /// Polls closer together than this reuse the previous scan.
 const MIN_SCAN_INTERVAL_SECS: f64 = 1.0;
 
@@ -55,11 +63,16 @@ struct Entry {
     tab: String,
     #[serde(default)]
     cpu_jiffies: u64,
-    state: String, // "none" | "active" | "quiet" | "acked"
+    state: String, // "none" | "active" | "waiting" | "read"
     #[serde(default)]
     quiet_since: Option<f64>,
     #[serde(default)]
     last_active_at: Option<f64>,
+    /// When the current uninterrupted busy streak began (CPU ≥ threshold every
+    /// poll since). `None` while idle. Gates `waiting`/`read` → `active` so a
+    /// momentary blip can't clear a stuck dot.
+    #[serde(default)]
+    busy_since: Option<f64>,
 }
 
 /// Path to the activity snapshot.
@@ -68,7 +81,7 @@ fn state_path() -> PathBuf {
 }
 
 /// Read the latest activity states as `tab_name -> state` (`"active"`,
-/// `"quiet"`, `"none"`, `"acked"`). Empty on any read/parse failure.
+/// `"waiting"`, `"read"`, `"none"`). Empty on any read/parse failure.
 pub fn read_states() -> BTreeMap<String, String> {
     read_states_at(&state_path())
 }
@@ -98,8 +111,10 @@ pub fn poll_and_save_at(path: &Path, managed: &[ManagedWorktree], now: f64) {
     save(path, &snap);
 }
 
-/// Ack a worktree's tab: a `quiet` "look at me" dot clears once the user is on
-/// the tab. No-op if the tab isn't quiet.
+/// Mark a worktree's tab as read: a `waiting` "look at me" dot (filled red)
+/// turns `read` (hollow red) once the user focuses the tab. The dot is *not*
+/// cleared — it stays hollow until work genuinely resumes. No-op unless the tab
+/// is `waiting`.
 pub fn ack(tab: &str) {
     ack_at(&state_path(), tab);
 }
@@ -109,9 +124,8 @@ pub fn ack_at(path: &Path, tab: &str) {
     let mut snap = load(path);
     let mut changed = false;
     for e in snap.worktrees.values_mut() {
-        if e.tab == tab && e.state == "quiet" {
-            e.state = "acked".into();
-            e.quiet_since = None;
+        if e.tab == tab && e.state == "waiting" {
+            e.state = "read".into();
             changed = true;
         }
     }
@@ -136,32 +150,62 @@ fn poll(snap: &mut Snapshot, managed: &[ManagedWorktree], now: f64) {
     let first_poll = snap.polled_at == 0.0;
     let threshold = ACTIVE_JIFFIES_PER_SEC * wall;
 
-    let mut next: BTreeMap<String, Entry> = BTreeMap::new();
+    // Start from the prior snapshot so worktrees absent from `managed` this
+    // cycle (a transient DB-read gap, a not-yet-persisted tab) carry their state
+    // forward unchanged instead of being reset to `none`.
+    let mut next = std::mem::take(&mut snap.worktrees);
     for w in managed {
         let cur = jiffies.get(&w.worktree).copied().unwrap_or(0);
-        let prev = snap.worktrees.get(&w.worktree);
-        let mut e = prev.cloned().unwrap_or(Entry {
+        let prev_known = next.contains_key(&w.worktree);
+        let mut e = next.remove(&w.worktree).unwrap_or(Entry {
             tab: w.tab.clone(),
             cpu_jiffies: cur,
             state: "none".into(),
             quiet_since: None,
             last_active_at: None,
+            busy_since: None,
         });
         e.tab = w.tab.clone(); // tab renames follow the caller
 
         // A first sighting (or first-ever poll) records a baseline; deltas only
         // mean something from the second reading on.
-        if prev.is_some() && !first_poll {
+        if prev_known && !first_poll {
             let delta = cur.saturating_sub(e.cpu_jiffies) as f64;
-            if delta >= threshold && wall > 0.0 {
-                e.state = "active".into();
-                e.quiet_since = None;
-                e.last_active_at = Some(now);
-            } else if e.state == "active"
-                && now - e.last_active_at.unwrap_or(0.0) >= QUIET_GRACE_SECS
-            {
-                e.state = "quiet".into();
-                e.quiet_since = Some(now);
+            let busy = delta >= threshold && wall > 0.0;
+
+            // Track the uninterrupted busy streak.
+            if busy {
+                e.busy_since.get_or_insert(now);
+            } else {
+                e.busy_since = None;
+            }
+
+            match e.state.as_str() {
+                // Red is sticky: only sustained, genuine work resumes it. A
+                // momentary blip (busy for a single window) is ignored.
+                "waiting" | "read" => {
+                    if busy && now - e.busy_since.unwrap_or(now) >= RESUME_GRACE_SECS {
+                        e.state = "active".into();
+                        e.quiet_since = None;
+                        e.last_active_at = Some(now);
+                    }
+                }
+                "active" => {
+                    if busy {
+                        e.last_active_at = Some(now);
+                    } else if now - e.last_active_at.unwrap_or(0.0) >= QUIET_GRACE_SECS {
+                        e.state = "waiting".into();
+                        e.quiet_since = Some(now);
+                    }
+                }
+                // none / legacy / unknown: any work wakes it.
+                _ => {
+                    if busy {
+                        e.state = "active".into();
+                        e.quiet_since = None;
+                        e.last_active_at = Some(now);
+                    }
+                }
             }
         }
         e.cpu_jiffies = cur;
@@ -170,7 +214,7 @@ fn poll(snap: &mut Snapshot, managed: &[ManagedWorktree], now: f64) {
 
     snap.version = 1;
     snap.polled_at = now;
-    snap.worktrees = next; // worktrees gone from the caller are pruned here
+    snap.worktrees = next;
 }
 
 /// Sum utime+stime jiffies per managed worktree for every process whose cwd is
@@ -266,12 +310,12 @@ mod tests {
     #[test]
     fn parses_tab_states_from_disk() {
         let path = tmp("parse");
-        let json = r#"{"worktrees":{"/wt/a":{"tab":"app/home","state":"active","cpu_jiffies":0},
-                        "/wt/b":{"tab":"app/feat","state":"quiet","cpu_jiffies":0}}}"#;
+        let json = r#"{"worktrees":{"/wt/a":{"tab":"app/home","state":"waiting","cpu_jiffies":0},
+                        "/wt/b":{"tab":"app/feat","state":"read","cpu_jiffies":0}}}"#;
         std::fs::write(&path, json).unwrap();
         let m = read_states_at(&path);
-        assert_eq!(m.get("app/home").map(String::as_str), Some("active"));
-        assert_eq!(m.get("app/feat").map(String::as_str), Some("quiet"));
+        assert_eq!(m.get("app/home").map(String::as_str), Some("waiting"));
+        assert_eq!(m.get("app/feat").map(String::as_str), Some("read"));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -289,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn poll_records_baseline_then_quiet_then_ack() {
+    fn poll_records_baseline_then_waiting_then_read() {
         let path = tmp("fsm");
         let _ = std::fs::remove_file(&path);
         let managed = vec![ManagedWorktree {
@@ -302,22 +346,22 @@ mod tests {
             read_states_at(&path).get("app/home").map(String::as_str),
             Some("none")
         );
-        // No CPU advance (path doesn't exist) → stays none/quiet, never panics.
+        // No CPU advance (path doesn't exist) → stays none, never panics.
         poll_and_save_at(&path, &managed, 1100.0);
         let st = read_states_at(&path);
         assert!(st.contains_key("app/home"));
 
-        // Manually mark quiet, then ack clears it to acked.
+        // Manually mark waiting, then ack turns it to read (hollow, not cleared).
         let mut snap = load(&path);
         if let Some(e) = snap.worktrees.values_mut().next() {
-            e.state = "quiet".into();
+            e.state = "waiting".into();
             e.quiet_since = Some(1100.0);
         }
         save(&path, &snap);
         ack_at(&path, "app/home");
         assert_eq!(
             read_states_at(&path).get("app/home").map(String::as_str),
-            Some("acked")
+            Some("read")
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -339,13 +383,13 @@ mod tests {
 
     /// Seed an `active` entry with a known low jiffies baseline so the next
     /// poll (no real CPU advance under the bogus path) sees `delta < threshold`
-    /// and `now - last_active_at >= QUIET_GRACE_SECS`, flipping it to `quiet`.
+    /// and `now - last_active_at >= QUIET_GRACE_SECS`, flipping it to `waiting`.
     #[test]
-    fn active_goes_quiet_after_grace() {
-        let path = tmp("quiet");
+    fn active_goes_waiting_after_grace() {
+        let path = tmp("waiting");
         let _ = std::fs::remove_file(&path);
         let managed = vec![ManagedWorktree {
-            worktree: "/nonexistent/wt-quiet".into(),
+            worktree: "/nonexistent/wt-waiting".into(),
             tab: "app/q".into(),
         }];
         // Baseline poll establishes prev + polled_at.
@@ -355,7 +399,7 @@ mod tests {
         // timestamp, then poll again past the grace window with no CPU advance.
         let mut snap = load(&path);
         {
-            let e = snap.worktrees.get_mut("/nonexistent/wt-quiet").unwrap();
+            let e = snap.worktrees.get_mut("/nonexistent/wt-waiting").unwrap();
             e.state = "active".into();
             e.cpu_jiffies = 0;
             e.last_active_at = Some(1000.0);
@@ -366,15 +410,115 @@ mod tests {
         // wall = 1010 - 1000 = 10s > 0; delta = 0 < threshold; grace elapsed.
         poll_and_save_at(&path, &managed, 1010.0);
         let st = read_states_at(&path);
-        assert_eq!(st.get("app/q").map(String::as_str), Some("quiet"));
+        assert_eq!(st.get("app/q").map(String::as_str), Some("waiting"));
 
         // The quiet_since stamp was recorded.
         let snap = load(&path);
         assert_eq!(
-            snap.worktrees["/nonexistent/wt-quiet"].quiet_since,
+            snap.worktrees["/nonexistent/wt-waiting"].quiet_since,
             Some(1010.0)
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A `waiting`/`read` dot is sticky: an idle poll (no CPU advance) never
+    /// clears it, and a worktree absent from `managed` carries its state
+    /// forward unchanged instead of resetting to `none`.
+    #[test]
+    fn waiting_is_sticky_and_survives_absence() {
+        let path = tmp("sticky");
+        let _ = std::fs::remove_file(&path);
+        let managed = vec![ManagedWorktree {
+            worktree: "/nonexistent/wt-sticky".into(),
+            tab: "app/s".into(),
+        }];
+        poll_and_save_at(&path, &managed, 1000.0);
+
+        let mut snap = load(&path);
+        {
+            let e = snap.worktrees.get_mut("/nonexistent/wt-sticky").unwrap();
+            e.state = "waiting".into();
+            e.cpu_jiffies = 0;
+            e.quiet_since = Some(1000.0);
+        }
+        save(&path, &snap);
+
+        // Idle poll: no CPU advance under the bogus path → stays waiting.
+        poll_and_save_at(&path, &managed, 1100.0);
+        assert_eq!(
+            read_states_at(&path).get("app/s").map(String::as_str),
+            Some("waiting")
+        );
+
+        // The worktree drops out of `managed` for a cycle → carried forward.
+        poll_and_save_at(&path, &[], 1200.0);
+        assert_eq!(
+            read_states_at(&path).get("app/s").map(String::as_str),
+            Some("waiting")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A real CPU burner under a managed worktree drives the sticky-resume
+    /// edge: a `read` dot stays red through a single busy window and only flips
+    /// to `active` once the busy streak has lasted `RESUME_GRACE_SECS`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_resumes_active_only_after_sustained_busy() {
+        use std::process::Command;
+        let wt = std::env::temp_dir().join(format!("sz-act-resume-{}", std::process::id()));
+        std::fs::create_dir_all(&wt).unwrap();
+        let path = tmp("resume");
+        let _ = std::fs::remove_file(&path);
+        let managed = vec![ManagedWorktree {
+            worktree: wt.to_string_lossy().into_owned(),
+            tab: "app/r".into(),
+        }];
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("while :; do :; done")
+            .current_dir(&wt)
+            .spawn()
+            .expect("spawn cpu burner");
+
+        // Baseline records the burner's current jiffies, then seed `read`.
+        poll_and_save_at(&path, &managed, 1000.0);
+        let mut snap = load(&path);
+        {
+            let e = snap
+                .worktrees
+                .get_mut(&wt.to_string_lossy().into_owned())
+                .unwrap();
+            e.state = "read".into();
+            e.busy_since = None;
+        }
+        save(&path, &snap);
+
+        // First busy window (wall=1s): busy=true but the streak is 0s old, so a
+        // sticky red dot must NOT clear yet.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        poll_and_save_at(&path, &managed, 1001.0);
+        assert_eq!(
+            read_states_at(&path).get("app/r").map(String::as_str),
+            Some("read"),
+            "a single busy window must not clear the sticky dot"
+        );
+
+        // Keep burning until the streak exceeds RESUME_GRACE_SECS (3s): resume.
+        // wall = 1005 - 1001 = 4s ⇒ threshold = 12 jiffies; burn well past it.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        poll_and_save_at(&path, &managed, 1005.0);
+        assert_eq!(
+            read_states_at(&path).get("app/r").map(String::as_str),
+            Some("active"),
+            "sustained busy must resume the worktree to active"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&wt);
     }
 
     /// An `active` entry still inside the grace window neither flaps to quiet
