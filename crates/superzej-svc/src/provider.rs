@@ -604,6 +604,13 @@ pub trait ProviderFiles: Send + Sync {
     async fn list_dir(&self, id: &str, path: &str) -> Result<Vec<FileEntry>>;
     async fn delete(&self, id: &str, path: &str) -> Result<()>;
 
+    /// Write `data` as an **executable** (mode 0755 where the provider's file API
+    /// supports a mode). Default delegates to [`write`](Self::write) — the bytes
+    /// land, the exec bit is best-effort; providers with a mode override this.
+    async fn write_exec(&self, id: &str, path: &str, data: &[u8]) -> Result<()> {
+        self.write(id, path, data).await
+    }
+
     /// Recursively upload `local` into the sandbox at `remote` (skips `.git`).
     async fn upload_dir(&self, id: &str, local: &Path, remote: &str) -> Result<()> {
         for (abs, rel) in collect_files(local)? {
@@ -651,6 +658,31 @@ impl SpritesProvider {
     fn fs_op_url(&self, name: &str, op: &str) -> String {
         format!("{}/sprites/{name}/fs/{op}", self.api_base)
     }
+    /// PUT `/fs/write` with an explicit unix `mode` (octal string). `write`
+    /// uses `0644`; `write_exec` uses `0755` so a pushed binary is runnable.
+    async fn write_with_mode(&self, id: &str, path: &str, data: &[u8], mode: &str) -> Result<()> {
+        let resp = self
+            .client
+            .put(self.fs_op_url(id, "write"))
+            .bearer_auth(&self.token)
+            .query(&[
+                ("path", path),
+                ("workingDir", "/"),
+                ("mode", mode),
+                ("mkdirParents", "true"),
+            ])
+            .header("Content-Type", "application/octet-stream")
+            .body(data.to_vec())
+            .send()
+            .await
+            .context("sprites: PUT /fs/write")?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(anyhow!("sprites write {path} failed ({})", resp.status()))
+        }
+    }
+
     /// Parse a listing entry: `{name, size, isDir}` (the server uses camelCase
     /// `isDir`; tolerate `is_dir` too).
     fn parse_entry(v: &serde_json::Value) -> Option<FileEntry> {
@@ -682,27 +714,11 @@ impl ProviderFiles for SpritesProvider {
     }
 
     async fn write(&self, id: &str, path: &str, data: &[u8]) -> Result<()> {
-        // PUT (not POST), path/mode/mkdirParents as query params, body = bytes.
-        let resp = self
-            .client
-            .put(self.fs_op_url(id, "write"))
-            .bearer_auth(&self.token)
-            .query(&[
-                ("path", path),
-                ("workingDir", "/"),
-                ("mode", "0644"),
-                ("mkdirParents", "true"),
-            ])
-            .header("Content-Type", "application/octet-stream")
-            .body(data.to_vec())
-            .send()
-            .await
-            .context("sprites: PUT /fs/write")?;
-        if resp.status().is_success() {
-            Ok(())
-        } else {
-            Err(anyhow!("sprites write {path} failed ({})", resp.status()))
-        }
+        self.write_with_mode(id, path, data, "0644").await
+    }
+
+    async fn write_exec(&self, id: &str, path: &str, data: &[u8]) -> Result<()> {
+        self.write_with_mode(id, path, data, "0755").await
     }
 
     async fn list_dir(&self, id: &str, path: &str) -> Result<Vec<FileEntry>> {
@@ -753,6 +769,19 @@ pub struct ProviderCaps {
     pub checkpoints: bool,
     pub egress: bool,
     pub exec_api: bool,
+}
+
+/// A cheap, dependency-free content fingerprint (FNV-1a 64-bit, hex). Used by
+/// [`Provider::ensure_executable`] to decide whether a pushed binary needs
+/// re-uploading — collision-resistance isn't security-critical here, only
+/// change-detection, so a fast non-crypto hash is the right tool.
+pub fn fingerprint(data: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
 }
 
 /// The generic managed-sandbox provider dispatcher. Lifecycle methods delegate to
@@ -836,6 +865,55 @@ impl Provider {
         }
     }
 
+    /// Read a file from the sandbox fs.
+    pub async fn read(&self, id: &str, path: &str) -> Result<Vec<u8>> {
+        match self {
+            Provider::Sprites(p) => p.read(id, path).await,
+            Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
+        }
+    }
+
+    /// Write a file into the sandbox fs.
+    pub async fn write(&self, id: &str, path: &str, data: &[u8]) -> Result<()> {
+        match self {
+            Provider::Sprites(p) => p.write(id, path, data).await,
+            Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
+        }
+    }
+
+    /// Write an executable into the sandbox fs (mode 0755 where supported).
+    pub async fn write_exec(&self, id: &str, path: &str, data: &[u8]) -> Result<()> {
+        match self {
+            Provider::Sprites(p) => p.write_exec(id, path, data).await,
+            Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
+        }
+    }
+
+    /// Idempotently install the executable `data` at `path` in the sandbox: a
+    /// content-addressed handshake. Compares a fingerprint stored at `<path>.fp`
+    /// and (re)uploads only on mismatch, returning whether it pushed (`true`) or
+    /// the env was already current (`false`). This is the resident-bridge binary
+    /// push — content-addressed so a rebuilt binary re-pushes, an unchanged one
+    /// does not. Requires the provider's file API (`caps().files`).
+    pub async fn ensure_executable(&self, id: &str, path: &str, data: &[u8]) -> Result<bool> {
+        if !self.caps().files {
+            return Err(anyhow!("provider does not support a file push"));
+        }
+        let want = fingerprint(data);
+        let fp_path = format!("{path}.fp");
+        let current = self
+            .read(id, &fp_path)
+            .await
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok());
+        if current.as_deref() == Some(want.as_str()) {
+            return Ok(false);
+        }
+        self.write_exec(id, path, data).await?;
+        self.write(id, &fp_path, want.as_bytes()).await?;
+        Ok(true)
+    }
+
     /// Push a local directory into the sandbox fs (provider `sync` projection).
     pub async fn upload_dir(&self, id: &str, local: &Path, remote: &str) -> Result<()> {
         match self {
@@ -876,6 +954,19 @@ mod tests {
         // Empty api_base falls back to the documented default.
         let d = SpritesProvider::new("", "t", "s");
         assert_eq!(d.sprites_url(), "https://api.sprites.dev/v1/sprites");
+    }
+
+    #[test]
+    fn fingerprint_is_stable_and_change_sensitive() {
+        let a = fingerprint(b"szhost-binary-bytes");
+        assert_eq!(a, fingerprint(b"szhost-binary-bytes"), "stable");
+        assert_eq!(a.len(), 16, "16 hex chars (64-bit)");
+        assert_ne!(
+            a,
+            fingerprint(b"szhost-binary-bytez"),
+            "1-byte change differs"
+        );
+        assert_ne!(a, fingerprint(b""), "empty differs");
     }
 
     #[test]

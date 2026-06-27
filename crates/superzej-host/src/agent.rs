@@ -614,6 +614,37 @@ fn provider_for(
     }
 }
 
+/// Idempotently install the resident bridge binary into a provider env so a
+/// `Placement::Provider` bridge connect finds it at `remote_path`. Content-
+/// addressed handshake (push only on fingerprint mismatch). Best-effort and
+/// off-loop (its own runtime via `block_on_provider`): a failure warns and leaves
+/// the per-op git path as the fallback. No-op for envs without a file-capable
+/// provider. Called from `run.rs::connect_worktree_bridge` before `sup.connect`.
+pub fn ensure_remote_bridge(cfg: &Config, env_name: &str, binary: &Path, remote_path: &str) {
+    let Some((provider, id, _)) = provider_sync_target(cfg, env_name) else {
+        return;
+    };
+    let data = match std::fs::read(binary) {
+        Ok(d) => d,
+        Err(e) => {
+            superzej_core::msg::warn(&format!(
+                "bridge binary unreadable ({}): {e}",
+                binary.display()
+            ));
+            return;
+        }
+    };
+    match block_on_provider(|| async { provider.ensure_executable(&id, remote_path, &data).await })
+    {
+        Ok(true) => superzej_core::msg::info(&format!(
+            "pushed resident bridge → {id}:{remote_path} ({} bytes)",
+            data.len()
+        )),
+        Ok(false) => {} // already current — no re-push
+        Err(e) => superzej_core::msg::warn(&format!("bridge binary push failed: {e}")),
+    }
+}
+
 /// `(provider, sandbox_id, workdir)` for a provider env that supports file-sync,
 /// or `None` (unconfigured / no id / no token / provider can't do files).
 fn provider_sync_target(

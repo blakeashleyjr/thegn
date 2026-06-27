@@ -133,6 +133,35 @@
         # The harness's own conformance tests aren't relevant to building the bin.
         doCheck = false;
       };
+
+      # Static x86_64-linux-musl `szhost` — the resident bridge agent pushed into
+      # Firecracker provider envs (Sprites). Self-contained (musl libc + bundled
+      # sqlite + rustls TLS — no openssl), so it runs in a bare microVM. Built via
+      # the cross stdenv's musl cc with +crt-static; a bare binary (no yazi/git
+      # PATH wrapping — the bridge only speaks the stdio protocol on stdin/stdout).
+      muslTarget = "x86_64-unknown-linux-musl";
+      muslCross = pkgs.pkgsCross.musl64;
+      rustMusl = pkgs.rust-bin.stable.latest.default.override {
+        targets = [muslTarget];
+      };
+      muslRustPlatform = pkgs.makeRustPlatform {
+        cargo = rustMusl;
+        rustc = rustMusl;
+      };
+      muslCc = "${muslCross.stdenv.cc}/bin/${muslCross.stdenv.cc.targetPrefix}cc";
+      szhostMusl = muslRustPlatform.buildRustPackage {
+        pname = "szhost-musl";
+        version = "0.1.0";
+        src = superzejSrc;
+        cargoLock.lockFile = ./Cargo.lock;
+        cargoBuildFlags = ["-p" "superzej-host" "--bin" "szhost"];
+        CARGO_BUILD_TARGET = muslTarget;
+        CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
+        CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = muslCc;
+        CC_x86_64_unknown_linux_musl = muslCc;
+        nativeBuildInputs = [muslCross.stdenv.cc];
+        doCheck = false;
+      };
     in {
       packages.default = superzej;
       packages.superzej = superzej;
@@ -140,6 +169,9 @@
       packages.yazi = yaziPinned;
       # The muse e2e harness (`nix run .#muse`, also on the dev-shell PATH).
       packages.muse = musePkg;
+      # Static musl bridge binary (`nix build .#szhost-musl`) — pushed into
+      # provider microVMs as the resident agent (8-B.3).
+      packages.szhost-musl = szhostMusl;
 
       # `nix fmt` formats every tracked file via treefmt.toml.
       formatter = treefmtWrapper;

@@ -58,6 +58,16 @@ build-profiling: _apps
 release: _apps
     cargo build --workspace --release
 
+# Build a static x86_64-linux-musl `szhost` — the resident bridge binary pushed
+# into Firecracker provider envs (Sprites). Self-contained (musl + bundled
+# sqlite + rustls, no openssl) so it runs in a bare microVM. Needs the musl
+# target (`rustup target add x86_64-unknown-linux-musl`) + a musl cross cc; in
+# nix use `nix build .#szhost-musl` instead. Output:
+# target/x86_64-unknown-linux-musl/release/szhost — point SUPERZEJ_BRIDGE_BINARY
+# at it (or drop it next to the host exe as `szhost-musl`).
+build-musl: _apps
+    cargo build --release -p superzej-host --bin szhost --target x86_64-unknown-linux-musl
+
 # Run the native host compositor. Builds it first. Run from a real terminal —
 # it acquires raw mode and owns the screen.
 host *args: build
