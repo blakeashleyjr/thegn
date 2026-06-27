@@ -158,13 +158,12 @@ impl superzej_core::mcp::HouseForge for HouseGitImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
     use superzej_core::mcp::{HouseForge, HouseGit};
 
+    // Route test git through the scrubbing helper rather than a raw git command,
+    // matching the repo invariant the lint guardrail enforces.
     fn git(dir: &Path, args: &[&str]) {
-        let ok = Command::new("git")
-            .arg("-C")
-            .arg(dir)
+        let ok = superzej_core::util::git_cmd(dir)
             .args(args)
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@t")
@@ -233,9 +232,7 @@ mod tests {
         let out = h.commit(wt, "add line two").unwrap();
         assert!(out.contains("add line two"), "commit out: {out}");
         // The commit landed.
-        let log = Command::new("git")
-            .arg("-C")
-            .arg(&dir)
+        let log = superzej_core::util::git_cmd(&dir)
             .args(["log", "--oneline", "-1"])
             .output()
             .unwrap();
