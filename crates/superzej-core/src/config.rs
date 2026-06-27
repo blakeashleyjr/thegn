@@ -2228,6 +2228,17 @@ pub struct SandboxConfig {
     pub mounts: Vec<String>, // extra binds ("host:dest[:ro|rw|cache]" or "host"); suffix allowed
     pub init_script: String, // runs inside before the agent/shell
     pub devenv: bool,        // wrap inner cmd with `devenv shell --`
+    /// Inject the repo's Nix flake `devShell` toolchain (its `PATH` + safe
+    /// exported vars) into worktree panes — resolved on the host (writable
+    /// store + daemon) and cached, so a sandboxed pane that can't reach the Nix
+    /// daemon still gets the project linters/formatters/tools out of the box.
+    /// No-op for repos without a flake `devShell`. See [`crate::devenv`].
+    pub inject_devshell: bool,
+    /// Bind-mount the host Nix daemon socket into the sandbox so full
+    /// `nix develop`/`build`/`fmt` work *inside* it. Off by default: it relaxes
+    /// the isolation the hardening profiles provide (Tier A `inject_devshell`
+    /// already covers read-only tool access without this).
+    pub nix_daemon: bool,
     /// Shell to use inside the sandbox. `""` = resolve from the host's `$SHELL`
     /// at pane-spawn time. Set to an absolute path or name (e.g. `"zsh"`) to
     /// override per workspace via `.superzej.toml`.
@@ -2296,6 +2307,8 @@ impl Default for SandboxConfig {
             ],
             init_script: String::new(),
             devenv: false,
+            inject_devshell: true,
+            nix_daemon: false,
             shell: String::new(),
             on_missing: OnMissing::Warn,
             remote: RemoteConfig::default(),
@@ -2333,6 +2346,8 @@ pub struct SandboxOverlay {
     pub mounts: Option<Vec<String>>,
     pub init_script: Option<String>,
     pub devenv: Option<bool>,
+    pub inject_devshell: Option<bool>,
+    pub nix_daemon: Option<bool>,
     pub shell: Option<String>,
     pub on_missing: Option<OnMissing>,
     pub remote: Option<RemoteOverlay>,
@@ -2416,6 +2431,12 @@ impl SandboxOverlay {
         }
         if let Some(v) = self.devenv {
             base.devenv = v;
+        }
+        if let Some(v) = self.inject_devshell {
+            base.inject_devshell = v;
+        }
+        if let Some(v) = self.nix_daemon {
+            base.nix_daemon = v;
         }
         if let Some(v) = self.shell {
             base.shell = v;
@@ -3197,6 +3218,12 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     }
     if let Some(v) = env.get("SUPERZEJ_SANDBOX_ENABLED") {
         o.sandbox.enabled = parse_bool(&v, "SUPERZEJ_SANDBOX_ENABLED");
+    }
+    if let Some(v) = env.get("SUPERZEJ_SANDBOX_INJECT_DEVSHELL") {
+        o.sandbox.inject_devshell = parse_bool(&v, "SUPERZEJ_SANDBOX_INJECT_DEVSHELL");
+    }
+    if let Some(v) = env.get("SUPERZEJ_SANDBOX_NIX_DAEMON") {
+        o.sandbox.nix_daemon = parse_bool(&v, "SUPERZEJ_SANDBOX_NIX_DAEMON");
     }
     if let Some(host) = env.get("SUPERZEJ_SANDBOX_REMOTE_HOST") {
         o.sandbox.remote = Some(RemoteOverlay {

@@ -198,7 +198,7 @@ e2e-update: build
 # at 95% lines. The native host and the svc layer carry their own tests but are
 # not part of this gate (their I/O-heavy surface is the same reason the seams
 # above are excluded).
-cov_ignore := 'superzej-core/src/(repo|worktree|sandbox|remote|github|picker|util|msg|out|log|plugin_api|forge/mod)\.rs'
+cov_ignore := 'superzej-core/src/(repo|worktree|sandbox|remote|github|picker|util|msg|out|log|devenv|plugin_api|forge/mod)\.rs'
 
 # The LLM-proxy crate is gated separately at 88% lines (its decision logic lives
 # in the 95%-gated core::proxy; this covers the I/O shell — router, server, relay,
@@ -232,6 +232,7 @@ coverage-html:
 
 # Comprehensive linting: rust (clippy), bash (shellcheck), yaml (yamllint), toml (taplo).
 lint: _apps
+    @for t in shellcheck yamllint taplo; do command -v "$t" >/dev/null 2>&1 || { echo "lint: '$t' not found — run inside 'nix develop' (or 'direnv allow'); 'just doctor' for details"; exit 1; }; done
     cargo clippy --workspace --all-targets -- -D warnings
     shellcheck -x install.sh test/smoke.sh test/pty-smoke.sh test/install-plan.sh test/dev-tui-plan.sh test/sandbox-network.sh test/git-hooks/post-checkout.sh
     yamllint .
@@ -240,6 +241,31 @@ lint: _apps
     # is scrubbed (the core.worktree-pollution class). Only the builder in util.rs
     # may call `git` directly; raw `Command::new("git")` anywhere else is rejected.
     ! grep -rIn 'Command::new("git")' crates --include='*.rs' | grep -v 'superzej-core/src/util.rs' || (echo 'ERROR: raw Command::new("git") outside util::git_cmd — route through git_cmd/GitLoc to scrub GIT_ENV_VARS' && exit 1)
+
+# Diagnose the dev environment: report any missing toolchain bit with a one-line
+# fix. Exits non-zero if anything is missing — handy for agents/CI to confirm the
+# gates won't silently skip. (superzej panes get the devShell automatically via
+# `[sandbox] inject_devshell`; this is for working ON superzej directly.)
+doctor:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    echo "superzej dev-env doctor"
+    miss=0
+    check() { if command -v "$1" >/dev/null 2>&1; then echo "  ok    $1"; else echo "  MISS  $1 — $2"; miss=1; fi; }
+    check nix            "install Nix (or you're on a non-Nix host)"
+    check cargo          "rust toolchain — enter 'nix develop'"
+    check just           "task runner — enter 'nix develop'"
+    check shellcheck     "lint dep — enter 'nix develop' (or 'direnv allow')"
+    check yamllint       "lint dep — enter 'nix develop'"
+    check taplo          "lint/fmt dep — enter 'nix develop'"
+    check treefmt        "formatter ('nix fmt') — enter 'nix develop'"
+    check cargo-llvm-cov "coverage — enter 'nix develop'"
+    if [ -z "${IN_NIX_SHELL:-}" ]; then
+      echo "  note: not in a 'nix develop' shell (IN_NIX_SHELL unset)."
+      echo "        Run 'nix develop', or 'direnv allow' (a .envrc is provided)."
+    fi
+    if [ "$miss" -eq 0 ]; then echo "all dev tools present ✔"; else echo "missing tools above — apply the fixes, then re-run 'just doctor'"; fi
+    exit "$miss"
 
 # Rustdoc must stay warning-clean; public API docs are part of the release gate.
 doc-check:

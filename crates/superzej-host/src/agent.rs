@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use superzej_core::config::Config;
 use superzej_core::db::Db;
 use superzej_core::remote::GitLoc;
-use superzej_core::{account, repo, sandbox};
+use superzej_core::{account, devenv, repo, sandbox};
 use superzej_svc::vpn::VpnProvider;
 
 /// The literal shell sentinel — distinct from any configured agent/tool name.
@@ -617,6 +617,24 @@ pub fn launch_spec_with_key(
         }
     }
 
+    // Tier A: inject the repo's flake `devShell` toolchain (PATH + safe vars) so
+    // the pane gets the project's linters/formatters/compilers out of the box —
+    // crucial inside a sandbox, which can't reach the Nix daemon to `nix develop`
+    // itself. Resolved on the host + cached; a cold cache kicks a background
+    // resolve the next launch picks up. Local worktrees only (remote panes run
+    // where the host store isn't mounted). See [`devenv`].
+    let devshell = (cfg.sandbox.inject_devshell && !loc.is_remote() && !outcome.is_remote)
+        .then(|| devenv::cached(&repo_root))
+        .flatten();
+    match (&devshell, outcome.spec.as_mut()) {
+        (Some(dev), Some(spec)) => inject_devshell_sandbox(spec, dev),
+        // No cache yet — warm it in the background for the next launch.
+        (None, _) if cfg.sandbox.inject_devshell && !loc.is_remote() && !outcome.is_remote => {
+            devenv::prewarm(&repo_root);
+        }
+        _ => {}
+    }
+
     let mut spec = compose_spec(cfg, worktree, branch, choice, &loc, &outcome);
     // On the host path (no sandbox spec) the credential home + build env ride
     // the pane env.
@@ -625,6 +643,12 @@ pub fn launch_spec_with_key(
             spec.env.push((var, dir.to_string_lossy().into_owned()));
         }
         spec.env.extend(build_env);
+    }
+    // Host (no-sandbox) devShell injection rides the pane env directly.
+    if outcome.spec.is_none()
+        && let Some(dev) = &devshell
+    {
+        inject_devshell_host(&mut spec, dev);
     }
     Ok(spec)
 }
@@ -663,6 +687,47 @@ fn build_env_vars(cfg: &Config, repo_root: &Path) -> Vec<(String, String)> {
         ));
     }
     out
+}
+
+/// Tier A inject for a sandboxed pane: prepend the devShell `PATH` via a raw
+/// `init_script` line — `$PATH` expands to the sandbox's *own* base PATH, so it
+/// works for OCI and bwrap alike without the host knowing the in-sandbox PATH —
+/// and set other safe exported vars as overrides (never clobbering one the user
+/// already pinned).
+fn inject_devshell_sandbox(spec: &mut sandbox::SandboxSpec, dev: &devenv::Devshell) {
+    if let Some(path) = &dev.path {
+        let line = format!("export PATH=\"{path}:$PATH\"\n");
+        spec.init_script = Some(match spec.init_script.take() {
+            Some(existing) => format!("{line}{existing}"),
+            None => line,
+        });
+    }
+    for (k, v) in &dev.vars {
+        spec.env_overrides
+            .entry(k.clone())
+            .or_insert_with(|| v.clone());
+    }
+}
+
+/// Tier A inject for the host (no-sandbox) path: prepend the devShell `PATH` to
+/// the pane env (base = the host's current `PATH`) and add other safe vars that
+/// aren't already set on the spec.
+fn inject_devshell_host(spec: &mut LaunchSpec, dev: &devenv::Devshell) {
+    if let Some(path) = &dev.path {
+        let base = std::env::var("PATH").unwrap_or_default();
+        let merged = if base.is_empty() {
+            path.clone()
+        } else {
+            format!("{path}:{base}")
+        };
+        spec.env.retain(|(k, _)| k != "PATH");
+        spec.env.push(("PATH".to_string(), merged));
+    }
+    for (k, v) in &dev.vars {
+        if !spec.env.iter().any(|(ek, _)| ek == k) {
+            spec.env.push((k.clone(), v.clone()));
+        }
+    }
 }
 
 /// The persisted slug for a repo root (for per-workspace account defaults), or
@@ -979,5 +1044,52 @@ mod tests {
             // exercised without a running container.
             assert_eq!(spec.backend, "host");
         });
+    }
+
+    #[test]
+    fn inject_devshell_host_prepends_path_and_merges_vars() {
+        let dev = devenv::Devshell {
+            path: Some("/nix/store/tools/bin".into()),
+            vars: vec![
+                ("SUPERZEJ_YAZI_BIN".into(), "/nix/store/yz/bin/yazi".into()),
+                // A var the user already set on the pane must NOT be clobbered.
+                ("KEEP_ME".into(), "from-devshell".into()),
+            ],
+        };
+        let mut spec = LaunchSpec {
+            argv: vec!["sh".into()],
+            cwd: None,
+            env: vec![("KEEP_ME".to_string(), "user-set".to_string())],
+            backend: "host".into(),
+            warnings: vec![],
+        };
+        // SAFETY: single-threaded test; set a known base PATH to assert prepend.
+        unsafe { std::env::set_var("PATH", "/usr/bin:/bin") };
+        inject_devshell_host(&mut spec, &dev);
+
+        let path = spec.env.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v);
+        assert_eq!(
+            path.map(String::as_str),
+            Some("/nix/store/tools/bin:/usr/bin:/bin"),
+            "devShell PATH must be prepended to the existing PATH"
+        );
+        // Only one PATH entry (any prior was replaced, not duplicated).
+        assert_eq!(spec.env.iter().filter(|(k, _)| k == "PATH").count(), 1);
+        // New var injected; pre-existing var preserved (not overwritten).
+        assert_eq!(
+            spec.env
+                .iter()
+                .find(|(k, _)| k == "SUPERZEJ_YAZI_BIN")
+                .map(|(_, v)| v.as_str()),
+            Some("/nix/store/yz/bin/yazi")
+        );
+        assert_eq!(
+            spec.env
+                .iter()
+                .find(|(k, _)| k == "KEEP_ME")
+                .map(|(_, v)| v.as_str()),
+            Some("user-set"),
+            "a var the user already set must not be clobbered"
+        );
     }
 }
