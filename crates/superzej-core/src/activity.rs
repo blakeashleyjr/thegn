@@ -85,16 +85,35 @@ pub fn read_states_at(path: &Path) -> BTreeMap<String, String> {
 /// Advance the FSM one step over `managed` and persist. Cheap to call on a
 /// timer; skips the `/proc` walk if the last scan was under a second ago.
 pub fn poll_and_save(managed: &[ManagedWorktree]) {
-    poll_and_save_at(&state_path(), managed, unix_now());
+    poll_and_save_with(managed, &BTreeMap::new());
+}
+
+/// [`poll_and_save`] with injected per-worktree jiffies (keyed by worktree path)
+/// that **override** the local `/proc` scan for those paths. Used for remote/
+/// provider worktrees whose real processes run in the env, not on this host —
+/// the host gathers their jiffies over the resident bridge (`proc.list`) and
+/// passes them in. Local worktrees (absent from `extra`) are scanned as usual.
+pub fn poll_and_save_with(managed: &[ManagedWorktree], extra: &BTreeMap<String, u64>) {
+    poll_and_save_at_with(&state_path(), managed, extra, unix_now());
 }
 
 /// [`poll_and_save`] against an explicit path/clock (testable).
 pub fn poll_and_save_at(path: &Path, managed: &[ManagedWorktree], now: f64) {
+    poll_and_save_at_with(path, managed, &BTreeMap::new(), now);
+}
+
+/// [`poll_and_save_with`] against an explicit path/clock (testable).
+pub fn poll_and_save_at_with(
+    path: &Path,
+    managed: &[ManagedWorktree],
+    extra: &BTreeMap<String, u64>,
+    now: f64,
+) {
     let mut snap = load(path);
     if now - snap.polled_at < MIN_SCAN_INTERVAL_SECS {
         return;
     }
-    poll(&mut snap, managed, now);
+    poll(&mut snap, managed, extra, now);
     save(path, &snap);
 }
 
@@ -120,8 +139,10 @@ pub fn ack_at(path: &Path, tab: &str) {
     }
 }
 
-/// One scan + state-machine step over every managed worktree.
-fn poll(snap: &mut Snapshot, managed: &[ManagedWorktree], now: f64) {
+/// One scan + state-machine step over every managed worktree. `extra` supplies
+/// pre-fetched jiffies (e.g. from a remote env's bridge) that override the local
+/// `/proc` scan for those worktree paths.
+fn poll(snap: &mut Snapshot, managed: &[ManagedWorktree], extra: &BTreeMap<String, u64>, now: f64) {
     // Longest-prefix targets so a worktree nested under its repo root
     // (worktree_mode = "in_repo") wins over the home tab.
     let mut targets: Vec<(PathBuf, String)> = managed
@@ -130,7 +151,13 @@ fn poll(snap: &mut Snapshot, managed: &[ManagedWorktree], now: f64) {
         .collect();
     targets.sort_by_key(|(p, _)| std::cmp::Reverse(p.as_os_str().len()));
 
-    let jiffies = scan_proc(&targets);
+    let mut jiffies = scan_proc(&targets);
+    // Remote/provider worktrees: the bridge's in-env scan is authoritative (it
+    // is inserted even when 0, so a stray host process under a bind path can't
+    // masquerade as in-env activity).
+    for (k, v) in extra {
+        jiffies.insert(k.clone(), *v);
+    }
 
     let wall = (now - snap.polled_at).max(0.0);
     let first_poll = snap.polled_at == 0.0;
@@ -492,6 +519,36 @@ mod tests {
         let _ = std::fs::remove_file(&p);
         // A missing file also yields None.
         assert_eq!(stat_jiffies(PathBuf::from("/no/such/stat")), None);
+    }
+
+    /// Injected jiffies (the remote-bridge `proc.list` path) drive the FSM
+    /// independent of the local `/proc` scan: a bogus path with no local
+    /// processes goes `active` purely from the `extra` override advancing.
+    #[test]
+    fn injected_jiffies_drive_active() {
+        let path = tmp("inject");
+        let _ = std::fs::remove_file(&path);
+        let managed = vec![ManagedWorktree {
+            worktree: "/nonexistent/remote-wt".into(),
+            tab: "app/remote".into(),
+        }];
+        // Baseline poll establishes prev + polled_at with injected jiffies = 0.
+        let mut extra = BTreeMap::new();
+        extra.insert("/nonexistent/remote-wt".to_string(), 0u64);
+        poll_and_save_at_with(&path, &managed, &extra, 1000.0);
+        assert_eq!(
+            read_states_at(&path).get("app/remote").map(String::as_str),
+            Some("none")
+        );
+        // A second poll 1s later with a large jiffies advance (delta well over
+        // the 3-jiffies/s threshold) flips it to active — no /proc involvement.
+        extra.insert("/nonexistent/remote-wt".to_string(), 500u64);
+        poll_and_save_at_with(&path, &managed, &extra, 1001.0);
+        assert_eq!(
+            read_states_at(&path).get("app/remote").map(String::as_str),
+            Some("active")
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The public, default-path wrappers must run without panicking, covering
