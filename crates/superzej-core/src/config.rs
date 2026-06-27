@@ -883,6 +883,8 @@ pub struct UiConfig {
     pub language: String,
     /// Ask before destructive worktree actions (deleting a worktree from disk via the sidebar).
     pub confirm_delete_workspace: bool,
+    /// Whether to display the full word for the mode chip (e.g., "Normal" instead of "N").
+    pub full_mode_chip: bool,
 }
 
 impl Default for UiConfig {
@@ -890,6 +892,7 @@ impl Default for UiConfig {
         Self {
             language: "auto".to_string(),
             confirm_delete_workspace: true,
+            full_mode_chip: true,
         }
     }
 }

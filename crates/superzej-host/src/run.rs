@@ -106,20 +106,35 @@ fn resolve_undercurl(cfg: &superzej_core::config::Config) -> bool {
     }
 }
 
-fn apply_mode_status(model: &mut FrameModel, mode: crate::keymap::Mode) {
+fn apply_mode_status(
+    model: &mut FrameModel,
+    mode: crate::keymap::Mode,
+    config: &superzej_core::config::Config,
+) {
     // The bottom bar carries the contextual keybind hints; the status slot
     // only flags a non-default input mode. The mode chip always shows.
     model.status = match mode {
         crate::keymap::Mode::Normal => String::new(),
         m => format!("{} mode", m.as_str()),
     };
-    model.mode_chip = match mode {
-        crate::keymap::Mode::Normal => "N",
-        crate::keymap::Mode::VimNormal => "V",
-        crate::keymap::Mode::VimInsert => "I",
-        crate::keymap::Mode::Emacs => "E",
+
+    if config.ui.full_mode_chip {
+        model.mode_chip = match mode {
+            crate::keymap::Mode::Normal => "NORMAL",
+            crate::keymap::Mode::VimNormal => "VIM NORMAL",
+            crate::keymap::Mode::VimInsert => "VIM INSERT",
+            crate::keymap::Mode::Emacs => "EMACS",
+        }
+        .into();
+    } else {
+        model.mode_chip = match mode {
+            crate::keymap::Mode::Normal => "N",
+            crate::keymap::Mode::VimNormal => "V",
+            crate::keymap::Mode::VimInsert => "I",
+            crate::keymap::Mode::Emacs => "E",
+        }
+        .into();
     }
-    .into();
 }
 
 /// Toggles the Asciinema cast recorder. When turned on, a new `.cast` file
@@ -498,7 +513,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     }
     let mut model = build_initial_model(&session, startup_db.as_ref());
     model.accent = cfg.accent_rgb();
-    apply_mode_status(&mut model, mode);
+    apply_mode_status(&mut model, mode, &cfg);
     // Surface keybind conflicts at launch (non-fatal — the shell always opens).
     if let Some(summary) = keybind_conflict_summary(&cfg) {
         model.status = summary;
@@ -9458,7 +9473,7 @@ async fn event_loop<T: Terminal>(
                 }
             }
             refresh_tab_model(&mut model, &session, &mut sb);
-            apply_mode_status(&mut model, mode);
+            apply_mode_status(&mut model, mode, &current_config);
             model.accent = current_config.accent_rgb();
             model.bars = current_config.bars.clone();
             model.stats_icons = current_config.stats.clone();
@@ -15131,7 +15146,7 @@ async fn event_loop<T: Terminal>(
                             Action::SwitchMode(next) => {
                                 mode = next;
                                 keymap.reset();
-                                apply_mode_status(&mut model, mode);
+                                apply_mode_status(&mut model, mode, &current_config);
                             }
                             Action::ToggleKeyLock => {
                                 focus.locked = true;
