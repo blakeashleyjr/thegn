@@ -466,6 +466,26 @@ command = "claude"
 name = "aider"
 command = "aider --model sonnet"
 
+# The pi coding agent, embedded over ACP (the upper control plane). pi runs its
+# own tools natively; superzej is ADDITIVE — it observes activity (the statusbar
+# chip), routes pi's model through the proxy, and exposes its house tools
+# (budget / fleet / worktree status) to pi via MCP-over-ACP. Setup:
+# `npm i -g @earendil-works/pi-coding-agent` (pi >=0.80 bundles the extension's
+# deps, so no separate install is needed).
+#
+# In the command: `--extension` loads superzej's ACP bridge; `--skill` loads the
+# bundled superzej-house skill (teaches the agent the house tools + conventions);
+# `--provider superzej-proxy --model <id>` selects the proxy-routed model (the
+# extension registers `superzej-proxy` at init from the SUPERZEJ_PROXY_* env when
+# [llm_proxy].route_agent is on — env registers it, the CLI flags activate it;
+# `--model` must match [llm_proxy].agent_model). superzej injects the ACP port via
+# the ACP_PORT env var. pi's own extension/skill discovery stays ON, so you can
+# drop your own into ~/.pi/agent/{extensions,skills}/ alongside these, and
+# `pi install npm:…` / `pi install git:…` works for extras (e.g. web search).
+[[agents]]
+name = "pi"
+command = "pi --extension /path/to/superzej/extensions/superzej-acp.ts --skill /path/to/superzej/extensions/skills/superzej-house --provider superzej-proxy --model model-proxy/standard"
+
 [[agents]]
 name = "shell"
 command = "__shell__"
@@ -1160,6 +1180,18 @@ heartbeat_secs = 10
 # holds. Levels: off | conservative | balanced | aggressive.
 token_reduction = false
 token_reduction_level = "conservative"
+# Route a launched agent's model traffic through the proxy at `listen` by
+# injecting provider config into the agent's environment at spawn. Independent of
+# `enabled` (which launches szproxy): leave `enabled = false` and set this `true`
+# to point the agent at an already-running proxy on `listen` without launching
+# our own. `agent_api` is the pi-side API id for that endpoint — the proxy serves
+# the Anthropic Messages API (/v1/messages), and pi's OpenAI client speaks the
+# Responses API (which the proxy doesn't implement), so keep "anthropic-messages".
+# `agent_model` is the model id the agent requests (the proxy maps it to a real
+# backend, e.g. "model-proxy/standard" / "model-proxy/fast").
+route_agent = false
+agent_api = "anthropic-messages"
+agent_model = "model-proxy/standard"
 
 # ── Media player control (optional) ────────────────────────────────────────
 # Drive your music/media player from superzej: play/pause, next/previous,

@@ -27,6 +27,40 @@ pub struct AiMetrics {
     pub cost: f64,
 }
 
+/// The embedded agent's ACP connection state, surfaced in the statusbar chip so
+/// a connect/proxy failure is visible (the chip is the *only* native signal — pi
+/// owns the conversation in its terminal pane, by design).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AgentConn {
+    /// ACP server spawned; client not connected/initialized yet.
+    Connecting,
+    /// Connected + initialized (+ provider routed when the proxy is enabled).
+    #[default]
+    Online,
+    /// The ACP socket dropped (agent likely went away).
+    Exited,
+    /// Connect / initialize / provider-routing failed.
+    Error,
+}
+
+/// Live activity of the embedded `pi` agent, streamed over ACP `session/update`
+/// (tool calls + context-window usage) plus its connection lifecycle. Distinct
+/// from [`AiMetrics`], which is proxy-side spend; this is the agent's own
+/// progress, rendered as a statusbar chip so the user sees what the agent is
+/// doing without leaving their pane.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AgentActivity {
+    /// Connection lifecycle (drives the offline/error chip states).
+    pub conn: AgentConn,
+    /// The most recent tool the agent invoked (e.g. "bash", "edit").
+    pub last_tool: Option<String>,
+    /// Whether that tool is still running (vs. completed/failed).
+    pub running: bool,
+    /// Context-window tokens used / total, from `usage_update` (0 = unknown).
+    pub context_used: i64,
+    pub context_size: i64,
+}
+
 /// The resolved chrome palette. A process-global because every draw helper
 /// needs it and threading it through each call would touch every signature;
 /// the event loop writes it (startup + config reload), render-time code only
@@ -276,6 +310,8 @@ pub struct FrameModel {
     /// The active worktree group's name ("app/feat") — the tabbar's left label.
     pub worktree: String,
     pub ai_metrics: Option<AiMetrics>,
+    /// Live embedded-agent activity (ACP `session/update`), shown as a chip.
+    pub agent_activity: Option<AgentActivity>,
     /// The active worktree's tab chip titles (tabs live WITHIN a worktree).
     pub tabs: Vec<String>,
     /// Index of the active chip in `tabs`.
@@ -1335,6 +1371,33 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
                 metrics.tokens.input + metrics.tokens.output
             ),
         ));
+    }
+    if let Some(ref a) = model.agent_activity {
+        use superzej_core::theme::Hue;
+        // The chip is the only native signal, so it must show failure states too.
+        let (hue, label) = match a.conn {
+            AgentConn::Error => (Hue::Red, " ⚠ agent error ".to_string()),
+            AgentConn::Exited => (Hue::Orange, " ⚠ agent offline ".to_string()),
+            AgentConn::Connecting => (Hue::Blue, " 🤖 agent connecting… ".to_string()),
+            AgentConn::Online => {
+                let tool = match (&a.last_tool, a.running) {
+                    (Some(t), true) => format!("🛠 {t}…"),
+                    (Some(t), false) => format!("🛠 {t}"),
+                    (None, _) => "🤖 agent".to_string(),
+                };
+                // Append context-window usage as a percentage when reported.
+                let label = if a.context_size > 0 {
+                    let pct = (a.context_used * 100 / a.context_size).clamp(0, 100);
+                    format!(" {tool} · {pct}% ctx ")
+                } else {
+                    format!(" {tool} ")
+                };
+                let hue = if a.running { Hue::Amber } else { Hue::Teal };
+                (hue, label)
+            }
+        };
+        r.push(seg(Tok::Slot(S::Text), " "));
+        r.push(Seg::chip(Tok::Hue(hue), label));
     }
     if model.zoomed {
         r.push(seg(Tok::Slot(S::Text), " "));
