@@ -19,6 +19,44 @@ pub struct StatsSnapshot {
     pub net_bps: Option<(u64, u64)>,
     /// Battery as (percent 0–100, charging). Absent on desktops.
     pub battery: Option<(u8, bool)>,
+    /// Free space on the worktrees' filesystem, as a percentage 0–100.
+    pub disk_free_pct: Option<u8>,
+}
+
+/// Free space on the filesystem containing `path`, as a percentage (0–100).
+/// Walks up to the first existing ancestor so a not-yet-created worktrees dir
+/// still reports its parent fs. `None` on a non-unix target or `statvfs` error.
+#[cfg(unix)]
+pub fn disk_free_pct(path: &std::path::Path) -> Option<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut p = path;
+    while !p.exists() {
+        p = p.parent()?;
+    }
+    let c = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `c` is a valid NUL-terminated path; `st` is zeroed before the call
+    // and only read on success.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    let total = st.f_blocks as u64;
+    if total == 0 {
+        return None;
+    }
+    // f_bavail = blocks available to unprivileged users (the headroom you'd
+    // actually get), which is what "free %" should reflect.
+    let avail = st.f_bavail as u64;
+    Some(
+        ((avail as f64 / total as f64) * 100.0)
+            .round()
+            .clamp(0.0, 100.0) as u8,
+    )
+}
+
+#[cfg(not(unix))]
+pub fn disk_free_pct(_path: &std::path::Path) -> Option<u8> {
+    None
 }
 
 /// Read the first battery under `/sys/class/power_supply` (capacity %, and
@@ -56,6 +94,8 @@ pub struct StatsSampler {
     prev_cores: Vec<(u64, u64)>,
     prev_net: Option<(u64, u64, std::time::Instant)>,
     gpu: GpuProbe,
+    /// Filesystem (any path on it) measured for the disk free-space stat.
+    disk_path: std::path::PathBuf,
 }
 
 /// How GPU utilization is read (probed once at startup).
@@ -92,12 +132,13 @@ fn probe_gpu() -> GpuProbe {
 }
 
 impl StatsSampler {
-    pub fn new() -> Self {
+    pub fn new(disk_path: std::path::PathBuf) -> Self {
         StatsSampler {
             prev_cpu: None,
             prev_cores: Vec::new(),
             prev_net: None,
             gpu: probe_gpu(),
+            disk_path,
         }
     }
 
@@ -131,6 +172,8 @@ impl StatsSampler {
         }
 
         snap.battery = read_battery(std::path::Path::new("/sys/class/power_supply"));
+
+        snap.disk_free_pct = disk_free_pct(&self.disk_path);
 
         if let Ok(net) = std::fs::read_to_string("/proc/net/dev") {
             let (rx, tx) = parse_net_dev(&net);
@@ -259,13 +302,25 @@ pub fn parse_net_dev(text: &str) -> (u64, u64) {
 /// Fixed-width (6 char) bytes/sec for the NET widget — stable width so the
 /// right-aligned stats block never shifts as numbers grow.
 pub fn fmt_rate(bps: u64) -> String {
-    let s = match bps {
-        b if b >= 1024 * 1024 * 1024 => format!("{:.1}G", b as f64 / (1u64 << 30) as f64),
-        b if b >= 1024 * 1024 => format!("{:.1}M", b as f64 / (1 << 20) as f64),
-        b if b >= 1024 => format!("{:.0}K", b as f64 / 1024.0),
-        b => format!("{b}B"),
+    const UNITS: [&str; 4] = ["B", "K", "M", "G"];
+    let mut v = bps as f64;
+    let mut u = 0;
+    // Step up a unit before the number would reach four digits, so the value
+    // stays ≤3 digits — that keeps the masthead net widget tight and its width
+    // stable as the rate changes.
+    while v >= 999.5 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    // One decimal only for a sub-10 non-byte value ("1.5M"); whole numbers
+    // otherwise ("12M", "120M", "999B"). `9.95` guards the ".0→two-digit" jump.
+    let s = if u == 0 || v >= 9.95 {
+        format!("{v:.0}{}", UNITS[u])
+    } else {
+        format!("{v:.1}{}", UNITS[u])
     };
-    format!("{s:>6}")
+    // ≤3 digits + a one-char unit ⇒ ≤4 columns; pad to 4 for a steady width.
+    format!("{s:>4}")
 }
 
 #[cfg(test)]
@@ -327,14 +382,34 @@ Inter-|   Receive                                                |  Transmit
         assert_eq!(parse_net_dev(text), (1500, 2700));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn disk_free_pct_is_a_valid_percentage_and_climbs_to_ancestor() {
+        // An existing dir reports a sane percentage.
+        let tmp = std::env::temp_dir();
+        let p = disk_free_pct(&tmp).expect("temp dir is on a real fs");
+        assert!(p <= 100, "free% in range: {p}");
+        // A non-existent path climbs to its first existing ancestor (same fs).
+        let missing = tmp.join("sz-no-such-dir-xyz/deeper/still");
+        let p2 = disk_free_pct(&missing).expect("climbs to an existing ancestor");
+        assert!(p2 <= 100);
+    }
+
     #[test]
     fn rate_formatting_is_fixed_width() {
-        assert_eq!(fmt_rate(12), "   12B");
-        assert_eq!(fmt_rate(2048), "    2K");
-        assert_eq!(fmt_rate(3 * 1024 * 1024 / 2), "  1.5M");
-        assert_eq!(fmt_rate(3 * 1024 * 1024 * 1024 / 2), "  1.5G");
-        for v in [0, 999, 10_240, 5 << 20, 3 << 30] {
-            assert_eq!(fmt_rate(v).chars().count(), 6, "{v}");
+        assert_eq!(fmt_rate(12), " 12B");
+        assert_eq!(fmt_rate(2048), "2.0K");
+        assert_eq!(fmt_rate(3 * 1024 * 1024 / 2), "1.5M");
+        assert_eq!(fmt_rate(3 * 1024 * 1024 * 1024 / 2), "1.5G");
+        // Always ≤3 digits + unit, padded to a steady 4 columns.
+        for v in [0, 999, 1000, 10_240, 5 << 20, 999 << 20, 3 << 30, 50 << 30] {
+            let s = fmt_rate(v);
+            assert_eq!(s.chars().count(), 4, "{v} → {s:?}");
+            // The numeric portion never exceeds three characters.
+            assert!(
+                s.trim().trim_end_matches(['B', 'K', 'M', 'G']).len() <= 3,
+                "{s:?}"
+            );
         }
     }
 
