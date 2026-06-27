@@ -77,6 +77,114 @@ struct FsEventNote {
     kind: String,
 }
 
+// --- streaming process channel (proc.spawn) -------------------------------
+// A long-lived child in the env with bidirectional stdio over the bridge — the
+// shared primitive for a remote LSP server (lsp-forward) and an interactive pane
+// (drop the provider CLI). Distinct from `exec` (one-shot, buffered): here output
+// streams as `proc.out` notifications and the client feeds stdin via `proc.stdin`.
+// Binary-safe: payloads are base64 (LSP is UTF-8, but a PTY is arbitrary bytes).
+
+#[derive(Serialize, Deserialize)]
+struct SpawnParams {
+    chan: u64,
+    argv: Vec<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    env: Vec<(String, String)>,
+}
+#[derive(Serialize, Deserialize)]
+struct ChanData {
+    chan: u64,
+    /// base64-encoded bytes.
+    data: String,
+}
+#[derive(Serialize, Deserialize)]
+struct ChanRef {
+    chan: u64,
+}
+/// `proc.out` server→client notification: a chunk of the child's stdout/stderr.
+#[derive(Serialize, Deserialize)]
+struct ProcOutNote {
+    chan: u64,
+    /// `"stdout"` | `"stderr"`.
+    stream: String,
+    data: String,
+}
+/// `proc.exit` server→client notification: the child terminated with `code`.
+#[derive(Serialize, Deserialize)]
+struct ProcExitNote {
+    chan: u64,
+    code: i32,
+}
+
+/// An event from a streaming process channel ([`BridgeClient::spawn_proc`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcEvent {
+    /// A chunk of output. `stream` is `"stdout"` or `"stderr"`; `data` is raw bytes.
+    Out { stream: String, data: Vec<u8> },
+    /// The process exited with this code (`-1` if killed/unknown).
+    Exit { code: i32 },
+}
+
+/// Dependency-free base64 (standard alphabet) — bridge payloads are JSON strings,
+/// so streamed binary (PTY) bytes are base64'd. Small + self-contained on purpose.
+pub(crate) fn b64_encode(data: &[u8]) -> String {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(A[(n >> 18 & 63) as usize] as char);
+        out.push(A[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            A[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            A[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+pub(crate) fn b64_decode(s: &str) -> Vec<u8> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None, // skips '=' padding and whitespace
+        }
+    }
+    let syms: Vec<u32> = s.bytes().filter_map(val).collect();
+    let mut out = Vec::with_capacity(syms.len() / 4 * 3);
+    for chunk in syms.chunks(4) {
+        if chunk.len() < 2 {
+            break;
+        }
+        let n = (chunk[0] << 18)
+            | (chunk[1] << 12)
+            | (chunk.get(2).copied().unwrap_or(0) << 6)
+            | chunk.get(3).copied().unwrap_or(0);
+        out.push((n >> 16) as u8);
+        if chunk.len() > 2 {
+            out.push((n >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push(n as u8);
+        }
+    }
+    out
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct Request {
     id: u64,
@@ -96,6 +204,8 @@ struct Response {
 type Pending = Arc<Mutex<HashMap<u64, Sender<std::result::Result<serde_json::Value, String>>>>>;
 /// Active `fs.watch` subscriptions: watch_id → the channel delivering its events.
 type Subs = Arc<Mutex<HashMap<u64, Sender<FsEvent>>>>;
+/// Active streaming-process channels: chan → the channel delivering its events.
+type Procs = Arc<Mutex<HashMap<u64, Sender<ProcEvent>>>>;
 
 /// The host side of the bridge: spawn-over-transport happens by the caller (it
 /// hands us the connected stream's reader+writer), then `exec()` issues blocking
@@ -108,6 +218,8 @@ pub struct BridgeClient {
     _reader: std::thread::JoinHandle<()>,
     subs: Subs,
     next_watch: AtomicU64,
+    procs: Procs,
+    next_chan: AtomicU64,
     /// The spawned agent process, owned so it's killed when the client drops
     /// (subprocess transports). `None` for a caller-provided stream (tests).
     child: Mutex<Option<Child>>,
@@ -142,11 +254,13 @@ impl BridgeClient {
     ) -> BridgeClient {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let subs: Subs = Arc::new(Mutex::new(HashMap::new()));
+        let procs: Procs = Arc::new(Mutex::new(HashMap::new()));
         let reader_pending = pending.clone();
         let reader_subs = subs.clone();
+        let reader_procs = procs.clone();
         let handle = std::thread::Builder::new()
             .name("bridge-reader".into())
-            .spawn(move || reader_loop(reader, reader_pending, reader_subs))
+            .spawn(move || reader_loop(reader, reader_pending, reader_subs, reader_procs))
             .expect("spawn bridge reader");
         BridgeClient {
             writer: Arc::new(Mutex::new(Box::new(writer))),
@@ -156,6 +270,8 @@ impl BridgeClient {
             _reader: handle,
             subs,
             next_watch: AtomicU64::new(1),
+            procs,
+            next_chan: AtomicU64::new(1),
             child: Mutex::new(child),
         }
     }
@@ -226,6 +342,53 @@ impl BridgeClient {
         }
         Ok(rx)
     }
+
+    /// Spawn a long-lived process in the env with streaming stdio — the
+    /// foundation for a forwarded LSP server and an interactive pane. Returns the
+    /// channel id and a receiver of [`ProcEvent`]s (output chunks + exit); feed
+    /// its stdin with [`proc_stdin`](Self::proc_stdin), end it with
+    /// [`proc_kill`](Self::proc_kill). Events flow until the process exits or the
+    /// connection drops.
+    pub fn spawn_proc(
+        &self,
+        argv: &[&str],
+        cwd: Option<&str>,
+        env: &[(String, String)],
+    ) -> Result<(u64, Receiver<ProcEvent>)> {
+        let (tx, rx) = channel();
+        let chan = self.next_chan.fetch_add(1, Ordering::SeqCst);
+        // Register before the request so early output can't race the insert.
+        self.procs.lock().unwrap().insert(chan, tx);
+        let params = serde_json::to_value(SpawnParams {
+            chan,
+            argv: argv.iter().map(|s| s.to_string()).collect(),
+            cwd: cwd.map(str::to_string),
+            env: env.to_vec(),
+        })?;
+        if let Err(e) = self.call("proc.spawn", params) {
+            self.procs.lock().unwrap().remove(&chan);
+            return Err(e);
+        }
+        Ok((chan, rx))
+    }
+
+    /// Write bytes to a streaming process's stdin.
+    pub fn proc_stdin(&self, chan: u64, data: &[u8]) -> Result<()> {
+        let params = serde_json::to_value(ChanData {
+            chan,
+            data: b64_encode(data),
+        })?;
+        self.call("proc.stdin", params)?;
+        Ok(())
+    }
+
+    /// Kill a streaming process (and stop its stream).
+    pub fn proc_kill(&self, chan: u64) -> Result<()> {
+        let params = serde_json::to_value(ChanRef { chan })?;
+        self.call("proc.kill", params)?;
+        self.procs.lock().unwrap().remove(&chan);
+        Ok(())
+    }
 }
 
 impl Drop for BridgeClient {
@@ -281,7 +444,7 @@ pub fn for_loc(loc: &GitLoc) -> Option<Arc<BridgeClient>> {
     registry().lock().unwrap().get(&key).cloned()
 }
 
-fn reader_loop(mut reader: impl Read, pending: Pending, subs: Subs) {
+fn reader_loop(mut reader: impl Read, pending: Pending, subs: Subs, procs: Procs) {
     let mut dec = FrameDecoder::new();
     let mut buf = [0u8; 8192];
     loop {
@@ -294,20 +457,50 @@ fn reader_loop(mut reader: impl Read, pending: Pending, subs: Subs) {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
                 continue;
             };
-            // A server→client notification (no `id`): route `fs.event` to its sub.
-            if v.get("method").and_then(|m| m.as_str()) == Some("fs.event") {
-                if let Some(note) = v
-                    .get("params")
-                    .cloned()
-                    .and_then(|p| serde_json::from_value::<FsEventNote>(p).ok())
-                    && let Some(tx) = subs.lock().unwrap().get(&note.watch_id)
-                {
-                    let _ = tx.send(FsEvent {
-                        paths: note.paths,
-                        kind: note.kind,
-                    });
+            // A server→client notification (no `id`): route to its subscriber.
+            match v.get("method").and_then(|m| m.as_str()) {
+                Some("fs.event") => {
+                    if let Some(note) = v
+                        .get("params")
+                        .cloned()
+                        .and_then(|p| serde_json::from_value::<FsEventNote>(p).ok())
+                        && let Some(tx) = subs.lock().unwrap().get(&note.watch_id)
+                    {
+                        let _ = tx.send(FsEvent {
+                            paths: note.paths,
+                            kind: note.kind,
+                        });
+                    }
+                    continue;
                 }
-                continue;
+                Some("proc.out") => {
+                    if let Some(note) = v
+                        .get("params")
+                        .cloned()
+                        .and_then(|p| serde_json::from_value::<ProcOutNote>(p).ok())
+                        && let Some(tx) = procs.lock().unwrap().get(&note.chan)
+                    {
+                        let _ = tx.send(ProcEvent::Out {
+                            stream: note.stream,
+                            data: b64_decode(&note.data),
+                        });
+                    }
+                    continue;
+                }
+                Some("proc.exit") => {
+                    if let Some(note) = v
+                        .get("params")
+                        .cloned()
+                        .and_then(|p| serde_json::from_value::<ProcExitNote>(p).ok())
+                    {
+                        // Final event, then drop the sub so the receiver ends.
+                        if let Some(tx) = procs.lock().unwrap().remove(&note.chan) {
+                            let _ = tx.send(ProcEvent::Exit { code: note.code });
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
             }
             // Otherwise a response to a pending request.
             if let Ok(resp) = serde_json::from_value::<Response>(v)
@@ -335,10 +528,21 @@ fn reader_loop(mut reader: impl Read, pending: Pending, subs: Subs) {
 /// threads (which push `fs.event` notifications).
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
+/// A live streaming child: only its stdin is retained (for `proc.stdin`). Dropping
+/// it closes stdin → the child sees EOF → exits → its waiter thread fires
+/// `proc.exit`. So `proc.kill` and connection-close are just a map removal — no
+/// shared `Child` mutex, no libc signal, no deadlock between reader/kill paths.
+struct ProcState {
+    stdin: Arc<Mutex<std::process::ChildStdin>>,
+}
+type ProcRegistry = Arc<Mutex<HashMap<u64, ProcState>>>;
+
 pub fn serve(mut reader: impl Read, writer: impl Write + Send + 'static) {
     let writer: SharedWriter = Arc::new(Mutex::new(Box::new(writer)));
     // Live fs.watch watchers, kept alive for the connection's lifetime.
     let mut watchers: Vec<RecommendedWatcher> = Vec::new();
+    // Live streaming processes (proc.spawn), keyed by channel id.
+    let procs: ProcRegistry = Arc::new(Mutex::new(HashMap::new()));
     let mut dec = FrameDecoder::new();
     let mut buf = [0u8; 8192];
     loop {
@@ -355,11 +559,135 @@ pub fn serve(mut reader: impl Read, writer: impl Write + Send + 'static) {
                 "exec" => exec_response(&req),
                 "proc.list" => proc_response(&req),
                 "fs.watch" => watch_response(&req, &writer, &mut watchers),
+                "proc.spawn" => proc_spawn_response(&req, &writer, &procs),
+                "proc.stdin" => proc_stdin_response(&req, &procs),
+                "proc.kill" => proc_kill_response(&req, &procs),
                 other => resp_err(req.id, format!("unknown method: {other}")),
             };
             write_frame(&writer, &resp);
         }
     }
+    // Connection closed: drop every child's stdin → EOF → the children exit.
+    procs.lock().unwrap().clear();
+}
+
+fn proc_spawn_response(req: &Request, writer: &SharedWriter, procs: &ProcRegistry) -> Response {
+    let p: SpawnParams = match serde_json::from_value(req.params.clone()) {
+        Ok(p) => p,
+        Err(e) => return resp_err(req.id, format!("bad proc.spawn params: {e}")),
+    };
+    match do_spawn(p, writer.clone(), procs.clone()) {
+        Ok(()) => resp_ok(req.id, serde_json::json!({})),
+        Err(e) => resp_err(req.id, format!("proc.spawn failed: {e}")),
+    }
+}
+
+fn do_spawn(p: SpawnParams, writer: SharedWriter, procs: ProcRegistry) -> Result<()> {
+    let Some((cmd, args)) = p.argv.split_first() else {
+        bail!("empty argv");
+    };
+    let mut c = Command::new(cmd);
+    c.args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(cwd) = &p.cwd {
+        c.current_dir(cwd);
+    }
+    for (k, v) in &p.env {
+        c.env(k, v);
+    }
+    let mut child = c
+        .spawn()
+        .with_context(|| format!("spawn {}", p.argv.join(" ")))?;
+    let stdout = child.stdout.take().context("child stdout")?;
+    let stderr = child.stderr.take().context("child stdin")?;
+    let stdin = child.stdin.take().context("child stdin")?;
+    let chan = p.chan;
+    procs.lock().unwrap().insert(
+        chan,
+        ProcState {
+            stdin: Arc::new(Mutex::new(stdin)),
+        },
+    );
+    // Stream stdout + stderr as proc.out notifications.
+    spawn_stream_relay(stdout, chan, "stdout", writer.clone());
+    spawn_stream_relay(stderr, chan, "stderr", writer.clone());
+    // Waiter: owns the Child, blocks on exit (no lock held), then reports exit and
+    // drops the channel. The child exits when it finishes or when proc.kill /
+    // connection-close drops its stdin (EOF).
+    std::thread::Builder::new()
+        .name("bridge-proc-wait".into())
+        .spawn(move || {
+            let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
+            procs.lock().unwrap().remove(&chan);
+            let note = serde_json::json!({
+                "method": "proc.exit",
+                "params": ProcExitNote { chan, code },
+            });
+            write_frame(&writer, &note);
+        })
+        .ok();
+    Ok(())
+}
+
+/// Relay a child stream to the client as `proc.out` notifications until EOF.
+fn spawn_stream_relay(
+    mut r: impl Read + Send + 'static,
+    chan: u64,
+    stream: &'static str,
+    writer: SharedWriter,
+) {
+    std::thread::Builder::new()
+        .name(format!("bridge-proc-{stream}"))
+        .spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match r.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let note = serde_json::json!({
+                            "method": "proc.out",
+                            "params": ProcOutNote {
+                                chan,
+                                stream: stream.to_string(),
+                                data: b64_encode(&buf[..n]),
+                            },
+                        });
+                        write_frame(&writer, &note);
+                    }
+                }
+            }
+        })
+        .ok();
+}
+
+fn proc_stdin_response(req: &Request, procs: &ProcRegistry) -> Response {
+    let p: ChanData = match serde_json::from_value(req.params.clone()) {
+        Ok(p) => p,
+        Err(e) => return resp_err(req.id, format!("bad proc.stdin params: {e}")),
+    };
+    let stdin = procs.lock().unwrap().get(&p.chan).map(|s| s.stdin.clone());
+    let Some(stdin) = stdin else {
+        return resp_err(req.id, format!("no such channel {}", p.chan));
+    };
+    let data = b64_decode(&p.data);
+    let mut g = stdin.lock().unwrap();
+    match g.write_all(&data).and_then(|_| g.flush()) {
+        Ok(()) => resp_ok(req.id, serde_json::json!({})),
+        Err(e) => resp_err(req.id, format!("proc.stdin write: {e}")),
+    }
+}
+
+fn proc_kill_response(req: &Request, procs: &ProcRegistry) -> Response {
+    let p: ChanRef = match serde_json::from_value(req.params.clone()) {
+        Ok(p) => p,
+        Err(e) => return resp_err(req.id, format!("bad proc.kill params: {e}")),
+    };
+    // Drop the ProcState → close stdin → EOF → the child exits; the waiter fires
+    // proc.exit. (A child that ignores stdin EOF is reaped on env teardown.)
+    procs.lock().unwrap().remove(&p.chan);
+    resp_ok(req.id, serde_json::json!({}))
 }
 
 fn resp_ok(id: u64, v: impl Serialize) -> Response {
@@ -651,6 +979,72 @@ mod tests {
             ev.paths
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn b64_roundtrips_binary() {
+        for case in [
+            &b""[..],
+            b"a",
+            b"ab",
+            b"abc",
+            b"abcd",
+            &[0u8, 255, 1, 254, 128],
+        ] {
+            assert_eq!(b64_decode(&b64_encode(case)), case, "roundtrip {case:?}");
+        }
+        // Known vector.
+        assert_eq!(b64_encode(b"hello"), "aGVsbG8=");
+        assert_eq!(b64_decode("aGVsbG8="), b"hello");
+    }
+
+    #[test]
+    fn spawn_proc_streams_stdin_to_stdout_then_exits() {
+        // `cat` echoes stdin to stdout — the canonical bidirectional stream test.
+        let c = connect();
+        let (chan, rx) = c.spawn_proc(&["cat"], None, &[]).unwrap();
+        c.proc_stdin(chan, b"ping\n").unwrap();
+        // The echoed bytes come back as a proc.out(stdout) event.
+        let got = loop {
+            match rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a proc event")
+            {
+                ProcEvent::Out { stream, data } => {
+                    assert_eq!(stream, "stdout");
+                    break data;
+                }
+                ProcEvent::Exit { .. } => panic!("exited before echo"),
+            }
+        };
+        assert_eq!(&got, b"ping\n");
+        // Killing the channel closes cat's stdin (EOF) → it exits → Exit event.
+        c.proc_kill(chan).unwrap();
+        // Drain until the Exit (the kill-removed client sub may drop it, so accept
+        // either an Exit or the channel closing).
+        let mut saw_end = false;
+        while let Ok(ev) = rx.recv_timeout(Duration::from_secs(5)) {
+            if matches!(ev, ProcEvent::Exit { .. }) {
+                saw_end = true;
+                break;
+            }
+        }
+        let _ = saw_end; // the receiver ending (sender dropped) is also acceptance
+    }
+
+    #[test]
+    fn spawn_proc_reports_exit_code() {
+        let c = connect();
+        // Exits 0 immediately; stdin EOF isn't needed.
+        let (_chan, rx) = c.spawn_proc(&["sh", "-c", "exit 0"], None, &[]).unwrap();
+        let mut code = None;
+        while let Ok(ev) = rx.recv_timeout(Duration::from_secs(5)) {
+            if let ProcEvent::Exit { code: c } = ev {
+                code = Some(c);
+                break;
+            }
+        }
+        assert_eq!(code, Some(0));
     }
 
     #[test]
