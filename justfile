@@ -391,6 +391,50 @@ start name="dev": build
 # Alias for `start`.
 attach: start
 
+# Point THIS repo (all its worktrees) at a sandbox backend / managed-sandbox
+# provider, without touching any other repo — the engine behind the `backend=`
+# param on `start-term`/`start-term-release`. Writes a per-repo `.superzej.toml`
+# overlay at the MAIN worktree (resolved via `git --git-common-dir`, mirroring
+# `superzej_core::repo::main_worktree`), which every superzej worktree reads.
+#   - `sprites` (a managed-sandbox PROVIDER) → overlay `env = "sprites"`, and the
+#     global `[env.sprites]` block is auto-scaffolded into
+#     $XDG_CONFIG_HOME/superzej/config.toml if missing (needs the `sprite` CLI on
+#     PATH + SPRITES_TOKEN set; both are checked here, fail-fast).
+#   - a real sandbox backend (podman|docker|bwrap|systemd|none) → overlay
+#     `[sandbox] backend = "<x>"`.
+# Empty `backend` is a no-op. Refuses to clobber a hand-authored overlay that
+# already carries a `[keybinds]`/`[sandbox]` table. To revert: delete the overlay
+# (`rm "$(git rev-parse --show-toplevel)/.superzej.toml"` from the main checkout).
+_apply-backend backend="":
+    backend="{{backend}}"; \
+    if [ -n "$backend" ]; then \
+      root="$(git rev-parse --path-format=absolute --git-common-dir)"; \
+      case "$root" in */.git) root="${root%/.git}";; esac; \
+      overlay="$root/.superzej.toml"; \
+      cfg="${XDG_CONFIG_HOME:-$HOME/.config}/superzej/config.toml"; \
+      if [ -f "$overlay" ] && grep -qE '^\[(keybinds|sandbox)' "$overlay"; then \
+        echo "$overlay already has a [keybinds]/[sandbox] table — edit it by hand to set the backend" >&2; exit 1; \
+      fi; \
+      case "$backend" in \
+        sprites) \
+          command -v sprite >/dev/null 2>&1 || { echo "sprite CLI not on PATH — install it before using backend=sprites" >&2; exit 1; }; \
+          [ -n "${SPRITES_TOKEN:-}" ] || { echo "SPRITES_TOKEN not set — export it before using backend=sprites" >&2; exit 1; }; \
+          if ! grep -q '^\[env\.sprites\]' "$cfg" 2>/dev/null; then \
+            mkdir -p "$(dirname "$cfg")"; \
+            printf '\n[env.sprites]\nplacement = "provider"\ndata = "in_env"\n[env.sprites.provider]\nprovider = "sprites"\nid = "superzej"\napi_key_env = "SPRITES_TOKEN"\nexec_command = ["sprite", "exec", "-s", "{id}", "--"]\ninteractive_command = ["sprite", "exec", "-s", "{id}", "--tty", "--"]\nup_command = ["sprite", "create", "{id}", "--skip-console"]\ndown_command = ["sprite", "destroy", "-s", "{id}", "--force"]\n' >> "$cfg"; \
+            echo "scaffolded [env.sprites] into $cfg"; \
+          fi; \
+          printf 'env = "sprites"\n' > "$overlay"; \
+          echo "set $overlay -> env = \"sprites\" (applies to all worktrees under $root)"; \
+          ;; \
+        podman|docker|bwrap|systemd|none) \
+          printf '[sandbox]\nbackend = "%s"\n' "$backend" > "$overlay"; \
+          echo "set $overlay -> [sandbox] backend = \"$backend\" (applies to all worktrees under $root)"; \
+          ;; \
+        *) echo "unknown backend '$backend' — expected: sprites | podman | docker | bwrap | systemd | none" >&2; exit 1;; \
+      esac; \
+    fi
+
 # Build and open the native host in a fresh ghostty window with the FULL
 # dev/debug/profiling toolchain wired up. ghostty runs a hermetic, perf-tuned
 # profile (config/ghostty.config: --config-default-files=false keeps your
@@ -406,7 +450,10 @@ attach: start
 # NOTE: this is a DEBUG binary (~2.5x slower than release), so read the
 # flamegraph/perf rollup for structure & relative cost — for absolute timings
 # use the release-grade `just bench` / `just bench-idle` harnesses.
-start-term name="dev": build-profiling
+# Optional `backend=` flips THIS repo's worktrees onto a sandbox backend /
+# managed provider (e.g. `just start-term dev backend=sprites`) — see
+# `_apply-backend`. Empty (the default) leaves config untouched.
+start-term name="dev" backend="": build-profiling (_apply-backend backend)
     state="$HOME/.superzej-{{name}}/state"; run="$HOME/.superzej-{{name}}/run"; pidfile="$run/szhost.pid"; mkdir -p "$state" "$run"; \
       if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then kill "$(cat "$pidfile")" 2>/dev/null || true; fi; \
       echo "profiler: 'kill -USR2 \$(pgrep -n szhost)' to start sampling, again to dump → $state/superzej/profiles/"; \
@@ -415,6 +462,7 @@ start-term name="dev": build-profiling
       'pidfile="$1"; shift; echo $$ > "$pidfile"; exec env "$@"' \
       sh "$pidfile" \
       "XDG_STATE_HOME=$state" \
+      "SPRITES_TOKEN=${SPRITES_TOKEN:-}" \
       "SUPERZEJ_LOG=info,szhost::frame=debug,szhost::hydrate=debug,szhost::perf=debug" \
       "SUPERZEJ_PERF=1" \
       "$PWD/{{bin}}"
@@ -425,7 +473,14 @@ start-term name="dev": build-profiling
 # every log channel + the SIGUSR2 flamegraph profiler on, so live perf readings
 # (frame render_ms, the szhost::perf rollup, idle CPU) reflect real shipped cost
 # instead of the debug penalty. Use this to inhabit superzej all day.
-start-term-release name="dev": release-profiling
+# Optional `backend=` flips THIS repo's worktrees onto a sandbox backend /
+# managed provider before launch — `just start-term-release backend=sprites`
+# dogfoods the superzej repo onto sprites (auto-scaffolds the global
+# `[env.sprites]`; needs the `sprite` CLI + SPRITES_TOKEN). Also accepts a real
+# sandbox backend: podman|docker|bwrap|systemd|none. Affects ONLY this repo (a
+# `.superzej.toml` overlay at the main worktree); empty leaves config untouched.
+# See `_apply-backend` for the full mechanics.
+start-term-release name="dev" backend="": release-profiling (_apply-backend backend)
     state="$HOME/.superzej-{{name}}/state"; run="$HOME/.superzej-{{name}}/run"; pidfile="$run/szhost.pid"; mkdir -p "$state" "$run"; \
       if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then kill "$(cat "$pidfile")" 2>/dev/null || true; fi; \
       echo "profiler: 'kill -USR2 \$(pgrep -n szhost)' to start sampling, again to dump → $state/superzej/profiles/"; \
@@ -434,6 +489,7 @@ start-term-release name="dev": release-profiling
       'pidfile="$1"; shift; echo $$ > "$pidfile"; exec env "$@"' \
       sh "$pidfile" \
       "XDG_STATE_HOME=$state" \
+      "SPRITES_TOKEN=${SPRITES_TOKEN:-}" \
       "SUPERZEJ_LOG=info,szhost::frame=debug,szhost::hydrate=debug,szhost::perf=debug" \
       "SUPERZEJ_PERF=1" \
       "$PWD/target/release/szhost"

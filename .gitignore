@@ -9,3 +9,10 @@ devenv.local.nix
 __pycache__/
 .opencode/
 .claude/
+
+# Machine-local per-repo backend overlay written by `just start-term[-release]
+# backend=<x>` (dogfood switch); not committed — see `_apply-backend` in justfile.
+.superzej.toml
+.superzej.yaml
+.superzej.yml
+.superzej.json
