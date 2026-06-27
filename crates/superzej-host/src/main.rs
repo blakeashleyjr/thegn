@@ -17,6 +17,7 @@ mod cmd;
 mod compositor;
 mod copymode;
 mod desktop_notify;
+mod detail;
 mod emulator;
 mod focus;
 mod font;
