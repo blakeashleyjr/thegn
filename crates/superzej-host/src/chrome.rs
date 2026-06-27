@@ -2137,44 +2137,6 @@ fn draw_columns_frame(surface: &mut Surface, chrome: &crate::layout::ChromeLayou
     }
 }
 
-/// A centered confirmation modal: `msg` in a summoned layer (dimmed backdrop,
-/// cast shadow) with chip affordances. Drawn above everything while a
-/// destructive action awaits its answer.
-pub fn draw_confirm(surface: &mut Surface, screen: Rect, msg: &str) {
-    use crate::layer::{LayerSpec, open_layer};
-    use crate::seg::{Line, Seg, Tok, draw_lines, seg};
-    if screen.rows < 5 || screen.cols < 12 {
-        return;
-    }
-    let cols = msg.chars().count().clamp(16, screen.cols.saturating_sub(8));
-    let spec = LayerSpec {
-        title: "confirm".into(),
-        cols,
-        rows: 3,
-        border: Tok::Slot(S::Focus),
-        ..LayerSpec::default()
-    };
-    let Some(inner) = open_layer(surface, screen, &spec) else {
-        return;
-    };
-    let lines = [
-        Line::segs(vec![seg(Tok::Slot(S::Text), msg)]),
-        Line::Blank,
-        Line::split(
-            vec![Seg::chip(Tok::Slot(S::Accent), " y confirm ")],
-            // A muted-but-legible secondary chip: light text on the raised
-            // surface. `Seg::chip` would paint near-black `chip_fg` on `Raise`
-            // (#0b0e16 on #222942) — dark-on-dark and unreadable.
-            vec![
-                seg(Tok::Slot(S::Dim), " any key cancels ")
-                    .bg(Tok::Slot(S::Raise))
-                    .bold(),
-            ],
-        ),
-    ];
-    draw_lines(surface, inner, &lines, Tok::Slot(S::Panel));
-}
-
 /// Compose a multi-pane tab: lay the `center` tree out within `chrome.center`
 /// with every pane's 1-cell frame ring reserved, paint each visible pane's
 /// content (resolved via `lookup`), draw the frames (focused ring in the
@@ -2360,28 +2322,6 @@ mod tests {
         let mut loc_changed = base.clone();
         loc_changed.loc = Some(42);
         assert!(!base.hydration_eq(&loc_changed), "loc change must repaint");
-    }
-
-    /// The delete-worktree confirmation modal (and any `draw_confirm` caller)
-    /// must render every glyph legibly — the `y confirm` / cancel chips and the
-    /// message. Guards the regression where the cancel chip was near-black text
-    /// on the dark `raise` surface.
-    #[test]
-    fn confirm_modal_text_is_legible() {
-        let screen = Rect {
-            x: 0,
-            y: 0,
-            cols: 64,
-            rows: 14,
-        };
-        let mut s = Surface::new(screen.cols, screen.rows);
-        draw_confirm(
-            &mut s,
-            screen,
-            "Delete 2 worktree(s) from disk? (alpha, beta)",
-        );
-        let v = crate::seg::text_contrast_violations(&mut s, 3.0);
-        assert!(v.is_empty(), "low-contrast text in confirm modal: {v:?}");
     }
 
     /// Build a minimal sidebar row for renderer tests.
