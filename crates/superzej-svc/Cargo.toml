@@ -21,6 +21,10 @@ base64 = "0.22"
 # MPRIS media control over D-Bus (the [media] backend; playerctl is the fallback).
 zbus.workspace = true
 futures.workspace = true
+# ACP client transport (newline-JSON over TCP) + request/reply plumbing.
+tokio-util = { version = "0.7.18", features = ["codec"] }
+futures-channel = "0.3.32"
+futures-util = "0.3.32"
 
 [dev-dependencies]
 criterion.workspace = true
