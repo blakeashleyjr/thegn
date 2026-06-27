@@ -480,6 +480,16 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // WAL) and we already touched it in load_or_seed_session — this is a
     // second handle, not a new migration. None falls back gracefully.
     let startup_db = superzej_core::db::Db::open().ok();
+    // Ensure a default "local" terminal exists so the sidebar's Terminals
+    // section is always present (it's hidden when the table is empty). Seeding
+    // only on an empty table keeps it a one-time default the user can rename or
+    // delete; a deliberately-emptied list is reseeded on the next launch, which
+    // matches "there is always a local terminal".
+    if let Some(db) = startup_db.as_ref()
+        && db.terminals().map(|t| t.is_empty()).unwrap_or(false)
+    {
+        let _ = db.put_terminal("local", "local", "", None);
+    }
     let mut model = build_initial_model(&session, startup_db.as_ref());
     model.accent = cfg.accent_rgb();
     apply_mode_status(&mut model, mode);
@@ -1759,6 +1769,37 @@ fn activate_row_target(
                 return;
             }
             session.switch_to_tab(gi, ti);
+        }
+        // A terminal row uses the sentinel repo_path "terminal" when its group
+        // isn't resident in the session yet (a terminal declared in the global
+        // `terminals` table — e.g. the auto-provisioned default — that this
+        // session has never opened). Switch to the existing group if present,
+        // else materialize a fresh Terminal group; its pane spawns lazily via
+        // the materialize path, which resolves the connection by name.
+        crate::sidebar::RowTarget::Workspace { repo_path, group } if repo_path == "terminal" => {
+            let Some(name) = group else {
+                return;
+            };
+            if let Some(gi) = session.worktrees.iter().position(|w| w.name == name) {
+                session.switch_to_tab(gi, 0);
+            } else {
+                let placeholder = panes.reserve_ids(1);
+                session.worktrees.push(crate::session::WorktreeGroup {
+                    name,
+                    kind: crate::session::GroupKind::Terminal,
+                    path: String::new(),
+                    tabs: vec![crate::session::Tab {
+                        title: "main".to_string(),
+                        center: crate::center::CenterTree::Leaf(placeholder),
+                        focused_pane: placeholder,
+                        pane_cwds: Default::default(),
+                        pane_cmds: Default::default(),
+                    }],
+                    active_tab: 0,
+                });
+                session.active = session.worktrees.len() - 1;
+                *need_relayout = true;
+            }
         }
         crate::sidebar::RowTarget::Workspace { repo_path, group } => {
             let Ok(db) = superzej_core::db::Db::open() else {
@@ -5545,6 +5586,19 @@ fn contain_yazi_argv(
     wrapped
 }
 
+/// Resolve a terminal group's connection string (ssh/mosh target, or "" for a
+/// local shell) by its unique name from the `terminals` table. Returns "" when
+/// the row is gone or the DB can't be opened — a safe fall back to a local
+/// shell. Call this off the event loop (it opens the DB).
+fn terminal_connection_for(name: &str) -> String {
+    superzej_core::db::Db::open()
+        .ok()
+        .and_then(|db| db.terminals().ok())
+        .and_then(|ts| ts.into_iter().find(|t| t.name == name))
+        .map(|t| t.connection_string)
+        .unwrap_or_default()
+}
+
 /// Spawn a fresh (hidden or visible) yazi pane for `dir`; falls back to a
 /// plain shell when no yazi tool is configured.
 fn spawn_worktree_shell_pane(
@@ -5556,10 +5610,8 @@ fn spawn_worktree_shell_pane(
     terminal_connection: Option<&str>,
 ) -> Result<u32> {
     if is_terminal {
-        let (cmd, args) = crate::panes::pane_shell_argv(cfg, terminal_connection.unwrap_or(""));
-        let mut argv = vec![cmd];
-        argv.extend(args);
-        return panes.spawn_argv_env(&argv, dir, &[], center);
+        let spec = crate::panes::terminal_launch_spec(cfg, terminal_connection.unwrap_or(""));
+        return panes.spawn_argv_env(&spec.argv, dir, &spec.env, center);
     }
 
     if let Some(dir) = dir
@@ -7252,7 +7304,7 @@ async fn event_loop<T: Terminal>(
                 &waker,
             );
             // Pre-warm sibling tabs so first focus of a neighbor is instant.
-            for (name, wt, ti, missing) in prewarm_requests(&panes, &mut session) {
+            for (name, wt, ti, missing, is_terminal) in prewarm_requests(&panes, &mut session) {
                 let key = (name.clone(), ti);
                 if prewarm_inflight.contains(&key) || prewarm_failed.contains(&key) {
                     continue; // in-flight or previously failed — skip
@@ -7262,9 +7314,15 @@ async fn event_loop<T: Terminal>(
                 let tx = spec_tx.clone();
                 let wk = waker.clone();
                 task::spawn_blocking(move || {
-                    let specs = crate::agent::launch_spec(&cfg, &wt, None, "shell")
-                        .map(|spec| missing.into_iter().map(|id| (id, spec.clone())).collect())
-                        .map_err(|e| e.to_string());
+                    let specs = if is_terminal {
+                        let conn = terminal_connection_for(&name);
+                        let spec = crate::panes::terminal_launch_spec(&cfg, &conn);
+                        Ok(missing.into_iter().map(|id| (id, spec.clone())).collect())
+                    } else {
+                        crate::agent::launch_spec(&cfg, &wt, None, "shell")
+                            .map(|spec| missing.into_iter().map(|id| (id, spec.clone())).collect())
+                            .map_err(|e| e.to_string())
+                    };
                     if tx.send((name, wt, ti, specs)).is_ok() {
                         let _ = wk.wake();
                     }
@@ -7325,11 +7383,16 @@ async fn event_loop<T: Terminal>(
         // keypress/center click clears `center_dormant` and the next loop turn
         // materializes the shell.
         if !center_dormant && first_frame_logged {
-            let (name, path, ti) = {
+            let (name, path, ti, is_terminal) = {
                 let g = &mut session.worktrees[session.active];
                 let ti = g.active_tab.min(g.tabs.len().saturating_sub(1));
                 g.active_tab = ti;
-                (g.name.clone(), g.path.clone(), ti)
+                (
+                    g.name.clone(),
+                    g.path.clone(),
+                    ti,
+                    g.kind == crate::session::GroupKind::Terminal,
+                )
             };
             // A worktree whose dir vanished (deleted externally) must never
             // crash the loop: prune it from the session + registry, land on
@@ -7383,9 +7446,17 @@ async fn event_loop<T: Terminal>(
                     let wt = path.clone();
                     let gname = name.clone();
                     task::spawn_blocking(move || {
-                        let specs = crate::agent::launch_spec(&cfg, &wt, None, "shell")
-                            .map(|spec| missing.into_iter().map(|id| (id, spec.clone())).collect())
-                            .map_err(|e| e.to_string());
+                        let specs = if is_terminal {
+                            let conn = terminal_connection_for(&gname);
+                            let spec = crate::panes::terminal_launch_spec(&cfg, &conn);
+                            Ok(missing.into_iter().map(|id| (id, spec.clone())).collect())
+                        } else {
+                            crate::agent::launch_spec(&cfg, &wt, None, "shell")
+                                .map(|spec| {
+                                    missing.into_iter().map(|id| (id, spec.clone())).collect()
+                                })
+                                .map_err(|e| e.to_string())
+                        };
                         if tx.send((gname, wt, ti, specs)).is_ok() {
                             let _ = wk.wake();
                         }
