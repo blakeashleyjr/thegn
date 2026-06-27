@@ -7,6 +7,7 @@
 mod agent;
 mod apps;
 mod borders;
+mod bridge_sup;
 mod center;
 mod chrome;
 mod clipboard;

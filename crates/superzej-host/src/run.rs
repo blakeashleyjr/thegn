@@ -1994,9 +1994,38 @@ fn forget_worktree_group(
             crate::agent::deregister_vpn(&path);
             crate::agent::deproject(&path);
             crate::agent::deprovision_sync(&path);
+            crate::bridge_sup::disconnect_path(&path);
             superzej_core::sandbox::teardown_by_path(&path);
         });
     }
+}
+
+/// Connect a resident bridge for `worktree` if it's a remote/provider env and not
+/// already connected. Resolves the env off the event loop (DB + git/`resolve_env`)
+/// then spawns the agent; a non-remote loc, a miss, or a spawn failure silently
+/// leaves the per-op git path in place.
+fn connect_worktree_bridge(
+    sup: &crate::bridge_sup::BridgeSupervisor,
+    worktree: &std::path::Path,
+    cfg: &superzej_core::config::Config,
+) {
+    let loc = superzej_core::remote::GitLoc::for_worktree(worktree);
+    if !loc.is_remote() || sup.is_connected(&loc) {
+        return;
+    }
+    let sup = sup.clone();
+    let cfg = cfg.clone();
+    let wt = worktree.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let repo_root = superzej_core::repo::main_worktree(&wt).unwrap_or_else(|| wt.clone());
+        let env_name = superzej_core::db::Db::open()
+            .ok()
+            .and_then(|db| db.worktree_env(&wt.to_string_lossy()).ok().flatten());
+        let env = cfg.resolve_env(&repo_root, &loc, env_name.as_deref());
+        if let Some(cmd) = crate::bridge_sup::bridge_command(&env.placement) {
+            sup.connect(&loc, &loc.path(), &wt.to_string_lossy(), cmd);
+        }
+    });
 }
 
 fn delete_groups(
@@ -6705,6 +6734,18 @@ async fn event_loop<T: Terminal>(
             }
         });
     }
+    // Resident bridge: for a remote/provider worktree, connect a persistent in-env
+    // agent (git routes through it; fs.watch becomes refreshes). fs.watch events
+    // fire `RefreshKind::Model` + waker, exactly like the LSP diag forwarder above.
+    let bridge_sup = {
+        let rtx = refresh_tx.clone();
+        let bridge_waker = waker.clone();
+        crate::bridge_sup::BridgeSupervisor::new(std::sync::Arc::new(move || {
+            let _ = rtx.send(RefreshKind::Model);
+            let _ = bridge_waker.wake();
+        }))
+    };
+    crate::bridge_sup::set_global(bridge_sup.clone());
     // Symbols section: the fetched outline / references, cached host-side so they
     // survive model-hydration swaps. The displayed list is derived each frame
     // from the active view (outline vs references) — see the pre-render block.
@@ -7180,6 +7221,10 @@ async fn event_loop<T: Terminal>(
             last_active_worktree = Some(current_worktree.clone());
             // A selection anchored in the previous worktree's pane is stale.
             mouse_sel = None;
+            // For a remote/provider worktree, connect its resident bridge (off
+            // the loop) so git routes through the persistent agent and in-env
+            // file edits stream back as refreshes. No-op for local worktrees.
+            connect_worktree_bridge(&bridge_sup, &current_worktree, keymap.config());
             // Re-heal the canonical checkout's shared `.git/config` off-thread:
             // another agent committing in a sibling worktree could have leaked a
             // stray `core.worktree` since launch. Silent unless it strips a key;
