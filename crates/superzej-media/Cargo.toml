@@ -1,0 +1,35 @@
+[package]
+name = "superzej-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cross-platform media-player control (MPRIS / SMTC / mpv / AppleScript) for the superzej [media] feature"
+
+# Deliberately a LEAF crate with NO internal/SQLite/C build deps, so it can be
+# `cargo check --target <macos|windows>`-ed on a Linux CI box (see the
+# `check-cross` justfile recipe) — the per-OS backends are typecheck-gated.
+# The pure model lives in `model.rs` and is re-exported by `superzej-core`;
+# config stays in core and is lowered into `ResolveOpts`, so this crate never
+# depends on core. Keep heavy deps out.
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+# `net` (on top of the workspace base) for the mpv Unix-socket IPC; the workspace
+# build gets it via feature-unification, but the isolated `cargo check --target`
+# (check-cross) needs the leaf to request it explicitly.
+tokio = { workspace = true, features = ["net"] }
+
+# Linux MPRIS: native D-Bus via zbus + the `futures` stream combinators its
+# signal watcher uses. (`playerctl` fallback shells out — no extra dep.)
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus.workspace = true
+futures.workspace = true
+
+# Windows System Media Transport Controls (added with smtc.rs).
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+  "Media_Control",
+  "Foundation",
+  "Foundation_Collections",
+] }

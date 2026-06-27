@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use tokio::process::Command;
 
-use super::{MediaBackend, MediaCaps, MediaError};
-use superzej_core::media::{LoopMode, MediaState, PlaybackState, Playlist};
+use crate::model::{LoopMode, MediaState, PlaybackState, Playlist};
+use crate::{MediaBackend, MediaCaps, MediaError};
 
 /// Field separator for the `metadata --format` template — a unit-separator byte,
 /// which never appears in track text.

@@ -1165,22 +1165,27 @@ token_reduction_level = "conservative"
 # Drive your music/media player from superzej: play/pause, next/previous,
 # shuffle, loop, volume, and a playlist/player picker — plus a now-playing
 # statusbar badge and panel section. The shell never depends on this; it is
-# strictly additive, so it is OFF by default.
+# strictly additive.
 #
-# `backend = "mpris"` speaks the Linux D-Bus standard (org.mpris.MediaPlayer2)
-# and controls nearly any player: Spotify desktop, mpv (with the mpris plugin),
-# ncspot, spotify-player, musikcube, moc, VLC, cmus (plugin), … It uses native
-# zbus and falls back to the `playerctl` CLI if D-Bus access fails — so install
-# `playerctl` if zbus can't reach your session bus. `backend = "mpv"` instead
-# drives a single mpv instance over its JSON IPC socket (see [media.mpv]).
-# `backend = "jellyfin"` is reserved for a future release.
+# `backend = "auto"` (the default) picks the right backend for your OS:
+#   • Linux   → MPRIS (org.mpris.MediaPlayer2) — native zbus, falling back to the
+#               `playerctl` CLI. Controls Spotify, mpv (mpris plugin), ncspot,
+#               spotify-player, musikcube, moc, VLC, cmus, … (install `playerctl`
+#               if zbus can't reach your session bus).
+#   • Windows → SMTC (System Media Transport Controls) — whatever app owns the
+#               system media session (Spotify, browsers, Groove, …).
+#   • macOS   → AppleScript via `osascript` — Music.app + Spotify.
+# Force a specific backend with `mpris` / `smtc` / `applescript`, or `mpv` to
+# drive a single mpv instance over its JSON IPC socket (see [media.mpv]).
+# `jellyfin` is reserved. A backend selected on the wrong OS is simply inert.
 #
-# Only the selected backend's sub-table is consulted. Turning this off
-# (enabled = false) removes the badge, the panel section, and makes every
-# media-* keybind inert — with zero idle cost.
+# Only the selected backend's sub-table is consulted. On by default; it degrades
+# to inert (no badge, no panel section, no watcher) wherever no supported player
+# is reachable. Set enabled = false to remove the badge, the panel section, and
+# make every media-* keybind inert — zero idle cost.
 [media]
-enabled = false
-backend = "none"            # none | mpris | mpv | jellyfin
+enabled = true
+backend = "auto"            # auto | none | mpris | mpv | smtc | applescript | jellyfin
 # Preferred players (MPRIS bus-name tails) when several are running at once; the
 # first match wins. Empty = pick whatever is actively playing, else the first.
 players_priority = []        # e.g. ["spotify", "mpv"]

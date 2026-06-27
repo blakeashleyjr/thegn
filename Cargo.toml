@@ -4,6 +4,7 @@ members = [
   "crates/superzej-core",
   "crates/superzej-svc",
   "crates/superzej-metrics",
+  "crates/superzej-media",
   "crates/superzej-host",
   "crates/superzej-proxy",
   "crates/sz-kit",
@@ -81,9 +82,14 @@ reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls",
 ] }
 russh = "0.61"
-# MPRIS media control over D-Bus (optional [media] feature). tokio-integrated so
-# the host's runtime drives it; default async-io backend disabled.
+# MPRIS media control over D-Bus (the Linux media backend). tokio-integrated so
+# the host's runtime drives it; default async-io backend disabled. Lives in the
+# C-dep-free `superzej-media` leaf, target-gated to Linux.
 zbus = { version = "5", default-features = false, features = ["tokio"] }
+# Windows System Media Transport Controls — the Windows media backend, target-
+# gated to `cfg(windows)` in the `superzej-media` leaf (cross-checked, never
+# linked on Linux).
+windows = "0.58"
 # --- LLM proxy (group U/V): the one new HTTP-server dependency. tokio/reqwest
 # are widened with extra features inside the superzej-proxy crate's own manifest
 # (cargo merges them with the workspace base). ---
@@ -116,6 +122,7 @@ starship-battery = "0.11"
 superzej-core = { path = "crates/superzej-core" }
 superzej-svc = { path = "crates/superzej-svc" }
 superzej-metrics = { path = "crates/superzej-metrics" }
+superzej-media = { path = "crates/superzej-media" }
 # --- dev/bench tooling ---
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
