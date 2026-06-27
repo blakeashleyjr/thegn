@@ -15316,7 +15316,9 @@ async fn event_loop<T: Terminal>(
                                     Some((_, repo_path)) => match superzej_core::db::Db::open() {
                                         Ok(db) => {
                                             let items = crate::palette::build_move_to_folder_items(
-                                                &db, &repo_path,
+                                                &db,
+                                                &repo_path,
+                                                &keymap.file_worktree_folders(),
                                             );
                                             palette = Some(
                                                 crate::search_everywhere::PaletteSession::new(
@@ -16905,8 +16907,10 @@ async fn event_loop<T: Terminal>(
                     crate::sequence::MatchResult::Pending => {
                         // Show the which-key popup of next-key candidates.
                         which_key_prefix = crate::keyhint::key_hint(&input_key);
-                        which_key =
-                            crate::keyhint::which_key_rows(&keymap.pending_continuations(mode));
+                        which_key = crate::keyhint::which_key_rows(
+                            &keymap.pending_continuations(mode),
+                            keymap.custom_actions(),
+                        );
                         model.status = format!("{} mode   awaiting next key…", mode.as_str());
                         dirty = true;
                         continue;

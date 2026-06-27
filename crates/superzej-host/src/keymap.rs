@@ -1325,6 +1325,31 @@ impl KeyMap {
     pub fn custom_actions(&self) -> &[HostCustomAction] {
         &self.custom_actions
     }
+
+    /// Folder names declared by `file-worktree` custom actions, in config
+    /// order, de-duplicated case-insensitively (matching `ensure_folder`'s
+    /// collation). Lets configured destinations surface in the folder picker /
+    /// palette before any worktree has actually been filed into them.
+    pub fn file_worktree_folders(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for action in &self.custom_actions {
+            if let HostCustomAction::Composite {
+                action: CompositeAction::FileWorktree { folder },
+                ..
+            } = action
+            {
+                let folder = folder.trim();
+                if folder.is_empty() {
+                    continue;
+                }
+                if out.iter().any(|f| f.eq_ignore_ascii_case(folder)) {
+                    continue;
+                }
+                out.push(folder.to_string());
+            }
+        }
+        out
+    }
 }
 
 const ALL_MODES: [Mode; 4] = [Mode::Normal, Mode::VimNormal, Mode::VimInsert, Mode::Emacs];
@@ -2585,6 +2610,33 @@ mod tests {
             } => assert_eq!(folder, "Ready to merge"),
             other => panic!("expected FileWorktree composite, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn file_worktree_folders_collects_and_dedups() {
+        let mk = |name: &str, key: &str, folder: &str| superzej_core::config::CustomAction {
+            name: name.into(),
+            key: key.into(),
+            run: None,
+            action: Some("file-worktree".into()),
+            params: [("folder".to_string(), folder.to_string())]
+                .into_iter()
+                .collect(),
+            menu: true,
+            hint: None,
+            floating: true,
+            close_on_exit: true,
+        };
+        let mut cfg = superzej_core::config::Config::default();
+        cfg.actions.push(mk("a", "Alt m f r", "Ready to merge"));
+        cfg.actions.push(mk("b", "Alt m f p", "PRing"));
+        // Case-only duplicate of the first folder is dropped.
+        cfg.actions.push(mk("c", "Alt m f m", "ready to MERGE"));
+        let map = default_keymap_for(&cfg, None, None);
+        assert_eq!(
+            map.file_worktree_folders(),
+            vec!["Ready to merge".to_string(), "PRing".to_string()]
+        );
     }
 
     #[test]
