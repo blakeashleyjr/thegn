@@ -121,12 +121,8 @@ mod tests {
     #[test]
     fn tune_allocator_is_callable() {
         // Smoke: the env path + FFI call must not panic. (No-op off glibc.)
-        unsafe {
-            std::env::set_var("SUPERZEJ_MALLOC_ARENA_MAX", "0");
-        }
+        // The guard serializes on ENV_LOCK and restores the var on drop.
+        let _env = crate::testenv::EnvVarGuard::set(&[("SUPERZEJ_MALLOC_ARENA_MAX", "0")]);
         tune_allocator();
-        unsafe {
-            std::env::remove_var("SUPERZEJ_MALLOC_ARENA_MAX");
-        }
     }
 }
