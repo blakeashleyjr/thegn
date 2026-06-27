@@ -58,6 +58,7 @@ sz-kit = { path = "../sz-kit" }
 tokei.workspace = true
 alacritty_terminal = "0.26"
 toml_edit = "0.25.12"
-# Display-width of glyphs so the compositor never advances a wide (CJK/emoji)
-# cell past a pane's content rect into the adjacent card border column.
+# Display-width math: chrome layout (CJK/wide/emoji-aware truncation, so a line
+# that measures `w` paints exactly `w` columns) and the compositor border clamp
+# (never advance a wide cell past a pane's content rect into the card border).
 unicode-width = "0.2"

@@ -199,6 +199,10 @@ pub enum Anchor {
     /// Horizontally centered, near the bottom (toast position, above the
     /// statusbar).
     Bottom,
+    /// The box's top-left corner pinned at (x, y) in screen cells, clamped so
+    /// the box stays fully on-screen. Used to drop a popup below a masthead
+    /// item or float one above a statusbar item.
+    At { x: usize, y: usize },
 }
 
 /// A summoned layer: boxed, filled, optionally dimming the backdrop and
@@ -237,6 +241,24 @@ impl Default for LayerSpec {
     }
 }
 
+/// The on-screen box dimensions (border + 1-cell pad each side horizontally,
+/// 1-cell border top/bottom) a `spec` will occupy after clamping its content to
+/// `screen`. Mirrors `open_layer`'s clamping so placement math can't drift from
+/// what actually gets drawn.
+pub fn box_dims(spec: &LayerSpec, screen: Rect) -> (usize, usize) {
+    let cols = spec.cols.min(screen.cols.saturating_sub(6));
+    let rows = spec.rows.min(screen.rows.saturating_sub(3));
+    (cols + 4, rows + 2)
+}
+
+/// Clamp a desired box origin so a `bw×bh` box stays fully inside `screen`.
+/// Saturating: a box larger than the screen pins to the top-left corner.
+pub fn clamp_origin(x: usize, y: usize, bw: usize, bh: usize, screen: Rect) -> (usize, usize) {
+    let max_x = (screen.x + screen.cols).saturating_sub(bw).max(screen.x);
+    let max_y = (screen.y + screen.rows).saturating_sub(bh).max(screen.y);
+    (x.clamp(screen.x, max_x), y.clamp(screen.y, max_y))
+}
+
 /// Compose a layer onto `surface`: dim → shadow → fill → rounded border +
 /// title + badge. Returns the interior content rect for the caller's
 /// `seg::draw_lines`. `None` when the screen is too small for any box.
@@ -248,13 +270,16 @@ pub fn open_layer(surface: &mut Surface, screen: Rect, spec: &LayerSpec) -> Opti
     let rows = spec.rows.min(screen.rows.saturating_sub(3));
     let bw = cols + 4; // border + 1 pad each side
     let bh = rows + 2; // top/bottom border
-    let bx = screen.x + (screen.cols - bw) / 2;
-    let by = match spec.anchor {
-        Anchor::Center => screen.y + (screen.rows - bh) / 2,
-        Anchor::TopThird => screen.y + (screen.rows / 4).min(screen.rows - bh),
+    let center_x = screen.x + (screen.cols - bw) / 2;
+    let (bx, by) = match spec.anchor {
+        Anchor::Center => (center_x, screen.y + (screen.rows - bh) / 2),
+        Anchor::TopThird => (center_x, screen.y + (screen.rows / 4).min(screen.rows - bh)),
         // One row of breathing room above the bottom edge (the statusbar sits
         // outside `screen` for overlays, so this hugs the content's bottom).
-        Anchor::Bottom => screen.y + screen.rows.saturating_sub(bh + 1),
+        Anchor::Bottom => (center_x, screen.y + screen.rows.saturating_sub(bh + 1)),
+        // Pin to an explicit origin (popup below/above a bar item), clamped so
+        // the box never overflows the screen.
+        Anchor::At { x, y } => clamp_origin(x, y, bw, bh, screen),
     };
     let boxr = Rect {
         x: bx,
@@ -473,6 +498,75 @@ mod tests {
             .take(inner.cols)
             .collect();
         assert_eq!(mid.trim(), "");
+    }
+
+    #[test]
+    fn clamp_origin_keeps_box_on_screen() {
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            cols: 80,
+            rows: 24,
+        };
+        // Origin past the right/bottom edge slides back so the box fits.
+        let (x, y) = clamp_origin(78, 23, 20, 8, screen);
+        assert!(x + 20 <= screen.cols, "x={x}");
+        assert!(y + 8 <= screen.rows, "y={y}");
+        assert_eq!((x, y), (60, 16));
+        // A fitting origin is untouched.
+        assert_eq!(clamp_origin(5, 3, 20, 8, screen), (5, 3));
+    }
+
+    #[test]
+    fn clamp_origin_oversized_box_pins_top_left() {
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            cols: 40,
+            rows: 10,
+        };
+        // A box bigger than the screen pins to the origin (top-left).
+        assert_eq!(clamp_origin(20, 5, 100, 50, screen), (0, 0));
+    }
+
+    #[test]
+    fn anchor_at_positions_box_origin() {
+        let mut s = surface_with_text(60, 20, &" ".repeat(60));
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            cols: 60,
+            rows: 20,
+        };
+        let spec = LayerSpec {
+            cols: 10,
+            rows: 3,
+            anchor: Anchor::At { x: 7, y: 4 },
+            ..LayerSpec::default()
+        };
+        let inner = open_layer(&mut s, screen, &spec).expect("fits");
+        // Interior sits one row down + two cols in from the box origin.
+        assert_eq!(inner.x, 7 + 2);
+        assert_eq!(inner.y, 4 + 1);
+    }
+
+    #[test]
+    fn box_dims_matches_open_layer_clamping() {
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            cols: 30,
+            rows: 8,
+        };
+        let spec = LayerSpec {
+            cols: 100,
+            rows: 50,
+            ..LayerSpec::default()
+        };
+        // Content clamps to screen-6 cols / screen-3 rows, plus border/pad.
+        let (bw, bh) = box_dims(&spec, screen);
+        assert_eq!(bw, (30 - 6) + 4);
+        assert_eq!(bh, (8 - 3) + 2);
     }
 
     #[test]

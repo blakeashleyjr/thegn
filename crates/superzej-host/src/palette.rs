@@ -321,22 +321,76 @@ pub(crate) fn build_command_palette_items(
     items
 }
 
+/// Folder names declared by `file-worktree` custom actions in config order,
+/// de-duplicated case-insensitively. Mirrors `HostKeymap::file_worktree_folders`
+/// but reads raw config so call sites without the parsed keymap (the palette)
+/// can derive the same list.
+pub(crate) fn configured_file_worktree_folders(cfg: &superzej_core::config::Config) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for action in &cfg.actions {
+        if action.action.as_deref() != Some("file-worktree") {
+            continue;
+        }
+        let Some(folder) = action.params.get("folder").map(|f| f.trim()) else {
+            continue;
+        };
+        if folder.is_empty() || out.iter().any(|f| f.eq_ignore_ascii_case(folder)) {
+            continue;
+        }
+        out.push(folder.to_string());
+    }
+    out
+}
+
 /// Picker rows for "Move worktree to folder…": one row per existing folder in
-/// the workspace (`move-to-folder:<name>`) plus a trailing "new folder" row
-/// (`move-to-folder:__new__`) that prompts for a name.
+/// the workspace (`move-to-folder:<name>`), then any `configured` folder (from
+/// `file-worktree` custom actions) not already present, plus a trailing "new
+/// folder" row (`move-to-folder:__new__`) that prompts for a name. Selecting a
+/// configured-but-not-yet-existing folder creates it via `ensure_folder`.
 pub(crate) fn build_move_to_folder_items(
     db: &superzej_core::db::Db,
     repo_path: &str,
+    configured: &[String],
 ) -> Vec<crate::palette::PaletteItem> {
     use crate::palette::PaletteItem;
-    let mut items: Vec<PaletteItem> = db
+    let existing: Vec<String> = db
         .folders_for_workspace(repo_path)
         .unwrap_or_default()
         .into_iter()
-        .map(|f| PaletteItem::new(format!("move-to-folder:{}", f.name), f.name))
+        .map(|f| f.name)
         .collect();
+    let mut items: Vec<PaletteItem> = existing
+        .iter()
+        .map(|name| PaletteItem::new(format!("move-to-folder:{name}"), name.clone()))
+        .collect();
+    for folder in configured {
+        if existing.iter().any(|e| e.eq_ignore_ascii_case(folder)) {
+            continue;
+        }
+        items.push(PaletteItem::new(
+            format!("move-to-folder:{folder}"),
+            folder.clone(),
+        ));
+    }
     items.push(PaletteItem::new("move-to-folder:__new__", "＋ New folder…"));
     items
+}
+
+/// The display label for a workspace switch entry. Carries the Ctrl+1..9
+/// quick-jump slot (1-based position in the visible sidebar `workspace_order`)
+/// for slots 1..9, so the entry fuzzy-matches by number or name and the digit
+/// matches the sidebar hint. Workspaces past slot 9, or not in `workspace_order`
+/// (no DB row yet), get no number.
+fn workspace_palette_label(name: &str, repo_path: &str, workspace_order: &[String]) -> String {
+    match workspace_order
+        .iter()
+        .position(|p| p == repo_path)
+        .filter(|i| *i < 9)
+        .map(|i| i + 1)
+    {
+        Some(n) => format!("\u{2726} {n} \u{b7} {name}"),
+        None => format!("\u{2726} {name}"),
+    }
 }
 
 /// Build the palette's item list: the command actions + a nav row per open tab
@@ -347,9 +401,21 @@ pub(crate) fn build_palette(
     db: &superzej_core::db::Db,
     cfg: &superzej_core::config::Config,
     issues: &[superzej_core::issue::Issue],
+    workspace_order: &[String],
 ) -> Vec<crate::palette::PaletteItem> {
     use crate::palette::PaletteItem;
     let mut items = build_command_palette_items(cfg);
+
+    // Folders declared by `file-worktree` custom actions: searchable "file into"
+    // destinations, so a configured folder is reachable from Cmd-K even before
+    // it exists in the DB (the `move-to-folder:` dispatch arm creates it).
+    for folder in configured_file_worktree_folders(cfg) {
+        let key = format!("move-to-folder:{folder}");
+        if items.iter().any(|i| i.key == key) {
+            continue;
+        }
+        items.push(PaletteItem::new(key, format!("📁 File into: {folder}")));
+    }
 
     // Configured pins (scope-filtered to the current workspace): summon by name.
     let ws = (!session.id.is_empty()).then_some(session.id.as_str());
@@ -405,16 +471,17 @@ pub(crate) fn build_palette(
         }
     }
 
-    // Add workspaces (repos) for switching
+    // Add workspaces (repos) for switching. The label carries the Ctrl+1..9
+    // quick-jump slot (from the visible sidebar order) for slots 1..9, so the
+    // entry is fuzzy-matchable by number *or* name and the digit matches the
+    // sidebar hint. The active workspace stays excluded, but its slot is still
+    // reserved in `workspace_order` so the numbers line up.
     if let Ok(workspaces) = db.workspaces() {
         for w in workspaces {
             // Don't add the current workspace as a switch target
             if w.repo_path != session.id {
-                let name = w.name;
-                items.push(PaletteItem::new(
-                    format!("repo:{}", w.repo_path),
-                    format!("✦ {}", name),
-                ));
+                let label = workspace_palette_label(&w.name, &w.repo_path, workspace_order);
+                items.push(PaletteItem::new(format!("repo:{}", w.repo_path), label));
             }
         }
     }
@@ -519,6 +586,88 @@ mod tests {
             PaletteItem::new("switch", "Switch workspace"),
             PaletteItem::new("diff", "Show diff"),
         ]
+    }
+
+    #[test]
+    fn build_palette_numbers_workspace_entries_and_excludes_active() {
+        use superzej_core::config::Config;
+        use superzej_core::db::Db;
+
+        let dir = std::env::temp_dir().join(format!(
+            "sz-palette-build-{}-{}",
+            std::process::id(),
+            superzej_core::util::now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open_at(&dir.join("superzej.db")).unwrap();
+        // Three workspaces in the DB; "/repo/app" is the active session.
+        db.put_workspace("/repo/app", "app", "repo").unwrap();
+        db.put_workspace("/repo/svc", "svc", "repo").unwrap();
+        db.put_workspace("/repo/web", "web", "repo").unwrap();
+
+        let session = crate::session::Session {
+            id: "/repo/app".into(),
+            worktrees: vec![],
+            active: 0,
+        };
+        // Slot order (as `sidebar_workspace_order` would report): app=1, svc=2,
+        // web=3. The active "app" still occupies slot 1 so svc/web get 2/3.
+        let order = vec![
+            "/repo/app".to_string(),
+            "/repo/svc".to_string(),
+            "/repo/web".to_string(),
+        ];
+        let cfg = Config::default();
+        let items = build_palette(&session, &db, &cfg, &[], &order);
+
+        let find = |key: &str| items.iter().find(|i| i.key == key).cloned();
+        // Active workspace is not offered as a switch target.
+        assert!(
+            find("repo:/repo/app").is_none(),
+            "active workspace excluded: {items:?}"
+        );
+        // The other two carry their quick-jump slot in the label.
+        assert_eq!(
+            find("repo:/repo/svc").map(|i| i.label),
+            Some("\u{2726} 2 \u{b7} svc".to_string()),
+        );
+        assert_eq!(
+            find("repo:/repo/web").map(|i| i.label),
+            Some("\u{2726} 3 \u{b7} web".to_string()),
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn workspace_label_carries_quick_jump_slot() {
+        let order = vec![
+            "/repo/app".to_string(),
+            "/repo/svc".to_string(),
+            "/repo/web".to_string(),
+        ];
+        // Slot = 1-based position in the visible sidebar order, matching Ctrl+N.
+        assert_eq!(
+            workspace_palette_label("svc", "/repo/svc", &order),
+            "\u{2726} 2 \u{b7} svc"
+        );
+        // Unknown repo (no DB row in the order yet) → no number.
+        assert_eq!(
+            workspace_palette_label("ghost", "/repo/ghost", &order),
+            "\u{2726} ghost"
+        );
+        // Past slot 9 → no number (Ctrl+N only covers 1..9).
+        let mut long: Vec<String> = (0..10).map(|i| format!("/repo/w{i}")).collect();
+        long.push("/repo/tenth".into());
+        assert_eq!(
+            workspace_palette_label("tenth", "/repo/tenth", &long),
+            "\u{2726} tenth"
+        );
+        // The 9th (index 8) still gets a number.
+        assert_eq!(
+            workspace_palette_label("w8", "/repo/w8", &long),
+            "\u{2726} 9 \u{b7} w8"
+        );
     }
 
     #[test]
@@ -660,6 +809,86 @@ mod tests {
             custom.label.contains("Ctrl-Alt-r"),
             "label was {}",
             custom.label
+        );
+    }
+
+    fn cfg_with_file_worktree(folders: &[&str]) -> superzej_core::config::Config {
+        let mut cfg = superzej_core::config::Config::default();
+        for (i, folder) in folders.iter().enumerate() {
+            cfg.actions.push(superzej_core::config::CustomAction {
+                name: format!("File: {folder}"),
+                key: format!("Alt m f {i}"),
+                run: None,
+                action: Some("file-worktree".into()),
+                params: [("folder".to_string(), folder.to_string())]
+                    .into_iter()
+                    .collect(),
+                menu: false,
+                hint: None,
+                floating: true,
+                close_on_exit: true,
+            });
+        }
+        cfg
+    }
+
+    #[test]
+    fn configured_folders_collects_filters_and_dedups() {
+        let cfg = cfg_with_file_worktree(&["Ready to merge", "PRing", "ready to MERGE"]);
+        assert_eq!(
+            configured_file_worktree_folders(&cfg),
+            vec!["Ready to merge".to_string(), "PRing".to_string()]
+        );
+        // A shell action (no `action = "file-worktree"`) is ignored.
+        let mut cfg = cfg_with_file_worktree(&["Done"]);
+        cfg.actions.push(superzej_core::config::CustomAction {
+            name: "run".into(),
+            key: "Ctrl r".into(),
+            run: Some("just test".into()),
+            action: None,
+            params: Default::default(),
+            menu: true,
+            hint: None,
+            floating: true,
+            close_on_exit: true,
+        });
+        assert_eq!(
+            configured_file_worktree_folders(&cfg),
+            vec!["Done".to_string()]
+        );
+    }
+
+    #[test]
+    fn move_to_folder_unions_db_and_configured_without_dupes() {
+        let db = superzej_core::db::Db::open_memory().unwrap();
+        db.put_workspace("/x/app", "app", "repo").unwrap();
+        db.create_folder("/x/app", "Ready to merge").unwrap();
+        // "ready to MERGE" is a case-dup of the DB folder → not added twice;
+        // "PRing" is configured-only → appears; "__new__" stays last.
+        let configured = vec!["ready to MERGE".to_string(), "PRing".to_string()];
+        let items = build_move_to_folder_items(&db, "/x/app", &configured);
+        let keys: Vec<&str> = items.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "move-to-folder:Ready to merge",
+                "move-to-folder:PRing",
+                "move-to-folder:__new__",
+            ]
+        );
+    }
+
+    #[test]
+    fn command_palette_surfaces_configured_folder_destinations() {
+        let cfg = cfg_with_file_worktree(&["Ready to merge"]);
+        // `build_command_palette_items` is the static command list; the dynamic
+        // destination row is added by `build_palette`, but we can assert the
+        // helper feeds it: the folder is present and not gated on `menu = true`.
+        assert!(configured_file_worktree_folders(&cfg).contains(&"Ready to merge".to_string()));
+        let items = build_command_palette_items(&cfg);
+        assert!(
+            !items.iter().any(|i| i.key == "File: Ready to merge"),
+            "menu=false keeps the action itself out of the static list"
         );
     }
 

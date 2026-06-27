@@ -13,6 +13,7 @@
 
 use termwiz::color::ColorAttribute;
 use termwiz::surface::Surface;
+use unicode_width::UnicodeWidthStr;
 
 use crate::chrome::{self, S, col};
 use crate::compositor::Rect;
@@ -255,15 +256,26 @@ pub fn draw_splash(surface: &mut Surface, rect: Rect, model: &crate::chrome::Fra
 
     // Center one line made of (text, fg) parts.
     let centered_parts = |surface: &mut Surface, y: usize, parts: &[(&str, ColorAttribute)]| {
-        let w: usize = parts.iter().map(|(t, _)| t.chars().count()).sum();
+        let w: usize = parts.iter().map(|(t, _)| UnicodeWidthStr::width(*t)).sum();
         let mut x = rect.x + rect.cols.saturating_sub(w) / 2;
         for (t, fg) in parts {
             chrome::draw_text(surface, x, y, t, *fg, bg, rect.x + rect.cols - x);
-            x += t.chars().count();
+            x += UnicodeWidthStr::width(*t);
         }
     };
 
-    match splash_variant(rect.cols, rect.rows) {
+    // The Large/Small wordmarks are a half-block (`▀▄█`) pixel font that an
+    // ASCII-only terminal can't render; fall back to the plain text wordmark.
+    let variant = match splash_variant(rect.cols, rect.rows) {
+        v @ (SplashVariant::Large | SplashVariant::Small)
+            if crate::caps::unicode_level() == superzej_core::termcaps::UnicodeLevel::Ascii =>
+        {
+            let _ = v;
+            SplashVariant::Text
+        }
+        v => v,
+    };
+    match variant {
         SplashVariant::Large => {
             // Loading: wordmark(3) + gap(1) + version(1) + gap(1) + steps(N).
             // Idle:    wordmark(3) + gap(1) + version(1) + gap(1) + hints(3) = 9 rows total.
@@ -375,11 +387,12 @@ fn step_glyph(
     accent: ColorAttribute,
 ) -> (&'static str, ColorAttribute) {
     use crate::chrome::StepState;
+    let g = crate::caps::active_glyphs();
     match step.state {
-        StepState::Done => ("✓", col(S::Dim)),
-        StepState::Active => ("◆", accent),
-        StepState::Pending => ("◇", col(S::Ghost)),
-        StepState::Failed => ("✗", col(S::Ghost)),
+        StepState::Done => (g.check, col(S::Dim)),
+        StepState::Active => (g.diamond_filled, accent),
+        StepState::Pending => (g.diamond_hollow, col(S::Ghost)),
+        StepState::Failed => (g.cross, col(S::Ghost)),
     }
 }
 
@@ -396,7 +409,7 @@ fn draw_steps(
     // Find the width of the widest label to left-align the block as a whole.
     let max_label = steps
         .iter()
-        .map(|s| s.label.chars().count())
+        .map(|s| UnicodeWidthStr::width(s.label.as_str()))
         .max()
         .unwrap_or(0);
     // glyph(1) + space(1) + label
@@ -558,5 +571,28 @@ mod tests {
         assert!(all.contains("superzej"));
         assert!(all.contains(env!("CARGO_PKG_VERSION")));
         assert!(!all.contains('▀'), "no pixel wordmark in text fallback");
+    }
+
+    #[test]
+    fn ascii_terminal_forces_text_splash_even_when_large() {
+        use superzej_core::termcaps::UnicodeLevel;
+        crate::caps::test_override::with_unicode(UnicodeLevel::Ascii, || {
+            // A generously large area would normally draw the half-block wordmark.
+            let mut s = Surface::new(80, 24);
+            let rect = Rect {
+                x: 0,
+                y: 0,
+                cols: 80,
+                rows: 24,
+            };
+            let model = crate::chrome::FrameModel::default();
+            draw_splash(&mut s, rect, &model);
+            let all = lines(&mut s).join("\n");
+            assert!(all.contains("superzej"), "text wordmark present");
+            assert!(
+                !all.contains('▀') && !all.contains('▄') && !all.contains('█'),
+                "no half-block pixel font on an ASCII terminal"
+            );
+        });
     }
 }

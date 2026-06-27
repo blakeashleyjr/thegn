@@ -7,14 +7,16 @@
 //! bg) is painted in the line's pad background — so a tinted row colors its
 //! whole width with one call.
 //!
-//! Cell math is `chars().count()`, matching the rest of chrome; the viz
-//! primitives (blocks, braille, box drawing) are all width-1. CJK/emoji in
-//! segs is out of contract.
+//! Cell math is **display width** (`unicode-width`): a wide glyph (CJK, many
+//! emoji) advances two cells, so a line that measures `w` paints exactly `w`
+//! columns and truncation never splits a wide glyph across the right edge. The
+//! viz primitives (blocks, braille, box drawing) are width-1.
 #![allow(dead_code)] // the full mockup style vocabulary (italic/strike/Rgb/underline) — kept whole even where chrome hasn't adopted a token yet
 
 use termwiz::cell::{CellAttributes, Intensity, Underline};
 use termwiz::color::ColorAttribute;
 use termwiz::surface::{Change, Position, Surface};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::chrome::{self, S};
 use crate::compositor::Rect;
@@ -153,8 +155,25 @@ impl Seg {
     }
 
     fn width(&self) -> usize {
-        self.text.chars().count()
+        self.text.width()
     }
+}
+
+/// Return the longest prefix of `s` whose display width is `<= max`, never
+/// splitting a wide glyph across the boundary. The returned width is therefore
+/// `<= max` and may be one cell short when a 2-wide glyph straddles the edge
+/// (the caller pads the gap). Ambiguous-width glyphs count as 1, matching most
+/// terminals.
+pub(crate) fn take_cols(s: &str, max: usize) -> &str {
+    let mut used = 0usize;
+    for (i, ch) in s.char_indices() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > max {
+            return &s[..i];
+        }
+        used += w;
+    }
+    s
 }
 
 /// A row spec, fitted to exactly `w` cells by [`draw_line`].
@@ -209,7 +228,7 @@ pub(crate) fn cut(segs: &[Seg], max: usize) -> Vec<Seg> {
         let room = max - 1 - used;
         if room > 0 {
             let mut clipped = s.clone();
-            clipped.text = s.text.chars().take(room).collect();
+            clipped.text = take_cols(&s.text, room).to_string();
             out.push(clipped);
         }
         out.push(seg(Tok::Slot(S::Ghost), "…"));
@@ -388,6 +407,39 @@ mod tests {
     }
 
     const PAD: Tok = Tok::Slot(S::Bg1);
+
+    #[test]
+    fn take_cols_counts_display_width() {
+        // ASCII: one column per char.
+        assert_eq!(take_cols("hello", 3), "hel");
+        // Wide glyphs (CJK) advance two columns each.
+        assert_eq!(take_cols("\u{4f60}\u{597d}", 4), "\u{4f60}\u{597d}"); // 你好 = 4 cols
+        assert_eq!(take_cols("\u{4f60}\u{597d}", 3), "\u{4f60}"); // only 你 fits in 3
+        // A wide glyph straddling the boundary is dropped, not split.
+        assert_eq!(take_cols("\u{4f60}\u{597d}", 2), "\u{4f60}");
+        assert_eq!(take_cols("\u{4f60}\u{597d}", 1), ""); // 你 needs 2, won't split
+    }
+
+    #[test]
+    fn seg_width_is_display_width() {
+        assert_eq!(seg(Tok::Slot(S::Text), "ab").width(), 2);
+        assert_eq!(seg(Tok::Slot(S::Text), "\u{4f60}\u{597d}").width(), 4);
+    }
+
+    #[test]
+    fn wide_glyph_line_paints_exact_width() {
+        // A 6-cell line holding "你好" (each glyph is 2 cols) + pad must place the
+        // two wide glyphs at cols 0 and 2 (col 1/3 are continuation cells) and
+        // pad cols 4–5 — i.e. exactly 6 cells, no overflow.
+        let mut s = Surface::new(6, 1);
+        let line = Line::Segs(vec![seg(Tok::Slot(S::Text), "\u{4f60}\u{597d}")]);
+        draw_line(&mut s, 0, 0, 6, &line, PAD);
+        let cells = s.screen_cells();
+        assert_eq!(cells[0][0].str(), "\u{4f60}", "first wide glyph at col 0");
+        assert_eq!(cells[0][2].str(), "\u{597d}", "second wide glyph at col 2");
+        assert_eq!(cells[0][4].str(), " ", "pad after glyphs");
+        assert_eq!(cells[0][5].str(), " ", "pad fills to width");
+    }
 
     #[test]
     fn blank_line_fills_width() {
