@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use superzej_core::config::{Config, LimitsConfig, Task, TaskKind};
+use superzej_core::remote::GitLoc;
 
 use crate::panel::{self, TestLocation, TestNode, TestNodeKind, TestState, TestTask};
 
@@ -158,6 +159,7 @@ fn isolated_cargo_target(worktree: &Path, limits: &LimitsConfig) -> Option<PathB
 /// the deadline (so a run wedged on a build lock can't hang the panel forever).
 fn run_capped(
     command: &str,
+    loc: &GitLoc,
     worktree: &Path,
     limits: &LimitsConfig,
     slot: &str,
@@ -172,34 +174,48 @@ fn run_capped(
         "-c".to_string(),
         command.to_string(),
     ];
-    run_capped_argv(&inner, worktree, limits, slot, generation, timeout)
+    run_capped_argv(&inner, loc, worktree, limits, slot, generation, timeout)
 }
 
 /// Like [`run_capped`] but runs a prebuilt argv directly (no shell), so callers
 /// passing user/pattern data — e.g. the ripgrep source scan — never have to
 /// shell-quote. `inner[0]` is the program; the cap wrapper is prepended.
+/// Build the `Command` for a task's inner argv, routed by the worktree's
+/// location. **Local**: the host cap wrapper (systemd-run memory limit) + the
+/// worktree cwd + an isolated `CARGO_TARGET_DIR`. **Remote** (ssh/provider): run
+/// the argv *inside the env* via the control transport (`GitLoc::sh_command`,
+/// which `cd`s into the worktree) — the host cap wrapper and host cargo-target
+/// don't apply across the transport, and the env enforces its own limits.
+/// Stdio/process-group are applied by the caller (identical for both).
+fn task_command(loc: &GitLoc, inner: &[String], worktree: &Path, limits: &LimitsConfig) -> Command {
+    if loc.is_remote() {
+        return loc.sh_command(&superzej_core::util::sh_join(inner));
+    }
+    let argv = wrap_capped(inner, limits, detect_cap_backend());
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..]).current_dir(worktree);
+    if let Some(target) = isolated_cargo_target(worktree, limits) {
+        cmd.env("CARGO_TARGET_DIR", target);
+    }
+    cmd
+}
+
 fn run_capped_argv(
     inner: &[String],
+    loc: &GitLoc,
     worktree: &Path,
     limits: &LimitsConfig,
     slot: &str,
     generation: u64,
     timeout: Option<Duration>,
 ) -> CapOutput {
-    let argv = wrap_capped(inner, limits, detect_cap_backend());
-
     // Supersede any older job in this slot.
     cancel_slot(slot);
 
-    let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..])
-        .current_dir(worktree)
-        .stdin(Stdio::null())
+    let mut cmd = task_command(loc, inner, worktree, limits);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(target) = isolated_cargo_target(worktree, limits) {
-        cmd.env("CARGO_TARGET_DIR", target);
-    }
     #[cfg(unix)]
     {
         cmd.process_group(0);
@@ -664,6 +680,7 @@ fn infer_matcher(command: &str) -> String {
 
 pub fn run_task(
     worktree: PathBuf,
+    loc: &GitLoc,
     generation: u64,
     task: TestTask,
     limits: &LimitsConfig,
@@ -672,6 +689,7 @@ pub fn run_task(
     let slot = format!("{}:run", worktree.display());
     let out = run_capped(
         &task.command,
+        loc,
         &worktree,
         limits,
         &slot,
@@ -878,6 +896,7 @@ fn parse_scan_output(text: &str) -> Vec<TestNode> {
 
 pub fn discover_tests(
     worktree: PathBuf,
+    loc: &GitLoc,
     generation: u64,
     task: TestTask,
     limits: &LimitsConfig,
@@ -890,7 +909,7 @@ pub fn discover_tests(
     // declarations. rg/grep exit 1 on "no matches" — not an error here.
     if let Some(rule) = scan_rule(task.matcher.as_str()) {
         let argv = build_scan_argv(&rule);
-        let out = run_capped_argv(&argv, &worktree, limits, &slot, generation, timeout);
+        let out = run_capped_argv(&argv, loc, &worktree, limits, &slot, generation, timeout);
         if out.timed_out {
             return DiscoveryOutcome {
                 worktree: wt,
@@ -929,7 +948,7 @@ pub fn discover_tests(
         };
     };
 
-    let out = run_capped(command, &worktree, limits, &slot, generation, timeout);
+    let out = run_capped(command, loc, &worktree, limits, &slot, generation, timeout);
     if out.timed_out {
         return DiscoveryOutcome {
             worktree: wt,
@@ -1206,6 +1225,40 @@ mod tests {
     }
 
     #[test]
+    fn task_command_routes_remote_through_env_and_local_directly() {
+        let inner = vec!["sh".to_string(), "-c".to_string(), "cargo test".to_string()];
+        // Provider loc → the command runs IN the env via the control prefix,
+        // cd'd into the worktree (no host cap wrapper).
+        let prov = GitLoc::provider(
+            vec!["sprite".into(), "exec".into(), "--".into()],
+            "/workspace",
+        );
+        let cmd = task_command(&prov, &inner, std::path::Path::new("/ignored"), &uncapped());
+        assert_eq!(cmd.get_program().to_string_lossy(), "sprite");
+        let joined: String = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            joined.contains("cd /workspace &&"),
+            "cd into env workdir: {joined}"
+        );
+        assert!(
+            joined.contains("cargo test"),
+            "carries the command: {joined}"
+        );
+
+        // Local loc → run directly on the host at the worktree cwd (uncapped ⇒
+        // the program is the inner argv[0], not a transport).
+        let wt = temp_dir("task-cmd-local");
+        let local = GitLoc::Local(wt.clone());
+        let cmd = task_command(&local, &inner, &wt, &uncapped());
+        assert_eq!(cmd.get_program().to_string_lossy(), "sh");
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
     fn configured_test_task_beats_manifest_fallback() {
         let wt = temp_dir("configured");
         std::fs::write(
@@ -1437,7 +1490,13 @@ mod tests {
         // Run the real test command (single-threaded for stable output).
         let run_task_spec =
             TestTask::new("cargo test", "cargo test -- --test-threads=1", "cargo-test");
-        let outcome = run_task(wt.clone(), 1, run_task_spec, &uncapped());
+        let outcome = run_task(
+            wt.clone(),
+            &GitLoc::Local(wt.clone()),
+            1,
+            run_task_spec,
+            &uncapped(),
+        );
         let nodes = parse_task_outcome(&outcome);
 
         assert_eq!(outcome.exit_code, Some(101), "real cargo test should fail");
@@ -1457,7 +1516,7 @@ mod tests {
         // Discovery is metadata-based (no compile, no build lock): it lists the
         // crate's testable *targets*, marked as placeholders until a run fills
         // in the per-test results.
-        let disc = discover_tests(wt.clone(), 2, task, &uncapped());
+        let disc = discover_tests(wt.clone(), &GitLoc::Local(wt.clone()), 2, task, &uncapped());
         assert!(disc.error.is_none(), "discovery error: {:?}", disc.error);
         let target = disc
             .nodes
@@ -1488,7 +1547,7 @@ mod tests {
     fn e2e_generic_shell_task_runs_real_process() {
         let wt = temp_dir("e2e-generic");
         let task = TestTask::new("echo-pass", "echo '✓ widget::works' && true", "generic");
-        let outcome = run_task(wt.clone(), 1, task, &uncapped());
+        let outcome = run_task(wt.clone(), &GitLoc::Local(wt.clone()), 1, task, &uncapped());
         assert_eq!(outcome.exit_code, Some(0));
         let nodes = parse_task_outcome(&outcome);
         assert!(
@@ -1528,7 +1587,7 @@ mod tests {
             "nextest",
         )
         .with_ingestion(crate::panel::Ingestion::Json);
-        let outcome = run_task(wt.clone(), 1, task, &uncapped());
+        let outcome = run_task(wt.clone(), &GitLoc::Local(wt.clone()), 1, task, &uncapped());
 
         // Only assert structured results if this nextest version actually emitted
         // libtest-json `"type":"test"` events; otherwise the experimental format
@@ -1656,7 +1715,15 @@ mod tests {
         let slot2 = slot.clone();
         let handle = std::thread::spawn(move || {
             // Sleeps 30s unless its process group is killed.
-            run_capped("sleep 30", &wt, &uncapped(), &slot2, 1, None)
+            run_capped(
+                "sleep 30",
+                &GitLoc::Local(wt.clone()),
+                &wt,
+                &uncapped(),
+                &slot2,
+                1,
+                None,
+            )
         });
         // Wait for the child to register, then supersede it.
         let mut waited = 0;
@@ -1683,6 +1750,7 @@ mod tests {
         let start = Instant::now();
         let out = run_capped(
             "sleep 30",
+            &GitLoc::Local(wt.clone()),
             &wt,
             &uncapped(),
             &slot,
@@ -1800,7 +1868,7 @@ mod tests {
 
         let task = detect_test_task(&wt, &Config::default()).unwrap();
         assert_eq!(task.matcher, "go-test");
-        let disc = discover_tests(wt.clone(), 1, task, &uncapped());
+        let disc = discover_tests(wt.clone(), &GitLoc::Local(wt.clone()), 1, task, &uncapped());
         assert!(disc.error.is_none(), "discovery error: {:?}", disc.error);
         let labels: Vec<&str> = disc
             .nodes
