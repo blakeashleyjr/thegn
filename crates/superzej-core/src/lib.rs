@@ -18,6 +18,7 @@ pub mod custom_cmd;
 pub mod db;
 pub mod diff_highlight;
 pub mod diff_sbs;
+pub mod disk;
 pub mod dns_filter;
 pub mod env;
 pub mod event_bus;

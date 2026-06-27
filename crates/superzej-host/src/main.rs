@@ -125,6 +125,27 @@ pub enum Command {
     },
     /// List managed worktrees.
     List,
+    /// Report per-worktree disk usage (checkout + reclaimable `target/`).
+    Disk {
+        /// Scan only this worktree (defaults to all known worktrees).
+        #[arg(long)]
+        worktree: Option<String>,
+        /// Scan every known worktree (the default when no `--worktree` is given).
+        #[arg(long)]
+        all: bool,
+    },
+    /// Reclaim a worktree's `target/` build artifacts (keeps the checkout).
+    Clean {
+        /// Clean this worktree (defaults to the current one).
+        #[arg(long)]
+        worktree: Option<String>,
+        /// Clean every known worktree (except the active one).
+        #[arg(long)]
+        all: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        force: bool,
+    },
     /// List git repos discovered under repo_roots.
     Repos,
     /// List recently opened repos (history).
@@ -221,6 +242,12 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             file,
         } => cmd::diff::run(worktree, base, stat, file),
         Command::List => cmd::list::run(&cfg),
+        Command::Disk { worktree, all } => cmd::disk::disk(&cfg, worktree, all),
+        Command::Clean {
+            worktree,
+            all,
+            force,
+        } => cmd::disk::clean(&cfg, worktree, all, force),
         Command::Repos => cmd::repos::repos(&cfg),
         Command::Recent { count } => cmd::repos::recent(count),
         Command::Config { action } => cmd::config::run(&cfg, action, config_path),
