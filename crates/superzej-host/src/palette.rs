@@ -339,6 +339,23 @@ pub(crate) fn build_move_to_folder_items(
     items
 }
 
+/// The display label for a workspace switch entry. Carries the Ctrl+1..9
+/// quick-jump slot (1-based position in the visible sidebar `workspace_order`)
+/// for slots 1..9, so the entry fuzzy-matches by number or name and the digit
+/// matches the sidebar hint. Workspaces past slot 9, or not in `workspace_order`
+/// (no DB row yet), get no number.
+fn workspace_palette_label(name: &str, repo_path: &str, workspace_order: &[String]) -> String {
+    match workspace_order
+        .iter()
+        .position(|p| p == repo_path)
+        .filter(|i| *i < 9)
+        .map(|i| i + 1)
+    {
+        Some(n) => format!("\u{2726} {n} \u{b7} {name}"),
+        None => format!("\u{2726} {name}"),
+    }
+}
+
 /// Build the palette's item list: the command actions + a nav row per open tab
 /// (`tab:<name>`), ordered by frecency for the empty-query view (the host port
 /// of the old engine's command + nav + frecency sources).
@@ -347,6 +364,7 @@ pub(crate) fn build_palette(
     db: &superzej_core::db::Db,
     cfg: &superzej_core::config::Config,
     issues: &[superzej_core::issue::Issue],
+    workspace_order: &[String],
 ) -> Vec<crate::palette::PaletteItem> {
     use crate::palette::PaletteItem;
     let mut items = build_command_palette_items(cfg);
@@ -405,16 +423,17 @@ pub(crate) fn build_palette(
         }
     }
 
-    // Add workspaces (repos) for switching
+    // Add workspaces (repos) for switching. The label carries the Ctrl+1..9
+    // quick-jump slot (from the visible sidebar order) for slots 1..9, so the
+    // entry is fuzzy-matchable by number *or* name and the digit matches the
+    // sidebar hint. The active workspace stays excluded, but its slot is still
+    // reserved in `workspace_order` so the numbers line up.
     if let Ok(workspaces) = db.workspaces() {
         for w in workspaces {
             // Don't add the current workspace as a switch target
             if w.repo_path != session.id {
-                let name = w.name;
-                items.push(PaletteItem::new(
-                    format!("repo:{}", w.repo_path),
-                    format!("✦ {}", name),
-                ));
+                let label = workspace_palette_label(&w.name, &w.repo_path, workspace_order);
+                items.push(PaletteItem::new(format!("repo:{}", w.repo_path), label));
             }
         }
     }
@@ -519,6 +538,88 @@ mod tests {
             PaletteItem::new("switch", "Switch workspace"),
             PaletteItem::new("diff", "Show diff"),
         ]
+    }
+
+    #[test]
+    fn build_palette_numbers_workspace_entries_and_excludes_active() {
+        use superzej_core::config::Config;
+        use superzej_core::db::Db;
+
+        let dir = std::env::temp_dir().join(format!(
+            "sz-palette-build-{}-{}",
+            std::process::id(),
+            superzej_core::util::now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open_at(&dir.join("superzej.db")).unwrap();
+        // Three workspaces in the DB; "/repo/app" is the active session.
+        db.put_workspace("/repo/app", "app", "repo").unwrap();
+        db.put_workspace("/repo/svc", "svc", "repo").unwrap();
+        db.put_workspace("/repo/web", "web", "repo").unwrap();
+
+        let session = crate::session::Session {
+            id: "/repo/app".into(),
+            worktrees: vec![],
+            active: 0,
+        };
+        // Slot order (as `sidebar_workspace_order` would report): app=1, svc=2,
+        // web=3. The active "app" still occupies slot 1 so svc/web get 2/3.
+        let order = vec![
+            "/repo/app".to_string(),
+            "/repo/svc".to_string(),
+            "/repo/web".to_string(),
+        ];
+        let cfg = Config::default();
+        let items = build_palette(&session, &db, &cfg, &[], &order);
+
+        let find = |key: &str| items.iter().find(|i| i.key == key).cloned();
+        // Active workspace is not offered as a switch target.
+        assert!(
+            find("repo:/repo/app").is_none(),
+            "active workspace excluded: {items:?}"
+        );
+        // The other two carry their quick-jump slot in the label.
+        assert_eq!(
+            find("repo:/repo/svc").map(|i| i.label),
+            Some("\u{2726} 2 \u{b7} svc".to_string()),
+        );
+        assert_eq!(
+            find("repo:/repo/web").map(|i| i.label),
+            Some("\u{2726} 3 \u{b7} web".to_string()),
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn workspace_label_carries_quick_jump_slot() {
+        let order = vec![
+            "/repo/app".to_string(),
+            "/repo/svc".to_string(),
+            "/repo/web".to_string(),
+        ];
+        // Slot = 1-based position in the visible sidebar order, matching Ctrl+N.
+        assert_eq!(
+            workspace_palette_label("svc", "/repo/svc", &order),
+            "\u{2726} 2 \u{b7} svc"
+        );
+        // Unknown repo (no DB row in the order yet) → no number.
+        assert_eq!(
+            workspace_palette_label("ghost", "/repo/ghost", &order),
+            "\u{2726} ghost"
+        );
+        // Past slot 9 → no number (Ctrl+N only covers 1..9).
+        let mut long: Vec<String> = (0..10).map(|i| format!("/repo/w{i}")).collect();
+        long.push("/repo/tenth".into());
+        assert_eq!(
+            workspace_palette_label("tenth", "/repo/tenth", &long),
+            "\u{2726} tenth"
+        );
+        // The 9th (index 8) still gets a number.
+        assert_eq!(
+            workspace_palette_label("w8", "/repo/w8", &long),
+            "\u{2726} 9 \u{b7} w8"
+        );
     }
 
     #[test]
