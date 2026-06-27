@@ -71,6 +71,8 @@ pub struct Overlays {
     pub search: bool,
     pub which_key: bool,
     pub toasts: bool,
+    /// A bar-item detail popup/modal (CPU graph, notifications list, …).
+    pub detail: bool,
 }
 
 impl Overlays {
@@ -87,6 +89,7 @@ impl Overlays {
             || self.search
             || self.which_key
             || self.toasts
+            || self.detail
     }
 }
 
@@ -259,6 +262,10 @@ mod tests {
             },
             Overlays {
                 toasts: true,
+                ..Default::default()
+            },
+            Overlays {
+                detail: true,
                 ..Default::default()
             },
         ];

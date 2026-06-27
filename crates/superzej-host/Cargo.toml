@@ -58,3 +58,7 @@ sz-kit = { path = "../sz-kit" }
 tokei.workspace = true
 alacritty_terminal = "0.26"
 toml_edit = "0.25.12"
+# Display-width math for chrome layout (CJK/wide/emoji-aware truncation), so a
+# line that measures `w` paints exactly `w` columns. Already in the tree via
+# alacritty_terminal; pinned here as a direct dep.
+unicode-width = "0.2"

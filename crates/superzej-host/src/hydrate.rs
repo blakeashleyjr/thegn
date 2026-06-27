@@ -15,19 +15,32 @@ use termwiz::terminal::TerminalWaker;
 use crate::chrome::{FrameModel, LoadStep};
 use crate::run::now_secs;
 
-/// Sidebar/panel re-hydration cadence — and the fidelity knob for the sidebar's
-/// live status: the activity-dot FSM (`activity::poll_and_save`) and the git
-/// glyphs (dirty / ahead-behind per worktree) are sampled inside this tick, so
-/// they only refresh this often. Default 1s (was 2s); override with
-/// `SUPERZEJ_MODEL_REFRESH_MS`. Clamped to a multiple of the 500ms ticker base,
-/// min 500ms. Lower = snappier dots/glyphs at the cost of more background git
-/// work; a re-hydration that changes nothing is dropped before any repaint by
-/// `FrameModel::hydration_eq`, so a faster cadence does NOT cost idle frames.
+/// Default for [`model_refresh_interval`]. Matches `bg_glyph_ttl`'s 5s default
+/// (the ticker's only job is refreshing background glyphs + the activity FSM);
+/// must stay a multiple of the 500ms base that divides `PR_REFRESH_INTERVAL` so
+/// the ticker keeps emitting `RefreshKind::Pr` (see the cadence-invariant test).
+const DEFAULT_MODEL_REFRESH_MS: u64 = 5000;
+
+/// Safety-net cadence for the background model re-hydration ticker. The *active*
+/// worktree's panel + git glyphs already update in real time off the diff
+/// fs-watcher (`retarget_diff_watcher`), so this tick exists only to (a) refresh
+/// *background* worktrees' sidebar glyphs — themselves capped to the
+/// `bg_glyph_ttl` (5s) staleness window, so ticking faster does no extra git
+/// work — and (b) advance the activity-dot FSM (`activity::poll_and_save`, which
+/// is wall-normalized and so stays correct at any cadence; dots just react up to
+/// one tick later). The default therefore matches that 5s TTL.
+///
+/// It was 1s, which rebuilt the whole model — a ~0.3-0.4s `git` fan-out — every
+/// second even when fully idle. `FrameModel::hydration_eq` drops the idle
+/// *frame*, but NOT the wasted *build CPU*; on this thread that redundant rebuild
+/// was the dominant idle/agent-active hydration cost. Override with
+/// `SUPERZEJ_MODEL_REFRESH_MS` (lower = snappier dots/glyphs, more background git
+/// work). Clamped to a multiple of the 500ms ticker base, min 500ms.
 fn model_refresh_interval() -> Duration {
     let ms = std::env::var("SUPERZEJ_MODEL_REFRESH_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(1000)
+        .unwrap_or(DEFAULT_MODEL_REFRESH_MS)
         .max(500);
     Duration::from_millis((ms / 500) * 500)
 }
@@ -82,6 +95,51 @@ pub(crate) fn should_rescan_glyphs(
         None => true,
         Some(age) => age >= ttl,
     }
+}
+
+/// Merge a freshly-attempted git scan against the worktree's last-known-good
+/// row. Pure, so it's unit-tested. A live `gix` read (dirty / ahead-behind /
+/// branch) can return `Err` when it races a concurrent `.git` mutation — the
+/// user committing/fetching in the pane, or hydration's own index rewrite. That
+/// transient failure must NOT collapse a real glyph to zero/clean; each errored
+/// field reuses the prior cached value instead. A genuine `Ok(None)` from
+/// `ahead_behind` (no upstream configured) is the real "no arrows" state and is
+/// kept as `(0, 0)`. The returned `bool` is `true` only when every read
+/// succeeded — a degraded row must not overwrite the cache (else it would poison
+/// background reuse for up to the TTL). `Err` is modelled as `()` so the helper
+/// stays free of the git backend's error type.
+#[allow(clippy::type_complexity)]
+pub(crate) fn merge_glyph_scan(
+    prior: Option<&GlyphRow>,
+    dirty: std::result::Result<bool, ()>,
+    ahead_behind: std::result::Result<Option<(usize, usize)>, ()>,
+    branch: std::result::Result<Option<String>, ()>,
+    repo_root: String,
+) -> (GlyphRow, bool) {
+    let mut clean = true;
+    let dirty = match dirty {
+        Ok(d) => d,
+        Err(()) => {
+            clean = false;
+            prior.map(|p| p.0).unwrap_or(false)
+        }
+    };
+    let (ahead, behind) = match ahead_behind {
+        Ok(Some((a, b))) => (a, b),
+        Ok(None) => (0, 0),
+        Err(()) => {
+            clean = false;
+            prior.map(|p| (p.1, p.2)).unwrap_or((0, 0))
+        }
+    };
+    let branch = match branch {
+        Ok(b) => b,
+        Err(()) => {
+            clean = false;
+            prior.and_then(|p| p.3.clone())
+        }
+    };
+    ((dirty, ahead, behind, branch, repo_root), clean)
 }
 
 /// A refresh request delivered to the event loop. `Model` rehydrates the
@@ -666,6 +724,11 @@ fn collect_sidebar_status(
     let now = Instant::now();
     let mut to_scan: Vec<String> = Vec::new();
     let mut reused: Vec<(String, GlyphRow)> = Vec::new();
+    // Last-known-good rows for the paths we're about to rescan, so a scan that
+    // hits a transient gix error can reuse the prior value instead of dropping
+    // the glyph to zero/clean (see `merge_glyph_scan`).
+    let mut prior_for_scan: std::collections::HashMap<String, GlyphRow> =
+        std::collections::HashMap::new();
     {
         let cache = glyph_cache().lock().unwrap();
         for p in &paths {
@@ -673,6 +736,9 @@ fn collect_sidebar_status(
             let cached = cache.get(p);
             let age = cached.map(|(_, ts)| now.saturating_duration_since(*ts));
             if should_rescan_glyphs(is_active, age, ttl) {
+                if let Some((row, _)) = cached {
+                    prior_for_scan.insert(p.clone(), row.clone());
+                }
                 to_scan.push(p.clone());
             } else if let Some((row, _)) = cached {
                 reused.push((p.clone(), row.clone()));
@@ -682,10 +748,13 @@ fn collect_sidebar_status(
         }
     }
 
-    // (path, GlyphRow) — git only, no DB access in the scope. `repo_root` is the
-    // main-worktree root shared by every linked worktree of the repo; it keys
-    // the repo-wide `pr_branch_cache` (item 28).
-    let scanned: Vec<(String, GlyphRow)> = std::thread::scope(|s| {
+    // (path, GlyphRow, clean) — git only, no DB access in the scope. `repo_root`
+    // is the main-worktree root shared by every linked worktree of the repo; it
+    // keys the repo-wide `pr_branch_cache` (item 28). `clean` is false when any
+    // read errored (and reused its prior value) — those rows must not overwrite
+    // the cache. See `merge_glyph_scan`.
+    let prior_for_scan = &prior_for_scan;
+    let scanned: Vec<(String, GlyphRow, bool)> = std::thread::scope(|s| {
         let handles: Vec<_> = to_scan
             .iter()
             .map(|p| {
@@ -693,13 +762,20 @@ fn collect_sidebar_status(
                     let wt = std::path::Path::new(p);
                     let loc = GitLoc::for_worktree(wt);
                     let git = GixGit::new();
-                    let dirty = git.is_dirty(&loc).unwrap_or(false);
-                    let (ahead, behind) = git.ahead_behind(&loc).ok().flatten().unwrap_or((0, 0));
-                    let branch = git.current_branch(&loc).ok();
+                    let dirty = git.is_dirty(&loc).map_err(|_| ());
+                    let ahead_behind = git.ahead_behind(&loc).map_err(|_| ());
+                    let branch = git.current_branch(&loc).map(Some).map_err(|_| ());
                     let repo_root = superzej_core::repo::main_worktree(wt)
                         .map(|r| r.to_string_lossy().into_owned())
                         .unwrap_or_else(|| p.clone());
-                    (p.clone(), (dirty, ahead, behind, branch, repo_root))
+                    let (row, clean) = merge_glyph_scan(
+                        prior_for_scan.get(p),
+                        dirty,
+                        ahead_behind,
+                        branch,
+                        repo_root,
+                    );
+                    (p.clone(), row, clean)
                 })
             })
             .collect();
@@ -707,23 +783,27 @@ fn collect_sidebar_status(
     });
 
     // Refresh the cache with the fresh rows and drop entries for worktrees that
-    // are no longer present (bounds growth across the process lifetime).
+    // are no longer present (bounds growth across the process lifetime). A
+    // degraded row (a transient read error that reused its prior value) is left
+    // out so the existing cache entry is preserved rather than poisoned.
     {
         let mut cache = glyph_cache().lock().unwrap();
-        for (p, row) in &scanned {
-            cache.insert(p.clone(), (row.clone(), now));
+        for (p, row, clean) in &scanned {
+            if *clean {
+                cache.insert(p.clone(), (row.clone(), now));
+            }
         }
         cache.retain(|k, _| paths.iter().any(|p| p == k));
     }
 
     let scanned_n = scanned.len();
-    let git_rows =
-        scanned
-            .into_iter()
-            .chain(reused)
-            .map(|(p, (dirty, ahead, behind, branch, repo_root))| {
-                (p, dirty, ahead, behind, branch, repo_root)
-            });
+    let git_rows = scanned
+        .into_iter()
+        .map(|(p, row, _clean)| (p, row))
+        .chain(reused)
+        .map(|(p, (dirty, ahead, behind, branch, repo_root))| {
+            (p, dirty, ahead, behind, branch, repo_root)
+        });
     for (path, dirty, ahead, behind, branch, repo_root) in git_rows {
         status.git.insert(
             path.clone(),
@@ -2030,6 +2110,34 @@ fn is_git_state_path(p: &std::path::Path) -> bool {
     )
 }
 
+/// Whether a single diff-watcher event path should drive a model re-hydration.
+/// Three cases, in precedence order:
+/// 1. `.git`-internal paths (inside a `.git` component, or under the resolved
+///    gitdir/common-dir `roots`) refresh ONLY for real git-state changes —
+///    commits, checkouts, branch/tag moves, in-progress merge/rebase — gated by
+///    [`is_git_state_path`] so index/object-store churn can't drive a loop.
+/// 2. Otherwise, gitignored worktree paths (build artifacts like `target/`)
+///    never refresh: they can't appear in `git diff HEAD`, so a rebuild would be
+///    pure waste — and a cargo/agent running in the tree churns them constantly.
+/// 3. Everything else (real edits to tracked/untracked source files) refreshes.
+///
+/// Pure (given a prebuilt matcher), so the precedence is unit-tested.
+fn watcher_path_triggers_refresh(
+    p: &std::path::Path,
+    roots: &[std::path::PathBuf],
+    ignore: &ignore::gitignore::Gitignore,
+) -> bool {
+    if in_dot_git(p) || roots.iter().any(|r| p.starts_with(r)) {
+        is_git_state_path(p)
+    } else {
+        // Case 2 vs 3: gitignored build churn is dropped; everything else (real
+        // source edits) refreshes.
+        !ignore
+            .matched_path_or_any_parents(p, p.is_dir())
+            .is_ignore()
+    }
+}
+
 pub(crate) fn retarget_diff_watcher(
     session: &crate::session::Session,
     watched: &mut Option<std::path::PathBuf>,
@@ -2090,6 +2198,25 @@ pub(crate) fn retarget_diff_watcher(
             .unwrap_or_else(Instant::now);
         let wake = w.clone();
         let roots = git_roots.clone();
+        // Drop watcher events for gitignored paths (`target/`, `node_modules/`,
+        // build outputs): a change to an ignored file can never alter
+        // `git diff HEAD`, so firing a model rebuild for it is pure waste — yet a
+        // cargo/sccache/agent running inside the worktree churns these constantly,
+        // which was the dominant source of redundant ~Hz hydrations. Built once
+        // per retarget from the worktree's root `.gitignore` (nested `.gitignore`s
+        // are rare for the high-churn dirs we care about; revisit only if
+        // profiling shows residual churn). A missing/unreadable `.gitignore`
+        // yields an empty matcher → every path passes → unchanged behavior, so
+        // remote/provider worktrees with no local `.gitignore` are unaffected.
+        // NOTE: a force-added (`git add -f`) or negate-pattern (`!keep`) ignored
+        // file *can* appear in the diff and would be dropped here; that's rare,
+        // and the safety-net ticker still rebuilds the panel within a few seconds.
+        let ignore = {
+            let mut b = ignore::gitignore::GitignoreBuilder::new(&cwd);
+            let _ = b.add(".gitignore");
+            b.build()
+                .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty())
+        };
         let new_watcher = recommended_watcher(move |res: notify::Result<Event>| {
             if let Ok(ev) = res
                 && matches!(
@@ -2107,13 +2234,10 @@ pub(crate) fn retarget_diff_watcher(
                 // the old self-sustaining ~2 Hz refresh loop — which once read
                 // as a freeze — from coming back.
                 && (ev.paths.is_empty()
-                    || ev.paths.iter().any(|p| {
-                        if in_dot_git(p) || roots.iter().any(|r| p.starts_with(r)) {
-                            is_git_state_path(p)
-                        } else {
-                            true
-                        }
-                    }))
+                    || ev
+                        .paths
+                        .iter()
+                        .any(|p| watcher_path_triggers_refresh(p, &roots, &ignore)))
                 && last_send.elapsed() > Duration::from_millis(500)
             {
                 if tx.send(RefreshKind::Model).is_ok() {
@@ -2189,6 +2313,72 @@ mod tests {
             Some(Duration::from_millis(1)),
             Duration::ZERO
         ));
+    }
+
+    #[test]
+    fn glyph_scan_clean_read_updates() {
+        // A fully successful read produces the scanned values and is `clean` so
+        // the caller updates the cache.
+        let (row, clean) = merge_glyph_scan(
+            None,
+            Ok(true),
+            Ok(Some((4, 1))),
+            Ok(Some("feat".into())),
+            "/repo".into(),
+        );
+        assert_eq!(row, (true, 4, 1, Some("feat".into()), "/repo".into()));
+        assert!(clean);
+    }
+
+    #[test]
+    fn glyph_scan_no_upstream_is_zero_not_error() {
+        // `Ok(None)` from ahead_behind is the genuine "no upstream" state: zero
+        // arrows, and still a clean read.
+        let prior: GlyphRow = (true, 4, 1, Some("feat".into()), "/repo".into());
+        let (row, clean) = merge_glyph_scan(
+            Some(&prior),
+            Ok(false),
+            Ok(None),
+            Ok(Some("feat".into())),
+            "/repo".into(),
+        );
+        assert_eq!(row, (false, 0, 0, Some("feat".into()), "/repo".into()));
+        assert!(clean);
+    }
+
+    #[test]
+    fn glyph_scan_transient_error_reuses_prior() {
+        // A transient gix error on every read must reuse the prior row, not
+        // collapse to zero/clean, and the row is NOT clean (cache untouched).
+        let prior: GlyphRow = (true, 4, 1, Some("feat".into()), "/repo".into());
+        let (row, clean) =
+            merge_glyph_scan(Some(&prior), Err(()), Err(()), Err(()), "/repo".into());
+        assert_eq!(row, (true, 4, 1, Some("feat".into()), "/repo".into()));
+        assert!(!clean);
+    }
+
+    #[test]
+    fn glyph_scan_partial_error_keeps_only_failed_field() {
+        // ahead_behind errors (reuse prior counts) while dirty succeeds (fresh).
+        let prior: GlyphRow = (true, 4, 1, Some("feat".into()), "/repo".into());
+        let (row, clean) = merge_glyph_scan(
+            Some(&prior),
+            Ok(false),
+            Err(()),
+            Ok(Some("feat".into())),
+            "/repo".into(),
+        );
+        assert_eq!(row, (false, 4, 1, Some("feat".into()), "/repo".into()));
+        assert!(!clean);
+    }
+
+    #[test]
+    fn glyph_scan_error_without_prior_falls_back_to_defaults() {
+        // First-ever scan that errors has no prior to reuse: best-effort zeros,
+        // and not clean so it won't be cached.
+        let (row, clean) = merge_glyph_scan(None, Err(()), Err(()), Err(()), "/repo".into());
+        assert_eq!(row, (false, 0, 0, None, "/repo".into()));
+        assert!(!clean);
     }
 
     /// End-to-end over the I/O seam: a real temp git repo with an edited
@@ -2366,5 +2556,74 @@ mod tests {
         // Editor scratch + config — not a state change.
         assert!(no("/repo/.git/COMMIT_EDITMSG"));
         assert!(no("/repo/.git/config"));
+    }
+
+    #[test]
+    fn watcher_drops_gitignored_churn_but_keeps_source_and_git_state() {
+        use std::path::{Path, PathBuf};
+        // Matcher built like the live watcher, but from inline patterns so the
+        // test needs no temp `.gitignore` on disk.
+        let mut b = ignore::gitignore::GitignoreBuilder::new("/repo");
+        // `/target` is the ROOT-ANCHORED form this repo's own `.gitignore` uses —
+        // the fix hinges on the anchored pattern matching via parent lookup.
+        b.add_line(None, "/target").unwrap();
+        b.add_line(None, "*.log").unwrap();
+        let ig = b.build().unwrap();
+        let roots: Vec<PathBuf> = vec![PathBuf::from("/repo/.git")];
+        let fires = |p: &str| watcher_path_triggers_refresh(Path::new(p), &roots, &ig);
+
+        // Gitignored build churn — the storm this filter exists to kill.
+        assert!(!fires("/repo/target/debug/szhost"));
+        assert!(!fires("/repo/target/debug/.fingerprint/x"));
+        assert!(!fires("/repo/run.log"));
+        // Real source edits still refresh the panel.
+        assert!(fires("/repo/src/main.rs"));
+        assert!(fires("/repo/crates/foo/Cargo.toml"));
+        // Git-state changes still refresh (the `.git` branch wins; the gitignore
+        // matcher never even sees these).
+        assert!(fires("/repo/.git/HEAD"));
+        assert!(fires("/repo/.git/refs/heads/main"));
+        // Git-internal churn stays dropped (index/objects).
+        assert!(!fires("/repo/.git/index"));
+        assert!(!fires("/repo/.git/objects/ab/cdef"));
+    }
+
+    #[test]
+    fn empty_gitignore_matcher_passes_every_worktree_edit() {
+        // Remote/provider worktrees (no local `.gitignore`) build an empty
+        // matcher; it must not drop any edit — unchanged pre-filter behavior.
+        use std::path::{Path, PathBuf};
+        let ig = ignore::gitignore::Gitignore::empty();
+        let roots: Vec<PathBuf> = vec![];
+        assert!(watcher_path_triggers_refresh(
+            Path::new("/wt/target/x"),
+            &roots,
+            &ig
+        ));
+        assert!(watcher_path_triggers_refresh(
+            Path::new("/wt/src/main.rs"),
+            &roots,
+            &ig
+        ));
+    }
+
+    #[test]
+    fn ticker_pr_cadence_is_a_multiple_of_the_model_cadence() {
+        // The ticker emits `RefreshKind::Pr` only from inside the `model_every`
+        // block, so PR auto-refresh silently stops unless model_every divides
+        // pr_every. Lock that for the shipped defaults.
+        let base_ms = 500u64;
+        assert_eq!(
+            DEFAULT_MODEL_REFRESH_MS % base_ms,
+            0,
+            "must align to base tick"
+        );
+        let model_every = (DEFAULT_MODEL_REFRESH_MS / base_ms).max(1);
+        let pr_every = PR_REFRESH_INTERVAL.as_millis() as u64 / base_ms;
+        assert_eq!(
+            pr_every % model_every,
+            0,
+            "pr_every={pr_every} not a multiple of model_every={model_every}"
+        );
     }
 }
