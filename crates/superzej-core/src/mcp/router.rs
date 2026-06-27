@@ -6,11 +6,30 @@ use std::sync::Arc;
 pub struct McpRouter {
     db: Arc<Db>,
     bus: Arc<crate::event_bus::EventBus>,
+    /// Host-injected git/semantic provider (svc-backed). When set, the git house
+    /// tools are advertised + serviced against `worktree`.
+    git: Option<Arc<dyn crate::mcp::HouseGit>>,
+    /// The connection's worktree (the git tools operate here; the agent doesn't
+    /// pass a path, so it can't query other worktrees).
+    worktree: Option<String>,
 }
 
 impl McpRouter {
     pub fn new(db: Arc<Db>, bus: Arc<crate::event_bus::EventBus>) -> Self {
-        Self { db, bus }
+        Self {
+            db,
+            bus,
+            git: None,
+            worktree: None,
+        }
+    }
+
+    /// Attach the host's git/semantic provider scoped to `worktree`, enabling the
+    /// `git_status`/`git_diff`/`git_branches`/`semantic_diff` house tools.
+    pub fn with_git(mut self, git: Arc<dyn crate::mcp::HouseGit>, worktree: String) -> Self {
+        self.git = Some(git);
+        self.worktree = Some(worktree);
+        self
     }
 
     pub fn handle_request(&self, req_raw: &serde_json::Value) -> serde_json::Value {
@@ -72,8 +91,24 @@ impl McpRouter {
     }
 
     fn handle_tools_list(&self) -> Result<serde_json::Value, (i32, String)> {
-        Ok(json!({
-            "tools": [
+        // The git/semantic house tools take no args — they operate on the
+        // connection's worktree — and are advertised only when a provider is
+        // attached.
+        let mut tools = if self.git.is_some() {
+            vec![
+                json!({ "name": "git_status", "description": "Working-tree status (staged/unstaged/untracked) for this worktree.",
+                    "inputSchema": { "type": "object", "properties": {} } }),
+                json!({ "name": "git_diff", "description": "Changed files vs HEAD with +/- line counts for this worktree.",
+                    "inputSchema": { "type": "object", "properties": {} } }),
+                json!({ "name": "git_branches", "description": "Local branches in this worktree (current is marked).",
+                    "inputSchema": { "type": "object", "properties": {} } }),
+                json!({ "name": "semantic_diff", "description": "Entity-level (function/struct/...) summary of the diff vs HEAD plus a suggested commit message.",
+                    "inputSchema": { "type": "object", "properties": {} } }),
+            ]
+        } else {
+            Vec::new()
+        };
+        let base = json!([
                 {
                     "name": "check_my_budget",
                     "description": "Checks the token/cost budget for the agent's current scope.",
@@ -122,8 +157,37 @@ impl McpRouter {
                         "required": ["worktree", "reason"]
                     }
                 }
-            ]
-        }))
+        ]);
+        if let serde_json::Value::Array(items) = base {
+            tools.extend(items);
+        }
+        Ok(json!({ "tools": tools }))
+    }
+
+    /// Dispatch the git/semantic house tools against the connection worktree.
+    /// Returns `None` when `name` isn't one of them (caller falls through to the
+    /// built-in tools).
+    fn git_tool(&self, name: &str) -> Option<Result<serde_json::Value, (i32, String)>> {
+        if !matches!(
+            name,
+            "git_status" | "git_diff" | "git_branches" | "semantic_diff"
+        ) {
+            return None;
+        }
+        let (Some(git), Some(wt)) = (self.git.as_ref(), self.worktree.as_deref()) else {
+            return Some(Err((-32603, "git provider not configured".to_string())));
+        };
+        let res = match name {
+            "git_status" => git.status(wt),
+            "git_diff" => git.diff(wt),
+            "git_branches" => git.branches(wt),
+            "semantic_diff" => git.semantic_diff(wt),
+            _ => unreachable!(),
+        };
+        Some(match res {
+            Ok(text) => Ok(json!({ "content": [{ "type": "text", "text": text }] })),
+            Err(e) => Err((-32603, e)),
+        })
     }
 
     fn handle_tools_call(
@@ -132,6 +196,11 @@ impl McpRouter {
     ) -> Result<serde_json::Value, (i32, String)> {
         let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let args = params.get("arguments").unwrap_or(&serde_json::Value::Null);
+
+        // Git/semantic house tools — no args; operate on the connection worktree.
+        if let Some(out) = self.git_tool(name) {
+            return out;
+        }
 
         match name {
             "check_my_budget" => {

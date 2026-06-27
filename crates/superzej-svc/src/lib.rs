@@ -14,6 +14,7 @@ pub mod git;
 pub mod issue;
 pub mod log;
 pub mod lsp;
+pub mod mcp_git;
 pub mod media;
 pub mod provider;
 pub mod ssh;

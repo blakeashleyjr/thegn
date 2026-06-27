@@ -6493,6 +6493,7 @@ fn dispatch_acp_inbound(
         } => {
             if let Some(client) = client {
                 let bus = event_bus.clone();
+                let wt_owned = wt.to_string();
                 tokio::spawn(async move {
                     let resp = tokio::task::spawn_blocking(move || {
                         let id = inner.get("id").cloned().unwrap_or(serde_json::Value::Null);
@@ -6500,10 +6501,16 @@ fn dispatch_acp_inbound(
                             Ok(db) => {
                                 // The Arcs live only on this blocking thread (Db's
                                 // Connection is !Send); McpRouter::new requires Arc.
+                                // Attach the svc-backed git/semantic house tools
+                                // scoped to this connection's worktree.
                                 #[allow(clippy::arc_with_non_send_sync)]
                                 let router = superzej_core::mcp::router::McpRouter::new(
                                     std::sync::Arc::new(db),
                                     std::sync::Arc::new(bus),
+                                )
+                                .with_git(
+                                    std::sync::Arc::new(superzej_svc::mcp_git::HouseGitImpl),
+                                    wt_owned,
                                 );
                                 router.handle_request(&inner)
                             }
