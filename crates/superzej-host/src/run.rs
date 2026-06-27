@@ -1850,6 +1850,7 @@ fn activate_row_target(
                         focused_pane: placeholder,
                         pane_cwds: Default::default(),
                         pane_cmds: Default::default(),
+                        pane_sessions: Default::default(),
                     }],
                     active_tab: 0,
                 });
@@ -2494,6 +2495,10 @@ fn remap_cold_workspace_ids(session: &mut crate::session::Session, panes: &mut P
             tab.pane_cmds = std::mem::take(&mut tab.pane_cmds)
                 .into_iter()
                 .map(|(id, cmd)| (map.get(&id).copied().unwrap_or(id), cmd))
+                .collect();
+            tab.pane_sessions = std::mem::take(&mut tab.pane_sessions)
+                .into_iter()
+                .map(|(id, s)| (map.get(&id).copied().unwrap_or(id), s))
                 .collect();
         }
     }
@@ -5865,6 +5870,12 @@ fn spawn_worktree_shell_pane(
         && dir.is_dir()
     {
         let wt = dir.to_string_lossy().into_owned();
+        // Native provider exec (CLI-free): when the worktree's env is a managed
+        // provider with a native exec API and `exec != cli`, attach the pane over
+        // the provider's WSS exec instead of wrapping its vendor CLI.
+        if let Some(n) = crate::agent::native_shell_exec(cfg, &wt) {
+            return panes.spawn_native_shell(n, None, center);
+        }
         let spec = crate::agent::launch_spec(cfg, &wt, None, "shell")?;
         return panes.spawn_argv_env(
             &spec.argv,
@@ -6434,9 +6445,34 @@ fn capture_pane_cmds(session: &mut crate::session::Session, panes: &Panes) {
     }
 }
 
+/// Capture each live `Stream` pane's provider session into its tab's
+/// `pane_sessions` so a restart reattaches the live remote session (replaying
+/// scrollback) instead of opening a fresh shell. A pane that isn't a native-exec
+/// stream — or whose session id hasn't been announced — clears any stale entry.
+fn capture_pane_sessions(session: &mut crate::session::Session, panes: &Panes) {
+    for g in &mut session.worktrees {
+        for tab in &mut g.tabs {
+            for id in tab.center.pane_ids() {
+                let Some(p) = panes.table.get(&id) else {
+                    continue;
+                };
+                match p.provider_session() {
+                    Some(ps) => {
+                        tab.pane_sessions.insert(id, ps);
+                    }
+                    None => {
+                        tab.pane_sessions.remove(&id);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn persist_session_layout(session: &mut crate::session::Session, panes: &Panes) {
     capture_pane_cwds(session, panes);
     capture_pane_cmds(session, panes);
+    capture_pane_sessions(session, panes);
     if let Ok(db) = superzej_core::db::Db::open() {
         let _ = session.persist(&db, &session.id, now_secs());
     }
@@ -9360,7 +9396,9 @@ async fn event_loop<T: Terminal>(
                     LoadStep::active("shell"),
                 ];
             }
-            if let Err(e) = panes.materialize_with_specs(tab, &wt, &specs, chrome.center) {
+            if let Err(e) =
+                panes.materialize_with_specs(&current_config, tab, &wt, &specs, chrome.center)
+            {
                 model.status = format!("Pane spawn failed: {e}");
                 if is_active {
                     model.load_steps = vec![
@@ -11606,6 +11644,7 @@ async fn event_loop<T: Terminal>(
                                                     focused_pane: 0,
                                                     pane_cwds: Default::default(),
                                                     pane_cmds: Default::default(),
+                                                    pane_sessions: Default::default(),
                                                 }],
                                                 active_tab: 0,
                                             });
@@ -18296,6 +18335,7 @@ mod tests {
                 focused_pane: 0,
                 pane_cwds: String::new(),
                 pane_cmds: String::new(),
+                pane_sessions: String::new(),
             },
         )
         .unwrap();

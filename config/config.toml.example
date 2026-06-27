@@ -1254,7 +1254,15 @@ ready_timeout_secs = 20
 # #                          #   sandbox is opt-in; else run `superzej env provision`.
 # # auto_checkpoint = false  # checkpoint the sprite on worktree close (suspend-on-
 # #                          #   close, fast resume). Off by default (storage cost).
-# # Pane exec bridges through the `sprite` CLI (PTY-capable):
+# # exec = "auto"            # how the interactive pane attaches:
+# #                          #   auto — native API exec (PTY-over-WebSocket, NO
+# #                          #          `sprite` CLI) when the provider supports it
+# #                          #          (Sprites does), else the CLI. The default.
+# #                          #   api  — force native API exec (error if unsupported).
+# #                          #   cli  — always use the `*_command` CLI bridge below.
+# #                          # Native exec also persists its session id, so a restart
+# #                          # reattaches the live sprite session and replays scrollback.
+# # The CLI bridge (used for exec = "cli", and as the auto fallback). PTY-capable:
 # exec_command = ["sprite", "exec", "-s", "{id}", "--"]
 # interactive_command = ["sprite", "exec", "-s", "{id}", "--tty", "--"]
 # up_command = ["sprite", "create", "{id}", "--skip-console"]
@@ -1275,8 +1283,10 @@ ready_timeout_secs = 20
 # #    at it), it's pushed into the sprite and run as `szhost bridge`, so git is
 # #    fast (no per-op latency), file edits stream back live (fs.watch), activity
 # #    dots reflect in-env CPU, and tests/jobs run in the sandbox.
-# # The interactive pane still execs through the `sprite` CLI; an API-exec (WSS)
-# # bridge that removes that CLI dependency is a follow-up (needs a WS client dep).
+# #  • NATIVE EXEC — with `exec = "auto"` (default) the interactive pane attaches
+# #    over the Sprites WSS exec API directly (no `sprite` CLI), and reattaches its
+# #    live session (replaying scrollback) across restarts. Set `exec = "cli"` to
+# #    fall back to the `interactive_command` bridge.
 # ── LLM proxy (group U/V) ──────────────────────────────────────────────────
 # The AI-traffic chokepoint daemon (binary `szproxy`). The shell never hard-
 # depends on this — AI is strictly additive — so it is OFF by default. When

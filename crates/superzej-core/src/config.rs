@@ -1977,6 +1977,19 @@ impl EnvK8sConfig {
     }
 }
 
+config_enum! {
+    /// How a `provider`-placement env runs its interactive pane.
+    /// - `auto` — native API exec when the provider supports it (its `exec_api`
+    ///   capability), else the vendor CLI. The default: a provider that has a
+    ///   native exec API (e.g. Sprites) is CLI-free out of the box.
+    /// - `api`  — force native API exec; surface an error rather than silently
+    ///   falling back to the CLI when the provider can't do it.
+    /// - `cli`  — always wrap the vendor CLI (`interactive_command`).
+    pub enum ProviderExecMode: "provider exec mode" {
+        Auto = "auto", Api = "api", Cli = "cli",
+    } default = Auto;
+}
+
 /// `[env.<name>.provider]` — a managed-sandbox provider for a `provider`
 /// placement (Daytona, Codespaces, …). `exec_command` is a static argv template
 /// (`{id}` is substituted with `id`) that runs a command in the sandbox; the
@@ -2004,6 +2017,10 @@ pub struct EnvProviderConfig {
     pub api_base: String,
     /// Env var holding the provider API token.
     pub api_key_env: String,
+    /// How the interactive pane attaches: native API exec (PTY-over-WebSocket,
+    /// no vendor CLI) vs the `interactive_command` CLI bridge. `auto` (default)
+    /// prefers native when the provider supports it.
+    pub exec: ProviderExecMode,
     /// Provider sandbox template/image to create from.
     pub template: String,
     /// Working directory inside the sandbox that a `data = "sync"` projection
@@ -2029,6 +2046,7 @@ impl EnvProviderConfig {
             && self.down_command.is_empty()
             && self.api_base.is_empty()
             && self.api_key_env.is_empty()
+            && self.exec == ProviderExecMode::Auto
             && self.template.is_empty()
             && self.workdir.is_empty()
             && !self.auto_provision
@@ -4357,6 +4375,26 @@ fn parse_hex_rgb(hex: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_exec_mode_parses_and_defaults_to_auto() {
+        assert_eq!(ProviderExecMode::default(), ProviderExecMode::Auto);
+        assert_eq!(
+            ProviderExecMode::from_str_validated("api"),
+            Ok(ProviderExecMode::Api)
+        );
+        assert_eq!(
+            ProviderExecMode::from_str_validated("CLI"),
+            Ok(ProviderExecMode::Cli)
+        );
+        assert_eq!(ProviderExecMode::Auto.as_str(), "auto");
+        assert!(ProviderExecMode::from_str_validated("nope").is_err());
+        // A fresh provider block is "default" (so it round-trips as absent) and
+        // its exec mode is Auto.
+        let pc = EnvProviderConfig::default();
+        assert!(pc.is_default());
+        assert_eq!(pc.exec, ProviderExecMode::Auto);
+    }
 
     #[test]
     fn app_tab_config_defaults_to_work_first_and_default() {

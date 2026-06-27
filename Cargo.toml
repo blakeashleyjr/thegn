@@ -81,6 +81,14 @@ reqwest = { version = "0.12", default-features = false, features = [
   "json",
   "rustls-tls",
 ] }
+# Native provider exec: PTY-over-WebSocket to a managed sandbox (Sprites WSS exec
+# API), so interactive panes need no vendor CLI. rustls + webpki-roots matches
+# reqwest's TLS stack (ring crypto provider) so there's a single rustls in tree.
+tokio-tungstenite = { version = "0.24", default-features = false, features = [
+  "connect",
+  "handshake",
+  "rustls-tls-webpki-roots",
+] }
 russh = "0.61"
 # MPRIS media control over D-Bus (the Linux media backend). tokio-integrated so
 # the host's runtime drives it; default async-io backend disabled. Lives in the

@@ -771,6 +771,13 @@ pub struct ProviderCaps {
     pub exec_api: bool,
 }
 
+/// Whether the named provider has a native exec API (PTY-over-WebSocket), so an
+/// env can prefer it over the vendor CLI *without* first constructing a
+/// (token-requiring) [`Provider`]. Mirrors `Provider::caps().exec_api` by name.
+pub fn exec_api_by_name(provider: &str) -> bool {
+    matches!(provider.trim(), "sprites")
+}
+
 /// A cheap, dependency-free content fingerprint (FNV-1a 64-bit, hex). Used by
 /// [`Provider::ensure_executable`] to decide whether a pushed binary needs
 /// re-uploading — collision-resistance isn't security-critical here, only
@@ -782,6 +789,255 @@ pub fn fingerprint(data: &[u8]) -> String {
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("{h:016x}")
+}
+
+// ===========================================================================
+// Native exec (the `exec_api` capability) — a generic, provider-agnostic PTY
+// stream so an interactive pane attaches over the provider's API instead of a
+// local PTY child running a vendor CLI. The transport is decoupled via channels
+// (async-fn-in-trait isn't object-safe, so there's no `dyn ExecStream`): a
+// provider's `open_exec`/`attach_exec` spawns a driver task that bridges its
+// socket to these channels, and the host wires them into a pane.
+// ===========================================================================
+
+/// What to run for a native exec session (provider-agnostic).
+#[derive(Debug, Clone)]
+pub struct ExecSpec {
+    /// The command + args to run in the sandbox (e.g. the login shell).
+    pub argv: Vec<String>,
+    /// Allocate a PTY (interactive panes always do).
+    pub tty: bool,
+    pub cols: u16,
+    pub rows: u16,
+    /// Extra environment as `KEY=VALUE` pairs.
+    pub env: Vec<(String, String)>,
+    /// Working directory inside the sandbox. Providers without a cwd param bake
+    /// it into `argv` upstream; `None` ⇒ the sandbox default.
+    pub cwd: Option<String>,
+}
+
+/// One server→client event from a native exec session. PTY mode merges stderr
+/// into the pty stream, so only `Stdout`/`Exit` occur.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecFrame {
+    Stdout(Vec<u8>),
+    Exit(i32),
+}
+
+/// One client→server control message for a native exec session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecControl {
+    Stdin(Vec<u8>),
+    Resize { cols: u16, rows: u16 },
+    Close,
+}
+
+/// A live native exec session: a provider-agnostic handle built from channels.
+/// The provider spawns a driver task that bridges the underlying transport (e.g.
+/// a WebSocket) to these channels until the socket closes or `Close` is sent.
+pub struct ExecSession {
+    /// Server→client output and the terminal exit.
+    pub frames: tokio::sync::mpsc::Receiver<ExecFrame>,
+    /// Client→server stdin/resize/close.
+    pub control: tokio::sync::mpsc::Sender<ExecControl>,
+    /// The provider session id once the server announces it (for reattach). It
+    /// arrives asynchronously on connect, so it's a watch the caller reads when
+    /// persisting — `None` until the session-info frame lands.
+    pub session_id: tokio::sync::watch::Receiver<Option<String>>,
+}
+
+/// Rewrite an `http(s)` API base to its `ws(s)` scheme for the WebSocket handshake.
+fn ws_scheme(api_base: &str) -> String {
+    if let Some(rest) = api_base.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = api_base.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        api_base.to_string()
+    }
+}
+
+/// Build the Sprites open-exec WSS URL: `wss://…/sprites/{id}/exec?cmd=…&tty=…`.
+fn exec_ws_url(api_base: &str, id: &str, spec: &ExecSpec) -> Result<String> {
+    let base = ws_scheme(api_base);
+    let mut url = reqwest::Url::parse(&format!("{base}/sprites/{id}/exec"))
+        .context("sprites: bad exec url")?;
+    {
+        let mut q = url.query_pairs_mut();
+        for a in &spec.argv {
+            q.append_pair("cmd", a);
+        }
+        q.append_pair("tty", if spec.tty { "true" } else { "false" });
+        q.append_pair("stdin", "true");
+        q.append_pair("cols", &spec.cols.to_string());
+        q.append_pair("rows", &spec.rows.to_string());
+        for (k, v) in &spec.env {
+            q.append_pair("env", &format!("{k}={v}"));
+        }
+    }
+    Ok(url.to_string())
+}
+
+/// Build the Sprites reattach WSS URL: `wss://…/sprites/{id}/exec/{session}?cols=…&rows=…`.
+fn attach_ws_url(api_base: &str, id: &str, session: &str, cols: u16, rows: u16) -> Result<String> {
+    let base = ws_scheme(api_base);
+    let mut url = reqwest::Url::parse(&format!("{base}/sprites/{id}/exec/{session}"))
+        .context("sprites: bad attach url")?;
+    {
+        let mut q = url.query_pairs_mut();
+        q.append_pair("cols", &cols.to_string());
+        q.append_pair("rows", &rows.to_string());
+    }
+    Ok(url.to_string())
+}
+
+/// The resize control frame the Sprites exec socket expects.
+fn resize_json(cols: u16, rows: u16) -> String {
+    format!("{{\"type\":\"resize\",\"cols\":{cols},\"rows\":{rows}}}")
+}
+
+/// A parsed Sprites exec text (control) frame.
+#[derive(Debug, PartialEq, Eq)]
+enum SpriteCtrl {
+    /// The session-info frame announced its `session_id` (for reattach).
+    Session(String),
+    /// The command exited with this code.
+    Exit(i32),
+    /// A frame we don't act on (port notifications, unknown shapes).
+    Ignore,
+}
+
+/// Classify a Sprites exec text frame: `{"type":"exit","exit_code":N}` ⇒ exit,
+/// a frame carrying `session_id` ⇒ the session announcement, else ignore.
+fn parse_sprite_ctrl(text: &str) -> SpriteCtrl {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return SpriteCtrl::Ignore;
+    };
+    if v.get("type").and_then(|t| t.as_str()) == Some("exit") {
+        let code = v.get("exit_code").and_then(|c| c.as_i64()).unwrap_or(0);
+        return SpriteCtrl::Exit(code as i32);
+    }
+    if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
+        return SpriteCtrl::Session(sid.to_string());
+    }
+    SpriteCtrl::Ignore
+}
+
+impl SpritesProvider {
+    /// Open a native PTY exec session over the Sprites WSS exec API — no `sprite`
+    /// CLI. The returned [`ExecSession`]'s driver task lives on the ambient tokio
+    /// runtime until the socket closes or `ExecControl::Close` is sent.
+    pub async fn open_exec(&self, id: &str, spec: &ExecSpec) -> Result<ExecSession> {
+        let url = exec_ws_url(&self.api_base, id, spec)?;
+        self.start_session(url).await
+    }
+
+    /// Reattach to a persisted exec session (the server replays its scrollback).
+    pub async fn attach_exec(
+        &self,
+        id: &str,
+        session: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<ExecSession> {
+        let url = attach_ws_url(&self.api_base, id, session, cols, rows)?;
+        self.start_session(url).await
+    }
+
+    /// Run the WSS handshake (bearer auth) and spawn the bridge task.
+    async fn start_session(&self, url: String) -> Result<ExecSession> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut req = url
+            .into_client_request()
+            .context("sprites: build exec ws request")?;
+        let auth = format!("Bearer {}", self.token)
+            .parse()
+            .context("sprites: exec auth header")?;
+        req.headers_mut().insert("Authorization", auth);
+        let (ws, _resp) = tokio_tungstenite::connect_async(req)
+            .await
+            .context("sprites: exec ws connect")?;
+
+        let (frames_tx, frames_rx) = tokio::sync::mpsc::channel::<ExecFrame>(256);
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel::<ExecControl>(256);
+        let (sid_tx, sid_rx) = tokio::sync::watch::channel::<Option<String>>(None);
+
+        tokio::spawn(drive_exec(ws, frames_tx, control_rx, sid_tx));
+
+        Ok(ExecSession {
+            frames: frames_rx,
+            control: control_tx,
+            session_id: sid_rx,
+        })
+    }
+}
+
+/// The exec bridge task: pump WebSocket frames ⇄ the [`ExecSession`] channels.
+/// Generic over the socket so the concrete (TLS) stream type need not be named.
+async fn drive_exec<S>(
+    ws: S,
+    frames_tx: tokio::sync::mpsc::Sender<ExecFrame>,
+    mut control_rx: tokio::sync::mpsc::Receiver<ExecControl>,
+    sid_tx: tokio::sync::watch::Sender<Option<String>>,
+) where
+    S: futures_util::Sink<tokio_tungstenite::tungstenite::Message>
+        + futures_util::Stream<
+            Item = std::result::Result<
+                tokio_tungstenite::tungstenite::Message,
+                tokio_tungstenite::tungstenite::Error,
+            >,
+        > + Unpin,
+{
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let (mut write, mut read) = ws.split();
+    loop {
+        tokio::select! {
+            ctrl = control_rx.recv() => match ctrl {
+                Some(ExecControl::Stdin(b)) => {
+                    if write.send(Message::Binary(b)).await.is_err() {
+                        break;
+                    }
+                }
+                Some(ExecControl::Resize { cols, rows }) => {
+                    let _ = write.send(Message::Text(resize_json(cols, rows))).await;
+                }
+                Some(ExecControl::Close) | None => {
+                    let _ = write.send(Message::Close(None)).await;
+                    break;
+                }
+            },
+            msg = read.next() => match msg {
+                Some(Ok(Message::Binary(b))) => {
+                    if frames_tx.send(ExecFrame::Stdout(b)).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(Message::Text(t))) => match parse_sprite_ctrl(t.as_str()) {
+                    SpriteCtrl::Session(s) => {
+                        let _ = sid_tx.send(Some(s));
+                    }
+                    SpriteCtrl::Exit(code) => {
+                        let _ = frames_tx.send(ExecFrame::Exit(code)).await;
+                        break;
+                    }
+                    SpriteCtrl::Ignore => {}
+                },
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = write.send(Message::Pong(p)).await;
+                }
+                Some(Ok(Message::Close(_))) | None => {
+                    let _ = frames_tx.send(ExecFrame::Exit(0)).await;
+                    break;
+                }
+                Some(Ok(_)) => {}
+                Some(Err(_)) => {
+                    let _ = frames_tx.send(ExecFrame::Exit(-1)).await;
+                    break;
+                }
+            },
+        }
+    }
 }
 
 /// The generic managed-sandbox provider dispatcher. Lifecycle methods delegate to
@@ -802,7 +1058,7 @@ impl Provider {
                 egress: true,
                 checkpoints: true,
                 files: true,
-                ..ProviderCaps::default()
+                exec_api: true,
             },
         }
     }
@@ -940,6 +1196,30 @@ impl Provider {
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
         }
     }
+
+    /// Open a native PTY exec session (the `exec_api` capability), so an
+    /// interactive pane attaches over the provider API with no vendor CLI. Gate
+    /// on [`caps`]`().exec_api`.
+    pub async fn open_exec(&self, id: &str, spec: &ExecSpec) -> Result<ExecSession> {
+        match self {
+            Provider::Sprites(p) => p.open_exec(id, spec).await,
+            Provider::Daytona(_) => Err(anyhow!("provider 'daytona' has no native exec API")),
+        }
+    }
+
+    /// Reattach to a persisted exec session (replays scrollback). `exec_api` only.
+    pub async fn attach_exec(
+        &self,
+        id: &str,
+        session: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<ExecSession> {
+        match self {
+            Provider::Sprites(p) => p.attach_exec(id, session, cols, rows).await,
+            Provider::Daytona(_) => Err(anyhow!("provider 'daytona' has no native exec API")),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1026,6 +1306,84 @@ mod tests {
                 "--".into(),
             ])
         );
+    }
+
+    #[test]
+    fn sprites_has_native_exec_capability() {
+        assert!(Provider::Sprites(sprites()).caps().exec_api);
+        assert!(!Provider::Daytona(provider()).caps().exec_api);
+    }
+
+    #[test]
+    fn ws_scheme_rewrites_http_family_only() {
+        assert_eq!(
+            ws_scheme("https://api.sprites.dev/v1"),
+            "wss://api.sprites.dev/v1"
+        );
+        assert_eq!(ws_scheme("http://localhost:8080"), "ws://localhost:8080");
+        // Already a ws(s) base is left alone.
+        assert_eq!(ws_scheme("wss://x/y"), "wss://x/y");
+    }
+
+    #[test]
+    fn exec_ws_url_carries_cmd_tty_dims_and_env() {
+        let spec = ExecSpec {
+            argv: vec!["/bin/sh".into(), "-lc".into(), "exec bash -l".into()],
+            tty: true,
+            cols: 120,
+            rows: 40,
+            env: vec![("FOO".into(), "bar baz".into())],
+            cwd: None,
+        };
+        let url = exec_ws_url("https://api.sprites.dev/v1", "dev", &spec).unwrap();
+        assert!(url.starts_with("wss://api.sprites.dev/v1/sprites/dev/exec?"));
+        // Each arg is a repeated, percent-encoded `cmd` pair (insertion order).
+        assert!(url.contains("cmd=%2Fbin%2Fsh"));
+        assert!(url.contains("cmd=-lc"));
+        assert!(url.contains("cmd=exec+bash+-l"));
+        assert!(url.contains("tty=true"));
+        assert!(url.contains("stdin=true"));
+        assert!(url.contains("cols=120"));
+        assert!(url.contains("rows=40"));
+        assert!(url.contains("env=FOO%3Dbar+baz"));
+    }
+
+    #[test]
+    fn attach_ws_url_targets_session_with_dims() {
+        let url = attach_ws_url("https://api.sprites.dev/v1", "dev", "sess-123", 80, 24).unwrap();
+        assert!(url.starts_with("wss://api.sprites.dev/v1/sprites/dev/exec/sess-123?"));
+        assert!(url.contains("cols=80"));
+        assert!(url.contains("rows=24"));
+    }
+
+    #[test]
+    fn resize_json_is_the_documented_frame() {
+        assert_eq!(
+            resize_json(120, 40),
+            r#"{"type":"resize","cols":120,"rows":40}"#
+        );
+    }
+
+    #[test]
+    fn parse_sprite_ctrl_classifies_frames() {
+        assert_eq!(
+            parse_sprite_ctrl(r#"{"type":"exit","exit_code":0}"#),
+            SpriteCtrl::Exit(0)
+        );
+        assert_eq!(
+            parse_sprite_ctrl(r#"{"type":"exit","exit_code":137}"#),
+            SpriteCtrl::Exit(137)
+        );
+        assert_eq!(
+            parse_sprite_ctrl(r#"{"session_id":"abc","tty":true,"cols":80}"#),
+            SpriteCtrl::Session("abc".into())
+        );
+        // Port notifications and garbage are ignored, not misclassified.
+        assert_eq!(
+            parse_sprite_ctrl(r#"{"type":"port_opened","port":8080}"#),
+            SpriteCtrl::Ignore
+        );
+        assert_eq!(parse_sprite_ctrl("not json"), SpriteCtrl::Ignore);
     }
 
     #[test]
