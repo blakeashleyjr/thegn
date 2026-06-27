@@ -89,11 +89,14 @@ export default function (pi: ExtensionAPI) {
     // env crosses superzej's `sh -lc` + sandbox wrapping, an appended flag does
     // not). We MUST bind exactly this port — falling back to 0 (OS-ephemeral)
     // would make superzej connect to the wrong port.
+    // Prefer a bind-mounted unix socket (sealed sandbox — crosses the netns
+    // without network); otherwise the TCP port (non-sandboxed). superzej sets one.
+    const socketPath = process.env.ACP_SOCKET;
     const flagStr = pi.getFlag("acp-port") as string;
     const portStr = flagStr && flagStr !== "0" ? flagStr : (process.env.ACP_PORT ?? "0");
     const port = parseInt(portStr, 10) || 0;
-    if (port === 0) {
-      ctx.ui.setStatus("acp", "ACP: no port provided (ACP_PORT unset) — not starting server");
+    if (!socketPath && port === 0) {
+      ctx.ui.setStatus("acp", "ACP: no ACP_SOCKET/ACP_PORT provided — not starting server");
       return;
     }
 
@@ -118,12 +121,17 @@ export default function (pi: ExtensionAPI) {
       });
     });
 
-    server.listen(port, "127.0.0.1", () => {
-      const addr = server?.address();
-      const actualPort = typeof addr === "object" ? addr?.port : port;
-      // Tell superzej where to connect
-      ctx.ui.setStatus("acp", `ACP Server listening on port ${actualPort}`);
-    });
+    if (socketPath) {
+      server.listen(socketPath, () => {
+        ctx.ui.setStatus("acp", `ACP Server listening on ${socketPath}`);
+      });
+    } else {
+      server.listen(port, "127.0.0.1", () => {
+        const addr = server?.address();
+        const actualPort = typeof addr === "object" ? addr?.port : port;
+        ctx.ui.setStatus("acp", `ACP Server listening on port ${actualPort}`);
+      });
+    }
   });
 
   function sendAcp(socket: net.Socket, msg: any) {
