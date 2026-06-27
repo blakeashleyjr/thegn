@@ -12,6 +12,7 @@
 pub mod account;
 pub mod activity;
 pub mod blame;
+pub mod capabilities;
 pub mod ci;
 pub mod config;
 pub mod custom_cmd;
@@ -43,6 +44,7 @@ pub mod patch;
 pub mod picker;
 pub mod placement;
 pub mod plugin_api;
+pub mod projection;
 pub mod proxy;
 pub mod rebase_todo;
 pub mod reflog;

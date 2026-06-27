@@ -909,6 +909,13 @@ pub(crate) fn build_model(
         // on `podman ps` subprocess calls.
         containers: vec![],
         container_events: db.container_events(&loc.path(), 10).unwrap_or_default(),
+        // Unified timeline: sandbox audit + proxy spend, merged newest-first.
+        // Two small off-loop reads on the hydration thread (never the event loop).
+        timeline: superzej_core::models::merge_timeline(
+            &db.container_events(&loc.path(), 20).unwrap_or_default(),
+            &db.proxy_requests(&loc.path(), 20).unwrap_or_default(),
+            20,
+        ),
         panel,
         panel_focused: false,
         status: format!(

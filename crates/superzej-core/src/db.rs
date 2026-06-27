@@ -1093,6 +1093,53 @@ impl Db {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// The most recent `limit` proxy requests for a worktree, newest first.
+    /// Carries only routing/usage/cost metadata (never bodies). Used to fold
+    /// model-traffic spend into the unified activity timeline.
+    pub fn proxy_requests(&self, worktree: &str, limit: usize) -> Result<Vec<ProxyRequestRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ts_ms,protocol,route,virtual_key,agent,worktree,workspace,
+                    client_model,backend,backend_model,input_tokens,output_tokens,
+                    cost_usd,cost_source,outcome,error_code
+             FROM proxy_requests
+             WHERE worktree = ?1
+             ORDER BY ts_ms DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![worktree, limit as i64], |r| {
+            Ok(ProxyRequestRow {
+                ts_ms: r.get(0)?,
+                protocol: r.get(1)?,
+                route: r.get(2)?,
+                virtual_key: r.get(3)?,
+                agent: r.get(4)?,
+                worktree: r.get(5)?,
+                workspace: r.get(6)?,
+                client_model: r.get(7)?,
+                backend: r.get(8)?,
+                backend_model: r.get(9)?,
+                input_tokens: r.get(10)?,
+                output_tokens: r.get(11)?,
+                cost_usd: r.get(12)?,
+                cost_source: r.get(13)?,
+                outcome: r.get(14)?,
+                error_code: r.get(15)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Total proxy spend (USD) for a worktree since `since_ms` — the statusbar
+    /// spend badge. `0.0` when there are no requests.
+    pub fn proxy_spend_since(&self, worktree: &str, since_ms: i64) -> Result<f64> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM proxy_requests
+             WHERE worktree = ?1 AND ts_ms >= ?2",
+            params![worktree, since_ms],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Look up a virtual key by its id, returning `(scope, upstream)` when the
     /// key exists and is not revoked.
     pub fn proxy_virtual_key(&self, key_id: &str) -> Result<Option<(String, Option<String>)>> {

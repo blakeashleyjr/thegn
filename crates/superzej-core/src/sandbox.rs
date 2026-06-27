@@ -263,6 +263,19 @@ pub struct SandboxSpec {
     /// is requested (or it was refused by the active profile). Pure data — the
     /// behavior (bring-up, readiness, teardown) lives in `superzej-svc::vpn`.
     pub vpn: Option<VpnSpec>,
+    /// Remote OCI daemon to drive (`[sandbox] oci_host`): a podman connection
+    /// URL/name or docker host. `None` ⇒ the local daemon. Injected before every
+    /// container subcommand by [`oci_prefix`].
+    pub oci_host: Option<String>,
+}
+
+impl SandboxSpec {
+    /// The aggregated [`Capabilities`](crate::capabilities::Capabilities) of this
+    /// resolved spec — what it can project/enforce/observe/snapshot — so callers
+    /// ask one value instead of re-deriving `is_oci`/profile/placement booleans.
+    pub fn capabilities(&self) -> crate::capabilities::Capabilities {
+        crate::capabilities::Capabilities::derive(self)
+    }
 }
 
 /// A resolved, identity-bearing VPN attachment request for one sandbox. Pure
@@ -584,6 +597,7 @@ pub fn resolve_placed(
             }
             build_vpn_spec(&cfg.vpn, name, profile)
         },
+        oci_host: (!cfg.oci_host.trim().is_empty()).then(|| cfg.oci_host.trim().to_string()),
     })
 }
 
@@ -1000,7 +1014,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
     // bind-mount source per line. A container in "created" state passes inspect
     // but cannot accept exec sessions — we must not treat it as healthy.
     let fmt = "{{if .State.Running}}RUNNING{{end}}\n{{range .Mounts}}{{if eq .Type \"bind\"}}{{.Source}}\n{{end}}{{end}}";
-    let mut argv = backend_prefix(spec.backend);
+    let mut argv = oci_prefix(spec);
     // For remote worktrees the transport wraps the argv; for local we call
     // podman/docker directly. run_control_t_owned gives us the timeout but
     // discards stdout, so we use output_with_timeout for local transport and
@@ -1030,7 +1044,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
         (true, mounts_ok)
     } else {
         // Remote: run the same inspect command over SSH to verify mounts.
-        let mut remote_argv = backend_prefix(spec.backend);
+        let mut remote_argv = oci_prefix(spec);
         remote_argv.extend([
             "container".into(),
             "inspect".into(),
@@ -1087,7 +1101,7 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
             PROBE_TIMEOUT,
         );
     }
-    let mut argv: Vec<String> = backend_prefix(spec.backend);
+    let mut argv: Vec<String> = oci_prefix(spec);
     argv.extend([
         "run".into(),
         "-d".into(),
@@ -1120,7 +1134,7 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
             ],
             PROBE_TIMEOUT,
         );
-        let mut retry: Vec<String> = backend_prefix(spec.backend);
+        let mut retry: Vec<String> = oci_prefix(spec);
         retry.extend([
             "run".into(),
             "-d".into(),
@@ -1274,7 +1288,7 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
         | Backend::Smol
         | Backend::Apple
         | Backend::Wsl => {
-            let mut v = backend_prefix(spec.backend);
+            let mut v = oci_prefix(spec);
             v.extend(["exec".into(), "-it".into()]);
             if spec.file_access != FileAccess::None {
                 v.extend(["--workdir".into(), wt]);
@@ -1666,6 +1680,45 @@ fn backend_prefix(backend: Backend) -> Vec<String> {
         Backend::PodmanRootful => vec!["sudo".into(), "-n".into(), "podman".into()],
         _ => vec![backend.binary().into()],
     }
+}
+
+/// The OCI runtime prefix for a *resolved spec*, including the remote-daemon
+/// connection flag when `[sandbox] oci_host` is set (drives a remote daemon
+/// instead of SSH-wrapping the whole argv). podman takes `--url <ssh://…>` (or
+/// `--connection <name>` for a configured connection); docker takes `-H <host>`.
+/// Falls back to the plain [`backend_prefix`] for the local daemon or a non-OCI
+/// backend. Used by every container lifecycle/exec call so create, inspect, exec
+/// and teardown all target the same daemon.
+fn oci_prefix(spec: &SandboxSpec) -> Vec<String> {
+    let mut v = backend_prefix(spec.backend);
+    let Some(host) = spec
+        .oci_host
+        .as_deref()
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+    else {
+        return v;
+    };
+    if !spec.backend.is_oci() {
+        return v;
+    }
+    // Insert the global connection flag right after the binary (before the
+    // subcommand). For rootful podman the binary is at index 2 (`sudo -n podman`).
+    let bin_idx = if spec.backend == Backend::PodmanRootful {
+        2
+    } else {
+        0
+    };
+    let flags: Vec<String> = match spec.backend {
+        Backend::Docker => vec!["-H".into(), host.to_string()],
+        // podman: a URL (scheme://) is `--url`; a bare token is a named `--connection`.
+        _ if host.contains("://") => vec!["--url".into(), host.to_string()],
+        _ => vec!["--connection".into(), host.to_string()],
+    };
+    for (i, f) in flags.into_iter().enumerate() {
+        v.insert(bin_idx + 1 + i, f);
+    }
+    v
 }
 
 /// The argv prefix to invoke the container CLI for an OCI `backend`
@@ -2334,7 +2387,44 @@ mod tests {
             devenv_path: None,
             name: "superzej-repo-feat".into(),
             vpn: None,
+            oci_host: None,
         }
+    }
+
+    #[test]
+    fn oci_prefix_injects_remote_daemon_connection() {
+        // Local daemon (default): plain prefix.
+        let mut s = spec(Backend::Podman);
+        assert_eq!(oci_prefix(&s), vec!["podman"]);
+
+        // podman URL → --url before the subcommand.
+        s.oci_host = Some("ssh://user@box/run/podman.sock".into());
+        assert_eq!(
+            oci_prefix(&s),
+            vec!["podman", "--url", "ssh://user@box/run/podman.sock"]
+        );
+
+        // podman bare token → named --connection.
+        s.oci_host = Some("workbox".into());
+        assert_eq!(oci_prefix(&s), vec!["podman", "--connection", "workbox"]);
+
+        // docker → -H.
+        let mut d = spec(Backend::Docker);
+        d.oci_host = Some("ssh://user@box".into());
+        assert_eq!(oci_prefix(&d), vec!["docker", "-H", "ssh://user@box"]);
+
+        // rootful podman: flag lands after `sudo -n podman`, not before.
+        let mut r = spec(Backend::PodmanRootful);
+        r.oci_host = Some("workbox".into());
+        assert_eq!(
+            oci_prefix(&r),
+            vec!["sudo", "-n", "podman", "--connection", "workbox"]
+        );
+
+        // Non-OCI backend ignores oci_host.
+        let mut b = spec(Backend::Bwrap);
+        b.oci_host = Some("workbox".into());
+        assert_eq!(oci_prefix(&b), vec!["bwrap"]);
     }
 
     #[test]

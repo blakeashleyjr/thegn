@@ -367,6 +367,11 @@ pub struct FrameModel {
     pub container_health: ContainerHealth,
     /// Recent audit events for the active worktree's container (last 10, newest first).
     pub container_events: Vec<superzej_core::models::ContainerEvent>,
+    /// Unified per-worktree activity timeline: the sandbox audit log and the
+    /// LLM-proxy request/spend log merged and time-sorted (newest first). The
+    /// cross-backend "what is this worktree doing" view, rendered in System →
+    /// sandbox. Built off-loop by [`merge_timeline`](superzej_core::models::merge_timeline).
+    pub timeline: Vec<superzej_core::models::TimelineEvent>,
     /// Names of orphan containers removed at startup GC (shown once in System panel).
     pub startup_orphans_removed: Vec<String>,
     /// Top-level app-tab chip labels in masthead order: `work` first, then the
@@ -468,6 +473,7 @@ impl FrameModel {
             && self.active_container_name == other.active_container_name
             && self.active_sandbox_backend == other.active_sandbox_backend
             && self.container_events == other.container_events
+            && self.timeline == other.timeline
             && self.status == other.status
             && self.panel == other.panel
     }

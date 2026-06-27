@@ -14,6 +14,7 @@ use superzej_core::config::Config;
 use superzej_core::db::Db;
 use superzej_core::remote::GitLoc;
 use superzej_core::{account, repo, sandbox};
+use superzej_svc::projection::ProjectionBackend;
 use superzej_svc::vpn::VpnProvider;
 
 /// The literal shell sentinel — distinct from any configured agent/tool name.
@@ -134,6 +135,10 @@ pub struct SandboxOutcome {
     /// Whether the env runs off the local host (ssh/k8s/provider). Drives the
     /// pane cwd: a remote placement has no local working directory.
     pub is_remote: bool,
+    /// An explicit pane cwd that overrides the worktree path — set when the data
+    /// mode projects the tree to a local mountpoint (`sshfs`/`sync`), so the pane
+    /// runs locally *at the mountpoint* rather than over the raw placement.
+    pub cwd_override: Option<PathBuf>,
 }
 
 /// Resolve and `ensure` the sandbox for `worktree` — the BLOCKING half of a
@@ -183,7 +188,29 @@ pub fn prepare_sandbox_env(
     let environment = cfg.resolve_env(repo_root, loc, selected_env);
     let placement = environment.placement.clone();
     let env_shell = environment.sandbox.shell.clone();
-    let env_is_remote = environment.is_remote();
+    // The worktree-projection plan (sshfs/sync) for this env's `data` mode, or
+    // `None` for the default `in_env` (no projection). Captured before `sandbox`
+    // is moved out of `environment` below.
+    let projection = superzej_core::projection::for_environment(&environment);
+    // Data mode + env name for the provider file-sync path below (a provider
+    // placement isn't handled by `for_environment`, which is ssh-only).
+    let env_data = environment.data;
+    let env_name = environment.name.clone();
+    // A data mode that projects the tree to a local mountpoint (sshfs/sync) means
+    // the pane runs LOCALLY *at the mountpoint*: the (ssh) placement is used only
+    // to establish the projection, while execution is local. So pin the pane cwd
+    // to the mountpoint and resolve the backend against a Local exec placement.
+    // (Intended with `backend = none`/host; combining OCI sandboxing with a
+    // projected tree is a future combination.)
+    let cwd_override = projection
+        .as_ref()
+        .map(|p| std::path::PathBuf::from(&p.mountpoint));
+    let exec_placement = if cwd_override.is_some() {
+        superzej_core::placement::Placement::Local
+    } else {
+        placement.clone()
+    };
+    let env_is_remote = environment.is_remote() && cwd_override.is_none();
     let mut sb = environment.sandbox;
     let mut explicit_backend =
         sandbox::Backend::from_config(sb.backend).filter(|b| *b != sandbox::Backend::None);
@@ -227,9 +254,55 @@ pub fn prepare_sandbox_env(
     } else {
         base_cname
     };
+    // Bring the execution placement up (k8s pod / provider sandbox) and project
+    // the worktree into it BEFORE resolving the backend. Both are no-ops for the
+    // default local `in_env` env, so this changes nothing for the common case;
+    // for remote placements / `sshfs` it removes the previous need to run
+    // `superzej env up` by hand. This runs on the (already off-event-loop)
+    // sandbox-prepare path, mirroring the VPN sidecar bring-up below.
+    if !placement.is_local()
+        && let Err(e) = placement.ensure()
+    {
+        anyhow::bail!("env placement bring-up failed for {worktree}: {e}");
+    }
+    if let Some(pspec) = &projection {
+        let backend = superzej_svc::projection::for_data_mode(pspec);
+        match backend.mount(pspec) {
+            // Record the live projection so the worktree-close thread (which only
+            // has the path) can unmount it without re-resolving the env.
+            Ok(_) => register_projection(worktree, pspec.clone()),
+            Err(e) => {
+                warnings.push(format!("projection ({}) failed: {e}", backend.kind()));
+                superzej_core::msg::warn(&format!("projection mount failed for {worktree}: {e}"));
+            }
+        }
+    }
+    // Provider file-sync (`data = "sync"` on a managed provider): push the local
+    // worktree into the sandbox fs before the pane execs (the pane runs IN the
+    // sandbox, so there's no local cwd override). Best-effort: a failure warns,
+    // never blocks the pane. Runs on a scoped thread with its own runtime so it
+    // is safe regardless of the caller's async context.
+    if env_data == superzej_core::config::DataMode::Sync
+        && matches!(placement, superzej_core::placement::Placement::Provider(_))
+        && let Some((provider, id, workdir)) = provider_sync_target(cfg, &env_name)
+    {
+        match block_on_provider(|| async {
+            provider
+                .upload_dir(&id, std::path::Path::new(worktree), &workdir)
+                .await
+        }) {
+            Ok(()) => register_provider_sync(worktree, &env_name),
+            Err(e) => {
+                warnings.push(format!("provider sync upload failed: {e}"));
+                superzej_core::msg::warn(&format!(
+                    "provider sync upload failed for {worktree}: {e}"
+                ));
+            }
+        }
+    }
     for candidate in sandbox_candidates(&sb) {
         if let Some(mut spec) =
-            sandbox::resolve_placed(&candidate, loc, &cname, hardening, placement.clone())
+            sandbox::resolve_placed(&candidate, loc, &cname, hardening, exec_placement.clone())
         {
             if spec.backend == sandbox::Backend::None {
                 // A `none` backend on a *local* placement means "run on the host"
@@ -246,6 +319,7 @@ pub fn prepare_sandbox_env(
                     warnings,
                     shell: env_shell,
                     is_remote: env_is_remote,
+                    cwd_override,
                 });
             }
             if let Some(expected) = explicit_backend
@@ -271,6 +345,7 @@ pub fn prepare_sandbox_env(
                         warnings,
                         shell: env_shell,
                         is_remote: env_is_remote,
+                        cwd_override,
                     });
                 }
                 Err(e) if explicit_choice => {
@@ -315,6 +390,7 @@ pub fn prepare_sandbox_env(
         warnings,
         shell: env_shell,
         is_remote: env_is_remote,
+        cwd_override,
     })
 }
 
@@ -444,6 +520,149 @@ pub(crate) fn deregister_vpn(path: &str) {
     }
 }
 
+/// In-process registry of live worktree projections (path → resolved spec), so
+/// the worktree-close teardown thread — which only has the path — can unmount the
+/// projection (sshfs/sync) without re-resolving the named env. Best-effort: a
+/// projection created in a previous process isn't tracked here (it auto-reaps
+/// like the VPN ephemeral nodes, or is cleaned by `superzej env down`).
+fn projection_registry() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, superzej_core::projection::ProjectionSpec>,
+> {
+    static REG: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<String, superzej_core::projection::ProjectionSpec>,
+        >,
+    > = std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn register_projection(worktree: &str, spec: superzej_core::projection::ProjectionSpec) {
+    if let Ok(mut reg) = projection_registry().lock() {
+        reg.insert(worktree.to_string(), spec);
+    }
+}
+
+/// Tear down a worktree's projection (unmount sshfs / final sync) on close.
+/// A no-op when nothing was projected. Called from the worktree-close teardown
+/// thread alongside [`deregister_vpn`].
+pub(crate) fn deproject(path: &str) {
+    let spec = projection_registry()
+        .lock()
+        .ok()
+        .and_then(|mut r| r.remove(path));
+    if let Some(spec) = spec {
+        let backend = superzej_svc::projection::for_data_mode(&spec);
+        let _ = backend.unmount(&spec);
+    }
+}
+
+/// Build the API [`Provider`](superzej_svc::provider::Provider) for an env's
+/// provider config (best-effort: `None` if unconfigured or the token env var is
+/// unset). Mirrors `cmd::env::api_provider` but infallible for the launch path.
+fn provider_for(
+    pc: &superzej_core::config::EnvProviderConfig,
+) -> Option<superzej_svc::provider::Provider> {
+    use superzej_svc::provider::{DaytonaProvider, Provider, SpritesProvider};
+    match pc.provider.as_str() {
+        "sprites" => {
+            let key = if pc.api_key_env.trim().is_empty() {
+                "SPRITES_TOKEN"
+            } else {
+                pc.api_key_env.trim()
+            };
+            let token = std::env::var(key).ok()?;
+            Some(Provider::Sprites(SpritesProvider::new(
+                &pc.api_base,
+                &token,
+                &pc.id,
+            )))
+        }
+        "daytona" => {
+            let token = std::env::var(pc.api_key_env.trim()).ok()?;
+            Some(Provider::Daytona(DaytonaProvider::new(
+                &pc.api_base,
+                &token,
+                &pc.template,
+            )))
+        }
+        _ => None,
+    }
+}
+
+/// `(provider, sandbox_id, workdir)` for a provider env that supports file-sync,
+/// or `None` (unconfigured / no id / no token / provider can't do files).
+fn provider_sync_target(
+    cfg: &Config,
+    env_name: &str,
+) -> Option<(superzej_svc::provider::Provider, String, String)> {
+    let pc = &cfg.env.get(env_name)?.provider;
+    let id = pc.id.trim().to_string();
+    if id.is_empty() {
+        return None;
+    }
+    let provider = provider_for(pc)?;
+    if !provider.caps().files {
+        return None;
+    }
+    Some((provider, id, pc.sync_workdir()))
+}
+
+/// Run an async provider call to completion on a fresh OS thread with its own
+/// tokio runtime — safe to call from any context (no nested-runtime panic), and
+/// blocking from the caller's view (used on the off-loop prepare/close paths).
+fn block_on_provider<T, Fut>(f: impl FnOnce() -> Fut + Send) -> anyhow::Result<T>
+where
+    T: Send,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| anyhow::anyhow!("tokio runtime: {e}"))?;
+            rt.block_on(f())
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("provider sync thread panicked"))?
+    })
+}
+
+/// In-process registry of worktrees with a live provider file-sync (path →
+/// env name), so the close thread can pull changes back without re-resolving.
+fn provider_sync_registry() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>>
+{
+    static REG: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn register_provider_sync(worktree: &str, env_name: &str) {
+    if let Ok(mut r) = provider_sync_registry().lock() {
+        r.insert(worktree.to_string(), env_name.to_string());
+    }
+}
+
+/// On worktree close, pull the sandbox fs back into the local worktree for a
+/// provider `data = "sync"` env. Best-effort; a no-op when nothing was synced.
+pub(crate) fn deprovision_sync(path: &str) {
+    let env_name = provider_sync_registry()
+        .lock()
+        .ok()
+        .and_then(|mut r| r.remove(path));
+    let Some(env_name) = env_name else {
+        return;
+    };
+    let cfg = Config::load_layered(&superzej_core::config::ProcessEnv, &[], None);
+    let Some((provider, id, workdir)) = provider_sync_target(&cfg, &env_name) else {
+        return;
+    };
+    let p = path.to_string();
+    let _ = block_on_provider(|| async {
+        provider
+            .download_dir(&id, &workdir, std::path::Path::new(&p))
+            .await
+    });
+}
+
 /// Pure composition of the final [`LaunchSpec`] from a settled sandbox: argv
 /// (sandbox-wrapped, or a bare login shell on the host fallback), cwd, env,
 /// plus the effective backend label and any fallback warnings.
@@ -472,7 +691,12 @@ pub fn compose_spec(
     // Local worktrees run in their own dir; a remote worktree (its `GitLoc`) or
     // a remote placement (ssh/k8s/provider env) has no local dir — the placement
     // cd's on the target — so the pane cwd stays unset.
-    let cwd = (!loc.is_remote() && !sb.is_remote).then(|| PathBuf::from(worktree));
+    // A projected data mode (sshfs/sync) pins the pane to its local mountpoint;
+    // otherwise a local worktree runs in its own dir and a remote one has none.
+    let cwd = sb
+        .cwd_override
+        .clone()
+        .or_else(|| (!loc.is_remote() && !sb.is_remote).then(|| PathBuf::from(worktree)));
     let env = vec![
         ("SUPERZEJ_WORKTREE".to_string(), worktree.to_string()),
         (
@@ -777,6 +1001,7 @@ mod tests {
             warnings: vec!["sandbox auto selected host".into()],
             shell: String::new(),
             is_remote: false,
+            cwd_override: None,
         };
         let spec = compose_spec(&cfg, "/wt/x", Some("sz/x"), "claude", &loc, &host);
         assert_eq!(
