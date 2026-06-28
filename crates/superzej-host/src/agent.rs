@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use superzej_core::config::Config;
 use superzej_core::db::Db;
 use superzej_core::remote::GitLoc;
-use superzej_core::{account, devenv, repo, sandbox};
+use superzej_core::{account, devenv, direnv, repo, sandbox};
 use superzej_svc::projection::ProjectionBackend;
 use superzej_svc::vpn::VpnProvider;
 
@@ -1214,6 +1214,14 @@ pub fn launch_spec_with_key(
         _ => {}
     }
 
+    // Pre-warm this worktree's `direnv` cache on the host so the in-sandbox
+    // direnv hook replays it read-only instead of failing on the read-only
+    // `/nix/store`. Off-loop, gated by `needs_warm`; local worktrees only (a
+    // remote worktree's `.envrc` isn't on this host's filesystem).
+    if !loc.is_remote() && !outcome.is_remote {
+        warm_direnv(cfg, Path::new(worktree));
+    }
+
     let mut spec = compose_spec(cfg, worktree, branch, choice, &loc, &outcome);
     // On the host path (no sandbox spec) the credential home + build env ride
     // the pane env.
@@ -1454,6 +1462,19 @@ fn build_env_vars(cfg: &Config, repo_root: &Path) -> Vec<(String, String)> {
         ));
     }
     out
+}
+
+/// Map `[sandbox] warm_direnv` to a host-side `direnv` cache warm for
+/// `worktree`. Off-loop and self-gating (`direnv::warm` is a no-op without a
+/// cold flake-backed `.envrc`); no-op when warming is disabled.
+pub(crate) fn warm_direnv(cfg: &Config, worktree: &Path) {
+    use superzej_core::config::WarmDirenv;
+    let allow = match cfg.sandbox.warm_direnv {
+        WarmDirenv::Off => return,
+        WarmDirenv::AllowedOnly => false,
+        WarmDirenv::Auto => true,
+    };
+    direnv::warm(worktree, allow);
 }
 
 /// Tier A inject for a sandboxed pane: prepend the devShell `PATH` via a raw

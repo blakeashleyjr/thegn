@@ -66,6 +66,17 @@ pane_padding = 0
 # ($TERM / $TERM_PROGRAM / $VTE_VERSION); "on" / "off" force it. Unsupported
 # terminals degrade to a single underline.
 undercurl = "auto"
+# Color fidelity. "auto" sniffs the terminal (COLORTERM / $TERM / WT_SESSION /
+# NO_COLOR) and degrades truecolor -> 256 -> 16 -> mono as needed; pin a level
+# with "truecolor", "256", "16", or "none"/"mono". The NO_COLOR env var forces
+# "none" unless you set an explicit value here. (env: SUPERZEJ_THEME_COLOR)
+color = "auto"
+# Glyph fidelity for chrome (box drawing, status dots, arrows, the logotype).
+# "auto" sniffs the locale (UTF-8?) and terminal; "unicode" forces the rounded
+# Unicode look; "ascii" forces 7-bit fallbacks (+ - | * o ^ v) for bare
+# terminals / fonts without box-drawing glyphs. Run `superzej doctor` to see
+# what your terminal resolves to. (env: SUPERZEJ_THEME_GLYPHS)
+glyphs = "auto"
 
 # Optional: override any chrome surface/text color (all "#rrggbb"; unset keys
 # keep the preset's palette). Invalid hex warns and keeps the default.
@@ -285,6 +296,11 @@ pr_interval_secs = 20  # PR refresh cadence (SUPERZEJ_WATCH_PR_INTERVAL)
 override_gpg = false   # true => history rewrites pass -c commit.gpgSign=false
                        # -c tag.gpgSign=false, so a gpg passphrase prompt can
                        # never hang a background operation
+merge_guard = true     # install a pre-merge-commit hook that refuses `git merge`
+                       # in the canonical checkout from inside a sandbox (where
+                       # its FS view can be incoherent and corrupt the merge);
+                       # points at `szhost integrate`. No-op outside a sandbox or
+                       # in linked worktrees. Escape hatch: SUPERZEJ_MERGE_GUARD_OFF=1
 
 # User-defined git commands, surfaced in the git panel's custom-commands menu
 # (`x`). `command` is a template expanded against the current selection — see
@@ -399,6 +415,9 @@ format = "text"           # text | json
 #     name). Bind one per folder you sort into; firing again files into the same
 #     folder (no duplicates). The interactive picker is `move-worktree-to-folder`
 #     (bindable / in the palette) when you'd rather choose or name a folder.
+#     Every folder named by a file-worktree action surfaces automatically as a
+#     destination — in that picker, in the Cmd-K palette ("File into: <name>"),
+#     and in the which-key popup — even before anything has been filed there.
 #
 # A scratch worktree on bwrap with a shell, no prompts:
 # [[actions]]
@@ -917,10 +936,33 @@ env_passthrough = [
 shell = ""
 
 # ── Init script ───────────────────────────────────────────────────────────────
-# POSIX sh snippet run inside the sandbox before each agent/shell starts.
-# Useful for first-run tool installation, env setup, or container git config.
+# POSIX sh snippet run INSIDE the sandbox before each agent/shell starts (runs
+# in every pane, before the login shell `exec`s). Useful for first-run tool
+# installation, env setup, or container git config.
 # init_script = "mise install 2>/dev/null || true"
 init_script = ""
+
+# ── Prepare hooks (host-side, one-time per worktree) ──────────────────────────
+# Commands run ON THE HOST (off-loop, via `sh -lc` in the worktree) once when a
+# worktree is created, before its first pane spawns. Unlike `init_script` these
+# run on the host — with the writable Nix store, the Nix daemon, and full
+# network — so they suit heavyweight setup that a sandboxed pane can't do
+# itself. The built-in `direnv` warm (`warm_direnv`, below) runs alongside them.
+# prepare = ["mise install || true", "pnpm install --frozen-lockfile || true"]
+prepare = []
+
+# ── direnv ────────────────────────────────────────────────────────────────────
+# Pre-warm a worktree's `direnv` cache on the HOST so the in-sandbox `direnv`
+# hook actually works. A worktree pane is a login shell, so your rc's `direnv
+# hook` fires inside the sandbox; with `use flake`, a cold nix-direnv cache makes
+# direnv rebuild the devShell — which writes/locks `/nix/store` and fails on the
+# sandbox's read-only store (no daemon). Warming on the host (writable store +
+# daemon) means the in-pane direnv replays the cached env read-only instead.
+#   "auto"         — warm + `direnv allow` the worktree (trusts the repo's own
+#                    .envrc, the same boundary `inject_devshell` already crosses)
+#   "allowed-only" — warm only worktrees you've already `direnv allow`-ed
+#   "off"          — never warm (the in-pane direnv falls back as before)
+warm_direnv = "auto"
 
 # Wrap the inner command in `devenv shell --`. Auto-enabled if devenv.nix is
 # present in the worktree root and the `devenv` binary is on PATH.
@@ -1344,6 +1386,33 @@ agent_model = "model-proxy/standard"
 # reaches the proxy via the container gateway instead. Off = the additive model:
 # pi runs its own tools in-process and edits auto-apply.
 bouncer = false
+
+# ── Local merge queue: the "fold-actor" (optional) ─────────────────────────
+# Stop hand-sequencing parallel branches into main. The fold-actor folds every
+# queued worktree branch onto `target_branch` entirely in the git object
+# database (no checkout, milliseconds): branches that merge clean land
+# automatically as sequential merge commits, and only genuine conflicts are
+# deferred for you (or an agent) to resolve. Fire it once with `superzej
+# integrate` / the palette action, or let `auto_drain` fold on agent-done.
+#
+# Because ten clean *textual* merges say nothing about whether their *union*
+# builds, the fold is test-gated: the folded tip is checked out into a throwaway
+# worktree, `gate_command` runs, and main only advances (atomic compare-and-swap)
+# if it's green — bisecting the offending branch on red. This is the real
+# correctness wall, automated rather than babysat.
+#
+# Disabled by default; AI-free and strictly additive — the shell never depends
+# on it.
+[merge_queue]
+enabled = false
+target_branch = "auto"        # branch to advance; "auto" = repo HEAD/default
+gate_command = ""             # e.g. "just ci" / "cargo test --workspace"; "" disables the gate
+gate_on = true                # run gate_command before advancing main
+bisect_on_red = true          # on a red gate, defer just the offending branch
+auto_drain = true             # fold automatically when an agent signals done
+snapshot_dirty = false        # auto-commit uncommitted worktree work before folding
+regenerate_paths = ["Cargo.lock"]  # conflicts confined to these are "regenerable", not handed off
+conflict_handoff = "agent"    # agent | notify | manual — fate of a deferred branch
 
 # ── Media player control (optional) ────────────────────────────────────────
 # Drive your music/media player from superzej: play/pause, next/previous,

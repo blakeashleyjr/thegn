@@ -1088,6 +1088,13 @@ pub fn run_worker(
         }
     }
 
+    // Host-side setup for the finalized worktree (`path` is now settled past any
+    // rename/move): run the one-time `[sandbox] prepare` hooks and warm the
+    // `direnv` cache so the first pane's in-sandbox direnv replays it read-only
+    // instead of failing on the read-only store. Both off-loop and self-gating.
+    superzej_core::sandbox::run_prepare(&path, &cfg.sandbox.prepare);
+    crate::agent::warm_direnv(cfg, &path);
+
     // --- compose the launch spec (pure); the loop does the openpty+exec.
     // Bouncer env (proxy + tool override) rides the sandbox's env_overrides; a
     // host fallback gets the proxy vars on the pane env instead.

@@ -45,13 +45,31 @@ use std::path::PathBuf;
 /// unchanged; thereafter order is manual (Ctrl+Alt+↑/↓) and stable.
 /// v20: adds `worktree_disk` (per-worktree size + target/ size cache) backing
 /// the disk-usage badges, the statusbar threshold warning, and `superzej disk`.
-/// v22: adds `group_tabs.pane_sessions` (per-leaf provider exec session, JSON
+/// v22: adds `merge_queue` (the local fold-actor's per-worktree queue + result
+/// cache) backing `superzej integrate`, the merge-queue panel, and auto-drain.
+/// v23: adds `group_tabs.pane_sessions` (per-leaf provider exec session, JSON
 /// `pane id → {provider, id, session}`) so a native-exec (provider WSS) pane
 /// reattaches to its live remote session — replaying scrollback — on restart.
-const SCHEMA_VERSION: i64 = 22;
+const SCHEMA_VERSION: i64 = 23;
 
 pub struct Db {
     conn: Connection,
+}
+
+/// One row of the local merge queue (`[merge_queue]`, v22). Keyed by worktree;
+/// `status` is one of queued/folding/verifying/landed/deferred/gate_failed.
+/// `conflict_paths` is newline-joined when present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeQueueRow {
+    pub worktree: String,
+    pub branch: String,
+    pub target_branch: String,
+    pub status: String,
+    pub queued_at: i64,
+    pub updated_at: i64,
+    pub result_oid: Option<String>,
+    pub conflict_paths: Option<String>,
+    pub error_detail: Option<String>,
 }
 
 /// A persisted ingress share (`[share]`) — the resurrection record for a tunnel
@@ -530,6 +548,23 @@ impl Db {
               last_used  INTEGER,
               PRIMARY KEY (provider, name)
             );
+            -- merge_queue (v22): the local fold-actor's queue + result cache,
+            -- keyed by worktree. Git stays the source of truth; this is the UI
+            -- feed and the durable record of what landed / what was deferred.
+            -- status: queued | folding | verifying | landed | deferred | gate_failed
+            CREATE TABLE IF NOT EXISTS merge_queue (
+              worktree       TEXT PRIMARY KEY,
+              branch         TEXT NOT NULL,
+              target_branch  TEXT NOT NULL,
+              status         TEXT NOT NULL DEFAULT 'queued',
+              queued_at      INTEGER NOT NULL,
+              updated_at     INTEGER NOT NULL,
+              result_oid     TEXT,
+              conflict_paths TEXT,
+              error_detail   TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_merge_queue_status
+              ON merge_queue (status, queued_at);
             COMMIT;
             "#,
         )?;
@@ -557,9 +592,9 @@ impl Db {
         // {argv, cwd}) so a resurrected/crashed pane can offer to relaunch the
         // program it was running. Additive; absent/NULL on pre-v15 rows = none.
         let _ = conn.execute("ALTER TABLE group_tabs ADD COLUMN pane_cmds TEXT", []);
-        // v22: per-leaf provider exec session (JSON map of pane id →
+        // v23: per-leaf provider exec session (JSON map of pane id →
         // {provider, id, session}) so a native-exec pane reattaches to its live
-        // remote session on restart. Additive; absent/NULL on pre-v22 rows = none.
+        // remote session on restart. Additive; absent/NULL on pre-v23 rows = none.
         let _ = conn.execute("ALTER TABLE group_tabs ADD COLUMN pane_sessions TEXT", []);
         // Backfill any unset positions deterministically by creation order
         // (path as the tie-breaker), giving pre-v8 worktrees a stable,
@@ -722,6 +757,94 @@ impl Db {
             params![worktree, branch, json, util::now()],
         )?;
         Ok(())
+    }
+
+    // --- merge queue (v22): the local fold-actor's queue + result cache ----
+
+    /// Enqueue (or re-enqueue) a worktree branch for the next fold. Re-enqueueing
+    /// resets the row to `queued` and clears any prior result/conflict/error, so
+    /// a branch that was deferred and then rebased starts fresh.
+    pub fn enqueue_merge(&self, worktree: &str, branch: &str, target_branch: &str) -> Result<()> {
+        let now = util::now();
+        self.conn.execute(
+            r#"INSERT INTO merge_queue
+                 (worktree,branch,target_branch,status,queued_at,updated_at,
+                  result_oid,conflict_paths,error_detail)
+               VALUES(?1,?2,?3,'queued',?4,?4,NULL,NULL,NULL)
+               ON CONFLICT(worktree) DO UPDATE SET
+                 branch=?2, target_branch=?3, status='queued',
+                 queued_at=?4, updated_at=?4,
+                 result_oid=NULL, conflict_paths=NULL, error_detail=NULL"#,
+            params![worktree, branch, target_branch, now],
+        )?;
+        Ok(())
+    }
+
+    /// Update a queued worktree's status and (optionally) its result oid,
+    /// conflicted paths (newline-joined), and error detail. Passing `None` leaves
+    /// the corresponding column unchanged.
+    pub fn update_merge_status(
+        &self,
+        worktree: &str,
+        status: &str,
+        result_oid: Option<&str>,
+        conflict_paths: Option<&str>,
+        error_detail: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"UPDATE merge_queue SET
+                 status=?2, updated_at=?3,
+                 result_oid=COALESCE(?4, result_oid),
+                 conflict_paths=COALESCE(?5, conflict_paths),
+                 error_detail=COALESCE(?6, error_detail)
+               WHERE worktree=?1"#,
+            params![
+                worktree,
+                status,
+                util::now(),
+                result_oid,
+                conflict_paths,
+                error_detail
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Drop a worktree's merge-queue row (e.g. after a clean land is recorded
+    /// elsewhere, or the worktree is removed).
+    pub fn remove_merge_entry(&self, worktree: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM merge_queue WHERE worktree=?1",
+            params![worktree],
+        )?;
+        Ok(())
+    }
+
+    /// The whole queue, oldest-queued first (the fold order + UI feed).
+    pub fn list_merge_queue(&self) -> Result<Vec<MergeQueueRow>> {
+        let mut stmt = self.conn.prepare(
+            r#"SELECT worktree,branch,target_branch,status,queued_at,updated_at,
+                      result_oid,conflict_paths,error_detail
+               FROM merge_queue ORDER BY queued_at"#,
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(MergeQueueRow {
+                worktree: r.get(0)?,
+                branch: r.get(1)?,
+                target_branch: r.get(2)?,
+                status: r.get(3)?,
+                queued_at: r.get(4)?,
+                updated_at: r.get(5)?,
+                result_oid: r.get(6)?,
+                conflict_paths: r.get(7)?,
+                error_detail: r.get(8)?,
+            })
+        })?;
+        let mut v = Vec::new();
+        for row in rows {
+            v.push(row?);
+        }
+        Ok(v)
     }
 
     // --- per-worktree disk usage cache (v20) -------------------------------
@@ -2824,6 +2947,62 @@ mod tests {
         let rows = db.list_shares().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].local_port, 8080);
+    }
+
+    #[test]
+    fn merge_queue_enqueue_update_list_and_remove() {
+        let db = db();
+        assert!(db.list_merge_queue().unwrap().is_empty());
+
+        db.enqueue_merge("/wt/a", "feat-a", "main").unwrap();
+        db.enqueue_merge("/wt/b", "feat-b", "main").unwrap();
+        let q = db.list_merge_queue().unwrap();
+        assert_eq!(q.len(), 2);
+        // Oldest-queued first, all start `queued` with empty result/conflict.
+        assert_eq!(q[0].worktree, "/wt/a");
+        assert_eq!(q[0].status, "queued");
+        assert!(q[0].result_oid.is_none() && q[0].conflict_paths.is_none());
+
+        // Land one (records the merge-commit oid); defer the other (paths).
+        db.update_merge_status("/wt/a", "landed", Some("deadbeef"), None, None)
+            .unwrap();
+        db.update_merge_status(
+            "/wt/b",
+            "deferred",
+            None,
+            Some("src/x.rs\nCargo.toml"),
+            None,
+        )
+        .unwrap();
+        let by = |wt: &str| -> MergeQueueRow {
+            db.list_merge_queue()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.worktree == wt)
+                .unwrap()
+        };
+        let a = by("/wt/a");
+        assert_eq!(a.status, "landed");
+        assert_eq!(a.result_oid.as_deref(), Some("deadbeef"));
+        let b = by("/wt/b");
+        assert_eq!(b.status, "deferred");
+        assert_eq!(b.conflict_paths.as_deref(), Some("src/x.rs\nCargo.toml"));
+
+        // COALESCE keeps the prior result_oid when a later update passes None.
+        db.update_merge_status("/wt/a", "verifying", None, None, None)
+            .unwrap();
+        assert_eq!(by("/wt/a").result_oid.as_deref(), Some("deadbeef"));
+
+        // Re-enqueue resets a deferred branch to a clean `queued` row.
+        db.enqueue_merge("/wt/b", "feat-b", "main").unwrap();
+        let b = by("/wt/b");
+        assert_eq!(b.status, "queued");
+        assert!(b.conflict_paths.is_none() && b.error_detail.is_none());
+
+        db.remove_merge_entry("/wt/a").unwrap();
+        let q = db.list_merge_queue().unwrap();
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].worktree, "/wt/b");
     }
 
     #[test]
