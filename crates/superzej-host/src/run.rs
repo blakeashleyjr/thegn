@@ -2189,6 +2189,21 @@ fn connect_worktree_bridge(
                 &crate::bridge_sup::remote_szhost(),
             );
         }
+        // CLI-free control plane: for an exec_api provider (and exec != cli),
+        // start the bridge over the native exec API instead of the vendor CLI.
+        if let superzej_core::placement::Placement::Provider(p) = &env.placement
+            && let Some(provider) = crate::agent::native_bridge_provider(&cfg, &env)
+        {
+            sup.connect_native(
+                &loc,
+                &loc.path(),
+                &wt.to_string_lossy(),
+                provider,
+                p.id.clone(),
+                tokio::runtime::Handle::current(),
+            );
+            return;
+        }
         if let Some(cmd) = crate::bridge_sup::bridge_command(&env.placement) {
             sup.connect(&loc, &loc.path(), &wt.to_string_lossy(), cmd);
         }

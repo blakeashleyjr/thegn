@@ -10,12 +10,14 @@
 //! unit-testable without a terminal and stays decoupled from the loop's channels.
 
 use std::collections::HashMap;
+use std::io::{self, Read, Write};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use superzej_core::placement::Placement;
 use superzej_core::remote::{GitLoc, ssh_base};
 use superzej_svc::bridge::{self, BridgeClient};
+use superzej_svc::provider::{ExecControl, ExecFrame, ExecSession, ExecSpec, Provider};
 
 /// Fired on every `fs.watch` event from any connected bridge — wired to
 /// `refresh_tx.send(RefreshKind::Model)` + `waker.wake()` by `run.rs`.
@@ -64,6 +66,29 @@ impl BridgeSupervisor {
         match BridgeClient::spawn(cmd) {
             Ok(client) => self.connect_client(loc, workdir, host_path, Arc::new(client)),
             Err(e) => superzej_core::msg::warn(&format!("bridge connect failed: {e}")),
+        }
+    }
+
+    /// Like [`connect`] but over a provider's **native exec API** (no vendor CLI):
+    /// run `szhost bridge` via `provider.open_exec(tty=false)` and talk to it over
+    /// the resulting [`ExecSession`] channels. `rt` is the host runtime handle the
+    /// session's driver task lives on. Best-effort: a failure leaves the per-op
+    /// (CLI) git path as the fallback, same as [`connect`].
+    pub fn connect_native(
+        &self,
+        loc: &GitLoc,
+        workdir: &str,
+        host_path: &str,
+        provider: Provider,
+        sandbox_id: String,
+        rt: tokio::runtime::Handle,
+    ) {
+        if bridge::bridge_key(loc).is_none() || self.is_connected(loc) {
+            return;
+        }
+        match open_bridge_native(&provider, &sandbox_id, &rt) {
+            Ok(client) => self.connect_client(loc, workdir, host_path, Arc::new(client)),
+            Err(e) => superzej_core::msg::warn(&format!("native bridge connect failed: {e}")),
         }
     }
 
@@ -200,6 +225,102 @@ fn argv_command(argv: &[String]) -> Command {
     c
 }
 
+/// Open the resident bridge over a provider's native exec API and build a
+/// [`BridgeClient`] on its [`ExecSession`] channels. The session's driver task
+/// runs on `rt` (the host runtime) and outlives this call, so the bridge stays
+/// live; it ends when the client (and thus the `ControlWriter`) drops.
+fn open_bridge_native(
+    provider: &Provider,
+    sandbox_id: &str,
+    rt: &tokio::runtime::Handle,
+) -> anyhow::Result<BridgeClient> {
+    let spec = ExecSpec {
+        argv: vec![remote_szhost(), "bridge".to_string()],
+        tty: false,
+        cols: 0,
+        rows: 0,
+        env: Vec::new(),
+        cwd: None,
+    };
+    // block_on is valid here: callers run on a `spawn_blocking` thread (not a
+    // runtime worker), and `open_exec`'s driver `tokio::spawn` lands on `rt`.
+    let session = rt.block_on(provider.open_exec(sandbox_id, &spec))?;
+    let ExecSession {
+        frames, control, ..
+    } = session;
+    Ok(BridgeClient::new(
+        FramesReader::new(frames),
+        ControlWriter { tx: control },
+    ))
+}
+
+/// Adapts an [`ExecSession`]'s stdout frames into a blocking [`Read`] for the
+/// `BridgeClient` reader thread. EOF on an `Exit` frame or a closed channel.
+/// Uses `blocking_recv` — only sound off a runtime worker (the bridge reader is
+/// a dedicated std::thread, which satisfies that).
+struct FramesReader {
+    rx: tokio::sync::mpsc::Receiver<ExecFrame>,
+    buf: Vec<u8>,
+    pos: usize,
+    done: bool,
+}
+
+impl FramesReader {
+    fn new(rx: tokio::sync::mpsc::Receiver<ExecFrame>) -> Self {
+        FramesReader {
+            rx,
+            buf: Vec::new(),
+            pos: 0,
+            done: false,
+        }
+    }
+}
+
+impl Read for FramesReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if self.pos < self.buf.len() {
+                let n = (self.buf.len() - self.pos).min(out.len());
+                out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+                self.pos += n;
+                return Ok(n);
+            }
+            if self.done {
+                return Ok(0);
+            }
+            match self.rx.blocking_recv() {
+                Some(ExecFrame::Stdout(d)) => {
+                    self.buf = d;
+                    self.pos = 0;
+                }
+                Some(ExecFrame::Exit(_)) | None => {
+                    self.done = true;
+                    return Ok(0);
+                }
+            }
+        }
+    }
+}
+
+/// Adapts blocking [`Write`] into an [`ExecSession`]'s stdin control channel.
+/// Uses `blocking_send` — sound off a runtime worker (the `BridgeClient` writes
+/// from the git backend's `spawn_blocking` threads).
+struct ControlWriter {
+    tx: tokio::sync::mpsc::Sender<ExecControl>,
+}
+
+impl Write for ControlWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.tx
+            .blocking_send(ExecControl::Stdin(data.to_vec()))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "exec session closed"))?;
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,6 +339,41 @@ mod tests {
         });
         let sock = TcpStream::connect(addr).unwrap();
         Arc::new(BridgeClient::new(sock.try_clone().unwrap(), sock))
+    }
+
+    #[test]
+    fn exec_session_adapter_roundtrips_and_eofs() {
+        // The ExecSession→Read/Write adapter the native bridge transport uses.
+        let (frames_tx, frames_rx) = tokio::sync::mpsc::channel::<ExecFrame>(8);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<ExecControl>(8);
+        let mut reader = FramesReader::new(frames_rx);
+        let mut writer = ControlWriter { tx: control_tx };
+
+        // Write side: bytes become an ExecControl::Stdin.
+        writer.write_all(b"ping").unwrap();
+        assert_eq!(
+            control_rx.blocking_recv(),
+            Some(ExecControl::Stdin(b"ping".to_vec()))
+        );
+
+        // Read side: stdout frames stream out across buffer boundaries, Exit ⇒ EOF.
+        frames_tx
+            .blocking_send(ExecFrame::Stdout(b"ab".to_vec()))
+            .unwrap();
+        frames_tx
+            .blocking_send(ExecFrame::Stdout(b"cd".to_vec()))
+            .unwrap();
+        frames_tx.blocking_send(ExecFrame::Exit(0)).unwrap();
+        let mut out = Vec::new();
+        let mut tmp = [0u8; 3];
+        loop {
+            let n = reader.read(&mut tmp).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&tmp[..n]);
+        }
+        assert_eq!(out, b"abcd");
     }
 
     #[test]
