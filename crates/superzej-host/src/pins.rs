@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use superzej_core::config::{Config, Pin, PinLocation, PinRestart};
+use superzej_core::config::{Config, Pin, PinCorner, PinLocation, PinRestart};
 
 use crate::compositor::Rect;
 
@@ -37,6 +37,8 @@ pub enum PinPlacement {
     Float,
     /// A tiled pane spliced into the focused tab's center tree.
     Layout,
+    /// A small bordered overlay docked in a screen corner (one at a time).
+    Corner,
     /// Its own session tab.
     Tab,
 }
@@ -47,6 +49,7 @@ impl PinPlacement {
             PinLocation::Strip => PinPlacement::Strip,
             PinLocation::Float => PinPlacement::Float,
             PinLocation::Layout => PinPlacement::Layout,
+            PinLocation::Corner => PinPlacement::Corner,
             PinLocation::Tab => PinPlacement::Tab,
         }
     }
@@ -56,6 +59,7 @@ impl PinPlacement {
             PinPlacement::Strip => "strip",
             PinPlacement::Float => "float",
             PinPlacement::Layout => "layout",
+            PinPlacement::Corner => "corner",
             PinPlacement::Tab => "tab",
         }
     }
@@ -404,6 +408,44 @@ impl PinSupervisor {
     }
 }
 
+/// The outer rect a corner pin occupies: `width`×`height` (already resolved to
+/// cells) clamped to `[1, screen]` and anchored to `corner` inside the full
+/// `cols`×`rows` screen. Pure — unit-tested. The bordered card is drawn over
+/// this rect; the PTY/emulator gets [`inset1`] of it.
+pub fn corner_rect(
+    corner: PinCorner,
+    width: usize,
+    height: usize,
+    cols: usize,
+    rows: usize,
+) -> Rect {
+    let w = width.clamp(1, cols.max(1));
+    let h = height.clamp(1, rows.max(1));
+    let (right, bottom) = match corner {
+        PinCorner::TopLeft => (false, false),
+        PinCorner::TopRight => (true, false),
+        PinCorner::BottomLeft => (false, true),
+        PinCorner::BottomRight => (true, true),
+    };
+    Rect {
+        x: if right { cols.saturating_sub(w) } else { 0 },
+        y: if bottom { rows.saturating_sub(h) } else { 0 },
+        cols: w,
+        rows: h,
+    }
+}
+
+/// Inset a rect by a single cell on every side (the card's border ring). The
+/// content rect handed to the PTY. Degenerate rects collapse toward zero.
+pub fn inset1(r: Rect) -> Rect {
+    Rect {
+        x: r.x + 1,
+        y: r.y + 1,
+        cols: r.cols.saturating_sub(2),
+        rows: r.rows.saturating_sub(2),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,7 +466,110 @@ mod tests {
             env: Default::default(),
             label: None,
             ratio: None,
+            corner: superzej_core::config::PinCorner::BottomRight,
+            corner_width: None,
+            corner_height: None,
         }
+    }
+
+    #[test]
+    fn corner_rect_anchors_each_corner() {
+        // 100x40 screen, a 30x12 card.
+        assert_eq!(
+            corner_rect(PinCorner::TopLeft, 30, 12, 100, 40),
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 30,
+                rows: 12
+            }
+        );
+        assert_eq!(
+            corner_rect(PinCorner::TopRight, 30, 12, 100, 40),
+            Rect {
+                x: 70,
+                y: 0,
+                cols: 30,
+                rows: 12
+            }
+        );
+        assert_eq!(
+            corner_rect(PinCorner::BottomLeft, 30, 12, 100, 40),
+            Rect {
+                x: 0,
+                y: 28,
+                cols: 30,
+                rows: 12
+            }
+        );
+        assert_eq!(
+            corner_rect(PinCorner::BottomRight, 30, 12, 100, 40),
+            Rect {
+                x: 70,
+                y: 28,
+                cols: 30,
+                rows: 12
+            }
+        );
+    }
+
+    #[test]
+    fn corner_rect_clamps_oversize_to_screen() {
+        // A card larger than the screen clamps to the full screen at the origin.
+        let r = corner_rect(PinCorner::BottomRight, 200, 200, 100, 40);
+        assert_eq!(
+            r,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 100,
+                rows: 40
+            }
+        );
+        // Width/height never collapse below 1 even on a degenerate screen.
+        let r = corner_rect(PinCorner::TopLeft, 0, 0, 0, 0);
+        assert_eq!(
+            r,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 1,
+                rows: 1
+            }
+        );
+    }
+
+    #[test]
+    fn inset1_carves_the_border_ring() {
+        assert_eq!(
+            inset1(Rect {
+                x: 70,
+                y: 28,
+                cols: 30,
+                rows: 12
+            }),
+            Rect {
+                x: 71,
+                y: 29,
+                cols: 28,
+                rows: 10
+            }
+        );
+        // A 1-cell rect collapses to zero content, not underflow.
+        assert_eq!(
+            inset1(Rect {
+                x: 5,
+                y: 5,
+                cols: 1,
+                rows: 1
+            }),
+            Rect {
+                x: 6,
+                y: 6,
+                cols: 0,
+                rows: 0
+            }
+        );
     }
 
     #[test]

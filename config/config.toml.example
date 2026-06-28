@@ -785,10 +785,30 @@ visible = true
 # `label` (strip/chip text), `ratio` (this pin's weight in the strip). For layout/
 # strip pins, omitted cwd means the focused repo/worktree if resolvable; for tab/
 # float pins, omitted cwd means $HOME.
+#
+# location = "corner" docks the pin as a small bordered overlay in a screen
+# corner (toggle with Ctrl+Alt+o), sized by `corner_width`/`corner_height`
+# ("30%" of the screen, or an absolute cell count) and anchored by `corner`
+# ("bottom-right" (default) | "bottom-left" | "top-right" | "top-left"). A single
+# corner pin is live at a time. Great for a video player; audio plays through your
+# normal system audio, and YouTube works via mpv's yt-dlp integration (pass a URL).
+#   - On a kitty-graphics terminal (Ghostty, kitty, WezTerm) use `mpv --vo=kitty`
+#     for CRISP pixel video: superzej relays the corner's kitty images to the outer
+#     terminal, offset to the corner rect (auto-detected).
+#   - Elsewhere use `mpv --vo=tct` — colored Unicode half-blocks (text+truecolor),
+#     blocky but works on any terminal.
 # [[pins]]
 # name = "aerc"
 # command = "aerc"
 # location = "float"
+#
+# [[pins]]
+# name = "video"
+# command = "mpv --vo=kitty --really-quiet"   # or "--vo=tct" on non-kitty terminals
+# location = "corner"
+# corner = "bottom-right"
+# corner_width = "30%"
+# corner_height = "30%"
 #
 # [[pins]]
 # name = "logs"

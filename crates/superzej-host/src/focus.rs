@@ -21,6 +21,9 @@ pub enum Zone {
     /// The bottom file-manager drawer (yazi). Sits below the center, above the
     /// statusbar; keys forward to its PTY only while it owns focus.
     Drawer,
+    /// A corner overlay pin (e.g. an `mpv --vo=tct` video player). Toggle-driven,
+    /// not on the spatial graph; keys forward to its PTY while it owns focus.
+    Corner,
     /// The top bar (brand + stats cluster).
     Masthead,
     /// The bottom bar (hints + status widgets).
@@ -44,6 +47,9 @@ impl FocusState {
     }
     pub fn drawer(&self) -> bool {
         self.zone == Zone::Drawer
+    }
+    pub fn corner(&self) -> bool {
+        self.zone == Zone::Corner
     }
     pub fn center(&self) -> bool {
         self.zone == Zone::Center
@@ -140,6 +146,10 @@ pub fn route(zone: Zone, dir: Move, ctx: &RouteCtx) -> FocusMove {
             Move::Left => FocusMove::WithinZone(-1),
             _ => FocusMove::None,
         },
+        // The corner overlay is toggle-driven (Ctrl+Alt+v / Esc), not part of
+        // the spatial graph: directional moves dead-end here so arrow/seek keys
+        // reach the player's PTY instead of stealing focus.
+        Zone::Corner => FocusMove::None,
     }
 }
 
@@ -147,7 +157,7 @@ pub fn route(zone: Zone, dir: Move, ctx: &RouteCtx) -> FocusMove {
 /// owns the keyboard: the center panes, or the bottom drawer (yazi) while it is
 /// focused. The Ctrl+g keybind lock short-circuits before this.
 pub fn forwards_to_pane(zone: Zone) -> bool {
-    matches!(zone, Zone::Center | Zone::Drawer)
+    matches!(zone, Zone::Center | Zone::Drawer | Zone::Corner)
 }
 
 #[cfg(test)]
@@ -341,13 +351,30 @@ mod tests {
 
     #[test]
     fn forwards_to_pane_matrix() {
-        // Only the PTY zones forward keys: the center and the focused drawer.
+        // Only the PTY zones forward keys: the center, the focused drawer, and
+        // the focused corner overlay.
         assert!(forwards_to_pane(Zone::Center));
         assert!(forwards_to_pane(Zone::Drawer));
+        assert!(forwards_to_pane(Zone::Corner));
         assert!(!forwards_to_pane(Zone::Sidebar));
         assert!(!forwards_to_pane(Zone::Panel));
         assert!(!forwards_to_pane(Zone::Masthead));
         assert!(!forwards_to_pane(Zone::Statusbar));
+    }
+
+    #[test]
+    fn corner_is_off_the_spatial_graph() {
+        // The corner overlay dead-ends every directional move (toggle-driven).
+        let l = two_panes();
+        let c = ctx(&l, 1, true, true);
+        for dir in [Move::Up, Move::Down, Move::Left, Move::Right] {
+            assert_eq!(route(Zone::Corner, dir, &c), FocusMove::None);
+        }
+        let f = FocusState {
+            zone: Zone::Corner,
+            locked: false,
+        };
+        assert!(f.corner() && !f.center());
     }
 
     #[test]
