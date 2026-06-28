@@ -15,6 +15,7 @@ pub mod diff;
 pub mod disk;
 pub mod doctor;
 pub mod env;
+pub mod integrate;
 pub mod issue;
 pub mod list;
 pub mod logs;

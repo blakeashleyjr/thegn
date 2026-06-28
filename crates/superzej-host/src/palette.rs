@@ -297,7 +297,14 @@ pub(crate) fn build_command_palette_items(
 ) -> Vec<crate::palette::PaletteItem> {
     let mut items: Vec<crate::palette::PaletteItem> = crate::keymap::action_specs()
         .iter()
-        .filter(|spec| spec.palette)
+        // The fold-actor command only makes sense when the merge queue is on.
+        .filter(|spec| {
+            if spec.id == "integrate" {
+                cfg.merge_queue.enabled
+            } else {
+                spec.palette
+            }
+        })
         .map(|spec| {
             let label = crate::keymap::chord_hint_for(cfg, spec.id)
                 .map(|chord| format!("{}  ({chord})", spec.label))

@@ -704,6 +704,10 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // (branch moves, PR cache) and bounds staleness. The loop owns the actual
     // refresh; this thread just pulses a tick + waker on the interval.
     let (refresh_tx, refresh_rx) = tokio_mpsc::unbounded_channel::<RefreshKind>();
+    // The local merge queue ("fold-actor"): a one-shot fold runs off the loop
+    // (git + an optional multi-second test-gate) and its result lands here.
+    let (fold_tx, fold_rx) =
+        tokio_mpsc::unbounded_channel::<anyhow::Result<crate::integrate::FoldReport>>();
     let (stats_tx, stats_rx) = tokio_mpsc::unbounded_channel::<superzej_metrics::StatsSnapshot>();
     let (container_tx, container_rx) =
         tokio_mpsc::unbounded_channel::<Vec<superzej_core::sandbox::ContainerInfo>>();
@@ -814,6 +818,8 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         config_rx,
         refresh_tx,
         refresh_rx,
+        fold_tx,
+        fold_rx,
         stats_rx,
         container_rx,
         metrics_rx,
@@ -3063,6 +3069,27 @@ fn spawn_hunk_fetch(
             .diff_hunks(&loc, "HEAD", &path, 16)
             .unwrap_or_default();
         if tx.send((generation, path, hunks)).is_ok() {
+            let _ = waker.wake();
+        }
+    });
+}
+
+/// Kick a one-shot fold-actor run off the loop. The fold does git plumbing plus
+/// an optional multi-second test-gate, so it must never run on the loop; the
+/// result (a `FoldReport` or an error) comes back on `fold_tx` and pulses the
+/// waker, exactly like the hunk/model fetches. `any_path` is any path inside the
+/// repo (the runner resolves the main checkout itself).
+fn spawn_fold(
+    fold_tx: &tokio_mpsc::UnboundedSender<anyhow::Result<crate::integrate::FoldReport>>,
+    waker: &TerminalWaker,
+    mq: superzej_core::config::MergeQueueConfig,
+    any_path: std::path::PathBuf,
+) {
+    let tx = fold_tx.clone();
+    let waker = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        let r = crate::integrate::fold_active_repo(&mq, &any_path);
+        if tx.send(r).is_ok() {
             let _ = waker.wake();
         }
     });
@@ -7421,6 +7448,8 @@ async fn event_loop<T: Terminal>(
     mut config_rx: tokio_mpsc::UnboundedReceiver<Result<superzej_core::config::Config, String>>,
     refresh_tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     mut refresh_rx: tokio_mpsc::UnboundedReceiver<RefreshKind>,
+    fold_tx: tokio_mpsc::UnboundedSender<anyhow::Result<crate::integrate::FoldReport>>,
+    mut fold_rx: tokio_mpsc::UnboundedReceiver<anyhow::Result<crate::integrate::FoldReport>>,
     mut stats_rx: tokio_mpsc::UnboundedReceiver<superzej_metrics::StatsSnapshot>,
     mut container_rx: tokio_mpsc::UnboundedReceiver<Vec<superzej_core::sandbox::ContainerInfo>>,
     mut metrics_rx: tokio_mpsc::UnboundedReceiver<crate::metrics::MetricsState>,
@@ -8006,6 +8035,9 @@ async fn event_loop<T: Terminal>(
     // current (a pre-switch hydration landing post-switch). The startup spawn
     // in `run()` used 0, which this initial value accepts.
     let mut hydration_gen: u64 = 0;
+    // True while a fold-actor run is off the loop; blocks a second concurrent
+    // trigger (a fold advances `main` globally, so one at a time).
+    let mut fold_inflight = false;
 
     // Kick an immediate model hydration for the CURRENT session. Used after a
     // workspace switch: `refresh_tab_model` rebuilds the sidebar from the stale
@@ -10176,6 +10208,36 @@ async fn event_loop<T: Terminal>(
         let mut want_issue_refresh = false;
         let mut want_ci_refresh = false;
         let mut want_disk_refresh = false;
+        // Fold-actor results: report what landed/deferred and re-hydrate so the
+        // advanced target tip and cleared activity dots show immediately.
+        while let Ok(result) = fold_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Fold);
+            fold_inflight = false;
+            match result {
+                Ok(r) => {
+                    let msg = if r.deferred.is_empty() {
+                        format!("Integrated: {} landed", r.landed.len())
+                    } else {
+                        format!(
+                            "Integrated: {} landed, {} deferred",
+                            r.landed.len(),
+                            r.deferred.len()
+                        )
+                    };
+                    toasts.success(msg, std::time::Instant::now());
+                    want_model_refresh = true;
+                }
+                Err(e) => {
+                    toasts.push(
+                        crate::toast::ToastKind::Info,
+                        format!("Integrate failed: {e}"),
+                        std::time::Instant::now(),
+                        std::time::Duration::from_secs(6),
+                    );
+                }
+            }
+            dirty = true;
+        }
         while let Ok(kind) = refresh_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
             match kind {
@@ -15998,6 +16060,36 @@ async fn event_loop<T: Terminal>(
                                     },
                                 );
                                 focus.zone = crate::focus::Zone::Panel;
+                            }
+                            Action::Integrate => {
+                                if !current_config.merge_queue.enabled {
+                                    toasts.push(
+                                        crate::toast::ToastKind::Info,
+                                        "Merge queue disabled — set [merge_queue] enabled = true"
+                                            .to_string(),
+                                        std::time::Instant::now(),
+                                        std::time::Duration::from_secs(6),
+                                    );
+                                } else if fold_inflight {
+                                    toasts.push(
+                                        crate::toast::ToastKind::Info,
+                                        "Already integrating…".to_string(),
+                                        std::time::Instant::now(),
+                                        std::time::Duration::from_secs(3),
+                                    );
+                                } else {
+                                    fold_inflight = true;
+                                    toasts.success(
+                                        "Integrating…".to_string(),
+                                        std::time::Instant::now(),
+                                    );
+                                    spawn_fold(
+                                        &fold_tx,
+                                        &waker,
+                                        current_config.merge_queue.clone(),
+                                        crate::hydrate::active_tab_path(&session),
+                                    );
+                                }
                             }
                             Action::NextTab => {
                                 session.next_tab();
