@@ -430,11 +430,12 @@ pub enum WakeSource {
     Outline,
     Hover,
     Input,
+    Fold,
     Other,
 }
 
 impl WakeSource {
-    pub const ALL: [WakeSource; 24] = [
+    pub const ALL: [WakeSource; 25] = [
         WakeSource::Pty,
         WakeSource::Model,
         WakeSource::Pr,
@@ -458,6 +459,7 @@ impl WakeSource {
         WakeSource::Outline,
         WakeSource::Hover,
         WakeSource::Input,
+        WakeSource::Fold,
         WakeSource::Other,
     ];
     pub const N: usize = Self::ALL.len();
@@ -487,6 +489,7 @@ impl WakeSource {
             WakeSource::Outline => "Outline",
             WakeSource::Hover => "Hover",
             WakeSource::Input => "Input",
+            WakeSource::Fold => "Fold",
             WakeSource::Other => "Other",
         }
     }

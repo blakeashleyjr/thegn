@@ -18,13 +18,42 @@ use termwiz::escape::csi::{Cursor, DecPrivateMode, DecPrivateModeCode, Mode, Sgr
 use termwiz::escape::{CSI, OneBased};
 use termwiz::surface::{Change, CursorVisibility, Position};
 
-fn color_spec(c: ColorAttribute) -> termwiz::color::ColorSpec {
+use superzej_core::termcaps::{ColorDepth, index_256_to_rgb, rgb_to_16, rgb_to_256};
+
+/// Convert a frame `ColorAttribute` to the `ColorSpec` we put on the wire,
+/// downsampling to the outer terminal's [`ColorDepth`]. The frame is always
+/// composed in truecolor; on a lesser terminal we quantize here — the single
+/// site every chrome + pane color flows through. `None` is handled by the
+/// caller (it skips color SGRs entirely), but maps to `Default` defensively.
+fn color_spec(c: ColorAttribute, depth: ColorDepth) -> termwiz::color::ColorSpec {
     use termwiz::color::ColorSpec;
+    if depth == ColorDepth::None {
+        return ColorSpec::Default;
+    }
     match c {
         ColorAttribute::Default => ColorSpec::Default,
-        ColorAttribute::PaletteIndex(i) => ColorSpec::PaletteIndex(i),
+        ColorAttribute::PaletteIndex(i) => match depth {
+            // Indices 0..15 render natively even on a 16-color terminal; higher
+            // indices are re-quantized through their RGB value down to 16.
+            ColorDepth::Ansi16 if i >= 16 => {
+                let (r, g, b) = index_256_to_rgb(i);
+                ColorSpec::PaletteIndex(rgb_to_16(r, g, b))
+            }
+            _ => ColorSpec::PaletteIndex(i),
+        },
         ColorAttribute::TrueColorWithDefaultFallback(t)
-        | ColorAttribute::TrueColorWithPaletteFallback(t, _) => ColorSpec::TrueColor(t),
+        | ColorAttribute::TrueColorWithPaletteFallback(t, _) => match depth {
+            ColorDepth::Truecolor => ColorSpec::TrueColor(t),
+            ColorDepth::Ansi256 => {
+                let (r, g, b, _) = t.to_srgb_u8();
+                ColorSpec::PaletteIndex(rgb_to_256(r, g, b))
+            }
+            ColorDepth::Ansi16 => {
+                let (r, g, b, _) = t.to_srgb_u8();
+                ColorSpec::PaletteIndex(rgb_to_16(r, g, b))
+            }
+            ColorDepth::None => ColorSpec::Default,
+        },
     }
 }
 
@@ -34,6 +63,9 @@ pub struct WireRenderer {
     cur: CellAttributes,
     /// Force the next attribute emission (start of stream / after reset).
     dirty: bool,
+    /// The outer terminal's color depth, refreshed once per frame from the
+    /// installed [`crate::caps`]. Colors are quantized to it in [`color_spec`].
+    depth: ColorDepth,
 }
 
 impl Default for WireRenderer {
@@ -41,6 +73,7 @@ impl Default for WireRenderer {
         WireRenderer {
             cur: CellAttributes::default(),
             dirty: true,
+            depth: ColorDepth::Truecolor,
         }
     }
 }
@@ -57,10 +90,21 @@ impl WireRenderer {
         self.dirty = true;
     }
 
+    /// Set the outer terminal's color depth (from [`crate::caps`]); if it
+    /// changed (config reload / async probe upgrade) force a re-emit so
+    /// on-screen colors are re-quantized to the new depth.
+    pub fn set_depth(&mut self, depth: ColorDepth) {
+        if depth != self.depth {
+            self.depth = depth;
+            self.dirty = true;
+        }
+    }
+
     fn emit_attrs(&mut self, out: &mut String, next: &CellAttributes) {
         if !self.dirty && &self.cur == next {
             return;
         }
+        let mono = self.depth == ColorDepth::None;
         // Reset-then-set: a handful of bytes per style run, no transition
         // table to get wrong.
         let mut w = |sgr: Sgr| {
@@ -76,8 +120,11 @@ impl WireRenderer {
         if next.underline() != Underline::None {
             w(Sgr::Underline(next.underline()));
         }
-        if next.underline_color() != ColorAttribute::Default {
-            w(Sgr::UnderlineColor(color_spec(next.underline_color())));
+        if !mono && next.underline_color() != ColorAttribute::Default {
+            w(Sgr::UnderlineColor(color_spec(
+                next.underline_color(),
+                self.depth,
+            )));
         }
         if next.strikethrough() {
             w(Sgr::StrikeThrough(true));
@@ -91,11 +138,11 @@ impl WireRenderer {
         if next.blink() != Blink::None {
             w(Sgr::Blink(next.blink()));
         }
-        if next.foreground() != ColorAttribute::Default {
-            w(Sgr::Foreground(color_spec(next.foreground())));
+        if !mono && next.foreground() != ColorAttribute::Default {
+            w(Sgr::Foreground(color_spec(next.foreground(), self.depth)));
         }
-        if next.background() != ColorAttribute::Default {
-            w(Sgr::Background(color_spec(next.background())));
+        if !mono && next.background() != ColorAttribute::Default {
+            w(Sgr::Background(color_spec(next.background(), self.depth)));
         }
         self.cur = next.clone();
         self.dirty = false;
@@ -165,45 +212,10 @@ fn vis_mode(v: CursorVisibility) -> Mode {
 }
 
 /// Whether the outer terminal is known to render curly underlines, from
-/// `$TERM` / `$TERM_PROGRAM` / `$VTE_VERSION`. Pure for tests.
-pub fn undercurl_supported_env(
-    term: Option<&str>,
-    term_program: Option<&str>,
-    vte_version: Option<&str>,
-) -> bool {
-    let term = term.unwrap_or("").to_ascii_lowercase();
-    let prog = term_program.unwrap_or("").to_ascii_lowercase();
-    const TERMS: &[&str] = &[
-        "kitty",
-        "wezterm",
-        "foot",
-        "ghostty",
-        "alacritty",
-        "contour",
-        "rio",
-    ];
-    if TERMS.iter().any(|t| term.contains(t)) {
-        return true;
-    }
-    const PROGS: &[&str] = &[
-        "wezterm",
-        "kitty",
-        "ghostty",
-        "iterm.app",
-        "rio",
-        "alacritty",
-    ];
-    if PROGS.iter().any(|p| prog.contains(p)) {
-        return true;
-    }
-    // VTE-based terminals support undercurl since 0.52 (VTE_VERSION=5200).
-    if let Some(v) = vte_version
-        && v.parse::<u32>().is_ok_and(|n| n >= 5200)
-    {
-        return true;
-    }
-    false
-}
+/// `$TERM` / `$TERM_PROGRAM` / `$VTE_VERSION`. Pure for tests. The detection now
+/// lives in `superzej_core::termcaps` (folded into `TermCaps`); re-exported here
+/// so existing callers/tests keep working.
+pub use superzej_core::termcaps::undercurl_supported_env;
 
 /// Read the environment-sniffed undercurl capability.
 pub fn detect_undercurl() -> bool {
@@ -430,5 +442,89 @@ mod tests {
         assert!(!undercurl_supported_env(Some("xterm-256color"), None, None));
         assert!(!undercurl_supported_env(None, None, None));
         assert!(!undercurl_supported_env(Some("screen"), Some("tmux"), None));
+    }
+
+    fn red() -> ColorAttribute {
+        ColorAttribute::TrueColorWithDefaultFallback(SrgbaTuple(1.0, 0.0, 0.0, 1.0))
+    }
+
+    #[test]
+    fn color_spec_downsamples_per_depth() {
+        use termwiz::color::ColorSpec;
+        // Truecolor: pass through unchanged.
+        assert!(matches!(
+            color_spec(red(), ColorDepth::Truecolor),
+            ColorSpec::TrueColor(_)
+        ));
+        // 256: pure red quantizes to the cube corner index 196.
+        assert_eq!(
+            color_spec(red(), ColorDepth::Ansi256),
+            ColorSpec::PaletteIndex(196)
+        );
+        // 16: pure red -> bright red (9).
+        assert_eq!(
+            color_spec(red(), ColorDepth::Ansi16),
+            ColorSpec::PaletteIndex(9)
+        );
+        // mono: no color at all.
+        assert_eq!(color_spec(red(), ColorDepth::None), ColorSpec::Default);
+        // A high palette index is re-quantized to 16 on a 16-color terminal,
+        // but passes through on 256.
+        assert_eq!(
+            color_spec(ColorAttribute::PaletteIndex(231), ColorDepth::Ansi256),
+            ColorSpec::PaletteIndex(231)
+        );
+        assert!(matches!(
+            color_spec(ColorAttribute::PaletteIndex(231), ColorDepth::Ansi16),
+            ColorSpec::PaletteIndex(i) if i < 16
+        ));
+    }
+
+    #[test]
+    fn mono_depth_emits_no_color_sgrs() {
+        let mut r = WireRenderer::new();
+        r.set_depth(ColorDepth::None);
+        let mut out = String::new();
+        let attrs = attrs_with(|a| {
+            a.set_foreground(red());
+            a.set_background(ColorAttribute::PaletteIndex(4));
+            a.set_underline(Underline::Curly);
+            a.set_underline_color(red());
+            a.set_intensity(Intensity::Bold);
+        });
+        r.render(
+            &[Change::AllAttributes(attrs), Change::Text("x".into())],
+            &mut out,
+        );
+        // No 24-bit (`38;2`/`48;2`), no indexed (`38;5`/`48;5`), no underline
+        // color (`58`) — but non-color attributes (bold) still emit.
+        assert!(!out.contains("38;"), "no fg color: {out:?}");
+        assert!(!out.contains("48;"), "no bg color: {out:?}");
+        assert!(
+            !out.contains("58:") && !out.contains("58;"),
+            "no ul color: {out:?}"
+        );
+        let back = sgrs(&parse(&out));
+        assert!(back.contains(&Sgr::Intensity(Intensity::Bold)), "{back:?}");
+        assert!(out.ends_with('x'));
+    }
+
+    #[test]
+    fn ansi256_depth_emits_indexed_not_truecolor() {
+        let mut r = WireRenderer::new();
+        r.set_depth(ColorDepth::Ansi256);
+        let mut out = String::new();
+        let attrs = attrs_with(|a| {
+            a.set_foreground(red());
+        });
+        r.render(&[Change::AllAttributes(attrs)], &mut out);
+        let back = sgrs(&parse(&out));
+        assert!(
+            back.iter().any(|s| matches!(
+                s,
+                Sgr::Foreground(termwiz::color::ColorSpec::PaletteIndex(_))
+            )),
+            "fg is indexed under 256: {back:?}"
+        );
     }
 }

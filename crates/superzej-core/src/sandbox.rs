@@ -528,6 +528,12 @@ pub fn resolve_placed(
         .filter_map(|k| std::env::var(k).ok().map(|v| (k.clone(), v)))
         .collect();
 
+    // Marker so a pane's shell rc / tooling can tell it's running inside a
+    // superzej sandbox (e.g. to skip a redundant in-sandbox `direnv` hook).
+    // Emitted via the backend's env mechanism (`--setenv`/`-e`); host-fallback
+    // panes carry no spec and so stay unmarked — correct, they aren't sandboxed.
+    env.push(("SUPERZEJ_SANDBOX".to_string(), "1".to_string()));
+
     // Tier B (opt-in): expose the host Nix daemon inside the sandbox so full
     // `nix develop`/`build`/`fmt` work there (Tier A only gives read-only tools
     // on PATH). Path-preserving bind of the daemon-socket dir + `NIX_REMOTE`;
@@ -1248,6 +1254,33 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
             let _ = run_control_t_owned(&placement, &argv, PROBE_TIMEOUT);
         }
     }
+}
+
+/// Run the host-side `[sandbox] prepare` hooks for a worktree: each command via
+/// `sh -lc` in the worktree dir, sequentially, on a background thread
+/// (fire-and-forget — a failing hook is the user's script's concern). These run
+/// on the HOST — with the writable Nix store, daemon, and full network — unlike
+/// `init_script`, which runs *inside* the sandbox. Returns immediately; no-op
+/// for an empty hook list. Subprocess seam (cov_ignore), exercised by smoke.
+pub fn run_prepare(worktree: &std::path::Path, cmds: &[String]) {
+    let cmds: Vec<String> = cmds
+        .iter()
+        .filter(|c| !c.trim().is_empty())
+        .cloned()
+        .collect();
+    if cmds.is_empty() {
+        return;
+    }
+    let wt = worktree.to_path_buf();
+    std::thread::spawn(move || {
+        for c in &cmds {
+            let _ = std::process::Command::new("sh")
+                .arg("-lc")
+                .arg(c)
+                .current_dir(&wt)
+                .status();
+        }
+    });
 }
 
 /// The full argv to exec for an interactive pane running `inner` (a shell command

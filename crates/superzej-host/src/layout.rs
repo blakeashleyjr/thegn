@@ -15,8 +15,10 @@ pub const SIDEBAR_MIN_COLS: usize = 76;
 /// Default surface extents.
 pub const MASTHEAD_ROWS: usize = 1;
 pub const STATUSBAR_ROWS: usize = 1;
-pub const SIDEBAR_COLS: usize = 26; // was 20; ~16% at 160 cols — room for dynamic titles
+pub const SIDEBAR_COLS: usize = 32; // ~20% at 160 cols — room for the two-tier rows + status
 pub const PANEL_COLS: usize = 44; // ~27% at 160 cols
+/// The slim collapsed rail's fixed width: an activity dot + one initial.
+pub const RAIL_COLS: usize = 4;
 
 /// The strip is suppressed when the band is too short to give it ≥ this many rows
 /// while leaving the center at least this many — i.e. the strip never starves the
@@ -64,6 +66,45 @@ impl PanelWidth {
             "half" => PanelWidth::Half,
             "full" => PanelWidth::Full,
             _ => PanelWidth::Normal,
+        }
+    }
+}
+
+/// The sidebar's display mode, cycled by `ToggleSidebar` (Ctrl+Alt+S):
+/// `Full` is the wide rich panel; `Rail` is the slim always-on activity strip
+/// (dots + initials); `Hidden` reclaims the columns for the center.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SidebarMode {
+    #[default]
+    Full,
+    Rail,
+    Hidden,
+}
+
+impl SidebarMode {
+    /// Advance Full → Rail → Hidden → Full.
+    pub fn cycle(self) -> Self {
+        match self {
+            SidebarMode::Full => SidebarMode::Rail,
+            SidebarMode::Rail => SidebarMode::Hidden,
+            SidebarMode::Hidden => SidebarMode::Full,
+        }
+    }
+
+    /// Stable key for persistence.
+    pub fn as_key(self) -> &'static str {
+        match self {
+            SidebarMode::Full => "full",
+            SidebarMode::Rail => "rail",
+            SidebarMode::Hidden => "hidden",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Self {
+        match s {
+            "rail" => SidebarMode::Rail,
+            "hidden" => SidebarMode::Hidden,
+            _ => SidebarMode::Full,
         }
     }
 }
@@ -244,8 +285,12 @@ pub fn compute_full(
     drawer_rows: usize,
     drawer_full_width: bool,
 ) -> ChromeLayout {
-    // A full-width panel claims the whole band — the sidebar steps aside.
-    let show_sidebar = want_sidebar && cols >= SIDEBAR_MIN_COLS && panel_width != PanelWidth::Full;
+    // A full-width panel claims the whole band — the sidebar steps aside. The
+    // slim rail (width ≤ RAIL_COLS) is cheap, so it survives below the
+    // auto-hide width threshold that the full panel honors.
+    let rail = sidebar_cols <= RAIL_COLS;
+    let show_sidebar =
+        want_sidebar && (rail || cols >= SIDEBAR_MIN_COLS) && panel_width != PanelWidth::Full;
     let show_panel = want_panel && (cols >= PANEL_MIN_COLS || panel_forced);
 
     let masthead = Rect {
@@ -306,7 +351,9 @@ pub fn compute_full(
     // asks for ~half the window. The `used()` shrink loop below trades width
     // back so the center keeps its mandatory column.
     let mut left = if show_sidebar {
-        sidebar_cols.max(SIDEBAR_MIN_WIDTH)
+        // The full panel floors at SIDEBAR_MIN_WIDTH; the rail keeps its slim
+        // RAIL_COLS (the user-facing nudge min is enforced before storage).
+        sidebar_cols.max(if rail { RAIL_COLS } else { SIDEBAR_MIN_WIDTH })
     } else {
         0
     };
@@ -816,5 +863,75 @@ mod tests {
             + usize::from(l.sep_right.is_some())
             + l.panel.map(|r| r.cols).unwrap_or(0);
         assert_eq!(used, SIDEBAR_MIN_COLS);
+    }
+
+    #[test]
+    fn rail_width_is_not_floored_to_the_full_panel_minimum() {
+        // The slim rail keeps RAIL_COLS; only the full panel floors at
+        // SIDEBAR_MIN_WIDTH.
+        let l = compute_full(
+            160,
+            40,
+            true,
+            false,
+            false,
+            PanelWidth::Normal,
+            RAIL_COLS,
+            false,
+            0.0,
+            0,
+            false,
+        );
+        assert_eq!(l.sidebar.unwrap().cols, RAIL_COLS);
+    }
+
+    #[test]
+    fn rail_survives_below_the_sidebar_width_threshold() {
+        // The full panel auto-hides under SIDEBAR_MIN_COLS; the cheap rail does
+        // not, so ambient activity stays visible on narrow terminals.
+        let narrow = SIDEBAR_MIN_COLS - 1;
+        let full = compute_full(
+            narrow,
+            20,
+            true,
+            false,
+            false,
+            PanelWidth::Normal,
+            SIDEBAR_COLS,
+            false,
+            0.0,
+            0,
+            false,
+        );
+        assert!(full.sidebar.is_none(), "full panel hides when narrow");
+        let rail = compute_full(
+            narrow,
+            20,
+            true,
+            false,
+            false,
+            PanelWidth::Normal,
+            RAIL_COLS,
+            false,
+            0.0,
+            0,
+            false,
+        );
+        assert_eq!(
+            rail.sidebar.map(|r| r.cols),
+            Some(RAIL_COLS),
+            "rail stays visible when narrow"
+        );
+    }
+
+    #[test]
+    fn sidebar_mode_cycles_full_rail_hidden() {
+        assert_eq!(SidebarMode::Full.cycle(), SidebarMode::Rail);
+        assert_eq!(SidebarMode::Rail.cycle(), SidebarMode::Hidden);
+        assert_eq!(SidebarMode::Hidden.cycle(), SidebarMode::Full);
+        // Keys round-trip for persistence.
+        for m in [SidebarMode::Full, SidebarMode::Rail, SidebarMode::Hidden] {
+            assert_eq!(SidebarMode::from_key(m.as_key()), m);
+        }
     }
 }

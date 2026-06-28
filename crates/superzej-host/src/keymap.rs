@@ -108,6 +108,9 @@ pub enum Action {
     StopWorktreeShare,
     /// Open the right panel to the System ▸ Share section and focus it.
     OpenShares,
+    /// Drain the local merge queue: fold eligible worktree branches into the
+    /// repo's target branch (`[merge_queue]`, the fold-actor).
+    Integrate,
     OpenPalette,
     Lazygit,
     Yazi,
@@ -187,7 +190,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         id: "new-worktree",
         label: "New worktree",
         hint: "worktree",
-        default_chords: &["Alt w"],
+        default_chords: &["Ctrl w"],
         palette: true,
     },
     ActionSpec {
@@ -195,6 +198,15 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         label: "New workspace",
         hint: "workspace",
         default_chords: &["Alt W"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "integrate",
+        label: "Integrate (fold-actor)",
+        hint: "integrate",
+        // No default chord — palette-only + user-bindable, gated on
+        // [merge_queue].enabled (see palette::build_command_palette_items).
+        default_chords: &[],
         palette: true,
     },
     ActionSpec {
@@ -229,7 +241,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         id: "close-pane",
         label: "Close pane",
         hint: "close pane",
-        default_chords: &["Ctrl w"],
+        default_chords: &["Alt w"],
         palette: true,
     },
     ActionSpec {
@@ -889,6 +901,7 @@ impl Action {
             Action::StopWorktreeShare => "stop-worktree-share",
             Action::OpenShares => "open-shares",
             Action::ToggleNotifications => "toggle-notifications",
+            Action::Integrate => "integrate",
             Action::OpenPalette => "palette",
             Action::Lazygit => "lazygit",
             Action::Yazi => "yazi",
@@ -977,6 +990,7 @@ impl Action {
             "stop-worktree-share" => Action::StopWorktreeShare,
             "open-shares" => Action::OpenShares,
             "toggle-notifications" => Action::ToggleNotifications,
+            "integrate" => Action::Integrate,
             "palette" | "menu" => Action::OpenPalette,
             "lazygit" | "tool-lazygit" => Action::Lazygit,
             "yazi" | "tool-yazi" => Action::Yazi,
@@ -1338,6 +1352,31 @@ impl KeyMap {
     pub fn custom_actions(&self) -> &[HostCustomAction] {
         &self.custom_actions
     }
+
+    /// Folder names declared by `file-worktree` custom actions, in config
+    /// order, de-duplicated case-insensitively (matching `ensure_folder`'s
+    /// collation). Lets configured destinations surface in the folder picker /
+    /// palette before any worktree has actually been filed into them.
+    pub fn file_worktree_folders(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for action in &self.custom_actions {
+            if let HostCustomAction::Composite {
+                action: CompositeAction::FileWorktree { folder },
+                ..
+            } = action
+            {
+                let folder = folder.trim();
+                if folder.is_empty() {
+                    continue;
+                }
+                if out.iter().any(|f| f.eq_ignore_ascii_case(folder)) {
+                    continue;
+                }
+                out.push(folder.to_string());
+            }
+        }
+        out
+    }
 }
 
 const ALL_MODES: [Mode; 4] = [Mode::Normal, Mode::VimNormal, Mode::VimInsert, Mode::Emacs];
@@ -1425,7 +1464,7 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl Alt e", Action::SwitchMode(Mode::Emacs))
         .unwrap();
 
-    map.insert_all("Alt w", Action::NewWorktree).unwrap();
+    map.insert_all("Ctrl w", Action::NewWorktree).unwrap();
     map.insert_all("Alt W", Action::NewWorkspace).unwrap();
     map.insert_all("Alt Shift X", Action::DeleteWorkspace)
         .unwrap();
@@ -1443,7 +1482,7 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Alt o", Action::SwitchWorkspace).unwrap();
     map.insert_all("Alt n", Action::SplitDown).unwrap();
     map.insert_all("Alt N", Action::SplitRight).unwrap();
-    map.insert_all("Ctrl w", Action::CloseSplitPane).unwrap();
+    map.insert_all("Alt w", Action::CloseSplitPane).unwrap();
     map.insert_all("Alt g", Action::Lazygit).unwrap();
     map.insert_all("Alt y", Action::Yazi).unwrap();
     map.insert_all("Alt e", Action::Editor).unwrap();
@@ -1603,8 +1642,8 @@ pub fn default_keymap_with_config(cfg: &superzej_core::config::Config) -> KeyMap
 
 /// Overlay an IDE keymap preset (item 621) onto `map`: a small set of familiar
 /// chords mapped to existing host actions, applied after the built-in defaults
-/// and before user `[keybinds]` so user overrides still win. Chords are chosen
-/// to avoid the core nav defaults (`Ctrl h/j/k/l`, `Ctrl w`). `"default"` (and
+/// `Esc` (`Ctrl [`), which gets translated to VimNormal in Vim mode; it binds `Alt`
+/// to avoid the core nav defaults (`Ctrl h/j/k/l`). `"default"` (and
 /// the Vim/Emacs modes, which live in `default_keymap`) are a no-op. A bad chord
 /// is skipped, never fatal.
 pub fn apply_keymap_preset(map: &mut KeyMap, preset: &str) {
@@ -1843,24 +1882,25 @@ mod tests {
     }
 
     #[test]
-    fn runtime_dispatch_matches_alt_w_in_normal_mode() {
+    fn runtime_dispatch_matches_ctrl_w_in_normal_mode() {
         // The runtime path is keymap.dispatch(mode, Key), NOT map_key. Prove a
         // parsed Alt+w (what termwiz yields for both legacy ESC-w and kitty
         // CSI 119;3u) actually triggers NewWorktree through the real matcher.
         let mut map = default_keymap();
-        let key = Key::modified(KeyCode::Char('w'), Modifiers::ALT);
+        let key = Key::modified(KeyCode::Char('w'), Modifiers::CTRL);
         assert!(
             matches!(
                 map.dispatch(Mode::Normal, key),
                 crate::sequence::MatchResult::Matched(Action::NewWorktree)
             ),
-            "Alt+w must match NewWorktree via the runtime dispatch path"
+            "Ctrl+w must match NewWorktree via the runtime dispatch path"
         );
     }
 
     #[test]
     fn alt_chords_map_to_lifecycle_actions() {
-        assert_eq!(k('w', Modifiers::ALT), Some(Action::NewWorktree));
+        assert_eq!(k('w', Modifiers::ALT), Some(Action::CloseSplitPane));
+        assert_eq!(k('w', Modifiers::CTRL), Some(Action::NewWorktree));
         assert_eq!(k('W', Modifiers::ALT), Some(Action::NewWorkspace));
         assert_eq!(k('o', Modifiers::ALT), Some(Action::SwitchWorkspace));
         assert_eq!(k('t', Modifiers::ALT), Some(Action::NewTab));
@@ -2260,7 +2300,7 @@ mod tests {
                 Mode::Normal,
                 Key::modified(KeyCode::Char('w'), Modifiers::ALT)
             ),
-            MatchResult::Matched(Action::NewWorktree)
+            MatchResult::Matched(Action::CloseSplitPane)
         );
         assert_eq!(
             map.dispatch(Mode::VimNormal, Key::char('j')),
@@ -2652,6 +2692,33 @@ mod tests {
             } => assert_eq!(folder, "Ready to merge"),
             other => panic!("expected FileWorktree composite, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn file_worktree_folders_collects_and_dedups() {
+        let mk = |name: &str, key: &str, folder: &str| superzej_core::config::CustomAction {
+            name: name.into(),
+            key: key.into(),
+            run: None,
+            action: Some("file-worktree".into()),
+            params: [("folder".to_string(), folder.to_string())]
+                .into_iter()
+                .collect(),
+            menu: true,
+            hint: None,
+            floating: true,
+            close_on_exit: true,
+        };
+        let mut cfg = superzej_core::config::Config::default();
+        cfg.actions.push(mk("a", "Alt m f r", "Ready to merge"));
+        cfg.actions.push(mk("b", "Alt m f p", "PRing"));
+        // Case-only duplicate of the first folder is dropped.
+        cfg.actions.push(mk("c", "Alt m f m", "ready to MERGE"));
+        let map = default_keymap_for(&cfg, None, None);
+        assert_eq!(
+            map.file_worktree_folders(),
+            vec!["Ready to merge".to_string(), "PRing".to_string()]
+        );
     }
 
     #[test]

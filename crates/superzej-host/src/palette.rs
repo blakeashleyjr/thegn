@@ -297,7 +297,14 @@ pub(crate) fn build_command_palette_items(
 ) -> Vec<crate::palette::PaletteItem> {
     let mut items: Vec<crate::palette::PaletteItem> = crate::keymap::action_specs()
         .iter()
-        .filter(|spec| spec.palette)
+        // The fold-actor command only makes sense when the merge queue is on.
+        .filter(|spec| {
+            if spec.id == "integrate" {
+                cfg.merge_queue.enabled
+            } else {
+                spec.palette
+            }
+        })
         .map(|spec| {
             let label = crate::keymap::chord_hint_for(cfg, spec.id)
                 .map(|chord| format!("{}  ({chord})", spec.label))
@@ -321,20 +328,57 @@ pub(crate) fn build_command_palette_items(
     items
 }
 
+/// Folder names declared by `file-worktree` custom actions in config order,
+/// de-duplicated case-insensitively. Mirrors `HostKeymap::file_worktree_folders`
+/// but reads raw config so call sites without the parsed keymap (the palette)
+/// can derive the same list.
+pub(crate) fn configured_file_worktree_folders(cfg: &superzej_core::config::Config) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for action in &cfg.actions {
+        if action.action.as_deref() != Some("file-worktree") {
+            continue;
+        }
+        let Some(folder) = action.params.get("folder").map(|f| f.trim()) else {
+            continue;
+        };
+        if folder.is_empty() || out.iter().any(|f| f.eq_ignore_ascii_case(folder)) {
+            continue;
+        }
+        out.push(folder.to_string());
+    }
+    out
+}
+
 /// Picker rows for "Move worktree to folder…": one row per existing folder in
-/// the workspace (`move-to-folder:<name>`) plus a trailing "new folder" row
-/// (`move-to-folder:__new__`) that prompts for a name.
+/// the workspace (`move-to-folder:<name>`), then any `configured` folder (from
+/// `file-worktree` custom actions) not already present, plus a trailing "new
+/// folder" row (`move-to-folder:__new__`) that prompts for a name. Selecting a
+/// configured-but-not-yet-existing folder creates it via `ensure_folder`.
 pub(crate) fn build_move_to_folder_items(
     db: &superzej_core::db::Db,
     repo_path: &str,
+    configured: &[String],
 ) -> Vec<crate::palette::PaletteItem> {
     use crate::palette::PaletteItem;
-    let mut items: Vec<PaletteItem> = db
+    let existing: Vec<String> = db
         .folders_for_workspace(repo_path)
         .unwrap_or_default()
         .into_iter()
-        .map(|f| PaletteItem::new(format!("move-to-folder:{}", f.name), f.name))
+        .map(|f| f.name)
         .collect();
+    let mut items: Vec<PaletteItem> = existing
+        .iter()
+        .map(|name| PaletteItem::new(format!("move-to-folder:{name}"), name.clone()))
+        .collect();
+    for folder in configured {
+        if existing.iter().any(|e| e.eq_ignore_ascii_case(folder)) {
+            continue;
+        }
+        items.push(PaletteItem::new(
+            format!("move-to-folder:{folder}"),
+            folder.clone(),
+        ));
+    }
     items.push(PaletteItem::new("move-to-folder:__new__", "＋ New folder…"));
     items
 }
@@ -368,6 +412,17 @@ pub(crate) fn build_palette(
 ) -> Vec<crate::palette::PaletteItem> {
     use crate::palette::PaletteItem;
     let mut items = build_command_palette_items(cfg);
+
+    // Folders declared by `file-worktree` custom actions: searchable "file into"
+    // destinations, so a configured folder is reachable from Cmd-K even before
+    // it exists in the DB (the `move-to-folder:` dispatch arm creates it).
+    for folder in configured_file_worktree_folders(cfg) {
+        let key = format!("move-to-folder:{folder}");
+        if items.iter().any(|i| i.key == key) {
+            continue;
+        }
+        items.push(PaletteItem::new(key, format!("📁 File into: {folder}")));
+    }
 
     // Configured pins (scope-filtered to the current workspace): summon by name.
     let ws = (!session.id.is_empty()).then_some(session.id.as_str());
@@ -761,6 +816,86 @@ mod tests {
             custom.label.contains("Ctrl-Alt-r"),
             "label was {}",
             custom.label
+        );
+    }
+
+    fn cfg_with_file_worktree(folders: &[&str]) -> superzej_core::config::Config {
+        let mut cfg = superzej_core::config::Config::default();
+        for (i, folder) in folders.iter().enumerate() {
+            cfg.actions.push(superzej_core::config::CustomAction {
+                name: format!("File: {folder}"),
+                key: format!("Alt m f {i}"),
+                run: None,
+                action: Some("file-worktree".into()),
+                params: [("folder".to_string(), folder.to_string())]
+                    .into_iter()
+                    .collect(),
+                menu: false,
+                hint: None,
+                floating: true,
+                close_on_exit: true,
+            });
+        }
+        cfg
+    }
+
+    #[test]
+    fn configured_folders_collects_filters_and_dedups() {
+        let cfg = cfg_with_file_worktree(&["Ready to merge", "PRing", "ready to MERGE"]);
+        assert_eq!(
+            configured_file_worktree_folders(&cfg),
+            vec!["Ready to merge".to_string(), "PRing".to_string()]
+        );
+        // A shell action (no `action = "file-worktree"`) is ignored.
+        let mut cfg = cfg_with_file_worktree(&["Done"]);
+        cfg.actions.push(superzej_core::config::CustomAction {
+            name: "run".into(),
+            key: "Ctrl r".into(),
+            run: Some("just test".into()),
+            action: None,
+            params: Default::default(),
+            menu: true,
+            hint: None,
+            floating: true,
+            close_on_exit: true,
+        });
+        assert_eq!(
+            configured_file_worktree_folders(&cfg),
+            vec!["Done".to_string()]
+        );
+    }
+
+    #[test]
+    fn move_to_folder_unions_db_and_configured_without_dupes() {
+        let db = superzej_core::db::Db::open_memory().unwrap();
+        db.put_workspace("/x/app", "app", "repo").unwrap();
+        db.create_folder("/x/app", "Ready to merge").unwrap();
+        // "ready to MERGE" is a case-dup of the DB folder → not added twice;
+        // "PRing" is configured-only → appears; "__new__" stays last.
+        let configured = vec!["ready to MERGE".to_string(), "PRing".to_string()];
+        let items = build_move_to_folder_items(&db, "/x/app", &configured);
+        let keys: Vec<&str> = items.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "move-to-folder:Ready to merge",
+                "move-to-folder:PRing",
+                "move-to-folder:__new__",
+            ]
+        );
+    }
+
+    #[test]
+    fn command_palette_surfaces_configured_folder_destinations() {
+        let cfg = cfg_with_file_worktree(&["Ready to merge"]);
+        // `build_command_palette_items` is the static command list; the dynamic
+        // destination row is added by `build_palette`, but we can assert the
+        // helper feeds it: the folder is present and not gated on `menu = true`.
+        assert!(configured_file_worktree_folders(&cfg).contains(&"Ready to merge".to_string()));
+        let items = build_command_palette_items(&cfg);
+        assert!(
+            !items.iter().any(|i| i.key == "File: Ready to merge"),
+            "menu=false keeps the action itself out of the static list"
         );
     }
 

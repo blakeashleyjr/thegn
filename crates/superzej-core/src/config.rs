@@ -144,6 +144,26 @@ config_enum! {
     } default = Auto;
 }
 config_enum! {
+    /// Color fidelity sent to the outer terminal. "auto" sniffs the terminal
+    /// (COLORTERM / $TERM / WT_SESSION / NO_COLOR) and degrades truecolor →
+    /// 256 → 16 → mono; the explicit values pin a depth.
+    pub enum ColorMode: "color mode" {
+        Auto = "auto",
+        Truecolor = "truecolor" | "24bit",
+        Ansi256 = "256",
+        Ansi16 = "16",
+        None = "none" | "mono",
+    } default = Auto;
+}
+config_enum! {
+    /// Glyph fidelity for chrome (box drawing, dots, arrows, logotype). "auto"
+    /// sniffs the locale + terminal; "ascii" forces 7-bit fallbacks for bare
+    /// terminals/fonts.
+    pub enum GlyphMode: "glyph mode" {
+        Auto = "auto", Unicode = "unicode", Ascii = "ascii",
+    } default = Auto;
+}
+config_enum! {
     /// Where worktrees live on disk.
     pub enum WorktreeMode: "worktree_mode" {
         Global = "global", InRepo = "in_repo",
@@ -205,6 +225,26 @@ config_enum! {
         Sealed = "sealed" | "locked" | "isolated",
         SealedTunnel = "sealed-tunnel" | "tunnel-only" | "vpn-only",
     } default = Hardened;
+}
+config_enum! {
+    /// Whether superzej pre-warms a worktree's `direnv` cache **on the host** so
+    /// the in-sandbox `direnv` hook works against the read-only `/nix/store`.
+    /// A cold `nix-direnv` (`use flake`) cache makes the in-pane direnv try to
+    /// rebuild the devShell, which fails on the read-only store + no daemon;
+    /// warming on the host (writable store + daemon) lets the pane replay the
+    /// cached env read-only. See [`crate::direnv`].
+    ///
+    /// - `auto`         — warm + `direnv allow` the worktree (trusts the repo's
+    ///                    own `.envrc`, the same boundary `inject_devshell`
+    ///                    already crosses). The default.
+    /// - `allowed-only` — warm only worktrees the user has already
+    ///                    `direnv allow`-ed; never auto-allows.
+    /// - `off`          — never warm (the in-pane direnv falls back as before).
+    pub enum WarmDirenv: "warm_direnv" {
+        Auto = "auto" | "on" | "true",
+        AllowedOnly = "allowed-only" | "allowed_only" | "allowed",
+        Off = "off" | "false" | "none" | "no",
+    } default = Auto;
 }
 
 impl SandboxProfile {
@@ -477,6 +517,71 @@ impl LlmProxyConfig {
             self.routing.as_str().to_string(),
         );
         Some(("szproxy".to_string(), Vec::new(), env))
+    }
+}
+
+config_enum! {
+    /// `[merge_queue] conflict_handoff` — what happens to a branch that the fold
+    /// can't land cleanly. `"agent"` (default) dispatches the worktree's agent to
+    /// rebase onto the new `main` and re-resolve; `"notify"` just raises a
+    /// notification and leaves it queued; `"manual"` leaves it silently queued.
+    pub enum ConflictHandoff: "conflict handoff" {
+        Agent = "agent",
+        Notify = "notify",
+        Manual = "manual" | "off" | "none",
+    } default = Agent;
+}
+
+/// `[merge_queue]` — the local "fold-actor": fold parallel worktree branches into
+/// `target_branch` in the object database (no checkout), auto-landing every
+/// branch that merges clean and deferring only genuine conflicts. Disabled by
+/// default; the AI-free shell never depends on it. See `superzej_core::fold` for
+/// the pure engine and the host `integrate` runner for the I/O (test-gate + CAS).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct MergeQueueConfig {
+    /// Master switch. When off, the `integrate` command and auto-drain are inert.
+    pub enabled: bool,
+    /// Branch the fold advances. `"auto"` resolves it per repo (HEAD/default).
+    pub target_branch: String,
+    /// Shell command run on the folded tip (in a throwaway worktree) to gate the
+    /// CAS-advance — the "does the union build?" check. Empty disables the gate
+    /// (textual-clean only). Example: `just ci` or `cargo test --workspace`.
+    pub gate_command: String,
+    /// Whether to run `gate_command` at all. Off ⇒ advance as soon as branches
+    /// merge without text conflicts.
+    pub gate_on: bool,
+    /// On a red gate, re-land branches incrementally to find the offender and
+    /// defer just that one, instead of failing the whole batch.
+    pub bisect_on_red: bool,
+    /// Fold automatically when an agent signals done (ACP `AgentEnd` / dispatch
+    /// → merged), so a burst of completions drains the queue without a keystroke.
+    pub auto_drain: bool,
+    /// Auto-commit uncommitted worktree work before folding (a branch must be a
+    /// commit for `merge-tree`). Off ⇒ only committed branch tips are folded and
+    /// dirty worktrees are skipped with a warning.
+    pub snapshot_dirty: bool,
+    /// Conflicting paths confined to these (matched by exact path or basename,
+    /// e.g. `Cargo.lock` matches `crates/x/Cargo.lock`) are classified
+    /// regenerable — resolved by regenerating, not handed to a human.
+    pub regenerate_paths: Vec<String>,
+    /// What to do with a deferred (conflicting) branch.
+    pub conflict_handoff: ConflictHandoff,
+}
+
+impl Default for MergeQueueConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            target_branch: "auto".to_string(),
+            gate_command: String::new(),
+            gate_on: true,
+            bisect_on_red: true,
+            auto_drain: true,
+            snapshot_dirty: false,
+            regenerate_paths: vec!["Cargo.lock".to_string()],
+            conflict_handoff: ConflictHandoff::default(),
+        }
     }
 }
 
@@ -898,7 +1003,7 @@ impl Default for UiConfig {
 }
 
 /// Git behavior knobs for the panel's write operations (`[git]`).
-#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct GitConfig {
     /// Pass `-c commit.gpgSign=false -c tag.gpgSign=false` to
@@ -906,6 +1011,23 @@ pub struct GitConfig {
     /// passphrase prompt can never hang a background op. Off by default: a
     /// working gpg-agent signs headlessly.
     pub override_gpg: bool,
+    /// Install a `pre-merge-commit` hook that refuses a `git merge` run against
+    /// the canonical (primary) checkout from *inside* a superzej sandbox, where
+    /// the canonical worktree's filesystem view can be incoherent and silently
+    /// corrupt the merge. On by default; points at `szhost integrate` (an
+    /// object-DB fold with no checkout). No-op outside a sandbox, in linked
+    /// worktrees, and when a foreign hook is already present. Per-merge escape
+    /// hatch: `SUPERZEJ_MERGE_GUARD_OFF=1`.
+    pub merge_guard: bool,
+}
+
+impl Default for GitConfig {
+    fn default() -> Self {
+        Self {
+            override_gpg: false,
+            merge_guard: true,
+        }
+    }
 }
 
 /// Host keybinding overrides. The flat `[keybinds]` table remains the
@@ -1027,6 +1149,11 @@ pub struct ThemeConfig {
     pub pane_padding: u16,
     /// Curly-underline support: "auto" (sniff the terminal), "on", "off".
     pub undercurl: UndercurlMode,
+    /// Color fidelity: "auto" (sniff + degrade), "truecolor", "256", "16",
+    /// "none"/"mono". `NO_COLOR` forces "none" unless an explicit value is set.
+    pub color: ColorMode,
+    /// Glyph fidelity: "auto" (sniff locale/terminal), "unicode", "ascii".
+    pub glyphs: GlyphMode,
     /// Optional overrides for every chrome surface/text color.
     pub colors: ThemeColors,
     /// Optional overrides for the eight semantic hues.
@@ -1041,6 +1168,8 @@ impl Default for ThemeConfig {
             focus_border: "#6ee7d8".into(),
             pane_padding: 0,
             undercurl: UndercurlMode::Auto,
+            color: ColorMode::Auto,
+            glyphs: GlyphMode::Auto,
             colors: ThemeColors::default(),
             hues: ThemeHues::default(),
         }
@@ -1222,7 +1351,7 @@ impl Default for StatsConfig {
             battery_warn: 25,
             disk_icon: "\u{f0a0}".into(), // nf-fa-hdd_o — hard drive
             disk_free_warn: 15,
-            disk_free_critical: 5,
+            disk_free_critical: 10,
             disk_path: String::new(),
             refresh_rates: vec![1.0, 2.0, 5.0, 10.0],
         }
@@ -2599,7 +2728,17 @@ pub struct SandboxConfig {
     pub auto_caches: bool,
     pub mounts: Vec<String>, // extra binds ("host:dest[:ro|rw|cache]" or "host"); suffix allowed
     pub init_script: String, // runs inside before the agent/shell
-    pub devenv: bool,        // wrap inner cmd with `devenv shell --`
+    /// Host-side setup commands run (off-loop, via `sh -lc` in the worktree)
+    /// once when a worktree is created, before its first pane spawns — for
+    /// heavyweight prep that benefits from the host's writable store/daemon and
+    /// network (e.g. `mise install`, a cache warm). The built-in `direnv` warm
+    /// (`warm_direnv`) runs alongside these.
+    pub prepare: Vec<String>,
+    /// Pre-warm a worktree's `direnv` cache on the host so the in-sandbox
+    /// `direnv` hook works against the read-only `/nix/store`. See
+    /// [`crate::direnv`] and [`WarmDirenv`].
+    pub warm_direnv: WarmDirenv,
+    pub devenv: bool, // wrap inner cmd with `devenv shell --`
     /// Inject the repo's Nix flake `devShell` toolchain (its `PATH` + safe
     /// exported vars) into worktree panes — resolved on the host (writable
     /// store + daemon) and cached, so a sandboxed pane that can't reach the Nix
@@ -2685,6 +2824,8 @@ impl Default for SandboxConfig {
                 "/run/user".into(),
             ],
             init_script: String::new(),
+            prepare: Vec::new(),
+            warm_direnv: WarmDirenv::Auto,
             devenv: false,
             inject_devshell: true,
             nix_daemon: false,
@@ -2725,6 +2866,8 @@ pub struct SandboxOverlay {
     pub auto_caches: Option<bool>,
     pub mounts: Option<Vec<String>>,
     pub init_script: Option<String>,
+    pub prepare: Option<Vec<String>>,
+    pub warm_direnv: Option<WarmDirenv>,
     pub devenv: Option<bool>,
     pub inject_devshell: Option<bool>,
     pub nix_daemon: Option<bool>,
@@ -2809,6 +2952,12 @@ impl SandboxOverlay {
         if let Some(v) = self.init_script {
             base.init_script = v;
         }
+        if let Some(v) = self.prepare {
+            base.prepare = v;
+        }
+        if let Some(v) = self.warm_direnv {
+            base.warm_direnv = v;
+        }
         if let Some(v) = self.devenv {
             base.devenv = v;
         }
@@ -2855,6 +3004,8 @@ impl SandboxOverlay {
             && self.auto_caches.is_none()
             && self.mounts.is_none()
             && self.init_script.is_none()
+            && self.prepare.is_none()
+            && self.warm_direnv.is_none()
             && self.devenv.is_none()
             && self.shell.is_none()
             && self.on_missing.is_none()
@@ -3239,6 +3390,9 @@ pub struct Config {
     pub lsp: LspConfig,
     /// The LLM proxy daemon (`[llm_proxy]`). Disabled by default — AI is additive.
     pub llm_proxy: LlmProxyConfig,
+    /// `[merge_queue]` — the local fold-actor (parallel-branch integration).
+    /// Disabled by default; AI-free and additive.
+    pub merge_queue: MergeQueueConfig,
     /// `[media]` — media-player control. On by default (`mpris` backend), inert
     /// where D-Bus/`playerctl` are absent. Additive — the shell never depends on it.
     pub media: MediaConfig,
@@ -3322,6 +3476,7 @@ impl Default for Config {
             palette: PaletteConfig::default(),
             lsp: LspConfig::default(),
             llm_proxy: LlmProxyConfig::default(),
+            merge_queue: MergeQueueConfig::default(),
             media: MediaConfig::default(),
             share: ShareConfig::default(),
             keybinds: KeybindConfig::default(),
@@ -3381,6 +3536,8 @@ pub struct ConfigOverlay {
     pub accent: Option<String>,
     pub focus_border: Option<String>,
     pub frame_border: Option<String>,
+    pub theme_color: Option<ColorMode>,
+    pub theme_glyphs: Option<GlyphMode>,
     pub pr_ttl_secs: Option<u64>,
     pub watch_pr_interval_secs: Option<u64>,
     pub metrics_interval_secs: Option<f64>,
@@ -3427,6 +3584,8 @@ impl ConfigOverlay {
         set!(base.profile, self.profile);
         set!(base.theme.accent, self.accent);
         set!(base.theme.focus_border, self.focus_border);
+        set!(base.theme.color, self.theme_color);
+        set!(base.theme.glyphs, self.theme_glyphs);
         if self.frame_border.is_some() {
             base.theme.colors.border = self.frame_border;
         }
@@ -3513,6 +3672,12 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     o.accent = env.get("SUPERZEJ_THEME_ACCENT");
     o.focus_border = env.get("SUPERZEJ_THEME_FOCUS_BORDER");
     o.frame_border = env.get("SUPERZEJ_THEME_BORDER");
+    if let Some(v) = env.get("SUPERZEJ_THEME_COLOR") {
+        o.theme_color = ColorMode::from_str_validated(v.trim()).ok();
+    }
+    if let Some(v) = env.get("SUPERZEJ_THEME_GLYPHS") {
+        o.theme_glyphs = GlyphMode::from_str_validated(v.trim()).ok();
+    }
 
     // [pr] — SUPERZEJ_PR_TTL, with deprecated SZ_PR_TTL fallback.
     if let Some(v) = env.get("SUPERZEJ_PR_TTL") {
@@ -3608,6 +3773,9 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     }
     if let Some(v) = env.get("SUPERZEJ_SANDBOX_NIX_DAEMON") {
         o.sandbox.nix_daemon = parse_bool(&v, "SUPERZEJ_SANDBOX_NIX_DAEMON");
+    }
+    if let Some(v) = env.get("SUPERZEJ_SANDBOX_WARM_DIRENV") {
+        o.sandbox.warm_direnv = WarmDirenv::from_str_validated(v.trim()).ok();
     }
     if let Some(host) = env.get("SUPERZEJ_SANDBOX_REMOTE_HOST") {
         o.sandbox.remote = Some(RemoteOverlay {
@@ -6630,6 +6798,55 @@ transport = \"ssh\"
         assert_eq!(t.focus_border, "#6ee7d8");
         assert_eq!(t.pane_padding, 0);
         assert_eq!(t.undercurl, UndercurlMode::Auto);
+        assert_eq!(t.color, ColorMode::Auto);
+        assert_eq!(t.glyphs, GlyphMode::Auto);
+    }
+
+    #[test]
+    fn color_and_glyph_modes_parse_with_aliases() {
+        assert_eq!(
+            ColorMode::from_str_validated("auto").unwrap(),
+            ColorMode::Auto
+        );
+        assert_eq!(
+            ColorMode::from_str_validated("24bit").unwrap(),
+            ColorMode::Truecolor
+        );
+        assert_eq!(
+            ColorMode::from_str_validated("256").unwrap(),
+            ColorMode::Ansi256
+        );
+        assert_eq!(
+            ColorMode::from_str_validated("MONO").unwrap(),
+            ColorMode::None
+        );
+        assert!(ColorMode::from_str_validated("16bit").is_err());
+
+        assert_eq!(
+            GlyphMode::from_str_validated("ascii").unwrap(),
+            GlyphMode::Ascii
+        );
+        assert_eq!(
+            GlyphMode::from_str_validated("unicode").unwrap(),
+            GlyphMode::Unicode
+        );
+        assert!(GlyphMode::from_str_validated("nerd").is_err());
+    }
+
+    #[test]
+    fn theme_color_glyph_env_overrides_apply() {
+        let mut env = MapEnv::default();
+        env.0
+            .insert("SUPERZEJ_THEME_COLOR".to_string(), "16".to_string());
+        env.0
+            .insert("SUPERZEJ_THEME_GLYPHS".to_string(), "ascii".to_string());
+        let o = env_overlay(&env);
+        assert_eq!(o.theme_color, Some(ColorMode::Ansi16));
+        assert_eq!(o.theme_glyphs, Some(GlyphMode::Ascii));
+        let mut cfg = Config::default();
+        o.apply(&mut cfg);
+        assert_eq!(cfg.theme.color, ColorMode::Ansi16);
+        assert_eq!(cfg.theme.glyphs, GlyphMode::Ascii);
     }
 
     #[test]
@@ -6716,6 +6933,33 @@ transport = \"ssh\"
             toml::from_str("[sandbox.limits]\ncpu = \"2\"\nmemory = \"4G\"\n").unwrap();
         assert_eq!(cfg.sandbox.limits.cpu.as_deref(), Some("2"));
         assert_eq!(cfg.sandbox.limits.memory.as_deref(), Some("4G"));
+    }
+
+    #[test]
+    fn sandbox_warm_direnv_and_prepare_parse() {
+        // Default: warm on, no prepare hooks.
+        let d = SandboxConfig::default();
+        assert_eq!(d.warm_direnv, WarmDirenv::Auto);
+        assert!(d.prepare.is_empty());
+        // Round-trips from a `[sandbox]` table, and the overlay layers them.
+        let cfg: Config = toml::from_str(
+            "[sandbox]\nwarm_direnv = \"allowed-only\"\nprepare = [\"mise install\", \"echo hi\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.sandbox.warm_direnv, WarmDirenv::AllowedOnly);
+        assert_eq!(cfg.sandbox.prepare, vec!["mise install", "echo hi"]);
+        // Unknown value warns and falls back to the default (infallible enum).
+        let cfg2: Config = toml::from_str("[sandbox]\nwarm_direnv = \"bogus\"\n").unwrap();
+        assert_eq!(cfg2.sandbox.warm_direnv, WarmDirenv::Auto);
+        // `off` aliases.
+        assert_eq!(
+            WarmDirenv::from_str_validated("off").unwrap(),
+            WarmDirenv::Off
+        );
+        assert_eq!(
+            WarmDirenv::from_str_validated("false").unwrap(),
+            WarmDirenv::Off
+        );
     }
 
     // ---- launch_spec full env coverage ----
@@ -6814,6 +7058,8 @@ transport = \"ssh\"
             accent: Some("#111111".into()),
             focus_border: Some("#222222".into()),
             frame_border: Some("#333333".into()),
+            theme_color: Some(ColorMode::Ansi256),
+            theme_glyphs: Some(GlyphMode::Unicode),
             pr_ttl_secs: Some(99),
             watch_pr_interval_secs: Some(43),
             metrics_interval_secs: Some(11.0),

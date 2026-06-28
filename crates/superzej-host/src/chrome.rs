@@ -185,7 +185,7 @@ pub fn draw_text_bold(
     surface.add_change(Change::Attribute(AttributeChange::Intensity(
         termwiz::cell::Intensity::Bold,
     )));
-    let clipped: String = text.chars().take(max_cols).collect();
+    let clipped: String = crate::seg::take_cols(text, max_cols).to_string();
     surface.add_change(Change::Text(clipped));
     surface.add_change(Change::Attribute(AttributeChange::Intensity(
         termwiz::cell::Intensity::Normal,
@@ -209,7 +209,7 @@ pub fn draw_text(
     });
     surface.add_change(Change::Attribute(AttributeChange::Foreground(fg)));
     surface.add_change(Change::Attribute(AttributeChange::Background(bg)));
-    let clipped: String = text.chars().take(max_cols).collect();
+    let clipped: String = crate::seg::take_cols(text, max_cols).to_string();
     surface.add_change(Change::Text(clipped));
 }
 
@@ -336,6 +336,12 @@ pub struct FrameModel {
     /// When `Some`, an open row context menu: (anchor visible-row index,
     /// entries, menu cursor).
     pub sidebar_menu: Option<RowMenu>,
+    /// Top visible-row index of the scroll window (clamped by `build_sidebar`
+    /// so the cursor stays in view). Mirrors `SidebarState::scroll`.
+    pub sidebar_scroll: usize,
+    /// True when the sidebar is in its slim collapsed rail mode (activity dots
+    /// + initials only); false renders the full panel.
+    pub sidebar_rail: bool,
     /// Data carriers populated by the hydration thread and consumed by the
     /// event loop to (re)derive `sidebar_rows`. The `(slug, display, kind)`
     /// workspace list in display order (`kind` = "repo" | "dir"), and
@@ -369,7 +375,12 @@ pub struct FrameModel {
     /// from the center) — the bar renders raised so the focus is visible.
     pub masthead_focused: bool,
     pub statusbar_focused: bool,
-    pub active_statusbar_widget: usize,
+    /// Index of the selected item in the masthead's navigable cluster (when the
+    /// masthead owns focus). Clamped to the visible item count each frame.
+    pub masthead_sel: usize,
+    /// Index of the selected item in the statusbar's navigable right cluster
+    /// (config widgets followed by the always-on badges).
+    pub statusbar_sel: usize,
     /// True when the center zone owns keyboard focus (drives the focused
     /// pane's light-blue frame ring; sidebar/panel focus dims every ring).
     pub center_focused: bool,
@@ -665,34 +676,20 @@ pub fn draw_masthead(
     let accent = theme_color(model.accent_or_default());
     let bg = col(bar_bg);
 
-    // Resolve the right cluster once; pick the widest brand that still lets
-    // the (possibly thinned) cluster fit.
-    let parts: Vec<(String, MastheadWidget)> = model
-        .bars
-        .top_right
-        .iter()
-        .filter_map(|id| masthead_widget(id, model).map(|w| (id.clone(), w)))
-        .collect();
-    let widths: Vec<(String, usize)> = parts
-        .iter()
-        .map(|(id, w)| (id.clone(), w.text.chars().count()))
-        .collect();
-    let mut brand_cols = masthead_brand_cols(rect.cols);
-    let kept = loop {
-        let avail = rect.cols.saturating_sub(brand_cols.max(1));
-        let kept = fit_stats_cluster(&widths, avail);
-        if cluster_width(&widths, &kept) <= avail || brand_cols == 0 {
-            break kept;
-        }
-        brand_cols = if brand_cols >= BRAND_FULL_COLS {
-            BRAND_COMPACT_COLS
-        } else {
-            0
-        };
-    };
+    // Resolve the visible cluster + brand width once (shared with navigation /
+    // hit-testing via `masthead_fit`).
+    let (brand_cols, items) = masthead_fit(model, rect.cols);
 
     if brand_cols > 0 {
-        draw_text(surface, rect.x + 1, rect.y, "\u{25c6} ", accent, bg, 2);
+        draw_text(
+            surface,
+            rect.x + 1,
+            rect.y,
+            &format!("{} ", crate::caps::active_glyphs().diamond_filled),
+            accent,
+            bg,
+            2,
+        );
         draw_text(surface, rect.x + 3, rect.y, "superzej", col(S::Text), bg, 8);
         if brand_cols >= BRAND_FULL_COLS {
             draw_text(
@@ -707,13 +704,13 @@ pub fn draw_masthead(
         }
     }
 
-    let cluster: Vec<&MastheadWidget> = kept.iter().map(|&i| &parts[i].1).collect();
     draw_masthead_cluster(
         surface,
         layout.masthead_stats_row(),
-        &cluster,
+        &items,
         brand_cols,
         bg,
+        model,
     );
     // Top-level app tabs sit right after the brand; the masthead-left widgets
     // (breadcrumb/clock/…) start after them.
@@ -905,6 +902,43 @@ pub struct MastheadWidget {
     fg: ColorAttribute,
 }
 
+/// The stable identity of a navigable bar item — what focus selects, what Enter
+/// (or a click) opens a detail view for, and the key the popup-content mapping
+/// dispatches on. Config widgets carry their `[bars]` id string; the always-on
+/// statusbar badges are their own enumerated kinds (they are NOT in `[bars]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BarItemId {
+    /// A `[bars]` config widget (e.g. "cpu", "mem", "pr", "tests").
+    Widget(String),
+    /// One of the hard-coded statusbar badge blocks.
+    Badge(BarBadge),
+}
+
+/// The statusbar's always-on badges, in render order. Each maps to one of the
+/// imperative badge blocks in [`draw_statusbar`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarBadge {
+    Notifications,
+    Ci,
+    DiskWarn,
+    Ingress,
+    Media,
+    AiCost,
+    Agent,
+    Zoom,
+    Lock,
+    Sync,
+}
+
+impl BarItemId {
+    /// Whether activating this item (Enter / click) opens a detail view. Every
+    /// navigable item has one today; kept as a seam so a future inert item can
+    /// opt out (Enter becomes a no-op rather than an empty modal).
+    pub fn has_detail(&self) -> bool {
+        true
+    }
+}
+
 /// Utilization pressure for threshold coloring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Level {
@@ -1048,9 +1082,11 @@ fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> {
         "net" => s.net_bps.map(|(rx, tx)| {
             w(
                 format!(
-                    "{} \u{2193}{} \u{2191}{}",
+                    "{} {}{} {}{}",
                     ic.net_icon,
+                    crate::caps::active_glyphs().arrow_down,
                     superzej_metrics::fmt_rate(rx),
+                    crate::caps::active_glyphs().arrow_up,
                     superzej_metrics::fmt_rate(tx)
                 ),
                 col(S::Dim),
@@ -1118,12 +1154,9 @@ pub fn bottombar_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> 
         }),
         // Active worktree's disk usage (size of its checkout incl. target/),
         // from the off-loop scan; sits next to LOC. Hidden until first scanned.
-        "disk" => model.active_worktree_disk.map(|b| {
-            w(
-                format!("{} DISK", superzej_core::disk::human(b)),
-                col(S::Dim),
-            )
-        }),
+        "disk" => model
+            .active_worktree_disk
+            .map(|b| w(superzej_core::disk::human(b), col(S::Dim))),
         // Forge + PR number, colored by state: open green, draft/queued
         // amber, closed and merged purple. Hidden when no PR exists.
         "pr" => model.panel.pr.as_ref().map(|pr| {
@@ -1155,10 +1188,11 @@ pub fn bottombar_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> 
             } else {
                 theme_color(theme::GREEN)
             };
+            let g = crate::caps::active_glyphs();
             let text = if t.failed > 0 {
-                format!("\u{2713}{} \u{2717}{}", t.passed, t.failed)
+                format!("{}{} {}{}", g.check, t.passed, g.cross, t.failed)
             } else {
-                format!("\u{2713}{}", t.passed)
+                format!("{}{}", g.check, t.passed)
             };
             Some(w(text, fg))
         }),
@@ -1207,86 +1241,195 @@ fn draw_masthead_left(surface: &mut Surface, rect: Rect, model: &FrameModel, bra
     }
 }
 
-/// The pre-fitted right cluster, right-aligned with `·` separators. The
-/// caller has already dropped whatever wouldn't fit (see `draw_masthead`).
+/// The masthead's resolved layout for a width: the brand column count and the
+/// visible right-cluster items (stable id + resolved widget) in display order,
+/// after the graceful width-degradation drop. The single source of truth shared
+/// by [`draw_masthead`] (placement) and [`masthead_item_spans`] (navigation +
+/// hit-testing), so which items show — and in what order — never disagrees.
+fn masthead_fit(model: &FrameModel, cols: usize) -> (usize, Vec<(BarItemId, MastheadWidget)>) {
+    let parts: Vec<(String, MastheadWidget)> = model
+        .bars
+        .top_right
+        .iter()
+        .filter_map(|id| masthead_widget(id, model).map(|w| (id.clone(), w)))
+        .collect();
+    let widths: Vec<(String, usize)> = parts
+        .iter()
+        .map(|(id, w)| (id.clone(), w.text.chars().count()))
+        .collect();
+    let mut brand_cols = masthead_brand_cols(cols);
+    let kept = loop {
+        let avail = cols.saturating_sub(brand_cols.max(1));
+        let kept = fit_stats_cluster(&widths, avail);
+        if cluster_width(&widths, &kept) <= avail || brand_cols == 0 {
+            break kept;
+        }
+        brand_cols = if brand_cols >= BRAND_FULL_COLS {
+            BRAND_COMPACT_COLS
+        } else {
+            0
+        };
+    };
+    let items = kept
+        .into_iter()
+        .map(|i| {
+            let (id, w) = &parts[i];
+            (
+                BarItemId::Widget(id.clone()),
+                MastheadWidget {
+                    text: w.text.clone(),
+                    fg: w.fg,
+                },
+            )
+        })
+        .collect();
+    (brand_cols, items)
+}
+
+/// The right cluster's `(x, width)` cell spans, right-aligned with ` · `
+/// separators. Mirrors [`draw_masthead_cluster`]'s placement exactly (the +1
+/// right margin, the brand floor) so highlight and hit-testing land on the
+/// painted glyphs.
+fn masthead_cluster_spans(widths: &[usize], rect: Rect, brand_cols: usize) -> Vec<(usize, usize)> {
+    if widths.is_empty() {
+        return Vec::new();
+    }
+    let end = rect.x + rect.cols;
+    let total: usize = widths.iter().sum::<usize>() + 3 * (widths.len() - 1) + 1;
+    let mut rx = end
+        .saturating_sub(total)
+        .max(rect.x + brand_cols.max(1) + 1);
+    let mut out = Vec::with_capacity(widths.len());
+    for (i, w) in widths.iter().enumerate() {
+        if i > 0 {
+            rx += 3;
+        }
+        out.push((rx, *w));
+        rx += w;
+    }
+    out
+}
+
+/// The masthead right cluster's absolute `(id, Rect)` spans for the loop's mouse
+/// hit-testing and detail-popup anchoring.
+pub fn masthead_item_spans(
+    model: &FrameModel,
+    layout: &crate::layout::ChromeLayout,
+) -> Vec<(BarItemId, Rect)> {
+    let rect = layout.masthead_stats_row();
+    if rect.rows == 0 || rect.cols == 0 {
+        return Vec::new();
+    }
+    let (brand_cols, items) = masthead_fit(model, rect.cols);
+    let widths: Vec<usize> = items.iter().map(|(_, w)| w.text.chars().count()).collect();
+    masthead_cluster_spans(&widths, rect, brand_cols)
+        .into_iter()
+        .zip(items)
+        .map(|((x, w), (id, _))| {
+            (
+                id,
+                Rect {
+                    x,
+                    y: rect.y,
+                    cols: w,
+                    rows: 1,
+                },
+            )
+        })
+        .collect()
+}
+
+/// The pre-fitted right cluster, right-aligned with `·` separators, with the
+/// focused item drawn as a focus-tinted selection block. The caller has already
+/// dropped whatever wouldn't fit (see `draw_masthead` / `masthead_fit`).
 fn draw_masthead_cluster(
     surface: &mut Surface,
     rect: Rect,
-    parts: &[&MastheadWidget],
+    parts: &[(BarItemId, MastheadWidget)],
     brand_cols: usize,
     bg: ColorAttribute,
+    model: &FrameModel,
 ) {
     if rect.rows == 0 || rect.cols == 0 || parts.is_empty() {
         return;
     }
     let sep = " \u{00b7} ";
-    let end = rect.x + rect.cols;
-    let total: usize =
-        parts.iter().map(|p| p.text.chars().count()).sum::<usize>() + 3 * (parts.len() - 1) + 1;
-    let mut rx = end
-        .saturating_sub(total)
-        .max(rect.x + brand_cols.max(1) + 1);
-    for (i, p) in parts.iter().enumerate() {
+    let widths: Vec<usize> = parts.iter().map(|(_, w)| w.text.chars().count()).collect();
+    let spans = masthead_cluster_spans(&widths, rect, brand_cols);
+    let sel = if model.masthead_focused {
+        Some(model.masthead_sel.min(parts.len().saturating_sub(1)))
+    } else {
+        None
+    };
+    let pill = theme_color(&theme::blend_over(&focus_rgb(), &panel_rgb(), 0.28));
+    let focus_fg = col(S::Focus);
+    for (i, ((_, p), (x, w))) in parts.iter().zip(spans.iter()).enumerate() {
         if i > 0 {
-            draw_text(surface, rx, rect.y, sep, col(S::Ghost), bg, 3);
-            rx += 3;
+            draw_text(
+                surface,
+                x.saturating_sub(3),
+                rect.y,
+                sep,
+                col(S::Ghost),
+                bg,
+                3,
+            );
         }
-        draw_text(
-            surface,
-            rx,
-            rect.y,
-            &p.text,
-            p.fg,
-            bg,
-            end.saturating_sub(rx),
-        );
-        rx += p.text.chars().count();
+        if sel == Some(i) {
+            fill(
+                surface,
+                Rect {
+                    x: *x,
+                    y: rect.y,
+                    cols: *w,
+                    rows: 1,
+                },
+                pill,
+            );
+            draw_text(surface, *x, rect.y, &p.text, focus_fg, pill, *w);
+        } else {
+            draw_text(surface, *x, rect.y, &p.text, p.fg, bg, *w);
+        }
     }
 }
 
-/// The bottom widget bar: mode chip + `[bars] bottom_left` (context keybind
-/// hints as key chips + dim labels) left-aligned, `bottom_right` (PR / LOC /
-/// transient status) right-aligned with `│` rules, and the zoom/lock badges
-/// as inverse chips always outermost-right.
-pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
-    use crate::seg::{Line, Seg, Tok, draw_line, seg, seg_width};
-    if rect.rows == 0 {
-        return;
-    }
+/// The statusbar's ordered navigable right-cluster items — the `bottom_right`
+/// config widgets followed by the always-on badges — each as its stable id plus
+/// the segments that render it (WITHOUT the inter-item separator, which the
+/// layout adds). The single source of truth shared by [`draw_statusbar`]
+/// (placement + highlight), navigation (item count), and
+/// [`statusbar_item_spans`] (mouse + popup anchoring), so they can never drift.
+pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Seg>)> {
+    use crate::seg::{Seg, Tok, seg};
+    let mut items: Vec<(BarItemId, Vec<Seg>)> = Vec::new();
 
-    // Right side: per-widget colors (e.g. the PR state) with `│` rules, then
-    // the zoom/lock badges outermost (the lock badge is safety-critical). Built
-    // first because the right cluster wins space — the left fits in what's left.
-    let mut r: Vec<Seg> = Vec::new();
-    let parts: Vec<MastheadWidget> = model
-        .bars
-        .bottom_right
-        .iter()
-        .filter_map(|id| bottombar_widget(id, model))
-        .collect();
-    for (i, p) in parts.into_iter().enumerate() {
-        if i > 0 {
-            r.push(seg(Tok::Slot(S::Ghost3), " \u{2502} "));
-        }
-        r.push(seg(Tok::Attr(p.fg), p.text));
-
-        if model.statusbar_focused && i == model.active_statusbar_widget {
-            r.push(seg(Tok::Slot(S::Ghost3), " \u{25c4} "));
+    // Config widgets (PR / tests / LOC / disk / transient status).
+    for id in &model.bars.bottom_right {
+        if let Some(p) = bottombar_widget(id, model) {
+            items.push((
+                BarItemId::Widget(id.clone()),
+                vec![seg(Tok::Attr(p.fg), p.text)],
+            ));
         }
     }
+
     // Red ⚑ flag is reserved for attention (Alert priority); a neutral blue inbox
     // chip carries Notice-priority unread. Info-priority events show in neither.
     if model.panel.alert_notifications > 0 {
-        r.push(seg(Tok::Slot(S::Text), " "));
-        r.push(Seg::chip(
-            Tok::Hue(superzej_core::theme::Hue::Red),
-            format!(" \u{2691} {} ", model.panel.alert_notifications),
+        items.push((
+            BarItemId::Badge(BarBadge::Notifications),
+            vec![Seg::chip(
+                Tok::Hue(superzej_core::theme::Hue::Red),
+                format!(" \u{2691} {} ", model.panel.alert_notifications),
+            )],
         ));
     } else if model.panel.unread_notifications > 0 {
-        r.push(seg(Tok::Slot(S::Text), " "));
-        r.push(Seg::chip(
-            Tok::Hue(superzej_core::theme::Hue::Blue),
-            format!(" \u{2709} {} ", model.panel.unread_notifications),
+        items.push((
+            BarItemId::Badge(BarBadge::Notifications),
+            vec![Seg::chip(
+                Tok::Hue(superzej_core::theme::Hue::Blue),
+                format!(" \u{2709} {} ", model.panel.unread_notifications),
+            )],
         ));
     }
     // CI rollup badge (AV group, item 158): a red ✗ chip when recent runs have
@@ -1308,16 +1451,20 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             .filter(|r| r.state == CiState::Running)
             .count();
         if fail > 0 {
-            r.push(seg(Tok::Slot(S::Text), " "));
-            r.push(Seg::chip(
-                Tok::Hue(superzej_core::theme::Hue::Red),
-                format!(" \u{2717} {fail} CI "),
+            items.push((
+                BarItemId::Badge(BarBadge::Ci),
+                vec![Seg::chip(
+                    Tok::Hue(superzej_core::theme::Hue::Red),
+                    format!(" {} {fail} CI ", crate::caps::active_glyphs().cross),
+                )],
             ));
         } else if running > 0 {
-            r.push(seg(Tok::Slot(S::Text), " "));
-            r.push(Seg::chip(
-                Tok::Hue(superzej_core::theme::Hue::Amber),
-                format!(" \u{25cf} {running} CI "),
+            items.push((
+                BarItemId::Badge(BarBadge::Ci),
+                vec![Seg::chip(
+                    Tok::Hue(superzej_core::theme::Hue::Amber),
+                    format!(" {} {running} CI ", crate::caps::active_glyphs().dot_filled),
+                )],
             ));
         }
     }
@@ -1341,10 +1488,12 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             } else {
                 superzej_core::theme::Hue::Amber
             };
-            r.push(seg(Tok::Slot(S::Text), " "));
-            r.push(Seg::chip(
-                Tok::Hue(hue),
-                format!(" \u{26c1} {} ", superzej_core::disk::human(total)),
+            items.push((
+                BarItemId::Badge(BarBadge::DiskWarn),
+                vec![Seg::chip(
+                    Tok::Hue(hue),
+                    format!(" \u{26c1} {} ", superzej_core::disk::human(total)),
+                )],
             ));
         }
     }
@@ -1370,13 +1519,17 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             } else {
                 superzej_core::theme::Hue::Teal
             };
-            r.push(seg(Tok::Slot(S::Text), " "));
-            r.push(Seg::chip(Tok::Hue(hue), label));
+            items.push((
+                BarItemId::Badge(BarBadge::Ingress),
+                vec![Seg::chip(Tok::Hue(hue), label)],
+            ));
         } else if failed > 0 {
-            r.push(seg(Tok::Slot(S::Text), " "));
-            r.push(Seg::chip(
-                Tok::Hue(superzej_core::theme::Hue::Amber),
-                " \u{21c5} ! ".to_string(),
+            items.push((
+                BarItemId::Badge(BarBadge::Ingress),
+                vec![Seg::chip(
+                    Tok::Hue(superzej_core::theme::Hue::Amber),
+                    " \u{21c5} ! ".to_string(),
+                )],
             ));
         }
     }
@@ -1393,26 +1546,31 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
         };
         let clipped: String = {
             let max = 30;
-            if text.chars().count() > max {
-                let s: String = text.chars().take(max.saturating_sub(1)).collect();
-                format!("{}\u{2026}", s.trim_end())
+            if crate::seg::take_cols(&text, max) != text.as_str() {
+                let g = crate::caps::active_glyphs();
+                let body = crate::seg::take_cols(&text, max.saturating_sub(3));
+                format!("{}{}", body.trim_end(), g.ellipsis)
             } else {
                 text
             }
         };
-        r.push(seg(Tok::Slot(S::Text), " "));
-        r.push(Seg::chip(Tok::Hue(hue), format!(" {clipped} ")));
+        items.push((
+            BarItemId::Badge(BarBadge::Media),
+            vec![Seg::chip(Tok::Hue(hue), format!(" {clipped} "))],
+        ));
     }
     if let Some(ref metrics) = model.ai_metrics {
-        r.push(seg(Tok::Slot(S::Text), " "));
-        r.push(Seg::chip(
-            Tok::Hue(superzej_core::theme::Hue::Teal),
-            format!(
-                " 🤖 {}: ${:.2} ({}t) ",
-                metrics.agent,
-                metrics.cost,
-                metrics.tokens.input + metrics.tokens.output
-            ),
+        items.push((
+            BarItemId::Badge(BarBadge::AiCost),
+            vec![Seg::chip(
+                Tok::Hue(superzej_core::theme::Hue::Teal),
+                format!(
+                    " 🤖 {}: ${:.2} ({}t) ",
+                    metrics.agent,
+                    metrics.cost,
+                    metrics.tokens.input + metrics.tokens.output
+                ),
+            )],
         ));
     }
     if let Some(ref a) = model.agent_activity {
@@ -1439,31 +1597,159 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
                 (hue, label)
             }
         };
-        r.push(seg(Tok::Slot(S::Text), " "));
-        r.push(Seg::chip(Tok::Hue(hue), label));
+        items.push((
+            BarItemId::Badge(BarBadge::Agent),
+            vec![Seg::chip(Tok::Hue(hue), label)],
+        ));
     }
     if model.zoomed {
-        r.push(seg(Tok::Slot(S::Text), " "));
-        r.push(Seg::chip(
-            Tok::Hue(superzej_core::theme::Hue::Purple),
-            " \u{26f6} ZOOM ",
+        items.push((
+            BarItemId::Badge(BarBadge::Zoom),
+            vec![Seg::chip(
+                Tok::Hue(superzej_core::theme::Hue::Purple),
+                " \u{26f6} ZOOM ",
+            )],
         ));
     }
     if model.key_locked {
-        r.push(seg(Tok::Slot(S::Text), " "));
-        r.push(Seg::chip(
-            Tok::Hue(superzej_core::theme::Hue::Amber),
-            " \u{2301} LOCKED ",
+        items.push((
+            BarItemId::Badge(BarBadge::Lock),
+            vec![Seg::chip(
+                Tok::Hue(superzej_core::theme::Hue::Amber),
+                " \u{2301} LOCKED ",
+            )],
         ));
     }
     if model.sync_panes {
-        r.push(seg(Tok::Slot(S::Text), " "));
-        r.push(Seg::chip(
-            Tok::Hue(superzej_core::theme::Hue::Red),
-            " \u{29c9} SYNC ",
+        items.push((
+            BarItemId::Badge(BarBadge::Sync),
+            vec![Seg::chip(
+                Tok::Hue(superzej_core::theme::Hue::Red),
+                " \u{29c9} SYNC ",
+            )],
         ));
     }
+    items
+}
+
+/// Recolor an item's segments as the focused-selection block: bright focus
+/// foreground over a focus-tinted pill, matching the masthead app-chips' active
+/// look ("reads like a selected tab"). Width is unchanged, so spans are stable.
+fn highlight_segs(
+    segs: &[crate::seg::Seg],
+    pill: ColorAttribute,
+    fg: ColorAttribute,
+) -> Vec<crate::seg::Seg> {
+    use crate::seg::Tok;
+    segs.iter()
+        .map(|s| {
+            let mut h = s.clone();
+            h.fg = Tok::Attr(fg);
+            h.bg = Some(Tok::Attr(pill));
+            h.bold = true;
+            h
+        })
+        .collect()
+}
+
+/// Lay out the statusbar right cluster from [`statusbar_items`]: join items with
+/// separators (` │ ` between adjacent config widgets, a single space before each
+/// badge, trailing space) and, when `sel` is `Some`, highlight that item.
+/// Returns the seg run for [`draw_line`] plus each item's `(id, x_offset, width)`
+/// WITHIN the cluster (offset 0 = the cluster's left cell). Separators add width
+/// but are not items, so offsets account for them.
+fn statusbar_right_layout(
+    items: &[(BarItemId, Vec<crate::seg::Seg>)],
+    sel: Option<(usize, ColorAttribute, ColorAttribute)>,
+) -> (Vec<crate::seg::Seg>, Vec<(BarItemId, usize, usize)>) {
+    use crate::seg::{Seg, Tok, seg, seg_width};
+    let mut r: Vec<Seg> = Vec::new();
+    let mut spans: Vec<(BarItemId, usize, usize)> = Vec::new();
+    let mut off = 0usize;
+    let mut prev_widget = false;
+    for (idx, (id, segs)) in items.iter().enumerate() {
+        let is_widget = matches!(id, BarItemId::Widget(_));
+        // Separator: ` │ ` between two adjacent config widgets, a single space
+        // before any badge (reproduces the historical leading-space per badge).
+        if is_widget {
+            if prev_widget {
+                let s = seg(Tok::Slot(S::Ghost3), " \u{2502} ");
+                off += seg_width(std::slice::from_ref(&s));
+                r.push(s);
+            }
+        } else {
+            r.push(seg(Tok::Slot(S::Text), " "));
+            off += 1;
+        }
+        let drawn = match sel {
+            Some((s, pill, fg)) if s == idx => highlight_segs(segs, pill, fg),
+            _ => segs.clone(),
+        };
+        let w = seg_width(&drawn);
+        spans.push((id.clone(), off, w));
+        off += w;
+        r.extend(drawn);
+        prev_widget = is_widget;
+    }
     r.push(seg(Tok::Slot(S::Text), " "));
+    (r, spans)
+}
+
+/// The statusbar right-cluster items' absolute `(id, Rect)` spans for the given
+/// statusbar rect — mouse hit-testing and detail-popup anchoring. Mirrors
+/// [`draw_statusbar`]'s right-alignment (the cluster hugs the right edge), so a
+/// hit/anchor lands exactly where the item is painted.
+pub fn statusbar_item_spans(model: &FrameModel, rect: Rect) -> Vec<(BarItemId, Rect)> {
+    use crate::seg::seg_width;
+    if rect.rows == 0 || rect.cols == 0 {
+        return Vec::new();
+    }
+    let items = statusbar_items(model);
+    let (r, spans) = statusbar_right_layout(&items, None);
+    let rl = seg_width(&r);
+    // `Line::Split` right-aligns the right cluster: it begins at `cols - rl`.
+    let base = (rect.x + rect.cols).saturating_sub(rl);
+    spans
+        .into_iter()
+        .map(|(id, off, w)| {
+            (
+                id,
+                Rect {
+                    x: base + off,
+                    y: rect.y,
+                    cols: w,
+                    rows: 1,
+                },
+            )
+        })
+        .collect()
+}
+
+/// The bottom widget bar: mode chip + `[bars] bottom_left` (context keybind
+/// hints as key chips + dim labels) left-aligned, `bottom_right` (PR / LOC /
+/// transient status) right-aligned with `│` rules, and the zoom/lock badges
+/// as inverse chips always outermost-right.
+pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
+    use crate::seg::{Line, Seg, Tok, draw_line, seg, seg_width};
+    if rect.rows == 0 {
+        return;
+    }
+
+    // Right side: per-widget colors with `│` rules then the badges, built from
+    // the shared enumerator so navigation/highlight/hit-test stay in lock-step.
+    // The right cluster wins space — the left fits in what's left.
+    let items = statusbar_items(model);
+    let sel = if model.statusbar_focused {
+        let pill = theme_color(&theme::blend_over(&focus_rgb(), &panel_rgb(), 0.28));
+        Some((
+            model.statusbar_sel.min(items.len().saturating_sub(1)),
+            pill,
+            col(S::Focus),
+        ))
+    } else {
+        None
+    };
+    let (r, _spans) = statusbar_right_layout(&items, sel);
 
     // Cells the left cluster gets once the right wins its space — mirrors
     // `Line::split`'s math so keyhints can be trimmed at whole-binding
@@ -1526,6 +1812,15 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
 
 pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
     fill(surface, rect, col(S::Panel));
+    if rect.cols == 0 || rect.rows == 0 {
+        return;
+    }
+    // The slim rail is its own compact language (activity dot + initial); the
+    // full panel renders the header, the laid-out rows, metrics, and menu.
+    if model.sidebar_rail {
+        draw_sidebar_rail(surface, rect, model);
+        return;
+    }
     let accent = theme_color(model.accent_or_default());
 
     // Header: the live filter input, or the "WORKSPACES" section title — in
@@ -1553,174 +1848,38 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
         );
     }
 
-    // Only visible rows are listed; the selection index is into that subset.
-    let visible: Vec<&crate::sidebar::SidebarRow> =
-        model.sidebar_rows.iter().filter(|r| r.visible).collect();
-
-    // Pre-compute the Ctrl+1..9 quick-jump slot for each visible row, matching
-    // `sidebar_workspace_order` exactly: only switchable (DB-backed, has a
-    // `worktree_path`) workspace rows count, in visible order, slots 1..=9.
-    let workspace_slots: Vec<Option<u8>> = {
-        let mut next: u8 = 1;
-        visible
-            .iter()
-            .map(|r| {
-                if r.kind == crate::sidebar::RowKind::Workspace && r.worktree_path.is_some() {
-                    let slot = (next <= 9).then_some(next);
-                    next += 1;
-                    slot
-                } else {
-                    None
-                }
-            })
-            .collect()
-    };
-
-    let metrics_rows = if rect.rows > 10 && !model.metrics.targets.is_empty() {
-        6.min(rect.rows.saturating_sub(4))
-    } else {
-        0
-    };
-    let list_bottom = rect.y + rect.rows.saturating_sub(metrics_rows);
-
-    // Rows advance a running `y` (not `rect.y + 2 + i`) so a first-class
-    // section banner can claim a blank breathing line above itself; text,
-    // highlight, and badge overpaint all derive from this same `y`.
-    let mut y = rect.y + 2;
-    for (i, row) in visible.iter().enumerate() {
-        if row.kind == crate::sidebar::RowKind::SectionHeading && i > 0 {
-            y += 1; // breathing gap above the banner
-        }
-        if y >= list_bottom {
-            break;
-        }
-        // A section banner renders like the "WORKSPACES" title — bold, in the
-        // Text color, no selection pill / status tail / badges.
-        if row.kind == crate::sidebar::RowKind::SectionHeading {
-            // A section heading is never a workspace, so it carries no
-            // Ctrl+1..9 quick-jump slot.
-            let composed = compose_sidebar_row(row, None, None);
-            draw_text_bold(
-                surface,
-                rect.x,
-                y,
-                &format!(" {}", composed.text),
-                col(S::Text),
-                col(S::Panel),
-                rect.cols,
-            );
-            y += 1;
-            continue;
-        }
-        let selected = i == model.sidebar_selected;
-        let marked = model.sidebar_marked.contains(&i);
-        // The active worktree/tab row carries the focus-tint pill (same
-        // highlight language as the masthead's active chip), blended over the
-        // zone's panel tint so it never punches a dark hole in the surface.
-        let pill = theme_color(&theme::blend_over(&focus_rgb(), &panel_rgb(), 0.16));
-        let bg = if selected {
-            col(S::Panel2)
-        } else if row.active {
-            pill
-        } else if marked {
-            col(S::Raise)
-        } else {
-            col(S::Panel)
-        };
-        if selected || marked || row.active {
-            fill(
-                surface,
-                Rect {
-                    x: rect.x,
-                    y,
-                    cols: rect.cols,
-                    rows: 1,
-                },
-                bg,
-            );
-        }
+    // One layout pass: the renderer and the click hit-test (`sidebar_hits`)
+    // both derive geometry from `build_sidebar`, so paint and clicks can never
+    // drift apart (the same contract the panel uses via `build_panel`).
+    let frame = build_sidebar(model, rect, model.sidebar_scroll);
+    for p in &frame.rows {
+        // `draw_lines` fills the placement's full width in `bg`; every composed
+        // line begins with a 1-col gutter so the cursor bar can overpaint col 0
+        // without clobbering content.
+        crate::seg::draw_lines(
+            surface,
+            Rect {
+                x: rect.x,
+                y: p.y,
+                cols: rect.cols,
+                rows: p.height,
+            },
+            &p.lines,
+            p.bg,
+        );
         // Left-edge accent bar marks the cursor only while focused, so a stale
         // selection isn't mistaken for focus.
-        if selected && model.sidebar_focused {
-            draw_text(surface, rect.x, y, "\u{2590}", col(S::Focus), bg, 1);
-        }
-
-        let window_title = row
-            .worktree_path
-            .as_deref()
-            .and_then(|p| model.sidebar_window_titles.get(p))
-            .map(String::as_str);
-        let composed = compose_sidebar_row(row, window_title, workspace_slots[i]);
-        let fg = if row.active {
-            col(S::Focus)
-        } else if selected {
-            col(S::Text)
-        } else {
-            col(S::Dim)
-        };
-        draw_text(
-            surface,
-            rect.x + 1,
-            y,
-            &composed.text,
-            fg,
-            bg,
-            rect.cols.saturating_sub(1),
-        );
-        // Recolor the activity dot (item 20) in its own state color: white while
-        // the worktree is working, red when its agent is waiting for input. The
-        // dormant state draws no dot, so `activity_col` is None and we skip.
-        if let Some(dc) = composed.activity_col {
-            let dx = rect.x + 1 + dc;
-            if dx < rect.x + rect.cols {
-                draw_text(
-                    surface,
-                    dx,
-                    y,
-                    activity_dot(row.activity).trim_end(),
-                    activity_dot_color(row.activity),
-                    bg,
-                    (rect.x + rect.cols).saturating_sub(dx),
-                );
-            }
-        }
-        // Overpaint the status segment (git/agent/activity) in its own colors,
-        // right after the label, when there's room. Track the running column so
-        // badges paint after the status tail.
-        let mut col_off = composed.status_col;
-        if let Some(seg) = &composed.status {
-            let sx = rect.x + 1 + col_off;
-            if sx < rect.x + rect.cols {
-                draw_text(
-                    surface,
-                    sx,
-                    y,
-                    seg,
-                    status_seg_color(row),
-                    bg,
-                    (rect.x + rect.cols).saturating_sub(sx),
-                );
-            }
-            col_off += seg.chars().count();
-        }
-        // Badges (item 28): PR / unread / alert counts, each in its own color.
-        for badge in &composed.badges {
-            let sx = rect.x + 1 + col_off;
-            if sx >= rect.x + rect.cols {
-                break;
-            }
+        if p.cursor_bar {
             draw_text(
                 surface,
-                sx,
-                y,
-                &badge.text,
-                badge.color,
-                bg,
-                (rect.x + rect.cols).saturating_sub(sx),
+                rect.x,
+                p.y,
+                "\u{2590}",
+                col(S::Focus),
+                tok_col(p.bg),
+                1,
             );
-            col_off += badge.text.chars().count();
         }
-        y += 1;
     }
 
     // Row context menu overlay (item 27).
@@ -1728,18 +1887,248 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
         draw_row_menu(surface, rect, menu, accent);
     }
 
-    if metrics_rows > 0 {
-        draw_metrics_section(
+    if let Some(mrect) = frame.metrics {
+        draw_metrics_section(surface, mrect, model);
+    }
+}
+
+/// The slim collapsed rail: one row per visible worktree, an activity dot in
+/// its state color plus the first letter of the label. `model.sidebar_scroll`
+/// keeps the cursor in view.
+fn draw_sidebar_rail(surface: &mut Surface, rect: Rect, model: &FrameModel) {
+    let frame = build_sidebar(model, rect, model.sidebar_scroll);
+    for p in &frame.rows {
+        crate::seg::draw_lines(
             surface,
             Rect {
                 x: rect.x,
-                y: rect.y + rect.rows - metrics_rows,
+                y: p.y,
                 cols: rect.cols,
-                rows: metrics_rows,
+                rows: p.height,
             },
-            model,
+            &p.lines,
+            p.bg,
         );
     }
+}
+
+/// A laid-out sidebar row: which visible-row it is, where it sits, how tall it
+/// is, and the composed line(s) + background to paint. The cursor row may be
+/// two lines tall (the expanded detail tier); a section heading carries a
+/// leading blank gap.
+pub(crate) struct SidebarPlacement {
+    pub visible_index: usize,
+    pub y: usize,
+    pub height: usize,
+    pub lines: Vec<crate::seg::Line>,
+    pub bg: crate::seg::Tok,
+    pub cursor_bar: bool,
+}
+
+/// The result of one sidebar layout pass: the on-screen row placements, the
+/// (clamped) scroll offset actually used, and the metrics section rect (full
+/// mode only). Pure — the renderer paints it and the mouse path hit-tests it.
+pub(crate) struct SidebarFrame {
+    pub rows: Vec<SidebarPlacement>,
+    pub scroll: usize,
+    pub metrics: Option<Rect>,
+}
+
+/// Lay out the sidebar rows for `rect`, starting from `desired_scroll` (clamped
+/// so the cursor row stays fully visible). Variable row heights (the cursor's
+/// two-tier expansion, the section-heading gap) are resolved here so render and
+/// click share one source.
+pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usize) -> SidebarFrame {
+    use crate::sidebar::RowKind;
+    let rail = model.sidebar_rail;
+    let visible: Vec<&crate::sidebar::SidebarRow> =
+        model.sidebar_rows.iter().filter(|r| r.visible).collect();
+
+    // Ctrl+1..9 quick-jump slots: only switchable (DB-backed, has a
+    // `worktree_path`) workspace rows count, in visible order, slots 1..=9.
+    let slots: Vec<Option<u8>> = {
+        let mut next: u8 = 1;
+        visible
+            .iter()
+            .map(|r| {
+                if r.kind == RowKind::Workspace && r.worktree_path.is_some() {
+                    let s = (next <= 9).then_some(next);
+                    next += 1;
+                    s
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+
+    // The full panel reserves a header + blank row at the top and a metrics
+    // section at the bottom; the rail uses the whole column.
+    let (head_rows, metrics_rows) = if rail {
+        (0, 0)
+    } else {
+        let m = if rect.rows > 10 && !model.metrics.targets.is_empty() {
+            6.min(rect.rows.saturating_sub(4))
+        } else {
+            0
+        };
+        (2, m)
+    };
+    let metrics = (metrics_rows > 0).then_some(Rect {
+        x: rect.x,
+        y: rect.y + rect.rows - metrics_rows,
+        cols: rect.cols,
+        rows: metrics_rows,
+    });
+    let list_y = rect.y + head_rows;
+    let list_rows = rect.rows.saturating_sub(head_rows + metrics_rows);
+    let cursor = if visible.is_empty() {
+        0
+    } else {
+        model.sidebar_selected.min(visible.len() - 1)
+    };
+
+    // Compose every visible row's line(s) + background once; the cursor row
+    // expands to a detail line when it has secondary metadata.
+    let mut composed: Vec<(Vec<crate::seg::Line>, crate::seg::Tok, bool)> =
+        Vec::with_capacity(visible.len());
+    for (i, row) in visible.iter().enumerate() {
+        let is_cursor = i == cursor;
+        // A row is the last child at its depth when the next visible row steps
+        // back up the tree (or there is none) — drives the └ vs ├ connector.
+        let is_last = visible.get(i + 1).is_none_or(|n| n.depth < row.depth);
+        let mut lines = if rail {
+            vec![compose_rail_line(row)]
+        } else {
+            let wt = row
+                .worktree_path
+                .as_deref()
+                .and_then(|p| model.sidebar_window_titles.get(p))
+                .map(String::as_str);
+            compose_row_lines(row, wt, is_cursor, is_last, slots[i])
+        };
+        // A section banner gets a breathing gap above it (except at the top).
+        if !rail && row.kind == RowKind::SectionHeading && i > 0 {
+            lines.insert(0, crate::seg::Line::Blank);
+        }
+        let bg = row_bg(row, i, cursor, model);
+        let cursor_bar = !rail
+            && is_cursor
+            && model.sidebar_focused
+            && !matches!(row.kind, RowKind::SectionHeading);
+        composed.push((lines, bg, cursor_bar));
+    }
+    let heights: Vec<usize> = composed.iter().map(|(l, _, _)| l.len().max(1)).collect();
+    let scroll = clamp_sidebar_scroll(&heights, cursor, list_rows, desired_scroll);
+
+    let mut rows = Vec::new();
+    let mut y = list_y;
+    let bottom = list_y + list_rows;
+    for (i, (lines, bg, cursor_bar)) in composed.into_iter().enumerate().skip(scroll) {
+        if y >= bottom {
+            break;
+        }
+        let height = heights[i].min(bottom - y); // clip a partly-fitting tail row
+        rows.push(SidebarPlacement {
+            visible_index: i,
+            y,
+            height,
+            lines,
+            bg,
+            cursor_bar,
+        });
+        y += heights[i];
+    }
+    SidebarFrame {
+        rows,
+        scroll,
+        metrics,
+    }
+}
+
+/// Pick `scroll` (top visible-row index) so the cursor row fits fully within
+/// `list_rows`, honoring `desired` where possible. Heights are per-row (the
+/// cursor row may be 2). O(n·window) but `n` is the worktree count — tiny.
+fn clamp_sidebar_scroll(
+    heights: &[usize],
+    cursor: usize,
+    list_rows: usize,
+    desired: usize,
+) -> usize {
+    let n = heights.len();
+    if n == 0 || list_rows == 0 {
+        return 0;
+    }
+    let cursor = cursor.min(n - 1);
+    // Never scroll past the cursor (it must be at least the top row).
+    let mut scroll = desired.min(cursor);
+    loop {
+        // Walk from `scroll`; does the cursor row's last line fit in the window?
+        let mut used = 0usize;
+        let mut fits = false;
+        for (i, h) in heights.iter().enumerate().skip(scroll) {
+            if i == cursor {
+                fits = used + h <= list_rows;
+                break;
+            }
+            used += h;
+            if used >= list_rows {
+                break;
+            }
+        }
+        if fits || scroll >= cursor {
+            break;
+        }
+        scroll += 1;
+    }
+    scroll
+}
+
+/// Background token for a row: cursor selection > active worktree > multi-select
+/// mark > a recessed band for header rows (workspace/host/folder) > the plain
+/// panel tint. Section banners never highlight — they read as titles.
+fn row_bg(
+    row: &crate::sidebar::SidebarRow,
+    i: usize,
+    cursor: usize,
+    model: &FrameModel,
+) -> crate::seg::Tok {
+    use crate::seg::Tok;
+    use crate::sidebar::RowKind;
+    if row.kind == RowKind::SectionHeading {
+        return Tok::Slot(S::Panel);
+    }
+    let header = matches!(
+        row.kind,
+        RowKind::Workspace | RowKind::TerminalHost | RowKind::Folder
+    );
+    if i == cursor {
+        Tok::Slot(S::Panel2)
+    } else if row.active {
+        Tok::SelAccent
+    } else if model.sidebar_marked.contains(&i) {
+        Tok::Slot(S::Raise)
+    } else if header {
+        Tok::Slot(S::Bg0)
+    } else {
+        Tok::Slot(S::Panel)
+    }
+}
+
+/// Resolve a seg color token to a concrete color (for the focus bar's bg).
+fn tok_col(t: crate::seg::Tok) -> ColorAttribute {
+    with_palette(|p| t.resolve(p))
+}
+
+/// The `(visible_index, y, height)` of each rendered sidebar row — the same
+/// `build_sidebar` pass the renderer painted, so a click resolves against
+/// what is on screen. Pure; the mouse path calls it on demand.
+pub(crate) fn sidebar_hits(model: &FrameModel, rect: Rect) -> Vec<(usize, usize, usize)> {
+    build_sidebar(model, rect, model.sidebar_scroll)
+        .rows
+        .iter()
+        .map(|p| (p.visible_index, p.y, p.height))
+        .collect()
 }
 
 fn draw_metrics_section(surface: &mut Surface, rect: Rect, model: &FrameModel) {
@@ -1773,10 +2162,11 @@ fn draw_metrics_section(surface: &mut Surface, rect: Rect, model: &FrameModel) {
         if y >= max_y {
             break;
         }
+        let gl = crate::caps::active_glyphs();
         let (dot, dot_fg, health) = match target.health {
-            crate::metrics::MetricHealth::Up => ("\u{25cf}", theme_color(theme::GREEN), "up"),
-            crate::metrics::MetricHealth::Stale => ("\u{25cb}", col(S::Dim), "stale"),
-            crate::metrics::MetricHealth::Error => ("\u{25cb}", theme_color(theme::RED), "err"),
+            crate::metrics::MetricHealth::Up => (gl.dot_filled, theme_color(theme::GREEN), "up"),
+            crate::metrics::MetricHealth::Stale => (gl.dot_hollow, col(S::Dim), "stale"),
+            crate::metrics::MetricHealth::Error => (gl.dot_hollow, theme_color(theme::RED), "err"),
         };
         draw_text(surface, rect.x + 1, y, dot, dot_fg, col(S::Panel), 1);
         let label = format!("{} {}", target.name, health);
@@ -1831,248 +2221,277 @@ fn draw_metrics_section(surface: &mut Surface, rect: Rect, model: &FrameModel) {
     }
 }
 
-/// The text composed for a row plus where its status segment begins (so the
-/// renderer can recolor it). `text` already includes caret/connector/label and
-/// a trailing space before the status; `status` is the git/agent/activity tail.
-struct ComposedRow {
-    text: String,
-    status: Option<String>,
-    status_col: usize,
-    /// Char column of the activity dot within `text`, when the row renders one
-    /// (item 20). The renderer over-paints just this glyph in its state color.
-    activity_col: Option<usize>,
-    /// Badge segments (item 28): PR / unread / alert counts, each with its own
-    /// color, drawn after the git status tail.
-    badges: Vec<Badge>,
+/// The indent + connector segments for a tree row at `depth` (worktree = 1,
+/// folder child = 2). Two cells of indent per ancestor level, then a `└`/`├`
+/// connector in a ghost tone so the nesting is visible at a glance.
+fn tree_lead(depth: u8, is_last: bool) -> Vec<crate::seg::Seg> {
+    use crate::seg::{Tok, seg, sp};
+    let indent = (depth.saturating_sub(1)) as usize * 2;
+    let conn = if is_last { "\u{2514} " } else { "\u{251c} " }; // └ / ├
+    vec![sp(indent), seg(Tok::Slot(S::Ghost2), conn)]
 }
 
-/// A single sidebar badge segment with its own color.
-struct Badge {
-    text: String,
-    color: ColorAttribute,
+/// The activity dot glyph for a worktree row (item 20): filled while active or
+/// waiting, hollow once read-but-still-stuck. `None` renders nothing. Uses the
+/// active glyph set so it degrades to ASCII on limited terminals.
+fn activity_dot_glyph(state: crate::sidebar::ActivityState) -> &'static str {
+    use crate::sidebar::ActivityState::*;
+    let g = crate::caps::active_glyphs();
+    match state {
+        Active | Waiting => g.dot_filled, // ● / *
+        Read => g.dot_hollow,             // ○ / o
+        None => "",
+    }
 }
 
-fn compose_sidebar_row(
+/// The activity dot color token, per state (`[theme.colors] activity_active` /
+/// `activity_waiting`). Both red states share the waiting slot — filled vs
+/// hollow is glyph-only.
+fn activity_dot_tok(state: crate::sidebar::ActivityState) -> crate::seg::Tok {
+    use crate::sidebar::ActivityState::*;
+    crate::seg::Tok::Slot(match state {
+        Active => S::ActivityActive,
+        Waiting | Read => S::ActivityWaiting,
+        None => S::Dim,
+    })
+}
+
+/// Compose the on-screen line(s) for one visible row. Headers (workspace / host
+/// / folder) are a single bold styled line; section banners render like the
+/// "WORKSPACES" title; worktrees are a name/status split, and the cursor row
+/// (`expanded`) grows a second detail line carrying the secondary metadata
+/// (env / backend / PR / unread / disk). `slot` is the Ctrl+1..9 quick-jump
+/// digit for switchable workspace rows. Every line starts with a 1-col gutter
+/// so the focus bar can overpaint col 0.
+fn compose_row_lines(
     row: &crate::sidebar::SidebarRow,
     window_title: Option<&str>,
-    workspace_slot: Option<u8>,
-) -> ComposedRow {
-    use crate::sidebar::RowKind;
-    let mut text = String::new();
-    let mut activity_col = None;
-
-    // Quick-jump digit on a switchable workspace row (Ctrl+1..9). Prepended
-    // before the caret so the later char-offset bookkeeping (status/badge
-    // columns) folds it in automatically.
-    if row.kind == RowKind::Workspace
-        && let Some(n) = workspace_slot
-    {
-        text.push_str(&format!("{n} "));
-    }
+    expanded: bool,
+    is_last: bool,
+    slot: Option<u8>,
+) -> Vec<crate::seg::Line> {
+    use crate::seg::{Line, Seg, Tok, seg, sp};
+    use crate::sidebar::{ActivityState, RowKind};
+    let gl = crate::caps::active_glyphs();
+    let caret = |collapsed: bool| {
+        if collapsed {
+            "\u{25b8}" // ▸
+        } else {
+            "\u{25be}" // ▾
+        }
+    };
 
     match row.kind {
-        RowKind::Folder => {
-            text.push_str("  ");
-            let caret = if row.collapsed {
-                "\u{25b8}"
-            } else {
-                "\u{25be}"
-            };
-            text.push_str(caret);
-            text.push(' ');
-            text.push_str("\u{1f4c2} "); // open folder glyph
-            text.push_str(&row.label);
-        }
-        RowKind::SectionHeading => {
-            // Bold-banner styling (matching the "WORKSPACES" title) is applied
-            // by the draw loop; here we only carry the label text.
-            text.push_str(&row.label);
-        }
         RowKind::Workspace | RowKind::TerminalHost => {
-            let caret = if row.collapsed {
-                "\u{25b8}"
-            } else {
-                "\u{25be}"
-            };
-            text.push_str(caret);
-            text.push(' ');
+            let mut l = vec![sp(1)];
+            // Quick-jump digit on a switchable workspace row (Ctrl+1..9).
+            if row.kind == RowKind::Workspace
+                && let Some(n) = slot
+            {
+                l.push(seg(Tok::Slot(S::Faint), format!("{n} ")));
+            }
+            l.push(seg(Tok::Slot(S::Faint), caret(row.collapsed)));
+            l.push(sp(1));
             if row.kind == RowKind::TerminalHost {
-                // Host group glyph: 💻 local vs 🌐 remote, keyed off the
+                // Host group glyph: local vs remote, keyed off the
                 // representative connection set in `build_rows`.
                 let local = row
                     .terminal_connection
                     .as_deref()
                     .map(str::is_empty)
                     .unwrap_or(true);
-                text.push_str(if local { "💻 " } else { "🌐 " });
+                l.push(seg(
+                    Tok::Slot(S::Dim),
+                    if local { "\u{1f4bb} " } else { "\u{1f310} " },
+                ));
             } else if row.dir {
                 // A non-git "dir" workspace gets a folder glyph so it reads
                 // differently from a repo workspace.
-                text.push_str("\u{1f4c1} ");
+                l.push(seg(Tok::Slot(S::Text), "\u{1f4c1} "));
             }
-            text.push_str(&row.label);
+            l.push(seg(Tok::Slot(S::Text), row.label.clone()).bold());
+            vec![Line::Segs(l)]
         }
+        RowKind::SectionHeading => vec![Line::Segs(vec![
+            sp(1),
+            seg(Tok::Slot(S::Text), row.label.clone()).bold(),
+        ])],
+        RowKind::Folder => vec![Line::Segs(vec![
+            sp(1),
+            sp(2),
+            seg(Tok::Slot(S::Faint), caret(row.collapsed)),
+            sp(1),
+            seg(Tok::Slot(S::Dim), "\u{1f4c2} "), // 📂
+            seg(Tok::Slot(S::Text), row.label.clone()).bold(),
+        ])],
         RowKind::Terminal => {
-            text.push_str("  ");
-            // Render terminal with a distinct visual language
-            if let Some(loc) = &row.terminal_connection {
-                if loc.starts_with("ssh") {
-                    text.push_str("🌐 ");
-                } else if loc.starts_with("mosh") {
-                    text.push_str("🚀 ");
-                } else {
-                    text.push_str("💻 ");
-                }
-            } else {
-                text.push_str("💻 ");
-            }
-            text.push_str(&row.label);
+            let glyph = match row.terminal_connection.as_deref() {
+                Some(c) if c.starts_with("ssh") => "\u{1f310} ", // 🌐
+                Some(c) if c.starts_with("mosh") => "\u{1f680} ", // 🚀
+                _ => "\u{1f4bb} ",                               // 💻
+            };
+            let mut l = vec![sp(1)];
+            l.extend(tree_lead(row.depth, is_last));
+            l.push(seg(Tok::Slot(S::Dim), glyph));
+            l.push(seg(Tok::Slot(S::Dim), row.label.clone()));
+            vec![Line::Segs(l)]
         }
         RowKind::Worktree => {
-            text.push_str("  ");
-            let dot = activity_dot(row.activity);
-            if !dot.is_empty() {
-                activity_col = Some(text.chars().count());
+            // Left cluster: gutter, tree connector, activity dot (own color),
+            // the dynamic name, then the agent glyph.
+            let mut left = vec![sp(1)];
+            left.extend(tree_lead(row.depth, is_last));
+            if matches!(row.activity, ActivityState::None) {
+                left.push(sp(2)); // keep names aligned with dotted rows
+            } else {
+                left.push(seg(
+                    activity_dot_tok(row.activity),
+                    activity_dot_glyph(row.activity),
+                ));
+                left.push(sp(1));
             }
-            text.push_str(dot);
-            // Dynamic title: `[PR: <n> | <window-title>]`, else the window
-            // title, else the branch (`row.label`). See `compose_row_label`.
-            text.push_str(&crate::sidebar::compose_row_label(
-                row.pr_number,
-                window_title,
-                &row.label,
-            ));
+            let name_fg = if row.active {
+                Tok::Slot(S::Focus)
+            } else if expanded {
+                Tok::Slot(S::Text)
+            } else {
+                Tok::Slot(S::Dim)
+            };
+            let label = crate::sidebar::compose_row_label(row.pr_number, window_title, &row.label);
+            left.push(seg(name_fg, label));
+            if let Some(agent) = &row.agent {
+                left.push(seg(
+                    Tok::Hue(theme::Hue::Teal),
+                    format!(" {}", superzej_core::theme::agent_glyph(agent)),
+                ));
+            }
+
+            // Right cluster (always-on): git status + the alert badge. PR /
+            // unread / disk move to the expanded detail line to de-crowd.
+            let mut right: Vec<Seg> = Vec::new();
+            let push_sp = |v: &mut Vec<Seg>| {
+                if !v.is_empty() {
+                    v.push(sp(1));
+                }
+            };
+            if let Some(g) = row.git {
+                if g.dirty {
+                    right.push(seg(Tok::Hue(theme::Hue::Amber), gl.dot_filled)); // ●
+                }
+                if g.ahead > 0 {
+                    push_sp(&mut right);
+                    right.push(seg(
+                        Tok::Slot(S::Dim),
+                        format!("{}{}", gl.arrow_up, g.ahead),
+                    )); // ↑N
+                }
+                if g.behind > 0 {
+                    push_sp(&mut right);
+                    right.push(seg(
+                        Tok::Slot(S::Dim),
+                        format!("{}{}", gl.arrow_down, g.behind),
+                    ));
+                    // ↓N
+                }
+            }
+            if row.alert_count > 0 {
+                push_sp(&mut right);
+                right.push(seg(
+                    Tok::Hue(theme::Hue::Red),
+                    format!("\u{26a0}{}", row.alert_count),
+                ));
+                // ⚠N
+            }
+
+            let mut lines = vec![if right.is_empty() {
+                Line::Segs(left)
+            } else {
+                Line::Split { l: left, r: right }
+            }];
+            if expanded && let Some(detail) = compose_detail_line(row) {
+                lines.push(detail);
+            }
+            lines
         }
     }
+}
 
-    // A non-default execution environment badges before the backend, so a
-    // worktree pinned to `company-k8s`/`datonya`/etc. is visible at a glance.
+/// The expanded cursor row's second line: the secondary metadata that would
+/// crowd the always-on row — execution env, sandbox backend, open PRs, unread
+/// notifications, and disk size. `None` when the row has nothing extra to show.
+fn compose_detail_line(row: &crate::sidebar::SidebarRow) -> Option<crate::seg::Line> {
+    use crate::seg::{Line, Seg, Tok, seg, sp};
+    // Gutter + indent so the detail reads as hanging under the name.
+    let mut segs: Vec<Seg> = vec![sp(5)];
+    let start = segs.len();
+
     if let Some(env) = &row.env_name
         && !env.is_empty()
         && env != "default"
     {
-        text.push_str(&format!(" «{env}»"));
+        segs.push(seg(Tok::Slot(S::Faint), format!("\u{ab}{env}\u{bb} ")));
     }
-
-    // Agent glyph (item 19) sits just after the label.
     if let Some(backend) = &row.sandbox_backend
         && !backend.is_empty()
         && backend != "none"
         && backend != "host"
     {
-        text.push_str(&format!(" ({backend})"));
+        segs.push(seg(Tok::Slot(S::Faint), format!("({backend}) ")));
     }
-
-    if let Some(agent) = &row.agent {
-        text.push(' ');
-        text.push_str(&superzej_core::theme::agent_glyph(agent));
-    }
-
-    // Git glyphs (item 18) form the recolored status tail.
-    let status = row.git.map(|g| {
-        let mut s = String::new();
-        if g.dirty {
-            s.push_str(" \u{25cf}"); // ●
-        }
-        if g.ahead > 0 {
-            s.push_str(&format!(" \u{2191}{}", g.ahead)); // ↑N
-        }
-        if g.behind > 0 {
-            s.push_str(&format!(" \u{2193}{}", g.behind)); // ↓N
-        }
-        s
-    });
-    let status = status.filter(|s| !s.is_empty());
-    let status_col = text.chars().count();
-    let badges = compose_badges(row);
-    ComposedRow {
-        text,
-        status,
-        status_col,
-        activity_col,
-        badges,
-    }
-}
-
-/// Build the per-row badge segments (item 28): open PRs, unread notifications,
-/// and alerts. Only non-zero counts render. Each badge is a glyph + count and
-/// carries its own color so the renderer can paint them distinctly.
-fn compose_badges(row: &crate::sidebar::SidebarRow) -> Vec<Badge> {
-    let mut badges = Vec::new();
-    // PR badge: open PRs for this worktree's branch (green = good state).
     if let Some(pr) = row.pr_count.filter(|&c| c > 0) {
-        badges.push(Badge {
-            text: format!(" \u{2b21}{pr}"), // ⬡N
-            color: theme_color(theme::GREEN),
-        });
+        segs.push(seg(Tok::Hue(theme::Hue::Green), format!("\u{2b21}{pr} "))); // ⬡N
     }
-    // Unread badge: unread notifications (blue = informational).
     if row.unread_count > 0 {
-        badges.push(Badge {
-            text: format!(" \u{2709}{}", row.unread_count), // ✉N
-            color: theme_color(theme::BLUE),
-        });
+        segs.push(seg(
+            Tok::Hue(theme::Hue::Blue),
+            format!("\u{2709}{} ", row.unread_count),
+        ));
+        // ✉N
     }
-    // Alert badge: test failures, agent failures, log errors (red = action).
-    if row.alert_count > 0 {
-        badges.push(Badge {
-            text: format!(" \u{26a0}{}", row.alert_count), // ⚠N
-            color: theme_color(theme::RED),
-        });
-    }
-    // Disk-size badge (item 152/413): the worktree's size, dim by default and
-    // amber when the reclaimable `target/` dominates (>1 GiB and >half the
-    // total) — a nudge that `superzej clean` would recover real space. Only
-    // populated when the off-loop disk scan has run (i.e. `[disk].show_sizes`).
     if let Some(total) = row.disk_bytes {
         let target = row.target_bytes.unwrap_or(0);
         let heavy = target > 1024 * 1024 * 1024 && target * 2 > total;
-        badges.push(Badge {
-            text: format!(" {}", superzej_core::disk::human(total)),
-            color: if heavy {
-                theme_color(theme::AMBER)
+        let fg = if heavy {
+            Tok::Hue(theme::Hue::Amber)
+        } else {
+            Tok::Slot(S::Dim)
+        };
+        segs.push(seg(fg, superzej_core::disk::human(total)));
+    }
+
+    (segs.len() > start).then_some(Line::Segs(segs))
+}
+
+/// The slim-rail line for one row: a colored activity dot (or a faint marker
+/// for headers) plus the label's first letter, fitted to the rail's ~4 cols.
+fn compose_rail_line(row: &crate::sidebar::SidebarRow) -> crate::seg::Line {
+    use crate::seg::{Line, Tok, seg, sp};
+    use crate::sidebar::{ActivityState, RowKind};
+    let gl = crate::caps::active_glyphs();
+    match row.kind {
+        RowKind::Worktree => {
+            let dot = if matches!(row.activity, ActivityState::None) {
+                seg(Tok::Slot(S::Ghost2), gl.middot) // · placeholder keeps the column
             } else {
-                theme_color(theme::DIM)
-            },
-        });
-    }
-    badges
-}
-
-/// The activity dot prefix for a worktree row (item 20), recolored at render by
-/// [`activity_dot_color`]: `Active` (worktree busy / agent working) is a filled
-/// white ●; `Waiting` (idle — agent stuck, unread) is a filled red ●; `Read`
-/// (the user has seen it but it is still stuck) is a hollow red ○; dormant
-/// (`None`) shows nothing.
-fn activity_dot(state: crate::sidebar::ActivityState) -> &'static str {
-    use crate::sidebar::ActivityState::*;
-    match state {
-        Active => "\u{25cf} ",  // ●
-        Waiting => "\u{25cf} ", // ●
-        Read => "\u{25cb} ",    // ○
-        None => "",
-    }
-}
-
-/// The color the activity dot is over-painted in, per state (configurable via
-/// `[theme.colors] activity_active` / `activity_waiting`). Both red states share
-/// the `activity_waiting` slot — filled vs hollow is glyph-only. `None` never draws.
-fn activity_dot_color(state: crate::sidebar::ActivityState) -> ColorAttribute {
-    use crate::sidebar::ActivityState::*;
-    match state {
-        Active => col(S::ActivityActive),
-        Waiting | Read => col(S::ActivityWaiting),
-        None => col(S::Dim),
-    }
-}
-
-fn status_seg_color(row: &crate::sidebar::SidebarRow) -> ColorAttribute {
-    // Dirty dominates the tail color; otherwise neutral-dim and the ↑↓ read
-    // fine. (Per-glyph coloring is a later refinement.)
-    match row.git {
-        Some(g) if g.dirty => theme_color(theme::AMBER),
-        Some(g) if g.ahead > 0 || g.behind > 0 => col(S::Dim),
-        _ => col(S::Dim),
+                seg(
+                    activity_dot_tok(row.activity),
+                    activity_dot_glyph(row.activity),
+                )
+            };
+            let initial: String = row
+                .label
+                .chars()
+                .next()
+                .map(|c| c.to_string())
+                .unwrap_or_default();
+            let fg = if row.active {
+                Tok::Slot(S::Focus)
+            } else {
+                Tok::Slot(S::Dim)
+            };
+            Line::Segs(vec![sp(1), dot, sp(1), seg(fg, initial)])
+        }
+        _ => Line::Segs(vec![sp(1), seg(Tok::Slot(S::Faint), gl.box_h)]), // header marker
     }
 }
 
@@ -2561,6 +2980,48 @@ pub fn render_panes<'a>(
     }
 }
 
+/// Repaint a single pane's card ring into `surface`, reusing the exact style the
+/// full path applies in [`render_panes`]. The partial render paths (scroll /
+/// selection drag / incremental pane output) recompose only pane *content*; the
+/// card border lives in the 1-cell frame ring *outside* that content, so without
+/// this the border can be left stale — or, when a wide glyph composes at the last
+/// content column, partially overwritten — producing the gaps reported on the
+/// right edge while scrolling. Drawing only the touched pane keeps the bounded
+/// diff minimal. No-ops when `pane` has no card (e.g. the drawer, which is a
+/// separate reserved rect and never appears in `frames`).
+pub fn redraw_pane_card(
+    surface: &mut Surface,
+    frames: &[(crate::center::PaneId, Rect, Rect)],
+    pane: crate::center::PaneId,
+    focused: crate::center::PaneId,
+    model: &FrameModel,
+    title_of: &dyn Fn(crate::center::PaneId) -> String,
+) {
+    let Some(entry) = frames.iter().find(|(id, _, _)| *id == pane).copied() else {
+        return;
+    };
+    // Same ring rule as render_panes: focus blue while the center owns the
+    // keyboard, white otherwise, so the return target stays obvious.
+    let ring = if model.center_focused {
+        col(S::Focus)
+    } else {
+        col(S::Text)
+    };
+    crate::borders::draw_pane_frames(
+        surface,
+        &[entry],
+        Some(focused),
+        &crate::borders::FrameStyle {
+            border: col(S::Border),
+            focus: ring,
+            bg: col(S::Panel),
+            title: col(S::Dim),
+            title_focused: ring,
+        },
+        title_of,
+    );
+}
+
 /// Compose a full frame: the center panes ([`render_panes`]) plus the chrome
 /// ([`draw_chrome`]). The damage-tracked loop calls the two halves separately
 /// for incremental recompose; this wrapper is the full-repaint path + tests.
@@ -2684,6 +3145,73 @@ mod tests {
     }
 
     #[test]
+    fn redraw_pane_card_restores_a_nibbled_border() {
+        use crate::center::CenterTree;
+        let tree = CenterTree::single(1);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            cols: 20,
+            rows: 5,
+        };
+        let frames = tree.layout_framed(area);
+        let (_, _frame, content) = frames[0];
+        let right = area.x + area.cols - 1;
+        let model = FrameModel {
+            center_focused: true,
+            ..Default::default()
+        };
+        let mut s = Surface::new(20, 5);
+        redraw_pane_card(&mut s, &frames, 1, 1, &model, &|_| String::new());
+        assert_eq!(
+            s.screen_cells()[2][right].str(),
+            "\u{2502}",
+            "card border drawn"
+        );
+        // Simulate content overflowing into the border: a wide glyph straddling
+        // the last content column and the border column.
+        s.add_change(Change::CursorPosition {
+            x: Position::Absolute(content.x + content.cols - 1),
+            y: Position::Absolute(2),
+        });
+        s.add_change(Change::Text("\u{6f22}".into()));
+        assert_ne!(
+            s.screen_cells()[2][right].str(),
+            "\u{2502}",
+            "the wide glyph nibbled the border (the bug)"
+        );
+        // Repainting the card heals every interior border row.
+        redraw_pane_card(&mut s, &frames, 1, 1, &model, &|_| String::new());
+        for y in (area.y + 1)..(area.y + area.rows - 1) {
+            assert_eq!(
+                s.screen_cells()[y][right].str(),
+                "\u{2502}",
+                "border solid again at row {y}"
+            );
+        }
+    }
+
+    #[test]
+    fn redraw_pane_card_skips_panes_without_a_card() {
+        use crate::center::CenterTree;
+        let frames = CenterTree::single(1).layout_framed(Rect {
+            x: 0,
+            y: 0,
+            cols: 20,
+            rows: 5,
+        });
+        let mut s = Surface::new(20, 5);
+        // A pane id not in `frames` (e.g. the drawer) is a no-op: nothing drawn.
+        redraw_pane_card(&mut s, &frames, 99, 99, &FrameModel::default(), &|_| {
+            String::new()
+        });
+        assert!(
+            s.screen_chars_to_string().trim().is_empty(),
+            "no card drawn for an absent pane"
+        );
+    }
+
+    #[test]
     fn sidebar_focus_indicator_appears_only_when_focused() {
         let rect = Rect {
             x: 0,
@@ -2715,6 +3243,69 @@ mod tests {
         assert!(
             !text2.contains('\u{2590}'),
             "no cursor bar when unfocused: {text2:?}"
+        );
+    }
+
+    #[test]
+    fn statusbar_items_includes_badges_so_they_are_navigable() {
+        // The core fix: badges (notifications/agent/…) must be in the same
+        // ordered item list nav steps, after the config widgets — otherwise the
+        // cursor can never reach them (the original bug).
+        let model = FrameModel {
+            bars: superzej_core::config::BarsConfig {
+                bottom_right: vec!["loc".into()],
+                ..Default::default()
+            },
+            loc: Some(1234),
+            panel: crate::panel::PanelData {
+                alert_notifications: 2,
+                ..Default::default()
+            },
+            agent_activity: Some(AgentActivity::default()),
+            zoomed: true,
+            ..Default::default()
+        };
+        let ids: Vec<BarItemId> = statusbar_items(&model)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids[0], BarItemId::Widget("loc".into()), "widgets first");
+        assert!(ids.contains(&BarItemId::Badge(BarBadge::Notifications)));
+        assert!(ids.contains(&BarItemId::Badge(BarBadge::Agent)));
+        assert!(ids.contains(&BarItemId::Badge(BarBadge::Zoom)));
+    }
+
+    #[test]
+    fn masthead_fit_sheds_items_when_narrow() {
+        // Navigation enumerates exactly what draw shows, so the width-degraded
+        // drop must shrink the navigable set too (no cursor on a hidden item).
+        let model = FrameModel {
+            bars: superzej_core::config::BarsConfig {
+                top_right: vec!["cpu".into(), "mem".into(), "swap".into(), "date".into()],
+                ..Default::default()
+            },
+            stats: superzej_metrics::StatsSnapshot {
+                cpu_pct: Some(99),
+                mem_gib: Some((4.0, 16.0)),
+                swap_gib: Some((1.0, 8.0)),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (_, wide) = masthead_fit(&model, 200);
+        let (_, narrow) = masthead_fit(&model, 24);
+        assert_eq!(wide.len(), 4);
+        assert!(
+            narrow.len() < wide.len(),
+            "narrow={} wide={}",
+            narrow.len(),
+            wide.len()
+        );
+        // cpu/mem survive longest (softest stats shed first).
+        assert!(
+            narrow
+                .iter()
+                .any(|(id, _)| *id == BarItemId::Widget("cpu".into()))
         );
     }
 
@@ -2852,6 +3443,9 @@ mod tests {
         wt.alert_count = 1;
         let model = FrameModel {
             sidebar_rows: vec![ws, wt],
+            // Select the worktree so its two-tier detail line (PR/unread)
+            // expands; the alert badge is always-on on the primary line.
+            sidebar_selected: 1,
             ..Default::default()
         };
         let mut s = Surface::new(40, 6);
@@ -2880,6 +3474,8 @@ mod tests {
         wt.target_bytes = Some(60 * 1024 * 1024 * 1024);
         let model = FrameModel {
             sidebar_rows: vec![ws, wt],
+            // The disk size rides the expanded detail line of the selected row.
+            sidebar_selected: 1,
             ..Default::default()
         };
         let mut s = Surface::new(40, 6);
@@ -2925,15 +3521,11 @@ mod tests {
         let mut model = FrameModel::default();
         assert!(
             bottombar_widget("disk", &model).is_none(),
-            "hidden until scanned"
+            "hidden when size unknown"
         );
         model.active_worktree_disk = Some(7 * 1024 * 1024 * 1024); // 7G
         let wdg = bottombar_widget("disk", &model).expect("disk widget present");
-        assert!(
-            wdg.text.contains("7G") && wdg.text.contains("DISK"),
-            "{:?}",
-            wdg.text
-        );
+        assert_eq!(wdg.text, "7GB");
     }
 
     #[test]
@@ -3025,6 +3617,128 @@ mod tests {
         // The dir workspace carries the folder glyph; the repo one does not.
         assert!(text.contains('\u{1f4c1}'), "dir folder glyph 📁: {text:?}");
         assert!(text.contains("scratch") && text.contains("repo-ws"));
+    }
+
+    /// A tall sidebar with one workspace + several worktrees; `n` rows total.
+    fn many_rows(n: usize) -> Vec<crate::sidebar::SidebarRow> {
+        use crate::sidebar::RowKind;
+        let mut rows = vec![row(RowKind::Workspace, "app")];
+        for i in 0..n {
+            rows.push(row(RowKind::Worktree, &format!("wt{i}")));
+        }
+        rows
+    }
+
+    #[test]
+    fn build_sidebar_and_click_hit_test_round_trip() {
+        // Every rendered row's [y, y+height) maps back to its own visible index
+        // via `sidebar_hits` — the contract that keeps clicks aligned with paint
+        // even when the cursor row expands to two lines.
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 40,
+            rows: 12,
+        };
+        let mut rows = many_rows(4);
+        // Give the selected worktree (visible index 2) secondary metadata so it
+        // expands to a 2-row placement.
+        rows[2].disk_bytes = Some(1024);
+        let model = FrameModel {
+            sidebar_rows: rows,
+            sidebar_selected: 2,
+            sidebar_focused: true,
+            ..Default::default()
+        };
+        let frame = build_sidebar(&model, rect, model.sidebar_scroll);
+        let cursor_row = frame.rows.iter().find(|p| p.visible_index == 2).unwrap();
+        assert_eq!(cursor_row.height, 2, "selected row with detail expands");
+        assert!(cursor_row.cursor_bar, "focused cursor draws the bar");
+
+        let hits = sidebar_hits(&model, rect);
+        for p in &frame.rows {
+            for dy in 0..p.height {
+                let found = hits
+                    .iter()
+                    .find(|(_, y, h)| (p.y + dy) >= *y && (p.y + dy) < *y + *h)
+                    .map(|(i, _, _)| *i);
+                assert_eq!(
+                    found,
+                    Some(p.visible_index),
+                    "click on row {} line {dy} resolves to itself",
+                    p.visible_index
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_sidebar_scrolls_to_keep_cursor_visible() {
+        // More rows than fit: the selected row must always be laid out, no
+        // matter how far down it is (the old renderer left it unreachable).
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 30,
+            rows: 6, // header + blank leaves ~4 list rows
+        };
+        let rows = many_rows(20);
+        for sel in [0usize, 5, 12, 20] {
+            let model = FrameModel {
+                sidebar_rows: rows.clone(),
+                sidebar_selected: sel,
+                ..Default::default()
+            };
+            let frame = build_sidebar(&model, rect, model.sidebar_scroll);
+            assert!(
+                frame.rows.iter().any(|p| p.visible_index == sel),
+                "selected row {sel} is rendered (scroll={})",
+                frame.scroll
+            );
+        }
+    }
+
+    #[test]
+    fn clamp_sidebar_scroll_keeps_cursor_in_window() {
+        // Uniform 1-row heights, a 4-row window.
+        let heights = vec![1usize; 10];
+        assert_eq!(clamp_sidebar_scroll(&heights, 0, 4, 0), 0);
+        assert_eq!(clamp_sidebar_scroll(&heights, 6, 4, 0), 3);
+        assert_eq!(clamp_sidebar_scroll(&heights, 2, 4, 8), 2);
+        assert_eq!(clamp_sidebar_scroll(&[], 0, 4, 0), 0);
+        assert_eq!(clamp_sidebar_scroll(&heights, 0, 0, 0), 0);
+    }
+
+    #[test]
+    fn rail_mode_renders_dots_not_full_rows() {
+        use crate::sidebar::{ActivityState, RowKind};
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 4,
+            rows: 8,
+        };
+        let mut wt = row(RowKind::Worktree, "feature");
+        wt.activity = ActivityState::Active;
+        let model = FrameModel {
+            sidebar_rows: vec![row(RowKind::Workspace, "app"), wt],
+            sidebar_rail: true,
+            ..Default::default()
+        };
+        let mut s = Surface::new(4, 8);
+        draw_sidebar(&mut s, rect, &model);
+        let text = s.screen_chars_to_string();
+        // The rail shows the worktree's initial but not the full label or the
+        // "WORKSPACES" header.
+        assert!(text.contains('f'), "rail worktree initial: {text:?}");
+        assert!(
+            !text.contains("WORKSPACES"),
+            "rail omits the header: {text:?}"
+        );
+        assert!(
+            !text.contains("feature"),
+            "rail omits full labels: {text:?}"
+        );
     }
 
     #[test]

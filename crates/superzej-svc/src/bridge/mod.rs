@@ -931,18 +931,18 @@ mod tests {
         let c = connect();
         let (chan, rx) = c.spawn_proc(&["cat"], None, &[]).unwrap();
         c.proc_stdin(chan, b"ping\n").unwrap();
-        // The echoed bytes come back as a proc.out(stdout) event.
-        let got = loop {
-            match rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("a proc event")
-            {
-                ProcEvent::Out { stream, data } => {
-                    assert_eq!(stream, "stdout");
-                    break data;
-                }
-                ProcEvent::Exit { .. } => panic!("exited before echo"),
+        // The echoed bytes come back as a proc.out(stdout) event — the first
+        // event is either that (the happy path) or an early Exit (a failure),
+        // so a single recv suffices.
+        let got = match rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a proc event")
+        {
+            ProcEvent::Out { stream, data } => {
+                assert_eq!(stream, "stdout");
+                data
             }
+            ProcEvent::Exit { .. } => panic!("exited before echo"),
         };
         assert_eq!(&got, b"ping\n");
         // Killing the channel closes cat's stdin (EOF) → it exits → Exit event.

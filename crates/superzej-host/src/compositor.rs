@@ -78,7 +78,9 @@ fn flush_run(surface: &mut Surface, run: &mut String) {
 /// a `String` per cell) only to be discarded on the first styled cell. Styled
 /// content is the common case, so that pre-scan doubled the hot-path cost.
 pub fn compose_pane(surface: &mut Surface, emu: &dyn PaneEmulator, rect: Rect) {
+    use unicode_width::UnicodeWidthStr;
     let (erows, ecols) = emu.size();
+    let last_col = rect.cols.min(ecols as usize).saturating_sub(1);
     let mut current_style: Option<CellStyle> = None;
     let mut run = String::new();
     for row in 0..rect.rows.min(erows as usize) {
@@ -121,6 +123,15 @@ pub fn compose_pane(surface: &mut Surface, emu: &dyn PaneEmulator, rect: Rect) {
                 current_style = Some(style);
             }
             if text.is_empty() {
+                run.push(' ');
+            } else if col == last_col && text.width() > 1 {
+                // A double-width glyph at the final column would make the
+                // terminal advance into the cell *right* of the rect — the pane
+                // card's border column — leaving a gap in the `│` on the next
+                // diff. It can't be shown in one cell anyway, so blank it; the
+                // emulator already wraps wide glyphs off its own last column, so
+                // this only fires in the brief window where the emulator is still
+                // wider than a just-shrunk rect (e.g. opening the right panel).
                 run.push(' ');
             } else {
                 run.push_str(text);
@@ -286,5 +297,41 @@ mod tests {
         // Row 0 untouched (blank), row 1 has the X's starting at column 2.
         assert_eq!(lines[1].trim_end(), "  XXXXX");
         assert_eq!(lines[0].trim_end(), "");
+    }
+
+    #[test]
+    fn wide_glyph_at_last_col_does_not_nibble_the_border() {
+        // The emulator is wider than the rect we compose into — the brief window
+        // after the right panel opens and shrinks the center before the PTY has
+        // resized. A double-width glyph sitting at the rect's last content column
+        // must NOT advance the terminal into the cell to its right (the pane
+        // card's border column), which is the gap reported on the right edge.
+        let mut emu = AlacrittyEmulator::new(1, 6, 0);
+        emu.advance("aaaa\u{6f22}".as_bytes()); // 'a'×4 then a wide glyph at cols 4-5
+        let mut surface = Surface::new(8, 1);
+        // Sentinel border in the column just right of the 5-wide content rect.
+        surface.add_change(Change::CursorPosition {
+            x: Position::Absolute(5),
+            y: Position::Absolute(0),
+        });
+        surface.add_change(Change::Text("\u{2502}".into()));
+        compose_pane(
+            &mut surface,
+            &emu,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 5,
+                rows: 1,
+            },
+        );
+        let cells = surface.screen_cells();
+        assert_eq!(
+            cells[0][5].str(),
+            "\u{2502}",
+            "content must not nibble the border column"
+        );
+        // A wide glyph that can't fit the last cell is blanked, not half-drawn.
+        assert_eq!(cells[0][4].str(), " ", "edge wide glyph blanked");
     }
 }
