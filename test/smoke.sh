@@ -240,6 +240,34 @@ wait "$REACH_PID" 2>/dev/null || true
 check "share rejects an invalid --reach value" \
   "'$SZ' --config '$TMP/share-reach.toml' share start 3000 --reach bogus --worktree '$WT' 2>&1 | grep -q 'reach'"
 
+# ── auto port forwarding (`[forward]`) ───────────────────────────────────────
+# Config round-trips (the [forward] block parses + serializes) and the
+# inspection CLI runs. Forwarding itself is driven by the live compositor's
+# detector, so the bring-up path is exercised by the host unit tests + a
+# live container check (below, guarded on podman); here we cover the CLI seam.
+check "forward config round-trips through config show" \
+  "'$SZ' config show | grep -q 'open_on_detect'"
+check "forward list runs and reports an empty set" \
+  "'$SZ' forward list 2>&1 | grep -q 'no forwards'"
+
+# Seed a forward record and assert `forward list` renders the mapping + URL
+# (exercises Db::upsert/list_forwards through the CLI read path).
+if command -v sqlite3 >/dev/null 2>&1; then
+  FDB="$XDG_STATE_HOME/superzej/superzej.db"
+  "$SZ" forward list >/dev/null 2>&1 || true # ensure the DB + schema exist
+  sqlite3 "$FDB" \
+    "INSERT INTO forwards(worktree,container_port,host_port,url,created_at)
+     VALUES('$WT',3000,8001,'http://127.0.0.1:8001',0);"
+  check "forward list shows a remapped forward (container → host)" \
+    "'$SZ' forward list 2>&1 | grep -q '3000 → 8001'"
+  check "forward list shows the preview URL" \
+    "'$SZ' forward list 2>&1 | grep -q 'http://127.0.0.1:8001'"
+  check "forward stop removes the recorded forward" \
+    "'$SZ' forward stop 3000 --worktree '$WT' >/dev/null 2>&1 && ! '$SZ' forward list 2>&1 | grep -q '3000 → 8001'"
+else
+  echo "  skip forward DB checks (sqlite3 not on PATH)"
+fi
+
 # v5 → v6 layout migration: seed a legacy flat tab_layout (pages as " ·N" name
 # suffixes) into the state DB, open it once, and assert it transformed into
 # worktree groups (tabs-within-a-worktree) with the legacy table dropped.

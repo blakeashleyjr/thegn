@@ -21,6 +21,7 @@ mod detail;
 mod emulator;
 mod focus;
 mod font;
+mod forward;
 mod gitmut;
 mod hover;
 mod hydrate;
@@ -121,6 +122,11 @@ pub enum Command {
     Share {
         #[command(subcommand)]
         action: cmd::share::Action,
+    },
+    /// Inspect auto port forwards / browser previews (`[forward]`).
+    Forward {
+        #[command(subcommand)]
+        action: cmd::forward::Action,
     },
     /// Emit a syntax-highlighted diff of a worktree against its branch point.
     Diff {
@@ -284,6 +290,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             cmd::theme::run(&cfg, action, p)
         }
         Command::Share { action } => cmd::share::run(&cfg, action),
+        Command::Forward { action } => cmd::forward::run(action),
         Command::Diff {
             worktree,
             base,
