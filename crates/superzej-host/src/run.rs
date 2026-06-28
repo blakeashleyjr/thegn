@@ -1225,6 +1225,11 @@ struct SidebarState {
     /// Wide expand toggle (`e`): mirrors the panel's expand affordance. When
     /// set, the sidebar claims ~half the window, ignoring [`width`].
     expanded: bool,
+    /// Display mode cycled by `ToggleSidebar`: full panel, slim rail, hidden.
+    mode: crate::layout::SidebarMode,
+    /// Desired top visible-row index of the scroll window; `build_sidebar`
+    /// clamps it each frame so the cursor row stays in view.
+    scroll: usize,
 }
 
 impl SidebarState {
@@ -1245,17 +1250,20 @@ impl SidebarState {
                 self.width = value.parse().ok();
             } else if key == "sidebar_expanded" {
                 self.expanded = value == "1";
+            } else if key == "sidebar_mode" {
+                self.mode = crate::layout::SidebarMode::from_key(&value);
             }
         }
     }
 
-    /// Effective sidebar width in columns: half the window when expanded
-    /// (Wide), else the user's fine-nudged width (or the layout default).
+    /// Effective sidebar width in columns: the slim rail's fixed width when in
+    /// rail mode; otherwise half the window when expanded (Wide), else the
+    /// user's fine-nudged width (or the layout default).
     fn effective_cols(&self, cols: usize) -> usize {
-        if self.expanded {
-            (cols / 2).max(crate::layout::SIDEBAR_COLS)
-        } else {
-            self.width.unwrap_or(crate::layout::SIDEBAR_COLS)
+        match self.mode {
+            crate::layout::SidebarMode::Rail => crate::layout::RAIL_COLS,
+            _ if self.expanded => (cols / 2).max(crate::layout::SIDEBAR_COLS),
+            _ => self.width.unwrap_or(crate::layout::SIDEBAR_COLS),
         }
     }
 
@@ -1308,6 +1316,8 @@ impl SidebarState {
         model.sidebar_sort = self.view.sort;
         model.sidebar_marked = self.marked.clone();
         model.sidebar_menu = self.menu.clone();
+        model.sidebar_scroll = self.scroll;
+        model.sidebar_rail = self.mode == crate::layout::SidebarMode::Rail;
     }
 
     fn focus_active_row(&mut self, model: &mut FrameModel) {
@@ -7651,6 +7661,8 @@ async fn event_loop<T: Terminal>(
     let mut panel_ui = crate::panel::PanelUi::default();
     if let Ok(db) = superzej_core::db::Db::open() {
         sb.load(&db, &session.id);
+        // The persisted sidebar mode (full/rail/hidden) survives restart.
+        want_sidebar = sb.mode != crate::layout::SidebarMode::Hidden;
         for (key, value) in db.ui_state_in_scope("panel").unwrap_or_default() {
             match key.as_str() {
                 "open" => {
@@ -11329,13 +11341,17 @@ async fn event_loop<T: Terminal>(
                             );
                         }
                         dirty = true;
-                    } else if chrome.sidebar.is_some_and(|r| contains(r, mx, my)) {
+                    } else if let Some(r) = chrome.sidebar.filter(|r| contains(*r, mx, my)) {
                         let visible = SidebarState::visible_len(&model);
                         if up {
                             sb.cursor = sb.cursor.saturating_sub(3);
                         } else if visible > 0 {
                             sb.cursor = (sb.cursor + 3).min(visible - 1);
                         }
+                        sb.sync(&mut model);
+                        // Persist the clamped scroll window so it stays stable
+                        // across subsequent keyboard navigation.
+                        sb.scroll = crate::chrome::build_sidebar(&model, r, sb.scroll).scroll;
                         sb.sync(&mut model);
                         dirty = true;
                     }
@@ -11458,41 +11474,45 @@ async fn event_loop<T: Terminal>(
                         focus.zone = crate::focus::Zone::Sidebar;
                         sb.focused = true;
                         sb.sync(&mut model);
-                        // Rows start two below the header (one blank row).
-                        if my > r.y + 1 {
-                            let idx = my - r.y - 2;
-                            if idx < SidebarState::visible_len(&model) {
-                                sb.cursor = idx;
-                                if m.modifiers.contains(Modifiers::CTRL) {
-                                    // Ctrl+click: toggle the multi-select mark.
-                                    if !sb.marked.remove(&idx) {
-                                        sb.marked.insert(idx);
-                                    }
-                                    sb.sync(&mut model);
-                                } else {
-                                    sb.sync(&mut model);
-                                    // row target activations within a single
-                                    // workspace are tab/zoom, not relayout;
-                                    // workspace switch sets it via need_relayout
-                                    if let Some(t) = sb.cursor_target(&model)
-                                        && activate_row_target(
-                                            t,
-                                            &mut session,
-                                            &mut model,
-                                            &mut sb,
-                                            &mut panes,
-                                            &mut drawer,
-                                            &mut drawer_pool,
-                                            &mut drawer_home,
-                                            &mut workspace_pool,
-                                            keymap.config(),
-                                            chrome.center,
-                                            &mut need_relayout,
-                                            &mut clear_on_next_frame,
-                                        )
-                                    {
-                                        kick_model_hydration!();
-                                    }
+                        // Resolve the click against the same `build_sidebar`
+                        // pass the renderer painted, so variable-height (two-
+                        // tier) rows map to the right index — never the old
+                        // `my - r.y - 2` shortcut.
+                        if let Some(idx) = crate::chrome::sidebar_hits(&model, r)
+                            .into_iter()
+                            .find(|(_, y, h)| my >= *y && my < *y + *h)
+                            .map(|(i, _, _)| i)
+                        {
+                            sb.cursor = idx;
+                            if m.modifiers.contains(Modifiers::CTRL) {
+                                // Ctrl+click: toggle the multi-select mark.
+                                if !sb.marked.remove(&idx) {
+                                    sb.marked.insert(idx);
+                                }
+                                sb.sync(&mut model);
+                            } else {
+                                sb.sync(&mut model);
+                                // row target activations within a single
+                                // workspace are tab/zoom, not relayout;
+                                // workspace switch sets it via need_relayout
+                                if let Some(t) = sb.cursor_target(&model)
+                                    && activate_row_target(
+                                        t,
+                                        &mut session,
+                                        &mut model,
+                                        &mut sb,
+                                        &mut panes,
+                                        &mut drawer,
+                                        &mut drawer_pool,
+                                        &mut drawer_home,
+                                        &mut workspace_pool,
+                                        keymap.config(),
+                                        chrome.center,
+                                        &mut need_relayout,
+                                        &mut clear_on_next_frame,
+                                    )
+                                {
+                                    kick_model_hydration!();
                                 }
                             }
                         }
@@ -15826,7 +15846,13 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::ToggleSidebar => {
-                                want_sidebar = !want_sidebar;
+                                // Cycle Full → Rail → Hidden. The rail keeps
+                                // ambient activity visible; Hidden reclaims the
+                                // columns for the center.
+                                sb.mode = sb.mode.cycle();
+                                want_sidebar = sb.mode != crate::layout::SidebarMode::Hidden;
+                                sidebar_cols = sb.effective_cols(cols);
+                                sb.persist(&session.id, "sidebar_mode", sb.mode.as_key());
                                 chrome = compute_chrome(
                                     cols,
                                     rows,
@@ -15840,11 +15866,12 @@ async fn event_loop<T: Terminal>(
                                     drawer_rows,
                                     drawer_full,
                                 );
+                                // Only the Hidden leg surrenders keyboard focus.
                                 if !want_sidebar && focus.sidebar() {
                                     focus.zone = crate::focus::Zone::Center;
                                     sb.focused = false;
-                                    sb.sync(&mut model);
                                 }
+                                sb.sync(&mut model);
                                 need_relayout = true;
                             }
                             Action::TogglePanel => {
@@ -15880,8 +15907,13 @@ async fn event_loop<T: Terminal>(
                                 need_relayout = true;
                             }
                             Action::FocusSidebar => {
-                                if !want_sidebar {
+                                // Explicitly focusing the sidebar promotes it to
+                                // the full navigable panel (out of rail/hidden).
+                                if sb.mode != crate::layout::SidebarMode::Full {
+                                    sb.mode = crate::layout::SidebarMode::Full;
+                                    sb.persist(&session.id, "sidebar_mode", sb.mode.as_key());
                                     want_sidebar = true;
+                                    sidebar_cols = sb.effective_cols(cols);
                                     chrome = compute_chrome(
                                         cols,
                                         rows,
@@ -18554,6 +18586,22 @@ mod tests {
         // SAFETY: test is single-threaded.
         unsafe { std::env::remove_var("XDG_STATE_HOME") };
         let _ = std::fs::remove_dir_all(&state_home);
+    }
+
+    #[test]
+    fn effective_cols_per_sidebar_mode() {
+        use crate::layout::{SidebarMode, RAIL_COLS, SIDEBAR_COLS};
+        let mut sb = SidebarState::default();
+        // Full (default): the layout default width.
+        assert_eq!(sb.mode, SidebarMode::Full);
+        assert_eq!(sb.effective_cols(160), SIDEBAR_COLS);
+        // Rail: the fixed slim width regardless of window size or expand.
+        sb.mode = SidebarMode::Rail;
+        sb.expanded = true;
+        assert_eq!(sb.effective_cols(160), RAIL_COLS);
+        // Back to Full + expanded → ~half the window.
+        sb.mode = SidebarMode::Full;
+        assert_eq!(sb.effective_cols(160), 80);
     }
 
     #[test]
