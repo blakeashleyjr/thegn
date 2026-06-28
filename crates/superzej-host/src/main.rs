@@ -25,6 +25,7 @@ mod gitmut;
 mod hover;
 mod hydrate;
 mod input;
+mod integrate;
 mod keyhint;
 mod keymap;
 mod layer;
@@ -137,6 +138,10 @@ pub enum Command {
     },
     /// List managed worktrees.
     List,
+    /// Drain the local merge queue: fold eligible worktree branches into the
+    /// repo's target branch, landing clean ones and deferring conflicts
+    /// (`[merge_queue]`, the fold-actor).
+    Integrate,
     /// Report per-worktree disk usage (checkout + reclaimable `target/`).
     Disk {
         /// Scan only this worktree (defaults to all known worktrees).
@@ -286,6 +291,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             file,
         } => cmd::diff::run(worktree, base, stat, file),
         Command::List => cmd::list::run(&cfg),
+        Command::Integrate => cmd::integrate::run(&cfg),
         Command::Disk { worktree, all } => cmd::disk::disk(&cfg, worktree, all),
         Command::Clean {
             worktree,

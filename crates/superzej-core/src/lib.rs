@@ -26,6 +26,7 @@ pub mod disk;
 pub mod dns_filter;
 pub mod env;
 pub mod event_bus;
+pub mod fold;
 pub mod forge;
 pub mod github;
 pub mod gitrefs;

@@ -521,6 +521,71 @@ impl LlmProxyConfig {
 }
 
 config_enum! {
+    /// `[merge_queue] conflict_handoff` — what happens to a branch that the fold
+    /// can't land cleanly. `"agent"` (default) dispatches the worktree's agent to
+    /// rebase onto the new `main` and re-resolve; `"notify"` just raises a
+    /// notification and leaves it queued; `"manual"` leaves it silently queued.
+    pub enum ConflictHandoff: "conflict handoff" {
+        Agent = "agent",
+        Notify = "notify",
+        Manual = "manual" | "off" | "none",
+    } default = Agent;
+}
+
+/// `[merge_queue]` — the local "fold-actor": fold parallel worktree branches into
+/// `target_branch` in the object database (no checkout), auto-landing every
+/// branch that merges clean and deferring only genuine conflicts. Disabled by
+/// default; the AI-free shell never depends on it. See `superzej_core::fold` for
+/// the pure engine and the host `integrate` runner for the I/O (test-gate + CAS).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct MergeQueueConfig {
+    /// Master switch. When off, the `integrate` command and auto-drain are inert.
+    pub enabled: bool,
+    /// Branch the fold advances. `"auto"` resolves it per repo (HEAD/default).
+    pub target_branch: String,
+    /// Shell command run on the folded tip (in a throwaway worktree) to gate the
+    /// CAS-advance — the "does the union build?" check. Empty disables the gate
+    /// (textual-clean only). Example: `just ci` or `cargo test --workspace`.
+    pub gate_command: String,
+    /// Whether to run `gate_command` at all. Off ⇒ advance as soon as branches
+    /// merge without text conflicts.
+    pub gate_on: bool,
+    /// On a red gate, re-land branches incrementally to find the offender and
+    /// defer just that one, instead of failing the whole batch.
+    pub bisect_on_red: bool,
+    /// Fold automatically when an agent signals done (ACP `AgentEnd` / dispatch
+    /// → merged), so a burst of completions drains the queue without a keystroke.
+    pub auto_drain: bool,
+    /// Auto-commit uncommitted worktree work before folding (a branch must be a
+    /// commit for `merge-tree`). Off ⇒ only committed branch tips are folded and
+    /// dirty worktrees are skipped with a warning.
+    pub snapshot_dirty: bool,
+    /// Conflicting paths confined to these (matched by exact path or basename,
+    /// e.g. `Cargo.lock` matches `crates/x/Cargo.lock`) are classified
+    /// regenerable — resolved by regenerating, not handed to a human.
+    pub regenerate_paths: Vec<String>,
+    /// What to do with a deferred (conflicting) branch.
+    pub conflict_handoff: ConflictHandoff,
+}
+
+impl Default for MergeQueueConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            target_branch: "auto".to_string(),
+            gate_command: String::new(),
+            gate_on: true,
+            bisect_on_red: true,
+            auto_drain: true,
+            snapshot_dirty: false,
+            regenerate_paths: vec!["Cargo.lock".to_string()],
+            conflict_handoff: ConflictHandoff::default(),
+        }
+    }
+}
+
+config_enum! {
     /// `[media] backend` — how superzej talks to your player. `"auto"` (the
     /// default) picks the right backend for the current OS: Linux → MPRIS,
     /// Windows → SMTC, macOS → AppleScript. `"none"` disables. `"mpris"` is the
@@ -3290,6 +3355,9 @@ pub struct Config {
     pub lsp: LspConfig,
     /// The LLM proxy daemon (`[llm_proxy]`). Disabled by default — AI is additive.
     pub llm_proxy: LlmProxyConfig,
+    /// `[merge_queue]` — the local fold-actor (parallel-branch integration).
+    /// Disabled by default; AI-free and additive.
+    pub merge_queue: MergeQueueConfig,
     /// `[media]` — media-player control. On by default (`mpris` backend), inert
     /// where D-Bus/`playerctl` are absent. Additive — the shell never depends on it.
     pub media: MediaConfig,
@@ -3373,6 +3441,7 @@ impl Default for Config {
             palette: PaletteConfig::default(),
             lsp: LspConfig::default(),
             llm_proxy: LlmProxyConfig::default(),
+            merge_queue: MergeQueueConfig::default(),
             media: MediaConfig::default(),
             share: ShareConfig::default(),
             keybinds: KeybindConfig::default(),

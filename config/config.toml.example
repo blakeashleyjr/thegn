@@ -1369,6 +1369,33 @@ agent_model = "model-proxy/standard"
 # pi runs its own tools in-process and edits auto-apply.
 bouncer = false
 
+# ── Local merge queue: the "fold-actor" (optional) ─────────────────────────
+# Stop hand-sequencing parallel branches into main. The fold-actor folds every
+# queued worktree branch onto `target_branch` entirely in the git object
+# database (no checkout, milliseconds): branches that merge clean land
+# automatically as sequential merge commits, and only genuine conflicts are
+# deferred for you (or an agent) to resolve. Fire it once with `superzej
+# integrate` / the palette action, or let `auto_drain` fold on agent-done.
+#
+# Because ten clean *textual* merges say nothing about whether their *union*
+# builds, the fold is test-gated: the folded tip is checked out into a throwaway
+# worktree, `gate_command` runs, and main only advances (atomic compare-and-swap)
+# if it's green — bisecting the offending branch on red. This is the real
+# correctness wall, automated rather than babysat.
+#
+# Disabled by default; AI-free and strictly additive — the shell never depends
+# on it.
+[merge_queue]
+enabled = false
+target_branch = "auto"        # branch to advance; "auto" = repo HEAD/default
+gate_command = ""             # e.g. "just ci" / "cargo test --workspace"; "" disables the gate
+gate_on = true                # run gate_command before advancing main
+bisect_on_red = true          # on a red gate, defer just the offending branch
+auto_drain = true             # fold automatically when an agent signals done
+snapshot_dirty = false        # auto-commit uncommitted worktree work before folding
+regenerate_paths = ["Cargo.lock"]  # conflicts confined to these are "regenerable", not handed off
+conflict_handoff = "agent"    # agent | notify | manual — fate of a deferred branch
+
 # ── Media player control (optional) ────────────────────────────────────────
 # Drive your music/media player from superzej: play/pause, next/previous,
 # shuffle, loop, volume, and a playlist/player picker — plus a now-playing

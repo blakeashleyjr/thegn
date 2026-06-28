@@ -108,6 +108,9 @@ pub enum Action {
     StopWorktreeShare,
     /// Open the right panel to the System ▸ Share section and focus it.
     OpenShares,
+    /// Drain the local merge queue: fold eligible worktree branches into the
+    /// repo's target branch (`[merge_queue]`, the fold-actor).
+    Integrate,
     OpenPalette,
     Lazygit,
     Yazi,
@@ -195,6 +198,15 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         label: "New workspace",
         hint: "workspace",
         default_chords: &["Alt W"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "integrate",
+        label: "Integrate (fold-actor)",
+        hint: "integrate",
+        // No default chord — palette-only + user-bindable, gated on
+        // [merge_queue].enabled (see palette::build_command_palette_items).
+        default_chords: &[],
         palette: true,
     },
     ActionSpec {
@@ -889,6 +901,7 @@ impl Action {
             Action::StopWorktreeShare => "stop-worktree-share",
             Action::OpenShares => "open-shares",
             Action::ToggleNotifications => "toggle-notifications",
+            Action::Integrate => "integrate",
             Action::OpenPalette => "palette",
             Action::Lazygit => "lazygit",
             Action::Yazi => "yazi",
@@ -977,6 +990,7 @@ impl Action {
             "stop-worktree-share" => Action::StopWorktreeShare,
             "open-shares" => Action::OpenShares,
             "toggle-notifications" => Action::ToggleNotifications,
+            "integrate" => Action::Integrate,
             "palette" | "menu" => Action::OpenPalette,
             "lazygit" | "tool-lazygit" => Action::Lazygit,
             "yazi" | "tool-yazi" => Action::Yazi,
