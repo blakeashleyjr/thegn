@@ -1459,6 +1459,11 @@ impl SidebarState {
             self.persist("sort_mode", self.view.sort.as_str());
         }
         self.rebuild(model, session);
+        // Keep the highlight on the worktree that just moved (now the active
+        // group), so the cursor travels with the item the way workspace
+        // reorders already do (rebuild only re-syncs the cursor while unfocused).
+        self.cursor = visible_index_of_active(model);
+        self.sync(model);
         true
     }
 
@@ -19257,6 +19262,10 @@ mod tests {
         let order: Vec<&str> = session.worktrees.iter().map(|g| g.name.as_str()).collect();
         assert_eq!(order, vec!["app/home", "app/beta", "app/alpha"]);
         assert_eq!(session.worktrees[session.active].name, "app/beta");
+        // The cursor follows the moved worktree (now the active row) so the
+        // highlight travels with the item rather than stranding on its old slot.
+        assert_eq!(sb.cursor, visible_index_of_active(&model));
+        assert!(sb.selected_row(&model).is_some_and(|r| r.active));
 
         // Move beta up again: the slot above is home — blocked, nothing moves.
         assert!(!sb.move_active_worktree(&mut model, &mut session, true));
