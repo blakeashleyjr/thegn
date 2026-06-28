@@ -2322,6 +2322,7 @@ fn delete_groups(
     panes: &mut Panes,
     mut targets: Vec<usize>,
     keep_files: bool,
+    waker: Option<termwiz::terminal::TerminalWaker>,
 ) -> String {
     targets.sort_unstable_by(|a, b| b.cmp(a));
     targets.dedup();
@@ -2337,27 +2338,52 @@ fn delete_groups(
         }
         let path = session.worktrees[gi].path.clone();
         if !path.is_empty() {
-            if let Some(root) = superzej_core::repo::main_worktree(Path::new(&path)) {
-                // Remove from git, keeping files if requested.
-                // git worktree remove does both.
-                if keep_files {
-                    // git does not have a "keep files" flag for `worktree remove`.
-                    // We must delete the files ourselves if we don't want them, but if we DO want them,
-                    // we cannot run `git worktree remove` as it destroys the files.
-                    // Instead, we just delete the .git file so it becomes a plain directory.
-                    // We will need to run `git worktree prune` in the main repo to clean up the metadata.
-                    let _ = std::fs::remove_file(Path::new(&path).join(".git"));
-                    superzej_core::util::git_ok(&root, &["worktree", "prune"]);
-                } else {
-                    superzej_core::worktree::remove(&root, Path::new(&path), "", false);
+            if let Some(waker) = waker.clone() {
+                let path_clone = path.clone();
+                std::thread::spawn(move || {
+                    if let Some(root) = superzej_core::repo::main_worktree(Path::new(&path_clone)) {
+                        // Remove from git, keeping files if requested.
+                        // git worktree remove does both.
+                        if keep_files {
+                            // git does not have a "keep files" flag for `worktree remove`.
+                            // We must delete the files ourselves if we don't want them, but if we DO want them,
+                            // we cannot run `git worktree remove` as it destroys the files.
+                            // Instead, we just delete the .git file so it becomes a plain directory.
+                            // We will need to run `git worktree prune` in the main repo to clean up the metadata.
+                            let _ = std::fs::remove_file(Path::new(&path_clone).join(".git"));
+                            superzej_core::util::git_ok(&root, &["worktree", "prune"]);
+                        } else {
+                            superzej_core::worktree::remove(
+                                &root,
+                                Path::new(&path_clone),
+                                "",
+                                false,
+                            );
+                        }
+                    }
+                    if !keep_files {
+                        // git is the source of truth, but `git worktree remove` leaves the
+                        // dir behind if it ever fails (locked, detached, prune races); a
+                        // lingering dir is re-adopted on the next launch and looks like a
+                        // failed delete. Make sure the directory is actually gone.
+                        let _ = std::fs::remove_dir_all(&path_clone);
+                    }
+                    let _ = waker.wake();
+                });
+            } else {
+                if let Some(root) = superzej_core::repo::main_worktree(Path::new(&path)) {
+                    // Remove from git, keeping files if requested.
+                    // git worktree remove does both.
+                    if keep_files {
+                        let _ = std::fs::remove_file(Path::new(&path).join(".git"));
+                        superzej_core::util::git_ok(&root, &["worktree", "prune"]);
+                    } else {
+                        superzej_core::worktree::remove(&root, Path::new(&path), "", false);
+                    }
                 }
-            }
-            if !keep_files {
-                // git is the source of truth, but `git worktree remove` leaves the
-                // dir behind if it ever fails (locked, detached, prune races); a
-                // lingering dir is re-adopted on the next launch and looks like a
-                // failed delete. Make sure the directory is actually gone.
-                let _ = std::fs::remove_dir_all(&path);
+                if !keep_files {
+                    let _ = std::fs::remove_dir_all(&path);
+                }
             }
         }
         if let Some(db) = &db {
@@ -12329,8 +12355,13 @@ async fn event_loop<T: Terminal>(
                             if let menu::MenuChoice::ConfirmDeleteWorktrees { keep_files } = choice
                                 && let Some(targets) = pending_confirm_delete_worktrees.take()
                             {
-                                model.status =
-                                    delete_groups(&mut session, &mut panes, targets, keep_files);
+                                model.status = delete_groups(
+                                    &mut session,
+                                    &mut panes,
+                                    targets,
+                                    keep_files,
+                                    Some(waker.clone()),
+                                );
 
                                 // Full sidebar refresh after deletion
                                 sb.marked.clear();
@@ -13386,8 +13417,13 @@ async fn event_loop<T: Terminal>(
                                 // Sort targets descending so deletion doesn't shift upcoming indices
                                 targets.sort_unstable_by(|a, b| b.cmp(a));
 
-                                model.status =
-                                    delete_groups(&mut session, &mut panes, targets, false);
+                                model.status = delete_groups(
+                                    &mut session,
+                                    &mut panes,
+                                    targets,
+                                    false,
+                                    Some(waker.clone()),
+                                );
 
                                 // Restore focus based on stable name
                                 if let Some(target_name) = active_group_name
@@ -17020,8 +17056,13 @@ async fn event_loop<T: Terminal>(
                                 } else {
                                     // confirm disabled — remove from disk immediately,
                                     // mirroring the sidebar's no-confirm branch.
-                                    model.status =
-                                        delete_groups(&mut session, &mut panes, targets, false);
+                                    model.status = delete_groups(
+                                        &mut session,
+                                        &mut panes,
+                                        targets,
+                                        false,
+                                        Some(waker.clone()),
+                                    );
                                     sb.marked.clear();
                                     refresh_tab_model(&mut model, &session, &mut sb);
                                     sb.focus_active_row(&mut model);

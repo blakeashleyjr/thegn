@@ -124,7 +124,11 @@ pub fn fold(
             }
             MergeOutcome::Conflict { paths } => {
                 let kind = classify(&paths, regenerate_paths);
-                deferred.push(Deferred { branch: b, paths, kind });
+                deferred.push(Deferred {
+                    branch: b,
+                    paths,
+                    kind,
+                });
             }
         }
     }
@@ -220,13 +224,22 @@ mod tests {
 
     #[test]
     fn all_clean_lands_all_and_advances_running_tip() {
-        let git = Fake::new().branch("b1", None).branch("b2", None).branch("b3", None);
+        let git = Fake::new()
+            .branch("b1", None)
+            .branch("b2", None)
+            .branch("b3", None);
         let plan = fold(&git, "base", vec![br("b1"), br("b2"), br("b3")], &[]).unwrap();
 
         assert!(plan.deferred.is_empty());
         let names: Vec<&str> = plan.landed.iter().map(|l| l.branch.name.as_str()).collect();
         assert_eq!(names, ["b1", "b2", "b3"], "land order preserved");
-        assert_eq!(plan.landed.iter().map(|l| l.commit.as_str()).collect::<Vec<_>>(), ["M1", "M2", "M3"]);
+        assert_eq!(
+            plan.landed
+                .iter()
+                .map(|l| l.commit.as_str())
+                .collect::<Vec<_>>(),
+            ["M1", "M2", "M3"]
+        );
         assert_eq!(plan.final_tip, "M3");
         assert!(plan.advanced());
 
@@ -246,7 +259,10 @@ mod tests {
         let plan = fold(&git, "base", vec![br("b1"), br("b2"), br("b3")], &[]).unwrap();
 
         assert_eq!(
-            plan.landed.iter().map(|l| l.branch.name.as_str()).collect::<Vec<_>>(),
+            plan.landed
+                .iter()
+                .map(|l| l.branch.name.as_str())
+                .collect::<Vec<_>>(),
             ["b1", "b3"]
         );
         assert_eq!(plan.deferred.len(), 1);
@@ -277,19 +293,34 @@ mod tests {
     #[test]
     fn branch_conflicting_only_with_an_earlier_landed_one_is_deferred() {
         // b2 is clean against base but collides once b1 lands.
-        let git = Fake::new()
-            .branch("b1", None)
-            .branch("b2", Some(Rule::ConflictIfLanded("b1", vec!["shared.rs".into()])));
+        let git = Fake::new().branch("b1", None).branch(
+            "b2",
+            Some(Rule::ConflictIfLanded("b1", vec!["shared.rs".into()])),
+        );
 
         // With b1 first, b2 must defer.
         let plan = fold(&git, "base", vec![br("b1"), br("b2")], &[]).unwrap();
-        assert_eq!(plan.landed.iter().map(|l| l.branch.name.as_str()).collect::<Vec<_>>(), ["b1"]);
-        assert_eq!(plan.deferred.iter().map(|d| d.branch.name.as_str()).collect::<Vec<_>>(), ["b2"]);
+        assert_eq!(
+            plan.landed
+                .iter()
+                .map(|l| l.branch.name.as_str())
+                .collect::<Vec<_>>(),
+            ["b1"]
+        );
+        assert_eq!(
+            plan.deferred
+                .iter()
+                .map(|d| d.branch.name.as_str())
+                .collect::<Vec<_>>(),
+            ["b2"]
+        );
 
         // b2 alone (b1 never landed) folds clean — proves the dependence is on
         // the *running tip*, not an intrinsic property of b2.
-        let git2 = Fake::new()
-            .branch("b2", Some(Rule::ConflictIfLanded("b1", vec!["shared.rs".into()])));
+        let git2 = Fake::new().branch(
+            "b2",
+            Some(Rule::ConflictIfLanded("b1", vec!["shared.rs".into()])),
+        );
         let plan2 = fold(&git2, "base", vec![br("b2")], &[]).unwrap();
         assert_eq!(plan2.landed.len(), 1);
         assert!(plan2.deferred.is_empty());
@@ -300,28 +331,61 @@ mod tests {
         let regen = vec!["Cargo.lock".to_string()];
         // Nested path still matches by basename.
         let git = Fake::new()
-            .branch("b1", Some(Rule::Conflict(vec!["crates/x/Cargo.lock".into()])))
-            .branch("b2", Some(Rule::Conflict(vec!["Cargo.lock".into(), "src/x.rs".into()])));
+            .branch(
+                "b1",
+                Some(Rule::Conflict(vec!["crates/x/Cargo.lock".into()])),
+            )
+            .branch(
+                "b2",
+                Some(Rule::Conflict(vec!["Cargo.lock".into(), "src/x.rs".into()])),
+            );
         let plan = fold(&git, "base", vec![br("b1"), br("b2")], &regen).unwrap();
 
-        assert_eq!(plan.deferred[0].kind, ConflictKind::Regenerable, "lockfile-only");
-        assert_eq!(plan.deferred[1].kind, ConflictKind::Textual, "mixed → textual");
+        assert_eq!(
+            plan.deferred[0].kind,
+            ConflictKind::Regenerable,
+            "lockfile-only"
+        );
+        assert_eq!(
+            plan.deferred[1].kind,
+            ConflictKind::Textual,
+            "mixed → textual"
+        );
     }
 
     #[test]
     fn classify_edges() {
         let regen = vec!["Cargo.lock".to_string(), "flake.lock".to_string()];
         assert_eq!(classify(&[], &regen), ConflictKind::Textual, "empty");
-        assert_eq!(classify(&["Cargo.lock".into()], &regen), ConflictKind::Regenerable);
-        assert_eq!(classify(&["flake.lock".into(), "Cargo.lock".into()], &regen), ConflictKind::Regenerable);
-        assert_eq!(classify(&["a/b/Cargo.lock".into()], &regen), ConflictKind::Regenerable);
-        assert_eq!(classify(&["Cargo.lock".into(), "x.rs".into()], &regen), ConflictKind::Textual);
+        assert_eq!(
+            classify(&["Cargo.lock".into()], &regen),
+            ConflictKind::Regenerable
+        );
+        assert_eq!(
+            classify(&["flake.lock".into(), "Cargo.lock".into()], &regen),
+            ConflictKind::Regenerable
+        );
+        assert_eq!(
+            classify(&["a/b/Cargo.lock".into()], &regen),
+            ConflictKind::Regenerable
+        );
+        assert_eq!(
+            classify(&["Cargo.lock".into(), "x.rs".into()], &regen),
+            ConflictKind::Textual
+        );
         assert_eq!(classify(&["x.rs".into()], &regen), ConflictKind::Textual);
-        assert_eq!(classify(&["Cargo.lock".into()], &[]), ConflictKind::Textual, "no regen list");
+        assert_eq!(
+            classify(&["Cargo.lock".into()], &[]),
+            ConflictKind::Textual,
+            "no regen list"
+        );
     }
 
     #[test]
     fn merge_msg_names_the_branch() {
-        assert_eq!(merge_msg(&br("feat-x")), "Merge branch 'feat-x' (fold-actor)");
+        assert_eq!(
+            merge_msg(&br("feat-x")),
+            "Merge branch 'feat-x' (fold-actor)"
+        );
     }
 }
