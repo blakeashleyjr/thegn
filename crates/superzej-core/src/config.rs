@@ -1003,7 +1003,7 @@ impl Default for UiConfig {
 }
 
 /// Git behavior knobs for the panel's write operations (`[git]`).
-#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct GitConfig {
     /// Pass `-c commit.gpgSign=false -c tag.gpgSign=false` to
@@ -1011,6 +1011,23 @@ pub struct GitConfig {
     /// passphrase prompt can never hang a background op. Off by default: a
     /// working gpg-agent signs headlessly.
     pub override_gpg: bool,
+    /// Install a `pre-merge-commit` hook that refuses a `git merge` run against
+    /// the canonical (primary) checkout from *inside* a superzej sandbox, where
+    /// the canonical worktree's filesystem view can be incoherent and silently
+    /// corrupt the merge. On by default; points at `szhost integrate` (an
+    /// object-DB fold with no checkout). No-op outside a sandbox, in linked
+    /// worktrees, and when a foreign hook is already present. Per-merge escape
+    /// hatch: `SUPERZEJ_MERGE_GUARD_OFF=1`.
+    pub merge_guard: bool,
+}
+
+impl Default for GitConfig {
+    fn default() -> Self {
+        Self {
+            override_gpg: false,
+            merge_guard: true,
+        }
+    }
 }
 
 /// Host keybinding overrides. The flat `[keybinds]` table remains the

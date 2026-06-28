@@ -562,6 +562,22 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     if !session.id.is_empty() {
         crate::agent::warm_direnv(&cfg, std::path::Path::new(&session.id));
     }
+    // Install/refresh the in-sandbox merge guard into the shared hooks dir
+    // (`core.hooksPath` → the canonical `.git/hooks`). On by default; it refuses
+    // a raw `git merge` run against the canonical checkout from inside a sandbox
+    // (where its FS view can be incoherent) and points at `szhost integrate`.
+    // No-op for a foreign hook. See `superzej_core::merge_guard`.
+    if cfg.git.merge_guard {
+        let hooks = superzej_core::util::git_common_dir(&cwd).join("hooks");
+        match superzej_core::merge_guard::install(&hooks) {
+            Ok(action) => tracing::debug!(
+                target: "szhost::startup", ?action, dir = %hooks.display(), "merge-guard hook"
+            ),
+            Err(e) => tracing::debug!(
+                target: "szhost::startup", error = %e, "merge-guard hook install skipped"
+            ),
+        }
+    }
     // Auto-launch the LLM-proxy daemon when enabled (disabled by default — AI is
     // additive). Held for the lifetime of `main`; the supervisor thread keeps it
     // alive and `Drop` stops it on graceful return (process-group exit otherwise).
