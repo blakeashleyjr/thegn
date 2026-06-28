@@ -291,7 +291,7 @@ macro_rules! run_float {
 pub const BUILTINS: &[Action] = &[
     Action {
         id: "new-worktree",
-        chords: &["Alt w"],
+        chords: &["Ctrl w"],
         menu_label: "New worktree — branch off the base",
         hint: "worktree",
         invocation: run_float!("new-worktree"),
@@ -1155,7 +1155,7 @@ mod tests {
         // A floating Run is emitted MULTI-LINE (zellij KDL rejects an inline
         // nested block); check the head line + its child options.
         assert!(kdl.contains(
-            "        bind \"Alt w\" {\n            Run \"superzej\" \"new-worktree\" {\n"
+            "        bind \"Ctrl w\" {\n            Run \"superzej\" \"new-worktree\" {\n"
         ));
         assert!(kdl.contains("                floating true\n"));
         assert!(kdl.contains("                close_on_exit true\n"));
@@ -1438,7 +1438,7 @@ mod tests {
         let acts = effective(&cfg);
         let nw = acts.iter().find(|a| a.id == "new-worktree").unwrap();
         // The bad rebind is rejected; the builtin default chord is kept.
-        assert_eq!(nw.chords[0].to_kdl(), "Alt w");
+        assert_eq!(nw.chords[0].to_kdl(), "Ctrl w");
     }
 
     #[test]
