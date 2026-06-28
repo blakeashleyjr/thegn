@@ -1013,6 +1013,52 @@ nix_daemon = false
 #   fail   — refuse to open the pane.
 on_missing = "warn"
 
+# ── Failover when the SELECTED environment can't be brought up ─────────────────
+# Distinct from on_missing (which governs only the local Auto backend chain).
+# When a *named* [env.<name>] or an explicit non-local placement (provider/k8s/
+# ssh) fails to come up — e.g. a managed provider rejects the token, or a pod
+# won't schedule — should superzej quietly fall back to another backend / the
+# host, or stop?
+#   false — (default) HALT that worktree's pane and show a warning overlay. A
+#           remote/managed env is often required for correctness or safety, so a
+#           silent drop to the host is refused. You explicitly re-enable failover
+#           (here or per-env) or fix the env.
+#   true  — walk backend_chain down to the host on failure (historical behavior).
+# Override per environment with `[env.<name>] failover = true|false`.
+failover = false
+
+# ── Personal environment layer ────────────────────────────────────────────────
+# [sandbox.home] makes a sandbox/remote feel like LOCAL by reproducing *your*
+# setup in it — independent of any repo. The PROJECT toolchain is derived
+# automatically from the repo (flake.nix/devenv.nix/.envrc, .tool-versions,
+# language manifests); this table is the generic, declarative PERSONAL layer on
+# top. Applied to every provider/remote sandbox on first open, then checkpointed
+# so it's one-time. Empty (the default) = nothing extra.
+# [sandbox.home]
+# # CLI tools installed in every sandbox. Nix-first (`nix profile install
+# # nixpkgs#<tool>`, consistent names) when Nix is present, else a best-effort
+# # native package manager (apt/apk/dnf). Bespoke installs go in `setup` below.
+# tools = ["fd", "fzf", "atuin", "ripgrep"]
+# # Host dotfiles (basenames under your $HOME) uploaded into the sandbox home.
+# dotfiles = [".zshrc", ".gitconfig", ".tmux.conf"]
+# # OR clone a dotfiles repo + run its install.sh/bootstrap.sh/setup.sh.
+# dotfiles_repo = ""
+# # Bring-your-own setup — inline commands run (in order) in every sandbox, e.g.
+# # install an agent CLI or internal tooling that isn't a package.
+# setup = []
+# # OR a setup script (host path uploaded + run, or an in-sandbox path).
+# setup_script = ""
+# # Coding agents to make work out-of-the-box INSIDE the sandbox: known CLIs are
+# # installed and every listed agent's host config/credentials are uploaded so
+# # it's logged-in there (claude code, codex, or a custom one like hermes). NOTE:
+# # this carries credentials into the remote VM — list only agents you trust there.
+# agents = ["claude", "codex"]
+# # Host services exposed INSIDE the sandbox via a reverse tunnel (over the
+# # resident bridge) so an in-sandbox process/agent reaching 127.0.0.1:<port> hits
+# # the HOST's service — a host localhost DB/API, or a host-bound MCP server.
+# # Specs: "5432" (same port), "8080:5432" (host loopback port), "8080:db.lan:5432".
+# reverse_forwards = ["5432", "11434"]
+
 # Drive the OCI runtime against a REMOTE daemon instead of SSH-wrapping the whole
 # backend argv (an alternative reach to `[env.<name>] placement = "ssh"`, for when
 # the container daemon — not just the shell — lives on another box). Empty = local.
@@ -1378,6 +1424,11 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # #    over the Sprites WSS exec API directly (no `sprite` CLI), and reattaches its
 # #    live session (replaying scrollback) across restarts. Set `exec = "cli"` to
 # #    fall back to the `interactive_command` bridge.
+# # FAILOVER — by default, if the sprite can't be brought up (bad/expired token,
+# #   API down, quota), the worktree's pane HALTS with a warning overlay rather
+# #   than silently dropping to a host shell (see [sandbox] failover). To let THIS
+# #   env fall back to the local backend chain / host instead, override per-env:
+# # failover = true            # this env may degrade to host; omit/false ⇒ halt+warn
 # ── LLM proxy (group U/V) ──────────────────────────────────────────────────
 # The AI-traffic chokepoint daemon (binary `szproxy`). The shell never hard-
 # depends on this — AI is strictly additive — so it is OFF by default. When
@@ -1432,6 +1483,16 @@ agent_model = "model-proxy/standard"
 # reaches the proxy via the container gateway instead. Off = the additive model:
 # pi runs its own tools in-process and edits auto-apply.
 bouncer = false
+# Base URL an agent running INSIDE a remote/provider sandbox (a sprite VM that
+# can't reach host loopback) uses to reach szproxy — a tunnel/public endpoint.
+# When set (+ route_agent), superzej injects ANTHROPIC_BASE_URL + the per-worktree
+# virtual key into the sprite's shell so ANY agent there (pi, claude code, …)
+# routes through the proxy by default. Empty ⇒ in-sprite agents talk upstream
+# directly. (Local/OCI agents already reach the proxy via loopback/gateway/unix.)
+# "auto" stands up a reverse tunnel (the in-sandbox resident bridge ⇄ host) so the
+# sprite reaches szproxy at http://127.0.0.1:<listen-port> with ZERO public
+# exposure; or set an explicit reachable URL (e.g. a tailnet/proxy endpoint).
+# remote_base_url = "auto"
 
 # ── Local merge queue: the "fold-actor" (optional) ─────────────────────────
 # Stop hand-sequencing parallel branches into main. The fold-actor folds every
