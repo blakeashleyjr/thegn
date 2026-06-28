@@ -380,29 +380,40 @@ fn nix_install_script() -> String {
     )
 }
 
-/// An sh prelude that exports `NIX_CONFIG` with a GitHub `access-tokens` line when
-/// a token is in the env (GH_TOKEN, else GITHUB_TOKEN). nix's flake-input fetcher
-/// does NOT use git's credential helper, so a **private flake input** (e.g. a
-/// private `github:org/repo` input in the repo's flake.nix) 404s without this even
-/// though `git clone` of the repo itself authenticates fine. Runtime-only (never
-/// written to nix.conf), so the token isn't baked into the checkpoint. Trailing
-/// `;` so it composes as a prefix; a no-op when no token is present.
-fn nix_token_prelude() -> &'static str {
+/// An sh prelude for any step that runs `nix` builds. Two jobs:
+///
+/// 1. **Private flake inputs**: export `NIX_CONFIG` with a GitHub `access-tokens`
+///    line from the env token (GH_TOKEN, else GITHUB_TOKEN). nix's flake-input
+///    fetcher does NOT use git's credential helper, so a private `github:org/repo`
+///    input 404s without this even though `git clone` of the repo authenticates.
+///    Runtime-only (never written to nix.conf), so the token isn't baked into the
+///    checkpoint (same principle as the git credential helper).
+/// 2. **`/homeless-shelter` purge**: single-user nix in a microVM can't use the
+///    build sandbox, so it uses `/homeless-shelter` as a throwaway `$HOME` during
+///    each build and REFUSES to start if a leftover one exists. A build interrupted
+///    by the sprite suspending on idle leaves it behind, wedging every later nix
+///    build. Remove it up front (owned by the build user, so no sudo).
+///
+/// Trailing `;` so it composes as a prefix; a no-op for the token half when no
+/// token is present.
+fn nix_runtime_prelude() -> &'static str {
     "tok=\"${GH_TOKEN:-${GITHUB_TOKEN:-}}\"; \
-     if [ -n \"$tok\" ]; then export NIX_CONFIG=\"access-tokens = github.com=$tok\"; fi; "
+     if [ -n \"$tok\" ]; then export NIX_CONFIG=\"access-tokens = github.com=$tok\"; fi; \
+     rm -rf /homeless-shelter 2>/dev/null || true; "
 }
 
 /// Install direnv + hook it into the login shells, so entering the workdir
 /// activates the flake devShell exactly like local. Idempotent.
 fn direnv_install_script() -> String {
-    String::from(
-        "command -v direnv >/dev/null 2>&1 || (nix profile install nixpkgs#direnv 2>/dev/null \
+    format!(
+        "{}command -v direnv >/dev/null 2>&1 || (nix profile install nixpkgs#direnv 2>/dev/null \
            || (export DEBIAN_FRONTEND=noninteractive; apt-get update -y && apt-get install -y direnv)); \
          for rc in \"$HOME/.bashrc\" \"$HOME/.zshrc\"; do \
            [ -f \"$rc\" ] || touch \"$rc\"; \
            grep -q 'direnv hook' \"$rc\" 2>/dev/null || \
              printf '\\neval \"$(direnv hook %s)\"\\n' \"$(basename \"$rc\" | sed s/^\\.//;s/rc$//)\" >> \"$rc\"; \
          done",
+        nix_runtime_prelude(),
     )
 }
 
@@ -411,7 +422,7 @@ fn direnv_install_script() -> String {
 /// devShell / devenv directly.
 fn devshell_warm_script(workdir: &str, req: &EnvRequirements) -> String {
     let wd = sh_quote(workdir);
-    let tok = nix_token_prelude();
+    let tok = nix_runtime_prelude();
     let nixsh = format!(
         "{tok}. \"$HOME/.nix-profile/etc/profile.d/nix.sh\" 2>/dev/null || true; \
          export PATH=\"$HOME/.nix-profile/bin:$PATH\""
@@ -828,9 +839,17 @@ mod tests {
             s.contains("GH_TOKEN") && s.contains("GITHUB_TOKEN"),
             "derives from either token var"
         );
+        // Purge a leftover /homeless-shelter so an interrupted prior build doesn't
+        // wedge the next nix build (sandbox-less single-user nix in a microVM).
+        assert!(
+            s.contains("rm -rf /homeless-shelter"),
+            "clears leftover /homeless-shelter"
+        );
         // Plain (no-flake) warm also carries the prelude.
         let plain = devshell_warm_script("/workspace", &EnvRequirements::default());
-        assert!(plain.contains("NIX_CONFIG"));
+        assert!(plain.contains("NIX_CONFIG") && plain.contains("/homeless-shelter"));
+        // direnv install (also a nix build) carries the prelude too.
+        assert!(direnv_install_script().contains("/homeless-shelter"));
     }
 
     #[test]
