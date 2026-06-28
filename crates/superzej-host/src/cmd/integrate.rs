@@ -56,9 +56,16 @@ pub fn run(cfg: &Config) -> Result<()> {
     }
     for d in &report.deferred {
         if d.gate_failed {
-            outln!("  ✗ {} held back — breaks the build (gate offender)", d.branch);
+            outln!(
+                "  ✗ {} held back — breaks the build (gate offender)",
+                d.branch
+            );
         } else {
-            outln!("  ✗ {} deferred — conflicts: {}", d.branch, d.paths.join(", "));
+            outln!(
+                "  ✗ {} deferred — conflicts: {}",
+                d.branch,
+                d.paths.join(", ")
+            );
         }
     }
     match &report.gate {
@@ -71,7 +78,10 @@ pub fn run(cfg: &Config) -> Result<()> {
     }
     if report.advanced {
         let retried = if report.cas_attempts > 1 {
-            format!(" ({} CAS attempts — {target} moved under the fold)", report.cas_attempts)
+            format!(
+                " ({} CAS attempts — {target} moved under the fold)",
+                report.cas_attempts
+            )
         } else {
             String::new()
         };

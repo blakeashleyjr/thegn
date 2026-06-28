@@ -188,7 +188,11 @@ pub fn persist(db: &Db, cands: &Candidates, report: &FoldReport) -> Result<()> {
     }
     for d in &report.deferred {
         if let Some(wt) = cands.worktrees.get(&d.branch) {
-            let status = if d.gate_failed { "gate_failed" } else { "deferred" };
+            let status = if d.gate_failed {
+                "gate_failed"
+            } else {
+                "deferred"
+            };
             let paths = (!d.paths.is_empty()).then(|| d.paths.join("\n"));
             db.update_merge_status(wt, status, None, paths.as_deref(), None)?;
         }
@@ -205,7 +209,10 @@ fn gate_tip(repo_root: &Path, oid: &str, gate_command: &str) -> Result<bool> {
         util::now()
     ));
     let tmp_s = tmp.to_string_lossy().to_string();
-    if !util::git_ok(repo_root, &["worktree", "add", "--detach", "--force", &tmp_s, oid]) {
+    if !util::git_ok(
+        repo_root,
+        &["worktree", "add", "--detach", "--force", &tmp_s, oid],
+    ) {
         anyhow::bail!("merge queue: could not create gate worktree at {tmp_s}");
     }
     let status = std::process::Command::new("sh")
@@ -393,8 +400,14 @@ pub fn run_fold(
         // Green (or no gate) → atomically advance the target ref.
         cas_attempts += 1;
         if CliGit.update_ref_cas(&loc, &target_ref, &plan.final_tip, &base)? {
-            let mut report =
-                build_report(&target_branch, &original, &plan, &gate_offenders, gate, cas_attempts);
+            let mut report = build_report(
+                &target_branch,
+                &original,
+                &plan,
+                &gate_offenders,
+                gate,
+                cas_attempts,
+            );
             report.advanced = true;
             return Ok(report);
         }
@@ -502,7 +515,10 @@ mod tests {
         // main moved and now contains both files.
         assert_ne!(repo.out(&["rev-parse", "main"]), before);
         let files = repo.out(&["ls-tree", "-r", "--name-only", "main"]);
-        assert!(files.contains("a.txt") && files.contains("b.txt"), "{files}");
+        assert!(
+            files.contains("a.txt") && files.contains("b.txt"),
+            "{files}"
+        );
     }
 
     #[test]
@@ -517,7 +533,14 @@ mod tests {
 
         let report = run_fold(&cfg(""), &repo.dir, repo.branch_set()).unwrap();
         assert!(report.advanced, "the clean branch should land");
-        assert_eq!(report.landed.iter().map(|l| l.branch.as_str()).collect::<Vec<_>>(), ["clean"]);
+        assert_eq!(
+            report
+                .landed
+                .iter()
+                .map(|l| l.branch.as_str())
+                .collect::<Vec<_>>(),
+            ["clean"]
+        );
         assert_eq!(report.deferred.len(), 1);
         assert_eq!(report.deferred[0].branch, "bad");
         assert!(!report.deferred[0].gate_failed);
@@ -541,8 +564,17 @@ mod tests {
         repo.feature("b2", "b.txt", "b\n");
         let report = run_fold(&cfg("false"), &repo.dir, repo.branch_set()).unwrap();
         assert!(!report.advanced);
-        assert_eq!(repo.out(&["rev-parse", "main"]), mid, "red gate must not move main");
+        assert_eq!(
+            repo.out(&["rev-parse", "main"]),
+            mid,
+            "red gate must not move main"
+        );
         assert!(matches!(report.gate, GateOutcome::Failed { .. }));
-        assert!(report.deferred.iter().any(|d| d.branch == "b2" && d.gate_failed));
+        assert!(
+            report
+                .deferred
+                .iter()
+                .any(|d| d.branch == "b2" && d.gate_failed)
+        );
     }
 }

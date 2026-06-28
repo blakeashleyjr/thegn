@@ -805,8 +805,10 @@ impl Db {
     /// Drop a worktree's merge-queue row (e.g. after a clean land is recorded
     /// elsewhere, or the worktree is removed).
     pub fn remove_merge_entry(&self, worktree: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM merge_queue WHERE worktree=?1", params![worktree])?;
+        self.conn.execute(
+            "DELETE FROM merge_queue WHERE worktree=?1",
+            params![worktree],
+        )?;
         Ok(())
     }
 
@@ -2954,8 +2956,14 @@ mod tests {
         // Land one (records the merge-commit oid); defer the other (paths).
         db.update_merge_status("/wt/a", "landed", Some("deadbeef"), None, None)
             .unwrap();
-        db.update_merge_status("/wt/b", "deferred", None, Some("src/x.rs\nCargo.toml"), None)
-            .unwrap();
+        db.update_merge_status(
+            "/wt/b",
+            "deferred",
+            None,
+            Some("src/x.rs\nCargo.toml"),
+            None,
+        )
+        .unwrap();
         let by = |wt: &str| -> MergeQueueRow {
             db.list_merge_queue()
                 .unwrap()

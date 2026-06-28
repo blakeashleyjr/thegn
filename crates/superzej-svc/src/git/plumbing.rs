@@ -57,7 +57,14 @@ pub trait PlumbingOps: GitBackend {
     fn merge_tree(&self, loc: &GitLoc, ours: &str, theirs: &str) -> Result<MergeTreeOutcome> {
         let (code, stdout, stderr) = run_status(
             loc,
-            &["merge-tree", "--write-tree", "--name-only", "-z", ours, theirs],
+            &[
+                "merge-tree",
+                "--write-tree",
+                "--name-only",
+                "-z",
+                ours,
+                theirs,
+            ],
         )?;
         // Output sections are NUL-separated: <tree-oid> then (on conflict) the
         // conflicted filenames, then an empty record before informational
@@ -95,7 +102,9 @@ pub trait PlumbingOps: GitBackend {
             args.push("-p");
             args.push(p);
         }
-        Ok(run_stdin(loc, &[], &args, msg.as_bytes())?.trim().to_string())
+        Ok(run_stdin(loc, &[], &args, msg.as_bytes())?
+            .trim()
+            .to_string())
     }
 
     /// Atomically advance a (fully-qualified) ref only if it still points at
@@ -189,9 +198,15 @@ mod tests {
             .commit_tree(&loc, &tree, &[&main, &feat], "fold feat")
             .unwrap();
         let parents = repo.out(&["rev-list", "--parents", "-n", "1", &merge]);
-        assert!(parents.contains(&main) && parents.contains(&feat), "{parents}");
+        assert!(
+            parents.contains(&main) && parents.contains(&feat),
+            "{parents}"
+        );
         let files = repo.out(&["ls-tree", "-r", "--name-only", &merge]);
-        assert!(files.contains("feat.txt") && files.contains("main.txt"), "{files}");
+        assert!(
+            files.contains("feat.txt") && files.contains("main.txt"),
+            "{files}"
+        );
         // Worktree/HEAD untouched by the object-DB fold.
         assert_eq!(repo.head(), main);
         assert_ne!(base, main);
