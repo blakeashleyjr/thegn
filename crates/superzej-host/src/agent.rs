@@ -865,6 +865,20 @@ pub fn native_shell_exec(cfg: &Config, worktree: &str) -> Option<NativeShell> {
     // default — sets ANTHROPIC_BASE_URL etc. when a reachable remote proxy URL is
     // configured. No-op otherwise (the agent talks upstream directly).
     env.extend(cfg.llm_proxy.remote_agent_env(None));
+    // Let an in-sandbox `nix develop` / direnv `use flake` fetch PRIVATE flake
+    // inputs: nix's fetcher ignores git's credential helper, so without a
+    // `github.com` access-token a private `github:org/repo` flake input 404s even
+    // though the repo clone authenticated. Derive NIX_CONFIG from the token we
+    // already carry in (runtime-only; never persisted to nix.conf/checkpoint).
+    if let Some((_, tok)) = env
+        .iter()
+        .find(|(k, v)| (k == "GH_TOKEN" || k == "GITHUB_TOKEN") && !v.is_empty())
+    {
+        env.push((
+            "NIX_CONFIG".to_string(),
+            format!("access-tokens = github.com={tok}"),
+        ));
+    }
     env.push(("SUPERZEJ_WORKTREE".to_string(), worktree.to_string()));
     env.push(("SUPERZEJ_BRANCH".to_string(), String::new()));
     Some(NativeShell {
