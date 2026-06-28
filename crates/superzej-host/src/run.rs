@@ -2422,6 +2422,20 @@ fn delete_groups(
         }
         let path = session.worktrees[gi].path.clone();
         if !path.is_empty() {
+            // Tear down the per-worktree provider sandbox (sprite/…) if this env
+            // has one. Resolve the env name from the DB NOW (before
+            // `forget_worktree_group` below removes the worktree's rows), then
+            // destroy off-thread (a network DELETE; idempotent on 404). No-op for
+            // local/ssh/k8s envs or an unconfigured/tokenless provider.
+            if let Some(db) = &db {
+                let repo_root = db.repo_root_for(&path).ok().flatten().unwrap_or_default();
+                if let Some(env_name) = db.effective_env(&path, &repo_root) {
+                    let p = path.clone();
+                    std::thread::spawn(move || {
+                        crate::agent::destroy_provider_sandbox(&p, &env_name);
+                    });
+                }
+            }
             if let Some(waker) = waker.clone() {
                 let path_clone = path.clone();
                 std::thread::spawn(move || {

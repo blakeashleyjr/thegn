@@ -656,6 +656,21 @@ pub(crate) fn deproject(path: &str) {
 fn provider_for(
     pc: &superzej_core::config::EnvProviderConfig,
 ) -> Option<superzej_svc::provider::Provider> {
+    provider_for_named(pc, &pc.id)
+}
+
+/// Like [`provider_for`] but bakes an explicit sandbox **name** into the provider
+/// instead of the raw configured `pc.id`. This matters for `create()`/
+/// `ensure_exists()`, which name the new sandbox from the provider's own baked
+/// name (not a call argument): the raw `pc.id` may be a per-worktree template
+/// (`{worktree}`) or empty, so the caller must pass the resolved
+/// [`effective_provider_id`](superzej_core::config::effective_provider_id) to
+/// create the correctly-named sandbox. Exec/read/write/destroy take the id as an
+/// argument, so for those `provider_for` is equivalent.
+fn provider_for_named(
+    pc: &superzej_core::config::EnvProviderConfig,
+    name: &str,
+) -> Option<superzej_svc::provider::Provider> {
     use superzej_svc::provider::{DaytonaProvider, Provider, SpritesProvider};
     match pc.provider.as_str() {
         "sprites" => {
@@ -668,7 +683,7 @@ fn provider_for(
             Some(Provider::Sprites(SpritesProvider::new(
                 &pc.api_base,
                 &token,
-                &pc.id,
+                name,
             )))
         }
         "daytona" => {
@@ -971,7 +986,9 @@ pub fn provision_provider_env(
     if id.is_empty() {
         return Ok(false);
     }
-    let Some(provider) = provider_for(pc) else {
+    // Bake the resolved id so a recreate (`ensure_exists`→`create`) names the
+    // sandbox correctly when `pc.id` is a `{worktree}` template.
+    let Some(provider) = provider_for_named(pc, &id) else {
         return Ok(false);
     };
     if !provider.caps().files {
@@ -979,6 +996,15 @@ pub fn provision_provider_env(
     }
     let workdir = pc.sync_workdir();
     let marker = EnvPlan::marker_path(&workdir);
+
+    // Recreate-if-missing: the sandbox may have been cleaned up out-of-band (TTL,
+    // manual delete, provider GC). `ensure_exists` recreates it before we read the
+    // marker / run any exec, so provisioning can't fail against a dead sandbox.
+    // A freshly recreated sandbox has no marker ⇒ a full re-provision runs below.
+    // (No-op when it already exists; cheap list+maybe-create.)
+    if let Err(e) = block_on_provider(|| async { provider.ensure_exists(&id).await }) {
+        return Err(anyhow::anyhow!("ensure sandbox {id}: {e}"));
+    }
 
     // Idempotent: already provisioned ⇒ nothing to do.
     if block_on_provider(|| async { provider.read(&id, &marker).await }).is_ok() {
@@ -1349,7 +1375,9 @@ fn auto_provision_sandbox(cfg: &Config, env_name: &str, worktree: &str) -> anyho
     if !pc.auto_provision || name.is_empty() {
         return Ok(());
     }
-    let Some(provider) = provider_for(pc) else {
+    // Bake the RESOLVED per-worktree name so `ensure_exists`→`create` names the
+    // new sandbox correctly (the raw `pc.id` may be a `{worktree}` template).
+    let Some(provider) = provider_for_named(pc, &name) else {
         return Ok(());
     };
     match block_on_provider(|| async { provider.ensure_exists(&name).await }) {
@@ -1397,6 +1425,39 @@ pub fn checkpoint_on_close(worktree: &str) {
     match block_on_provider(|| async { provider.checkpoint(&name, Some("auto-close")).await }) {
         Ok(id) => superzej_core::msg::info(&format!("checkpointed {name} on close: {id}")),
         Err(e) => superzej_core::msg::warn(&format!("auto-checkpoint on close failed: {e}")),
+    }
+}
+
+/// Tear down a worktree's managed-provider sandbox when the worktree is deleted.
+/// Mirror of [`checkpoint_on_close`] but for permanent deletion: a deleted
+/// worktree should not leave a paid-for, per-worktree sandbox (sprite) running.
+/// Best-effort + off-loop (network DELETE): loads config, resolves the env from
+/// the path, and destroys the per-worktree sandbox if the env is a provider.
+/// No-op for local/ssh/k8s envs or an unconfigured/tokenless provider. Idempotent
+/// (the provider treats a 404 as already-gone), so racing a TTL/manual delete is
+/// fine. Called from the worktree-delete thread, which has only the path.
+/// Destroy the per-worktree sandbox for a worktree whose env name is already
+/// known. The worktree-delete path resolves the env name from the DB *before* it
+/// forgets the worktree's rows (a later DB-based resolve would return nothing and
+/// leak the sandbox). Best-effort + off-loop (a network DELETE); idempotent (the
+/// provider treats a 404 as already-gone). No-op for local/ssh/k8s envs or an
+/// unconfigured/tokenless provider.
+pub fn destroy_provider_sandbox(worktree: &str, env_name: &str) {
+    let cfg = Config::load_layered(&superzej_core::config::ProcessEnv, &[], None);
+    let Some(env) = cfg.env.get(env_name) else {
+        return;
+    };
+    let pc = &env.provider;
+    let name = superzej_core::config::effective_provider_id(&pc.id, Path::new(worktree));
+    if name.is_empty() {
+        return;
+    }
+    let Some(provider) = provider_for_named(pc, &name) else {
+        return;
+    };
+    match block_on_provider(|| async { provider.destroy(&name).await }) {
+        Ok(()) => superzej_core::msg::info(&format!("destroyed sandbox {name} on worktree delete")),
+        Err(e) => superzej_core::msg::warn(&format!("sandbox teardown on delete failed: {e}")),
     }
 }
 

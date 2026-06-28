@@ -503,6 +503,12 @@ pub fn agent_config_paths(agent: &str) -> (Vec<String>, Vec<String>) {
             vec![".claude".into(), ".config/claude".into()],
         ),
         "codex" => (vec![], vec![".codex".into(), ".config/codex".into()]),
+        // pi keeps its config + user extensions/skills under ~/.pi
+        // (e.g. ~/.pi/agent/{extensions,skills}/); carry the whole tree.
+        "pi" => (
+            vec![".pi.json".into()],
+            vec![".pi".into(), ".config/pi".into()],
+        ),
         other => (
             vec![format!(".{other}.json")],
             vec![format!(".{other}"), format!(".config/{other}")],
@@ -524,6 +530,8 @@ fn agents_install_script(agents: &[String]) -> String {
                 "have claude || npm_g @anthropic-ai/claude-code || true".to_string()
             }
             "codex" => "have codex || npm_g @openai/codex || true".to_string(),
+            // superzej's own agent; pi >=0.80 bundles its extension deps.
+            "pi" => "have pi || npm_g @earendil-works/pi-coding-agent || true".to_string(),
             other => format!("# {other}: install via [sandbox.home] setup/tools"),
         };
         lines.push(line);
@@ -759,6 +767,10 @@ mod tests {
         let (files, dirs) = agent_config_paths("claude");
         assert!(files.contains(&".claude.json".to_string()));
         assert!(dirs.contains(&".claude".to_string()));
+        // pi keeps its config/extensions under ~/.pi.
+        let (fp, dp) = agent_config_paths("pi");
+        assert!(fp.contains(&".pi.json".to_string()));
+        assert!(dp.contains(&".pi".to_string()));
         // Unknown agent → conventional dotfile/dir fallback.
         let (f2, d2) = agent_config_paths("hermes");
         assert!(f2.contains(&".hermes.json".to_string()));
@@ -767,9 +779,15 @@ mod tests {
 
     #[test]
     fn agents_installer_has_known_installers() {
-        let s = agents_install_script(&["claude".into(), "codex".into(), "hermes".into()]);
+        let s = agents_install_script(&[
+            "claude".into(),
+            "codex".into(),
+            "pi".into(),
+            "hermes".into(),
+        ]);
         assert!(s.contains("@anthropic-ai/claude-code"));
         assert!(s.contains("@openai/codex"));
+        assert!(s.contains("@earendil-works/pi-coding-agent"));
         // unknown agent doesn't fabricate an installer.
         assert!(s.contains("hermes: install via"));
     }
