@@ -619,6 +619,25 @@ fn provider_for(
     }
 }
 
+/// The provider to drive a resolved env's resident bridge over its **native exec
+/// API** (CLI-free control plane), or `None` when the env isn't an exec_api
+/// provider, opts out (`exec = "cli"`), or its token is unset. Used by the bridge
+/// supervisor's `connect_native`; the sandbox id is the placement's `id`.
+pub(crate) fn native_bridge_provider(
+    cfg: &Config,
+    env: &superzej_core::env::Environment,
+) -> Option<superzej_svc::provider::Provider> {
+    use superzej_core::config::ProviderExecMode;
+    let superzej_core::placement::Placement::Provider(_) = &env.placement else {
+        return None;
+    };
+    let pc = &cfg.env.get(&env.name)?.provider;
+    if pc.exec == ProviderExecMode::Cli || !superzej_svc::provider::exec_api_by_name(&pc.provider) {
+        return None;
+    }
+    provider_for(pc)
+}
+
 /// A resolved native-exec plan for a worktree's interactive shell: the built
 /// provider, the sandbox id, the inner login-shell command to run inside it, the
 /// in-sandbox working dir, and the pane env. Consumed by the host spawner to open
@@ -815,6 +834,22 @@ fn provision_provider_repo(repo_root: &Path, loc: &GitLoc, branch: Option<&str>)
         return;
     };
     let script = superzej_core::remote::provision_repo_script(&origin, branch);
+    // Prefer the resident bridge (CLI-free) when it's already up for this loc;
+    // else fall back to the per-op CLI control prefix.
+    if let Some(b) = superzej_svc::bridge::for_loc(loc) {
+        match b.exec(&["/bin/sh", "-lc", &script], Some(&loc.path()), &[]) {
+            Ok(r) if r.exit == 0 => return,
+            Ok(r) => {
+                superzej_core::msg::warn(&format!(
+                    "provider repo provision failed: {}",
+                    r.stderr.trim()
+                ));
+                return;
+            }
+            // Bridge hiccup — fall through to the CLI path below.
+            Err(e) => superzej_core::msg::warn(&format!("provider repo provision via bridge: {e}")),
+        }
+    }
     match loc.sh_command(&script).output() {
         Ok(o) if o.status.success() => {}
         Ok(o) => superzej_core::msg::warn(&format!(

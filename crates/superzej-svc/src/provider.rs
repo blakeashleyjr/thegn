@@ -896,6 +896,43 @@ fn resize_json(cols: u16, rows: u16) -> String {
     format!("{{\"type\":\"resize\",\"cols\":{cols},\"rows\":{rows}}}")
 }
 
+// --- non-PTY (tty=false) binary stream framing -----------------------------
+// In non-PTY mode each binary frame is prefixed with a 1-byte stream id:
+//   0=stdin (client→server), 1=stdout, 2=stderr, 3=exit, 4=stdin-EOF.
+// (PTY mode is raw, no prefix.) The bridge runs non-PTY so stdout stays a clean
+// byte stream separate from the agent's stderr logs.
+
+/// Prefix client stdin with the stdin stream id (0) for non-PTY mode.
+fn encode_stream_stdin(data: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(data.len() + 1);
+    v.push(0u8);
+    v.extend_from_slice(data);
+    v
+}
+
+/// A decoded non-PTY server→client binary frame.
+#[derive(Debug, PartialEq, Eq)]
+enum StreamMsg {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    Exit(i32),
+    /// Empty/unknown stream id — ignored.
+    Ignore,
+}
+
+/// Split a non-PTY server→client binary frame on its 1-byte stream id.
+fn decode_stream_frame(b: &[u8]) -> StreamMsg {
+    let Some((&id, rest)) = b.split_first() else {
+        return StreamMsg::Ignore;
+    };
+    match id {
+        1 => StreamMsg::Stdout(rest.to_vec()),
+        2 => StreamMsg::Stderr(rest.to_vec()),
+        3 => StreamMsg::Exit(String::from_utf8_lossy(rest).trim().parse().unwrap_or(0)),
+        _ => StreamMsg::Ignore,
+    }
+}
+
 /// A parsed Sprites exec text (control) frame.
 #[derive(Debug, PartialEq, Eq)]
 enum SpriteCtrl {
@@ -929,10 +966,11 @@ impl SpritesProvider {
     /// runtime until the socket closes or `ExecControl::Close` is sent.
     pub async fn open_exec(&self, id: &str, spec: &ExecSpec) -> Result<ExecSession> {
         let url = exec_ws_url(&self.api_base, id, spec)?;
-        self.start_session(url).await
+        self.start_session(url, spec.tty).await
     }
 
     /// Reattach to a persisted exec session (the server replays its scrollback).
+    /// Reattach is always interactive (PTY), so the stream is raw.
     pub async fn attach_exec(
         &self,
         id: &str,
@@ -941,11 +979,12 @@ impl SpritesProvider {
         rows: u16,
     ) -> Result<ExecSession> {
         let url = attach_ws_url(&self.api_base, id, session, cols, rows)?;
-        self.start_session(url).await
+        self.start_session(url, true).await
     }
 
-    /// Run the WSS handshake (bearer auth) and spawn the bridge task.
-    async fn start_session(&self, url: String) -> Result<ExecSession> {
+    /// Run the WSS handshake (bearer auth) and spawn the bridge task. `tty`
+    /// selects the wire framing: raw (PTY) vs 1-byte stream-id prefixes (non-PTY).
+    async fn start_session(&self, url: String, tty: bool) -> Result<ExecSession> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let mut req = url
             .into_client_request()
@@ -962,7 +1001,7 @@ impl SpritesProvider {
         let (control_tx, control_rx) = tokio::sync::mpsc::channel::<ExecControl>(256);
         let (sid_tx, sid_rx) = tokio::sync::watch::channel::<Option<String>>(None);
 
-        tokio::spawn(drive_exec(ws, frames_tx, control_rx, sid_tx));
+        tokio::spawn(drive_exec(ws, tty, frames_tx, control_rx, sid_tx));
 
         Ok(ExecSession {
             frames: frames_rx,
@@ -974,8 +1013,12 @@ impl SpritesProvider {
 
 /// The exec bridge task: pump WebSocket frames ⇄ the [`ExecSession`] channels.
 /// Generic over the socket so the concrete (TLS) stream type need not be named.
+/// `tty` selects the wire framing: raw bytes (PTY) vs 1-byte stream-id prefixes
+/// (non-PTY — stdin gets a `0` prefix; only stdout/exit are surfaced, stderr is
+/// dropped so a non-PTY consumer like the bridge sees a clean byte stream).
 async fn drive_exec<S>(
     ws: S,
+    tty: bool,
     frames_tx: tokio::sync::mpsc::Sender<ExecFrame>,
     mut control_rx: tokio::sync::mpsc::Receiver<ExecControl>,
     sid_tx: tokio::sync::watch::Sender<Option<String>>,
@@ -995,7 +1038,8 @@ async fn drive_exec<S>(
         tokio::select! {
             ctrl = control_rx.recv() => match ctrl {
                 Some(ExecControl::Stdin(b)) => {
-                    if write.send(Message::Binary(b)).await.is_err() {
+                    let frame = if tty { b } else { encode_stream_stdin(&b) };
+                    if write.send(Message::Binary(frame)).await.is_err() {
                         break;
                     }
                 }
@@ -1009,8 +1053,25 @@ async fn drive_exec<S>(
             },
             msg = read.next() => match msg {
                 Some(Ok(Message::Binary(b))) => {
-                    if frames_tx.send(ExecFrame::Stdout(b)).await.is_err() {
-                        break;
+                    if tty {
+                        if frames_tx.send(ExecFrame::Stdout(b)).await.is_err() {
+                            break;
+                        }
+                    } else {
+                        match decode_stream_frame(&b) {
+                            StreamMsg::Stdout(d) => {
+                                if frames_tx.send(ExecFrame::Stdout(d)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            StreamMsg::Exit(code) => {
+                                let _ = frames_tx.send(ExecFrame::Exit(code)).await;
+                                break;
+                            }
+                            // stderr (agent logs) and unknown ids: not part of the
+                            // consumer's byte stream.
+                            StreamMsg::Stderr(_) | StreamMsg::Ignore => {}
+                        }
                     }
                 }
                 Some(Ok(Message::Text(t))) => match parse_sprite_ctrl(t.as_str()) {
@@ -1362,6 +1423,27 @@ mod tests {
             resize_json(120, 40),
             r#"{"type":"resize","cols":120,"rows":40}"#
         );
+    }
+
+    #[test]
+    fn non_pty_stream_framing_roundtrips() {
+        // stdin is prefixed with the stdin stream id (0).
+        assert_eq!(encode_stream_stdin(b"hi"), vec![0, b'h', b'i']);
+        // server frames split on the 1-byte stream id.
+        assert_eq!(
+            decode_stream_frame(&[1, b'o', b'k']),
+            StreamMsg::Stdout(b"ok".to_vec())
+        );
+        assert_eq!(
+            decode_stream_frame(&[2, b'e', b'r', b'r']),
+            StreamMsg::Stderr(b"err".to_vec())
+        );
+        assert_eq!(
+            decode_stream_frame(&[3, b'1', b'3', b'7']),
+            StreamMsg::Exit(137)
+        );
+        assert_eq!(decode_stream_frame(&[]), StreamMsg::Ignore);
+        assert_eq!(decode_stream_frame(&[9, 1, 2]), StreamMsg::Ignore);
     }
 
     #[test]
