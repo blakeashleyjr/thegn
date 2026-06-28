@@ -414,6 +414,10 @@ pub struct FrameModel {
     /// statusbar badge + the System ▸ Share panel section. Synced from the
     /// `ShareSupervisor` (loop-local), not from hydration.
     pub shares: Vec<crate::share::ShareView>,
+    /// Active auto port forwards (`[forward]`) for the current worktree — feeds
+    /// the System ▸ Forward panel section + the `o` open-in-browser action.
+    /// Synced from the `ForwardSupervisor` (loop-local), not from hydration.
+    pub forwards: Vec<crate::forward::ForwardView>,
     /// Deterministic container name for the active worktree path. The sandbox
     /// panel uses this to show the sandbox for the selected worktree instead of
     /// the first superzej-owned container on the machine.
@@ -2755,6 +2759,7 @@ pub(crate) fn panel_help_pairs(ui: &crate::panel::PanelUi) -> Vec<(String, Strin
             ("≡", "playlist"),
         ],
         Section::Share => &[("j/k", "row"), ("↵", "copy url")],
+        Section::Forward => &[("j/k", "row"), ("o", "open in browser"), ("↵", "copy url")],
         Section::Debug | Section::Sandbox | Section::Db | Section::Telemetry | Section::Keys => {
             &[("j/k", "row")]
         }

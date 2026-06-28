@@ -1200,6 +1200,25 @@ ready_timeout_secs = 20
 # extra_args = []  # extra `dumbpipe listen-tcp` flags (e.g. a self-hosted relay).
 #                  # The consumer connects with `dumbpipe connect-tcp <ticket>`.
 
+# ── Automatic port forwarding / browser preview (`[forward]`) ───────────────
+# The outbound-localhost sibling of [share]: when a dev server binds a port INSIDE
+# a worktree's sandbox (container / ssh host / k8s pod), superzej auto-detects it
+# and forwards it to the host so it's previewable at http://localhost:<port>.
+# Active forwards appear in the System panel; press `o` to open the focused one in
+# your browser. On by default — forwards bind loopback only, so this is safe.
+[forward]
+auto = true            # auto-detect + forward newly-bound sandbox ports
+range = "8000-8999"    # host-port range for remaps when a port's own number is taken
+ignore = []            # container ports never to forward, e.g. [5432, 22]
+only = []              # if non-empty, ONLY forward these container ports
+bind = "127.0.0.1"     # host interface to bind forwards on (loopback = host-local)
+poll_secs = 2          # how often the sandbox is scanned for new listening ports
+browser = ""           # "open in browser" command; "" = $BROWSER, then xdg-open/open
+open_on_detect = false # auto-open the browser when a new forward comes up
+# Conflict handling: if a detected port's own number is already bound on the host,
+# the forward is remapped to the next free port in `range` and a notification shows
+# the real URL (e.g. "port 3000 in use → forwarded at localhost:8001").
+
 # ── Named execution environments (`[env.<name>]`) ───────────────────────────
 # A reusable *library* of execution environments. Each bundles three orthogonal
 # axes: a PLACEMENT (where processes run — local / ssh / k8s / provider), an

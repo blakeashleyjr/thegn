@@ -561,6 +561,14 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
                 vec![seg(g2(), "off")]
             }
         }
+        Section::Forward => {
+            let n = model.forwards.len();
+            if n > 0 {
+                vec![seg(hue(Hue::Teal), format!("\u{21c5} {n}"))]
+            } else {
+                vec![seg(g2(), "—")]
+            }
+        }
     }
 }
 
@@ -613,6 +621,7 @@ pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
         Section::Debug => misc::debug(),
         Section::Sandbox => misc::sandbox(ctx),
         Section::Share => misc::share(ctx),
+        Section::Forward => misc::forward(ctx),
         Section::Db => misc::db(),
         Section::Telemetry => telemetry::content(ctx),
         Section::Keys => keys::content(ctx),
@@ -1023,10 +1032,10 @@ mod spec {
             assert!(!h.is_empty(), "{section:?} half");
             assert!(!f.is_empty(), "{section:?} full");
             // Debug/Db are dead-code placeholder sections — distinctness is waived.
-            // Logs/Share are flat lists with no width-specific full view.
+            // Logs/Share/Forward are flat lists with no width-specific full view.
             if matches!(
                 section,
-                Section::Debug | Section::Db | Section::Logs | Section::Share
+                Section::Debug | Section::Db | Section::Logs | Section::Share | Section::Forward
             ) {
                 continue;
             }

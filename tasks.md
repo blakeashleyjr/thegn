@@ -874,10 +874,10 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 - [ ] 365. Container DNS proxy
 - [ ] 366. Single auditable egress point
 - [ ] 367. Shared chokepoint with LLM proxy
-- [ ] 368. Open-port detection
-- [ ] 369. One-click open in browser
+- [x] 368. Open-port detection — `[forward]` off-loop detector (`ss` probe + diff)
+- [x] 369. One-click open in browser — System ▸ Forward panel, `o` opens preview
 - [ ] 370. Friendly local hostnames (worktree.localhost)
-- [ ] 371. Reverse proxy for ports
+- [x] 371. Reverse proxy for ports — userspace `exec`-bridge proxy, auto-remap on conflict (local; ssh/k8s = Phase 2/3)
 - [~] 372. Block/allow lists per container
 
 ### AD. Container observability

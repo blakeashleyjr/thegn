@@ -127,6 +127,9 @@ pub enum Section {
     /// Active ingress shares (`[share]`): the ports this worktree exposes and
     /// their public URLs.
     Share,
+    /// Active auto port forwards (`[forward]`): sandbox-internal dev-server ports
+    /// forwarded to the host's loopback for browser preview.
+    Forward,
     Telemetry,
     /// Now-playing + transport for the optional `[media]` feature. Hidden unless
     /// `[media] enabled`.
@@ -143,11 +146,11 @@ pub enum Section {
 /// sections` is unset. Grouped by tab:
 /// - Git (5): Changes, Commits, Branches, Stash, Files
 /// - Work (8): Mine, Pr, Ci, Issues, Problems, Jobs, Tests, Symbols
-/// - System (7): Notifications, Logs, Sandbox, Share, Telemetry, Media, Keys
+/// - System (8): Notifications, Logs, Sandbox, Share, Forward, Telemetry, Media, Keys
 ///
 /// The live order (config-reordered, possibly trimmed) rides on
 /// [`PanelUi::order`]; numbered jump keys index the ACTIVE TAB's slice.
-pub const SECTION_ORDER: [Section; 20] = [
+pub const SECTION_ORDER: [Section; 21] = [
     // Git tab
     Section::Changes,
     Section::Commits,
@@ -168,6 +171,7 @@ pub const SECTION_ORDER: [Section; 20] = [
     Section::Logs,
     Section::Sandbox,
     Section::Share,
+    Section::Forward,
     Section::Telemetry,
     Section::Media,
     Section::Keys,
@@ -199,6 +203,7 @@ impl Section {
             Section::Logs => "logs",
             Section::Media => "media",
             Section::Share => "share",
+            Section::Forward => "forward",
         }
     }
 
@@ -222,6 +227,7 @@ impl Section {
             | Section::Logs
             | Section::Sandbox
             | Section::Share
+            | Section::Forward
             | Section::Telemetry
             | Section::Media
             | Section::Keys
@@ -1073,7 +1079,7 @@ mod tests {
 
     #[test]
     fn section_order_jump_and_cycle() {
-        assert_eq!(SECTION_ORDER.len(), 20);
+        assert_eq!(SECTION_ORDER.len(), 21);
         // Default tab = Git; Changes is in Git tab.
         let ui = PanelUi::default(); // open = Changes, tab = Git
         assert_eq!(ui.next_section(), Section::Commits); // next in Git tab
