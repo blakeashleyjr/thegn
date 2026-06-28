@@ -121,6 +121,35 @@ impl LaunchSpec {
     }
 }
 
+/// Why a NON-LOCAL environment (provider/k8s/ssh) could not be brought up while
+/// failover is disabled (`[sandbox] failover = false`, or a per-env override).
+/// Carried as the error so silent host degradation is refused — the spawn site
+/// surfaces it as a warning modal instead of opening a host shell. See
+/// [`env_halt_reason`] (the cheap proactive check) and `prepare_sandbox_env`
+/// (the bring-up-failure path).
+#[derive(Debug, Clone)]
+pub struct SandboxHalt {
+    pub env_name: String,
+    /// Placement label, e.g. `provider:sprites` / `k8s` / `ssh`.
+    pub placement: String,
+    /// Human-readable cause (token missing, auth rejected, no runnable backend…).
+    pub reason: String,
+}
+
+impl std::fmt::Display for SandboxHalt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "environment '{}' ({}) could not be brought up: {} — failover is off, \
+             so superzej will not silently fall back to the host. Fix the env, or \
+             set `failover = true` ([sandbox] or [env.{}]) to allow it.",
+            self.env_name, self.placement, self.reason, self.env_name
+        )
+    }
+}
+
+impl std::error::Error for SandboxHalt {}
+
 /// The settled sandbox for a worktree: the resolved+ensured spec, or `None`
 /// for the host fallback. `backend_label` is what the DB records ("host" when
 /// no sandbox stuck); `warnings` are the human-visible fallback notes that
@@ -200,6 +229,12 @@ pub fn prepare_sandbox_env(
     // placement isn't handled by `for_environment`, which is ssh-only).
     let env_data = environment.data;
     let env_name = environment.name.clone();
+    // Failover policy for THIS env. When false (the default) and the env is
+    // non-local, a bring-up failure halts (a `SandboxHalt` error) rather than
+    // degrading to the host — a remote/managed env is often required, so a quiet
+    // host drop is refused. `true` restores the historical chain→host fallback.
+    let failover = cfg.env_failover(repo_root, &env_name);
+    let placement_label = placement.label();
     // For a managed-provider env, persist a `GitLoc::Provider` location so the
     // chrome's git/fs reads route into the sandbox via the control-plane exec
     // prefix. `None` for local/ssh/k8s (their data plane is unchanged). The
@@ -284,8 +319,22 @@ pub fn prepare_sandbox_env(
     // sandbox-prepare path, mirroring the VPN sidecar bring-up below.
     // Warm-on-open: create the API sandbox first if `auto_provision` is set, so
     // the subsequent ensure/clone/connect find it live (8-E). No-op otherwise.
-    if matches!(placement, superzej_core::placement::Placement::Provider(_)) {
-        auto_provision_sandbox(cfg, &env_name, worktree);
+    if matches!(placement, superzej_core::placement::Placement::Provider(_))
+        && let Err(e) = auto_provision_sandbox(cfg, &env_name, worktree)
+    {
+        // A provider that won't provision (bad token, quota, API down) can't host
+        // the pane. With failover off, halt instead of silently degrading; with
+        // failover on, keep the historical best-effort warn-and-continue.
+        if !failover {
+            return Err(SandboxHalt {
+                env_name: env_name.clone(),
+                placement: placement_label.clone(),
+                reason: format!("auto-provision failed: {e}"),
+            }
+            .into());
+        }
+        warnings.push(format!("sandbox auto-provision failed: {e}"));
+        superzej_core::msg::warn(&format!("sandbox auto-provision failed: {e}"));
     }
     if !placement.is_local()
         && let Err(e) = placement.ensure()
@@ -407,6 +456,21 @@ pub fn prepare_sandbox_env(
             "explicit sandbox backend '{}' did not produce a runnable sandbox for {worktree}",
             sb.backend
         );
+    }
+    // Reaching here means no candidate produced a runnable sandbox and we'd fall
+    // back to a bare host shell. For a NON-LOCAL env with failover off, that
+    // silent drop is exactly what we refuse — halt with a warning instead.
+    if !placement.is_local() && !failover {
+        return Err(SandboxHalt {
+            env_name: env_name.clone(),
+            placement: placement_label.clone(),
+            reason: if warnings.is_empty() {
+                "no usable backend produced a runnable sandbox".to_string()
+            } else {
+                warnings.join("; ")
+            },
+        }
+        .into());
     }
     if auto_choice && warnings.is_empty() {
         warnings.push("sandbox auto selected host".to_string());
@@ -777,10 +841,17 @@ pub fn native_shell_exec(cfg: &Config, worktree: &str) -> Option<NativeShell> {
     } else {
         shell_inner_override(&sb_shell)
     };
-    let env = vec![
-        ("SUPERZEJ_WORKTREE".to_string(), worktree.to_string()),
-        ("SUPERZEJ_BRANCH".to_string(), String::new()),
-    ];
+    // Carry the host's passthrough secrets (GH_TOKEN, ANTHROPIC_API_KEY, …) into
+    // the provider exec so the in-sprite shell + any agent it spawns (pi, claude
+    // code, hermes) work like local. Remote-safe filter drops host-local socket
+    // vars (SSH_AUTH_SOCK/GPG_*) that would dangle in the VM. SUPERZEJ_* win.
+    let mut env = environment.sandbox.passthrough_env_remote();
+    // Route any agent in the sprite (pi, claude code, hermes) through szproxy by
+    // default — sets ANTHROPIC_BASE_URL etc. when a reachable remote proxy URL is
+    // configured. No-op otherwise (the agent talks upstream directly).
+    env.extend(cfg.llm_proxy.remote_agent_env(None));
+    env.push(("SUPERZEJ_WORKTREE".to_string(), worktree.to_string()));
+    env.push(("SUPERZEJ_BRANCH".to_string(), String::new()));
     Some(NativeShell {
         provider,
         provider_name: pc.provider.clone(),
@@ -789,6 +860,446 @@ pub fn native_shell_exec(cfg: &Config, worktree: &str) -> Option<NativeShell> {
         workdir: pc.sync_workdir(),
         env,
     })
+}
+
+/// Clear the failure cooldown for the worktree's provider native exec so a
+/// retry actually re-attempts the connection (otherwise [`env_halt_reason`]
+/// would re-halt immediately on the stale cooldown). No-op for non-provider
+/// envs; the token check in `env_halt_reason` still gates a tokenless retry.
+pub fn clear_native_exec_cooldown(cfg: &Config, worktree: &str) {
+    let loc = GitLoc::for_worktree(Path::new(worktree));
+    let repo_root: PathBuf = Db::open()
+        .ok()
+        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| repo::main_worktree(Path::new(worktree)))
+        .unwrap_or_else(|| PathBuf::from(worktree));
+    let selected_env = Db::open()
+        .ok()
+        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let environment = cfg.resolve_env(
+        &repo_root,
+        &loc,
+        Path::new(worktree),
+        selected_env.as_deref(),
+    );
+    if let superzej_core::placement::Placement::Provider(_) = &environment.placement
+        && let Some(envc) = cfg.env.get(&environment.name)
+    {
+        native_exec_report(&envc.provider.provider, true);
+    }
+}
+
+/// Visual state of one provisioning step, surfaced to the loading screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvisionState {
+    Active,
+    Done,
+    Failed,
+}
+
+/// A provisioning step as shown on the loading screen (label + live state).
+#[derive(Debug, Clone)]
+pub struct ProvisionStepView {
+    pub label: String,
+    pub state: ProvisionState,
+}
+
+/// Provision the worktree's environment if it runs on a managed **provider**
+/// (sprites, …) — a no-op (`Ok(false)`) for local/ssh/k8s envs. Resolves the env
+/// from the worktree, then delegates to [`provision_provider_env`]. This is the
+/// entry point the run loop calls off-thread before resolving the pane's launch
+/// spec, so a fresh sandbox is set up (and the loading screen streamed) before
+/// the pane attaches.
+pub fn provision_worktree(
+    cfg: &Config,
+    worktree: &str,
+    progress: impl FnMut(&[ProvisionStepView]),
+) -> anyhow::Result<bool> {
+    let loc = GitLoc::for_worktree(Path::new(worktree));
+    let repo_root: PathBuf = Db::open()
+        .ok()
+        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| repo::main_worktree(Path::new(worktree)))
+        .unwrap_or_else(|| PathBuf::from(worktree));
+    let selected_env = Db::open()
+        .ok()
+        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let environment = cfg.resolve_env(
+        &repo_root,
+        &loc,
+        Path::new(worktree),
+        selected_env.as_deref(),
+    );
+    if !matches!(
+        environment.placement,
+        superzej_core::placement::Placement::Provider(_)
+    ) {
+        return Ok(false);
+    }
+    provision_provider_env(cfg, worktree, &environment.name, progress)
+}
+
+/// Make a sandbox/remote env "just work" like local, by reproducing the repo's
+/// **declared** environment inside it (see `superzej_core::envplan`): clone the
+/// repo, install the declared toolchain (Nix devShell / mise / runtimes), sync
+/// dotfiles, and checkpoint so the heavy install is one-time. Provider-agnostic
+/// over the exec/fs APIs — no `sprite` CLI or musl bridge required.
+///
+/// Idempotent: a marker file under the workdir short-circuits a re-provision.
+/// Runs OFF the event loop (network + minutes-long installs). `progress` is
+/// called with the full step list after every state change so the caller can
+/// render a live loading screen. Returns `Ok(true)` when the env is provisioned
+/// (now or already), `Ok(false)` when not applicable (not a provider env / no
+/// provider built), `Err` if a step failed.
+pub fn provision_provider_env(
+    cfg: &Config,
+    worktree: &str,
+    env_name: &str,
+    mut progress: impl FnMut(&[ProvisionStepView]),
+) -> anyhow::Result<bool> {
+    use superzej_core::envplan::{self, EnvPlan, PlanOpts, StepKind};
+
+    let Some(env) = cfg.env.get(env_name) else {
+        return Ok(false);
+    };
+    let pc = &env.provider;
+    let id = superzej_core::config::effective_provider_id(&pc.id, Path::new(worktree));
+    if id.is_empty() {
+        return Ok(false);
+    }
+    let Some(provider) = provider_for(pc) else {
+        return Ok(false);
+    };
+    if !provider.caps().files {
+        return Ok(false); // can't provision without the fs API
+    }
+    let workdir = pc.sync_workdir();
+    let marker = EnvPlan::marker_path(&workdir);
+
+    // Idempotent: already provisioned ⇒ nothing to do.
+    if block_on_provider(|| async { provider.read(&id, &marker).await }).is_ok() {
+        return Ok(true);
+    }
+
+    // Resolve the repo origin so the sprite can clone it.
+    let repo_root: PathBuf = Db::open()
+        .ok()
+        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| repo::main_worktree(Path::new(worktree)))
+        .unwrap_or_else(|| PathBuf::from(worktree));
+
+    let req = envplan::detect(Path::new(worktree));
+    // Host secrets (GH_TOKEN, ANTHROPIC_API_KEY, …) carried into every provisioning
+    // command so the clone authenticates against private repos and setup steps can
+    // reach the network/model. Remote-safe (no host-local socket vars).
+    let exec_env = cfg.repo_sandbox(&repo_root).passthrough_env_remote();
+    // The generic, declarative personal layer ([sandbox.home]) — applied to every
+    // sandbox so it feels like local. `dotfiles` defaults sensibly when unset.
+    let home = &cfg.repo_sandbox(&repo_root).home;
+    let dotfiles = if home.dotfiles.is_empty() {
+        default_dotfiles()
+    } else {
+        home.dotfiles.clone()
+    };
+    let opts = PlanOpts {
+        workdir: workdir.clone(),
+        origin: local_origin(&repo_root),
+        branch: None,
+        dotfiles,
+        tools: home.tools.clone(),
+        dotfiles_repo: home.dotfiles_repo.clone(),
+        setup: resolve_setup(home),
+        agents: home.agents.clone(),
+        allow_nix: true,
+        checkpoint: pc.auto_checkpoint,
+    };
+    let plan = envplan::plan(&req, &opts);
+
+    // The sandbox user's real `$HOME` — uploads must land there (sprites exec as
+    // user `sprite`, HOME=/home/sprite, NOT /root). Resolved once via the exec API.
+    let sprite_home = block_on_provider(|| async {
+        provider
+            .run_exec(
+                &id,
+                &[
+                    "/bin/sh".to_string(),
+                    "-lc".to_string(),
+                    "printf %s \"$HOME\"".to_string(),
+                ],
+                None,
+                &[],
+            )
+            .await
+    })
+    .ok()
+    .map(|(_, out)| out.trim().to_string())
+    .filter(|h| h.starts_with('/'))
+    .unwrap_or_else(|| "/root".to_string());
+
+    // Seed the loading screen with all steps pending→active.
+    let mut views: Vec<ProvisionStepView> = plan
+        .steps
+        .iter()
+        .map(|s| ProvisionStepView {
+            label: s.label.clone(),
+            state: ProvisionState::Active,
+        })
+        .collect();
+
+    for (i, step) in plan.steps.iter().enumerate() {
+        for (j, v) in views.iter_mut().enumerate() {
+            v.state = match j.cmp(&i) {
+                std::cmp::Ordering::Less => ProvisionState::Done,
+                std::cmp::Ordering::Equal => ProvisionState::Active,
+                std::cmp::Ordering::Greater => ProvisionState::Active, // pending shows as active spinner
+            };
+        }
+        progress(&views);
+
+        let result: anyhow::Result<()> = match &step.kind {
+            StepKind::Exec(script) => {
+                // `/bin/sh -lc` + `2>&1` so the non-tty exec captures stderr too.
+                // Prefix PATH with the per-user nix + local-bin dirs: the provider
+                // exec env is non-login (no `$USER`), so the installer's profile.d
+                // hook is a no-op — every step must put these on PATH itself for a
+                // later step to see a tool a prior step installed (nix, mise, …).
+                let argv = vec![
+                    "/bin/sh".to_string(),
+                    "-lc".to_string(),
+                    format!(
+                        "export PATH=\"$HOME/.nix-profile/bin:$HOME/.local/state/nix/profile/bin:$HOME/.local/bin:$PATH\"; {script} 2>&1"
+                    ),
+                ];
+                block_on_provider(|| async { provider.run_exec(&id, &argv, None, &exec_env).await })
+                    .and_then(|(code, out)| {
+                        if code == 0 {
+                            Ok(())
+                        } else {
+                            Err(anyhow::anyhow!(
+                                "{} (exit {code}): {}",
+                                step.label,
+                                tail_lines(&out, 4)
+                            ))
+                        }
+                    })
+            }
+            StepKind::Dotfiles(files) => upload_dotfiles(&provider, &id, &sprite_home, files),
+            StepKind::AgentConfigs(agents) => {
+                upload_agent_configs(&provider, &id, &sprite_home, agents)
+            }
+            StepKind::Checkpoint => block_on_provider(|| async {
+                provider.checkpoint(&id, Some("superzej-provisioned")).await
+            })
+            .map(|_| ()),
+        };
+
+        if let Err(e) = result {
+            views[i].state = ProvisionState::Failed;
+            progress(&views);
+            return Err(e);
+        }
+        views[i].state = ProvisionState::Done;
+        progress(&views);
+    }
+
+    // Drop the marker so a later open skips re-provisioning.
+    let _ = block_on_provider(|| async { provider.write(&id, &marker, b"ok\n").await });
+    Ok(true)
+}
+
+/// The final personal setup commands: the inline `[sandbox.home] setup` list,
+/// then `setup_script` resolved — if it names an existing HOST file, its contents
+/// are inlined (so no upload is needed); otherwise it's treated as an in-sandbox
+/// path and run with `sh`. Bring-your-own escape hatch (agent CLIs, internal
+/// tooling, anything not a package).
+fn resolve_setup(home: &superzej_core::config::HomeConfig) -> Vec<String> {
+    let mut cmds = home.setup.clone();
+    let script = home.setup_script.trim();
+    if !script.is_empty() {
+        let host_path = if let Some(rest) = script.strip_prefix("~/") {
+            std::env::var("HOME")
+                .map(|h| format!("{h}/{rest}"))
+                .unwrap_or_else(|_| script.to_string())
+        } else {
+            script.to_string()
+        };
+        match std::fs::read_to_string(&host_path) {
+            Ok(body) => cmds.push(body),
+            Err(_) => cmds.push(format!("sh {}", superzej_core::util::sh_quote(script))),
+        }
+    }
+    cmds
+}
+
+/// Host dotfiles to carry into a sandbox `$HOME` so the shell feels like home.
+/// Only those that exist on the host are uploaded (see [`upload_dotfiles`]).
+fn default_dotfiles() -> Vec<String> {
+    [
+        ".gitconfig",
+        ".zshrc",
+        ".bashrc",
+        ".profile",
+        ".tmux.conf",
+        ".vimrc",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Upload the present host dotfiles/dotdirs into the sandbox's `$HOME` (`/root`).
+/// A basename that's a FILE is uploaded via the fs `write`; a DIRECTORY (e.g.
+/// `.config/gcloud`, `.aws`) is uploaded recursively via `upload_dir` — so cloud
+/// creds and multi-file config carry over too. Missing host paths are skipped; a
+/// genuine upload failure aborts the step.
+fn upload_dotfiles(
+    provider: &superzej_svc::provider::Provider,
+    id: &str,
+    sandbox_home: &str,
+    files: &[String],
+) -> anyhow::Result<()> {
+    let host_home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let base = sandbox_home.trim_end_matches('/');
+    for name in files {
+        let src = Path::new(&host_home).join(name);
+        let dest = format!("{base}/{name}");
+        if src.is_dir() {
+            block_on_provider(|| async { provider.upload_dir(id, &src, &dest).await })?;
+        } else if let Ok(data) = std::fs::read(&src) {
+            block_on_provider(|| async { provider.write(id, &dest, &data).await })?;
+        }
+    }
+    Ok(())
+}
+
+/// Upload coding agents' host config/credential dirs into the sandbox `$HOME`
+/// (`/root`) so the agent (claude code, codex, custom) is logged-in there.
+/// Per-agent paths come from [`envplan::agent_config_paths`]; missing host paths
+/// are skipped. Files go via the fs `write`; directories via recursive
+/// `upload_dir`. A genuine upload error aborts the step (surfaced on the splash).
+fn upload_agent_configs(
+    provider: &superzej_svc::provider::Provider,
+    id: &str,
+    sandbox_home: &str,
+    agents: &[String],
+) -> anyhow::Result<()> {
+    let host_home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let base = sandbox_home.trim_end_matches('/');
+    for agent in agents {
+        let (files, dirs) = superzej_core::envplan::agent_config_paths(agent);
+        for f in files {
+            let src = Path::new(&host_home).join(&f);
+            let Ok(data) = std::fs::read(&src) else {
+                continue;
+            };
+            let dest = format!("{base}/{f}");
+            block_on_provider(|| async { provider.write(id, &dest, &data).await })?;
+        }
+        for d in dirs {
+            let src = Path::new(&host_home).join(&d);
+            if !src.is_dir() {
+                continue;
+            }
+            let dest = format!("{base}/{d}");
+            block_on_provider(|| async { provider.upload_dir(id, &src, &dest).await })?;
+        }
+    }
+    Ok(())
+}
+
+/// Last `n` non-empty lines of command output, for a compact error message.
+fn tail_lines(out: &str, n: usize) -> String {
+    let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join(" | ")
+}
+
+/// Cheap, **loop-safe** (no network/subprocess) check made right before a
+/// worktree pane spawns: should this worktree HALT with a warning instead of
+/// opening a (host-degraded) pane? Returns `Some` only for a NON-LOCAL env with
+/// failover disabled whose bring-up is already known to be impossible — its API
+/// token is unset, or its native exec is in the post-failure cooldown (the live
+/// signal a recent connect/auth attempt failed, e.g. the sprites 401). `None`
+/// (proceed normally) for local envs, when failover is allowed, or when there's
+/// no cheap evidence of failure yet — in which case a later bring-up failure is
+/// caught in `prepare_sandbox_env` / the native relay, which flip the health flag
+/// so the next spawn halts here.
+pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
+    use superzej_core::config::ProviderExecMode;
+    let loc = GitLoc::for_worktree(Path::new(worktree));
+    let repo_root: PathBuf = Db::open()
+        .ok()
+        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| repo::main_worktree(Path::new(worktree)))
+        .unwrap_or_else(|| PathBuf::from(worktree));
+    let selected_env = Db::open()
+        .ok()
+        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let environment = cfg.resolve_env(
+        &repo_root,
+        &loc,
+        Path::new(worktree),
+        selected_env.as_deref(),
+    );
+    // Local envs never halt; an env that opts into failover keeps the old behavior.
+    if environment.placement.is_local() || cfg.env_failover(&repo_root, &environment.name) {
+        return None;
+    }
+    let placement = environment.placement.label();
+    if let superzej_core::placement::Placement::Provider(_) = &environment.placement {
+        let pc = &cfg.env.get(&environment.name)?.provider;
+        // Token check: the var the provider reads (defaults to SPRITES_TOKEN).
+        let var = {
+            let v = pc.api_key_env.trim();
+            if v.is_empty() { "SPRITES_TOKEN" } else { v }
+        };
+        let token_present = std::env::var(var)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+        let healthy = native_exec_healthy(&pc.provider);
+        tracing::debug!(
+            target: "szhost::sandbox",
+            env = %environment.name, %placement, provider = %pc.provider,
+            token_var = %var, token_present, native_exec_healthy = healthy,
+            exec = ?pc.exec,
+            "env_halt_reason: evaluating provider env"
+        );
+        if !token_present {
+            tracing::warn!(target: "szhost::sandbox", env = %environment.name, token_var = %var, "HALT: API token not set");
+            return Some(SandboxHalt {
+                env_name: environment.name.clone(),
+                placement,
+                reason: format!("API token ${var} is not set"),
+            });
+        }
+        // Native-exec failure cooldown: a recent connect/auth failure (e.g. 401)
+        // marked the provider unhealthy. With failover off we won't drop to host,
+        // so surface the halt rather than spawn a doomed pane.
+        if pc.exec != ProviderExecMode::Cli
+            && superzej_svc::provider::exec_api_by_name(&pc.provider)
+            && !healthy
+        {
+            tracing::warn!(target: "szhost::sandbox", env = %environment.name, provider = %pc.provider, "HALT: native exec unhealthy (recent failure)");
+            return Some(SandboxHalt {
+                env_name: environment.name.clone(),
+                placement,
+                reason: format!(
+                    "provider '{}' is unreachable or rejected authentication (recent exec failure)",
+                    pc.provider
+                ),
+            });
+        }
+        tracing::debug!(target: "szhost::sandbox", env = %environment.name, "env_halt_reason: provider OK, no halt");
+    }
+    None
 }
 
 /// Idempotently install the resident bridge binary into a provider env so a
@@ -824,25 +1335,30 @@ pub fn ensure_remote_bridge(cfg: &Config, env_name: &str, binary: &Path, remote_
 
 /// Warm-on-open (8-E): for a provider env with `auto_provision`, create the
 /// sandbox if it doesn't exist yet (API providers — CLI providers use
-/// `up_command`/`placement.ensure`). Best-effort + off-loop; a failure warns and
-/// later steps (clone/connect) degrade as usual. No-op unless `auto_provision`.
-fn auto_provision_sandbox(cfg: &Config, env_name: &str, worktree: &str) {
+/// `up_command`/`placement.ensure`). Runs off-loop. Returns `Err` if the provider
+/// rejected the request (e.g. a bad/expired token → 401); the caller decides
+/// whether that halts (failover off) or just warns (failover on). `Ok(())` on
+/// success, already-exists, or a no-op (not a provider / `auto_provision` off).
+fn auto_provision_sandbox(cfg: &Config, env_name: &str, worktree: &str) -> anyhow::Result<()> {
     let Some(env) = cfg.env.get(env_name) else {
-        return;
+        return Ok(());
     };
     let pc = &env.provider;
     // Per-worktree id (so each worktree warms its own sandbox).
     let name = superzej_core::config::effective_provider_id(&pc.id, Path::new(worktree));
     if !pc.auto_provision || name.is_empty() {
-        return;
+        return Ok(());
     }
     let Some(provider) = provider_for(pc) else {
-        return;
+        return Ok(());
     };
     match block_on_provider(|| async { provider.ensure_exists(&name).await }) {
-        Ok(true) => superzej_core::msg::info(&format!("provisioned sandbox {name}")),
-        Ok(false) => {} // already exists
-        Err(e) => superzej_core::msg::warn(&format!("sandbox auto-provision failed: {e}")),
+        Ok(true) => {
+            superzej_core::msg::info(&format!("provisioned sandbox {name}"));
+            Ok(())
+        }
+        Ok(false) => Ok(()), // already exists
+        Err(e) => Err(e),
     }
 }
 

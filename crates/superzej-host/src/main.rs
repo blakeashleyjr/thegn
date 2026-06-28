@@ -52,6 +52,7 @@ mod queries;
 mod recorder;
 mod relay;
 mod render_plan;
+mod revtunnel;
 mod run;
 mod sandbox_events;
 mod search;
@@ -212,6 +213,16 @@ pub enum Command {
     /// stdout. Not for interactive use — stdout is the protocol channel.
     #[command(hide = true)]
     Bridge,
+    /// Hidden: run the reverse-tunnel agent over stdio. The host spawns this
+    /// *inside* a remote env; it binds `127.0.0.1:<port>` in the sandbox and
+    /// multiplexes every connection to that port back to the host (which dials the
+    /// real target, e.g. the local `szproxy`) over this stdio channel. stdout is
+    /// the protocol channel — not for interactive use.
+    #[command(hide = true)]
+    BridgeRevtunnel {
+        /// Loopback port to listen on inside the sandbox.
+        port: u16,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -317,6 +328,17 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             // The resident agent: framed protocol over stdio until EOF. stdout is
             // the protocol channel — nothing else may write to it.
             superzej_svc::bridge::serve(std::io::stdin().lock(), std::io::stdout());
+            Ok(())
+        }
+        Command::BridgeRevtunnel { port } => {
+            // Reverse-tunnel sandbox endpoint: listen on loopback and mux every
+            // accepted connection back to the host over stdin/stdout.
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+                let stream = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
+                superzej_svc::revtunnel::run_sandbox(stream, listener).await
+            })?;
             Ok(())
         }
         Command::SandboxArgv { worktree } => {
