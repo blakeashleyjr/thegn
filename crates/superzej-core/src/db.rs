@@ -50,7 +50,8 @@ use std::path::PathBuf;
 /// v23: adds `group_tabs.pane_sessions` (per-leaf provider exec session, JSON
 /// `pane id → {provider, id, session}`) so a native-exec (provider WSS) pane
 /// reattaches to its live remote session — replaying scrollback — on restart.
-const SCHEMA_VERSION: i64 = 23;
+/// v24: adds `forwards` (the resurrection layer for auto port forwards, `[forward]`).
+const SCHEMA_VERSION: i64 = 24;
 
 pub struct Db {
     conn: Connection,
@@ -81,6 +82,17 @@ pub struct ShareRow {
     pub provider: String,
     pub public_url: Option<String>,
     pub state: String,
+    pub created_at: i64,
+}
+
+/// A persisted auto port forward (`[forward]`) — the resurrection record for a
+/// forward the host re-detects on restart. Keyed by `(worktree, container_port)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardRow {
+    pub worktree: String,
+    pub container_port: u16,
+    pub host_port: u16,
+    pub url: String,
     pub created_at: i64,
 }
 
@@ -663,6 +675,20 @@ impl Db {
             )",
             [],
         );
+        // v23: auto port forwards (`[forward]`). A worktree can forward several
+        // ports, so the key is (worktree, container_port). Additive; a row is the
+        // resurrection record so the host re-detects forwards on restart.
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS forwards (
+              worktree       TEXT    NOT NULL,
+              container_port INTEGER NOT NULL,
+              host_port      INTEGER NOT NULL,
+              url            TEXT    NOT NULL,
+              created_at     INTEGER NOT NULL,
+              PRIMARY KEY (worktree, container_port)
+            )",
+            [],
+        );
         // v18: the named execution environment selected per workspace/worktree
         // (`[env.<name>]`). Additive; absent/NULL = inherit the next layer down
         // (worktree → workspace → repo `.superzej.*` → global default → default).
@@ -733,6 +759,63 @@ impl Db {
             public_url: r.get(3)?,
             state: r.get(4)?,
             created_at: r.get(5)?,
+        })
+    }
+
+    // --- auto port forwards (`[forward]`; resurrection layer) --------------
+    /// Insert or update the forward record for `(worktree, container_port)`.
+    pub fn upsert_forward(
+        &self,
+        worktree: &str,
+        container_port: u16,
+        host_port: u16,
+        url: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO forwards(worktree,container_port,host_port,url,created_at)
+             VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(worktree,container_port) DO UPDATE SET
+               host_port=excluded.host_port,
+               url=excluded.url",
+            params![
+                worktree,
+                container_port as i64,
+                host_port as i64,
+                url,
+                util::now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// All persisted forwards, newest first (restore + panel listing).
+    pub fn list_forwards(&self) -> Result<Vec<ForwardRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT worktree,container_port,host_port,url,created_at \
+             FROM forwards ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], Self::map_forward_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Remove the forward record for `(worktree, container_port)`.
+    pub fn delete_forward(&self, worktree: &str, container_port: u16) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM forwards WHERE worktree=?1 AND container_port=?2",
+            params![worktree, container_port as i64],
+        )?;
+        Ok(())
+    }
+
+    fn map_forward_row(r: &rusqlite::Row) -> rusqlite::Result<ForwardRow> {
+        Ok(ForwardRow {
+            worktree: r.get(0)?,
+            container_port: r.get::<_, i64>(1)? as u16,
+            host_port: r.get::<_, i64>(2)? as u16,
+            url: r.get(3)?,
+            created_at: r.get(4)?,
         })
     }
 
@@ -2947,6 +3030,36 @@ mod tests {
         let rows = db.list_shares().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].local_port, 8080);
+    }
+
+    #[test]
+    fn forwards_upsert_list_and_delete() {
+        let db = db();
+        assert!(db.list_forwards().unwrap().is_empty());
+
+        // Two forwards on one worktree: one keeps its port, one was remapped.
+        db.upsert_forward("/wt/a", 3000, 3000, "http://127.0.0.1:3000")
+            .unwrap();
+        db.upsert_forward("/wt/a", 8080, 8001, "http://127.0.0.1:8001")
+            .unwrap();
+        assert_eq!(db.list_forwards().unwrap().len(), 2);
+
+        // Upsert updates the host port + url in place (conflict re-remap).
+        db.upsert_forward("/wt/a", 8080, 8002, "http://127.0.0.1:8002")
+            .unwrap();
+        let rows = db.list_forwards().unwrap();
+        assert_eq!(rows.len(), 2);
+        let updated = rows
+            .iter()
+            .find(|r| r.container_port == 8080)
+            .expect("port 8080");
+        assert_eq!(updated.host_port, 8002);
+        assert_eq!(updated.url, "http://127.0.0.1:8002");
+
+        db.delete_forward("/wt/a", 3000).unwrap();
+        let rows = db.list_forwards().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].container_port, 8080);
     }
 
     #[test]

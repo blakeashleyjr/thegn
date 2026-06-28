@@ -2584,6 +2584,74 @@ impl ShareConfig {
     }
 }
 
+/// `[forward]` — automatically forward dev-server ports bound *inside* a
+/// worktree's sandbox to the host's loopback for browser preview. The
+/// *outbound-localhost* sibling of [`ShareConfig`]: `[share]` exposes a port at a
+/// public URL; `[forward]` makes a sandbox-internal port reachable on the host.
+/// On by default — forwards bind loopback only, so this is safe.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct ForwardConfig {
+    /// Auto-detect newly-bound ports inside the worktree's sandbox and forward
+    /// them to the host. When `false`, only an explicit `superzej forward` acts.
+    pub auto: bool,
+    /// Host-port allocation range (`"lo-hi"`, inclusive) used when a detected
+    /// port's own number is already taken on the host. Malformed ⇒ `8000-8999`.
+    pub range: String,
+    /// Container ports never to forward (e.g. an in-sandbox database or sshd).
+    pub ignore: Vec<u16>,
+    /// If non-empty, an allowlist: ONLY these container ports are forwarded.
+    pub only: Vec<u16>,
+    /// Host interface to bind forwards on. Loopback keeps previews host-local.
+    pub bind: String,
+    /// Detector poll cadence in seconds (how often the sandbox is scanned for
+    /// newly-bound listening ports).
+    pub poll_secs: u64,
+    /// Browser command for the "open in browser" action. Empty ⇒ `$BROWSER`,
+    /// then `xdg-open`/`open`.
+    pub browser: String,
+    /// Open the browser automatically when a new forward comes up.
+    pub open_on_detect: bool,
+}
+
+impl Default for ForwardConfig {
+    fn default() -> Self {
+        ForwardConfig {
+            auto: true,
+            range: "8000-8999".into(),
+            ignore: Vec::new(),
+            only: Vec::new(),
+            bind: "127.0.0.1".into(),
+            poll_secs: 2,
+            browser: String::new(),
+            open_on_detect: false,
+        }
+    }
+}
+
+impl ForwardConfig {
+    /// Whether a newly-detected `container_port` should be auto-forwarded:
+    /// `auto` is on, the port is not in `ignore`, and (if `only` is set) it is
+    /// allow-listed.
+    pub fn should_auto_forward(&self, container_port: u16) -> bool {
+        self.auto
+            && !self.ignore.contains(&container_port)
+            && (self.only.is_empty() || self.only.contains(&container_port))
+    }
+
+    /// Parse `range` into an inclusive `(lo, hi)`, falling back to `(8000, 8999)`
+    /// on a malformed or inverted value.
+    pub fn port_range(&self) -> (u16, u16) {
+        let parsed = || -> Option<(u16, u16)> {
+            let (lo, hi) = self.range.split_once('-')?;
+            let lo: u16 = lo.trim().parse().ok()?;
+            let hi: u16 = hi.trim().parse().ok()?;
+            (lo != 0 && hi >= lo).then_some((lo, hi))
+        };
+        parsed().unwrap_or((8000, 8999))
+    }
+}
+
 /// `[share.bore]` — <https://github.com/ekzhang/bore>, a tiny TCP tunnel. The
 /// client connects out to a relay (`to`) and exposes the local port at
 /// `to:<remote_port>`. Run your own `bore server` and set `to`/`secret`.
@@ -3398,6 +3466,9 @@ pub struct Config {
     pub media: MediaConfig,
     /// `[share]` — expose a worktree port at a public URL. Disabled by default.
     pub share: ShareConfig,
+    /// `[forward]` — auto-forward sandbox-internal dev-server ports to the host's
+    /// loopback for browser preview. On by default (loopback-only ⇒ safe).
+    pub forward: ForwardConfig,
     /// Rebind a built-in action by id, e.g. `new-worktree = "Ctrl w"`. The flat
     /// table is the global/default layer; nested mode tables are native-host only.
     pub keybinds: KeybindConfig,
@@ -3479,6 +3550,7 @@ impl Default for Config {
             merge_queue: MergeQueueConfig::default(),
             media: MediaConfig::default(),
             share: ShareConfig::default(),
+            forward: ForwardConfig::default(),
             keybinds: KeybindConfig::default(),
             actions: Vec::new(),
             profile: String::new(),
