@@ -339,6 +339,7 @@ impl PtyPane {
         rt.spawn(relay_exec(
             id,
             provider,
+            provider_name.clone(),
             sandbox_id.clone(),
             open,
             tx,
@@ -548,21 +549,47 @@ impl PtyPane {
 /// exact contract the PTY reader thread fulfills, so the event loop is blind to
 /// which transport a pane uses. Forwards stdin/resize from `ctrl_rx`, publishes
 /// the announced session id into `session_cell`, and ends on exit/close/drop.
+/// How a single [`relay_session`] ended — drives reconnect vs propagate.
+#[derive(Debug, PartialEq, Eq)]
+enum SessionEnd {
+    /// The server reported a command exit (terminal — propagate it).
+    Exited(i32),
+    /// The socket dropped without an exit; `progressed` = forwarded any output
+    /// this session (resets the reconnect budget).
+    Dropped { progressed: bool },
+    /// The pane was dropped (its control channel closed) — stop, no exit event.
+    PaneGone,
+}
+
+/// Max consecutive reconnects that make no progress before giving up.
+const MAX_DEAD_RECONNECTS: u32 = 3;
+
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    target = "szhost::frame",
+    name = "native_pane",
+    skip_all,
+    fields(pane = id, provider = %provider_name)
+)]
 async fn relay_exec(
     id: u32,
     provider: Provider,
+    provider_name: String,
     sandbox_id: String,
     open: ExecOpen,
     tx: tokio_mpsc::Sender<PaneEvent>,
     waker: Option<TerminalWaker>,
-    ctrl_rx: tokio_mpsc::Receiver<ExecControl>,
+    mut ctrl_rx: tokio_mpsc::Receiver<ExecControl>,
     session_cell: Arc<Mutex<Option<String>>>,
 ) {
     let wake = || {
         if let Some(w) = &waker {
             let _ = w.wake();
         }
+    };
+    let (cols, rows) = match &open {
+        ExecOpen::Open(spec) => (spec.cols, spec.rows),
+        ExecOpen::Attach { cols, rows, .. } => (*cols, *rows),
     };
     let opened = match open {
         ExecOpen::Open(spec) => provider.open_exec(&sandbox_id, &spec).await,
@@ -576,11 +603,15 @@ async fn relay_exec(
                 .await
         }
     };
-    let session = match opened {
-        Ok(s) => s,
+    let mut session = match opened {
+        Ok(s) => {
+            crate::agent::native_exec_report(&provider_name, true);
+            s
+        }
         Err(e) => {
-            // Surface the failure in the pane and exit non-zero so the loop's
-            // crash path can offer a fallback/relaunch.
+            // Mark the provider unhealthy so `exec=auto` panes fall back to the
+            // CLI during the cooldown; surface the failure + a non-zero exit.
+            crate::agent::native_exec_report(&provider_name, false);
             let _ = tx
                 .send(PaneEvent::Output(
                     id,
@@ -593,22 +624,50 @@ async fn relay_exec(
             return;
         }
     };
-    relay_session(id, session, tx, waker, ctrl_rx, session_cell).await;
+
+    // Reconnect loop: a transient socket drop with a known session id reattaches
+    // (replaying scrollback). Bounded so a permanently-dead session still exits.
+    let mut dead = 0u32;
+    loop {
+        match relay_session(id, session, &tx, &waker, &mut ctrl_rx, &session_cell).await {
+            SessionEnd::Exited(code) => {
+                let _ = tx.send(PaneEvent::Exit(id, Some(code))).await;
+                wake();
+                return;
+            }
+            SessionEnd::PaneGone => return,
+            SessionEnd::Dropped { progressed } => {
+                dead = if progressed { 0 } else { dead + 1 };
+                let sid = session_cell.lock().ok().and_then(|c| c.clone());
+                if dead < MAX_DEAD_RECONNECTS
+                    && let Some(sid) = sid
+                    && let Ok(s) = provider.attach_exec(&sandbox_id, &sid, cols, rows).await
+                {
+                    session = s;
+                    continue;
+                }
+                let _ = tx.send(PaneEvent::Exit(id, None)).await;
+                wake();
+                return;
+            }
+        }
+    }
 }
 
 /// Bridge an already-open [`ExecSession`] to the pane's `PaneEvent` channel until
-/// it exits/closes or the pane is dropped. Split out from [`relay_exec`] so it's
-/// unit-testable with a hand-built session (no live socket).
+/// it exits/closes or the pane is dropped, returning *why* it ended (so the
+/// caller can reconnect on a transient drop). Split out from [`relay_exec`] so
+/// it's unit-testable with a hand-built session (no live socket).
 async fn relay_session(
     id: u32,
     session: ExecSession,
-    tx: tokio_mpsc::Sender<PaneEvent>,
-    waker: Option<TerminalWaker>,
-    mut ctrl_rx: tokio_mpsc::Receiver<ExecControl>,
-    session_cell: Arc<Mutex<Option<String>>>,
-) {
+    tx: &tokio_mpsc::Sender<PaneEvent>,
+    waker: &Option<TerminalWaker>,
+    ctrl_rx: &mut tokio_mpsc::Receiver<ExecControl>,
+    session_cell: &Arc<Mutex<Option<String>>>,
+) -> SessionEnd {
     let wake = || {
-        if let Some(w) = &waker {
+        if let Some(w) = waker {
             let _ = w.wake();
         }
     };
@@ -619,33 +678,27 @@ async fn relay_session(
     } = session;
 
     let mut sid_done = false;
+    let mut progressed = false;
     loop {
         tokio::select! {
             frame = frames.recv() => match frame {
                 Some(ExecFrame::Stdout(b)) => {
                     if tx.send(PaneEvent::Output(id, b)).await.is_err() {
-                        break;
+                        return SessionEnd::PaneGone;
                     }
+                    progressed = true;
                     wake();
                 }
-                Some(ExecFrame::Exit(code)) => {
-                    let _ = tx.send(PaneEvent::Exit(id, Some(code))).await;
-                    wake();
-                    break;
-                }
-                None => {
-                    let _ = tx.send(PaneEvent::Exit(id, None)).await;
-                    wake();
-                    break;
-                }
+                Some(ExecFrame::Exit(code)) => return SessionEnd::Exited(code),
+                None => return SessionEnd::Dropped { progressed },
             },
             ctrl = ctrl_rx.recv() => match ctrl {
                 Some(c) => {
                     if control.send(c).await.is_err() {
-                        break; // session driver gone
+                        return SessionEnd::Dropped { progressed }; // driver/socket gone
                     }
                 }
-                None => break, // pane dropped
+                None => return SessionEnd::PaneGone, // pane dropped
             },
             res = session_id.changed(), if !sid_done => {
                 match res {
@@ -807,14 +860,13 @@ mod tests {
             control: prov_ctrl_tx,
             session_id: sid_rx,
         };
-        rt.spawn(relay_session(
-            7,
-            session,
-            tx,
-            None,
-            pane_ctrl_rx,
-            cell.clone(),
-        ));
+        let cell_task = cell.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<SessionEnd>();
+        rt.spawn(async move {
+            let mut pane_ctrl_rx = pane_ctrl_rx;
+            let end = relay_session(7, session, &tx, &None, &mut pane_ctrl_rx, &cell_task).await;
+            let _ = done_tx.send(end);
+        });
 
         // 1. provider stdout → PaneEvent::Output, and it lands in the grid.
         frames_tx
@@ -862,12 +914,13 @@ mod tests {
         }
         assert_eq!(got.as_deref(), Some("sess-9"));
 
-        // 4. provider exit → PaneEvent::Exit with the code.
+        // 4. a provider exit ends the session as Exited(code) (relay_exec is what
+        // turns that into PaneEvent::Exit).
         frames_tx.blocking_send(ExecFrame::Exit(0)).unwrap();
-        assert!(matches!(
-            rx.blocking_recv(),
-            Some(PaneEvent::Exit(7, Some(0)))
-        ));
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(2)),
+            Ok(SessionEnd::Exited(0))
+        );
     }
 
     #[test]

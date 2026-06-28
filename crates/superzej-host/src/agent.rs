@@ -619,6 +619,54 @@ fn provider_for(
     }
 }
 
+/// Per-provider native-exec health: after a connect/exec failure, `exec = "auto"`
+/// spawns skip the native path (use the CLI) for a cooldown, then retry — so one
+/// flaky WSS connect degrades gracefully instead of husking every new pane.
+/// `exec = "api"` ignores this (it always tries native). The relay/bridge report
+/// outcomes via [`native_exec_report`]; the spawn decision consults
+/// [`native_exec_healthy`].
+mod native_health {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    const COOLDOWN: Duration = Duration::from_secs(30);
+
+    fn reg() -> &'static Mutex<HashMap<String, Instant>> {
+        static R: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+        R.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) fn report(provider: &str, ok: bool) {
+        let mut g = reg().lock().unwrap();
+        if ok {
+            g.remove(provider);
+        } else {
+            g.insert(provider.to_string(), Instant::now());
+        }
+    }
+
+    pub(super) fn healthy(provider: &str) -> bool {
+        reg()
+            .lock()
+            .unwrap()
+            .get(provider)
+            .is_none_or(|t| t.elapsed() >= COOLDOWN)
+    }
+}
+
+/// Report a native-exec connect/exec outcome for `provider` (drives the
+/// `exec = "auto"` fallback cooldown). Called from the pane relay + the bridge.
+pub(crate) fn native_exec_report(provider: &str, ok: bool) {
+    native_health::report(provider, ok);
+}
+
+/// Whether `provider`'s native exec is currently considered healthy (no recent
+/// failure within the cooldown). `exec = "auto"` skips native when this is false.
+pub(crate) fn native_exec_healthy(provider: &str) -> bool {
+    native_health::healthy(provider)
+}
+
 /// The provider to drive a resolved env's resident bridge over its **native exec
 /// API** (CLI-free control plane), or `None` when the env isn't an exec_api
 /// provider, opts out (`exec = "cli"`), or its token is unset. Used by the bridge
@@ -633,6 +681,11 @@ pub(crate) fn native_bridge_provider(
     };
     let pc = &cfg.env.get(&env.name)?.provider;
     if pc.exec == ProviderExecMode::Cli || !superzej_svc::provider::exec_api_by_name(&pc.provider) {
+        return None;
+    }
+    // Auto backs off to the CLI bridge during a provider's failure cooldown; api
+    // always tries native.
+    if pc.exec == ProviderExecMode::Auto && !native_exec_healthy(&pc.provider) {
         return None;
     }
     provider_for(pc)
@@ -701,6 +754,11 @@ pub fn native_shell_exec(cfg: &Config, worktree: &str) -> Option<NativeShell> {
     };
     let pc = &cfg.env.get(&environment.name)?.provider;
     if pc.exec == ProviderExecMode::Cli || !superzej_svc::provider::exec_api_by_name(&pc.provider) {
+        return None;
+    }
+    // Auto backs off to the CLI pane during a provider's failure cooldown; api
+    // always tries native.
+    if pc.exec == ProviderExecMode::Auto && !native_exec_healthy(&pc.provider) {
         return None;
     }
     // Token missing ⇒ no provider built ⇒ fall back to the CLI path (which has
@@ -1474,6 +1532,18 @@ fn sandbox_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_exec_health_reports_and_recovers() {
+        // Unique provider name so the process-global registry doesn't collide
+        // with other tests.
+        let p = "sprites-health-test-xyz";
+        assert!(native_exec_healthy(p), "unseen provider starts healthy");
+        native_exec_report(p, false);
+        assert!(!native_exec_healthy(p), "a failure marks it unhealthy");
+        native_exec_report(p, true);
+        assert!(native_exec_healthy(p), "a success clears it");
+    }
 
     fn cfg_with(agents: &[(&str, &str)], tools: &[(&str, &str)]) -> Config {
         let mut cfg = Config::default();

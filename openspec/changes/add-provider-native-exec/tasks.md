@@ -61,6 +61,18 @@ seam once registered; the bridge agent is now started over native exec.
 - [ ] 6.4 Live-verify on a real sprite with a musl bridge binary
       (`nix build .#szhost-musl`, `SUPERZEJ_BRIDGE_BINARY`).
 
+## 8. Polish (Phase D) — LANDED
+
+- [x] 8.1 `exec=auto` health-gated fallback: a per-provider failure cooldown
+      (`agent::native_exec_report`/`native_exec_healthy`); after a connect/exec
+      failure, `auto` shell panes + the native bridge back off to the CLI for the
+      cooldown, then retry. `api` always tries native. Unit-tested.
+- [x] 8.2 Bounded mid-session reconnect: `relay_session` returns a `SessionEnd`;
+      `relay_exec` reattaches via `attach_exec` on a transient drop (replays
+      scrollback), capped at `MAX_DEAD_RECONNECTS` no-progress attempts.
+- [x] 8.3 Trace span on the relay task (`szhost::frame` / `native_pane`) for the
+      live pass. (Full `szhost::perf` wake-source attribution deferred.)
+
 ## 7. Out of scope — agent pane in a provider env
 
 The AI **agent** pane (`attach_agent_pane`, `run.rs`) is not routed through native
