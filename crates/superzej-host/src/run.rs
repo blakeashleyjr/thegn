@@ -10225,9 +10225,18 @@ async fn event_loop<T: Terminal>(
             // Preserve transient status messages (crash alerts, user feedback)
             // so a periodic hydration tick doesn't silently clear them.
             let prev_status = std::mem::take(&mut model.status);
+            // Preserve the launch/provision splash steps: they're transient launch
+            // UI owned by the materialize/provision/spec flow, NOT hydration (which
+            // carries only git/db data and leaves load_steps empty). Without this, a
+            // periodic/fs-watch hydration during the minutes-long provider provision
+            // wipes the steps and the next provision update re-adds them — the
+            // loading screen flickers in and out. Cleared normally on first PTY
+            // output / spec failure, so preserving here never makes the splash stick.
+            let load_steps = std::mem::take(&mut model.load_steps);
             model = next_model;
             model.stats = stats;
             model.metrics = metrics;
+            model.load_steps = load_steps;
             if model.status.is_empty() {
                 model.status = prev_status;
             }
