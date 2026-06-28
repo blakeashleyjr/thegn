@@ -1447,10 +1447,11 @@ bouncer = false
 # if it's green — bisecting the offending branch on red. This is the real
 # correctness wall, automated rather than babysat.
 #
-# Disabled by default; AI-free and strictly additive — the shell never depends
-# on it.
+# On by default; the core (fold + integrate) is AI-free — the agent handoff is
+# the only AI touch and only fires on a conflict. Set enabled = false to remove
+# the command, panel section, and badge entirely.
 [merge_queue]
-enabled = false
+enabled = true
 target_branch = "auto"        # branch to advance; "auto" = repo HEAD/default
 gate_command = ""             # e.g. "just ci" / "cargo test --workspace"; "" disables the gate
 gate_on = true                # run gate_command before advancing main

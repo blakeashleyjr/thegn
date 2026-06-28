@@ -545,9 +545,10 @@ config_enum! {
 
 /// `[merge_queue]` — the local "fold-actor": fold parallel worktree branches into
 /// `target_branch` in the object database (no checkout), auto-landing every
-/// branch that merges clean and deferring only genuine conflicts. Disabled by
-/// default; the AI-free shell never depends on it. See `superzej_core::fold` for
-/// the pure engine and the host `integrate` runner for the I/O (test-gate + CAS).
+/// branch that merges clean and deferring only genuine conflicts. On by default;
+/// the core (fold + integrate) is AI-free — the conflict handoff is the only AI
+/// touch and only fires on a deferral. See `superzej_core::fold` for the pure
+/// engine and the host `integrate` runner for the I/O (test-gate + CAS).
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct MergeQueueConfig {
@@ -588,7 +589,7 @@ pub struct MergeQueueConfig {
 impl Default for MergeQueueConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             target_branch: "auto".to_string(),
             gate_command: String::new(),
             gate_on: true,
@@ -3488,7 +3489,7 @@ pub struct Config {
     /// The LLM proxy daemon (`[llm_proxy]`). Disabled by default — AI is additive.
     pub llm_proxy: LlmProxyConfig,
     /// `[merge_queue]` — the local fold-actor (parallel-branch integration).
-    /// Disabled by default; AI-free and additive.
+    /// On by default; the core is AI-free (agent handoff only fires on conflict).
     pub merge_queue: MergeQueueConfig,
     /// `[media]` — media-player control. On by default (`mpris` backend), inert
     /// where D-Bus/`playerctl` are absent. Additive — the shell never depends on it.
