@@ -436,6 +436,21 @@ _apply-backend backend="":
       esac; \
     fi
 
+# Dogfood the local merge queue (the fold-actor): same isolated state root as
+# `start`, but with `[merge_queue]` switched on via --set overrides (no daily
+# config edit needed). Folds eligible worktree branches into the target branch
+# with a compile gate; Super+K → "Integrate" / "Merge queue", or it auto-drains
+# ~5s after an agent finishes. Override the gate with `gate='just test'` etc.
+start-mq name="dev" gate="cargo build --workspace": build
+    state="$HOME/.superzej-{{name}}/state"; run="$HOME/.superzej-{{name}}/run"; pidfile="$run/szhost.pid"; mkdir -p "$state" "$run"; \
+      if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then kill "$(cat "$pidfile")" 2>/dev/null || true; fi; \
+      echo $$ > "$pidfile"; exec env \
+      "SUPERZEJ_ALACRITTY_CONFIG=$PWD/config/alacritty.toml" \
+      "XDG_STATE_HOME=$state" \
+      {{bin}} --set merge_queue.enabled=true \
+              --set 'merge_queue.gate_command={{gate}}' \
+              --set merge_queue.regenerate_command="cargo update --workspace"
+
 # Build and open the native host in a fresh ghostty window with the FULL
 # dev/debug/profiling toolchain wired up. ghostty runs a hermetic, perf-tuned
 # profile (config/ghostty.config: --config-default-files=false keeps your
