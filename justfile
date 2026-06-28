@@ -422,7 +422,7 @@ _apply-backend backend="":
           command -v sprite >/dev/null 2>&1 || echo "note: sprite CLI not on PATH — fine for native exec (the default exec=auto attaches over the WSS API with just SPRITES_TOKEN); the CLI is only the fallback transport" >&2; \
           if ! grep -q '^\[env\.sprites\]' "$cfg" 2>/dev/null; then \
             mkdir -p "$(dirname "$cfg")"; \
-            printf '\n[env.sprites]\nplacement = "provider"\ndata = "in_env"\n[env.sprites.provider]\nprovider = "sprites"\nid = "superzej"\napi_key_env = "SPRITES_TOKEN"\nexec = "auto"\nauto_provision = true\nauto_checkpoint = true\n# CLI bridge — only used if you set exec = "cli"; lifecycle is API (auto_provision/auto_checkpoint).\nexec_command = ["sprite", "exec", "-s", "{id}", "--"]\ninteractive_command = ["sprite", "exec", "-s", "{id}", "--tty", "--"]\n' >> "$cfg"; \
+            printf '\n[env.sprites]\nplacement = "provider"\ndata = "in_env"\n[env.sprites.provider]\nprovider = "sprites"\n# Per-worktree sprite: {worktree}=dir basename, {slug}=full-path (globally unique), ""=basename.\nid = "{worktree}"\napi_key_env = "SPRITES_TOKEN"\nexec = "auto"\nauto_provision = true\nauto_checkpoint = true\n# CLI bridge — only used if you set exec = "cli"; lifecycle is API (auto_provision/auto_checkpoint).\nexec_command = ["sprite", "exec", "-s", "{id}", "--"]\ninteractive_command = ["sprite", "exec", "-s", "{id}", "--tty", "--"]\n' >> "$cfg"; \
             echo "scaffolded [env.sprites] into $cfg"; \
           fi; \
           printf 'env = "sprites"\n' > "$overlay"; \

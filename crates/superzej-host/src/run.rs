@@ -2299,7 +2299,7 @@ fn connect_worktree_bridge(
         let env_name = superzej_core::db::Db::open()
             .ok()
             .and_then(|db| db.worktree_env(&wt.to_string_lossy()).ok().flatten());
-        let env = cfg.resolve_env(&repo_root, &loc, env_name.as_deref());
+        let env = cfg.resolve_env(&repo_root, &loc, &wt, env_name.as_deref());
         // For a managed provider, install the resident bridge binary first (8-B.3,
         // idempotent content handshake) so the connect below finds it in the env.
         // No-op when no local binary is configured or the env isn't a provider.

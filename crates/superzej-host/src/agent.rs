@@ -189,7 +189,7 @@ pub fn prepare_sandbox_env(
     scope: SandboxScope,
     selected_env: Option<&str>,
 ) -> anyhow::Result<SandboxOutcome> {
-    let environment = cfg.resolve_env(repo_root, loc, selected_env);
+    let environment = cfg.resolve_env(repo_root, loc, Path::new(worktree), selected_env);
     let placement = environment.placement.clone();
     let env_shell = environment.sandbox.shell.clone();
     // The worktree-projection plan (sshfs/sync) for this env's `data` mode, or
@@ -285,7 +285,7 @@ pub fn prepare_sandbox_env(
     // Warm-on-open: create the API sandbox first if `auto_provision` is set, so
     // the subsequent ensure/clone/connect find it live (8-E). No-op otherwise.
     if matches!(placement, superzej_core::placement::Placement::Provider(_)) {
-        auto_provision_sandbox(cfg, &env_name);
+        auto_provision_sandbox(cfg, &env_name, worktree);
     }
     if !placement.is_local()
         && let Err(e) = placement.ensure()
@@ -748,7 +748,12 @@ pub fn native_shell_exec(cfg: &Config, worktree: &str) -> Option<NativeShell> {
     let selected_env = Db::open()
         .ok()
         .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
-    let environment = cfg.resolve_env(&repo_root, &loc, selected_env.as_deref());
+    let environment = cfg.resolve_env(
+        &repo_root,
+        &loc,
+        Path::new(worktree),
+        selected_env.as_deref(),
+    );
     let superzej_core::placement::Placement::Provider(p) = &environment.placement else {
         return None;
     };
@@ -821,19 +826,19 @@ pub fn ensure_remote_bridge(cfg: &Config, env_name: &str, binary: &Path, remote_
 /// sandbox if it doesn't exist yet (API providers — CLI providers use
 /// `up_command`/`placement.ensure`). Best-effort + off-loop; a failure warns and
 /// later steps (clone/connect) degrade as usual. No-op unless `auto_provision`.
-fn auto_provision_sandbox(cfg: &Config, env_name: &str) {
+fn auto_provision_sandbox(cfg: &Config, env_name: &str, worktree: &str) {
     let Some(env) = cfg.env.get(env_name) else {
         return;
     };
     let pc = &env.provider;
-    let name = pc.id.trim();
+    // Per-worktree id (so each worktree warms its own sandbox).
+    let name = superzej_core::config::effective_provider_id(&pc.id, Path::new(worktree));
     if !pc.auto_provision || name.is_empty() {
         return;
     }
     let Some(provider) = provider_for(pc) else {
         return;
     };
-    let name = name.to_string();
     match block_on_provider(|| async { provider.ensure_exists(&name).await }) {
         Ok(true) => superzej_core::msg::info(&format!("provisioned sandbox {name}")),
         Ok(false) => {} // already exists
@@ -862,7 +867,8 @@ pub fn checkpoint_on_close(worktree: &str) {
         return;
     };
     let pc = &env.provider;
-    let name = pc.id.trim();
+    // Per-worktree id (so each worktree checkpoints its own sandbox).
+    let name = superzej_core::config::effective_provider_id(&pc.id, Path::new(worktree));
     if !pc.auto_checkpoint || name.is_empty() {
         return;
     }
@@ -872,7 +878,6 @@ pub fn checkpoint_on_close(worktree: &str) {
     if !provider.caps().checkpoints {
         return;
     }
-    let name = name.to_string();
     match block_on_provider(|| async { provider.checkpoint(&name, Some("auto-close")).await }) {
         Ok(id) => superzej_core::msg::info(&format!("checkpointed {name} on close: {id}")),
         Err(e) => superzej_core::msg::warn(&format!("auto-checkpoint on close failed: {e}")),

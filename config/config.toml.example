@@ -1291,7 +1291,10 @@ ready_timeout_secs = 20
 #                            #         pane spawn, pull changes back on close.
 # [env.sprites.provider]
 # provider = "sprites"       # selects the SpritesProvider REST adapter
-# id = "my-worktree"         # the sprite name (created/attached)
+# id = "{worktree}"          # sprite name. Tokens give a PER-WORKTREE sprite:
+#                            #   {worktree}=dir basename, {slug}=full path (globally
+#                            #   unique), ""=basename. A literal name with no token
+#                            #   = one SHARED sprite across all worktrees.
 # api_key_env = "SPRITES_TOKEN"        # empty ⇒ defaults to SPRITES_TOKEN
 # # api_base = "https://api.sprites.dev/v1"   # empty ⇒ this default
 # # workdir = "/workspace"   # data = "sync" pushes/pulls the worktree here
