@@ -1148,12 +1148,9 @@ pub fn bottombar_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> 
         }),
         // Active worktree's disk usage (size of its checkout incl. target/),
         // from the off-loop scan; sits next to LOC. Hidden until first scanned.
-        "disk" => model.active_worktree_disk.map(|b| {
-            w(
-                format!("{} DISK", superzej_core::disk::human(b)),
-                col(S::Dim),
-            )
-        }),
+        "disk" => model
+            .active_worktree_disk
+            .map(|b| w(superzej_core::disk::human(b), col(S::Dim))),
         // Forge + PR number, colored by state: open green, draft/queued
         // amber, closed and merged purple. Hidden when no PR exists.
         "pr" => model.panel.pr.as_ref().map(|pr| {
@@ -3387,15 +3384,11 @@ mod tests {
         let mut model = FrameModel::default();
         assert!(
             bottombar_widget("disk", &model).is_none(),
-            "hidden until scanned"
+            "hidden when size unknown"
         );
         model.active_worktree_disk = Some(7 * 1024 * 1024 * 1024); // 7G
         let wdg = bottombar_widget("disk", &model).expect("disk widget present");
-        assert!(
-            wdg.text.contains("7G") && wdg.text.contains("DISK"),
-            "{:?}",
-            wdg.text
-        );
+        assert_eq!(wdg.text, "7GB");
     }
 
     #[test]
