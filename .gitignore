@@ -13,6 +13,9 @@ __pycache__/
 # Machine-local per-repo backend overlay written by `just start-term[-release]
 # backend=<x>` (dogfood switch); not committed — see `_apply-backend` in justfile.
 .superzej.toml
+
+# Machine-local secrets sourced by .envrc (e.g. SPRITES_TOKEN); never committed.
+.envrc.local
 .superzej.yaml
 .superzej.yml
 .superzej.json

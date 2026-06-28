@@ -169,13 +169,22 @@
         version = "0.1.0";
         src = superzejSrc;
         cargoLock.lockFile = ./Cargo.lock;
-        cargoBuildFlags = ["-p" "superzej-host" "--bin" "szhost"];
-        CARGO_BUILD_TARGET = muslTarget;
+        # Force the musl target explicitly (env-only CARGO_BUILD_TARGET was being
+        # overridden by buildRustPackage → a glibc host binary that can't run in a
+        # bare microVM). `+crt-static` makes it fully static (no ld-musl loader
+        # needed in the sandbox). Install from the cross target dir, not target/release.
+        cargoBuildFlags = ["-p" "superzej-host" "--bin" "szhost" "--target" muslTarget];
         CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
         CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = muslCc;
         CC_x86_64_unknown_linux_musl = muslCc;
         nativeBuildInputs = [muslCross.stdenv.cc];
         doCheck = false;
+        installPhase = ''
+          runHook preInstall
+          mkdir -p $out/bin
+          cp target/${muslTarget}/release/szhost $out/bin/szhost
+          runHook postInstall
+        '';
       };
     in {
       packages.default = superzej;

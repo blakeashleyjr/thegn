@@ -324,6 +324,16 @@ fmt-check:
 test: _apps
     cargo test
 
+# Live integration tests against the REAL Sprites API (creates + destroys throwaway
+# sprites — real cloud spend). Sources SPRITES_TOKEN from .envrc.local. Validates
+# the provider exec/fs/checkpoint primitives + the env-provisioning clone path that
+# back the transparent sandbox/remote feature. `#[ignore]` so normal `just test`
+# skips them.
+test-sprite:
+    [ -f .envrc.local ] && set -a && . ./.envrc.local && set +a; \
+      [ -n "${SPRITES_TOKEN:-}" ] || { echo "SPRITES_TOKEN not set (put it in .envrc.local)" >&2; exit 1; }; \
+      cargo test -p superzej-svc --test sprites_live -- --ignored --nocapture
+
 # Hermetic end-to-end test against the debug binary.
 smoke: build
     ./test/install-plan.sh
@@ -471,6 +481,7 @@ start-mq name="dev" gate="cargo build --workspace": build
 # `_apply-backend`. Empty (the default) leaves config untouched.
 start-term name="dev" backend="": build-profiling (_apply-backend backend)
     state="$HOME/.superzej-{{name}}/state"; run="$HOME/.superzej-{{name}}/run"; pidfile="$run/szhost.pid"; mkdir -p "$state" "$run"; \
+      if [ -f "$PWD/.envrc.local" ]; then set -a; . "$PWD/.envrc.local"; set +a; fi; \
       if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then kill "$(cat "$pidfile")" 2>/dev/null || true; fi; \
       echo "profiler: 'kill -USR2 \$(pgrep -n szhost)' to start sampling, again to dump → $state/superzej/profiles/"; \
       echo "logs: $state/superzej/logs/szhost.log (startup waterfall + frame/hydrate/perf)"; \
@@ -489,6 +500,11 @@ start-term name="dev" backend="": build-profiling (_apply-backend backend)
 # every log channel + the SIGUSR2 flamegraph profiler on, so live perf readings
 # (frame render_ms, the szhost::perf rollup, idle CPU) reflect real shipped cost
 # instead of the debug penalty. Use this to inhabit superzej all day.
+# LOGGING IS MAXED OUT here for crash diagnosis: SUPERZEJ_LOG=debug globally with
+# all superzej crates at trace → $logs/szhost.log, RUST_BACKTRACE=full, and the
+# host's stderr (where panics print, normally swallowed when the ghostty window
+# closes on a crash) is captured to $logs/stderr.log. After a crash, read
+# stderr.log first (the panic + backtrace), then szhost.log for the lead-up.
 # Optional `backend=` flips THIS repo's worktrees onto a sandbox backend /
 # managed provider before launch — `just start-term-release backend=sprites`
 # dogfoods the superzej repo onto sprites (auto-scaffolds the global
@@ -497,16 +513,19 @@ start-term name="dev" backend="": build-profiling (_apply-backend backend)
 # `.superzej.toml` overlay at the main worktree); empty leaves config untouched.
 # See `_apply-backend` for the full mechanics.
 start-term-release name="dev" backend="": release-profiling (_apply-backend backend)
-    state="$HOME/.superzej-{{name}}/state"; run="$HOME/.superzej-{{name}}/run"; pidfile="$run/szhost.pid"; mkdir -p "$state" "$run"; \
+    state="$HOME/.superzej-{{name}}/state"; run="$HOME/.superzej-{{name}}/run"; pidfile="$run/szhost.pid"; logs="$state/superzej/logs"; mkdir -p "$state" "$run" "$logs"; \
+      if [ -f "$PWD/.envrc.local" ]; then set -a; . "$PWD/.envrc.local"; set +a; fi; \
       if [ -s "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then kill "$(cat "$pidfile")" 2>/dev/null || true; fi; \
       echo "profiler: 'kill -USR2 \$(pgrep -n szhost)' to start sampling, again to dump → $state/superzej/profiles/"; \
-      echo "logs: $state/superzej/logs/szhost.log (startup waterfall + frame/hydrate/perf)"; \
+      echo "logs: $logs/szhost.log (full trace: startup/frame/hydrate/perf + every crate) + $logs/stderr.log (panic message + full backtrace)"; \
+      echo "sprites token: $([ -n "${SPRITES_TOKEN:-}" ] && echo "loaded (len ${#SPRITES_TOKEN})" || echo "NOT set — sprites envs will halt; put SPRITES_TOKEN in .envrc.local")"; \
       setsid -f ghostty --config-default-files=false --config-file="$PWD/config/ghostty.config" -e sh -lc \
-      'pidfile="$1"; shift; echo $$ > "$pidfile"; exec env "$@"' \
-      sh "$pidfile" \
+      'pidfile="$1"; errlog="$2"; shift 2; echo $$ > "$pidfile"; exec env "$@" 2>"$errlog"' \
+      sh "$pidfile" "$logs/stderr.log" \
       "XDG_STATE_HOME=$state" \
       "SPRITES_TOKEN=${SPRITES_TOKEN:-}" \
-      "SUPERZEJ_LOG=info,szhost::frame=debug,szhost::hydrate=debug,szhost::perf=debug" \
+      "RUST_BACKTRACE=full" \
+      "SUPERZEJ_LOG=debug,szhost=trace,superzej_core=trace,superzej_svc=trace,superzej_proxy=trace" \
       "SUPERZEJ_PERF=1" \
       "$PWD/target/release/szhost"
 
