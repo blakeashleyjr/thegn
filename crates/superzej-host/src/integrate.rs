@@ -24,18 +24,110 @@ use superzej_svc::git::{CliGit, GitBackend, MergeTreeOutcome, PlumbingOps};
 /// Drives the pure fold engine over real git plumbing at one repo root.
 struct PlumbingAdapter {
     loc: GitLoc,
+    repo_root: PathBuf,
+    regenerate_paths: Vec<String>,
+    /// Empty disables lockfile regeneration (regenerable conflicts just defer).
+    regenerate_command: String,
 }
 
 impl FoldGit for PlumbingAdapter {
     fn merge_tree(&self, ours: &str, theirs: &str) -> Result<MergeOutcome> {
-        Ok(match CliGit.merge_tree(&self.loc, ours, theirs)? {
-            MergeTreeOutcome::Clean { tree } => MergeOutcome::Clean { tree },
-            MergeTreeOutcome::Conflict { paths, .. } => MergeOutcome::Conflict { paths },
-        })
+        match CliGit.merge_tree(&self.loc, ours, theirs)? {
+            MergeTreeOutcome::Clean { tree } => Ok(MergeOutcome::Clean { tree }),
+            MergeTreeOutcome::Conflict { paths, .. } => {
+                // A conflict confined to regenerable artifacts (e.g. Cargo.lock)
+                // isn't a real merge conflict — rebuild them and land it, rather
+                // than deferring to a human. Only when a regenerate_command is set.
+                if !self.regenerate_command.is_empty()
+                    && fold::classify(&paths, &self.regenerate_paths)
+                        == fold::ConflictKind::Regenerable
+                    && let Some(tree) = regenerate_merge(
+                        &self.repo_root,
+                        ours,
+                        theirs,
+                        &self.regenerate_paths,
+                        &self.regenerate_command,
+                    )
+                {
+                    return Ok(MergeOutcome::Clean { tree });
+                }
+                Ok(MergeOutcome::Conflict { paths })
+            }
+        }
     }
     fn commit_tree(&self, tree: &str, parents: &[&str], msg: &str) -> Result<String> {
         CliGit.commit_tree(&self.loc, tree, parents, msg)
     }
+}
+
+/// Resolve a regenerable-only merge by replaying it in a throwaway worktree:
+/// merge `theirs` onto `ours`, take the incoming side of each regenerate path,
+/// run `regenerate_command` to rebuild them, and write the merged tree. Returns
+/// the written tree oid, or `None` if anything fails (caller falls back to
+/// deferring). Never leaves a worktree behind.
+fn regenerate_merge(
+    repo_root: &Path,
+    ours: &str,
+    theirs: &str,
+    regenerate_paths: &[String],
+    regenerate_command: &str,
+) -> Option<String> {
+    let tmp = std::env::temp_dir().join(format!(
+        "sz-foldregen-{}-{}",
+        std::process::id(),
+        util::now()
+    ));
+    let tmp_s = tmp.to_string_lossy().to_string();
+    if !util::git_ok(
+        repo_root,
+        &["worktree", "add", "--detach", "--force", &tmp_s, ours],
+    ) {
+        return None;
+    }
+    let tree = (|| -> Option<String> {
+        // Merge theirs in (conflicts on the lockfiles are expected → ignore the
+        // exit status; we resolve them next).
+        let _ = util::git_cmd(&tmp)
+            .args(["merge", "--no-commit", "--no-ff", theirs])
+            .output()
+            .ok()?;
+        // Take the incoming version of each regenerate path so it's a valid file
+        // (not conflict-marked), then the regen command reconciles it.
+        for p in regenerate_paths {
+            let _ = util::git_cmd(&tmp)
+                .args(["checkout", "--theirs", "--", p])
+                .output();
+        }
+        // Rebuild the regenerate artifacts from the merged manifests.
+        let ok = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(regenerate_command)
+            .current_dir(&tmp)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return None;
+        }
+        let _ = util::git_cmd(&tmp).args(["add", "-A"]).output();
+        // Bail if any path is still unmerged — we only handle regenerable cases.
+        let unmerged =
+            util::git_out(&tmp, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default();
+        if !unmerged.trim().is_empty() {
+            return None;
+        }
+        let tree = util::git_out(&tmp, &["write-tree"])?;
+        let tree = tree.trim().to_string();
+        (!tree.is_empty()).then_some(tree)
+    })();
+    let _ = util::git_ok(repo_root, &["worktree", "remove", "--force", &tmp_s]);
+    if tree.is_some() {
+        superzej_core::msg::info(&format!(
+            "merge queue: regenerated {} for a lockfile-only merge",
+            regenerate_paths.join(", ")
+        ));
+    }
+    tree
 }
 
 /// What the test-gate decided about the folded tip.
@@ -316,7 +408,12 @@ pub fn run_fold(
     candidates: Vec<Branch>,
 ) -> Result<FoldReport> {
     let loc = GitLoc::for_worktree(repo_root);
-    let adapter = PlumbingAdapter { loc: loc.clone() };
+    let adapter = PlumbingAdapter {
+        loc: loc.clone(),
+        repo_root: repo_root.to_path_buf(),
+        regenerate_paths: cfg.regenerate_paths.clone(),
+        regenerate_command: cfg.regenerate_command.clone(),
+    };
     let target_branch = resolve_target(cfg, repo_root);
     let target_ref = format!("refs/heads/{target_branch}");
     let original = CliGit.rev_parse(&loc, &target_ref)?;
@@ -497,6 +594,7 @@ mod tests {
             auto_drain: false,
             snapshot_dirty: false,
             regenerate_paths: vec!["Cargo.lock".into()],
+            regenerate_command: String::new(),
             conflict_handoff: Default::default(),
         }
     }
@@ -576,5 +674,52 @@ mod tests {
                 .iter()
                 .any(|d| d.branch == "b2" && d.gate_failed)
         );
+    }
+
+    /// Build a repo where branch `b1` and `main` both bump `Cargo.lock` (so the
+    /// fold conflicts ONLY on the lockfile), plus a disjoint file on `b1`.
+    fn regen_repo(tag: &str) -> Repo {
+        let repo = Repo::new(tag);
+        repo.commit("Cargo.lock", "base\n", "c0 lock");
+        git(&repo.dir, &["checkout", "-q", "-b", "b1"]);
+        repo.commit("a.txt", "a\n", "b1 add");
+        repo.commit("Cargo.lock", "b1\n", "b1 lock");
+        git(&repo.dir, &["checkout", "-q", "main"]);
+        repo.commit("Cargo.lock", "mainline\n", "main lock"); // diverge the lockfile
+        repo
+    }
+
+    #[test]
+    fn regenerable_lockfile_conflict_auto_lands_with_regenerate_command() {
+        let repo = regen_repo("regen-land");
+        let mut c = cfg("");
+        c.regenerate_command = "printf 'regenerated\\n' > Cargo.lock".into();
+
+        let report = run_fold(&c, &repo.dir, repo.branch_set()).unwrap();
+        assert!(report.advanced, "the regenerable branch should land");
+        assert_eq!(
+            report
+                .landed
+                .iter()
+                .map(|l| l.branch.as_str())
+                .collect::<Vec<_>>(),
+            ["b1"]
+        );
+        assert!(report.deferred.is_empty());
+        // main carries the regenerated lockfile and the disjoint file.
+        assert_eq!(repo.out(&["show", "main:Cargo.lock"]), "regenerated");
+        let files = repo.out(&["ls-tree", "-r", "--name-only", "main"]);
+        assert!(files.contains("a.txt"), "{files}");
+    }
+
+    #[test]
+    fn regenerable_conflict_defers_without_a_regenerate_command() {
+        let repo = regen_repo("regen-defer");
+        // cfg("") has regenerate_command = "" → no regeneration, just classify+defer.
+        let report = run_fold(&cfg(""), &repo.dir, repo.branch_set()).unwrap();
+        assert!(!report.advanced);
+        assert_eq!(report.deferred.len(), 1);
+        assert_eq!(report.deferred[0].branch, "b1");
+        assert_eq!(report.deferred[0].kind, ConflictKind::Regenerable);
     }
 }

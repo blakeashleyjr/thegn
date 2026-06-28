@@ -576,6 +576,11 @@ pub struct MergeQueueConfig {
     /// e.g. `Cargo.lock` matches `crates/x/Cargo.lock`) are classified
     /// regenerable — resolved by regenerating, not handed to a human.
     pub regenerate_paths: Vec<String>,
+    /// Command run (in a throwaway worktree, cwd = repo) to rebuild the
+    /// `regenerate_paths` artifacts when a branch's *only* conflicts are in them,
+    /// turning that defer into an automatic land. Empty disables regeneration
+    /// (regenerable conflicts just defer). E.g. `cargo update --workspace`.
+    pub regenerate_command: String,
     /// What to do with a deferred (conflicting) branch.
     pub conflict_handoff: ConflictHandoff,
 }
@@ -591,6 +596,7 @@ impl Default for MergeQueueConfig {
             auto_drain: true,
             snapshot_dirty: false,
             regenerate_paths: vec!["Cargo.lock".to_string()],
+            regenerate_command: String::new(),
             conflict_handoff: ConflictHandoff::default(),
         }
     }

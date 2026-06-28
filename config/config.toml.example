@@ -1458,6 +1458,7 @@ bisect_on_red = true          # on a red gate, defer just the offending branch
 auto_drain = true             # fold automatically when an agent signals done
 snapshot_dirty = false        # auto-commit uncommitted worktree work before folding
 regenerate_paths = ["Cargo.lock"]  # conflicts confined to these are "regenerable", not handed off
+regenerate_command = ""        # e.g. "cargo update --workspace"; rebuilds regenerate_paths to auto-land them ("" defers instead)
 conflict_handoff = "agent"    # agent | notify | manual — fate of a deferred branch
 
 # ── Media player control (optional) ────────────────────────────────────────
