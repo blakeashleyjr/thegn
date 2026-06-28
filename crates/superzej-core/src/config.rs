@@ -4124,6 +4124,7 @@ impl Config {
         &self,
         repo_root: &Path,
         loc: &GitLoc,
+        worktree: &Path,
         selected: Option<&str>,
     ) -> Environment {
         let base = self.repo_sandbox(repo_root);
@@ -4156,7 +4157,7 @@ impl Config {
         // Named env: overlay its isolation onto the base, build its placement.
         let mut sb = base;
         envc.sandbox.clone().apply(&mut sb);
-        let placement = build_env_placement(envc, &sb, loc);
+        let placement = build_env_placement(envc, &sb, loc, worktree);
         Environment {
             name,
             placement,
@@ -4444,10 +4445,35 @@ fn data_mode_from_remote(mode: RemoteMode) -> DataMode {
     }
 }
 
+/// Resolve a provider env's effective sandbox id for `worktree`, expanding the
+/// per-worktree tokens in the configured `id`: `{worktree}` = worktree dir
+/// basename slug, `{slug}` = full worktree-path slug (globally unique), empty =
+/// basename slug (the per-worktree default). A configured id with no token is
+/// returned as-is (a static, shared sandbox — back-compat). The resolved id flows
+/// into `ProviderPlacement.id` + the `{id}` command/`control_prefix` templates, so
+/// each worktree gets its own sprite (and a distinct `bridge_key`).
+pub fn effective_provider_id(configured: &str, worktree: &Path) -> String {
+    let base = worktree
+        .file_name()
+        .map(|n| util::slugify(&n.to_string_lossy()))
+        .unwrap_or_default();
+    let c = configured.trim();
+    if c.is_empty() {
+        return base;
+    }
+    let full = util::slugify(&worktree.to_string_lossy());
+    c.replace("{worktree}", &base).replace("{slug}", &full)
+}
+
 /// Build the runtime [`Placement`] for a named env from its `[env.<name>]`
 /// placement mode + the matching sub-table. For `ssh`, an empty `[env.*.ssh]
 /// host` falls back to the worktree's own remote target, then `[sandbox.remote]`.
-fn build_env_placement(envc: &EnvConfig, sb: &SandboxConfig, loc: &GitLoc) -> Placement {
+fn build_env_placement(
+    envc: &EnvConfig,
+    sb: &SandboxConfig,
+    loc: &GitLoc,
+    worktree: &Path,
+) -> Placement {
     let opt = |s: &str| {
         let t = s.trim();
         (!t.is_empty()).then(|| t.to_string())
@@ -4500,9 +4526,12 @@ fn build_env_placement(envc: &EnvConfig, sb: &SandboxConfig, loc: &GitLoc) -> Pl
             image: opt(&envc.k8s.image),
         }),
         PlacementMode::Provider => {
+            // Per-worktree id: each worktree gets its own sandbox (so panes,
+            // the bridge key, and the persisted location are all distinct).
+            let id = effective_provider_id(&envc.provider.id, worktree);
             let sub = |tpl: &[String]| {
                 tpl.iter()
-                    .map(|s| s.replace("{id}", envc.provider.id.trim()))
+                    .map(|s| s.replace("{id}", &id))
                     .collect::<Vec<_>>()
             };
             let control_prefix = sub(&envc.provider.exec_command);
@@ -4511,13 +4540,17 @@ fn build_env_placement(envc: &EnvConfig, sb: &SandboxConfig, loc: &GitLoc) -> Pl
             } else {
                 sub(&envc.provider.interactive_command)
             };
+            // Compute all substitutions before moving `id` into the struct (the
+            // `sub` closure borrows it).
+            let up_command = sub(&envc.provider.up_command);
+            let down_command = sub(&envc.provider.down_command);
             Placement::Provider(ProviderPlacement {
                 provider: envc.provider.provider.trim().to_string(),
-                id: envc.provider.id.trim().to_string(),
+                id,
                 interactive_prefix,
                 control_prefix,
-                up_command: sub(&envc.provider.up_command),
-                down_command: sub(&envc.provider.down_command),
+                up_command,
+                down_command,
             })
         }
     }
@@ -4543,6 +4576,28 @@ fn parse_hex_rgb(hex: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_provider_id_is_per_worktree() {
+        let wt = Path::new("/home/u/.superzej/worktrees/superzej/sz-quick-dagger");
+        let canon = Path::new("/home/u/code/superzej");
+        // Empty ⇒ basename slug (the per-worktree default).
+        assert_eq!(effective_provider_id("", wt), "sz-quick-dagger");
+        assert_eq!(effective_provider_id("", canon), "superzej");
+        // {worktree} ⇒ basename; distinct per worktree.
+        assert_ne!(
+            effective_provider_id("{worktree}", wt),
+            effective_provider_id("{worktree}", canon)
+        );
+        // {slug} ⇒ full-path slug (globally unique).
+        assert!(effective_provider_id("{slug}", wt).contains("worktrees"));
+        // A static id with no token stays shared (back-compat).
+        assert_eq!(effective_provider_id("shared", wt), "shared");
+        assert_eq!(
+            effective_provider_id("shared", wt),
+            effective_provider_id("shared", canon)
+        );
+    }
 
     #[test]
     fn provider_exec_mode_parses_and_defaults_to_auto() {
@@ -6000,7 +6055,7 @@ forward_agent = false
         let cfg = Config::default();
         let dir = tmpdir("env-default");
         let loc = GitLoc::Local(dir.clone());
-        let env = cfg.resolve_env(&dir, &loc, None);
+        let env = cfg.resolve_env(&dir, &loc, &dir, None);
         assert_eq!(env.name, "default");
         assert!(env.placement.is_local());
         assert!(!env.is_remote());
@@ -6024,7 +6079,7 @@ profile = \"sealed\"
         .unwrap();
         let dir = tmpdir("env-local");
         let loc = GitLoc::Local(dir.clone());
-        let env = cfg.resolve_env(&dir, &loc, Some("local-containers"));
+        let env = cfg.resolve_env(&dir, &loc, &dir, Some("local-containers"));
         assert_eq!(env.name, "local-containers");
         assert!(env.placement.is_local());
         assert_eq!(env.sandbox.backend, SandboxBackend::Podman);
@@ -6050,7 +6105,7 @@ pod = \"sz-dev\"
         .unwrap();
         let dir = tmpdir("env-k8s");
         let loc = GitLoc::Local(dir.clone());
-        let env = cfg.resolve_env(&dir, &loc, Some("company-k8s"));
+        let env = cfg.resolve_env(&dir, &loc, &dir, Some("company-k8s"));
         assert!(env.is_remote());
         assert_eq!(env.placement.label(), "k8s:dev-blake/sz-dev");
         // The kubectl exec argv carries the configured context/namespace/pod.
@@ -6077,7 +6132,7 @@ exec_command = [\"daytona\", \"ssh\", \"{id}\", \"--\"]
         .unwrap();
         let dir = tmpdir("env-prov");
         let loc = GitLoc::Local(dir.clone());
-        let env = cfg.resolve_env(&dir, &loc, Some("daytona"));
+        let env = cfg.resolve_env(&dir, &loc, &dir, Some("daytona"));
         assert!(env.is_remote());
         let argv = env.placement.interactive_argv(&["ls".into()]);
         assert_eq!(&argv[..4], &["daytona", "ssh", "sb-42", "--"]);
@@ -6101,7 +6156,7 @@ down_command = [\"daytona\", \"delete\", \"{id}\"]
         .unwrap();
         let dir = tmpdir("env-prov-life");
         let loc = GitLoc::Local(dir.clone());
-        let env = cfg.resolve_env(&dir, &loc, Some("daytona"));
+        let env = cfg.resolve_env(&dir, &loc, &dir, Some("daytona"));
         match env.placement {
             crate::placement::Placement::Provider(p) => {
                 assert_eq!(p.up_command, vec!["daytona", "create", "--id", "sb-7"]);
@@ -6136,15 +6191,15 @@ backend = \"podman\"
         std::fs::write(dir.join(".superzej.toml"), "env = \"r\"\n").unwrap();
         let loc = GitLoc::Local(dir.clone());
         // No explicit selection → repo overlay "r" wins over global default "g".
-        assert_eq!(cfg.resolve_env(&dir, &loc, None).name, "r");
+        assert_eq!(cfg.resolve_env(&dir, &loc, &dir, None).name, "r");
         assert_eq!(
-            cfg.resolve_env(&dir, &loc, None).sandbox.backend,
+            cfg.resolve_env(&dir, &loc, &dir, None).sandbox.backend,
             SandboxBackend::Docker
         );
         // Explicit selection beats the repo overlay.
-        assert_eq!(cfg.resolve_env(&dir, &loc, Some("x")).name, "x");
+        assert_eq!(cfg.resolve_env(&dir, &loc, &dir, Some("x")).name, "x");
         // Empty/whitespace selection is ignored (falls through to repo).
-        assert_eq!(cfg.resolve_env(&dir, &loc, Some("  ")).name, "r");
+        assert_eq!(cfg.resolve_env(&dir, &loc, &dir, Some("  ")).name, "r");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6153,7 +6208,7 @@ backend = \"podman\"
         let cfg = Config::default();
         let dir = tmpdir("env-unknown");
         let loc = GitLoc::Local(dir.clone());
-        let env = cfg.resolve_env(&dir, &loc, Some("does-not-exist"));
+        let env = cfg.resolve_env(&dir, &loc, &dir, Some("does-not-exist"));
         assert_eq!(env.name, "default");
         assert!(env.placement.is_local());
         let _ = std::fs::remove_dir_all(&dir);
@@ -6176,7 +6231,7 @@ transport = \"ssh\"
         .unwrap();
         let dir = tmpdir("env-ssh");
         let loc = GitLoc::Local(dir.clone());
-        let env = cfg.resolve_env(&dir, &loc, Some("remote-dev"));
+        let env = cfg.resolve_env(&dir, &loc, &dir, Some("remote-dev"));
         assert!(env.is_remote());
         assert_eq!(env.placement.label(), "ssh:u@devbox");
         let _ = std::fs::remove_dir_all(&dir);

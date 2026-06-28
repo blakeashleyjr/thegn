@@ -205,11 +205,11 @@ fn provider_and_id(
     worktree: Option<String>,
 ) -> Result<(superzej_svc::provider::Provider, String)> {
     let env = resolve_for(cfg, worktree.clone());
-    let id = cfg
-        .env
-        .get(&env.name)
-        .map(|e| e.provider.id.trim().to_string())
-        .unwrap_or_default();
+    // The resolved placement carries the per-worktree sandbox id.
+    let id = match &env.placement {
+        superzej_core::placement::Placement::Provider(p) => p.id.clone(),
+        _ => String::new(),
+    };
     if id.is_empty() {
         anyhow::bail!(
             "set `[env.{}.provider] id` to the sandbox name first",
@@ -341,7 +341,7 @@ fn resolve_for(cfg: &Config, worktree: Option<String>) -> superzej_core::env::En
     let selected = Db::open()
         .ok()
         .and_then(|db| db.effective_env(&wt, &repo_root.to_string_lossy()));
-    cfg.resolve_env(&repo_root, &loc, selected.as_deref())
+    cfg.resolve_env(&repo_root, &loc, Path::new(&wt), selected.as_deref())
 }
 
 fn list(cfg: &Config) -> Result<()> {
@@ -404,7 +404,7 @@ fn show(cfg: &Config, worktree: Option<String>) -> Result<()> {
     let selected = Db::open()
         .ok()
         .and_then(|db| db.effective_env(&wt, &repo_root.to_string_lossy()));
-    let env = cfg.resolve_env(&repo_root, &loc, selected.as_deref());
+    let env = cfg.resolve_env(&repo_root, &loc, Path::new(&wt), selected.as_deref());
     outln!("worktree: {wt}");
     outln!("env:      {}", env.name);
     outln!("placement: {}", env.placement.label());
