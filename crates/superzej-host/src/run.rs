@@ -1190,6 +1190,14 @@ fn is_collapsible(kind: crate::sidebar::RowKind) -> bool {
     )
 }
 
+/// `ui_state` scope for the sidebar's persisted view state. The sidebar is a
+/// single global tree showing every workspace at once, so its view state
+/// (pins, collapse, sort, width, expand) is process-global — NOT keyed by the
+/// active workspace. (Mirrors the right panel's `"panel"` scope. Keying this by
+/// `session.id`, which is the active workspace's repo path, stranded pins in
+/// per-workspace scopes so they never reloaded.)
+const SIDEBAR_SCOPE: &str = "sidebar";
+
 /// Interaction + persisted view state for the workspace tree (items 16–27).
 /// The single source of truth the event loop mutates; [`SidebarState::rebuild`]
 /// derives `FrameModel`'s sidebar fields from it plus the model's data carriers.
@@ -1338,10 +1346,10 @@ enum SidebarOutcome {
 }
 
 impl SidebarState {
-    /// Persist a single `ui_state` key for this session's scope.
-    fn persist(&self, session_id: &str, key: &str, value: &str) {
+    /// Persist a single `ui_state` key in the global [`SIDEBAR_SCOPE`].
+    fn persist(&self, key: &str, value: &str) {
         if let Ok(db) = superzej_core::db::Db::open() {
-            let _ = db.set_ui_state(session_id, key, value);
+            let _ = db.set_ui_state(SIDEBAR_SCOPE, key, value);
         }
     }
 
@@ -1407,7 +1415,7 @@ impl SidebarState {
         // computed sort was active so the move is visible and survives restart.
         if self.view.sort != crate::sidebar::SortMode::Manual {
             self.view.sort = crate::sidebar::SortMode::Manual;
-            self.persist(&session.id, "sort_mode", self.view.sort.as_str());
+            self.persist("sort_mode", self.view.sort.as_str());
         }
         self.rebuild(model, session);
         true
@@ -1655,7 +1663,7 @@ impl SidebarState {
             }
             KeyCode::Char('s') => {
                 self.view.sort = self.view.sort.next();
-                self.persist(&session.id, "sort_mode", self.view.sort.as_str());
+                self.persist("sort_mode", self.view.sort.as_str());
                 self.rebuild(model, session);
             }
             KeyCode::Char('p') => return self.toggle_pin(model, session),
@@ -1697,20 +1705,16 @@ impl SidebarState {
                 }
             }
             KeyCode::Char('<') | KeyCode::Char(',') => {
-                return self.adjust_width(-2, session);
+                return self.adjust_width(-2);
             }
             KeyCode::Char('>') | KeyCode::Char('.') => {
-                return self.adjust_width(2, session);
+                return self.adjust_width(2);
             }
             KeyCode::Char('e') => {
                 // Toggle the Wide expand (mirrors the panel's `e`): ~half the
                 // window vs. the fine-nudged width.
                 self.expanded = !self.expanded;
-                self.persist(
-                    &session.id,
-                    "sidebar_expanded",
-                    if self.expanded { "1" } else { "0" },
-                );
+                self.persist("sidebar_expanded", if self.expanded { "1" } else { "0" });
                 return SidebarOutcome::Relayout;
             }
             _ => return SidebarOutcome::NotHandled,
@@ -1766,7 +1770,6 @@ impl SidebarState {
                 true
             };
             self.persist(
-                &session.id,
                 &format!("collapse:{slug}"),
                 if now_collapsed { "1" } else { "0" },
             );
@@ -1796,21 +1799,21 @@ impl SidebarState {
         for key in keys {
             if let Some(pos) = self.view.pins.iter().position(|k| *k == key) {
                 self.view.pins.remove(pos);
-                self.persist(&session.id, &format!("pin:{key}"), "0");
+                self.persist(&format!("pin:{key}"), "0");
             } else {
                 self.view.pins.push(key.clone());
-                self.persist(&session.id, &format!("pin:{key}"), "1");
+                self.persist(&format!("pin:{key}"), "1");
             }
         }
         self.rebuild(model, session);
         SidebarOutcome::Redraw
     }
 
-    fn adjust_width(&mut self, delta: i32, session: &crate::session::Session) -> SidebarOutcome {
+    fn adjust_width(&mut self, delta: i32) -> SidebarOutcome {
         // A fine nudge drops out of Wide so the change is visible and sticks.
         if self.expanded {
             self.expanded = false;
-            self.persist(&session.id, "sidebar_expanded", "0");
+            self.persist("sidebar_expanded", "0");
         }
         let cur = self.width.unwrap_or(crate::layout::SIDEBAR_COLS) as i32;
         let next = (cur + delta).clamp(
@@ -1818,7 +1821,7 @@ impl SidebarState {
             crate::layout::SIDEBAR_MAX_WIDTH as i32,
         ) as usize;
         self.width = Some(next);
-        self.persist(&session.id, "sidebar_cols", &next.to_string());
+        self.persist("sidebar_cols", &next.to_string());
         SidebarOutcome::Relayout
     }
 
@@ -7634,7 +7637,7 @@ async fn event_loop<T: Terminal>(
     let mut sb = SidebarState::default();
     let mut panel_ui = crate::panel::PanelUi::default();
     if let Ok(db) = superzej_core::db::Db::open() {
-        sb.load(&db, &session.id);
+        sb.load(&db, SIDEBAR_SCOPE);
         for (key, value) in db.ui_state_in_scope("panel").unwrap_or_default() {
             match key.as_str() {
                 "open" => {
@@ -18572,7 +18575,7 @@ mod tests {
         let _ = press(&mut sb, 'e', &mut model, &session);
         let db = superzej_core::db::Db::open().unwrap();
         let mut reloaded = SidebarState::default();
-        reloaded.load(&db, &session.id);
+        reloaded.load(&db, SIDEBAR_SCOPE);
         assert!(reloaded.expanded, "expanded state restored from the DB");
 
         // A fine `<` nudge drops out of Wide so the change is visible.
@@ -18591,6 +18594,78 @@ mod tests {
         let mut sb = focused_state(&mut model, &session);
         let out = sb.handle_key(&KeyCode::Escape, Modifiers::NONE, &mut model, &session);
         assert!(matches!(out, SidebarOutcome::Defocus));
+    }
+
+    #[test]
+    fn workspace_pin_persists_globally_not_per_active_workspace() {
+        // Regression: pins used to be keyed by `session.id` (the active
+        // workspace's repo path), so a pin made while workspace A was active was
+        // stranded under A's scope and never reloaded under any other workspace
+        // — the sidebar rendered unpinned. Pins now live in the global
+        // SIDEBAR_SCOPE: they reload regardless of the active workspace.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let state_home = std::env::temp_dir().join(format!("sz-host-wspin-{}", std::process::id()));
+        // SAFETY: test is single-threaded; sets/clears an XDG var around calls.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state_home) };
+
+        // Two DB-backed workspaces; the active one is "/tmp/app" (session.id).
+        let session = Session {
+            id: "/tmp/app".into(),
+            worktrees: vec![
+                WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/app"),
+                WorktreeGroup::new("lib/home", GroupKind::Home, "/tmp/lib"),
+            ],
+            active: 0,
+        };
+        let mut model = build_initial_model(&session, None);
+        model.sidebar_workspaces = vec![
+            ("app".into(), "app".into(), "repo".into(), "/tmp/app".into()),
+            ("lib".into(), "lib".into(), "repo".into(), "/tmp/lib".into()),
+        ];
+        let mut sb = focused_state(&mut model, &session);
+
+        // Put the cursor on the "lib" workspace row and pin it (`p`).
+        sb.cursor = model
+            .sidebar_rows
+            .iter()
+            .filter(|r| r.visible)
+            .position(|r| r.kind == crate::sidebar::RowKind::Workspace && r.workspace_slug == "lib")
+            .expect("lib workspace row is visible");
+        press(&mut sb, 'p', &mut model, &session);
+
+        // Immediate: "lib" floats above the active "app".
+        assert!(sb.view.pins.contains(&"lib".to_string()));
+        assert_eq!(
+            sidebar_workspace_order(&model.sidebar_rows),
+            vec!["/tmp/lib".to_string(), "/tmp/app".to_string()],
+        );
+
+        // The pin is written to the GLOBAL scope, NOT the active workspace's
+        // (`/tmp/app`) scope — the heart of the fix.
+        let db = superzej_core::db::Db::open().unwrap();
+        let global = db.ui_state_in_scope(SIDEBAR_SCOPE).unwrap();
+        assert!(
+            global.iter().any(|(k, v)| k == "pin:lib" && v == "1"),
+            "pin saved in the global sidebar scope",
+        );
+        let ws_scoped = db.ui_state_in_scope(&session.id).unwrap();
+        assert!(
+            !ws_scoped.iter().any(|(k, _)| k == "pin:lib"),
+            "pin must NOT be saved under the active workspace's scope",
+        );
+
+        // It reloads from the global scope — independent of which workspace is
+        // active at startup (the cross-workspace failure mode).
+        let mut reloaded = SidebarState::default();
+        reloaded.load(&db, SIDEBAR_SCOPE);
+        assert!(
+            reloaded.view.pins.contains(&"lib".to_string()),
+            "pin restored from the global scope on reload",
+        );
+
+        // SAFETY: test is single-threaded.
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+        let _ = std::fs::remove_dir_all(&state_home);
     }
 
     #[test]
