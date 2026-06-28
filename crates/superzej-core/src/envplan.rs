@@ -380,6 +380,18 @@ fn nix_install_script() -> String {
     )
 }
 
+/// An sh prelude that exports `NIX_CONFIG` with a GitHub `access-tokens` line when
+/// a token is in the env (GH_TOKEN, else GITHUB_TOKEN). nix's flake-input fetcher
+/// does NOT use git's credential helper, so a **private flake input** (e.g. a
+/// private `github:org/repo` input in the repo's flake.nix) 404s without this even
+/// though `git clone` of the repo itself authenticates fine. Runtime-only (never
+/// written to nix.conf), so the token isn't baked into the checkpoint. Trailing
+/// `;` so it composes as a prefix; a no-op when no token is present.
+fn nix_token_prelude() -> &'static str {
+    "tok=\"${GH_TOKEN:-${GITHUB_TOKEN:-}}\"; \
+     if [ -n \"$tok\" ]; then export NIX_CONFIG=\"access-tokens = github.com=$tok\"; fi; "
+}
+
 /// Install direnv + hook it into the login shells, so entering the workdir
 /// activates the flake devShell exactly like local. Idempotent.
 fn direnv_install_script() -> String {
@@ -399,8 +411,12 @@ fn direnv_install_script() -> String {
 /// devShell / devenv directly.
 fn devshell_warm_script(workdir: &str, req: &EnvRequirements) -> String {
     let wd = sh_quote(workdir);
-    let nixsh = ". \"$HOME/.nix-profile/etc/profile.d/nix.sh\" 2>/dev/null || true; \
-                 export PATH=\"$HOME/.nix-profile/bin:$PATH\"";
+    let tok = nix_token_prelude();
+    let nixsh = format!(
+        "{tok}. \"$HOME/.nix-profile/etc/profile.d/nix.sh\" 2>/dev/null || true; \
+         export PATH=\"$HOME/.nix-profile/bin:$PATH\""
+    );
+    let nixsh = nixsh.as_str();
     if req.direnv && req.direnv_uses_flake {
         format!(
             "{nixsh}; cd {wd} && direnv allow . 2>/dev/null; direnv exec . true 2>/dev/null || nix develop --command true 2>/dev/null || true"
@@ -790,6 +806,31 @@ mod tests {
         assert!(s.contains("@earendil-works/pi-coding-agent"));
         // unknown agent doesn't fabricate an installer.
         assert!(s.contains("hermes: install via"));
+    }
+
+    #[test]
+    fn devshell_warm_sets_nix_access_token_for_private_inputs() {
+        // The flake-devShell warm must export a github access-token (runtime, via
+        // NIX_CONFIG) so a private flake INPUT fetches — git's credential helper
+        // doesn't cover nix's fetcher.
+        let req = EnvRequirements {
+            direnv: true,
+            direnv_uses_flake: true,
+            ..Default::default()
+        };
+        let s = devshell_warm_script("/workspace", &req);
+        assert!(s.contains("NIX_CONFIG"), "exports NIX_CONFIG");
+        assert!(
+            s.contains("access-tokens = github.com="),
+            "sets a github access-token line"
+        );
+        assert!(
+            s.contains("GH_TOKEN") && s.contains("GITHUB_TOKEN"),
+            "derives from either token var"
+        );
+        // Plain (no-flake) warm also carries the prelude.
+        let plain = devshell_warm_script("/workspace", &EnvRequirements::default());
+        assert!(plain.contains("NIX_CONFIG"));
     }
 
     #[test]
