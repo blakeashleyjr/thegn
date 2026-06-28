@@ -591,6 +591,12 @@ async fn relay_exec(
         ExecOpen::Open(spec) => (spec.cols, spec.rows),
         ExecOpen::Attach { cols, rows, .. } => (*cols, *rows),
     };
+    tracing::debug!(
+        target: "szhost::sandbox",
+        provider = %provider_name, sandbox = %sandbox_id, %cols, %rows,
+        attach = matches!(open, ExecOpen::Attach { .. }),
+        "native exec: opening interactive session"
+    );
     let opened = match open {
         ExecOpen::Open(spec) => provider.open_exec(&sandbox_id, &spec).await,
         ExecOpen::Attach {

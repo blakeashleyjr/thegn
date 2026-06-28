@@ -89,6 +89,8 @@ pub enum MenuChoice {
     ApproveTool { allow: bool },
     // share reach picker: the chosen reach (public/team/peer).
     ShareReach(superzej_core::config::ShareReach),
+    // sandbox bring-up failed (failover off): retry the active worktree's env.
+    SandboxRetry,
     Dismiss,
 }
 
@@ -109,6 +111,7 @@ pub enum MenuKindTag {
     KeymapPicker,
     Approval,
     ShareReach,
+    SandboxHalt,
 }
 
 /// One selectable row: an optional letter hotkey (rendered as a chip), the
@@ -438,6 +441,23 @@ pub fn approval_menu(title: impl Into<String>, body: impl Into<String>) -> MenuO
         vec![
             item(Some('a'), "allow", MenuChoice::ApproveTool { allow: true }),
             item(Some('d'), "deny", MenuChoice::ApproveTool { allow: false }).danger(),
+        ],
+    )
+    .with_body(body)
+}
+
+/// A non-local environment (provider/k8s/ssh) could not be brought up and
+/// failover is off, so superzej refuses to silently open a host shell. `[r]`
+/// retries the bring-up; `[n]`/Esc dismisses (the worktree stays without a pane).
+/// `title` names the placement; `body` is the failure reason + how to allow
+/// failover. Resolves to `SandboxRetry` or `Dismiss`.
+pub fn sandbox_halt_menu(title: impl Into<String>, body: impl Into<String>) -> MenuOverlay {
+    MenuOverlay::new(
+        MenuKindTag::SandboxHalt,
+        title,
+        vec![
+            item(Some('r'), "retry bring-up", MenuChoice::SandboxRetry),
+            item(Some('n'), "dismiss", MenuChoice::Dismiss),
         ],
     )
     .with_body(body)

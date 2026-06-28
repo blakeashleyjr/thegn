@@ -2315,6 +2315,7 @@ fn forget_worktree_group(
 /// leaves the per-op git path in place.
 fn connect_worktree_bridge(
     sup: &crate::bridge_sup::BridgeSupervisor,
+    rsup: &crate::revtunnel::ReverseTunnelSupervisor,
     worktree: &std::path::Path,
     cfg: &superzej_core::config::Config,
 ) {
@@ -2323,6 +2324,7 @@ fn connect_worktree_bridge(
         return;
     }
     let sup = sup.clone();
+    let rsup = rsup.clone();
     let cfg = cfg.clone();
     let wt = worktree.to_path_buf();
     tokio::task::spawn_blocking(move || {
@@ -2345,6 +2347,38 @@ fn connect_worktree_bridge(
                 &bin,
                 &crate::bridge_sup::remote_szhost(),
             );
+        }
+        // Reverse host→sandbox tunnels, all over the resident bridge:
+        //  • P0b model-proxy: when an in-sandbox agent should reach the host
+        //    `szproxy` by default (`[llm_proxy] route_agent` + `remote_base_url =
+        //    "auto"`) → bind the proxy port in the sandbox → host szproxy, so any
+        //    agent there routes through it via the injected ANTHROPIC_BASE_URL.
+        //  • P1 host services / host-bound MCP: each `[sandbox.home]
+        //    reverse_forwards` spec → bind a sandbox port → a host target.
+        // No-op when not a provider / nothing configured.
+        if let superzej_core::placement::Placement::Provider(p) = &env.placement {
+            let mut tunnels: Vec<(u16, String)> = Vec::new();
+            if let Some(port) = cfg.llm_proxy.remote_tunnel_port() {
+                tunnels.push((port, format!("127.0.0.1:{}", cfg.llm_proxy.listen_port())));
+            }
+            for spec in &env.sandbox.home.reverse_forwards {
+                if let Some(t) = superzej_core::revtunnel::parse_reverse_forward(spec) {
+                    tunnels.push(t);
+                }
+            }
+            for (sandbox_port, host_target) in tunnels {
+                if let Some(provider) = crate::agent::native_bridge_provider(&cfg, &env) {
+                    rsup.start(
+                        &tokio::runtime::Handle::current(),
+                        &wt.to_string_lossy(),
+                        provider,
+                        p.id.clone(),
+                        crate::bridge_sup::remote_szhost(),
+                        sandbox_port,
+                        host_target,
+                    );
+                }
+            }
         }
         // CLI-free control plane: for an exec_api provider (and exec != cli),
         // start the bridge over the native exec API instead of the vendor CLI.
@@ -5282,6 +5316,9 @@ fn dispatch_menu_choice(
         // The bouncer approval gate is resolved directly in the loop (it owns the
         // approval queue + oneshots); it never routes through this git dispatcher.
         MenuChoice::ApproveTool { .. } => {}
+        // Sandbox-halt retry is resolved directly in the loop (re-arms the lazy
+        // materialize); it never routes through this git dispatcher.
+        MenuChoice::SandboxRetry => {}
     }
     GitAfter::None
 }
@@ -6089,6 +6126,13 @@ fn spawn_worktree_shell_pane(
         && dir.is_dir()
     {
         let wt = dir.to_string_lossy().into_owned();
+        // Failover off + a non-local env that's known-down (token unset / native
+        // exec in failure cooldown): refuse to open a host-degraded pane. The
+        // `SandboxHalt` error is caught at the call site, which raises a warning
+        // modal instead of degrading silently.
+        if let Some(halt) = crate::agent::env_halt_reason(cfg, &wt) {
+            return Err(halt.into());
+        }
         // Native provider exec (CLI-free): when the worktree's env is a managed
         // provider with a native exec API and `exec != cli`, attach the pane over
         // the provider's WSS exec instead of wrapping its vendor CLI.
@@ -7261,6 +7305,58 @@ fn approval_overlay<R>(req: &crate::bouncer::ApprovalRequest<R>) -> MenuOverlay 
     menu::approval_menu(title, crate::bouncer::summary(&req.detail))
 }
 
+/// Build the warning modal for a refused sandbox bring-up (failover off). Names
+/// the placement, states the reason, and points at the `failover` knob.
+fn sandbox_halt_overlay(halt: &crate::agent::SandboxHalt) -> MenuOverlay {
+    let title = format!("⚠ {} unavailable", halt.placement);
+    let body = format!(
+        "{} — failover is off, so superzej won't drop to the host. Fix the env \
+         (e.g. set its token) then retry, or set `failover = true` under \
+         [env.{}] / [sandbox] to allow a host fallback.",
+        halt.reason, halt.env_name
+    );
+    menu::sandbox_halt_menu(title, body)
+}
+
+/// Find a [`SandboxHalt`](crate::agent::SandboxHalt) anywhere in an error's
+/// source chain (robust to `.context()` wrapping). `Some` ⇒ surface the modal
+/// instead of a plain status line.
+fn sandbox_halt_in(e: &anyhow::Error) -> Option<&crate::agent::SandboxHalt> {
+    e.chain()
+        .find_map(|src| src.downcast_ref::<crate::agent::SandboxHalt>())
+}
+
+/// Map provisioning step views (from the off-loop env provisioner) into the
+/// splash's [`LoadStep`]s for a live "setting up your environment" loading screen.
+fn provision_load_steps(views: &[crate::agent::ProvisionStepView]) -> Vec<LoadStep> {
+    use crate::agent::ProvisionState;
+    views
+        .iter()
+        .map(|v| match v.state {
+            ProvisionState::Active => LoadStep::active(v.label.clone()),
+            ProvisionState::Done => LoadStep::done(v.label.clone()),
+            ProvisionState::Failed => LoadStep::failed(v.label.clone()),
+        })
+        .collect()
+}
+
+/// Error carried over the off-thread spec-resolution channel. Preserves a
+/// [`SandboxHalt`](crate::agent::SandboxHalt) (so the receiver can raise the
+/// warning modal) and stringifies everything else.
+enum SpecError {
+    Halt(crate::agent::SandboxHalt),
+    Other(String),
+}
+
+/// Lower an `anyhow::Error` from `launch_spec` into a channel-safe [`SpecError`],
+/// keeping the typed halt when present.
+fn spec_err(e: anyhow::Error) -> SpecError {
+    match sandbox_halt_in(&e) {
+        Some(h) => SpecError::Halt(h.clone()),
+        None => SpecError::Other(e.to_string()),
+    }
+}
+
 /// Ask the bouncer gate for permission to run a consequential tool call (bouncer
 /// mode only). Sends an `ApprovalRequest` to the loop, pulses the waker so the
 /// overlay is raised, and awaits the user's decision. Returns `true` to proceed;
@@ -7757,9 +7853,15 @@ async fn event_loop<T: Terminal>(
         String, // group name (routing key)
         String, // worktree path (spawn cwd)
         usize,  // tab index
-        std::result::Result<Vec<(u32, crate::agent::LaunchSpec)>, String>,
+        std::result::Result<Vec<(u32, crate::agent::LaunchSpec)>, SpecError>,
     );
     let (spec_tx, mut spec_rx) = tokio_mpsc::unbounded_channel::<SpecBatch>();
+    // Live env-provisioning progress for the active tab: the off-loop spec task
+    // streams the setup steps (clone → toolchain → tools → dotfiles → snapshot)
+    // as `LoadStep`s so the splash shows a rich "setting up your environment"
+    // screen while a fresh provider sandbox is built. Keyed (group name, tab).
+    type ProvisionProgress = (String, usize, Vec<LoadStep>);
+    let (provision_tx, mut provision_rx) = tokio_mpsc::unbounded_channel::<ProvisionProgress>();
     let mut materialize_inflight: Option<(String, usize)> = None;
     // Active-tab keys (group name, tab) whose sandbox probe failed: skip
     // re-probing on the next tick for the same reason as prewarm_failed.
@@ -7915,6 +8017,9 @@ async fn event_loop<T: Terminal>(
     // container netns. `forward_target` is the worktree the detector watches; the
     // loop updates it as the active worktree changes.
     let mut forward_supervisor = crate::forward::ForwardSupervisor::new();
+    // Reverse host→sandbox tunnels (P0b model-proxy-by-default, P1 host services):
+    // per-worktree, started in `connect_worktree_bridge`, stopped on close.
+    let reverse_tunnel_supervisor = crate::revtunnel::ReverseTunnelSupervisor::new();
     let (forward_tx, mut forward_rx) =
         tokio_mpsc::unbounded_channel::<crate::forward::ForwardEvent>();
     let forward_target: crate::forward::DetectTarget =
@@ -8558,7 +8663,12 @@ async fn event_loop<T: Terminal>(
             // For a remote/provider worktree, connect its resident bridge (off
             // the loop) so git routes through the persistent agent and in-env
             // file edits stream back as refreshes. No-op for local worktrees.
-            connect_worktree_bridge(&bridge_sup, &current_worktree, keymap.config());
+            connect_worktree_bridge(
+                &bridge_sup,
+                &reverse_tunnel_supervisor,
+                &current_worktree,
+                keymap.config(),
+            );
             // Re-heal the canonical checkout's shared `.git/config` off-thread:
             // another agent committing in a sibling worktree could have leaked a
             // stray `core.worktree` since launch. Silent unless it strips a key;
@@ -8701,10 +8811,14 @@ async fn event_loop<T: Terminal>(
                         let conn = terminal_connection_for(&name);
                         let spec = crate::panes::terminal_launch_spec(&cfg, &conn);
                         Ok(missing.into_iter().map(|id| (id, spec.clone())).collect())
+                    } else if let Some(halt) = crate::agent::env_halt_reason(&cfg, &wt) {
+                        // Non-local env, failover off, known-down (token unset /
+                        // exec cooldown): halt rather than degrade to host.
+                        Err(SpecError::Halt(halt))
                     } else {
                         crate::agent::launch_spec(&cfg, &wt, None, "shell")
                             .map(|spec| missing.into_iter().map(|id| (id, spec.clone())).collect())
-                            .map_err(|e| e.to_string())
+                            .map_err(spec_err)
                     };
                     if tx.send((name, wt, ti, specs)).is_ok() {
                         let _ = wk.wake();
@@ -8825,6 +8939,7 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     let cfg = keymap.config().clone();
                     let tx = spec_tx.clone();
+                    let ptx = provision_tx.clone();
                     let wk = waker.clone();
                     let wt = path.clone();
                     let gname = name.clone();
@@ -8833,12 +8948,36 @@ async fn event_loop<T: Terminal>(
                             let conn = terminal_connection_for(&gname);
                             let spec = crate::panes::terminal_launch_spec(&cfg, &conn);
                             Ok(missing.into_iter().map(|id| (id, spec.clone())).collect())
+                        } else if let Some(halt) = crate::agent::env_halt_reason(&cfg, &wt) {
+                            // Non-local env, failover off, known-down (token unset
+                            // / exec cooldown): halt rather than degrade to host.
+                            Err(SpecError::Halt(halt))
                         } else {
-                            crate::agent::launch_spec(&cfg, &wt, None, "shell")
-                                .map(|spec| {
-                                    missing.into_iter().map(|id| (id, spec.clone())).collect()
-                                })
-                                .map_err(|e| e.to_string())
+                            // Provision the env first (provider only; no-op
+                            // otherwise): clone the repo + reproduce the declared
+                            // toolchain + personal layer, streaming live steps to
+                            // the splash. Then resolve the pane's launch spec so
+                            // the pane only attaches once the env is ready.
+                            let gname_p = gname.clone();
+                            let wk_p = wk.clone();
+                            let prov = crate::agent::provision_worktree(&cfg, &wt, |views| {
+                                let _ =
+                                    ptx.send((gname_p.clone(), ti, provision_load_steps(views)));
+                                let _ = wk_p.wake();
+                            });
+                            match prov {
+                                Ok(_) => crate::agent::launch_spec(&cfg, &wt, None, "shell")
+                                    .map(|spec| {
+                                        missing.into_iter().map(|id| (id, spec.clone())).collect()
+                                    })
+                                    .map_err(spec_err),
+                                Err(e) => Err(match sandbox_halt_in(&e) {
+                                    Some(h) => SpecError::Halt(h.clone()),
+                                    None => {
+                                        SpecError::Other(format!("environment setup failed: {e}"))
+                                    }
+                                }),
+                            }
                         };
                         if tx.send((gname, wt, ti, specs)).is_ok() {
                             let _ = wk.wake();
@@ -9854,6 +9993,20 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
 
+        // Live env-provisioning progress for the active tab → the splash. The
+        // off-loop spec task streams setup steps while a fresh provider sandbox
+        // is built; only the active tab's stream drives the loading screen.
+        while let Ok((name, ti, steps)) = provision_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Spec);
+            if let Some(gi) = session.worktrees.iter().position(|g| g.name == name)
+                && gi == session.active
+                && session.worktrees[gi].active_tab == ti
+            {
+                model.load_steps = steps;
+                dirty = true;
+            }
+        }
+
         // Resolved launch specs: finish the deferred materialize (lazy focus
         // path and pre-warm alike). Routed back to the requesting group by its
         // unique name (a path can be shared by two groups); results for a group
@@ -9891,7 +10044,21 @@ async fn event_loop<T: Terminal>(
                     specs
                 }
                 Err(e) => {
-                    model.status = format!("Pane launch blocked: {e}");
+                    // Failover off + non-local env couldn't come up: raise the
+                    // warning modal instead of just a status line. Otherwise a
+                    // plain blocked-launch status.
+                    match e {
+                        SpecError::Halt(halt) => {
+                            model.status =
+                                format!("{} unavailable: {}", halt.placement, halt.reason);
+                            if is_active {
+                                active_menu = Some(sandbox_halt_overlay(&halt));
+                            }
+                        }
+                        SpecError::Other(s) => {
+                            model.status = format!("Pane launch blocked: {s}");
+                        }
+                    }
                     if is_active {
                         model.load_steps = vec![LoadStep::failed("sandbox")];
                         center_dormant = true;
@@ -10941,6 +11108,8 @@ async fn event_loop<T: Terminal>(
                             let _ = db.delete_forward(prev, port);
                         }
                     }
+                    // Tear down the reverse model-proxy/host tunnels too.
+                    reverse_tunnel_supervisor.stop_worktree(prev);
                     model.forwards = current_forward_views(&forward_supervisor, &session);
                     dirty = true;
                 }
@@ -12924,6 +13093,28 @@ async fn event_loop<T: Terminal>(
                                     let _ = done.reply.send(allow);
                                 }
                                 active_menu = acp_approvals.active().map(approval_overlay);
+                                dirty = true;
+                                continue;
+                            }
+                            // Sandbox-halt retry: clear the provider failure
+                            // cooldown and re-arm the active tab's lazy
+                            // materialize so it re-resolves specs (the env may
+                            // now be fixed). If it's still down, the blocked-
+                            // launch handler raises this modal again.
+                            if let menu::MenuChoice::SandboxRetry = choice {
+                                if let Some(wt) = active_cwd(&session) {
+                                    crate::agent::clear_native_exec_cooldown(
+                                        keymap.config(),
+                                        &wt.to_string_lossy(),
+                                    );
+                                }
+                                if let Some(g) = session.worktrees.get(session.active) {
+                                    let key = (g.name.clone(), g.active_tab);
+                                    materialize_failed.remove(&key);
+                                    prewarm_failed.remove(&key);
+                                }
+                                center_dormant = false;
+                                model.status = "Retrying environment bring-up…".into();
                                 dirty = true;
                                 continue;
                             }
@@ -16356,8 +16547,16 @@ async fn event_loop<T: Terminal>(
                                                     }
                                                 }
                                                 Err(e) => {
-                                                    model.status =
-                                                        format!("Pane spawn failed: {e}");
+                                                    if let Some(h) = sandbox_halt_in(&e) {
+                                                        active_menu = Some(sandbox_halt_overlay(h));
+                                                        model.status = format!(
+                                                            "{} unavailable: {}",
+                                                            h.placement, h.reason
+                                                        );
+                                                    } else {
+                                                        model.status =
+                                                            format!("Pane spawn failed: {e}");
+                                                    }
                                                 }
                                             }
                                         }
@@ -17177,7 +17376,15 @@ async fn event_loop<T: Terminal>(
                                         }
                                     }
                                     Err(e) => {
-                                        model.status = format!("Pane spawn failed: {e}");
+                                        if let Some(h) = sandbox_halt_in(&e) {
+                                            active_menu = Some(sandbox_halt_overlay(h));
+                                            model.status = format!(
+                                                "{} unavailable: {}",
+                                                h.placement, h.reason
+                                            );
+                                        } else {
+                                            model.status = format!("Pane spawn failed: {e}");
+                                        }
                                     }
                                 }
                             }
@@ -17358,7 +17565,15 @@ async fn event_loop<T: Terminal>(
                                     Ok(id) => id,
                                     Err(e) => {
                                         // Survivable: report, don't exit the loop.
-                                        model.status = format!("Pane spawn failed: {e}");
+                                        if let Some(h) = sandbox_halt_in(&e) {
+                                            active_menu = Some(sandbox_halt_overlay(h));
+                                            model.status = format!(
+                                                "{} unavailable: {}",
+                                                h.placement, h.reason
+                                            );
+                                        } else {
+                                            model.status = format!("Pane spawn failed: {e}");
+                                        }
                                         dirty = true;
                                         continue;
                                     }
@@ -17721,7 +17936,15 @@ async fn event_loop<T: Terminal>(
                                         }
                                     }
                                     Err(e) => {
-                                        model.status = format!("new tab spawn failed: {e:#}");
+                                        if let Some(h) = sandbox_halt_in(&e) {
+                                            active_menu = Some(sandbox_halt_overlay(h));
+                                            model.status = format!(
+                                                "{} unavailable: {}",
+                                                h.placement, h.reason
+                                            );
+                                        } else {
+                                            model.status = format!("new tab spawn failed: {e:#}");
+                                        }
                                     }
                                 }
                                 refresh_tab_model(&mut model, &session, &mut sb);
