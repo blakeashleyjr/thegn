@@ -45,23 +45,30 @@
 - [ ] 5.3 Live verification on a real sprite (`SPRITES_TOKEN`): no `sprite`
       process per pane, type/resize/exit, reattach replays scrollback.
 
-## 6. Follow-up — CLI-free control plane (Route A, separate change)
+## 6. CLI-free control plane (Route A) — LANDED
 
-The interactive pane (exec) and lifecycle (create/checkpoint) are now CLI-free.
-The chrome's control plane (git status/diff/log, gh, repo clone-on-open) still
-shells `sprite exec` via `GitLoc::Provider`'s `control_prefix`. The resident
-bridge ALREADY intercepts every control-plane op at the `git::run`/`run_w` seam
-(`superzej-svc/src/git/mod.rs:455-507`) once a `BridgeClient` is registered — so
-the only remaining CLI use is **starting** the bridge agent.
+The resident bridge intercepts every control-plane op at the `git::run`/`run_w`
+seam once registered; the bridge agent is now started over native exec.
 
-- [ ] 6.1 `bridge_sup.rs::bridge_command` (`:177-195`): for a `Placement::Provider`
-      with `caps().exec_api`, start `szhost bridge` via `provider.open_exec(tty=false)`
-      instead of the `control_prefix` CLI.
-- [ ] 6.2 Adapt the async `ExecSession` (frames/control channels) to the blocking
-      `Read`+`Write` that `BridgeClient::build` consumes (the reader runs on a
-      std::thread; mind tokio `blocking_send`/`blocking_recv` context rules).
-- [ ] 6.3 Route `provision_provider_repo` (`agent.rs:818`) through the bridge too,
-      so clone-on-open is CLI-free; keep the CLI path as graceful fallback.
-- [ ] 6.4 Requires a musl bridge binary (`nix build .#szhost-musl`,
-      `SUPERZEJ_BRIDGE_BINARY`) pushed via the existing `ensure_executable` fs API;
-      live-verify on a real sprite.
+- [x] 6.1 `connect_native` in `bridge_sup.rs`: start `szhost bridge` via
+      `provider.open_exec(tty=false)`; `connect_worktree_bridge` (`run.rs`) prefers
+      it for an exec_api provider (`exec != cli`), else the CLI `bridge_command`.
+- [x] 6.2 `ExecSession`→`Read`/`Write` adapter (`FramesReader`/`ControlWriter`,
+      blocking off the runtime workers they run on) feeding `BridgeClient::new`;
+      `drive_exec` made tty-aware (non-PTY 1-byte stream framing) + adapter test.
+- [x] 6.3 `provision_provider_repo` routes the clone through the bridge when up,
+      else the CLI fallback.
+- [ ] 6.4 Live-verify on a real sprite with a musl bridge binary
+      (`nix build .#szhost-musl`, `SUPERZEJ_BRIDGE_BINARY`).
+
+## 7. Out of scope — agent pane in a provider env
+
+The AI **agent** pane (`attach_agent_pane`, `run.rs`) is not routed through native
+exec. It's coupled to an out-of-band ACP channel (a localhost TCP port, or a
+bind-mounted unix socket under the bouncer) that the host connects to — neither
+reaches an agent running _inside_ a remote sprite, independent of how the pane is
+spawned. A CLI-free agent-in-provider needs its own ACP transport (e.g. ACP
+multiplexed over the resident bridge, or a provider port-forward API) — a separate
+design. Shell/split/new-tab/restore panes ARE covered (native exec + the Route A
+control plane). Terminal panes (ssh/local) and the yazi drawer (local tool) are
+intentionally left on their own paths.
