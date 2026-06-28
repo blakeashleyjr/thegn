@@ -34,7 +34,8 @@ repos/worktrees is a tab switch — never a session change (no teleport).
   `o` open · `c` create · `m` merge · `a` approve · `r` re-run failed checks · `f` refresh.
 - **Tools, scoped to the focused worktree, as floating panes:**
   `Alt-g` lazygit · `Alt-y` yazi · `Alt-e` `$EDITOR` · `Alt-/` git diff.
-- **Pinned programs:** `Alt-1..9` launch or focus a globally configured `[[pins]]` program. By default they open a dedicated `pin:<name>` tab, but `location = "layout"` injects them as a tiled pane directly into your focused layout.
+- **Quick-jump digits:** `Alt-1..9` jump to a worktree, `Ctrl-1..9` to a workspace, by their slot in sidebar order. The digit hints are revealed on the rows while the sidebar is focused (`Alt-s`); the keys work from anywhere.
+- **Pinned programs:** `Ctrl-Alt-1..9` launch or focus a globally configured `[[pins]]` program. By default they open a dedicated `pin:<name>` tab, but `location = "layout"` injects them as a tiled pane directly into your focused layout.
 - **Cleanup.** `Alt-X` removes the focused worktree and closes its tab (branch kept by
   default). Closing a plain panel never deletes a worktree.
 
@@ -47,28 +48,30 @@ panes, pane & tab modes. `Alt-[` / `Alt-]` cycle the center terminals through
 vertical / side-by-side / stacked arrangements (needs ≥2 center panes; the
 sidebar, tabbar and panel stay pinned).
 
-| Key               | Action                                                   |
-| ----------------- | -------------------------------------------------------- |
-| Cmd-K (Super-K)   | command palette (fuzzy menu of all actions)              |
-| Alt-←/→           | switch tabs                                              |
-| Alt-h/j/k/l       | move pane focus (sidebar ↔ terminals ↔ panel)            |
-| Super-Alt-←/→/h/l | same, across columns (needs a WM that forwards Super)    |
-| Super-Alt-↑/↓/j/k | same, between stacked terminal panes                     |
-| Alt-W             | new workspace (open a repo as its home tab)              |
-| Alt-w             | new worktree (a tab + "what to run" picker)              |
-| Alt-t             | new tab on the _same_ worktree (`{tab} ·2`, full chrome) |
-| Alt-n             | new panel (plain split pane)                             |
-| Alt-o             | switch workspace (floating repo picker)                  |
-| Alt-d             | worktree dashboard (jump to any worktree tab)            |
-| Alt-s             | hide / show the left sidebar                             |
-| Alt-p             | hide / show the right diff/PR panel                      |
-| Alt-g             | lazygit (floating, scoped to worktree)                   |
-| Alt-y             | yazi                                                     |
-| Alt-e             | `$EDITOR`                                                |
-| Alt-/             | git diff                                                 |
-| Alt-1..9          | launch / focus pinned programs (`[[pins]]` config)       |
-| Alt-x             | close active tab                                         |
-| Alt-X             | close active worktree                                    |
+| Key               | Action                                                    |
+| ----------------- | --------------------------------------------------------- |
+| Cmd-K (Super-K)   | command palette (fuzzy menu of all actions)               |
+| Alt-←/→           | switch tabs                                               |
+| Alt-h/j/k/l       | move pane focus (sidebar ↔ terminals ↔ panel)             |
+| Super-Alt-←/→/h/l | same, across columns (needs a WM that forwards Super)     |
+| Super-Alt-↑/↓/j/k | same, between stacked terminal panes                      |
+| Alt-W             | new workspace (open a repo as its home tab)               |
+| Alt-w             | new worktree (a tab + "what to run" picker)               |
+| Alt-t             | new tab on the _same_ worktree (`{tab} ·2`, full chrome)  |
+| Alt-n             | new panel (plain split pane)                              |
+| Alt-o             | switch workspace (floating repo picker)                   |
+| Alt-d             | worktree dashboard (jump to any worktree tab)             |
+| Alt-s             | hide / show the left sidebar                              |
+| Alt-p             | hide / show the right diff/PR panel                       |
+| Alt-g             | lazygit (floating, scoped to worktree)                    |
+| Alt-y             | yazi                                                      |
+| Alt-e             | `$EDITOR`                                                 |
+| Alt-/             | git diff                                                  |
+| Alt-1..9          | jump to worktree N (digits revealed when sidebar focused) |
+| Ctrl-1..9         | jump to workspace N                                       |
+| Ctrl-Alt-1..9     | launch / focus pinned programs (`[[pins]]` config)        |
+| Alt-x             | close active tab                                          |
+| Alt-X             | close active worktree                                     |
 
 _The above uses the `Normal` keybind mode. Superzej also ships with native `VimNormal` (with `Space` leader layer) and `Emacs` mode presets; switch modes with `Ctrl-Alt-v` or `Ctrl-Alt-e`._
 
