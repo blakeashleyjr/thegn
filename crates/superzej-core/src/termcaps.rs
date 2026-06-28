@@ -778,19 +778,19 @@ mod tests {
             terminal_name: Some("wezterm".into()),
         };
         // All auto → all upgraded.
-        let up = apply_probe(base.clone(), &modern, true, true, true);
+        let up = apply_probe(base, &modern, true, true, true);
         assert_eq!(up.color, ColorDepth::Truecolor);
         assert_eq!(up.unicode, UnicodeLevel::Full);
         assert!(up.undercurl);
 
         // Explicit config (auto=false) is preserved despite a modern probe.
-        let pinned = apply_probe(base.clone(), &modern, false, false, false);
+        let pinned = apply_probe(base, &modern, false, false, false);
         assert_eq!(pinned.color, ColorDepth::Ansi16);
         assert_eq!(pinned.unicode, UnicodeLevel::Ascii);
         assert!(!pinned.undercurl);
 
         // A non-modern probe never changes anything.
         let none = ProbeResult::default();
-        assert_eq!(apply_probe(base.clone(), &none, true, true, true), base);
+        assert_eq!(apply_probe(base, &none, true, true, true), base);
     }
 }
