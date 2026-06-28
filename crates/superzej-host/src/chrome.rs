@@ -1936,22 +1936,34 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
     let visible: Vec<&crate::sidebar::SidebarRow> =
         model.sidebar_rows.iter().filter(|r| r.visible).collect();
 
-    // Ctrl+1..9 quick-jump slots: only switchable (DB-backed, has a
-    // `worktree_path`) workspace rows count, in visible order, slots 1..=9.
-    let slots: Vec<Option<u8>> = {
-        let mut next: u8 = 1;
+    // Quick-jump digits are revealed only while the sidebar is focused — they
+    // declutter the resting view but let you see the Ctrl+N (workspace) and
+    // Alt+N (worktree) targets when you're navigating it. Each axis counts
+    // independently in visible order, slots 1..=9, matching the dispatch:
+    // workspaces follow `sidebar_workspace_order` (switchable = has a
+    // `worktree_path`); worktrees follow `sidebar_worktree_order` (Tab targets).
+    let slots: Vec<Option<u8>> = if model.sidebar_focused {
+        let (mut ws, mut wt): (u8, u8) = (1, 1);
         visible
             .iter()
-            .map(|r| {
-                if r.kind == RowKind::Workspace && r.worktree_path.is_some() {
-                    let s = (next <= 9).then_some(next);
-                    next += 1;
+            .map(|r| match r.kind {
+                RowKind::Workspace if r.worktree_path.is_some() => {
+                    let s = (ws <= 9).then_some(ws);
+                    ws += 1;
                     s
-                } else {
-                    None
                 }
+                RowKind::Worktree
+                    if matches!(r.tab_target, Some(crate::sidebar::RowTarget::Tab(..))) =>
+                {
+                    let s = (wt <= 9).then_some(wt);
+                    wt += 1;
+                    s
+                }
+                _ => None,
             })
             .collect()
+    } else {
+        vec![None; visible.len()]
     };
 
     // The full panel reserves a header + blank row at the top and a metrics
@@ -2323,9 +2335,13 @@ fn compose_row_lines(
             vec![Line::Segs(l)]
         }
         RowKind::Worktree => {
-            // Left cluster: gutter, tree connector, activity dot (own color),
-            // the dynamic name, then the agent glyph.
+            // Left cluster: gutter, the revealed Alt+1..9 quick-jump digit,
+            // tree connector, activity dot (own color), the dynamic name, then
+            // the agent glyph.
             let mut left = vec![sp(1)];
+            if let Some(n) = slot {
+                left.push(seg(Tok::Slot(S::Faint), format!("{n} ")));
+            }
             left.extend(tree_lead(row.depth, is_last));
             if matches!(row.activity, ActivityState::None) {
                 left.push(sp(2)); // keep names aligned with dotted rows
@@ -3295,6 +3311,8 @@ mod tests {
         c.worktree_path = Some("/repo/charlie".into());
         let model = FrameModel {
             sidebar_rows: vec![a, b, c],
+            // Digits are revealed only while the sidebar is focused.
+            sidebar_focused: true,
             ..Default::default()
         };
         let mut s = Surface::new(24, 10);
@@ -3317,45 +3335,78 @@ mod tests {
     }
 
     #[test]
-    fn workspace_rows_show_quick_jump_digits_regardless_of_focus() {
+    fn quick_jump_digits_revealed_only_while_sidebar_focused() {
         let rect = Rect {
             x: 0,
             y: 0,
             cols: 24,
             rows: 6,
         };
-        use crate::sidebar::RowKind;
-        // A switchable workspace carries a `worktree_path`; an unswitchable
-        // (live-fallback) one does not and so gets no slot — mirroring
-        // `sidebar_workspace_order`.
+        use crate::sidebar::{RowKind, RowTarget};
+        // A switchable workspace carries a `worktree_path`; a worktree with a
+        // Tab target gets an Alt+N jump digit.
         let mut ws = row(RowKind::Workspace, "app");
         ws.worktree_path = Some("/repo/app".into());
+        let mut wt = row(RowKind::Worktree, "home");
+        wt.tab_target = Some(RowTarget::Tab(0, 0));
         let model = FrameModel {
-            sidebar_rows: vec![ws, row(RowKind::Worktree, "home")],
-            sidebar_selected: 1,
+            sidebar_rows: vec![ws, wt],
+            sidebar_selected: 0,
             sidebar_focused: true,
             ..Default::default()
         };
         let mut s = Surface::new(24, 6);
         draw_sidebar(&mut s, rect, &model);
         let focused = s.screen_chars_to_string();
-        // Slot "1" is painted before the caret on the first switchable workspace.
+        // Focused: workspace shows its Ctrl+N digit, worktree its Alt+N digit.
         assert!(
             focused.contains("1 \u{25be} app"),
-            "digit hint on workspace row: {focused:?}"
+            "workspace digit while focused: {focused:?}"
+        );
+        assert!(
+            focused.contains("1 "),
+            "worktree digit while focused: {focused:?}"
         );
 
-        // The digit persists when the sidebar is not focused (user chose
-        // always-on hints, unlike the focus-only cursor bar).
+        // Unfocused: the resting view is decluttered — no digits at all.
         let mut unfocused = model.clone();
         unfocused.sidebar_focused = false;
         let mut s2 = Surface::new(24, 6);
         draw_sidebar(&mut s2, rect, &unfocused);
         let text2 = s2.screen_chars_to_string();
         assert!(
-            text2.contains("1 \u{25be} app"),
-            "digit hint shown unfocused too: {text2:?}"
+            text2.contains("\u{25be} app") && !text2.contains("1 \u{25be} app"),
+            "no workspace digit when unfocused: {text2:?}"
         );
+    }
+
+    #[test]
+    fn worktree_rows_show_alt_jump_digits_in_order_when_focused() {
+        use crate::sidebar::{RowKind, RowTarget};
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 24,
+            rows: 8,
+        };
+        let mut ws = row(RowKind::Workspace, "app");
+        ws.worktree_path = Some("/repo/app".into());
+        let mut a = row(RowKind::Worktree, "alpha");
+        a.tab_target = Some(RowTarget::Tab(0, 0));
+        let mut b = row(RowKind::Worktree, "bravo");
+        b.tab_target = Some(RowTarget::Tab(1, 0));
+        let model = FrameModel {
+            sidebar_rows: vec![ws, a, b],
+            // Select the workspace so neither worktree expands (keeps rows 1-line).
+            sidebar_selected: 0,
+            sidebar_focused: true,
+            ..Default::default()
+        };
+        let mut s = Surface::new(24, 8);
+        draw_sidebar(&mut s, rect, &model);
+        let text = s.screen_chars_to_string();
+        assert!(text.contains("1 ") && text.contains("alpha"), "alpha is worktree slot 1: {text:?}");
+        assert!(text.contains("2 ") && text.contains("bravo"), "bravo is worktree slot 2: {text:?}");
     }
 
     #[test]
