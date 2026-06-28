@@ -248,7 +248,10 @@ fn context_hints(
     resolved.sort_by_key(|a| std::cmp::Reverse(a.priority));
 
     let focus_context = match focus.zone {
-        crate::focus::Zone::Center => superzej_core::keymap::Context::Center,
+        // The corner overlay is a PTY zone like the center (keys forward to it).
+        crate::focus::Zone::Center | crate::focus::Zone::Corner => {
+            superzej_core::keymap::Context::Center
+        }
         crate::focus::Zone::Sidebar => superzej_core::keymap::Context::Left,
         crate::focus::Zone::Panel => superzej_core::keymap::Context::Right,
         crate::focus::Zone::Drawer | crate::focus::Zone::Statusbar => {
@@ -994,24 +997,26 @@ fn compute_chrome(
             l.strip = None;
             l
         }
-        // The bars are single rows and the drawer is never a zoom target —
-        // zooming them makes no sense; fall back to the normal layout (zoom is
-        // never set to these zones; this arm exists for exhaustiveness).
-        Some(Zone::Masthead) | Some(Zone::Statusbar) | Some(Zone::Drawer) | None => {
-            layout::compute_full(
-                cols,
-                rows,
-                want_sidebar,
-                want_panel,
-                panel_forced,
-                panel_width,
-                sidebar_cols,
-                strip,
-                supervisor.strip_ratio(),
-                drawer_rows,
-                drawer_full_width,
-            )
-        }
+        // The bars are single rows, and the drawer / corner overlay are never
+        // zoom targets — zooming them makes no sense; fall back to the normal
+        // layout (zoom is never set to these zones; this arm is for exhaustiveness).
+        Some(Zone::Masthead)
+        | Some(Zone::Statusbar)
+        | Some(Zone::Drawer)
+        | Some(Zone::Corner)
+        | None => layout::compute_full(
+            cols,
+            rows,
+            want_sidebar,
+            want_panel,
+            panel_forced,
+            panel_width,
+            sidebar_cols,
+            strip,
+            supervisor.strip_ratio(),
+            drawer_rows,
+            drawer_full_width,
+        ),
     }
 }
 
@@ -1090,6 +1095,16 @@ fn summon_pin(
     let ws = (!session.id.is_empty()).then_some(session.id.as_str());
     let resolved = crate::pins::PinSupervisor::resolve(cfg, ws);
     let pin = resolved.get(index.checked_sub(1)?)?;
+    // Corner pins are an overlay slot owned by the event loop (which tracks the
+    // single live corner + its focus), not the generic spawn-into-`center` path
+    // here — summoning one this way would orphan an invisible pane. Redirect to
+    // the dedicated toggle instead of mis-placing it.
+    if pin.location == superzej_core::config::PinLocation::Corner {
+        return Some(format!(
+            "'{}' is a corner overlay — toggle it with Ctrl+Alt+o",
+            pin.display_label()
+        ));
+    }
     if pin.singleton && supervisor.live_instance(&pin.name).is_some() {
         return Some(format!("Pin '{}' already running", pin.display_label()));
     }
@@ -6146,17 +6161,83 @@ fn apply_layout_to_active_tab(
 /// terminal `rows`: an `"NN%"` ratio of the screen, else a literal row count.
 /// Falls back to a third of the screen on a malformed value (this is what fixes
 /// the old silent 20-row fallback when `"35%"` failed to parse as a `usize`).
-fn resolve_drawer_rows(height: &str, rows: usize) -> usize {
-    let h = height.trim();
-    let resolved = if let Some(pct) = h.strip_suffix('%') {
+/// Resolve a dimension spec — `"NN%"` of `total`, or an absolute cell count — to
+/// cells, clamped to `[0, total]`. Falls back to `default` on an empty or
+/// unparseable spec. Shared by the drawer (rows) and corner pins (cols + rows).
+fn resolve_dim(spec: &str, total: usize, default: usize) -> usize {
+    let s = spec.trim();
+    let resolved = if let Some(pct) = s.strip_suffix('%') {
         pct.trim()
             .parse::<f32>()
             .ok()
-            .map(|p| (rows as f32 * p / 100.0).round() as usize)
+            .map(|p| (total as f32 * p / 100.0).round() as usize)
     } else {
-        h.parse::<usize>().ok()
+        s.parse::<usize>().ok()
     };
-    resolved.unwrap_or(rows / 3).min(rows)
+    resolved.unwrap_or(default).min(total)
+}
+
+fn resolve_drawer_rows(height: &str, rows: usize) -> usize {
+    resolve_dim(height, rows, rows / 3)
+}
+
+/// The outer rect a `location = "corner"` pin WILL occupy on a `cols`×`rows`
+/// screen, from its configured corner + width/height (defaulting to ~30%). The
+/// bordered card paints over this rect; the PTY gets `pins::inset1` of it. Pure
+/// w.r.t. the screen size, so it is recomputed each frame and reused for the
+/// bounded incremental diff.
+fn prospective_corner_rect(pin: &superzej_core::config::Pin, cols: usize, rows: usize) -> Rect {
+    let w = resolve_dim(
+        pin.corner_width.as_deref().unwrap_or("30%"),
+        cols,
+        (cols * 3) / 10,
+    );
+    let h = resolve_dim(
+        pin.corner_height.as_deref().unwrap_or("30%"),
+        rows,
+        (rows * 3) / 10,
+    );
+    crate::pins::corner_rect(pin.corner, w, h, cols, rows)
+}
+
+/// Compose the live corner overlay pin (content + bordered card) into `scratch`
+/// and return its outer rect (for the bounded incremental diff). No-op (returns
+/// `None`) when the corner slot is empty or its pin/pane has gone. The border
+/// reads in the focus color while the corner owns the keyboard, else the normal
+/// pane border. Shared by the incremental fast path and the full-frame compose.
+#[allow(clippy::too_many_arguments)]
+fn compose_corner(
+    scratch: &mut termwiz::surface::Surface,
+    panes: &Panes,
+    corner: Option<u32>,
+    corner_name: Option<&str>,
+    cfg: &superzej_core::config::Config,
+    cols: usize,
+    rows: usize,
+    focused: bool,
+) -> Option<Rect> {
+    let id = corner?;
+    let name = corner_name?;
+    let pin = cfg.pins.iter().find(|p| p.name == name)?;
+    let p = panes.table.get(&id)?;
+    let outer = prospective_corner_rect(pin, cols, rows);
+    crate::compositor::compose_pane(scratch, p.emulator(), crate::pins::inset1(outer));
+    let border = if focused {
+        crate::chrome::col(crate::chrome::S::Focus)
+    } else {
+        crate::chrome::col(crate::chrome::S::Border)
+    };
+    crate::borders::draw_card(
+        scratch,
+        outer,
+        pin.display_label(),
+        &crate::borders::CardStyle {
+            border,
+            title: crate::chrome::col(crate::chrome::S::Text),
+            bg: crate::chrome::col(crate::chrome::S::Bg0),
+        },
+    );
+    Some(outer)
 }
 
 fn spawn_yazi_pane(
@@ -8095,6 +8176,21 @@ async fn event_loop<T: Terminal>(
     let mut drawer_pool = DrawerPool::default();
     // The dir the VISIBLE drawer was opened for (its pool key when hidden).
     let mut drawer_home: Option<std::path::PathBuf> = None;
+    // The live corner-overlay pin pane (e.g. an `mpv --vo=tct` video player), if
+    // any. A single slot, so the corner is inherently a singleton; the pin name
+    // is kept so exit/toggle can drive the supervisor.
+    let mut corner: Option<u32> = None;
+    let mut corner_name: Option<String> = None;
+    // Kitty graphics relay for the corner pane (Phase 2 crisp video): when the
+    // OUTER terminal speaks the kitty protocol, the corner pane's image escapes
+    // (e.g. `mpv --vo=kitty`) are pulled out of its PTY stream and re-emitted to
+    // the outer terminal offset to the corner rect. `corner_gfx` queues the
+    // repositioned bytes for the post-flush emit; `corner_occluded` tracks whether
+    // a full-screen overlay covered the corner last frame (delete-on-occlude).
+    let corner_kitty = crate::kitty_relay::outer_supports_kitty_graphics();
+    let mut corner_relay = crate::kitty_relay::KittyRelay::new();
+    let mut corner_gfx: Vec<Vec<u8>> = Vec::new();
+    let mut corner_occluded = false;
     // Keeps every visited workspace's panes alive in memory across switches, so
     // a program left running in one repo is still there on return (no cap).
     let mut workspace_pool = WorkspacePool::default();
@@ -8236,6 +8332,25 @@ async fn event_loop<T: Terminal>(
             }
         }
         for pin in &to_launch {
+            // Corner pins resurrect into the event loop's single overlay slot
+            // (sized to their corner rect), not the generic spawn-into-`center`
+            // path — first one wins, and it comes back unfocused.
+            if pin.location == superzej_core::config::PinLocation::Corner {
+                if corner.is_none() {
+                    let content = crate::pins::inset1(prospective_corner_rect(pin, cols, rows));
+                    let argv = crate::pins::PinSupervisor::argv(pin);
+                    let env: Vec<(String, String)> = crate::pins::PinSupervisor::spawn_env(pin)
+                        .into_iter()
+                        .collect();
+                    let cwd = pin_cwd(pin, active_dir.clone());
+                    if let Ok(id) = panes.spawn_argv_env(&argv, Some(&cwd), &env, content) {
+                        supervisor.attach(pin, id);
+                        corner = Some(id);
+                        corner_name = Some(pin.name.clone());
+                    }
+                }
+                continue;
+            }
             spawn_pin(
                 pin,
                 &mut panes,
@@ -8777,6 +8892,26 @@ async fn event_loop<T: Terminal>(
             {
                 let _ = p.resize(d.rows as u16, d.cols as u16);
             }
+            // Size the corner overlay's PTY to its bordered content rect (screen-
+            // relative), so mpv/tct's grid tracks the card on resize.
+            if let Some(id) = corner
+                && let Some(name) = corner_name.as_deref()
+                && let Some(pin) = current_config.pins.iter().find(|p| p.name == name)
+            {
+                let content = crate::pins::inset1(prospective_corner_rect(pin, cols, rows));
+                if let Some(p) = panes.table.get_mut(&id) {
+                    let _ = p.resize(content.rows as u16, content.cols as u16);
+                }
+                // Clear any kitty image at the old geometry; the child re-transmits
+                // at the new size on its next frame.
+                if corner_kitty {
+                    use std::io::Write as _;
+                    let mut o = std::io::stdout();
+                    let _ = o.write_all(crate::kitty_relay::delete_all());
+                    let _ = o.flush();
+                    corner_gfx.clear();
+                }
+            }
             // Keep the tabbar chips in sync with the live pin set/health.
             let ws = (!session.id.is_empty()).then_some(session.id.as_str());
             model.pins = supervisor.chips(&current_config, ws);
@@ -8789,10 +8924,21 @@ async fn event_loop<T: Terminal>(
         // this frame instead of one wake late.
         // A set, not a Vec: the drain checks membership once per output chunk
         // (and per chunk-budget loop), so O(1) lookups beat a linear scan.
-        let visible: std::collections::HashSet<u32> = session
+        let mut visible: std::collections::HashSet<u32> = session
             .active_tab()
             .map(|t| t.center.pane_ids().into_iter().collect())
             .unwrap_or_default();
+        // The corner overlay pin is not in the active tab's center tree, so fold
+        // it into the visible set: its PTY output must dirty `dirty_panes` (the
+        // Panes channel), NOT the chrome `dirty` flag. A playing video streams
+        // ~24-30fps, so this wakes the loop continuously while it plays — that is
+        // correct and BOUNDED (render_plan keeps it a per-rect diff of the corner
+        // alone, never a Full chrome recompose). Do not "optimize" it onto the
+        // chrome dirty path or into render_plan::Overlays — either turns the
+        // bounded corner diff into a 30fps whole-screen recompose (wake storm).
+        if let Some(cid) = corner {
+            visible.insert(cid);
+        }
 
         // 1. Drain pending PTY output, routed by pane id. Only output from a pane
         //    visible in the active tab dirties the frame; others advance silently.
@@ -8819,32 +8965,108 @@ async fn event_loop<T: Terminal>(
                                 if !model.load_steps.is_empty() && visible.contains(&id) {
                                     model.load_steps.clear();
                                 }
-                                p.feed(&b);
-                                // Answer terminal queries (DA/DSR/OSC color,
-                                // kitty probes) the app just sent — without a
-                                // reply, programs like yazi warn or time out.
-                                let resp = {
-                                    let emu = p.emulator();
-                                    crate::queries::query_responses(&b, emu.cursor(), emu.size())
-                                };
-                                if !resp.is_empty() {
-                                    let _ = p.write_input(&resp);
-                                }
-                                // Clipboard sets (OSC 52) from inner apps go
-                                // VERBATIM to the outer terminal — vim's
-                                // "+y inside a pane reaches the system
-                                // clipboard like in a plain terminal.
-                                let fwd = crate::queries::osc_passthrough(&b);
-                                if !fwd.is_empty() {
-                                    use std::io::Write;
-                                    let mut out = std::io::stdout();
-                                    let _ = out.write_all(&fwd);
-                                    let _ = out.flush();
-                                }
-                                if visible.contains(&id) {
-                                    // Pane-content-only damage: recompose just
-                                    // this pane, not the chrome (see render_plan).
+                                if Some(id) == corner && corner_kitty {
+                                    // CRISP CORNER VIDEO: split the corner pane's
+                                    // stream — text feeds the emulator (so its
+                                    // cursor tracks the child's placement), kitty
+                                    // image escapes are pulled out, repositioned to
+                                    // the corner rect, and queued for the outer
+                                    // terminal (emitted after the frame flush). See
+                                    // `kitty_relay`.
+                                    let origin = current_config
+                                        .pins
+                                        .iter()
+                                        .find(|pp| Some(pp.name.as_str()) == corner_name.as_deref())
+                                        .map(|pp| {
+                                            let c = crate::pins::inset1(prospective_corner_rect(
+                                                pp, cols, rows,
+                                            ));
+                                            (c.y as u16, c.x as u16)
+                                        })
+                                        .unwrap_or((0, 0));
+                                    let mut emu_text: Vec<u8> = Vec::new();
+                                    for piece in corner_relay.feed(&b) {
+                                        match piece {
+                                            crate::kitty_relay::Piece::Emulator(t) => {
+                                                p.feed(&t);
+                                                emu_text.extend_from_slice(&t);
+                                            }
+                                            crate::kitty_relay::Piece::GfxDisplay(seq) => {
+                                                // Cursor reflects the text fed so
+                                                // far (the child homes right before
+                                                // the image); place there + origin.
+                                                let cur = p.emulator().cursor();
+                                                let mut bytes =
+                                                    crate::kitty_relay::cup(origin, cur);
+                                                bytes.extend_from_slice(&seq);
+                                                corner_gfx.push(bytes);
+                                            }
+                                            crate::kitty_relay::Piece::GfxOther(seq) => {
+                                                corner_gfx.push(seq);
+                                            }
+                                            crate::kitty_relay::Piece::GfxAnswer(ans) => {
+                                                let _ = p.write_input(&ans);
+                                            }
+                                        }
+                                    }
+                                    // DA/DSR/OSC replies + OSC52 passthrough on the
+                                    // graphics-stripped bytes only (the kitty probe,
+                                    // if any, was answered by the relay).
+                                    if !emu_text.is_empty() {
+                                        let resp = {
+                                            let emu = p.emulator();
+                                            crate::queries::query_responses(
+                                                &emu_text,
+                                                emu.cursor(),
+                                                emu.size(),
+                                            )
+                                        };
+                                        if !resp.is_empty() {
+                                            let _ = p.write_input(&resp);
+                                        }
+                                        let fwd = crate::queries::osc_passthrough(&emu_text);
+                                        if !fwd.is_empty() {
+                                            use std::io::Write;
+                                            let mut out = std::io::stdout();
+                                            let _ = out.write_all(&fwd);
+                                            let _ = out.flush();
+                                        }
+                                    }
+                                    // Corner is in `visible`; mark it dirty so the
+                                    // render block runs and flushes `corner_gfx`.
                                     dirty_panes.insert(id);
+                                } else {
+                                    p.feed(&b);
+                                    // Answer terminal queries (DA/DSR/OSC color,
+                                    // kitty probes) the app just sent — without a
+                                    // reply, programs like yazi warn or time out.
+                                    let resp = {
+                                        let emu = p.emulator();
+                                        crate::queries::query_responses(
+                                            &b,
+                                            emu.cursor(),
+                                            emu.size(),
+                                        )
+                                    };
+                                    if !resp.is_empty() {
+                                        let _ = p.write_input(&resp);
+                                    }
+                                    // Clipboard sets (OSC 52) from inner apps go
+                                    // VERBATIM to the outer terminal — vim's
+                                    // "+y inside a pane reaches the system
+                                    // clipboard like in a plain terminal.
+                                    let fwd = crate::queries::osc_passthrough(&b);
+                                    if !fwd.is_empty() {
+                                        use std::io::Write;
+                                        let mut out = std::io::stdout();
+                                        let _ = out.write_all(&fwd);
+                                        let _ = out.flush();
+                                    }
+                                    if visible.contains(&id) {
+                                        // Pane-content-only damage: recompose just
+                                        // this pane, not the chrome (see render_plan).
+                                        dirty_panes.insert(id);
+                                    }
                                 }
                             }
                         }
@@ -8875,6 +9097,65 @@ async fn event_loop<T: Terminal>(
                             }
                             // A pooled (hidden) drawer's yazi exited; just forget it.
                             if drawer_pool.remove_id(id) {
+                                dirty = true;
+                                continue;
+                            }
+                            // The corner overlay pin died (e.g. mpv quit on `q`).
+                            // It's a supervised pin, so still drive `on_exit` for
+                            // the chip/health + restart policy, but respawn into
+                            // the corner rect (not the center) and re-occupy the
+                            // single corner slot. A clean exit stays down unless
+                            // `restart = always`.
+                            if corner == Some(id) {
+                                corner = None;
+                                let name = corner_name.take();
+                                // The child is gone; clear its last image off the
+                                // outer terminal and reset the relay state.
+                                if corner_kitty {
+                                    use std::io::Write as _;
+                                    let mut o = std::io::stdout();
+                                    let _ = o.write_all(crate::kitty_relay::delete_all());
+                                    let _ = o.flush();
+                                }
+                                corner_relay.reset();
+                                corner_gfx.clear();
+                                corner_occluded = false;
+                                if focus.corner() {
+                                    focus.zone = crate::focus::Zone::Center;
+                                }
+                                if let Some(name) = name {
+                                    let respawn = matches!(
+                                        supervisor.on_exit(id, exit_code == Some(0)),
+                                        crate::pins::RestartDecision::Respawn
+                                    );
+                                    if respawn
+                                        && let Some(pin) = current_config
+                                            .pins
+                                            .iter()
+                                            .find(|p| p.name == name)
+                                            .cloned()
+                                    {
+                                        let active_dir = active_cwd(&session);
+                                        let content = crate::pins::inset1(prospective_corner_rect(
+                                            &pin, cols, rows,
+                                        ));
+                                        let argv = crate::pins::PinSupervisor::argv(&pin);
+                                        let env: Vec<(String, String)> =
+                                            crate::pins::PinSupervisor::spawn_env(&pin)
+                                                .into_iter()
+                                                .collect();
+                                        let cwd = pin_cwd(&pin, active_dir);
+                                        if let Ok(fresh) =
+                                            panes.spawn_argv_env(&argv, Some(&cwd), &env, content)
+                                        {
+                                            supervisor.reattach(&name, fresh);
+                                            corner = Some(fresh);
+                                            corner_name = Some(name);
+                                        }
+                                    }
+                                }
+                                persist_pin_state(&supervisor, &session.id);
+                                need_relayout = true;
                                 dirty = true;
                                 continue;
                             }
@@ -10227,6 +10508,29 @@ async fn event_loop<T: Terminal>(
                                     continue;
                                 }
                                 let pin = (*pin).clone();
+                                // A corner pin goes into the event loop's overlay
+                                // slot (sized to its corner rect), not the center.
+                                if pin.location == superzej_core::config::PinLocation::Corner {
+                                    if corner.is_none() {
+                                        let content = crate::pins::inset1(prospective_corner_rect(
+                                            &pin, cols, rows,
+                                        ));
+                                        let argv = crate::pins::PinSupervisor::argv(&pin);
+                                        let env: Vec<(String, String)> =
+                                            crate::pins::PinSupervisor::spawn_env(&pin)
+                                                .into_iter()
+                                                .collect();
+                                        let cwd = pin_cwd(&pin, active_dir.clone());
+                                        if let Ok(id) =
+                                            panes.spawn_argv_env(&argv, Some(&cwd), &env, content)
+                                        {
+                                            supervisor.attach(&pin, id);
+                                            corner = Some(id);
+                                            corner_name = Some(pin.name.clone());
+                                        }
+                                    }
+                                    continue;
+                                }
                                 spawn_pin(
                                     &pin,
                                     &mut panes,
@@ -10944,6 +11248,24 @@ async fn event_loop<T: Terminal>(
                 // screen size.
                 let frames = tree.layout_framed(chrome.center);
                 for &id in ids {
+                    // The corner overlay is an off-tree pane: compose its content
+                    // + card and diff ONLY its outer rect. This keeps a streaming
+                    // video frame a bounded one-rect diff (never a chrome recompose).
+                    if Some(id) == corner {
+                        if let Some(outer) = compose_corner(
+                            &mut scratch,
+                            &panes,
+                            corner,
+                            corner_name.as_deref(),
+                            &current_config,
+                            cols,
+                            rows,
+                            focus.corner(),
+                        ) {
+                            pane_diff_rects.push(outer);
+                        }
+                        continue;
+                    }
                     // (rect to compose, rect to diff, has a card ring). A framed
                     // pane composes its content but diffs the *frame* rect so the
                     // repainted border ring is scanned; the drawer has no card, so
@@ -11105,6 +11427,21 @@ async fn event_loop<T: Terminal>(
                 {
                     crate::compositor::compose_pane(&mut scratch, p.emulator(), rect);
                 }
+                // The corner overlay pin (e.g. the video player) composites last,
+                // on top of the center/panel/bars, so a full repaint redraws it.
+                // Modal overlays (palette/menus/toasts) below still paint above it.
+                if !app_tile_active {
+                    compose_corner(
+                        &mut scratch,
+                        &panes,
+                        corner,
+                        corner_name.as_deref(),
+                        &current_config,
+                        cols,
+                        rows,
+                        focus.corner(),
+                    );
+                }
             } // end full-compose else (fast_select reuses the prior scratch)
             let screen = Rect {
                 x: 0,
@@ -11220,7 +11557,11 @@ async fn event_loop<T: Terminal>(
                 // (inside its frame ring). When the drawer owns focus it follows
                 // yazi into the drawer rect instead. With no live focused pane
                 // (launch splash), hide it so nothing blinks over the wordmark.
-                let (focused_rect, cursor_pane) = if focus.drawer() {
+                let (focused_rect, cursor_pane) = if focus.corner() {
+                    // The corner player (mpv/tct) draws no useful caret; hide the
+                    // host hardware cursor while it owns the keyboard.
+                    (None, focused)
+                } else if focus.drawer() {
                     (chrome.drawer, drawer.unwrap_or(focused))
                 } else {
                     (
@@ -11275,6 +11616,34 @@ async fn event_loop<T: Terminal>(
                 let mut out = std::io::stdout();
                 out.write_all(bytes.as_bytes()).context("render")?;
                 out.flush().context("terminal flush")?;
+            }
+            // Corner kitty images ride ON TOP of the cell frame: emit the queued,
+            // repositioned graphics AFTER the diff is flushed. Images aren't cells
+            // — they bypass the diff entirely (fine; it's video). While a modal
+            // overlay is up, blank the video (delete once on the transition, drop
+            // new frames) so it can't bleed through the modal; it resumes on the
+            // child's next frame once the overlay clears.
+            if corner.is_some() && corner_kitty {
+                use std::io::Write as _;
+                let occluded_now = overlays.any();
+                let mut out = std::io::stdout();
+                if occluded_now {
+                    if !corner_occluded {
+                        let _ = out.write_all(crate::kitty_relay::delete_all());
+                        let _ = out.flush();
+                    }
+                    corner_gfx.clear();
+                } else if !corner_gfx.is_empty() {
+                    let mut blob = Vec::new();
+                    for g in corner_gfx.drain(..) {
+                        blob.extend_from_slice(&g);
+                    }
+                    let _ = out.write_all(&blob);
+                    let _ = out.flush();
+                }
+                corner_occluded = occluded_now;
+            } else {
+                corner_gfx.clear();
             }
             dirty = false;
             // Record the frame's compose+flush latency (p50/p99 in the rollup)
@@ -13451,7 +13820,11 @@ async fn event_loop<T: Terminal>(
                         dirty = true;
                         continue;
                     }
-                    let target_pane = drawer.unwrap_or(focused);
+                    let target_pane = if focus.corner() {
+                        corner.unwrap_or(focused)
+                    } else {
+                        drawer.unwrap_or(focused)
+                    };
                     if let Some(p) = panes.table.get_mut(&target_pane) {
                         let app = p.emulator().application_cursor();
                         if let Some(bytes) = crate::input::key_bytes_mode(&k.key, k.modifiers, app)
@@ -13480,6 +13853,20 @@ async fn event_loop<T: Terminal>(
                     } else if let Some(id) = drawer.take() {
                         panes.table.remove(&id);
                     }
+                    focus.zone = crate::focus::Zone::Center;
+                    dirty = true;
+                    continue;
+                }
+                // Esc hands the keyboard back to the center while the corner
+                // overlay keeps playing; the player's own keys (space, q to quit,
+                // arrows to seek) still reach it while it's focused, and
+                // Ctrl+Alt+o dismisses the overlay entirely.
+                if corner.is_some()
+                    && focus.corner()
+                    && crate::input::is_escape_key(&k.key)
+                    && !k.modifiers.contains(Modifiers::CTRL)
+                    && !k.modifiers.contains(Modifiers::ALT)
+                {
                     focus.zone = crate::focus::Zone::Center;
                     dirty = true;
                     continue;
@@ -16116,6 +16503,86 @@ async fn event_loop<T: Terminal>(
                                     }
                                 }
                             }
+                            Action::ToggleCorner => {
+                                // Summon-or-dismiss the corner overlay pin (the
+                                // first `location = "corner"` pin in scope, e.g. a
+                                // video player). The single `corner` slot makes it
+                                // inherently a singleton.
+                                if let Some(id) = corner.take() {
+                                    // Dismiss: kill the player, drop it from the
+                                    // supervisor, and repaint the freed region.
+                                    if let Some(name) = corner_name.take() {
+                                        supervisor.unpin(&name);
+                                    }
+                                    panes.table.remove(&id);
+                                    if focus.corner() {
+                                        focus.zone = crate::focus::Zone::Center;
+                                    }
+                                    persist_pin_state(&supervisor, &session.id);
+                                    // Clear the kitty image off the outer terminal
+                                    // and reset the relay.
+                                    if corner_kitty {
+                                        use std::io::Write as _;
+                                        let mut o = std::io::stdout();
+                                        let _ = o.write_all(crate::kitty_relay::delete_all());
+                                        let _ = o.flush();
+                                    }
+                                    corner_relay.reset();
+                                    corner_gfx.clear();
+                                    corner_occluded = false;
+                                    // The freed overlay region must be repainted
+                                    // clean (the post-match `dirty` covers the
+                                    // frame; full_repaint resets the baseline).
+                                    full_repaint = true;
+                                } else {
+                                    let ws =
+                                        (!session.id.is_empty()).then_some(session.id.as_str());
+                                    let pin =
+                                        crate::pins::PinSupervisor::resolve(&current_config, ws)
+                                            .into_iter()
+                                            .find(|p| {
+                                                p.location
+                                                    == superzej_core::config::PinLocation::Corner
+                                            })
+                                            .cloned();
+                                    if let Some(pin) = pin {
+                                        let content = crate::pins::inset1(prospective_corner_rect(
+                                            &pin, cols, rows,
+                                        ));
+                                        let argv = crate::pins::PinSupervisor::argv(&pin);
+                                        let env: Vec<(String, String)> =
+                                            crate::pins::PinSupervisor::spawn_env(&pin)
+                                                .into_iter()
+                                                .collect();
+                                        let cwd = pin_cwd(&pin, active_cwd(&session));
+                                        match panes.spawn_argv_env(&argv, Some(&cwd), &env, content)
+                                        {
+                                            Ok(id) => {
+                                                supervisor.attach(&pin, id);
+                                                corner = Some(id);
+                                                corner_name = Some(pin.name.clone());
+                                                // Fresh child → fresh relay state.
+                                                corner_relay.reset();
+                                                corner_gfx.clear();
+                                                corner_occluded = false;
+                                                focus.zone = crate::focus::Zone::Corner;
+                                                persist_pin_state(&supervisor, &session.id);
+                                            }
+                                            Err(_) => {
+                                                model.status = format!(
+                                                    "Corner pin '{}' failed to launch",
+                                                    pin.display_label()
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        model.status = "No [[pins]] with location = \
+                                            \"corner\" configured — see \
+                                            config.toml.example (e.g. an mpv player)"
+                                            .into();
+                                    }
+                                }
+                            }
                             Action::ToggleSidebar => {
                                 // Cycle Full → Rail → Hidden. The rail keeps
                                 // ambient activity visible; Hidden reclaims the
@@ -17719,9 +18186,11 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
-                // Route to the drawer's PTY only while the drawer owns focus;
+                // Route to the corner/drawer PTY only while it owns focus;
                 // otherwise the focused center pane gets the keys.
-                let pty_target = if focus.drawer() {
+                let pty_target = if focus.corner() {
+                    corner.unwrap_or(focused)
+                } else if focus.drawer() {
                     drawer.unwrap_or(focused)
                 } else {
                     focused
@@ -17891,7 +18360,9 @@ async fn event_loop<T: Terminal>(
                 // unambiguous "into the terminal" gesture and we only learn the
                 // focus zone, never the drop coordinates, so gating on
                 // `forwards_to_pane` would silently swallow drops onto chrome.
-                let target_pane = if focus.drawer() {
+                let target_pane = if focus.corner() {
+                    corner.unwrap_or(focused)
+                } else if focus.drawer() {
                     drawer.unwrap_or(focused)
                 } else {
                     focused

@@ -29,6 +29,7 @@ mod input;
 mod integrate;
 mod keyhint;
 mod keymap;
+mod kitty_relay;
 mod layer;
 mod layout;
 mod layout_spec;
