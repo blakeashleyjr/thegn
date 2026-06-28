@@ -366,9 +366,10 @@ format = "text"           # text | json
 # Sidebar navigation (global):
 #   Alt ↑/↓        navigate worktrees, wrapping WITHIN the current workspace
 #   Shift+Alt ↑/↓  switch to the previous/next *workspace* (a real context switch)
-#   Ctrl+1..9      jump straight to the workspace at that slot — the digit shown
-#                  on each workspace row in the sidebar (and in the Ctrl+K menu);
-#                  slots follow the visible sidebar order
+#   Alt+1..9       jump straight to the worktree at that slot in visible order
+#   Ctrl+1..9      jump straight to the workspace at that slot in visible order
+#                  (the Alt/Ctrl digit hints are revealed on the rows while the
+#                  sidebar is focused — Alt+s — and shown in the Ctrl+K menu)
 #   Ctrl+Alt ↑/↓   *reorder* (move) the selected item: the workspace under the
 #                  sidebar cursor if the sidebar is focused, else the active
 #                  worktree within its workspace
@@ -377,6 +378,8 @@ format = "text"           # text | json
 # prev-workspace = "Shift Alt Up"
 # next-workspace = "Shift Alt Down"
 # summon-workspace-1 = "Ctrl 1"    # …through summon-workspace-9 = "Ctrl 9"
+# summon-worktree-1 = "Alt 1"      # …through summon-worktree-9 = "Alt 9"
+# summon-pin-1 = "Ctrl Alt 1"      # …through summon-pin-9 = "Ctrl Alt 9"
 # move-item-up = "Ctrl Alt Up"     # (legacy id move-worktree-up still works)
 # move-item-down = "Ctrl Alt Down"
 
@@ -764,8 +767,9 @@ visible = true
 # command = "rust-analyzer"
 # args    = []
 
-# Pinned programs: summoned from anywhere with Alt-1..9 (in registration order)
-# or the tabbar's pin chips. Pins run on the host (no sandbox) and are managed by
+# Pinned programs: summoned from anywhere with Ctrl-Alt-1..9 (in registration
+# order; Alt-1..9 jumps to worktrees, Ctrl-1..9 to workspaces) or the tabbar's
+# pin chips. Pins run on the host (no sandbox) and are managed by
 # a supervisor (eager start, restart policy, health, survive workspace switches).
 #
 #   location = "tab"    opens/focuses a dedicated `pin:<name>` tab (default)
