@@ -982,6 +982,42 @@ impl SpritesProvider {
         self.start_session(url, true).await
     }
 
+    /// Run a one-shot command in the sprite over the WSS exec API (NON-tty) and
+    /// collect its combined output + exit code. This is the CLI-free / bridge-free
+    /// channel the env provisioner uses to set the sandbox up (the non-tty framing
+    /// surfaces stdout + the exit; redirect stderr with `2>&1` in the script to
+    /// capture it). Returns `(exit_code, output)`.
+    pub async fn run_exec(
+        &self,
+        id: &str,
+        argv: &[String],
+        cwd: Option<&str>,
+        env: &[(String, String)],
+    ) -> Result<(i32, String)> {
+        let spec = ExecSpec {
+            argv: argv.to_vec(),
+            tty: false,
+            cols: 0,
+            rows: 0,
+            env: env.to_vec(),
+            cwd: cwd.map(str::to_string),
+        };
+        let mut sess = self.open_exec(id, &spec).await?;
+        let mut out: Vec<u8> = Vec::new();
+        let mut code = -1;
+        while let Some(frame) = sess.frames.recv().await {
+            match frame {
+                ExecFrame::Stdout(b) => out.extend_from_slice(&b),
+                ExecFrame::Exit(c) => {
+                    code = c;
+                    break;
+                }
+            }
+        }
+        let _ = sess.control.send(ExecControl::Close).await;
+        Ok((code, String::from_utf8_lossy(&out).into_owned()))
+    }
+
     /// Run the WSS handshake (bearer auth) and spawn the bridge task. `tty`
     /// selects the wire framing: raw (PTY) vs 1-byte stream-id prefixes (non-PTY).
     async fn start_session(&self, url: String, tty: bool) -> Result<ExecSession> {
@@ -1264,6 +1300,21 @@ impl Provider {
     pub async fn open_exec(&self, id: &str, spec: &ExecSpec) -> Result<ExecSession> {
         match self {
             Provider::Sprites(p) => p.open_exec(id, spec).await,
+            Provider::Daytona(_) => Err(anyhow!("provider 'daytona' has no native exec API")),
+        }
+    }
+
+    /// Run a one-shot command (non-tty) and collect `(exit_code, output)`. Used by
+    /// the env provisioner to set up the sandbox without a CLI/bridge.
+    pub async fn run_exec(
+        &self,
+        id: &str,
+        argv: &[String],
+        cwd: Option<&str>,
+        env: &[(String, String)],
+    ) -> Result<(i32, String)> {
+        match self {
+            Provider::Sprites(p) => p.run_exec(id, argv, cwd, env).await,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' has no native exec API")),
         }
     }

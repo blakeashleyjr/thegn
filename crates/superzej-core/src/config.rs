@@ -466,6 +466,14 @@ pub struct LlmProxyConfig {
     /// traffic is relayed to the proxy over a unix socket too (full egress seal);
     /// otherwise it reaches the proxy via the container gateway.
     pub bouncer: bool,
+    /// Base URL an agent running INSIDE a remote/provider sandbox (a sprite VM
+    /// that can't reach host loopback) uses to reach `szproxy` — a tunnel/public
+    /// endpoint, e.g. `https://proxy.example.ts.net`. When set (and `route_agent`),
+    /// superzej injects `ANTHROPIC_BASE_URL` + the per-worktree virtual key into
+    /// the provider exec env so ANY agent there (pi, claude code, …) routes
+    /// through the proxy by default. Empty ⇒ no remote proxy injection (the
+    /// in-sprite agent would talk to the upstream model directly with its key).
+    pub remote_base_url: String,
 }
 
 impl Default for LlmProxyConfig {
@@ -485,11 +493,70 @@ impl Default for LlmProxyConfig {
             agent_api: "anthropic-messages".to_string(),
             agent_model: "model-proxy/standard".to_string(),
             bouncer: false,
+            remote_base_url: String::new(),
         }
     }
 }
 
 impl LlmProxyConfig {
+    /// Env vars for an agent/shell running inside a REMOTE/provider sandbox so its
+    /// model traffic routes through `szproxy` by default. Empty unless
+    /// `route_agent` is on and a reachable [`remote_base_url`](Self::remote_base_url)
+    /// is configured (a sprite VM can't reach host loopback). Sets the standard
+    /// `ANTHROPIC_BASE_URL` (honored by claude code / the Anthropic SDK / pi) plus
+    /// the `SUPERZEJ_PROXY_*` vars the pi extension reads. `virtual_key`, when
+    /// given, becomes the proxy auth key (else the passthrough master key is used).
+    pub fn remote_agent_env(&self, virtual_key: Option<&str>) -> Vec<(String, String)> {
+        let url = match self.remote_base_url() {
+            Some(u) => u,
+            None => return Vec::new(),
+        };
+        let mut v = vec![
+            ("ANTHROPIC_BASE_URL".to_string(), url.clone()),
+            ("SUPERZEJ_PROXY_BASE_URL".to_string(), url),
+            ("SUPERZEJ_PROXY_API".to_string(), self.agent_api.clone()),
+            ("SUPERZEJ_PROXY_MODEL".to_string(), self.agent_model.clone()),
+        ];
+        if let Some(k) = virtual_key.map(str::trim).filter(|k| !k.is_empty()) {
+            v.push(("ANTHROPIC_API_KEY".to_string(), k.to_string()));
+            v.push(("SUPERZEJ_PROXY_KEY".to_string(), k.to_string()));
+        }
+        v
+    }
+
+    /// The proxy base URL an in-remote agent should use, or `None` if remote
+    /// routing is off. `remote_base_url = "auto"` ⇒ the in-sandbox reverse tunnel
+    /// at `http://127.0.0.1:<proxy-port>` (superzej stands the tunnel up); an
+    /// explicit URL is used verbatim. `None` unless `route_agent` + a value set.
+    pub fn remote_base_url(&self) -> Option<String> {
+        let url = self.remote_base_url.trim();
+        if !self.route_agent || url.is_empty() {
+            return None;
+        }
+        if url == "auto" {
+            Some(format!("http://127.0.0.1:{}", self.listen_port()))
+        } else {
+            Some(url.to_string())
+        }
+    }
+
+    /// The loopback port the in-sandbox reverse tunnel should listen on (so the
+    /// injected `ANTHROPIC_BASE_URL` resolves), or `None` unless `route_agent` +
+    /// `remote_base_url = "auto"`. The host starts a tunnel on this port that
+    /// dials the real `szproxy`.
+    pub fn remote_tunnel_port(&self) -> Option<u16> {
+        (self.route_agent && self.remote_base_url.trim() == "auto").then(|| self.listen_port())
+    }
+
+    /// The port from `listen` (e.g. `127.0.0.1:8383` → 8383; 8383 on parse fail).
+    pub fn listen_port(&self) -> u16 {
+        self.listen
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(8383)
+    }
+
     /// The launch spec for the `szproxy` daemon — `(program, args, env)` — or
     /// `None` when the proxy is disabled. The host feeds this to its process
     /// supervisor (e.g. as a `restart = "always"` pinned daemon). `SZPROXY_LISTEN`
@@ -2050,6 +2117,12 @@ pub struct EnvConfig {
     /// `[env.<name>.provider]` — managed-sandbox provider (placement = provider).
     #[serde(skip_serializing_if = "EnvProviderConfig::is_default")]
     pub provider: EnvProviderConfig,
+    /// Per-env override of `[sandbox] failover`. `None` ⇒ inherit the global
+    /// policy; `Some(true)` lets *this* env fall back (chain → host) when it
+    /// can't be brought up; `Some(false)` forces a halt+warning even if the
+    /// global default allows failover. Resolved by [`Config::env_failover`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failover: Option<bool>,
 }
 
 /// `[env.<name>.ssh]` — connection settings for an `ssh`/`mosh` placement. An
@@ -2853,6 +2926,16 @@ pub struct SandboxConfig {
     /// override per workspace via `.superzej.toml`.
     pub shell: String,
     pub on_missing: OnMissing,
+    /// When the *selected* environment (a named `[env.<name>]` or an explicit
+    /// non-local placement — provider/k8s/ssh) cannot be brought up, may superzej
+    /// silently fall back to another backend or the host? Default `false`: a
+    /// bring-up failure **halts** that worktree's pane and shows a warning,
+    /// because a remote/managed env is often required for correctness or safety
+    /// and a quiet drop to the host would violate that. Set `true` (globally
+    /// here, or per-env via `[env.<name>] failover`) to allow walking the
+    /// `backend_chain` down to the host on failure (the historical behavior).
+    /// Independent of `on_missing`, which only governs the local `Auto` chain.
+    pub failover: bool,
     /// Drive the OCI runtime against a **remote daemon** instead of SSH-wrapping
     /// the whole backend argv: a podman connection URL/name or a docker host
     /// (e.g. `ssh://user@host`). Empty ⇒ local daemon (the default). Injected as
@@ -2872,6 +2955,10 @@ pub struct SandboxConfig {
     pub network_audit: bool,
     /// `[sandbox.vpn]` — attach the worktree to its own overlay/tunnel.
     pub vpn: VpnConfig,
+    /// `[sandbox.home]` — the generic, declarative *personal* environment layer
+    /// reproduced in every sandbox/remote (CLI tools, dotfiles, bring-your-own
+    /// setup) so a sandbox feels like local. See [`HomeConfig`].
+    pub home: HomeConfig,
 }
 
 impl Default for SandboxConfig {
@@ -2929,13 +3016,92 @@ impl Default for SandboxConfig {
             nix_daemon: false,
             shell: String::new(),
             on_missing: OnMissing::Warn,
+            failover: false,
             oci_host: String::new(),
             remote: RemoteConfig::default(),
             network_allow: Vec::new(),
             network_block: Vec::new(),
             network_audit: false,
             vpn: VpnConfig::default(),
+            home: HomeConfig::default(),
         }
+    }
+}
+
+impl SandboxConfig {
+    /// Resolve `env_passthrough` into the present `(KEY, VALUE)` pairs from the
+    /// host environment. Shared by the OCI spec build and the provider/remote
+    /// native-exec env so the SAME secrets (GH_TOKEN, ANTHROPIC_API_KEY, …) reach
+    /// EVERY placement, not just containers.
+    pub fn passthrough_env(&self) -> Vec<(String, String)> {
+        self.env_passthrough
+            .iter()
+            .filter_map(|k| std::env::var(k).ok().map(|v| (k.clone(), v)))
+            .collect()
+    }
+
+    /// Like [`passthrough_env`](Self::passthrough_env) but for a **remote**
+    /// placement (provider sprite / ssh exec into a different host): drops
+    /// host-local socket/path vars that would dangle remotely (an SSH_AUTH_SOCK
+    /// or GPG socket path only valid on the host). Those need forwarding (a
+    /// reverse bridge), not raw passthrough.
+    pub fn passthrough_env_remote(&self) -> Vec<(String, String)> {
+        const HOST_LOCAL: &[&str] = &["SSH_AUTH_SOCK", "GPG_AGENT_INFO", "GNUPGHOME", "GPG_TTY"];
+        self.passthrough_env()
+            .into_iter()
+            .filter(|(k, _)| !HOST_LOCAL.contains(&k.as_str()))
+            .collect()
+    }
+}
+
+/// `[sandbox.home]` — the **personal environment layer**: a generic, declarative
+/// description of *your* setup (independent of any repo) that superzej reproduces
+/// in every sandbox/remote so it works like local. NOT Nix-coupled — tools
+/// install Nix-first (consistent names) with a native package-manager fallback;
+/// anything bespoke (e.g. an agent CLI, internal tooling) goes in `setup`/
+/// `setup_script`. Applied by the env provisioner (see `crate::envplan`).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct HomeConfig {
+    /// CLI tools to install in every sandbox (e.g. `["fd", "fzf", "atuin"]`).
+    /// Installed `nix profile install nixpkgs#<tool>` when Nix is present, else
+    /// via the sandbox's native package manager (apt/apk/dnf, best-effort).
+    pub tools: Vec<String>,
+    /// Host dotfile basenames (relative to your `$HOME`) to upload into the
+    /// sandbox home, e.g. `[".zshrc", ".gitconfig"]`. Missing files are skipped.
+    pub dotfiles: Vec<String>,
+    /// Optional dotfiles repo URL to clone in the sandbox and bootstrap (runs its
+    /// `install.sh`/`bootstrap.sh`/`setup.sh` if present). Empty = disabled.
+    pub dotfiles_repo: String,
+    /// Inline bring-your-own setup commands run (in order) in every sandbox after
+    /// the tools/dotfiles — e.g. install an agent CLI or internal tooling.
+    pub setup: Vec<String>,
+    /// Alternatively, a setup script (a host path uploaded + run, or an absolute
+    /// in-sandbox path) executed after `setup`. Empty = disabled.
+    pub setup_script: String,
+    /// Coding-agent CLIs to make work out-of-the-box inside the sandbox (e.g.
+    /// `["claude", "codex"]`). Known agents get installed; every listed agent's
+    /// host config/credential dirs are uploaded so it's logged-in in the sandbox.
+    /// Carries credentials into the remote — list only agents you trust there.
+    pub agents: Vec<String>,
+    /// Host services to expose INSIDE the sandbox via a reverse tunnel, so an
+    /// in-sandbox process/agent reaching `127.0.0.1:<port>` hits the host's
+    /// service (a host `localhost` DB/API, or a host-bound MCP server). Each entry
+    /// is a [`crate::revtunnel::parse_reverse_forward`] spec: `"5432"` (same port
+    /// both sides), `"8080:5432"` (host loopback port), or `"8080:db.lan:5432"`.
+    pub reverse_forwards: Vec<String>,
+}
+
+impl HomeConfig {
+    /// Any personal-layer work declared at all?
+    pub fn is_enabled(&self) -> bool {
+        !self.tools.is_empty()
+            || !self.dotfiles.is_empty()
+            || !self.dotfiles_repo.trim().is_empty()
+            || !self.setup.is_empty()
+            || !self.setup_script.trim().is_empty()
+            || !self.agents.is_empty()
+            || !self.reverse_forwards.is_empty()
     }
 }
 
@@ -4266,6 +4432,20 @@ impl Config {
             sandbox: sb,
             data: envc.data,
         }
+    }
+
+    /// Effective failover policy for the environment named `env_name`: the env's
+    /// own `[env.<name>] failover` override if set, else the (repo-overlaid)
+    /// global `[sandbox] failover`. `true` ⇒ a bring-up failure may fall back
+    /// down the chain to the host; `false` (the default) ⇒ halt + warn. The
+    /// implicit/unknown "default" env has no override, so it inherits the global.
+    pub fn env_failover(&self, repo_root: &Path, env_name: &str) -> bool {
+        if let Some(envc) = self.env.get(env_name)
+            && let Some(f) = envc.failover
+        {
+            return f;
+        }
+        self.repo_sandbox(repo_root).failover
     }
 
     /// The accent as a truecolor "R;G;B" fragment; invalid hex falls back to
@@ -7533,6 +7713,122 @@ transport = \"ssh\"
         let c = Config::load_layered(&env, &flags, Some(f));
         assert_eq!(c.branch_prefix, "env/");
         assert_eq!(c.picker, Picker::Fzf);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remote_agent_env_routes_through_proxy_when_configured() {
+        // Off by default, and requires a reachable URL even with route_agent.
+        assert!(LlmProxyConfig::default().remote_agent_env(None).is_empty());
+        let only_route = LlmProxyConfig {
+            route_agent: true,
+            ..Default::default()
+        };
+        assert!(only_route.remote_agent_env(None).is_empty());
+        // Configured → inject the standard + superzej proxy vars.
+        let lp = LlmProxyConfig {
+            route_agent: true,
+            remote_base_url: "https://proxy.example".into(),
+            ..Default::default()
+        };
+        let env = lp.remote_agent_env(Some("vk-1"));
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "ANTHROPIC_BASE_URL" && v == "https://proxy.example"),
+            "claude code / SDK honor ANTHROPIC_BASE_URL"
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "ANTHROPIC_API_KEY" && v == "vk-1")
+        );
+        assert!(env.iter().any(|(k, _)| k == "SUPERZEJ_PROXY_BASE_URL"));
+        assert_eq!(
+            lp.remote_tunnel_port(),
+            None,
+            "explicit URL needs no tunnel"
+        );
+
+        // "auto" → derive the in-sandbox tunnel URL from the proxy port + signal
+        // the host to stand a reverse tunnel up on that port.
+        let auto = LlmProxyConfig {
+            route_agent: true,
+            remote_base_url: "auto".into(),
+            listen: "127.0.0.1:9999".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            auto.remote_base_url().as_deref(),
+            Some("http://127.0.0.1:9999")
+        );
+        assert_eq!(auto.remote_tunnel_port(), Some(9999));
+        let aenv = auto.remote_agent_env(None);
+        assert!(
+            aenv.iter()
+                .any(|(k, v)| k == "ANTHROPIC_BASE_URL" && v == "http://127.0.0.1:9999")
+        );
+    }
+
+    #[test]
+    fn passthrough_env_remote_drops_host_local_socket_vars() {
+        let sb = SandboxConfig {
+            env_passthrough: vec!["SZ_TEST_TOK_42".into(), "SSH_AUTH_SOCK".into()],
+            ..Default::default()
+        };
+        // SAFETY: test-local env mutation with a unique key; restored below.
+        unsafe {
+            std::env::set_var("SZ_TEST_TOK_42", "secret");
+            std::env::set_var("SSH_AUTH_SOCK", "/tmp/agent.sock");
+        }
+        let remote = sb.passthrough_env_remote();
+        assert!(
+            remote.iter().any(|(k, _)| k == "SZ_TEST_TOK_42"),
+            "value secrets pass to a remote placement"
+        );
+        assert!(
+            !remote.iter().any(|(k, _)| k == "SSH_AUTH_SOCK"),
+            "host-local socket vars are dropped for a remote placement"
+        );
+        // The unfiltered passthrough still carries it (OCI bind-mount case).
+        assert!(
+            sb.passthrough_env()
+                .iter()
+                .any(|(k, _)| k == "SSH_AUTH_SOCK")
+        );
+        unsafe {
+            std::env::remove_var("SZ_TEST_TOK_42");
+            std::env::remove_var("SSH_AUTH_SOCK");
+        }
+    }
+
+    #[test]
+    fn env_failover_resolves_override_then_global() {
+        let dir = tmpdir("failover");
+        let mut cfg = Config::default();
+        // Global default is opt-out (halt+warn).
+        assert!(!cfg.env_failover(&dir, "default"));
+        // An env with no override inherits the (repo-overlaid) global.
+        cfg.sandbox.failover = true;
+        cfg.env.insert("inherit".into(), EnvConfig::default());
+        assert!(cfg.env_failover(&dir, "inherit"));
+        // Some(false) forces a halt even when the global allows failover.
+        cfg.env.insert(
+            "strict".into(),
+            EnvConfig {
+                failover: Some(false),
+                ..Default::default()
+            },
+        );
+        assert!(!cfg.env_failover(&dir, "strict"));
+        // Some(true) allows failover even when the global forbids it.
+        cfg.sandbox.failover = false;
+        cfg.env.insert(
+            "loose".into(),
+            EnvConfig {
+                failover: Some(true),
+                ..Default::default()
+            },
+        );
+        assert!(cfg.env_failover(&dir, "loose"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

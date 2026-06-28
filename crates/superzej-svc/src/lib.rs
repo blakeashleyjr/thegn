@@ -19,6 +19,7 @@ pub mod lsp;
 pub mod mcp_git;
 pub mod projection;
 pub mod provider;
+pub mod revtunnel;
 pub mod share;
 pub mod ssh;
 pub mod vpn;

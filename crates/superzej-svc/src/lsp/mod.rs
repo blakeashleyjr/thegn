@@ -21,7 +21,7 @@ pub mod framing;
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
@@ -616,10 +616,18 @@ fn parse_one_diagnostic(v: &Value) -> Option<LspDiagnostic> {
 
 type Pending = Arc<Mutex<HashMap<i64, Sender<Result<Value, LspError>>>>>;
 
-/// A live connection to one language-server subprocess.
+/// Shared write half of the LSP transport — a local child's stdin, or a
+/// remote/bridge stream's writer.
+type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
+
+/// A live connection to one language server. The transport is abstracted over
+/// `Read`/`Write` so the server may run locally (a child process) OR inside a
+/// sandbox/remote, driven over the resident bridge's stdio (see [`from_io`]).
 pub struct LspClient {
-    stdin: Arc<Mutex<ChildStdin>>,
-    child: Mutex<Child>,
+    stdin: SharedWriter,
+    /// The local child, if any. `None` for a bridge/remote server (its lifecycle
+    /// is owned by the bridge/exec channel, which closes when this drops).
+    child: Mutex<Option<Child>>,
     next_id: AtomicI64,
     pending: Pending,
     root: PathBuf,
@@ -652,24 +660,52 @@ impl LspClient {
             .stdin
             .take()
             .ok_or_else(|| LspError::Spawn("no stdin".into()))?;
-        let stdin = Arc::new(Mutex::new(stdin));
+        Ok(Self::connect(
+            Box::new(stdout),
+            Box::new(stdin),
+            Some(child),
+            root,
+            diag_tx,
+        ))
+    }
 
+    /// Connect to a language server over ARBITRARY stdio rather than spawning a
+    /// local child — the seam for an **in-sandbox/remote** server whose stdin/
+    /// stdout are bridged to the host (e.g. via the resident bridge or a provider
+    /// exec). Same JSON-RPC behavior; no child to reap (the stream owns lifecycle).
+    pub fn from_io(
+        reader: Box<dyn Read + Send>,
+        writer: Box<dyn Write + Send>,
+        root: &Path,
+        diag_tx: Sender<PublishedDiagnostics>,
+    ) -> LspClient {
+        Self::connect(reader, writer, None, root, diag_tx)
+    }
+
+    fn connect(
+        reader: Box<dyn Read + Send>,
+        writer: Box<dyn Write + Send>,
+        child: Option<Child>,
+        root: &Path,
+        diag_tx: Sender<PublishedDiagnostics>,
+    ) -> LspClient {
+        let stdin: SharedWriter = Arc::new(Mutex::new(writer));
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        let reader = {
+        let reader_thread = {
             let pending = pending.clone();
             let stdin = stdin.clone();
-            thread::spawn(move || reader_loop(stdout, pending, diag_tx, stdin))
+            thread::spawn(move || reader_loop(reader, pending, diag_tx, stdin))
         };
 
-        Ok(LspClient {
+        LspClient {
             stdin,
             child: Mutex::new(child),
             next_id: AtomicI64::new(1),
             pending,
             root: root.to_path_buf(),
             timeout: Duration::from_secs(10),
-            _reader: reader,
-        })
+            _reader: reader_thread,
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -819,24 +855,28 @@ impl LspClient {
 
 impl Drop for LspClient {
     fn drop(&mut self) {
-        // Best-effort graceful exit, then make sure the child is gone.
+        // Best-effort graceful exit, then make sure a local child is gone (a
+        // bridge/remote server has no local child to reap).
         let _ = self.notify("exit", Value::Null);
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Ok(mut child) = self.child.lock()
+            && let Some(c) = child.as_mut()
+        {
+            let _ = c.kill();
+            let _ = c.wait();
         }
     }
 }
 
 /// Read framed messages off the server's stdout until EOF, dispatching each.
+/// Transport-agnostic: `reader` is a local child's stdout or a bridged stream.
 fn reader_loop(
-    stdout: std::process::ChildStdout,
+    reader: Box<dyn Read + Send>,
     pending: Pending,
     diag_tx: Sender<PublishedDiagnostics>,
-    stdin: Arc<Mutex<ChildStdin>>,
+    stdin: SharedWriter,
 ) {
     let mut decoder = framing::FrameDecoder::new();
-    let mut reader = BufReader::new(stdout);
+    let mut reader = BufReader::new(reader);
     let mut chunk = [0u8; 8192];
     loop {
         let n = match reader.read(&mut chunk) {
@@ -861,7 +901,7 @@ fn dispatch(
     msg: &Value,
     pending: &Pending,
     diag_tx: &Sender<PublishedDiagnostics>,
-    stdin: &Arc<Mutex<ChildStdin>>,
+    stdin: &SharedWriter,
 ) {
     let id = msg.get("id").and_then(Value::as_i64);
     let method = msg.get("method").and_then(Value::as_str);
