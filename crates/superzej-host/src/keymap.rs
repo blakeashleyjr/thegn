@@ -187,7 +187,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         id: "new-worktree",
         label: "New worktree",
         hint: "worktree",
-        default_chords: &["Alt w"],
+        default_chords: &["Ctrl w"],
         palette: true,
     },
     ActionSpec {
@@ -229,7 +229,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         id: "close-pane",
         label: "Close pane",
         hint: "close pane",
-        default_chords: &["Ctrl w"],
+        default_chords: &["Alt w"],
         palette: true,
     },
     ActionSpec {
@@ -1450,7 +1450,7 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl Alt e", Action::SwitchMode(Mode::Emacs))
         .unwrap();
 
-    map.insert_all("Alt w", Action::NewWorktree).unwrap();
+    map.insert_all("Ctrl w", Action::NewWorktree).unwrap();
     map.insert_all("Alt W", Action::NewWorkspace).unwrap();
     map.insert_all("Alt Shift X", Action::DeleteWorkspace)
         .unwrap();
@@ -1468,7 +1468,7 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Alt o", Action::SwitchWorkspace).unwrap();
     map.insert_all("Alt n", Action::SplitDown).unwrap();
     map.insert_all("Alt N", Action::SplitRight).unwrap();
-    map.insert_all("Ctrl w", Action::CloseSplitPane).unwrap();
+    map.insert_all("Alt w", Action::CloseSplitPane).unwrap();
     map.insert_all("Alt g", Action::Lazygit).unwrap();
     map.insert_all("Alt y", Action::Yazi).unwrap();
     map.insert_all("Alt e", Action::Editor).unwrap();
@@ -1628,8 +1628,8 @@ pub fn default_keymap_with_config(cfg: &superzej_core::config::Config) -> KeyMap
 
 /// Overlay an IDE keymap preset (item 621) onto `map`: a small set of familiar
 /// chords mapped to existing host actions, applied after the built-in defaults
-/// and before user `[keybinds]` so user overrides still win. Chords are chosen
-/// to avoid the core nav defaults (`Ctrl h/j/k/l`, `Ctrl w`). `"default"` (and
+/// `Esc` (`Ctrl [`), which gets translated to VimNormal in Vim mode; it binds `Alt`
+/// to avoid the core nav defaults (`Ctrl h/j/k/l`). `"default"` (and
 /// the Vim/Emacs modes, which live in `default_keymap`) are a no-op. A bad chord
 /// is skipped, never fatal.
 pub fn apply_keymap_preset(map: &mut KeyMap, preset: &str) {
@@ -1868,24 +1868,25 @@ mod tests {
     }
 
     #[test]
-    fn runtime_dispatch_matches_alt_w_in_normal_mode() {
+    fn runtime_dispatch_matches_ctrl_w_in_normal_mode() {
         // The runtime path is keymap.dispatch(mode, Key), NOT map_key. Prove a
         // parsed Alt+w (what termwiz yields for both legacy ESC-w and kitty
         // CSI 119;3u) actually triggers NewWorktree through the real matcher.
         let mut map = default_keymap();
-        let key = Key::modified(KeyCode::Char('w'), Modifiers::ALT);
+        let key = Key::modified(KeyCode::Char('w'), Modifiers::CTRL);
         assert!(
             matches!(
                 map.dispatch(Mode::Normal, key),
                 crate::sequence::MatchResult::Matched(Action::NewWorktree)
             ),
-            "Alt+w must match NewWorktree via the runtime dispatch path"
+            "Ctrl+w must match NewWorktree via the runtime dispatch path"
         );
     }
 
     #[test]
     fn alt_chords_map_to_lifecycle_actions() {
-        assert_eq!(k('w', Modifiers::ALT), Some(Action::NewWorktree));
+        assert_eq!(k('w', Modifiers::ALT), Some(Action::CloseSplitPane));
+        assert_eq!(k('w', Modifiers::CTRL), Some(Action::NewWorktree));
         assert_eq!(k('W', Modifiers::ALT), Some(Action::NewWorkspace));
         assert_eq!(k('o', Modifiers::ALT), Some(Action::SwitchWorkspace));
         assert_eq!(k('t', Modifiers::ALT), Some(Action::NewTab));
@@ -2285,7 +2286,7 @@ mod tests {
                 Mode::Normal,
                 Key::modified(KeyCode::Char('w'), Modifiers::ALT)
             ),
-            MatchResult::Matched(Action::NewWorktree)
+            MatchResult::Matched(Action::CloseSplitPane)
         );
         assert_eq!(
             map.dispatch(Mode::VimNormal, Key::char('j')),
