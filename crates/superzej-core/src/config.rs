@@ -1351,7 +1351,7 @@ impl Default for StatsConfig {
             battery_warn: 25,
             disk_icon: "\u{f0a0}".into(), // nf-fa-hdd_o — hard drive
             disk_free_warn: 15,
-            disk_free_critical: 5,
+            disk_free_critical: 10,
             disk_path: String::new(),
             refresh_rates: vec![1.0, 2.0, 5.0, 10.0],
         }

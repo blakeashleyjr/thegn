@@ -96,7 +96,7 @@ pub fn walk_size(path: &Path) -> u64 {
 /// Human-readable byte count: `B`, `K`, `M`, `G`, `T` (binary units, one
 /// decimal place above bytes, trimmed of a trailing `.0`).
 pub fn human(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     if bytes < 1024 {
         return format!("{bytes}B");
     }
@@ -126,11 +126,11 @@ mod tests {
     fn human_formats_binary_units() {
         assert_eq!(human(0), "0B");
         assert_eq!(human(512), "512B");
-        assert_eq!(human(1024), "1K");
-        assert_eq!(human(1536), "1.5K");
-        assert_eq!(human(1024 * 1024), "1M");
-        assert_eq!(human(70 * 1024 * 1024 * 1024), "70G");
-        assert_eq!(human(1024_u64.pow(4)), "1T");
+        assert_eq!(human(1024), "1KB");
+        assert_eq!(human(1536), "1.5KB");
+        assert_eq!(human(1024 * 1024), "1MB");
+        assert_eq!(human(70 * 1024 * 1024 * 1024), "70GB");
+        assert_eq!(human(1024_u64.pow(4)), "1TB");
     }
 
     #[test]
