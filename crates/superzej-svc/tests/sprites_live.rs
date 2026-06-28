@@ -36,6 +36,114 @@ where
     panic!("{label} never succeeded: {last:?}");
 }
 
+/// Live: the sandbox **lifecycle** the worktree open/delete paths depend on —
+/// `ensure_exists` creates a missing sandbox (recreate-if-cleaned-out-of-band),
+/// is a no-op when it already exists, and `destroy` is idempotent (a second
+/// delete / a delete of an already-gone sandbox both succeed). This is the live
+/// proof behind "recreate if one is missing" + "cleanup on delete".
+#[test]
+#[ignore = "live: needs SPRITES_TOKEN, network, creates a real sprite"]
+fn live_sandbox_lifecycle() {
+    let Ok(token) = std::env::var("SPRITES_TOKEN") else {
+        eprintln!("SPRITES_TOKEN unset — skipping");
+        return;
+    };
+    let name = format!("szlc-{}", std::process::id());
+    let prov = superzej_svc::provider::Provider::Sprites(SpritesProvider::new("", &token, &name));
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Clean slate (ignore: may not exist yet).
+        let _ = prov.destroy(&name).await;
+
+        // ensure_exists on a missing sandbox CREATES it (returns true).
+        assert!(
+            prov.ensure_exists(&name).await.expect("ensure create"),
+            "ensure_exists should create a missing sandbox"
+        );
+        // ensure_exists when it already exists is a no-op (returns false).
+        assert!(
+            !prov.ensure_exists(&name).await.expect("ensure noop"),
+            "ensure_exists should be a no-op when present"
+        );
+
+        // destroy works, and a SECOND destroy is idempotent (404 = already gone) —
+        // racing a TTL/manual delete must not error the teardown path.
+        prov.destroy(&name).await.expect("destroy");
+        prov.destroy(&name)
+            .await
+            .expect("destroy idempotent on 404");
+
+        // After an out-of-band delete, ensure_exists RECREATES (returns true) —
+        // this is the "a sandbox cleaned up without us" recovery.
+        assert!(
+            prov.ensure_exists(&name).await.expect("ensure recreate"),
+            "ensure_exists should recreate after out-of-band delete"
+        );
+        prov.destroy(&name).await.expect("final destroy");
+        println!("sandbox lifecycle (create/noop/idempotent-destroy/recreate) ok");
+    });
+}
+
+/// Live: agent **customizations** land in the sandbox. Uploads the config paths
+/// the host's `upload_agent_configs` uses (resolved from the SAME
+/// `envplan::agent_config_paths`) — a `.claude.json` file and a nested `.pi`
+/// extension/skill tree — into the sandbox `$HOME`, then reads them back and
+/// asserts byte-for-byte. Proves claude/pi/hermes customizations are carried in.
+#[test]
+#[ignore = "live: needs SPRITES_TOKEN, network, creates a real sprite"]
+fn live_agent_customizations() {
+    let Ok(token) = std::env::var("SPRITES_TOKEN") else {
+        eprintln!("SPRITES_TOKEN unset — skipping");
+        return;
+    };
+    let name = format!("szac-{}", std::process::id());
+    let p = SpritesProvider::new("", &token, &name);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let sh = |s: &str| vec!["/bin/sh".to_string(), "-lc".to_string(), s.to_string()];
+    rt.block_on(async {
+        p.create().await.expect("create");
+        let warm = sh("true");
+        warm_retry("warm", || p.run_exec(&name, &warm, None, &[])).await;
+
+        // Resolve the sandbox user's real $HOME (sprites exec as `sprite`).
+        let home_cmd = sh("printf %s \"$HOME\"");
+        let (_c, home) = p.run_exec(&name, &home_cmd, None, &[]).await.expect("home");
+        let home = home.trim();
+        assert!(home.starts_with('/'), "resolved $HOME: {home:?}");
+
+        // The host uploader maps each agent to (files, dirs) via this exact fn.
+        let (claude_files, _claude_dirs) = superzej_core::envplan::agent_config_paths("claude");
+        assert!(claude_files.contains(&".claude.json".to_string()));
+        let (_pi_files, pi_dirs) = superzej_core::envplan::agent_config_paths("pi");
+        assert!(pi_dirs.contains(&".pi".to_string()));
+
+        // Upload a claude top-level config FILE + a nested pi customization (an
+        // extension under ~/.pi/agent/extensions) exactly where the agents read.
+        let claude_path = format!("{home}/.claude.json");
+        let pi_path = format!("{home}/.pi/agent/extensions/my-ext.ts");
+        let claude_json = br#"{"theme":"dark","mcpServers":{}}"#;
+        let pi_ext = b"export default { name: 'my-ext' }\n";
+        warm_retry("upload .claude.json", || {
+            p.write(&name, &claude_path, claude_json)
+        })
+        .await;
+        warm_retry("upload .pi ext", || p.write(&name, &pi_path, pi_ext)).await;
+
+        // Read both back through the fs API and assert byte-for-byte.
+        let got_claude = p
+            .read(&name, &claude_path)
+            .await
+            .expect("read .claude.json");
+        assert_eq!(got_claude, claude_json, "claude config round-trip");
+        let got_pi = p.read(&name, &pi_path).await.expect("read pi ext");
+        assert_eq!(got_pi, pi_ext, "pi customization round-trip");
+
+        println!("agent customizations (claude.json + ~/.pi extension) landed in {home}");
+
+        p.destroy(&name).await.expect("destroy");
+    });
+}
+
 /// Live HEAVY: run the REAL Nix-install provisioning step (from the public
 /// `envplan::plan`) in a throwaway sprite and verify `nix` is usable afterward —
 /// the definitive "the declared dev env actually comes up" check. Slow (Nix
