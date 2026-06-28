@@ -297,9 +297,9 @@ pub(crate) fn build_command_palette_items(
 ) -> Vec<crate::palette::PaletteItem> {
     let mut items: Vec<crate::palette::PaletteItem> = crate::keymap::action_specs()
         .iter()
-        // The fold-actor command only makes sense when the merge queue is on.
+        // The fold-actor commands only make sense when the merge queue is on.
         .filter(|spec| {
-            if spec.id == "integrate" {
+            if spec.id == "integrate" || spec.id == "open-merge-queue" {
                 cfg.merge_queue.enabled
             } else {
                 spec.palette

@@ -105,6 +105,8 @@ pub enum Action {
     ToggleNotifications,
     /// Open the right panel to the Work ▸ CI section and focus it (AV group).
     OpenCi,
+    /// Open the right panel to the Work ▸ Merge queue section (fold-actor).
+    OpenMergeQueue,
     /// Prompt for a port and expose it from the active worktree (`[share]`).
     ShareWorktreePort,
     /// Stop all ingress shares on the active worktree.
@@ -485,6 +487,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         id: "open-ci",
         label: "Open CI/CD runs panel",
         hint: "ci",
+        default_chords: &[],
+        palette: true,
+    },
+    ActionSpec {
+        id: "open-merge-queue",
+        label: "Merge queue",
+        hint: "merge queue",
         default_chords: &[],
         palette: true,
     },
@@ -911,6 +920,7 @@ impl Action {
             Action::FocusSidebar => "focus-sidebar",
             Action::FocusPanel => "focus-panel",
             Action::OpenCi => "open-ci",
+            Action::OpenMergeQueue => "open-merge-queue",
             Action::ShareWorktreePort => "share-worktree-port",
             Action::StopWorktreeShare => "stop-worktree-share",
             Action::OpenShares => "open-shares",
@@ -1002,6 +1012,7 @@ impl Action {
             "focus-sidebar" => Action::FocusSidebar,
             "focus-panel" => Action::FocusPanel,
             "open-ci" => Action::OpenCi,
+            "open-merge-queue" => Action::OpenMergeQueue,
             "share-worktree-port" => Action::ShareWorktreePort,
             "stop-worktree-share" => Action::StopWorktreeShare,
             "open-shares" => Action::OpenShares,

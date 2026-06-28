@@ -924,6 +924,7 @@ pub enum BarItemId {
 pub enum BarBadge {
     Notifications,
     Ci,
+    MergeQueue,
     DiskWarn,
     Ingress,
     Media,
@@ -1468,6 +1469,37 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
                 vec![Seg::chip(
                     Tok::Hue(superzej_core::theme::Hue::Amber),
                     format!(" {} {running} CI ", crate::caps::active_glyphs().dot_filled),
+                )],
+            ));
+        }
+    }
+    // Merge-queue (fold-actor) badge: a red ⚑ chip when branches are deferred and
+    // need a rebase, else an amber chip while branches are queued/folding. Silent
+    // when the queue is empty (clean is quiet).
+    {
+        let q = &model.panel.merge_queue;
+        let deferred = q
+            .iter()
+            .filter(|r| r.status == "deferred" || r.status == "gate_failed")
+            .count();
+        let active = q
+            .iter()
+            .filter(|r| matches!(r.status.as_str(), "queued" | "folding" | "verifying"))
+            .count();
+        if deferred > 0 {
+            items.push((
+                BarItemId::Badge(BarBadge::MergeQueue),
+                vec![Seg::chip(
+                    Tok::Hue(superzej_core::theme::Hue::Red),
+                    format!(" ⚑ {deferred} MQ "),
+                )],
+            ));
+        } else if active > 0 {
+            items.push((
+                BarItemId::Badge(BarBadge::MergeQueue),
+                vec![Seg::chip(
+                    Tok::Hue(superzej_core::theme::Hue::Amber),
+                    format!(" ⧉ {active} MQ "),
                 )],
             ));
         }
@@ -2713,6 +2745,7 @@ pub(crate) fn panel_help_pairs(ui: &crate::panel::PanelUi) -> Vec<(String, Strin
             ("r", "rerun"),
             ("o", "browser"),
         ],
+        Section::MergeQueue => &[("j/k", "row")],
         Section::Files => &[("↵", "open"), ("y", "yazi")],
         Section::Issues => &[
             ("j/k", "row"),
