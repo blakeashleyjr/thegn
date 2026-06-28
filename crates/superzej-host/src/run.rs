@@ -14951,6 +14951,7 @@ async fn event_loop<T: Terminal>(
                                             }
                                         }
                                         Section::Ci
+                                        | Section::MergeQueue
                                         | Section::Debug
                                         | Section::Sandbox
                                         | Section::Db
@@ -16768,6 +16769,42 @@ async fn event_loop<T: Terminal>(
                                 panel_ui.switch_tab(crate::panel::PanelTab::Work);
                                 open_panel_section(
                                     crate::panel::Section::Ci,
+                                    &mut panel_ui,
+                                    &mut hydration_gen,
+                                    &model_tx,
+                                    &session,
+                                    &waker,
+                                    PanelDocsWiring {
+                                        model: &model,
+                                        generation: docs_gen,
+                                        tx: &docs_tx,
+                                    },
+                                );
+                                focus.zone = crate::focus::Zone::Panel;
+                            }
+                            Action::OpenMergeQueue => {
+                                panel_auto_revealed = None;
+                                if chrome.panel.is_none() {
+                                    want_panel = true;
+                                    panel_forced = cols < layout::PANEL_MIN_COLS;
+                                    chrome = compute_chrome(
+                                        cols,
+                                        rows,
+                                        want_sidebar,
+                                        want_panel,
+                                        panel_forced,
+                                        panel_width,
+                                        sidebar_cols,
+                                        zoom,
+                                        &supervisor,
+                                        drawer_rows,
+                                        drawer_full,
+                                    );
+                                    need_relayout = true;
+                                }
+                                panel_ui.switch_tab(crate::panel::PanelTab::Work);
+                                open_panel_section(
+                                    crate::panel::Section::MergeQueue,
                                     &mut panel_ui,
                                     &mut hydration_gen,
                                     &model_tx,

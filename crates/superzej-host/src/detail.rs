@@ -745,6 +745,36 @@ fn badge_detail(b: BarBadge, near: Placement, model: &FrameModel) -> Option<Deta
                 .collect();
             Some(list("CI runs", rows, "no CI runs", 56, 14))
         }
+        BarBadge::MergeQueue => {
+            if model.panel.merge_queue.is_empty() {
+                return None;
+            }
+            let rows: Vec<DetailRow> = model
+                .panel
+                .merge_queue
+                .iter()
+                .map(|r| {
+                    let (glyph, marker) = match r.status.as_str() {
+                        "landed" => ("✓", Tok::Hue(Hue::Green)),
+                        "deferred" | "gate_failed" => ("⚑", Tok::Hue(Hue::Red)),
+                        "folding" | "verifying" => ("●", Tok::Hue(Hue::Amber)),
+                        _ => ("○", Tok::Slot(S::Dim)),
+                    };
+                    let note = if r.status == "deferred" || r.status == "gate_failed" {
+                        r.conflict_paths.as_ref().map(|p| p.replace('\n', ", "))
+                    } else {
+                        None
+                    };
+                    DetailRow {
+                        marker,
+                        glyph: glyph.into(),
+                        text: r.branch.clone(),
+                        note,
+                    }
+                })
+                .collect();
+            Some(list("Merge queue", rows, "merge queue empty", 56, 14))
+        }
         BarBadge::Ingress => {
             if model.shares.is_empty() {
                 return None;

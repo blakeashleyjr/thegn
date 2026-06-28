@@ -20,6 +20,7 @@ mod issues;
 mod keys;
 mod logs;
 mod media;
+mod merge_queue;
 mod misc;
 pub(crate) mod my_work;
 mod notifications;
@@ -356,6 +357,42 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
                 v
             }
         }
+        Section::MergeQueue => {
+            let q = &data.merge_queue;
+            if q.is_empty() {
+                vec![seg(g2(), "—")]
+            } else {
+                let landed = q.iter().filter(|r| r.status == "landed").count();
+                let deferred = q
+                    .iter()
+                    .filter(|r| r.status == "deferred" || r.status == "gate_failed")
+                    .count();
+                let active = q
+                    .iter()
+                    .filter(|r| matches!(r.status.as_str(), "queued" | "folding" | "verifying"))
+                    .count();
+                let mut v: Vec<crate::seg::Seg> = Vec::new();
+                if landed > 0 {
+                    v.push(seg(hue(Hue::Green), format!("✓{landed}")));
+                }
+                if deferred > 0 {
+                    if !v.is_empty() {
+                        v.push(seg(g(), " "));
+                    }
+                    v.push(seg(hue(Hue::Red), format!("⚑{deferred}")));
+                }
+                if active > 0 {
+                    if !v.is_empty() {
+                        v.push(seg(g(), " "));
+                    }
+                    v.push(seg(hue(Hue::Amber), format!("●{active}")));
+                }
+                if v.is_empty() {
+                    v.push(seg(g2(), "—"));
+                }
+                v
+            }
+        }
         Section::Files => {
             let loc = model.loc.map(compact_count);
             match (data.file_count, loc) {
@@ -613,6 +650,7 @@ pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
         Section::Stash => stash::content(ctx),
         Section::Pr => git::content(ctx),
         Section::Ci => ci::content(ctx),
+        Section::MergeQueue => merge_queue::content(ctx),
         Section::Files => misc::files(ctx),
         Section::Problems => problems::content(ctx),
         Section::Jobs => tasks::content(ctx),
@@ -1032,10 +1070,15 @@ mod spec {
             assert!(!h.is_empty(), "{section:?} half");
             assert!(!f.is_empty(), "{section:?} full");
             // Debug/Db are dead-code placeholder sections — distinctness is waived.
-            // Logs/Share/Forward are flat lists with no width-specific full view.
+            // Logs/Share/Forward/MergeQueue are flat lists, no width-specific full view.
             if matches!(
                 section,
-                Section::Debug | Section::Db | Section::Logs | Section::Share | Section::Forward
+                Section::Debug
+                    | Section::Db
+                    | Section::Logs
+                    | Section::Share
+                    | Section::Forward
+                    | Section::MergeQueue
             ) {
                 continue;
             }

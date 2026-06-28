@@ -112,6 +112,8 @@ pub enum Section {
     Pr,
     /// CI/CD runs across providers (AV group): run history + per-run state.
     Ci,
+    /// Local merge queue (the fold-actor): per-branch land/defer status.
+    MergeQueue,
     Issues,
     Files,
     /// Compiler / linter / test diagnostics.
@@ -145,12 +147,12 @@ pub enum Section {
 /// The accordion's built-in display order — the default when `[panel]
 /// sections` is unset. Grouped by tab:
 /// - Git (5): Changes, Commits, Branches, Stash, Files
-/// - Work (8): Mine, Pr, Ci, Issues, Problems, Jobs, Tests, Symbols
+/// - Work (9): Mine, Pr, Ci, MergeQueue, Issues, Problems, Jobs, Tests, Symbols
 /// - System (8): Notifications, Logs, Sandbox, Share, Forward, Telemetry, Media, Keys
 ///
 /// The live order (config-reordered, possibly trimmed) rides on
 /// [`PanelUi::order`]; numbered jump keys index the ACTIVE TAB's slice.
-pub const SECTION_ORDER: [Section; 21] = [
+pub const SECTION_ORDER: [Section; 22] = [
     // Git tab
     Section::Changes,
     Section::Commits,
@@ -161,6 +163,7 @@ pub const SECTION_ORDER: [Section; 21] = [
     Section::Mine,
     Section::Pr,
     Section::Ci,
+    Section::MergeQueue,
     Section::Issues,
     Section::Problems,
     Section::Jobs,
@@ -188,6 +191,7 @@ impl Section {
             Section::Mine => "mine",
             Section::Pr => "pr",
             Section::Ci => "ci",
+            Section::MergeQueue => "merge",
             Section::Files => "files",
             Section::Problems => "problems",
             Section::Jobs => "jobs",
@@ -218,6 +222,7 @@ impl Section {
             Section::Mine
             | Section::Pr
             | Section::Ci
+            | Section::MergeQueue
             | Section::Issues
             | Section::Problems
             | Section::Jobs
@@ -470,6 +475,9 @@ pub struct PanelData {
     /// Recent CI runs (newest first) for the current branch, from `ci_runs_cache`
     /// — feeds the `Ci` section rollup (AV group). Empty when CI is off/undetected.
     pub ci_runs: Vec<superzej_core::ci::CiRun>,
+    /// The local merge queue (the fold-actor), from `merge_queue` — feeds the
+    /// `MergeQueue` section + statusbar badge. Empty when the queue is unused.
+    pub merge_queue: Vec<superzej_core::db::MergeQueueRow>,
     /// Now-playing snapshot for the optional `[media]` feature (`Media` section +
     /// statusbar badge). `None` when media is disabled or no player is loaded.
     pub media: Option<superzej_core::media::MediaState>,
@@ -1079,7 +1087,7 @@ mod tests {
 
     #[test]
     fn section_order_jump_and_cycle() {
-        assert_eq!(SECTION_ORDER.len(), 21);
+        assert_eq!(SECTION_ORDER.len(), 22);
         // Default tab = Git; Changes is in Git tab.
         let ui = PanelUi::default(); // open = Changes, tab = Git
         assert_eq!(ui.next_section(), Section::Commits); // next in Git tab
@@ -1336,18 +1344,18 @@ mod tests {
             accordion_key(&KeyCode::Char('2'), none, &work_ui),
             Some(PanelMsg::Open(Section::Pr))
         );
-        // Work order: Mine, Pr, Ci, Issues, Problems, … → '3' is Ci, '4' is Issues.
+        // Work order: Mine, Pr, Ci, MergeQueue, Issues, … → '3' Ci, '4' MergeQueue, '5' Issues.
         assert_eq!(
             accordion_key(&KeyCode::Char('3'), none, &work_ui),
             Some(PanelMsg::Open(Section::Ci))
         );
         assert_eq!(
             accordion_key(&KeyCode::Char('4'), none, &work_ui),
-            Some(PanelMsg::Open(Section::Issues))
+            Some(PanelMsg::Open(Section::MergeQueue))
         );
         assert_eq!(
             accordion_key(&KeyCode::Char('5'), none, &work_ui),
-            Some(PanelMsg::Open(Section::Problems))
+            Some(PanelMsg::Open(Section::Issues))
         );
         // A custom order filters to the tab's sections.
         let trimmed = PanelUi {

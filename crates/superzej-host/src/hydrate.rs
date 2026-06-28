@@ -1276,6 +1276,10 @@ pub(crate) fn build_panel(
         panel.ci_runs = runs;
     }
 
+    // The local merge queue (fold-actor) — a tiny table, read every model build
+    // (no dedicated RefreshKind). Feeds the `MergeQueue` section + statusbar badge.
+    panel.merge_queue = db.list_merge_queue().unwrap_or_default();
+
     panel.files = diff_entries
         .iter()
         .map(|f| crate::panel::DiffFile {
