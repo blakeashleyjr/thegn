@@ -40,6 +40,7 @@ pub mod log_trace;
 pub mod log_view;
 pub mod mcp;
 pub mod media;
+pub mod merge_guard;
 pub mod metrics;
 pub mod models;
 pub mod msg;

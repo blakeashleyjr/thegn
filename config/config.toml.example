@@ -296,6 +296,11 @@ pr_interval_secs = 20  # PR refresh cadence (SUPERZEJ_WATCH_PR_INTERVAL)
 override_gpg = false   # true => history rewrites pass -c commit.gpgSign=false
                        # -c tag.gpgSign=false, so a gpg passphrase prompt can
                        # never hang a background operation
+merge_guard = true     # install a pre-merge-commit hook that refuses `git merge`
+                       # in the canonical checkout from inside a sandbox (where
+                       # its FS view can be incoherent and corrupt the merge);
+                       # points at `szhost integrate`. No-op outside a sandbox or
+                       # in linked worktrees. Escape hatch: SUPERZEJ_MERGE_GUARD_OFF=1
 
 # User-defined git commands, surfaced in the git panel's custom-commands menu
 # (`x`). `command` is a template expanded against the current selection — see
