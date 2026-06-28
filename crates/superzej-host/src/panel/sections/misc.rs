@@ -210,6 +210,38 @@ pub(super) fn share(ctx: &SectionCtx) -> Vec<PanelRow> {
         .collect()
 }
 
+/// `[forward]` auto port forwards for the active worktree: one row per detected
+/// sandbox port → its `http://localhost:<host_port>` preview URL (remaps shown
+/// as `container → host`). Pure — `model.forwards` is the supervisor's snapshot.
+pub(super) fn forward(ctx: &SectionCtx) -> Vec<PanelRow> {
+    let forwards = &ctx.model.forwards;
+    if forwards.is_empty() {
+        return vec![PanelRow::plain(Line::segs(vec![seg(
+            g(),
+            "no forwards — start a dev server in the sandbox".to_string(),
+        )]))];
+    }
+    forwards
+        .iter()
+        .map(|f| {
+            // Show the port mapping; a remap (host ≠ container) is amber to flag
+            // that the preview URL isn't on the dev server's own number.
+            let (color, port_label) = if f.remapped {
+                (
+                    hue(Hue::Amber),
+                    format!("{} → {}", f.container_port, f.host_port),
+                )
+            } else {
+                (hue(Hue::Teal), f.container_port.to_string())
+            };
+            PanelRow::plain(Line::segs(vec![
+                seg(color, format!("\u{21c5} {port_label} ")).bold(),
+                seg(g(), f.url.clone()),
+            ]))
+        })
+        .collect()
+}
+
 // ---- tests ------------------------------------------------------------------
 
 pub(super) fn tests(ctx: &SectionCtx) -> Vec<PanelRow> {

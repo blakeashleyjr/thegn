@@ -28,6 +28,7 @@ pub mod env;
 pub mod event_bus;
 pub mod fold;
 pub mod forge;
+pub mod forward;
 pub mod github;
 pub mod gitrefs;
 pub mod gitviz;

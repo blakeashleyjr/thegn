@@ -2159,6 +2159,17 @@ fn current_share_views(
         .unwrap_or_default()
 }
 
+/// The active worktree's auto port forwards, for the System ▸ Forward section.
+fn current_forward_views(
+    sup: &crate::forward::ForwardSupervisor,
+    session: &crate::session::Session,
+) -> Vec<crate::forward::ForwardView> {
+    session
+        .active_group()
+        .map(|g| sup.views(&g.path))
+        .unwrap_or_default()
+}
+
 /// Persist a share lifecycle event to the `shares` table (resurrection layer).
 fn persist_share_event(ev: &crate::share::ShareEvent) {
     use crate::share::ShareEvent;
@@ -7811,6 +7822,37 @@ async fn event_loop<T: Terminal>(
         }
     }
 
+    // Automatic port forwards (`[forward]`): a single off-loop detector thread
+    // polls the ACTIVE worktree's sandbox for newly-bound listening ports and
+    // reports them on `forward_rx` (pulsing the waker). The loop binds a free
+    // host port and spawns a userspace proxy bridging localhost into the
+    // container netns. `forward_target` is the worktree the detector watches; the
+    // loop updates it as the active worktree changes.
+    let mut forward_supervisor = crate::forward::ForwardSupervisor::new();
+    let (forward_tx, mut forward_rx) =
+        tokio_mpsc::unbounded_channel::<crate::forward::ForwardEvent>();
+    let forward_target: crate::forward::DetectTarget =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    // The worktree the detector last watched — when it changes, the old
+    // worktree's forwards are torn down (the detector tracks one worktree, so it
+    // can't see its ports vanish once we switch away; they re-detect on return).
+    let mut last_forward_target: Option<String> = None;
+    if keymap.config().forward.auto {
+        // Forwards aren't resurrected blindly (the dev server may be gone): wipe
+        // stale rows and let the detector re-discover live ports.
+        if let Ok(db) = superzej_core::db::Db::open() {
+            for row in db.list_forwards().unwrap_or_default() {
+                let _ = db.delete_forward(&row.worktree, row.container_port);
+            }
+        }
+        crate::forward::spawn_detector(
+            forward_target.clone(),
+            std::time::Duration::from_secs(keymap.config().forward.poll_secs.max(1)),
+            forward_tx,
+            waker.clone(),
+        );
+    }
+
     // LSP: lazy, warm language servers per worktree. Clients push diagnostics on
     // a std channel; a bridge thread forwards them onto a loop channel and pulses
     // the waker (svc has no waker). `lsp_diags` persists them across model swaps.
@@ -8284,6 +8326,7 @@ async fn event_loop<T: Terminal>(
         }
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             share_supervisor.shutdown_all();
+            forward_supervisor.shutdown_all();
             persist_session_layout(&mut session, &panes);
             return Ok(());
         }
@@ -9732,6 +9775,8 @@ async fn event_loop<T: Terminal>(
             // Shares live on the supervisor (loop-local), not in hydration; a
             // fresh model wouldn't carry them — re-apply for the active worktree.
             model.shares = current_share_views(&share_supervisor, &session);
+            // Forwards likewise live on their supervisor — re-apply per worktree.
+            model.forwards = current_forward_views(&forward_supervisor, &session);
             // The Symbols list (outline/refs) is re-derived in the pre-render block.
             // Mirror an externally-started (or externally-finished) rebase
             // into the git flow state, so the TODO view and conflict chrome
@@ -10562,6 +10607,105 @@ async fn event_loop<T: Terminal>(
             if share_supervisor.on_event(ev) {
                 model.shares = current_share_views(&share_supervisor, &session);
                 dirty = true;
+            }
+        }
+
+        // Keep the detector pointed at the active worktree (cheap mutex store on
+        // each wake). `None` when nothing is sandbox-fileable so the detector
+        // backs off instead of probing.
+        {
+            use crate::session::GroupKind;
+            let target = if current_config.forward.auto {
+                session
+                    .active_group()
+                    .filter(|g| g.kind == GroupKind::Branch && !g.path.is_empty())
+                    .map(|g| g.path.clone())
+            } else {
+                None
+            };
+            if target != last_forward_target {
+                // Tear down forwards on the worktree we're leaving (proxies +
+                // resurrection rows); they re-detect if we switch back.
+                if let Some(prev) = &last_forward_target {
+                    for port in forward_supervisor.stop_all_on(prev) {
+                        if let Ok(db) = superzej_core::db::Db::open() {
+                            let _ = db.delete_forward(prev, port);
+                        }
+                    }
+                    model.forwards = current_forward_views(&forward_supervisor, &session);
+                    dirty = true;
+                }
+                last_forward_target = target.clone();
+            }
+            *forward_target.lock().unwrap() = target;
+        }
+
+        // Auto-forward state from the detector thread: bring up / tear down the
+        // host-side proxy, persist the row, notify on a conflict remap, and
+        // re-sync the model (a chrome change ⇒ Full frame).
+        while let Ok(ev) = forward_rx.try_recv() {
+            match ev {
+                crate::forward::ForwardEvent::Detected {
+                    worktree,
+                    container_port,
+                    runtime,
+                } => {
+                    // Ignore a late event for a worktree we've already switched
+                    // away from (its forwards were just torn down) — else we'd
+                    // leak a proxy the teardown won't reclaim.
+                    if last_forward_target.as_deref() == Some(worktree.as_str())
+                        && current_config.forward.should_auto_forward(container_port)
+                        && !forward_supervisor.has(&worktree, container_port)
+                    {
+                        match forward_supervisor.start(
+                            &current_config.forward,
+                            &worktree,
+                            container_port,
+                            &runtime,
+                        ) {
+                            Ok(started) => {
+                                if let Ok(db) = superzej_core::db::Db::open() {
+                                    let _ = db.upsert_forward(
+                                        &worktree,
+                                        container_port,
+                                        started.host_port,
+                                        &started.url,
+                                    );
+                                }
+                                model.status = if started.remapped {
+                                    format!(
+                                        "Port {container_port} in use → forwarded at {}",
+                                        started.url
+                                    )
+                                } else {
+                                    format!("Forwarding port {container_port} → {}", started.url)
+                                };
+                                if current_config.forward.open_on_detect {
+                                    open_url_detached(&started.url);
+                                }
+                                model.forwards =
+                                    current_forward_views(&forward_supervisor, &session);
+                                dirty = true;
+                            }
+                            Err(e) => {
+                                model.status = format!("Forward failed for {container_port}: {e}");
+                                dirty = true;
+                            }
+                        }
+                    }
+                }
+                crate::forward::ForwardEvent::Vanished {
+                    worktree,
+                    container_port,
+                } => {
+                    if forward_supervisor.stop(&worktree, container_port) {
+                        if let Ok(db) = superzej_core::db::Db::open() {
+                            let _ = db.delete_forward(&worktree, container_port);
+                        }
+                        model.forwards = current_forward_views(&forward_supervisor, &session);
+                        dirty = true;
+                    }
+                }
             }
         }
 
@@ -14398,6 +14542,22 @@ async fn event_loop<T: Terminal>(
                                                 model.status = format!("Copied {url}");
                                             }
                                         }
+                                        Section::Forward => {
+                                            // Enter copies the focused forward's preview URL.
+                                            if let Some(url) = model
+                                                .forwards
+                                                .get(panel_ui.cursor)
+                                                .map(|f| f.url.clone())
+                                            {
+                                                use std::io::Write as _;
+                                                let mut out = std::io::stdout();
+                                                let _ = out
+                                                    .write_all(&crate::copymode::osc52(&url))
+                                                    .and_then(|_| out.flush());
+                                                crate::clipboard::copy(&url);
+                                                model.status = format!("Copied {url}");
+                                            }
+                                        }
                                         Section::Ci
                                         | Section::Debug
                                         | Section::Sandbox
@@ -15031,6 +15191,24 @@ async fn event_loop<T: Terminal>(
                                 focus.zone = crate::focus::Zone::Center;
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
+                            }
+                            true
+                        }
+                        // -- forward: open the focused preview in the browser --
+                        (Section::Forward, KeyCode::Char('o')) => {
+                            if let Some(f) = model.forwards.get(panel_ui.cursor) {
+                                let cmd = current_config.forward.browser.trim();
+                                if cmd.is_empty() {
+                                    open_url_detached(&f.url);
+                                } else {
+                                    let _ = std::process::Command::new(cmd)
+                                        .arg(&f.url)
+                                        .stdin(std::process::Stdio::null())
+                                        .stdout(std::process::Stdio::null())
+                                        .stderr(std::process::Stdio::null())
+                                        .spawn();
+                                }
+                                model.status = format!("Opened {} in browser", f.url);
                             }
                             true
                         }
