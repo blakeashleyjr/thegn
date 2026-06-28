@@ -136,11 +136,14 @@ pub enum Action {
     /// passes through to the focused pane (compositor chords are suspended).
     ToggleKeyLock,
     SwitchMode(Mode),
-    /// Launch-or-focus the pin at 1-based index N (the `Alt-1..9` mapping).
+    /// Launch-or-focus the pin at 1-based index N (the `Ctrl-Alt-1..9` mapping).
     SummonPin(u8),
     /// Jump to the workspace at 1-based slot N in visible sidebar order (the
     /// `Ctrl-1..9` mapping). Out-of-range N is a no-op.
     SummonWorkspace(u8),
+    /// Jump to the worktree at 1-based slot N in visible sidebar order (the
+    /// `Alt-1..9` mapping). Out-of-range N is a no-op.
+    SummonWorktree(u8),
     /// Show/hide the top pinned-program strip.
     ToggleStrip,
     /// Grow the top strip (more rows).
@@ -923,6 +926,7 @@ impl Action {
             Action::SwitchMode(Mode::Emacs) => "mode-emacs",
             Action::SummonPin(_) => "summon-pin",
             Action::SummonWorkspace(_) => "summon-workspace",
+            Action::SummonWorktree(_) => "summon-worktree",
             Action::ToggleStrip => "toggle-strip",
             Action::GrowStrip => "grow-strip",
             Action::ShrinkStrip => "shrink-strip",
@@ -1035,6 +1039,14 @@ impl Action {
                     .filter(|n| (1..=9).contains(n))
                 {
                     return Some(Action::SummonWorkspace(n));
+                }
+                if let Some(n) = other
+                    .strip_prefix("summon-worktree-")
+                    .or_else(|| other.strip_prefix("worktree-"))
+                    .and_then(|s| s.parse::<u8>().ok())
+                    .filter(|n| (1..=9).contains(n))
+                {
+                    return Some(Action::SummonWorktree(n));
                 }
                 let n = other
                     .strip_prefix("summon-pin-")
@@ -1528,16 +1540,23 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl Alt /", Action::SearchPane).unwrap();
     map.insert_all("Ctrl /", Action::SearchGlobal).unwrap();
 
-    // Pins: Alt-1..9 launch-or-focus the configured pin in registration order;
-    // strip visibility/sizing and promote/unpin hang off Ctrl-Alt chords.
+    // Worktrees: Alt-1..9 jump directly to the worktree at that slot in the
+    // visible sidebar order (matches the digit hints revealed on worktree rows
+    // while the sidebar is focused).
     for n in 1u8..=9 {
-        map.insert_all(&format!("Alt {n}"), Action::SummonPin(n))
+        map.insert_all(&format!("Alt {n}"), Action::SummonWorktree(n))
             .unwrap();
     }
     // Workspaces: Ctrl-1..9 jump directly to the workspace at that slot in the
-    // visible sidebar order (matches the digit hints painted on workspace rows).
+    // visible sidebar order (matches the digit hints revealed on workspace rows).
     for n in 1u8..=9 {
         map.insert_all(&format!("Ctrl {n}"), Action::SummonWorkspace(n))
+            .unwrap();
+    }
+    // Pins: Ctrl-Alt-1..9 launch-or-focus the configured pin in registration
+    // order (moved off Alt-1..9, which now jumps to worktrees).
+    for n in 1u8..=9 {
+        map.insert_all(&format!("Ctrl Alt {n}"), Action::SummonPin(n))
             .unwrap();
     }
     map.insert_all("Ctrl Alt b", Action::ToggleStrip).unwrap();
@@ -2153,6 +2172,12 @@ mod tests {
         assert_eq!(Action::from_key("summon-pin-3"), Some(Action::SummonPin(3)));
         assert_eq!(Action::from_key("pin-1"), Some(Action::SummonPin(1)));
         assert_eq!(Action::from_key("pin-9"), Some(Action::SummonPin(9)));
+        // SummonWorktree parses both `summon-worktree-N` and `worktree-N`.
+        assert_eq!(
+            Action::from_key("summon-worktree-2"),
+            Some(Action::SummonWorktree(2))
+        );
+        assert_eq!(Action::from_key("worktree-7"), Some(Action::SummonWorktree(7)));
         assert_eq!(Action::from_key("pin-0"), None);
         assert_eq!(Action::from_key("pin-99"), None);
     }
@@ -2201,19 +2226,38 @@ mod tests {
     }
 
     #[test]
-    fn default_keymap_binds_alt_digits_to_summon_pin() {
+    fn default_keymap_binds_alt_digits_to_summon_worktree() {
         let mut map = default_keymap();
         assert_eq!(
             map.dispatch(
                 Mode::Normal,
                 Key::modified(KeyCode::Char('1'), Modifiers::ALT)
             ),
-            MatchResult::Matched(Action::SummonPin(1))
+            MatchResult::Matched(Action::SummonWorktree(1))
         );
         assert_eq!(
             map.dispatch(
                 Mode::Normal,
                 Key::modified(KeyCode::Char('9'), Modifiers::ALT)
+            ),
+            MatchResult::Matched(Action::SummonWorktree(9))
+        );
+    }
+
+    #[test]
+    fn default_keymap_binds_ctrl_alt_digits_to_summon_pin() {
+        let mut map = default_keymap();
+        assert_eq!(
+            map.dispatch(
+                Mode::Normal,
+                Key::modified(KeyCode::Char('1'), Modifiers::CTRL | Modifiers::ALT)
+            ),
+            MatchResult::Matched(Action::SummonPin(1))
+        );
+        assert_eq!(
+            map.dispatch(
+                Mode::Normal,
+                Key::modified(KeyCode::Char('9'), Modifiers::CTRL | Modifiers::ALT)
             ),
             MatchResult::Matched(Action::SummonPin(9))
         );

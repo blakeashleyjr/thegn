@@ -34,7 +34,8 @@ repos/worktrees is a tab switch — never a session change (no teleport).
   `o` open · `c` create · `m` merge · `a` approve · `r` re-run failed checks · `f` refresh.
 - **Tools, scoped to the focused worktree, as floating panes:**
   `Alt-g` lazygit · `Alt-y` yazi · `Alt-e` `$EDITOR` · `Alt-/` git diff.
-- **Pinned programs:** `Alt-1..9` launch or focus a globally configured `[[pins]]` program. By default they open a dedicated `pin:<name>` tab, but `location = "layout"` injects them as a tiled pane directly into your focused layout.
+- **Quick-jump digits:** `Alt-1..9` jump to a worktree, `Ctrl-1..9` to a workspace, by their slot in sidebar order. The digit hints are revealed on the rows while the sidebar is focused (`Alt-s`); the keys work from anywhere.
+- **Pinned programs:** `Ctrl-Alt-1..9` launch or focus a globally configured `[[pins]]` program. By default they open a dedicated `pin:<name>` tab, but `location = "layout"` injects them as a tiled pane directly into your focused layout.
 - **Cleanup.** `Alt-X` removes the focused worktree and closes its tab (branch kept by
   default). Closing a plain panel never deletes a worktree.
 
@@ -66,7 +67,9 @@ sidebar, tabbar and panel stay pinned).
 | Alt-y             | yazi                                                     |
 | Alt-e             | `$EDITOR`                                                |
 | Alt-/             | git diff                                                 |
-| Alt-1..9          | launch / focus pinned programs (`[[pins]]` config)       |
+| Alt-1..9          | jump to worktree N (digits revealed when sidebar focused)|
+| Ctrl-1..9         | jump to workspace N                                      |
+| Ctrl-Alt-1..9     | launch / focus pinned programs (`[[pins]]` config)       |
 | Alt-x             | close active tab                                         |
 | Alt-X             | close active worktree                                    |
 

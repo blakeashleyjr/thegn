@@ -16342,6 +16342,32 @@ async fn event_loop<T: Terminal>(
                                     );
                                 }
                             }
+                            Action::SummonWorktree(n) => {
+                                // Alt+1..9: jump directly to the worktree at slot
+                                // N in the *visible* sidebar order — the same
+                                // order Alt+↑/↓ walks and the digit hints reveal.
+                                // Out-of-range N or already-active is a no-op.
+                                let order = sidebar_worktree_order(&model);
+                                if let Some(&g) =
+                                    order.get((n as usize).saturating_sub(1))
+                                    && g != session.active
+                                {
+                                    session.switch_to(g);
+                                    focus.zone = crate::focus::Zone::Center;
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    need_relayout = true;
+                                    sync_drawer_persistence(
+                                        &session,
+                                        &mut panes,
+                                        &mut drawer,
+                                        &mut drawer_pool,
+                                        &mut drawer_home,
+                                        keymap.config(),
+                                        chrome.center,
+                                    );
+                                    persist_session_layout(&mut session, &panes);
+                                }
+                            }
                             Action::MoveItemUp | Action::MoveItemDown => {
                                 // Reorder the selected item: the workspace under
                                 // the sidebar cursor if the sidebar is focused on
