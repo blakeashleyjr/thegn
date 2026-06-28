@@ -93,6 +93,9 @@ pub enum Action {
     TogglePanel,
     ToggleRecorder,
     ToggleDrawer,
+    /// Summon-or-dismiss the corner overlay pin (the first `location = "corner"`
+    /// pin, e.g. an `mpv --vo=tct` video player docked bottom-right).
+    ToggleCorner,
     /// Move keyboard focus into the sidebar tree (shows it if hidden).
     FocusSidebar,
     /// Move keyboard focus into the right panel (shows it if hidden).
@@ -433,6 +436,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         label: "Toggle files drawer",
         hint: "drawer",
         default_chords: &["Ctrl Alt f"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "toggle-corner",
+        label: "Toggle corner overlay (video)",
+        hint: "corner",
+        default_chords: &["Ctrl Alt o"],
         palette: true,
     },
     ActionSpec {
@@ -882,6 +892,7 @@ impl Action {
             Action::TogglePanel => "toggle-panel",
             Action::ToggleRecorder => "toggle-recorder",
             Action::ToggleDrawer => "files-drawer",
+            Action::ToggleCorner => "toggle-corner",
             Action::FocusSidebar => "focus-sidebar",
             Action::FocusPanel => "focus-panel",
             Action::OpenCi => "open-ci",
@@ -970,6 +981,7 @@ impl Action {
             "toggle-panel" => Action::TogglePanel,
             "toggle-recorder" => Action::ToggleRecorder,
             "files" | "files-drawer" | "toggle-drawer" => Action::ToggleDrawer,
+            "toggle-corner" | "corner" | "video" => Action::ToggleCorner,
             "focus-sidebar" => Action::FocusSidebar,
             "focus-panel" => Action::FocusPanel,
             "open-ci" => Action::OpenCi,
@@ -1435,6 +1447,7 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl Alt r", Action::ToggleRecorder)
         .unwrap();
     map.insert_all("Ctrl Alt f", Action::ToggleDrawer).unwrap();
+    map.insert_all("Ctrl Alt o", Action::ToggleCorner).unwrap();
     map.insert_all("Alt s", Action::FocusSidebar).unwrap();
     map.insert_all("Alt .", Action::FocusPanel).unwrap();
     map.insert_all("Alt i", Action::ToggleNotifications)

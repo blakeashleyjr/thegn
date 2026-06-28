@@ -366,7 +366,18 @@ config_enum! {
         Layout = "layout" | "pane" | "active_layout" | "active-layout",
         Strip = "strip" | "top" | "top-strip" | "top_strip",
         Float = "float" | "floating" | "scratch",
+        Corner = "corner",
     } default = Tab;
+}
+
+config_enum! {
+    /// Which screen corner a `location = "corner"` pin docks in.
+    pub enum PinCorner: "pin corner" {
+        TopLeft = "top_left" | "top-left" | "tl",
+        TopRight = "top_right" | "top-right" | "tr",
+        BottomLeft = "bottom_left" | "bottom-left" | "bl",
+        BottomRight = "bottom_right" | "bottom-right" | "br",
+    } default = BottomRight;
 }
 
 config_enum! {
@@ -680,10 +691,11 @@ pub struct Account {
 }
 
 /// A `[[pins]]` entry — a named program that opens either as its own session
-/// tab (`location = "tab"`, the default) or as a tiled pane in the active
-/// layout (`location = "layout"`). Pins are summoned via `Alt-1..9` / the
-/// tabbar's pin chips, and can be global (all workspaces) or workspace-scoped.
-/// See `src/commands/pin.rs`.
+/// tab (`location = "tab"`, the default), as a tiled pane in the active layout
+/// (`location = "layout"`), or as a small bordered overlay docked in a screen
+/// **corner** (`location = "corner"`, e.g. a `mpv --vo=tct` video player in the
+/// bottom-right). Pins are summoned via `Alt-1..9` / the tabbar's pin chips, and
+/// can be global (all workspaces) or workspace-scoped. See `src/commands/pin.rs`.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Pin {
     pub name: String,
@@ -723,6 +735,17 @@ pub struct Pin {
     /// Relative weight of this pin within the top strip (defaults to 1.0).
     #[serde(default)]
     pub ratio: Option<f32>,
+    /// Which screen corner a `location = "corner"` pin docks in.
+    #[serde(default)]
+    pub corner: PinCorner,
+    /// Corner-pin width: a percentage of screen columns (`"30%"`) or an absolute
+    /// column count (`"40"`). Defaults to ~30% when unset.
+    #[serde(default)]
+    pub corner_width: Option<String>,
+    /// Corner-pin height: a percentage of screen rows (`"30%"`) or an absolute
+    /// row count (`"12"`). Defaults to ~30% when unset.
+    #[serde(default)]
+    pub corner_height: Option<String>,
 }
 
 impl Pin {
@@ -5758,6 +5781,9 @@ format = \"bad\"
             env: std::collections::BTreeMap::new(),
             label: None,
             ratio: None,
+            corner: crate::config::PinCorner::BottomRight,
+            corner_width: None,
+            corner_height: None,
         });
         assert_eq!(cfg.pin("test").unwrap().name, "test");
         assert!(cfg.pin("missing").is_none());
@@ -5783,6 +5809,9 @@ format = \"bad\"
             env: std::collections::BTreeMap::new(),
             label: None,
             ratio: None,
+            corner: crate::config::PinCorner::BottomRight,
+            corner_width: None,
+            corner_height: None,
         });
         cfg.pins.push(crate::config::Pin {
             name: "local".into(),
@@ -5798,6 +5827,9 @@ format = \"bad\"
             env: std::collections::BTreeMap::new(),
             label: None,
             ratio: None,
+            corner: crate::config::PinCorner::BottomRight,
+            corner_width: None,
+            corner_height: None,
         });
         cfg.pins.push(crate::config::Pin {
             name: "local_any".into(),
@@ -5813,6 +5845,9 @@ format = \"bad\"
             env: std::collections::BTreeMap::new(),
             label: None,
             ratio: None,
+            corner: crate::config::PinCorner::BottomRight,
+            corner_width: None,
+            corner_height: None,
         });
         let none_pins = cfg.pins_for_workspace(None);
         assert_eq!(none_pins.len(), 1); // just global
