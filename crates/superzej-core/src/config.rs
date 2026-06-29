@@ -2259,6 +2259,22 @@ config_enum! {
         Official = "official" | "nodaemon", Determinate = "determinate" | "ds",
     } default = Official;
 }
+config_enum! {
+    /// `[env.<name>.provider] connect` — how a provider sandbox's interactive
+    /// pane attaches.
+    ///
+    /// - `exec` — the provider's native WSS PTY exec (the default; superzej's
+    ///            vt100-over-WebSocket relay).
+    /// - `ssh`  — run `sshd` inside the sandbox and attach the pane as a LOCAL
+    ///            `ssh` client tunneled over the provider's TCP-over-WebSocket
+    ///            proxy. Delegates PTY/resize/flow-control to ssh (no hand-rolled
+    ///            relay) and unlocks scp/sshfs/agent-forwarding. (Sprites expose
+    ///            no UDP, so mosh is not possible — use a real `placement = "ssh"`
+    ///            env for that.)
+    pub enum ProviderConnect: "provider connect" {
+        Exec = "exec", Ssh = "ssh",
+    } default = Exec;
+}
 
 /// `[env.<name>.provider]` — a managed-sandbox provider for a `provider`
 /// placement (Daytona, Codespaces, …). `exec_command` is a static argv template
@@ -2291,6 +2307,10 @@ pub struct EnvProviderConfig {
     /// no vendor CLI) vs the `interactive_command` CLI bridge. `auto` (default)
     /// prefers native when the provider supports it.
     pub exec: ProviderExecMode,
+    /// How the interactive pane connects: the native WSS PTY `exec` (default) or
+    /// a local `ssh` client tunneled over the provider's TCP-over-WebSocket proxy.
+    /// See [`ProviderConnect`].
+    pub connect: ProviderConnect,
     /// Provider sandbox template/image to create from.
     pub template: String,
     /// Working directory inside the sandbox that a `data = "sync"` projection
