@@ -611,6 +611,10 @@ fn collect_sidebar_status(
     db: &superzej_core::db::Db,
     alert_kinds: &[&str],
     counted_kinds: &[&str],
+    // The budget-governed warm/lifecycle policy: reconciles the warm set (drops
+    // idle bridges so sandboxes suspend) and gates remote git-glyph scans so a
+    // suspended sandbox is never woken just to refresh the sidebar.
+    lifecycle: &superzej_core::config::LifecycleConfig,
 ) -> crate::sidebar::SidebarStatus {
     use superzej_core::remote::GitLoc;
     use superzej_svc::git::{GitBackend, GixGit};
@@ -671,6 +675,12 @@ fn collect_sidebar_status(
         .into_iter()
         .map(|(tab, st)| (tab, crate::sidebar::ActivityState::from_str(&st)))
         .collect();
+
+    // Reconcile the warm set now (after fresh activity): drop resident bridges for
+    // idle, over-budget remote sandboxes so they suspend — BEFORE the glyph scan
+    // below, so the just-suspended ones serve cache instead of being woken.
+    crate::lifecycle::reconcile(session, lifecycle);
+    let gate_remote_scans = lifecycle.enabled && lifecycle.serve_cached_glyphs;
 
     // Badge counts (item 28): unread + alert notifications grouped by worktree.
     status.unread_counts = db
@@ -734,6 +744,27 @@ fn collect_sidebar_status(
         for p in &paths {
             let is_active = active_path.as_deref() == Some(p.as_str());
             let cached = cache.get(p);
+            // Budget gate: never wake a suspended provider sandbox just to refresh
+            // the sidebar. A remote worktree that isn't active and has no live
+            // bridge is suspended — serve its last-known glyphs (or a placeholder)
+            // rather than running an in-sandbox `git status` that wakes it. The
+            // active worktree (and any warm one) still live-scans.
+            if gate_remote_scans {
+                let loc = GitLoc::for_worktree(std::path::Path::new(p));
+                let is_remote = loc.is_remote();
+                let warm = is_remote && superzej_svc::bridge::for_loc(&loc).is_some();
+                if !superzej_core::lifecycle::should_live_scan(is_remote, warm, is_active) {
+                    let row = cached.map(|(row, _)| row.clone()).unwrap_or((
+                        false,
+                        0,
+                        0,
+                        None,
+                        String::new(),
+                    ));
+                    reused.push((p.clone(), row));
+                    continue;
+                }
+            }
             let age = cached.map(|(_, ts)| now.saturating_duration_since(*ts));
             if should_rescan_glyphs(is_active, age, ttl) {
                 if let Some((row, _)) = cached {
@@ -1081,7 +1112,13 @@ pub(crate) fn build_model(
         .collect();
     let sidebar_db_worktrees = db_worktree_list(db);
     let sidebar_db_terminals = db.terminals().unwrap_or_default();
-    let sidebar_status = collect_sidebar_status(session, db, &alert_kinds, &counted_kinds);
+    let sidebar_status = collect_sidebar_status(
+        session,
+        db,
+        &alert_kinds,
+        &counted_kinds,
+        &app_cfg.lifecycle,
+    );
     let loc_count = worktree_loc(db, &cwd);
 
     let panel = build_panel(&cwd, db, &hints, &app_cfg);

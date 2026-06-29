@@ -33,6 +33,7 @@ mod kitty_relay;
 mod layer;
 mod layout;
 mod layout_spec;
+mod lifecycle;
 mod logotype;
 mod lsp;
 mod mem;
