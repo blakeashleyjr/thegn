@@ -877,6 +877,186 @@ impl NativeShell {
     }
 }
 
+/// Resolve `(provider, sandbox id, workdir)` for a worktree's PROVIDER env — for
+/// the SSH-over-WSS proxy path (`[env.<name>.provider] connect = "ssh"`). Unlike
+/// [`native_shell_exec`] it does NOT gate on the exec mode/health: it only needs
+/// the provider handle + the resolved sandbox id to open the TCP proxy. `None`
+/// when the env isn't a provider placement or the provider can't be built (e.g.
+/// the API token isn't set). Resolves the env exactly like `native_shell_exec`.
+pub fn provider_proxy_target(
+    cfg: &Config,
+    worktree: &str,
+) -> Option<(superzej_svc::provider::Provider, String, String)> {
+    let loc = GitLoc::for_worktree(Path::new(worktree));
+    let repo_root: PathBuf = Db::open()
+        .ok()
+        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| repo::main_worktree(Path::new(worktree)))
+        .unwrap_or_else(|| PathBuf::from(worktree));
+    let selected_env = Db::open()
+        .ok()
+        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let environment = cfg.resolve_env(
+        &repo_root,
+        &loc,
+        Path::new(worktree),
+        selected_env.as_deref(),
+    );
+    let superzej_core::placement::Placement::Provider(p) = &environment.placement else {
+        return None;
+    };
+    let pc = &cfg.env.get(&environment.name)?.provider;
+    let provider = provider_for_named(pc, &p.id)?;
+    Some((provider, p.id.clone(), pc.sync_workdir()))
+}
+
+/// In-sandbox sshd listen port for the SSH-over-WSS transport. A high port — the
+/// sprite user isn't root, so it can't bind 22.
+pub const SPRITE_SSHD_PORT: u16 = 2222;
+
+/// The superzej-managed ssh keypair for the sprite SSH-over-WSS transport, under
+/// `$XDG_STATE/superzej/ssh/`. Generated (ed25519, no passphrase) on first use.
+/// Returns `(private key path, public key line)`.
+pub fn sprite_ssh_keypair() -> anyhow::Result<(PathBuf, String)> {
+    let dir = superzej_core::util::superzej_dir().join("ssh");
+    std::fs::create_dir_all(&dir)?;
+    let key = dir.join("sprite_ed25519");
+    let pubp = dir.join("sprite_ed25519.pub");
+    if !pubp.exists() {
+        let out = std::process::Command::new("ssh-keygen")
+            .args([
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-C",
+                "superzej-sprite",
+                "-q",
+                "-f",
+            ])
+            .arg(&key)
+            .output()
+            .map_err(|e| anyhow::anyhow!("ssh-keygen: {e}"))?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "ssh-keygen failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+    let pubkey = std::fs::read_to_string(&pubp)?.trim().to_string();
+    Ok((key, pubkey))
+}
+
+/// Idempotent in-sandbox setup for the SSH-over-WSS transport (run during
+/// provisioning when `connect = "ssh"`): install openssh, generate a user-owned
+/// host key, authorize `pubkey`, and write a minimal sshd_config listening on
+/// `127.0.0.1:SPRITE_SSHD_PORT`. Pure (shell string).
+pub fn sprite_sshd_setup_script(pubkey: &str) -> String {
+    let pk = superzej_core::util::sh_quote(pubkey);
+    format!(
+        "command -v sshd >/dev/null 2>&1 || nix profile install nixpkgs#openssh 2>/dev/null || \
+           (export DEBIAN_FRONTEND=noninteractive; sudo apt-get update -y && sudo apt-get install -y openssh-server) 2>/dev/null || true; \
+         mkdir -p \"$HOME/.ssh\"; chmod 700 \"$HOME/.ssh\"; \
+         touch \"$HOME/.ssh/authorized_keys\"; chmod 600 \"$HOME/.ssh/authorized_keys\"; \
+         grep -qF {pk} \"$HOME/.ssh/authorized_keys\" 2>/dev/null || printf '%s\\n' {pk} >> \"$HOME/.ssh/authorized_keys\"; \
+         [ -f \"$HOME/.ssh/sprite_host_ed25519\" ] || ssh-keygen -t ed25519 -N '' -q -f \"$HOME/.ssh/sprite_host_ed25519\"; \
+         printf 'Port {port}\\nListenAddress 127.0.0.1\\nHostKey %s/.ssh/sprite_host_ed25519\\nAuthorizedKeysFile %s/.ssh/authorized_keys\\nPasswordAuthentication no\\nPidFile %s/.ssh/sprite_sshd.pid\\nPrintMotd no\\n' \"$HOME\" \"$HOME\" \"$HOME\" > \"$HOME/.ssh/sprite_sshd_config\"; \
+         true",
+        port = SPRITE_SSHD_PORT,
+    )
+}
+
+/// Idempotent: ensure the in-sandbox sshd is listening (start it if not). Run at
+/// connect time by the `sprite-proxy` ProxyCommand. Pure (shell string).
+pub fn sprite_sshd_start_script() -> String {
+    "SSHD=$(command -v sshd || echo \"$HOME/.nix-profile/bin/sshd\"); \
+     pgrep -f sprite_sshd_config >/dev/null 2>&1 || \
+       (\"$SSHD\" -f \"$HOME/.ssh/sprite_sshd_config\" 2>/dev/null || true); true"
+        .to_string()
+}
+
+/// When `worktree`'s resolved provider env has `connect = "ssh"`, the inputs to
+/// spawn the interactive pane as a local `ssh` client tunneled over the provider
+/// proxy: `(private key path, ssh user, in-sandbox workdir)`. `None` otherwise.
+pub fn sprite_ssh_connect(cfg: &Config, worktree: &str) -> Option<(PathBuf, String, String)> {
+    use superzej_core::config::ProviderConnect;
+    let loc = GitLoc::for_worktree(Path::new(worktree));
+    let repo_root: PathBuf = Db::open()
+        .ok()
+        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| repo::main_worktree(Path::new(worktree)))
+        .unwrap_or_else(|| PathBuf::from(worktree));
+    let selected_env = Db::open()
+        .ok()
+        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let environment = cfg.resolve_env(
+        &repo_root,
+        &loc,
+        Path::new(worktree),
+        selected_env.as_deref(),
+    );
+    let superzej_core::placement::Placement::Provider(_) = &environment.placement else {
+        return None;
+    };
+    let pc = &cfg.env.get(&environment.name)?.provider;
+    if pc.connect != ProviderConnect::Ssh {
+        return None;
+    }
+    let (key, _pub) = sprite_ssh_keypair().ok()?;
+    // The sprite user owns the in-sandbox sshd + authorized_keys (non-root sshd
+    // can only authenticate as itself), so ssh logs in as that user.
+    Some((key, "sprite".to_string(), pc.sync_workdir()))
+}
+
+/// Build the local `ssh` argv for the SSH-over-WSS pane: a real ssh client whose
+/// transport is the `sprite-proxy` ProxyCommand. `szhost_exe` is this binary (for
+/// the ProxyCommand); `key`/`user`/`workdir` come from [`sprite_ssh_connect`].
+pub fn sprite_ssh_argv(
+    szhost_exe: &str,
+    worktree: &str,
+    key: &Path,
+    user: &str,
+    workdir: &str,
+) -> Vec<String> {
+    let proxy = format!(
+        "{} sprite-proxy {}",
+        superzej_core::util::sh_quote(szhost_exe),
+        superzej_core::util::sh_quote(worktree),
+    );
+    let remote = if workdir.is_empty() {
+        "exec \"$SHELL\" -l".to_string()
+    } else {
+        format!(
+            "cd {} 2>/dev/null; exec \"$SHELL\" -l",
+            superzej_core::util::sh_quote(workdir)
+        )
+    };
+    vec![
+        "ssh".into(),
+        "-tt".into(),
+        "-o".into(),
+        format!("ProxyCommand={proxy}"),
+        "-o".into(),
+        "StrictHostKeyChecking=no".into(),
+        "-o".into(),
+        "UserKnownHostsFile=/dev/null".into(),
+        "-o".into(),
+        "LogLevel=ERROR".into(),
+        "-i".into(),
+        key.to_string_lossy().into_owned(),
+        "-p".into(),
+        SPRITE_SSHD_PORT.to_string(),
+        format!("{user}@sprite"),
+        "--".into(),
+        remote,
+    ]
+}
+
 /// Decide whether `worktree`'s interactive shell should attach via a provider's
 /// **native exec API** instead of the CLI/PTY path. `Some` when the resolved env
 /// is a `provider` placement whose provider has a native exec API, whose `exec`
@@ -1162,6 +1342,16 @@ pub fn provision_provider_env(
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/root"));
     let (dotfiles, home_store_roots) = resolve_personal_dotfiles(&host_home, &home, env_name);
+    // SSH-over-WSS transport (`connect = "ssh"`): add the one-time in-sandbox sshd
+    // setup (install openssh + host key + authorize our managed key + config) to
+    // the personal-layer setup so it's baked into the checkpoint. The daemon is
+    // (re)started at connect time by the `sprite-proxy` ProxyCommand.
+    let mut setup = resolve_setup(&home);
+    if pc.connect == superzej_core::config::ProviderConnect::Ssh
+        && let Ok((_key, pubkey)) = sprite_ssh_keypair()
+    {
+        setup.push(sprite_sshd_setup_script(&pubkey));
+    }
     let opts = PlanOpts {
         workdir: workdir.clone(),
         origin: local_origin(&repo_root),
@@ -1169,7 +1359,7 @@ pub fn provision_provider_env(
         dotfiles,
         tools: home.tools.clone(),
         dotfiles_repo: home.dotfiles_repo.clone(),
-        setup: resolve_setup(&home),
+        setup,
         agents: home.agents.clone(),
         allow_nix: true,
         checkpoint: pc.auto_checkpoint,
@@ -2461,6 +2651,40 @@ mod tests {
         assert!(files.is_empty(), "clean uploads no dotfiles");
 
         let _ = std::fs::remove_dir_all(&home_dir);
+    }
+
+    #[test]
+    fn sprite_ssh_argv_wraps_proxycommand_and_remote_shell() {
+        let argv = sprite_ssh_argv(
+            "/usr/bin/szhost",
+            "/home/me/wt",
+            std::path::Path::new("/state/sprite_ed25519"),
+            "sprite",
+            "/workspace",
+        );
+        let joined = argv.join(" ");
+        assert_eq!(argv[0], "ssh");
+        assert!(
+            joined.contains("ProxyCommand=/usr/bin/szhost sprite-proxy /home/me/wt"),
+            "{joined}"
+        );
+        assert!(joined.contains("-i /state/sprite_ed25519"));
+        assert!(joined.contains(&format!("-p {SPRITE_SSHD_PORT}")));
+        assert!(argv.iter().any(|a| a == "sprite@sprite"));
+        // The remote command cd's into the workdir then execs a login shell.
+        assert!(
+            argv.last().unwrap().contains("cd /workspace")
+                && argv.last().unwrap().contains("exec \"$SHELL\" -l")
+        );
+    }
+
+    #[test]
+    fn sprite_sshd_setup_script_authorizes_key_and_writes_config() {
+        let s = sprite_sshd_setup_script("ssh-ed25519 AAAA... superzej-sprite");
+        assert!(s.contains("authorized_keys"));
+        assert!(s.contains("ssh-ed25519 AAAA")); // the pubkey is embedded (quoted)
+        assert!(s.contains(&format!("Port {SPRITE_SSHD_PORT}")));
+        assert!(s.contains("sprite_host_ed25519") && s.contains("sprite_sshd_config"));
     }
 
     #[test]

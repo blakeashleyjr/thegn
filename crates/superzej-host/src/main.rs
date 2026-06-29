@@ -224,6 +224,65 @@ pub enum Command {
         /// Loopback port to listen on inside the sandbox.
         port: u16,
     },
+    /// Hidden: ssh `ProxyCommand` for a provider env with `connect = "ssh"`. Opens
+    /// the provider's TCP-over-WebSocket proxy to the in-sandbox `sshd`
+    /// (`127.0.0.1:22`) and relays it on stdin/stdout, so a local `ssh` client
+    /// gets a native session over the WSS. stdout is the ssh transport — not for
+    /// interactive use.
+    #[command(hide = true)]
+    SpriteProxy {
+        /// Worktree path (defaults to the current dir) — selects the env/sandbox.
+        worktree: Option<String>,
+    },
+}
+
+/// Relay a local `ssh` client's stdin/stdout to an in-sandbox `sshd` over the
+/// provider's TCP-over-WebSocket proxy (the `sprite-proxy` ProxyCommand). Pumps
+/// until either side closes; stdout carries the ssh transport verbatim.
+async fn sprite_proxy_relay(
+    provider: superzej_svc::provider::Provider,
+    id: String,
+) -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // Ensure the in-sandbox sshd is listening (idempotent; survives restarts).
+    let _ = provider
+        .run_exec(
+            &id,
+            &[
+                "/bin/sh".to_string(),
+                "-lc".to_string(),
+                agent::sprite_sshd_start_script(),
+            ],
+            None,
+            &[],
+        )
+        .await;
+    let mut stream = provider
+        .open_proxy(&id, "127.0.0.1", agent::SPRITE_SSHD_PORT)
+        .await?;
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+    let mut buf = vec![0u8; 32 * 1024];
+    loop {
+        tokio::select! {
+            n = stdin.read(&mut buf) => match n {
+                Ok(0) | Err(_) => break, // client EOF / error
+                Ok(n) => {
+                    if stream.tx.send(buf[..n].to_vec()).await.is_err() {
+                        break; // relay closed
+                    }
+                }
+            },
+            msg = stream.rx.recv() => match msg {
+                Some(b) => {
+                    stdout.write_all(&b).await?;
+                    stdout.flush().await?;
+                }
+                None => break, // server closed
+            },
+        }
+    }
+    Ok(())
 }
 
 fn main() -> anyhow::Result<()> {
@@ -341,6 +400,21 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
                 superzej_svc::revtunnel::run_sandbox(stream, listener).await
             })?;
             Ok(())
+        }
+        Command::SpriteProxy { worktree } => {
+            // ssh ProxyCommand: relay the in-sandbox sshd (127.0.0.1:22) over the
+            // provider's TCP-over-WebSocket proxy on stdin/stdout.
+            let wt = worktree
+                .or_else(|| std::env::current_dir().ok()?.to_str().map(str::to_string))
+                .ok_or_else(|| anyhow::anyhow!("sprite-proxy: no worktree"))?;
+            let (provider, id, _workdir) =
+                agent::provider_proxy_target(&cfg, &wt).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "sprite-proxy: {wt} is not a provider env (or its API token is unset)"
+                    )
+                })?;
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(sprite_proxy_relay(provider, id))
         }
         Command::SandboxArgv { worktree } => {
             let wt = worktree
