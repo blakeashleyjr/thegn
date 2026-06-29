@@ -700,7 +700,7 @@ mod tests {
             back.pane_sessions.get(&5).map(|s| s.session.as_str()),
             Some("sess-42")
         );
-        assert!(back.pane_sessions.get(&99).is_none(), "stale leaf pruned");
+        assert!(!back.pane_sessions.contains_key(&99), "stale leaf pruned");
     }
 
     #[test]
