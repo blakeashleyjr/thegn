@@ -390,7 +390,9 @@ fn step_glyph(
     let g = crate::caps::active_glyphs();
     match step.state {
         StepState::Done => (g.check, col(S::Dim)),
-        StepState::Active => (g.diamond_filled, accent),
+        // The in-progress step gets a distinct "working" glyph (↻ / ascii @), not
+        // another dot/diamond, so it reads as actively loading vs the pending rows.
+        StepState::Active => (g.refresh, accent),
         StepState::Pending => (g.diamond_hollow, col(S::Ghost)),
         StepState::Failed => (g.cross, col(S::Ghost)),
     }
