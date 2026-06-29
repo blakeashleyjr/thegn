@@ -6808,6 +6808,27 @@ profile = \"sealed\"
     }
 
     #[test]
+    fn provider_connect_parse_and_default() {
+        assert_eq!(ProviderConnect::default(), ProviderConnect::Exec);
+        assert_eq!(
+            ProviderConnect::from_str_validated("ssh"),
+            Ok(ProviderConnect::Ssh)
+        );
+        assert_eq!(
+            ProviderConnect::from_str_validated("exec"),
+            Ok(ProviderConnect::Exec)
+        );
+        assert!(ProviderConnect::from_str_validated("nope").is_err());
+        assert_eq!(ProviderConnect::Ssh.as_str(), "ssh");
+        // Parses from an env provider table.
+        let cfg: Config = toml::from_str(
+            "[env.x]\nplacement = \"provider\"\n[env.x.provider]\nprovider = \"sprites\"\nconnect = \"ssh\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.env["x"].provider.connect, ProviderConnect::Ssh);
+    }
+
+    #[test]
     fn home_config_default_is_portable_and_safe() {
         let h = HomeConfig::default();
         assert_eq!(h.strategy, ShellStrategy::Portable);

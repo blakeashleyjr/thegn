@@ -846,6 +846,19 @@ pub struct ExecSession {
     pub session_id: tokio::sync::watch::Receiver<Option<String>>,
 }
 
+/// A raw bidirectional byte stream to an in-sandbox `host:port`, tunneled over the
+/// provider's TCP-over-WebSocket proxy. Unlike [`ExecSession`] there is no framing
+/// — bytes are forwarded verbatim — so it can carry an arbitrary protocol (e.g. an
+/// SSH connection to an in-sandbox `sshd`). The driver task lives on the ambient
+/// runtime until either side closes.
+pub struct ProxyStream {
+    /// Server→client bytes (data from the in-sandbox service).
+    pub rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    /// Client→server bytes (data to the in-sandbox service). Dropping it (or
+    /// sending nothing) and draining `rx` to `None` ends the stream.
+    pub tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
 /// Rewrite an `http(s)` API base to its `ws(s)` scheme for the WebSocket handshake.
 fn ws_scheme(api_base: &str) -> String {
     if let Some(rest) = api_base.strip_prefix("https://") {
@@ -889,6 +902,23 @@ fn attach_ws_url(api_base: &str, id: &str, session: &str, cols: u16, rows: u16) 
         q.append_pair("rows", &rows.to_string());
     }
     Ok(url.to_string())
+}
+
+/// Build the Sprites TCP-proxy WSS URL: `wss://…/sprites/{id}/proxy`.
+fn proxy_ws_url(api_base: &str, id: &str) -> Result<String> {
+    let base = ws_scheme(api_base);
+    Ok(reqwest::Url::parse(&format!("{base}/sprites/{id}/proxy"))
+        .context("sprites: bad proxy url")?
+        .to_string())
+}
+
+/// The init frame the Sprites `/proxy` socket expects before it becomes a raw
+/// relay: `{"host":"…","port":N}`.
+fn proxy_init_json(host: &str, port: u16) -> String {
+    format!(
+        "{{\"host\":{},\"port\":{port}}}",
+        serde_json::to_string(host).unwrap_or_else(|_| "\"127.0.0.1\"".into())
+    )
 }
 
 /// The resize control frame the Sprites exec socket expects.
@@ -1045,6 +1075,81 @@ impl SpritesProvider {
             session_id: sid_rx,
         })
     }
+
+    /// Open a raw TCP relay to an in-sandbox `host:port` over the Sprites `/proxy`
+    /// WSS endpoint (bearer auth + a `{host,port}` init frame, then a transparent
+    /// byte relay). Used to tunnel an `ssh` connection to an in-sandbox `sshd`.
+    pub async fn open_proxy(&self, id: &str, host: &str, port: u16) -> Result<ProxyStream> {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let url = proxy_ws_url(&self.api_base, id)?;
+        let mut req = url
+            .into_client_request()
+            .context("sprites: build proxy ws request")?;
+        let auth = format!("Bearer {}", self.token)
+            .parse()
+            .context("sprites: proxy auth header")?;
+        req.headers_mut().insert("Authorization", auth);
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(req)
+            .await
+            .context("sprites: proxy ws connect")?;
+        // The init frame selects the target; after it, the socket is a raw relay.
+        ws.send(Message::Text(proxy_init_json(host, port)))
+            .await
+            .context("sprites: proxy init")?;
+
+        let (to_srv_tx, to_srv_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+        let (from_srv_tx, from_srv_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+        tokio::spawn(drive_proxy(ws, to_srv_rx, from_srv_tx));
+        Ok(ProxyStream {
+            rx: from_srv_rx,
+            tx: to_srv_tx,
+        })
+    }
+}
+
+/// The proxy relay task: pump raw bytes WebSocket ⇄ the [`ProxyStream`] channels.
+/// No framing — binary frames are forwarded verbatim in both directions.
+async fn drive_proxy<S>(
+    ws: S,
+    mut to_srv: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    from_srv: tokio::sync::mpsc::Sender<Vec<u8>>,
+) where
+    S: futures_util::Sink<tokio_tungstenite::tungstenite::Message>
+        + futures_util::Stream<
+            Item = std::result::Result<
+                tokio_tungstenite::tungstenite::Message,
+                tokio_tungstenite::tungstenite::Error,
+            >,
+        > + Unpin,
+{
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let (mut write, mut read) = ws.split();
+    loop {
+        tokio::select! {
+            out = to_srv.recv() => match out {
+                Some(b) => {
+                    if write.send(Message::Binary(b)).await.is_err() {
+                        break;
+                    }
+                }
+                None => break, // client closed
+            },
+            msg = read.next() => match msg {
+                Some(Ok(Message::Binary(b))) => {
+                    if from_srv.send(b).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(_)) => {} // ignore text/ping/pong
+                Some(Err(_)) => break,
+            },
+        }
+    }
+    let _ = write.send(Message::Close(None)).await;
 }
 
 /// The exec bridge task: pump WebSocket frames ⇄ the [`ExecSession`] channels.
@@ -1301,6 +1406,16 @@ impl Provider {
         match self {
             Provider::Sprites(p) => p.open_exec(id, spec).await,
             Provider::Daytona(_) => Err(anyhow!("provider 'daytona' has no native exec API")),
+        }
+    }
+
+    /// Open a raw TCP relay to an in-sandbox `host:port` over the provider's
+    /// TCP-over-WebSocket proxy. Used to tunnel `ssh` to an in-sandbox `sshd`
+    /// (`[env.<name>.provider] connect = "ssh"`).
+    pub async fn open_proxy(&self, id: &str, host: &str, port: u16) -> Result<ProxyStream> {
+        match self {
+            Provider::Sprites(p) => p.open_proxy(id, host, port).await,
+            Provider::Daytona(_) => Err(anyhow!("provider 'daytona' has no TCP proxy API")),
         }
     }
 
@@ -1725,6 +1840,19 @@ mod tests {
         );
         let bare = DaytonaProvider::new("x", "t", "  ");
         assert_eq!(bare.create_body(), serde_json::json!({}));
+    }
+
+    #[test]
+    fn proxy_url_and_init_frame() {
+        assert_eq!(
+            proxy_ws_url("https://api.sprites.dev/v1", "s1").unwrap(),
+            "wss://api.sprites.dev/v1/sprites/s1/proxy"
+        );
+        // init frame selects the in-sandbox target; host is JSON-escaped.
+        assert_eq!(
+            proxy_init_json("127.0.0.1", 22),
+            r#"{"host":"127.0.0.1","port":22}"#
+        );
     }
 
     #[test]

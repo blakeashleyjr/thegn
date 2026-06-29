@@ -412,6 +412,28 @@ impl Panes {
             if self.table.contains_key(old) || map.contains_key(old) {
                 continue; // raced a direct spawn; keep the live pane
             }
+            // SSH-over-WSS (`connect = "ssh"`): attach the leaf as a LOCAL `ssh`
+            // client tunneled over the `sprite-proxy` ProxyCommand — ssh owns the
+            // PTY (no hand-rolled WSS relay). A normal local PTY pane. Checked
+            // before native exec so it takes precedence when configured.
+            if !worktree.is_empty()
+                && let Some((key, user, workdir)) = crate::agent::sprite_ssh_connect(cfg, worktree)
+            {
+                let exe = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.to_str().map(str::to_string))
+                    .unwrap_or_else(|| "szhost".to_string());
+                let argv = crate::agent::sprite_ssh_argv(&exe, worktree, &key, &user, &workdir);
+                match self.spawn_argv_env(&argv, cwd.as_deref(), &[], center) {
+                    Ok(fresh) => {
+                        map.insert(*old, fresh);
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "szhost::startup", "ssh-over-wss spawn failed, falling back: {e}");
+                    }
+                }
+            }
             // Native provider exec (CLI-free): when this worktree's env wants it,
             // attach the leaf over the provider's WSS exec. A persisted session id
             // for this leaf reattaches the live remote session (replays

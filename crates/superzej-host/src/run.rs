@@ -6199,6 +6199,18 @@ fn spawn_worktree_shell_pane(
         if let Some(halt) = crate::agent::env_halt_reason(cfg, &wt) {
             return Err(halt.into());
         }
+        // SSH-over-WSS (`[env.<name>.provider] connect = "ssh"`): attach the pane
+        // as a LOCAL `ssh` client whose transport is the `sprite-proxy`
+        // ProxyCommand — ssh owns the PTY/resize/flow-control (no hand-rolled WSS
+        // relay). A normal local PTY pane.
+        if let Some((key, user, workdir)) = crate::agent::sprite_ssh_connect(cfg, &wt) {
+            let exe = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.to_str().map(str::to_string))
+                .unwrap_or_else(|| "szhost".to_string());
+            let argv = crate::agent::sprite_ssh_argv(&exe, &wt, &key, &user, &workdir);
+            return panes.spawn_argv_env(&argv, Some(dir), &[], center);
+        }
         // Native provider exec (CLI-free): when the worktree's env is a managed
         // provider with a native exec API and `exec != cli`, attach the pane over
         // the provider's WSS exec instead of wrapping its vendor CLI.
