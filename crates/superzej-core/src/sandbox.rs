@@ -106,7 +106,10 @@ pub enum Backend {
 }
 
 impl Backend {
-    fn parse(s: &str) -> Option<Backend> {
+    /// Resolve a config-facing backend name (as used in `backend_chain` entries,
+    /// e.g. `"podman-rootless"`, `"bwrap"`, `"host"`) to its concrete runtime
+    /// backend. Returns `None` for unknown names.
+    pub fn parse(s: &str) -> Option<Backend> {
         Some(match s {
             "podman" | "podman-rootless" | "rootless-podman" => Backend::Podman,
             "podman-rootful" | "rootful-podman" => Backend::PodmanRootful,

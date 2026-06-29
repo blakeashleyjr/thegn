@@ -6,8 +6,11 @@
 //! confirm what a given terminal gets without launching the compositor.
 
 use anyhow::Result;
-use superzej_core::config::Config;
+use superzej_core::capabilities::{Capabilities, IsolationClass};
+use superzej_core::config::{Config, SandboxProfile};
 use superzej_core::outln;
+use superzej_core::placement::Placement;
+use superzej_core::sandbox::Backend;
 use superzej_core::termcaps::{ColorDepth, TermCaps, TermEnv, UnicodeLevel};
 
 fn color_str(d: ColorDepth) -> &'static str {
@@ -29,6 +32,71 @@ fn unicode_str(l: UnicodeLevel) -> &'static str {
 
 fn yn(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
+}
+
+/// The honest boundary class a named backend resolves to at `Local` placement.
+fn isolation_of(backend_name: &str) -> Option<IsolationClass> {
+    let backend = Backend::parse(backend_name)?;
+    Some(Capabilities::from_parts(backend, &Placement::Local, false).isolation)
+}
+
+/// A one-line summary of the OS-isolation knobs a hardening preset imposes.
+fn profile_policy(p: SandboxProfile) -> String {
+    let mut parts = Vec::new();
+    if p.forces_no_network() {
+        parts.push("network=none".to_string());
+    }
+    if p.read_only_root() {
+        parts.push("read-only root".to_string());
+    }
+    if p.no_new_privileges() {
+        parts.push("no-new-privs".to_string());
+    }
+    if let Some(n) = p.pids_limit() {
+        parts.push(format!("pids\u{2264}{n}"));
+    }
+    parts.push(if p.drop_capabilities().iter().any(|c| c == "ALL") {
+        "caps: drop ALL".to_string()
+    } else {
+        "caps: runtime default".to_string()
+    });
+    parts.join(", ")
+}
+
+/// The candidate backends doctor reports for the human shell — the concrete
+/// configured backend, or the `backend_chain` when `backend = auto`.
+fn shell_chain(cfg: &Config) -> Vec<String> {
+    if Backend::from_config(cfg.sandbox.backend).is_some() {
+        vec![cfg.sandbox.backend.as_str().to_string()]
+    } else {
+        cfg.sandbox.backend_chain.clone()
+    }
+}
+
+fn sandbox_json(cfg: &Config) -> serde_json::Value {
+    let chain: Vec<serde_json::Value> = shell_chain(cfg)
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "backend": name,
+                "isolation": isolation_of(name).map(|c| c.as_str()),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "enabled": cfg.sandbox.enabled,
+        "backend": cfg.sandbox.backend.as_str(),
+        "candidates": chain,
+        "network": cfg.sandbox.network.as_str(),
+        "shell_profile": {
+            "name": cfg.sandbox.profile.as_str(),
+            "policy": profile_policy(cfg.sandbox.profile),
+        },
+        "agent_profile": {
+            "name": cfg.sandbox.agent_profile.as_str(),
+            "policy": profile_policy(cfg.sandbox.agent_profile),
+        },
+    })
 }
 
 pub fn run(cfg: &Config, json: bool) -> Result<()> {
@@ -56,6 +124,7 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
             },
             "detected": caps_json(&detected),
             "resolved": caps_json(&resolved),
+            "sandbox": sandbox_json(cfg),
         });
         outln!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
@@ -91,9 +160,70 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
     outln!("  sync output   {}", yn(resolved.sync_output));
 
     outln!("");
+    sandbox_report(cfg);
+
+    outln!("");
     outln!("Summary");
     outln!("  {}", summary(&resolved));
     Ok(())
+}
+
+/// Print the resolved sandbox boundary honestly: which backend(s) would run, the
+/// isolation class each one actually provides ("what would have to fail for an
+/// escape"), and the policy each hardening preset imposes.
+fn sandbox_report(cfg: &Config) {
+    outln!("Sandbox boundary");
+    if !cfg.sandbox.enabled {
+        outln!("  enabled       no  (panes run as plain host processes \u{2014} no containment)");
+        return;
+    }
+    outln!("  enabled       yes");
+    let resolved = Backend::from_config(cfg.sandbox.backend).is_some();
+    if resolved {
+        outln!("  backend       {}", cfg.sandbox.backend.as_str());
+    } else {
+        outln!(
+            "  backend       {} (resolved at spawn from backend_chain; not probed here)",
+            cfg.sandbox.backend.as_str()
+        );
+    }
+    let chain = shell_chain(cfg);
+    let mut all_weak = true;
+    for name in &chain {
+        match isolation_of(name) {
+            Some(class) => {
+                if !matches!(
+                    class,
+                    IsolationClass::SharedKernel | IsolationClass::HostProcess
+                ) {
+                    all_weak = false;
+                }
+                outln!(
+                    "    {:<16} {} \u{2014} {}",
+                    name,
+                    class,
+                    class.escape_note()
+                );
+            }
+            None => outln!("    {:<16} (unknown backend)", name),
+        }
+    }
+    outln!("  network       {}", cfg.sandbox.network.as_str());
+    outln!(
+        "  shell profile {} ({})",
+        cfg.sandbox.profile.as_str(),
+        profile_policy(cfg.sandbox.profile)
+    );
+    outln!(
+        "  agent profile {} ({})",
+        cfg.sandbox.agent_profile.as_str(),
+        profile_policy(cfg.sandbox.agent_profile)
+    );
+    if all_weak {
+        outln!("  note          even the strongest preset here shares the host kernel; for a");
+        outln!("                stronger boundary on agent code use a guest-kernel backend");
+        outln!("                (gVisor/libkrun) in agent_backend_chain.");
+    }
 }
 
 fn caps_json(c: &TermCaps) -> serde_json::Value {
@@ -172,5 +302,31 @@ mod tests {
     fn summary_reports_full_fidelity() {
         let s = summary(&TermCaps::FULL);
         assert!(s.starts_with("full fidelity"), "{s}");
+    }
+
+    #[test]
+    fn isolation_of_resolves_known_backends() {
+        assert_eq!(isolation_of("bwrap"), Some(IsolationClass::SharedKernel));
+        assert_eq!(isolation_of("podman"), Some(IsolationClass::SharedKernel));
+        assert_eq!(isolation_of("host"), Some(IsolationClass::HostProcess));
+        assert_eq!(isolation_of("not-a-backend"), None);
+    }
+
+    #[test]
+    fn profile_policy_describes_sealed_lockdown() {
+        let p = profile_policy(SandboxProfile::Sealed);
+        assert!(p.contains("network=none"), "{p}");
+        assert!(p.contains("drop ALL"), "{p}");
+        // The default hardened preset leaves caps at runtime defaults.
+        let h = profile_policy(SandboxProfile::Hardened);
+        assert!(h.contains("runtime default"), "{h}");
+    }
+
+    #[test]
+    fn sandbox_json_is_well_formed() {
+        let v = sandbox_json(&Config::default());
+        assert!(v.get("enabled").is_some());
+        assert!(v.get("candidates").unwrap().is_array());
+        assert!(v.get("agent_profile").unwrap().get("policy").is_some());
     }
 }

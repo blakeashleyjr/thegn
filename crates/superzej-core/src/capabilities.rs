@@ -60,9 +60,37 @@ pub enum ObsLevel {
     StatsOnly,
 }
 
+/// The kind of boundary that actually separates the workload from the host —
+/// "what would have to fail for an escape". This is the *honest* isolation class:
+/// it never claims more than the backend/placement provides, so a `sealed`
+/// container is reported as a shared host kernel, not as VM-grade isolation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationClass {
+    /// A plain host process — no container/VM kernel boundary at all (the `none`
+    /// backend). Only host-side LSM policy (Landlock/Seatbelt) confines it.
+    HostProcess,
+    /// A container: namespaces + cgroups + caps/seccomp, but the workload's
+    /// syscalls still execute in the **same host (or node) kernel**. A kernel LPE
+    /// in any allowed syscall path escapes it, no matter how locked-down.
+    SharedKernel,
+    /// A userspace application kernel (gVisor's Sentry) services the workload's
+    /// syscalls; the host kernel sees only a small allowlist from the Sentry.
+    UserspaceKernel,
+    /// A hardware-virtualized **guest kernel** (microVM / libkrun / Apple
+    /// container). The host kernel sees KVM ioctls + virtio I/O, not the guest
+    /// syscall ABI.
+    GuestKernel,
+    /// The boundary is enforced by an external managed provider's own
+    /// infrastructure (e.g. Sprites microVMs). superzej cannot verify or run its
+    /// own datapath inside it — you are trusting the provider's TCB and operator.
+    ProviderManaged,
+}
+
 /// The aggregated capability declaration for a resolved [`SandboxSpec`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capabilities {
+    /// The honest boundary class — what would have to fail for an escape.
+    pub isolation: IsolationClass,
     pub projection: ProjectionMode,
     pub egress: EgressKind,
     pub observability: ObsLevel,
@@ -93,6 +121,7 @@ impl Capabilities {
         // podman can checkpoint/restore a container (CRIU) — a real snapshot.
         let podman_checkpoint = matches!(backend, Backend::Podman | Backend::PodmanRootful);
         Capabilities {
+            isolation: isolation_for(backend, placement),
             projection: projection_for(placement),
             egress: egress_for(backend, placement, has_vpn),
             observability: obs_for(backend, placement),
@@ -105,6 +134,33 @@ impl Capabilities {
             // means the *backend itself* bills (providers do).
             meters_cost: is_provider,
         }
+    }
+}
+
+fn isolation_for(backend: Backend, placement: &Placement) -> IsolationClass {
+    // Placement decides first when it owns the boundary: a managed provider runs
+    // the workload in its own infra, and a k8s pod is a container on a node we
+    // don't control — both honestly a kernel we cannot harden ourselves.
+    match placement {
+        Placement::Provider(_) => return IsolationClass::ProviderManaged,
+        // A pod shares its node's kernel (unless the cluster opts into a VM
+        // RuntimeClass like Kata, which we can't detect — so under-promise).
+        Placement::K8s(_) => return IsolationClass::SharedKernel,
+        Placement::Local | Placement::Ssh(_) => {}
+    }
+    match backend {
+        Backend::None => IsolationClass::HostProcess,
+        // Apple's `container` runs each container in its own lightweight VM.
+        Backend::Apple => IsolationClass::GuestKernel,
+        Backend::Podman
+        | Backend::PodmanRootful
+        | Backend::Docker
+        | Backend::Smol
+        | Backend::Bwrap
+        | Backend::Systemd
+        | Backend::Wsl
+        | Backend::WinAppContainer
+        | Backend::WinJobObject => IsolationClass::SharedKernel,
     }
 }
 
@@ -144,6 +200,38 @@ fn obs_for(backend: Backend, placement: &Placement) -> ObsLevel {
         // timeline phase synthesizes pane exec/die for these from the host, which
         // is what lifts them toward `Instrumented` in practice.
         ObsLevel::StatsOnly
+    }
+}
+
+impl IsolationClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IsolationClass::HostProcess => "host-process",
+            IsolationClass::SharedKernel => "shared-kernel",
+            IsolationClass::UserspaceKernel => "userspace-kernel",
+            IsolationClass::GuestKernel => "guest-kernel",
+            IsolationClass::ProviderManaged => "provider-managed",
+        }
+    }
+
+    /// A one-line, honest description of "what would have to fail for an escape".
+    pub fn escape_note(self) -> &'static str {
+        match self {
+            IsolationClass::HostProcess => {
+                "no kernel boundary; only host LSM policy (Landlock/Seatbelt) confines it"
+            }
+            IsolationClass::SharedKernel => {
+                "a kernel exploit in any allowed syscall reaches the host"
+            }
+            IsolationClass::UserspaceKernel => "escape needs a gVisor Sentry or host-allowlist bug",
+            IsolationClass::GuestKernel => "escape needs a VMM/KVM bug",
+            IsolationClass::ProviderManaged => "you trust the provider's TCB and operator",
+        }
+    }
+}
+impl std::fmt::Display for IsolationClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -304,5 +392,66 @@ mod tests {
         assert_eq!(ProjectionMode::Sync.as_str(), "sync");
         assert_eq!(EgressKind::Translate.to_string(), "translate");
         assert_eq!(ObsLevel::StatsOnly.to_string(), "stats_only");
+        assert_eq!(IsolationClass::GuestKernel.to_string(), "guest-kernel");
+    }
+
+    #[test]
+    fn isolation_class_is_honest_per_backend() {
+        // Containers — including a fully-sealed one — are honestly a shared kernel.
+        for b in [
+            Backend::Podman,
+            Backend::Docker,
+            Backend::Bwrap,
+            Backend::Systemd,
+        ] {
+            assert_eq!(
+                Capabilities::from_parts(b, &Placement::Local, false).isolation,
+                IsolationClass::SharedKernel,
+                "{b:?} should report shared-kernel"
+            );
+        }
+        // The plain host fallback has no kernel boundary at all.
+        assert_eq!(
+            Capabilities::from_parts(Backend::None, &Placement::Local, false).isolation,
+            IsolationClass::HostProcess
+        );
+        // Apple's `container` runs each container in its own lightweight VM.
+        assert_eq!(
+            Capabilities::from_parts(Backend::Apple, &Placement::Local, false).isolation,
+            IsolationClass::GuestKernel
+        );
+    }
+
+    #[test]
+    fn isolation_class_lets_placement_own_the_boundary() {
+        // A provider runs the workload in its own infra — not a boundary we control.
+        assert_eq!(
+            Capabilities::from_parts(Backend::Podman, &provider(), false).isolation,
+            IsolationClass::ProviderManaged
+        );
+        // A k8s pod shares its node's kernel regardless of the local backend value.
+        assert_eq!(
+            Capabilities::from_parts(Backend::Podman, &k8s(), false).isolation,
+            IsolationClass::SharedKernel
+        );
+        // SSH falls through to the backend running on the remote host.
+        assert_eq!(
+            Capabilities::from_parts(Backend::Podman, &ssh(), false).isolation,
+            IsolationClass::SharedKernel
+        );
+    }
+
+    #[test]
+    fn escape_note_is_present_for_every_class() {
+        for c in [
+            IsolationClass::HostProcess,
+            IsolationClass::SharedKernel,
+            IsolationClass::UserspaceKernel,
+            IsolationClass::GuestKernel,
+            IsolationClass::ProviderManaged,
+        ] {
+            assert!(!c.escape_note().is_empty());
+            assert!(!c.as_str().is_empty());
+        }
     }
 }
