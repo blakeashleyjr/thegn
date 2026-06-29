@@ -1280,23 +1280,17 @@ pub fn provision_worktree(
 /// suspended sandbox, a lost exit frame) into a clear step failure.
 fn provision_step_timeout(step_id: &str) -> std::time::Duration {
     use std::time::Duration;
-    let heavy = matches!(
-        step_id,
-        "nix"
-            | "devshell"
-            | "cache_push"
-            | "clone"
-            | "mise"
-            | "languages"
-            | "tools"
-            | "dotfiles_repo"
-            | "home_closure"
-            | "home_switch"
-    );
-    if heavy {
-        Duration::from_secs(1200) // 20 min — the download/build-bound steps
+    // Only `workspace` (mkdir) and `git_auth` (git config) are truly instant — a
+    // stall there is the suspended-sandbox hang we want to catch fast. Everything
+    // else can legitimately run for minutes (clone, package installs incl. the
+    // openssh the ssh transport needs, npm agents, the nix devshell build, closure
+    // substitution), so give it a generous ceiling that still bounds an infinite
+    // hang rather than risk a false failure mid-build.
+    let instant = matches!(step_id, "workspace" | "git_auth");
+    if instant {
+        Duration::from_secs(120) // 2 min — catches the suspended-sandbox hang fast
     } else {
-        Duration::from_secs(120) // 2 min — git auth, setup, agents, …
+        Duration::from_secs(1800) // 30 min — build/download-bound steps
     }
 }
 
