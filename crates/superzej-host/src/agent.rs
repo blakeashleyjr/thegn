@@ -1274,6 +1274,32 @@ pub fn provision_worktree(
 /// render a live loading screen. Returns `Ok(true)` when the env is provisioned
 /// (now or already), `Ok(false)` when not applicable (not a provider env / no
 /// provider built), `Err` if a step failed.
+/// Per-step ceiling for a provisioning exec. Build/network-bound steps (nix
+/// devshell, clone, language runtimes) can legitimately run for many minutes; the
+/// rest are quick, so a short ceiling there turns an otherwise-infinite hang (a
+/// suspended sandbox, a lost exit frame) into a clear step failure.
+fn provision_step_timeout(step_id: &str) -> std::time::Duration {
+    use std::time::Duration;
+    let heavy = matches!(
+        step_id,
+        "nix"
+            | "devshell"
+            | "cache_push"
+            | "clone"
+            | "mise"
+            | "languages"
+            | "tools"
+            | "dotfiles_repo"
+            | "home_closure"
+            | "home_switch"
+    );
+    if heavy {
+        Duration::from_secs(1200) // 20 min — the download/build-bound steps
+    } else {
+        Duration::from_secs(120) // 2 min — git auth, setup, agents, …
+    }
+}
+
 pub fn provision_provider_env(
     cfg: &Config,
     worktree: &str,
@@ -1438,6 +1464,8 @@ pub fn provision_provider_env(
             };
         }
         progress(&views);
+        let step_t0 = std::time::Instant::now();
+        tracing::info!(target: "szhost::startup", step = %step.id, "provision step start");
 
         let result: anyhow::Result<()> = match &step.kind {
             StepKind::Exec(script) => {
@@ -1453,18 +1481,31 @@ pub fn provision_provider_env(
                         "export PATH=\"$HOME/.nix-profile/bin:$HOME/.local/state/nix/profile/bin:$HOME/.local/bin:$PATH\"; {script} 2>&1"
                     ),
                 ];
-                block_on_provider(|| async { provider.run_exec(&id, &argv, None, &exec_env).await })
-                    .and_then(|(code, out)| {
-                        if code == 0 {
-                            Ok(())
-                        } else {
-                            Err(anyhow::anyhow!(
-                                "{} (exit {code}): {}",
-                                step.label,
-                                tail_lines(&out, 4)
-                            ))
-                        }
-                    })
+                // Bound every exec: a suspended/slow sandbox can leave `run_exec`
+                // blocked on an exit frame that never comes, hanging the loading
+                // screen forever. Quick steps (git auth, dotfiles repo) get a short
+                // ceiling so a stall surfaces fast; build-bound steps (nix devshell)
+                // a generous one.
+                let to = provision_step_timeout(&step.id);
+                block_on_provider(|| async {
+                    match tokio::time::timeout(to, provider.run_exec(&id, &argv, None, &exec_env))
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(_) => Err(anyhow::anyhow!("exec timed out after {}s", to.as_secs())),
+                    }
+                })
+                .and_then(|(code, out)| {
+                    if code == 0 {
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "{} (exit {code}): {}",
+                            step.label,
+                            tail_lines(&out, 4)
+                        ))
+                    }
+                })
             }
             StepKind::Dotfiles(files) => upload_dotfiles(&provider, &id, &sprite_home, files),
             StepKind::AgentConfigs(agents) => {
@@ -1477,10 +1518,12 @@ pub fn provision_provider_env(
         };
 
         if let Err(e) = result {
+            tracing::warn!(target: "szhost::startup", step = %step.id, ms = step_t0.elapsed().as_millis() as u64, error = %e, "provision step failed");
             views[i].state = ProvisionState::Failed;
             progress(&views);
             return Err(e);
         }
+        tracing::info!(target: "szhost::startup", step = %step.id, ms = step_t0.elapsed().as_millis() as u64, "provision step done");
         views[i].state = ProvisionState::Done;
         progress(&views);
     }
