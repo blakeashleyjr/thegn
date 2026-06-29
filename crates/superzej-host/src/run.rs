@@ -6216,6 +6216,47 @@ fn spawn_worktree_shell_pane(
     panes.spawn(cfg, dir, center)
 }
 
+/// Spawn a **clean, rc-free** shell pane in `dir` — the startup watchdog's
+/// fallback when the worktree's resolved login shell produced no output in time
+/// (a personal dotfile hanging/erroring in a provisioned env). Mirrors
+/// [`spawn_worktree_shell_pane`] but forces [`agent::clean_shell_inner`]: the
+/// native-provider path opens the exec with `open_spec_clean`, and the
+/// local/sandbox path resolves the `clean-shell` choice (no rc, not persisted as
+/// the worktree's agent). Never edits the user's config.
+fn spawn_clean_shell_pane(
+    panes: &mut Panes,
+    cfg: &superzej_core::config::Config,
+    dir: Option<&std::path::Path>,
+    center: Rect,
+) -> Result<u32> {
+    if let Some(dir) = dir
+        && dir.is_dir()
+    {
+        let wt = dir.to_string_lossy().into_owned();
+        if let Some(n) = crate::agent::native_shell_exec(cfg, &wt) {
+            let cols = center.cols.max(1) as u16;
+            let rows = center.rows.max(1) as u16;
+            let open = crate::pane::ExecOpen::Open(n.open_spec_clean(cols, rows));
+            return panes.spawn_native(
+                n.provider,
+                n.provider_name,
+                n.sandbox_id,
+                open,
+                "sh".to_string(),
+                center,
+            );
+        }
+        let spec = crate::agent::launch_spec(cfg, &wt, None, "clean-shell")?;
+        return panes.spawn_argv_env(
+            &spec.argv,
+            spec.cwd.as_deref().or(Some(dir)),
+            &spec.env,
+            center,
+        );
+    }
+    panes.spawn(cfg, dir, center)
+}
+
 /// Capture the active tab's pane layout as an abstract [`LayoutSpec`] (items
 /// 99/115). Each leaf records its program (a plain shell → `None`).
 fn active_tab_layout_spec(
@@ -7963,6 +8004,16 @@ async fn event_loop<T: Terminal>(
     const CRASH_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(2);
     let mut respawn_crash_count: std::collections::HashMap<(usize, usize), u32> =
         std::collections::HashMap::new();
+    // Startup-shell watchdog: a freshly-spawned shell that emits no PTY output
+    // within this window keeps the loading splash up forever (it clears on first
+    // output). The usual cause is a personal login shell whose startup files
+    // hang/error in a provisioned env. After the deadline we warn + fall back
+    // ONCE per tab to a clean rc-free shell. 8s: well past a healthy shell's
+    // prompt (~1-2s incl. a provider session open) but short enough that a hang
+    // doesn't sit there flashing.
+    const SHELL_OUTPUT_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(8);
+    let mut shell_watchdog_fired: std::collections::HashSet<(usize, usize)> =
+        std::collections::HashSet::new();
     // The new-worktree wizard (Alt+w) + its creation pipeline. The worker
     // speculatively creates the worktree under the pregenerated name while
     // the wizard is open; `wizard_cmd_tx` carries the wizard's decisions to
@@ -10871,6 +10922,20 @@ async fn event_loop<T: Terminal>(
         // Media now-playing snapshots (watcher + control ops). Apply only while
         // the feature is enabled, so toggling `[media] enabled = false` clears the
         // badge/section without a restart. Mark dirty only on an actual change.
+        //
+        // `MediaState`'s `position` ticks continuously while a track plays, so the
+        // MPRIS push watcher fires a fresh snapshot on every `Position`/metadata
+        // signal — many players emit these several times a second. Repainting the
+        // whole chrome on each one is a self-sustaining ~10/s full-frame storm
+        // (it reads as flicker, and violates the idle-CPU contract) whenever a
+        // media player is running. So repaint only what the snapshot actually
+        // moves on screen, mirroring the stats bars-path guard above: the open
+        // Media panel section shows the position stamp (a real chrome change →
+        // full frame); the always-on statusbar badge tracks only state/title/
+        // artist via `badge()` (the cheap bars path); a position-only change with
+        // the section closed moves nothing visible and repaints nothing.
+        let media_section_open =
+            chrome.panel.is_some() && panel_ui.open == crate::panel::Section::Media;
         while let Ok(snap) = media_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
             let shown = if current_config.media.enabled {
@@ -10879,8 +10944,14 @@ async fn event_loop<T: Terminal>(
                 None
             };
             if model.panel.media != shown {
+                let badge_changed = model.panel.media.as_ref().and_then(|m| m.badge())
+                    != shown.as_ref().and_then(|m| m.badge());
                 model.panel.media = shown;
-                dirty = true;
+                if media_section_open {
+                    dirty = true;
+                } else if badge_changed {
+                    bars_dirty = true;
+                }
             }
         }
         // Media picker results: open a secondary palette of playlists / players.
@@ -11058,6 +11129,67 @@ async fn event_loop<T: Terminal>(
         }
         if want_disk_refresh {
             crate::hydrate::spawn_disk_scan(current_config.disk.clone(), Some(waker.clone()));
+        }
+
+        // Startup-shell watchdog: while the loading splash is up (it clears on
+        // the loading pane's first PTY output), a shell that has been alive past
+        // SHELL_OUTPUT_WATCHDOG with nothing on screen is hung — almost always a
+        // personal login shell whose startup files hang or error in a provisioned
+        // env (e.g. a host `.zshrc` sourcing `/nix/store/...` paths absent in the
+        // container). Warn about the likely cause and fall back ONCE per tab to a
+        // clean rc-free shell; the user's dotfiles are left untouched. Re-checked
+        // cheaply on each wake (the 500ms ticker guarantees one) — no new timer.
+        if !model.load_steps.is_empty() && !center_dormant {
+            let gi = session.active;
+            let ti = session.worktrees.get(gi).map(|g| g.active_tab).unwrap_or(0);
+            let leaf = (!shell_watchdog_fired.contains(&(gi, ti)))
+                .then(|| session.worktrees.get(gi).and_then(|g| g.tabs.get(ti)))
+                .flatten()
+                .map(|t| t.center.pane_ids())
+                .filter(|ids| ids.len() == 1)
+                .and_then(|ids| ids.first().copied())
+                .filter(|pid| {
+                    panes.table.contains_key(pid)
+                        && panes
+                            .pane_age(*pid)
+                            .is_some_and(|age| age > SHELL_OUTPUT_WATCHDOG)
+                });
+            if let Some(pid) = leaf {
+                shell_watchdog_fired.insert((gi, ti));
+                let cwd = group_cwd(&session.worktrees[gi])
+                    .or_else(|| std::env::var("HOME").ok().map(std::path::PathBuf::from));
+                match spawn_clean_shell_pane(
+                    &mut panes,
+                    keymap.config(),
+                    cwd.as_deref(),
+                    chrome.center,
+                ) {
+                    Ok(fresh) => {
+                        // Drop the hung pane and swap the clean shell into its leaf.
+                        panes.table.remove(&pid);
+                        panes.forget_spawn_time(pid);
+                        if let Some(tab) = session.tab_mut(gi, ti) {
+                            crate::panes::replace_single_dead_center_pane(tab, pid, fresh);
+                        }
+                        model.load_steps.clear();
+                        model.status = "Shell produced no output — fell back to a plain \
+                            shell. Your login shell's startup files likely hang or error \
+                            in this environment (e.g. dotfiles referencing host-only \
+                            paths); your config was left untouched."
+                            .into();
+                        need_relayout = true;
+                    }
+                    Err(e) => {
+                        model.load_steps.clear();
+                        center_dormant = true;
+                        model.status = format!(
+                            "Shell produced no output and the plain-shell fallback \
+                             failed: {e}"
+                        );
+                    }
+                }
+                dirty = true;
+            }
         }
 
         // Mark the focused worktree's "stuck" dot as read: a filled-red

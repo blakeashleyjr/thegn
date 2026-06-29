@@ -125,6 +125,160 @@ pub fn detect(worktree: &Path) -> EnvRequirements {
     }
 }
 
+/// Why a host dotfile would misbehave when transplanted into a sandbox/remote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PitfallKind {
+    /// References an absolute `/nix/store/<hash>-…` (or `/run/current-system/…`)
+    /// path that won't exist in a non-Nix / different-closure sandbox. The
+    /// classic home-manager-rc breakage.
+    AbsentStorePath,
+    /// Calls a command the rc assumes is installed but isn't declared in
+    /// `[sandbox.home] tools` (drives the `tool-parity` suggestion).
+    MissingTool,
+}
+
+/// One reason a specific dotfile may not work as-is in a sandbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DotfilePitfall {
+    /// The dotfile basename, e.g. `.zshrc`.
+    pub file: String,
+    pub kind: PitfallKind,
+    /// The offending store path (for `AbsentStorePath`) or command (`MissingTool`).
+    pub detail: String,
+}
+
+/// Extract the distinct top-level `/nix/store/<32-char-hash>-<name>` (and
+/// `/run/current-system/...`) roots referenced in `text`. Pure over a string —
+/// the host file read happens in the caller. Used to (a) decide whether a dotfile
+/// is portable, and (b) compute the closure to reproduce under host-parity.
+pub fn store_roots_in(text: &str) -> Vec<String> {
+    let mut roots: Vec<String> = Vec::new();
+    let mut push = |s: String| {
+        if !roots.contains(&s) {
+            roots.push(s);
+        }
+    };
+    // Scan byte-wise for the two prefixes; take the path up to the next char that
+    // can't be in a store path (whitespace, quotes, parens, etc.).
+    let stop =
+        |c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '(' | ')' | ':' | ';' | ',');
+    for prefix in ["/nix/store/", "/run/current-system"] {
+        let mut hay = text;
+        while let Some(i) = hay.find(prefix) {
+            let rest = &hay[i..];
+            let end = rest.find(stop).unwrap_or(rest.len());
+            let full = &rest[..end];
+            if prefix == "/nix/store/" {
+                // Reduce to the store root: /nix/store/<hash>-<name> (first 4 path
+                // components: "", "nix", "store", "<hash>-<name>").
+                let root: String = full.split('/').take(4).collect::<Vec<_>>().join("/");
+                // Only accept a plausible store entry (has a hash-name segment).
+                if root.len() > "/nix/store/".len() {
+                    push(root);
+                }
+            } else {
+                push(full.to_string());
+            }
+            hay = &rest[end..];
+        }
+    }
+    roots
+}
+
+/// Scan a dotfile's `contents` for transplant pitfalls. `declared_tools` are the
+/// `[sandbox.home] tools` already slated for install (so a referenced-and-declared
+/// tool isn't flagged). Pure + unit-tested; detection only — never edits the file.
+pub fn scan_dotfile(name: &str, contents: &str, declared_tools: &[String]) -> Vec<DotfilePitfall> {
+    let mut out = Vec::new();
+    for root in store_roots_in(contents) {
+        out.push(DotfilePitfall {
+            file: name.to_string(),
+            kind: PitfallKind::AbsentStorePath,
+            detail: root,
+        });
+    }
+    for tool in referenced_tools(contents) {
+        // Ignore shell builtins + ubiquitous base/coreutils tools — they're in
+        // every sandbox, so flagging them is noise. Only genuine "did you forget
+        // to install this?" tools (atuin, starship, zoxide, …) should surface.
+        if is_ubiquitous_tool(&tool) {
+            continue;
+        }
+        if declared_tools.iter().any(|t| t == &tool) {
+            continue;
+        }
+        out.push(DotfilePitfall {
+            file: name.to_string(),
+            kind: PitfallKind::MissingTool,
+            detail: tool,
+        });
+    }
+    out
+}
+
+/// Is `t` a shell builtin or a base/coreutils tool present in essentially every
+/// environment? Used to suppress no-signal `MissingTool` findings (a rc calling
+/// `$(dirname …)` shouldn't read as "install dirname").
+fn is_ubiquitous_tool(t: &str) -> bool {
+    matches!(
+        t,
+        // shell builtins / keywords
+        "cd" | "echo" | "export" | "eval" | "source" | "alias" | "set" | "unset"
+            | "command" | "test" | "printf" | "read" | "local" | "return" | "exit"
+            | "if" | "then" | "fi" | "for" | "do" | "done" | "case" | "esac" | "function"
+        // coreutils + ubiquitous base tools
+            | "cat" | "tr" | "cut" | "sed" | "awk" | "grep" | "egrep" | "fgrep"
+            | "ls" | "rm" | "cp" | "mv" | "mkdir" | "rmdir" | "ln" | "touch" | "chmod"
+            | "dirname" | "basename" | "realpath" | "readlink" | "mktemp" | "env"
+            | "head" | "tail" | "wc" | "sort" | "uniq" | "tee" | "xargs" | "find"
+            | "date" | "sleep" | "true" | "false" | "seq" | "tput" | "stty" | "uname"
+            | "which" | "type" | "hash" | "id" | "whoami" | "hostname" | "sh" | "bash"
+            | "git" | "ssh" | "curl" | "wget" | "sudo" | "kill" | "ps" | "pwd"
+    )
+}
+
+/// Heuristic: tool names the rc clearly depends on at startup — `eval "$(X …)"`,
+/// `source <(X …)`, and `command -v X`. Conservative (only these high-signal
+/// shapes) to avoid flagging every word. Deduped, order-stable.
+fn referenced_tools(contents: &str) -> Vec<String> {
+    let mut tools: Vec<String> = Vec::new();
+    let mut push = |t: &str| {
+        let t = t.trim();
+        if !t.is_empty()
+            && t.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            && !tools.iter().any(|x| x == t)
+        {
+            tools.push(t.to_string());
+        }
+    };
+    for line in contents.lines() {
+        let l = line.trim();
+        if l.starts_with('#') {
+            continue;
+        }
+        // `eval "$(X ...)"` / `eval "$(X)"`
+        for marker in ["$(", "<("] {
+            let mut hay = l;
+            while let Some(i) = hay.find(marker) {
+                let rest = &hay[i + marker.len()..];
+                if let Some(first) = rest.split_whitespace().next() {
+                    let first = first.trim_end_matches(')');
+                    push(first);
+                }
+                hay = rest;
+            }
+        }
+        // `command -v X`
+        if let Some(i) = l.find("command -v ")
+            && let Some(t) = l[i + "command -v ".len()..].split_whitespace().next()
+        {
+            push(t);
+        }
+    }
+    tools
+}
+
 /// Inputs the host supplies to compile a concrete plan (the bits `detect` can't
 /// know: where the repo lives, where to put it, what to carry over).
 #[derive(Debug, Clone)]
@@ -160,6 +314,18 @@ pub struct PlanOpts {
     pub nix_parallel: Option<u32>,
     /// Optional project binary cache so the devShell is a download, not a build.
     pub binary_cache: Option<BinaryCache>,
+    /// How hard to reproduce the host shell (`[sandbox.home] strategy`). Gates the
+    /// personal-layer steps: `Clean` emits none; `Portable`/`ToolParity` keep the
+    /// current ordering (the caller pre-filters `dotfiles` to portable ones);
+    /// `HostParity` additionally reproduces the host nix closure (experimental).
+    pub strategy: crate::config::ShellStrategy,
+    /// `HostParity` only: the user's home-manager flake ref for the in-sandbox
+    /// `home-manager switch` fallback (empty ⇒ disabled).
+    pub nix_home_flake: String,
+    /// `HostParity` only: host `/nix/store` roots referenced by the uploaded
+    /// dotfiles (detected on the host via [`store_roots_in`]); their closure is
+    /// made resolvable in the sandbox so the exact dotfiles work. Empty ⇒ none.
+    pub home_store_roots: Vec<String>,
 }
 
 /// A Nix binary-cache substituter (and optional push) for fast devShells.
@@ -189,6 +355,9 @@ impl Default for PlanOpts {
             nix_installer: crate::config::NixInstaller::Official,
             nix_parallel: None,
             binary_cache: None,
+            strategy: crate::config::ShellStrategy::default(),
+            nix_home_flake: String::new(),
+            home_store_roots: Vec::new(),
         }
     }
 }
@@ -329,24 +498,34 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
         }
         Tier::Bare => {}
     }
+    // Did the toolchain tier already install Nix? Host-parity needs it on any tier.
+    let nix_installed = matches!(tier, Tier::Nix) && opts.allow_nix;
 
     // 4. Personal layer (`[sandbox.home]`) — generic, repo-independent. Runs
     // after the project toolchain so the tool installer can use Nix when present.
-    if !opts.tools.is_empty() {
+    // The `strategy` gates it: `Clean` ships no personal dotfiles/tools/setup at
+    // all (just the rc-free shell); the others keep the ordering below. (Agents
+    // are orthogonal to the shell rc and run regardless.) The caller is
+    // responsible for pre-filtering `opts.dotfiles` to portable ones under
+    // `Portable`/`ToolParity`; `HostParity` passes them unfiltered + reproduces
+    // the host closure (below) so the absolute store paths resolve.
+    use crate::config::ShellStrategy;
+    let personal = opts.strategy != ShellStrategy::Clean;
+    if personal && !opts.tools.is_empty() {
         steps.push(ProvisionStep {
             id: "tools".into(),
             label: "Install personal tools".into(),
             kind: StepKind::Exec(tools_install_script(&opts.tools)),
         });
     }
-    if !opts.dotfiles_repo.trim().is_empty() {
+    if personal && !opts.dotfiles_repo.trim().is_empty() {
         steps.push(ProvisionStep {
             id: "dotfiles_repo".into(),
             label: "Set up dotfiles".into(),
             kind: StepKind::Exec(dotfiles_repo_script(opts.dotfiles_repo.trim())),
         });
     }
-    if !opts.setup.is_empty() {
+    if personal && !opts.setup.is_empty() {
         steps.push(ProvisionStep {
             id: "setup".into(),
             label: "Run setup".into(),
@@ -368,8 +547,48 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
         });
     }
 
-    // 5. Dotfiles (opportunistic).
-    if !opts.dotfiles.is_empty() {
+    // 4b. Host-parity (experimental): make the host nix closure the dotfiles
+    // reference resolvable in the sandbox, BEFORE uploading them, so the exact
+    // host rc works unchanged. Cache-first (substitute the detected store roots),
+    // else `home-manager switch` from the user's home flake. Dormant unless the
+    // caller (host) populated the carriers — so a default `Portable` plan is
+    // unchanged. Must come before the dotfiles upload + the checkpoint.
+    if opts.strategy == ShellStrategy::HostParity
+        && (!opts.home_store_roots.is_empty() || !opts.nix_home_flake.trim().is_empty())
+    {
+        // Host-parity needs `nix` (to substitute the closure / run home-manager).
+        // The Nix tier already installed it; on any other tier, install it now.
+        if !nix_installed && opts.allow_nix {
+            steps.push(ProvisionStep {
+                id: "nix".into(),
+                label: "Install Nix".into(),
+                kind: StepKind::Exec(nix_install_script(
+                    opts.nix_installer,
+                    opts.nix_parallel,
+                    opts.binary_cache.as_ref(),
+                )),
+            });
+        }
+        if !opts.home_store_roots.is_empty() {
+            steps.push(ProvisionStep {
+                id: "home_closure".into(),
+                label: "Sync home shell closure".into(),
+                kind: StepKind::Exec(home_substitute_script(
+                    &opts.home_store_roots,
+                    opts.binary_cache.as_ref(),
+                )),
+            });
+        } else if !opts.nix_home_flake.trim().is_empty() {
+            steps.push(ProvisionStep {
+                id: "home_switch".into(),
+                label: "Activate home-manager".into(),
+                kind: StepKind::Exec(home_switch_script(opts.nix_home_flake.trim())),
+            });
+        }
+    }
+
+    // 5. Dotfiles (opportunistic). Skipped entirely under `Clean`.
+    if personal && !opts.dotfiles.is_empty() {
         steps.push(ProvisionStep {
             id: "dotfiles".into(),
             label: "Sync dotfiles".into(),
@@ -521,6 +740,50 @@ fn cache_push_script(workdir: &str, cache: &BinaryCache) -> String {
          cd {wd} && sys=$(nix eval --impure --raw --expr builtins.currentSystem 2>/dev/null || echo x86_64-linux); \
          nix copy --to {url} \".#devShells.$sys.default\" 2>/dev/null || true",
         tok = nix_runtime_prelude(),
+    )
+}
+
+/// Host-parity (experimental): make the host `/nix/store` closure that the
+/// dotfiles reference resolvable in the sandbox, so the EXACT host rc works. Best
+/// effort — realise each detected root via the configured cache (else the default
+/// substituters, which cover most nixpkgs tools). Per-path `|| true` so a missing
+/// path degrades the rc gracefully instead of wedging provisioning.
+fn home_substitute_script(roots: &[String], cache: Option<&BinaryCache>) -> String {
+    let tok = nix_runtime_prelude();
+    let subst = match cache.filter(|c| !c.url.trim().is_empty()) {
+        Some(c) => format!(
+            " --option extra-substituters {} --option extra-trusted-public-keys {}",
+            sh_quote(c.url.trim()),
+            sh_quote(c.key.trim()),
+        ),
+        None => String::new(),
+    };
+    let realise: String = roots
+        .iter()
+        .map(|r| {
+            format!(
+                "nix-store --realise{subst} {} 2>/dev/null || true; ",
+                sh_quote(r)
+            )
+        })
+        .collect();
+    format!(
+        "{tok}. \"$HOME/.nix-profile/etc/profile.d/nix.sh\" 2>/dev/null || true; \
+         export PATH=\"$HOME/.nix-profile/bin:$PATH\"; {realise}true"
+    )
+}
+
+/// Host-parity fallback: rebuild the user's home environment in the sandbox from
+/// their home-manager flake. Heavier than the closure copy and the store hashes
+/// may diverge from the host, so home-manager renders its OWN rc (the host rc is
+/// skipped by the caller in this mode). Best-effort.
+fn home_switch_script(flake: &str) -> String {
+    let tok = nix_runtime_prelude();
+    format!(
+        "{tok}. \"$HOME/.nix-profile/etc/profile.d/nix.sh\" 2>/dev/null || true; \
+         export PATH=\"$HOME/.nix-profile/bin:$PATH\"; \
+         nix run home-manager -- switch --flake {} 2>/dev/null || true",
+        sh_quote(flake),
     )
 }
 
@@ -835,6 +1098,205 @@ mod tests {
                 "checkpoint"
             ]
         );
+    }
+
+    #[test]
+    fn plan_opts_default_strategy_is_portable() {
+        assert_eq!(
+            PlanOpts::default().strategy,
+            crate::config::ShellStrategy::Portable
+        );
+    }
+
+    #[test]
+    fn plan_clean_strategy_emits_no_personal_layer() {
+        let req = EnvRequirements::default(); // Bare
+        let opts = PlanOpts {
+            strategy: crate::config::ShellStrategy::Clean,
+            tools: vec!["fd".into()],
+            dotfiles_repo: "git@github.com:me/dots".into(),
+            setup: vec!["echo hi".into()],
+            dotfiles: vec![".zshrc".into()],
+            checkpoint: false,
+            ..Default::default()
+        };
+        let ids: Vec<String> = plan(&req, &opts)
+            .steps
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        // Clean drops every personal-layer step; only the workspace remains.
+        assert_eq!(ids, ["workspace"]);
+        assert!(
+            !ids.iter()
+                .any(|i| i == "tools" || i == "dotfiles" || i == "setup")
+        );
+    }
+
+    #[test]
+    fn plan_host_parity_substitutes_closure_before_dotfiles() {
+        let opts = PlanOpts {
+            strategy: crate::config::ShellStrategy::HostParity,
+            dotfiles: vec![".zshrc".into()],
+            home_store_roots: vec!["/nix/store/abc-starship".into()],
+            checkpoint: true,
+            ..Default::default()
+        };
+        let p = plan(&EnvRequirements::default(), &opts);
+        let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+        let closure = ids
+            .iter()
+            .position(|i| *i == "home_closure")
+            .expect("closure step");
+        let dots = ids
+            .iter()
+            .position(|i| *i == "dotfiles")
+            .expect("dotfiles step");
+        let chk = ids
+            .iter()
+            .position(|i| *i == "checkpoint")
+            .expect("checkpoint");
+        assert!(
+            closure < dots && dots < chk,
+            "closure before dotfiles before checkpoint: {ids:?}"
+        );
+        // host-parity needs nix even on a Bare-tier repo — installed before the closure.
+        let nix = ids
+            .iter()
+            .position(|i| *i == "nix")
+            .expect("nix installed for host-parity");
+        assert!(nix < closure, "nix before closure: {ids:?}");
+    }
+
+    #[test]
+    fn host_parity_closure_step_carries_cache_substituter_and_realises_roots() {
+        let opts = PlanOpts {
+            strategy: crate::config::ShellStrategy::HostParity,
+            dotfiles: vec![".zshrc".into()],
+            home_store_roots: vec!["/nix/store/abc-starship".into()],
+            binary_cache: Some(BinaryCache {
+                url: "https://cache.example.org".into(),
+                key: "cache.example.org-1:KEY".into(),
+                push: true,
+            }),
+            checkpoint: false,
+            ..Default::default()
+        };
+        let p = plan(&EnvRequirements::default(), &opts);
+        let step = p
+            .steps
+            .iter()
+            .find(|s| s.id == "home_closure")
+            .expect("closure step");
+        let StepKind::Exec(script) = &step.kind else {
+            panic!("home_closure must be an Exec step");
+        };
+        assert!(
+            script.contains("nix-store --realise"),
+            "realises the closure: {script}"
+        );
+        assert!(script.contains("/nix/store/abc-starship"), "names the root");
+        assert!(
+            script.contains("extra-substituters") && script.contains("cache.example.org"),
+            "adds the configured cache as a substituter: {script}"
+        );
+    }
+
+    #[test]
+    fn host_parity_switch_script_runs_home_manager() {
+        let s = home_switch_script("github:me/dots#me");
+        assert!(s.contains("home-manager") && s.contains("switch"), "{s}");
+        assert!(s.contains("github:me/dots#me"));
+    }
+
+    #[test]
+    fn plan_host_parity_falls_back_to_home_switch_without_roots() {
+        let opts = PlanOpts {
+            strategy: crate::config::ShellStrategy::HostParity,
+            nix_home_flake: "github:me/dots#me".into(),
+            checkpoint: false,
+            ..Default::default()
+        };
+        let p = plan(&EnvRequirements::default(), &opts);
+        let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+        assert!(
+            ids.contains(&"home_switch"),
+            "home_switch fallback: {ids:?}"
+        );
+        assert!(!ids.contains(&"home_closure"));
+    }
+
+    #[test]
+    fn store_roots_in_extracts_dedup_roots() {
+        let rc = "source /nix/store/abc123-zsh-syntax/share/x.zsh\n\
+                  eval \"$(/nix/store/abc123-zsh-syntax/bin/y)\"\n\
+                  PATH=/run/current-system/sw/bin:$PATH\n\
+                  echo /etc/profile";
+        let roots = store_roots_in(rc);
+        // The two references to the same store entry dedup to one root.
+        assert!(roots.contains(&"/nix/store/abc123-zsh-syntax".to_string()));
+        assert!(roots.iter().any(|r| r.starts_with("/run/current-system")));
+        assert_eq!(
+            roots
+                .iter()
+                .filter(|r| r.contains("abc123-zsh-syntax"))
+                .count(),
+            1
+        );
+        assert!(!roots.iter().any(|r| r.contains("/etc/profile")));
+    }
+
+    #[test]
+    fn scan_dotfile_flags_absent_store_path() {
+        let p = scan_dotfile(".zshrc", "source /nix/store/h-plugin/x.zsh", &[]);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].kind, PitfallKind::AbsentStorePath);
+        assert_eq!(p[0].file, ".zshrc");
+        assert!(p[0].detail.starts_with("/nix/store/"));
+    }
+
+    #[test]
+    fn scan_dotfile_flags_undeclared_tool_and_suppresses_declared() {
+        let rc = "eval \"$(atuin init zsh)\"\ncommand -v starship && eval \"$(starship init zsh)\"";
+        let flagged = scan_dotfile(".zshrc", rc, &[]);
+        let tools: Vec<&str> = flagged
+            .iter()
+            .filter(|p| p.kind == PitfallKind::MissingTool)
+            .map(|p| p.detail.as_str())
+            .collect();
+        assert!(
+            tools.contains(&"atuin") && tools.contains(&"starship"),
+            "{tools:?}"
+        );
+        // Declaring atuin suppresses its flag.
+        let after = scan_dotfile(".zshrc", rc, &["atuin".into()]);
+        assert!(
+            !after
+                .iter()
+                .any(|p| p.kind == PitfallKind::MissingTool && p.detail == "atuin")
+        );
+    }
+
+    #[test]
+    fn scan_dotfile_ignores_ubiquitous_tools() {
+        // coreutils / base tools in command substitutions are not "missing".
+        let rc = "X=$(dirname $0); echo $(cat /etc/x | tr a b); eval \"$(zoxide init zsh)\"";
+        let tools: Vec<String> = scan_dotfile(".zshrc", rc, &[])
+            .into_iter()
+            .filter(|p| p.kind == PitfallKind::MissingTool)
+            .map(|p| p.detail)
+            .collect();
+        assert_eq!(
+            tools,
+            vec!["zoxide".to_string()],
+            "only the real tool flagged: {tools:?}"
+        );
+    }
+
+    #[test]
+    fn scan_dotfile_portable_rc_has_no_pitfalls() {
+        let rc = "export PATH=\"$HOME/.local/bin:$PATH\"\nalias ll='ls -lah'\n# comment";
+        assert!(scan_dotfile(".zshrc", rc, &[]).is_empty());
     }
 
     #[test]

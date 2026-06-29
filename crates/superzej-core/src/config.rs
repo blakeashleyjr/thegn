@@ -246,6 +246,33 @@ config_enum! {
         Off = "off" | "false" | "none" | "no",
     } default = Auto;
 }
+config_enum! {
+    /// `[sandbox.home] strategy` — how hard superzej tries to reproduce *your*
+    /// host shell inside a sandbox/remote. A ladder mirroring the repo-toolchain
+    /// tiers, applied by the env provisioner (see [`crate::envplan`]).
+    ///
+    /// - `clean`        — no personal dotfiles/tools; just a plain rc-free login
+    ///                    shell (also the runtime watchdog fallback). Bulletproof,
+    ///                    feels foreign. Good for throwaway sandboxes.
+    /// - `portable`     — install `tools`, run `dotfiles_repo`/`setup`, and upload
+    ///                    only PORTABLE dotfiles. A dotfile that hard-codes absent
+    ///                    paths (e.g. a home-manager rc full of `/nix/store/…`) is
+    ///                    SKIPPED with a warning rather than uploaded broken. The
+    ///                    default — safe everywhere.
+    /// - `tool-parity`  — `portable` plus: tools your dotfiles reference but didn't
+    ///                    declare are installed too (Nix-first), so a portable rc
+    ///                    that calls e.g. `atuin`/`starship` lights up.
+    /// - `host-parity`  — reproduce the host nix closure so your EXACT dotfiles
+    ///                    work unchanged (cache-first; experimental). Heavy; meant
+    ///                    for long-lived boxes, set per-env via
+    ///                    `[env.<name>.sandbox.home] strategy = "host-parity"`.
+    pub enum ShellStrategy: "shell strategy" {
+        Clean = "clean",
+        Portable = "portable",
+        ToolParity = "tool-parity" | "tool_parity" | "toolparity",
+        HostParity = "host-parity" | "host_parity" | "hostparity",
+    } default = Portable;
+}
 
 impl SandboxProfile {
     /// Mount the container root filesystem read-only (writable: the worktree,
@@ -3096,7 +3123,7 @@ impl SandboxConfig {
 /// install Nix-first (consistent names) with a native package-manager fallback;
 /// anything bespoke (e.g. an agent CLI, internal tooling) goes in `setup`/
 /// `setup_script`. Applied by the env provisioner (see `crate::envplan`).
-#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct HomeConfig {
     /// CLI tools to install in every sandbox (e.g. `["fd", "fzf", "atuin"]`).
@@ -3126,10 +3153,45 @@ pub struct HomeConfig {
     /// is a [`crate::revtunnel::parse_reverse_forward`] spec: `"5432"` (same port
     /// both sides), `"8080:5432"` (host loopback port), or `"8080:db.lan:5432"`.
     pub reverse_forwards: Vec<String>,
+    /// How hard to reproduce your host shell here. See [`ShellStrategy`]. Default
+    /// `portable`: install tools + portable dotfiles, but SKIP (with a warning) a
+    /// dotfile that hard-codes paths absent in the sandbox (e.g. a home-manager rc
+    /// full of `/nix/store/…`) rather than uploading it broken.
+    pub strategy: ShellStrategy,
+    /// When `true` (the default), under `portable`/`tool-parity` a host dotfile
+    /// that references absent store paths is skipped + warned instead of uploaded.
+    /// Set `false` to force-upload every declared dotfile verbatim (you accept the
+    /// breakage; a warning is still logged). `host-parity` ignores this (it makes
+    /// the paths exist).
+    pub portable_dotfiles_only: bool,
+    /// `host-parity` only: the user's home-manager flake ref + attr (e.g.
+    /// `"github:me/dotfiles#me@host"`) for the in-sandbox `home-manager switch`
+    /// fallback when no binary cache is available. Empty = disabled. (Experimental;
+    /// the cache-first closure copy reuses `[env.<name>.provider] binary_cache_*`.)
+    pub nix_home_flake: String,
+}
+
+impl Default for HomeConfig {
+    fn default() -> Self {
+        HomeConfig {
+            tools: Vec::new(),
+            dotfiles: Vec::new(),
+            dotfiles_repo: String::new(),
+            setup: Vec::new(),
+            setup_script: String::new(),
+            agents: Vec::new(),
+            reverse_forwards: Vec::new(),
+            strategy: ShellStrategy::default(),
+            // Safe default: drop a non-portable rc rather than ship a broken shell.
+            portable_dotfiles_only: true,
+            nix_home_flake: String::new(),
+        }
+    }
 }
 
 impl HomeConfig {
-    /// Any personal-layer work declared at all?
+    /// Any personal-layer work declared at all? (`strategy`/`portable_dotfiles_only`
+    /// alone don't count — they only shape how the declared work is applied.)
     pub fn is_enabled(&self) -> bool {
         !self.tools.is_empty()
             || !self.dotfiles.is_empty()
@@ -3138,6 +3200,75 @@ impl HomeConfig {
             || !self.setup_script.trim().is_empty()
             || !self.agents.is_empty()
             || !self.reverse_forwards.is_empty()
+    }
+}
+
+/// Per-env overlay of [`HomeConfig`] — `[env.<name>.sandbox.home]`. Only the keys
+/// present override the global `[sandbox.home]`; absent keys inherit it. Lets a
+/// big ssh box run `strategy = "host-parity"` while an ephemeral sprite runs
+/// `strategy = "clean"`, all from one global base. Field-merged in
+/// [`SandboxOverlay::apply`].
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct HomeOverlay {
+    pub tools: Option<Vec<String>>,
+    pub dotfiles: Option<Vec<String>>,
+    pub dotfiles_repo: Option<String>,
+    pub setup: Option<Vec<String>>,
+    pub setup_script: Option<String>,
+    pub agents: Option<Vec<String>>,
+    pub reverse_forwards: Option<Vec<String>>,
+    pub strategy: Option<ShellStrategy>,
+    pub portable_dotfiles_only: Option<bool>,
+    pub nix_home_flake: Option<String>,
+}
+
+impl HomeOverlay {
+    /// No keys present? (so `SandboxOverlay::is_empty` stays accurate.)
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_none()
+            && self.dotfiles.is_none()
+            && self.dotfiles_repo.is_none()
+            && self.setup.is_none()
+            && self.setup_script.is_none()
+            && self.agents.is_none()
+            && self.reverse_forwards.is_none()
+            && self.strategy.is_none()
+            && self.portable_dotfiles_only.is_none()
+            && self.nix_home_flake.is_none()
+    }
+    /// Field-merge present keys into a resolved [`HomeConfig`].
+    pub fn apply(&self, base: &mut HomeConfig) {
+        if let Some(v) = &self.tools {
+            base.tools = v.clone();
+        }
+        if let Some(v) = &self.dotfiles {
+            base.dotfiles = v.clone();
+        }
+        if let Some(v) = &self.dotfiles_repo {
+            base.dotfiles_repo = v.clone();
+        }
+        if let Some(v) = &self.setup {
+            base.setup = v.clone();
+        }
+        if let Some(v) = &self.setup_script {
+            base.setup_script = v.clone();
+        }
+        if let Some(v) = &self.agents {
+            base.agents = v.clone();
+        }
+        if let Some(v) = &self.reverse_forwards {
+            base.reverse_forwards = v.clone();
+        }
+        if let Some(v) = self.strategy {
+            base.strategy = v;
+        }
+        if let Some(v) = self.portable_dotfiles_only {
+            base.portable_dotfiles_only = v;
+        }
+        if let Some(v) = &self.nix_home_flake {
+            base.nix_home_flake = v.clone();
+        }
     }
 }
 
@@ -3180,6 +3311,9 @@ pub struct SandboxOverlay {
     /// Whole-table replace (matching `remote`/`limits`): a `[sandbox.vpn]` in an
     /// overlay replaces the global VPN config wholesale rather than field-merging.
     pub vpn: Option<VpnConfig>,
+    /// Per-env personal layer (`[env.<name>.sandbox.home]`). Field-merged into the
+    /// global `[sandbox.home]` (present keys win, absent inherit). See [`HomeOverlay`].
+    pub home: Option<HomeOverlay>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
@@ -3288,6 +3422,9 @@ impl SandboxOverlay {
         if let Some(v) = self.vpn {
             base.vpn = v;
         }
+        if let Some(h) = self.home {
+            h.apply(&mut base.home);
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -3314,6 +3451,7 @@ impl SandboxOverlay {
             && self.network_block.is_none()
             && self.network_audit.is_none()
             && self.vpn.is_none()
+            && self.home.as_ref().is_none_or(|h| h.is_empty())
     }
 }
 
@@ -6647,6 +6785,93 @@ profile = \"sealed\"
         assert_eq!(env.sandbox.image, "registry.example.com/dev:latest");
         assert_eq!(env.sandbox.profile, SandboxProfile::Sealed);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn home_config_default_is_portable_and_safe() {
+        let h = HomeConfig::default();
+        assert_eq!(h.strategy, ShellStrategy::Portable);
+        assert!(
+            h.portable_dotfiles_only,
+            "safe default: drop non-portable rc"
+        );
+        assert!(!h.is_enabled(), "strategy alone is not 'enabled'");
+    }
+
+    #[test]
+    fn sandbox_overlay_merges_home_strategy_per_env() {
+        // Global portable; one env asks for host-parity, another for clean.
+        let cfg: Config = toml::from_str(
+            "\
+[sandbox.home]
+strategy = \"portable\"
+tools = [\"fd\", \"fzf\"]
+[env.bigbox]
+placement = \"local\"
+[env.bigbox.sandbox.home]
+strategy = \"host-parity\"
+[env.sprite]
+placement = \"local\"
+[env.sprite.sandbox.home]
+strategy = \"clean\"
+",
+        )
+        .unwrap();
+        let dir = tmpdir("env-home");
+        let loc = GitLoc::Local(dir.clone());
+        let big = cfg.resolve_env(&dir, &loc, &dir, Some("bigbox"));
+        let sprite = cfg.resolve_env(&dir, &loc, &dir, Some("sprite"));
+        let dflt = cfg.resolve_env(&dir, &loc, &dir, Some("nope-default"));
+        assert_eq!(big.sandbox.home.strategy, ShellStrategy::HostParity);
+        assert_eq!(sprite.sandbox.home.strategy, ShellStrategy::Clean);
+        assert_eq!(dflt.sandbox.home.strategy, ShellStrategy::Portable);
+        // Field-merge: the override only set `strategy`, so global `tools` inherit.
+        assert_eq!(
+            big.sandbox.home.tools,
+            vec!["fd".to_string(), "fzf".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn home_overlay_apply_field_merges_present_only() {
+        let mut base = HomeConfig {
+            tools: vec!["fd".into()],
+            strategy: ShellStrategy::Portable,
+            portable_dotfiles_only: true,
+            ..HomeConfig::default()
+        };
+        let ov = HomeOverlay {
+            strategy: Some(ShellStrategy::Clean),
+            ..HomeOverlay::default()
+        };
+        ov.apply(&mut base);
+        assert_eq!(base.strategy, ShellStrategy::Clean); // present → replaced
+        assert_eq!(base.tools, vec!["fd".to_string()]); // absent → inherited
+        assert!(base.portable_dotfiles_only); // absent → inherited
+    }
+
+    #[test]
+    fn sandbox_overlay_is_empty_accounts_for_home() {
+        let empty = SandboxOverlay::default();
+        assert!(empty.is_empty());
+        let with_home = SandboxOverlay {
+            home: Some(HomeOverlay {
+                strategy: Some(ShellStrategy::Clean),
+                ..HomeOverlay::default()
+            }),
+            ..SandboxOverlay::default()
+        };
+        assert!(
+            !with_home.is_empty(),
+            "a home strategy override makes it non-empty"
+        );
+        // An all-None HomeOverlay does NOT make the overlay non-empty.
+        let blank_home = SandboxOverlay {
+            home: Some(HomeOverlay::default()),
+            ..SandboxOverlay::default()
+        };
+        assert!(blank_home.is_empty());
     }
 
     #[test]

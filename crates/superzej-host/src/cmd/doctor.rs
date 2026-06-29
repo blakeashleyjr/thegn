@@ -96,6 +96,33 @@ fn sandbox_json(cfg: &Config) -> serde_json::Value {
             "name": cfg.sandbox.agent_profile.as_str(),
             "policy": profile_policy(cfg.sandbox.agent_profile),
         },
+        "home": home_json(cfg),
+    })
+}
+
+/// The personal-shell-layer summary for `--json`: the global strategy and any
+/// per-env strategy overrides.
+fn home_json(cfg: &Config) -> serde_json::Value {
+    let mut envs: Vec<(&String, &str)> = cfg
+        .env
+        .iter()
+        .filter_map(|(n, e)| {
+            e.sandbox
+                .home
+                .as_ref()
+                .and_then(|h| h.strategy)
+                .map(|s| (n, s.as_str()))
+        })
+        .collect();
+    envs.sort_by(|a, b| a.0.cmp(b.0));
+    let env_overrides: serde_json::Map<String, serde_json::Value> = envs
+        .into_iter()
+        .map(|(n, s)| (n.clone(), serde_json::Value::from(s)))
+        .collect();
+    serde_json::json!({
+        "strategy": cfg.sandbox.home.strategy.as_str(),
+        "portable_dotfiles_only": cfg.sandbox.home.portable_dotfiles_only,
+        "env_overrides": env_overrides,
     })
 }
 
@@ -163,9 +190,106 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
     sandbox_report(cfg);
 
     outln!("");
+    home_layer_report(cfg);
+
+    outln!("");
     outln!("Summary");
     outln!("  {}", summary(&resolved));
     Ok(())
+}
+
+/// "Will my shell work here?" — the personal-shell layer: the resolved strategy,
+/// per-env overrides, and a scan of the host dotfiles for transplant pitfalls
+/// (absent `/nix/store` paths, undeclared tools). Detection only.
+fn home_layer_report(cfg: &Config) {
+    use superzej_core::config::ShellStrategy;
+    use superzej_core::envplan::{PitfallKind, scan_dotfile};
+
+    let g = &cfg.sandbox.home;
+    outln!("Personal shell layer ([sandbox.home])");
+    outln!("  strategy      {}", g.strategy);
+    outln!("  portable-only {}", yn(g.portable_dotfiles_only));
+
+    let mut envs: Vec<(&String, ShellStrategy)> = cfg
+        .env
+        .iter()
+        .filter_map(|(n, e)| {
+            e.sandbox
+                .home
+                .as_ref()
+                .and_then(|h| h.strategy)
+                .map(|s| (n, s))
+        })
+        .collect();
+    envs.sort_by(|a, b| a.0.cmp(b.0));
+    for (n, s) in envs {
+        outln!("  env override  [{n}] strategy = {s}");
+    }
+
+    let candidates: Vec<String> = if !g.dotfiles.is_empty() {
+        g.dotfiles.clone()
+    } else {
+        [
+            ".gitconfig",
+            ".zshrc",
+            ".bashrc",
+            ".profile",
+            ".tmux.conf",
+            ".vimrc",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    };
+    let Ok(home_dir) = std::env::var("HOME") else {
+        outln!("  dotfiles      (HOME unset — cannot scan)");
+        return;
+    };
+    let skips = matches!(
+        g.strategy,
+        ShellStrategy::Portable | ShellStrategy::ToolParity
+    ) && g.portable_dotfiles_only;
+    outln!("  dotfiles (scanned in $HOME):");
+    let mut scanned_any = false;
+    for name in candidates {
+        let Ok(contents) = std::fs::read_to_string(std::path::Path::new(&home_dir).join(&name))
+        else {
+            continue; // missing or a directory — nothing to scan
+        };
+        scanned_any = true;
+        let pitfalls = scan_dotfile(&name, &contents, &g.tools);
+        let absent = pitfalls
+            .iter()
+            .filter(|p| p.kind == PitfallKind::AbsentStorePath)
+            .count();
+        let missing: Vec<&str> = pitfalls
+            .iter()
+            .filter(|p| p.kind == PitfallKind::MissingTool)
+            .map(|p| p.detail.as_str())
+            .collect();
+        if absent == 0 && missing.is_empty() {
+            outln!("    {name:<14} portable");
+        } else {
+            let mut notes = Vec::new();
+            if absent > 0 {
+                notes.push(format!(
+                    "{absent} absent /nix/store path(s){}",
+                    if skips {
+                        " → SKIPPED (clean shell)"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            if !missing.is_empty() {
+                notes.push(format!("undeclared tools: {}", missing.join(", ")));
+            }
+            outln!("    {name:<14} {}", notes.join("; "));
+        }
+    }
+    if !scanned_any {
+        outln!("    (none present on host)");
+    }
 }
 
 /// Print the resolved sandbox boundary honestly: which backend(s) would run, the
@@ -280,6 +404,20 @@ mod tests {
         let cfg = Config::default();
         assert!(run(&cfg, false).is_ok());
         assert!(run(&cfg, true).is_ok());
+    }
+
+    #[test]
+    fn home_layer_report_no_panic_and_json_includes_strategy() {
+        // Default config: report runs without panicking and the JSON carries the
+        // personal-shell strategy + portable-only flag.
+        let cfg = Config::default();
+        home_layer_report(&cfg);
+        let j = home_json(&cfg);
+        assert_eq!(j["strategy"], "portable");
+        assert_eq!(j["portable_dotfiles_only"], true);
+        assert!(j["env_overrides"].is_object());
+        // sandbox_json embeds it too.
+        assert_eq!(sandbox_json(&cfg)["home"]["strategy"], "portable");
     }
 
     #[test]
