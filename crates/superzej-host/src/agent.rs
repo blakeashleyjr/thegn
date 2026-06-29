@@ -1004,10 +1004,24 @@ pub fn sprite_ssh_connect(cfg: &Config, worktree: &str) -> Option<(PathBuf, Stri
         return None;
     };
     let pc = &cfg.env.get(&environment.name)?.provider;
+    tracing::debug!(
+        target: "szhost::sandbox",
+        env = %environment.name,
+        connect = ?pc.connect,
+        "sprite_ssh_connect: resolved provider env"
+    );
     if pc.connect != ProviderConnect::Ssh {
         return None;
     }
-    let (key, _pub) = sprite_ssh_keypair().ok()?;
+    let (key, _pubkey) = match sprite_ssh_keypair() {
+        Ok(k) => k,
+        Err(e) => {
+            superzej_core::msg::warn(&format!(
+                "connect=ssh: managed key generation failed ({e}); falling back to the WSS exec pane"
+            ));
+            return None;
+        }
+    };
     // The sprite user owns the in-sandbox sshd + authorized_keys (non-root sshd
     // can only authenticate as itself), so ssh logs in as that user.
     Some((key, "sprite".to_string(), pc.sync_workdir()))
