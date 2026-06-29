@@ -46,6 +46,7 @@ mod panel;
 mod panes;
 mod perf;
 mod pins;
+mod predict;
 mod probe;
 mod profile;
 mod proxy_daemon;
