@@ -1079,6 +1079,16 @@ pub fn provision_provider_env(
         agents: home.agents.clone(),
         allow_nix: true,
         checkpoint: pc.auto_checkpoint,
+        // Provisioning speedups (all no-ops unless configured).
+        nix_installer: pc.nix_installer,
+        nix_parallel: pc.nix_parallel(),
+        binary_cache: (!pc.binary_cache_url.trim().is_empty()).then(|| {
+            superzej_core::envplan::BinaryCache {
+                url: pc.binary_cache_url.trim().to_string(),
+                key: pc.binary_cache_key.trim().to_string(),
+                push: pc.binary_cache_push,
+            }
+        }),
     };
     let plan = envplan::plan(&req, &opts);
 

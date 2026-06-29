@@ -2222,6 +2222,17 @@ config_enum! {
     } default = Auto;
 }
 
+config_enum! {
+    /// Which Nix installer the provisioner runs in a fresh sandbox:
+    /// - `official` — the upstream `nixos.org/nix/install --no-daemon`
+    ///   (single-user; the safe default + fallback).
+    /// - `determinate` — Determinate Systems' faster Rust installer, with the
+    ///   official installer as an automatic fallback.
+    pub enum NixInstaller: "nix installer" {
+        Official = "official" | "nodaemon", Determinate = "determinate" | "ds",
+    } default = Official;
+}
+
 /// `[env.<name>.provider]` — a managed-sandbox provider for a `provider`
 /// placement (Daytona, Codespaces, …). `exec_command` is a static argv template
 /// (`{id}` is substituted with `id`) that runs a command in the sandbox; the
@@ -2266,6 +2277,20 @@ pub struct EnvProviderConfig {
     /// "suspend on close" for fast resume. Off by default (each checkpoint may
     /// incur storage cost).
     pub auto_checkpoint: bool,
+    /// Which Nix installer the provisioner uses in a fresh sandbox (speedup).
+    pub nix_installer: NixInstaller,
+    /// Parallelize Nix downloads in the sandbox: sets `http-connections` +
+    /// `max-substitution-jobs` to this value (clamped 1..=256). `0` ⇒ leave Nix's
+    /// defaults (the biggest cheap win on the download-bound devShell build).
+    pub nix_parallel_downloads: u32,
+    /// Extra Nix binary-cache substituter URL so the repo's devShell is a
+    /// download (not a build) in the sandbox. Empty ⇒ disabled.
+    pub binary_cache_url: String,
+    /// Public key trusting `binary_cache_url` (required to use it).
+    pub binary_cache_key: String,
+    /// Push the built devShell closure to `binary_cache_url` during provisioning
+    /// (needs a signing key in the env), so later sandboxes download it. Default off.
+    pub binary_cache_push: bool,
 }
 
 impl EnvProviderConfig {
@@ -2283,6 +2308,17 @@ impl EnvProviderConfig {
             && self.workdir.is_empty()
             && !self.auto_provision
             && !self.auto_checkpoint
+            && self.nix_installer == NixInstaller::Official
+            && self.nix_parallel_downloads == 0
+            && self.binary_cache_url.is_empty()
+            && self.binary_cache_key.is_empty()
+            && !self.binary_cache_push
+    }
+
+    /// `http-connections`/`max-substitution-jobs` value to use, clamped to a sane
+    /// range; `None` when unset (leave Nix's defaults).
+    pub fn nix_parallel(&self) -> Option<u32> {
+        (self.nix_parallel_downloads > 0).then(|| self.nix_parallel_downloads.clamp(1, 256))
     }
 
     /// The sandbox working dir for `sync` (config value or the `/workspace` default).
@@ -3585,6 +3621,88 @@ fn is_default_preset(s: &str) -> bool {
     s.is_empty() || s == "default"
 }
 
+config_enum! {
+    /// How far ahead of focus to eagerly provision provider sandboxes (so the
+    /// minutes-long one-time provisioning happens in the background, not on the
+    /// hot path). Non-provider worktrees are always a no-op.
+    pub enum EagerScope: "eager scope" {
+        Off = "off" | "none",
+        ActiveWorktreePlusNew = "active" | "active_plus_new" | "focus",
+        ActiveWorkspace = "workspace",
+        All = "all",
+    } default = ActiveWorktreePlusNew;
+}
+
+/// `[lifecycle.pool]` — an optional pool of pre-provisioned, unclaimed sandboxes
+/// per (repo, env) so a brand-new worktree opens instantly. `size = 0` disables
+/// it (the default); enabling it requires the DB worktree→sandbox mapping.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct PoolConfig {
+    /// Pre-provisioned spare sandboxes to keep ready per (repo, env). `0` = off.
+    pub size: usize,
+    /// Destroy an unclaimed pool member older than this (seconds).
+    pub max_idle_secs: u64,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            size: 0,
+            max_idle_secs: 600,
+        }
+    }
+}
+
+/// `[lifecycle]` — budget-governed warm/suspend policy for managed-provider
+/// sandboxes. The defaults are budget-safe: superzej's background sidebar/activity
+/// polling never wakes a suspended sandbox, and idle sandboxes suspend after the
+/// TTL while the few most-recently-used (and any busy/pane-held) stay warm.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct LifecycleConfig {
+    /// Master switch. When off, the policy is inert (no suspend, no gating) —
+    /// today's behavior. On by default (the default settings only *reduce* cost).
+    pub enabled: bool,
+    /// Max managed-provider sandboxes kept warm at once (bounds discretionary
+    /// keeps; active/busy/pane-held worktrees are always kept).
+    pub max_warm: usize,
+    /// Idle seconds before a non-essential warm sandbox may suspend.
+    pub idle_ttl_secs: u64,
+    /// How far ahead of focus to eagerly provision (hide the provisioning cost).
+    pub eager: EagerScope,
+    /// Always keep the active worktree's sandbox warm.
+    pub keep_active_warm: bool,
+    /// Keep a busy worktree (live in-sandbox process) warm past the idle TTL.
+    pub keep_busy_warm: bool,
+    /// Serve cached git glyphs/activity for non-warm provider worktrees instead of
+    /// running an in-sandbox query that would wake them (the core budget fix).
+    pub serve_cached_glyphs: bool,
+    /// Optional spend guardrail: est. $/warm-sandbox-hour for the ceiling math.
+    pub cost_per_warm_hour: f64,
+    /// Trim the warm set so estimated warm spend stays under this $/hour. `0` ⇒ off.
+    pub cost_ceiling_per_hour: f64,
+    /// Optional warm pool of pre-provisioned spares (`[lifecycle.pool]`).
+    pub pool: PoolConfig,
+}
+
+impl Default for LifecycleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_warm: 2,
+            idle_ttl_secs: 300,
+            eager: EagerScope::ActiveWorktreePlusNew,
+            keep_active_warm: true,
+            keep_busy_warm: true,
+            serve_cached_glyphs: true,
+            cost_per_warm_hour: 0.0,
+            cost_ceiling_per_hour: 0.0,
+            pool: PoolConfig::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct Config {
@@ -3665,6 +3783,10 @@ pub struct Config {
     /// `[forward]` — auto-forward sandbox-internal dev-server ports to the host's
     /// loopback for browser preview. On by default (loopback-only ⇒ safe).
     pub forward: ForwardConfig,
+    /// `[lifecycle]` — budget-governed warm/suspend policy for managed-provider
+    /// sandboxes (keep recently-used ones warm for fast resume; let idle ones
+    /// suspend; provision ahead of focus). Budget-safe defaults.
+    pub lifecycle: LifecycleConfig,
     /// Rebind a built-in action by id, e.g. `new-worktree = "Ctrl w"`. The flat
     /// table is the global/default layer; nested mode tables are native-host only.
     pub keybinds: KeybindConfig,
@@ -3747,6 +3869,7 @@ impl Default for Config {
             media: MediaConfig::default(),
             share: ShareConfig::default(),
             forward: ForwardConfig::default(),
+            lifecycle: LifecycleConfig::default(),
             keybinds: KeybindConfig::default(),
             actions: Vec::new(),
             profile: String::new(),
@@ -4910,7 +5033,6 @@ mod tests {
     #[test]
     fn effective_provider_id_is_per_worktree() {
         let wt = Path::new("/home/u/.superzej/worktrees/superzej/sz-quick-dagger");
-        let canon = Path::new("/home/u/code/superzej");
         // Empty ⇒ conflict-free default: repo-worktree-hash.
         let def = effective_provider_id("", wt, Some("superzej"));
         assert!(
@@ -4964,6 +5086,52 @@ mod tests {
             long.ends_with(&util::short_hash(&deep.to_string_lossy(), 6)),
             "clamp preserves the path-hash suffix: {long}"
         );
+    }
+
+    #[test]
+    fn lifecycle_defaults_are_budget_safe() {
+        let l = LifecycleConfig::default();
+        assert!(
+            l.enabled,
+            "policy on by default (defaults only reduce cost)"
+        );
+        assert_eq!(l.max_warm, 2);
+        assert_eq!(l.idle_ttl_secs, 300);
+        assert_eq!(l.eager, EagerScope::ActiveWorktreePlusNew);
+        assert!(l.keep_active_warm && l.keep_busy_warm && l.serve_cached_glyphs);
+        assert_eq!(l.cost_ceiling_per_hour, 0.0, "no ceiling by default");
+        assert_eq!(l.pool.size, 0, "pool disabled by default");
+    }
+
+    #[test]
+    fn nix_parallel_clamps_and_gates_on_zero() {
+        let mut pc = EnvProviderConfig::default();
+        assert_eq!(pc.nix_parallel(), None, "0 ⇒ leave nix defaults");
+        assert!(pc.is_default(), "speedup fields default to inert");
+        pc.nix_parallel_downloads = 100;
+        assert_eq!(pc.nix_parallel(), Some(100));
+        pc.nix_parallel_downloads = 9999;
+        assert_eq!(pc.nix_parallel(), Some(256), "clamped to 256");
+        assert!(!pc.is_default());
+    }
+
+    #[test]
+    fn eager_scope_and_nix_installer_parse() {
+        assert_eq!(
+            EagerScope::from_str_validated("focus"),
+            Ok(EagerScope::ActiveWorktreePlusNew)
+        );
+        assert_eq!(
+            EagerScope::from_str_validated("workspace"),
+            Ok(EagerScope::ActiveWorkspace)
+        );
+        assert_eq!(EagerScope::from_str_validated("off"), Ok(EagerScope::Off));
+        assert!(EagerScope::from_str_validated("bogus").is_err());
+        assert_eq!(
+            NixInstaller::from_str_validated("ds"),
+            Ok(NixInstaller::Determinate)
+        );
+        assert_eq!(NixInstaller::default(), NixInstaller::Official);
     }
 
     #[test]

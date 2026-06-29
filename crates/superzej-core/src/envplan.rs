@@ -153,6 +153,24 @@ pub struct PlanOpts {
     pub allow_nix: bool,
     /// Checkpoint the sandbox after a successful provision (one-time cost).
     pub checkpoint: bool,
+    /// Which Nix installer to run (speedup): official (default) or Determinate.
+    pub nix_installer: crate::config::NixInstaller,
+    /// `http-connections`/`max-substitution-jobs` to set in the sandbox nix.conf
+    /// (`None` ⇒ leave Nix defaults) — parallelizes the download-bound devShell build.
+    pub nix_parallel: Option<u32>,
+    /// Optional project binary cache so the devShell is a download, not a build.
+    pub binary_cache: Option<BinaryCache>,
+}
+
+/// A Nix binary-cache substituter (and optional push) for fast devShells.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryCache {
+    /// Substituter URL (e.g. `https://cache.example.org` or `s3://…`).
+    pub url: String,
+    /// Public key trusting the cache (required to substitute from it).
+    pub key: String,
+    /// Push the built devShell closure to the cache during provisioning.
+    pub push: bool,
 }
 
 impl Default for PlanOpts {
@@ -168,6 +186,9 @@ impl Default for PlanOpts {
             agents: Vec::new(),
             allow_nix: true,
             checkpoint: true,
+            nix_installer: crate::config::NixInstaller::Official,
+            nix_parallel: None,
+            binary_cache: None,
         }
     }
 }
@@ -259,7 +280,11 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
                 steps.push(ProvisionStep {
                     id: "nix".into(),
                     label: "Install Nix".into(),
-                    kind: StepKind::Exec(nix_install_script()),
+                    kind: StepKind::Exec(nix_install_script(
+                        opts.nix_installer,
+                        opts.nix_parallel,
+                        opts.binary_cache.as_ref(),
+                    )),
                 });
                 if req.direnv {
                     steps.push(ProvisionStep {
@@ -273,6 +298,19 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
                     label: "Build dev shell".into(),
                     kind: StepKind::Exec(devshell_warm_script(&opts.workdir, req)),
                 });
+                // Optional: push the freshly-built devShell closure to the project
+                // binary cache so later sandboxes download it instead of rebuilding.
+                if let Some(c) = opts
+                    .binary_cache
+                    .as_ref()
+                    .filter(|c| c.push && !c.url.trim().is_empty())
+                {
+                    steps.push(ProvisionStep {
+                        id: "cache_push".into(),
+                        label: "Push devShell to cache".into(),
+                        kind: StepKind::Exec(cache_push_script(&opts.workdir, c)),
+                    });
+                }
             }
         }
         Tier::ToolVersions => {
@@ -353,30 +391,59 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
 
 /// Single-user Nix install (no systemd/daemon — sprites are minimal microVMs),
 /// idempotent: a no-op if `nix` is already on `PATH`. Enables flakes.
-fn nix_install_script() -> String {
-    // `--no-daemon` = single-user (no systemd); works in a container without an
-    // init. Source the profile so the same shell sees `nix`. Enable flakes.
-    // POSIX sh (runs under /bin/sh = dash in the sprite): NO process substitution
-    // — download to a file then run. Single-user (`--no-daemon`), flakes enabled.
-    // POSIX sh (runs under /bin/sh = dash in the sprite): NO process substitution
-    // — download to a file then run. Single-user (`--no-daemon`); the installer
-    // uses sudo to create /nix when not root. Enable flakes. FAIL-FAST: the final
-    // `command -v nix` sets the exit code, so a failed install surfaces (not
-    // masked by the trailing writes).
-    String::from(
-        "if command -v nix >/dev/null 2>&1; then exit 0; fi; \
-         export HOME=${HOME:-/root}; \
-         n=0; while [ $n -lt 45 ]; do \
+fn nix_install_script(
+    installer: crate::config::NixInstaller,
+    parallel: Option<u32>,
+    cache: Option<&BinaryCache>,
+) -> String {
+    use crate::config::NixInstaller;
+    // Persisted nix.conf lines (static, safe to bake — NOT secrets; the token auth
+    // stays runtime-only in nix_runtime_prelude). These apply to the devShell build
+    // (the longest step) AND interactive in-pane `nix develop`/`direnv`.
+    let mut conf = String::from("experimental-features = nix-command flakes\\n");
+    if let Some(n) = parallel {
+        // Parallelize the download-bound devShell substitution — the biggest win.
+        conf.push_str(&format!(
+            "http-connections = {n}\\nmax-substitution-jobs = {n}\\n"
+        ));
+    }
+    if let Some(c) = cache.filter(|c| !c.url.trim().is_empty()) {
+        conf.push_str(&format!("extra-substituters = {}\\n", c.url.trim()));
+        if !c.key.trim().is_empty() {
+            conf.push_str(&format!("extra-trusted-public-keys = {}\\n", c.key.trim()));
+        }
+    }
+    // Readiness wait (sudo available + DNS) shared by both installers; the sprite
+    // user has passwordless sudo and the installer creates /nix via sudo.
+    let wait = "n=0; while [ $n -lt 45 ]; do \
            { sudo -n true 2>/dev/null || [ \"$(id -u)\" = 0 ]; } && \
              getent hosts nixos.org >/dev/null 2>&1 && break; \
            n=$((n+1)); sleep 2; \
-         done; \
-         curl -fsSL https://nixos.org/nix/install -o /tmp/nix-install.sh && \
-           sh /tmp/nix-install.sh --no-daemon --yes; \
+         done";
+    // Official: single-user (`--no-daemon`), POSIX sh (download then run — no
+    // process substitution under dash). The proven default + fallback.
+    let official = "curl -fsSL https://nixos.org/nix/install -o /tmp/nix-install.sh && \
+           sh /tmp/nix-install.sh --no-daemon --yes";
+    let install = match installer {
+        NixInstaller::Official => official.to_string(),
+        // Determinate (faster Rust installer). `--init none` = no systemd (a bare
+        // microVM); falls back to the official single-user installer on ANY failure
+        // so a determinate-incompatibility never wedges provisioning.
+        NixInstaller::Determinate => format!(
+            "(curl -fsSL https://install.determinate.systems/nix -o /tmp/nix-ds.sh && \
+               sh /tmp/nix-ds.sh install linux --no-confirm --init none) || ({official})"
+        ),
+    };
+    // FAIL-FAST: the final `command -v nix` sets the exit code.
+    format!(
+        "if command -v nix >/dev/null 2>&1; then exit 0; fi; \
+         export HOME=${{HOME:-/root}}; \
+         {wait}; \
+         {install}; \
          export PATH=\"$HOME/.nix-profile/bin:$PATH\"; \
          mkdir -p \"$HOME/.config/nix\"; \
-         printf 'experimental-features = nix-command flakes\\n' > \"$HOME/.config/nix/nix.conf\"; \
-         command -v nix >/dev/null 2>&1",
+         printf '{conf}' > \"$HOME/.config/nix/nix.conf\"; \
+         command -v nix >/dev/null 2>&1"
     )
 }
 
@@ -439,6 +506,22 @@ fn devshell_warm_script(workdir: &str, req: &EnvRequirements) -> String {
     } else {
         format!("{nixsh}; cd {wd} && nix develop --command true 2>/dev/null || true")
     }
+}
+
+/// Push the project's built devShell closure to a binary cache so later sandboxes
+/// substitute it instead of rebuilding. Best-effort (a missing signing key or an
+/// unreachable cache must not fail provisioning). Resolves the current system so
+/// the right `devShells.<system>.default` attribute is copied.
+fn cache_push_script(workdir: &str, cache: &BinaryCache) -> String {
+    let wd = sh_quote(workdir);
+    let url = sh_quote(cache.url.trim());
+    format!(
+        "{tok}. \"$HOME/.nix-profile/etc/profile.d/nix.sh\" 2>/dev/null || true; \
+         export PATH=\"$HOME/.nix-profile/bin:$PATH\"; \
+         cd {wd} && sys=$(nix eval --impure --raw --expr builtins.currentSystem 2>/dev/null || echo x86_64-linux); \
+         nix copy --to {url} \".#devShells.$sys.default\" 2>/dev/null || true",
+        tok = nix_runtime_prelude(),
+    )
 }
 
 /// Install mise + the repo's pinned toolchains.
@@ -850,6 +933,81 @@ mod tests {
         assert!(plain.contains("NIX_CONFIG") && plain.contains("/homeless-shelter"));
         // direnv install (also a nix build) carries the prelude too.
         assert!(direnv_install_script().contains("/homeless-shelter"));
+    }
+
+    #[test]
+    fn nix_installer_official_default_and_determinate_fallback() {
+        use crate::config::NixInstaller;
+        let off = nix_install_script(NixInstaller::Official, None, None);
+        assert!(off.contains("nixos.org/nix/install"), "official installer");
+        assert!(off.contains("--no-daemon"), "single-user");
+        assert!(!off.contains("determinate.systems"));
+        // Determinate carries the official installer as a fallback (|| (...)).
+        let det = nix_install_script(NixInstaller::Determinate, None, None);
+        assert!(
+            det.contains("install.determinate.systems"),
+            "uses Determinate"
+        );
+        assert!(det.contains("--init none"), "no-systemd flag");
+        assert!(
+            det.contains("nixos.org/nix/install"),
+            "falls back to the official installer"
+        );
+    }
+
+    #[test]
+    fn nix_parallel_downloads_written_to_conf() {
+        use crate::config::NixInstaller;
+        let none = nix_install_script(NixInstaller::Official, None, None);
+        assert!(!none.contains("http-connections"), "off by default");
+        let s = nix_install_script(NixInstaller::Official, Some(100), None);
+        assert!(s.contains("http-connections = 100"));
+        assert!(s.contains("max-substitution-jobs = 100"));
+        // still enables flakes.
+        assert!(s.contains("experimental-features = nix-command flakes"));
+    }
+
+    #[test]
+    fn binary_cache_substituter_and_push_step() {
+        use crate::config::NixInstaller;
+        let cache = BinaryCache {
+            url: "https://cache.example.org".into(),
+            key: "cache.example.org-1:abc".into(),
+            push: true,
+        };
+        let s = nix_install_script(NixInstaller::Official, None, Some(&cache));
+        assert!(s.contains("extra-substituters = https://cache.example.org"));
+        assert!(s.contains("extra-trusted-public-keys = cache.example.org-1:abc"));
+
+        // plan() adds a cache_push step (after devshell) only when push is set.
+        let req = EnvRequirements {
+            nix_flake_devshell: true,
+            ..Default::default()
+        };
+        let opts = PlanOpts {
+            origin: None,
+            checkpoint: false,
+            binary_cache: Some(cache),
+            ..Default::default()
+        };
+        let p = plan(&req, &opts);
+        let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+        let dev = ids.iter().position(|i| *i == "devshell").unwrap();
+        let push = ids.iter().position(|i| *i == "cache_push").unwrap();
+        assert!(push > dev, "cache_push runs after devshell");
+        // No push step when push=false.
+        let opts2 = PlanOpts {
+            origin: None,
+            checkpoint: false,
+            binary_cache: Some(BinaryCache {
+                url: "https://c".into(),
+                key: String::new(),
+                push: false,
+            }),
+            ..Default::default()
+        };
+        let p2 = plan(&req, &opts2);
+        assert!(!p2.steps.iter().any(|s| s.id == "cache_push"));
     }
 
     #[test]

@@ -37,6 +37,7 @@ pub mod history;
 pub mod i18n;
 pub mod issue;
 pub mod keymap;
+pub mod lifecycle;
 pub mod log;
 pub mod log_trace;
 pub mod log_view;
