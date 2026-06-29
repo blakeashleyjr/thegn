@@ -2046,6 +2046,58 @@ fn activate_row_target(
     workspace_switched
 }
 
+/// True when the active group is a terminal (Region T) rather than a worktree
+/// (Region W). Terminals live in the same `session.worktrees` vector, tagged by
+/// `GroupKind::Terminal`, so region membership is just the active group's kind.
+fn active_is_terminal(session: &crate::session::Session) -> bool {
+    session
+        .worktrees
+        .get(session.active)
+        .map(|g| g.kind == crate::session::GroupKind::Terminal)
+        .unwrap_or(false)
+}
+
+/// The host collapse-key of the active terminal (e.g. `local`, `prod`), resolved
+/// by matching the active group's name against the DB terminal list. `None` when
+/// the active group isn't a known terminal.
+fn active_terminal_host_key(
+    session: &crate::session::Session,
+    db_terminals: &[superzej_core::models::TerminalRow],
+) -> Option<String> {
+    let name = &session.worktrees.get(session.active)?.name;
+    let t = db_terminals.iter().find(|t| &t.name == name)?;
+    Some(crate::sidebar::terminal_host(&t.connection_string, &t.kind).0)
+}
+
+/// The sentinel row target that activates (or materializes) a terminal by name
+/// through [`activate_row_target`] — switches to the resident terminal group if
+/// present, else spawns a fresh one lazily.
+fn terminal_target(name: &str) -> crate::sidebar::RowTarget {
+    crate::sidebar::RowTarget::Workspace {
+        repo_path: "terminal".into(),
+        group: Some(name.to_string()),
+    }
+}
+
+/// The non-terminal group index to land on when leaving the terminals region:
+/// the remembered `region_last_w` (if still a valid worktree), else the first
+/// non-terminal group (the home worktree).
+fn worktree_landing(session: &crate::session::Session, last_w: Option<usize>) -> Option<usize> {
+    last_w
+        .filter(|&i| {
+            session
+                .worktrees
+                .get(i)
+                .is_some_and(|g| g.kind != crate::session::GroupKind::Terminal)
+        })
+        .or_else(|| {
+            session
+                .worktrees
+                .iter()
+                .position(|g| g.kind != crate::session::GroupKind::Terminal)
+        })
+}
+
 /// Worktree group indices in the order the sidebar DISPLAYS them (home-first
 /// name sort, pins, filter). Alt+↑/↓ steps through this, not the session's
 /// internal order — otherwise switching "skips around" relative to the tree.
@@ -7889,6 +7941,10 @@ async fn event_loop<T: Terminal>(
     // otherwise spawn a new slow probe that pegs the CPU at 100%.
     let mut prewarm_inflight: std::collections::HashSet<(String, usize)> =
         std::collections::HashSet::new();
+    // Worktrees whose eager (ahead-of-focus) provisioning has been kicked off this
+    // session, so the background pass fires at most once per worktree (provisioning
+    // is idempotent, but re-attempting churns a `list()` per switch).
+    let mut eager_inflight: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Keys whose sandbox probe failed: suppressed from future pre-warm probes
     // so a permanently-unavailable backend (no podman/bwrap installed) cannot
     // keep spawning new threads on every event loop iteration. The active-tab
@@ -8295,6 +8351,13 @@ async fn event_loop<T: Terminal>(
     // placeholders can never collide with the panes we're about to spawn.
     remap_cold_workspace_ids(&mut session, &mut panes);
     let mut need_relayout = true;
+    // Region-navigation memory: where the user last was in each region, so the
+    // Alt+` toggle (and the Shift+Alt+↑/↓ overflow ring) can restore their place.
+    // `region_last_w` is a group index into the current session (validated at
+    // use, reset on a workspace switch); `region_last_t` is a terminal NAME,
+    // robust across workspace switches because it re-materializes by name.
+    let mut region_last_w: Option<usize> = None;
+    let mut region_last_t: Option<String> = None;
     let mut drawer: Option<u32> = None;
     // Hidden keep-alive yazi panes per worktree (instant drawer toggles).
     let mut drawer_pool = DrawerPool::default();
@@ -8838,6 +8901,45 @@ async fn event_loop<T: Terminal>(
                         let _ = wk.wake();
                     }
                 });
+            }
+            // Eager provisioning ([lifecycle] eager): front-run the one-time
+            // provisioning (nix + devShell, minutes) for provider worktrees AHEAD
+            // of focus, in the background, so opening them is instant. Budget-safe:
+            // `needs_eager_provision` only fires when the sandbox does NOT exist yet
+            // (a list() GET — never wakes an idle/provisioned one). Scope: active
+            // worktree only, or the whole session (workspace/all). Once per session.
+            {
+                use superzej_core::config::EagerScope;
+                let scope = current_config.lifecycle.eager;
+                if current_config.lifecycle.enabled && scope != EagerScope::Off {
+                    let active_path = session.active_group().map(|g| g.path.clone());
+                    let targets: Vec<String> = session
+                        .worktrees
+                        .iter()
+                        .filter(|g| !g.path.is_empty())
+                        .map(|g| g.path.clone())
+                        .filter(|p| match scope {
+                            EagerScope::ActiveWorktreePlusNew => {
+                                active_path.as_deref() == Some(p.as_str())
+                            }
+                            _ => true, // ActiveWorkspace / All: every open worktree
+                        })
+                        .collect();
+                    for wt in targets {
+                        if !eager_inflight.insert(wt.clone()) {
+                            continue; // already attempted this session
+                        }
+                        let cfg = current_config.clone();
+                        let wk = waker.clone();
+                        task::spawn_blocking(move || {
+                            if crate::agent::needs_eager_provision(&cfg, &wt) {
+                                // Background: no splash for a non-focused worktree.
+                                let _ = crate::agent::provision_worktree(&cfg, &wt, |_views| {});
+                                let _ = wk.wake();
+                            }
+                        });
+                    }
+                }
             }
             // And the new worktree's hidden yazi drawer, so the first toggle
             // never waits on yazi's startup. Off by default ([drawer].prewarm)
@@ -17177,6 +17279,68 @@ async fn event_loop<T: Terminal>(
                                 );
                                 persist_session_layout(&mut session, &panes);
                             }
+                            Action::NextWorktree | Action::PrevWorktree
+                                if active_is_terminal(&session) =>
+                            {
+                                // Region T: Alt+↑/↓ cycles terminals WITHIN the
+                                // active host (mirror of the worktree cycle),
+                                // wrapping within the host. Resolve the next
+                                // terminal's name first so the model borrow drops
+                                // before activating (which mutably borrows it).
+                                let next_name: Option<String> = {
+                                    let host = active_terminal_host_key(
+                                        &session,
+                                        &model.sidebar_db_terminals,
+                                    );
+                                    let active_name = session
+                                        .worktrees
+                                        .get(session.active)
+                                        .map(|g| g.name.clone());
+                                    let hosts = crate::sidebar::terminal_hosts_ordered(
+                                        &model.sidebar_db_terminals,
+                                    );
+                                    host.as_ref()
+                                        .and_then(|k| hosts.iter().find(|(hk, ..)| hk == k))
+                                        .and_then(|(_, _, _, terms)| {
+                                            if terms.len() <= 1 {
+                                                return None;
+                                            }
+                                            let p = active_name.as_ref().and_then(|n| {
+                                                terms.iter().position(|t| &t.name == n)
+                                            })?;
+                                            let n = terms.len();
+                                            let next = if action == Action::NextWorktree {
+                                                (p + 1) % n
+                                            } else {
+                                                (p + n - 1) % n
+                                            };
+                                            Some(terms[next].name.clone())
+                                        })
+                                };
+                                if let Some(name) = next_name {
+                                    activate_row_target(
+                                        terminal_target(&name),
+                                        &mut session,
+                                        &mut model,
+                                        &mut sb,
+                                        &mut panes,
+                                        &mut drawer,
+                                        &mut drawer_pool,
+                                        &mut drawer_home,
+                                        &mut workspace_pool,
+                                        keymap.config(),
+                                        chrome.center,
+                                        &mut need_relayout,
+                                        &mut clear_on_next_frame,
+                                    );
+                                    need_relayout = true;
+                                }
+                                focus.zone = crate::focus::Zone::Center;
+                                region_last_t = session
+                                    .worktrees
+                                    .get(session.active)
+                                    .map(|g| g.name.clone());
+                            }
                             Action::NextWorktree | Action::PrevWorktree => {
                                 // Step in the sidebar's display order so the
                                 // motion matches what the user sees, but confined
@@ -17212,6 +17376,7 @@ async fn event_loop<T: Terminal>(
                                 // Worktree switches always land focus on the
                                 // center terminal — the user switched to work there.
                                 focus.zone = crate::focus::Zone::Center;
+                                region_last_w = Some(session.active);
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
                                 sync_drawer_persistence(
@@ -17226,48 +17391,217 @@ async fn event_loop<T: Terminal>(
                                 persist_session_layout(&mut session, &panes);
                             }
                             Action::NextWorkspace | Action::PrevWorkspace => {
-                                // Switch to the prev/next workspace in the
-                                // *visible* sidebar order (wraps), so the motion
-                                // matches the tree even when pins float a
-                                // workspace to the top or a filter hides one.
-                                // Only DB-backed workspaces are switchable; the
-                                // active one is always among them.
-                                let switchable = sidebar_workspace_order(&model.sidebar_rows);
-                                let cur = switchable.iter().position(|p| *p == session.id);
-                                if let (n, Some(p)) = (switchable.len(), cur)
-                                    && n > 1
-                                {
+                                // One combined ring: the switchable workspaces in
+                                // *visible* sidebar order (so the motion matches
+                                // the tree even with pins/filters), then the
+                                // terminal hosts. Stepping wraps across the whole
+                                // ring, so Shift+Alt+↓ overflows from the last
+                                // workspace into the terminals region and back.
+                                let workspaces = sidebar_workspace_order(&model.sidebar_rows);
+                                let host_keys: Vec<String> =
+                                    crate::sidebar::terminal_hosts_ordered(
+                                        &model.sidebar_db_terminals,
+                                    )
+                                    .into_iter()
+                                    .map(|(k, ..)| k)
+                                    .collect();
+                                let nw = workspaces.len();
+                                let total = nw + host_keys.len();
+                                let in_term = active_is_terminal(&session);
+                                let cur = if in_term {
+                                    active_terminal_host_key(&session, &model.sidebar_db_terminals)
+                                        .and_then(|k| host_keys.iter().position(|h| *h == k))
+                                        .map(|i| nw + i)
+                                } else {
+                                    workspaces.iter().position(|p| *p == session.id)
+                                };
+                                if let (Some(p), true) = (cur, total > 1) {
                                     let next = if action == Action::NextWorkspace {
-                                        (p + 1) % n
+                                        (p + 1) % total
                                     } else {
-                                        (p + n - 1) % n
+                                        (p + total - 1) % total
                                     };
-                                    let target = switchable[next].clone();
-                                    if let Ok(db) = superzej_core::db::Db::open()
-                                        && switch_workspace(
-                                            &target,
-                                            None,
+                                    if next < nw {
+                                        // Target is a workspace.
+                                        let target = workspaces[next].clone();
+                                        if target == session.id {
+                                            // Wrapped back onto the current
+                                            // workspace from the terminals region:
+                                            // just leave terminals for a worktree.
+                                            if let Some(gi) =
+                                                worktree_landing(&session, region_last_w)
+                                            {
+                                                session.switch_to(gi);
+                                            }
+                                            focus.zone = crate::focus::Zone::Center;
+                                            region_last_w = Some(session.active);
+                                            refresh_tab_model(&mut model, &session, &mut sb);
+                                            need_relayout = true;
+                                            sync_drawer_persistence(
+                                                &session,
+                                                &mut panes,
+                                                &mut drawer,
+                                                &mut drawer_pool,
+                                                &mut drawer_home,
+                                                keymap.config(),
+                                                chrome.center,
+                                            );
+                                            persist_session_layout(&mut session, &panes);
+                                        } else if let Ok(db) = superzej_core::db::Db::open()
+                                            && switch_workspace(
+                                                &target,
+                                                None,
+                                                &mut session,
+                                                &mut panes,
+                                                &mut workspace_pool,
+                                                &db,
+                                                &mut need_relayout,
+                                                &mut clear_on_next_frame,
+                                            )
+                                        {
+                                            focus.zone = crate::focus::Zone::Center;
+                                            // The new session re-indexes groups;
+                                            // drop the (now meaningless) memory.
+                                            region_last_w = Some(session.active);
+                                            region_last_t = None;
+                                            refresh_tab_model(&mut model, &session, &mut sb);
+                                            kick_model_hydration!();
+                                            need_relayout = true;
+                                            sync_drawer_persistence(
+                                                &session,
+                                                &mut panes,
+                                                &mut drawer,
+                                                &mut drawer_pool,
+                                                &mut drawer_home,
+                                                keymap.config(),
+                                                chrome.center,
+                                            );
+                                        }
+                                    } else {
+                                        // Target is a terminal host: activate its
+                                        // first terminal (or the remembered one if
+                                        // it belongs here), expanding the host.
+                                        let key = host_keys[next - nw].clone();
+                                        let pick: Option<String> = {
+                                            let hosts = crate::sidebar::terminal_hosts_ordered(
+                                                &model.sidebar_db_terminals,
+                                            );
+                                            hosts.iter().find(|(k, ..)| *k == key).and_then(
+                                                |(_, _, _, terms)| {
+                                                    region_last_t
+                                                        .as_ref()
+                                                        .filter(|n| {
+                                                            terms.iter().any(|t| &t.name == *n)
+                                                        })
+                                                        .cloned()
+                                                        .or_else(|| {
+                                                            terms.first().map(|t| t.name.clone())
+                                                        })
+                                                },
+                                            )
+                                        };
+                                        if let Some(name) = pick {
+                                            let slug = format!("terminals/host:{key}");
+                                            if sb.view.collapsed.remove(&slug) {
+                                                sb.persist(&format!("collapse:{slug}"), "0");
+                                            }
+                                            activate_row_target(
+                                                terminal_target(&name),
+                                                &mut session,
+                                                &mut model,
+                                                &mut sb,
+                                                &mut panes,
+                                                &mut drawer,
+                                                &mut drawer_pool,
+                                                &mut drawer_home,
+                                                &mut workspace_pool,
+                                                keymap.config(),
+                                                chrome.center,
+                                                &mut need_relayout,
+                                                &mut clear_on_next_frame,
+                                            );
+                                            focus.zone = crate::focus::Zone::Center;
+                                            region_last_t = session
+                                                .worktrees
+                                                .get(session.active)
+                                                .map(|g| g.name.clone());
+                                            need_relayout = true;
+                                        }
+                                    }
+                                }
+                            }
+                            Action::ToggleRegion => {
+                                // Alt+`: bounce between the workspaces and
+                                // terminals regions, restoring each region's last
+                                // place. Both regions share `session.worktrees`
+                                // (terminals are `GroupKind::Terminal`).
+                                if active_is_terminal(&session) {
+                                    // Leaving terminals → restore the last worktree
+                                    // (or the home worktree).
+                                    region_last_t = session
+                                        .worktrees
+                                        .get(session.active)
+                                        .map(|g| g.name.clone());
+                                    if let Some(gi) = worktree_landing(&session, region_last_w) {
+                                        session.switch_to(gi);
+                                        region_last_w = Some(session.active);
+                                    }
+                                    focus.zone = crate::focus::Zone::Center;
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    need_relayout = true;
+                                    sync_drawer_persistence(
+                                        &session,
+                                        &mut panes,
+                                        &mut drawer,
+                                        &mut drawer_pool,
+                                        &mut drawer_home,
+                                        keymap.config(),
+                                        chrome.center,
+                                    );
+                                    persist_session_layout(&mut session, &panes);
+                                } else {
+                                    // Entering terminals → the remembered terminal
+                                    // if still present, else the first terminal in
+                                    // sidebar order.
+                                    region_last_w = Some(session.active);
+                                    let pick: Option<String> = {
+                                        let hosts = crate::sidebar::terminal_hosts_ordered(
+                                            &model.sidebar_db_terminals,
+                                        );
+                                        let remembered = region_last_t.as_ref().filter(|n| {
+                                            hosts.iter().any(|(_, _, _, terms)| {
+                                                terms.iter().any(|t| &t.name == *n)
+                                            })
+                                        });
+                                        remembered.cloned().or_else(|| {
+                                            hosts
+                                                .iter()
+                                                .find_map(|(_, _, _, terms)| terms.first())
+                                                .map(|t| t.name.clone())
+                                        })
+                                    };
+                                    if let Some(name) = pick {
+                                        activate_row_target(
+                                            terminal_target(&name),
                                             &mut session,
-                                            &mut panes,
-                                            &mut workspace_pool,
-                                            &db,
-                                            &mut need_relayout,
-                                            &mut clear_on_next_frame,
-                                        )
-                                    {
-                                        focus.zone = crate::focus::Zone::Center;
-                                        refresh_tab_model(&mut model, &session, &mut sb);
-                                        kick_model_hydration!();
-                                        need_relayout = true;
-                                        sync_drawer_persistence(
-                                            &session,
+                                            &mut model,
+                                            &mut sb,
                                             &mut panes,
                                             &mut drawer,
                                             &mut drawer_pool,
                                             &mut drawer_home,
+                                            &mut workspace_pool,
                                             keymap.config(),
                                             chrome.center,
+                                            &mut need_relayout,
+                                            &mut clear_on_next_frame,
                                         );
+                                        focus.zone = crate::focus::Zone::Center;
+                                        region_last_t = session
+                                            .worktrees
+                                            .get(session.active)
+                                            .map(|g| g.name.clone());
+                                        need_relayout = true;
                                     }
                                 }
                             }
