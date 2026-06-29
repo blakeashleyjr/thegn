@@ -1401,6 +1401,17 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # # auto_checkpoint = false  # checkpoint the sprite on worktree close (suspend-on-
 # #                          #   close, fast resume) — over the API, CLI-free. Off
 # #                          #   by default (storage cost). Launcher scaffolds `true`.
+# # --- provisioning speedups (make the one-time nix install + devShell faster) ---
+# # nix_installer = "official"      # "official" (nixos.org --no-daemon, default +
+# #                                 #   fallback) or "determinate" (faster Rust
+# #                                 #   installer; falls back to official on failure)
+# # nix_parallel_downloads = 0      # >0 sets http-connections + max-substitution-jobs
+# #                                 #   (clamped 1..=256, e.g. 100) so the devShell's
+# #                                 #   deps download in parallel — the biggest win
+# # binary_cache_url = ""           # extra Nix substituter so the devShell is a
+# # binary_cache_key = ""           #   download not a build (needs the public key)
+# # binary_cache_push = false       # push the built devShell closure to the cache
+# #                                 #   during provisioning (needs a signing key)
 # # exec = "auto"            # how the interactive pane attaches:
 # #                          #   auto — native API exec (PTY-over-WebSocket, NO
 # #                          #          `sprite` CLI) when the provider supports it
@@ -1439,6 +1450,34 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # #   than silently dropping to a host shell (see [sandbox] failover). To let THIS
 # #   env fall back to the local backend chain / host instead, override per-env:
 # # failover = true            # this env may degrade to host; omit/false ⇒ halt+warn
+# ── Sandbox lifecycle: warm/suspend + budget ───────────────────────────────
+# Budget-governed warm policy for managed-provider sandboxes (sprites/ssh/k8s).
+# A provider sandbox only stays *running* while a live exec session into it exists
+# (a pane or the resident bridge); idle ones suspend for free (filesystem kept).
+# Defaults are budget-safe — superzej's own sidebar/activity polling never wakes a
+# suspended sandbox, idle ones suspend after the TTL, and the few most-recently-
+# used (plus any busy or pane-held) stay warm for instant resume. All optional.
+[lifecycle]
+# enabled = true              # master switch; off ⇒ inert (today's behavior)
+# max_warm = 2                # max sandboxes kept warm at once (bounds the
+#                             #   most-recently-used keeps; active/busy/pane-held
+#                             #   worktrees are always kept regardless)
+# idle_ttl_secs = 300         # idle seconds before a non-essential warm sandbox
+#                             #   may suspend
+# eager = "active"            # provision AHEAD of focus so the one-time nix/devShell
+#                             #   minutes happen in the background. off | active
+#                             #   (active worktree + newly-created) | workspace
+#                             #   (whole active workspace) | all (every worktree)
+# keep_active_warm = true     # the focused worktree's sandbox is always warm
+# keep_busy_warm = true       # a worktree with a live in-sandbox process stays
+#                             #   warm past the TTL (dev server / agent)
+# serve_cached_glyphs = true  # show cached git status/activity for non-warm
+#                             #   provider worktrees instead of waking them to poll
+# cost_per_warm_hour = 0.0    # est. $/warm-sandbox-hour, for the ceiling below
+# cost_ceiling_per_hour = 0.0 # trim the warm set to stay under this $/hr; 0 ⇒ off
+# [lifecycle.pool]            # optional pre-provisioned spares for instant new
+# size = 0                    #   worktrees (per repo+env); 0 ⇒ disabled (default)
+# max_idle_secs = 600         # reap an unclaimed pool member older than this
 # ── LLM proxy (group U/V) ──────────────────────────────────────────────────
 # The AI-traffic chokepoint daemon (binary `szproxy`). The shell never hard-
 # depends on this — AI is strictly additive — so it is OFF by default. When
