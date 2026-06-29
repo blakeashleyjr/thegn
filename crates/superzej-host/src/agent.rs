@@ -1042,13 +1042,15 @@ pub fn sprite_ssh_argv(
         superzej_core::util::sh_quote(szhost_exe),
         superzej_core::util::sh_quote(worktree),
     );
+    // Run the user's login shell, not the sprite's default `$SHELL` (which is
+    // bash → no zsh / no host-parity prompt). The same runtime probe chain the
+    // native pane uses (`command -v zsh && exec zsh -l; …`) so the uploaded
+    // `.zshrc` (and starship/etc.) loads exactly like local.
+    let shell = shell_inner(true);
     let remote = if workdir.is_empty() {
-        "exec \"$SHELL\" -l".to_string()
+        shell
     } else {
-        format!(
-            "cd {} 2>/dev/null; exec \"$SHELL\" -l",
-            superzej_core::util::sh_quote(workdir)
-        )
+        format!("cd {} 2>/dev/null; {shell}", superzej_core::util::sh_quote(workdir))
     };
     vec![
         "ssh".into(),
@@ -2722,10 +2724,13 @@ mod tests {
         assert!(joined.contains("-i /state/sprite_ed25519"));
         assert!(joined.contains(&format!("-p {SPRITE_SSHD_PORT}")));
         assert!(argv.iter().any(|a| a == "sprite@sprite"));
-        // The remote command cd's into the workdir then execs a login shell.
+        // The remote command cd's into the workdir then execs the user's login
+        // shell via the probe chain (zsh first), so the host-parity rc loads.
+        let remote = argv.last().unwrap();
+        assert!(remote.contains("cd /workspace"), "{remote}");
         assert!(
-            argv.last().unwrap().contains("cd /workspace")
-                && argv.last().unwrap().contains("exec \"$SHELL\" -l")
+            remote.contains("command -v zsh") && remote.contains("exec zsh -l"),
+            "remote should run the zsh-first login chain: {remote}"
         );
     }
 
