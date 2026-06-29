@@ -4425,7 +4425,7 @@ impl Config {
         // Named env: overlay its isolation onto the base, build its placement.
         let mut sb = base;
         envc.sandbox.clone().apply(&mut sb);
-        let placement = build_env_placement(envc, &sb, loc, worktree);
+        let placement = build_env_placement(envc, &sb, loc, worktree, repo_root);
         Environment {
             name,
             placement,
@@ -4727,24 +4727,66 @@ fn data_mode_from_remote(mode: RemoteMode) -> DataMode {
     }
 }
 
-/// Resolve a provider env's effective sandbox id for `worktree`, expanding the
-/// per-worktree tokens in the configured `id`: `{worktree}` = worktree dir
-/// basename slug, `{slug}` = full worktree-path slug (globally unique), empty =
-/// basename slug (the per-worktree default). A configured id with no token is
-/// returned as-is (a static, shared sandbox — back-compat). The resolved id flows
-/// into `ProviderPlacement.id` + the `{id}` command/`control_prefix` templates, so
-/// each worktree gets its own sprite (and a distinct `bridge_key`).
-pub fn effective_provider_id(configured: &str, worktree: &Path) -> String {
+/// Max length of a resolved sandbox id. Sandbox names become DNS labels (e.g. the
+/// sprite URL `<name>-xxxxx.sprites.app`), capped at 63 chars; leave headroom for
+/// a provider suffix.
+const MAX_PROVIDER_ID: usize = 50;
+
+/// Resolve a provider env's effective sandbox id for `worktree`, expanding tokens
+/// in the configured `id`:
+/// - `{worktree}` — worktree dir basename slug (e.g. the branch slug)
+/// - `{repo}` — the repo name (dir basename of `repo_root`), for readability
+/// - `{hash}` — a short STABLE digest of the **full worktree path**, the
+///   collision-defuser: two worktrees whose `{repo}`/`{worktree}` coincide
+///   (same branch name in different repos, or two checkouts of one repo) still
+///   get distinct ids because their paths differ
+/// - `{slug}` — full worktree-path slug (also globally unique, but long/ugly)
+///
+/// An **empty** id uses the conflict-free default `"{repo}-{worktree}-{hash}"`.
+/// A configured id with no token is returned as-is (a static, shared sandbox —
+/// back-compat). The result is dash-collapsed and clamped to a DNS-safe length,
+/// always preserving a path-hash suffix so the clamp can't reintroduce a
+/// collision. The id flows into `ProviderPlacement.id` + `{id}` command templates,
+/// so it MUST be derived identically everywhere — all callers resolve it through
+/// this one function (the host reads `ProviderPlacement.id` rather than
+/// re-deriving). `repo` is the repo dir name (`None` ⇒ `{repo}` expands empty).
+pub fn effective_provider_id(configured: &str, worktree: &Path, repo: Option<&str>) -> String {
     let base = worktree
         .file_name()
         .map(|n| util::slugify(&n.to_string_lossy()))
         .unwrap_or_default();
     let c = configured.trim();
-    if c.is_empty() {
-        return base;
+    let repo_slug = repo.map(util::slugify).unwrap_or_default();
+    // 6 base36 chars of a stable hash of the absolute worktree path.
+    let hash = util::short_hash(&worktree.to_string_lossy(), 6);
+
+    // Empty ⇒ the conflict-free default. A no-token literal stays verbatim
+    // (explicit shared sandbox); only token-bearing templates get expanded.
+    let template = if c.is_empty() {
+        "{repo}-{worktree}-{hash}"
+    } else {
+        c
+    };
+    let expanded = template
+        .replace("{worktree}", &base)
+        .replace("{slug}", &util::slugify(&worktree.to_string_lossy()))
+        .replace("{repo}", &repo_slug)
+        .replace("{hash}", &hash);
+    // Collapse empty segments (e.g. a `None` repo leaving a leading dash) and trim.
+    let name = expanded
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+
+    if name.len() <= MAX_PROVIDER_ID {
+        return name;
     }
-    let full = util::slugify(&worktree.to_string_lossy());
-    c.replace("{worktree}", &base).replace("{slug}", &full)
+    // Too long: truncate but ALWAYS keep a trailing path-hash so the clamp can't
+    // collapse two distinct worktrees onto one id.
+    let keep = MAX_PROVIDER_ID.saturating_sub(hash.len() + 1);
+    let head: String = name.chars().take(keep).collect();
+    format!("{}-{hash}", head.trim_end_matches('-'))
 }
 
 /// Build the runtime [`Placement`] for a named env from its `[env.<name>]`
@@ -4755,11 +4797,17 @@ fn build_env_placement(
     sb: &SandboxConfig,
     loc: &GitLoc,
     worktree: &Path,
+    repo_root: &Path,
 ) -> Placement {
     let opt = |s: &str| {
         let t = s.trim();
         (!t.is_empty()).then(|| t.to_string())
     };
+    // Repo name (dir basename) for the `{repo}` sandbox-id token.
+    let repo_name = repo_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.is_empty());
     match envc.placement {
         PlacementMode::Local => Placement::Local,
         PlacementMode::Ssh => {
@@ -4810,7 +4858,7 @@ fn build_env_placement(
         PlacementMode::Provider => {
             // Per-worktree id: each worktree gets its own sandbox (so panes,
             // the bridge key, and the persisted location are all distinct).
-            let id = effective_provider_id(&envc.provider.id, worktree);
+            let id = effective_provider_id(&envc.provider.id, worktree, repo_name);
             let sub = |tpl: &[String]| {
                 tpl.iter()
                     .map(|s| s.replace("{id}", &id))
@@ -4863,21 +4911,72 @@ mod tests {
     fn effective_provider_id_is_per_worktree() {
         let wt = Path::new("/home/u/.superzej/worktrees/superzej/sz-quick-dagger");
         let canon = Path::new("/home/u/code/superzej");
-        // Empty ⇒ basename slug (the per-worktree default).
-        assert_eq!(effective_provider_id("", wt), "sz-quick-dagger");
-        assert_eq!(effective_provider_id("", canon), "superzej");
-        // {worktree} ⇒ basename; distinct per worktree.
-        assert_ne!(
-            effective_provider_id("{worktree}", wt),
-            effective_provider_id("{worktree}", canon)
+        // Empty ⇒ conflict-free default: repo-worktree-hash.
+        let def = effective_provider_id("", wt, Some("superzej"));
+        assert!(
+            def.starts_with("superzej-sz-quick-dagger-"),
+            "default is repo-worktree-hash: {def}"
+        );
+        // Deterministic: same inputs ⇒ same id (must agree across call sites/runs).
+        assert_eq!(def, effective_provider_id("", wt, Some("superzej")));
+        // {worktree} ⇒ basename; {repo}/{hash} expand.
+        assert_eq!(
+            effective_provider_id("{worktree}", wt, Some("superzej")),
+            "sz-quick-dagger"
+        );
+        assert_eq!(
+            effective_provider_id("{repo}-{worktree}", wt, Some("superzej")),
+            "superzej-sz-quick-dagger"
         );
         // {slug} ⇒ full-path slug (globally unique).
-        assert!(effective_provider_id("{slug}", wt).contains("worktrees"));
+        assert!(effective_provider_id("{slug}", wt, None).contains("worktrees"));
         // A static id with no token stays shared (back-compat).
-        assert_eq!(effective_provider_id("shared", wt), "shared");
         assert_eq!(
-            effective_provider_id("shared", wt),
-            effective_provider_id("shared", canon)
+            effective_provider_id("shared", wt, Some("superzej")),
+            "shared"
+        );
+
+        // CONFLICT-FREE: two worktrees whose repo + branch basenames COINCIDE but
+        // whose full paths differ get distinct ids (the {hash} disambiguates) —
+        // e.g. a `main` worktree in two different checkouts.
+        let a = Path::new("/home/u/code/repo-a/worktrees/x/main");
+        let b = Path::new("/home/u/work/repo-b/worktrees/x/main");
+        let ia = effective_provider_id("", a, Some("x"));
+        let ib = effective_provider_id("", b, Some("x"));
+        assert_ne!(ia, ib, "same repo+branch, different path ⇒ distinct id");
+
+        // DNS-length clamp keeps it short and still ends in the path hash.
+        let deep = Path::new(
+            "/home/u/very/deeply/nested/path/that/keeps/going/superzej/worktrees/superzej/an-extremely-long-branch-name-that-overflows",
+        );
+        let long = effective_provider_id(
+            "{repo}-{worktree}-{hash}",
+            deep,
+            Some("a-very-long-repo-name"),
+        );
+        assert!(
+            long.len() <= MAX_PROVIDER_ID,
+            "clamped: {} ({})",
+            long,
+            long.len()
+        );
+        assert!(
+            long.ends_with(&util::short_hash(&deep.to_string_lossy(), 6)),
+            "clamp preserves the path-hash suffix: {long}"
+        );
+    }
+
+    #[test]
+    fn short_hash_is_stable_and_distinct() {
+        // Stable across calls (the property the sandbox name lifecycle relies on).
+        assert_eq!(util::short_hash("/a/b/c", 6), util::short_hash("/a/b/c", 6));
+        assert_eq!(util::short_hash("/a/b/c", 6).len(), 6);
+        assert_ne!(util::short_hash("/a/b/c", 6), util::short_hash("/a/b/d", 6));
+        // base36 charset only.
+        assert!(
+            util::short_hash("/x/y/z", 6)
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
         );
     }
 
