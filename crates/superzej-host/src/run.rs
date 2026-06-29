@@ -7969,7 +7969,20 @@ async fn event_loop<T: Terminal>(
     // screen while a fresh provider sandbox is built. Keyed (group name, tab).
     type ProvisionProgress = (String, usize, Vec<LoadStep>);
     let (provision_tx, mut provision_rx) = tokio_mpsc::unbounded_channel::<ProvisionProgress>();
-    let mut materialize_inflight: Option<(String, usize)> = None;
+    // Materialize requests in flight, keyed (group name, tab). A SET (not a single
+    // slot) that PERSISTS across worktree switches: switching away from a
+    // provisioning worktree and back must not re-kick its (idempotent but heavy)
+    // provision. An entry is removed when its spec lands (`spec_rx`).
+    let mut materialize_inflight: std::collections::HashSet<(String, usize)> =
+        std::collections::HashSet::new();
+    // Per-worktree loading-splash state, keyed (group name, tab) — the SINGLE
+    // source of truth for the splash. `model.load_steps` is DERIVED from the
+    // active worktree's entry each frame (see below), so switching worktrees
+    // preserves each one's provisioning progress instead of resetting it. Written
+    // by the lazy-materialize seed + `provision_rx`/`spec_rx`; an entry is dropped
+    // on the owning pane's first PTY output (loading done) or on a hard failure.
+    let mut loading_state: std::collections::HashMap<(String, usize), Vec<LoadStep>> =
+        std::collections::HashMap::new();
     // Active-tab keys (group name, tab) whose sandbox probe failed: skip
     // re-probing on the next tick for the same reason as prewarm_failed.
     // Cleared on worktree switch.
@@ -8837,7 +8850,11 @@ async fn event_loop<T: Terminal>(
             hydration_gen += 1;
             panel_ui.hunks.clear();
             hunk_inflight.clear();
-            materialize_inflight = None;
+            // NOTE: `materialize_inflight` deliberately PERSISTS across switches now
+            // (a provisioning worktree keeps provisioning in the background); its
+            // entries self-clear when each spec lands. `model.load_steps` is derived
+            // from `loading_state[active]` each frame, so the splash for this
+            // worktree is restored automatically — no reset.
             materialize_failed.clear();
             prewarm_failed.clear();
             respawn_crash_count.clear();
@@ -9094,15 +9111,18 @@ async fn event_loop<T: Terminal>(
                 let missing = panes.missing_leaves(&session.worktrees[session.active].tabs[ti]);
                 let key = (name.clone(), ti);
                 if !missing.is_empty()
-                    && materialize_inflight.as_ref() != Some(&key)
+                    && !materialize_inflight.contains(&key)
                     && !materialize_failed.contains(&key)
                 {
-                    materialize_inflight = Some(key);
-                    model.load_steps = vec![
-                        LoadStep::active("sandbox"),
-                        LoadStep::pending("container"),
-                        LoadStep::pending("shell"),
-                    ];
+                    materialize_inflight.insert(key.clone());
+                    loading_state.insert(
+                        key,
+                        vec![
+                            LoadStep::active("sandbox"),
+                            LoadStep::pending("container"),
+                            LoadStep::pending("shell"),
+                        ],
+                    );
                     dirty = true;
                     let cfg = keymap.config().clone();
                     let tx = spec_tx.clone();
@@ -9269,12 +9289,20 @@ async fn event_loop<T: Terminal>(
                     match ev {
                         PaneEvent::Output(id, b) => {
                             if let Some(p) = panes.table.get_mut(&id) {
-                                // First real output from the active pane: the
-                                // shell is live. Dismiss the loading screen now
-                                // so it disappears on the same frame as content,
-                                // never leaving a blank flash between the two.
-                                if !model.load_steps.is_empty() && visible.contains(&id) {
-                                    model.load_steps.clear();
+                                // First real output from a pane ⇒ that worktree's
+                                // shell is live; drop its loading-splash entry. By
+                                // owner (not just the visible pane) so a background
+                                // worktree that finished while you were away shows
+                                // no stale splash when you return. `model.load_steps`
+                                // is re-derived from `loading_state` below, so the
+                                // active splash disappears on this same frame.
+                                if !loading_state.is_empty()
+                                    && let Some((gi, ti)) = session
+                                        .iter_tabs()
+                                        .find(|(_, _, t)| t.center.pane_ids().contains(&id))
+                                        .map(|(gi, ti, _)| (gi, ti))
+                                {
+                                    loading_state.remove(&(session.worktrees[gi].name.clone(), ti));
                                 }
                                 if Some(id) == corner && corner_kitty {
                                     // CRISP CORNER VIDEO: split the corner pane's
@@ -9644,6 +9672,8 @@ async fn event_loop<T: Terminal>(
                                             // the loop and surface the problem. The user
                                             // can try a different backend or fix their
                                             // shell config, then switch worktrees to retry.
+                                            loading_state
+                                                .remove(&(session.worktrees[gi].name.clone(), ti));
                                             model.load_steps.clear();
                                             center_dormant = true;
                                             model.status =
@@ -9693,6 +9723,10 @@ async fn event_loop<T: Terminal>(
                                                     need_relayout = true;
                                                 }
                                                 Err(err) => {
+                                                    loading_state.remove(&(
+                                                        session.worktrees[gi].name.clone(),
+                                                        ti,
+                                                    ));
                                                     model.load_steps.clear();
                                                     center_dormant = true;
                                                     model.status =
@@ -10165,11 +10199,15 @@ async fn event_loop<T: Terminal>(
         // is built; only the active tab's stream drives the loading screen.
         while let Ok((name, ti, steps)) = provision_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Spec);
-            if let Some(gi) = session.worktrees.iter().position(|g| g.name == name)
-                && gi == session.active
-                && session.worktrees[gi].active_tab == ti
-            {
-                model.load_steps = steps;
+            // Always record this worktree's progress; the splash for whichever
+            // worktree is active is derived from `loading_state` below.
+            let active = session
+                .worktrees
+                .iter()
+                .position(|g| g.name == name)
+                .is_some_and(|gi| gi == session.active && session.worktrees[gi].active_tab == ti);
+            loading_state.insert((name, ti), steps);
+            if active {
                 dirty = true;
             }
         }
@@ -10182,9 +10220,7 @@ async fn event_loop<T: Terminal>(
         while let Ok((name, wt, ti, specs)) = spec_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Spec);
             let tab_key = (name.clone(), ti);
-            if materialize_inflight.as_ref() == Some(&tab_key) {
-                materialize_inflight = None;
-            }
+            materialize_inflight.remove(&tab_key);
             prewarm_inflight.remove(&tab_key);
             let Some(gi) = session.worktrees.iter().position(|g| g.name == name) else {
                 continue;
@@ -10195,17 +10231,20 @@ async fn event_loop<T: Terminal>(
             }
             let specs = match specs {
                 Ok(specs) => {
-                    if is_active {
-                        // sandbox done → container active; label shows backend
-                        let backend = specs
-                            .first()
-                            .map(|(_, s)| s.backend.clone())
-                            .unwrap_or_else(|| "host".into());
-                        model.load_steps = vec![
+                    // sandbox done → container active; label shows backend.
+                    let backend = specs
+                        .first()
+                        .map(|(_, s)| s.backend.clone())
+                        .unwrap_or_else(|| "host".into());
+                    loading_state.insert(
+                        tab_key.clone(),
+                        vec![
                             LoadStep::done("sandbox"),
                             LoadStep::active(format!("container  ({backend})")),
                             LoadStep::pending("shell"),
-                        ];
+                        ],
+                    );
+                    if is_active {
                         dirty = true;
                     }
                     specs
@@ -10226,8 +10265,8 @@ async fn event_loop<T: Terminal>(
                             model.status = format!("Pane launch blocked: {s}");
                         }
                     }
+                    loading_state.insert(tab_key.clone(), vec![LoadStep::failed("sandbox")]);
                     if is_active {
-                        model.load_steps = vec![LoadStep::failed("sandbox")];
                         center_dormant = true;
                         materialize_failed.insert(tab_key);
                     } else {
@@ -10246,31 +10285,35 @@ async fn event_loop<T: Terminal>(
             let Some(tab) = session.worktrees[gi].tabs.get_mut(ti) else {
                 continue;
             };
-            if is_active {
+            {
                 // container done → shell active
                 let backend = specs
                     .first()
                     .map(|(_, s)| s.backend.clone())
                     .unwrap_or_else(|| "host".into());
-                model.load_steps = vec![
-                    LoadStep::done("sandbox"),
-                    LoadStep::done(format!("container  ({backend})")),
-                    LoadStep::active("shell"),
-                ];
+                loading_state.insert(
+                    tab_key.clone(),
+                    vec![
+                        LoadStep::done("sandbox"),
+                        LoadStep::done(format!("container  ({backend})")),
+                        LoadStep::active("shell"),
+                    ],
+                );
             }
             if let Err(e) =
                 panes.materialize_with_specs(&current_config, tab, &wt, &specs, chrome.center)
             {
                 model.status = format!("Pane spawn failed: {e}");
-                if is_active {
-                    model.load_steps = vec![
+                loading_state.insert(
+                    tab_key.clone(),
+                    vec![
                         LoadStep::done("sandbox"),
                         LoadStep::done("container"),
                         LoadStep::failed("shell"),
-                    ];
-                }
+                    ],
+                );
             } else {
-                // Keep load_steps until first PTY output arrives (cleared in
+                // Keep the loading entry until first PTY output arrives (cleared in
                 // the PaneEvent::Output handler above) so the loading screen
                 // stays visible until the shell actually produces content —
                 // no blank flash between fork and first render.
@@ -11131,6 +11174,27 @@ async fn event_loop<T: Terminal>(
             crate::hydrate::spawn_disk_scan(current_config.disk.clone(), Some(waker.clone()));
         }
 
+        // Derive the loading splash from the per-worktree store: `model.load_steps`
+        // always reflects the ACTIVE worktree's provisioning progress, so switching
+        // away and back preserves it (no reset) and a finished background worktree
+        // shows no stale splash. The store is written by the materialize/provision/
+        // spec flow above and cleared on first PTY output / hard failure.
+        {
+            let akey = session
+                .worktrees
+                .get(session.active)
+                .map(|g| (g.name.clone(), g.active_tab));
+            let derived = akey
+                .as_ref()
+                .and_then(|k| loading_state.get(k))
+                .cloned()
+                .unwrap_or_default();
+            if model.load_steps != derived {
+                model.load_steps = derived;
+                dirty = true;
+            }
+        }
+
         // Startup-shell watchdog: while the loading splash is up (it clears on
         // the loading pane's first PTY output), a shell that has been alive past
         // SHELL_OUTPUT_WATCHDOG with nothing on screen is hung — almost always a
@@ -11171,6 +11235,7 @@ async fn event_loop<T: Terminal>(
                         if let Some(tab) = session.tab_mut(gi, ti) {
                             crate::panes::replace_single_dead_center_pane(tab, pid, fresh);
                         }
+                        loading_state.remove(&(session.worktrees[gi].name.clone(), ti));
                         model.load_steps.clear();
                         model.status = "Shell produced no output — fell back to a plain \
                             shell. Your login shell's startup files likely hang or error \
@@ -11180,6 +11245,7 @@ async fn event_loop<T: Terminal>(
                         need_relayout = true;
                     }
                     Err(e) => {
+                        loading_state.remove(&(session.worktrees[gi].name.clone(), ti));
                         model.load_steps.clear();
                         center_dormant = true;
                         model.status = format!(
