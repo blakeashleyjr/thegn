@@ -73,6 +73,10 @@ pub enum Action {
     NextWorkspace,
     /// Switch to the previous workspace (Shift+Alt+Up).
     PrevWorkspace,
+    /// Toggle keyboard between the workspaces region and the terminals region
+    /// (Alt+`), restoring the last-active item in each. From a worktree it jumps
+    /// to your last terminal; from a terminal it jumps back to your last worktree.
+    ToggleRegion,
     /// Reorder the selected item up (Ctrl+Alt+Up): the cursor workspace if the
     /// sidebar is focused on one, else the active worktree within its workspace.
     MoveItemUp,
@@ -383,6 +387,13 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         label: "Next workspace",
         hint: "next ws",
         default_chords: &["Shift Alt Down"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "toggle-region",
+        label: "Toggle workspaces / terminals",
+        hint: "ws↔term",
+        default_chords: &["Alt `"],
         palette: true,
     },
     ActionSpec {
@@ -902,6 +913,7 @@ impl Action {
             Action::PrevWorktree => "prev-worktree",
             Action::NextWorkspace => "next-workspace",
             Action::PrevWorkspace => "prev-workspace",
+            Action::ToggleRegion => "toggle-region",
             Action::MoveItemUp => "move-item-up",
             Action::MoveItemDown => "move-item-down",
             Action::MoveWorktreeToFolder => "move-worktree-to-folder",
@@ -994,6 +1006,7 @@ impl Action {
             "prev-worktree" => Action::PrevWorktree,
             "next-workspace" => Action::NextWorkspace,
             "prev-workspace" => Action::PrevWorkspace,
+            "toggle-region" | "terminals-toggle" => Action::ToggleRegion,
             "move-item-up" | "move-worktree-up" => Action::MoveItemUp,
             "move-item-down" | "move-worktree-down" => Action::MoveItemDown,
             "move-worktree-to-folder" => Action::MoveWorktreeToFolder,
@@ -1548,6 +1561,10 @@ pub fn default_keymap() -> KeyMap {
         .unwrap();
     map.insert_all("Shift Alt Down", Action::NextWorkspace)
         .unwrap();
+    // Alt+` bounces between the workspaces region and the terminals region,
+    // restoring the last item in each (Shift+Alt+↑/↓ also overflows across the
+    // boundary; see the region-navigation handlers in run.rs).
+    map.insert_all("Alt `", Action::ToggleRegion).unwrap();
     // Ctrl+Alt+↑/↓ reorders the selected item: the workspace under the sidebar
     // cursor if the sidebar is focused, else the active worktree.
     map.insert_all("Ctrl Alt Up", Action::MoveItemUp).unwrap();
@@ -2249,6 +2266,32 @@ mod tests {
                 Key::modified(KeyCode::Char('i'), Modifiers::ALT)
             ),
             MatchResult::Matched(Action::ToggleNotifications)
+        );
+    }
+
+    #[test]
+    fn toggle_region_action_round_trips_and_binds_alt_backtick() {
+        assert_eq!(Action::ToggleRegion.key(), "toggle-region");
+        assert_eq!(
+            Action::from_key("toggle-region"),
+            Some(Action::ToggleRegion)
+        );
+        // Legacy/alias id still resolves.
+        assert_eq!(
+            Action::from_key("terminals-toggle"),
+            Some(Action::ToggleRegion)
+        );
+        let spec = action_spec("toggle-region").expect("spec registered");
+        assert!(spec.palette, "must appear in the command palette");
+        assert_eq!(spec.default_chords, &["Alt `"]);
+        // The default keymap must actually BIND Alt+` (metadata is separate).
+        let mut map = default_keymap();
+        assert_eq!(
+            map.dispatch(
+                Mode::Normal,
+                Key::modified(KeyCode::Char('`'), Modifiers::ALT)
+            ),
+            MatchResult::Matched(Action::ToggleRegion)
         );
     }
 

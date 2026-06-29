@@ -913,6 +913,46 @@ pub fn native_shell_exec(cfg: &Config, worktree: &str) -> Option<NativeShell> {
     })
 }
 
+/// Whether eager (ahead-of-focus) provisioning should run for `worktree`: its env
+/// is a managed provider AND its sandbox does NOT exist yet (checked via a cheap
+/// `list()` GET that never wakes an existing/idle sandbox). This keeps eager
+/// provisioning budget-safe — it only ever front-runs the create+provision of a
+/// genuinely-missing sandbox (first-ever open or post-destroy), never waking an
+/// already-provisioned idle one just to re-check it. Off-loop (network); `false`
+/// for non-provider envs, a tokenless/unbuilt provider, or any list error.
+pub fn needs_eager_provision(cfg: &Config, worktree: &str) -> bool {
+    let loc = GitLoc::for_worktree(Path::new(worktree));
+    let repo_root: PathBuf = Db::open()
+        .ok()
+        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| repo::main_worktree(Path::new(worktree)))
+        .unwrap_or_else(|| PathBuf::from(worktree));
+    let selected_env = Db::open()
+        .ok()
+        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let environment = cfg.resolve_env(
+        &repo_root,
+        &loc,
+        Path::new(worktree),
+        selected_env.as_deref(),
+    );
+    let superzej_core::placement::Placement::Provider(p) = &environment.placement else {
+        return false;
+    };
+    let Some(envc) = cfg.env.get(&environment.name) else {
+        return false;
+    };
+    let Some(provider) = provider_for_named(&envc.provider, &p.id) else {
+        return false;
+    };
+    match block_on_provider(|| async { provider.list().await }) {
+        Ok(names) => !names.iter().any(|n| n == &p.id),
+        Err(_) => false,
+    }
+}
+
 /// Clear the failure cooldown for the worktree's provider native exec so a
 /// retry actually re-attempts the connection (otherwise [`env_halt_reason`]
 /// would re-halt immediately on the stale cooldown). No-op for non-provider

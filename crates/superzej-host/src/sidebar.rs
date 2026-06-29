@@ -323,6 +323,44 @@ pub(crate) fn terminal_host(conn: &str, kind: &str) -> (String, String, bool) {
     (host.to_lowercase(), host.to_string(), false)
 }
 
+/// Group `db_terminals` into host sections in sidebar **display order**:
+/// `local` first, then remote hosts by case-insensitive label. Each entry is
+/// `(collapse-key, display-label, is_local, terminals-in-order)`. The
+/// collapse-key is the bare host key; the row slug is `terminals/host:{key}`.
+/// Shared by the tree builder ([`build_rows`]) and the host/leaf region
+/// navigation in `run.rs`, so both see exactly one ordering.
+pub fn terminal_hosts_ordered(
+    db_terminals: &[superzej_core::models::TerminalRow],
+) -> Vec<(
+    String,
+    String,
+    bool,
+    Vec<&superzej_core::models::TerminalRow>,
+)> {
+    let mut host_order: Vec<(String, String, bool)> = Vec::new();
+    let mut groups: std::collections::HashMap<String, Vec<&superzej_core::models::TerminalRow>> =
+        std::collections::HashMap::new();
+    for t in db_terminals {
+        let (key, label, local) = terminal_host(&t.connection_string, &t.kind);
+        if !groups.contains_key(&key) {
+            host_order.push((key.clone(), label, local));
+        }
+        groups.entry(key).or_default().push(t);
+    }
+    // `local` sorts first; the rest by label, case-insensitively.
+    host_order.sort_by(|a, b| {
+        b.2.cmp(&a.2) // local (true) before remote (false)
+            .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
+    });
+    host_order
+        .into_iter()
+        .map(|(key, label, local)| {
+            let terms = groups.remove(&key).unwrap_or_default();
+            (key, label, local, terms)
+        })
+        .collect()
+}
+
 /// Build the full ordered row list for the tree. `workspaces` is the
 /// `(slug, display, kind, repo_path)` list in workspace order (caller pulls it
 /// from the DB + live groups). `status` carries per-worktree status merged
@@ -759,36 +797,19 @@ pub fn build_rows(
         });
 
         // Under the banner, terminals divide into collapsible sections by host,
-        // `local` first, then remote hosts in stable label order. Group order is
-        // derived from `db_terminals` (already ordered by position/last_active).
-        let mut host_order: Vec<(String, String, bool)> = Vec::new();
-        let mut groups: std::collections::HashMap<
-            String,
-            Vec<&superzej_core::models::TerminalRow>,
-        > = std::collections::HashMap::new();
-        for t in db_terminals {
-            let (key, label, local) = terminal_host(&t.connection_string, &t.kind);
-            if !groups.contains_key(&key) {
-                host_order.push((key.clone(), label, local));
-            }
-            groups.entry(key).or_default().push(t);
-        }
-        // `local` sorts first; the rest by label, case-insensitively.
-        host_order.sort_by(|a, b| {
-            b.2.cmp(&a.2) // local (true) before remote (false)
-                .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
-        });
+        // `local` first, then remote hosts in stable label order. Grouping +
+        // ordering is shared with the region-navigation logic in `run.rs`.
+        let host_order = terminal_hosts_ordered(db_terminals);
 
-        for (key, label, local) in &host_order {
+        for (key, label, local, terms) in &host_order {
             let slug = format!("terminals/host:{key}");
             let collapsed = view.collapsed.contains(&slug);
             // A representative connection drives the host glyph (💻 vs 🌐).
             let rep_conn = if *local {
                 String::new()
             } else {
-                groups
-                    .get(key)
-                    .and_then(|g| g.first())
+                terms
+                    .first()
                     .map(|t| t.connection_string.clone())
                     .unwrap_or_default()
             };
@@ -823,7 +844,7 @@ pub fn build_rows(
             if collapsed {
                 continue;
             }
-            for t in groups.get(key).into_iter().flatten() {
+            for t in terms {
                 let active = session
                     .worktrees
                     .get(session.active)
