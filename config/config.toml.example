@@ -365,7 +365,12 @@ format = "text"           # text | json
 # new-worktree = "Space g w"   # press Space, then g, then w
 # Sidebar navigation (global):
 #   Alt ↑/↓        navigate worktrees, wrapping WITHIN the current workspace
-#   Shift+Alt ↑/↓  switch to the previous/next *workspace* (a real context switch)
+#                  (in the TERMINALS region, cycles terminals within the host)
+#   Shift+Alt ↑/↓  switch to the previous/next *workspace* (a real context
+#                  switch); at the boundary it overflows into the TERMINALS
+#                  region (and its host groups) and wraps back around
+#   Alt+`          toggle between the workspaces and TERMINALS regions, restoring
+#                  the last item you were on in each
 #   Alt+1..9       jump straight to the worktree at that slot in visible order
 #   Ctrl+1..9      jump straight to the workspace at that slot in visible order
 #                  (the Alt/Ctrl digit hints are revealed on the rows while the
@@ -377,6 +382,7 @@ format = "text"           # text | json
 # with `s` while the sidebar is focused.
 # prev-workspace = "Shift Alt Up"
 # next-workspace = "Shift Alt Down"
+# toggle-region = "Alt `"          # bounce between workspaces and terminals
 # summon-workspace-1 = "Ctrl 1"    # …through summon-workspace-9 = "Ctrl 9"
 # summon-worktree-1 = "Alt 1"      # …through summon-worktree-9 = "Alt 9"
 # summon-pin-1 = "Ctrl Alt 1"      # …through summon-pin-9 = "Ctrl Alt 9"
@@ -1376,10 +1382,14 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 #                            #         pane spawn, pull changes back on close.
 # [env.sprites.provider]
 # provider = "sprites"       # selects the SpritesProvider REST adapter
-# id = "{worktree}"          # sprite name. Tokens give a PER-WORKTREE sprite:
-#                            #   {worktree}=dir basename, {slug}=full path (globally
-#                            #   unique), ""=basename. A literal name with no token
-#                            #   = one SHARED sprite across all worktrees.
+# id = "{repo}-{worktree}-{hash}"   # sprite name; tokens give a PER-WORKTREE sprite.
+#                            #   {repo}=repo dir name, {worktree}=worktree dir basename
+#                            #   (the branch slug), {hash}=stable digest of the full
+#                            #   worktree path (the collision-defuser: two same-named
+#                            #   branches in different repos still differ), {slug}=full
+#                            #   path. Empty ⇒ this default (conflict-free across repos,
+#                            #   org-wide). A literal with no token = one SHARED sprite.
+#                            #   Clamped to a DNS-safe length, keeping the hash suffix.
 # api_key_env = "SPRITES_TOKEN"        # empty ⇒ defaults to SPRITES_TOKEN
 # # api_base = "https://api.sprites.dev/v1"   # empty ⇒ this default
 # # workdir = "/workspace"   # data = "sync" pushes/pulls the worktree here

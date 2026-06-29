@@ -89,6 +89,28 @@ pub fn slugify(s: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+/// A short, STABLE alphanumeric digest of a string — deterministic across runs,
+/// processes, platforms, and Rust versions (unlike `DefaultHasher`, whose output
+/// is explicitly not stable). Used to give per-worktree sandbox names a
+/// collision-defusing suffix derived from the worktree's full path, so two
+/// worktrees whose human-readable parts (repo + branch) coincide still map to
+/// distinct sandboxes. FNV-1a 64-bit → fixed `len` base36 chars (36^6 ≈ 2.2e9 of
+/// space at the default length — ample for disambiguating worktrees).
+pub fn short_hash(s: &str, len: usize) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+    }
+    const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut buf = vec![b'0'; len.max(1)];
+    for slot in buf.iter_mut().rev() {
+        *slot = ALPHABET[(h % 36) as usize];
+        h /= 36;
+    }
+    String::from_utf8(buf).unwrap()
+}
+
 pub fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -698,6 +698,28 @@ fn provider_for_named(
     }
 }
 
+/// The resolved provider sandbox NAME for a worktree's env — the single source of
+/// truth. Resolves the env exactly as the pane path does (`resolve_env` →
+/// `ProviderPlacement.id`) so provisioning, attach (`native_shell_exec`),
+/// checkpoint, and teardown all compute the SAME name (the id embeds a stable
+/// path-hash; deriving it inconsistently would orphan/leak sandboxes). `None` for
+/// a non-provider env. Mirrors how the other launch paths resolve `repo_root`.
+fn provider_sandbox_name(cfg: &Config, worktree: &str, env_name: &str) -> Option<String> {
+    let loc = GitLoc::for_worktree(Path::new(worktree));
+    let repo_root: PathBuf = Db::open()
+        .ok()
+        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| repo::main_worktree(Path::new(worktree)))
+        .unwrap_or_else(|| PathBuf::from(worktree));
+    let env = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), Some(env_name));
+    match env.placement {
+        superzej_core::placement::Placement::Provider(p) => Some(p.id),
+        _ => None,
+    }
+}
+
 /// Per-provider native-exec health: after a connect/exec failure, `exec = "auto"`
 /// spawns skip the native path (use the CLI) for a cooldown, then retry — so one
 /// flaky WSS connect degrades gracefully instead of husking every new pane.
@@ -996,12 +1018,11 @@ pub fn provision_provider_env(
         return Ok(false);
     };
     let pc = &env.provider;
-    let id = superzej_core::config::effective_provider_id(&pc.id, Path::new(worktree));
-    if id.is_empty() {
+    let Some(id) = provider_sandbox_name(cfg, worktree, env_name).filter(|s| !s.is_empty()) else {
         return Ok(false);
-    }
+    };
     // Bake the resolved id so a recreate (`ensure_exists`→`create`) names the
-    // sandbox correctly when `pc.id` is a `{worktree}` template.
+    // sandbox correctly (the id embeds the repo/worktree tokens + a path-hash).
     let Some(provider) = provider_for_named(pc, &id) else {
         return Ok(false);
     };
@@ -1384,13 +1405,16 @@ fn auto_provision_sandbox(cfg: &Config, env_name: &str, worktree: &str) -> anyho
         return Ok(());
     };
     let pc = &env.provider;
-    // Per-worktree id (so each worktree warms its own sandbox).
-    let name = superzej_core::config::effective_provider_id(&pc.id, Path::new(worktree));
-    if !pc.auto_provision || name.is_empty() {
+    if !pc.auto_provision {
         return Ok(());
     }
-    // Bake the RESOLVED per-worktree name so `ensure_exists`→`create` names the
-    // new sandbox correctly (the raw `pc.id` may be a `{worktree}` template).
+    // Per-worktree id from the single source of truth (resolved placement).
+    let Some(name) = provider_sandbox_name(cfg, worktree, env_name).filter(|s| !s.is_empty())
+    else {
+        return Ok(());
+    };
+    // Bake the RESOLVED name so `ensure_exists`→`create` names the new sandbox
+    // correctly (the raw `pc.id` is a template + embeds a path-hash).
     let Some(provider) = provider_for_named(pc, &name) else {
         return Ok(());
     };
@@ -1425,12 +1449,15 @@ pub fn checkpoint_on_close(worktree: &str) {
         return;
     };
     let pc = &env.provider;
-    // Per-worktree id (so each worktree checkpoints its own sandbox).
-    let name = superzej_core::config::effective_provider_id(&pc.id, Path::new(worktree));
-    if !pc.auto_checkpoint || name.is_empty() {
+    if !pc.auto_checkpoint {
         return;
     }
-    let Some(provider) = provider_for(pc) else {
+    // Per-worktree id from the single source of truth (resolved placement).
+    let Some(name) = provider_sandbox_name(&cfg, worktree, &env_name).filter(|s| !s.is_empty())
+    else {
+        return;
+    };
+    let Some(provider) = provider_for_named(pc, &name) else {
         return;
     };
     if !provider.caps().checkpoints {
@@ -1442,30 +1469,23 @@ pub fn checkpoint_on_close(worktree: &str) {
     }
 }
 
-/// Tear down a worktree's managed-provider sandbox when the worktree is deleted.
-/// Mirror of [`checkpoint_on_close`] but for permanent deletion: a deleted
-/// worktree should not leave a paid-for, per-worktree sandbox (sprite) running.
-/// Best-effort + off-loop (network DELETE): loads config, resolves the env from
-/// the path, and destroys the per-worktree sandbox if the env is a provider.
-/// No-op for local/ssh/k8s envs or an unconfigured/tokenless provider. Idempotent
-/// (the provider treats a 404 as already-gone), so racing a TTL/manual delete is
-/// fine. Called from the worktree-delete thread, which has only the path.
-/// Destroy the per-worktree sandbox for a worktree whose env name is already
-/// known. The worktree-delete path resolves the env name from the DB *before* it
-/// forgets the worktree's rows (a later DB-based resolve would return nothing and
-/// leak the sandbox). Best-effort + off-loop (a network DELETE); idempotent (the
-/// provider treats a 404 as already-gone). No-op for local/ssh/k8s envs or an
-/// unconfigured/tokenless provider.
+/// Tear down a worktree's managed-provider sandbox when the worktree is deleted —
+/// a deleted worktree should not leave a paid-for per-worktree sandbox running.
+/// The worktree-delete path resolves the env name from the DB *before* it forgets
+/// the worktree's rows (a later DB-based resolve would return nothing and leak the
+/// sandbox). Best-effort + off-loop (a network DELETE); idempotent (the provider
+/// treats a 404 as already-gone, so racing a TTL/manual delete is fine). No-op for
+/// local/ssh/k8s envs or an unconfigured/tokenless provider.
 pub fn destroy_provider_sandbox(worktree: &str, env_name: &str) {
     let cfg = Config::load_layered(&superzej_core::config::ProcessEnv, &[], None);
     let Some(env) = cfg.env.get(env_name) else {
         return;
     };
     let pc = &env.provider;
-    let name = superzej_core::config::effective_provider_id(&pc.id, Path::new(worktree));
-    if name.is_empty() {
+    let Some(name) = provider_sandbox_name(&cfg, worktree, env_name).filter(|s| !s.is_empty())
+    else {
         return;
-    }
+    };
     let Some(provider) = provider_for_named(pc, &name) else {
         return;
     };
