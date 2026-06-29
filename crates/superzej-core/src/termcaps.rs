@@ -254,13 +254,13 @@ pub struct GlyphSet {
     pub cross_heavy: &'static str,    // ✖ pin failed
     pub arrow_up: &'static str,       // ↑ ahead
     pub arrow_down: &'static str,     // ↓ behind
-    pub diamond_filled: &'static str, // ◆ masthead / active step
+    pub diamond_filled: &'static str, // ◆ masthead
     pub diamond_hollow: &'static str, // ◇ pending step
     pub check: &'static str,          // ✓ pass
     pub cross: &'static str,          // ✗ fail
     pub ellipsis: &'static str,       // … truncation
     pub middot: &'static str,         // · separator
-    pub refresh: &'static str,        // ↻ relaunch hint
+    pub refresh: &'static str,        // ↻ relaunch hint / active (loading) step
     pub emdash: &'static str,         // — hint separator
     // Half-block pixel-font cells (logotype).
     pub block_full: &'static str, // █
