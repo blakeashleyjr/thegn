@@ -42,10 +42,10 @@ fn main() {
     // Forward a GitHub token (GH_TOKEN, else GITHUB_TOKEN) into the exec env as
     // GH_TOKEN, mirroring the real provisioner's passthrough so private clones work.
     let mut env: Vec<(String, String)> = Vec::new();
-    if let Ok(tok) = std::env::var("GH_TOKEN").or_else(|_| std::env::var("GITHUB_TOKEN")) {
-        if !tok.is_empty() {
-            env.push(("GH_TOKEN".to_string(), tok));
-        }
+    if let Ok(tok) = std::env::var("GH_TOKEN").or_else(|_| std::env::var("GITHUB_TOKEN"))
+        && !tok.is_empty()
+    {
+        env.push(("GH_TOKEN".to_string(), tok));
     }
     rt.block_on(async {
         let argv = vec!["/bin/sh".to_string(), "-lc".to_string(), cmd];

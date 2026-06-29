@@ -404,9 +404,11 @@ mod tests {
             let occupied = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
             let port = occupied.local_addr().unwrap().port();
             let mut sup = ForwardSupervisor::new();
-            let mut cfg = ForwardConfig::default();
             // Range that includes a free neighbour for the remap.
-            cfg.range = format!("{}-{}", port.saturating_add(1), port.saturating_add(50));
+            let cfg = ForwardConfig {
+                range: format!("{}-{}", port.saturating_add(1), port.saturating_add(50)),
+                ..ForwardConfig::default()
+            };
             let started = sup
                 .start(&cfg, "/wt", port, &["true".into()])
                 .expect("remap into range");
