@@ -97,8 +97,27 @@ fn shell_inner(in_oci: bool) -> String {
 }
 
 /// Like [`shell_inner`] but uses an explicit override from the sandbox config.
+/// Carries its own `exec` (like every branch of [`shell_inner`]'s probe chain)
+/// so the composer can drop it in verbatim — never prefixed with another `exec`.
 fn shell_inner_override(shell_override: &str) -> String {
-    format!("{shell_override} -l")
+    format!("exec {shell_override} -l")
+}
+
+/// The `inner` script for a **clean fallback shell**: a plain interactive shell
+/// with NO user rc/profile. Used by the startup watchdog when a personal login
+/// shell produces no output in time — typically a dotfile that hangs or errors
+/// in a provisioned env (e.g. a host `.zshrc` sourcing `/nix/store/...` paths
+/// that don't exist in the container). `bash --norc --noprofile` is the
+/// requested fallback; `zsh -f` (NO_RCS — skips every startup file) covers
+/// images without bash; `/bin/sh` is the universal last resort. None of these
+/// read the user rc, so a broken dotfile can't hang the fallback. Unlike
+/// [`shell_inner`], each branch carries its own `exec` and the script is used
+/// verbatim (no outer `exec` prefix), so it is composed without that wrapper.
+pub(crate) fn clean_shell_inner() -> String {
+    "command -v bash >/dev/null 2>&1 && exec bash --norc --noprofile; \
+     command -v zsh >/dev/null 2>&1 && exec zsh -f; \
+     exec /bin/sh"
+        .to_string()
 }
 
 /// A fully-resolved launch: the argv to spawn (sandbox/transport-wrapped when a
@@ -811,12 +830,41 @@ pub struct NativeShell {
 impl NativeShell {
     /// The [`ExecSpec`](superzej_svc::provider::ExecSpec) to open a fresh login
     /// shell inside the sandbox: a `/bin/sh -lc` that cd's into the worktree's
-    /// `workdir` then execs the resolved shell, with the pane env passed through.
+    /// `workdir` then runs the resolved shell, with the pane env passed through.
+    ///
+    /// `inner` is a self-contained script that does its OWN `exec` — either the
+    /// [`shell_inner`] runtime probe chain (`command -v zsh && exec zsh -l; …;
+    /// exec /bin/sh -l`) or [`shell_inner_override`] (`exec <shell> -l`). It must
+    /// NOT be prefixed with another `exec`: `exec command -v zsh …` makes the
+    /// shell try to exec a binary named `command` (a builtin), which fails with
+    /// 127 and kills the pane before any shell starts.
     pub fn open_spec(&self, cols: u16, rows: u16) -> superzej_svc::provider::ExecSpec {
         let script = if self.workdir.is_empty() {
             self.inner.clone()
         } else {
-            format!("cd {} 2>/dev/null; exec {}", self.workdir, self.inner)
+            format!("cd {} 2>/dev/null; {}", self.workdir, self.inner)
+        };
+        superzej_svc::provider::ExecSpec {
+            argv: vec!["/bin/sh".to_string(), "-lc".to_string(), script],
+            tty: true,
+            cols,
+            rows,
+            env: self.env.clone(),
+            cwd: (!self.workdir.is_empty()).then(|| self.workdir.clone()),
+        }
+    }
+
+    /// Like [`open_spec`](Self::open_spec) but execs a **clean, rc-free** shell
+    /// ([`clean_shell_inner`]) instead of the resolved login shell — the startup
+    /// watchdog's fallback when the login shell hangs/errors on the user's
+    /// dotfiles. The clean script carries its own `exec` chain, so it is dropped
+    /// in after the `cd` without an outer `exec` wrapper.
+    pub fn open_spec_clean(&self, cols: u16, rows: u16) -> superzej_svc::provider::ExecSpec {
+        let inner = clean_shell_inner();
+        let script = if self.workdir.is_empty() {
+            inner
+        } else {
+            format!("cd {} 2>/dev/null; {}", self.workdir, inner)
         };
         superzej_svc::provider::ExecSpec {
             argv: vec!["/bin/sh".to_string(), "-lc".to_string(), script],
@@ -1101,13 +1149,19 @@ pub fn provision_provider_env(
     // reach the network/model. Remote-safe (no host-local socket vars).
     let exec_env = cfg.repo_sandbox(&repo_root).passthrough_env_remote();
     // The generic, declarative personal layer ([sandbox.home]) — applied to every
-    // sandbox so it feels like local. `dotfiles` defaults sensibly when unset.
-    let home = &cfg.repo_sandbox(&repo_root).home;
-    let dotfiles = if home.dotfiles.is_empty() {
-        default_dotfiles()
-    } else {
-        home.dotfiles.clone()
-    };
+    // sandbox so it feels like local. Resolve it PER-ENV (the env overlay may set a
+    // different `strategy`, e.g. host-parity on a big box, clean on a sprite), then
+    // resolve which dotfiles to upload under that strategy (drops a non-portable rc
+    // with a warning; collects host store roots for host-parity).
+    let loc = GitLoc::for_worktree(Path::new(worktree));
+    let home = cfg
+        .resolve_env(&repo_root, &loc, Path::new(worktree), Some(env_name))
+        .sandbox
+        .home;
+    let host_home = std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/root"));
+    let (dotfiles, home_store_roots) = resolve_personal_dotfiles(&host_home, &home, env_name);
     let opts = PlanOpts {
         workdir: workdir.clone(),
         origin: local_origin(&repo_root),
@@ -1115,7 +1169,7 @@ pub fn provision_provider_env(
         dotfiles,
         tools: home.tools.clone(),
         dotfiles_repo: home.dotfiles_repo.clone(),
-        setup: resolve_setup(home),
+        setup: resolve_setup(&home),
         agents: home.agents.clone(),
         allow_nix: true,
         checkpoint: pc.auto_checkpoint,
@@ -1129,8 +1183,30 @@ pub fn provision_provider_env(
                 push: pc.binary_cache_push,
             }
         }),
+        strategy: home.strategy,
+        nix_home_flake: home.nix_home_flake.clone(),
+        home_store_roots,
     };
     let plan = envplan::plan(&req, &opts);
+
+    // Host-parity (Phase 2): push the host's home-shell closure to the configured
+    // binary cache so the in-sandbox `home_closure` step can substitute it and the
+    // exact host dotfiles resolve. Host-side (uses the host's `nix`), best-effort:
+    // only when a push cache is set — nixpkgs paths otherwise substitute from the
+    // default caches (cache.nixos.org) with no push. A failure just means the
+    // sandbox falls back to whatever its substituters can serve.
+    if opts.strategy == superzej_core::config::ShellStrategy::HostParity
+        && !opts.home_store_roots.is_empty()
+        && pc.binary_cache_push
+        && !pc.binary_cache_url.trim().is_empty()
+        && let Err(e) = push_home_closure(pc.binary_cache_url.trim(), &opts.home_store_roots)
+    {
+        superzej_core::msg::warn(&format!(
+            "host-parity: pushing the home closure to {} failed: {e}; the sandbox will \
+             substitute what it can from its default caches (e.g. cache.nixos.org).",
+            pc.binary_cache_url.trim(),
+        ));
+    }
 
     // The sandbox user's real `$HOME` — uploads must land there (sprites exec as
     // user `sprite`, HOME=/home/sprite, NOT /root). Resolved once via the exec API.
@@ -1246,6 +1322,108 @@ fn resolve_setup(home: &superzej_core::config::HomeConfig) -> Vec<String> {
         }
     }
     cmds
+}
+
+/// Resolve which host dotfiles to upload under the env's [`ShellStrategy`], and
+/// (for host-parity) the host `/nix/store` roots they reference.
+///
+/// - `Clean`: upload nothing (the plan drops the dotfiles step too).
+/// - `Portable`/`ToolParity` with `portable_dotfiles_only` (the default): read each
+///   candidate on the host and **skip** any that hard-codes absent store paths,
+///   warning which file + why. Portable files (`.gitconfig`, …) still upload.
+/// - `HostParity`: upload everything unfiltered and collect the store roots so the
+///   provisioner can reproduce their closure before the upload.
+///
+/// `home_dir` is the host `$HOME` (a param so it's unit-testable with a fixture).
+fn resolve_personal_dotfiles(
+    home_dir: &Path,
+    home: &superzej_core::config::HomeConfig,
+    env_name: &str,
+) -> (Vec<String>, Vec<String>) {
+    use superzej_core::config::ShellStrategy;
+    use superzej_core::envplan::{PitfallKind, scan_dotfile, store_roots_in};
+
+    let candidates = if home.dotfiles.is_empty() {
+        default_dotfiles()
+    } else {
+        home.dotfiles.clone()
+    };
+    let mut dotfiles = Vec::new();
+    let mut roots: Vec<String> = Vec::new();
+    for name in candidates {
+        let contents = std::fs::read_to_string(home_dir.join(&name)).ok();
+        match home.strategy {
+            ShellStrategy::Clean => {} // nothing personal under clean
+            ShellStrategy::HostParity => {
+                if let Some(c) = &contents {
+                    for r in store_roots_in(c) {
+                        if !roots.contains(&r) {
+                            roots.push(r);
+                        }
+                    }
+                }
+                dotfiles.push(name);
+            }
+            ShellStrategy::Portable | ShellStrategy::ToolParity => {
+                if home.portable_dotfiles_only
+                    && let Some(c) = &contents
+                {
+                    let absent: Vec<String> = scan_dotfile(&name, c, &home.tools)
+                        .into_iter()
+                        .filter(|p| p.kind == PitfallKind::AbsentStorePath)
+                        .map(|p| p.detail)
+                        .collect();
+                    if !absent.is_empty() {
+                        superzej_core::msg::warn(&format!(
+                            "[sandbox.home] {name} references {} path(s) absent in env {env_name:?} \
+                             (e.g. {}); skipping its upload (strategy=portable). Set \
+                             strategy=\"host-parity\" to reproduce the closure, or make the rc \
+                             portable (init tools by command name).",
+                            absent.len(),
+                            absent[0],
+                        ));
+                        continue;
+                    }
+                }
+                dotfiles.push(name);
+            }
+        }
+    }
+    (dotfiles, roots)
+}
+
+/// Pure: the `nix copy` argv to push the closure of `roots` to a binary cache.
+/// (Split out so the command shape is unit-testable without invoking `nix`.)
+fn nix_copy_argv(cache_url: &str, roots: &[String]) -> Vec<String> {
+    let mut argv = vec![
+        "copy".to_string(),
+        "--to".to_string(),
+        cache_url.to_string(),
+    ];
+    argv.extend(roots.iter().cloned());
+    argv
+}
+
+/// Host-side host-parity push: copy the closure of the host `/nix/store` `roots`
+/// the user's dotfiles reference to `cache_url`, so a sandbox can substitute them
+/// from there. Runs the host's `nix` (the host has the closure + a writable
+/// store). Best-effort — returns the error for the caller to warn on. `nix copy`
+/// closes over each root's full runtime closure automatically.
+fn push_home_closure(cache_url: &str, roots: &[String]) -> anyhow::Result<()> {
+    let argv = nix_copy_argv(cache_url, roots);
+    let out = std::process::Command::new("nix")
+        .args(&argv)
+        .output()
+        .map_err(|e| anyhow::anyhow!("spawn `nix copy`: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "nix copy exit {}: {}",
+            out.status.code().unwrap_or(-1),
+            tail_lines(&String::from_utf8_lossy(&out.stderr), 4)
+        ))
+    }
 }
 
 /// Host dotfiles to carry into a sandbox `$HOME` so the shell feels like home.
@@ -1689,7 +1867,11 @@ pub fn compose_spec(
     // (e.g. /run/current-system/sw/bin/zsh) does not exist in the container
     // filesystem.  Pass in_oci=true so shell_inner() uses only the basename.
     let in_oci = sb.spec.as_ref().is_some_and(|s| s.backend.is_oci());
-    let cmd = if choice == "shell" && !sb_shell.is_empty() {
+    let cmd = if choice == "clean-shell" {
+        // Watchdog fallback: a plain rc-free shell. Ignores any `[sandbox] shell`
+        // override on purpose — the override is part of what may be hanging.
+        clean_shell_inner()
+    } else if choice == "shell" && !sb_shell.is_empty() {
         shell_inner_override(&sb_shell)
     } else if choice == "shell" {
         shell_inner(in_oci)
@@ -1758,9 +1940,13 @@ pub fn launch_spec_with_key(
     let loc = GitLoc::for_worktree(Path::new(worktree));
 
     // Record the choice for the dashboard / `--resume` (keyed by worktree path).
+    // The transient `clean-shell` watchdog fallback is NOT recorded: it must not
+    // become the worktree's remembered agent (the user may fix their dotfiles).
     let saved_backend = match Db::open() {
         Ok(db) => {
-            let _ = db.set_worktree_agent(worktree, choice);
+            if choice != "clean-shell" {
+                let _ = db.set_worktree_agent(worktree, choice);
+            }
             db.worktree_sandbox(worktree).ok().flatten()
         }
         Err(_) => None,
@@ -2221,6 +2407,81 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resolve_personal_dotfiles_drops_nonportable_under_portable() {
+        use superzej_core::config::{HomeConfig, ShellStrategy};
+        let home_dir = std::env::temp_dir().join(format!("sz-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home_dir);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        // A portable file and a home-manager-style rc with absolute store paths.
+        std::fs::write(home_dir.join(".gitconfig"), "[user]\n  name = x\n").unwrap();
+        std::fs::write(
+            home_dir.join(".zshrc"),
+            "source /nix/store/abc-zsh-plugin/x.zsh\neval \"$(starship init zsh)\"\n",
+        )
+        .unwrap();
+
+        let portable = HomeConfig {
+            dotfiles: vec![".gitconfig".into(), ".zshrc".into()],
+            strategy: ShellStrategy::Portable,
+            portable_dotfiles_only: true,
+            ..HomeConfig::default()
+        };
+        let (files, roots) = resolve_personal_dotfiles(&home_dir, &portable, "sprite");
+        assert_eq!(
+            files,
+            vec![".gitconfig".to_string()],
+            "non-portable .zshrc dropped"
+        );
+        assert!(
+            roots.is_empty(),
+            "portable strategy collects no closure roots"
+        );
+
+        // host-parity keeps everything and collects the store roots.
+        let parity = HomeConfig {
+            strategy: ShellStrategy::HostParity,
+            ..portable.clone()
+        };
+        let (files, roots) = resolve_personal_dotfiles(&home_dir, &parity, "bigbox");
+        assert!(
+            files.contains(&".zshrc".to_string()),
+            "host-parity keeps the rc"
+        );
+        assert!(
+            roots.iter().any(|r| r.contains("zsh-plugin")),
+            "roots collected: {roots:?}"
+        );
+
+        // clean uploads nothing.
+        let clean = HomeConfig {
+            strategy: ShellStrategy::Clean,
+            ..portable.clone()
+        };
+        let (files, _) = resolve_personal_dotfiles(&home_dir, &clean, "sprite");
+        assert!(files.is_empty(), "clean uploads no dotfiles");
+
+        let _ = std::fs::remove_dir_all(&home_dir);
+    }
+
+    #[test]
+    fn nix_copy_argv_builds_push_command() {
+        let argv = nix_copy_argv(
+            "s3://my-cache",
+            &["/nix/store/a-foo".into(), "/nix/store/b-bar".into()],
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "copy".to_string(),
+                "--to".to_string(),
+                "s3://my-cache".to_string(),
+                "/nix/store/a-foo".to_string(),
+                "/nix/store/b-bar".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn native_exec_health_reports_and_recovers() {
         // Unique provider name so the process-global registry doesn't collide
         // with other tests.
@@ -2439,6 +2700,80 @@ mod tests {
             "host form must not emit a probe chain"
         );
         assert!(host.ends_with(" -l"), "host form must end with -l");
+    }
+
+    #[test]
+    fn native_open_spec_does_not_exec_prefix_the_probe_chain() {
+        // Regression: `open_spec` must not wrap the self-exec'ing probe chain in
+        // another `exec`. `exec command -v zsh …` makes the shell try to exec a
+        // binary named `command` (a builtin), failing with 127 and killing the
+        // pane before any shell starts — the sprite "shell instantly crashes +
+        // flashing splash" bug.
+        let n = NativeShell {
+            provider: superzej_svc::provider::Provider::Sprites(
+                superzej_svc::provider::SpritesProvider::new("", "t", "s"),
+            ),
+            provider_name: "sprites".into(),
+            sandbox_id: "s".into(),
+            inner: shell_inner(true),
+            workdir: "/workspace".into(),
+            env: vec![],
+        };
+        let spec = n.open_spec(80, 24);
+        let script = spec.argv.last().cloned().unwrap_or_default();
+        assert!(
+            !script.contains("exec command"),
+            "must not exec-prefix the probe chain (127 footgun): {script}"
+        );
+        // The chain itself still self-execs into a shell, ending in /bin/sh.
+        assert!(script.contains("command -v zsh") && script.contains("exec /bin/sh -l"));
+        // And it cd's into the workdir first.
+        assert!(script.starts_with("cd /workspace"));
+    }
+
+    #[test]
+    fn clean_shell_inner_is_rc_free_with_sh_fallback() {
+        let clean = clean_shell_inner();
+        // Plain bash is the requested fallback and must skip every startup file.
+        assert!(
+            clean.contains("bash --norc --noprofile"),
+            "must prefer a no-rc/no-profile bash"
+        );
+        // The zsh middle option must use -f (NO_RCS) so a broken .zshrc can't hang.
+        assert!(
+            clean.contains("zsh -f"),
+            "zsh fallback must skip startup files"
+        );
+        // Universal last resort.
+        assert!(clean.ends_with("exec /bin/sh"), "must end with /bin/sh");
+        // Crucially: it must NEVER run a login shell that sources the user rc.
+        assert!(
+            !clean.contains("-l") && !clean.contains("zsh -l") && !clean.contains("bash -l"),
+            "clean fallback must not be a login shell"
+        );
+    }
+
+    #[test]
+    fn compose_spec_clean_shell_choice_uses_rc_free_shell() {
+        // The `clean-shell` choice composes the rc-free chain, ignoring the normal
+        // login-shell path and any sandbox shell override.
+        let cfg = Config::default();
+        let loc = GitLoc::from_db("/wt/x", None);
+        let sb = SandboxOutcome {
+            spec: None, // host fallback → `$SHELL -lc <cmd>`
+            backend_label: "host".into(),
+            warnings: vec![],
+            shell: String::new(),
+            is_remote: false,
+            cwd_override: None,
+            location: None,
+        };
+        let spec = compose_spec(&cfg, "/wt/x", None, "clean-shell", &loc, &sb);
+        let joined = spec.argv.join(" ");
+        assert!(
+            joined.contains("bash --norc --noprofile"),
+            "clean-shell argv must carry the rc-free chain, got: {joined}"
+        );
     }
 
     #[test]

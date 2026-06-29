@@ -1064,6 +1064,31 @@ failover = false
 # # the HOST's service — a host localhost DB/API, or a host-bound MCP server.
 # # Specs: "5432" (same port), "8080:5432" (host loopback port), "8080:db.lan:5432".
 # reverse_forwards = ["5432", "11434"]
+# # How hard to reproduce YOUR host shell here (a ladder, default "portable"):
+# #   clean       — no personal dotfiles/tools; a plain rc-free shell. Bulletproof.
+# #   portable    — install tools + portable dotfiles, but SKIP (with a warning) a
+# #                 dotfile that hard-codes paths absent in the sandbox (e.g. a
+# #                 home-manager ~/.zshrc full of /nix/store/… paths) rather than
+# #                 shipping a broken shell. The safe default.
+# #   tool-parity — portable, plus install tools your rc references but didn't list.
+# #   host-parity — reproduce the host nix closure so your EXACT dotfiles work
+# #                 unchanged (experimental; cache-first, see below). Heavy — meant
+# #                 for long-lived boxes, set per-env (see [env.<name>] below).
+# strategy = "portable"
+# # When true (default), under portable/tool-parity a dotfile that references absent
+# # store paths is skipped+warned instead of uploaded broken. false = upload anyway.
+# portable_dotfiles_only = true
+# # host-parity fallback: your home-manager flake for an in-sandbox `home-manager
+# # switch` when no binary cache is available (the cache-first closure copy reuses
+# # [env.<name>.provider] binary_cache_*). Empty = disabled.
+# nix_home_flake = ""
+
+# The personal layer is per-env overridable: keep a safe global default, but ask
+# for full parity on a long-lived box and a clean shell on an ephemeral sprite.
+# [env.bigbox.sandbox.home]
+# strategy = "host-parity"
+# [env.sprite.sandbox.home]
+# strategy = "clean"
 
 # Drive the OCI runtime against a REMOTE daemon instead of SSH-wrapping the whole
 # backend argv (an alternative reach to `[env.<name>] placement = "ssh"`, for when
@@ -1411,7 +1436,15 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # # binary_cache_url = ""           # extra Nix substituter so the devShell is a
 # # binary_cache_key = ""           #   download not a build (needs the public key)
 # # binary_cache_push = false       # push the built devShell closure to the cache
-# #                                 #   during provisioning (needs a signing key)
+# #                                 #   during provisioning (needs a signing key).
+# #                                 #   ALSO used by [sandbox.home] strategy =
+# #                                 #   "host-parity": the host pushes your dotfiles'
+# #                                 #   /nix/store closure here so the sandbox
+# #                                 #   substitutes it (pure-nixpkgs paths need no
+# #                                 #   push — they come from cache.nixos.org). The
+# #                                 #   sandbox must have EGRESS to the cache host
+# #                                 #   (allow it in [sandbox] network_allow if the
+# #                                 #   env filters egress).
 # # exec = "auto"            # how the interactive pane attaches:
 # #                          #   auto — native API exec (PTY-over-WebSocket, NO
 # #                          #          `sprite` CLI) when the provider supports it
