@@ -418,7 +418,41 @@ fn show(cfg: &Config, worktree: Option<String>) -> Result<()> {
             &env.sandbox.image
         }
     );
+    match env_isolation(&env) {
+        Some(class) => outln!("isolation: {class} — {}", class.escape_note()),
+        None => outln!("isolation: resolved at spawn from backend_chain"),
+    }
     Ok(())
+}
+
+/// The honest boundary class the resolved environment provides, or `None` when
+/// the backend is `auto` (resolved at spawn). Placement owns the boundary first
+/// (provider/k8s), otherwise it follows the concrete backend.
+fn env_isolation(
+    env: &superzej_core::env::Environment,
+) -> Option<superzej_core::capabilities::IsolationClass> {
+    use superzej_core::placement::Placement;
+    match env.placement {
+        Placement::Provider(_) | Placement::K8s(_) => Some(
+            superzej_core::capabilities::Capabilities::from_parts(
+                superzej_core::sandbox::Backend::None,
+                &env.placement,
+                false,
+            )
+            .isolation,
+        ),
+        _ => {
+            let backend = superzej_core::sandbox::Backend::from_config(env.sandbox.backend)?;
+            Some(
+                superzej_core::capabilities::Capabilities::from_parts(
+                    backend,
+                    &env.placement,
+                    false,
+                )
+                .isolation,
+            )
+        }
+    }
 }
 
 fn set(cfg: &Config, name: &str, worktree: Option<String>, workspace: bool) -> Result<()> {
