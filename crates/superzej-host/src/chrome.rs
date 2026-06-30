@@ -392,6 +392,10 @@ pub struct FrameModel {
     pub sync_panes: bool,
     /// Transient message (errors, "Config reloaded", copy confirmations).
     pub status: String,
+    /// Warm-spare-pool state for the active workspace as `(ready, target)`, or
+    /// `None` to hide the sidebar chip (no provider env / pool disabled). Set by
+    /// the loop's pool maintainer, not hydration.
+    pub pool: Option<(usize, usize)>,
     /// Context-dependent keybind hints for the bottom bar as (chord, label)
     /// pairs (rebuilt per focus zone — the dynamic replacement for per-panel
     /// help rows). Rendered as key chips + dim labels.
@@ -447,6 +451,10 @@ pub struct FrameModel {
     /// Ordered launch steps shown in the loading screen while the first pane
     /// is spawning. Empty = no loading screen. Cleared once a live pane exists.
     pub load_steps: Vec<LoadStep>,
+    /// Context shown beneath the loading steps: `(key, value)` facts about where
+    /// the pane is coming up — env, placement, provider/sandbox, connect, workdir.
+    /// Empty hides the block. Only meaningful while [`Self::load_steps`] is set.
+    pub load_context: Vec<(String, String)>,
 }
 
 /// Health of the active worktree's container.
@@ -466,6 +474,9 @@ pub enum ContainerHealth {
 pub struct LoadStep {
     pub label: String,
     pub state: StepState,
+    /// Optional dim sub-line under the step — a live status for the active step
+    /// or the captured error for a failed one. Rendered indented below `label`.
+    pub detail: Option<String>,
 }
 
 /// Visual state of a [`LoadStep`].
@@ -486,25 +497,35 @@ impl LoadStep {
         Self {
             label: label.into(),
             state: StepState::Pending,
+            detail: None,
         }
     }
     pub fn active(label: impl Into<String>) -> Self {
         Self {
             label: label.into(),
             state: StepState::Active,
+            detail: None,
         }
     }
     pub fn done(label: impl Into<String>) -> Self {
         Self {
             label: label.into(),
             state: StepState::Done,
+            detail: None,
         }
     }
     pub fn failed(label: impl Into<String>) -> Self {
         Self {
             label: label.into(),
             state: StepState::Failed,
+            detail: None,
         }
+    }
+    /// Attach a dim sub-line (status / error) under the step.
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        let d = detail.into();
+        self.detail = (!d.trim().is_empty()).then_some(d);
+        self
     }
 }
 
@@ -2040,6 +2061,12 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
     // expands to a detail line when it has secondary metadata.
     let mut composed: Vec<(Vec<crate::seg::Line>, crate::seg::Tok, bool)> =
         Vec::with_capacity(visible.len());
+    // The warm-pool chip rides the ACTIVE workspace's row — the workspace_slug of
+    // the active worktree row. (Workspace rows themselves carry `active = false`.)
+    let active_ws_slug: Option<String> = visible
+        .iter()
+        .find(|r| r.active && r.kind == RowKind::Worktree)
+        .map(|r| r.workspace_slug.clone());
     for (i, row) in visible.iter().enumerate() {
         let is_cursor = i == cursor;
         // A row is the last child at its depth when the next visible row steps
@@ -2053,7 +2080,14 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
                 .as_deref()
                 .and_then(|p| model.sidebar_window_titles.get(p))
                 .map(String::as_str);
-            compose_row_lines(row, wt, is_cursor, is_last, slots[i])
+            let pool = if row.kind == RowKind::Workspace
+                && active_ws_slug.as_deref() == Some(row.workspace_slug.as_str())
+            {
+                model.pool
+            } else {
+                None
+            };
+            compose_row_lines(row, wt, is_cursor, is_last, slots[i], pool)
         };
         // A section banner gets a breathing gap above it (except at the top).
         if !rail && row.kind == RowKind::SectionHeading && i > 0 {
@@ -2317,6 +2351,9 @@ fn compose_row_lines(
     expanded: bool,
     is_last: bool,
     slot: Option<u8>,
+    // Warm-spare-pool `(ready, target)` to show on THIS row — `Some` only for the
+    // active workspace's row (the pool is per-workspace). `None` hides the chip.
+    pool: Option<(usize, usize)>,
 ) -> Vec<crate::seg::Line> {
     use crate::seg::{Line, Seg, Tok, seg, sp};
     use crate::sidebar::{ActivityState, RowKind};
@@ -2358,7 +2395,22 @@ fn compose_row_lines(
                 l.push(seg(Tok::Slot(S::Text), "\u{1f4c1} "));
             }
             l.push(seg(Tok::Slot(S::Text), row.label.clone()).bold());
-            vec![Line::Segs(l)]
+            // Warm-spare-pool chip, RIGHT-aligned on the active workspace's title
+            // (accent when full, dim while still provisioning spares).
+            match pool.filter(|(_, t)| *t > 0) {
+                Some((ready, target)) => {
+                    let tok = if ready >= target {
+                        Tok::Slot(S::Accent)
+                    } else {
+                        Tok::Slot(S::Dim)
+                    };
+                    vec![Line::Split {
+                        l,
+                        r: vec![seg(tok, format!("warm {ready}/{target} "))],
+                    }]
+                }
+                None => vec![Line::Segs(l)],
+            }
         }
         RowKind::SectionHeading => vec![Line::Segs(vec![
             sp(1),

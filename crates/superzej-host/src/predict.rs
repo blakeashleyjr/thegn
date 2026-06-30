@@ -13,9 +13,10 @@
 //! keystrokes/output/render to it (see the `predict` design doc). Everything here
 //! is deterministic + unit-tested; time is injected (millis) so there's no clock.
 //
-// The pane integration (overlay render + emulator alt-screen/app-mode gates +
-// the keystroke/output hooks) is the live-tuning follow-up; until it lands this
-// pure core is exercised only by the unit tests below.
+// The pane integration is live: `PtyPane` drives the keystroke/output hooks and
+// the alt-screen/app-mode/prompt-row gates (see `pane.rs`), and `run.rs` paints
+// the overlay + advances the caret just before the frame diff. A couple of
+// diagnostic accessors (srtt_ms, clear) are kept for tuning.
 #![allow(dead_code)]
 
 /// A smoothed round-trip-time estimate (EWMA), in milliseconds. Drives the
@@ -29,7 +30,10 @@ pub struct Srtt {
 impl Default for Srtt {
     fn default() -> Self {
         // 0.25 — standard-ish EWMA weight on the newest sample.
-        Srtt { ms: None, alpha: 0.25 }
+        Srtt {
+            ms: None,
+            alpha: 0.25,
+        }
     }
 }
 
@@ -110,13 +114,21 @@ impl Predictor {
         self.srtt.get().is_some_and(|ms| ms >= PREDICT_MIN_SRTT_MS)
     }
 
-    /// A printable keystroke was sent. Record it as a prediction (caller has
-    /// already checked [`should_predict`]). `now_ms` stamps the burst start for
-    /// the srtt sample taken on the next server output.
-    pub fn on_key(&mut self, c: char, now_ms: u64) {
-        if self.pending.is_empty() {
+    /// Record that a keystroke was sent (for the srtt estimate), WITHOUT
+    /// predicting. Called on every keystroke so srtt builds even before the
+    /// latency gate opens — otherwise `should_predict` (which needs srtt) and
+    /// the srtt (which needs keystroke timing) would deadlock. Stamps only the
+    /// first un-echoed keystroke of a burst.
+    pub fn note_key(&mut self, now_ms: u64) {
+        if self.last_key_ms.is_none() {
             self.last_key_ms = Some(now_ms);
         }
+    }
+
+    /// A printable keystroke was sent AND we're predicting: note it (srtt) and
+    /// add it to the overlay. Caller has already checked [`should_predict`].
+    pub fn on_key(&mut self, c: char, now_ms: u64) {
+        self.note_key(now_ms);
         self.pending.push(c);
     }
 
@@ -157,7 +169,12 @@ mod tests {
     use super::*;
 
     fn prompt(rows: usize, cursor_row: usize) -> ScreenState {
-        ScreenState { alt_screen: false, app_mode: false, cursor_row, rows }
+        ScreenState {
+            alt_screen: false,
+            app_mode: false,
+            cursor_row,
+            rows,
+        }
     }
 
     #[test]
@@ -197,10 +214,19 @@ mod tests {
         // Seed a slow link.
         p.on_key('a', 0);
         p.on_server_output(320);
-        assert!(p.should_predict(&prompt(24, 23)), "slow link, prompt row ⇒ predict");
+        assert!(
+            p.should_predict(&prompt(24, 23)),
+            "slow link, prompt row ⇒ predict"
+        );
         // Full-screen / raw apps never predict.
-        assert!(!p.should_predict(&ScreenState { alt_screen: true, ..prompt(24, 23) }));
-        assert!(!p.should_predict(&ScreenState { app_mode: true, ..prompt(24, 23) }));
+        assert!(!p.should_predict(&ScreenState {
+            alt_screen: true,
+            ..prompt(24, 23)
+        }));
+        assert!(!p.should_predict(&ScreenState {
+            app_mode: true,
+            ..prompt(24, 23)
+        }));
         // Mid-screen cursor (not the prompt line) ⇒ don't predict.
         assert!(!p.should_predict(&prompt(24, 10)));
     }

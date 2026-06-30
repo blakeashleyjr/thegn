@@ -1006,6 +1006,14 @@ devenv = false
 # so a sandboxed pane that can't reach the Nix daemon still gets the project's
 # linters/formatters/tools out of the box. No-op for repos without a devShell.
 inject_devshell = true
+# Which flake devShell a sandbox/sprite enters. Empty = the flake default (same as
+# host dev). Set to a leaner attr (e.g. "sandbox" → `.#devShells.sandbox`) so a
+# remote sprite builds/seeds a much smaller closure — only what's needed to build
+# the project, not the full lint/test/preview toolset. Exported as
+# SUPERZEJ_DEVSHELL into the sandbox; the repo's `.envrc` must read it
+# (`use flake ".#${SUPERZEJ_DEVSHELL:-default}"`). Missing tools are then a
+# `nix shell nixpkgs#<tool>` away in-pane.
+# devshell = "sandbox"
 # Tier B (opt-in): bind-mount the host Nix daemon socket into the sandbox so full
 # `nix develop`/`build`/`fmt` run INSIDE it. Off by default — it relaxes the
 # isolation the hardening profiles provide. `inject_devshell` already covers
@@ -1064,6 +1072,13 @@ failover = false
 # # the HOST's service — a host localhost DB/API, or a host-bound MCP server.
 # # Specs: "5432" (same port), "8080:5432" (host loopback port), "8080:db.lan:5432".
 # reverse_forwards = ["5432", "11434"]
+# # Opt-in (default false): carry your atuin shell-history credentials + config into
+# # every sandbox so its history joins your atuin sync (host <-> sprites, via atuin's
+# # own auto_sync). Uploads the dereferenced ~/.config/atuin/config.toml + the
+# # key/session under ~/.local/share/atuin; NOT the history DBs (the server syncs
+# # those). No-op if atuin isn't installed / there's no host atuin config. Carries
+# # credentials into the remote — enable only where you trust it.
+# atuin = true
 # # How hard to reproduce YOUR host shell here (a ladder, default "portable"):
 # #   clean       — no personal dotfiles/tools; a plain rc-free shell. Bulletproof.
 # #   portable    — install tools + portable dotfiles, but SKIP (with a warning) a
@@ -1072,8 +1087,18 @@ failover = false
 # #                 shipping a broken shell. The safe default.
 # #   tool-parity — portable, plus install tools your rc references but didn't list.
 # #   host-parity — reproduce the host nix closure so your EXACT dotfiles work
-# #                 unchanged (experimental; cache-first, see below). Heavy — meant
-# #                 for long-lived boxes, set per-env (see [env.<name>] below).
+# #                 unchanged (experimental). Heavy — meant for long-lived boxes,
+# #                 set per-env (see [env.<name>] below). Transport, auto-selected:
+# #                   • P2P (no infra): with connect="ssh" + no binary_cache_url,
+# #                     the host store IS the cache — the closure (zsh + starship/
+# #                     atuin/direnv/fzf + what your rc sources) is pushed straight
+# #                     into the sandbox over the WSS ssh tunnel (nix copy --to
+# #                     ssh-ng://), then `nix profile install`ed onto PATH. No hosted
+# #                     cache, no signing key. (Re)create the sandbox with
+# #                     connect="ssh" first.
+# #                   • Hosted cache: set [env.<name>.provider] binary_cache_* and
+# #                     the host pushes there; the sandbox substitutes from it.
+# #                   • home-manager: else set nix_home_flake (below).
 # strategy = "portable"
 # # When true (default), under portable/tool-parity a dotfile that references absent
 # # store paths is skipped+warned instead of uploaded broken. false = upload anyway.
@@ -1405,6 +1430,15 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # data = "in_env"            # in_env: work in the sprite's persistent fs (default)
 #                            # sync:   push the local worktree into the sprite on
 #                            #         pane spawn, pull changes back on close.
+# #                          # FULL LOCAL PARITY (in_env): a fresh sprite clones
+# #                          # origin AND replays your local state on top —
+# #                          # unpushed commits (a thin git bundle), uncommitted
+# #                          # tracked changes (git diff HEAD), and untracked
+# #                          # non-ignored files — so the sprite matches your
+# #                          # working tree, not just origin. Automatic + best-
+# #                          # effort (a capture/replay failure leaves the pristine
+# #                          # origin checkout). Runs once on first provision (and
+# #                          # on a warm-pool claim); re-opens reuse the fs.
 # [env.sprites.provider]
 # provider = "sprites"       # selects the SpritesProvider REST adapter
 # id = "{repo}-{worktree}-{hash}"   # sprite name; tokens give a PER-WORKTREE sprite.
@@ -1445,6 +1479,24 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # #                                 #   sandbox must have EGRESS to the cache host
 # #                                 #   (allow it in [sandbox] network_allow if the
 # #                                 #   env filters egress).
+# # push_devshell = false           # Use your HOST as the devShell cache (nix users).
+# #                                 #   Seeds the repo's closure — ALREADY BUILT on your
+# #                                 #   host (you run `nix develop`/direnv locally) —
+# #                                 #   into the sandbox store. SCOPED: uploads only the
+# #                                 #   paths public caches lack (the repo's from-source
+# #                                 #   builds + rust-overlay output) via a file:// cache
+# #                                 #   + the fs API; the sandbox fills the rest from
+# #                                 #   cache.nixos.org → a local store hit, not a
+# #                                 #   minutes-long from-source compile. No hosted
+# #                                 #   cache/signing key needed; the host IS the cache.
+# #                                 #   No-op without a nix devShell. Best-effort.
+# # skip_devshell_warm = false      # skip the blocking devShell BUILD during
+# #                                 #   provisioning. The repo's devShell then builds
+# #                                 #   lazily in-pane on first `direnv`/`nix develop`
+# #                                 #   instead of gating the loading screen on a
+# #                                 #   multi-minute toolchain build → the shell comes
+# #                                 #   up immediately. Trades a prebuilt (checkpointed)
+# #                                 #   devShell for instant launch. No-op without nix.
 # # exec = "auto"            # how the interactive pane attaches:
 # #                          #   auto — native API exec (PTY-over-WebSocket, NO
 # #                          #          `sprite` CLI) when the provider supports it
@@ -1508,9 +1560,15 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 #                             #   provider worktrees instead of waking them to poll
 # cost_per_warm_hour = 0.0    # est. $/warm-sandbox-hour, for the ceiling below
 # cost_ceiling_per_hour = 0.0 # trim the warm set to stay under this $/hr; 0 ⇒ off
-# [lifecycle.pool]            # optional pre-provisioned spares for instant new
-# size = 0                    #   worktrees (per repo+env); 0 ⇒ disabled (default)
-# max_idle_secs = 600         # reap an unclaimed pool member older than this
+# [lifecycle.pool]            # WARM SPARE POOL: keep N pre-provisioned, unclaimed
+# size = 0                    #   sandboxes ready per (repo, env) so the NEXT worktree
+#                             #   CLAIMS one instantly (bind + branch checkout) instead
+#                             #   of provisioning from scratch. 0 ⇒ disabled (default).
+#                             #   Spares are checkpointed (suspend for free) + refill in
+#                             #   the background after a claim. Adjust live with the
+#                             #   warm-pool-increment / -decrement hotkeys (Ctrl+Alt+= /
+#                             #   Ctrl+Alt+-); the sidebar header shows `warm ready/target`.
+# max_idle_secs = 600         # reap an unclaimed pool member older than this (recycled)
 # ── LLM proxy (group U/V) ──────────────────────────────────────────────────
 # The AI-traffic chokepoint daemon (binary `szproxy`). The shell never hard-
 # depends on this — AI is strictly additive — so it is OFF by default. When

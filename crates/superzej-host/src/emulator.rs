@@ -109,6 +109,11 @@ pub trait PaneEmulator: Send {
     fn application_cursor(&self) -> bool {
         false
     }
+    /// Alternate-screen active (a full-screen TUI). Predictive echo never fires
+    /// here. Default `false` for non-alacritty emulators.
+    fn alt_screen(&self) -> bool {
+        false
+    }
     /// Bracketed paste: when set, pastes are wrapped in `ESC[200~ … ESC[201~`.
     fn bracketed_paste(&self) -> bool {
         false
@@ -317,6 +322,10 @@ impl PaneEmulator for AlacrittyEmulator {
 
     fn application_cursor(&self) -> bool {
         self.term.lock().mode().contains(TermMode::APP_CURSOR)
+    }
+
+    fn alt_screen(&self) -> bool {
+        self.term.lock().mode().contains(TermMode::ALT_SCREEN)
     }
 
     fn bracketed_paste(&self) -> bool {

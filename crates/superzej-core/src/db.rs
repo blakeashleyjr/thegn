@@ -51,7 +51,7 @@ use std::path::PathBuf;
 /// `pane id → {provider, id, session}`) so a native-exec (provider WSS) pane
 /// reattaches to its live remote session — replaying scrollback — on restart.
 /// v24: adds `forwards` (the resurrection layer for auto port forwards, `[forward]`).
-const SCHEMA_VERSION: i64 = 24;
+const SCHEMA_VERSION: i64 = 26;
 
 pub struct Db {
     conn: Connection,
@@ -144,6 +144,22 @@ pub struct ProxyBudgetRow {
     pub limit_cost: Option<f64>,
     pub reset_ms: i64,
     pub killed: bool,
+}
+
+/// One pre-provisioned spare in the warm pool (`pool_spares`). A spare is created
+/// generically (not bound to a worktree), fully provisioned + checkpointed, then
+/// `claimed` by a new worktree which binds it via `worktrees.provider_sandbox_id`.
+#[derive(Debug, Clone)]
+pub struct PoolSpare {
+    pub sandbox_name: String,
+    pub repo_path: String,
+    pub env_name: String,
+    /// `"provisioning"` | `"ready"` | `"claimed"`.
+    pub state: String,
+    pub checkpoint_id: Option<String>,
+    pub lock_hash: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 fn db_path() -> PathBuf {
@@ -577,6 +593,18 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_merge_queue_status
               ON merge_queue (status, queued_at);
+            -- env_base_snapshots (v25): a per-(repo, env) provider snapshot that
+            -- already has the repo's nix devShell built, so a NEW worktree-sprite is
+            -- created FROM it (instant) instead of rebuilding the toolchain. Keyed
+            -- with the flake.lock hash so a lockfile change invalidates the base.
+            CREATE TABLE IF NOT EXISTS env_base_snapshots (
+              repo_path    TEXT NOT NULL,
+              env_name     TEXT NOT NULL,
+              snapshot_id  TEXT NOT NULL,
+              lock_hash    TEXT NOT NULL,
+              updated_at   INTEGER NOT NULL,
+              PRIMARY KEY (repo_path, env_name)
+            );
             COMMIT;
             "#,
         )?;
@@ -608,6 +636,37 @@ impl Db {
         // {provider, id, session}) so a native-exec pane reattaches to its live
         // remote session on restart. Additive; absent/NULL on pre-v23 rows = none.
         let _ = conn.execute("ALTER TABLE group_tabs ADD COLUMN pane_sessions TEXT", []);
+        // v26: warm spare-sandbox pool. `pool_spares` tracks pre-provisioned,
+        // UNCLAIMED sandboxes per (repo, env) so a new worktree opens instantly by
+        // claiming one; `pool_targets` is the runtime +/- override of the configured
+        // `[lifecycle.pool]` size; `worktrees.provider_sandbox_id` binds a worktree
+        // to the spare it claimed (overrides the derived sandbox name).
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS pool_spares (
+               sandbox_name  TEXT PRIMARY KEY,
+               repo_path     TEXT NOT NULL,
+               env_name      TEXT NOT NULL,
+               state         TEXT NOT NULL,
+               checkpoint_id TEXT,
+               lock_hash     TEXT,
+               created_at    INTEGER NOT NULL,
+               updated_at    INTEGER NOT NULL
+             )",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS pool_targets (
+               repo_path TEXT NOT NULL,
+               env_name  TEXT NOT NULL,
+               target    INTEGER NOT NULL,
+               PRIMARY KEY (repo_path, env_name)
+             )",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE worktrees ADD COLUMN provider_sandbox_id TEXT",
+            [],
+        );
         // Backfill any unset positions deterministically by creation order
         // (path as the tie-breaker), giving pre-v8 worktrees a stable,
         // collision-free order on first launch after upgrade. Runs once: after
@@ -2309,6 +2368,182 @@ impl Db {
         }
     }
 
+    /// Record a per-`(repo, env)` provider base snapshot (one that already has the
+    /// repo's devShell built) + the `flake.lock` hash it was built against, so later
+    /// worktree-sprites create FROM it. Replaces any prior base for the pair.
+    pub fn set_base_snapshot(
+        &self,
+        repo_path: &str,
+        env_name: &str,
+        snapshot_id: &str,
+        lock_hash: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO env_base_snapshots(repo_path,env_name,snapshot_id,lock_hash,updated_at)
+               VALUES(?1,?2,?3,?4,?5)
+               ON CONFLICT(repo_path,env_name) DO UPDATE SET
+                 snapshot_id=?3, lock_hash=?4, updated_at=?5"#,
+            params![repo_path, env_name, snapshot_id, lock_hash, util::now()],
+        )?;
+        Ok(())
+    }
+
+    /// The recorded base snapshot for `(repo, env)` as `(snapshot_id, lock_hash)`,
+    /// or `None`. The caller compares `lock_hash` against the current `flake.lock`
+    /// to decide whether the base is still valid.
+    pub fn base_snapshot(
+        &self,
+        repo_path: &str,
+        env_name: &str,
+    ) -> Result<Option<(String, String)>> {
+        let r = self
+            .conn
+            .query_row(
+                "SELECT snapshot_id, lock_hash FROM env_base_snapshots WHERE repo_path=?1 AND env_name=?2",
+                params![repo_path, env_name],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .ok();
+        Ok(r)
+    }
+
+    // --- warm spare pool (v26) -------------------------------------------
+
+    /// Insert a freshly-minted spare (state `"provisioning"`) for `(repo, env)`.
+    pub fn insert_pool_spare(&self, name: &str, repo: &str, env: &str) -> Result<()> {
+        let now = util::now();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO pool_spares
+               (sandbox_name,repo_path,env_name,state,checkpoint_id,lock_hash,created_at,updated_at)
+             VALUES(?1,?2,?3,'provisioning',NULL,NULL,?4,?4)",
+            params![name, repo, env, now],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a spare `ready` (provisioned + checkpointed) with its checkpoint id +
+    /// the `flake.lock` hash it was built against (for staleness checks).
+    pub fn set_pool_spare_ready(
+        &self,
+        name: &str,
+        checkpoint_id: Option<&str>,
+        lock_hash: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE pool_spares SET state='ready', checkpoint_id=?2, lock_hash=?3, updated_at=?4
+             WHERE sandbox_name=?1",
+            params![name, checkpoint_id, lock_hash, util::now()],
+        )?;
+        Ok(())
+    }
+
+    /// Drop a spare row (it was destroyed or claimed-and-finalized).
+    pub fn delete_pool_spare(&self, name: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM pool_spares WHERE sandbox_name=?1",
+            params![name],
+        )?;
+        Ok(())
+    }
+
+    /// All spares for `(repo, env)`, any state, newest first.
+    pub fn pool_spares_for(&self, repo: &str, env: &str) -> Result<Vec<PoolSpare>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT sandbox_name,repo_path,env_name,state,checkpoint_id,lock_hash,created_at,updated_at
+             FROM pool_spares WHERE repo_path=?1 AND env_name=?2 ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![repo, env], |r| {
+                Ok(PoolSpare {
+                    sandbox_name: r.get(0)?,
+                    repo_path: r.get(1)?,
+                    env_name: r.get(2)?,
+                    state: r.get(3)?,
+                    checkpoint_id: r.get(4)?,
+                    lock_hash: r.get(5)?,
+                    created_at: r.get(6)?,
+                    updated_at: r.get(7)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Atomically claim a `ready` spare for `(repo, env)` and bind it to `worktree`
+    /// (marks it `claimed`, sets `worktrees.provider_sandbox_id`). Returns the
+    /// claimed `(sandbox_name, checkpoint_id)` or `None` if no spare is ready. The
+    /// transaction makes two concurrent claims safe — the loser gets `None`.
+    pub fn claim_pool_spare(
+        &self,
+        repo: &str,
+        env: &str,
+        worktree: &str,
+    ) -> Result<Option<(String, Option<String>)>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let picked: Option<(String, Option<String>)> = tx
+            .query_row(
+                "SELECT sandbox_name, checkpoint_id FROM pool_spares
+                 WHERE repo_path=?1 AND env_name=?2 AND state='ready'
+                 ORDER BY created_at ASC LIMIT 1",
+                params![repo, env],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .ok();
+        if let Some((ref name, _)) = picked {
+            tx.execute(
+                "UPDATE pool_spares SET state='claimed', updated_at=?2 WHERE sandbox_name=?1",
+                params![name, util::now()],
+            )?;
+            tx.execute(
+                "UPDATE worktrees SET provider_sandbox_id=?2 WHERE worktree=?1",
+                params![worktree, name],
+            )?;
+        }
+        tx.commit()?;
+        Ok(picked)
+    }
+
+    /// The provider sandbox name a worktree is bound to (a claimed pool spare), or
+    /// `None` to use the derived `effective_provider_id`.
+    pub fn worktree_provider_sandbox(&self, worktree: &str) -> Result<Option<String>> {
+        let r = self
+            .conn
+            .query_row(
+                "SELECT provider_sandbox_id FROM worktrees WHERE worktree=?1",
+                params![worktree],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+            .filter(|s: &String| !s.is_empty());
+        Ok(r)
+    }
+
+    /// The runtime pool-target override for `(repo, env)` set by the +/- hotkey, or
+    /// `None` to fall back to the configured `[lifecycle.pool] size`.
+    pub fn pool_target(&self, repo: &str, env: &str) -> Result<Option<i64>> {
+        let r = self
+            .conn
+            .query_row(
+                "SELECT target FROM pool_targets WHERE repo_path=?1 AND env_name=?2",
+                params![repo, env],
+                |r| r.get::<_, i64>(0),
+            )
+            .ok();
+        Ok(r)
+    }
+
+    /// Set the runtime pool-target override for `(repo, env)`.
+    pub fn set_pool_target(&self, repo: &str, env: &str, target: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO pool_targets(repo_path,env_name,target) VALUES(?1,?2,?3)
+             ON CONFLICT(repo_path,env_name) DO UPDATE SET target=?3",
+            params![repo, env, target.max(0)],
+        )?;
+        Ok(())
+    }
+
     /// Select the named execution environment for a worktree (`[env.<name>]`).
     /// `""` clears it (inherit the workspace/repo/global layer).
     pub fn set_worktree_env(&self, wt: &str, env: &str) -> Result<()> {
@@ -2998,6 +3233,55 @@ mod tests {
 
     fn db() -> Db {
         Db::open_memory().unwrap()
+    }
+
+    #[test]
+    fn pool_spare_lifecycle_claim_and_target() {
+        let db = db();
+        assert!(db.pool_spares_for("/repo", "sprites").unwrap().is_empty());
+
+        // Mint two spares (provisioning), then mark them ready.
+        db.insert_pool_spare("repo-pool-1", "/repo", "sprites")
+            .unwrap();
+        db.insert_pool_spare("repo-pool-2", "/repo", "sprites")
+            .unwrap();
+        assert_eq!(db.pool_spares_for("/repo", "sprites").unwrap().len(), 2);
+        db.set_pool_spare_ready("repo-pool-1", Some("cp-1"), "lock-abc")
+            .unwrap();
+        db.set_pool_spare_ready("repo-pool-2", Some("cp-2"), "lock-abc")
+            .unwrap();
+
+        // A worktree claims a ready spare: atomic mark + bind.
+        db.put_worktree("tab", "/repo", "/wt/x", "sz/x", None, None)
+            .unwrap();
+        let claimed = db.claim_pool_spare("/repo", "sprites", "/wt/x").unwrap();
+        let (name, cp) = claimed.expect("a ready spare is claimed");
+        assert!(name.starts_with("repo-pool-"));
+        assert!(cp.is_some(), "checkpoint id carried through");
+        assert_eq!(
+            db.worktree_provider_sandbox("/wt/x").unwrap().as_deref(),
+            Some(name.as_str()),
+            "worktree bound to the claimed spare"
+        );
+        // The claimed spare is no longer 'ready'; one ready spare remains.
+        let ready = db
+            .pool_spares_for("/repo", "sprites")
+            .unwrap()
+            .into_iter()
+            .filter(|s| s.state == "ready")
+            .count();
+        assert_eq!(ready, 1);
+
+        // Runtime target override round-trips (and clamps ≥ 0).
+        assert!(db.pool_target("/repo", "sprites").unwrap().is_none());
+        db.set_pool_target("/repo", "sprites", 3).unwrap();
+        assert_eq!(db.pool_target("/repo", "sprites").unwrap(), Some(3));
+        db.set_pool_target("/repo", "sprites", -5).unwrap();
+        assert_eq!(db.pool_target("/repo", "sprites").unwrap(), Some(0));
+
+        // Delete drops the row.
+        db.delete_pool_spare(&name).unwrap();
+        assert_eq!(db.pool_spares_for("/repo", "sprites").unwrap().len(), 1);
     }
 
     #[test]

@@ -15,8 +15,8 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use superzej_core::config::LifecycleConfig;
-use superzej_core::lifecycle::{WarmBudget, WarmCandidate, WarmInputs, decide};
+use superzej_core::config::{Config, LifecycleConfig};
+use superzej_core::lifecycle::{WarmBudget, WarmCandidate, WarmInputs, decide, decide_pool};
 use superzej_core::remote::GitLoc;
 
 /// Per-worktree "last seen active/busy" timestamps, so the reconcile can apply the
@@ -100,4 +100,77 @@ pub fn reconcile(session: &crate::session::Session, cfg: &LifecycleConfig) {
             );
         }
     }
+}
+
+/// The effective warm-pool target for `(repo, env)`: the runtime +/- override in
+/// the DB (set by the hotkey, per repo+env) if present, else the configured
+/// `[lifecycle.pool] size`.
+pub fn effective_pool_target(
+    db: &superzej_core::db::Db,
+    cfg: &Config,
+    repo: &str,
+    env: &str,
+) -> usize {
+    db.pool_target(repo, env)
+        .ok()
+        .flatten()
+        .map(|t| t.max(0) as usize)
+        .unwrap_or(cfg.lifecycle.pool.size)
+}
+
+/// Reconcile the warm-spare POOL for one `(repo, env)`: create spares toward the
+/// target and destroy over-target/idle ones. Runs on a background thread (each
+/// spare provision is minutes); destroys are quick + synchronous, creates are
+/// spawned concurrently (each marks itself `provisioning` in the DB immediately,
+/// so a re-entrant tick won't double-provision). `notify` pulses the UI when the
+/// pool changes. No-op unless the pool is enabled for this (repo, env).
+pub fn reconcile_pool<N>(cfg: &Config, repo_root: &Path, env_name: &str, notify: N)
+where
+    N: Fn() + Clone + Send + 'static,
+{
+    let Ok(db) = superzej_core::db::Db::open() else {
+        return;
+    };
+    let repo = repo_root.to_string_lossy().into_owned();
+    let target = effective_pool_target(&db, cfg, &repo, env_name);
+    let max_idle = cfg.lifecycle.pool.max_idle_secs;
+
+    let spares = db.pool_spares_for(&repo, env_name).unwrap_or_default();
+    // Nothing configured and nothing to clean up ⇒ cheap no-op.
+    if target == 0 && spares.is_empty() {
+        return;
+    }
+    let now = superzej_core::util::now();
+    let provisioning = spares.iter().filter(|s| s.state == "provisioning").count();
+    let ready: Vec<(String, u64)> = spares
+        .iter()
+        .filter(|s| s.state == "ready")
+        .map(|s| (s.sandbox_name.clone(), (now - s.updated_at).max(0) as u64))
+        .collect();
+
+    let action = decide_pool(target, provisioning, &ready, max_idle);
+    for name in &action.destroy {
+        let _ = crate::agent::destroy_spare(cfg, env_name, name);
+        notify();
+    }
+    for _ in 0..action.create {
+        let cfg = cfg.clone();
+        let repo_root = repo_root.to_path_buf();
+        let env_name = env_name.to_string();
+        let notify = notify.clone();
+        // Concurrent build: provision_spare inserts a `provisioning` row first
+        // (so this tick + the next don't double-count), then builds + checkpoints.
+        std::thread::spawn(move || {
+            match crate::agent::provision_spare(&cfg, &repo_root, &env_name, |_| {}) {
+                Ok(name) => {
+                    tracing::debug!(target: "szhost::lifecycle", %name, "warm spare ready");
+                    notify();
+                }
+                Err(e) => {
+                    superzej_core::msg::warn(&format!("warm pool: spare provision failed: {e}"))
+                }
+            }
+        });
+    }
+    notify();
 }

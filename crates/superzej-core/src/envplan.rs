@@ -326,6 +326,39 @@ pub struct PlanOpts {
     /// dotfiles (detected on the host via [`store_roots_in`]); their closure is
     /// made resolvable in the sandbox so the exact dotfiles work. Empty ⇒ none.
     pub home_store_roots: Vec<String>,
+    /// `HostParity` only: push the closure straight from the host store into the
+    /// sandbox store over the WSS ssh tunnel (no hosted cache — the host *is* the
+    /// cache). Set by the host when `connect = "ssh"` and no `binary_cache_url`.
+    /// Emits a host-executed [`StepKind::HomeClosurePush`] instead of an
+    /// in-sandbox substitute step.
+    pub home_closure_p2p: bool,
+    /// `HostParity` + p2p only: store paths to `nix profile install` in the
+    /// sandbox after the push, so the shell + prompt tools (zsh/starship/atuin/…)
+    /// land on `PATH` by name. Empty ⇒ none.
+    pub home_profile_installs: Vec<String>,
+    /// Opt-in: carry the host's atuin credentials + config into the sandbox so its
+    /// shell history joins atuin sync. Emits an `atuin_sync` step after `tools`.
+    pub atuin: bool,
+    /// Opt-in: seed the host's already-built devShell closure into the sandbox
+    /// store so the in-sandbox devShell is a local store hit, not a from-source
+    /// rebuild. SCOPED — the host uploads only the paths public caches lack (the
+    /// repo's from-source builds + rust-overlay output) and the sandbox fills the
+    /// rest from cache.nixos.org. Emits a `devshell_push` step after `nix`,
+    /// independent of `skip_devshell_warm`. Only meaningful with a nix devShell.
+    pub push_devshell: bool,
+    /// Opt-in: skip the blocking `devshell` warm/build step during provisioning
+    /// (and the p2p push + cache push that feed it). The repo's devShell then
+    /// builds lazily in-pane on first `direnv`/`nix develop` instead of gating the
+    /// loading screen on a multi-minute toolchain build. Trades a prebuilt (and
+    /// checkpointed) devShell for a shell that comes up immediately.
+    pub skip_devshell_warm: bool,
+    /// Host path of the local worktree to bring to full parity inside the
+    /// sandbox after the origin clone: local unpushed commits (a thin git
+    /// bundle), uncommitted tracked changes (a `git diff HEAD` patch), and
+    /// untracked non-ignored files (a tar) are captured on the host and replayed
+    /// over the clone. `None` ⇒ pristine origin checkout only (e.g. a pool spare,
+    /// or a non-`in_env` data mode). Emits a `local_parity` step after `clone`.
+    pub local_parity: Option<String>,
 }
 
 /// A Nix binary-cache substituter (and optional push) for fast devShells.
@@ -358,6 +391,12 @@ impl Default for PlanOpts {
             strategy: crate::config::ShellStrategy::default(),
             nix_home_flake: String::new(),
             home_store_roots: Vec::new(),
+            home_closure_p2p: false,
+            home_profile_installs: Vec::new(),
+            atuin: false,
+            push_devshell: false,
+            skip_devshell_warm: false,
+            local_parity: None,
         }
     }
 }
@@ -387,6 +426,32 @@ pub enum StepKind {
     AgentConfigs(Vec<String>),
     /// Snapshot the sandbox so the (heavy) install is paid once.
     Checkpoint,
+    /// Host-executed (not in-sandbox): push the closure of these host `/nix/store`
+    /// roots straight into the sandbox store over the WSS ssh tunnel, using the
+    /// host's `nix`. The host store is an ephemeral binary cache — no hosted cache
+    /// or signing key. Runs after Nix is installed in the sandbox, before the
+    /// profile-install + dotfiles steps.
+    HomeClosurePush(Vec<String>),
+    /// Host-executed: carry the host's atuin credentials + config into the sandbox
+    /// (`~/.config/atuin/config.toml` dereferenced + `~/.local/share/atuin/{key,
+    /// session}`), so its shell history joins atuin's own sync. Opt-in
+    /// (`[sandbox.home] atuin = true`). Best-effort; the history DBs are NOT copied
+    /// (the sync server reconciles those).
+    AtuinSync,
+    /// Host-executed: transfer the repo's devShell closure — already built on the
+    /// HOST — into the sandbox store (host `nix copy --to file://` → fs upload →
+    /// sandbox `nix copy --from file://`), so the in-sandbox devShell is a local
+    /// store hit instead of a rebuild. Opt-in (`[env.<name>.provider] push_devshell
+    /// = true`). Best-effort; runs after Nix is installed/claimed, before the
+    /// devShell warm. The host repo root is resolved in the applier.
+    DevShellClosurePush,
+    /// Host-executed: bring the sandbox clone to full parity with the LOCAL
+    /// worktree — replay unpushed commits (a thin `git bundle`), uncommitted
+    /// tracked changes (`git diff HEAD`), and untracked non-ignored files. The
+    /// applier reads the host worktree (`worktree`), uploads the captured
+    /// artifacts, and execs the replay in `workdir`. Best-effort: a failure
+    /// leaves the pristine origin checkout in place.
+    LocalParity { worktree: String, workdir: String },
 }
 
 /// The compiled, backend-agnostic provisioning plan.
@@ -440,6 +505,21 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
             label: "Clone repository".into(),
             kind: StepKind::Exec(format!("cd {wd} && {clone}")),
         });
+        // Bring the clone to full parity with the local worktree (unpushed
+        // commits + uncommitted + untracked). Runs before the toolchain tier so
+        // a locally-modified flake.lock / .envrc drives the devShell build. Only
+        // for a real worktree (a pool spare passes `None` — it stays generic
+        // until a claim rebranches it).
+        if let Some(local) = opts.local_parity.as_deref() {
+            steps.push(ProvisionStep {
+                id: "local_parity".into(),
+                label: "Mirror local changes".into(),
+                kind: StepKind::LocalParity {
+                    worktree: local.to_string(),
+                    workdir: opts.workdir.clone(),
+                },
+            });
+        }
     }
 
     // 3. Tier-specific toolchain.
@@ -462,22 +542,51 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
                         kind: StepKind::Exec(direnv_install_script()),
                     });
                 }
-                steps.push(ProvisionStep {
-                    id: "devshell".into(),
-                    label: "Build dev shell".into(),
-                    kind: StepKind::Exec(devshell_warm_script(&opts.workdir, req)),
-                });
-                // Optional: push the freshly-built devShell closure to the project
-                // binary cache so later sandboxes download it instead of rebuilding.
-                if let Some(c) = opts
-                    .binary_cache
-                    .as_ref()
-                    .filter(|c| c.push && !c.url.trim().is_empty())
-                {
+                // Seed the host's already-built closure into the sandbox store
+                // (scoped: the push uploads only the paths public caches lack — the
+                // repo's from-source builds + rust-overlay output — and the sandbox
+                // fills the rest from cache.nixos.org). This is the FAST path: a
+                // local store hit instead of a from-source compile. Independent of
+                // `skip_devshell_warm` — seeding isn't the slow build, it replaces it.
+                if opts.push_devshell {
                     steps.push(ProvisionStep {
-                        id: "cache_push".into(),
-                        label: "Push devShell to cache".into(),
-                        kind: StepKind::Exec(cache_push_script(&opts.workdir, c)),
+                        id: "devshell_push".into(),
+                        label: "Seed dev shell from host".into(),
+                        kind: StepKind::DevShellClosurePush,
+                    });
+                }
+                // The from-scratch devShell BUILD is the single longest, most CPU/
+                // network-bound part of a provision. When `skip_devshell_warm` is set
+                // it's omitted: the loading screen no longer blocks on it, and the
+                // devShell instead resolves lazily in-pane on first `direnv`/`nix
+                // develop` (a local store hit when the scoped push above seeded it).
+                if !opts.skip_devshell_warm {
+                    steps.push(ProvisionStep {
+                        id: "devshell".into(),
+                        label: "Build dev shell".into(),
+                        kind: StepKind::Exec(devshell_warm_script(&opts.workdir, req)),
+                    });
+                    // Optional: push the freshly-built devShell closure to the project
+                    // binary cache so later sandboxes download it instead of building.
+                    if let Some(c) = opts
+                        .binary_cache
+                        .as_ref()
+                        .filter(|c| c.push && !c.url.trim().is_empty())
+                    {
+                        steps.push(ProvisionStep {
+                            id: "cache_push".into(),
+                            label: "Push devShell to cache".into(),
+                            kind: StepKind::Exec(cache_push_script(&opts.workdir, c)),
+                        });
+                    }
+                } else if req.direnv {
+                    // Skipping the build, but still TRUST the repo's `.envrc` (cheap,
+                    // instant) so the lazy in-pane build fires the moment you `cd` in
+                    // — no manual `direnv allow` needed.
+                    steps.push(ProvisionStep {
+                        id: "direnv_allow".into(),
+                        label: "Allow direnv".into(),
+                        kind: StepKind::Exec(direnv_allow_script(&opts.workdir)),
                     });
                 }
             }
@@ -547,6 +656,17 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
         });
     }
 
+    // atuin shell-history sync (opt-in): carry the host's atuin creds + config so
+    // the sandbox's history joins atuin's own sync. After `tools` (atuin must be
+    // installed) and before the checkpoint. Best-effort, host-executed.
+    if personal && opts.atuin {
+        steps.push(ProvisionStep {
+            id: "atuin_sync".into(),
+            label: "Sync atuin history".into(),
+            kind: StepKind::AtuinSync,
+        });
+    }
+
     // 4b. Host-parity (experimental): make the host nix closure the dotfiles
     // reference resolvable in the sandbox, BEFORE uploading them, so the exact
     // host rc works unchanged. Cache-first (substitute the detected store roots),
@@ -554,10 +674,13 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
     // caller (host) populated the carriers — so a default `Portable` plan is
     // unchanged. Must come before the dotfiles upload + the checkpoint.
     if opts.strategy == ShellStrategy::HostParity
-        && (!opts.home_store_roots.is_empty() || !opts.nix_home_flake.trim().is_empty())
+        && (!opts.home_store_roots.is_empty()
+            || !opts.nix_home_flake.trim().is_empty()
+            || !opts.home_profile_installs.is_empty())
     {
-        // Host-parity needs `nix` (to substitute the closure / run home-manager).
-        // The Nix tier already installed it; on any other tier, install it now.
+        // Host-parity needs `nix` (to substitute the closure / run home-manager /
+        // receive the p2p push). The Nix tier already installed it; on any other
+        // tier, install it now.
         if !nix_installed && opts.allow_nix {
             steps.push(ProvisionStep {
                 id: "nix".into(),
@@ -569,7 +692,25 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
                 )),
             });
         }
-        if !opts.home_store_roots.is_empty() {
+        if opts.home_closure_p2p {
+            // P2P: the host pushes its store straight into the sandbox (host-side,
+            // after the Nix install above), then we install the shell + tools by
+            // store path so they're on `PATH` by name.
+            if !opts.home_store_roots.is_empty() {
+                steps.push(ProvisionStep {
+                    id: "home_closure_push".into(),
+                    label: "Transfer home closure (p2p)".into(),
+                    kind: StepKind::HomeClosurePush(opts.home_store_roots.clone()),
+                });
+            }
+            if !opts.home_profile_installs.is_empty() {
+                steps.push(ProvisionStep {
+                    id: "home_profile".into(),
+                    label: "Install shell + prompt tools".into(),
+                    kind: StepKind::Exec(home_profile_install_script(&opts.home_profile_installs)),
+                });
+            }
+        } else if !opts.home_store_roots.is_empty() {
             steps.push(ProvisionStep {
                 id: "home_closure".into(),
                 label: "Sync home shell closure".into(),
@@ -653,13 +794,33 @@ fn nix_install_script(
                sh /tmp/nix-ds.sh install linux --no-confirm --init none) || ({official})"
         ),
     };
-    // FAIL-FAST: the final `command -v nix` sets the exit code.
+    // FAIL-FAST: the final `command -v nix` sets the exit code. Source BOTH the
+    // single-user (`~/.nix-profile`) and daemon/system (`/nix/var/nix/profiles/
+    // default`, where Determinate `--init none` lands) profile hooks + put both on
+    // PATH first — otherwise a successful Determinate install reports a false
+    // failure (its `nix` isn't under `~/.nix-profile`), printing "Nix was installed
+    // successfully!" while the step shows exit 127.
+    // `claim_store`: a non-root sandbox user CANNOT use a root-owned multi-user
+    // store with no daemon ("/nix/var/nix/db not writable") — it silently breaks
+    // every `nix profile install` (→ no tools, no starship). Determinate `--init
+    // none` (and some base images) leave exactly that. With passwordless sudo and no
+    // daemon, claim the whole store for SINGLE-USER use (chown to us): `nix profile`
+    // then works directly, no daemon to keep alive, and it survives checkpoints
+    // (FS ownership is captured) unlike a manually-started daemon. Run it BEFORE the
+    // early-exit (a base image may ship a root store) and AFTER install (Determinate
+    // leaves one). The early-exit now requires the db be WRITABLE, not just `nix`
+    // present, so a present-but-unusable store falls through to the claim.
     format!(
-        "if command -v nix >/dev/null 2>&1; then exit 0; fi; \
+        "claim_store() {{ if [ \"$(id -u)\" != 0 ] && [ -d /nix/var/nix/db ] && [ \"$(stat -c %u /nix/var/nix/db 2>/dev/null)\" != \"$(id -u)\" ] && [ ! -S /nix/var/nix/daemon-socket/socket ] && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then sudo chown -R \"$(id -u):$(id -g)\" /nix 2>/dev/null || true; fi; }}; \
          export HOME=${{HOME:-/root}}; \
+         claim_store; \
+         if command -v nix >/dev/null 2>&1 && {{ [ \"$(stat -c %u /nix/var/nix/db 2>/dev/null)\" = \"$(id -u)\" ] || [ -S /nix/var/nix/daemon-socket/socket ] || [ \"$(id -u)\" = 0 ]; }}; then exit 0; fi; \
          {wait}; \
          {install}; \
-         export PATH=\"$HOME/.nix-profile/bin:$PATH\"; \
+         [ -r \"$HOME/.nix-profile/etc/profile.d/nix.sh\" ] && . \"$HOME/.nix-profile/etc/profile.d/nix.sh\" 2>/dev/null || true; \
+         [ -r /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ] && . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh 2>/dev/null || true; \
+         export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH\"; \
+         claim_store; \
          mkdir -p \"$HOME/.config/nix\"; \
          printf '{conf}' > \"$HOME/.config/nix/nix.conf\"; \
          command -v nix >/dev/null 2>&1"
@@ -678,26 +839,34 @@ fn nix_install_script(
 ///    build sandbox, so it uses `/homeless-shelter` as a throwaway `$HOME` during
 ///    each build and REFUSES to start if a leftover one exists. A build interrupted
 ///    by the sprite suspending on idle leaves it behind, wedging every later nix
-///    build. Remove it up front (owned by the build user, so no sudo).
+///    build. Remove it up front — `sudo` first (a leftover from the pre-`claim_store`
+///    root era is root-owned and a plain `rm` can't touch it), then a plain `rm`.
 ///
 /// Trailing `;` so it composes as a prefix; a no-op for the token half when no
 /// token is present.
 fn nix_runtime_prelude() -> &'static str {
     "tok=\"${GH_TOKEN:-${GITHUB_TOKEN:-}}\"; \
      if [ -n \"$tok\" ]; then export NIX_CONFIG=\"access-tokens = github.com=$tok\"; fi; \
+     sudo -n rm -rf /homeless-shelter 2>/dev/null || true; \
      rm -rf /homeless-shelter 2>/dev/null || true; "
 }
 
 /// Install direnv + hook it into the login shells, so entering the workdir
 /// activates the flake devShell exactly like local. Idempotent.
 fn direnv_install_script() -> String {
+    // apt-FIRST: a fresh sprite's freshly-claimed Nix store makes `nix profile
+    // install` slow (~10s+); the native package is ~2s and direnv is just a PATH
+    // shim (no Nix integration needed here). Nix is the fallback for base images
+    // without apt.
     format!(
-        "{}command -v direnv >/dev/null 2>&1 || (nix profile install nixpkgs#direnv 2>/dev/null \
-           || (export DEBIAN_FRONTEND=noninteractive; apt-get update -y && apt-get install -y direnv)); \
-         for rc in \"$HOME/.bashrc\" \"$HOME/.zshrc\"; do \
+        "{}command -v direnv >/dev/null 2>&1 \
+           || (export DEBIAN_FRONTEND=noninteractive; apt-get update -y >/dev/null 2>&1 && apt-get install -y direnv >/dev/null 2>&1) \
+           || nix profile install nixpkgs#direnv 2>/dev/null; \
+         for sh in bash zsh; do \
+           rc=\"$HOME/.${{sh}}rc\"; \
            [ -f \"$rc\" ] || touch \"$rc\"; \
            grep -q 'direnv hook' \"$rc\" 2>/dev/null || \
-             printf '\\neval \"$(direnv hook %s)\"\\n' \"$(basename \"$rc\" | sed s/^\\.//;s/rc$//)\" >> \"$rc\"; \
+             printf '\\neval \"$(direnv hook %s)\"\\n' \"$sh\" >> \"$rc\"; \
          done",
         nix_runtime_prelude(),
     )
@@ -709,22 +878,45 @@ fn direnv_install_script() -> String {
 fn devshell_warm_script(workdir: &str, req: &EnvRequirements) -> String {
     let wd = sh_quote(workdir);
     let tok = nix_runtime_prelude();
+    // `set +e`: this is a BEST-EFFORT pre-warm (the devShell builds lazily in the
+    // pane if this is skipped), so no sub-command failure may abort it — the
+    // sandbox's `/bin/sh -l` can run with `set -e`, under which an unguarded group
+    // failure (e.g. `nix profile install devenv`) aborts the otherwise
+    // `|| true`-terminated script and surfaces a spurious "exit 2". Source both nix
+    // profiles + a trailing `true` so the step always reports success.
     let nixsh = format!(
-        "{tok}. \"$HOME/.nix-profile/etc/profile.d/nix.sh\" 2>/dev/null || true; \
-         export PATH=\"$HOME/.nix-profile/bin:$PATH\""
+        "set +e; {tok}[ -r \"$HOME/.nix-profile/etc/profile.d/nix.sh\" ] && . \"$HOME/.nix-profile/etc/profile.d/nix.sh\" 2>/dev/null || true; \
+         [ -r /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ] && . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh 2>/dev/null || true; \
+         export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH\""
     );
     let nixsh = nixsh.as_str();
     if req.direnv && req.direnv_uses_flake {
         format!(
-            "{nixsh}; cd {wd} && direnv allow . 2>/dev/null; direnv exec . true 2>/dev/null || nix develop --command true 2>/dev/null || true"
+            "{nixsh}; cd {wd} 2>/dev/null && direnv allow . 2>/dev/null; direnv exec . true 2>/dev/null || nix develop --command true 2>/dev/null || true; true"
         )
     } else if req.devenv {
         format!(
-            "{nixsh}; cd {wd} && (command -v devenv >/dev/null 2>&1 || nix profile install nixpkgs#devenv 2>/dev/null); devenv shell true 2>/dev/null || true"
+            "{nixsh}; cd {wd} 2>/dev/null && (command -v devenv >/dev/null 2>&1 || nix profile install nixpkgs#devenv 2>/dev/null) || true; devenv shell true 2>/dev/null || true; true"
         )
     } else {
-        format!("{nixsh}; cd {wd} && nix develop --command true 2>/dev/null || true")
+        format!(
+            "{nixsh}; cd {wd} 2>/dev/null && nix develop --command true 2>/dev/null || true; true"
+        )
     }
+}
+
+/// Trust the repo's `.envrc` without building anything (the companion to
+/// `skip_devshell_warm`). `direnv allow` is instant — it only marks the `.envrc`
+/// approved — so the loading screen doesn't block, yet the first in-pane `cd` into
+/// the worktree replays direnv and builds the devShell lazily, with no manual
+/// `direnv allow`. Best-effort: a missing direnv / no `.envrc` is a no-op.
+fn direnv_allow_script(workdir: &str) -> String {
+    let wd = sh_quote(workdir);
+    format!(
+        "{tok}export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$HOME/.local/state/nix/profile/bin:$HOME/.local/bin:$PATH\"; \
+         command -v direnv >/dev/null 2>&1 && cd {wd} 2>/dev/null && [ -f .envrc ] && direnv allow . 2>/dev/null; true",
+        tok = nix_runtime_prelude(),
+    )
 }
 
 /// Push the project's built devShell closure to a binary cache so later sandboxes
@@ -735,7 +927,7 @@ fn cache_push_script(workdir: &str, cache: &BinaryCache) -> String {
     let wd = sh_quote(workdir);
     let url = sh_quote(cache.url.trim());
     format!(
-        "{tok}. \"$HOME/.nix-profile/etc/profile.d/nix.sh\" 2>/dev/null || true; \
+        "{tok}[ -r \"$HOME/.nix-profile/etc/profile.d/nix.sh\" ] && . \"$HOME/.nix-profile/etc/profile.d/nix.sh\" 2>/dev/null || true; \
          export PATH=\"$HOME/.nix-profile/bin:$PATH\"; \
          cd {wd} && sys=$(nix eval --impure --raw --expr builtins.currentSystem 2>/dev/null || echo x86_64-linux); \
          nix copy --to {url} \".#devShells.$sys.default\" 2>/dev/null || true",
@@ -768,7 +960,7 @@ fn home_substitute_script(roots: &[String], cache: Option<&BinaryCache>) -> Stri
         })
         .collect();
     format!(
-        "{tok}. \"$HOME/.nix-profile/etc/profile.d/nix.sh\" 2>/dev/null || true; \
+        "{tok}[ -r \"$HOME/.nix-profile/etc/profile.d/nix.sh\" ] && . \"$HOME/.nix-profile/etc/profile.d/nix.sh\" 2>/dev/null || true; \
          export PATH=\"$HOME/.nix-profile/bin:$PATH\"; {realise}true"
     )
 }
@@ -780,10 +972,28 @@ fn home_substitute_script(roots: &[String], cache: Option<&BinaryCache>) -> Stri
 fn home_switch_script(flake: &str) -> String {
     let tok = nix_runtime_prelude();
     format!(
-        "{tok}. \"$HOME/.nix-profile/etc/profile.d/nix.sh\" 2>/dev/null || true; \
+        "{tok}[ -r \"$HOME/.nix-profile/etc/profile.d/nix.sh\" ] && . \"$HOME/.nix-profile/etc/profile.d/nix.sh\" 2>/dev/null || true; \
          export PATH=\"$HOME/.nix-profile/bin:$PATH\"; \
          nix run home-manager -- switch --flake {} 2>/dev/null || true",
         sh_quote(flake),
+    )
+}
+
+/// Host-parity p2p: after the host has pushed the closure into the sandbox store,
+/// `nix profile install` the pushed store paths so the shell + prompt tools
+/// (zsh/starship/atuin/…) resolve by name on `PATH`. The paths already exist in
+/// the store (the push delivered their full closure), so this is a cheap symlink
+/// into `~/.nix-profile`, not a download. Per-path `|| true` so one bad path can't
+/// abort the rest.
+fn home_profile_install_script(installs: &[String]) -> String {
+    let tok = nix_runtime_prelude();
+    let body: String = installs
+        .iter()
+        .map(|p| format!("nix profile install {} 2>/dev/null || true; ", sh_quote(p)))
+        .collect();
+    format!(
+        "{tok}[ -r \"$HOME/.nix-profile/etc/profile.d/nix.sh\" ] && . \"$HOME/.nix-profile/etc/profile.d/nix.sh\" 2>/dev/null || true; \
+         export PATH=\"$HOME/.nix-profile/bin:$PATH\"; {body}true"
     )
 }
 
@@ -863,6 +1073,27 @@ fn tools_install_script(tools: &[String]) -> String {
            nat_install \"$(nat \"$t\")\" 2>/dev/null || echo \"superzej: skipped tool $t (no installer)\" >&2; \
          done; true"
     )
+}
+
+/// Coding agents superzej knows how to reproduce in a sandbox. Used to
+/// AUTO-DETECT which agents the host has (so a sandbox reaches "exact local
+/// parity" without per-sandbox config) — each is probed on the host PATH /
+/// config locations. Known installers exist for a subset (see
+/// [`agents_install_script`]); the rest still get their config uploaded
+/// ([`agent_config_paths`]) and rely on a `setup` recipe to install the binary.
+pub fn known_agents() -> &'static [&'static str] {
+    &[
+        "claude",
+        "codex",
+        "pi",
+        "hermes",
+        "gemini",
+        "aider",
+        "opencode",
+        "amp",
+        "goose",
+        "cursor-agent",
+    ]
 }
 
 /// The host config/credential paths (relative to `$HOME`) for a coding agent —
@@ -1109,6 +1340,155 @@ mod tests {
     }
 
     #[test]
+    fn plan_devshell_push_after_nix_before_devshell_when_opted_in() {
+        let req = EnvRequirements {
+            nix_flake_devshell: true,
+            direnv: true,
+            direnv_uses_flake: true,
+            ..Default::default()
+        };
+        let opts = PlanOpts {
+            push_devshell: true,
+            ..Default::default()
+        };
+        let p = plan(&req, &opts);
+        let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+        let nix = ids.iter().position(|i| *i == "nix").expect("nix");
+        let push = ids
+            .iter()
+            .position(|i| *i == "devshell_push")
+            .expect("devshell_push present when opted in");
+        let dev = ids.iter().position(|i| *i == "devshell").expect("devshell");
+        assert!(
+            nix < push && push < dev,
+            "devshell_push after nix, before devshell: {ids:?}"
+        );
+        assert!(matches!(
+            p.steps
+                .iter()
+                .find(|s| s.id == "devshell_push")
+                .unwrap()
+                .kind,
+            StepKind::DevShellClosurePush
+        ));
+    }
+
+    #[test]
+    fn plan_no_devshell_push_when_off() {
+        let req = EnvRequirements {
+            nix_flake_devshell: true,
+            ..Default::default()
+        };
+        let p = plan(&req, &PlanOpts::default());
+        assert!(!p.steps.iter().any(|s| s.id == "devshell_push"));
+    }
+
+    #[test]
+    fn plan_skip_devshell_warm_omits_build_but_keeps_scoped_push() {
+        let req = EnvRequirements {
+            nix_flake_devshell: true,
+            direnv: true,
+            direnv_uses_flake: true,
+            ..Default::default()
+        };
+        // Skip drops the from-source BUILD (+ its cache push), but the scoped push
+        // (the fast seed) and the cheap `direnv allow` stay.
+        let opts = PlanOpts {
+            push_devshell: true,
+            skip_devshell_warm: true,
+            binary_cache: Some(BinaryCache {
+                url: "https://cache.example.org".into(),
+                key: "k".into(),
+                push: true,
+            }),
+            ..Default::default()
+        };
+        let p = plan(&req, &opts);
+        let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"nix"), "nix still installed: {ids:?}");
+        assert!(
+            !ids.contains(&"devshell") && !ids.contains(&"cache_push"),
+            "skip_devshell_warm omits the build + cache push: {ids:?}"
+        );
+        // The scoped push (fast seed) is independent of the warm decision.
+        let push = p
+            .steps
+            .iter()
+            .position(|s| s.id == "devshell_push")
+            .expect("scoped devshell_push present even when skipping the build");
+        let nix = ids.iter().position(|i| *i == "nix").unwrap();
+        assert!(nix < push, "push after nix: {ids:?}");
+        // ...and the cheap `direnv allow` stays, so the in-pane lazy build fires.
+        let allow = p
+            .steps
+            .iter()
+            .find(|s| s.id == "direnv_allow")
+            .expect("direnv_allow present when skipping the build with direnv");
+        assert!(matches!(
+            &allow.kind,
+            StepKind::Exec(s) if s.contains("direnv allow")
+        ));
+    }
+
+    #[test]
+    fn plan_warms_devshell_by_default() {
+        let req = EnvRequirements {
+            nix_flake_devshell: true,
+            direnv: true,
+            ..Default::default()
+        };
+        let p = plan(&req, &PlanOpts::default());
+        assert!(
+            p.steps.iter().any(|s| s.id == "devshell"),
+            "devshell warm present by default"
+        );
+    }
+
+    #[test]
+    fn plan_atuin_sync_after_tools_before_checkpoint_when_opted_in() {
+        let opts = PlanOpts {
+            tools: vec!["atuin".into()],
+            atuin: true,
+            checkpoint: true,
+            ..Default::default()
+        };
+        let p = plan(&EnvRequirements::default(), &opts);
+        let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+        let tools = ids.iter().position(|i| *i == "tools").expect("tools");
+        let atuin = ids
+            .iter()
+            .position(|i| *i == "atuin_sync")
+            .expect("atuin_sync step present when opted in");
+        let chk = ids
+            .iter()
+            .position(|i| *i == "checkpoint")
+            .expect("checkpoint");
+        assert!(
+            tools < atuin && atuin < chk,
+            "atuin_sync after tools, before checkpoint: {ids:?}"
+        );
+        assert!(matches!(
+            p.steps.iter().find(|s| s.id == "atuin_sync").unwrap().kind,
+            StepKind::AtuinSync
+        ));
+    }
+
+    #[test]
+    fn plan_no_atuin_sync_when_off_or_clean() {
+        // Off by default.
+        let p = plan(&EnvRequirements::default(), &PlanOpts::default());
+        assert!(!p.steps.iter().any(|s| s.id == "atuin_sync"));
+        // Even opted-in, `Clean` ships no personal layer.
+        let clean = PlanOpts {
+            atuin: true,
+            strategy: crate::config::ShellStrategy::Clean,
+            ..Default::default()
+        };
+        let pc = plan(&EnvRequirements::default(), &clean);
+        assert!(!pc.steps.iter().any(|s| s.id == "atuin_sync"));
+    }
+
+    #[test]
     fn plan_clean_strategy_emits_no_personal_layer() {
         let req = EnvRequirements::default(); // Bare
         let opts = PlanOpts {
@@ -1210,6 +1590,66 @@ mod tests {
     }
 
     #[test]
+    fn plan_local_parity_step_follows_clone_when_requested() {
+        let opts = PlanOpts {
+            origin: Some("https://example.com/r.git".into()),
+            branch: Some("feat".into()),
+            local_parity: Some("/home/u/wt".into()),
+            checkpoint: false,
+            ..Default::default()
+        };
+        let p = plan(&EnvRequirements::default(), &opts);
+        let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+        let clone = ids.iter().position(|i| *i == "clone").expect("clone");
+        let parity = ids
+            .iter()
+            .position(|i| *i == "local_parity")
+            .expect("local_parity step");
+        assert_eq!(parity, clone + 1, "parity immediately after clone: {ids:?}");
+        let StepKind::LocalParity { worktree, workdir } = &p
+            .steps
+            .iter()
+            .find(|s| s.id == "local_parity")
+            .unwrap()
+            .kind
+        else {
+            panic!("local_parity must be a LocalParity step");
+        };
+        assert_eq!(worktree, "/home/u/wt");
+        assert_eq!(workdir, "/workspace");
+    }
+
+    #[test]
+    fn plan_no_local_parity_without_origin_or_request() {
+        // No origin ⇒ no clone ⇒ no parity overlay even if requested.
+        let no_origin = PlanOpts {
+            origin: None,
+            local_parity: Some("/home/u/wt".into()),
+            ..Default::default()
+        };
+        assert!(
+            !plan(&EnvRequirements::default(), &no_origin)
+                .steps
+                .iter()
+                .any(|s| s.id == "local_parity"),
+            "no clone, no parity"
+        );
+        // Origin but parity not requested (a spare) ⇒ pristine clone only.
+        let spare = PlanOpts {
+            origin: Some("https://example.com/r.git".into()),
+            local_parity: None,
+            ..Default::default()
+        };
+        assert!(
+            !plan(&EnvRequirements::default(), &spare)
+                .steps
+                .iter()
+                .any(|s| s.id == "local_parity"),
+            "spare stays a pristine clone"
+        );
+    }
+
+    #[test]
     fn plan_host_parity_falls_back_to_home_switch_without_roots() {
         let opts = PlanOpts {
             strategy: crate::config::ShellStrategy::HostParity,
@@ -1224,6 +1664,67 @@ mod tests {
             "home_switch fallback: {ids:?}"
         );
         assert!(!ids.contains(&"home_closure"));
+    }
+
+    #[test]
+    fn plan_host_parity_p2p_pushes_then_installs_before_dotfiles() {
+        let opts = PlanOpts {
+            strategy: crate::config::ShellStrategy::HostParity,
+            dotfiles: vec![".zshrc".into()],
+            home_store_roots: vec!["/nix/store/abc-zsh".into()],
+            home_closure_p2p: true,
+            home_profile_installs: vec!["/nix/store/abc-zsh".into()],
+            checkpoint: true,
+            ..Default::default()
+        };
+        let p = plan(&EnvRequirements::default(), &opts);
+        let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+        let nix = ids.iter().position(|i| *i == "nix").expect("nix");
+        let push = ids
+            .iter()
+            .position(|i| *i == "home_closure_push")
+            .expect("p2p push step");
+        let prof = ids
+            .iter()
+            .position(|i| *i == "home_profile")
+            .expect("profile install step");
+        let dots = ids.iter().position(|i| *i == "dotfiles").expect("dotfiles");
+        assert!(
+            nix < push && push < prof && prof < dots,
+            "nix → push → install → dotfiles: {ids:?}"
+        );
+        // p2p does NOT emit the cache-substitute step.
+        assert!(
+            !ids.contains(&"home_closure"),
+            "no substitute step under p2p: {ids:?}"
+        );
+        // The push step carries the roots for the host to copy.
+        let StepKind::HomeClosurePush(roots) = &p
+            .steps
+            .iter()
+            .find(|s| s.id == "home_closure_push")
+            .unwrap()
+            .kind
+        else {
+            panic!("push step must be HomeClosurePush");
+        };
+        assert_eq!(roots, &vec!["/nix/store/abc-zsh".to_string()]);
+    }
+
+    #[test]
+    fn home_profile_install_script_installs_each_path_by_store_path() {
+        let s = home_profile_install_script(&[
+            "/nix/store/abc-zsh".into(),
+            "/nix/store/def-starship".into(),
+        ]);
+        // sh_quote leaves these clean paths unquoted.
+        assert!(s.contains("nix profile install /nix/store/abc-zsh"), "{s}");
+        assert!(
+            s.contains("nix profile install /nix/store/def-starship"),
+            "{s}"
+        );
+        // Per-path `|| true` so one bad path can't abort the rest.
+        assert!(s.contains("|| true"), "{s}");
     }
 
     #[test]

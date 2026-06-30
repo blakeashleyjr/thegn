@@ -87,9 +87,15 @@ fn shell_inner(in_oci: bool) -> String {
             .iter()
             .map(|s| format!("command -v {s} >/dev/null 2>&1 && exec {s} -l; "))
             .collect();
-        // The trailing /bin/sh -l is the unconditional fallback — it exists in
-        // every POSIX container.
-        format!("{checks}exec /bin/sh -l")
+        // Put the nix profile dirs on PATH FIRST so a `nix profile install`ed shell
+        // (zsh from nixpkgs) is actually found by `command -v` — covers both the
+        // single-user (`~/.nix-profile`) and daemon/system (Determinate `--init
+        // none`) profiles. Without this the checks miss the installed zsh and drop
+        // to `/bin/sh`. The trailing `/bin/sh -l` is the universal fallback.
+        format!(
+            "export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH\"; \
+             {checks}exec /bin/sh -l"
+        )
     } else {
         let host_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         format!("{host_shell} -l")
@@ -734,7 +740,16 @@ fn provider_sandbox_name(cfg: &Config, worktree: &str, env_name: &str) -> Option
         .unwrap_or_else(|| PathBuf::from(worktree));
     let env = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), Some(env_name));
     match env.placement {
-        superzej_core::placement::Placement::Provider(p) => Some(p.id),
+        superzej_core::placement::Placement::Provider(p) => {
+            // If this worktree CLAIMED a warm-pool spare, its sandbox is that
+            // spare's name (a DB binding), which overrides the derived id — so all
+            // lifecycle/exec calls target the handed-over sandbox. Else the derived
+            // `effective_provider_id`.
+            let bound = Db::open()
+                .ok()
+                .and_then(|db| db.worktree_provider_sandbox(worktree).ok().flatten());
+            Some(bound.unwrap_or(p.id))
+        }
         _ => None,
     }
 }
@@ -1050,7 +1065,10 @@ pub fn sprite_ssh_argv(
     let remote = if workdir.is_empty() {
         shell
     } else {
-        format!("cd {} 2>/dev/null; {shell}", superzej_core::util::sh_quote(workdir))
+        format!(
+            "cd {} 2>/dev/null; {shell}",
+            superzej_core::util::sh_quote(workdir)
+        )
     };
     vec![
         "ssh".into(),
@@ -1080,6 +1098,33 @@ pub fn sprite_ssh_argv(
 ///
 /// Resolves the env exactly as [`launch_spec_with_key`] does (DB repo-root +
 /// effective env) so the two paths never disagree about which env is in play.
+/// Auto-detect the coding agents the HOST has so a sandbox reproduces them
+/// ("exact local parity") without per-sandbox config. A known agent
+/// ([`superzej_core::envplan::known_agents`]) counts as present if its binary is
+/// on the host PATH or its config/credential dir exists in `$HOME`. The result
+/// drives the install + config-upload provisioning steps. Used only when
+/// `[sandbox.home] agents` is unset (an explicit list always wins).
+fn detect_host_agents() -> Vec<String> {
+    let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
+    let path = std::env::var("PATH").unwrap_or_default();
+    let dirs: Vec<&str> = path.split(':').filter(|s| !s.is_empty()).collect();
+    superzej_core::envplan::known_agents()
+        .iter()
+        .filter(|a| {
+            let on_path = dirs.iter().any(|d| Path::new(d).join(a).is_file());
+            if on_path {
+                return true;
+            }
+            let (files, cfg_dirs) = superzej_core::envplan::agent_config_paths(a);
+            files
+                .iter()
+                .chain(cfg_dirs.iter())
+                .any(|rel| home.join(rel).exists())
+        })
+        .map(|a| a.to_string())
+        .collect()
+}
+
 pub fn native_shell_exec(cfg: &Config, worktree: &str) -> Option<NativeShell> {
     use superzej_core::config::ProviderExecMode;
     let loc = GitLoc::for_worktree(Path::new(worktree));
@@ -1229,6 +1274,9 @@ pub fn clear_native_exec_cooldown(cfg: &Config, worktree: &str) {
 /// Visual state of one provisioning step, surfaced to the loading screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProvisionState {
+    /// Not started yet — shows the original dot.
+    Pending,
+    /// Currently running — shows the spinner/working glyph.
     Active,
     Done,
     Failed,
@@ -1239,6 +1287,9 @@ pub enum ProvisionState {
 pub struct ProvisionStepView {
     pub label: String,
     pub state: ProvisionState,
+    /// Sub-line under the step on the loading screen: a live status for the
+    /// active step or the captured error for a failed one. `None` = no sub-line.
+    pub detail: Option<String>,
 }
 
 /// Provision the worktree's environment if it runs on a managed **provider**
@@ -1276,6 +1327,125 @@ pub fn provision_worktree(
         return Ok(false);
     }
     provision_provider_env(cfg, worktree, &environment.name, progress)
+}
+
+/// A stable-ish generic name for a new warm-pool spare: `<repo>-pool-<hash>`. The
+/// hash varies per process+counter so concurrent mints never collide.
+fn mint_spare_name(repo: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let slug = Path::new(repo)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(superzej_core::util::slugify)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "sz".to_string());
+    let h = superzej_core::util::short_hash(&format!("{repo}-{}-{n}", std::process::id()), 6);
+    format!("{slug}-pool-{h}")
+}
+
+/// Hash of the repo's `flake.lock` (staleness key for a spare's seeded devShell);
+/// empty when the repo has no lockfile.
+fn flake_lock_hash(repo_root: &Path) -> String {
+    std::fs::read(repo_root.join("flake.lock"))
+        .ok()
+        .map(|b| superzej_core::util::short_hash(&String::from_utf8_lossy(&b), 16))
+        .unwrap_or_default()
+}
+
+/// Mint + fully provision a NEW warm-pool spare for `(repo, env)`: a generically-
+/// named sandbox, cloned + devShell-seeded + tooled + checkpointed (so it suspends
+/// for free), recorded `ready` so a worktree can claim it. Returns the spare name.
+/// On failure the half-built sandbox + DB row are torn down.
+pub fn provision_spare(
+    cfg: &Config,
+    repo_root: &Path,
+    env_name: &str,
+    mut progress: impl FnMut(&[ProvisionStepView]),
+) -> anyhow::Result<String> {
+    let repo = repo_root.to_string_lossy().to_string();
+    let name = mint_spare_name(&repo);
+    if let Ok(db) = Db::open() {
+        let _ = db.insert_pool_spare(&name, &repo, env_name);
+    }
+    // The repo's main worktree gives env-resolution + origin context; the name is
+    // overridden to the generic spare name (the clone is branch-less either way).
+    let ctx = repo::main_worktree(repo_root)
+        .unwrap_or_else(|| repo_root.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    match provision_provider_env_named(cfg, &ctx, env_name, Some(&name), &mut progress) {
+        Ok(_) => {
+            let lock = flake_lock_hash(repo_root);
+            if let Ok(db) = Db::open() {
+                let _ = db.set_pool_spare_ready(&name, None, &lock);
+            }
+            Ok(name)
+        }
+        Err(e) => {
+            let _ = destroy_spare(cfg, env_name, &name);
+            Err(e)
+        }
+    }
+}
+
+/// Claim a `ready` spare for `(repo, env)` and hand it to `worktree`: bind it (DB,
+/// atomic) then check out the worktree's branch in the spare's workdir. Returns the
+/// claimed sandbox name, or `None` when no spare is ready (caller provisions fresh).
+pub fn claim_spare(
+    cfg: &Config,
+    worktree: &str,
+    repo_root: &Path,
+    env_name: &str,
+    branch: Option<&str>,
+) -> Option<String> {
+    let repo = repo_root.to_string_lossy().into_owned();
+    let db = Db::open().ok()?;
+    let (name, _checkpoint) = db.claim_pool_spare(&repo, env_name, worktree).ok()??;
+    // Per-worktree work: settle the branch in the spare's existing clone (the
+    // sandbox auto-resumes when the exec opens). Best-effort — the bind already
+    // succeeded, so the pane opens against the spare regardless.
+    if let Some(env) = cfg.env.get(env_name)
+        && let Some(provider) = provider_for_named(&env.provider, &name)
+    {
+        let workdir = env.provider.sync_workdir();
+        if let Some(b) = branch.map(str::trim).filter(|b| !b.is_empty()) {
+            let wd = superzej_core::util::sh_quote(&workdir);
+            let bq = superzej_core::util::sh_quote(b);
+            let script = format!(
+                "cd {wd} 2>/dev/null && (git checkout {bq} 2>/dev/null || git checkout -b {bq}) 2>&1"
+            );
+            let argv = vec!["/bin/sh".to_string(), "-lc".to_string(), script];
+            let _ =
+                block_on_provider(|| async { provider.run_exec(&name, &argv, None, &[]).await });
+        }
+        // Bring the claimed spare to full parity with the local worktree, same as
+        // a fresh provision (only for an `in_env` provider — a projected data mode
+        // mirrors the tree by other means). Best-effort.
+        if env.data == superzej_core::config::DataMode::InEnv
+            && let Err(e) = apply_local_parity(&provider, &name, worktree, &workdir, &[])
+        {
+            superzej_core::msg::warn(&format!(
+                "local parity on claimed spare {name}: {e}; using the origin checkout."
+            ));
+        }
+    }
+    superzej_core::msg::info(&format!("claimed warm spare {name} for {worktree}"));
+    Some(name)
+}
+
+/// Destroy a spare sandbox + drop its DB row. Best-effort (idempotent).
+pub fn destroy_spare(cfg: &Config, env_name: &str, name: &str) -> anyhow::Result<()> {
+    if let Some(env) = cfg.env.get(env_name)
+        && let Some(provider) = provider_for_named(&env.provider, name)
+    {
+        let _ = block_on_provider(|| async { provider.destroy(name).await });
+    }
+    if let Ok(db) = Db::open() {
+        let _ = db.delete_pool_spare(name);
+    }
+    Ok(())
 }
 
 /// Make a sandbox/remote env "just work" like local, by reproducing the repo's
@@ -1316,13 +1486,33 @@ pub fn provision_provider_env(
     env_name: &str,
     mut progress: impl FnMut(&[ProvisionStepView]),
 ) -> anyhow::Result<bool> {
+    provision_provider_env_named(cfg, worktree, env_name, None, &mut progress)
+}
+
+/// Provision a provider env into a sandbox. `name_override` forces the sandbox
+/// name (used for warm-pool SPARES, which aren't bound to a worktree); `None`
+/// derives it from the worktree as usual. `worktree` always provides the env-
+/// resolution + repo-origin context (for a spare, pass the repo's main worktree).
+/// The clone is branch-less (`opts.branch = None`) either way, so a spare and a
+/// worktree provision identically apart from the name.
+pub fn provision_provider_env_named(
+    cfg: &Config,
+    worktree: &str,
+    env_name: &str,
+    name_override: Option<&str>,
+    progress: &mut impl FnMut(&[ProvisionStepView]),
+) -> anyhow::Result<bool> {
     use superzej_core::envplan::{self, EnvPlan, PlanOpts, StepKind};
 
     let Some(env) = cfg.env.get(env_name) else {
         return Ok(false);
     };
     let pc = &env.provider;
-    let Some(id) = provider_sandbox_name(cfg, worktree, env_name).filter(|s| !s.is_empty()) else {
+    let Some(id) = name_override
+        .map(str::to_string)
+        .or_else(|| provider_sandbox_name(cfg, worktree, env_name))
+        .filter(|s| !s.is_empty())
+    else {
         return Ok(false);
     };
     // Bake the resolved id so a recreate (`ensure_exists`→`create`) names the
@@ -1364,6 +1554,10 @@ pub fn provision_provider_env(
     // command so the clone authenticates against private repos and setup steps can
     // reach the network/model. Remote-safe (no host-local socket vars).
     let exec_env = cfg.repo_sandbox(&repo_root).passthrough_env_remote();
+    // Which flake devShell the sandbox builds/enters ([sandbox] devshell, e.g.
+    // "sandbox" for the lean build shell). Drives the seed build + realise so they
+    // match the in-pane `.envrc` (which reads SUPERZEJ_DEVSHELL from exec_env).
+    let devshell_attr = cfg.repo_sandbox(&repo_root).devshell.trim().to_string();
     // The generic, declarative personal layer ([sandbox.home]) — applied to every
     // sandbox so it feels like local. Resolve it PER-ENV (the env overlay may set a
     // different `strategy`, e.g. host-parity on a big box, clean on a sprite), then
@@ -1377,7 +1571,27 @@ pub fn provision_provider_env(
     let host_home = std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/root"));
-    let (dotfiles, home_store_roots) = resolve_personal_dotfiles(&host_home, &home, env_name);
+    let (dotfiles, mut home_store_roots) = resolve_personal_dotfiles(&host_home, &home, env_name);
+    // Host-parity transport selection. With no hosted binary cache configured but
+    // `connect = "ssh"`, push the host store straight into the sandbox over the WSS
+    // ssh tunnel (the host *is* the cache — no signing key, no hosted cache), then
+    // `nix profile install` the shell + prompt tools by store path so they land on
+    // `PATH`. Otherwise fall through to the cache-substitute / home-manager paths.
+    let p2p_parity = home.strategy == superzej_core::config::ShellStrategy::HostParity
+        && pc.connect == superzej_core::config::ProviderConnect::Ssh
+        && pc.binary_cache_url.trim().is_empty();
+    let home_profile_installs = if p2p_parity {
+        let roots = host_shell_store_roots();
+        // Push the binaries' closures too (not just what the rc sources).
+        for r in &roots {
+            if !home_store_roots.contains(r) {
+                home_store_roots.push(r.clone());
+            }
+        }
+        roots
+    } else {
+        Vec::new()
+    };
     // SSH-over-WSS transport (`connect = "ssh"`): add the one-time in-sandbox sshd
     // setup (install openssh + host key + authorize our managed key + config) to
     // the personal-layer setup so it's baked into the checkpoint. The daemon is
@@ -1388,15 +1602,40 @@ pub fn provision_provider_env(
     {
         setup.push(sprite_sshd_setup_script(&pubkey));
     }
+    // Check out the worktree's branch in the sandbox clone (so it's not stuck on
+    // origin's default). `git checkout <b> || git checkout -b <b>` — if the branch
+    // is on origin it lands with its commits; otherwise it's created off the
+    // default (push the branch for its content). A SPARE (name_override) stays on
+    // the default — it's generic until a worktree claims + rebranches it.
+    let branch = if name_override.is_some() {
+        None
+    } else {
+        superzej_core::util::git_cmd(Path::new(worktree))
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|b| !b.is_empty() && b != "HEAD")
+    };
     let opts = PlanOpts {
         workdir: workdir.clone(),
         origin: local_origin(&repo_root),
-        branch: None,
+        branch,
         dotfiles,
         tools: home.tools.clone(),
         dotfiles_repo: home.dotfiles_repo.clone(),
         setup,
-        agents: home.agents.clone(),
+        // Exact local parity for agents: an explicit `[sandbox.home] agents`
+        // list wins; otherwise reproduce whatever coding agents the HOST has
+        // (claude/pi/codex/hermes/…) so they're installed + logged-in in the
+        // sandbox by default. Known ones get an installer; all get their config
+        // (login, history, skills, MCP) uploaded.
+        agents: if home.agents.is_empty() {
+            detect_host_agents()
+        } else {
+            home.agents.clone()
+        },
         allow_nix: true,
         checkpoint: pc.auto_checkpoint,
         // Provisioning speedups (all no-ops unless configured).
@@ -1412,6 +1651,25 @@ pub fn provision_provider_env(
         strategy: home.strategy,
         nix_home_flake: home.nix_home_flake.clone(),
         home_store_roots,
+        home_closure_p2p: p2p_parity,
+        home_profile_installs,
+        atuin: home.atuin,
+        push_devshell: pc.push_devshell,
+        // A pool SPARE provisions in the BACKGROUND (no loading screen to gate),
+        // so it should fully BUILD the devShell — `skip_devshell_warm` is a
+        // loading-screen speed hack that only makes sense for an on-demand,
+        // foreground provision. Skipping it on a spare yields a "ready" spare
+        // whose devShell still builds lazily in-pane on claim ("not ready yet");
+        // building it up front is what makes a claimed worktree truly instant.
+        skip_devshell_warm: pc.skip_devshell_warm && name_override.is_none(),
+        // Full local parity (unpushed commits + uncommitted + untracked) for a
+        // real worktree on an `in_env` provider — so a fresh sandbox matches the
+        // working tree, not just origin. A SPARE (name_override) stays a pristine
+        // clone (generic until claimed); a non-`in_env` data mode projects the
+        // tree by other means, so skip the overlay there.
+        local_parity: (name_override.is_none()
+            && env.data == superzej_core::config::DataMode::InEnv)
+            .then(|| worktree.to_string()),
     };
     let plan = envplan::plan(&req, &opts);
 
@@ -1455,22 +1713,28 @@ pub fn provision_provider_env(
     .filter(|h| h.starts_with('/'))
     .unwrap_or_else(|| "/root".to_string());
 
-    // Seed the loading screen with all steps pending→active.
+    // Seed the loading screen with every step pending (the original dot).
     let mut views: Vec<ProvisionStepView> = plan
         .steps
         .iter()
         .map(|s| ProvisionStepView {
             label: s.label.clone(),
-            state: ProvisionState::Active,
+            state: ProvisionState::Pending,
+            detail: None,
         })
         .collect();
 
     for (i, step) in plan.steps.iter().enumerate() {
         for (j, v) in views.iter_mut().enumerate() {
             v.state = match j.cmp(&i) {
-                std::cmp::Ordering::Less => ProvisionState::Done,
-                std::cmp::Ordering::Equal => ProvisionState::Active,
-                std::cmp::Ordering::Greater => ProvisionState::Active, // pending shows as active spinner
+                // A best-effort step that already failed stays Failed (with its
+                // detail) — don't relabel a completed-with-warning step as Done.
+                std::cmp::Ordering::Less if v.state == ProvisionState::Failed => {
+                    ProvisionState::Failed
+                }
+                std::cmp::Ordering::Less => ProvisionState::Done, // check
+                std::cmp::Ordering::Equal => ProvisionState::Active, // spinner
+                std::cmp::Ordering::Greater => ProvisionState::Pending, // dot
             };
         }
         progress(&views);
@@ -1480,15 +1744,27 @@ pub fn provision_provider_env(
         let result: anyhow::Result<()> = match &step.kind {
             StepKind::Exec(script) => {
                 // `/bin/sh -lc` + `2>&1` so the non-tty exec captures stderr too.
-                // Prefix PATH with the per-user nix + local-bin dirs: the provider
-                // exec env is non-login (no `$USER`), so the installer's profile.d
-                // hook is a no-op — every step must put these on PATH itself for a
-                // later step to see a tool a prior step installed (nix, mise, …).
+                // Prefix PATH with EVERY place an installer drops `nix` + tools: the
+                // provider exec env is non-login (no `$USER`), so the installer's
+                // profile.d hook is a no-op — each step must put these on PATH itself
+                // for a later step to see what a prior step installed. CRITICAL:
+                // include the daemon/system profile (`/nix/var/nix/profiles/default`)
+                // where the Determinate installer (`--init none`) lands — without it
+                // every nix-using step (devShell, profile install, closure) fails
+                // "nix: not found" after a successful Determinate install, leaving a
+                // bare shell. Also source its profile hook for completeness.
                 let argv = vec![
                     "/bin/sh".to_string(),
                     "-lc".to_string(),
                     format!(
-                        "export PATH=\"$HOME/.nix-profile/bin:$HOME/.local/state/nix/profile/bin:$HOME/.local/bin:$PATH\"; {script} 2>&1"
+                        // `[ -r F ] && . F`, NOT `. F 2>/dev/null || true`: in dash
+                        // (the sandbox `/bin/sh`) sourcing a MISSING file is a
+                        // special-builtin error that exits the shell with status 2 —
+                        // `|| true` can't catch it — so on a fresh sandbox (no nix
+                        // yet) it aborted EVERY step, including the fatal `mkdir`.
+                        "[ -r /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ] && \
+                         . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh; \
+                         export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$HOME/.local/state/nix/profile/bin:$HOME/.local/bin:$PATH\"; {script} 2>&1"
                     ),
                 ];
                 // Bound every exec: a suspended/slow sandbox can leave `run_exec`
@@ -1521,17 +1797,84 @@ pub fn provision_provider_env(
             StepKind::AgentConfigs(agents) => {
                 upload_agent_configs(&provider, &id, &sprite_home, agents)
             }
+            StepKind::AtuinSync => upload_atuin_creds(&provider, &id, &sprite_home),
+            StepKind::DevShellClosurePush => {
+                // Host-executed: build the repo's devShell on the host (a no-op for a
+                // nix user who already has it) + transfer its closure into the sandbox
+                // store, so the `devshell` warm below is a local store hit. Best-effort
+                // — a failure just means the sandbox builds the devShell itself.
+                if let Err(e) =
+                    push_devshell_closure(&provider, &id, &repo_root, &workdir, &devshell_attr)
+                {
+                    superzej_core::msg::warn(&format!(
+                        "devshell push: {e}; the sandbox will build the devShell itself."
+                    ));
+                }
+                Ok(())
+            }
+            StepKind::LocalParity {
+                worktree: wt,
+                workdir: wd,
+            } => {
+                // Host-executed: capture the local worktree's unpushed commits +
+                // uncommitted + untracked state and replay it over the clone.
+                // Best-effort — a failure leaves the pristine origin checkout.
+                if let Err(e) = apply_local_parity(&provider, &id, wt, wd, &exec_env) {
+                    superzej_core::msg::warn(&format!(
+                        "local parity: {e}; the sandbox keeps the origin checkout."
+                    ));
+                }
+                Ok(())
+            }
             StepKind::Checkpoint => block_on_provider(|| async {
                 provider.checkpoint(&id, Some("superzej-provisioned")).await
             })
             .map(|_| ()),
+            StepKind::HomeClosurePush(roots) => {
+                // Host-executed: push the host store → sandbox store over the WSS
+                // ssh tunnel (host's `nix copy --to ssh-ng://`). Best-effort — a
+                // failure leaves the rc to source whatever the sandbox can resolve;
+                // it must not abort provisioning, so warn + continue.
+                match sprite_ssh_connect(cfg, worktree) {
+                    Some((key, user, _workdir)) => {
+                        let exe = std::env::current_exe()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_else(|_| "szhost".into());
+                        if let Err(e) = push_home_closure_p2p(&exe, worktree, &key, &user, roots) {
+                            superzej_core::msg::warn(&format!(
+                                "host-parity p2p: pushing the home closure to the sandbox \
+                                 failed: {e}; the shell will use whatever the sandbox can \
+                                 resolve. Ensure the sandbox was (re)created with connect=ssh."
+                            ));
+                        }
+                        Ok(())
+                    }
+                    None => {
+                        superzej_core::msg::warn(
+                            "host-parity p2p: connect=ssh is required to push the home \
+                             closure but the ssh tunnel is unavailable; skipping.",
+                        );
+                        Ok(())
+                    }
+                }
+            }
         };
 
         if let Err(e) = result {
-            tracing::warn!(target: "szhost::startup", step = %step.id, ms = step_t0.elapsed().as_millis() as u64, error = %e, "provision step failed");
             views[i].state = ProvisionState::Failed;
+            views[i].detail = Some(sanitize_detail(&e.to_string()));
             progress(&views);
-            return Err(e);
+            // Only the essential steps (the worktree dir + clone + nix) abort
+            // creation. The rest — warming the devShell/direnv, personal tools,
+            // dotfiles, the home-parity closure — are BEST-EFFORT: the shell still
+            // comes up and these resolve lazily in the pane. A best-effort failure
+            // warns + continues so one flaky `nix develop` can't kill the sandbox.
+            if step_is_fatal(&step.id) {
+                tracing::warn!(target: "szhost::startup", step = %step.id, ms = step_t0.elapsed().as_millis() as u64, error = %e, "provision step failed (fatal — aborting)");
+                return Err(e);
+            }
+            tracing::warn!(target: "szhost::startup", step = %step.id, ms = step_t0.elapsed().as_millis() as u64, error = %e, "provision step failed (best-effort — continuing)");
+            continue;
         }
         tracing::info!(target: "szhost::startup", step = %step.id, ms = step_t0.elapsed().as_millis() as u64, "provision step done");
         views[i].state = ProvisionState::Done;
@@ -1669,6 +2012,598 @@ fn push_home_closure(cache_url: &str, roots: &[String]) -> anyhow::Result<()> {
     }
 }
 
+/// Pure: the `nix copy` argv for a **p2p** push straight into the sandbox's own
+/// store over the WSS ssh tunnel (no hosted cache — the host store is the source).
+/// `--no-check-sigs` (the host is trusted) and `--substitute-on-destination` (let
+/// the sandbox fill public paths from its own substituters in parallel). The ssh
+/// transport (key, port, ProxyCommand) is supplied via `NIX_SSHOPTS`.
+fn nix_copy_p2p_argv(user: &str, roots: &[String]) -> Vec<String> {
+    let mut argv = vec![
+        "copy".to_string(),
+        "--to".to_string(),
+        format!("ssh-ng://{user}@sprite"),
+        "--no-check-sigs".to_string(),
+        "--substitute-on-destination".to_string(),
+    ];
+    argv.extend(roots.iter().cloned());
+    argv
+}
+
+/// Pure: truncate a `/nix/store/<hash>-<name>/...` path to its top-level store
+/// path (`/nix/store/<hash>-<name>`), which is what `nix copy` / `nix profile
+/// install` accept. `None` for non-store paths.
+fn store_root_of(p: &str) -> Option<String> {
+    let rest = p.strip_prefix("/nix/store/")?;
+    let entry = rest.split('/').next()?;
+    (!entry.is_empty()).then(|| format!("/nix/store/{entry}"))
+}
+
+/// Resolve the host `/nix/store` roots for the user's interactive shell + the
+/// ubiquitous prompt tools, so a host-parity p2p push carries the binaries
+/// themselves (not just what the rc sources) and they can be `nix profile
+/// install`ed by name in the sandbox. Host-only + best-effort (`command -v` →
+/// canonicalize → store-root); non-store / missing tools are skipped.
+fn host_shell_store_roots() -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(sh) = std::env::var("SHELL")
+        && let Some(n) = Path::new(&sh).file_name().and_then(|s| s.to_str())
+    {
+        names.push(n.to_string());
+    }
+    for t in ["zsh", "starship", "atuin", "direnv", "fzf"] {
+        if !names.iter().any(|s| s == t) {
+            names.push(t.to_string());
+        }
+    }
+    let mut roots: Vec<String> = Vec::new();
+    for t in names {
+        let Ok(out) = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("command -v {t}"))
+            .output()
+        else {
+            continue;
+        };
+        if !out.status.success() {
+            continue;
+        }
+        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if path.is_empty() {
+            continue;
+        }
+        if let Ok(real) = std::fs::canonicalize(&path)
+            && let Some(root) = store_root_of(&real.to_string_lossy())
+            && !roots.contains(&root)
+        {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+/// Write a tiny no-arg wrapper script for ssh's `ProxyCommand` next to the managed
+/// key. `NIX_SSHOPTS` is whitespace-split by `nix`, so a space-bearing
+/// ProxyCommand (`<szhost> sprite-proxy <wt>`) can't go inline — the wrapper is a
+/// single token. Returns its path.
+fn write_proxy_wrapper(key: &Path, proxy_cmd: &str) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = key.parent().unwrap_or_else(|| Path::new("."));
+    let script = dir.join("nix-copy-proxy.sh");
+    std::fs::write(&script, format!("#!/bin/sh\nexec {proxy_cmd}\n"))?;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+    Ok(script)
+}
+
+/// Host-side host-parity **p2p** push: copy the closure of `roots` straight into
+/// the sandbox's store over the WSS ssh tunnel (the `sprite-proxy` ProxyCommand),
+/// using the host's `nix`. No hosted cache or signing key — the host store is the
+/// source. Best-effort; returns the error for the caller to warn on. Requires the
+/// sandbox to have been (re)created with `connect = "ssh"` (so its sshd accepts
+/// the managed key) and `nix` installed in it.
+fn push_home_closure_p2p(
+    szhost_exe: &str,
+    worktree: &str,
+    key: &Path,
+    user: &str,
+    roots: &[String],
+) -> anyhow::Result<()> {
+    let proxy = format!(
+        "{} sprite-proxy {}",
+        superzej_core::util::sh_quote(szhost_exe),
+        superzej_core::util::sh_quote(worktree),
+    );
+    let proxy_script = write_proxy_wrapper(key, &proxy)?;
+    let ssh_opts = format!(
+        "-o ProxyCommand={} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+         -o LogLevel=ERROR -o ConnectTimeout=10 -o ServerAliveInterval=10 \
+         -o ServerAliveCountMax=3 -i {} -p {}",
+        superzej_core::util::sh_quote(&proxy_script.to_string_lossy()),
+        superzej_core::util::sh_quote(&key.to_string_lossy()),
+        SPRITE_SSHD_PORT,
+    );
+    let argv = nix_copy_p2p_argv(user, roots);
+    // HARD timeout: this is a blocking host-side call on the provisioning path. If
+    // the sandbox sshd isn't reachable yet (fresh sprite) or the closure is huge,
+    // `nix copy` would otherwise hang the loading screen indefinitely. `timeout`
+    // (coreutils) bounds it; `--kill-after` force-kills the ssh/ProxyCommand
+    // children. On timeout the caller warns + continues (best-effort), so the
+    // shell still opens — exact-parity is a nice-to-have, never a blocker.
+    let out = std::process::Command::new("timeout")
+        .arg("--kill-after=5")
+        .arg(HOME_CLOSURE_PUSH_TIMEOUT_SECS.to_string())
+        .arg("nix")
+        .args(&argv)
+        .env("NIX_SSHOPTS", ssh_opts)
+        .output()
+        .map_err(|e| anyhow::anyhow!("spawn `nix copy` (p2p): {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let code = out.status.code().unwrap_or(-1);
+    // `timeout` exits 124 when the deadline fired.
+    let why = if code == 124 {
+        format!(
+            "timed out after {HOME_CLOSURE_PUSH_TIMEOUT_SECS}s (sandbox sshd not reachable, or closure too large)"
+        )
+    } else {
+        format!(
+            "exit {code}: {}",
+            tail_lines(&String::from_utf8_lossy(&out.stderr), 6)
+        )
+    };
+    Err(anyhow::anyhow!("nix copy (p2p) {why}"))
+}
+
+/// Hard ceiling for the host-side p2p closure push, in seconds. Past this the
+/// step is abandoned (best-effort) so the first shell is never held hostage to a
+/// slow/unreachable transfer.
+const HOME_CLOSURE_PUSH_TIMEOUT_SECS: u32 = 75;
+
+/// Ceiling (seconds) for each host-side `nix` invocation in the devShell push
+/// (build+gcroot, then the `file://` copy). Generous: instant for a nix user who
+/// already has the devShell, but a cold host build can take a while.
+const DEVSHELL_PUSH_NIX_TIMEOUT_SECS: u32 = 600;
+
+/// Pure: the `nix develop <ref> --profile <gcroot> --command true` argv — builds
+/// the repo's devShell on the HOST and pins it behind a gcroot (so the copy can't
+/// race nix GC). Instant when the devShell is already built locally. `attr`
+/// selects the devShell (`<repo>#<attr>`, e.g. the lean `sandbox`); empty ⇒ the
+/// flake default — matching what the sandbox `.envrc` will enter.
+fn nix_develop_profile_argv(repo_root: &str, gcroot: &str, attr: &str) -> Vec<String> {
+    let reference = if attr.trim().is_empty() {
+        repo_root.to_string()
+    } else {
+        format!("{repo_root}#{}", attr.trim())
+    };
+    vec![
+        "develop".into(),
+        reference,
+        "--profile".into(),
+        gcroot.into(),
+        "--command".into(),
+        "true".into(),
+    ]
+}
+
+/// Pure: `nix copy --to file://<dir> --no-check-sigs <path>` — write a
+/// self-contained binary cache of `path`'s closure to a host dir for transfer.
+fn nix_copy_to_file_argv(cache_dir: &str, path: &str) -> Vec<String> {
+    vec![
+        "copy".into(),
+        "--to".into(),
+        // `compression=zstd`: the cache is built then mostly PRUNED (rust + public
+        // paths dropped), so we'd otherwise burn minutes xz-compressing ~600MB we
+        // immediately delete. zstd is ~100x faster to compress (the discarded bulk
+        // is then nearly free) and the kept paths still ship small. Modern nix on
+        // the sandbox reads zstd NARs fine.
+        format!("file://{cache_dir}?compression=zstd"),
+        "--no-check-sigs".into(),
+        path.into(),
+    ]
+}
+
+/// Filename-safe tag from a sandbox id (alnum/`-`/`_` only) for host temp paths.
+fn sanitize_tag(id: &str) -> String {
+    let t: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if t.is_empty() { "sandbox".into() } else { t }
+}
+
+/// Run a host `nix` subcommand bounded by `timeout` (coreutils). `Ok(output)` on
+/// success; `Err` with a tail of stderr (or "timed out") otherwise.
+fn run_host_nix_timeout(secs: u32, argv: &[String]) -> anyhow::Result<std::process::Output> {
+    let out = std::process::Command::new("timeout")
+        .arg("--kill-after=5")
+        .arg(secs.to_string())
+        .arg("nix")
+        .args(argv)
+        .output()
+        .map_err(|e| anyhow::anyhow!("spawn nix: {e}"))?;
+    if out.status.success() {
+        return Ok(out);
+    }
+    let code = out.status.code().unwrap_or(-1);
+    let why = if code == 124 {
+        format!("timed out after {secs}s")
+    } else {
+        format!("exit {code}")
+    };
+    Err(anyhow::anyhow!(
+        "nix {} {}: {}",
+        argv.first().map(String::as_str).unwrap_or("?"),
+        why,
+        tail_lines(&String::from_utf8_lossy(&out.stderr), 4)
+    ))
+}
+
+/// Host-side devShell speedup: build the repo's devShell on the HOST (instant for a
+/// nix user who already has it), serialize its closure to a `file://` binary cache,
+/// upload that cache into the sandbox, and import it there — so the in-sandbox
+/// devShell warm is a local store hit instead of a rebuild. Best-effort; the host
+/// `nix` steps are timeout-bounded. Requires the sandbox store to be writable (the
+/// `nix` step's `claim_store` ran first) + `nix` on the sandbox PATH.
+/// Bring the sandbox clone to full parity with the LOCAL worktree at `wt_host`:
+/// replay unpushed commits (a thin `git bundle … HEAD --not --remotes`), restore
+/// uncommitted tracked changes (`git diff HEAD --binary`), and lay down untracked
+/// non-ignored files (a tar). Host git reads use the GIT_*-scrubbed `git_cmd`
+/// wrapper; the three artifacts are written into the sandbox `/tmp` and a single
+/// replay script applies them in `workdir`. Best-effort throughout — any capture
+/// or apply failure leaves the pristine origin checkout intact.
+fn apply_local_parity(
+    provider: &superzej_svc::provider::Provider,
+    id: &str,
+    wt_host: &str,
+    workdir: &str,
+    exec_env: &[(String, String)],
+) -> anyhow::Result<()> {
+    use superzej_core::util::git_cmd;
+    let wt = Path::new(wt_host);
+    if !wt.join(".git").exists() {
+        // No git metadata (a bare directory) — nothing to mirror.
+        return Ok(());
+    }
+    let host_head = git_cmd(wt)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|h| !h.is_empty());
+
+    let tmp = std::env::temp_dir();
+    let tag = format!("{}-{}", sanitize_tag(id), std::process::id());
+
+    // 1. Unpushed commits → a thin bundle (prerequisites = the remote-tracking
+    //    tips the sandbox clone already has). An empty bundle (nothing unpushed)
+    //    exits non-zero; treat that as "no commits to carry".
+    let bundle_host = tmp.join(format!("sz-parity-{tag}.bundle"));
+    let has_bundle = git_cmd(wt)
+        .args(["bundle", "create"])
+        .arg(&bundle_host)
+        .args(["HEAD", "--not", "--remotes"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+        && bundle_host.metadata().map(|m| m.len() > 0).unwrap_or(false);
+
+    // 2. Uncommitted tracked changes (staged + unstaged vs HEAD), incl. deletions.
+    let patch = git_cmd(wt)
+        .args(["diff", "HEAD", "--binary"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| o.stdout)
+        .filter(|p| !p.is_empty());
+
+    // 3. Untracked, non-ignored files → a tar (paths relative to the worktree).
+    let tar_host = tmp.join(format!("sz-parity-{tag}.tar"));
+    let list_host = tmp.join(format!("sz-parity-{tag}.list"));
+    let untracked = git_cmd(wt)
+        .args(["ls-files", "--others", "--exclude-standard", "-z"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| o.stdout)
+        .filter(|l| !l.is_empty());
+    let has_tar = if let Some(list) = &untracked {
+        std::fs::write(&list_host, list).is_ok()
+            && std::process::Command::new("tar")
+                .arg("-C")
+                .arg(wt)
+                .arg("--null")
+                .arg("--files-from")
+                .arg(&list_host)
+                .arg("-cf")
+                .arg(&tar_host)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+            && tar_host.metadata().map(|m| m.len() > 0).unwrap_or(false)
+    } else {
+        false
+    };
+    let _ = std::fs::remove_file(&list_host);
+
+    if !has_bundle && patch.is_none() && !has_tar {
+        // Clean working tree with nothing unpushed — the origin clone is parity.
+        let _ = std::fs::remove_file(&bundle_host);
+        let _ = std::fs::remove_file(&tar_host);
+        return Ok(());
+    }
+
+    // Upload the captured artifacts into the sandbox /tmp.
+    if has_bundle {
+        let bytes = std::fs::read(&bundle_host)?;
+        block_on_provider(|| async { provider.write(id, "/tmp/sz-parity.bundle", &bytes).await })?;
+    }
+    if let Some(p) = &patch {
+        block_on_provider(|| async { provider.write(id, "/tmp/sz-parity.patch", p).await })?;
+    }
+    if has_tar {
+        let bytes = std::fs::read(&tar_host)?;
+        block_on_provider(|| async { provider.write(id, "/tmp/sz-parity.tar", &bytes).await })?;
+    }
+    let _ = std::fs::remove_file(&bundle_host);
+    let _ = std::fs::remove_file(&tar_host);
+
+    // Replay over the clone, in the workdir. Each stage is independently guarded
+    // (`[ -s file ]`) and non-fatal so a partial capture still helps.
+    let wd = superzej_core::util::sh_quote(workdir);
+    let reset = match (has_bundle, host_head.as_deref()) {
+        (true, Some(h)) => format!(
+            "if [ -s /tmp/sz-parity.bundle ]; then \
+               git fetch /tmp/sz-parity.bundle HEAD 2>&1 || git fetch /tmp/sz-parity.bundle 2>&1 || true; \
+               git reset --hard {} 2>&1 || true; \
+             fi; ",
+            superzej_core::util::sh_quote(h)
+        ),
+        _ => String::new(),
+    };
+    let apply_patch = if patch.is_some() {
+        "if [ -s /tmp/sz-parity.patch ]; then \
+           git apply --whitespace=nowarn /tmp/sz-parity.patch 2>&1 \
+             || git apply --3way --whitespace=nowarn /tmp/sz-parity.patch 2>&1 || true; \
+         fi; "
+    } else {
+        ""
+    };
+    let untar = if has_tar {
+        format!(
+            "if [ -s /tmp/sz-parity.tar ]; then tar xf /tmp/sz-parity.tar -C {wd} 2>&1 || true; fi; "
+        )
+    } else {
+        String::new()
+    };
+    let script = format!(
+        "cd {wd} || exit 1; {reset}{apply_patch}{untar}\
+         rm -f /tmp/sz-parity.bundle /tmp/sz-parity.patch /tmp/sz-parity.tar 2>/dev/null; \
+         echo 'local parity applied'"
+    );
+    let argv = vec!["/bin/sh".to_string(), "-lc".to_string(), script];
+    block_on_provider(|| async { provider.run_exec(id, &argv, None, exec_env).await })
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("replay exec failed: {e}"))
+}
+
+fn push_devshell_closure(
+    provider: &superzej_svc::provider::Provider,
+    id: &str,
+    repo_root: &Path,
+    workdir: &str,
+    devshell_attr: &str,
+) -> anyhow::Result<()> {
+    let repo = repo_root.to_string_lossy().into_owned();
+    if repo.trim().is_empty() {
+        return Err(anyhow::anyhow!("no repo root to build the devShell from"));
+    }
+    let tag = sanitize_tag(id);
+    let tmp = std::env::temp_dir();
+    let gcroot = tmp.join(format!("sz-devshell-gc-{tag}-{}", std::process::id()));
+    let cache = tmp.join(format!("sz-devshell-cache-{tag}-{}", std::process::id()));
+    let cache_str = cache.to_string_lossy().into_owned();
+    let gcroot_str = gcroot.to_string_lossy().into_owned();
+
+    // 1. Build + pin the devShell on the host (instant if already built). Build
+    //    the SAME attr the sandbox will enter, so the seeded paths match.
+    run_host_nix_timeout(
+        DEVSHELL_PUSH_NIX_TIMEOUT_SECS,
+        &nix_develop_profile_argv(&repo, &gcroot_str, devshell_attr),
+    )?;
+    // 2. Resolve the devShell store path (what the sandbox must import).
+    let pi = std::process::Command::new("nix")
+        .args(["path-info", &gcroot_str])
+        .output()
+        .map_err(|e| anyhow::anyhow!("nix path-info: {e}"))?;
+    let store_path = String::from_utf8_lossy(&pi.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    // 3. Serialize the closure to a host file:// cache.
+    let copy_res = run_host_nix_timeout(
+        DEVSHELL_PUSH_NIX_TIMEOUT_SECS,
+        &nix_copy_to_file_argv(&cache_str, &gcroot_str),
+    );
+    // 4. Upload the cache into the sandbox + realise it there, then clean up.
+    let result = (|| -> anyhow::Result<()> {
+        copy_res?;
+        if store_path.is_empty() {
+            return Err(anyhow::anyhow!("could not resolve the devShell store path"));
+        }
+        // SCOPE the push: drop every NAR cache.nixos.org already serves so the
+        // upload carries only the paths public caches lack (the repo's from-source
+        // builds + rust-overlay output) — far smaller than the full closure. The
+        // sandbox fills the pruned paths from cache.nixos.org when it realises.
+        // Best-effort: if pruning fails we just upload the full (correct) cache.
+        if let Err(e) = prune_cache_to_public(&cache_str) {
+            superzej_core::msg::warn(&format!(
+                "devshell push: cache pruning skipped ({e}); uploading the full closure."
+            ));
+        }
+        let dest = "/tmp/sz-devshell-cache";
+        block_on_provider(|| async { provider.upload_dir(id, &cache, dest).await })?;
+        // `nix` is on PATH after `claim_store`. Realise the devShell via an
+        // EVAL-based `nix develop` in the worktree, with the uploaded cache as an
+        // extra substituter. This resolves the full closure from three sources at
+        // once: our seeded paths (the repo's from-source builds) from the local
+        // file:// cache, the rust toolchain rebuilt from the upstream Rust CDN
+        // (its derivation, since we pruned it from the upload), and everything else
+        // from cache.nixos.org. Eval-based (not `nix-store -r <path>`) so nix has
+        // the derivations to build the pruned rust paths. Unsigned file:// paths are
+        // fine — the sandbox user owns the store (single-user). Then reclaim /tmp.
+        // Enter the SAME devShell attr the seed built (and the in-pane `.envrc`
+        // will use) — `.#<attr>` for the lean sandbox shell, bare for the default.
+        let dev_ref = if devshell_attr.is_empty() {
+            String::new()
+        } else {
+            format!(".#{devshell_attr} ")
+        };
+        let import = format!(
+            "export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH\"; \
+             cd {workdir} 2>/dev/null || exit 1; \
+             nix develop {dev_ref}--command true --option extra-substituters file://{dest} \
+             --option require-sigs false 2>&1; rc=$?; \
+             rm -rf {dest}; exit $rc"
+        );
+        let argv = vec!["/bin/sh".to_string(), "-lc".to_string(), import];
+        let (code, out) =
+            block_on_provider(|| async { provider.run_exec(id, &argv, None, &[]).await })?;
+        if code != 0 {
+            return Err(anyhow::anyhow!(
+                "sandbox realise (exit {code}): {}",
+                tail_lines(&out, 4)
+            ));
+        }
+        Ok(())
+    })();
+    // Host cleanup (best-effort): the gcroot symlink + the cache dir.
+    let _ = std::fs::remove_dir_all(&cache);
+    let _ = std::fs::remove_file(&gcroot);
+    result
+}
+
+/// Prune a host `file://` binary cache down to ONLY the paths the sandbox can't
+/// get cheaply elsewhere — the repo's own from-source builds (muse/openspec/…) —
+/// so the scoped devShell push uploads ~tens of MB instead of the whole (multi-
+/// hundred-MB) closure. Two passes drop what the sandbox can get cheaply itself:
+/// the **rust-overlay toolchain** (rustc/cargo/rust-std/clippy/…), which the
+/// sandbox rebuilds from the upstream Rust CDN (static.rust-lang.org) on its own
+/// fast downstream — far quicker than shipping ~300MB over the host's upstream
+/// (this is the bulk of a rust devShell) — and every path **cache.nixos.org**
+/// already serves (a quick HEAD on `/<hash>.narinfo`), which the sandbox
+/// substitutes from there. Best-effort (a missing tool / network blip just leaves
+/// more in the cache — still correct, just larger); bounded so it can't wedge a
+/// provision.
+fn prune_cache_to_public(cache_dir: &str) -> anyhow::Result<()> {
+    // POSIX sh. Pass 1 is name-based (rust toolchain); pass 2 is a parallel
+    // (`xargs -P`) HEAD against cache.nixos.org. `$1` is the cache dir.
+    let script = r#"cd "$1" 2>/dev/null || exit 0
+# Pass 1: drop rust-overlay toolchain paths (sandbox fetches them from the Rust CDN).
+for ni in *.narinfo; do
+  [ -e "$ni" ] || continue
+  sp=$(sed -n 's/^StorePath: //p' "$ni"); name=${sp##*/}; name=${name#*-}
+  case "$name" in
+    rustc-*|cargo-*|rust-std-*|rust-docs-*|rust-default-*|rust-src-*|rust-analyzer*|clippy-preview-*|rustfmt-preview-*|llvm-tools-preview-*)
+      nar=$(sed -n 's/^URL: //p' "$ni"); rm -f "$ni" "$nar" ;;
+  esac
+done
+# Pass 2: drop paths cache.nixos.org already serves (parallel HEAD).
+ls *.narinfo 2>/dev/null | xargs -P 16 -n1 sh -c '
+  ni=$0; h=${ni%.narinfo}
+  if curl -sfI --max-time 4 "https://cache.nixos.org/$h.narinfo" >/dev/null 2>&1; then
+    nar=$(sed -n "s/^URL: //p" "$ni")
+    rm -f "$ni" "$nar"
+  fi
+'
+exit 0"#;
+    let out = std::process::Command::new("timeout")
+        .arg("--kill-after=5")
+        .arg("180")
+        .arg("sh")
+        .arg("-c")
+        .arg(script)
+        .arg("sh")
+        .arg(cache_dir)
+        .output()
+        .map_err(|e| anyhow::anyhow!("spawn prune: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("exit {}", out.status.code().unwrap_or(-1)))
+    }
+}
+
+/// Which provisioning steps are ESSENTIAL — a failure aborts creation — vs
+/// best-effort (warn + continue; the shell still opens and the step resolves
+/// lazily in the pane). Essentials: the worktree dir, git auth, the clone.
+/// Everything else (nix install, devShell/direnv warm, personal tools, dotfiles,
+/// the home-parity closure, checkpoint) is best-effort, so one flaky `nix
+/// develop` / unreachable cache can't kill an otherwise-usable sandbox.
+fn step_is_fatal(step_id: &str) -> bool {
+    matches!(step_id, "workspace" | "git_auth" | "clone")
+}
+
+/// Sanitize a subprocess-derived message for display on the loading screen:
+/// strip ANSI/OSC escape sequences and other control bytes (provisioning output
+/// is full of them — they corrupt width math and have triggered renderer
+/// `capacity overflow`s), collapse runs of whitespace/newlines to single spaces,
+/// and clamp to a sane length. Pure + unit-tested.
+fn sanitize_detail(s: &str) -> String {
+    let mut out = String::with_capacity(s.len().min(256));
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // CSI (`ESC[ … final`) / OSC (`ESC] … BEL/ST`) / other ESC seq: skip
+            // the introducer and run to the terminating byte.
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    for d in chars.by_ref() {
+                        if ('@'..='~').contains(&d) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    for d in chars.by_ref() {
+                        if d == '\u{7}' || d == '\u{1b}' {
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    chars.next();
+                }
+            }
+            continue;
+        }
+        // Control chars (incl. newlines/tabs) + spaces → a single space; collapse
+        // runs so multi-line subprocess output reads as one tidy line.
+        if c.is_control() || c == ' ' {
+            if !out.ends_with(' ') {
+                out.push(' ');
+            }
+        } else {
+            out.push(c);
+        }
+        if out.chars().count() >= 200 {
+            out.push('…');
+            break;
+        }
+    }
+    out.trim().to_string()
+}
+
 /// Host dotfiles to carry into a sandbox `$HOME` so the shell feels like home.
 /// Only those that exist on the host are uploaded (see [`upload_dotfiles`]).
 fn default_dotfiles() -> Vec<String> {
@@ -1706,6 +2641,50 @@ fn upload_dotfiles(
         } else if let Ok(data) = std::fs::read(&src) {
             block_on_provider(|| async { provider.write(id, &dest, &data).await })?;
         }
+    }
+    Ok(())
+}
+
+/// Carry the host's atuin credentials + config into the sandbox so its shell
+/// history joins atuin's own sync (host ↔ sprites). Opt-in (`[sandbox.home]
+/// atuin = true`). Uploads the dereferenced `~/.config/atuin/config.toml` (the
+/// home-manager `/nix/store` symlink is read THROUGH, so the real bytes land, not
+/// a dangling link) + the auth/encryption files `~/.local/share/atuin/{key,
+/// session}`. The history DBs are deliberately NOT copied — atuin's sync server
+/// reconciles those. Best-effort: a missing source is skipped (only `key` and no
+/// `session` is a normal state); a genuine upload error aborts (surfaced as a
+/// best-effort step failure). Warns when there's nothing to carry.
+fn upload_atuin_creds(
+    provider: &superzej_svc::provider::Provider,
+    id: &str,
+    sandbox_home: &str,
+) -> anyhow::Result<()> {
+    let host_home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let base = sandbox_home.trim_end_matches('/');
+    // Config first, then the auth/encryption state. `provider.write` creates parent
+    // dirs (mkdirParents), so the nested `.config/atuin` / `.local/share/atuin`
+    // paths land without an explicit mkdir.
+    let rels = [
+        ".config/atuin/config.toml",
+        ".local/share/atuin/key",
+        ".local/share/atuin/session",
+    ];
+    let mut carried = 0usize;
+    for rel in rels {
+        let src = Path::new(&host_home).join(rel);
+        // `read` dereferences the symlink → the real bytes (the HM config.toml is a
+        // `/nix/store` symlink that would dangle in the sandbox).
+        if let Ok(data) = std::fs::read(&src) {
+            let dest = format!("{base}/{rel}");
+            block_on_provider(|| async { provider.write(id, &dest, &data).await })?;
+            carried += 1;
+        }
+    }
+    if carried == 0 {
+        superzej_core::msg::warn(
+            "atuin sync: no host atuin config/credentials found (~/.config/atuin, \
+             ~/.local/share/atuin) — nothing to carry.",
+        );
     }
     Ok(())
 }
@@ -1752,6 +2731,56 @@ fn tail_lines(out: &str, n: usize) -> String {
     lines[start..].join(" | ")
 }
 
+/// `(key, value)` facts about where a worktree's pane is coming up, for the
+/// loading screen's context block: env, placement, provider/sandbox, connect mode,
+/// shell strategy, workdir. Loop-safe (a DB read + pure config resolution, no
+/// network/subprocess). Empty for a plain local env (nothing interesting to show).
+pub fn loading_context(cfg: &Config, worktree: &str) -> Vec<(String, String)> {
+    use superzej_core::placement::Placement;
+    let loc = GitLoc::for_worktree(Path::new(worktree));
+    let repo_root: PathBuf = Db::open()
+        .ok()
+        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| repo::main_worktree(Path::new(worktree)))
+        .unwrap_or_else(|| PathBuf::from(worktree));
+    let selected = Db::open()
+        .ok()
+        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
+    let env = cfg.resolve_env(&repo_root, &loc, Path::new(worktree), selected.as_deref());
+    if env.placement.is_local() {
+        return Vec::new();
+    }
+    let mut out = vec![
+        ("env".to_string(), env.name.clone()),
+        ("placement".to_string(), env.placement.label()),
+    ];
+    if let Placement::Provider(_) = &env.placement
+        && let Some(ec) = cfg.env.get(&env.name)
+    {
+        let pc = &ec.provider;
+        if !pc.provider.trim().is_empty() {
+            out.push(("provider".to_string(), pc.provider.clone()));
+        }
+        if let Some(id) = provider_sandbox_name(cfg, worktree, &env.name).filter(|s| !s.is_empty())
+        {
+            out.push(("sandbox".to_string(), id));
+        }
+        out.push((
+            "connect".to_string(),
+            format!("{:?}", pc.connect).to_lowercase(),
+        ));
+        let wd = pc.sync_workdir();
+        if !wd.trim().is_empty() {
+            out.push(("workdir".to_string(), wd));
+        }
+    }
+    let strategy = format!("{:?}", env.sandbox.home.strategy).to_lowercase();
+    out.push(("shell".to_string(), strategy));
+    out
+}
+
 /// Cheap, **loop-safe** (no network/subprocess) check made right before a
 /// worktree pane spawns: should this worktree HALT with a warning instead of
 /// opening a (host-degraded) pane? Returns `Some` only for a NON-LOCAL env with
@@ -1772,6 +2801,34 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
         .map(PathBuf::from)
         .or_else(|| repo::main_worktree(Path::new(worktree)))
         .unwrap_or_else(|| PathBuf::from(worktree));
+    // Refuse to silently ignore a malformed repo `.superzej.*` overlay that was
+    // SELECTING a non-local env: `load_repo_overlay` drops a file that fails to
+    // parse, so its `env = "sprites"` selection vanishes and resolution falls back
+    // to local (host) — exactly the silent degradation failover-off forbids. Catch
+    // it BEFORE resolve_env (which has already lost the selection) and surface the
+    // same warning modal. (No halt for a parse error that wasn't selecting a
+    // non-local env, or when that env opts into failover.)
+    if let Some(pe) = superzej_core::config::repo_overlay_parse_error(&repo_root)
+        && !pe.selected_env.is_empty()
+        && let Some(envc) = cfg.env.get(&pe.selected_env)
+        && !matches!(envc.placement, superzej_core::config::PlacementMode::Local)
+        && !cfg.env_failover(&repo_root, &pe.selected_env)
+    {
+        tracing::warn!(
+            target: "szhost::sandbox",
+            path = %pe.path.display(), env = %pe.selected_env,
+            "HALT: repo overlay failed to parse, dropping a non-local env selection"
+        );
+        return Some(SandboxHalt {
+            env_name: pe.selected_env.clone(),
+            placement: format!("{:?}", envc.placement).to_lowercase(),
+            reason: format!(
+                "{} failed to parse ({}); the env selection was dropped",
+                pe.path.display(),
+                pe.error.lines().next().unwrap_or("").trim(),
+            ),
+        });
+    }
     let selected_env = Db::open()
         .ok()
         .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
@@ -2759,6 +3816,89 @@ mod tests {
                 "/nix/store/b-bar".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn devshell_push_argv_builders() {
+        assert_eq!(
+            nix_develop_profile_argv("/home/me/repo", "/tmp/gc", ""),
+            vec![
+                "develop",
+                "/home/me/repo",
+                "--profile",
+                "/tmp/gc",
+                "--command",
+                "true"
+            ]
+        );
+        assert_eq!(
+            nix_develop_profile_argv("/home/me/repo", "/tmp/gc", "sandbox"),
+            vec![
+                "develop",
+                "/home/me/repo#sandbox",
+                "--profile",
+                "/tmp/gc",
+                "--command",
+                "true"
+            ]
+        );
+        assert_eq!(
+            nix_copy_to_file_argv("/tmp/cache", "/tmp/gc"),
+            vec![
+                "copy",
+                "--to",
+                "file:///tmp/cache?compression=zstd",
+                "--no-check-sigs",
+                "/tmp/gc"
+            ]
+        );
+        assert_eq!(sanitize_tag("sz-cosmic-puma"), "sz-cosmic-puma");
+        assert_eq!(sanitize_tag("a/b c:d"), "a-b-c-d");
+        assert_eq!(sanitize_tag(""), "sandbox");
+    }
+
+    #[test]
+    fn nix_copy_p2p_argv_targets_ssh_ng_without_sig_check() {
+        let argv = nix_copy_p2p_argv("sprite", &["/nix/store/a-zsh".into()]);
+        assert_eq!(&argv[0], "copy");
+        assert_eq!(&argv[1], "--to");
+        assert_eq!(&argv[2], "ssh-ng://sprite@sprite");
+        assert!(argv.contains(&"--no-check-sigs".to_string()));
+        assert!(argv.contains(&"--substitute-on-destination".to_string()));
+        assert!(argv.contains(&"/nix/store/a-zsh".to_string()));
+    }
+
+    #[test]
+    fn store_root_of_truncates_to_top_level_store_path() {
+        assert_eq!(
+            store_root_of("/nix/store/abc-zsh-5.9.1/bin/zsh"),
+            Some("/nix/store/abc-zsh-5.9.1".to_string())
+        );
+        assert_eq!(
+            store_root_of("/nix/store/abc-zsh-5.9.1"),
+            Some("/nix/store/abc-zsh-5.9.1".to_string())
+        );
+        assert_eq!(store_root_of("/etc/profiles/per-user/me/bin/zsh"), None);
+        assert_eq!(store_root_of("/nix/store/"), None);
+    }
+
+    #[test]
+    fn sanitize_detail_strips_ansi_control_and_collapses_whitespace() {
+        // The real failing-step string: ANSI SGR codes + newlines (what tripped
+        // the renderer). Sanitized to a single clean line.
+        let raw = "Build dev shell (exit 2): \u{1b}[1m\u{1b}[32merror:\u{1b}[0m foo\n\n  bar\tbaz";
+        let s = sanitize_detail(raw);
+        assert!(!s.contains('\u{1b}'), "no escape bytes: {s:?}");
+        assert!(
+            !s.contains('\n') && !s.contains('\t'),
+            "no raw control: {s:?}"
+        );
+        assert_eq!(s, "Build dev shell (exit 2): error: foo bar baz");
+        // OSC sequence (ESC ] … BEL) is dropped whole.
+        assert_eq!(sanitize_detail("a\u{1b}]0;title\u{7}b"), "ab");
+        // Long input is clamped with an ellipsis.
+        let long = "x".repeat(500);
+        assert!(sanitize_detail(&long).chars().count() <= 201);
     }
 
     #[test]

@@ -134,10 +134,21 @@ pub fn decide(input: &WarmInputs) -> WarmDecision {
         }
     }
 
-    // Suspend anything currently warm that we are not keeping.
+    // Suspend a currently-warm sandbox ONLY once it is genuinely idle (past the
+    // idle TTL) and not otherwise kept. Crucially, a within-TTL worktree is NEVER
+    // suspended — even if it falls outside the `max_warm` discretionary keeps —
+    // because suspending a freshly-opened worktree's sandbox out from under its
+    // live pane drops the exec session and thrashes (open→suspend→reopen). So
+    // `max_warm` bounds the *discretionary keeps* (which gate live-scanning), but
+    // the suspend ACTION is strictly idle-TTL-driven: idle remotes suspend (and
+    // recover on next open), recently-used ones stay warm.
     let suspend: Vec<String> = remote
         .iter()
-        .filter(|c| c.currently_warm && !keep.iter().any(|k| k == &c.worktree))
+        .filter(|c| {
+            c.currently_warm
+                && !keep.iter().any(|k| k == &c.worktree)
+                && c.idle_secs >= input.budget.idle_ttl_secs
+        })
         .map(|c| c.worktree.clone())
         .collect();
 
@@ -145,6 +156,45 @@ pub fn decide(input: &WarmInputs) -> WarmDecision {
         keep_warm: keep,
         suspend,
     }
+}
+
+/// What the warm-spare-pool maintainer should do this tick: how many new spares
+/// to provision and which existing ones to destroy. Pure output of [`decide_pool`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PoolAction {
+    /// How many fresh spares to provision (toward the target).
+    pub create: usize,
+    /// Spare sandbox names to destroy (over-target or idle past the TTL).
+    pub destroy: Vec<String>,
+}
+
+/// Decide the warm-spare-pool actions for one `(repo, env)`. Pure + deterministic.
+///
+/// - `target`: desired ready spares (resolved size; `0` ⇒ disabled, tear all down).
+/// - `provisioning`: spares currently being built (counted toward the target so we
+///   don't over-provision while one is in flight).
+/// - `ready`: `(name, idle_secs)` for each READY (unclaimed, provisioned) spare.
+/// - `max_idle_secs`: destroy a ready spare idle longer than this (`0` ⇒ never).
+///
+/// Keeps the `target` freshest ready spares; destroys the rest (over-target) plus
+/// any ready spare past the idle TTL (recycled). `create` fills toward the target,
+/// counting in-flight provisions; if a stale one is destroyed the next tick refills.
+pub fn decide_pool(
+    target: usize,
+    provisioning: usize,
+    ready: &[(String, u64)],
+    max_idle_secs: u64,
+) -> PoolAction {
+    let create = target.saturating_sub(ready.len().saturating_add(provisioning));
+    let mut by_fresh: Vec<&(String, u64)> = ready.iter().collect();
+    by_fresh.sort_by_key(|(_, idle)| *idle); // freshest (smallest idle) first
+    let destroy = by_fresh
+        .iter()
+        .enumerate()
+        .filter(|(i, (_, idle))| *i >= target || (max_idle_secs > 0 && *idle >= max_idle_secs))
+        .map(|(_, (name, _))| name.clone())
+        .collect();
+    PoolAction { create, destroy }
 }
 
 #[cfg(test)]
@@ -171,6 +221,51 @@ mod tests {
             keep_active_warm: true,
             keep_busy_warm: true,
         }
+    }
+
+    fn ready(specs: &[(&str, u64)]) -> Vec<(String, u64)> {
+        specs.iter().map(|(n, i)| (n.to_string(), *i)).collect()
+    }
+
+    #[test]
+    fn decide_pool_fills_toward_target() {
+        // Empty pool, target 2 ⇒ create 2.
+        assert_eq!(decide_pool(2, 0, &[], 600).create, 2);
+        // One ready + one provisioning ⇒ at target, create 0.
+        let d = decide_pool(2, 1, &ready(&[("a", 5)]), 600);
+        assert_eq!(d.create, 0);
+        assert!(d.destroy.is_empty());
+        // Two provisioning toward target 2 ⇒ create 0 (don't over-provision).
+        assert_eq!(decide_pool(2, 2, &[], 600).create, 0);
+    }
+
+    #[test]
+    fn decide_pool_destroys_over_target_keeping_freshest() {
+        // 3 ready, target 2 ⇒ destroy the most-idle (c, idle 30); keep a,b.
+        let d = decide_pool(2, 0, &ready(&[("a", 5), ("b", 10), ("c", 30)]), 600);
+        assert_eq!(d.create, 0);
+        assert_eq!(d.destroy, vec!["c".to_string()]);
+    }
+
+    #[test]
+    fn decide_pool_recycles_idle_expired() {
+        // Within target but past the idle TTL ⇒ destroy it (next tick refills).
+        let d = decide_pool(2, 0, &ready(&[("a", 5), ("stale", 999)]), 600);
+        assert!(d.destroy.contains(&"stale".to_string()));
+        assert!(!d.destroy.contains(&"a".to_string()));
+        // max_idle_secs = 0 disables idle recycling.
+        assert!(
+            decide_pool(2, 0, &ready(&[("a", 99999)]), 0)
+                .destroy
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn decide_pool_target_zero_tears_down() {
+        let d = decide_pool(0, 0, &ready(&[("a", 1), ("b", 2)]), 600);
+        assert_eq!(d.create, 0);
+        assert_eq!(d.destroy.len(), 2);
     }
 
     #[test]
@@ -221,9 +316,12 @@ mod tests {
     }
 
     #[test]
-    fn budget_caps_discretionary_keeps_by_recency() {
-        // 4 idle warm worktrees, max_warm=2, none active/pane/busy ⇒ keep the 2
-        // most recently active, suspend the other 2.
+    fn max_warm_caps_discretionary_keeps_but_never_suspends_within_ttl() {
+        // 4 idle warm worktrees, max_warm=2, none active/pane/busy, all WITHIN the
+        // idle TTL ⇒ the 2 most recently active are the discretionary keeps, but
+        // NOTHING is suspended: a within-TTL (recently-used) worktree is never
+        // suspended out from under a live pane (the thrash bug). They simply stay
+        // warm, untouched.
         let mut cands = Vec::new();
         for (i, name) in ["w0", "w1", "w2", "w3"].iter().enumerate() {
             let mut c = cand(name, true);
@@ -238,8 +336,32 @@ mod tests {
         };
         let d = decide(&input);
         assert!(d.keep_warm.contains(&"w0".to_string()) && d.keep_warm.contains(&"w1".to_string()));
-        assert_eq!(d.suspend.len(), 2);
-        assert!(d.suspend.contains(&"w2".to_string()) && d.suspend.contains(&"w3".to_string()));
+        assert!(
+            d.suspend.is_empty(),
+            "within-TTL worktrees are never suspended (no thrash): {:?}",
+            d.suspend
+        );
+    }
+
+    #[test]
+    fn fresh_worktrees_beyond_max_warm_are_not_suspended() {
+        // The reported bug: 3 just-opened remote worktrees (idle ~0), max_warm=2,
+        // none active yet (still materializing) ⇒ NONE suspended (all within TTL),
+        // so their exec sessions don't thrash.
+        let cands: Vec<_> = ["a", "b", "c"]
+            .iter()
+            .map(|n| {
+                let mut c = cand(n, true);
+                c.idle_secs = 0;
+                c
+            })
+            .collect();
+        let input = WarmInputs {
+            active_worktree: None,
+            budget: budget(),
+            candidates: cands,
+        };
+        assert!(decide(&input).suspend.is_empty());
     }
 
     #[test]

@@ -98,6 +98,11 @@ pub struct PtyPane {
     /// once the server announces it, read at persist time for reattach. `None`
     /// for a PTY pane (and until the announcement lands).
     session_cell: Option<Arc<Mutex<Option<String>>>>,
+    /// Predictive local-echo state — instant keystroke echo on a high-latency
+    /// remote pane (the srtt gate auto-enables only on a slow link). See `predict`.
+    predictor: crate::predict::Predictor,
+    /// Monotonic base for the predictor's round-trip timing (ms since creation).
+    predict_clock: std::time::Instant,
 }
 
 /// Derive a pane's program name from its spawn argv. Handles the common
@@ -311,6 +316,8 @@ impl PtyPane {
             pid,
             pending_relaunch: None,
             session_cell: None,
+            predictor: crate::predict::Predictor::new(),
+            predict_clock: std::time::Instant::now(),
         })
     }
 
@@ -363,6 +370,8 @@ impl PtyPane {
             pid: None,
             pending_relaunch: None,
             session_cell: Some(session_cell),
+            predictor: crate::predict::Predictor::new(),
+            predict_clock: std::time::Instant::now(),
         }
     }
 
@@ -425,6 +434,10 @@ impl PtyPane {
     /// Feed PTY output into the emulator grid and the plain-text history ring.
     /// Drain-without-render is just this without a subsequent compose.
     pub fn feed(&mut self, bytes: &[u8]) {
+        // Server output is authoritative (and carries the echoed keystrokes), so
+        // it retires the prediction overlay + folds a round-trip sample into srtt.
+        let now = self.predict_now_ms();
+        self.predictor.on_server_output(now);
         self.emulator.advance(bytes);
         feed_bytes_to_history(
             bytes,
@@ -432,6 +445,62 @@ impl PtyPane {
             &mut self.history_partial,
             &mut self.history_stripper,
         );
+    }
+
+    /// ms since this pane was created — the predictor's round-trip clock.
+    fn predict_now_ms(&self) -> u64 {
+        self.predict_clock.elapsed().as_millis() as u64
+    }
+
+    /// The screen state the predictor's safety gate reads (never predict in a
+    /// full-screen/raw TUI, or off the prompt row).
+    fn predict_screen_state(&self) -> crate::predict::ScreenState {
+        let (rows, _) = self.emulator.size();
+        let (cur_row, _) = self.emulator.cursor();
+        crate::predict::ScreenState {
+            alt_screen: self.emulator.alt_screen(),
+            // NB: do NOT gate on bracketed-paste — bash/zsh enable DECSET 2004 at
+            // the *prompt* by default, which is exactly where we want to predict.
+            // application-cursor (DECCKM) is the real raw/TUI signal.
+            app_mode: self.emulator.application_cursor(),
+            cursor_row: cur_row as usize,
+            rows: rows as usize,
+        }
+    }
+
+    /// A printable keystroke is being sent: time it (for srtt) and, when the gate
+    /// is open (slow link + prompt row + not a TUI), add it to the prediction
+    /// overlay. Returns whether the overlay changed (caller marks the pane dirty).
+    pub fn predict_key(&mut self, c: char) -> bool {
+        let now = self.predict_now_ms();
+        let s = self.predict_screen_state();
+        if self.predictor.should_predict(&s) {
+            self.predictor.on_key(c, now);
+            true
+        } else {
+            self.predictor.note_key(now);
+            false
+        }
+    }
+
+    /// Backspace pops the last prediction; returns whether anything changed.
+    pub fn predict_backspace(&mut self) -> bool {
+        let had = !self.predictor.is_empty();
+        self.predictor.on_backspace();
+        had
+    }
+
+    /// A line was submitted / a control key pressed — flush the overlay (the
+    /// server redraws). Returns whether anything was showing.
+    pub fn predict_flush(&mut self) -> bool {
+        let had = !self.predictor.is_empty();
+        self.predictor.on_enter();
+        had
+    }
+
+    /// The predicted chars to overlay at the cursor (empty when not predicting).
+    pub fn predicted(&self) -> &[char] {
+        self.predictor.pending()
     }
 
     /// Forward user input bytes to the child. Typing snaps the viewport back to
@@ -523,6 +592,8 @@ impl PtyPane {
             pid: None,
             pending_relaunch: None,
             session_cell: Some(Arc::new(Mutex::new(None))),
+            predictor: crate::predict::Predictor::new(),
+            predict_clock: std::time::Instant::now(),
         }
     }
 
@@ -591,6 +662,14 @@ async fn relay_exec(
         ExecOpen::Open(spec) => (spec.cols, spec.rows),
         ExecOpen::Attach { cols, rows, .. } => (*cols, *rows),
     };
+    // Keep the open spec so a permanently-dropped session can be RE-OPENED fresh
+    // (not just reattached) — opening a new exec resumes a suspended/restarted
+    // sandbox and restores input. `None` for an Attach-only pane (restart
+    // reattach), which has no spec to reopen from.
+    let reopen_spec = match &open {
+        ExecOpen::Open(spec) => Some(spec.clone()),
+        ExecOpen::Attach { .. } => None,
+    };
     tracing::debug!(
         target: "szhost::sandbox",
         provider = %provider_name, sandbox = %sandbox_id, %cols, %rows,
@@ -637,6 +716,11 @@ async fn relay_exec(
     loop {
         match relay_session(id, session, &tx, &waker, &mut ctrl_rx, &session_cell).await {
             SessionEnd::Exited(code) => {
+                tracing::debug!(
+                    target: "szhost::sandbox",
+                    pane = id, sandbox = %sandbox_id, code,
+                    "exec session exited (command returned)"
+                );
                 let _ = tx.send(PaneEvent::Exit(id, Some(code))).await;
                 wake();
                 return;
@@ -644,14 +728,49 @@ async fn relay_exec(
             SessionEnd::PaneGone => return,
             SessionEnd::Dropped { progressed } => {
                 dead = if progressed { 0 } else { dead + 1 };
-                let sid = session_cell.lock().ok().and_then(|c| c.clone());
-                if dead < MAX_DEAD_RECONNECTS
-                    && let Some(sid) = sid
-                    && let Ok(s) = provider.attach_exec(&sandbox_id, &sid, cols, rows).await
-                {
-                    session = s;
-                    continue;
+                tracing::debug!(
+                    target: "szhost::sandbox",
+                    pane = id, sandbox = %sandbox_id, progressed, dead,
+                    "exec session dropped (socket closed, no exit); reconnecting"
+                );
+                if dead < MAX_DEAD_RECONNECTS {
+                    let sid = session_cell.lock().ok().and_then(|c| c.clone());
+                    // 1. Prefer reattaching the SAME session: a transient socket
+                    //    drop replays scrollback with the shell state preserved.
+                    if let Some(sid) = &sid
+                        && let Ok(s) = provider.attach_exec(&sandbox_id, sid, cols, rows).await
+                    {
+                        tracing::debug!(target: "szhost::sandbox", pane = id, "reattached exec session");
+                        session = s;
+                        continue;
+                    }
+                    // 2. Reattach failed — the session is genuinely gone (the
+                    //    sandbox was suspended/restarted). Open a FRESH exec: this
+                    //    resumes the sandbox and restores a working shell (a new
+                    //    shell process; fs/cwd preserved). This is the
+                    //    "suspend-idle, recover-on-return" path so a backgrounded
+                    //    remote pane never becomes a permanently dead shell.
+                    if let Some(spec) = &reopen_spec {
+                        if let Ok(mut c) = session_cell.lock() {
+                            *c = None; // drop the stale id; the fresh session announces a new one
+                        }
+                        if let Ok(s) = provider.open_exec(&sandbox_id, spec).await {
+                            tracing::debug!(
+                                target: "szhost::sandbox",
+                                pane = id, sandbox = %sandbox_id,
+                                "re-opened a FRESH exec session (resumed the sandbox)"
+                            );
+                            crate::agent::native_exec_report(&provider_name, true);
+                            session = s;
+                            continue;
+                        }
+                    }
                 }
+                tracing::warn!(
+                    target: "szhost::sandbox",
+                    pane = id, sandbox = %sandbox_id, dead,
+                    "exec session gone after reconnect attempts; pane exits"
+                );
                 let _ = tx.send(PaneEvent::Exit(id, None)).await;
                 wake();
                 return;
