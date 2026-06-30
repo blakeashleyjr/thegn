@@ -1658,13 +1658,22 @@ pub fn provision_provider_env_named(
         // SUPERSEDES the one-shot devShell file:// push when on — keep push_devshell
         // only as the fallback for providers without the reverse tunnel.
         push_devshell: pc.push_devshell && !pc.host_cache,
-        // A pool SPARE provisions in the BACKGROUND (no loading screen to gate),
-        // so it should fully BUILD the devShell — `skip_devshell_warm` is a
-        // loading-screen speed hack that only makes sense for an on-demand,
-        // foreground provision. Skipping it on a spare yields a "ready" spare
-        // whose devShell still builds lazily in-pane on claim ("not ready yet");
-        // building it up front is what makes a claimed worktree truly instant.
-        skip_devshell_warm: pc.skip_devshell_warm && name_override.is_none(),
+        // devShell warm policy:
+        //  • Real worktree: respect the configured `skip_devshell_warm`.
+        //  • SPARE (name_override): a spare provisions in the BACKGROUND, so it
+        //    would normally BUILD the devShell up front to make a claim instant.
+        //    BUT a spare can't reach the host nix cache (the reverse tunnel is
+        //    per-worktree, set up on focus), so with `host_cache` on it would build
+        //    the whole devShell FROM SOURCE — slow, so the pool can't refill fast
+        //    enough to stay warm. With the cache on, SKIP the spare's build: the
+        //    spare provisions fast (clone + checkpoint), and the claimed worktree's
+        //    in-pane `direnv` substitutes the devShell from the host cache (fast)
+        //    once its tunnel is up. Build up front only when there's no cache.
+        skip_devshell_warm: if name_override.is_some() {
+            pc.host_cache
+        } else {
+            pc.skip_devshell_warm
+        },
         // Full local parity (unpushed commits + uncommitted + untracked) for a
         // real worktree on an `in_env` provider — so a fresh sandbox matches the
         // working tree, not just origin. A SPARE (name_override) stays a pristine
