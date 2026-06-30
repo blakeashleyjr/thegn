@@ -11147,18 +11147,28 @@ async fn event_loop<T: Terminal>(
                     // Pane spawn (openpty+exec) is the only loop-side step;
                     // on failure the tab's empty leaves fall through to the
                     // materialize path, which backs it with a plain shell.
-                    if attach_agent_pane(
-                        &mut session,
-                        &mut panes,
-                        &payload.tab,
-                        &payload.spec,
-                        chrome.center,
-                        keymap.config(),
-                        &acp_inbound_tx,
-                        &acp_reg_tx,
-                        &acp_status_tx,
-                        &waker,
-                    ) {
+                    // A native-exec provider (sprite) runs the chosen agent IN the
+                    // sandbox via the materialize path (native_agent_exec). The
+                    // host-PTY launch below needs the provider CLI prefix (`sprite
+                    // exec …`), which isn't installed on the host — so skip the
+                    // doomed spawn for native providers and let materialize back the
+                    // tab with the agent over the native exec.
+                    let native_provider =
+                        crate::agent::native_shell_exec(keymap.config(), &payload.path).is_some();
+                    let attached = !native_provider
+                        && attach_agent_pane(
+                            &mut session,
+                            &mut panes,
+                            &payload.tab,
+                            &payload.spec,
+                            chrome.center,
+                            keymap.config(),
+                            &acp_inbound_tx,
+                            &acp_reg_tx,
+                            &acp_status_tx,
+                            &waker,
+                        );
+                    if attached || native_provider {
                         focus.zone = crate::focus::Zone::Center;
                         let backend = &payload.spec.backend;
                         model.status = match payload.spec.warning_summary() {
