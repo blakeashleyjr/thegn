@@ -1602,10 +1602,14 @@ heartbeat_secs = 10
 token_reduction = false
 token_reduction_level = "conservative"
 # Route a launched agent's model traffic through the proxy at `listen` by
-# injecting provider config into the agent's environment at spawn. Independent of
-# `enabled` (which launches szproxy): leave `enabled = false` and set this `true`
-# to point the agent at an already-running proxy on `listen` without launching
-# our own. `agent_api` is the pi-side API id for that endpoint — the proxy serves
+# injecting provider config into the agent's environment at spawn. `route_agent`
+# is the SINGLE SWITCH: setting it `true` (a) launches szproxy itself (you do NOT
+# also need `enabled = true`), and (b) for a remote/provider sandbox, defaults
+# `remote_base_url` to "auto" so the host stands up the reverse tunnel and injects
+# ANTHROPIC_BASE_URL automatically. Add a `config_path` routes file or the proxy
+# will answer /health but 404 real agent requests (superzej warns at startup).
+# (Set `enabled = true` separately if you want szproxy running without routing
+# agents through it.) `agent_api` is the pi-side API id for that endpoint — the proxy serves
 # the Anthropic Messages API (/v1/messages), and pi's OpenAI client speaks the
 # Responses API (which the proxy doesn't implement), so keep "anthropic-messages".
 # `agent_model` is the model id the agent requests (the proxy maps it to a real
@@ -1625,14 +1629,14 @@ agent_model = "model-proxy/standard"
 bouncer = false
 # Base URL an agent running INSIDE a remote/provider sandbox (a sprite VM that
 # can't reach host loopback) uses to reach szproxy — a tunnel/public endpoint.
-# When set (+ route_agent), superzej injects ANTHROPIC_BASE_URL + the per-worktree
+# With `route_agent`, superzej injects ANTHROPIC_BASE_URL + the per-worktree
 # virtual key into the sprite's shell so ANY agent there (pi, claude code, …)
-# routes through the proxy by default. Empty ⇒ in-sprite agents talk upstream
-# directly. (Local/OCI agents already reach the proxy via loopback/gateway/unix.)
-# "auto" stands up a reverse tunnel (the in-sandbox resident bridge ⇄ host) so the
-# sprite reaches szproxy at http://127.0.0.1:<listen-port> with ZERO public
-# exposure; or set an explicit reachable URL (e.g. a tailnet/proxy endpoint).
-# remote_base_url = "auto"
+# routes through the proxy. (Local/OCI agents already reach the proxy via
+# loopback/gateway/unix.) EMPTY (the default) under `route_agent` ⇒ "auto": superzej
+# stands up a reverse tunnel (the in-sandbox resident bridge ⇄ host) so the sprite
+# reaches szproxy at http://127.0.0.1:<listen-port> with ZERO public exposure. Set
+# an explicit reachable URL (e.g. a tailnet/proxy endpoint) to skip the tunnel.
+# remote_base_url = ""   # "" or "auto" = reverse tunnel; or an explicit URL
 
 # ── Local merge queue: the "fold-actor" (optional) ─────────────────────────
 # Stop hand-sequencing parallel branches into main. The fold-actor folds every

@@ -581,13 +581,26 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
             ),
         }
     }
-    // Auto-launch the LLM-proxy daemon when enabled (disabled by default — AI is
-    // additive). Held for the lifetime of `main`; the supervisor thread keeps it
-    // alive and `Drop` stops it on graceful return (process-group exit otherwise).
+    // Auto-launch the LLM-proxy daemon when enabled OR routing agents through it
+    // (disabled by default — AI is additive). Held for the lifetime of `main`; the
+    // supervisor thread keeps it alive and `Drop` stops it on graceful return
+    // (process-group exit otherwise).
     let _proxy_daemon = cfg
         .llm_proxy
         .launch_spec()
         .and_then(crate::proxy_daemon::launch);
+    // Diagnose the common silent-failure: routing is on (so agents get
+    // ANTHROPIC_BASE_URL pointed at the proxy + the reverse tunnel fires) but no
+    // routes are configured, so the proxy 404s every agent request. `/health` still
+    // works (proves the tunnel), but real calls fail until `config_path` is set.
+    if cfg.llm_proxy.route_agent && cfg.llm_proxy.config_path.trim().is_empty() {
+        tracing::warn!(
+            target: "szhost::startup",
+            "[llm_proxy] route_agent is on but config_path is empty — the proxy will \
+             answer /health but 404 agent requests until you point config_path at a \
+             routes file. The reverse tunnel + ANTHROPIC_BASE_URL injection are active."
+        );
+    }
     let keymap = rebuild_keymap(&cfg, &session);
     let mode = crate::keymap::startup_mode(&cfg);
     // Validate that no keybinding scope has ambiguous duplicates. Cross-scope

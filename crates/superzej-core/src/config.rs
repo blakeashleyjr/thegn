@@ -527,9 +527,10 @@ impl Default for LlmProxyConfig {
 
 impl LlmProxyConfig {
     /// Env vars for an agent/shell running inside a REMOTE/provider sandbox so its
-    /// model traffic routes through `szproxy` by default. Empty unless
-    /// `route_agent` is on and a reachable [`remote_base_url`](Self::remote_base_url)
-    /// is configured (a sprite VM can't reach host loopback). Sets the standard
+    /// model traffic routes through `szproxy` by default. Empty unless `route_agent`
+    /// is on; the loopback URL is then reachable via the reverse tunnel superzej
+    /// stands up (empty/`auto` `remote_base_url`) or via an explicit external URL.
+    /// Sets the standard
     /// `ANTHROPIC_BASE_URL` (honored by claude code / the Anthropic SDK / pi) plus
     /// the `SUPERZEJ_PROXY_*` vars the pi extension reads. `virtual_key`, when
     /// given, becomes the proxy auth key (else the passthrough master key is used).
@@ -556,11 +557,14 @@ impl LlmProxyConfig {
     /// at `http://127.0.0.1:<proxy-port>` (superzej stands the tunnel up); an
     /// explicit URL is used verbatim. `None` unless `route_agent` + a value set.
     pub fn remote_base_url(&self) -> Option<String> {
-        let url = self.remote_base_url.trim();
-        if !self.route_agent || url.is_empty() {
+        if !self.route_agent {
             return None;
         }
-        if url == "auto" {
+        let url = self.remote_base_url.trim();
+        // `route_agent` alone is the single switch: an empty (or explicit "auto")
+        // `remote_base_url` resolves to the in-sandbox reverse tunnel at
+        // `http://127.0.0.1:<proxy-port>`. An explicit URL is used verbatim.
+        if url.is_empty() || url == "auto" {
             Some(format!("http://127.0.0.1:{}", self.listen_port()))
         } else {
             Some(url.to_string())
@@ -572,7 +576,11 @@ impl LlmProxyConfig {
     /// `remote_base_url = "auto"`. The host starts a tunnel on this port that
     /// dials the real `szproxy`.
     pub fn remote_tunnel_port(&self) -> Option<u16> {
-        (self.route_agent && self.remote_base_url.trim() == "auto").then(|| self.listen_port())
+        // The tunnel is needed whenever the resolved base URL is the loopback
+        // (empty or "auto" under `route_agent`); an explicit external URL needs no
+        // tunnel.
+        let url = self.remote_base_url.trim();
+        (self.route_agent && (url.is_empty() || url == "auto")).then(|| self.listen_port())
     }
 
     /// The port from `listen` (e.g. `127.0.0.1:8383` → 8383; 8383 on parse fail).
@@ -589,7 +597,12 @@ impl LlmProxyConfig {
     /// supervisor (e.g. as a `restart = "always"` pinned daemon). `SZPROXY_LISTEN`
     /// and `SZPROXY_CONFIG` mirror the standalone env knobs the daemon reads.
     pub fn launch_spec(&self) -> Option<(String, Vec<String>, BTreeMap<String, String>)> {
-        if !self.enabled {
+        // Launch the daemon when explicitly enabled OR when routing agents through
+        // it (`route_agent`) — otherwise the injected `ANTHROPIC_BASE_URL` + reverse
+        // tunnel would dial a dead port. `route_agent` alone is enough to bring the
+        // proxy up; routes still come from `config_path` (see the no-routes warning
+        // at the launch site).
+        if !self.enabled && !self.route_agent {
             return None;
         }
         let mut env = BTreeMap::new();
@@ -8435,13 +8448,22 @@ transport = \"ssh\"
 
     #[test]
     fn remote_agent_env_routes_through_proxy_when_configured() {
-        // Off by default, and requires a reachable URL even with route_agent.
+        // Off by default (no route_agent → no injection).
         assert!(LlmProxyConfig::default().remote_agent_env(None).is_empty());
+        // `route_agent` alone is the single switch: an empty remote_base_url resolves
+        // to the auto reverse-tunnel loopback, so the env IS injected and the tunnel
+        // port is signalled.
         let only_route = LlmProxyConfig {
             route_agent: true,
             ..Default::default()
         };
-        assert!(only_route.remote_agent_env(None).is_empty());
+        let oenv = only_route.remote_agent_env(None);
+        assert!(
+            oenv.iter()
+                .any(|(k, v)| k == "ANTHROPIC_BASE_URL" && v == "http://127.0.0.1:8383"),
+            "route_agent alone → auto loopback URL injected"
+        );
+        assert_eq!(only_route.remote_tunnel_port(), Some(8383));
         // Configured → inject the standard + superzej proxy vars.
         let lp = LlmProxyConfig {
             route_agent: true,
