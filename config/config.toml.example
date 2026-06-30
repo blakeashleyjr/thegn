@@ -500,25 +500,25 @@ command = "claude"
 name = "aider"
 command = "aider --model sonnet"
 
-# The pi coding agent, embedded over ACP (the upper control plane). pi runs its
-# own tools natively; superzej is ADDITIVE — it observes activity (the statusbar
+# The MANAGED pi coding agent, embedded over ACP (the upper control plane). pi runs
+# its own tools natively; superzej is ADDITIVE — it observes activity (the statusbar
 # chip), routes pi's model through the proxy, and exposes its house tools
-# (budget / fleet / worktree status) to pi via MCP-over-ACP. Setup:
-# `npm i -g @earendil-works/pi-coding-agent` (pi >=0.80 bundles the extension's
-# deps, so no separate install is needed).
+# (budget / fleet / worktree status) to pi via MCP-over-ACP.
 #
-# In the command: `--extension` loads superzej's ACP bridge; `--skill` loads the
-# bundled superzej-house skill (teaches the agent the house tools + conventions);
-# `--provider superzej-proxy --model <id>` selects the proxy-routed model (the
-# extension registers `superzej-proxy` at init from the SUPERZEJ_PROXY_* env when
-# [llm_proxy].route_agent is on — env registers it, the CLI flags activate it;
-# `--model` must match [llm_proxy].agent_model). superzej injects the ACP port via
-# the ACP_PORT env var. pi's own extension/skill discovery stays ON, so you can
-# drop your own into ~/.pi/agent/{extensions,skills}/ alongside these, and
-# `pi install npm:…` / `pi install git:…` works for extras (e.g. web search).
+# superzej OWNS this pi under `~/.superzej/pi`: a pinned binary + a managed agent
+# dir (PI_CODING_AGENT_DIR) seeded with the superzej-acp extension package. Run
+# `szhost agent setup` once (superzej also self-heals it on launch when this entry
+# is present). The command sets PI_CODING_AGENT_DIR and runs the pinned binary;
+# `$HOME` resolves per-context, so the SAME entry works on the host AND inside a
+# sprite (where the managed pi is provisioned to `<home>/.superzej/pi`). The
+# superzej-acp extension registers the proxy-routed model from the SUPERZEJ_PROXY_*
+# env when [llm_proxy].route_agent is on. (A "Vanilla Pi" entry that does NOT set
+# PI_CODING_AGENT_DIR — e.g. `command = "npx -y @earendil-works/pi-coding-agent"` —
+# stays unmanaged, using the default ~/.pi.)
 [[agents]]
-name = "pi"
-command = "pi --extension /path/to/superzej/extensions/superzej-acp.ts --skill /path/to/superzej/extensions/skills/superzej-house --provider superzej-proxy --model model-proxy/standard"
+name = "Agent"
+command = 'PI_CODING_AGENT_DIR="$HOME/.superzej/pi/agent" exec "$HOME/.superzej/pi/node_modules/.bin/pi"'
+provider = "pi"
 
 [[agents]]
 name = "shell"

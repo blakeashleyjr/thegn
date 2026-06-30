@@ -618,6 +618,22 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         None
     };
     let host_cache_port = _nix_cache.as_ref().map(|h| h.port);
+    // Self-heal the managed pi: if a configured agent runs the managed pi
+    // (`~/.superzej/pi`) but it's missing/stale, install+seed it off-thread (npm +
+    // extension seed — never blocks the loop). Explicit `szhost agent setup` does
+    // the same; this just means the "Agent" entry works without a manual step.
+    if !crate::cmd::agent::is_current()
+        && cfg
+            .agents
+            .iter()
+            .any(|a| a.command.contains(".superzej/pi"))
+    {
+        tokio::task::spawn_blocking(|| {
+            if let Err(e) = crate::cmd::agent::setup(false) {
+                tracing::warn!(target: "szhost::startup", error = %e, "managed pi setup failed; run `szhost agent setup`");
+            }
+        });
+    }
     let keymap = rebuild_keymap(&cfg, &session);
     let mode = crate::keymap::startup_mode(&cfg);
     // Validate that no keybinding scope has ambiguous duplicates. Cross-scope
