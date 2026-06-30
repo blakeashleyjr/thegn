@@ -1797,7 +1797,7 @@ pub fn provision_provider_env_named(
             StepKind::AgentConfigs(agents) => {
                 upload_agent_configs(&provider, &id, &sprite_home, agents)
             }
-            StepKind::AtuinSync => upload_atuin_creds(&provider, &id, &sprite_home),
+            StepKind::AtuinSync => upload_atuin_creds(&provider, &id, &sprite_home, &exec_env),
             StepKind::DevShellClosurePush => {
                 // Host-executed: build the repo's devShell on the host (a no-op for a
                 // nix user who already has it) + transfer its closure into the sandbox
@@ -2658,18 +2658,29 @@ fn upload_atuin_creds(
     provider: &superzej_svc::provider::Provider,
     id: &str,
     sandbox_home: &str,
+    exec_env: &[(String, String)],
 ) -> anyhow::Result<()> {
     let host_home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
     let base = sandbox_home.trim_end_matches('/');
     // Config first, then the auth/encryption state. `provider.write` creates parent
     // dirs (mkdirParents), so the nested `.config/atuin` / `.local/share/atuin`
     // paths land without an explicit mkdir.
+    //
+    // `meta.db` is the SERVER-AUTH carrier: atuin >=18 keeps the sync session token
+    // (the `hub_session` bearer for the sync server) in `meta.db`, NOT in a flat
+    // `session` file (which modern atuin no longer writes). Without it the sandbox
+    // has the encryption `key` but is logged OUT, so `auto_sync` can't authenticate
+    // and Ctrl-R stays empty. We still carry `session` too (older atuin / other
+    // hosts may have it) and deliberately skip the heavy history/records DBs — the
+    // server reconciles those once authenticated. `meta.db` is small (~28K).
     let rels = [
         ".config/atuin/config.toml",
         ".local/share/atuin/key",
         ".local/share/atuin/session",
+        ".local/share/atuin/meta.db",
     ];
     let mut carried = 0usize;
+    let mut token_carried = false;
     for rel in rels {
         let src = Path::new(&host_home).join(rel);
         // `read` dereferences the symlink → the real bytes (the HM config.toml is a
@@ -2678,6 +2689,9 @@ fn upload_atuin_creds(
             let dest = format!("{base}/{rel}");
             block_on_provider(|| async { provider.write(id, &dest, &data).await })?;
             carried += 1;
+            if rel.ends_with("meta.db") || rel.ends_with("session") {
+                token_carried = true;
+            }
         }
     }
     if carried == 0 {
@@ -2685,6 +2699,29 @@ fn upload_atuin_creds(
             "atuin sync: no host atuin config/credentials found (~/.config/atuin, \
              ~/.local/share/atuin) — nothing to carry.",
         );
+        return Ok(());
+    }
+    // Prime history at provision time so it's baked into the checkpoint and Ctrl-R
+    // is populated the instant the pane opens (instead of waiting for the first
+    // `auto_sync` tick). `sync -f` forces a full reconcile regardless of the carried
+    // last-sync throttle, pulling the server's records into the sandbox's empty
+    // store. Best-effort: a sync failure (offline, server hiccup) just means history
+    // fills in on the next auto_sync. Skipped when no auth token was carried.
+    if token_carried {
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-lc".to_string(),
+            "export PATH=\"$HOME/.local/bin:$HOME/.nix-profile/bin:$PATH\"; \
+             command -v atuin >/dev/null 2>&1 && atuin sync -f 2>&1 || true"
+                .to_string(),
+        ];
+        if let Err(e) =
+            block_on_provider(|| async { provider.run_exec(id, &argv, None, exec_env).await })
+        {
+            superzej_core::msg::warn(&format!(
+                "atuin sync: priming history failed ({e}); it will fill in on auto_sync."
+            ));
+        }
     }
     Ok(())
 }
