@@ -359,6 +359,12 @@ pub struct PlanOpts {
     /// over the clone. `None` ⇒ pristine origin checkout only (e.g. a pool spare,
     /// or a non-`in_env` data mode). Emits a `local_parity` step after `clone`.
     pub local_parity: Option<String>,
+    /// Sandbox-side URL of the host's embedded nix binary cache (the loopback the
+    /// reverse tunnel binds, e.g. `http://127.0.0.1:8484`), or `None`. When set,
+    /// it's baked into the sandbox nix.conf as an `extra-substituters` entry with
+    /// `require-sigs = false`, so `nix develop`/`direnv` substitute prebuilt store
+    /// paths from the host instead of building. See `[env.<name>.provider] host_cache`.
+    pub host_cache_url: Option<String>,
 }
 
 /// A Nix binary-cache substituter (and optional push) for fast devShells.
@@ -397,6 +403,7 @@ impl Default for PlanOpts {
             push_devshell: false,
             skip_devshell_warm: false,
             local_parity: None,
+            host_cache_url: None,
         }
     }
 }
@@ -533,6 +540,7 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
                         opts.nix_installer,
                         opts.nix_parallel,
                         opts.binary_cache.as_ref(),
+                        opts.host_cache_url.as_deref(),
                     )),
                 });
                 if req.direnv {
@@ -689,6 +697,7 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
                     opts.nix_installer,
                     opts.nix_parallel,
                     opts.binary_cache.as_ref(),
+                    opts.host_cache_url.as_deref(),
                 )),
             });
         }
@@ -755,6 +764,7 @@ fn nix_install_script(
     installer: crate::config::NixInstaller,
     parallel: Option<u32>,
     cache: Option<&BinaryCache>,
+    host_cache_url: Option<&str>,
 ) -> String {
     use crate::config::NixInstaller;
     // Persisted nix.conf lines (static, safe to bake — NOT secrets; the token auth
@@ -772,6 +782,16 @@ fn nix_install_script(
         if !c.key.trim().is_empty() {
             conf.push_str(&format!("extra-trusted-public-keys = {}\\n", c.key.trim()));
         }
+    }
+    // The host's embedded nix cache (served over the reverse tunnel). It's UNSIGNED
+    // — paths are served straight from the host store with no signing key — so the
+    // sandbox must accept unsigned substitutes: `require-sigs = false`. Safe here
+    // (the cache is reachable only over the per-sandbox loopback tunnel, the store
+    // is single-user, and NarHash still content-checks each download). `nix`
+    // accumulates `extra-substituters` lines, so this coexists with `cache` above.
+    if let Some(url) = host_cache_url.map(str::trim).filter(|u| !u.is_empty()) {
+        conf.push_str(&format!("extra-substituters = {url}\\n"));
+        conf.push_str("require-sigs = false\\n");
     }
     // Readiness wait (sudo available + DNS) shared by both installers; the sprite
     // user has passwordless sudo and the installer creates /nix via sudo.
@@ -1901,12 +1921,12 @@ mod tests {
     #[test]
     fn nix_installer_official_default_and_determinate_fallback() {
         use crate::config::NixInstaller;
-        let off = nix_install_script(NixInstaller::Official, None, None);
+        let off = nix_install_script(NixInstaller::Official, None, None, None);
         assert!(off.contains("nixos.org/nix/install"), "official installer");
         assert!(off.contains("--no-daemon"), "single-user");
         assert!(!off.contains("determinate.systems"));
         // Determinate carries the official installer as a fallback (|| (...)).
-        let det = nix_install_script(NixInstaller::Determinate, None, None);
+        let det = nix_install_script(NixInstaller::Determinate, None, None, None);
         assert!(
             det.contains("install.determinate.systems"),
             "uses Determinate"
@@ -1921,9 +1941,9 @@ mod tests {
     #[test]
     fn nix_parallel_downloads_written_to_conf() {
         use crate::config::NixInstaller;
-        let none = nix_install_script(NixInstaller::Official, None, None);
+        let none = nix_install_script(NixInstaller::Official, None, None, None);
         assert!(!none.contains("http-connections"), "off by default");
-        let s = nix_install_script(NixInstaller::Official, Some(100), None);
+        let s = nix_install_script(NixInstaller::Official, Some(100), None, None);
         assert!(s.contains("http-connections = 100"));
         assert!(s.contains("max-substitution-jobs = 100"));
         // still enables flakes.
@@ -1938,9 +1958,22 @@ mod tests {
             key: "cache.example.org-1:abc".into(),
             push: true,
         };
-        let s = nix_install_script(NixInstaller::Official, None, Some(&cache));
+        let s = nix_install_script(NixInstaller::Official, None, Some(&cache), None);
         assert!(s.contains("extra-substituters = https://cache.example.org"));
         assert!(s.contains("extra-trusted-public-keys = cache.example.org-1:abc"));
+        // host_cache_url adds the loopback substituter + require-sigs=false (unsigned
+        // host store served over the reverse tunnel), and coexists with a real cache.
+        let hc = nix_install_script(
+            NixInstaller::Official,
+            None,
+            Some(&cache),
+            Some("http://127.0.0.1:8484"),
+        );
+        assert!(hc.contains("extra-substituters = http://127.0.0.1:8484"));
+        assert!(hc.contains("require-sigs = false"));
+        assert!(hc.contains("extra-substituters = https://cache.example.org"));
+        // No host cache ⇒ no require-sigs line (signatures stay enforced).
+        assert!(!s.contains("require-sigs"));
 
         // plan() adds a cache_push step (after devshell) only when push is set.
         let req = EnvRequirements {

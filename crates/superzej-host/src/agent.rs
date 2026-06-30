@@ -1654,7 +1654,10 @@ pub fn provision_provider_env_named(
         home_closure_p2p: p2p_parity,
         home_profile_installs,
         atuin: home.atuin,
-        push_devshell: pc.push_devshell,
+        // The embedded host cache (a general substituter over the whole host store)
+        // SUPERSEDES the one-shot devShell file:// push when on — keep push_devshell
+        // only as the fallback for providers without the reverse tunnel.
+        push_devshell: pc.push_devshell && !pc.host_cache,
         // A pool SPARE provisions in the BACKGROUND (no loading screen to gate),
         // so it should fully BUILD the devShell — `skip_devshell_warm` is a
         // loading-screen speed hack that only makes sense for an on-demand,
@@ -1670,6 +1673,12 @@ pub fn provision_provider_env_named(
         local_parity: (name_override.is_none()
             && env.data == superzej_core::config::DataMode::InEnv)
             .then(|| worktree.to_string()),
+        // When the host cache is on, bake its sandbox-side loopback substituter into
+        // nix.conf so the devShell build + in-pane `nix develop` substitute from the
+        // host store over the reverse tunnel (which the host stands up separately).
+        host_cache_url: pc
+            .host_cache
+            .then(|| format!("http://127.0.0.1:{}", crate::nixcache::SANDBOX_PORT)),
     };
     let plan = envplan::plan(&req, &opts);
 

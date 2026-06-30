@@ -5599,8 +5599,10 @@ version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
+ "axum",
  "chrono",
  "clap 4.6.1",
+ "futures",
  "grep-matcher",
  "grep-regex",
  "grep-searcher",
@@ -5622,6 +5624,7 @@ dependencies = [
  "termwiz",
  "tokei",
  "tokio",
+ "tokio-util",
  "toml 0.8.23",
  "toml_edit 0.25.12+spec-1.1.0",
  "tracing",

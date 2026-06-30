@@ -2364,6 +2364,13 @@ pub struct EnvProviderConfig {
     /// build. Use when you want the shell to come up immediately and don't need a
     /// prebuilt (checkpointed) devShell.
     pub skip_devshell_warm: bool,
+    /// Serve the HOST `/nix/store` as a live HTTP binary cache reachable from the
+    /// sandbox over the reverse tunnel (opt-in, default off), so an in-sandbox `nix
+    /// develop`/`direnv` SUBSTITUTES prebuilt store paths from the host instead of
+    /// building from source. A general substituter covering the whole host store —
+    /// strictly more capable than `push_devshell`'s one-shot devShell upload, which
+    /// it supersedes when set. Needs a provider with the resident bridge (sprites).
+    pub host_cache: bool,
 }
 
 impl EnvProviderConfig {
@@ -2388,6 +2395,7 @@ impl EnvProviderConfig {
             && !self.binary_cache_push
             && !self.push_devshell
             && !self.skip_devshell_warm
+            && !self.host_cache
     }
 
     /// `http-connections`/`max-substitution-jobs` value to use, clamped to a sane

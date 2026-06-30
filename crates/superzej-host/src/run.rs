@@ -601,6 +601,23 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
              routes file. The reverse tunnel + ANTHROPIC_BASE_URL injection are active."
         );
     }
+    // Embedded host nix cache: when any env opts into `[env.<name>.provider]
+    // host_cache`, serve the host /nix/store on an ephemeral loopback port for the
+    // whole session. Each provider worktree's reverse tunnel then forwards a fixed
+    // sandbox port to this one (see connect_worktree_bridge). Held for main's
+    // lifetime; the bound port is threaded into the bridge connect.
+    let _nix_cache = if cfg.env.values().any(|e| e.provider.host_cache) {
+        match crate::nixcache::serve(([127, 0, 0, 1], 0).into()).await {
+            Ok(h) => Some(h),
+            Err(e) => {
+                tracing::warn!(target: "szhost::startup", error = %e, "host nix cache failed to start");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let host_cache_port = _nix_cache.as_ref().map(|h| h.port);
     let keymap = rebuild_keymap(&cfg, &session);
     let mode = crate::keymap::startup_mode(&cfg);
     // Validate that no keybinding scope has ambiguous duplicates. Cross-scope
@@ -862,6 +879,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         start,
         shutdown,
         event_bus,
+        host_cache_port,
     )
     .await;
 
@@ -2383,6 +2401,7 @@ fn connect_worktree_bridge(
     rsup: &crate::revtunnel::ReverseTunnelSupervisor,
     worktree: &std::path::Path,
     cfg: &superzej_core::config::Config,
+    host_cache_port: Option<u16>,
 ) {
     let loc = superzej_core::remote::GitLoc::for_worktree(worktree);
     if !loc.is_remote() || sup.is_connected(&loc) {
@@ -2425,6 +2444,21 @@ fn connect_worktree_bridge(
             let mut tunnels: Vec<(u16, String)> = Vec::new();
             if let Some(port) = cfg.llm_proxy.remote_tunnel_port() {
                 tunnels.push((port, format!("127.0.0.1:{}", cfg.llm_proxy.listen_port())));
+            }
+            // Embedded host nix cache: bind the cache port in the sandbox → the
+            // host's ephemeral cache server, so the sprite's `extra-substituters =
+            // http://127.0.0.1:<SANDBOX_PORT>` (baked into nix.conf) resolves.
+            if let Some(host_port) = host_cache_port
+                && cfg
+                    .env
+                    .get(&env.name)
+                    .map(|e| e.provider.host_cache)
+                    .unwrap_or(false)
+            {
+                tunnels.push((
+                    crate::nixcache::SANDBOX_PORT,
+                    format!("127.0.0.1:{host_port}"),
+                ));
             }
             for spec in &env.sandbox.home.reverse_forwards {
                 if let Some(t) = superzej_core::revtunnel::parse_reverse_forward(spec) {
@@ -7971,6 +8005,9 @@ async fn event_loop<T: Terminal>(
     start: std::time::Instant,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     event_bus: superzej_core::event_bus::EventBus,
+    // Bound port of the embedded host nix cache (`None` unless an env opts in), so
+    // each provider worktree's reverse tunnel forwards to it.
+    host_cache_port: Option<u16>,
 ) -> Result<()> {
     let mut recorder: Option<Recorder> = None;
     let mut scratch = Surface::new(cols, rows);
@@ -8930,6 +8967,7 @@ async fn event_loop<T: Terminal>(
                 &reverse_tunnel_supervisor,
                 &current_worktree,
                 keymap.config(),
+                host_cache_port,
             );
             // Re-heal the canonical checkout's shared `.git/config` off-thread:
             // another agent committing in a sibling worktree could have leaked a
