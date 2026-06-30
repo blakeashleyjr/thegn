@@ -566,28 +566,37 @@ fn join_remote(base: &str, rel: &str) -> String {
 /// iterative (no recursion); skips `.git` (never sync the repo metadata into a
 /// sandbox). Returns an error only if `root` can't be read.
 fn collect_files(root: &Path) -> Result<Vec<(std::path::PathBuf, String)>> {
+    use ignore::WalkBuilder;
+    // A missing source is an error (don't silently sync nothing).
+    anyhow::ensure!(
+        root.exists(),
+        "source dir does not exist: {}",
+        root.display()
+    );
+    // Gitignore-aware: upload the worktree's tracked + untracked WORK but SKIP the
+    // build/junk the repo ignores (target/, result/, .direnv/, node_modules/…) —
+    // otherwise a `data = "sync"` projection pushes gigabytes of artifacts over the
+    // per-file fs API. `.git` is always skipped (the sandbox has its own from the
+    // clone). Dotfiles are KEPT (`hidden(false)`) since `.envrc`/`.config` are real
+    // state; `require_git(false)` applies `.gitignore` even though a worktree's
+    // `.git` is a file pointing into the canonical repo.
     let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let entries =
-            std::fs::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))?;
-        for e in entries.flatten() {
-            let path = e.path();
-            let name = e.file_name().to_string_lossy().into_owned();
-            if name == ".git" {
-                continue;
-            }
-            let ft = match e.file_type() {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if ft.is_dir() {
-                stack.push(path);
-            } else if ft.is_file()
-                && let Ok(rel) = path.strip_prefix(root)
-            {
-                out.push((path.clone(), rel.to_string_lossy().replace('\\', "/")));
-            }
+    let walk = WalkBuilder::new(root)
+        .hidden(false)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(true)
+        .require_git(false)
+        .filter_entry(|e| e.file_name() != ".git")
+        .build();
+    for entry in walk.flatten() {
+        if entry.file_type().is_some_and(|t| t.is_file())
+            && let Ok(rel) = entry.path().strip_prefix(root)
+        {
+            out.push((
+                entry.path().to_path_buf(),
+                rel.to_string_lossy().replace('\\', "/"),
+            ));
         }
     }
     Ok(out)

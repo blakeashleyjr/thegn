@@ -227,6 +227,23 @@
         });
       };
 
+      # Lean shell for sandboxes/sprites: ONLY what's needed to build + run
+      # superzej (`cargo build`, `just build`/`just host`). Deliberately omits the
+      # full dev closure — yazi + preview deps, openspec, muse, python+pyte,
+      # hyperfine, the lint/format stack — which a build sandbox doesn't need and
+      # which dominate the devShell's size (the slow part to seed/fetch on a fresh
+      # sprite). Anything missing is one `nix shell nixpkgs#<tool>` away in-pane
+      # (see the shellHook). Selected per-sandbox via `[sandbox] devshell =
+      # "sandbox"` → `SUPERZEJ_DEVSHELL` → the repo `.envrc`'s `use flake` ref.
+      devShells.sandbox = pkgs.mkShell {
+        packages = [rustToolchain pkgs.just];
+        shellHook = ''
+          export PATH="$PWD/target/debug:$PATH"
+          echo "superzej sandbox shell (lean: rust + just). Need a tool? Ephemeral:"
+          echo "  nix shell nixpkgs#<tool>   |   persistent: nix profile install nixpkgs#<tool>"
+        '';
+      };
+
       devShells.default = pkgs.mkShell {
         packages = with pkgs;
           [

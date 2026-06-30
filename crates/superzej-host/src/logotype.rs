@@ -165,6 +165,12 @@ fn glyph(face: Face, c: char) -> Option<&'static Glyph> {
 /// The wordmark text. One brand, one place.
 pub const WORDMARK: &str = "SUPERZEJ";
 
+/// Stable content-height reserve for the loading splash (steps + context rows).
+/// Centering uses `max(actual, this)` so the wordmark holds a fixed position as
+/// steps tick and the context block appears — no vertical "bounce". Sized for a
+/// typical provision plan (~10 steps) plus its context block (~6 lines).
+const LOADING_RESERVE_ROWS: usize = 16;
+
 /// (cols, rows) `text` occupies in `face`: glyph widths + 1-px letter spacing.
 /// Unknown characters are skipped and contribute nothing (no gap either).
 pub fn measure(face: Face, text: &str) -> (usize, usize) {
@@ -277,9 +283,24 @@ pub fn draw_splash(surface: &mut Surface, rect: Rect, model: &crate::chrome::Fra
     };
     match variant {
         SplashVariant::Large => {
-            // Loading: wordmark(3) + gap(1) + version(1) + gap(1) + steps(N).
-            // Idle:    wordmark(3) + gap(1) + version(1) + gap(1) + hints(3) = 9 rows total.
-            let content_rows = if loading { model.load_steps.len() } else { 3 };
+            // Loading: wordmark(3) + gap(1) + version(1) + gap(1) + steps(N) +
+            //          gap(1) + context(M). Idle: …hints(3) = 9 rows total.
+            let ctx_rows = if model.load_context.is_empty() {
+                0
+            } else {
+                1 + model.load_context.len()
+            };
+            let content_rows = if loading {
+                // STABLE reserve: the wordmark must NOT re-center as steps tick
+                // through (done→active→done), as a failed step's error sub-line
+                // appears, or as the context block lands — a moving anchor reads as
+                // the splash "bouncing". Reserve a fixed height that fits a typical
+                // provision plan + its context, so `y0` is constant for the whole
+                // session; only genuine overflow (rare, very many steps) grows it.
+                (steps_rows(&model.load_steps) + ctx_rows).max(LOADING_RESERVE_ROWS)
+            } else {
+                3
+            };
             let total_rows = 9.max(3 + 3 + content_rows); // always at least 9 for stable centering
             let y0 = rect.y + rect.rows.saturating_sub(total_rows) / 2;
             let (w, _) = measure(Face::Large, WORDMARK);
@@ -301,7 +322,10 @@ pub fn draw_splash(surface: &mut Surface, rect: Rect, model: &crate::chrome::Fra
                 &[(version, col(S::Dim)), (tagline, col(S::Faint))],
             );
             if loading {
-                draw_steps(surface, rect, &model.load_steps, y0 + 6, bg, accent);
+                let next = draw_steps(surface, rect, &model.load_steps, y0 + 6, bg, accent);
+                // Context block (env / placement / sandbox / connect / workdir) a
+                // row below the steps.
+                draw_context(surface, rect, &model.load_context, next + 1, bg);
             } else {
                 let hints = [
                     ("Ctrl-Space", "command palette"),
@@ -398,7 +422,15 @@ fn step_glyph(
     }
 }
 
-/// Render a step list centered as a block below `y_start`.
+/// Number of rows [`draw_steps`] will occupy: one per step plus one per step
+/// that carries a `detail` sub-line. Used for vertical centering.
+fn steps_rows(steps: &[crate::chrome::LoadStep]) -> usize {
+    steps.len() + steps.iter().filter(|s| s.detail.is_some()).count()
+}
+
+/// Render a step list centered as a block below `y_start`. A step's optional
+/// `detail` (a failed step's error / an active step's status) renders as a dim
+/// indented sub-line right below it. Returns the next free row.
 fn draw_steps(
     surface: &mut Surface,
     rect: Rect,
@@ -406,7 +438,7 @@ fn draw_steps(
     y_start: usize,
     bg: ColorAttribute,
     accent: ColorAttribute,
-) {
+) -> usize {
     use crate::chrome::StepState;
     // Find the width of the widest label to left-align the block as a whole.
     let max_label = steps
@@ -417,10 +449,11 @@ fn draw_steps(
     // glyph(1) + space(1) + label
     let block_w = 2 + max_label;
     let bx = rect.x + rect.cols.saturating_sub(block_w) / 2;
+    let bottom = rect.y + rect.rows;
 
-    for (i, step) in steps.iter().enumerate() {
-        let y = y_start + i;
-        if y >= rect.y + rect.rows {
+    let mut y = y_start;
+    for step in steps {
+        if y >= bottom {
             break;
         }
         let (glyph, glyph_fg) = step_glyph(step, accent);
@@ -439,6 +472,75 @@ fn draw_steps(
             label_fg,
             bg,
             (rect.x + rect.cols).saturating_sub(bx + 2),
+        );
+        y += 1;
+        // Detail sub-line (failed step's error / active step's status), dim, under
+        // the label and clamped to the frame width.
+        if let Some(detail) = &step.detail {
+            if y >= bottom {
+                break;
+            }
+            let fg = if step.state == StepState::Failed {
+                chrome::theme_color(superzej_core::theme::RED)
+            } else {
+                col(S::Faint)
+            };
+            chrome::draw_text(
+                surface,
+                bx + 2,
+                y,
+                detail,
+                fg,
+                bg,
+                (rect.x + rect.cols).saturating_sub(bx + 2),
+            );
+            y += 1;
+        }
+    }
+    y
+}
+
+/// Render the `(key, value)` loading-context facts (env / placement / sandbox /
+/// connect / workdir) as dim, right-of-key aligned lines centered below the
+/// steps. Returns nothing; clamped to the frame.
+fn draw_context(
+    surface: &mut Surface,
+    rect: Rect,
+    ctx: &[(String, String)],
+    y_start: usize,
+    bg: ColorAttribute,
+) {
+    if ctx.is_empty() {
+        return;
+    }
+    let key_w = ctx
+        .iter()
+        .map(|(k, _)| UnicodeWidthStr::width(k.as_str()))
+        .max()
+        .unwrap_or(0);
+    let val_w = ctx
+        .iter()
+        .map(|(_, v)| UnicodeWidthStr::width(v.as_str()))
+        .max()
+        .unwrap_or(0);
+    let block_w = key_w + 2 + val_w;
+    let bx = rect.x + rect.cols.saturating_sub(block_w) / 2;
+    let bottom = rect.y + rect.rows;
+    for (i, (k, v)) in ctx.iter().enumerate() {
+        let y = y_start + i;
+        if y >= bottom {
+            break;
+        }
+        chrome::draw_text(surface, bx, y, k, col(S::Ghost), bg, key_w);
+        let vx = bx + key_w + 2;
+        chrome::draw_text(
+            surface,
+            vx,
+            y,
+            v,
+            col(S::Dim),
+            bg,
+            (rect.x + rect.cols).saturating_sub(vx),
         );
     }
 }

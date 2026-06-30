@@ -192,6 +192,46 @@ pub fn overlay_selection(
     }
 }
 
+/// Overlay predicted (not-yet-confirmed) keystrokes at a pane's cursor — dim +
+/// underlined, mosh-style — so local echo appears instantly on a high-latency
+/// link. Written onto `scratch` just before the diff so the front buffer stays in
+/// sync and the prediction clears on the next frame when the server's
+/// authoritative output lands. Clipped to `rect`.
+pub fn overlay_predicted(
+    surface: &mut Surface,
+    rect: Rect,
+    cur_row: u16,
+    cur_col: u16,
+    predicted: &[char],
+) {
+    if predicted.is_empty() || cur_row as usize >= rect.rows {
+        return;
+    }
+    let y = rect.y + cur_row as usize;
+    let x = rect.x + cur_col as usize;
+    surface.add_change(Change::CursorPosition {
+        x: Position::Absolute(x),
+        y: Position::Absolute(y),
+    });
+    surface.add_change(Change::Attribute(AttributeChange::Foreground(
+        ColorAttribute::PaletteIndex(8), // dim gray — reads as provisional
+    )));
+    surface.add_change(Change::Attribute(AttributeChange::Underline(
+        Underline::Single,
+    )));
+    // Clip to the pane's right edge — only as many predictions as fit.
+    let room = (rect.x + rect.cols).saturating_sub(x);
+    for &c in predicted.iter().take(room) {
+        surface.add_change(Change::Text(c.to_string()));
+    }
+    surface.add_change(Change::Attribute(AttributeChange::Underline(
+        Underline::None,
+    )));
+    surface.add_change(Change::Attribute(AttributeChange::Foreground(
+        ColorAttribute::Default,
+    )));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

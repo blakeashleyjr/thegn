@@ -2463,6 +2463,13 @@ fn delete_groups(
     targets.sort_unstable_by(|a, b| b.cmp(a));
     targets.dedup();
     let db = superzej_core::db::Db::open().ok();
+    // For tearing down per-worktree provider sandboxes: resolve each worktree's env
+    // by the SAME precedence launch uses (DB selection → repo `.superzej.toml`
+    // `env=` → global default), not just the DB — a repo-selected provider env
+    // (e.g. superzej's `env = "sprites"`) isn't stored in the DB, so a DB-only
+    // lookup returned None and LEAKED the sprite on delete.
+    let del_cfg =
+        superzej_core::config::Config::load_layered(&superzej_core::config::ProcessEnv, &[], None);
     let (mut deleted, mut skipped) = (0usize, 0usize);
     for gi in targets {
         if gi >= session.worktrees.len() {
@@ -2480,9 +2487,31 @@ fn delete_groups(
             // destroy off-thread (a network DELETE; idempotent on 404). No-op for
             // local/ssh/k8s envs or an unconfigured/tokenless provider.
             if let Some(db) = &db {
-                let repo_root = db.repo_root_for(&path).ok().flatten().unwrap_or_default();
-                if let Some(env_name) = db.effective_env(&path, &repo_root) {
-                    let p = path.clone();
+                // repo_root by the same fallback launch uses (DB → climb from path).
+                let repo_root = db
+                    .repo_root_for(&path)
+                    .ok()
+                    .flatten()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| {
+                        superzej_core::repo::main_worktree(Path::new(&path))
+                            .map(|p| p.to_string_lossy().into_owned())
+                    })
+                    .unwrap_or_else(|| path.clone());
+                // Resolve the env NOW (path still on disk; the git-remove thread runs
+                // below) by full precedence, so a repo-selected provider env is found.
+                let loc = superzej_core::remote::GitLoc::for_worktree(Path::new(&path));
+                let selected = db.effective_env(&path, &repo_root);
+                let env = del_cfg.resolve_env(
+                    Path::new(&repo_root),
+                    &loc,
+                    Path::new(&path),
+                    selected.as_deref(),
+                );
+                // Only provider placements have a sandbox to destroy (no-op for
+                // local/ssh/k8s — destroy_provider_sandbox also guards internally).
+                if !env.placement.is_local() {
+                    let (p, env_name) = (path.clone(), env.name.clone());
                     std::thread::spawn(move || {
                         crate::agent::destroy_provider_sandbox(&p, &env_name);
                     });
@@ -7451,12 +7480,63 @@ fn provision_load_steps(views: &[crate::agent::ProvisionStepView]) -> Vec<LoadSt
     use crate::agent::ProvisionState;
     views
         .iter()
-        .map(|v| match v.state {
-            ProvisionState::Active => LoadStep::active(v.label.clone()),
-            ProvisionState::Done => LoadStep::done(v.label.clone()),
-            ProvisionState::Failed => LoadStep::failed(v.label.clone()),
+        .map(|v| {
+            let step = match v.state {
+                ProvisionState::Pending => LoadStep::pending(v.label.clone()),
+                ProvisionState::Active => LoadStep::active(v.label.clone()),
+                ProvisionState::Done => LoadStep::done(v.label.clone()),
+                ProvisionState::Failed => LoadStep::failed(v.label.clone()),
+            };
+            match &v.detail {
+                Some(d) => step.with_detail(d.clone()),
+                None => step,
+            }
         })
         .collect()
+}
+
+/// Adjust the warm-spare-pool target for the ACTIVE workspace's `(repo, env)` by
+/// `delta`, persisting the override in the DB (the `+`/`-` hotkeys). Returns a
+/// status message (the new target, or why it didn't apply). The caller resets the
+/// maintainer throttle so the change takes effect immediately.
+fn pool_target_adjust(
+    session: &crate::session::Session,
+    cfg: &superzej_core::config::Config,
+    delta: i64,
+) -> Option<String> {
+    let g = session.active_group().filter(|g| !g.path.is_empty())?;
+    let wt = g.path.clone();
+    let loc = superzej_core::remote::GitLoc::for_worktree(std::path::Path::new(&wt));
+    if !loc.is_remote() {
+        return Some("warm pool: only for provider (remote) workspaces".into());
+    }
+    let db = superzej_core::db::Db::open().ok()?;
+    let repo_root = db
+        .repo_root_for(&wt)
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            superzej_core::repo::main_worktree(std::path::Path::new(&wt))
+                .map(|p| p.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| wt.clone());
+    let env_name = cfg
+        .resolve_env(
+            std::path::Path::new(&repo_root),
+            &loc,
+            std::path::Path::new(&wt),
+            None,
+        )
+        .name;
+    let cur = db
+        .pool_target(&repo_root, &env_name)
+        .ok()
+        .flatten()
+        .unwrap_or(cfg.lifecycle.pool.size as i64);
+    let new = (cur + delta).max(0);
+    db.set_pool_target(&repo_root, &env_name, new).ok()?;
+    Some(format!("warm pool target: {new} spare(s)"))
 }
 
 /// Error carried over the off-thread spec-resolution channel. Preserves a
@@ -8011,6 +8091,13 @@ async fn event_loop<T: Terminal>(
     // session, so the background pass fires at most once per worktree (provisioning
     // is idempotent, but re-attempting churns a `list()` per switch).
     let mut eager_inflight: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Throttle the warm-spare-pool maintainer (it reconciles the active workspace's
+    // (repo, env) toward `[lifecycle.pool] size`). `None` = never run yet.
+    let mut last_pool_reconcile: Option<std::time::Instant> = None;
+    // Coalesce media-player position ticks (a playing track emits ~4/s): an open
+    // media section would otherwise full-recompose the chrome per tick → flicker.
+    // Repaint it at most ~1/s; the snapshot data is updated every tick regardless.
+    let mut last_media_full: Option<std::time::Instant> = None;
     // Keys whose sandbox probe failed: suppressed from future pre-warm probes
     // so a permanently-unavailable backend (no podman/bwrap installed) cannot
     // keep spawning new threads on every event loop iteration. The active-tab
@@ -8037,6 +8124,15 @@ async fn event_loop<T: Terminal>(
     // prompt (~1-2s incl. a provider session open) but short enough that a hang
     // doesn't sit there flashing.
     const SHELL_OUTPUT_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(8);
+    // A REMOTE/provider pane legitimately produces no output for far longer than a
+    // local shell: opening a provider exec, resuming a suspended sandbox, and —
+    // the big one — a first-`direnv`/`nix develop` that builds the repo's devShell
+    // can sit SILENT for minutes while it evaluates + downloads a toolchain (e.g. a
+    // from-source rust build) before printing anything. Using the 8s local deadline
+    // there mistakes that build for a hung shell and swaps in a clean rc-free bash.
+    // Give remote panes a generous window so the build's first output clears the
+    // splash naturally; a genuinely hung remote shell still falls back, just later.
+    const SHELL_OUTPUT_WATCHDOG_REMOTE: std::time::Duration = std::time::Duration::from_secs(300);
     let mut shell_watchdog_fired: std::collections::HashSet<(usize, usize)> =
         std::collections::HashSet::new();
     // The new-worktree wizard (Alt+w) + its creation pipeline. The worker
@@ -8993,32 +9089,126 @@ async fn event_loop<T: Terminal>(
                 let scope = current_config.lifecycle.eager;
                 if current_config.lifecycle.enabled && scope != EagerScope::Off {
                     let active_path = session.active_group().map(|g| g.path.clone());
-                    let targets: Vec<String> = session
+                    // (path, group name, active tab) so the background provisioner
+                    // can report progress into `loading_state` under the SAME key the
+                    // splash derives from — switching to a still-provisioning worktree
+                    // then shows its live loading screen, never a premature shell.
+                    let targets: Vec<(String, String, usize)> = session
                         .worktrees
                         .iter()
                         .filter(|g| !g.path.is_empty())
-                        .map(|g| g.path.clone())
-                        .filter(|p| match scope {
+                        .filter(|g| match scope {
                             EagerScope::ActiveWorktreePlusNew => {
-                                active_path.as_deref() == Some(p.as_str())
+                                active_path.as_deref() == Some(g.path.as_str())
                             }
                             _ => true, // ActiveWorkspace / All: every open worktree
                         })
+                        .map(|g| (g.path.clone(), g.name.clone(), g.active_tab))
                         .collect();
-                    for wt in targets {
+                    for (wt, gname, ti) in targets {
                         if !eager_inflight.insert(wt.clone()) {
                             continue; // already attempted this session
                         }
                         let cfg = current_config.clone();
                         let wk = waker.clone();
+                        let ptx = provision_tx.clone();
                         task::spawn_blocking(move || {
                             if crate::agent::needs_eager_provision(&cfg, &wt) {
-                                // Background: no splash for a non-focused worktree.
-                                let _ = crate::agent::provision_worktree(&cfg, &wt, |_views| {});
+                                // Lock the loading screen up the moment we commit to
+                                // provisioning (before the first step), so switching
+                                // here can never catch a half-ready shell — the splash
+                                // wins while `loading_state` is non-empty.
+                                let _ = ptx.send((
+                                    gname.clone(),
+                                    ti,
+                                    vec![LoadStep::active("provisioning")],
+                                ));
+                                let _ = wk.wake();
+                                let prov = crate::agent::provision_worktree(&cfg, &wt, |views| {
+                                    let _ =
+                                        ptx.send((gname.clone(), ti, provision_load_steps(views)));
+                                    let _ = wk.wake();
+                                });
+                                // On success, clear the lock so a now-ready worktree
+                                // shows no stale splash (materialize takes over on
+                                // open). On failure, leave the failed steps visible.
+                                if prov.is_ok() {
+                                    let _ = ptx.send((gname.clone(), ti, Vec::new()));
+                                }
                                 let _ = wk.wake();
                             }
                         });
                     }
+                }
+            }
+            // Warm-spare pool maintainer: keep `[lifecycle.pool] size` spares ready
+            // for the ACTIVE workspace's (repo, env) so the NEXT worktree claims one
+            // (instant) instead of provisioning from scratch. Throttled (~8s); the
+            // whole reconcile runs off-loop (a cheap DB read + provider create/destroy)
+            // and is a no-op when the pool is empty/disabled.
+            if current_config.lifecycle.enabled
+                && last_pool_reconcile
+                    .map(|t| t.elapsed() >= std::time::Duration::from_secs(8))
+                    .unwrap_or(true)
+                && let Some(g) = session.active_group()
+                && !g.path.is_empty()
+            {
+                let wt = g.path.clone();
+                let loc = superzej_core::remote::GitLoc::for_worktree(std::path::Path::new(&wt));
+                if loc.is_remote() {
+                    last_pool_reconcile = Some(std::time::Instant::now());
+                    // Resolve (repo, env) on-loop (fast, throttled) so we can update
+                    // the sidebar chip AND hand the resolved values to the off-loop
+                    // reconcile.
+                    if let Ok(db) = superzej_core::db::Db::open() {
+                        let repo_root = db
+                            .repo_root_for(&wt)
+                            .ok()
+                            .flatten()
+                            .filter(|s| !s.is_empty())
+                            .map(std::path::PathBuf::from)
+                            .or_else(|| {
+                                superzej_core::repo::main_worktree(std::path::Path::new(&wt))
+                            })
+                            .unwrap_or_else(|| std::path::PathBuf::from(&wt));
+                        let env_name = current_config
+                            .resolve_env(&repo_root, &loc, std::path::Path::new(&wt), None)
+                            .name;
+                        let repo = repo_root.to_string_lossy().into_owned();
+                        let target = crate::lifecycle::effective_pool_target(
+                            &db,
+                            &current_config,
+                            &repo,
+                            &env_name,
+                        );
+                        let ready = db
+                            .pool_spares_for(&repo, &env_name)
+                            .unwrap_or_default()
+                            .iter()
+                            .filter(|s| s.state == "ready")
+                            .count();
+                        let pool = (target > 0).then_some((ready, target));
+                        if model.pool != pool {
+                            model.pool = pool;
+                            dirty = true;
+                        }
+                        let cfg = current_config.clone();
+                        let wk = waker.clone();
+                        task::spawn_blocking(move || {
+                            crate::lifecycle::reconcile_pool(
+                                &cfg,
+                                &repo_root,
+                                &env_name,
+                                move || {
+                                    let _ = wk.wake();
+                                },
+                            );
+                        });
+                    }
+                } else if model.pool.is_some() {
+                    // Switched to a non-provider workspace ⇒ drop the stale chip.
+                    model.pool = None;
+                    dirty = true;
                 }
             }
             // And the new worktree's hidden yazi drawer, so the first toggle
@@ -9152,30 +9342,89 @@ async fn event_loop<T: Terminal>(
                             // / exec cooldown): halt rather than degrade to host.
                             Err(SpecError::Halt(halt))
                         } else {
-                            // Provision the env first (provider only; no-op
-                            // otherwise): clone the repo + reproduce the declared
-                            // toolchain + personal layer, streaming live steps to
-                            // the splash. Then resolve the pane's launch spec so
-                            // the pane only attaches once the env is ready.
-                            let gname_p = gname.clone();
-                            let wk_p = wk.clone();
-                            let prov = crate::agent::provision_worktree(&cfg, &wt, |views| {
-                                let _ =
-                                    ptx.send((gname_p.clone(), ti, provision_load_steps(views)));
-                                let _ = wk_p.wake();
-                            });
-                            match prov {
-                                Ok(_) => crate::agent::launch_spec(&cfg, &wt, None, "shell")
+                            // FAST PATH: claim a pre-provisioned warm spare for this
+                            // (repo, env) — an instant hand-over (bind + branch
+                            // checkout) instead of a from-scratch provision. Falls
+                            // through to a full provision when no spare is ready.
+                            let loc = superzej_core::remote::GitLoc::for_worktree(
+                                std::path::Path::new(&wt),
+                            );
+                            let claimed = loc.is_remote() && {
+                                let repo_root = superzej_core::db::Db::open()
+                                    .ok()
+                                    .and_then(|db| db.repo_root_for(&wt).ok().flatten())
+                                    .filter(|s| !s.is_empty())
+                                    .map(std::path::PathBuf::from)
+                                    .or_else(|| {
+                                        superzej_core::repo::main_worktree(std::path::Path::new(
+                                            &wt,
+                                        ))
+                                    })
+                                    .unwrap_or_else(|| std::path::PathBuf::from(&wt));
+                                let env_name = cfg
+                                    .resolve_env(&repo_root, &loc, std::path::Path::new(&wt), None)
+                                    .name;
+                                let branch =
+                                    superzej_core::util::git_cmd(std::path::Path::new(&wt))
+                                        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                                        .output()
+                                        .ok()
+                                        .filter(|o| o.status.success())
+                                        .map(|o| {
+                                            String::from_utf8_lossy(&o.stdout).trim().to_string()
+                                        })
+                                        .filter(|b| !b.is_empty() && b != "HEAD");
+                                crate::agent::claim_spare(
+                                    &cfg,
+                                    &wt,
+                                    &repo_root,
+                                    &env_name,
+                                    branch.as_deref(),
+                                )
+                                .is_some()
+                            };
+                            if claimed {
+                                // Bound to a ready spare — clear any loading lock and
+                                // open the pane straight against it (no provisioning).
+                                let _ = ptx.send((gname.clone(), ti, Vec::new()));
+                                let _ = wk.wake();
+                                crate::agent::launch_spec(&cfg, &wt, None, "shell")
                                     .map(|spec| {
                                         missing.into_iter().map(|id| (id, spec.clone())).collect()
                                     })
-                                    .map_err(spec_err),
-                                Err(e) => Err(match sandbox_halt_in(&e) {
-                                    Some(h) => SpecError::Halt(h.clone()),
-                                    None => {
-                                        SpecError::Other(format!("environment setup failed: {e}"))
-                                    }
-                                }),
+                                    .map_err(spec_err)
+                            } else {
+                                // Provision the env first (provider only; no-op
+                                // otherwise): clone the repo + reproduce the declared
+                                // toolchain + personal layer, streaming live steps to
+                                // the splash. Then resolve the pane's launch spec so
+                                // the pane only attaches once the env is ready.
+                                let gname_p = gname.clone();
+                                let wk_p = wk.clone();
+                                let prov = crate::agent::provision_worktree(&cfg, &wt, |views| {
+                                    let _ = ptx.send((
+                                        gname_p.clone(),
+                                        ti,
+                                        provision_load_steps(views),
+                                    ));
+                                    let _ = wk_p.wake();
+                                });
+                                match prov {
+                                    Ok(_) => crate::agent::launch_spec(&cfg, &wt, None, "shell")
+                                        .map(|spec| {
+                                            missing
+                                                .into_iter()
+                                                .map(|id| (id, spec.clone()))
+                                                .collect()
+                                        })
+                                        .map_err(spec_err),
+                                    Err(e) => Err(match sandbox_halt_in(&e) {
+                                        Some(h) => SpecError::Halt(h.clone()),
+                                        None => SpecError::Other(format!(
+                                            "environment setup failed: {e}"
+                                        )),
+                                    }),
+                                }
                             }
                         };
                         if tx.send((gname, wt, ti, specs)).is_ok() {
@@ -10234,6 +10483,14 @@ async fn event_loop<T: Terminal>(
             let tab_key = (name.clone(), ti);
             materialize_inflight.remove(&tab_key);
             prewarm_inflight.remove(&tab_key);
+            // A remote materialize may have just CLAIMED a warm spare (ready →
+            // claimed), so the chip's count is now stale. Force the pool
+            // maintainer to re-read on the next loop (it's otherwise throttled to
+            // ~8s) so `warm N/M` drops promptly instead of showing a phantom
+            // ready spare that was already handed off.
+            if superzej_core::remote::GitLoc::for_worktree(std::path::Path::new(&wt)).is_remote() {
+                last_pool_reconcile = None;
+            }
             let Some(gi) = session.worktrees.iter().position(|g| g.name == name) else {
                 continue;
             };
@@ -10441,10 +10698,18 @@ async fn event_loop<T: Terminal>(
             // loading screen flickers in and out. Cleared normally on first PTY
             // output / spec failure, so preserving here never makes the splash stick.
             let load_steps = std::mem::take(&mut model.load_steps);
+            // Same reason — the env-details block under the splash is launch UI, not
+            // hydration data; preserve it or it flashes in/out on every tick.
+            let load_context = std::mem::take(&mut model.load_context);
+            // The warm-pool chip is loop-set (by the pool maintainer), not hydration
+            // data — preserve it across the model swap or it blinks off every tick.
+            let pool = model.pool;
             model = next_model;
             model.stats = stats;
             model.metrics = metrics;
             model.load_steps = load_steps;
+            model.load_context = load_context;
+            model.pool = pool;
             if model.status.is_empty() {
                 model.status = prev_status;
             }
@@ -11003,7 +11268,18 @@ async fn event_loop<T: Terminal>(
                     != shown.as_ref().and_then(|m| m.badge());
                 model.panel.media = shown;
                 if media_section_open {
-                    dirty = true;
+                    // Coalesce: a playing track ticks ~4/s, and a full chrome
+                    // recompose per tick is a flicker storm. Repaint at most ~1/s
+                    // (the data above is already current); a non-position change
+                    // (track/play-state, surfaced via the badge) repaints at once.
+                    if badge_changed
+                        || last_media_full
+                            .map(|t| t.elapsed() >= std::time::Duration::from_millis(900))
+                            .unwrap_or(true)
+                    {
+                        dirty = true;
+                        last_media_full = Some(std::time::Instant::now());
+                    }
                 } else if badge_changed {
                     bars_dirty = true;
                 }
@@ -11203,6 +11479,15 @@ async fn event_loop<T: Terminal>(
                 .unwrap_or_default();
             if model.load_steps != derived {
                 model.load_steps = derived;
+                // Refresh the context block (env / placement / sandbox / connect /
+                // workdir) only when the splash is up — a cheap DB+config resolve,
+                // gated to provisioning-state changes so it's not per-frame.
+                model.load_context = if model.load_steps.is_empty() {
+                    Vec::new()
+                } else {
+                    let wt = active_tab_path(&session);
+                    crate::agent::loading_context(&current_config, &wt.to_string_lossy())
+                };
                 dirty = true;
             }
         }
@@ -11218,6 +11503,16 @@ async fn event_loop<T: Terminal>(
         if !model.load_steps.is_empty() && !center_dormant {
             let gi = session.active;
             let ti = session.worktrees.get(gi).map(|g| g.active_tab).unwrap_or(0);
+            // A provider/remote worktree gets the long deadline (a silent devShell
+            // build is not a hang); local keeps the snappy 8s.
+            let watchdog =
+                if superzej_core::remote::GitLoc::for_worktree(&active_tab_path(&session))
+                    .is_remote()
+                {
+                    SHELL_OUTPUT_WATCHDOG_REMOTE
+                } else {
+                    SHELL_OUTPUT_WATCHDOG
+                };
             let leaf = (!shell_watchdog_fired.contains(&(gi, ti)))
                 .then(|| session.worktrees.get(gi).and_then(|g| g.tabs.get(ti)))
                 .flatten()
@@ -11226,12 +11521,17 @@ async fn event_loop<T: Terminal>(
                 .and_then(|ids| ids.first().copied())
                 .filter(|pid| {
                     panes.table.contains_key(pid)
-                        && panes
-                            .pane_age(*pid)
-                            .is_some_and(|age| age > SHELL_OUTPUT_WATCHDOG)
+                        && panes.pane_age(*pid).is_some_and(|age| age > watchdog)
                 });
             if let Some(pid) = leaf {
                 shell_watchdog_fired.insert((gi, ti));
+                tracing::warn!(
+                    target: "szhost::startup",
+                    pane = pid,
+                    secs = watchdog.as_secs(),
+                    "startup-shell watchdog fired: no PTY output within deadline — \
+                     falling back to a clean rc-free shell"
+                );
                 let cwd = group_cwd(&session.worktrees[gi])
                     .or_else(|| std::env::var("HOME").ok().map(std::path::PathBuf::from));
                 match spawn_clean_shell_pane(
@@ -12010,6 +12310,32 @@ async fn event_loop<T: Terminal>(
             }
             // Toasts float above everything else — last in, top of the stack.
             toasts.render(&mut scratch, screen);
+            // Predictive local echo: paint the focused pane's not-yet-confirmed
+            // keystrokes (dim, at its cursor) onto `scratch` just before the diff,
+            // so they appear instantly on a high-latency link and clear naturally
+            // when the server's authoritative output lands (which retires them).
+            // The focused pane is dirtied by the keystroke hook, so its rect is in
+            // the bounded diff and the overlay cells flush this frame.
+            if focus.center()
+                && let Some(p) = panes.table.get(&focused)
+            {
+                let pred = p.predicted();
+                if !pred.is_empty()
+                    && let Some((_, _, prect)) = tree
+                        .layout_framed(chrome.center)
+                        .into_iter()
+                        .find(|(id, _, _)| *id == focused)
+                {
+                    let (cur_row, cur_col) = p.emulator().cursor();
+                    crate::compositor::overlay_predicted(
+                        &mut scratch,
+                        prect,
+                        cur_row,
+                        cur_col,
+                        pred,
+                    );
+                }
+            }
             // Flush path: diff `scratch` against our own `front` buffer and
             // render the change list directly on the terminal.
             //
@@ -12083,11 +12409,15 @@ async fn event_loop<T: Terminal>(
                 };
                 if let (Some(rect), Some(p)) = (focused_rect, panes.table.get(&cursor_pane)) {
                     let (cur_row, cur_col) = p.emulator().cursor();
+                    // Sit the caret AFTER any predicted (not-yet-echoed) text, so
+                    // it tracks where you're typing during the round-trip.
+                    let col =
+                        (cur_col as usize + p.predicted().len()).min(rect.cols.saturating_sub(1));
                     pending.push(Change::CursorVisibility(
                         termwiz::surface::CursorVisibility::Visible,
                     ));
                     pending.push(Change::CursorPosition {
-                        x: Position::Absolute(rect.x + cur_col as usize),
+                        x: Position::Absolute(rect.x + col),
                         y: Position::Absolute(rect.y + cur_row as usize),
                     });
                 } else {
@@ -17152,6 +17482,19 @@ async fn event_loop<T: Terminal>(
                                 sb.sync(&mut model);
                                 need_relayout = true;
                             }
+                            Action::PoolIncrement | Action::PoolDecrement => {
+                                let delta = if matches!(action, Action::PoolIncrement) {
+                                    1
+                                } else {
+                                    -1
+                                };
+                                if let Some(msg) =
+                                    pool_target_adjust(&session, &current_config, delta)
+                                {
+                                    model.status = msg;
+                                    last_pool_reconcile = None; // reconcile immediately
+                                }
+                            }
                             Action::TogglePanel => {
                                 panel_auto_revealed = None;
                                 // Toggle on what the user SEES: if the panel
@@ -19124,6 +19467,31 @@ async fn event_loop<T: Terminal>(
                         }
                     } else if let Some(p) = panes.table.get_mut(&target_pane) {
                         p.write_input(&batched)?;
+                        // Predictive local echo: show the keystroke(s) instantly
+                        // (PtyPane gates this to slow links + prompt rows, never in
+                        // a TUI) and dirty the pane so the overlay paints THIS frame
+                        // — ~one RTT before the server's echo lands and retires it.
+                        let predicted = match k.key {
+                            KeyCode::Char(c)
+                                if !c.is_control()
+                                    && !k.modifiers.intersects(
+                                        Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER,
+                                    ) =>
+                            {
+                                let mut any = false;
+                                for _ in 0..repeat.max(1) {
+                                    any |= p.predict_key(c);
+                                }
+                                any
+                            }
+                            KeyCode::Backspace => p.predict_backspace(),
+                            // Enter + any non-printable key retire the overlay (the
+                            // server redraws the line / screen).
+                            _ => p.predict_flush(),
+                        };
+                        if predicted {
+                            dirty_panes.insert(target_pane);
+                        }
                     }
                     keymap.reset();
                     // Typing into the terminal clears selections elsewhere

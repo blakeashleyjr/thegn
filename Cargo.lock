@@ -5680,6 +5680,7 @@ dependencies = [
  "futures-channel",
  "futures-util",
  "gix",
+ "ignore",
  "notify",
  "octocrab",
  "reqwest",

@@ -961,6 +961,22 @@ non-agent processes and plain task panes._
 - [ ] 429. Sound/bell config
 - [x] 430. Aggregated bus across all sources _(core `EventBus` aggregates PR/agent/test/log/worktree/process events)_
 
+_**Near-term (flagged 2026-06-29): sophisticated in-app diagnostic / toast surfacing.**
+Today `msg::warn`/`msg::error` + `config_warn` route through `tracing` to the LOG
+FILE once the subscriber is installed — invisible in the TUI. So config/overlay
+parse errors, capability downgrades, and best-effort provisioning failures sink
+silently. Motivating bug: a malformed repo `.superzej.toml` silently dropped an
+`env = "sprites"` selection and the session ran local; only `env_halt_reason` now
+halts (warning modal) on the placement-changing case. The general fix is a
+first-class surfacing layer on top of the existing `toast` module + `EventBus` +
+notifications inbox (428)._
+
+- [ ] 749. In-app diagnostic surfacing — tee `msg::warn`/`error` + `config_warn` + parse/halt diagnostics to visible toasts (not just the log file); a `tracing` layer or a diagnostics sink the loop drains + renders
+- [ ] 750. Toast severity + lifecycle — info/success/warn/error tiers, per-severity TTL + sticky errors, dedup/coalescing of repeated diagnostics, bounded stacking with overflow into the inbox
+- [ ] 751. Actionable toasts — keybound/click-through actions (open the offending file, open the log, retry the halted env, copy the error), wired to the palette + EventBus
+- [ ] 752. Unified diagnostics center — fold config + runtime diagnostics into the notifications inbox (428) with source attribution + severity/source filtering + replay
+- [ ] 753. Startup diagnostics gate — a visible startup summary whenever config/overlay parse errors or capability/placement downgrades occurred, so a dropped overlay or degraded remote→host is never silent (consistent with the failover-halt modal)
+
 ### AJ. Security / opsec
 
 - [ ] 431. Credential brokerage — agents never see raw keys

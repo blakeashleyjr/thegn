@@ -2338,6 +2338,19 @@ pub struct EnvProviderConfig {
     /// Push the built devShell closure to `binary_cache_url` during provisioning
     /// (needs a signing key in the env), so later sandboxes download it. Default off.
     pub binary_cache_push: bool,
+    /// P2P devShell speedup (opt-in, default off): transfer the repo's devShell
+    /// closure — already built on the HOST (you run `nix develop`/direnv locally) —
+    /// straight into the sandbox store (host `nix copy --to file://` → fs upload →
+    /// sandbox `nix copy --from file://`), so the in-sandbox devShell is a local
+    /// store hit, not a rebuild/redownload. No hosted cache needed; the host is the
+    /// cache. No-op when the repo has no nix devShell or the host hasn't built it.
+    pub push_devshell: bool,
+    /// Skip the blocking devShell build during provisioning (opt-in, default off).
+    /// The repo's devShell then builds lazily in-pane on first `direnv`/`nix
+    /// develop` instead of gating the loading screen on a multi-minute toolchain
+    /// build. Use when you want the shell to come up immediately and don't need a
+    /// prebuilt (checkpointed) devShell.
+    pub skip_devshell_warm: bool,
 }
 
 impl EnvProviderConfig {
@@ -2360,6 +2373,8 @@ impl EnvProviderConfig {
             && self.binary_cache_url.is_empty()
             && self.binary_cache_key.is_empty()
             && !self.binary_cache_push
+            && !self.push_devshell
+            && !self.skip_devshell_warm
     }
 
     /// `http-connections`/`max-substitution-jobs` value to use, clamped to a sane
@@ -2999,6 +3014,12 @@ pub struct SandboxConfig {
     /// daemon still gets the project linters/formatters/tools out of the box.
     /// No-op for repos without a flake `devShell`. See [`crate::devenv`].
     pub inject_devshell: bool,
+    /// Which flake devShell attribute a sandbox/sprite enters, e.g. `"sandbox"`
+    /// for a lean build-only shell (`.#devShells.sandbox`). Empty ⇒ `default`
+    /// (unchanged). Exported as `SUPERZEJ_DEVSHELL` into the sandbox (pane + the
+    /// provisioning seed), which the repo `.envrc`'s `use flake .#${…:-default}`
+    /// reads — so the sandbox builds/enters a smaller closure than full host dev.
+    pub devshell: String,
     /// Bind-mount the host Nix daemon socket into the sandbox so full
     /// `nix develop`/`build`/`fmt` work *inside* it. Off by default: it relaxes
     /// the isolation the hardening profiles provide (Tier A `inject_devshell`
@@ -3096,6 +3117,7 @@ impl Default for SandboxConfig {
             warm_direnv: WarmDirenv::Auto,
             devenv: false,
             inject_devshell: true,
+            devshell: String::new(),
             nix_daemon: false,
             shell: String::new(),
             on_missing: OnMissing::Warn,
@@ -3130,10 +3152,62 @@ impl SandboxConfig {
     /// reverse bridge), not raw passthrough.
     pub fn passthrough_env_remote(&self) -> Vec<(String, String)> {
         const HOST_LOCAL: &[&str] = &["SSH_AUTH_SOCK", "GPG_AGENT_INFO", "GNUPGHOME", "GPG_TTY"];
-        self.passthrough_env()
+        let mut env: Vec<(String, String)> = self
+            .passthrough_env()
             .into_iter()
             .filter(|(k, _)| !HOST_LOCAL.contains(&k.as_str()))
-            .collect()
+            // Normalize an exotic host TERM (xterm-ghostty/kitty/alacritty) to a
+            // type the remote's terminfo DB actually has — otherwise `clear`/`tput`/
+            // curses fail "unknown terminal type" in a fresh sandbox.
+            .map(|(k, v)| {
+                if k == "TERM" {
+                    (k, remote_safe_term(&v))
+                } else {
+                    (k, v)
+                }
+            })
+            .collect();
+        // Tell the sandbox which flake devShell to enter (`[sandbox] devshell`).
+        // The repo `.envrc` reads `SUPERZEJ_DEVSHELL` (`use flake .#${…:-default}`),
+        // so a fresh sprite enters the lean build shell instead of the full dev
+        // closure. Unset on the host → the default shell, unchanged.
+        let attr = self.devshell.trim();
+        if !attr.is_empty() {
+            env.push(("SUPERZEJ_DEVSHELL".to_string(), attr.to_string()));
+        }
+        env
+    }
+}
+
+/// Map a host `TERM` to a value a fresh remote/sandbox terminfo DB is sure to
+/// have. Exotic terminal types (`xterm-ghostty`, `xterm-kitty`, `alacritty`, …)
+/// aren't usually installed remotely, so `clear`/`tput`/ncurses error with
+/// "unknown terminal type". They're all `xterm-256color`-compatible, so downgrade
+/// to that; pass universally-shipped types through unchanged.
+pub fn remote_safe_term(term: &str) -> String {
+    const KNOWN: &[&str] = &[
+        "xterm",
+        "xterm-256color",
+        "xterm-color",
+        "screen",
+        "screen-256color",
+        "tmux",
+        "tmux-256color",
+        "vt100",
+        "vt220",
+        "linux",
+        "ansi",
+        "dumb",
+    ];
+    let t = term.trim();
+    if t.is_empty() || KNOWN.contains(&t) {
+        if t.is_empty() {
+            "xterm-256color".to_string()
+        } else {
+            t.to_string()
+        }
+    } else {
+        "xterm-256color".to_string()
     }
 }
 
@@ -3189,6 +3263,15 @@ pub struct HomeConfig {
     /// fallback when no binary cache is available. Empty = disabled. (Experimental;
     /// the cache-first closure copy reuses `[env.<name>.provider] binary_cache_*`.)
     pub nix_home_flake: String,
+    /// Opt-in (default `false`): carry the host's atuin shell-history credentials
+    /// and config into every sandbox so its history joins your atuin sync across the
+    /// host and sprites, via atuin's own auto-sync. Uploads the dereferenced
+    /// `~/.config/atuin/config.toml` plus the `key`/`session` auth files under
+    /// `~/.local/share/atuin`, but not the history databases (the sync server
+    /// reconciles those). A no-op when atuin is not installed or the host has no
+    /// atuin config. Carries credentials into the remote, so enable only where
+    /// you trust it.
+    pub atuin: bool,
 }
 
 impl Default for HomeConfig {
@@ -3205,6 +3288,7 @@ impl Default for HomeConfig {
             // Safe default: drop a non-portable rc rather than ship a broken shell.
             portable_dotfiles_only: true,
             nix_home_flake: String::new(),
+            atuin: false,
         }
     }
 }
@@ -3220,6 +3304,7 @@ impl HomeConfig {
             || !self.setup_script.trim().is_empty()
             || !self.agents.is_empty()
             || !self.reverse_forwards.is_empty()
+            || self.atuin
     }
 }
 
@@ -3241,6 +3326,7 @@ pub struct HomeOverlay {
     pub strategy: Option<ShellStrategy>,
     pub portable_dotfiles_only: Option<bool>,
     pub nix_home_flake: Option<String>,
+    pub atuin: Option<bool>,
 }
 
 impl HomeOverlay {
@@ -3256,6 +3342,7 @@ impl HomeOverlay {
             && self.strategy.is_none()
             && self.portable_dotfiles_only.is_none()
             && self.nix_home_flake.is_none()
+            && self.atuin.is_none()
     }
     /// Field-merge present keys into a resolved [`HomeConfig`].
     pub fn apply(&self, base: &mut HomeConfig) {
@@ -3288,6 +3375,9 @@ impl HomeOverlay {
         }
         if let Some(v) = &self.nix_home_flake {
             base.nix_home_flake = v.clone();
+        }
+        if let Some(v) = self.atuin {
+            base.atuin = v;
         }
     }
 }
@@ -4996,6 +5086,78 @@ fn load_repo_overlay(repo_root: &std::path::Path) -> Option<RepoConfigFile> {
         };
     }
     None
+}
+
+/// A repo-root `.superzej.*` overlay that EXISTS but failed to parse. Returned by
+/// [`repo_overlay_parse_error`] so the host can refuse to silently ignore it: a
+/// dropped overlay can change placement (e.g. a malformed file that was selecting
+/// `env = "sprites"` → falls back to local/host), which is exactly the silent
+/// degradation a failover-off env forbids.
+#[derive(Debug, Clone)]
+pub struct RepoOverlayParseError {
+    pub path: PathBuf,
+    pub error: String,
+    /// Best-effort lenient read of the `env = "…"` selector (empty if absent), so
+    /// a parse failure elsewhere in the file doesn't hide which env it requested.
+    pub selected_env: String,
+}
+
+/// If a repo-root `.superzej.*` file exists but fails to parse, return the error
+/// (+ a lenient `env =` read). `None` when there's no file or it parses cleanly.
+/// Mirrors [`load_repo_overlay`]'s file precedence; the difference is intent —
+/// `load_repo_overlay` swallows the error to keep opening the worktree, this lets
+/// the caller surface it (a visible halt/warning) so a dropped overlay that
+/// changes placement is never silent.
+pub fn repo_overlay_parse_error(repo_root: &Path) -> Option<RepoOverlayParseError> {
+    for (ext, kind) in [
+        ("toml", "toml"),
+        ("yaml", "yaml"),
+        ("yml", "yaml"),
+        ("json", "json"),
+    ] {
+        let path = repo_root.join(format!(".superzej.{ext}"));
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let err = match kind {
+            "toml" => toml::from_str::<RepoConfigFile>(&text)
+                .err()
+                .map(|e| e.to_string()),
+            "yaml" => serde_yaml::from_str::<RepoConfigFile>(&text)
+                .err()
+                .map(|e| e.to_string()),
+            _ => serde_json::from_str::<RepoConfigFile>(&text)
+                .err()
+                .map(|e| e.to_string()),
+        };
+        return err.map(|error| RepoOverlayParseError {
+            path,
+            error,
+            selected_env: lenient_env_selector(&text),
+        });
+    }
+    None
+}
+
+/// Best-effort extraction of a top-level `env = "VALUE"` (TOML/JSON-ish) or
+/// `env: VALUE` (YAML) selector from a repo overlay's raw text, so a parse failure
+/// elsewhere doesn't hide which env it was selecting. Empty when absent.
+fn lenient_env_selector(text: &str) -> String {
+    for line in text.lines() {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix("env") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('=').or_else(|| rest.strip_prefix(':')) else {
+            continue; // `environment = …`, `env_name = …`, `[env.x]` — not the selector
+        };
+        let v = rest.trim().trim_matches('"').trim_matches('\'').trim();
+        if !v.is_empty() && !v.starts_with('{') && !v.starts_with('[') {
+            return v.to_string();
+        }
+    }
+    String::new()
 }
 
 /// Map the legacy `[sandbox.remote] mode` onto the env [`DataMode`], so the
@@ -6893,6 +7055,28 @@ strategy = \"clean\"
     }
 
     #[test]
+    fn home_overlay_merges_atuin_and_is_enabled_counts_it() {
+        // Per-env opt-in: present overrides, absent inherits.
+        let mut base = HomeConfig::default();
+        assert!(!base.atuin && !base.is_enabled(), "off by default");
+        HomeOverlay {
+            atuin: Some(true),
+            ..HomeOverlay::default()
+        }
+        .apply(&mut base);
+        assert!(base.atuin, "overlay turns atuin on");
+        assert!(base.is_enabled(), "atuin alone enables the personal layer");
+        // An overlay without `atuin` leaves the base value untouched.
+        let mut on = HomeConfig {
+            atuin: true,
+            ..HomeConfig::default()
+        };
+        HomeOverlay::default().apply(&mut on);
+        assert!(on.atuin, "absent overlay key inherits the base");
+        assert!(!HomeOverlay::default().atuin.is_some());
+    }
+
+    #[test]
     fn sandbox_overlay_is_empty_accounts_for_home() {
         let empty = SandboxOverlay::default();
         assert!(empty.is_empty());
@@ -8334,6 +8518,65 @@ transport = \"ssh\"
     }
 
     #[test]
+    fn remote_safe_term_downgrades_exotic_terminals() {
+        // Exotic types the remote won't have terminfo for → xterm-256color.
+        assert_eq!(remote_safe_term("xterm-ghostty"), "xterm-256color");
+        assert_eq!(remote_safe_term("xterm-kitty"), "xterm-256color");
+        assert_eq!(remote_safe_term("alacritty"), "xterm-256color");
+        assert_eq!(remote_safe_term(""), "xterm-256color");
+        // Universally-shipped types pass through unchanged.
+        assert_eq!(remote_safe_term("xterm-256color"), "xterm-256color");
+        assert_eq!(remote_safe_term("screen-256color"), "screen-256color");
+        assert_eq!(remote_safe_term("vt100"), "vt100");
+    }
+
+    #[test]
+    fn passthrough_env_remote_injects_devshell_selector() {
+        // Unset → no SUPERZEJ_DEVSHELL (host default shell unchanged).
+        let plain = SandboxConfig::default();
+        assert!(
+            !plain
+                .passthrough_env_remote()
+                .iter()
+                .any(|(k, _)| k == "SUPERZEJ_DEVSHELL"),
+            "no selector when [sandbox] devshell is unset"
+        );
+        // Set → exported so the sandbox `.envrc` enters that attr.
+        let sb = SandboxConfig {
+            devshell: "sandbox".into(),
+            ..Default::default()
+        };
+        assert!(
+            sb.passthrough_env_remote()
+                .iter()
+                .any(|(k, v)| k == "SUPERZEJ_DEVSHELL" && v == "sandbox"),
+            "devshell attr exported as SUPERZEJ_DEVSHELL"
+        );
+    }
+
+    #[test]
+    fn passthrough_env_remote_normalizes_term() {
+        let sb = SandboxConfig {
+            env_passthrough: vec!["TERM".into()],
+            ..Default::default()
+        };
+        // SAFETY: test-local env mutation; restored below.
+        unsafe {
+            std::env::set_var("TERM", "xterm-ghostty");
+        }
+        let remote = sb.passthrough_env_remote();
+        assert!(
+            remote
+                .iter()
+                .any(|(k, v)| k == "TERM" && v == "xterm-256color"),
+            "exotic host TERM normalized for the remote: {remote:?}"
+        );
+        unsafe {
+            std::env::remove_var("TERM");
+        }
+    }
+
+    #[test]
     fn env_failover_resolves_override_then_global() {
         let dir = tmpdir("failover");
         let mut cfg = Config::default();
@@ -8377,6 +8620,44 @@ transport = \"ssh\"
         assert!(sb.enabled);
         assert_eq!(sb.image, "");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repo_overlay_parse_error_surfaces_dropped_env_selection() {
+        let dir = tmpdir("parseerr");
+        // The real-world footgun: `env = "sprites"` (selector string) colliding
+        // with an `[env.sprites.provider]` table — fails to parse, and the dropped
+        // overlay would silently lose the sprites selection.
+        std::fs::write(
+            dir.join(".superzej.toml"),
+            "env = \"sprites\"\n[env.sprites.provider]\nconnect = \"ssh\"\n",
+        )
+        .unwrap();
+        let pe = repo_overlay_parse_error(&dir).expect("a present, malformed overlay");
+        assert!(!pe.error.is_empty());
+        assert_eq!(pe.selected_env, "sprites", "lenient env selector recovered");
+        // A clean overlay yields None.
+        std::fs::write(dir.join(".superzej.toml"), "env = \"sprites\"\n").unwrap();
+        assert!(
+            repo_overlay_parse_error(&dir).is_none(),
+            "valid overlay parses"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lenient_env_selector_reads_toml_and_yaml_not_tables() {
+        assert_eq!(lenient_env_selector("env = \"sprites\"\n"), "sprites");
+        assert_eq!(lenient_env_selector("env: bigbox\n"), "bigbox");
+        // Must not match table headers or sibling keys.
+        assert_eq!(
+            lenient_env_selector("[env.sprites]\nprovider = \"sprites\"\n"),
+            ""
+        );
+        assert_eq!(
+            lenient_env_selector("env_name = \"x\"\nenvironment = \"y\"\n"),
+            ""
+        );
     }
 
     #[test]
