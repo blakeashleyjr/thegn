@@ -62,6 +62,19 @@ pub fn superzej_dir() -> PathBuf {
         .unwrap_or_else(|| home().join(".superzej"))
 }
 
+/// The superzej-MANAGED pi install root (`~/.superzej/pi`): a pinned pi binary
+/// (`node_modules/.bin/pi`) plus the managed agent dir below. Self-contained +
+/// reproducible — owned by superzej, not the host's global `pi`/`~/.pi`.
+pub fn managed_pi_dir() -> PathBuf {
+    superzej_dir().join("pi")
+}
+
+/// The managed pi's `PI_CODING_AGENT_DIR` (`~/.superzej/pi/agent`) — its config,
+/// settings, and the seeded `superzej-acp` extension package live here.
+pub fn managed_pi_agent_dir() -> PathBuf {
+    managed_pi_dir().join("agent")
+}
+
 /// Expand a leading `~` to `$HOME` (config values may contain it literally).
 pub fn expand_tilde(p: &str) -> String {
     if p == "~" {
@@ -561,6 +574,14 @@ pub fn git_ok(dir: &Path, args: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_pi_dirs_nest_under_superzej_dir() {
+        let base = superzej_dir();
+        assert_eq!(managed_pi_dir(), base.join("pi"));
+        assert_eq!(managed_pi_agent_dir(), base.join("pi").join("agent"));
+        assert!(managed_pi_agent_dir().ends_with("pi/agent"));
+    }
 
     #[test]
     fn git_common_dir_resolves_main_and_linked() {

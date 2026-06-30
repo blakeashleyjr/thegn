@@ -46,6 +46,7 @@ mod pane;
 mod panel;
 mod panes;
 mod perf;
+mod pi_assets;
 mod pins;
 mod predict;
 mod probe;
@@ -187,6 +188,12 @@ pub enum Command {
     Env {
         #[command(subcommand)]
         action: cmd::env::Action,
+    },
+    /// Install + configure superzej's managed pi under `~/.superzej/pi` (the
+    /// "Agent" picker entry): a pinned binary + the superzej-acp extension.
+    Agent {
+        #[command(subcommand)]
+        action: cmd::agent::Action,
     },
     /// Print the exact sandbox argv for a worktree (for debugging).
     SandboxArgv {
@@ -383,6 +390,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Recent { count } => cmd::repos::recent(count),
         Command::Config { action } => cmd::config::run(&cfg, action, config_path),
         Command::Env { action } => cmd::env::run(&cfg, action),
+        Command::Agent { action } => cmd::agent::run(action),
         Command::Notify { action } => cmd::notify::run(action),
         Command::Logs { action } => cmd::logs::run(&cfg, action),
         Command::Doctor { json } => cmd::doctor::run(&cfg, json),
