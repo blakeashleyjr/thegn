@@ -40,6 +40,7 @@ mod mem;
 mod menu;
 mod metrics;
 mod mousefilter;
+mod nixcache;
 mod palette;
 mod pane;
 mod panel;

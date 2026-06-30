@@ -34,6 +34,12 @@ toml.workspace = true
 schemars = "0.8"
 # Compositor substrate (Phase 1). Feature set is pinned at the workspace level.
 tokio = { workspace = true }
+# Embedded host nix binary cache (src/nixcache.rs): an axum HTTP server that serves
+# the host /nix/store to sprites over the reverse tunnel. tokio-util streams the
+# `nix-store --dump` NAR with constant memory; futures provides the Stream trait.
+axum = { workspace = true }
+tokio-util = { version = "0.7", features = ["io"] }
+futures = { workspace = true }
 portable-pty.workspace = true
 termwiz.workspace = true
 libc.workspace = true

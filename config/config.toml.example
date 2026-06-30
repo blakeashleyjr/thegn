@@ -1479,6 +1479,17 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # #                                 #   sandbox must have EGRESS to the cache host
 # #                                 #   (allow it in [sandbox] network_allow if the
 # #                                 #   env filters egress).
+# # host_cache = false              # Serve your HOST /nix/store as a LIVE binary cache
+# #                                 #   (substituter) reachable from the sprite over the
+# #                                 #   reverse tunnel, so in-sprite `nix develop`/`direnv`
+# #                                 #   SUBSTITUTE prebuilt store paths from your host
+# #                                 #   instead of building from source. A general cache
+# #                                 #   over the WHOLE host store — strictly more capable
+# #                                 #   than push_devshell's one-shot devShell upload,
+# #                                 #   which it SUPERSEDES when set. Unsigned + loopback-
+# #                                 #   tunnel-only (require-sigs=false in the sprite). The
+# #                                 #   host serves it from the szhost process; needs a
+# #                                 #   resident-bridge provider (sprites). Recommended.
 # # push_devshell = false           # Use your HOST as the devShell cache (nix users).
 # #                                 #   Seeds the repo's closure — ALREADY BUILT on your
 # #                                 #   host (you run `nix develop`/direnv locally) —
@@ -1490,6 +1501,7 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # #                                 #   minutes-long from-source compile. No hosted
 # #                                 #   cache/signing key needed; the host IS the cache.
 # #                                 #   No-op without a nix devShell. Best-effort.
+# #                                 #   (host_cache above supersedes this when both set.)
 # # skip_devshell_warm = false      # skip the blocking devShell BUILD during
 # #                                 #   provisioning. The repo's devShell then builds
 # #                                 #   lazily in-pane on first `direnv`/`nix develop`
