@@ -1126,6 +1126,29 @@ fn detect_host_agents() -> Vec<String> {
 }
 
 pub fn native_shell_exec(cfg: &Config, worktree: &str) -> Option<NativeShell> {
+    native_exec_for(cfg, worktree, None)
+}
+
+/// Like [`native_shell_exec`] but runs the AGENT `choice`'s command in the sandbox
+/// over the native exec API — so the "Agent"/claude/codex/… picker entries run
+/// INSIDE the sprite (where the code is), instead of via the provider CLI prefix
+/// (`sprite exec …`) which isn't installed on the host. `None` for the plain shell
+/// choice (use [`native_shell_exec`]) or a non-native-exec env. The agent inherits
+/// the same in-sprite env as the shell (host secrets + proxy routing when set), so
+/// e.g. the managed pi snippet's `$HOME/.superzej/pi` resolves to the sprite home.
+pub fn native_agent_exec(cfg: &Config, worktree: &str, choice: &str) -> Option<NativeShell> {
+    if choice.is_empty() || choice == SHELL || choice == "clean-shell" {
+        return None;
+    }
+    // Only real agents (not tools) route through here.
+    cfg.agent_command(choice)?;
+    native_exec_for(cfg, worktree, Some(resolve_command(cfg, choice)))
+}
+
+/// Shared body: build a [`NativeShell`] for a native-exec provider worktree. With
+/// `agent_cmd = None` the inner command is the login shell; with `Some(cmd)` it's
+/// that agent command (run via the same `cd workdir; <cmd>` wrapper).
+fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> Option<NativeShell> {
     use superzej_core::config::ProviderExecMode;
     let loc = GitLoc::for_worktree(Path::new(worktree));
     let repo_root: PathBuf = Db::open()
@@ -1162,10 +1185,12 @@ pub fn native_shell_exec(cfg: &Config, worktree: &str) -> Option<NativeShell> {
     // The host's absolute $SHELL path won't exist in the sandbox, so use the
     // basename form (in_oci = true), honoring an explicit env shell override.
     let sb_shell = environment.sandbox.shell.trim().to_string();
-    let inner = if sb_shell.is_empty() {
-        shell_inner(true)
-    } else {
-        shell_inner_override(&sb_shell)
+    let inner = match agent_cmd {
+        // An agent choice: run its command directly in the sandbox.
+        Some(cmd) => cmd,
+        // The plain shell pane.
+        None if sb_shell.is_empty() => shell_inner(true),
+        None => shell_inner_override(&sb_shell),
     };
     // Carry the host's passthrough secrets (GH_TOKEN, ANTHROPIC_API_KEY, …) into
     // the provider exec so the in-sprite shell + any agent it spawns (pi, claude

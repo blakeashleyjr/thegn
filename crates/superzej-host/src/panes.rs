@@ -441,9 +441,24 @@ impl Panes {
             // `launch_spec` still ran (so the sandbox is provisioned); its CLI argv
             // is simply unused on this path. Falls through to the PTY path if the
             // env isn't a native-exec provider or the provider can't be built.
-            if !worktree.is_empty()
-                && let Some(n) = crate::agent::native_shell_exec(cfg, worktree)
-            {
+            //
+            // Run the worktree's chosen AGENT in the sprite (managed pi / claude /
+            // codex / …) over the same native exec — not just a shell — so picking
+            // an agent for a sprite actually launches it (the provider CLI prefix it
+            // would otherwise need isn't installed on the host). The remembered
+            // choice (set by `launch_spec` at create) drives it; absent / "shell" ⇒
+            // the login shell.
+            let native = if worktree.is_empty() {
+                None
+            } else {
+                superzej_core::db::Db::open()
+                    .ok()
+                    .and_then(|db| db.worktree_agent(worktree).ok().flatten())
+                    .as_deref()
+                    .and_then(|c| crate::agent::native_agent_exec(cfg, worktree, c))
+                    .or_else(|| crate::agent::native_shell_exec(cfg, worktree))
+            };
+            if let Some(n) = native {
                 let session = tab.pane_sessions.get(old).map(|s| s.session.clone());
                 match self.spawn_native_shell(n, session, center) {
                     Ok(fresh) => {
