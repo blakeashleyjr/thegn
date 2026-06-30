@@ -1679,6 +1679,14 @@ pub fn provision_provider_env_named(
         host_cache_url: pc
             .host_cache
             .then(|| format!("http://127.0.0.1:{}", crate::nixcache::SANDBOX_PORT)),
+        // Provision the managed pi in the sandbox when a configured agent runs it
+        // (its command references `~/.superzej/pi`), so the "Agent" entry's snippet
+        // resolves in-sprite. A real worktree only (a spare stays generic).
+        managed_pi: name_override.is_none()
+            && cfg
+                .agents
+                .iter()
+                .any(|a| a.command.contains(".superzej/pi")),
     };
     let plan = envplan::plan(&req, &opts);
 
@@ -1831,6 +1839,18 @@ pub fn provision_provider_env_named(
                 if let Err(e) = apply_local_parity(&provider, &id, wt, wd, &exec_env) {
                     superzej_core::msg::warn(&format!(
                         "local parity: {e}; the sandbox keeps the origin checkout."
+                    ));
+                }
+                Ok(())
+            }
+            StepKind::ManagedPi => {
+                // Host-executed: provision the managed pi inside the sandbox so the
+                // "Agent" entry's `$HOME/.superzej/pi` snippet resolves in-sprite.
+                // Best-effort throughout — a failure just means the Agent entry won't
+                // work in this sprite (the host one still does).
+                if let Err(e) = provision_managed_pi(&provider, &id, &sprite_home, &exec_env) {
+                    superzej_core::msg::warn(&format!(
+                        "managed pi: {e}; the \"Agent\" entry may not work in this sandbox."
                     ));
                 }
                 Ok(())
@@ -2400,6 +2420,45 @@ fn apply_local_parity(
     block_on_provider(|| async { provider.run_exec(id, &argv, None, exec_env).await })
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("replay exec failed: {e}"))
+}
+
+/// Provision the MANAGED pi inside the sandbox: carry the host's seeded agent dir
+/// (`~/.superzej/pi/agent` → `<sprite_home>/.superzej/pi/agent`) and npm-install the
+/// pinned binary there, so the "Agent" picker entry's `$HOME/.superzej/pi` snippet
+/// resolves in-sprite exactly as on the host. Best-effort.
+fn provision_managed_pi(
+    provider: &superzej_svc::provider::Provider,
+    id: &str,
+    sprite_home: &str,
+    exec_env: &[(String, String)],
+) -> anyhow::Result<()> {
+    // Make sure the host's managed agent dir is seeded — it's the bytes we carry.
+    if let Err(e) = crate::cmd::agent::setup(false) {
+        superzej_core::msg::warn(&format!("managed pi: host setup before carry failed: {e}"));
+    }
+    let host_agent = superzej_core::util::managed_pi_agent_dir();
+    anyhow::ensure!(
+        host_agent.is_dir(),
+        "host managed pi agent dir missing ({}); run `szhost agent setup`",
+        host_agent.display()
+    );
+
+    // 1. Carry the agent dir (superzej-acp package + settings) into the sandbox.
+    let dest = format!("{}/.superzej/pi/agent", sprite_home.trim_end_matches('/'));
+    block_on_provider(|| async { provider.upload_dir(id, &host_agent, &dest).await })
+        .map_err(|e| anyhow::anyhow!("carry managed agent dir → {dest}: {e}"))?;
+
+    // 2. Install the pinned pi binary in the sandbox (best-effort — needs node/npm;
+    //    a missing npm just means the Agent entry won't work here, not a hard fail).
+    let pin = crate::pi_assets::PI_PIN;
+    let script = format!(
+        "command -v npm >/dev/null 2>&1 || {{ echo 'npm not found — managed pi binary not installed'; exit 0; }}; \
+         npm install --prefix \"$HOME/.superzej/pi\" @earendil-works/pi-coding-agent@{pin} 2>&1"
+    );
+    let argv = vec!["/bin/sh".to_string(), "-lc".to_string(), script];
+    block_on_provider(|| async { provider.run_exec(id, &argv, None, exec_env).await })
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("npm install managed pi in sandbox: {e}"))
 }
 
 fn push_devshell_closure(
