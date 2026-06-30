@@ -489,9 +489,18 @@ format = "text"           # text | json
 # Coding agents offered in the new-worktree picker.
 # Use "__shell__" for a plain login shell.
 #
+# THIS LIST IS THE SOURCE OF TRUTH for which agents a SANDBOX/sprite provisions
+# (installs + carries config/login for): every entry you surface here is set up in
+# the sandbox; an entry you remove is NOT (so the picker both surfaces custom agents
+# and disables defaults you don't want). The agent KIND is the entry's `provider`,
+# else its command's program basename — kinds dedup (e.g. a managed-pi "Agent" +
+# a "Vanilla Pi" → one `pi`). `[sandbox.home] agents = [...]` overrides this with an
+# explicit install list; only when NO `[[agents]]` are configured at all does
+# superzej fall back to detecting the host's agents.
+#
 # `provider` (optional) tags an agent for client-side account switching
-# (CODEX_HOME / CLAUDE_CONFIG_DIR). When omitted, the provider is inferred from
-# the command's program basename (e.g. "codex …" → codex, "claude …" → claude).
+# (CODEX_HOME / CLAUDE_CONFIG_DIR) AND fixes its provisioning kind. When omitted,
+# it's inferred from the command's program basename (e.g. "codex …" → codex).
 [[agents]]
 name = "claude"
 command = "claude"

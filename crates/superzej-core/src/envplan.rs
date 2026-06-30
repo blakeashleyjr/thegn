@@ -1180,6 +1180,8 @@ fn agents_install_script(agents: &[String]) -> String {
             "codex" => "have codex || npm_g @openai/codex || true".to_string(),
             // superzej's own agent; pi >=0.80 bundles its extension deps.
             "pi" => "have pi || npm_g @earendil-works/pi-coding-agent || true".to_string(),
+            // Nous Research hermes-agent (Python/uv) — its own curl installer.
+            "hermes" => "have hermes || (curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash) || true".to_string(),
             other => format!("# {other}: install via [sandbox.home] setup/tools"),
         };
         lines.push(line);
@@ -1927,8 +1929,11 @@ mod tests {
         assert!(s.contains("@anthropic-ai/claude-code"));
         assert!(s.contains("@openai/codex"));
         assert!(s.contains("@earendil-works/pi-coding-agent"));
-        // unknown agent doesn't fabricate an installer.
-        assert!(s.contains("hermes: install via"));
+        // hermes (Nous) installs via its own curl installer.
+        assert!(s.contains("hermes-agent.nousresearch.com/install.sh"));
+        // a genuinely unknown agent doesn't fabricate an installer.
+        let unknown = agents_install_script(&["frobnicator".into()]);
+        assert!(unknown.contains("frobnicator: install via"));
     }
 
     #[test]

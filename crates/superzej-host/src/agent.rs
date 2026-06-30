@@ -1098,12 +1098,45 @@ pub fn sprite_ssh_argv(
 ///
 /// Resolves the env exactly as [`launch_spec_with_key`] does (DB repo-root +
 /// effective env) so the two paths never disagree about which env is in play.
-/// Auto-detect the coding agents the HOST has so a sandbox reproduces them
-/// ("exact local parity") without per-sandbox config. A known agent
+/// The agent KINDS surfaced in the `[[agents]]` picker — what gets provisioned
+/// into a sandbox (installed + config-carried). Each entry maps to its kind via
+/// its explicit `provider` (e.g. the managed pi's `provider = "pi"`), else the
+/// program basename of its command. The plain shell (`__shell__`) is skipped, and
+/// kinds dedup (so "Agent" + "Vanilla Pi" → one `pi`). This makes the config the
+/// source of truth: a custom agent you add is provisioned; one you remove is
+/// disabled — instead of sniffing the host. `[sandbox.home] agents` overrides.
+fn provisioned_agent_kinds(cfg: &Config) -> Vec<String> {
+    let mut kinds: Vec<String> = Vec::new();
+    for a in &cfg.agents {
+        if a.name == "shell" || a.command.trim() == "__shell__" {
+            continue;
+        }
+        let kind = a
+            .provider
+            .clone()
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or_else(|| {
+                a.command
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            });
+        let kind = kind.trim().to_string();
+        if !kind.is_empty() && !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    kinds
+}
+
+/// Auto-detect the coding agents the HOST has — the FALLBACK when no `[[agents]]`
+/// picker is configured at all (see [`provisioned_agent_kinds`]). A known agent
 /// ([`superzej_core::envplan::known_agents`]) counts as present if its binary is
-/// on the host PATH or its config/credential dir exists in `$HOME`. The result
-/// drives the install + config-upload provisioning steps. Used only when
-/// `[sandbox.home] agents` is unset (an explicit list always wins).
+/// on the host PATH or its config/credential dir exists in `$HOME`.
 fn detect_host_agents() -> Vec<String> {
     let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
     let path = std::env::var("PATH").unwrap_or_default();
@@ -1651,15 +1684,22 @@ pub fn provision_provider_env_named(
         tools: home.tools.clone(),
         dotfiles_repo: home.dotfiles_repo.clone(),
         setup,
-        // Exact local parity for agents: an explicit `[sandbox.home] agents`
-        // list wins; otherwise reproduce whatever coding agents the HOST has
-        // (claude/pi/codex/hermes/…) so they're installed + logged-in in the
-        // sandbox by default. Known ones get an installer; all get their config
-        // (login, history, skills, MCP) uploaded.
-        agents: if home.agents.is_empty() {
-            detect_host_agents()
-        } else {
+        // CONFIG-DRIVEN agents (you control which get installed + logged-in in
+        // the sandbox): an explicit `[sandbox.home] agents` list wins; otherwise
+        // the agents are derived from YOUR `[[agents]]` picker — every entry you
+        // surface there is provisioned (a custom agent you add is installed; one
+        // you remove is disabled). Only when no picker is configured at all do we
+        // fall back to detecting the host's agents. Known kinds get an installer;
+        // all get their config (login/history/skills/MCP) uploaded.
+        agents: if !home.agents.is_empty() {
             home.agents.clone()
+        } else {
+            let from_picker = provisioned_agent_kinds(cfg);
+            if from_picker.is_empty() {
+                detect_host_agents()
+            } else {
+                from_picker
+            }
         },
         allow_nix: true,
         checkpoint: pc.auto_checkpoint,
@@ -4063,6 +4103,38 @@ mod tests {
         cfg.agents = agents.iter().map(mk).collect();
         cfg.tools = tools.iter().map(mk).collect();
         cfg
+    }
+
+    #[test]
+    fn provisioned_agent_kinds_derive_from_picker() {
+        // Mirrors a real picker: managed Agent (provider pi) + claude + hermes +
+        // codex + a vanilla-pi npx entry + a shell. Kinds dedup; shell is skipped.
+        let mut cfg = cfg_with(
+            &[
+                ("shell", "__shell__"),
+                ("Agent", "PI_CODING_AGENT_DIR=x exec /a/pi"),
+                ("claude", "claude"),
+                ("hermes", "hermes"),
+                ("codex", "codex"),
+                ("Vanilla Pi", "npx -y @earendil-works/pi-coding-agent"),
+            ],
+            &[],
+        );
+        // Explicit providers (as the real config sets) drive the pi/claude/codex kinds.
+        for (name, prov) in [
+            ("Agent", "pi"),
+            ("claude", "claude"),
+            ("codex", "codex"),
+            ("Vanilla Pi", "pi"),
+        ] {
+            if let Some(a) = cfg.agents.iter_mut().find(|a| a.name == name) {
+                a.provider = Some(prov.to_string());
+            }
+        }
+        let kinds = provisioned_agent_kinds(&cfg);
+        assert_eq!(kinds, vec!["pi", "claude", "hermes", "codex"]); // deduped, shell skipped
+        // No picker → empty (the caller then falls back to host detection).
+        assert!(provisioned_agent_kinds(&Config::default()).is_empty());
     }
 
     #[test]
