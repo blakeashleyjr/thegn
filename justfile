@@ -275,13 +275,25 @@ coverage-html:
 lint: _apps
     @for t in shellcheck yamllint taplo; do command -v "$t" >/dev/null 2>&1 || { echo "lint: '$t' not found — run inside 'nix develop' (or 'direnv allow'); 'just doctor' for details"; exit 1; }; done
     cargo clippy --workspace --all-targets -- -D warnings
-    shellcheck -x install.sh test/smoke.sh test/pty-smoke.sh test/install-plan.sh test/dev-tui-plan.sh test/sandbox-network.sh test/git-hooks/post-checkout.sh
+    shellcheck -x install.sh test/smoke.sh test/pty-smoke.sh test/install-plan.sh test/dev-tui-plan.sh test/sandbox-network.sh test/git-hooks/post-checkout.sh test/git-hooks/heal-worktree.sh
     yamllint .
     taplo lint
     # Guardrail: all git must route through util::git_cmd / GitLoc so GIT_ENV_VARS
     # is scrubbed (the core.worktree-pollution class). Only the builder in util.rs
     # may call `git` directly; raw `Command::new("git")` anywhere else is rejected.
     ! grep -rIn 'Command::new("git")' crates --include='*.rs' | grep -v 'superzej-core/src/util.rs' || (echo 'ERROR: raw Command::new("git") outside util::git_cmd — route through git_cmd/GitLoc to scrub GIT_ENV_VARS' && exit 1)
+
+# Repair a wedged checkout: strip a stray `core.worktree` that an external
+# worktree tool (herdr) or a GIT_*-exporting child leaked into the shared
+# `.git/config`. Symptom: `git add`/`commit`/`status` mis-target another tree,
+# or (once the leaked path is deleted) git aborts with "Invalid path" / "must be
+# run in a work tree". Pure-text repair — needs no working git, so it fixes the
+# case a pre-commit hook can't (git dies before hooks run). Same key szhost heals
+# in-process at startup + on worktree switch; this covers manual/CI git. No-op
+# when clean.
+heal-git:
+    sh test/git-hooks/heal-worktree.sh -v || true
+    @top=$(git rev-parse --show-toplevel 2>/dev/null) && echo "heal-git: ok — worktree $top" || echo "heal-git: git still wedged — inspect .git/config by hand"
 
 # Diagnose the dev environment: report any missing toolchain bit with a one-line
 # fix. Exits non-zero if anything is missing — handy for agents/CI to confirm the

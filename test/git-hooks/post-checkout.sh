@@ -16,6 +16,19 @@
 # prek-managed stage, so prek/devenv hook re-installs won't clobber it.
 #
 # Installed into the effective hooks dir by devenv.nix's enterShell.
+
+# First, defensively strip any stray `core.worktree` that an external worktree
+# tool (herdr) or a GIT_*-exporting child leaked into the shared `.git/config`
+# since the last heal -- post-checkout fires right after `git worktree add` /
+# branch checkout, the moments such a leak most often lands, and while the
+# target path usually still exists (so git isn't yet wedged). Pure-text, no git;
+# a safe no-op when clean. Best-effort: never block the checkout. (cwd is the
+# worktree top, where the tracked script lives; szhost heals the same key
+# in-process, and `just heal-git` covers the wedged/dangling case.)
+if [ -f test/git-hooks/heal-worktree.sh ]; then
+  sh test/git-hooks/heal-worktree.sh >/dev/null 2>&1 || true
+fi
+
 cfg=.pre-commit-config.yaml
 
 # Already have a live config (real file or working symlink) -- nothing to do.
