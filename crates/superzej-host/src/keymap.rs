@@ -99,6 +99,12 @@ pub enum Action {
     PoolDecrement,
     TogglePanel,
     ToggleRecorder,
+    /// Open time-travel replay for the focused pane — scrub its recorded byte
+    /// stream (play/pause, seek, search across time). See `[replay]`.
+    EnterReplay,
+    /// Paste from a named register (`"a`–`"z`, `"0`–`"9`, `"+` = clipboard) into
+    /// the focused pane; prompts for the register char.
+    PasteRegister,
     ToggleDrawer,
     /// Summon-or-dismiss the corner overlay pin (the first `location = "corner"`
     /// pin, e.g. an `mpv --vo=tct` video player docked bottom-right).
@@ -975,6 +981,8 @@ impl Action {
             Action::PoolDecrement => "warm-pool-decrement",
             Action::TogglePanel => "toggle-panel",
             Action::ToggleRecorder => "toggle-recorder",
+            Action::EnterReplay => "enter-replay",
+            Action::PasteRegister => "paste-register",
             Action::ToggleDrawer => "files-drawer",
             Action::ToggleCorner => "toggle-corner",
             Action::FocusSidebar => "focus-sidebar",
@@ -1072,6 +1080,8 @@ impl Action {
             "warm-pool-decrement" => Action::PoolDecrement,
             "toggle-panel" => Action::TogglePanel,
             "toggle-recorder" => Action::ToggleRecorder,
+            "enter-replay" | "replay" => Action::EnterReplay,
+            "paste-register" => Action::PasteRegister,
             "files" | "files-drawer" | "toggle-drawer" => Action::ToggleDrawer,
             "toggle-corner" | "corner" | "video" => Action::ToggleCorner,
             "focus-sidebar" => Action::FocusSidebar,
@@ -1550,6 +1560,9 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl Alt p", Action::TogglePanel).unwrap();
     map.insert_all("Ctrl Alt r", Action::ToggleRecorder)
         .unwrap();
+    // Time-travel replay for the focused pane (Ctrl+Alt+r is the whole-session
+    // asciinema recorder — a different feature).
+    map.insert_all("Alt r", Action::EnterReplay).unwrap();
     map.insert_all("Ctrl Alt f", Action::ToggleDrawer).unwrap();
     map.insert_all("Ctrl Alt o", Action::ToggleCorner).unwrap();
     map.insert_all("Alt s", Action::FocusSidebar).unwrap();

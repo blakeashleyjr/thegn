@@ -210,6 +210,9 @@ pub(crate) struct Panes {
     /// relay tasks. Captured at construction (present at runtime); `None` in unit
     /// tests that build `Panes` outside a runtime.
     rt: Option<tokio::runtime::Handle>,
+    /// `[replay]` config — when `enabled`, each newly spawned pane gets a
+    /// recording ring attached. `None`/disabled ⇒ panes record nothing.
+    replay_cfg: Option<superzej_core::config::ReplayConfig>,
 }
 
 impl Panes {
@@ -222,6 +225,7 @@ impl Panes {
             waker: None,
             spawn_times: std::collections::HashMap::new(),
             rt: tokio::runtime::Handle::try_current().ok(),
+            replay_cfg: None,
         }
     }
 
@@ -233,6 +237,23 @@ impl Panes {
             waker: Some(waker),
             spawn_times: std::collections::HashMap::new(),
             rt: tokio::runtime::Handle::try_current().ok(),
+            replay_cfg: None,
+        }
+    }
+
+    /// Install the `[replay]` config so subsequently spawned panes attach a
+    /// recording ring when replay is enabled. Called at startup and on config
+    /// reload.
+    pub(crate) fn set_replay_config(&mut self, cfg: superzej_core::config::ReplayConfig) {
+        self.replay_cfg = if cfg.enabled { Some(cfg) } else { None };
+    }
+
+    /// Attach a fresh recording ring to a just-spawned pane when replay is on.
+    fn maybe_record(&mut self, id: u32, rows: u16, cols: u16) {
+        if let Some(cfg) = &self.replay_cfg
+            && let Some(pane) = self.table.get_mut(&id)
+        {
+            pane.enable_recording(crate::replay::Recording::from_config(cfg, rows, cols));
         }
     }
 
@@ -283,6 +304,7 @@ impl Panes {
         )?;
         self.table.insert(id, pane);
         self.spawn_times.insert(id, std::time::Instant::now());
+        self.maybe_record(id, center.rows.max(1) as u16, center.cols.max(1) as u16);
         Ok(id)
     }
 
@@ -322,6 +344,7 @@ impl Panes {
         );
         self.table.insert(id, pane);
         self.spawn_times.insert(id, std::time::Instant::now());
+        self.maybe_record(id, center.rows.max(1) as u16, center.cols.max(1) as u16);
         Ok(id)
     }
 

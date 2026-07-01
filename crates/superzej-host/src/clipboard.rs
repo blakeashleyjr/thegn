@@ -52,6 +52,62 @@ pub fn copy(text: &str) {
     });
 }
 
+/// Ordered clipboard-*read* argv candidates for `(os, wayland)` — the paste
+/// counterpart of [`candidates`]. Pure; the first tool that produces output wins.
+pub fn paste_candidates(os: &str, wayland: bool) -> Vec<Vec<&'static str>> {
+    match os {
+        "macos" => vec![vec!["pbpaste"]],
+        // PowerShell's Get-Clipboard is the closest built-in on Windows.
+        "windows" => vec![vec![
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "Get-Clipboard",
+        ]],
+        _ if wayland => vec![
+            vec!["wl-paste", "--no-newline"],
+            vec!["xclip", "-selection", "clipboard", "-o"],
+            vec!["xsel", "--clipboard", "--output"],
+        ],
+        _ => vec![
+            vec!["xclip", "-selection", "clipboard", "-o"],
+            vec!["xsel", "--clipboard", "--output"],
+            vec!["wl-paste", "--no-newline"],
+        ],
+    }
+}
+
+/// Read the system clipboard, trying each candidate tool until one produces
+/// output. Returns `None` when no tool is installed or the clipboard is empty.
+/// Synchronous (a short subprocess) — call off the hot path; used for the `"+`
+/// register paste, a deliberate user action.
+pub fn paste() -> Option<String> {
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    for argv in paste_candidates(std::env::consts::OS, wayland) {
+        if let Some(out) = read_from(&argv) {
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// Spawn one read tool and capture its stdout as a `String`. `None` if it can't
+/// spawn, exits non-zero, or yields no output.
+fn read_from(argv: &[&str]) -> Option<String> {
+    let (cmd, args) = argv.split_first()?;
+    let out = Command::new(cmd)
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).into_owned();
+    if s.is_empty() { None } else { Some(s) }
+}
+
 /// Spawn one tool and write `text` to its stdin. Returns `true` if it spawned.
 fn pipe_to(argv: &[&str], text: &str) -> bool {
     let Some((cmd, args)) = argv.split_first() else {
@@ -102,5 +158,15 @@ mod tests {
         let c = candidates("linux", false);
         assert_eq!(c[0], vec!["xclip", "-selection", "clipboard"]);
         assert_eq!(c.last().unwrap(), &vec!["wl-copy"]);
+    }
+
+    #[test]
+    fn paste_candidates_mirror_copy_tools() {
+        assert_eq!(paste_candidates("macos", false), vec![vec!["pbpaste"]]);
+        let c = paste_candidates("linux", true);
+        assert_eq!(c[0], vec!["wl-paste", "--no-newline"]);
+        assert!(c.iter().any(|a| a[0] == "xclip" && a.contains(&"-o")));
+        let x = paste_candidates("linux", false);
+        assert_eq!(x[0], vec!["xclip", "-selection", "clipboard", "-o"]);
     }
 }

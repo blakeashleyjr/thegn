@@ -1048,7 +1048,8 @@ brokered creds and no open ports. This is what lets AR 541–543 reach any harne
 ### AN. Audit / logging / replay
 
 - [~] 481. Central event log (all sources)
-- [ ] 482. Per-task replay
+- [~] 482. Per-task replay — time-travel recording + scrub/search overlay (`Alt+r`) +
+  vim registers + replay-subsumed screen swap (`openspec/changes/add-time-travel-replay`)
 - [ ] 483. Session recording
 - [ ] 484. Exportable audit trail
 - [ ] 485. Searchable history

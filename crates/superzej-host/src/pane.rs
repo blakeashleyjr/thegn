@@ -109,6 +109,9 @@ pub struct PtyPane {
     predictor: crate::predict::Predictor,
     /// Monotonic base for the predictor's round-trip timing (ms since creation).
     predict_clock: std::time::Instant,
+    /// Time-travel recording ring (`[replay]`). `None` when replay is disabled —
+    /// then `feed` does a single null check and allocates nothing.
+    record: Option<crate::replay::Recording>,
 }
 
 /// Derive a pane's program name from its spawn argv. Handles the common
@@ -324,6 +327,7 @@ impl PtyPane {
             session_cell: None,
             predictor: crate::predict::Predictor::new(),
             predict_clock: std::time::Instant::now(),
+            record: None,
         })
     }
 
@@ -378,6 +382,7 @@ impl PtyPane {
             session_cell: Some(session_cell),
             predictor: crate::predict::Predictor::new(),
             predict_clock: std::time::Instant::now(),
+            record: None,
         }
     }
 
@@ -451,6 +456,23 @@ impl PtyPane {
             &mut self.history_partial,
             &mut self.history_stripper,
         );
+        // Time-travel recording tap: a third sink beside the emulator and the
+        // history ring. `None` (replay disabled) ⇒ one null check, zero alloc.
+        if let Some(rec) = &mut self.record {
+            rec.push_bytes(bytes, std::time::Instant::now());
+        }
+    }
+
+    /// Attach a fresh recording ring so this pane's output is captured for
+    /// time-travel replay. Called after spawn when `[replay] enabled`.
+    pub fn enable_recording(&mut self, rec: crate::replay::Recording) {
+        self.record = Some(rec);
+    }
+
+    /// This pane's recording ring, if replay is enabled — for the replay overlay
+    /// to reconstruct and search past frames.
+    pub fn recording(&self) -> Option<&crate::replay::Recording> {
+        self.record.as_ref()
     }
 
     /// ms since this pane was created — the predictor's round-trip clock.
@@ -549,6 +571,11 @@ impl PtyPane {
         self.emulator.resize(rows, cols);
         self.rows = rows;
         self.cols = cols;
+        // Record the resize so replay re-`resize()`s the scratch emulator at the
+        // right moment (geometry is part of the reconstructed grid).
+        if let Some(rec) = &mut self.record {
+            rec.record_resize(rows, cols, std::time::Instant::now());
+        }
         Ok(())
     }
 
@@ -600,6 +627,7 @@ impl PtyPane {
             session_cell: Some(Arc::new(Mutex::new(None))),
             predictor: crate::predict::Predictor::new(),
             predict_clock: std::time::Instant::now(),
+            record: None,
         }
     }
 

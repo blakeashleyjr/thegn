@@ -1740,6 +1740,24 @@ regenerate_paths = ["Cargo.lock"]  # conflicts confined to these are "regenerabl
 regenerate_command = ""        # e.g. "cargo update --workspace"; rebuilds regenerate_paths to auto-land them ("" defers instead)
 conflict_handoff = "agent"    # agent | notify | manual — fate of a deferred branch
 
+# ── Time-travel replay (optional) ───────────────────────────────────────────
+# Record each pane's full byte stream into a bounded in-memory ring so you can
+# scrub a pane's history like a video (Alt+r): play/pause, step, seek, skip idle
+# gaps — and search for any string that EVER appeared on screen, including inside
+# full-screen apps (vim/htop) whose output never reaches scrollback. Distinct from
+# the whole-session asciinema recorder (Ctrl+Alt+r), which writes a .cast file.
+#
+# On by default and bounded by BOTH a byte and a duration budget per pane; when
+# enabled = false no ring is allocated and recording costs a single null check.
+[replay]
+enabled = true                 # master switch; false ⇒ zero cost, no recording
+max_bytes_per_pane = 8388608    # per-pane ring byte budget (8 MiB); oldest events evicted past this
+max_duration_secs = 1800        # per-pane time budget (30 m); older events evicted
+keyframe_interval_ms = 4000     # capture a scrub-timeline marker after this much activity …
+keyframe_interval_bytes = 262144 # … or after this many bytes, whichever first (256 KiB)
+idle_threshold_ms = 1000        # during playback, gaps longer than this are collapsed (skip-inactivity)
+persist = false                 # mirror rings to $XDG_STATE_HOME/superzej/replay/<session>/<pane>.szr for cross-restart scrubbing
+
 # ── Media player control (optional) ────────────────────────────────────────
 # Drive your music/media player from superzej: play/pause, next/previous,
 # shuffle, loop, volume, and a playlist/player picker — plus a now-playing
