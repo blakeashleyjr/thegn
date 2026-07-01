@@ -538,6 +538,7 @@ fn do_spawn(p: SpawnParams, writer: SharedWriter, procs: ProcRegistry) -> Result
     if let Some(cwd) = &p.cwd {
         c.current_dir(cwd);
     }
+    scrub_git_env(&mut c);
     for (k, v) in &p.env {
         c.env(k, v);
     }
@@ -764,6 +765,20 @@ fn relevant_fs_path(p: &Path) -> bool {
         || rest.starts_with("ORIG_HEAD")
 }
 
+/// Strip the outer repo's git-targeting env vars (`GIT_DIR`/`GIT_WORK_TREE`/
+/// `GIT_INDEX_FILE`/…) from a bridged command so a `git -C <dir>` run over the
+/// bridge targets the intended repo, never whatever repo the host process was
+/// launched in. Matters most locally: when the test suite runs under a git
+/// pre-commit hook, git exports those vars into the environment, which would
+/// otherwise retarget a bridged `git` at the outer superzej repo. Same
+/// invariant (and var list) as [`superzej_core::util::git_cmd`]. Applied before
+/// the caller's explicit `env`, so an intentional override still wins.
+fn scrub_git_env(c: &mut Command) {
+    for var in superzej_core::util::GIT_ENV_VARS {
+        c.env_remove(var);
+    }
+}
+
 fn do_exec(p: &ExecParams) -> Result<ExecResult> {
     let Some((cmd, args)) = p.argv.split_first() else {
         bail!("empty argv");
@@ -773,6 +788,7 @@ fn do_exec(p: &ExecParams) -> Result<ExecResult> {
     if let Some(cwd) = &p.cwd {
         c.current_dir(cwd);
     }
+    scrub_git_env(&mut c);
     for (k, v) in &p.env {
         c.env(k, v);
     }
