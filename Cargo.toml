@@ -8,6 +8,11 @@ members = [
   "crates/superzej-host",
   "crates/superzej-proxy",
   "crates/sz-kit",
+  "crates/gtui-core",
+  "crates/gtui-query",
+  "crates/gtui-render",
+  "crates/gtui-app",
+  "crates/gtui-embed",
 ]
 # Integrated app repos live under apps/ as git submodules, each with its OWN
 # cargo workspace; keep these out of superzej's workspace so commands run from
