@@ -141,7 +141,28 @@ where
         return;
     }
     let now = superzej_core::util::now();
-    let provisioning = spares.iter().filter(|s| s.state == "provisioning").count();
+    // A spare stuck in `provisioning` past this is ORPHANED — its provision task
+    // died with a previous szhost session (a restart drops the in-flight thread),
+    // or hung. Without clearing it, `decide_pool` counts it as in-flight FOREVER
+    // (`create = target - (ready + provisioning)` → 0) so the pool never refills
+    // and no warm spare appears. Destroy stale ones so a replacement is created; a
+    // genuinely in-flight provision (clone + nix + seeded devShell) finishes well
+    // under this ceiling. (`provisioning` rows don't heartbeat, so age = created_at.)
+    const PROVISION_STALE_SECS: i64 = 20 * 60;
+    let mut provisioning = 0usize;
+    for s in spares.iter().filter(|s| s.state == "provisioning") {
+        if now - s.created_at >= PROVISION_STALE_SECS {
+            superzej_core::msg::warn(&format!(
+                "warm pool: clearing stale provisioning spare {} (orphaned by a prior \
+                 session or hung) so the pool refills",
+                s.sandbox_name
+            ));
+            let _ = crate::agent::destroy_spare(cfg, env_name, &s.sandbox_name);
+            notify();
+        } else {
+            provisioning += 1;
+        }
+    }
     let ready: Vec<(String, u64)> = spares
         .iter()
         .filter(|s| s.state == "ready")
