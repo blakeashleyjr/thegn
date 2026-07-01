@@ -1,0 +1,12 @@
+[package]
+name = "gtui-embed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gtui-app = { path = "../gtui-app" }
+sz-kit = { path = "../sz-kit" }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+gtui-core = { version = "0.1.0", path = "../gtui-core" }
