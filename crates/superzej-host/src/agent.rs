@@ -1295,7 +1295,23 @@ pub fn needs_eager_provision(cfg: &Config, worktree: &str) -> bool {
         return false;
     };
     match block_on_provider(|| async { provider.list().await }) {
-        Ok(names) => !names.iter().any(|n| n == &p.id),
+        // Missing ⇒ needs create + a full provision.
+        Ok(names) if !names.iter().any(|n| n == &p.id) => true,
+        // Exists — but is the TOOLCHAIN actually provisioned? `launch_spec`'s
+        // `auto_provision` only `ensure_exists`es a BARE sprite (no nix/direnv/
+        // agents), and a destroyed+recreated sprite is bare too. If we gate only on
+        // existence, eager sees "exists" and SKIPS the splash-lock, so the pane
+        // opens on a not-ready sprite — the premature shell. A missing provision
+        // marker ⇒ still needs provisioning (which is idempotent: a present marker
+        // short-circuits it). Only reached for an existing sandbox, once per
+        // session per worktree (the `eager_inflight` guard), and for `Active*`
+        // scope only the worktree we're opening anyway — so it doesn't wake idle
+        // sandboxes wholesale.
+        Ok(_) => {
+            let workdir = envc.provider.sync_workdir();
+            let marker = superzej_core::envplan::EnvPlan::marker_path(&workdir);
+            block_on_provider(|| async { provider.read(&p.id, &marker).await }).is_err()
+        }
         Err(_) => false,
     }
 }

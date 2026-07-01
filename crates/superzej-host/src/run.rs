@@ -7554,6 +7554,20 @@ fn watchdog_deadline(remote_env: bool) -> std::time::Duration {
     std::time::Duration::from_secs(if remote_env { 300 } else { 8 })
 }
 
+/// Whether a loading-step list is in the terminal "waiting on the shell" shape —
+/// sandbox + container done, the final `shell` step pending/active — as opposed to
+/// a still-live provisioning sequence (`workspace`/`clone`/`nix`/`direnv`/
+/// `devshell_push`/`setup`/`agents`/`atuin`/…). Both the materialize
+/// (`[sandbox, container, shell]`) and eager-provision streams flow through
+/// `load_steps`; the difference is the LAST step's label. Used to gate actions
+/// that must only fire once provisioning is DONE and we're merely waiting on the
+/// shell to speak: the startup-shell watchdog (catch a hung *login shell*, not a
+/// slow provision) and the first-output splash-clear (never drop the splash
+/// mid-provision → a premature/bare shell).
+fn is_shell_wait(steps: &[LoadStep]) -> bool {
+    steps.last().is_some_and(|s| s.label == "shell")
+}
+
 fn provision_load_steps(views: &[crate::agent::ProvisionStepView]) -> Vec<LoadStep> {
     use crate::agent::ProvisionState;
     views
@@ -9636,12 +9650,20 @@ async fn event_loop<T: Terminal>(
                                         .find(|(_, _, t)| t.center.pane_ids().contains(&id))
                                         .map(|(gi, ti, _)| (gi, ti))
                                 {
-                                    // Diagnostic: the splash clears the instant a pane
-                                    // emits its first byte — which for a provider/remote
-                                    // shell is the prompt, potentially BEFORE in-shell
-                                    // init (direnv/nix/agent) finishes ⇒ "premature
-                                    // shell". Log the worktree + remoteness so a repro
-                                    // pins whether this is the clear that fired.
+                                    let key = (session.worktrees[gi].name.clone(), ti);
+                                    // E2: clear the splash on first output ONLY when
+                                    // provisioning is DONE and we're merely waiting on
+                                    // the shell (terminal [sandbox,container,shell]
+                                    // shape). While live provisioning steps are still
+                                    // present (workspace/clone/nix/direnv/devshell/
+                                    // agents/atuin/…), the shell's first byte (prompt or
+                                    // reattach scrollback) must NOT drop the splash —
+                                    // that exposes a not-ready shell mid-provision (the
+                                    // premature-shell bug). The eager/materialize
+                                    // provision clears the splash itself (empty steps)
+                                    // when it completes.
+                                    let ready =
+                                        loading_state.get(&key).is_some_and(|s| is_shell_wait(s));
                                     if tracing::enabled!(target: "szhost::loading", tracing::Level::DEBUG)
                                     {
                                         let g = &session.worktrees[gi];
@@ -9653,10 +9675,14 @@ async fn event_loop<T: Terminal>(
                                             target: "szhost::loading",
                                             worktree = %g.name,
                                             remote,
-                                            "splash cleared: first pane output"
+                                            cleared = ready,
+                                            "first pane output (cleared ⇒ provisioning done; \
+                                             else splash held until provision completes)"
                                         );
                                     }
-                                    loading_state.remove(&(session.worktrees[gi].name.clone(), ti));
+                                    if ready {
+                                        loading_state.remove(&key);
+                                    }
                                 }
                                 if Some(id) == corner && corner_kitty {
                                     // CRISP CORNER VIDEO: split the corner pane's
@@ -11608,7 +11634,7 @@ async fn event_loop<T: Terminal>(
         // to produce output. Never during clone/nix/devShell/cold-resume, where
         // silence is expected (not a hung shell) — otherwise a slow provider
         // provision trips the fallback and destroys the real shell.
-        if !center_dormant && model.load_steps.last().is_some_and(|s| s.label == "shell") {
+        if !center_dormant && is_shell_wait(&model.load_steps) {
             let gi = session.active;
             let ti = session.worktrees.get(gi).map(|g| g.active_tab).unwrap_or(0);
             // A provider/remote worktree gets the long deadline (a silent devShell
@@ -19835,6 +19861,26 @@ mod tests {
         assert_eq!(watchdog_deadline(false), std::time::Duration::from_secs(8));
         assert_eq!(watchdog_deadline(true), std::time::Duration::from_secs(300));
         assert!(watchdog_deadline(true) > watchdog_deadline(false));
+    }
+
+    #[test]
+    fn is_shell_wait_only_in_the_shell_attach_shape() {
+        use crate::chrome::LoadStep;
+        // Nothing / live provisioning steps ⇒ NOT shell-wait: the splash must stay
+        // up and the first-output clear must be held (premature-shell guard).
+        assert!(!is_shell_wait(&[]));
+        assert!(!is_shell_wait(&[LoadStep::active("provisioning")]));
+        assert!(!is_shell_wait(&[
+            LoadStep::done("nix"),
+            LoadStep::active("direnv"),
+        ]));
+        // Terminal materialize shape (sandbox+container done, waiting on the shell)
+        // ⇒ shell-wait: ok to clear on first output / arm the watchdog.
+        assert!(is_shell_wait(&[
+            LoadStep::done("sandbox"),
+            LoadStep::active("container"),
+            LoadStep::pending("shell"),
+        ]));
     }
 
     #[test]
