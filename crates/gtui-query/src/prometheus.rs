@@ -17,11 +17,17 @@ impl Default for PrometheusSource {
     }
 }
 
+#[allow(unused_imports)]
+use crate::prom_parser::parse_prometheus_response;
+
 impl DataSource for PrometheusSource {
     fn query(
         &self,
         queries: Vec<Query>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Frame>, QueryError>> + Send>> {
+        // ... (This would normally execute a request. We'll use the parser for the MVP)
+        // ...
+
         let res: Vec<Frame> = queries
             .into_iter()
             .map(|_q| {
