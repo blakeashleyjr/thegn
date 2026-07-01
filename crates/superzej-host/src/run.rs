@@ -2695,14 +2695,21 @@ fn remove_workspace(
     let db = superzej_core::db::Db::open().ok();
     let was_active = session.id == repo_path;
 
-    // Destructive: delete the workspace's worktree dirs from disk. Read the
-    // registry BEFORE `remove_workspace_with_db` prunes it. The home checkout
-    // (its path == `repo_path`) is never deleted — only branch worktrees.
-    if !keep_files && let Some(db) = &db {
+    // Read the workspace's branch-worktree dirs from the registry BEFORE
+    // `remove_workspace_with_db` prunes it. The home checkout (its path ==
+    // `repo_path`) is never included — only branch worktrees. Used either to
+    // delete them (destructive) or to report how many survive (keep-files).
+    let worktree_dirs = db
+        .as_ref()
+        .map(|db| workspace_worktree_dirs(db, repo_path))
+        .unwrap_or_default();
+
+    // Destructive: delete the workspace's worktree dirs from disk.
+    if !keep_files {
         let root = Path::new(repo_path);
-        for path in workspace_worktree_dirs(db, repo_path) {
-            superzej_core::worktree::remove(root, Path::new(&path), "", false);
-            let _ = std::fs::remove_dir_all(&path);
+        for path in &worktree_dirs {
+            superzej_core::worktree::remove(root, Path::new(path), "", false);
+            let _ = std::fs::remove_dir_all(path);
         }
     }
 
@@ -2711,22 +2718,42 @@ fn remove_workspace(
     // Removing the active workspace leaves the session pointing at nothing;
     // land on the next available workspace, else empty out.
     if was_active {
-        let mut switched = false;
-        if let Some(db) = &db
-            && let Ok(workspaces) = db.workspaces()
-            && let Some(next) = workspaces.first()
-        {
-            switched = session.switch_to_workspace(&next.repo_path, db).is_ok();
-        }
-        if !switched {
-            session.id.clear();
-            session.worktrees.clear();
-            session.active = 0;
-        }
+        land_after_workspace_removed(session, db.as_ref());
     }
 
+    workspace_removed_status(display, keep_files, worktree_dirs.len())
+}
+
+/// After removing the *active* workspace, land on the first remaining workspace,
+/// or empty the session (no dangling context) when none remain. Split out so it
+/// can be unit-tested with an injected DB (the parent opens the process DB).
+fn land_after_workspace_removed(
+    session: &mut crate::session::Session,
+    db: Option<&superzej_core::db::Db>,
+) {
+    let mut switched = false;
+    if let Some(db) = db
+        && let Ok(workspaces) = db.workspaces()
+        && let Some(next) = workspaces.first()
+    {
+        switched = session.switch_to_workspace(&next.repo_path, db).is_ok();
+    }
+    if !switched {
+        session.id.clear();
+        session.worktrees.clear();
+        session.active = 0;
+    }
+}
+
+/// The status line after a workspace removal. Non-destructive (`keep_files`)
+/// removals report the orphaned-worktree count so the user knows what survived.
+fn workspace_removed_status(display: &str, keep_files: bool, orphan_count: usize) -> String {
     if keep_files {
-        format!("Removed workspace '{display}' (files kept on disk)")
+        match orphan_count {
+            0 => format!("Removed workspace '{display}' (files kept on disk)"),
+            1 => format!("Removed workspace '{display}' (1 worktree remains on disk)"),
+            n => format!("Removed workspace '{display}' ({n} worktrees remain on disk)"),
+        }
     } else {
         format!("Deleted workspace '{display}' (worktrees removed from disk)")
     }
@@ -5489,6 +5516,9 @@ fn dispatch_menu_choice(
         MenuChoice::ShareReach(_) => {}
         MenuChoice::ConfirmDeleteWorkspace { .. } => {}
         MenuChoice::ConfirmInitGit { .. } => {}
+        // The new-workspace discovery picker is intercepted at the call site (it
+        // owns session/panes/pool); never routes through this git dispatcher.
+        MenuChoice::CreateWorkspaceFromPath(_) | MenuChoice::NewWorkspacePrompt => {}
         // The bouncer approval gate is resolved directly in the loop (it owns the
         // approval queue + oneshots); it never routes through this git dispatcher.
         MenuChoice::ApproveTool { .. } => {}
@@ -14052,6 +14082,64 @@ async fn event_loop<T: Terminal>(
                                 dirty = true;
                                 continue;
                             }
+                            // Discovery picker → "enter a path or URL…": open the
+                            // typed-input overlay (URL clone + git-init offer live
+                            // there, in the NewWorkspace submit handler).
+                            if let menu::MenuChoice::NewWorkspacePrompt = choice {
+                                begin_new_workspace_prompt(&mut host_input, &mut model);
+                                dirty = true;
+                                continue;
+                            }
+                            // Discovery picker → a chosen repo: create + switch via
+                            // the same path as the typed-input submit / init-git
+                            // flows above.
+                            if let menu::MenuChoice::CreateWorkspaceFromPath(path) = choice {
+                                persist_session_layout(&mut session, &panes);
+                                let prev_id = session.id.clone();
+                                let snapshot = ResidentWorkspace {
+                                    worktrees: session.worktrees.clone(),
+                                    active: session.active,
+                                };
+                                match superzej_core::db::Db::open()
+                                    .context("open superzej db")
+                                    .and_then(|db| {
+                                        create_workspace_from_input_with_config(
+                                            &path,
+                                            &mut session,
+                                            &db,
+                                            &current_config,
+                                        )
+                                    }) {
+                                    Ok(WorkspaceResolution::Repo(created)) => {
+                                        workspace_pool.stash(prev_id, snapshot);
+                                        remap_cold_workspace_ids(&mut session, &mut panes, false);
+                                        focus.zone = crate::focus::Zone::Center;
+                                        refresh_tab_model(&mut model, &session, &mut sb);
+                                        sync_drawer_persistence(
+                                            &session,
+                                            &mut panes,
+                                            &mut drawer,
+                                            &mut drawer_pool,
+                                            &mut drawer_home,
+                                            keymap.config(),
+                                            chrome.center,
+                                        );
+                                        model.status =
+                                            format!("workspace created: {}", created.display());
+                                        need_relayout = true;
+                                    }
+                                    Ok(WorkspaceResolution::NotARepo(p)) => {
+                                        active_menu = Some(menu::init_git_menu(
+                                            p.to_string_lossy().into_owned(),
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        model.status = format!("workspace create failed: {e}");
+                                    }
+                                }
+                                dirty = true;
+                                continue;
+                            }
                             if let menu::MenuChoice::ConfirmDeleteWorkspace { keep_files } = choice
                                 && let Some((repo_path, slug, display)) =
                                     pending_delete_workspace.take()
@@ -18874,7 +18962,18 @@ async fn event_loop<T: Terminal>(
                                 ));
                             }
                             Action::NewWorkspace => {
-                                begin_new_workspace_prompt(&mut host_input, &mut model);
+                                // Discovery-first: offer repos found under the
+                                // configured `repo_roots` (item 31). With none
+                                // discovered, fall straight through to the typed
+                                // path/URL prompt (today's behavior).
+                                let repos = superzej_core::repo::discover_repos(&current_config);
+                                if repos.is_empty() {
+                                    begin_new_workspace_prompt(&mut host_input, &mut model);
+                                } else {
+                                    active_menu = Some(menu::new_workspace_menu(&repos));
+                                    model.status =
+                                        "New workspace: pick a repo or [p] to type a path".into();
+                                }
                             }
                             Action::DeleteWorkspace => {
                                 // Remove the *active* workspace. Same modal + path
@@ -21378,6 +21477,102 @@ mod tests {
         assert_eq!(db.active_workspace().unwrap(), None);
 
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn remove_workspace_reports_orphan_count() {
+        // The keep-files (non-destructive) removal MUST tell the user how many
+        // worktrees survive on disk; the destructive removal never mentions them.
+        assert_eq!(
+            workspace_removed_status("lib", true, 0),
+            "Removed workspace 'lib' (files kept on disk)"
+        );
+        assert_eq!(
+            workspace_removed_status("lib", true, 1),
+            "Removed workspace 'lib' (1 worktree remains on disk)"
+        );
+        assert_eq!(
+            workspace_removed_status("lib", true, 3),
+            "Removed workspace 'lib' (3 worktrees remain on disk)"
+        );
+        assert_eq!(
+            workspace_removed_status("lib", false, 3),
+            "Deleted workspace 'lib' (worktrees removed from disk)"
+        );
+    }
+
+    #[test]
+    fn delete_last_workspace_empties_session() {
+        // Removing the active (and only) workspace must fall back to an empty
+        // home rather than leave the session pointing at a pruned workspace.
+        let db_path = std::env::temp_dir().join(format!(
+            "sj-host-last-ws-{}-{}.sqlite",
+            std::process::id(),
+            now_secs()
+        ));
+        let db = superzej_core::db::Db::open_at(&db_path).unwrap();
+        // No workspace rows remain (the caller already pruned the last one).
+        let mut session = Session {
+            id: "/tmp/repo-lib".into(),
+            worktrees: vec![WorktreeGroup::new(
+                "lib/home",
+                GroupKind::Home,
+                "/tmp/repo-lib",
+            )],
+            active: 0,
+        };
+
+        land_after_workspace_removed(&mut session, Some(&db));
+
+        assert!(session.id.is_empty(), "session id cleared");
+        assert!(session.worktrees.is_empty(), "no groups remain");
+        assert_eq!(session.active, 0);
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn new_workspace_menu_offers_discovered_repos() {
+        // With repo_roots pointing at a dir containing a git repo, the create
+        // action's discovery source finds it and the picker lists it as a
+        // CreateWorkspaceFromPath — alongside the always-present manual-entry item.
+        let tmp = std::env::temp_dir().join(format!(
+            "sj-host-discover-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let repo = tmp.join("myrepo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let repo_s = repo.to_string_lossy().into_owned();
+
+        let cfg = superzej_core::config::Config {
+            repo_roots: vec![tmp.to_string_lossy().into_owned()],
+            repo_scan_depth: 3,
+            ..Default::default()
+        };
+        let repos = superzej_core::repo::discover_repos(&cfg);
+        assert!(
+            repos.iter().any(|p| p == &repo_s),
+            "discover_repos should find the temp repo: {repos:?}"
+        );
+
+        let overlay = menu::new_workspace_menu(&repos);
+        let choices: Vec<&menu::MenuChoice> = overlay.items().iter().map(|i| &i.choice).collect();
+        assert!(
+            choices.iter().any(|c| matches!(
+                c,
+                menu::MenuChoice::CreateWorkspaceFromPath(p) if *p == repo_s
+            )),
+            "picker lists the discovered repo: {choices:?}"
+        );
+        assert!(
+            choices
+                .iter()
+                .any(|c| matches!(c, menu::MenuChoice::NewWorkspacePrompt)),
+            "picker always offers manual entry: {choices:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// End-to-end input path for the Ctrl+1..9 workspace jump: raw terminal

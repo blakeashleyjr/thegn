@@ -216,6 +216,16 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         palette: true,
     },
     ActionSpec {
+        id: "delete-workspace",
+        label: "Delete workspace",
+        hint: "remove the active workspace",
+        // No default chord — `Alt X` / `Space X` belong to close-worktree, so
+        // this action is palette-driven + user-bindable (also reachable from the
+        // sidebar row menu's "Remove workspace").
+        default_chords: &[],
+        palette: true,
+    },
+    ActionSpec {
         id: "integrate",
         label: "Integrate (fold-actor)",
         hint: "integrate",
@@ -1536,8 +1546,8 @@ pub fn default_keymap() -> KeyMap {
 
     map.insert_all("Ctrl w", Action::NewWorktree).unwrap();
     map.insert_all("Alt W", Action::NewWorkspace).unwrap();
-    map.insert_all("Alt Shift X", Action::DeleteWorkspace)
-        .unwrap();
+    // NB: `Alt X` / `Space X` bind close-worktree below; delete-workspace has no
+    // default chord (palette-driven + user-bindable) to avoid shadowing it.
     map.insert_all("Alt T", Action::NewTerminal).unwrap();
     map.insert_all("Alt t", Action::NewTab).unwrap();
     map.insert_all("Alt p", Action::NewPane).unwrap();
@@ -1672,8 +1682,7 @@ pub fn default_keymap() -> KeyMap {
         .unwrap();
     map.insert(Mode::VimNormal, "Space W", Action::NewWorkspace)
         .unwrap();
-    map.insert(Mode::VimNormal, "Space X", Action::DeleteWorkspace)
-        .unwrap();
+    // `Space X` binds close-worktree below; delete-workspace is palette-driven.
     map.insert(Mode::VimNormal, "Space T", Action::NewTerminal)
         .unwrap();
     map.insert(Mode::VimNormal, "Space t", Action::NewTab)
@@ -2627,6 +2636,41 @@ mod tests {
         let dst = map.program_remap("lazygit", &src).expect("remap present");
         assert_eq!(dst, &[Key::from_code(KeyCode::Enter)]);
         assert!(map.program_remap("yazi", &src).is_none());
+    }
+
+    #[test]
+    fn delete_workspace_keybind_maps_correctly() {
+        // delete-workspace is palette-driven + user-bindable: it has an
+        // ActionSpec (so it shows in the palette) but NO default chord, because
+        // `Alt X` / `Space X` belong to close-worktree (asserted separately in
+        // `close_tab_is_lowercase_alt_x_and_close_worktree_is_shift_alt_x`).
+        assert_eq!(
+            Action::from_key("delete-workspace"),
+            Some(Action::DeleteWorkspace)
+        );
+        let spec = action_spec("delete-workspace").expect("delete-workspace ActionSpec");
+        assert!(spec.palette, "reachable from the command palette");
+        assert!(
+            spec.default_chords.is_empty(),
+            "no default chord (would shadow close-worktree)"
+        );
+
+        // The `Alt X` slot stays close-worktree; new-workspace keeps `Alt W`.
+        let mut map = default_keymap();
+        assert_eq!(
+            map.dispatch(
+                Mode::Normal,
+                Key::modified(KeyCode::Char('X'), Modifiers::ALT)
+            ),
+            MatchResult::Matched(Action::CloseWorktree)
+        );
+        assert_eq!(
+            map.dispatch(
+                Mode::Normal,
+                Key::modified(KeyCode::Char('W'), Modifiers::ALT)
+            ),
+            MatchResult::Matched(Action::NewWorkspace)
+        );
     }
 
     #[test]
