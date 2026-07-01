@@ -401,6 +401,44 @@ start name="dev": build
 # Alias for `start`.
 attach: start
 
+# Headless terminal-capability matrix: run `szhost doctor` under a set of
+# degraded environments (each a clean `env -i`, so the outer terminal's
+# COLORTERM / TERM_PROGRAM can't leak in and mask a degradation) and assert the
+# resolved color depth + glyph level match what each terminal should get. Proves
+# the graceful-degradation layer (`superzej_core::termcaps`) end to end without a
+# tty, complementing the pure unit tests. For the real rendered proof, launch
+# `just start-term` under a degraded TERM (e.g. `TERM=xterm LANG=C`).
+term-check: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bin="$PWD/{{bin}}"
+    tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+    base=(PATH="$PATH" HOME="$tmp" XDG_STATE_HOME="$tmp/state" XDG_CONFIG_HOME="$tmp/cfg")
+    fail=0
+    # check <name> <want-color> <want-glyph> <env...>
+    check() {
+      local name="$1" ec="$2" eg="$3"; shift 3
+      local out; out="$(env -i "${base[@]}" "$@" "$bin" doctor 2>&1)"
+      local caps color glyph
+      caps="$(printf '%s\n' "$out" | sed -n '/Resolved capabilities/,/Summary/p')"
+      color="$(printf '%s\n' "$caps" | awk '/^  color /{print $2; exit}')"
+      glyph="$(printf '%s\n' "$caps" | awk '/^  glyphs /{print $2; exit}')"
+      if [ "$color" = "$ec" ] && [ "$glyph" = "$eg" ]; then
+        printf '  PASS  %-11s color=%-10s glyphs=%s\n' "$name" "$color" "$glyph"
+      else
+        printf '  FAIL  %-11s color=%s (want %s)  glyphs=%s (want %s)\n' \
+          "$name" "$color" "$ec" "$glyph" "$eg"; fail=1
+      fi
+    }
+    echo "terminal-capability matrix (szhost doctor, clean env):"
+    check kitty      truecolor  full  TERM=xterm-kitty COLORTERM=truecolor LANG=en_US.UTF-8
+    check bare       16-color   ascii TERM=xterm LANG=C
+    check no-color   monochrome full  TERM=xterm-kitty COLORTERM=truecolor NO_COLOR=1 LANG=en_US.UTF-8
+    check 256color   256-color  basic TERM=xterm-256color LANG=en_US.UTF-8
+    check glyph=asci truecolor  ascii TERM=xterm-kitty COLORTERM=truecolor LANG=en_US.UTF-8 SUPERZEJ_THEME_GLYPHS=ascii
+    check color=16   16-color   full  TERM=xterm-kitty COLORTERM=truecolor LANG=en_US.UTF-8 SUPERZEJ_THEME_COLOR=16
+    if [ "$fail" = 0 ]; then echo "term-check: all green"; else echo "term-check: MISMATCH"; exit 1; fi
+
 # Point THIS repo (all its worktrees) at a sandbox backend / managed-sandbox
 # provider, without touching any other repo — the engine behind the `backend=`
 # param on `start-term`/`start-term-release`. Writes a per-repo `.superzej.toml`
