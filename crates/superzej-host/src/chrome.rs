@@ -367,6 +367,12 @@ pub struct FrameModel {
     /// Active worktree's total size (bytes), for the bottom `disk` widget next
     /// to LOC. From the off-loop scan cache; `None` until first scanned.
     pub active_worktree_disk: Option<u64>,
+    /// Do-not-disturb active (item 426): drives the statusbar DND chip. Set each
+    /// frame from the notification runtime.
+    pub notify_dnd: bool,
+    /// Active notification routing mode (item 427; `""` = default). Shown as a
+    /// statusbar chip when non-empty.
+    pub notify_mode: String,
     /// True if the last input was mouse activity.
     pub panel: crate::panel::PanelData,
     /// True when the right panel currently owns keyboard focus.
@@ -1437,6 +1443,32 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
                 vec![seg(Tok::Attr(p.fg), p.text)],
             ));
         }
+    }
+
+    // Do-not-disturb (item 426): a muted amber chip while quiet hours / the
+    // manual toggle suppress ephemeral delivery. The active routing mode (item
+    // 427) rides alongside it when non-default.
+    if model.notify_dnd {
+        let suffix = if model.notify_mode.is_empty() {
+            String::new()
+        } else {
+            format!(":{}", model.notify_mode)
+        };
+        items.push((
+            BarItemId::Badge(BarBadge::Notifications),
+            vec![Seg::chip(
+                Tok::Hue(superzej_core::theme::Hue::Amber),
+                format!(" \u{25cf} dnd{suffix} "),
+            )],
+        ));
+    } else if !model.notify_mode.is_empty() {
+        items.push((
+            BarItemId::Badge(BarBadge::Notifications),
+            vec![Seg::chip(
+                Tok::Hue(superzej_core::theme::Hue::Teal),
+                format!(" \u{25c9} {} ", model.notify_mode),
+            )],
+        ));
     }
 
     // Red ⚑ flag is reserved for attention (Alert priority); a neutral blue inbox
@@ -3379,6 +3411,37 @@ mod tests {
         assert!(ids.contains(&BarItemId::Badge(BarBadge::Notifications)));
         assert!(ids.contains(&BarItemId::Badge(BarBadge::Agent)));
         assert!(ids.contains(&BarItemId::Badge(BarBadge::Zoom)));
+    }
+
+    #[test]
+    fn statusbar_notify_chip_reflects_dnd_and_mode() {
+        // No DND, no mode ⇒ no notify chip.
+        let plain = FrameModel::default();
+        let text = |m: &FrameModel| -> String {
+            statusbar_items(m)
+                .into_iter()
+                .flat_map(|(_, segs)| segs)
+                .map(|s| s.text)
+                .collect()
+        };
+        assert!(!text(&plain).contains("dnd"));
+
+        // Active mode ⇒ a mode chip.
+        let moded = FrameModel {
+            notify_mode: "focus".into(),
+            ..Default::default()
+        };
+        assert!(text(&moded).contains("focus"));
+
+        // DND wins and shows the mode alongside it.
+        let dnd = FrameModel {
+            notify_dnd: true,
+            notify_mode: "focus".into(),
+            ..Default::default()
+        };
+        let t = text(&dnd);
+        assert!(t.contains("dnd"));
+        assert!(t.contains("focus"));
     }
 
     #[test]
