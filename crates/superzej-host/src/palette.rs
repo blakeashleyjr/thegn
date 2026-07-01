@@ -582,6 +582,71 @@ pub(crate) fn build_account_palette(
     items
 }
 
+/// Build the env-bundle switcher palette: every configured `[bundle.<name>]`
+/// plus a "no bundle" row to clear the binding. Selecting `bundle:<name>` pins
+/// it as the focused repo's default (workspace scope) or the global default when
+/// no repo is focused; `bundle-clear` removes the binding. The currently active
+/// bundle is marked. See [`superzej_core::bundle`].
+pub(crate) fn build_bundle_palette(
+    cfg: &superzej_core::config::Config,
+    db: &superzej_core::db::Db,
+    worktree: &str,
+    slug: Option<&str>,
+) -> Vec<PaletteItem> {
+    use superzej_core::bundle;
+    let active = bundle::active_name(cfg, db, worktree, slug);
+    let mut items = Vec::new();
+    items.push(PaletteItem::new(
+        "bundle-clear",
+        format!("○ No bundle{}", if active.is_none() { " ✓" } else { "" }),
+    ));
+    for name in cfg.bundle.keys() {
+        let mark = if active.as_deref() == Some(name.as_str()) {
+            " ✓"
+        } else {
+            ""
+        };
+        items.push(PaletteItem::new(
+            format!("bundle:{name}"),
+            format!("◆ {name}{mark}"),
+        ));
+    }
+    items
+}
+
+/// Build the profile switcher palette: `default` plus every profile known from
+/// `[profiles.<name>]` config and every `profiles/<name>/config.toml` on disk.
+/// Selecting `profile:<name>` launches (or re-uses) that profile's window; the
+/// active profile is marked. See [`superzej_core::profile`].
+pub(crate) fn build_profile_palette(cfg: &superzej_core::config::Config) -> Vec<PaletteItem> {
+    let active = superzej_core::profile::name();
+    let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    names.insert("default".to_string());
+    for k in cfg.profiles.keys() {
+        names.insert(k.clone());
+    }
+    // Profiles defined only by a `profiles/<name>/config.toml` file on disk.
+    let pdir = superzej_core::util::xdg_config_home()
+        .join("superzej")
+        .join("profiles");
+    if let Ok(entries) = std::fs::read_dir(&pdir) {
+        for e in entries.flatten() {
+            if e.path().join("config.toml").is_file()
+                && let Some(n) = e.file_name().to_str()
+            {
+                names.insert(n.to_string());
+            }
+        }
+    }
+    names
+        .into_iter()
+        .map(|n| {
+            let mark = if n == active { " ✓" } else { "" };
+            PaletteItem::new(format!("profile:{n}"), format!("⬢ {n}{mark}"))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,6 +658,45 @@ mod tests {
             PaletteItem::new("switch", "Switch workspace"),
             PaletteItem::new("diff", "Show diff"),
         ]
+    }
+
+    #[test]
+    fn build_bundle_palette_lists_bundles_clear_and_marks_active() {
+        use superzej_core::config::{Bundle, Config};
+        use superzej_core::db::Db;
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.bundle.insert("work".into(), Bundle::default());
+        cfg.bundle.insert("personal".into(), Bundle::default());
+        superzej_core::bundle::set_active(
+            &db,
+            superzej_core::bundle::Bind::Global,
+            "/wt",
+            None,
+            "work",
+        )
+        .unwrap();
+        let items = build_bundle_palette(&cfg, &db, "/wt", None);
+        let keys: Vec<&str> = items.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, vec!["bundle-clear", "bundle:personal", "bundle:work"]);
+        // The active bundle is marked with a check.
+        let work = items.iter().find(|i| i.key == "bundle:work").unwrap();
+        assert!(work.label.contains('✓'));
+    }
+
+    #[test]
+    fn build_profile_palette_includes_default_and_configured_marks_active() {
+        use superzej_core::config::{Config, ProfileConfig};
+        let mut cfg = Config::default();
+        cfg.profiles.insert("work".into(), ProfileConfig::default());
+        let items = build_profile_palette(&cfg);
+        let keys: Vec<&str> = items.iter().map(|i| i.key.as_str()).collect();
+        // Always offers default + the configured profile (dir scan may add more).
+        assert!(keys.contains(&"profile:default"));
+        assert!(keys.contains(&"profile:work"));
+        // No profile active in tests ⇒ default is marked.
+        let def = items.iter().find(|i| i.key == "profile:default").unwrap();
+        assert!(def.label.contains('✓'));
     }
 
     #[test]

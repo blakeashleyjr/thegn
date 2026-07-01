@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use superzej_core::config::Config;
 use superzej_core::db::Db;
 use superzej_core::remote::GitLoc;
-use superzej_core::{account, devenv, direnv, repo, sandbox};
+use superzej_core::{bundle, devenv, direnv, repo, sandbox};
 use superzej_svc::projection::ProjectionBackend;
 use superzej_svc::vpn::VpnProvider;
 
@@ -3565,31 +3565,55 @@ pub fn launch_spec_with_key(
         spec.env.retain(|(k, _)| k != "ANTHROPIC_API_KEY");
     }
 
-    // Client-side account switching (item 656): point the agent's credential
-    // home (CODEX_HOME / CLAUDE_CONFIG_DIR) at the active account, resolved by
-    // worktree → workspace → global precedence. Local worktrees only — a remote
-    // agent runs where the host's account dir doesn't exist.
-    let account_env = (!loc.is_remote())
+    // Environment bundles (AU): resolve the active bundle(s) for this scope into
+    // env overrides + credential/config-dir redirection + account selection, and
+    // fold them into the sandbox spec (or, on the host fallback, the pane env
+    // below). This subsumes the old inline account-switch (item 656) — a plain
+    // account selection is just a bundle with no bundle bound (`compose` folds
+    // the legacy per-provider active account when nothing else set it). Local
+    // worktrees only — a remote agent runs where the host's cred dirs don't exist.
+    let resolved = (!loc.is_remote())
         .then(|| Db::open().ok())
         .flatten()
-        .and_then(|db| {
+        .map(|db| {
             let slug = repo_slug(&db, &repo_root);
-            account::launch_env(cfg, &db, worktree, slug.as_deref(), choice)
-        });
-    if let Some((var, dir)) = account_env.as_ref() {
-        // The CLI writes tokens/history here; ensure it exists.
+            // At launch (off the event loop) so secret resolvers may run.
+            bundle::compose_at_launch(cfg, &db, worktree, slug.as_deref(), Some(choice))
+        })
+        .unwrap_or_default();
+    // Credential/HOME dirs the child writes into must exist before launch.
+    for dir in &resolved.ensure_dirs {
         let _ = std::fs::create_dir_all(dir);
-        let dir_s = dir.to_string_lossy().into_owned();
-        if let Some(spec) = outcome.spec.as_mut() {
-            spec.env_overrides.insert(var.clone(), dir_s.clone());
-            // Path-preserving mount so the dir is reachable at the same path
-            // inside the sandbox (mirrors the worktree mount).
-            spec.mounts.push(sandbox::Mount {
-                host: dir_s.clone(),
-                dest: dir_s,
-                ro: false,
-                cache: false,
-            });
+    }
+    // Tier-2 dotfiles: materialize each active bundle's dotfile tree into its
+    // managed HOME (idempotent, off the event loop — launch_spec is blocking).
+    if !loc.is_remote()
+        && let Ok(db) = Db::open()
+    {
+        let slug = repo_slug(&db, &repo_root);
+        for name in bundle::active_chain(cfg, &db, worktree, slug.as_deref()) {
+            if let Some(b) = cfg.bundle.get(&name)
+                && let Some(spec) = &b.dotfiles
+            {
+                bundle::materialize_dotfiles(spec, &bundle::managed_home(&name));
+            }
+        }
+    }
+    if let Some(spec) = outcome.spec.as_mut() {
+        resolved.merge_into_spec(spec);
+        // Profile credential firewall (H): mount the active profile's git/gh/gpg
+        // config dirs path-preservingly so the container sees the profile
+        // identity its rerooted GIT_CONFIG_GLOBAL/GH_CONFIG_DIR env points at.
+        // No-op on the default profile.
+        for (host, ro) in superzej_core::profile::sandbox_cred_mounts() {
+            if !spec.mounts.iter().any(|m| m.dest == host) {
+                spec.mounts.push(sandbox::Mount {
+                    dest: host.clone(),
+                    host,
+                    ro,
+                    cache: false,
+                });
+            }
         }
     }
 
@@ -3635,12 +3659,10 @@ pub fn launch_spec_with_key(
     }
 
     let mut spec = compose_spec(cfg, worktree, branch, choice, &loc, &outcome);
-    // On the host path (no sandbox spec) the credential home + build env ride
-    // the pane env.
+    // On the host path (no sandbox spec) the bundle identity + build env ride
+    // the pane env (layered on the curated base in `spawn_with_env`).
     if outcome.spec.is_none() {
-        if let Some((var, dir)) = account_env {
-            spec.env.push((var, dir.to_string_lossy().into_owned()));
-        }
+        spec.env.extend(resolved.env_pairs());
         spec.env.extend(build_env);
         // Host agent panes: proxy-routing vars ride the pane env (from bouncer
         // mode's host fallback, or plain `route_agent` host routing). Sandboxed

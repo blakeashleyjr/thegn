@@ -69,6 +69,7 @@ mod sequence;
 mod session;
 mod share;
 mod sidebar;
+mod subsystem;
 mod task;
 mod telemetry;
 #[cfg(test)]
@@ -97,6 +98,12 @@ pub struct Cli {
     /// Override a config value (e.g. `--set theme.accent=cyan --set drawer.height=15`)
     #[arg(long = "set", global = true, value_name = "KEY=VALUE")]
     pub overrides: Vec<String>,
+
+    /// Run under a named **profile** — a whole-process firewall (separate
+    /// state/DB, config overlay, credentials): e.g. `--profile work`. Falls back
+    /// to `SUPERZEJ_PROFILE`; absent / `default` keeps today's shared paths.
+    #[arg(long, global = true, value_name = "NAME")]
+    pub profile: Option<String>,
 
     /// A non-interactive subcommand. With none, launch the compositor.
     #[command(subcommand)]
@@ -316,10 +323,36 @@ fn main() -> anyhow::Result<()> {
         cli.overrides.push(format!("log.level={lvl}"));
     }
 
+    // Reroot the process environment for the active profile (H) BEFORE the tokio
+    // runtime or any thread starts — a whole-process firewall enforced via
+    // `std::env::set_var` of profile-scoped roots (state/DB/logs), which every
+    // path/sandbox/token read then honors for free. No-op for the default
+    // profile (today's shared paths). Sequencing is load-bearing: a single
+    // `Db::open()` before this would touch the wrong (shared) DB. Runs for
+    // subcommands too, so `superzej --profile work pr …` uses the work DB.
+    superzej_core::profile::reroot(cli.profile.as_deref());
+
     // A subcommand runs synchronously and exits; no subcommand launches the
     // interactive compositor (the default).
     if let Some(command) = cli.command.take() {
         return run_subcommand(&cli, command);
+    }
+
+    // Per-profile advisory singleton (H): one interactive window per named
+    // profile. Advisory only — if the profile is already running we warn and
+    // continue (per-profile DBs are separate + WAL-safe; a hard refusal would
+    // break running szhost inside szhost). No-op for the default profile. The
+    // guard is held for the whole process (released on exit/death, never stale).
+    let _profile_lock = superzej_core::profile::acquire_singleton();
+    if matches!(
+        _profile_lock,
+        superzej_core::profile::Singleton::AlreadyRunning
+    ) {
+        superzej_core::msg::warn(&format!(
+            "profile {:?} appears to be already running in another window; \
+             continuing (windows share the profile's WAL database)",
+            superzej_core::profile::name()
+        ));
     }
 
     // Manual runtime instead of #[tokio::main]: dropping a Runtime blocks on

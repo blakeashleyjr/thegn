@@ -6330,6 +6330,21 @@ fn terminal_connection_for(name: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Resolve the repo slug for a worktree path (for scoping account/bundle
+/// bindings): DB repo-root → slug, or `None` when the path isn't in a known repo.
+fn bundle_scope_slug(db: &superzej_core::db::Db, worktree: &str) -> Option<String> {
+    let root = db
+        .repo_root_for(worktree)
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())?;
+    let base = std::path::Path::new(&root)
+        .file_name()?
+        .to_string_lossy()
+        .into_owned();
+    db.slug_for_repo(&root, &base).ok()
+}
+
 /// Spawn a fresh (hidden or visible) yazi pane for `dir`; falls back to a
 /// plain shell when no yazi tool is configured.
 fn spawn_worktree_shell_pane(
@@ -8151,6 +8166,15 @@ async fn event_loop<T: Terminal>(
     // Set while the panel was popped up by Ctrl+→ at the center edge; holds
     // the (want_panel, panel_forced) pair to restore when focus leaves it.
     let mut panel_auto_revealed: Option<(bool, bool)> = None;
+    // Profile subsystems (H, subprofiles): the `workspace` shell plus any
+    // subprofile-capable subsystem (a stub `comms` until Comms lands). Held as a
+    // loop local so a subprofile switch can `teardown()`→`bind()` one subsystem
+    // in-process without touching `workspace`. No polling; periodic work rides
+    // the `TerminalWaker`. `mut` because a future subprofile-switch action
+    // rebinds it; today it is registered + logged (Comms is its first consumer).
+    #[allow(unused_mut)]
+    let mut subsystems = crate::subsystem::Subsystems::with_defaults();
+    tracing::debug!(target: "szhost::startup", subsystems = ?subsystems.names(), "profile subsystems registered");
     // Inline hunk previews arrive from background `git diff` fetches tagged
     // with the hydration generation at request time; `hunk_inflight` dedupes
     // re-selects while a fetch is still out.
@@ -14784,6 +14808,81 @@ async fn event_loop<T: Terminal>(
                                     palette = None;
                                     dirty = true;
                                     continue;
+                                } else if key == "bundle-clear" || key.starts_with("bundle:") {
+                                    // Env-bundle switcher (AU): pin the chosen bundle
+                                    // as the focused repo's default (workspace scope),
+                                    // or the global default when no repo is focused;
+                                    // "bundle-clear" removes the binding at that scope.
+                                    // Affects panes launched *after* the switch (same
+                                    // hot-swap semantics as the account switcher).
+                                    let wt = active_tab_path(&session);
+                                    let wt_s = wt.to_string_lossy().into_owned();
+                                    if let Ok(db) = superzej_core::db::Db::open() {
+                                        let slug = bundle_scope_slug(&db, &wt_s);
+                                        let bind = if slug.is_some() {
+                                            superzej_core::bundle::Bind::Workspace
+                                        } else {
+                                            superzej_core::bundle::Bind::Global
+                                        };
+                                        if let Some(name) = key.strip_prefix("bundle:") {
+                                            let _ = superzej_core::bundle::set_active(
+                                                &db,
+                                                bind,
+                                                &wt_s,
+                                                slug.as_deref(),
+                                                name,
+                                            );
+                                            model.status = format!("Bundle → {name}");
+                                        } else {
+                                            let _ = superzej_core::bundle::clear_active(
+                                                &db,
+                                                bind,
+                                                &wt_s,
+                                                slug.as_deref(),
+                                            );
+                                            model.status = "Bundle cleared".to_string();
+                                        }
+                                    }
+                                    palette = None;
+                                    dirty = true;
+                                    continue;
+                                } else if let Some(name) = key.strip_prefix("profile:") {
+                                    // Profile switcher (H): launch the chosen
+                                    // profile in a NEW terminal window (szhost owns
+                                    // a raw TTY, so there is no portable focus-my-
+                                    // window primitive; spawn works on Wayland/SSH).
+                                    // Selecting the active profile is a no-op.
+                                    if name == superzej_core::profile::name() {
+                                        model.status = format!("Already on profile {name}");
+                                    } else {
+                                        let exe = std::env::current_exe()
+                                            .ok()
+                                            .and_then(|p| p.to_str().map(str::to_string))
+                                            .unwrap_or_else(|| "szhost".to_string());
+                                        match superzej_core::profile::launch_window_argv(
+                                            None, &exe, name,
+                                        ) {
+                                            Some(argv) => {
+                                                let spawned = std::process::Command::new(&argv[0])
+                                                    .args(&argv[1..])
+                                                    .spawn()
+                                                    .is_ok();
+                                                model.status = if spawned {
+                                                    format!("Launching profile {name}…")
+                                                } else {
+                                                    format!("Could not launch profile {name}")
+                                                };
+                                            }
+                                            None => {
+                                                model.status =
+                                                    "No terminal emulator found for profile launch"
+                                                        .to_string();
+                                            }
+                                        }
+                                    }
+                                    palette = None;
+                                    dirty = true;
+                                    continue;
                                 } else if let Some(branch) = key.strip_prefix("git-branch:") {
                                     let wt_path = active_tab_path(&session);
                                     if let Some(focused_pane) = panes.table.get_mut(&focused) {
@@ -17753,6 +17852,26 @@ async fn event_loop<T: Terminal>(
                                         crate::palette::build_account_palette(&current_config, &db),
                                     ));
                                 }
+                            }
+                            Action::SwitchBundle => {
+                                if let Ok(db) = superzej_core::db::Db::open() {
+                                    let wt = active_tab_path(&session);
+                                    let wt_s = wt.to_string_lossy().into_owned();
+                                    let slug = bundle_scope_slug(&db, &wt_s);
+                                    palette = Some(crate::search_everywhere::PaletteSession::new(
+                                        crate::palette::build_bundle_palette(
+                                            &current_config,
+                                            &db,
+                                            &wt_s,
+                                            slug.as_deref(),
+                                        ),
+                                    ));
+                                }
+                            }
+                            Action::SwitchProfile => {
+                                palette = Some(crate::search_everywhere::PaletteSession::new(
+                                    crate::palette::build_profile_palette(&current_config),
+                                ));
                             }
                             Action::ToggleDrawer => {
                                 // The reserved-geometry reflow + PTY resize are

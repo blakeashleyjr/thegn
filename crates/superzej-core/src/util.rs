@@ -196,6 +196,103 @@ pub fn scrub_git_env() {
     }
 }
 
+/// Exact env-var names carried from superzej's own process into a freshly
+/// spawned pane. This is the *allowlist* half of the clear-then-allowlist pane
+/// env firewall ([`crate`] consumers call [`host_base_env`]): a pane starts from
+/// an EMPTY environment seeded only with these infrastructure vars, then the
+/// caller layers the pane's identity (env-bundle / profile / agent env) on top.
+///
+/// Credential-shaped vars the launching shell exported (`GH_TOKEN`,
+/// `ANTHROPIC_API_KEY`, `SSH_AUTH_SOCK`, `*_TOKEN`/`*_KEY`/`*_SECRET`/…) are
+/// therefore NOT inherited by default — closing the "every pane sees every var
+/// szhost inherited" leak that both env-bundles (AU) and process-profiles (H)
+/// depend on. The list is generous on *infrastructure* (locale, terminal,
+/// display) but carries no secrets; extra names are re-admitted via
+/// [`set_host_env_allow_extra`].
+pub const HOST_ENV_ALLOW_EXACT: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "PWD",
+    "OLDPWD",
+    "LANG",
+    "LANGUAGE",
+    "TERM",
+    "COLORTERM",
+    "TERMINFO",
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "TZ",
+    "TMPDIR",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "SSH_TTY",
+    // Credential *config-dir* vars (they name a dir/file, not a secret value):
+    // safe to carry so a pane inherits the active profile's git/gh/gpg identity
+    // (or, on the default profile, the user's own). The secret token vars
+    // (`GH_TOKEN`/`*_KEY`/…) are deliberately NOT here — they stay firewalled.
+    "GIT_CONFIG_GLOBAL",
+    "GH_CONFIG_DIR",
+    "GNUPGHOME",
+    "GIT_SSH_COMMAND",
+    "GPG_TTY",
+];
+
+/// Prefix families admitted alongside [`HOST_ENV_ALLOW_EXACT`]:
+/// - `LC_*` — locale categories.
+/// - `XDG_*` — base-dir spec, incl. `XDG_RUNTIME_DIR` (rootless podman needs it).
+/// - `DBUS_*` — the session bus a rootless container runtime talks to.
+/// - `NIX_*` — dev-shell plumbing (`NIX_PATH`, `NIX_PROFILES`, …).
+/// - `SUPERZEJ_*` — our own non-secret context markers (profile, sandbox flag).
+///
+/// None of these families carry credentials; secrets ship under distinct names
+/// (`*_TOKEN`/`*_KEY`/…) that no family matches.
+pub const HOST_ENV_ALLOW_PREFIX: &[&str] = &["LC_", "XDG_", "DBUS_", "NIX_", "SUPERZEJ_"];
+
+/// Process-global extra allowlist (config `[sandbox] host_env_allow`), set once
+/// at startup. Same write-once holder pattern as the render-time caps/palette:
+/// read cheaply from every pane spawn without threading config through
+/// `spawn_with_env`. Empty until set.
+static HOST_ENV_ALLOW_EXTRA: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Install the config-driven extra host-env allowlist. Idempotent-by-first-write
+/// (`OnceLock`): call once at startup after config load. Later calls are no-ops.
+pub fn set_host_env_allow_extra(extra: Vec<String>) {
+    let _ = HOST_ENV_ALLOW_EXTRA.set(extra);
+}
+
+/// The configured extra host-env allowlist (empty if never set).
+pub fn host_env_allow_extra() -> &'static [String] {
+    HOST_ENV_ALLOW_EXTRA.get().map(Vec::as_slice).unwrap_or(&[])
+}
+
+/// Pure allowlist filter: keep only vars whose key is in
+/// [`HOST_ENV_ALLOW_EXACT`], matches a [`HOST_ENV_ALLOW_PREFIX`] family, or is
+/// explicitly re-admitted via `extra`. Order-preserving. The testable core of
+/// the pane-env firewall (the I/O wrapper [`host_base_env`] just feeds it
+/// `std::env::vars()`).
+pub fn filter_host_env<I>(vars: I, extra: &[String]) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    vars.into_iter()
+        .filter(|(k, _)| {
+            HOST_ENV_ALLOW_EXACT.contains(&k.as_str())
+                || HOST_ENV_ALLOW_PREFIX.iter().any(|p| k.starts_with(p))
+                || extra.iter().any(|e| e == k)
+        })
+        .collect()
+}
+
+/// The current process environment filtered through [`filter_host_env`] with the
+/// configured [`host_env_allow_extra`] — the seed env for a freshly spawned pane.
+pub fn host_base_env() -> Vec<(String, String)> {
+    filter_host_env(std::env::vars(), host_env_allow_extra())
+}
+
 /// A `git -C <dir>` command with the parent's repo-targeting env scrubbed.
 /// When superzej (or its test suite, via a pre-commit hook) runs inside a git
 /// hook, git exports GIT_DIR/GIT_INDEX_FILE/GIT_WORK_TREE — often as paths
@@ -641,6 +738,71 @@ mod tests {
         assert_eq!(age(n), "0s");
         assert_eq!(age(n - 120), "2m");
         assert_eq!(age(n - 7200), "2h");
+    }
+
+    #[test]
+    fn host_env_filter_keeps_infra_drops_secrets() {
+        let input = vec![
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("HOME".to_string(), "/home/x".to_string()),
+            ("LC_ALL".to_string(), "C".to_string()),
+            ("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string()),
+            (
+                "DBUS_SESSION_BUS_ADDRESS".to_string(),
+                "unix:...".to_string(),
+            ),
+            ("NIX_PATH".to_string(), "nixpkgs=...".to_string()),
+            ("SUPERZEJ_PROFILE".to_string(), "work".to_string()),
+            // Secrets / launcher-shell leakage — must be dropped.
+            ("GH_TOKEN".to_string(), "ghp_xxx".to_string()),
+            ("GITHUB_TOKEN".to_string(), "ghp_yyy".to_string()),
+            ("ANTHROPIC_API_KEY".to_string(), "sk-ant".to_string()),
+            ("SSH_AUTH_SOCK".to_string(), "/tmp/agent".to_string()),
+            ("MY_SECRET".to_string(), "hunter2".to_string()),
+            ("AWS_SECRET_ACCESS_KEY".to_string(), "z".to_string()),
+        ];
+        let out = filter_host_env(input, &[]);
+        let keys: std::collections::HashSet<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
+        for keep in [
+            "PATH",
+            "HOME",
+            "LC_ALL",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "NIX_PATH",
+            "SUPERZEJ_PROFILE",
+        ] {
+            assert!(
+                keys.contains(keep),
+                "{keep} must survive the host-env filter"
+            );
+        }
+        for drop in [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "SSH_AUTH_SOCK",
+            "MY_SECRET",
+            "AWS_SECRET_ACCESS_KEY",
+        ] {
+            assert!(
+                !keys.contains(drop),
+                "{drop} must NOT leak past the host-env filter"
+            );
+        }
+    }
+
+    #[test]
+    fn host_env_filter_extra_readmits_named_var() {
+        let input = vec![("SSH_AUTH_SOCK".to_string(), "/tmp/agent".to_string())];
+        // Not admitted by default…
+        assert!(filter_host_env(input.clone(), &[]).is_empty());
+        // …but an explicit config re-admit lets it through.
+        let out = filter_host_env(input, &["SSH_AUTH_SOCK".to_string()]);
+        assert_eq!(
+            out,
+            vec![("SSH_AUTH_SOCK".to_string(), "/tmp/agent".to_string())]
+        );
     }
 
     #[test]

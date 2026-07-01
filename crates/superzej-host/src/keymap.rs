@@ -62,6 +62,10 @@ pub enum Action {
     SwitchWorkspace,
     /// Open the coding-agent account switcher for the focused worktree (item 656).
     SwitchAccount,
+    /// Open the environment-bundle switcher for the focused worktree (AU group).
+    SwitchBundle,
+    /// Open the profile switcher — launch/focus a whole-process profile (H).
+    SwitchProfile,
     NextTab,
     PrevTab,
     /// Switch to the next worktree (Alt+Down), wrapping WITHIN the active
@@ -368,6 +372,20 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         label: "Switch agent account",
         hint: "account",
         default_chords: &["Ctrl Alt a"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "switch-bundle",
+        label: "Switch env bundle",
+        hint: "bundle",
+        default_chords: &["Ctrl Alt u"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "switch-profile",
+        label: "Switch profile",
+        hint: "profile",
+        default_chords: &["Ctrl Alt g"],
         palette: true,
     },
     ActionSpec {
@@ -959,6 +977,8 @@ impl Action {
             Action::CloseWorktree => "close-worktree",
             Action::SwitchWorkspace => "switch-workspace",
             Action::SwitchAccount => "switch-account",
+            Action::SwitchBundle => "switch-bundle",
+            Action::SwitchProfile => "switch-profile",
             Action::NextTab => "next-tab",
             Action::PrevTab => "prev-tab",
             Action::NextWorktree => "next-worktree",
@@ -1058,6 +1078,8 @@ impl Action {
             "close-worktree" => Action::CloseWorktree,
             "switch-workspace" | "switch-repo" => Action::SwitchWorkspace,
             "switch-account" => Action::SwitchAccount,
+            "switch-bundle" => Action::SwitchBundle,
+            "switch-profile" => Action::SwitchProfile,
             "next-tab" => Action::NextTab,
             "prev-tab" => Action::PrevTab,
             "next-worktree" => Action::NextWorktree,
