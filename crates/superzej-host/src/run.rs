@@ -2858,7 +2858,18 @@ impl WorkspacePool {
 /// reserved past every live pane, so its persisted tree can't alias a live pane
 /// of another resident workspace (the bleed the old reap-on-switch prevented).
 /// `materialize_with_specs` then spawns real panes over these placeholders.
-fn remap_cold_workspace_ids(session: &mut crate::session::Session, panes: &mut Panes) {
+///
+/// `clear_sessions`: drop the persisted provider exec session ids instead of
+/// remapping them. Set on a RESTART (startup) resurrect — those ids are from the
+/// PRIOR process, so reattaching yields a dead/silent session (a broken shell, or
+/// a full watchdog-timeout fallback). Dropping them makes `materialize` open a
+/// FRESH exec (a prompt arrives at once). Within-run workspace switches keep them
+/// (the session is live this run, so reattach replays scrollback).
+fn remap_cold_workspace_ids(
+    session: &mut crate::session::Session,
+    panes: &mut Panes,
+    clear_sessions: bool,
+) {
     for g in &mut session.worktrees {
         for tab in &mut g.tabs {
             let mut uniq = tab.center.pane_ids();
@@ -2888,10 +2899,15 @@ fn remap_cold_workspace_ids(session: &mut crate::session::Session, panes: &mut P
                 .into_iter()
                 .map(|(id, cmd)| (map.get(&id).copied().unwrap_or(id), cmd))
                 .collect();
-            tab.pane_sessions = std::mem::take(&mut tab.pane_sessions)
-                .into_iter()
-                .map(|(id, s)| (map.get(&id).copied().unwrap_or(id), s))
-                .collect();
+            if clear_sessions {
+                // Restart: the prior process's exec sessions are gone — open fresh.
+                tab.pane_sessions.clear();
+            } else {
+                tab.pane_sessions = std::mem::take(&mut tab.pane_sessions)
+                    .into_iter()
+                    .map(|(id, s)| (map.get(&id).copied().unwrap_or(id), s))
+                    .collect();
+            }
         }
     }
 }
@@ -2970,7 +2986,7 @@ fn switch_workspace(
         return false;
     }
     pool.stash(prev_id, snapshot);
-    remap_cold_workspace_ids(session, panes);
+    remap_cold_workspace_ids(session, panes, false);
     true
 }
 
@@ -8601,8 +8617,11 @@ async fn event_loop<T: Terminal>(
     // it and leave two trees aliasing one live PtyPane (a worktree mirroring
     // another). Move the initial session's ids onto a disjoint reserved range up
     // front, exactly as a cold workspace switch does, so resurrected
-    // placeholders can never collide with the panes we're about to spawn.
-    remap_cold_workspace_ids(&mut session, &mut panes);
+    // placeholders can never collide with the panes we're about to spawn. Clear
+    // the persisted provider exec sessions: this is a RESTART, so those ids are
+    // dead — open fresh execs (a prompt at once) instead of reattaching to a
+    // silent zombie (which stalls until the shell watchdog fires).
+    remap_cold_workspace_ids(&mut session, &mut panes, true);
     let mut need_relayout = true;
     // Region-navigation memory: where the user last was in each region, so the
     // Alt+` toggle (and the Shift+Alt+↑/↓ overflow ring) can restore their place.
@@ -13569,7 +13588,11 @@ async fn event_loop<T: Terminal>(
                                             }) {
                                             Ok(WorkspaceResolution::Repo(path)) => {
                                                 workspace_pool.stash(prev_id, snapshot);
-                                                remap_cold_workspace_ids(&mut session, &mut panes);
+                                                remap_cold_workspace_ids(
+                                                    &mut session,
+                                                    &mut panes,
+                                                    false,
+                                                );
                                                 focus.zone = crate::focus::Zone::Center;
                                                 refresh_tab_model(&mut model, &session, &mut sb);
                                                 sync_drawer_persistence(
@@ -13999,7 +14022,11 @@ async fn event_loop<T: Terminal>(
                                         }) {
                                         Ok(WorkspaceResolution::Repo(_)) => {
                                             workspace_pool.stash(prev_id, snapshot);
-                                            remap_cold_workspace_ids(&mut session, &mut panes);
+                                            remap_cold_workspace_ids(
+                                                &mut session,
+                                                &mut panes,
+                                                false,
+                                            );
                                             focus.zone = crate::focus::Zone::Center;
                                             refresh_tab_model(&mut model, &session, &mut sb);
                                             sync_drawer_persistence(
@@ -21791,7 +21818,7 @@ mod tests {
         let reserved = panes.reserve_ids(10);
         assert_eq!(reserved, 1);
 
-        remap_cold_workspace_ids(&mut session, &mut panes);
+        remap_cold_workspace_ids(&mut session, &mut panes, false);
 
         let mut ids: Vec<u32> = session
             .worktrees
@@ -21835,7 +21862,7 @@ mod tests {
         let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(16);
         let mut panes = Panes::new(tx); // fresh registry, next_id == 1
 
-        remap_cold_workspace_ids(&mut session, &mut panes);
+        remap_cold_workspace_ids(&mut session, &mut panes, false);
 
         // Every restored leaf id is unique across the whole session.
         let mut ids: Vec<u32> = session
