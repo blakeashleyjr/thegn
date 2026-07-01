@@ -596,13 +596,13 @@ impl LlmProxyConfig {
     /// `None` when the proxy is disabled. The host feeds this to its process
     /// supervisor (e.g. as a `restart = "always"` pinned daemon). `SZPROXY_LISTEN`
     /// and `SZPROXY_CONFIG` mirror the standalone env knobs the daemon reads.
+    ///
+    /// Launching is gated on `enabled` ONLY — orthogonal to `route_agent`. This
+    /// lets `route_agent` point agents at an EXTERNAL proxy already listening on
+    /// `listen` (e.g. a separate model-proxy) without superzej trying to bind the
+    /// same port and colliding. Run superzej's own szproxy with `enabled = true`.
     pub fn launch_spec(&self) -> Option<(String, Vec<String>, BTreeMap<String, String>)> {
-        // Launch the daemon when explicitly enabled OR when routing agents through
-        // it (`route_agent`) — otherwise the injected `ANTHROPIC_BASE_URL` + reverse
-        // tunnel would dial a dead port. `route_agent` alone is enough to bring the
-        // proxy up; routes still come from `config_path` (see the no-routes warning
-        // at the launch site).
-        if !self.enabled && !self.route_agent {
+        if !self.enabled {
             return None;
         }
         let mut env = BTreeMap::new();

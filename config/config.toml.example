@@ -1624,13 +1624,14 @@ token_reduction = false
 token_reduction_level = "conservative"
 # Route a launched agent's model traffic through the proxy at `listen` by
 # injecting provider config into the agent's environment at spawn. `route_agent`
-# is the SINGLE SWITCH: setting it `true` (a) launches szproxy itself (you do NOT
-# also need `enabled = true`), and (b) for a remote/provider sandbox, defaults
-# `remote_base_url` to "auto" so the host stands up the reverse tunnel and injects
-# ANTHROPIC_BASE_URL automatically. Add a `config_path` routes file or the proxy
-# will answer /health but 404 real agent requests (superzej warns at startup).
-# (Set `enabled = true` separately if you want szproxy running without routing
-# agents through it.) `agent_api` is the pi-side API id for that endpoint — the proxy serves
+# and `enabled` are ORTHOGONAL: `enabled` launches superzej's OWN szproxy;
+# `route_agent` only injects the env (ANTHROPIC_BASE_URL → `listen`, and for a
+# remote/provider sandbox an empty/"auto" `remote_base_url` stands up the reverse
+# tunnel to it). So point agents at an EXTERNAL proxy already on `listen` (e.g. a
+# separate model-proxy) with `route_agent = true` + `enabled = false` (superzej
+# won't try to bind the same port); run superzej's own proxy with `enabled = true`
+# (+ a `config_path` routes file, else it 404s — superzej warns at startup).
+# `agent_api` is the pi-side API id for that endpoint — the proxy serves
 # the Anthropic Messages API (/v1/messages), and pi's OpenAI client speaks the
 # Responses API (which the proxy doesn't implement), so keep "anthropic-messages".
 # `agent_model` is the model id the agent requests (the proxy maps it to a real

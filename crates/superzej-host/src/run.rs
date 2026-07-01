@@ -589,16 +589,18 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         .llm_proxy
         .launch_spec()
         .and_then(crate::proxy_daemon::launch);
-    // Diagnose the common silent-failure: routing is on (so agents get
-    // ANTHROPIC_BASE_URL pointed at the proxy + the reverse tunnel fires) but no
-    // routes are configured, so the proxy 404s every agent request. `/health` still
-    // works (proves the tunnel), but real calls fail until `config_path` is set.
-    if cfg.llm_proxy.route_agent && cfg.llm_proxy.config_path.trim().is_empty() {
+    // Diagnose the common silent-failure: superzej is launching ITS OWN proxy
+    // (`enabled`) and routing agents to it, but no routes are configured, so it
+    // 404s every agent request. (When `route_agent` points at an EXTERNAL proxy —
+    // `enabled = false` — routes live there, so this doesn't apply.)
+    if cfg.llm_proxy.enabled
+        && cfg.llm_proxy.route_agent
+        && cfg.llm_proxy.config_path.trim().is_empty()
+    {
         tracing::warn!(
             target: "szhost::startup",
-            "[llm_proxy] route_agent is on but config_path is empty — the proxy will \
-             answer /health but 404 agent requests until you point config_path at a \
-             routes file. The reverse tunnel + ANTHROPIC_BASE_URL injection are active."
+            "[llm_proxy] enabled + route_agent but config_path is empty — the proxy will \
+             answer /health but 404 agent requests until you point config_path at a routes file."
         );
     }
     // Embedded host nix cache: when any env opts into `[env.<name>.provider]
