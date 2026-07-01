@@ -88,18 +88,12 @@ fn shell_inner(in_oci: bool) -> String {
             .map(|s| format!("command -v {s} >/dev/null 2>&1 && exec {s} -l; "))
             .collect();
         // Put the nix profile dirs on PATH FIRST so a `nix profile install`ed shell
-        // (zsh + starship from nixpkgs) is actually found by `command -v`. Cover
-        // EVERY profile layout an installer uses, matching the provision scripts'
-        // prelude — the single-user `~/.nix-profile`, the daemon/system profile
-        // (`/nix/var/nix/profiles/default`, Determinate `--init none`), the
-        // Determinate `nix profile install` target (`~/.local/state/nix/profile`),
-        // and `~/.local/bin`. Missing the `.local/state` one made the probe skip an
-        // installed zsh and drop to bash — the pane opened to a plain `sh` prompt
-        // instead of the user's zsh+starship. The trailing `/bin/sh -l` is the
-        // universal fallback.
+        // (zsh from nixpkgs) is actually found by `command -v` — covers both the
+        // single-user (`~/.nix-profile`) and daemon/system (Determinate `--init
+        // none`) profiles. Without this the checks miss the installed zsh and drop
+        // to `/bin/sh`. The trailing `/bin/sh -l` is the universal fallback.
         format!(
-            "export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:\
-             $HOME/.local/state/nix/profile/bin:$HOME/.local/bin:$PATH\"; \
+            "export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH\"; \
              {checks}exec /bin/sh -l"
         )
     } else {
@@ -1575,19 +1569,6 @@ pub fn provision_provider_env(
 /// resolution + repo-origin context (for a spare, pass the repo's main worktree).
 /// The clone is branch-less (`opts.branch = None`) either way, so a spare and a
 /// worktree provision identically apart from the name.
-/// The process-global per-sandbox-id provisioning lock (see the call site in
-/// [`provision_provider_env_named`]). Serializes concurrent eager + materialize
-/// provisions of the same sprite so they can't race the toolchain into a
-/// half-baked environment.
-fn provision_lock(id: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
-    static LOCKS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>,
-    > = std::sync::OnceLock::new();
-    let map = LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let mut m = map.lock().unwrap_or_else(|e| e.into_inner());
-    m.entry(id.to_string()).or_default().clone()
-}
-
 pub fn provision_provider_env_named(
     cfg: &Config,
     worktree: &str,
@@ -1616,15 +1597,6 @@ pub fn provision_provider_env_named(
     if !provider.caps().files {
         return Ok(false); // can't provision without the fs API
     }
-    // Serialize provisioning per sandbox id. Eager (front-run) and lazy-materialize
-    // can both call this for the SAME worktree; without a lock they run the
-    // toolchain (clone/nix/direnv/devShell/agents/…) CONCURRENTLY on one sprite,
-    // racing each other's exec commands into a half-baked env — the "incomplete
-    // shell" that only `exit`+reconnect repairs. Hold the per-id lock across the
-    // whole provision so the loser waits, then hits the marker short-circuit below
-    // (a no-op). Process-global: both callers are separate `spawn_blocking` threads.
-    let plock = provision_lock(&id);
-    let _provision_guard = plock.lock().unwrap_or_else(|e| e.into_inner());
     let workdir = pc.sync_workdir();
     let marker = EnvPlan::marker_path(&workdir);
 
@@ -1637,16 +1609,10 @@ pub fn provision_provider_env_named(
         return Err(anyhow::anyhow!("ensure sandbox {id}: {e}"));
     }
 
-    // Already provisioned? A present marker means the one-time toolchain
-    // (clone/nix/devShell/agents/…) is done. We don't bail, though: the CHEAP
-    // idempotent "on-open" steps (today `direnv_allow`) must re-run on a RESUME —
-    // a checkpoint/restore or a content-hash change can invalidate them, so a
-    // resumed sprite otherwise opens to `.envrc is blocked` + no toolchain. Below,
-    // the step loop runs ONLY the on-open steps when `provisioned` (detection-
-    // driven: they're in the plan only for the tiers that added them, e.g.
-    // flake/direnv — a non-nix/direnv repo has none), and the marker write is
-    // skipped. A fresh (marker-absent) sandbox still runs the full sequence.
-    let provisioned = block_on_provider(|| async { provider.read(&id, &marker).await }).is_ok();
+    // Idempotent: already provisioned ⇒ nothing to do.
+    if block_on_provider(|| async { provider.read(&id, &marker).await }).is_ok() {
+        return Ok(true);
+    }
 
     // Resolve the repo origin so the sprite can clone it.
     let repo_root: PathBuf = Db::open()
@@ -1866,11 +1832,6 @@ pub fn provision_provider_env_named(
         .collect();
 
     for (i, step) in plan.steps.iter().enumerate() {
-        // On a RESUME (already provisioned), re-run ONLY the idempotent on-open
-        // steps (e.g. `direnv_allow`); the one-time heavy steps stay done.
-        if provisioned && !step_is_on_open(&step.id) {
-            continue;
-        }
         for (j, v) in views.iter_mut().enumerate() {
             v.state = match j.cmp(&i) {
                 // A best-effort step that already failed stays Failed (with its
@@ -2039,11 +2000,8 @@ pub fn provision_provider_env_named(
         progress(&views);
     }
 
-    // Drop the marker so a later open skips re-provisioning — only on a FRESH
-    // provision; a resume already has it (and only re-ran the on-open steps).
-    if !provisioned {
-        let _ = block_on_provider(|| async { provider.write(&id, &marker, b"ok\n").await });
-    }
+    // Drop the marker so a later open skips re-provisioning.
+    let _ = block_on_provider(|| async { provider.write(&id, &marker, b"ok\n").await });
     Ok(true)
 }
 
@@ -2752,17 +2710,6 @@ fn step_is_fatal(step_id: &str) -> bool {
     matches!(step_id, "workspace" | "git_auth" | "clone")
 }
 
-/// Whether a provision step is cheap + idempotent enough to re-run on every open,
-/// including a RESUME of an already-provisioned sandbox. These re-apply state a
-/// checkpoint/restore or a content-hash change can invalidate — currently just
-/// `direnv_allow` (a resumed sprite otherwise opens to `.envrc is blocked`). The
-/// heavy one-time steps (clone/nix/devShell/agents/…) run only on a fresh
-/// provision. Detection-driven: a step is only present in the plan for the tiers
-/// that added it, so a non-nix/direnv repo re-runs nothing here.
-fn step_is_on_open(step_id: &str) -> bool {
-    matches!(step_id, "direnv_allow")
-}
-
 /// Sanitize a subprocess-derived message for display on the loading screen:
 /// strip ANSI/OSC escape sequences and other control bytes (provisioning output
 /// is full of them — they corrupt width math and have triggered renderer
@@ -2948,11 +2895,7 @@ fn upload_atuin_creds(
 /// over 1 GB of `*.jsonl` transcripts). Skipped so the config sync carries only
 /// auth + settings and can't hang/502 pushing transcripts over the per-file fs API.
 const AGENT_STATE_SKIP_DIRS: &[&str] = &[
-    "projects",        // claude: per-repo session transcripts (~1 GB)
-    "file-history",    // claude: per-edit file snapshots (~500 MB, 10k+ files — 502/hang)
-    "plugins",         // claude: installed plugin trees (not auth)
-    "backups",         // claude: config backups
-    "paste-cache",     // claude: pasted-content cache
+    "projects",        // claude: per-repo session transcripts (the 502/hang source)
     "todos",           // claude runtime scratch
     "statsig",         // claude telemetry cache
     "shell-snapshots", // claude runtime
@@ -4057,17 +4000,6 @@ fn sandbox_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn on_open_steps_re_run_on_resume_and_are_never_fatal() {
-        // direnv_allow re-runs on resume (idempotent); heavy steps do not.
-        assert!(step_is_on_open("direnv_allow"));
-        assert!(!step_is_on_open("clone"));
-        assert!(!step_is_on_open("nix"));
-        assert!(!step_is_on_open("devshell_push"));
-        // An on-open step must never be fatal — it re-runs best-effort on resume.
-        assert!(!step_is_fatal("direnv_allow"));
-    }
 
     #[test]
     fn agent_config_upload_skips_transcripts_and_bulk() {
