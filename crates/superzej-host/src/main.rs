@@ -41,6 +41,7 @@ mod menu;
 mod metrics;
 mod mousefilter;
 mod nixcache;
+mod notify;
 mod palette;
 mod pane;
 mod panel;

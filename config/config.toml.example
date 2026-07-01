@@ -735,6 +735,57 @@ process_exit = "failures_and_tasks"
 # worktree_created = "notice" # demote less: show in the unread count
 # pr_state_changed = "info"   # silence: inbox-only
 
+# User routing rules (item 420). Evaluated top-to-bottom at delivery time; a rule
+# fires when EVERY present selector matches (absent selectors are wildcards):
+#   kind / kinds       — a single kind or a list (snake_case names)
+#   worktree           — glob over the worktree path (`*` any run, `?` any char)
+#   source             — prefix of the source ref ("linear:", "pr:", …)
+#   message            — regex matched against the message text
+#   min_priority       — only fire at/above "info"|"notice"|"alert"
+#   modes / profile    — only under this active routing mode / profile
+# Actions: set_priority ("info"|"notice"|"alert"), route (a subset of
+# "inbox"/"desktop"/"toast"/"sound"), mute (drop ephemeral channels, keep inbox),
+# drop (drop entirely), sound ("bell"|"off"|<command>), stop (halt evaluation).
+# [[notifications.rules]]
+# name = "mute scratch worktrees"
+# worktree = "*/scratch"
+# mute = true
+# [[notifications.rules]]
+# message = "flaky|known-issue"
+# drop = true
+# [[notifications.rules]]
+# kind = "agent_done"
+# set_priority = "alert"      # sound + break through DND when an agent finishes
+
+# Do-not-disturb / quiet hours (item 426). During DND, notifications below
+# `allow_priority` stay in the inbox but pop no desktop toast, in-app toast, or
+# sound. Toggle at runtime with Ctrl+Alt+d (the toggle overrides the schedule).
+#   windows — "HH:MM-HH:MM" ranges (may wrap past midnight) with an optional
+#             leading weekday token ("Sat", "mon-fri", "sat,sun").
+# [notifications.dnd]
+# enabled = false
+# windows = ["22:00-08:00", "sat,sun 00:00-24:00"]
+# allow_priority = "alert"
+
+# Sound / bell (item 429). `mode`: "bell" (terminal BEL, default), "command" (run
+# a command line off-thread), or "off". Only fires at/above `min_priority`.
+# [notifications.sound]
+# mode = "bell"
+# min_priority = "alert"
+# command = "paplay /usr/share/sounds/freedesktop/stereo/complete.oga"
+# [notifications.sound.per_priority]   # optional per-priority command overrides
+# alert = "paplay /usr/share/sounds/freedesktop/stereo/dialog-warning.oga"
+
+# Routing modes (item 427): named presets you switch between at runtime with
+# Ctrl+Alt+m. A rule's `modes` selector limits it to the listed modes;
+# `active_mode` sets the startup mode ("" = default). Per-profile overrides live
+# under `[profiles.<name>.notifications]` (same keys as `[notifications]`).
+# active_mode = ""
+# [notifications.modes.focus]
+# label = "Heads down"
+# [notifications.modes.away]
+# label = "Away"
+
 # Top pinned-program strip: a horizontal band above the center that renders
 # `location = "strip"` pins side by side (toggle Ctrl+Alt+t; grow/shrink at
 # runtime). `ratio` is the fraction of the center band it occupies.

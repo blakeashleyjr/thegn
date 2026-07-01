@@ -179,6 +179,10 @@ pub enum Action {
     MediaSelectPlaylist,
     /// Open the picker to choose which player to control.
     MediaSelectPlayer,
+    /// Toggle do-not-disturb (quiet notifications) on/off (item 426).
+    NotifyDndToggle,
+    /// Cycle the active notification routing mode (item 427).
+    NotifyModeCycle,
     Quit,
     Custom(u16),
 }
@@ -796,6 +800,21 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         default_chords: &["Alt m o"],
         palette: true,
     },
+    // Notification routing (items 426/427).
+    ActionSpec {
+        id: "notify-dnd-toggle",
+        label: "Notifications: Toggle do-not-disturb",
+        hint: "dnd",
+        default_chords: &["Ctrl Alt d"],
+        palette: true,
+    },
+    ActionSpec {
+        id: "notify-mode-cycle",
+        label: "Notifications: Cycle routing mode",
+        hint: "notif mode",
+        default_chords: &["Ctrl Alt m"],
+        palette: true,
+    },
 ];
 
 pub fn action_specs() -> &'static [ActionSpec] {
@@ -1003,6 +1022,8 @@ impl Action {
             Action::MediaVolumeDown => "media-volume-down",
             Action::MediaSelectPlaylist => "media-select-playlist",
             Action::MediaSelectPlayer => "media-select-player",
+            Action::NotifyDndToggle => "notify-dnd-toggle",
+            Action::NotifyModeCycle => "notify-mode-cycle",
             Action::Quit => "quit",
             Action::Custom(_) => "custom-action",
         }
@@ -1096,6 +1117,8 @@ impl Action {
             "media-volume-down" => Action::MediaVolumeDown,
             "media-select-playlist" | "media-playlist" => Action::MediaSelectPlaylist,
             "media-select-player" | "media-player" => Action::MediaSelectPlayer,
+            "notify-dnd-toggle" | "dnd" | "dnd-toggle" => Action::NotifyDndToggle,
+            "notify-mode-cycle" | "notify-mode" => Action::NotifyModeCycle,
             // `summon-pin-N` / `pin-N` → SummonPin(N) (1..=9);
             // `summon-workspace-N` / `workspace-N` → SummonWorkspace(N) (1..=9).
             other => {
@@ -1650,6 +1673,10 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Alt m l", Action::MediaSelectPlaylist)
         .unwrap();
     map.insert_all("Alt m o", Action::MediaSelectPlayer)
+        .unwrap();
+    map.insert_all("Ctrl Alt d", Action::NotifyDndToggle)
+        .unwrap();
+    map.insert_all("Ctrl Alt m", Action::NotifyModeCycle)
         .unwrap();
 
     // Vim-normal mode: one-key navigation plus leader-like Space sequences.
@@ -2548,6 +2575,7 @@ mod tests {
                 default_mode: "emacs".into(),
                 keybinds: Default::default(),
                 sandbox: Default::default(),
+                notifications: Default::default(),
             },
         );
         let cfg = superzej_core::config::Config {

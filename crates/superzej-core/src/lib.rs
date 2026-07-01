@@ -48,6 +48,7 @@ pub mod metrics;
 pub mod models;
 pub mod msg;
 pub mod notification;
+pub mod notification_route;
 pub mod out;
 pub mod patch;
 pub mod picker;

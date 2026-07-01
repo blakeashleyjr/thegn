@@ -8706,6 +8706,15 @@ async fn event_loop<T: Terminal>(
     );
 
     let mut current_config = keymap.config().clone();
+    // Notification routing runtime (rules / DND / modes / sound). Threaded to
+    // every dispatch site; the loop consumes the latched bell + reads DND/mode
+    // for the status chip. Built from the effective (global + profile) config;
+    // refreshed on live config reload.
+    let notify_state = crate::notify::NotifyState::new(
+        current_config.effective_notifications(None),
+        current_config.profile.clone(),
+        waker.clone(),
+    );
 
     // First-launch keymap picker (item 621). Skip entirely when the user has set
     // `keymap_preset` in config (an explicit choice). Otherwise apply a preset
@@ -10004,6 +10013,7 @@ async fn event_loop<T: Terminal>(
                                                 exit_code, is_shell, policy,
                                             );
                                         let bus = event_bus.clone();
+                                        let nstate = notify_state.clone();
                                         tokio::task::spawn_blocking(move || {
                                             let Ok(db) = superzej_core::db::Db::open() else {
                                                 return;
@@ -10025,8 +10035,14 @@ async fn event_loop<T: Terminal>(
                                                     "agent {} in {base}",
                                                     if failed { "crashed" } else { "finished" }
                                                 );
-                                                let _ =
-                                                    db.put_notification(kind, &issue_id, &msg, &wt);
+                                                // Routing gate: a rule may drop this
+                                                // from the inbox; a sound fires per the
+                                                // decision (agent panes have no desktop
+                                                // event, matching prior behavior).
+                                                let (dec, _) = crate::notify::record(
+                                                    &db, &nstate, kind, &issue_id, &msg, &wt,
+                                                );
+                                                nstate.emit_sound(&dec);
                                                 let _ = db.update_dispatch_status(
                                                     dispatch_id,
                                                     if failed { "failed" } else { "done" },
@@ -10058,11 +10074,14 @@ async fn event_loop<T: Terminal>(
                                                     format!("{label} finished")
                                                 }
                                             };
-                                            let _ = db.put_notification(kind, &program, &msg, &wt);
-                                            // Desktop toast (urgency gating decides
-                                            // whether it actually pops).
-                                            bus.publish_with_notification(
-                                                &superzej_core::event_bus::Event::ProcessExited {
+                                            // Routing gate: record (unless dropped),
+                                            // then desktop toast + sound only when the
+                                            // decision allows (rules / DND / modes).
+                                            let (dec, _) = crate::notify::record(
+                                                &db, &nstate, kind, &program, &msg, &wt,
+                                            );
+                                            let event =
+                                                superzej_core::event_bus::Event::ProcessExited {
                                                     worktree: wt.clone(),
                                                     program: program.clone(),
                                                     exit_code,
@@ -10070,8 +10089,16 @@ async fn event_loop<T: Terminal>(
                                                         outcome,
                                                         ProcessOutcome::Failed
                                                     ),
-                                                },
-                                            );
+                                                };
+                                            // Desktop urgency gating still applies in the
+                                            // notifier thread; the decision decides whether
+                                            // it is eligible at all.
+                                            if dec.desktop {
+                                                bus.publish_with_notification(&event);
+                                            } else {
+                                                bus.publish(&event);
+                                            }
+                                            nstate.emit_sound(&dec);
                                         });
                                     }
                                 }
@@ -10299,25 +10326,34 @@ async fn event_loop<T: Terminal>(
                 if outcome.exit_code != Some(0) {
                     let wt = outcome.worktree.clone();
                     let failed = panel_ui.tests.summary.failed;
+                    let msg = format!(
+                        "tests: {} failure{}",
+                        failed,
+                        if failed == 1 { "" } else { "s" }
+                    );
+                    // Route the failure: rules / DND / modes decide the desktop
+                    // toast + sound; the inbox record is gated by a drop rule.
+                    let dec = notify_state.decide("test_failed", &wt, &msg, &wt);
+                    let event = superzej_core::event_bus::Event::TestsFailed {
+                        worktree: wt.clone(),
+                        count: failed,
+                    };
                     // Surface the failure on the event bus → desktop toast +
                     // sidebar alert badge (item 28/430).
-                    event_bus.publish_with_notification(
-                        &superzej_core::event_bus::Event::TestsFailed {
-                            worktree: wt.clone(),
-                            count: failed,
-                        },
-                    );
-                    tokio::task::spawn_blocking(move || {
-                        let Ok(db) = superzej_core::db::Db::open() else {
-                            return;
-                        };
-                        let msg = format!(
-                            "tests: {} failure{}",
-                            failed,
-                            if failed == 1 { "" } else { "s" }
-                        );
-                        let _ = db.put_notification("test_failed", &wt, &msg, &wt);
-                    });
+                    if dec.desktop {
+                        event_bus.publish_with_notification(&event);
+                    } else {
+                        event_bus.publish(&event);
+                    }
+                    notify_state.emit_sound(&dec);
+                    if dec.record {
+                        tokio::task::spawn_blocking(move || {
+                            let Ok(db) = superzej_core::db::Db::open() else {
+                                return;
+                            };
+                            let _ = db.put_notification("test_failed", &wt, &msg, &wt);
+                        });
+                    }
                 }
                 model.status = format!(
                     "Tests finished in {:.1}s: {}",
@@ -11267,24 +11303,29 @@ async fn event_loop<T: Terminal>(
                     {
                         let branch = payload.branch.clone();
                         let path = payload.path.clone();
+                        let msg = format!("worktree {} ready", branch);
+                        // Route: rules / DND / modes decide the (low-urgency)
+                        // desktop toast + sound; a drop rule gates the record.
+                        let dec = notify_state.decide("worktree_created", &path, &msg, &path);
+                        let event = superzej_core::event_bus::Event::WorktreeCreated {
+                            path: path.clone(),
+                            branch: branch.clone(),
+                        };
                         // Announce on the event bus (low-urgency desktop toast).
-                        event_bus.publish_with_notification(
-                            &superzej_core::event_bus::Event::WorktreeCreated {
-                                path: path.clone(),
-                                branch: branch.clone(),
-                            },
-                        );
-                        tokio::task::spawn_blocking(move || {
-                            let Ok(db) = superzej_core::db::Db::open() else {
-                                return;
-                            };
-                            let _ = db.put_notification(
-                                "worktree_created",
-                                &path,
-                                &format!("worktree {} ready", branch),
-                                &path,
-                            );
-                        });
+                        if dec.desktop {
+                            event_bus.publish_with_notification(&event);
+                        } else {
+                            event_bus.publish(&event);
+                        }
+                        notify_state.emit_sound(&dec);
+                        if dec.record {
+                            tokio::task::spawn_blocking(move || {
+                                let Ok(db) = superzej_core::db::Db::open() else {
+                                    return;
+                                };
+                                let _ = db.put_notification("worktree_created", &path, &msg, &path);
+                            });
+                        }
                     }
                     if let Some(cp) = creating.take() {
                         cp.stop_ticker();
@@ -11499,6 +11540,9 @@ async fn event_loop<T: Terminal>(
                     panel_ui.set_order(crate::panel::resolve_order(&new_cfg));
                     panel_ui.docs.cfg_keys = crate::keyhint::cheatsheet_groups(&new_cfg);
                     current_config = new_cfg;
+                    // Live notification-routing reload: swap in the reloaded
+                    // rules/DND/sound/modes (preserving the runtime mode/toggle).
+                    notify_state.update_cfg(current_config.effective_notifications(None));
                     // Live media toggle: (re)spawn or stop the watcher to match the
                     // reloaded `[media]` config.
                     restart_media_watch(
@@ -12021,6 +12065,11 @@ async fn event_loop<T: Terminal>(
             // only) so the sidebar's dynamic row titles track the focused pane's
             // current title. Cheap in-memory map build; never blocks the loop.
             model.sidebar_window_titles = collect_window_titles(&session, &panes);
+            // Notification routing chip state (DND + active mode), read fresh so a
+            // scheduled DND window flips the chip as time passes (evaluated at
+            // render time — no timer).
+            model.notify_dnd = notify_state.dnd_active();
+            model.notify_mode = notify_state.active_mode();
             let tree = if zoom == Some(crate::focus::Zone::Center) {
                 crate::center::CenterTree::Leaf(focused)
             } else {
@@ -12644,6 +12693,16 @@ async fn event_loop<T: Terminal>(
                 let mut out = std::io::stdout();
                 out.write_all(bytes.as_bytes()).context("render")?;
                 out.flush().context("terminal flush")?;
+            }
+            // Terminal bell (item 429): a latched notification sound. Written on
+            // the loop thread right after the frame flush so it never interleaves
+            // with termwiz's writes; BEL neither moves the cursor nor prints, so
+            // it is safe between frames. Best-effort.
+            if notify_state.take_bell() {
+                use std::io::Write as _;
+                let mut out = std::io::stdout();
+                let _ = out.write_all(b"\x07");
+                let _ = out.flush();
             }
             // Corner kitty images ride ON TOP of the cell frame: emit the queued,
             // repositioned graphics AFTER the diff is flushed. Images aren't cells
@@ -14085,7 +14144,7 @@ async fn event_loop<T: Terminal>(
                                     }) {
                                     Ok(WorkspaceResolution::Repo(created)) => {
                                         workspace_pool.stash(prev_id, snapshot);
-                                        remap_cold_workspace_ids(&mut session, &mut panes, false);
+                                        remap_cold_workspace_ids(&mut session, &mut panes);
                                         focus.zone = crate::focus::Zone::Center;
                                         refresh_tab_model(&mut model, &session, &mut sb);
                                         sync_drawer_persistence(
@@ -19607,6 +19666,22 @@ async fn event_loop<T: Terminal>(
                                 } else {
                                     model.status = "Media is off ([media] enabled = false)".into();
                                 }
+                            }
+                            Action::NotifyDndToggle => {
+                                let on = notify_state.toggle_dnd();
+                                model.status = if on {
+                                    "Do-not-disturb: on (only alerts break through)".into()
+                                } else {
+                                    "Do-not-disturb: off".into()
+                                };
+                            }
+                            Action::NotifyModeCycle => {
+                                let mode = notify_state.cycle_mode();
+                                model.status = if mode.is_empty() {
+                                    "Notification mode: default".into()
+                                } else {
+                                    format!("Notification mode: {mode}")
+                                };
                             }
                         }
                         dirty = true;

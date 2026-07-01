@@ -1260,6 +1260,11 @@ pub struct ProfileConfig {
     /// without touching per-repo config.
     #[serde(skip_serializing_if = "SandboxOverlay::is_empty")]
     pub sandbox: SandboxOverlay,
+    /// Notification routing overrides for this profile (item 427). Applied after
+    /// the global `[notifications]` and before any repo-root overlay, so
+    /// per-profile rules/DND/sound take effect without touching per-repo config.
+    #[serde(skip_serializing_if = "NotificationsOverlay::is_empty")]
+    pub notifications: NotificationsOverlay,
 }
 
 /// Per-workspace config (`[workspace.<slug>.keybinds]`), keyed by repo slug.
@@ -3638,6 +3643,10 @@ impl RemoteOverlay {
 struct RepoConfigFile {
     sandbox: SandboxOverlay,
     keybinds: KeybindConfig,
+    /// Per-repo notification routing overlay, applied on top of global +
+    /// profile (see [`Config::effective_notifications`]).
+    #[serde(default)]
+    notifications: NotificationsOverlay,
     /// Selects a named `[env.<name>]` for every worktree of this repo (the
     /// repo-level layer of env selection). Empty ⇒ inherit the global default.
     #[serde(default)]
@@ -3726,6 +3735,29 @@ pub struct NotificationsConfig {
     /// unknown keys/values are ignored. `alert` raises the red flag, `notice`
     /// the neutral unread count, `info` is inbox-only (never counted).
     pub priority: std::collections::BTreeMap<String, String>,
+    /// Ordered user routing rules (item 420). Each rule matches on any subset of
+    /// selectors (kind/worktree/source/message/priority/mode/profile) and acts by
+    /// overriding priority, restricting channels, muting, dropping, or setting a
+    /// sound. Evaluated top-to-bottom by [`crate::notification_route::decide`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<NotificationRule>,
+    /// Do-not-disturb / quiet-hours (item 426): suppress ephemeral channels
+    /// (desktop/toast/sound) for notifications below `allow_priority` during a
+    /// configured window or when toggled on at runtime. The inbox always records.
+    pub dnd: DndConfig,
+    /// Audible sound/bell channel (item 429): terminal `BEL` (default), a
+    /// configured command, or off — gated by `min_priority`.
+    pub sound: SoundConfig,
+    /// Named routing modes (item 427): a rule with a `modes` selector only
+    /// applies when the active mode is listed. Values are presets you switch
+    /// between at runtime (e.g. `focus`, `away`). The map value carries an
+    /// optional human label; membership is what matters.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub modes: std::collections::BTreeMap<String, NotificationMode>,
+    /// The routing mode active at startup (`""` ⇒ no mode / the default set of
+    /// rules with an empty `modes` selector). Switchable at runtime.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub active_mode: String,
 }
 
 impl Default for NotificationsConfig {
@@ -3735,6 +3767,11 @@ impl Default for NotificationsConfig {
             desktop_min_urgency: "normal".into(),
             process_exit: "failures_and_tasks".into(),
             priority: std::collections::BTreeMap::new(),
+            rules: Vec::new(),
+            dnd: DndConfig::default(),
+            sound: SoundConfig::default(),
+            modes: std::collections::BTreeMap::new(),
+            active_mode: String::new(),
         }
     }
 }
@@ -3772,6 +3809,227 @@ impl NotificationsConfig {
     /// query so informational kinds are never counted.
     pub fn counted_unread_kind_names(&self) -> Vec<&'static str> {
         self.kind_names_at_or_above(crate::notification::Priority::Notice)
+    }
+
+    /// True when routing rules are present. The host uses this to decide between
+    /// the SQL kind-level count fast path (no rules) and rule-aware Rust
+    /// aggregation over loaded rows.
+    pub fn has_rules(&self) -> bool {
+        !self.rules.is_empty()
+    }
+}
+
+/// serde `skip_serializing_if` helper for `bool` fields (skips `false`).
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+config_enum! {
+    /// `[notifications.sound] mode` — how the audible cue is produced. `bell`
+    /// writes a terminal `BEL` on the next render flush; `command` runs a
+    /// configured command off-thread; `off` is silent.
+    pub enum SoundMode: "notification sound mode" {
+        Off = "off" | "none" | "silent",
+        Bell = "bell" | "beep" | "terminal",
+        Command = "command" | "cmd" | "exec",
+    } default = Bell;
+}
+
+/// One user routing rule (`[[notifications.rules]]`, item 420). All present
+/// selectors must match for the rule to fire (absent selectors are wildcards);
+/// the action then reshapes the [`crate::notification_route::RouteDecision`].
+/// Matching + regex/glob compilation live in `notification_route.rs`; this is
+/// pure config data.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct NotificationRule {
+    /// Optional human note (ignored by matching).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    // --- selectors ---
+    /// Match a single kind (snake_case, e.g. `"test_failed"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Match any of these kinds (union with `kind`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<String>,
+    /// Glob over the notification's `worktree_path` (`*` any run, `?` any char).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    /// Prefix match on `source_ref` (e.g. `"linear:"`, `"pr:"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Regex matched against the message text (unanchored).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Only fire when the (base) effective priority is `>=` this
+    /// (`"info"`/`"notice"`/`"alert"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_priority: Option<String>,
+    /// Only fire when the active routing mode is one of these (empty = any mode).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub modes: Vec<String>,
+    /// Only fire under this active profile (empty = any profile).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    // --- actions ---
+    /// Override the effective priority (`"info"`/`"notice"`/`"alert"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub set_priority: Option<String>,
+    /// Restrict delivery to this channel subset. Values from
+    /// `inbox`/`desktop`/`toast`/`sound`. `None` ⇒ leave channels at default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route: Option<Vec<String>>,
+    /// Suppress every ephemeral channel (desktop/toast/sound); inbox still records.
+    #[serde(skip_serializing_if = "is_false")]
+    pub mute: bool,
+    /// Drop entirely — no inbox record, no delivery.
+    #[serde(skip_serializing_if = "is_false")]
+    pub drop: bool,
+    /// Override the sound: `"bell"`, `"off"`, or a command string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sound: Option<String>,
+    /// Stop evaluating further rules after this one matches.
+    #[serde(skip_serializing_if = "is_false")]
+    pub stop: bool,
+}
+
+/// `[notifications.dnd]` — do-not-disturb / quiet hours (item 426).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct DndConfig {
+    /// Startup state of the manual toggle. The runtime toggle overrides the
+    /// schedule; this seeds it.
+    pub enabled: bool,
+    /// Quiet windows, each `"HH:MM-HH:MM"` with an optional leading weekday token
+    /// (`"Sat"`, `"mon-fri"`); ranges may wrap past midnight (`"22:00-08:00"`).
+    /// Empty ⇒ no scheduled DND (only the manual toggle applies).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<String>,
+    /// Notifications at or above this priority still deliver during DND
+    /// (`"info"`/`"notice"`/`"alert"`, default `"alert"`).
+    pub allow_priority: String,
+}
+
+impl Default for DndConfig {
+    fn default() -> Self {
+        DndConfig {
+            enabled: false,
+            windows: Vec::new(),
+            allow_priority: "alert".into(),
+        }
+    }
+}
+
+/// `[notifications.sound]` — the audible cue (item 429).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct SoundConfig {
+    /// How to produce the cue: `bell` (default), `command`, or `off`.
+    pub mode: SoundMode,
+    /// Minimum effective priority that makes a sound (`"info"`/`"notice"`/
+    /// `"alert"`, default `"alert"`).
+    pub min_priority: String,
+    /// Command for `mode = "command"` (run best-effort, off-thread). A literal
+    /// command line, e.g. `"paplay /usr/share/sounds/alert.oga"`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub command: String,
+    /// Optional per-priority command overrides (keys `info`/`notice`/`alert`),
+    /// consulted before `command` when `mode = "command"`.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub per_priority: std::collections::BTreeMap<String, String>,
+}
+
+impl Default for SoundConfig {
+    fn default() -> Self {
+        SoundConfig {
+            mode: SoundMode::Bell,
+            min_priority: "alert".into(),
+            command: String::new(),
+            per_priority: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+/// `[notifications.modes.<name>]` — a named routing mode (item 427). Currently
+/// just an optional label; membership drives rule `modes` selectors.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct NotificationMode {
+    /// Human label for the status chip / palette (defaults to the map key).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub label: String,
+}
+
+/// `[profiles.<p>.notifications]` — per-profile routing overlay (item 427).
+/// Present fields replace the corresponding global `[notifications]` fields for
+/// the active profile; absent fields inherit. Mirrors [`SandboxOverlay`].
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct NotificationsOverlay {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desktop: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desktop_min_urgency: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_exit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rules: Option<Vec<NotificationRule>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dnd: Option<DndConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sound: Option<SoundConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modes: Option<std::collections::BTreeMap<String, NotificationMode>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_mode: Option<String>,
+}
+
+impl NotificationsOverlay {
+    /// True when nothing is set — lets `ProfileConfig` skip serialization.
+    pub fn is_empty(&self) -> bool {
+        self.desktop.is_none()
+            && self.desktop_min_urgency.is_none()
+            && self.process_exit.is_none()
+            && self.priority.is_none()
+            && self.rules.is_none()
+            && self.dnd.is_none()
+            && self.sound.is_none()
+            && self.modes.is_none()
+            && self.active_mode.is_none()
+    }
+
+    /// Apply present fields onto `base` (present wins, absent inherits).
+    pub fn apply(self, base: &mut NotificationsConfig) {
+        if let Some(v) = self.desktop {
+            base.desktop = v;
+        }
+        if let Some(v) = self.desktop_min_urgency {
+            base.desktop_min_urgency = v;
+        }
+        if let Some(v) = self.process_exit {
+            base.process_exit = v;
+        }
+        if let Some(v) = self.priority {
+            base.priority = v;
+        }
+        if let Some(v) = self.rules {
+            base.rules = v;
+        }
+        if let Some(v) = self.dnd {
+            base.dnd = v;
+        }
+        if let Some(v) = self.sound {
+            base.sound = v;
+        }
+        if let Some(v) = self.modes {
+            base.modes = v;
+        }
+        if let Some(v) = self.active_mode {
+            base.active_mode = v;
+        }
     }
 }
 
@@ -4741,6 +4999,28 @@ impl Config {
             layers.push(overlay.keybinds);
         }
         layers
+    }
+
+    /// The effective notification config: the global `[notifications]` with the
+    /// active profile's `[profiles.<p>.notifications]` overlay applied on top,
+    /// then a repo-root `.superzej.*` overlay when a worktree is in scope. Follows
+    /// the same precedence as [`Self::effective_keybinds`] / [`Self::repo_sandbox`].
+    /// `repo_root` is `None` outside a workspace (e.g. the home tab).
+    pub fn effective_notifications(
+        &self,
+        repo_root: Option<&std::path::Path>,
+    ) -> NotificationsConfig {
+        let mut n = self.notifications.clone();
+        if let Some(p) = self.active_profile() {
+            p.notifications.clone().apply(&mut n);
+        }
+        if let Some(root) = repo_root
+            && let Some(overlay) = load_repo_overlay(root)
+            && !overlay.notifications.is_empty()
+        {
+            overlay.notifications.apply(&mut n);
+        }
+        n
     }
 
     /// The effective sandbox config for a worktree's repo: the global `[sandbox]`
@@ -7515,6 +7795,154 @@ transport = \"ssh\"
         cfg.priority
             .insert("worktree_created".into(), "alert".into());
         assert!(cfg.alert_kind_names().contains(&"worktree_created"));
+    }
+
+    #[test]
+    fn notification_routing_config_parses() {
+        let toml = r#"
+[notifications]
+active_mode = "focus"
+
+[notifications.dnd]
+enabled = true
+windows = ["22:00-08:00", "sat,sun 00:00-24:00"]
+allow_priority = "notice"
+
+[notifications.sound]
+mode = "command"
+min_priority = "notice"
+command = "paplay alert.oga"
+
+[notifications.sound.per_priority]
+alert = "paplay crit.oga"
+
+[notifications.modes.focus]
+label = "Heads down"
+
+[[notifications.rules]]
+name = "mute noisy"
+worktree = "*/scratch"
+mute = true
+
+[[notifications.rules]]
+kind = "agent_done"
+set_priority = "alert"
+stop = true
+"#;
+        let cfg: Config = toml::from_str(toml).expect("parses");
+        let n = &cfg.notifications;
+        assert_eq!(n.active_mode, "focus");
+        assert!(n.dnd.enabled);
+        assert_eq!(n.dnd.windows.len(), 2);
+        assert_eq!(n.dnd.allow_priority, "notice");
+        assert_eq!(n.sound.mode, SoundMode::Command);
+        assert_eq!(n.sound.command, "paplay alert.oga");
+        assert_eq!(
+            n.sound.per_priority.get("alert").unwrap(),
+            "paplay crit.oga"
+        );
+        assert!(n.modes.contains_key("focus"));
+        assert_eq!(n.rules.len(), 2);
+        assert_eq!(n.rules[0].worktree.as_deref(), Some("*/scratch"));
+        assert!(n.rules[0].mute);
+        assert_eq!(n.rules[1].kind.as_deref(), Some("agent_done"));
+        assert!(n.rules[1].stop);
+    }
+
+    #[test]
+    fn notification_bad_sound_mode_warns_and_defaults() {
+        let cfg: Config = toml::from_str(
+            r#"
+[notifications.sound]
+mode = "bogus"
+"#,
+        )
+        .expect("parses");
+        // Unknown enum value warns and falls back to the default (Bell).
+        assert_eq!(cfg.notifications.sound.mode, SoundMode::Bell);
+    }
+
+    #[test]
+    fn profile_notifications_overlay_layers() {
+        let toml = r#"
+profile = "work"
+
+[notifications]
+desktop = true
+active_mode = "all"
+
+[notifications.sound]
+mode = "bell"
+
+[profiles.work.notifications]
+active_mode = "focus"
+
+[profiles.work.notifications.sound]
+mode = "off"
+min_priority = "alert"
+"#;
+        let cfg: Config = toml::from_str(toml).expect("parses");
+        // Global untouched.
+        assert_eq!(cfg.notifications.active_mode, "all");
+        assert_eq!(cfg.notifications.sound.mode, SoundMode::Bell);
+        // Effective (no repo root) applies the active profile overlay.
+        let eff = cfg.effective_notifications(None);
+        assert_eq!(eff.active_mode, "focus");
+        assert_eq!(eff.sound.mode, SoundMode::Off);
+        // A field the overlay didn't set inherits the global value.
+        assert!(eff.desktop);
+    }
+
+    #[test]
+    fn effective_notifications_no_profile_is_identity() {
+        let cfg = Config::default();
+        let eff = cfg.effective_notifications(None);
+        assert_eq!(eff.active_mode, cfg.notifications.active_mode);
+        assert_eq!(eff.sound.mode, cfg.notifications.sound.mode);
+    }
+
+    #[test]
+    fn notifications_overlay_apply_covers_every_field() {
+        // is_empty on the default overlay.
+        assert!(NotificationsOverlay::default().is_empty());
+
+        let mut base = NotificationsConfig::default();
+        let mut priority = std::collections::BTreeMap::new();
+        priority.insert("agent_done".to_string(), "alert".to_string());
+        let mut modes = std::collections::BTreeMap::new();
+        modes.insert("focus".to_string(), NotificationMode::default());
+        let overlay = NotificationsOverlay {
+            desktop: Some(false),
+            desktop_min_urgency: Some("critical".into()),
+            process_exit: Some("all".into()),
+            priority: Some(priority),
+            rules: Some(vec![NotificationRule {
+                drop: true,
+                ..Default::default()
+            }]),
+            dnd: Some(DndConfig {
+                enabled: true,
+                windows: vec!["22:00-08:00".into()],
+                allow_priority: "notice".into(),
+            }),
+            sound: Some(SoundConfig {
+                mode: SoundMode::Off,
+                ..Default::default()
+            }),
+            modes: Some(modes),
+            active_mode: Some("focus".into()),
+        };
+        assert!(!overlay.is_empty());
+        overlay.apply(&mut base);
+        assert!(!base.desktop);
+        assert_eq!(base.desktop_min_urgency, "critical");
+        assert_eq!(base.process_exit, "all");
+        assert_eq!(base.priority.get("agent_done").unwrap(), "alert");
+        assert!(base.has_rules());
+        assert!(base.dnd.enabled);
+        assert_eq!(base.sound.mode, SoundMode::Off);
+        assert!(base.modes.contains_key("focus"));
+        assert_eq!(base.active_mode, "focus");
     }
 
     #[test]
