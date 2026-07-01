@@ -552,6 +552,28 @@ impl LlmProxyConfig {
         v
     }
 
+    /// Env for an agent running ON THE HOST (not a sandbox) so its model traffic
+    /// routes through the proxy over the LOCAL `listen` loopback directly — no
+    /// tunnel, no relay. Mirrors [`remote_agent_env`](Self::remote_agent_env) but
+    /// always targets `http://127.0.0.1:<listen-port>`, so it stays correct even
+    /// when `remote_base_url` points at an external endpoint used for *remote*
+    /// sandboxes. Sets `ANTHROPIC_BASE_URL` (claude/codex/Anthropic SDK) + the
+    /// `SUPERZEJ_PROXY_*` vars the pi extension reads. Empty unless `route_agent`;
+    /// no auth key (the pi extension falls back to its default), matching the
+    /// keyless sprite path. See [`crate::config::LlmProxyConfig`].
+    pub fn local_agent_env(&self) -> Vec<(String, String)> {
+        if !self.route_agent {
+            return Vec::new();
+        }
+        let url = format!("http://127.0.0.1:{}", self.listen_port());
+        vec![
+            ("ANTHROPIC_BASE_URL".to_string(), url.clone()),
+            ("SUPERZEJ_PROXY_BASE_URL".to_string(), url),
+            ("SUPERZEJ_PROXY_API".to_string(), self.agent_api.clone()),
+            ("SUPERZEJ_PROXY_MODEL".to_string(), self.agent_model.clone()),
+        ]
+    }
+
     /// The proxy base URL an in-remote agent should use, or `None` if remote
     /// routing is off. `remote_base_url = "auto"` ⇒ the in-sandbox reverse tunnel
     /// at `http://127.0.0.1:<proxy-port>` (superzej stands the tunnel up); an
@@ -8512,6 +8534,49 @@ transport = \"ssh\"
         assert!(
             aenv.iter()
                 .any(|(k, v)| k == "ANTHROPIC_BASE_URL" && v == "http://127.0.0.1:9999")
+        );
+    }
+
+    #[test]
+    fn local_agent_env_targets_host_loopback_regardless_of_remote_base_url() {
+        // Off by default.
+        assert!(LlmProxyConfig::default().local_agent_env().is_empty());
+        // `route_agent` on: always the LOCAL listen loopback, even when
+        // `remote_base_url` points at an external endpoint for remote sandboxes.
+        let lp = LlmProxyConfig {
+            route_agent: true,
+            remote_base_url: "https://proxy.example.ts.net".into(),
+            listen: "127.0.0.1:8383".into(),
+            ..Default::default()
+        };
+        let env = lp.local_agent_env();
+        let url = "http://127.0.0.1:8383";
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "ANTHROPIC_BASE_URL" && v == url),
+            "host agent uses the local loopback, not the external remote URL"
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "SUPERZEJ_PROXY_BASE_URL" && v == url),
+            "the pi extension's base URL is the local proxy"
+        );
+        assert!(env.iter().any(|(k, _)| k == "SUPERZEJ_PROXY_API"));
+        assert!(env.iter().any(|(k, _)| k == "SUPERZEJ_PROXY_MODEL"));
+        // Keyless (like the sprite path) — the pi extension falls back to default.
+        assert!(!env.iter().any(|(k, _)| k == "SUPERZEJ_PROXY_KEY"));
+        assert!(!env.iter().any(|(k, _)| k == "ANTHROPIC_API_KEY"));
+        // Honors a custom listen port.
+        let custom = LlmProxyConfig {
+            route_agent: true,
+            listen: "127.0.0.1:7000".into(),
+            ..Default::default()
+        };
+        assert!(
+            custom
+                .local_agent_env()
+                .iter()
+                .any(|(k, v)| k == "SUPERZEJ_PROXY_BASE_URL" && v == "http://127.0.0.1:7000")
         );
     }
 

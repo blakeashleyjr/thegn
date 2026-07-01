@@ -7541,6 +7541,19 @@ fn sandbox_halt_in(e: &anyhow::Error) -> Option<&crate::agent::SandboxHalt> {
 
 /// Map provisioning step views (from the off-loop env provisioner) into the
 /// splash's [`LoadStep`]s for a live "setting up your environment" loading screen.
+/// The startup-shell watchdog deadline: how long a just-attached login shell may
+/// emit no PTY output before it's treated as hung and swapped for a clean rc-free
+/// shell. A LOCAL shell should prompt in ~1-2s, so 8s is snappy-but-safe. A
+/// REMOTE/provider pane (`remote_env == true`) legitimately stays silent for far
+/// longer — opening a provider exec, resuming a cold sandbox, and (the big one) a
+/// first `direnv`/`nix develop` that builds the repo's devShell can sit silent for
+/// minutes — so it gets a generous 300s window; a genuinely hung remote shell still
+/// falls back, just later. Pure so the remote-vs-local choice is unit-tested (it
+/// regressed once when driven off a per-path DB blob that read empty for sprites).
+fn watchdog_deadline(remote_env: bool) -> std::time::Duration {
+    std::time::Duration::from_secs(if remote_env { 300 } else { 8 })
+}
+
 fn provision_load_steps(views: &[crate::agent::ProvisionStepView]) -> Vec<LoadStep> {
     use crate::agent::ProvisionState;
     views
@@ -8184,23 +8197,9 @@ async fn event_loop<T: Terminal>(
     const CRASH_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(2);
     let mut respawn_crash_count: std::collections::HashMap<(usize, usize), u32> =
         std::collections::HashMap::new();
-    // Startup-shell watchdog: a freshly-spawned shell that emits no PTY output
-    // within this window keeps the loading splash up forever (it clears on first
-    // output). The usual cause is a personal login shell whose startup files
-    // hang/error in a provisioned env. After the deadline we warn + fall back
-    // ONCE per tab to a clean rc-free shell. 8s: well past a healthy shell's
-    // prompt (~1-2s incl. a provider session open) but short enough that a hang
-    // doesn't sit there flashing.
-    const SHELL_OUTPUT_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(8);
-    // A REMOTE/provider pane legitimately produces no output for far longer than a
-    // local shell: opening a provider exec, resuming a suspended sandbox, and —
-    // the big one — a first-`direnv`/`nix develop` that builds the repo's devShell
-    // can sit SILENT for minutes while it evaluates + downloads a toolchain (e.g. a
-    // from-source rust build) before printing anything. Using the 8s local deadline
-    // there mistakes that build for a hung shell and swaps in a clean rc-free bash.
-    // Give remote panes a generous window so the build's first output clears the
-    // splash naturally; a genuinely hung remote shell still falls back, just later.
-    const SHELL_OUTPUT_WATCHDOG_REMOTE: std::time::Duration = std::time::Duration::from_secs(300);
+    // Startup-shell watchdog deadlines live in `watchdog_deadline` (module-level,
+    // unit-tested). It fires ONCE per tab (tracked here) to swap a hung login
+    // shell for a clean rc-free one.
     let mut shell_watchdog_fired: std::collections::HashSet<(usize, usize)> =
         std::collections::HashSet::new();
     // The new-worktree wizard (Alt+w) + its creation pipeline. The worker
@@ -9455,6 +9454,11 @@ async fn event_loop<T: Terminal>(
                             if claimed {
                                 // Bound to a ready spare — clear any loading lock and
                                 // open the pane straight against it (no provisioning).
+                                tracing::debug!(
+                                    target: "szhost::loading",
+                                    worktree = %gname,
+                                    "splash cleared: warm spare claimed (no provisioning)"
+                                );
                                 let _ = ptx.send((gname.clone(), ti, Vec::new()));
                                 let _ = wk.wake();
                                 crate::agent::launch_spec(&cfg, &wt, None, "shell")
@@ -9632,6 +9636,26 @@ async fn event_loop<T: Terminal>(
                                         .find(|(_, _, t)| t.center.pane_ids().contains(&id))
                                         .map(|(gi, ti, _)| (gi, ti))
                                 {
+                                    // Diagnostic: the splash clears the instant a pane
+                                    // emits its first byte — which for a provider/remote
+                                    // shell is the prompt, potentially BEFORE in-shell
+                                    // init (direnv/nix/agent) finishes ⇒ "premature
+                                    // shell". Log the worktree + remoteness so a repro
+                                    // pins whether this is the clear that fired.
+                                    if tracing::enabled!(target: "szhost::loading", tracing::Level::DEBUG)
+                                    {
+                                        let g = &session.worktrees[gi];
+                                        let remote = superzej_core::remote::GitLoc::for_worktree(
+                                            std::path::Path::new(&g.path),
+                                        )
+                                        .is_remote();
+                                        tracing::debug!(
+                                            target: "szhost::loading",
+                                            worktree = %g.name,
+                                            remote,
+                                            "splash cleared: first pane output"
+                                        );
+                                    }
                                     loading_state.remove(&(session.worktrees[gi].name.clone(), ti));
                                 }
                                 if Some(id) == corner && corner_kitty {
@@ -11579,19 +11603,23 @@ async fn event_loop<T: Terminal>(
         // container). Warn about the likely cause and fall back ONCE per tab to a
         // clean rc-free shell; the user's dotfiles are left untouched. Re-checked
         // cheaply on each wake (the 500ms ticker guarantees one) — no new timer.
-        if !model.load_steps.is_empty() && !center_dormant {
+        // Arm ONLY in the shell-attach wait — the loading phase's final "shell"
+        // step, after provisioning finished and we're waiting on the login shell
+        // to produce output. Never during clone/nix/devShell/cold-resume, where
+        // silence is expected (not a hung shell) — otherwise a slow provider
+        // provision trips the fallback and destroys the real shell.
+        if !center_dormant && model.load_steps.last().is_some_and(|s| s.label == "shell") {
             let gi = session.active;
             let ti = session.worktrees.get(gi).map(|g| g.active_tab).unwrap_or(0);
             // A provider/remote worktree gets the long deadline (a silent devShell
-            // build is not a hang); local keeps the snappy 8s.
-            let watchdog =
-                if superzej_core::remote::GitLoc::for_worktree(&active_tab_path(&session))
-                    .is_remote()
-                {
-                    SHELL_OUTPUT_WATCHDOG_REMOTE
-                } else {
-                    SHELL_OUTPUT_WATCHDOG
-                };
+            // build / cold-sprite resume is not a hang); local keeps the snappy 8s.
+            // Remoteness comes from the config-resolved ENV PLACEMENT via
+            // `load_context` (populated by `agent::loading_context`, non-empty only
+            // for a non-local provider/remote env) — NOT `GitLoc::for_worktree`,
+            // whose per-path `worktrees.location` DB lookup is empty on a fresh /
+            // just-cleared DB and would misclassify a sprite as local ⇒ the 8s
+            // deadline ⇒ premature rc-free-bash fallback.
+            let watchdog = watchdog_deadline(!model.load_context.is_empty());
             let leaf = (!shell_watchdog_fired.contains(&(gi, ti)))
                 .then(|| session.worktrees.get(gi).and_then(|g| g.tabs.get(ti)))
                 .flatten()
@@ -11781,12 +11809,21 @@ async fn event_loop<T: Terminal>(
 
         // -- 23. Log streams
         while let Ok(batch) = logs_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
             model.panel.log_lines_structured.extend(batch);
             if model.panel.log_lines_structured.len() > 1000 {
                 let overflow = model.panel.log_lines_structured.len() - 1000;
                 model.panel.log_lines_structured.drain(0..overflow);
             }
-            dirty = true;
+            // Only repaint when the Logs section is actually on screen. szhost
+            // tails its OWN szhost.log; under a verbose `SUPERZEJ_LOG` every
+            // rendered frame writes a log line, so an unconditional repaint here
+            // would feed the tailer → dirty → render → another log line → a
+            // ~10Hz full-frame feedback loop (0%-idle regression). Lines still
+            // accumulate into the model so they're present when the panel opens.
+            if want_panel && panel_ui.open == crate::panel::Section::Logs {
+                dirty = true;
+            }
         }
 
         // Ingress-share state from the supervisor threads: persist the row,
@@ -12020,6 +12057,23 @@ async fn event_loop<T: Terminal>(
                 bars: bars_dirty,
             };
             let frame_plan = crate::render_plan::plan(&damage, &overlays);
+            // Diagnostic: when a FULL frame is chosen, record which damage
+            // channel forced it (geometry `full`, chrome `dirty`, or `bars`) so
+            // a steady-state full-frame storm (0%-idle regression) can be traced
+            // to its dirtying source without reproducing blind. Free unless
+            // `SUPERZEJ_LOG=szhost::frame=debug`; skips per-pane content frames.
+            if matches!(frame_plan, crate::render_plan::RenderPlan::Full)
+                && tracing::enabled!(target: "szhost::frame", tracing::Level::DEBUG)
+            {
+                tracing::debug!(
+                    target: "szhost::frame",
+                    full = damage.full,
+                    chrome = damage.chrome,
+                    bars = damage.bars,
+                    panes = damage.panes.len(),
+                    "full frame chosen"
+                );
+            }
             // Rects recomposed by the incremental path; drive the bounded diff.
             let mut pane_diff_rects: Vec<Rect> = Vec::new();
             // Card titles: "{title} · {worktree-leaf}" — the OSC window title the
@@ -17124,6 +17178,22 @@ async fn event_loop<T: Terminal>(
                         None => keymap.dispatch(mode, input_key.clone()),
                     }
                 };
+                // Diagnostic: raw termwiz key + modifier bits (pre/post
+                // normalization) and the action they resolved to. Free unless
+                // `SUPERZEJ_LOG=szhost::input=debug`. This is the ground truth
+                // for chord-match bugs (e.g. a terminal dropping SHIFT on an
+                // arrow, or adding an enhancement flag that breaks exact match).
+                if tracing::enabled!(target: "szhost::input", tracing::Level::DEBUG) {
+                    tracing::debug!(
+                        target: "szhost::input",
+                        raw_key = ?k.key,
+                        raw_mods = ?k.modifiers,
+                        norm_key = ?input_key.code,
+                        norm_mods = ?input_key.mods,
+                        result = ?dispatch,
+                        "key dispatch"
+                    );
+                }
                 match dispatch {
                     crate::sequence::MatchResult::Matched(action) => {
                         use crate::keymap::Action;
@@ -19756,6 +19826,16 @@ mod tests {
     use crate::center::CenterTree;
     use crate::hydrate::build_model;
     use crate::session::{GroupKind, Session, WorktreeGroup};
+
+    #[test]
+    fn watchdog_deadline_gives_provider_panes_the_long_window() {
+        // Local shell: snappy 8s. A remote/provider (sprite) pane: 300s, so a cold
+        // resume + devShell build isn't mistaken for a hung shell (the restart→bash
+        // regression). The bool is the config-resolved placement signal.
+        assert_eq!(watchdog_deadline(false), std::time::Duration::from_secs(8));
+        assert_eq!(watchdog_deadline(true), std::time::Duration::from_secs(300));
+        assert!(watchdog_deadline(true) > watchdog_deadline(false));
+    }
 
     #[test]
     fn read_scoped_file_reads_inside_and_rejects_escape() {
