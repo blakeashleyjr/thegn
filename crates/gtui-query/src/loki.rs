@@ -17,6 +17,9 @@ impl Default for LokiSource {
     }
 }
 
+#[allow(unused_imports)]
+use crate::loki_parser::parse_loki_response;
+
 impl DataSource for LokiSource {
     fn query(
         &self,
