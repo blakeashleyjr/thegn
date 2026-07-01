@@ -1,0 +1,11 @@
+[package]
+name = "gtui-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gtui-core = { path = "../gtui-core" }
+sz-kit = { path = "../sz-kit" }
+anyhow = { workspace = true }
+ratatui = "0.30.2"
