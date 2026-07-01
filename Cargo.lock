@@ -2897,6 +2897,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "superzej-metrics",
  "tokio",
 ]
 

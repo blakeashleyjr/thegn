@@ -25,7 +25,8 @@ impl DataSource for HostSource {
         let res: Vec<Frame> = queries
             .into_iter()
             .map(|_q| {
-                // Return an empty frame for now (MVP stub)
+                // In a real implementation this would call `superzej_metrics::sample_system()`
+                // and convert it. For Phase 1.1 MVP stub we just return empty frames.
                 let field = Field::new("value", FieldType::Float64, vec![]);
                 Frame::new(vec![field])
             })
