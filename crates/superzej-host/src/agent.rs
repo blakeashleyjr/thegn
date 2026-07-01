@@ -88,12 +88,16 @@ fn shell_inner(in_oci: bool) -> String {
             .map(|s| format!("command -v {s} >/dev/null 2>&1 && exec {s} -l; "))
             .collect();
         // Put the nix profile dirs on PATH FIRST so a `nix profile install`ed shell
-        // (zsh from nixpkgs) is actually found by `command -v` — covers both the
-        // single-user (`~/.nix-profile`) and daemon/system (Determinate `--init
-        // none`) profiles. Without this the checks miss the installed zsh and drop
-        // to `/bin/sh`. The trailing `/bin/sh -l` is the universal fallback.
+        // (zsh from nixpkgs) is actually found by `command -v` — covers the
+        // single-user (`~/.nix-profile`), daemon/system (Determinate `--init none`,
+        // `/nix/var/nix/profiles/default`), the Determinate per-user profile
+        // (`~/.local/state/nix/profile/bin`, where `nix profile install` lands on
+        // a Determinate install), and `~/.local/bin`. Without these the checks miss
+        // the installed zsh/starship and drop to `/bin/sh`. The trailing
+        // `/bin/sh -l` is the universal fallback.
         format!(
-            "export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH\"; \
+            "export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:\
+             $HOME/.local/state/nix/profile/bin:$HOME/.local/bin:$PATH\"; \
              {checks}exec /bin/sh -l"
         )
     } else {
@@ -2896,6 +2900,10 @@ fn upload_atuin_creds(
 /// auth + settings and can't hang/502 pushing transcripts over the per-file fs API.
 const AGENT_STATE_SKIP_DIRS: &[&str] = &[
     "projects",        // claude: per-repo session transcripts (the 502/hang source)
+    "file-history",    // claude: ~500 MB of tiny edit-history blobs — the 502/hang source
+    "plugins",         // claude: bulky plugin trees, not auth/config
+    "backups",         // claude: rolling config backups
+    "paste-cache",     // claude: transient paste spool
     "todos",           // claude runtime scratch
     "statsig",         // claude telemetry cache
     "shell-snapshots", // claude runtime
