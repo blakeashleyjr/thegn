@@ -1061,16 +1061,48 @@ impl SpritesProvider {
     /// selects the wire framing: raw (PTY) vs 1-byte stream-id prefixes (non-PTY).
     async fn start_session(&self, url: String, tty: bool) -> Result<ExecSession> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-        let mut req = url
-            .into_client_request()
-            .context("sprites: build exec ws request")?;
-        let auth = format!("Bearer {}", self.token)
-            .parse()
-            .context("sprites: exec auth header")?;
-        req.headers_mut().insert("Authorization", auth);
-        let (ws, _resp) = tokio_tungstenite::connect_async(req)
-            .await
-            .context("sprites: exec ws connect")?;
+        let auth: tokio_tungstenite::tungstenite::http::HeaderValue =
+            format!("Bearer {}", self.token)
+                .parse()
+                .context("sprites: exec auth header")?;
+        // A freshly-created sprite's exec endpoint isn't up during its first cold
+        // boot, so a single `connect_async` hangs on a dead endpoint (~OS timeout)
+        // and then fatally aborts the provision's `workspace` step. Retry with a
+        // short per-attempt timeout + backoff so the connect lands the moment the
+        // sprite warms, within a bounded budget (a genuinely unreachable sprite
+        // still errors, just after the budget rather than on a lone long hang).
+        const ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+        const CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
+        const BACKOFF: std::time::Duration = std::time::Duration::from_secs(3);
+        let start = std::time::Instant::now();
+        let ws = loop {
+            let mut req = url
+                .clone()
+                .into_client_request()
+                .context("sprites: build exec ws request")?;
+            req.headers_mut().insert("Authorization", auth.clone());
+            match tokio::time::timeout(ATTEMPT_TIMEOUT, tokio_tungstenite::connect_async(req)).await
+            {
+                Ok(Ok((ws, _resp))) => break ws,
+                res => {
+                    if start.elapsed() >= CONNECT_BUDGET {
+                        return match res {
+                            Ok(Err(e)) => Err(e).context("sprites: exec ws connect"),
+                            _ => Err(anyhow!(
+                                "sprites: exec ws connect timed out after {}s (sandbox never became ready)",
+                                CONNECT_BUDGET.as_secs()
+                            )),
+                        };
+                    }
+                    tracing::debug!(
+                        target: "szhost::sandbox",
+                        elapsed_s = start.elapsed().as_secs(),
+                        "sprite exec endpoint not ready (cold boot?); retrying connect"
+                    );
+                    tokio::time::sleep(BACKOFF).await;
+                }
+            }
+        };
 
         let (frames_tx, frames_rx) = tokio::sync::mpsc::channel::<ExecFrame>(256);
         let (control_tx, control_rx) = tokio::sync::mpsc::channel::<ExecControl>(256);
