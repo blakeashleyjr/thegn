@@ -40,4 +40,4 @@
 ## 7. Docs
 
 - [x] 7.1 README compatibility section; CLAUDE.md rendering note.
-- [ ] 7.2 `openspec validate --strict`.
+- [x] 7.2 `openspec validate --strict`.
