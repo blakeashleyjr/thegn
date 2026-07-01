@@ -1,0 +1,12 @@
+[package]
+name = "gtui-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+polars = { version = "0.45", features = ["dtype-datetime", "dtype-struct"] }
+chrono = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+thiserror = "2.0.18"

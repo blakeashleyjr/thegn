@@ -1,0 +1,15 @@
+[package]
+name = "gtui-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gtui-core = { path = "../gtui-core" }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

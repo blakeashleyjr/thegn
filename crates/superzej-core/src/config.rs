@@ -7116,7 +7116,7 @@ strategy = \"clean\"
         };
         HomeOverlay::default().apply(&mut on);
         assert!(on.atuin, "absent overlay key inherits the base");
-        assert!(!HomeOverlay::default().atuin.is_some());
+        assert!(HomeOverlay::default().atuin.is_none());
     }
 
     #[test]

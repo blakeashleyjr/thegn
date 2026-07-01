@@ -436,7 +436,7 @@ mod tests {
     #[test]
     fn sync_to_overflows_past_the_bound() {
         let mut d = FrameDecoder::new();
-        d.push(&vec![b'x'; 64]);
+        d.push(&[b'x'; 64]);
         assert_eq!(d.sync_to(SYNC_MAGIC, 32), SyncOutcome::Overflow);
     }
 
@@ -463,7 +463,7 @@ mod tests {
     fn resync_gives_up_past_the_bound() {
         let mut d = FrameDecoder::new();
         // A long run of bytes that never forms a plausible header (type 0xFF).
-        d.push(&vec![0xFFu8; 200]);
+        d.push(&[0xFFu8; 200]);
         assert!(d.next_frame().is_err());
         assert_eq!(d.resync(64), None, "exceeds max_skip without realigning");
     }
