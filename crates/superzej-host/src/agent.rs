@@ -2873,6 +2873,64 @@ fn upload_atuin_creds(
 /// Per-agent paths come from [`envplan::agent_config_paths`]; missing host paths
 /// are skipped. Files go via the fs `write`; directories via recursive
 /// `upload_dir`. A genuine upload error aborts the step (surfaced on the splash).
+/// Directory names under an agent's config tree that hold bulky, ephemeral state
+/// (session transcripts, caches, snapshots) — NEVER needed to make the agent
+/// "logged in", and gigabytes in practice (`~/.claude/projects` alone is often
+/// over 1 GB of `*.jsonl` transcripts). Skipped so the config sync carries only
+/// auth + settings and can't hang/502 pushing transcripts over the per-file fs API.
+const AGENT_STATE_SKIP_DIRS: &[&str] = &[
+    "projects",        // claude: per-repo session transcripts (the 502/hang source)
+    "todos",           // claude runtime scratch
+    "statsig",         // claude telemetry cache
+    "shell-snapshots", // claude runtime
+    "sessions",        // pi/others: session transcripts
+    "history",         // pi/others: command/session history
+    "logs",            // any: log spool
+    "cache",
+    ".cache",
+];
+
+/// Skip an individual config file larger than this — real agent config/auth is
+/// tiny (KB); anything large under a config dir is transcript/cache data.
+const AGENT_CONFIG_MAX_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
+
+/// Collect `(absolute, relative)` files under an agent config `dir`, skipping the
+/// bulky-state subdirs in [`AGENT_STATE_SKIP_DIRS`] and any file over
+/// [`AGENT_CONFIG_MAX_BYTES`]. Iterative; symlinks are not followed.
+fn collect_agent_config_files(dir: &Path) -> Vec<(std::path::PathBuf, String)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(cur) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&cur) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if AGENT_STATE_SKIP_DIRS.iter().any(|s| *s == name) {
+                    continue;
+                }
+                stack.push(path);
+            } else if ft.is_file() {
+                let too_big = entry
+                    .metadata()
+                    .map(|m| m.len() > AGENT_CONFIG_MAX_BYTES)
+                    .unwrap_or(true);
+                if too_big {
+                    continue;
+                }
+                if let Ok(rel) = path.strip_prefix(dir) {
+                    out.push((path.clone(), rel.to_string_lossy().replace('\\', "/")));
+                }
+            }
+        }
+    }
+    out
+}
+
 fn upload_agent_configs(
     provider: &superzej_svc::provider::Provider,
     id: &str,
@@ -2896,8 +2954,15 @@ fn upload_agent_configs(
             if !src.is_dir() {
                 continue;
             }
-            let dest = format!("{base}/{d}");
-            block_on_provider(|| async { provider.upload_dir(id, &src, &dest).await })?;
+            // Upload only the auth/config files, NOT the agent's bulky session
+            // state (transcripts/caches) — see `collect_agent_config_files`.
+            for (abs, rel) in collect_agent_config_files(&src) {
+                let Ok(data) = std::fs::read(&abs) else {
+                    continue;
+                };
+                let dest = format!("{base}/{d}/{rel}");
+                block_on_provider(|| async { provider.write(id, &dest, &data).await })?;
+            }
         }
     }
     Ok(())
@@ -3561,8 +3626,9 @@ pub fn launch_spec_with_key(
             spec.env.push((var, dir.to_string_lossy().into_owned()));
         }
         spec.env.extend(build_env);
-        // Host fallback under bouncer: the override is inert but proxy vars ride
-        // the pane env (sandboxed agents already got them via env_overrides).
+        // Host agent panes: proxy-routing vars ride the pane env (from bouncer
+        // mode's host fallback, or plain `route_agent` host routing). Sandboxed
+        // agents already got them via env_overrides; shells get nothing.
         spec.env.extend(bouncer.host_env);
     }
     // Host (no-sandbox) devShell injection rides the pane env directly.
@@ -3721,42 +3787,76 @@ pub struct BouncerLaunch {
     pub host_env: Vec<(String, String)>,
 }
 
-/// In bouncer mode, inject the agent's proxy + tool-override env (and the
-/// control-socket mounts) into the resolved sandbox `outcome` before its argv is
-/// composed, minting the stable per-worktree proxy key. No-op unless the bouncer
-/// is on and `choice` is a configured agent. Sandbox env rides `env_overrides`
-/// (exported inside the container); a host fallback returns the vars to ride the
-/// pane env. See [`crate::bouncer::agent_env_plan`].
+/// Whether `choice` is a real routable agent (not the plain/clean shell). The
+/// picker carries "shell"/"clean-shell" as `[[agents]]` entries with the
+/// `__shell__` sentinel command, so a name lookup alone isn't enough.
+fn is_agent_choice(cfg: &Config, choice: &str) -> bool {
+    !choice.is_empty()
+        && choice != SHELL
+        && choice != "clean-shell"
+        && cfg
+            .agent_command(choice)
+            .map(|c| c.trim() != "__shell__")
+            .unwrap_or(false)
+}
+
+/// Inject the agent's proxy env into the launch, for a configured agent `choice`
+/// (never a plain shell). Two modes:
+///
+/// - **Bouncer on:** the full proxy + tool-override plan (+ control-socket mounts)
+///   into the sealed sandbox's `env_overrides`, minting the stable per-worktree
+///   proxy key superzej's own szproxy validates. A host fallback returns the vars
+///   to ride the pane env.
+/// - **Bouncer off, `route_agent` on, HOST pane:** point the agent at the proxy
+///   over the host loopback directly (no tunnel/relay). Local sandboxes are left to
+///   the bouncer; remote sprites to the native-exec path (`remote_agent_env`).
+///
+/// No-op otherwise. See [`crate::bouncer::agent_env_plan`] /
+/// [`superzej_core::config::LlmProxyConfig::local_agent_env`].
 pub fn apply_bouncer_launch(
     cfg: &Config,
     worktree: &str,
     choice: &str,
     outcome: &mut SandboxOutcome,
 ) -> BouncerLaunch {
-    if !(cfg.llm_proxy.bouncer && cfg.agent_command(choice).is_some()) {
+    // Only a configured agent routes through the proxy; a plain shell never does
+    // (the picker lists "shell"/"clean-shell" as `[[agents]]` entries whose command
+    // is the `__shell__` sentinel — `agent_command` finds them, so exclude them).
+    if !is_agent_choice(cfg, choice) {
         return BouncerLaunch::default();
     }
-    let key = cfg
-        .llm_proxy
-        .route_agent
-        .then(|| mint_stable_proxy_key(worktree))
-        .flatten();
-    let sandbox = outcome.spec.as_ref().map(|s| (s.backend, s.network));
-    let plan = crate::bouncer::agent_env_plan(cfg, worktree, sandbox, key.as_deref());
-    match outcome.spec.as_mut() {
-        Some(spec) => {
-            for (k, v) in plan.vars {
-                spec.env_overrides.insert(k, v);
+    if cfg.llm_proxy.bouncer {
+        let key = cfg
+            .llm_proxy
+            .route_agent
+            .then(|| mint_stable_proxy_key(worktree))
+            .flatten();
+        let sandbox = outcome.spec.as_ref().map(|s| (s.backend, s.network));
+        let plan = crate::bouncer::agent_env_plan(cfg, worktree, sandbox, key.as_deref());
+        return match outcome.spec.as_mut() {
+            Some(spec) => {
+                for (k, v) in plan.vars {
+                    spec.env_overrides.insert(k, v);
+                }
+                spec.mounts.extend(plan.mounts);
+                BouncerLaunch::default()
             }
-            spec.mounts.extend(plan.mounts);
-            BouncerLaunch::default()
-        }
-        // Host fallback (no isolation): the bouncer override is inert, but the
-        // proxy vars still ride the pane env.
-        None => BouncerLaunch {
-            host_env: plan.vars,
-        },
+            // Host fallback (no isolation): the bouncer override is inert, but the
+            // proxy vars still ride the pane env.
+            None => BouncerLaunch {
+                host_env: plan.vars,
+            },
+        };
     }
+    // No bouncer, but `route_agent` on for a HOST pane: route the agent through the
+    // proxy over the host loopback directly. (Sandboxed panes can't reach host
+    // loopback without a relay — that's the bouncer's / sprite tunnel's job.)
+    if cfg.llm_proxy.route_agent && outcome.spec.is_none() {
+        return BouncerLaunch {
+            host_env: cfg.llm_proxy.local_agent_env(),
+        };
+    }
+    BouncerLaunch::default()
 }
 
 /// Resolve a configured build path: `~`/`~/…` expands to home; a relative path
@@ -3884,6 +3984,49 @@ fn sandbox_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_config_upload_skips_transcripts_and_bulk() {
+        let root = std::env::temp_dir().join(format!("sz-claude-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("projects/repo-a/subagents")).unwrap();
+        std::fs::create_dir_all(root.join("statsig")).unwrap();
+        // Real config/auth (kept).
+        std::fs::write(root.join(".credentials.json"), b"{\"tok\":\"x\"}").unwrap();
+        std::fs::write(root.join("settings.json"), b"{}").unwrap();
+        // Bulky transcript state (skipped by dir name).
+        std::fs::write(root.join("projects/repo-a/subagents/a.jsonl"), b"huge").unwrap();
+        std::fs::write(root.join("statsig/cache.bin"), b"x").unwrap();
+        // An oversized file directly under the config dir (skipped by size).
+        std::fs::write(
+            root.join("big.log"),
+            vec![0u8; (AGENT_CONFIG_MAX_BYTES + 1) as usize],
+        )
+        .unwrap();
+
+        let got: Vec<String> = collect_agent_config_files(&root)
+            .into_iter()
+            .map(|(_, rel)| rel)
+            .collect();
+        assert!(
+            got.contains(&".credentials.json".to_string()),
+            "auth kept: {got:?}"
+        );
+        assert!(got.contains(&"settings.json".to_string()), "settings kept");
+        assert!(
+            !got.iter().any(|r| r.starts_with("projects/")),
+            "session transcripts skipped: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|r| r.starts_with("statsig/")),
+            "cache skipped"
+        );
+        assert!(
+            !got.contains(&"big.log".to_string()),
+            "oversized file skipped"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn resolve_personal_dotfiles_drops_nonportable_under_portable() {
@@ -4303,6 +4446,58 @@ mod tests {
         assert_eq!(
             spec.warning_summary().as_deref(),
             Some("sandbox auto selected host")
+        );
+    }
+
+    fn host_outcome() -> SandboxOutcome {
+        SandboxOutcome {
+            spec: None,
+            backend_label: "host".into(),
+            warnings: Vec::new(),
+            shell: String::new(),
+            is_remote: false,
+            cwd_override: None,
+            location: None,
+        }
+    }
+
+    #[test]
+    fn route_agent_injects_proxy_env_into_host_agent_pane() {
+        // `route_agent` on, bouncer OFF: a configured agent on the host gets the
+        // proxy vars routed to the LOCAL loopback; a plain shell gets nothing.
+        let mut cfg = cfg_with(&[("shell", "__shell__"), ("Agent", "/a/pi")], &[]);
+        cfg.llm_proxy.route_agent = true;
+        cfg.llm_proxy.bouncer = false;
+
+        let mut outcome = host_outcome();
+        let agent = apply_bouncer_launch(&cfg, "/wt/x", "Agent", &mut outcome);
+        assert!(
+            agent
+                .host_env
+                .iter()
+                .any(|(k, v)| k == "SUPERZEJ_PROXY_BASE_URL" && v == "http://127.0.0.1:8383"),
+            "host agent pane routes through the local proxy without bouncer"
+        );
+        assert!(
+            agent
+                .host_env
+                .iter()
+                .any(|(k, _)| k == "ANTHROPIC_BASE_URL"),
+            "claude/codex on host also get ANTHROPIC_BASE_URL"
+        );
+
+        // A shell never routes.
+        let mut outcome = host_outcome();
+        let shell = apply_bouncer_launch(&cfg, "/wt/x", "shell", &mut outcome);
+        assert!(shell.host_env.is_empty(), "shells are not routed");
+
+        // route_agent OFF → no injection even for an agent.
+        cfg.llm_proxy.route_agent = false;
+        let mut outcome = host_outcome();
+        let off = apply_bouncer_launch(&cfg, "/wt/x", "Agent", &mut outcome);
+        assert!(
+            off.host_env.is_empty(),
+            "no routing when route_agent is off"
         );
     }
 

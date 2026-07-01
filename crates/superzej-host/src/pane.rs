@@ -51,6 +51,12 @@ pub enum ExecOpen {
         session: String,
         cols: u16,
         rows: u16,
+        /// Fresh-open spec to RE-OPEN the exec if the reattach is a dead/stale
+        /// session — e.g. one that didn't survive a szhost restart or a sandbox
+        /// suspend. Without it a stale reattach can only re-attach to the corpse:
+        /// a broken/frozen shell that flaps back to the loading splash. With it,
+        /// the reconnect loop opens a fresh working shell (fs/cwd preserved).
+        fallback: superzej_svc::provider::ExecSpec,
     },
 }
 
@@ -668,7 +674,7 @@ async fn relay_exec(
     // reattach), which has no spec to reopen from.
     let reopen_spec = match &open {
         ExecOpen::Open(spec) => Some(spec.clone()),
-        ExecOpen::Attach { .. } => None,
+        ExecOpen::Attach { fallback, .. } => Some(fallback.clone()),
     };
     tracing::debug!(
         target: "szhost::sandbox",
@@ -682,6 +688,7 @@ async fn relay_exec(
             session,
             cols,
             rows,
+            ..
         } => {
             provider
                 .attach_exec(&sandbox_id, &session, cols, rows)

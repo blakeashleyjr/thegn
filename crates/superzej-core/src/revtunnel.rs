@@ -35,6 +35,47 @@ const T_CLOSE: u8 = 3;
 /// corrupt/garbage length can't trigger a huge allocation. Senders chunk to this.
 pub const MAX_FRAME_PAYLOAD: usize = 1 << 20; // 1 MiB
 
+/// The fixed marker the SANDBOX endpoint writes as the very FIRST bytes of the mux
+/// stream, before any frame. The transport carrying the stream (a provider `exec`
+/// stdout) can prepend a one-time preamble the framing protocol never produced —
+/// a runtime banner/MOTD, a status line, a login-shell echo — which would
+/// otherwise be read as a bogus frame header and desync the decoder for good
+/// (a huge `len` → `PayloadTooLarge`). The host discards everything up to and
+/// including this marker before decoding, so any such preamble is skipped. Eight
+/// distinctive bytes (NUL-led + a non-frame type byte) make an accidental match in
+/// real preamble text vanishingly unlikely.
+pub const SYNC_MAGIC: &[u8] = b"\x00szREV\x01\n";
+
+/// Longest preamble (bytes before [`SYNC_MAGIC`]) or mid-stream garbage the
+/// decoder will skip before giving up and treating the stream as fatally corrupt.
+/// Generous vs any real banner, bounded so a stream that never syncs can't spin or
+/// grow without limit.
+pub const MAX_RESYNC_SKIP: usize = 64 * 1024;
+
+/// Outcome of [`FrameDecoder::sync_to`] — skipping a startup preamble.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncOutcome {
+    /// The marker was found; `skipped` preamble bytes were discarded. `preview` is
+    /// the leading (truncated) bytes of that preamble, for diagnostics.
+    Synced { skipped: usize, preview: Vec<u8> },
+    /// The marker has not arrived yet — feed more bytes and call again.
+    NeedMore,
+    /// Scanned past `max_skip` bytes without the marker — treat as fatal.
+    Overflow,
+}
+
+/// First index of `needle` within `hay`, or `None`. Small linear scan — the
+/// buffers here are a few KiB at most (a preamble + one frame).
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Bytes to keep as a bounded preview of skipped/garbage data in logs.
+const PREVIEW_LEN: usize = 48;
+
 /// Wire layout: `[type:u8][id:u32 BE][len:u32 BE][payload:len]`. `Open`/`Close`
 /// carry `len = 0`.
 pub fn encode(frame: &Frame) -> Vec<u8> {
@@ -125,6 +166,62 @@ impl FrameDecoder {
     /// Bytes buffered but not yet a complete frame (for tests / backpressure).
     pub fn pending(&self) -> usize {
         self.buf.len()
+    }
+
+    /// Skip a startup preamble: discard buffered bytes up to and including the
+    /// first occurrence of `marker`. Call after each `push` until it returns
+    /// [`SyncOutcome::Synced`] (then decode frames normally). Bounds the scan at
+    /// `max_skip` so a stream that never carries the marker fails fast instead of
+    /// buffering forever. See [`SYNC_MAGIC`].
+    pub fn sync_to(&mut self, marker: &[u8], max_skip: usize) -> SyncOutcome {
+        match find_subslice(&self.buf, marker) {
+            Some(pos) => {
+                let preview: Vec<u8> = self.buf[..pos.min(PREVIEW_LEN)].to_vec();
+                self.buf.drain(..pos + marker.len());
+                SyncOutcome::Synced {
+                    skipped: pos,
+                    preview,
+                }
+            }
+            // Not yet — but if we've buffered well past the bound (and could still
+            // hold a partial marker at the tail), give up.
+            None if self.buf.len() > max_skip + marker.len() => SyncOutcome::Overflow,
+            None => SyncOutcome::NeedMore,
+        }
+    }
+
+    /// Attempt to re-align after a mid-stream [`DecodeError`]: drop leading bytes
+    /// one at a time (up to `max_skip`) until the head of the buffer is a plausible
+    /// frame header (known type + `len <= MAX_FRAME_PAYLOAD`) or more bytes are
+    /// needed. Returns `Some((dropped, preview))` on re-alignment (resume decoding),
+    /// or `None` if `max_skip` was exceeded without one (caller treats as fatal).
+    /// Defense-in-depth beyond the startup handshake; mirrors the LSP framing's
+    /// resync-on-garbage behavior.
+    pub fn resync(&mut self, max_skip: usize) -> Option<(usize, Vec<u8>)> {
+        let preview: Vec<u8> = self.buf[..self.buf.len().min(PREVIEW_LEN)].to_vec();
+        let mut dropped = 0usize;
+        loop {
+            if self.buf.is_empty() || self.plausible_header() {
+                return Some((dropped, preview));
+            }
+            if dropped >= max_skip {
+                return None;
+            }
+            self.buf.drain(..1);
+            dropped += 1;
+        }
+    }
+
+    /// Whether the buffer head could begin a valid frame: fewer than 9 bytes (need
+    /// more — inconclusive but not garbage) or a known type byte with an in-bound
+    /// length. Used only by [`resync`](Self::resync) to decide when to stop dropping.
+    fn plausible_header(&self) -> bool {
+        if self.buf.len() < 9 {
+            return true;
+        }
+        let known = matches!(self.buf[0], T_OPEN | T_DATA | T_CLOSE);
+        let len = u32::from_be_bytes([self.buf[5], self.buf[6], self.buf[7], self.buf[8]]) as usize;
+        known && len <= MAX_FRAME_PAYLOAD
     }
 }
 
@@ -299,5 +396,75 @@ mod tests {
         let mut d = FrameDecoder::new();
         assert_eq!(d.next_frame().unwrap(), None);
         assert!(d.drain().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sync_to_skips_startup_preamble_then_decodes() {
+        // A runtime banner precedes the magic + a real frame.
+        let mut wire = b"Welcome to sprite-vm 1.2\r\n$ ".to_vec();
+        wire.extend_from_slice(SYNC_MAGIC);
+        wire.extend(encode(&Frame::Open(7)));
+        let mut d = FrameDecoder::new();
+        d.push(&wire);
+        match d.sync_to(SYNC_MAGIC, MAX_RESYNC_SKIP) {
+            SyncOutcome::Synced { skipped, preview } => {
+                assert_eq!(skipped, 28, "the banner bytes before the marker");
+                assert!(preview.starts_with(b"Welcome"));
+            }
+            other => panic!("expected Synced, got {other:?}"),
+        }
+        // After syncing, the real frame decodes cleanly.
+        assert_eq!(d.next_frame().unwrap(), Some(Frame::Open(7)));
+    }
+
+    #[test]
+    fn sync_to_needs_more_until_marker_arrives() {
+        let mut d = FrameDecoder::new();
+        d.push(b"partial-banner-no-marker-yet");
+        assert_eq!(
+            d.sync_to(SYNC_MAGIC, MAX_RESYNC_SKIP),
+            SyncOutcome::NeedMore
+        );
+        // Marker split across a later push still syncs.
+        d.push(SYNC_MAGIC);
+        assert!(matches!(
+            d.sync_to(SYNC_MAGIC, MAX_RESYNC_SKIP),
+            SyncOutcome::Synced { .. }
+        ));
+    }
+
+    #[test]
+    fn sync_to_overflows_past_the_bound() {
+        let mut d = FrameDecoder::new();
+        d.push(&vec![b'x'; 64]);
+        assert_eq!(d.sync_to(SYNC_MAGIC, 32), SyncOutcome::Overflow);
+    }
+
+    #[test]
+    fn resync_realigns_after_midstream_garbage() {
+        // Garbage bytes, then a valid frame. next_frame errors on the garbage;
+        // resync drops bytes until the real frame's header is at the head.
+        let good = encode(&Frame::Data(3, b"payload".to_vec()));
+        let mut wire = vec![0x74u8, 0x63, 0x0A, 0x2C, 0xFF]; // "tc\n," + junk
+        wire.extend_from_slice(&good);
+        let mut d = FrameDecoder::new();
+        d.push(&wire);
+        // First decode hits the garbage as a bogus header.
+        assert!(d.next_frame().is_err());
+        let (dropped, _preview) = d.resync(MAX_RESYNC_SKIP).expect("should realign");
+        assert_eq!(dropped, 5, "dropped the 5 junk bytes");
+        assert_eq!(
+            d.next_frame().unwrap(),
+            Some(Frame::Data(3, b"payload".to_vec()))
+        );
+    }
+
+    #[test]
+    fn resync_gives_up_past_the_bound() {
+        let mut d = FrameDecoder::new();
+        // A long run of bytes that never forms a plausible header (type 0xFF).
+        d.push(&vec![0xFFu8; 200]);
+        assert!(d.next_frame().is_err());
+        assert_eq!(d.resync(64), None, "exceeds max_skip without realigning");
     }
 }

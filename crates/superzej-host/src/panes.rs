@@ -337,10 +337,15 @@ impl Panes {
         let cols = center.cols.max(1) as u16;
         let rows = center.rows.max(1) as u16;
         let open = match session {
+            // Carry a fresh-open spec as the fallback: if this reattach hits a dead
+            // session (didn't survive a restart / the sandbox was suspended), the
+            // relay's reconnect loop re-opens a fresh shell instead of flapping on
+            // the corpse.
             Some(session) => crate::pane::ExecOpen::Attach {
                 session,
                 cols,
                 rows,
+                fallback: n.open_spec(cols, rows),
             },
             None => crate::pane::ExecOpen::Open(n.open_spec(cols, rows)),
         };

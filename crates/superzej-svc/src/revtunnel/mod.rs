@@ -20,7 +20,9 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use superzej_core::revtunnel::{Frame, FrameDecoder, encode, encode_data_chunked};
+use superzej_core::revtunnel::{
+    Frame, FrameDecoder, MAX_RESYNC_SKIP, SYNC_MAGIC, SyncOutcome, encode, encode_data_chunked,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -164,10 +166,36 @@ async fn pump_conn(
 /// Shared per-connection routing table: id → inbound payload sender.
 type Conns = Arc<Mutex<HashMap<u32, UnboundedSender<Vec<u8>>>>>;
 
+/// Render a bounded byte preview for logs: printable ASCII verbatim, everything
+/// else as `.`. So a skipped preamble/garbage run shows up readably.
+fn preview_str(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|&b| {
+            if b.is_ascii_graphic() || b == b' ' {
+                b as char
+            } else {
+                '.'
+            }
+        })
+        .collect()
+}
+
 /// Drive the shared read loop: decode frames off `rd` and route them. `on_open`
 /// is called for each `Open(id)` (the host dials; the sandbox never receives
 /// `Open`). `Data`/`Close` are routed to the registered connection.
-async fn read_loop<R, F, Fut>(mut rd: R, conns: Conns, mut on_open: F) -> io::Result<()>
+///
+/// `sync` (when `Some`) is a startup marker the loop skips to before decoding —
+/// the host passes [`SYNC_MAGIC`] so a one-time preamble on the exec's stdout
+/// (banner/MOTD/shell echo) can't desync the framing. Beyond that, a mid-stream
+/// [`DecodeError`] triggers a bounded resync (drop garbage until the framing
+/// re-aligns) instead of tearing the tunnel down.
+async fn read_loop<R, F, Fut>(
+    mut rd: R,
+    conns: Conns,
+    mut on_open: F,
+    sync: Option<&'static [u8]>,
+) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
     F: FnMut(u32) -> Fut,
@@ -175,24 +203,64 @@ where
 {
     let mut dec = FrameDecoder::new();
     let mut buf = vec![0u8; 16 * 1024];
+    let mut synced = sync.is_none();
     loop {
         let n = rd.read(&mut buf).await?;
         if n == 0 {
             return Ok(());
         }
         dec.push(&buf[..n]);
-        while let Some(frame) = dec.next_frame().map_err(decode_err)? {
-            match frame {
-                Frame::Open(id) => on_open(id).await,
-                Frame::Data(id, d) => {
-                    if let Some(tx) = conns.lock().await.get(&id) {
-                        let _ = tx.send(d);
+        // Skip a one-time startup preamble before the first frame.
+        if !synced {
+            match dec.sync_to(sync.unwrap(), MAX_RESYNC_SKIP) {
+                SyncOutcome::Synced { skipped, preview } => {
+                    if skipped > 0 {
+                        tracing::warn!(
+                            target: "szhost::revtunnel",
+                            skipped,
+                            preview = %preview_str(&preview),
+                            "skipped reverse-tunnel startup preamble before sync marker"
+                        );
                     }
+                    synced = true;
                 }
-                Frame::Close(id) => {
-                    // Dropping the inbound sender ends the connection's writer.
-                    conns.lock().await.remove(&id);
+                SyncOutcome::NeedMore => continue,
+                SyncOutcome::Overflow => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "reverse tunnel: no sync marker within bound (stream contaminated)",
+                    ));
                 }
+            }
+        }
+        loop {
+            match dec.next_frame() {
+                Ok(Some(frame)) => match frame {
+                    Frame::Open(id) => on_open(id).await,
+                    Frame::Data(id, d) => {
+                        if let Some(tx) = conns.lock().await.get(&id) {
+                            let _ = tx.send(d);
+                        }
+                    }
+                    Frame::Close(id) => {
+                        // Dropping the inbound sender ends the connection's writer.
+                        conns.lock().await.remove(&id);
+                    }
+                },
+                Ok(None) => break, // partial frame — need more bytes
+                Err(e) => match dec.resync(MAX_RESYNC_SKIP) {
+                    Some((dropped, preview)) => {
+                        tracing::warn!(
+                            target: "szhost::revtunnel",
+                            dropped,
+                            error = ?e,
+                            preview = %preview_str(&preview),
+                            "resynced reverse-tunnel stream after a decode error"
+                        );
+                        continue;
+                    }
+                    None => return Err(decode_err(e)),
+                },
             }
         }
     }
@@ -209,23 +277,28 @@ where
     let sink = spawn_sink(wr);
     let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
     let conns2 = conns.clone();
-    read_loop(rd, conns, move |id| {
-        let dialer = dialer.clone();
-        let sink = sink.clone();
-        let conns = conns2.clone();
-        async move {
-            let (in_tx, in_rx) = unbounded_channel::<Vec<u8>>();
-            conns.lock().await.insert(id, in_tx);
-            tokio::spawn(async move {
-                match dialer.dial().await {
-                    Ok(local) => pump_conn(id, local, in_rx, sink).await,
-                    Err(_) => {
-                        let _ = sink.send(encode(&Frame::Close(id)));
+    read_loop(
+        rd,
+        conns,
+        move |id| {
+            let dialer = dialer.clone();
+            let sink = sink.clone();
+            let conns = conns2.clone();
+            async move {
+                let (in_tx, in_rx) = unbounded_channel::<Vec<u8>>();
+                conns.lock().await.insert(id, in_tx);
+                tokio::spawn(async move {
+                    match dialer.dial().await {
+                        Ok(local) => pump_conn(id, local, in_rx, sink).await,
+                        Err(_) => {
+                            let _ = sink.send(encode(&Frame::Close(id)));
+                        }
                     }
-                }
-            });
-        }
-    })
+                });
+            }
+        },
+        Some(SYNC_MAGIC),
+    )
     .await
 }
 
@@ -238,6 +311,10 @@ where
 {
     let (rd, wr) = tokio::io::split(stream);
     let sink = spawn_sink(wr);
+    // Emit the sync marker as the FIRST bytes on stdout, before any frame, so the
+    // host can skip whatever one-time preamble the exec transport prepended (a
+    // runtime banner/MOTD/shell echo) and lock onto the framing. See `SYNC_MAGIC`.
+    let _ = sink.send(SYNC_MAGIC.to_vec());
     let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
     let next_id = Arc::new(AtomicU32::new(1));
 
@@ -263,8 +340,10 @@ where
         }
     });
 
-    // The sandbox never receives Open; Data/Close route to accepted conns.
-    let res = read_loop(rd, conns, |_id| async {}).await;
+    // The sandbox never receives Open; Data/Close route to accepted conns. The
+    // host→sandbox direction is superzej's own clean frame stream (no preamble),
+    // so no sync marker is expected here.
+    let res = read_loop(rd, conns, |_id| async {}, None).await;
     accept.abort();
     res
 }
@@ -381,5 +460,54 @@ mod tests {
         rd.read_to_end(&mut got).await.unwrap();
         writer.await.unwrap();
         assert_eq!(got, payload, "large payload round-trips intact");
+    }
+
+    /// The host tolerates a startup preamble the exec transport prepends to the
+    /// sandbox's stdout (a banner/MOTD/shell echo): it skips to the sync marker
+    /// `run_sandbox` emits, then decodes frames normally. Regression for the
+    /// `PayloadTooLarge` desync that killed the proxy tunnel.
+    #[tokio::test]
+    async fn host_skips_startup_preamble_before_frames() {
+        // Three channels wire host ⇄ sandbox with a splice on the sandbox→host
+        // leg that injects a banner ahead of run_sandbox's real (SYNC_MAGIC-led)
+        // output — exactly the transport preamble that desynced the live tunnel.
+        let (h2s_host, h2s_sbx) = tokio::io::duplex(64 * 1024); // host→sandbox control
+        let (sbx_out_a, sbx_out_b) = tokio::io::duplex(64 * 1024); // run_sandbox's writes
+        let (s2h_a, s2h_b) = tokio::io::duplex(64 * 1024); // spliced → run_host reads
+
+        let (h2s_sbx_rd, _h2s_sbx_wr) = tokio::io::split(h2s_sbx);
+        let (_sbx_out_a_rd, sbx_out_a_wr) = tokio::io::split(sbx_out_a);
+        let (mut sbx_out_b_rd, _sbx_out_b_wr) = tokio::io::split(sbx_out_b);
+        let (s2h_b_rd, _s2h_b_wr) = tokio::io::split(s2h_b);
+        let (_s2h_a_rd, mut s2h_a_wr) = tokio::io::split(s2h_a);
+        let (_h2s_host_rd, h2s_host_wr) = tokio::io::split(h2s_host);
+
+        // Splice: banner first, then relay run_sandbox's output verbatim.
+        tokio::spawn(async move {
+            s2h_a_wr
+                .write_all(b"sprite-vm ready\r\n\x1b[0m$ ")
+                .await
+                .unwrap();
+            let _ = tokio::io::copy(&mut sbx_out_b_rd, &mut s2h_a_wr).await;
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // run_host reads the spliced (banner + frames) stream; writes control back.
+        tokio::spawn(run_host(tokio::io::join(s2h_b_rd, h2s_host_wr), EchoDialer));
+        // run_sandbox reads host control; writes frames (SYNC_MAGIC-led) to splice.
+        tokio::spawn(run_sandbox(
+            tokio::io::join(h2s_sbx_rd, sbx_out_a_wr),
+            listener,
+        ));
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client.write_all(b"through-preamble").await.unwrap();
+        let mut buf = [0u8; 16];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(
+            &buf, b"through-preamble",
+            "tunnel works despite a startup banner on the sandbox stdout"
+        );
     }
 }
