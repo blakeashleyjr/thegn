@@ -51,7 +51,9 @@ use std::path::PathBuf;
 /// `pane id → {provider, id, session}`) so a native-exec (provider WSS) pane
 /// reattaches to its live remote session — replaying scrollback — on restart.
 /// v24: adds `forwards` (the resurrection layer for auto port forwards, `[forward]`).
-const SCHEMA_VERSION: i64 = 26;
+/// v27: adds `registers` (persisted vim-style yank registers `"a`–`"z`/`"0`–`"9`;
+/// the volatile `"+` system-clipboard register is never persisted).
+const SCHEMA_VERSION: i64 = 27;
 
 pub struct Db {
     conn: Connection,
@@ -753,11 +755,52 @@ impl Db {
         // (worktree → workspace → repo `.superzej.*` → global default → default).
         let _ = conn.execute("ALTER TABLE workspaces ADD COLUMN env_name TEXT", []);
         let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN env_name TEXT", []);
+        // v27: persisted vim-style registers (Phase 3 of time-travel-replay).
+        // Additive; keyed by the single-char register id. The `"+` clipboard
+        // register is volatile and never written here.
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS registers (
+              name       TEXT PRIMARY KEY,
+              value      BLOB NOT NULL,
+              updated_at INTEGER NOT NULL
+            )",
+            [],
+        );
         // v6: transform any remaining flat v4/v5 `tab_layout` into worktree
         // groups. Keyed on the legacy table's existence (not the version) so
         // it is idempotent and a failed earlier attempt retries next open.
         migrate_tab_layout_v6(&conn);
         Ok(Db { conn })
+    }
+
+    // --- registers (persisted yank registers, v27) ------------------------
+    /// Persist a register's value (upsert). The single-char `name` is the
+    /// register id; the volatile `+` clipboard register is never stored here.
+    pub fn put_register(&self, name: char, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO registers(name,value,updated_at) VALUES(?1,?2,?3)
+             ON CONFLICT(name) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            params![name.to_string(), value.as_bytes(), util::now()],
+        )?;
+        Ok(())
+    }
+
+    /// Load every persisted register as `(name, value)` pairs.
+    pub fn all_registers(&self) -> Result<Vec<(char, String)>> {
+        let mut stmt = self.conn.prepare("SELECT name, value FROM registers")?;
+        let rows = stmt.query_map([], |r| {
+            let name: String = r.get(0)?;
+            let value: Vec<u8> = r.get(1)?;
+            Ok((name, value))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (name, value) = row?;
+            if let Some(ch) = name.chars().next() {
+                out.push((ch, String::from_utf8_lossy(&value).into_owned()));
+            }
+        }
+        Ok(out)
     }
 
     // --- ingress shares (`[share]`; resurrection layer for tunnels) --------
@@ -3941,6 +3984,63 @@ mod tests {
             vec!["/newest", "/mid", "/old"],
             "backfill must rank position 0 = most-recently-active"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn registers_roundtrip_on_fresh_db() {
+        let db = Db::open_memory().unwrap();
+        assert!(db.all_registers().unwrap().is_empty());
+        db.put_register('a', "hello").unwrap();
+        db.put_register('1', "world").unwrap();
+        db.put_register('a', "hello again").unwrap(); // upsert
+        let mut got = db.all_registers().unwrap();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![('1', "world".to_string()), ('a', "hello again".to_string())]
+        );
+    }
+
+    #[test]
+    fn migrates_registers_additive_from_v26() {
+        // A pre-v27 DB (no `registers` table): opening it creates the table
+        // additively without touching existing data.
+        let dir = std::env::temp_dir().join(format!("sz-db-reg-mig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA user_version = 26;
+                CREATE TABLE repos (path TEXT PRIMARY KEY, name TEXT);
+                INSERT INTO repos(path,name) VALUES ('/keep','keep');
+                "#,
+            )
+            .unwrap();
+        }
+        let db = Db::open_at(&path).unwrap();
+        // Existing data survives …
+        let kept: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM repos WHERE path='/keep'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(kept, 1);
+        // … and the new registers table is usable.
+        db.put_register('z', "migrated").unwrap();
+        assert_eq!(
+            db.all_registers().unwrap(),
+            vec![('z', "migrated".to_string())]
+        );
+        let ver: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, SCHEMA_VERSION);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

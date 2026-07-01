@@ -57,6 +57,8 @@ mod queries;
 mod recorder;
 mod relay;
 mod render_plan;
+mod replay;
+mod replay_overlay;
 mod revtunnel;
 mod run;
 mod sandbox_events;

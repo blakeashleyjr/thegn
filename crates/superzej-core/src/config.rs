@@ -732,6 +732,52 @@ impl Default for MergeQueueConfig {
     }
 }
 
+/// `[replay]` — per-pane time-travel recording. Every byte a pane emits is
+/// appended to a bounded in-memory ring with periodic keyframe markers, so the
+/// user can scrub a pane's history like a video (`Alt+r`) and search for any
+/// string that ever appeared on screen — including inside full-screen apps
+/// (vim/htop) whose output never reaches scrollback. On by default; bounded by
+/// both a byte and a duration budget. When `enabled = false` no ring is
+/// allocated and `PtyPane::feed` does a single null check (free when off).
+/// Distinct from the whole-session asciinema `Recorder` (`Ctrl+Alt+r`).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct ReplayConfig {
+    /// Master switch. Off ⇒ no recording ring, zero allocation.
+    pub enabled: bool,
+    /// Per-pane byte budget for the ring; oldest events (and any keyframe whose
+    /// byte range no longer exists) are evicted past this.
+    pub max_bytes_per_pane: u64,
+    /// Per-pane duration budget in seconds; events older than this are evicted.
+    pub max_duration_secs: u64,
+    /// Capture a keyframe marker after this many ms of activity …
+    pub keyframe_interval_ms: u64,
+    /// … or after this many bytes, whichever comes first.
+    pub keyframe_interval_bytes: u64,
+    /// During playback, a gap larger than this (ms) between recorded events is
+    /// collapsed to a short constant so idle stretches don't stall the scrub.
+    pub idle_threshold_ms: u64,
+    /// Mirror each pane's ring to `$XDG_STATE_HOME/superzej/replay/<session>/
+    /// <pane>.szr` on an off-loop writer thread, so scrubbing reaches into the
+    /// previous run after a restart. Off by default — the one feature with real
+    /// disk cost.
+    pub persist: bool,
+}
+
+impl Default for ReplayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_bytes_per_pane: 8 * 1024 * 1024,
+            max_duration_secs: 1800,
+            keyframe_interval_ms: 4000,
+            keyframe_interval_bytes: 262144,
+            idle_threshold_ms: 1000,
+            persist: false,
+        }
+    }
+}
+
 config_enum! {
     /// `[media] backend` — how superzej talks to your player. `"auto"` (the
     /// default) picks the right backend for the current OS: Linux → MPRIS,
@@ -4324,6 +4370,9 @@ pub struct Config {
     /// `[merge_queue]` — the local fold-actor (parallel-branch integration).
     /// On by default; the core is AI-free (agent handoff only fires on conflict).
     pub merge_queue: MergeQueueConfig,
+    /// `[replay]` — per-pane time-travel recording + scrub/search (`Alt+r`). On
+    /// by default, bounded 8 MiB / 30 m per pane; free when disabled.
+    pub replay: ReplayConfig,
     /// `[media]` — media-player control. On by default (`mpris` backend), inert
     /// where D-Bus/`playerctl` are absent. Additive — the shell never depends on it.
     pub media: MediaConfig,
@@ -4415,6 +4464,7 @@ impl Default for Config {
             lsp: LspConfig::default(),
             llm_proxy: LlmProxyConfig::default(),
             merge_queue: MergeQueueConfig::default(),
+            replay: ReplayConfig::default(),
             media: MediaConfig::default(),
             share: ShareConfig::default(),
             forward: ForwardConfig::default(),

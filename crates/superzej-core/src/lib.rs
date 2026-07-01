@@ -58,6 +58,7 @@ pub mod projection;
 pub mod proxy;
 pub mod rebase_todo;
 pub mod reflog;
+pub mod registers;
 pub mod remote;
 pub mod repo;
 pub mod revtunnel;

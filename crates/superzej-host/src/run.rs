@@ -193,6 +193,39 @@ fn apply_mode_status(
 /// Toggles the Asciinema cast recorder. When turned on, a new `.cast` file
 /// is created in `~/.local/state/superzej/recordings/` and every frame pushed
 /// to the terminal is appended to it.
+/// Yank `text` into register `name` (in memory) and persist the affected
+/// registers to the DB so they survive a restart. `name` defaults to `"`; the
+/// yank also updates the default register (vim semantics), so an unnamed
+/// `PasteRegister` retrieves the most recent copy. The volatile `"+` clipboard
+/// register is never persisted (the caller writes the OS clipboard separately).
+fn store_yank(registers: &mut superzej_core::registers::Registers, name: char, text: String) {
+    use superzej_core::registers::{DEFAULT, is_persistent};
+    if !registers.yank(name, text.clone()) {
+        return;
+    }
+    if let Ok(db) = superzej_core::db::Db::open() {
+        if is_persistent(name) {
+            let _ = db.put_register(name, &text);
+        }
+        if name != DEFAULT {
+            let _ = db.put_register(DEFAULT, &text);
+        }
+    }
+}
+
+/// Write `text` into a pane as input, wrapping it in the bracketed-paste
+/// markers when the app has requested them (so editors don't auto-indent).
+fn paste_text_into_pane(pane: &mut crate::pane::PtyPane, text: &str) -> anyhow::Result<()> {
+    if pane.emulator().bracketed_paste() {
+        pane.write_input(b"\x1b[200~")?;
+        pane.write_input(text.as_bytes())?;
+        pane.write_input(b"\x1b[201~")?;
+    } else {
+        pane.write_input(text.as_bytes())?;
+    }
+    Ok(())
+}
+
 fn toggle_recorder(
     recorder: &mut Option<Recorder>,
     rows: usize,
@@ -8557,6 +8590,11 @@ async fn event_loop<T: Terminal>(
     let _file_index_gen: u64 = 0;
     // Search overlay state: lives here so it survives across loop iterations.
     let mut search: Option<crate::search::SearchOverlay> = None;
+    // Time-travel replay: a modal overlay (sibling of `search`) that scrubs the
+    // focused pane's recording, plus the playback clock (a thread that pulses the
+    // waker only while playing, otherwise parked — zero idle wakeups).
+    let mut replay: Option<crate::replay_overlay::ReplayOverlay> = None;
+    let playback_clock = crate::replay_overlay::PlaybackClock::spawn(waker.clone());
     // Panel document payloads (git calendar/log, the selected file's diff)
     // are fetched off-loop on section entry and tagged with `docs_gen`; a
     // worktree switch bumps the generation so stale results die on arrival.
@@ -8584,6 +8622,15 @@ async fn event_loop<T: Terminal>(
     // The transient which-key popup (set while a multi-key prefix is pending).
     let mut which_key: Vec<crate::keyhint::HintRow> = Vec::new();
     let mut which_key_prefix = String::new();
+    // Persisted vim-style registers (`"a`–`"z`/`"0`–`"9`, `"` default, `"+`
+    // clipboard). Loaded from the DB; a yank persists back. `PasteRegister` arms
+    // `pending_paste_register` so the next key names the register to paste.
+    let mut registers = superzej_core::db::Db::open()
+        .ok()
+        .and_then(|db| db.all_registers().ok())
+        .map(superzej_core::registers::Registers::from_pairs)
+        .unwrap_or_default();
+    let mut pending_paste_register = false;
     let (tx, mut rx) = tokio_mpsc::channel::<PaneEvent>(PANE_EVENT_CHANNEL_CAPACITY);
     let mut panes = Panes::with_waker(tx, waker.clone());
 
@@ -8715,6 +8762,9 @@ async fn event_loop<T: Terminal>(
         current_config.profile.clone(),
         waker.clone(),
     );
+    // Time-travel replay: attach a per-pane recording ring to panes spawned from
+    // here on when `[replay] enabled` (default on, bounded 8 MiB / 30 m).
+    panes.set_replay_config(current_config.replay.clone());
 
     // First-launch keymap picker (item 621). Skip entirely when the user has set
     // `keymap_preset` in config (an explicit choice). Otherwise apply a preset
@@ -10207,6 +10257,21 @@ async fn event_loop<T: Terminal>(
             return Ok(());
         }
 
+        // Advance the replay playback clock by real elapsed time. The clock thread
+        // woke us at frame cadence; here we move the cursor (scaled by speed,
+        // collapsing idle gaps) and repaint. Paused/closed ⇒ no-op, and the clock
+        // thread is parked so no wake happened in the first place.
+        if let Some(ov) = replay.as_mut()
+            && ov.is_playing()
+        {
+            if let Some(rec) = panes.table.get(&ov.pane_id()).and_then(|p| p.recording())
+                && ov.advance_clock(rec)
+            {
+                dirty = true;
+            }
+            playback_clock.set(ov.is_playing(), crate::replay_overlay::REPLAY_FRAME_DT_MS);
+        }
+
         // Hydrated models replace the whole FrameModel; re-apply the loop-owned
         // fields (stats, bars, accent, pins, hints). Stale generations are
         // dropped — a fresh hydration is always in flight for the current one.
@@ -11543,6 +11608,9 @@ async fn event_loop<T: Terminal>(
                     // Live notification-routing reload: swap in the reloaded
                     // rules/DND/sound/modes (preserving the runtime mode/toggle).
                     notify_state.update_cfg(current_config.effective_notifications(None));
+                    // Live replay toggle: newly spawned panes pick up the reloaded
+                    // `[replay]` config (existing panes keep their current ring).
+                    panes.set_replay_config(current_config.replay.clone());
                     // Live media toggle: (re)spawn or stop the watcher to match the
                     // reloaded `[media]` config.
                     restart_media_watch(
@@ -12499,6 +12567,13 @@ async fn event_loop<T: Terminal>(
             if let Some(pal) = &palette {
                 pal.render(&mut scratch, screen);
             }
+            // Replay overlay paints the scratch grid over the center, below the
+            // search overlay/menus.
+            if let Some(ref ov) = replay
+                && let Some(rec) = panes.table.get(&ov.pane_id()).and_then(|p| p.recording())
+            {
+                ov.render(&mut scratch, chrome.center, rec);
+            }
             // Search overlay is composited above the center, below menus.
             if let Some(ref ov) = search {
                 let rect = search_overlay_rect(chrome.center);
@@ -13374,6 +13449,13 @@ async fn event_loop<T: Terminal>(
                                     let _ = out.write_all(&crate::copymode::osc52(&text));
                                     let _ = out.flush();
                                     crate::clipboard::copy(&text);
+                                    // Also land in the default register (persisted),
+                                    // so `PasteRegister "` recalls it across restarts.
+                                    store_yank(
+                                        &mut registers,
+                                        superzej_core::registers::DEFAULT,
+                                        text.clone(),
+                                    );
                                     toasts.success(
                                         "Text copied to clipboard",
                                         std::time::Instant::now(),
@@ -13395,6 +13477,32 @@ async fn event_loop<T: Terminal>(
                     continue;
                 }
                 let k = normalize_key(k);
+                // Register paste is armed (PasteRegister): the next key names the
+                // register (`a`–`z`/`0`–`9`, `"` default, `+` clipboard). It's a
+                // top-priority mini-modal so the char never leaks to the pane.
+                if pending_paste_register {
+                    pending_paste_register = false;
+                    dirty = true;
+                    if let termwiz::input::KeyCode::Char(c) = k.key {
+                        let text = if c == superzej_core::registers::CLIPBOARD {
+                            crate::clipboard::paste()
+                        } else {
+                            registers.get(c).map(str::to_string)
+                        };
+                        match text {
+                            Some(t) if !t.is_empty() => {
+                                if let Some(p) = panes.table.get_mut(&focused) {
+                                    paste_text_into_pane(p, &t)?;
+                                }
+                            }
+                            _ => toasts.info(
+                                format!("Register \"{c} is empty"),
+                                std::time::Instant::now(),
+                            ),
+                        }
+                    }
+                    continue;
+                }
                 // The hover preview is modal-lite: any key dismisses it and is
                 // consumed (so it never also acts on the panel beneath).
                 if hover_popup.take().is_some() {
@@ -14475,6 +14583,30 @@ async fn event_loop<T: Terminal>(
                     if consumed {
                         dirty = true;
                         continue;
+                    }
+                }
+                // Modal: when the replay overlay is open it captures all keys.
+                // It scrubs the focused pane's recording; keys never reach the
+                // live pane while open.
+                if let Some(ref mut ov) = replay {
+                    let outcome = match panes.table.get(&ov.pane_id()).and_then(|p| p.recording()) {
+                        Some(rec) => ov.handle_key(&k.key, k.modifiers, rec),
+                        // Recording vanished (pane closed) — just exit replay.
+                        None => crate::replay_overlay::ReplayOutcome::Dismiss,
+                    };
+                    match outcome {
+                        crate::replay_overlay::ReplayOutcome::Pending => {
+                            playback_clock
+                                .set(ov.is_playing(), crate::replay_overlay::REPLAY_FRAME_DT_MS);
+                            dirty = true;
+                            continue;
+                        }
+                        crate::replay_overlay::ReplayOutcome::Dismiss => {
+                            replay = None;
+                            playback_clock.set(false, crate::replay_overlay::REPLAY_FRAME_DT_MS);
+                            dirty = true;
+                            continue;
+                        }
                     }
                 }
                 // Modal: when the search overlay is open it captures all keys.
@@ -19342,6 +19474,11 @@ async fn event_loop<T: Terminal>(
                                         let _ = out.write_all(&crate::copymode::osc52(&text));
                                         let _ = out.flush();
                                         crate::clipboard::copy(&text);
+                                        store_yank(
+                                            &mut registers,
+                                            superzej_core::registers::DEFAULT,
+                                            text.clone(),
+                                        );
                                         toasts.success(
                                             if mouse_sel.is_some() {
                                                 "Selection copied to clipboard"
@@ -19620,6 +19757,36 @@ async fn event_loop<T: Terminal>(
                             }
                             Action::ToggleRecorder => {
                                 toggle_recorder(&mut recorder, rows, cols, &mut toasts);
+                            }
+                            Action::EnterReplay => {
+                                // Open time-travel replay for the focused pane, if
+                                // it has a recording (replay enabled + some output).
+                                match panes.table.get(&focused).and_then(|p| p.recording()) {
+                                    Some(rec) if !rec.is_empty() => {
+                                        replay = Some(crate::replay_overlay::ReplayOverlay::new(
+                                            focused,
+                                            rec,
+                                            current_config.replay.idle_threshold_ms,
+                                        ));
+                                    }
+                                    Some(_) => toasts.info(
+                                        "Replay: nothing recorded for this pane yet",
+                                        std::time::Instant::now(),
+                                    ),
+                                    None => toasts.info(
+                                        "Replay is disabled ([replay] enabled = false)",
+                                        std::time::Instant::now(),
+                                    ),
+                                }
+                            }
+                            Action::PasteRegister => {
+                                // Arm: the next key names the register to paste
+                                // into the focused pane.
+                                pending_paste_register = true;
+                                toasts.info(
+                                    "Paste register: press a–z / 0–9 / \" / +",
+                                    std::time::Instant::now(),
+                                );
                             }
                             Action::MediaPlayPause
                             | Action::MediaNext
