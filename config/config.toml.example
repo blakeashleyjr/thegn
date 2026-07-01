@@ -468,6 +468,24 @@ format = "text"           # text | json
 # [profiles.vim.keybinds]
 # focus-down = "j"
 
+# ── Profiles: whole-process firewall (H) ────────────────────────────────────
+# `szhost --profile work` (or SUPERZEJ_PROFILE=work) runs a NAMED profile — a
+# whole-process work/personal firewall. A named profile reroots its own world
+# under ~/.superzej/profiles/<name>/: separate state DB + logs, its own worktrees
+# dir, and profile-scoped credentials (GIT_CONFIG_GLOBAL / GH_CONFIG_DIR /
+# GNUPGHOME under the profile, forge tokens dropped so they can't cross profiles;
+# GIT_SSH_COMMAND pinned with IdentitiesOnly=yes only when profiles/<name>/ssh/id
+# exists). The DEFAULT profile keeps today's shared paths untouched — no
+# migration. A named profile also loads an optional full-config overlay from the
+# REAL config home (never rerooted) at <XDG_CONFIG_HOME>/superzej/profiles/<name>/
+# config.toml, layered below env/`--set`. Switch/launch with Ctrl+Alt+g (spawns a
+# new terminal window running szhost --profile=<name>); one advisory window per
+# profile (a second is warned-about, not refused — profile DBs are WAL-safe).
+#
+# CAVEAT: the firewall is only as strong as the loosest sandbox setting —
+# `[sandbox] file_access = "all"`, `network = "host"`, or SSH agent forwarding
+# defeat credential isolation.
+
 # Per-workspace overrides, keyed by repo slug (the workspace tab prefix). Applied
 # above [keybinds] but below a repo-root `.superzej.{toml,yaml,json}` overlay,
 # which may also carry its own [keybinds] table — the most specific layer wins.
@@ -586,6 +604,42 @@ command = "git diff"
 # as [sandbox] mounts below). These extend the global mounts; the global list is
 # the "all workspaces" scope, this is the "per workspace" scope:
 # sandbox_mounts = ["~/datasets:ro", "/opt/toolchain"]
+# Default env bundle for this workspace (see [bundle.*] below):
+# env_bundle = "work"
+
+# ── Environment bundles (AU) ────────────────────────────────────────────────
+# Soft "work vs personal" identities WITHIN one running process — the middle
+# ground between per-provider account switching (above) and heavyweight process
+# profiles ([profiles.*] / --profile, below). A bundle composes env vars +
+# credential/config-dir redirection + account selection (+ optional dotfiles),
+# binds at any scope (global / workspace / worktree), and is injected into EVERY
+# pane spawn (shells too, not just agents). Switch with Ctrl+Alt+u (or the
+# "Switch env bundle" palette entry); it affects panes launched after the switch.
+# Precedence: base ◁ extends-chain ◁ global ◁ workspace ◁ worktree ◁ .env.
+#
+# [bundle.work]
+# extends      = ["base"]                       # optional composition (low→high)
+# accounts     = { claude = "work" }            # → CLAUDE_CONFIG_DIR (see accounts)
+# env          = { ANTHROPIC_BASE_URL = "https://proxy.work", FOO = "env:HOST_FOO" }
+# config_dirs  = { GIT_CONFIG_GLOBAL = "~/.config/git/work" }  # Tier-1 redirection
+# dotenv       = true                           # opt into the worktree .env (below)
+# home         = "managed"                       # Tier-3 synthetic HOME (opt-in)
+# [bundle.work.dotfiles]                          # Tier-2 materialized dotfiles
+# source = "~/dotfiles/work"
+# mode   = "symlink"                              # "symlink" | "template"
+#
+# Secret values never sit in this file in plaintext — reference them through a
+# resolver scheme and superzej runs the command at launch (off-loop, never
+# persisted; a failure degrades to skipping the key):
+# [secrets.resolvers]
+# pass = "pass show {ref}"        # value "pass:work/anthropic" → runs `pass show work/anthropic`
+# op   = "op read {value}"        # {value} = the full "op://vault/item/field"
+# sops = "sops --decrypt --extract '[\"{key}\"]' {file}"   # {ref} split on last ':' → {file}:{key}
+#
+# Opt-in `.env`: with `dotenv = true`, a worktree's `.env` loads at LOWEST
+# precedence (never overrides a bundle value), only after you allow-list it (the
+# switcher prompts), and credential-shaped keys (*_TOKEN/*_KEY/*_SECRET/
+# *_PASSWORD) are always dropped — a repo `.env` can never inject a token.
 
 # General tasks: surfaced in the Tests panel and, later, Problems/Timeline/Search
 # Everywhere. `kind = "test"` makes a task eligible for test discovery/runs.
@@ -1005,8 +1059,16 @@ mounts = ["~/.gitconfig:ro"]
 # gpu = "all"
 
 # ── Environment ──────────────────────────────────────────────────────────────
-# Host env vars forwarded into the sandbox. Extend this list if your agent
-# needs additional credentials or toolchain vars.
+# Host env vars forwarded into the SANDBOX. Extend this list if your agent needs
+# additional credentials or toolchain vars.
+#
+# NOTE: separately, EVERY pane (sandboxed or not) is spawned clear-then-allowlist
+# — it does NOT inherit szhost's whole environment, so the launching shell's
+# GH_TOKEN / ANTHROPIC_API_KEY / SSH_AUTH_SOCK etc. do not leak into panes. A
+# curated infrastructure base (PATH/HOME/locale/terminal/display + the XDG/DBus
+# vars a rootless runtime needs) is seeded, then the pane's bundle/profile
+# identity is layered on. To re-admit a specific var into a plain (non-sandbox)
+# shell, set it via a [bundle.*] `env` entry.
 env_passthrough = [
   "SSH_AUTH_SOCK",      # SSH key forwarding (needed for git push inside OCI)
   "GH_TOKEN",           # GitHub CLI auth
@@ -1014,6 +1076,8 @@ env_passthrough = [
   "ANTHROPIC_API_KEY",
   "TERM",
   "COLORTERM",
+  "GIT_CONFIG_GLOBAL",  # profile git identity into the sandbox (H)
+  "GH_CONFIG_DIR",      # profile gh config into the sandbox (H)
 ]
 
 # ── Shell ─────────────────────────────────────────────────────────────────────

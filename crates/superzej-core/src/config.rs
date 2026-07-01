@@ -247,6 +247,18 @@ config_enum! {
     } default = Auto;
 }
 config_enum! {
+    /// How an env-bundle's Tier-2 dotfiles are materialized into its managed
+    /// HOME (`[bundle.<n>.dotfiles] mode`). See [`crate::bundle`].
+    ///
+    /// - `symlink`  — symlink each source entry into the managed HOME (cheapest;
+    ///                edits to the source are reflected live). The default.
+    /// - `template` — copy the source tree (a private snapshot; edits to the
+    ///                source do not leak into the bundle until re-materialized).
+    pub enum DotfileMode: "dotfile mode" {
+        Symlink = "symlink" | "link", Template = "template" | "copy",
+    } default = Symlink;
+}
+config_enum! {
     /// `[sandbox.home] strategy` — how hard superzej tries to reproduce *your*
     /// host shell inside a sandbox/remote. A ladder mirroring the repo-toolchain
     /// tiers, applied by the env provisioner (see [`crate::envplan`]).
@@ -1337,6 +1349,85 @@ pub struct WorkspaceConfig {
     /// repo slug, like the other `[workspace.<slug>]` keys.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sandbox_mounts: Vec<String>,
+    /// Default env-bundle for this workspace (`[workspace.<slug>] env_bundle =
+    /// "work"`). Consulted below a worktree override and above the global active
+    /// bundle — the same precedence shape as `accounts`. See [`crate::bundle`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env_bundle: Option<String>,
+}
+
+/// A named **environment bundle** (`[bundle.<name>]`) — a composable unit of env
+/// vars + credential/config-dir redirection + per-provider account selection +
+/// optional dotfiles, bound at any scope (global/workspace/worktree) and injected
+/// at the pane-spawn seam for **every** pane. The "soft" work/personal identity
+/// layer (roadmap AU): lighter than a whole-process profile (roadmap H), heavier
+/// than the single-var account switch it generalizes. All fields optional; an
+/// empty bundle is the no-op identity. Resolution lives in [`crate::bundle`].
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct Bundle {
+    /// Names of other bundles merged first (low precedence), for composition
+    /// (`extends = ["base"]`). Cycles are broken defensively.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub extends: Vec<String>,
+    /// Arbitrary env vars. Values support `env:`/`file:` indirection and
+    /// `<scheme>:<ref>` secret resolvers (see `[secrets.resolvers]`).
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Per-provider account selection (`accounts = { claude = "work" }`).
+    /// Resolved through [`crate::account`] to the credential-home env var +
+    /// path-preserving mount — how `account.rs` becomes a bundle consumer.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub accounts: std::collections::BTreeMap<String, String>,
+    /// Tier-1 config-dir redirection (`config_dirs = { GIT_CONFIG_GLOBAL =
+    /// "~/.config/git/work" }`). Just env vars pointing well-known tools at an
+    /// alternate config dir; no file operations. `~` is expanded.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub config_dirs: std::collections::BTreeMap<String, String>,
+    /// Tier-2 materialized dotfiles (opt-in) — a source tree symlinked/templated
+    /// into the bundle's managed HOME. See [`crate::bundle`] (materialized
+    /// off-loop).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dotfiles: Option<DotfilesSpec>,
+    /// Tier-3 synthetic HOME (opt-in): `"managed"` roots panes at the bundle's
+    /// managed HOME; `"<path>"` roots them at an explicit dir; absent ⇒ inherit
+    /// the real HOME.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub home: String,
+    /// Opt into loading the worktree's `.env` on top of this bundle
+    /// (allowlisted + credential-key-filtered; see [`crate::bundle`]).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dotenv: bool,
+}
+
+/// Tier-2 dotfile materialization spec (`[bundle.<n>.dotfiles]`).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct DotfilesSpec {
+    /// Source tree to materialize into the managed HOME (`~` expanded).
+    pub source: String,
+    /// Symlink (default) or template/copy.
+    pub mode: DotfileMode,
+}
+
+/// `[secrets.resolvers]` — pluggable external secret-resolver commands, keyed by
+/// scheme. A bundle value like `ANTHROPIC_API_KEY = "pass:work/anthropic"` runs
+/// the `pass` resolver at launch, off the event loop; values are never persisted.
+/// The command template may contain `{ref}` (the part after `<scheme>:`),
+/// `{key}` and `{file}` (for `sops`-style refs). See [`crate::bundle`].
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct SecretsConfig {
+    /// scheme → command template (`pass = "pass show {ref}"`).
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub resolvers: std::collections::BTreeMap<String, String>,
+}
+
+impl SecretsConfig {
+    /// True when no resolvers are configured (so serialization skips the table).
+    pub fn is_empty(&self) -> bool {
+        self.resolvers.is_empty()
+    }
 }
 
 /// `[theme]` — visual tuning: the accent, the focus frame color, and optional
@@ -3196,6 +3287,12 @@ impl Default for SandboxConfig {
                 "GPG_AGENT_INFO",
                 "GNUPGHOME",
                 "GPG_TTY",
+                // Profile git identity into the sandbox (H): the profile reroot
+                // points these at the profile config dirs, path-preservingly
+                // mounted via `profile::sandbox_cred_mounts`. Unset on the
+                // default profile ⇒ no-op there.
+                "GIT_CONFIG_GLOBAL",
+                "GH_CONFIG_DIR",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -4398,6 +4495,15 @@ pub struct Config {
     /// workspace/repo/worktree selects from. See [`Config::resolve_env`].
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub env: std::collections::BTreeMap<String, EnvConfig>,
+    /// Named environment bundles (`[bundle.<name>]`) — soft work/personal
+    /// identities bound per scope and injected at every pane spawn. See
+    /// [`crate::bundle`].
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub bundle: std::collections::BTreeMap<String, Bundle>,
+    /// `[secrets.resolvers]` — external secret-resolver commands used to expand
+    /// `<scheme>:<ref>` bundle values at launch without persisting the secret.
+    #[serde(skip_serializing_if = "SecretsConfig::is_empty")]
+    pub secrets: SecretsConfig,
     /// Per-program host-action overlays (`[program_keybinds.<program>]`), keyed
     /// by the focused pane's program name. Consulted before the active mode.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -4476,6 +4582,8 @@ impl Default for Config {
             profiles: std::collections::BTreeMap::new(),
             workspace: std::collections::BTreeMap::new(),
             env: std::collections::BTreeMap::new(),
+            bundle: std::collections::BTreeMap::new(),
+            secrets: SecretsConfig::default(),
             program_keybinds: std::collections::BTreeMap::new(),
             program_remap: std::collections::BTreeMap::new(),
         }
@@ -4776,6 +4884,20 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     o
 }
 
+/// Recursively merge `overlay` into `base` (both JSON): objects merge key-wise
+/// (recursing), any other value replaces. The primitive behind config profile
+/// overlays — a key the overlay omits keeps the base value.
+fn deep_merge_json(base: &mut serde_json::Value, overlay: serde_json::Value) {
+    match (base, overlay) {
+        (serde_json::Value::Object(b), serde_json::Value::Object(o)) => {
+            for (k, v) in o {
+                deep_merge_json(b.entry(k).or_insert(serde_json::Value::Null), v);
+            }
+        }
+        (b, o) => *b = o,
+    }
+}
+
 fn parse_bool(raw: &str, key: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -4803,6 +4925,17 @@ impl Config {
         let file = path.unwrap_or_else(Self::path);
         let s = std::fs::read_to_string(&file).unwrap_or_else(|_| "".into());
         let mut cfg: Config = toml::from_str(&s).map_err(|e| format!("{e}"))?;
+
+        // Profile overlay (H): a named profile's own `config.toml` (a full
+        // Config-shaped overlay) merges over the shared base, from the REAL
+        // config home — `XDG_CONFIG_HOME` is deliberately NOT rerooted, so the
+        // shared base still loads while the profile refines it. Below env/`--set`.
+        if let Some(pfile) = Self::profile_overlay_path(env)
+            && let Ok(ps) = std::fs::read_to_string(&pfile)
+            && let Err(e) = Self::apply_toml_overlay(&mut cfg, &ps)
+        {
+            config_warn(&format!("profile config {}: {e}", pfile.display()));
+        }
 
         env_overlay(env).apply(&mut cfg);
 
@@ -4840,6 +4973,32 @@ impl Config {
                 cfg
             }
         }
+    }
+
+    /// The active named profile's config-overlay file
+    /// (`<real XDG_CONFIG_HOME>/superzej/profiles/<name>/config.toml`), or `None`
+    /// for the default profile. Uses `xdg_config_home()` directly (the shared
+    /// config home is never rerooted).
+    fn profile_overlay_path(env: &dyn EnvSource) -> Option<PathBuf> {
+        let name = crate::profile::normalize_name(&env.get("SUPERZEJ_PROFILE").unwrap_or_default());
+        (name != "default").then(|| {
+            util::xdg_config_home()
+                .join("superzej")
+                .join("profiles")
+                .join(name)
+                .join("config.toml")
+        })
+    }
+
+    /// Deep-merge a TOML overlay string over `cfg` (overlay wins per-key; base
+    /// keys the overlay omits are preserved). The mechanism behind the profile
+    /// (and later subprofile) full overlays. Pure + unit-tested.
+    pub fn apply_toml_overlay(cfg: &mut Config, toml_str: &str) -> Result<(), String> {
+        let overlay: serde_json::Value = toml::from_str(toml_str).map_err(|e| format!("{e}"))?;
+        let mut base = serde_json::to_value(&*cfg).map_err(|e| e.to_string())?;
+        deep_merge_json(&mut base, overlay);
+        *cfg = serde_json::from_value(base).map_err(|e| format!("{e}"))?;
+        Ok(())
     }
 
     fn apply_override_str(cfg: &mut Config, key: &str, val: &str) -> Result<(), String> {
@@ -7713,6 +7872,40 @@ transport = \"ssh\"
     #[test]
     fn expand_env_ref_returns_literal_for_plain_value() {
         assert_eq!(expand_env_ref("lin_abc123"), Some("lin_abc123".into()));
+    }
+
+    #[test]
+    fn profile_toml_overlay_merges_over_base_and_preserves_untouched() {
+        let mut cfg = Config::default();
+        cfg.branch_prefix = "sz/".into();
+        let base_accent = cfg.theme.accent.clone();
+        // A profile overlay changes branch_prefix + a nested sandbox field, and
+        // leaves theme.accent untouched.
+        Config::apply_toml_overlay(
+            &mut cfg,
+            "branch_prefix = \"work/\"\n[sandbox]\nnetwork = \"none\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.branch_prefix, "work/", "overlay wins");
+        assert_eq!(cfg.sandbox.network, Network::None, "nested overlay applies");
+        assert_eq!(
+            cfg.theme.accent, base_accent,
+            "untouched base key preserved"
+        );
+    }
+
+    #[test]
+    fn profile_overlay_path_none_for_default_some_for_named() {
+        struct FakeEnv(Option<String>);
+        impl EnvSource for FakeEnv {
+            fn get(&self, k: &str) -> Option<String> {
+                (k == "SUPERZEJ_PROFILE").then(|| self.0.clone()).flatten()
+            }
+        }
+        assert!(Config::profile_overlay_path(&FakeEnv(None)).is_none());
+        assert!(Config::profile_overlay_path(&FakeEnv(Some("default".into()))).is_none());
+        let p = Config::profile_overlay_path(&FakeEnv(Some("work".into()))).unwrap();
+        assert!(p.ends_with("superzej/profiles/work/config.toml"));
     }
 
     #[test]

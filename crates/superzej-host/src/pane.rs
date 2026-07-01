@@ -254,6 +254,21 @@ impl PtyPane {
         if let Some(dir) = cwd {
             cmd.cwd(dir);
         }
+        // Clear-then-allowlist: a pane does NOT inherit szhost's whole
+        // environment (that leaks the launching shell's GH_TOKEN /
+        // ANTHROPIC_API_KEY / SSH_AUTH_SOCK past any identity boundary). Start
+        // from an empty env seeded only with curated infrastructure vars
+        // (`superzej_core::util::host_base_env` — locale/terminal/display + the
+        // XDG/DBus vars a rootless container runtime needs), then layer the
+        // caller-supplied identity env on top. This is the shared prerequisite
+        // for env-bundles (AU) and process-profiles (H). For sandboxed panes the
+        // secret VALUES reach the container via the wrapper argv (`-e K=V` /
+        // `--setenv`), so clearing the launcher's own env is safe.
+        cmd.env_clear();
+        for (k, v) in superzej_core::util::host_base_env() {
+            cmd.env(k, v);
+        }
+        // Terminal defaults, unless the caller (or base env) already set them.
         cmd.env("TERM", "xterm-256color");
         // The emulator parses 24-bit SGR; advertise it so apps (btop, modern
         // CLIs) pick truecolor instead of degraded 256-color ramps.
@@ -978,6 +993,46 @@ mod tests {
                 .row_text(0)
                 .map(|r| r.trim_end().to_string()),
             Some("hello-pty".to_string())
+        );
+    }
+
+    #[test]
+    fn spawn_with_env_firewalls_launcher_creds_but_keeps_infra() {
+        // The clear-then-allowlist firewall: a credential-shaped var present in
+        // szhost's OWN environment must NOT reach a spawned pane, while curated
+        // infrastructure (PATH) still does. Setting GH_TOKEN here is safe under
+        // test parallelism because `host_base_env` filters it out regardless —
+        // it can never enter any child — so a transient set corrupts nothing.
+        unsafe { std::env::set_var("GH_TOKEN", "leak-me-if-you-can") };
+        let (tx, mut rx) = tokio_mpsc::channel(1024);
+        let mut pane = PtyPane::spawn_with_env(
+            0,
+            &sh(r#"printf 'PATH=%s TOK=[%s]' "${PATH:+set}" "$GH_TOKEN""#),
+            None,
+            &[],
+            24,
+            80,
+            tx,
+            None,
+        )
+        .unwrap();
+        assert!(
+            drain_until_exit(&mut pane, &mut rx, 5000),
+            "child should exit"
+        );
+        unsafe { std::env::remove_var("GH_TOKEN") };
+        let line = pane
+            .emulator()
+            .row_text(0)
+            .map(|r| r.trim_end().to_string())
+            .unwrap_or_default();
+        assert!(
+            line.contains("PATH=set"),
+            "base infra env (PATH) must reach the pane: {line:?}"
+        );
+        assert!(
+            line.contains("TOK=[]"),
+            "launcher-shell GH_TOKEN must be firewalled out of the pane: {line:?}"
         );
     }
 
