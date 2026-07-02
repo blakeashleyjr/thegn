@@ -4,7 +4,8 @@
 
 **Goal:** Build a unified CLI reporting tool and a live background sidecar that aggregates metrics from our newly created agent adapters (Claude, Codex, OpenCode, Hermes, Pi) and streams them to the Superzej UI chrome.
 
-**Architecture:** 
+**Architecture:**
+
 - A Python CLI (`src/report.py`) that queries all adapter endpoints on-demand and prints a consolidated cost/usage report.
 - A Python background daemon (`src/sidecar.py`) that continuously tails the agent log directories (`~/.pi/agent/sessions/`, `~/.codex/sessions/`) using `inotify` or polling, and emits live JSON updates.
 - A small Rust integration in `crates/superzej-host/src/chrome.rs` (or similar) that reads the sidecar's JSON stream and updates the status bar.
@@ -18,10 +19,12 @@
 **Objective:** Create a CLI script that aggregates static snapshot data across all adapters and prints a human-readable cost/token report.
 
 **Files:**
+
 - Create: `src/report.py`
 - Modify: `tests/test_report.py` (Create)
 
 **Step 1: Write failing test**
+
 ```python
 def test_unified_report(capsys):
     import src.report as report
@@ -36,6 +39,7 @@ Run: `source .venv/bin/activate && export PYTHONPATH="$(pwd)" && pytest tests/te
 Expected: FAIL — "ModuleNotFoundError: No module named 'src.report'"
 
 **Step 3: Write minimal implementation**
+
 ```python
 # src/report.py
 import sys
@@ -44,7 +48,7 @@ def generate_report(mock_adapters=False):
     # In a real run, this will import the adapters and fetch real data.
     # For now, it provides the skeleton.
     print("=== Unified Agent Metrics ===")
-    
+
     if mock_adapters:
         print("Claude Code: $0.10 (500 tokens)")
         print("Pi Agent: $0.05 (250 tokens)")
@@ -62,6 +66,7 @@ Run: `source .venv/bin/activate && export PYTHONPATH="$(pwd)" && pytest tests/te
 Expected: PASS
 
 **Step 5: Commit**
+
 ```bash
 git add src/report.py tests/test_report.py
 git commit -m "feat: add unified CLI reporter skeleton" --no-verify
@@ -74,9 +79,11 @@ git commit -m "feat: add unified CLI reporter skeleton" --no-verify
 **Objective:** Build a Python background process that tails new JSONL files in `~/.pi/agent/sessions/` and emits live token usage updates to `stdout`.
 
 **Files:**
+
 - Create: `src/sidecar.py`
 
 **Step 1: Write failing test**
+
 ```python
 # tests/test_sidecar.py
 def test_sidecar_event_emission(capsys):
@@ -92,6 +99,7 @@ Run: `source .venv/bin/activate && export PYTHONPATH="$(pwd)" && pytest tests/te
 Expected: FAIL — module not found
 
 **Step 3: Write minimal implementation**
+
 ```python
 # src/sidecar.py
 import json
@@ -117,6 +125,7 @@ Run: `source .venv/bin/activate && export PYTHONPATH="$(pwd)" && pytest tests/te
 Expected: PASS
 
 **Step 5: Commit**
+
 ```bash
 git add src/sidecar.py tests/test_sidecar.py
 git commit -m "feat: add live metrics sidecar event emitter" --no-verify
@@ -129,10 +138,12 @@ git commit -m "feat: add live metrics sidecar event emitter" --no-verify
 **Objective:** Add a struct and a background Tokio task in `superzej-host` to spawn the `sidecar.py` process, read its stdout, and update a shared state `Arc<Mutex<AiMetrics>>`.
 
 **Files:**
+
 - Modify: `crates/superzej-host/src/chrome.rs` (or equivalent status bar file)
 - Modify: `crates/superzej-host/src/run.rs` (to spawn the task)
 
 **Step 1: Write failing test**
+
 ```rust
 // In crates/superzej-host/src/chrome.rs
 #[cfg(test)]
@@ -153,6 +164,7 @@ Run: `cargo test -p superzej-host --lib chrome`
 Expected: FAIL — `AiMetrics` not found.
 
 **Step 3: Write minimal implementation**
+
 ```rust
 // Add to crates/superzej-host/src/chrome.rs
 use serde::Deserialize;
@@ -177,6 +189,7 @@ Run: `cargo test -p superzej-host --lib chrome`
 Expected: PASS
 
 **Step 5: Commit**
+
 ```bash
 git add crates/superzej-host/src/chrome.rs
 git commit -m "feat(host): add AiMetrics struct for sidecar IPC" --no-verify
@@ -189,12 +202,14 @@ git commit -m "feat(host): add AiMetrics struct for sidecar IPC" --no-verify
 **Objective:** Read the stdout lines from the child process asynchronously. When a new JSON line arrives, parse it, update the state, and pulse the `TerminalWaker` to trigger a re-render.
 
 **Files:**
+
 - Modify: `crates/superzej-host/src/run.rs`
 
 **Step 1: Write failing test**
 (No direct unit test for Tokio I/O loops; verify via compiler type checking).
 
 **Step 2: Write minimal implementation**
+
 ```rust
 // In crates/superzej-host/src/run.rs
 use tokio::process::Command;
@@ -229,6 +244,7 @@ Run: `cargo check -p superzej-host`
 Expected: PASS
 
 **Step 4: Commit**
+
 ```bash
 git add crates/superzej-host/src/run.rs
 git commit -m "feat(host): spawn Python sidecar and pulse terminal waker" --no-verify
@@ -241,9 +257,11 @@ git commit -m "feat(host): spawn Python sidecar and pulse terminal waker" --no-v
 **Objective:** Display the active AI metrics in the `superzej` UI chrome (status bar).
 
 **Files:**
+
 - Modify: `crates/superzej-host/src/chrome.rs`
 
 **Step 1: Implementation**
+
 ```rust
 // Inside the `render_statusbar` or equivalent function:
 pub fn render_ai_status(surface: &mut termwiz::surface::Surface, metrics: &Option<AiMetrics>) {
@@ -261,6 +279,7 @@ Run: `cargo check -p superzej-host`
 Expected: PASS
 
 **Step 3: Commit**
+
 ```bash
 git add crates/superzej-host/src/chrome.rs
 git commit -m "feat(host): render AI metrics in status bar" --no-verify

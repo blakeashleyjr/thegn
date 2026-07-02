@@ -37,6 +37,8 @@ command = "yamlfmt"
 includes = ["*.yaml", "*.yml"]
 
 [formatter.prettier]
-command = "prettier"
-options = ["--write"]
+# Fixed-point shim: prettier's markdown printer is not idempotent on code
+# spans that wrap across a line break, so the shim re-runs it until the
+# output is stable (otherwise pre-commit --fail-on-change fails repeatedly).
+command = "./test/fmt/prettier-stable.sh"
 includes = ["*.md"]

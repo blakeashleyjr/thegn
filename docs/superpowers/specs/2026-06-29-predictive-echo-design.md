@@ -10,7 +10,7 @@ of the transport** — the WSS exec PTY and ssh-over-WSS are equally laggy. The
 only fix is what mosh does: **echo the user's keystrokes locally, immediately, and
 reconcile when the server's authoritative output arrives.** superzej owns the
 vt100 emulator + the pane, so it can do this transport-agnostically — it works on
-the *existing* native-exec pane (no ssh, no fresh sprite, no re-provision).
+the _existing_ native-exec pane (no ssh, no fresh sprite, no re-provision).
 
 ## Scope (conservative first cut)
 
@@ -18,8 +18,8 @@ Mosh's engine does per-cell epoch validation; we start with a smaller, low-glitc
 subset that covers the 90% case (typing a command at a shell prompt):
 
 - **Predict printable keystrokes only.** On a `Key(char)` to a high-latency pane,
-  append the char to a per-pane *prediction overlay* and advance a *predicted
-  cursor*; render it immediately (dimmed/underlined, like mosh) at the cursor.
+  append the char to a per-pane _prediction overlay_ and advance a _predicted
+  cursor_; render it immediately (dimmed/underlined, like mosh) at the cursor.
 - **Backspace** pops the last predicted char; **Enter** flushes the overlay (the
   line is submitted — the server will redraw).
 - **Reconcile by clear-on-output.** When real `PaneEvent::Output` for the pane

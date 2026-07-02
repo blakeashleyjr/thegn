@@ -15,16 +15,19 @@
 **Objective:** Extract session metrics, costs, and statuses from Claude Code's JSON outputs.
 
 **Implementation Details:**
+
 - Run commands using `claude -p '<prompt>' --output-format json`.
 - Parse the resulting JSON to extract `session_id`, `num_turns`, `total_cost_usd`, and `usage` (`input_tokens`, `output_tokens`).
 - Use `claude -p '<prompt>' --output-format stream-json --verbose --include-partial-messages` to read real-time streaming events for live status tracking.
 - Create a reader for `claude auth status` to track readiness.
 
 **Files:**
+
 - Create: `src/adapters/claude_code.py`
 - Test: `tests/adapters/test_claude_code.py`
 
 **Step 1: Write failing test**
+
 ```python
 def test_parse_claude_json_output():
     raw_output = '{"type": "result", "session_id": "1234", "total_cost_usd": 0.05, "usage": {"input_tokens": 10, "output_tokens": 20}}'
@@ -38,6 +41,7 @@ Run: `pytest tests/adapters/test_claude_code.py`
 Expected: FAIL
 
 **Step 3: Write minimal implementation**
+
 ```python
 import json
 
@@ -63,6 +67,7 @@ Run: `pytest tests/adapters/test_claude_code.py`
 Expected: PASS
 
 **Step 5: Commit**
+
 ```bash
 git add src/adapters/claude_code.py tests/adapters/test_claude_code.py
 git commit -m "feat: add claude code JSON adapter"
@@ -75,15 +80,18 @@ git commit -m "feat: add claude code JSON adapter"
 **Objective:** Parse Codex JSONL execution streams to track session IDs and tool execution.
 
 **Implementation Details:**
+
 - Use `codex exec '<prompt>' --json` to retrieve live JSONL events.
 - Parse standard output line-by-line using `json.loads` to aggregate cost and tool call execution status.
 - Monitor `~/.codex/sessions/` for durable session files and parse session metadata.
 
 **Files:**
+
 - Create: `src/adapters/codex.py`
 - Test: `tests/adapters/test_codex.py`
 
 **Step 1: Write failing test**
+
 ```python
 def test_codex_jsonl_parser():
     jsonl = '{"type": "start", "session": "abc"}\n{"type": "end"}'
@@ -97,6 +105,7 @@ Run: `pytest tests/adapters/test_codex.py`
 Expected: FAIL
 
 **Step 3: Write minimal implementation**
+
 ```python
 import json
 
@@ -111,6 +120,7 @@ Run: `pytest tests/adapters/test_codex.py`
 Expected: PASS
 
 **Step 5: Commit**
+
 ```bash
 git add src/adapters/codex.py tests/adapters/test_codex.py
 git commit -m "feat: add codex JSONL adapter"
@@ -123,15 +133,18 @@ git commit -m "feat: add codex JSONL adapter"
 **Objective:** Fetch OpenCode session titles, stats, and live execution json.
 
 **Implementation Details:**
+
 - Invoke `opencode session list --format json` to get a structured list of sessions containing `{ id, title, updatedAt, model }`.
 - Invoke `opencode stats --format json` to get overarching token usage and cost metrics.
 - For active runs: use `opencode run '<prompt>' --format json`.
 
 **Files:**
+
 - Create: `src/adapters/opencode.py`
 - Test: `tests/adapters/test_opencode.py`
 
 **Step 1: Write failing test**
+
 ```python
 def test_opencode_session_list():
     raw_json = '[{"id": "ses_123", "title": "Refactor auth", "model": "claude"}]'
@@ -144,6 +157,7 @@ Run: `pytest tests/adapters/test_opencode.py`
 Expected: FAIL
 
 **Step 3: Write minimal implementation**
+
 ```python
 import json
 
@@ -156,6 +170,7 @@ Run: `pytest tests/adapters/test_opencode.py`
 Expected: PASS
 
 **Step 5: Commit**
+
 ```bash
 git add src/adapters/opencode.py tests/adapters/test_opencode.py
 git commit -m "feat: add opencode CLI adapter"
@@ -168,15 +183,18 @@ git commit -m "feat: add opencode CLI adapter"
 **Objective:** Read Hermes state directly from its SQLite FTS5 database to extract deep session metrics without subprocess polling.
 
 **Implementation Details:**
+
 - Connect directly to `~/.hermes/state.db` using Python's `sqlite3`.
 - Query the `sessions` and `messages` tables to extract `session_id`, `title`, `when`, and message/token counts.
 - Fallback/Alternative: Run `hermes sessions export <file>.jsonl` and parse the output.
 
 **Files:**
+
 - Create: `src/adapters/hermes.py`
 - Test: `tests/adapters/test_hermes.py`
 
 **Step 1: Write failing test**
+
 ```python
 def test_hermes_sqlite_query(tmp_path):
     import sqlite3
@@ -185,7 +203,7 @@ def test_hermes_sqlite_query(tmp_path):
     conn.execute("CREATE TABLE sessions (session_id TEXT, title TEXT)")
     conn.execute("INSERT INTO sessions VALUES ('h_123', 'Build DB')")
     conn.commit()
-    
+
     sessions = get_hermes_sessions(db)
     assert sessions[0]["title"] == "Build DB"
 ```
@@ -195,6 +213,7 @@ Run: `pytest tests/adapters/test_hermes.py`
 Expected: FAIL
 
 **Step 3: Write minimal implementation**
+
 ```python
 import sqlite3
 
@@ -210,6 +229,7 @@ Run: `pytest tests/adapters/test_hermes.py`
 Expected: PASS
 
 **Step 5: Commit**
+
 ```bash
 git add src/adapters/hermes.py tests/adapters/test_hermes.py
 git commit -m "feat: add hermes SQLite adapter"
@@ -222,15 +242,18 @@ git commit -m "feat: add hermes SQLite adapter"
 **Objective:** Parse Pi's `.jsonl` session files and CLI output.
 
 **Implementation Details:**
+
 - Pi stores sessions globally grouped by workspace paths: `~/.pi/agent/sessions/--path--/*.jsonl`.
 - The CLI command `pi -p '<prompt>' --mode json` outputs direct JSONL events on stdout.
 - Parse the `usage` block from `assistantMessageEvent` to track `input_tokens`, `output_tokens`, and `cost`.
 
 **Files:**
+
 - Create: `src/adapters/pi.py`
 - Test: `tests/adapters/test_pi.py`
 
 **Step 1: Write failing test**
+
 ```python
 def test_parse_pi_events():
     jsonl = '{"type":"session","id":"pi-123"}\n{"type":"turn_end","usage":{"input": 10, "output": 5}}'
@@ -244,6 +267,7 @@ Run: `pytest tests/adapters/test_pi.py`
 Expected: FAIL
 
 **Step 3: Write minimal implementation**
+
 ```python
 import json
 
@@ -267,6 +291,7 @@ Run: `pytest tests/adapters/test_pi.py`
 Expected: PASS
 
 **Step 5: Commit**
+
 ```bash
 git add src/adapters/pi.py tests/adapters/test_pi.py
 git commit -m "feat: add pi JSONL adapter"
@@ -275,9 +300,11 @@ git commit -m "feat: add pi JSONL adapter"
 ---
 
 ### Risks and Tradeoffs
+
 - **CLI Schema Changes:** The agents (claude, opencode, pi) might change their JSON structure across versions without warning. We should implement schema validation (e.g., Pydantic) to catch this early.
 - **SQLite Locking:** Reading `~/.hermes/state.db` while Hermes is actively writing may hit locks. Use WAL mode considerations or fallback to `hermes sessions export`.
 - **Live Streams:** Adapters parsing `stream-json` or JSONL stdout in real-time will require asynchronous non-blocking read pipelines.
 
 ### Verification Steps
+
 Run `pytest tests/adapters/ -v` to ensure all parsers properly extract metric data from mocked JSON/JSONL/SQLite structures mirroring real agent outputs.

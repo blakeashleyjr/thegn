@@ -18,7 +18,7 @@
       pause/exit — 0 idle wakeups when paused/closed.
 - [x] 2.2 Time-search over re-fed frames (literal, case-insensitive + time-expr
       jump), grid text via `cell().text` iteration (not `row_text`) + `Action::
-      EnterReplay` bound to **`Alt+r`** — **test** finds a string that only
+EnterReplay` bound to **`Alt+r`** — **test** finds a string that only
       appeared in an alt-screen app (`search_finds_alt_screen_string_never_in_scrollback`).
       _(Bounded + Enter-triggered ⇒ runs inline; spawn_blocking is a future
       optimization for very large persisted logs.)_

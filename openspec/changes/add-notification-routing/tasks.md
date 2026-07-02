@@ -42,6 +42,6 @@
 - [x] 4.1 Document `[notifications.rules]`/`.dnd`/`.sound`/`.modes` + the
       `[profiles.<p>.notifications]` overlay in `config/config.toml.example`.
 - [x] 4.2 Gates green: `cargo fmt --check`, `clippy --workspace --all-targets
-    -D warnings`, core+host tests, `just coverage` (core ≥95%),
+-D warnings`, core+host tests, `just coverage` (core ≥95%),
       `openspec validate --strict`. (`smoke` / `nix-build` not run in this
       sandbox — read-only nix store.)
