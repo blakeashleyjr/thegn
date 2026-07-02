@@ -1,0 +1,75 @@
+# cargo-deny configuration (`just deps-audit`, part of `just lint`).
+# Gates: security advisories, license policy, duplicate major versions.
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = false
+
+[advisories]
+# Fail on any advisory (vulnerabilities, unmaintained, unsound, notices are
+# warnings by default; vulnerabilities error).
+db-path = "$CARGO_HOME/advisory-dbs"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "warn"
+# Documented exceptions — each needs a reason and an exit condition.
+ignore = [
+  # rsa Marvin timing sidechannel via jsonwebtoken←octocrab (GitHub App JWT
+  # signing in a local CLI; not a network-facing service). No fixed rsa
+  # release exists yet; drop this when rsa ships the fix.
+  "RUSTSEC-2023-0071",
+  # tokei 12.1.2 (code-stats) is the latest release and pins a legacy tree:
+  # clap 2 → ansi_term/atty, parking_lot 0.11 → instant, term_size. All
+  # "unmaintained" notices, no vulnerabilities. Drop when tokei 13 releases
+  # or the stats backend is replaced.
+  "RUSTSEC-2021-0139", # ansi_term unmaintained (via tokei)
+  "RUSTSEC-2024-0375", # atty unmaintained (via tokei)
+  "RUSTSEC-2024-0384", # instant unmaintained (via tokei)
+  "RUSTSEC-2020-0163", # term_size unmaintained (via tokei)
+  # syntect 5 (syntax highlighting) still serializes its dumps with
+  # bincode 1; unmaintained-notice only. Drop when syntect moves off it.
+  "RUSTSEC-2025-0141",
+]
+
+[licenses]
+# Permissive set only; anything else needs an explicit exception here.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "BSL-1.0",
+  "CC0-1.0",
+  "Unicode-3.0",
+  "Unlicense",
+  "MPL-2.0",
+  "CDLA-Permissive-2.0",
+  "OpenSSL",
+  # data-tables licenses used by unicode crates (finl_unicode, wezterm-bidi)
+  "Unicode-DFS-2016",
+  # terminfo (transitive via termwiz path)
+  "WTFPL",
+]
+confidence-threshold = 0.8
+
+[[licenses.clarify]]
+crate = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+# Duplicate versions are a warning, not an error: the tree already carries a
+# few known splits (syn 1+2, clap 2+4, windows 0.57/0.58/0.62). Ratchet to
+# "deny" once those are consolidated.
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace-internal `{ path = ... }` deps are versionless by design; none of
+# these crates are published.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = []

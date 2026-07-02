@@ -21,6 +21,9 @@
     # linters (not formatters — kept as separate pre-commit hooks)
     shellcheck
     yamllint
+    # dependency gates (`just deps-audit`)
+    cargo-deny
+    cargo-machete
     # runtime tools superzej shells out to
     git
     fzf

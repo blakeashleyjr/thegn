@@ -1,0 +1,251 @@
+name: ci
+# Server-side `just ci` gate. Adapted from the workflow proven green on the
+# sz/quiet-falcon-1 branch (8 ubuntu jobs), extended with the stages `just ci`
+# has since grown: deps-audit, check-cross, openspec-validate.
+#
+# Triggers: push to main + pull_request to main + dispatch. Note the prior
+# branch's finding: on a high-velocity main a PR's merge-ref sometimes can't be
+# computed, which silently stops `pull_request` runs from scheduling — the
+# `push` trigger covers main independently of merge-ability.
+#
+# Each `just ci` stage is its own job (parallel; one push surfaces every
+# failure at once). Shared setup (nix + nix-store/cargo caches) is the local
+# composite action .github/actions/ci-setup. Every gate runs through
+# `nix develop --command` so the toolchain (rust + shellcheck/yamllint/taplo +
+# cargo-deny/cargo-machete + openspec + cross targets) comes from the flake.
+#
+# `just ci` locally = fmt-check lint deps-audit build check-cross test
+# doc-check openspec-validate coverage smoke sandbox-e2e-dns sandbox-e2e-db
+# e2e nix-build. Stages NOT in the routine server-side gate:
+#  - e2e (muse visual suite): OPT-IN via `[ci-e2e]` commit marker or dispatch.
+#    The muse specs spawn szhost in a PTY (which does work on ubuntu runners),
+#    but the visual baselines in test/muse/snapshots/ were never committed and
+#    a few specs carry stale `toBeVisible` expectations from main's UI drift,
+#    so routine runs would always be red. `[gen-baselines]` runs the one-shot
+#    generator job that commits baselines back.
+#  - sandbox-e2e-full (Tier-2 podman suites): not part of `just ci` either;
+#    the Tier-1 dns/db tests (no container runtime needed) DO run here.
+#  - macos: not part of `just ci`; OPT-IN via `[ci-macos]` (10x minute cost).
+#
+# nix `access-tokens` comes from the NIX_GITHUB_TOKEN secret — it must read the
+# private flake inputs (muse, termite-chat) AND public ones, so it must be a
+# CLASSIC PAT with `repo` scope.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      - run: nix develop --command just fmt-check
+  lint:
+    # `just lint` also carries the git_cmd guard (no raw Command::new("git"))
+    # and the file-size ratchet (test/file-size-ratchet.sh).
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      - run: nix develop --command just lint
+  deps-audit:
+    # cargo-deny (advisories/licenses/dup majors) + cargo-machete; fetches the
+    # RustSec DB over the network on a cold cache.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      - run: nix develop --command just deps-audit
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      # The svc git tests create temp repos; their bare "remote" is made with
+      # `git init --bare` (no -b), so a fresh runner's default `master` breaks
+      # origin/main tracking. Give the runner the `main` default + an identity.
+      - name: git defaults for the svc git tests
+        run: |
+          git config --global init.defaultBranch main
+          git config --global user.email ci@superzej.local
+          git config --global user.name "superzej CI"
+      - run: nix develop --command bash -lc "just build && just test"
+  doc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      - run: nix develop --command just doc-check
+  check-cross:
+    # Typechecks the leaf crates' macOS/Windows code paths from Linux
+    # (`cargo check --target`, no cross linker needed; targets come from the
+    # flake's rust toolchain).
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      - run: nix develop --command just check-cross
+  openspec:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      - run: nix develop --command just openspec-validate
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      - run: nix develop --command just coverage
+  smoke:
+    # Hermetic end-to-end CLI tests against the debug binary (isolated
+    # XDG_STATE_HOME; includes the pty-smoke harness, which works on runners).
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      - run: nix develop --command just smoke
+  sandbox-e2e:
+    # Tier-1 only (DNS filter + DB audit trail) — no container runtime needed.
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      - run: nix develop --command bash -lc "just sandbox-e2e-dns && just sandbox-e2e-db"
+  nix-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      - run: nix build .#default --print-build-logs
+  e2e:
+    # OPT-IN (see header): muse visual baselines aren't committed yet and a few
+    # specs have stale expectations, so this isn't in the routine gate. Run via
+    # dispatch or a `[ci-e2e]` commit-message marker (absent on PR events, so
+    # PRs never schedule it).
+    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ci-e2e]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      - run: nix develop --command just e2e
+  macos:
+    # OPT-IN (10x minute cost): runs only via dispatch or a `[ci-macos]` commit
+    # message marker. macos-14 = GitHub-hosted Apple silicon; covers the
+    # aarch64-darwin build + unit tests (end-to-end `apple` backend verification
+    # is the on-device checklist, tasks.md §AX).
+    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ci-macos]') }}
+    runs-on: macos-14
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+          gc-max-store-size: 8G
+      - name: git defaults for the svc git tests
+        run: |
+          git config --global init.defaultBranch main
+          git config --global user.email ci@superzej.local
+          git config --global user.name "superzej CI"
+      - run: nix develop --command bash -lc "just build && just test"
+  # One-shot baseline generator: muse visual baselines were never committed, so
+  # `e2e` can't pass until they exist. Push a commit whose message contains
+  # `[gen-baselines]` to (re)generate them in the CI env where `e2e` checks
+  # them, and commit them back. The generated commit has no marker, so it can't
+  # loop.
+  update-baselines:
+    if: contains(github.event.head_commit.message, '[gen-baselines]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      # Tolerate partial failures: a few specs have stale expectations from
+      # main's UI drift, but the rest still regenerate — commit what we got.
+      - run: nix develop --command just e2e-update || true
+      - name: commit regenerated baselines
+        run: |
+          git config user.name "superzej CI"
+          git config user.email ci@superzej.local
+          if [ -n "$(git status --porcelain test/muse/snapshots/)" ]; then
+            git add test/muse/snapshots/
+            git commit -m "test(e2e): generate muse visual baselines in CI"
+            git push origin "HEAD:${{ github.ref_name }}"
+          else
+            echo "no baseline changes to commit"
+          fi
