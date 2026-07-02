@@ -18,6 +18,24 @@ use anyhow::{Context, Result, anyhow};
 use std::path::Path;
 use superzej_core::remote::SshTarget;
 
+/// Build the shared reqwest client for a provider. The default `Client::new()`
+/// has **no timeouts**, so a stalled TCP handshake or a hung TLS negotiation to
+/// the provider's control plane blocks the calling request *forever* — which is
+/// exactly what strands the "Sync agent logins" provisioning step on a bad
+/// network. We bound only **connection establishment** (not the whole request),
+/// so legitimately long transfers (large binary/closure pushes) still complete,
+/// but an unreachable endpoint fails fast instead of hanging. Falls back to the
+/// plain client if the builder ever fails (it won't in practice).
+fn provider_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        // Reap idle keep-alive sockets so a half-open connection to a sprite that
+        // was suspended/rotated doesn't get reused into a silent stall.
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// How to exec into a provider sandbox once it exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecKind {
@@ -64,7 +82,7 @@ impl DaytonaProvider {
             api_base: api_base.trim_end_matches('/').to_string(),
             token: token.to_string(),
             snapshot: snapshot.to_string(),
-            client: reqwest::Client::new(),
+            client: provider_http_client(),
         }
     }
 
@@ -199,7 +217,7 @@ impl SpritesProvider {
             },
             token: token.to_string(),
             name: name.trim().to_string(),
-            client: reqwest::Client::new(),
+            client: provider_http_client(),
         }
     }
 
