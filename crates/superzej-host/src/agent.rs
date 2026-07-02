@@ -1268,14 +1268,14 @@ fn native_exec_for(cfg: &Config, worktree: &str, agent_cmd: Option<String>) -> O
     })
 }
 
-/// Whether eager (ahead-of-focus) provisioning should run for `worktree`: its env
-/// is a managed provider AND its sandbox does NOT exist yet (checked via a cheap
-/// `list()` GET that never wakes an existing/idle sandbox). This keeps eager
-/// provisioning budget-safe — it only ever front-runs the create+provision of a
-/// genuinely-missing sandbox (first-ever open or post-destroy), never waking an
-/// already-provisioned idle one just to re-check it. Off-loop (network); `false`
-/// for non-provider envs, a tokenless/unbuilt provider, or any list error.
-pub fn needs_eager_provision(cfg: &Config, worktree: &str) -> bool {
+/// Whether `worktree`'s provider env still needs its one-time provisioning: a
+/// managed provider AND (its sandbox does NOT exist yet — a cheap `list()` GET —
+/// OR the sandbox exists but is BARE, i.e. the provision marker is absent). Two
+/// callers: the eager provisioner (fire the create+provision ahead of focus) and
+/// the pre-warm spec task (SKIP — prewarm must never create a sprite nor attach
+/// to a bare one; the focused materialize provisions it). Off-loop (network);
+/// `false` for non-provider envs, a tokenless/unbuilt provider, or a list error.
+pub fn provision_pending(cfg: &Config, worktree: &str) -> bool {
     let loc = GitLoc::for_worktree(Path::new(worktree));
     let repo_root: PathBuf = Db::open()
         .ok()

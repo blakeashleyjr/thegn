@@ -34,6 +34,7 @@ mod layer;
 mod layout;
 mod layout_spec;
 mod lifecycle;
+mod loading;
 mod logotype;
 mod lsp;
 mod mem;
