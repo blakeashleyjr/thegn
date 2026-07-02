@@ -8,6 +8,7 @@
 use anyhow::Result;
 use superzej_core::capabilities::{Capabilities, IsolationClass};
 use superzej_core::config::{Config, SandboxProfile};
+use superzej_core::managed_tool::{ManagedTool, Resolution};
 use superzej_core::outln;
 use superzej_core::placement::Placement;
 use superzej_core::sandbox::Backend;
@@ -152,6 +153,8 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
             "detected": caps_json(&detected),
             "resolved": caps_json(&resolved),
             "sandbox": sandbox_json(cfg),
+            "managed_tools": managed_tools_json(cfg),
+            "mcp_servers": mcp_servers_json(cfg),
         });
         outln!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
@@ -191,6 +194,12 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
 
     outln!("");
     home_layer_report(cfg);
+
+    outln!("");
+    managed_tools_report(cfg);
+
+    outln!("");
+    mcp_servers_report(cfg);
 
     outln!("");
     outln!("Summary");
@@ -350,6 +359,103 @@ fn sandbox_report(cfg: &Config) {
     }
 }
 
+/// The pinned-vs-installed state phrase for a managed tool, given its resolution.
+fn tool_version_state(tool: &ManagedTool, res: &Resolution) -> String {
+    match res {
+        Resolution::Managed { current: true, .. } => format!("pinned {}, current", tool.version),
+        Resolution::Managed { .. } if tool.bin_path().exists() => {
+            format!("pinned {}, installed differs", tool.version)
+        }
+        Resolution::Managed { .. } => format!("pinned {}, not installed", tool.version),
+        _ => format!("external (managed pin {} bypassed)", tool.version),
+    }
+}
+
+/// Report each known managed tool: the tier that resolves it (override / PATH /
+/// managed), its path, and the pinned-vs-installed state — so a user can see
+/// whether a tool is overridden, found on PATH, or managed, and if the managed
+/// copy is current. Detection only; resolves via config override + PATH.
+fn managed_tools_report(cfg: &Config) {
+    outln!("Managed tools ([managed_tools])");
+    for tool in crate::managed_tool::known() {
+        let over = cfg.managed_tools.get(&tool.name);
+        let res = tool.resolve(over, superzej_core::util::which_path);
+        outln!(
+            "  {:<10} {:<9} {}",
+            tool.name,
+            res.tier(),
+            tool_version_state(&tool, &res)
+        );
+        outln!("             {}", res.path());
+        // BugStalker is Linux-x86-64-only; flag the gate so a "not installed"
+        // row on an unsupported host isn't read as merely "run setup".
+        if tool.name == "bugstalker"
+            && let Some(reason) = superzej_core::debug::unsupported_reason()
+        {
+            outln!("             note: {reason}");
+        }
+    }
+}
+
+fn managed_tools_json(cfg: &Config) -> serde_json::Value {
+    let tools: Vec<serde_json::Value> = crate::managed_tool::known()
+        .into_iter()
+        .map(|tool| {
+            let over = cfg.managed_tools.get(&tool.name);
+            let res = tool.resolve(over, superzej_core::util::which_path);
+            serde_json::json!({
+                "name": tool.name,
+                "tier": res.tier(),
+                "path": res.path(),
+                "pinned": tool.version,
+                "current": matches!(res, Resolution::Managed { current: true, .. }),
+            })
+        })
+        .collect();
+    serde_json::Value::Array(tools)
+}
+
+/// Report user-declared MCP servers and their capability grants (detection
+/// only; grants gate acquisition in `szhost mcp install`).
+fn mcp_servers_report(cfg: &Config) {
+    outln!("MCP servers ([mcp_servers])");
+    if cfg.mcp_servers.is_empty() {
+        outln!("  (none declared)");
+        return;
+    }
+    for (name, srv) in &cfg.mcp_servers {
+        let cmd = superzej_core::mcp::config::launch_argv(srv).join(" ");
+        outln!("  {name:<12} {cmd}");
+        if srv.grants.is_empty() {
+            outln!("               grants: none (acquisition refused)");
+        } else {
+            let gs: Vec<String> = srv
+                .grants
+                .iter()
+                .map(|g| format!("{}={}", g.kind, g.scope))
+                .collect();
+            outln!("               grants: {}", gs.join(", "));
+        }
+    }
+}
+
+fn mcp_servers_json(cfg: &Config) -> serde_json::Value {
+    let servers: Vec<serde_json::Value> = cfg
+        .mcp_servers
+        .iter()
+        .map(|(name, srv)| {
+            serde_json::json!({
+                "name": name,
+                "command": superzej_core::mcp::config::launch_argv(srv),
+                "grants": srv.grants.iter().map(|g| serde_json::json!({
+                    "kind": g.kind, "scope": g.scope,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    serde_json::Value::Array(servers)
+}
+
 fn caps_json(c: &TermCaps) -> serde_json::Value {
     serde_json::json!({
         "color": color_str(c.color),
@@ -458,6 +564,62 @@ mod tests {
         // The default hardened preset leaves caps at runtime defaults.
         let h = profile_policy(SandboxProfile::Hardened);
         assert!(h.contains("runtime default"), "{h}");
+    }
+
+    #[test]
+    fn managed_tools_json_reports_pi_and_honors_override() {
+        // Default config: pi is a managed tool, resolved to the managed tier
+        // (nothing on PATH in the test env, no override) and reported.
+        let cfg = Config::default();
+        let tools = managed_tools_json(&cfg);
+        let arr = tools.as_array().expect("array");
+        let pi = arr.iter().find(|t| t["name"] == "pi").expect("pi reported");
+        assert_eq!(
+            pi["pinned"],
+            superzej_core::managed_tool::ManagedTool::npm(
+                "pi",
+                "p",
+                "pi",
+                crate::pi_assets::PI_PIN,
+            )
+            .version
+        );
+
+        // A user override (as parsed from `[managed_tools.pi]`) wins the tier.
+        let mut cfg = Config::default();
+        cfg.managed_tools.insert(
+            "pi".to_string(),
+            superzej_core::managed_tool::ToolOverride {
+                path: "/opt/custom/pi".into(),
+                args: vec![],
+            },
+        );
+        let arr = managed_tools_json(&cfg);
+        let pi = arr
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "pi")
+            .unwrap()
+            .clone();
+        assert_eq!(pi["tier"], "override");
+        assert_eq!(pi["path"], "/opt/custom/pi");
+        // The report runs without panicking too.
+        managed_tools_report(&cfg);
+    }
+
+    #[test]
+    fn managed_tools_override_parses_from_toml() {
+        // `[managed_tools.pi]` layers into Config like the other keyed maps.
+        let toml = r#"
+[managed_tools.pi]
+path = "/usr/local/bin/pi"
+args = ["--verbose"]
+"#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        let over = cfg.managed_tools.get("pi").expect("override present");
+        assert_eq!(over.path, "/usr/local/bin/pi");
+        assert_eq!(over.args, vec!["--verbose".to_string()]);
     }
 
     #[test]

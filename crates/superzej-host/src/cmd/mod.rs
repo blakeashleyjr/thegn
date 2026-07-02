@@ -12,6 +12,7 @@
 pub mod agent;
 pub mod ci;
 pub mod config;
+pub mod debug;
 pub mod diff;
 pub mod disk;
 pub mod doctor;
@@ -21,6 +22,7 @@ pub mod integrate;
 pub mod issue;
 pub mod list;
 pub mod logs;
+pub mod mcp;
 pub mod notify;
 pub mod pr;
 pub mod repos;

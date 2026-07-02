@@ -7,7 +7,29 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use superzej_core::managed_tool::{ManagedTool, UpdatePolicy};
 use superzej_core::{msg, outln, util};
+
+/// The managed pi as a [`ManagedTool`] spec. Pi keeps its legacy layout
+/// (`~/.superzej/pi`, `node_modules/.bin/pi`, `.superzej-pi-version`) for
+/// byte-for-byte compatibility with existing installs and carried sprites; the
+/// `pi`-on-PATH tier-2 fallback covers the npm-absent case. See
+/// [`superzej_core::managed_tool`] for the shared resolver.
+pub fn pi_tool() -> ManagedTool {
+    ManagedTool::npm(
+        "pi",
+        "@earendil-works/pi-coding-agent",
+        "pi",
+        crate::pi_assets::PI_PIN,
+    )
+    .with_policy(UpdatePolicy::Once)
+    .with_path_fallbacks(&["pi"])
+    .with_layout(
+        util::managed_pi_dir(),
+        "node_modules/.bin/pi",
+        ".superzej-pi-version",
+    )
+}
 
 #[derive(clap::Subcommand, Clone)]
 pub enum Action {
@@ -21,9 +43,13 @@ pub enum Action {
     Path,
 }
 
-pub fn run(action: Action) -> Result<()> {
+pub fn run(cfg: &superzej_core::config::Config, action: Action) -> Result<()> {
     match action {
-        Action::Setup { force } => setup(force),
+        Action::Setup { force } => {
+            setup(force)?;
+            inject_mcp_servers(cfg);
+            Ok(())
+        }
         Action::Path => {
             outln!("binary: {}", managed_pi_bin().display());
             outln!(
@@ -35,53 +61,52 @@ pub fn run(action: Action) -> Result<()> {
     }
 }
 
-/// Run a setup subprocess. `setup` can run interactively (`szhost agent setup`)
-/// OR off-loop from the live compositor (provisioning a sprite's managed pi). In
-/// the latter, `msg::tui_active()` is set and the child's inherited stdio would
-/// paint over the alt-screen frame — so capture it and fold the output into the
-/// log / error message. On the CLI (flag clear) inherit stdio so npm/pi progress
-/// streams live. `fail` is the message when the child exits non-zero.
-// CLI path or off-loop (sprite provisioning runs it from spawn_blocking); the
-// blocking wait never happens on the event loop.
-#[expect(clippy::disallowed_methods)]
-fn run_setup_cmd(mut cmd: Command, ctx: &str, fail: &str) -> Result<()> {
-    if msg::tui_active() {
-        let out = cmd.output().with_context(|| ctx.to_string())?;
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if !stdout.trim().is_empty() || !stderr.trim().is_empty() {
-            tracing::debug!(
-                target: "szhost::provision",
-                cmd = ctx,
-                stdout = %stdout.trim(),
-                stderr = %stderr.trim(),
-                "managed-pi setup subprocess output (captured; not painted on the frame)"
-            );
-        }
-        anyhow::ensure!(out.status.success(), "{fail}: {}", stderr.trim());
-    } else {
-        let status = cmd.status().with_context(|| ctx.to_string())?;
-        anyhow::ensure!(status.success(), "{fail}");
-    }
-    Ok(())
-}
-
 /// The pinned pi binary npm drops under the managed dir.
 pub fn managed_pi_bin() -> PathBuf {
-    util::managed_pi_dir().join("node_modules/.bin/pi")
+    pi_tool().bin_path()
 }
 
-fn version_marker() -> PathBuf {
-    util::managed_pi_dir().join(".superzej-pi-version")
+/// Merge user-declared MCP servers (`[mcp_servers.<name>]`) into the managed
+/// pi's `settings.json` under the de-facto `mcpServers` key — additive, so
+/// `pi install`'s own keys (packages, …) are preserved. Best-effort: settings
+/// are agent config (a cache-like artifact), so a read/parse/write failure logs
+/// and never fails `agent setup`. No-op when no servers are declared.
+pub fn inject_mcp_servers(cfg: &superzej_core::config::Config) {
+    if cfg.mcp_servers.is_empty() {
+        return;
+    }
+    let path = util::managed_pi_agent_dir().join("settings.json");
+    let mut root = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(obj) = root.as_object_mut() {
+        obj.insert(
+            "mcpServers".to_string(),
+            superzej_core::mcp::config::settings_block(&cfg.mcp_servers),
+        );
+        match serde_json::to_string_pretty(&root) {
+            Ok(s) => {
+                if let Err(e) = std::fs::write(&path, s) {
+                    tracing::debug!(target: "szhost::provision", error = %e, "best-effort: write pi settings.json (mcpServers)");
+                } else {
+                    msg::info(&format!(
+                        "injected {} MCP server(s) into pi settings",
+                        cfg.mcp_servers.len()
+                    ));
+                }
+            }
+            Err(e) => {
+                tracing::debug!(target: "szhost::provision", error = %e, "best-effort: serialize pi settings.json")
+            }
+        }
+    }
 }
 
 /// `true` when the pinned binary is present at the current `PI_PIN` — used to
 /// skip the (slow) npm install on re-runs and by the launch-time ensure check.
 pub fn is_current() -> bool {
-    managed_pi_bin().exists()
-        && std::fs::read_to_string(version_marker())
-            .map(|s| s.trim() == crate::pi_assets::PI_PIN)
-            .unwrap_or(false)
+    pi_tool().is_current()
 }
 
 /// Idempotent install + configure of the managed pi. Safe to re-run: the binary
@@ -92,28 +117,18 @@ pub fn setup(force: bool) -> Result<()> {
     let dir = util::managed_pi_dir();
     let agent = util::managed_pi_agent_dir();
     let pin = crate::pi_assets::PI_PIN;
+    let tool = pi_tool();
     std::fs::create_dir_all(&agent).with_context(|| format!("create {}", agent.display()))?;
 
-    // 1. Pinned binary (npm --prefix → <dir>/node_modules/.bin/pi).
-    if force || !is_current() {
-        anyhow::ensure!(
-            util::have("npm"),
-            "npm not found — needed to install the pinned pi (@earendil-works/pi-coding-agent@{pin}). \
-             Install Node/npm, or add a `pi` to PATH and re-run."
-        );
+    // 1. Pinned binary (npm --prefix → <dir>/node_modules/.bin/pi), through the
+    //    shared managed-tool resolver. The install gate is the tool's update
+    //    policy (Once ⇒ install unless force or not-current).
+    if tool.needs_install(force) {
         msg::info(&format!(
             "installing pinned pi {pin} into {}",
             dir.display()
         ));
-        let mut cmd = Command::new("npm");
-        cmd.args(["install", "--prefix"])
-            .arg(&dir)
-            .arg(format!("@earendil-works/pi-coding-agent@{pin}"));
-        run_setup_cmd(
-            cmd,
-            "npm install pinned pi",
-            &format!("npm install @earendil-works/pi-coding-agent@{pin} failed"),
-        )?;
+        crate::managed_tool::acquire(&tool)?;
     } else {
         msg::info(&format!("pinned pi {pin} already installed"));
     }
@@ -127,7 +142,10 @@ pub fn setup(force: bool) -> Result<()> {
     //    settings.json `{ "packages": ["packages/superzej-acp"] }`).
     register(&agent)?;
 
-    std::fs::write(version_marker(), pin).ok();
+    // Marker written last (after registration), so `is_current()` — and the
+    // launch-time auto-ensure gate that keys on it — means "fully set up",
+    // not merely "binary present".
+    crate::managed_tool::mark_installed(&tool);
     msg::info(&format!(
         "managed pi ready — binary {}, PI_CODING_AGENT_DIR={}",
         managed_pi_bin().display(),
@@ -150,7 +168,7 @@ fn register(agent: &Path) -> Result<()> {
         .arg("packages/superzej-acp")
         .current_dir(agent)
         .env("PI_CODING_AGENT_DIR", agent);
-    run_setup_cmd(
+    crate::managed_tool::run_setup_cmd(
         cmd,
         &format!("{} install packages/superzej-acp", pi.display()),
         "registering superzej-acp (pi install) failed",

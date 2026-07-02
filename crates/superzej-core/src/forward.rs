@@ -13,6 +13,30 @@
 use crate::config::ForwardConfig;
 use std::collections::BTreeSet;
 
+impl ForwardConfig {
+    /// Whether a newly-detected `container_port` should be auto-forwarded:
+    /// `auto` is on, the port is not in `ignore`, and (if `only` is set) it is
+    /// allow-listed. (Inherent methods may live in any module of the defining
+    /// crate; kept here beside their only callers to keep `config.rs` lean.)
+    pub fn should_auto_forward(&self, container_port: u16) -> bool {
+        self.auto
+            && !self.ignore.contains(&container_port)
+            && (self.only.is_empty() || self.only.contains(&container_port))
+    }
+
+    /// Parse `range` into an inclusive `(lo, hi)`, falling back to `(8000, 8999)`
+    /// on a malformed or inverted value.
+    pub fn port_range(&self) -> (u16, u16) {
+        let parsed = || -> Option<(u16, u16)> {
+            let (lo, hi) = self.range.split_once('-')?;
+            let lo: u16 = lo.trim().parse().ok()?;
+            let hi: u16 = hi.trim().parse().ok()?;
+            (lo != 0 && hi >= lo).then_some((lo, hi))
+        };
+        parsed().unwrap_or((8000, 8999))
+    }
+}
+
 /// A resolved request to forward one sandbox-internal port to the host. Pure
 /// data assembled by [`build_forward_spec`]; the actual host-port binding (which
 /// may remap on conflict) is decided by the host via [`alloc_host_port`].

@@ -1343,6 +1343,10 @@ pub(crate) fn build_panel(
     // (no dedicated RefreshKind). Feeds the `MergeQueue` section + statusbar badge.
     panel.merge_queue = db.list_merge_queue().unwrap_or_default();
 
+    // Cross-worktree attention stream (the `Across` section): every worktree's
+    // failing CI, from the CI cache. Cheap DB reads only, off the event loop.
+    panel.across = build_across(db);
+
     panel.files = diff_entries
         .iter()
         .map(|f| crate::panel::DiffFile {
@@ -2339,6 +2343,29 @@ pub(crate) fn retarget_diff_watcher(
             }
         }
     });
+}
+
+/// Build the cross-worktree attention stream from every worktree's cached CI:
+/// each worktree's failing runs become excerpts, grouped + sorted by
+/// [`superzej_core::aggregate`]. Pure DB reads (the CI cache), so it is cheap and
+/// safe to run on the model-hydration `spawn_blocking`. As dirty-file / content
+/// producers land they append their excerpts here too.
+fn build_across(db: &superzej_core::db::Db) -> superzej_core::aggregate::Aggregation {
+    use superzej_core::aggregate::{Aggregation, ci_failure_excerpts};
+    let mut excerpts = Vec::new();
+    for w in db.worktrees().unwrap_or_default() {
+        let label = if w.branch.is_empty() {
+            w.tab_name.clone()
+        } else {
+            w.branch.clone()
+        };
+        if let Ok(Some((json, _))) = db.get_ci_cache(&w.worktree)
+            && let Ok(runs) = serde_json::from_str::<Vec<superzej_core::ci::CiRun>>(&json)
+        {
+            excerpts.extend(ci_failure_excerpts(&w.worktree, &label, &runs));
+        }
+    }
+    Aggregation::from_excerpts(excerpts)
 }
 
 #[cfg(test)]
