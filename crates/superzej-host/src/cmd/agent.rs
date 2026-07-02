@@ -41,6 +41,9 @@ pub fn run(action: Action) -> Result<()> {
 /// paint over the alt-screen frame — so capture it and fold the output into the
 /// log / error message. On the CLI (flag clear) inherit stdio so npm/pi progress
 /// streams live. `fail` is the message when the child exits non-zero.
+// CLI path or off-loop (sprite provisioning runs it from spawn_blocking); the
+// blocking wait never happens on the event loop.
+#[expect(clippy::disallowed_methods)]
 fn run_setup_cmd(mut cmd: Command, ctx: &str, fail: &str) -> Result<()> {
     if msg::tui_active() {
         let out = cmd.output().with_context(|| ctx.to_string())?;
@@ -72,7 +75,7 @@ fn version_marker() -> PathBuf {
     util::managed_pi_dir().join(".superzej-pi-version")
 }
 
-/// `true` when the pinned binary is present at the current [`PI_PIN`] — used to
+/// `true` when the pinned binary is present at the current `PI_PIN` — used to
 /// skip the (slow) npm install on re-runs and by the launch-time ensure check.
 pub fn is_current() -> bool {
     managed_pi_bin().exists()

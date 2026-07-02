@@ -8,7 +8,7 @@
 //! host, exactly as [`crate::vpn`] hands its plan back to `superzej_core::sandbox`.
 //!
 //! Division of labor mirrors the other svc seams: the pure plan builder and URL
-//! matcher are unit-tested here ([`tests`]); the subprocess execution
+//! matcher are unit-tested here (`tests`); the subprocess execution
 //! ([`start`]) is the I/O seam, exercised by `test/smoke.sh`.
 //!
 //! `bore` (<https://github.com/ekzhang/bore>) is the first and only backend; the

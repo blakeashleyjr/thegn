@@ -359,7 +359,7 @@ pub fn rules_from(allow: &[String], block: &[String]) -> Vec<PolicyRule> {
     rules
 }
 
-/// Egress-policy translation — realizes [`EgressKind::Translate`]
+/// Egress-policy translation — realizes `EgressKind::Translate`
 /// (`superzej_core::capabilities`): lower allow/block lists to the provider's own
 /// network controls, since we can't run our DNS filter inside the provider's box.
 #[allow(async_fn_in_trait)]
@@ -1285,7 +1285,7 @@ async fn drive_exec<S>(
 
 /// The generic managed-sandbox provider dispatcher. Lifecycle methods delegate to
 /// the variant's [`RemoteProvider`]; axis methods delegate to the variant's
-/// sub-trait impl or return a clear "unsupported" error (gate on [`caps`]).
+/// sub-trait impl or return a clear "unsupported" error (gate on `caps`).
 pub enum Provider {
     Daytona(DaytonaProvider),
     Sprites(SpritesProvider),
@@ -1442,7 +1442,7 @@ impl Provider {
 
     /// Open a native PTY exec session (the `exec_api` capability), so an
     /// interactive pane attaches over the provider API with no vendor CLI. Gate
-    /// on [`caps`]`().exec_api`.
+    /// on `caps().exec_api`.
     pub async fn open_exec(&self, id: &str, spec: &ExecSpec) -> Result<ExecSession> {
         match self {
             Provider::Sprites(p) => p.open_exec(id, spec).await,

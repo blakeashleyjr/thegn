@@ -1,6 +1,6 @@
 //! Per-pane time-travel recording ("replay mode", `Alt+r`).
 //!
-//! Every byte a pane emits already funnels through the single [`PtyPane::feed`]
+//! Every byte a pane emits already funnels through the single `PtyPane::feed`
 //! (`pane.rs`) call — the natural recording tap. A [`Recording`] is a third sink
 //! there, alongside the emulator and the ANSI-stripped history ring: it appends
 //! each output chunk as a timestamped [`Event`] into a bounded ring, plus a

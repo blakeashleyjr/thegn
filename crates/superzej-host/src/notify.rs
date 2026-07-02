@@ -192,6 +192,8 @@ fn parse_kind(s: &str) -> Option<NotificationKind> {
 /// Run a sound command line off-thread via `sh -c`, fully detached. Best-effort:
 /// a missing shell or a failing command is swallowed — a sound must never
 /// disrupt the session.
+// off-loop: the wait happens on the detached "notify-sound" std::thread below.
+#[expect(clippy::disallowed_methods)]
 fn spawn_sound_command(cmd: &str) {
     let cmd = cmd.to_string();
     std::thread::Builder::new()

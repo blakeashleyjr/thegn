@@ -35,7 +35,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> IoStream for T {}
 
 /// Adapt a provider [`ExecSession`](crate::provider::ExecSession) (a non-tty exec
 /// over the WSS API — stdout frames in, stdin control out) into a standard
-/// bidirectional [`DuplexStream`] so [`run_host`] can pump the tunnel over it.
+/// bidirectional `DuplexStream` so `run_host` can pump the tunnel over it.
 /// The returned stream's writes become `Stdin` to the sandbox process; the
 /// sandbox's stdout becomes reads. Two forwarding tasks own the session.
 pub fn exec_stream(session: crate::provider::ExecSession) -> tokio::io::DuplexStream {

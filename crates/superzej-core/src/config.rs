@@ -1313,7 +1313,7 @@ pub struct ProfileConfig {
     #[serde(skip_serializing_if = "KeybindConfig::is_empty")]
     pub keybinds: KeybindConfig,
     /// Sandbox policy overrides for this profile (network_allow, network_block,
-    /// network_audit, env_passthrough, etc.). Applied after the global [sandbox]
+    /// network_audit, env_passthrough, etc.). Applied after the global `[sandbox]`
     /// and before the repo-root overlay, so per-profile restrictions take effect
     /// without touching per-repo config.
     #[serde(skip_serializing_if = "SandboxOverlay::is_empty")]
@@ -3503,7 +3503,7 @@ impl HomeConfig {
 /// present override the global `[sandbox.home]`; absent keys inherit it. Lets a
 /// big ssh box run `strategy = "host-parity"` while an ephemeral sprite runs
 /// `strategy = "clean"`, all from one global base. Field-merged in
-/// [`SandboxOverlay::apply`].
+/// `SandboxOverlay::apply`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct HomeOverlay {
@@ -3874,7 +3874,7 @@ pub struct NotificationsConfig {
     pub process_exit: String,
     /// Per-kind attention priority overrides: maps a notification kind
     /// (snake_case, e.g. `"agent_done"`) to `"alert"`, `"notice"`, or `"info"`.
-    /// Unset kinds use their built-in [`NotificationKind::default_priority`];
+    /// Unset kinds use their built-in `NotificationKind::default_priority`;
     /// unknown keys/values are ignored. `alert` raises the red flag, `notice`
     /// the neutral unread count, `info` is inbox-only (never counted).
     pub priority: std::collections::BTreeMap<String, String>,
@@ -5636,7 +5636,7 @@ pub struct RepoOverlayParseError {
 
 /// If a repo-root `.superzej.*` file exists but fails to parse, return the error
 /// (+ a lenient `env =` read). `None` when there's no file or it parses cleanly.
-/// Mirrors [`load_repo_overlay`]'s file precedence; the difference is intent —
+/// Mirrors `load_repo_overlay`'s file precedence; the difference is intent —
 /// `load_repo_overlay` swallows the error to keep opening the worktree, this lets
 /// the caller surface it (a visible halt/warning) so a dropped overlay that
 /// changes placement is never silent.
@@ -7876,8 +7876,10 @@ transport = \"ssh\"
 
     #[test]
     fn profile_toml_overlay_merges_over_base_and_preserves_untouched() {
-        let mut cfg = Config::default();
-        cfg.branch_prefix = "sz/".into();
+        let mut cfg = Config {
+            branch_prefix: "sz/".into(),
+            ..Config::default()
+        };
         let base_accent = cfg.theme.accent.clone();
         // A profile overlay changes branch_prefix + a nested sandbox field, and
         // leaves theme.accent untouched.

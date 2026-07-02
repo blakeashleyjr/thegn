@@ -69,11 +69,11 @@ impl BridgeSupervisor {
         }
     }
 
-    /// Like [`connect`] but over a provider's **native exec API** (no vendor CLI):
+    /// Like [`connect`](Self::connect) but over a provider's **native exec API** (no vendor CLI):
     /// run `szhost bridge` via `provider.open_exec(tty=false)` and talk to it over
     /// the resulting [`ExecSession`] channels. `rt` is the host runtime handle the
     /// session's driver task lives on. Best-effort: a failure leaves the per-op
-    /// (CLI) git path as the fallback, same as [`connect`].
+    /// (CLI) git path as the fallback, same as [`connect`](Self::connect).
     pub fn connect_native(
         &self,
         loc: &GitLoc,

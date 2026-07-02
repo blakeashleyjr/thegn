@@ -7,7 +7,7 @@
 //! existing source-of-truth predicates that already live next to the thing they
 //! describe:
 //! - the isolation engine — [`Backend::is_oci`](crate::sandbox::Backend::is_oci),
-//! - the execution placement — the [`Placement`](crate::placement::Placement) variant,
+//! - the execution placement — the `Placement` variant,
 //! - the hardening preset — the [`SandboxProfile`](crate::config::SandboxProfile) methods,
 //! - the tunnel attachment — [`SandboxSpec::vpn`](crate::sandbox::SandboxSpec).
 //!

@@ -2,6 +2,8 @@
 name = "superzej-metrics"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+publish = false
 license.workspace = true
 description = "Cross-platform system metrics substrate for the superzej masthead + telemetry overlay"
 

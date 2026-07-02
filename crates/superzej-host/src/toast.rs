@@ -5,7 +5,7 @@
 //!
 //! The stack model (push/cap, expiry pruning, next-expiry) and the styled
 //! line builder are pure and unit-tested; the host owns one [`Toasts`] and
-//! schedules a one-shot wake at [`Toasts::next_expiry`] so an expired toast
+//! schedules a one-shot wake at `Toasts::next_expiry` so an expired toast
 //! clears even with no further input (the event loop never polls on a timer).
 
 use std::time::{Duration, Instant};

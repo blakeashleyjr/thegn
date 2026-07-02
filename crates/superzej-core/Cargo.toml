@@ -2,6 +2,8 @@
 name = "superzej-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+publish = false
 license.workspace = true
 description = "superzej substrate-agnostic core: state, git, sandbox, config, theme"
 

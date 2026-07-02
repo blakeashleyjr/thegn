@@ -28,6 +28,8 @@ pub fn run(
         .unwrap_or_else(|| "HEAD".to_string());
 
     let emit_highlighted = |git_args: &[&str], file_path: Option<&str>| {
+        // CLI path: `szhost diff` runs synchronously, no event loop.
+        #[expect(clippy::disallowed_methods)]
         if let Ok(output) = loc.git_command(git_args).output() {
             let raw = String::from_utf8_lossy(&output.stdout);
             let highlighted = diff_highlight::highlight_diff(&raw, file_path.unwrap_or(""));
@@ -46,6 +48,8 @@ pub fn run(
     }
 
     // --stat: stream straight through (colors / large diffs).
+    // CLI path: `szhost diff` runs synchronously, no event loop.
+    #[expect(clippy::disallowed_methods)]
     let _ = loc
         .git_command(&["-c", "color.ui=always", "diff", "--stat", &target])
         .status();

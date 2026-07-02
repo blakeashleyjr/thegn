@@ -293,35 +293,49 @@ impl PtyPane {
         // Blocking the *reader* thread on `wait()` is safe — it's about to end
         // anyway and never touches the event loop.
         std::thread::spawn(move || {
-            let mut buf = [0u8; 8192];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break, // EOF: child exited or PTY closed
-                    Ok(n) => {
-                        // One exact-sized Vec per chunk: ownership must cross
-                        // the channel, and the 8K stack buffer is reused, so
-                        // this is the minimal copy (a buffer pool would add
-                        // complexity for no measured win).
-                        if tx
-                            .blocking_send(PaneEvent::Output(id, buf[..n].to_vec()))
-                            .is_err()
-                        {
-                            return; // consumer gone — don't bother reaping
+            // Contain panics: an unwinding reader must still deliver an Exit
+            // event, or the pane freezes silently and anything the thread
+            // held is poisoned. A panic degrades into a normal pane exit.
+            let tx_panic = tx.clone();
+            let waker_panic = waker.clone();
+            let body = std::panic::AssertUnwindSafe(move || {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => break, // EOF: child exited or PTY closed
+                        Ok(n) => {
+                            // One exact-sized Vec per chunk: ownership must cross
+                            // the channel, and the 8K stack buffer is reused, so
+                            // this is the minimal copy (a buffer pool would add
+                            // complexity for no measured win).
+                            if tx
+                                .blocking_send(PaneEvent::Output(id, buf[..n].to_vec()))
+                                .is_err()
+                            {
+                                return; // consumer gone — don't bother reaping
+                            }
+                            if let Some(w) = &waker {
+                                let _ = w.wake();
+                            }
                         }
-                        if let Some(w) = &waker {
-                            let _ = w.wake();
-                        }
+                        Err(_) => break, // read error: treat as exit, status unknown
                     }
-                    Err(_) => break, // read error: treat as exit, status unknown
                 }
-            }
-            // Reap the child so the exit carries its real code (None if the
-            // status can't be retrieved). u32 → i32 keeps the conventional
-            // exit-code range; 0 == success.
-            let code = child.wait().ok().map(|s| s.exit_code() as i32);
-            let _ = tx.blocking_send(PaneEvent::Exit(id, code));
-            if let Some(w) = &waker {
-                let _ = w.wake();
+                // Reap the child so the exit carries its real code (None if the
+                // status can't be retrieved). u32 → i32 keeps the conventional
+                // exit-code range; 0 == success.
+                let code = child.wait().ok().map(|s| s.exit_code() as i32);
+                let _ = tx.blocking_send(PaneEvent::Exit(id, code));
+                if let Some(w) = &waker {
+                    let _ = w.wake();
+                }
+            });
+            if std::panic::catch_unwind(body).is_err() {
+                tracing::error!("pane {id} reader thread panicked; reporting pane exit");
+                let _ = tx_panic.blocking_send(PaneEvent::Exit(id, None));
+                if let Some(w) = &waker_panic {
+                    let _ = w.wake();
+                }
             }
         });
 

@@ -80,6 +80,8 @@ fn edit(path: &PathBuf) -> Result<()> {
         msg::info(&format!("seeded {} from the example", path.display()));
     }
     let editor = util::editor();
+    // CLI path: `szhost config edit` hands the terminal to $EDITOR, no event loop.
+    #[expect(clippy::disallowed_methods)]
     let status = Command::new(util::shell())
         .arg("-lc")
         .arg(format!(

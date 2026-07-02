@@ -61,6 +61,8 @@ fn set(_cfg: &Config, config_path: std::path::PathBuf) -> Result<()> {
         }
     }
 
+    // CLI path: `szhost theme` runs an interactive fzf/gum picker, no event loop.
+    #[expect(clippy::disallowed_methods)]
     let output = child.wait_with_output()?;
     if !output.status.success() {
         return Ok(()); // user cancelled
@@ -71,17 +73,7 @@ fn set(_cfg: &Config, config_path: std::path::PathBuf) -> Result<()> {
         return Ok(());
     }
 
-    // Use CLI config command to mutate the local TOML
-    // A bit hacky but guarantees we don't clobber comments by rewriting it ourselves
-    let _status = Command::new(std::env::current_exe()?)
-        .args(["--set", &format!("theme.name={selected}")])
-        // Wait, the `--set` arg overrides runtime config. We need to save it.
-        // Actually, let's use the standard rust way to manipulate config.toml if superzej has one
-        // Wait, `szhost` doesn't have a `config set` command natively!
-        .output()?; // This won't work to SAVE it.
-
-    // Let's implement a manual update to the toml file, or inform the user.
-    // Better: Read TOML, use `toml_edit` to set the value and write back.
+    // Persist via toml_edit so user comments in config.toml survive the write.
     let toml_str = std::fs::read_to_string(&config_path).unwrap_or_else(|_| "".to_string());
 
     // use the newer toml_edit Document parsing

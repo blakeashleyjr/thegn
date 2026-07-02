@@ -2,17 +2,16 @@
 name = "gtui-query"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+publish = false
 license.workspace = true
 
 [dependencies]
 gtui-core = { path = "../gtui-core" }
 chrono = { workspace = true }
-anyhow = { workspace = true }
-reqwest = { workspace = true }
 tokio = { workspace = true }
 serde_json.workspace = true
 serde = { workspace = true, features = ["derive"] }
-superzej-metrics.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

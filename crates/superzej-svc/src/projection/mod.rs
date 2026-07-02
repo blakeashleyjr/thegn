@@ -1,13 +1,13 @@
 //! Worktree **projection** backends — realize the `data` axis of a named
 //! environment: make the worktree available where the env runs and keep it
-//! coherent. The pure plan ([`ProjectionSpec`](superzej_core::projection::ProjectionSpec))
+//! coherent. The pure plan (`ProjectionSpec`)
 //! is built in core; this layer runs/tears it down, mirroring the vpn seam
 //! (core `VpnSpec` / svc `VpnProvider`).
 //!
 //! Division of labor: `Bind`/`in_env`/`local_exec` need no active projection —
 //! the placement or the OCI bind-mount already lands the process in the worktree,
 //! so their methods are no-ops. `Sshfs` runs the FUSE mount/unmount (reusing the
-//! argv builders on [`SshPlacement`](superzej_core::placement::SshPlacement)). The
+//! argv builders on `SshPlacement`). The
 //! `sync` mode (changed-files manifest, for file-API-only providers) plugs in here
 //! in the sync phase.
 //!

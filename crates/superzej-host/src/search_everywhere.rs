@@ -1033,6 +1033,8 @@ pub fn spawn_content_search(
     });
 }
 
+// off-loop: the entire body runs inside spawn_blocking.
+#[expect(clippy::disallowed_methods)]
 pub fn spawn_git_search(
     root: PathBuf,
     query: String,

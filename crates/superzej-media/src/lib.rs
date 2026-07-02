@@ -16,9 +16,9 @@
 //! - [`mpris_cli`] (Linux) — the `playerctl` CLI fallback when the session bus
 //!   can't be opened.
 //! - [`mpv`] (Unix) — a single mpv instance over its JSON IPC socket.
-//! - [`smtc`] (Windows) — the System Media Transport Controls session manager,
+//! - `smtc` (Windows) — the System Media Transport Controls session manager,
 //!   with a push event watcher.
-//! - [`applescript`] (macOS) — `osascript` driving Music.app + Spotify (no
+//! - `applescript` (macOS) — `osascript` driving Music.app + Spotify (no
 //!   entitlement, every macOS version; Apple gates system-wide MediaRemote read
 //!   on 15.4+).
 //!

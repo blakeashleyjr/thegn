@@ -1295,6 +1295,9 @@ pub(crate) fn build_panel(
             .then(|| s.spawn(|| GixGit::new().branches_full(&loc).unwrap_or_default()));
         let h_stashes =
             want_stashes.then(|| s.spawn(|| GixGit::new().stash_list(&loc).unwrap_or_default()));
+        // off-loop: build_panel only runs on hydration workers
+        // (spawn_model_hydration / spawn_panel_prefetch spawn_blocking).
+        #[expect(clippy::disallowed_methods)]
         let h_ls = want_lsfiles.then(|| {
             s.spawn(|| {
                 loc.git_command(&["ls-files"])
@@ -2470,6 +2473,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sz-sem-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        // test code: fixture setup, never on the event loop.
+        #[expect(clippy::disallowed_methods)]
         let run = |args: &[&str]| {
             assert!(
                 git_cmd(&dir).args(args).status().unwrap().success(),

@@ -900,8 +900,10 @@ mod tests {
     fn tier3_managed_home_folds_home_override_and_ensure() {
         let db = Db::open_memory().unwrap();
         let mut cfg = Config::default();
-        let mut b = Bundle::default();
-        b.home = "managed".into();
+        let b = Bundle {
+            home: "managed".into(),
+            ..Bundle::default()
+        };
         cfg.bundle.insert("work".into(), b);
         set_active(&db, Bind::Global, "/wt", None, "work").unwrap();
         let r = compose(&cfg, &db, "/wt", None, None);

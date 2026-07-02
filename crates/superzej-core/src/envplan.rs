@@ -1131,7 +1131,7 @@ fn tools_install_script(tools: &[String]) -> String {
 /// AUTO-DETECT which agents the host has (so a sandbox reaches "exact local
 /// parity" without per-sandbox config) — each is probed on the host PATH /
 /// config locations. Known installers exist for a subset (see
-/// [`agents_install_script`]); the rest still get their config uploaded
+/// `agents_install_script`); the rest still get their config uploaded
 /// ([`agent_config_paths`]) and rely on a `setup` recipe to install the binary.
 pub fn known_agents() -> &'static [&'static str] {
     &[

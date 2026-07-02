@@ -938,6 +938,10 @@ pub const SPRITE_SSHD_PORT: u16 = 2222;
 /// The superzej-managed ssh keypair for the sprite SSH-over-WSS transport, under
 /// `$XDG_STATE/superzej/ssh/`. Generated (ed25519, no passphrase) on first use.
 /// Returns `(private key path, public key line)`.
+// off-loop: ssh-keygen runs once, on the provisioning path (spawn_blocking /
+// pool thread / CLI); loop-side callers (sprite_ssh_connect) find the key
+// already cached and skip the subprocess.
+#[expect(clippy::disallowed_methods)]
 pub fn sprite_ssh_keypair() -> anyhow::Result<(PathBuf, String)> {
     let dir = superzej_core::util::superzej_dir().join("ssh");
     std::fs::create_dir_all(&dir)?;
@@ -1685,6 +1689,9 @@ pub fn provision_provider_env_named(
     // is on origin it lands with its commits; otherwise it's created off the
     // default (push the branch for its content). A SPARE (name_override) stays on
     // the default — it's generic until a worktree claims + rebranches it.
+    // off-loop: provisioning entry — only called from provision_spare (pool
+    // thread), provision_worktree (spawn_blocking), or the CLI.
+    #[expect(clippy::disallowed_methods)]
     let branch = if name_override.is_some() {
         None
     } else {
@@ -2044,7 +2051,7 @@ fn resolve_setup(home: &superzej_core::config::HomeConfig) -> Vec<String> {
     cmds
 }
 
-/// Resolve which host dotfiles to upload under the env's [`ShellStrategy`], and
+/// Resolve which host dotfiles to upload under the env's `ShellStrategy`, and
 /// (for host-parity) the host `/nix/store` roots they reference.
 ///
 /// - `Clean`: upload nothing (the plan drops the dotfiles step too).
@@ -2129,6 +2136,8 @@ fn nix_copy_argv(cache_url: &str, roots: &[String]) -> Vec<String> {
 /// from there. Runs the host's `nix` (the host has the closure + a writable
 /// store). Best-effort — returns the error for the caller to warn on. `nix copy`
 /// closes over each root's full runtime closure automatically.
+// off-loop: provisioning path — reached only via spawn_blocking / the pool thread / CLI.
+#[expect(clippy::disallowed_methods)]
 fn push_home_closure(cache_url: &str, roots: &[String]) -> anyhow::Result<()> {
     let argv = nix_copy_argv(cache_url, roots);
     let out = std::process::Command::new("nix")
@@ -2177,6 +2186,8 @@ fn store_root_of(p: &str) -> Option<String> {
 /// themselves (not just what the rc sources) and they can be `nix profile
 /// install`ed by name in the sandbox. Host-only + best-effort (`command -v` →
 /// canonicalize → store-root); non-store / missing tools are skipped.
+// off-loop: provisioning path — reached only via spawn_blocking / the pool thread / CLI.
+#[expect(clippy::disallowed_methods)]
 fn host_shell_store_roots() -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     if let Ok(sh) = std::env::var("SHELL")
@@ -2234,6 +2245,8 @@ fn write_proxy_wrapper(key: &Path, proxy_cmd: &str) -> anyhow::Result<PathBuf> {
 /// source. Best-effort; returns the error for the caller to warn on. Requires the
 /// sandbox to have been (re)created with `connect = "ssh"` (so its sshd accepts
 /// the managed key) and `nix` installed in it.
+// off-loop: provisioning path — reached only via spawn_blocking / the pool thread / CLI.
+#[expect(clippy::disallowed_methods)]
 fn push_home_closure_p2p(
     szhost_exe: &str,
     worktree: &str,
@@ -2353,6 +2366,8 @@ fn sanitize_tag(id: &str) -> String {
 
 /// Run a host `nix` subcommand bounded by `timeout` (coreutils). `Ok(output)` on
 /// success; `Err` with a tail of stderr (or "timed out") otherwise.
+// off-loop: provisioning path — reached only via spawn_blocking / the pool thread / CLI.
+#[expect(clippy::disallowed_methods)]
 fn run_host_nix_timeout(secs: u32, argv: &[String]) -> anyhow::Result<std::process::Output> {
     let out = std::process::Command::new("timeout")
         .arg("--kill-after=5")
@@ -2391,6 +2406,8 @@ fn run_host_nix_timeout(secs: u32, argv: &[String]) -> anyhow::Result<std::proce
 /// wrapper; the three artifacts are written into the sandbox `/tmp` and a single
 /// replay script applies them in `workdir`. Best-effort throughout — any capture
 /// or apply failure leaves the pristine origin checkout intact.
+// off-loop: provisioning path — reached only via spawn_blocking / the pool thread / CLI.
+#[expect(clippy::disallowed_methods)]
 fn apply_local_parity(
     provider: &superzej_svc::provider::Provider,
     id: &str,
@@ -2566,6 +2583,8 @@ fn provision_managed_pi(
         .map_err(|e| anyhow::anyhow!("npm install managed pi in sandbox: {e}"))
 }
 
+// off-loop: provisioning path — reached only via spawn_blocking / the pool thread / CLI.
+#[expect(clippy::disallowed_methods)]
 fn push_devshell_closure(
     provider: &superzej_svc::provider::Provider,
     id: &str,
@@ -2676,6 +2695,8 @@ fn push_devshell_closure(
 /// substitutes from there. Best-effort (a missing tool / network blip just leaves
 /// more in the cache — still correct, just larger); bounded so it can't wedge a
 /// provision.
+// off-loop: provisioning path — reached only via spawn_blocking / the pool thread / CLI.
+#[expect(clippy::disallowed_methods)]
 fn prune_cache_to_public(cache_dir: &str) -> anyhow::Result<()> {
     // POSIX sh. Pass 1 is name-based (rust toolchain); pass 2 is a parallel
     // (`xargs -P`) HEAD against cache.nixos.org. `$1` is the cache dir.
@@ -2901,7 +2922,7 @@ fn upload_atuin_creds(
 
 /// Upload coding agents' host config/credential dirs into the sandbox `$HOME`
 /// (`/root`) so the agent (claude code, codex, custom) is logged-in there.
-/// Per-agent paths come from [`envplan::agent_config_paths`]; missing host paths
+/// Per-agent paths come from `envplan::agent_config_paths`; missing host paths
 /// are skipped. Files go via the fs `write`; directories via recursive
 /// `upload_dir`. A genuine upload error aborts the step (surfaced on the splash).
 /// Directory names under an agent's config tree that hold bulky, ephemeral state
@@ -3341,6 +3362,11 @@ pub fn destroy_provider_sandbox(worktree: &str, env_name: &str) {
 /// the clone is the inherent first-open cost; a failure warns and leaves the env
 /// as-is (the chrome just shows an empty tree until it succeeds). No-op when the
 /// local repo has no `origin`.
+// off-loop by contract: runs inside launch_spec_with_key, which is documented
+// blocking and must be called off the event loop (materialize spawn_blocking /
+// CLI). NOTE: some direct pane-spawn helpers still call launch_spec on the
+// loop — see the sweep report; the fix belongs at those callers.
+#[expect(clippy::disallowed_methods)]
 fn provision_provider_repo(repo_root: &Path, loc: &GitLoc, branch: Option<&str>) {
     let Some(origin) = local_origin(repo_root) else {
         return;
@@ -3373,6 +3399,9 @@ fn provision_provider_repo(repo_root: &Path, loc: &GitLoc, branch: Option<&str>)
 }
 
 /// The local repo's `origin` remote URL, or `None` (no remote / not a repo).
+// off-loop by contract: only called from the blocking provisioning path
+// (provision_provider_env_named / launch_spec_with_key) — see note above.
+#[expect(clippy::disallowed_methods)]
 fn local_origin(repo_root: &Path) -> Option<String> {
     let out = superzej_core::util::git_cmd(repo_root)
         .args(["remote", "get-url", "origin"])
@@ -3734,6 +3763,8 @@ pub fn launch_spec_with_key(
 /// bwrap / none) as its interactive pane — superzej is the agent's "hands and
 /// bouncer". BLOCKING (sandbox resolution may ensure a container); callers must
 /// run it off the event loop.
+// off-loop: only called inside spawn_blocking (ACP terminal/create servicing, run.rs).
+#[expect(clippy::disallowed_methods)]
 pub fn run_in_sandbox(cfg: &Config, worktree: &str, command: &str) -> anyhow::Result<String> {
     let loc = GitLoc::for_worktree(Path::new(worktree));
     let saved_backend = Db::open()

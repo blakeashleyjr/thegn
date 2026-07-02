@@ -2784,7 +2784,7 @@ impl Db {
     }
 
     /// Swap the persisted sort positions of two workspaces (by repo_path). The
-    /// workspace analogue of [`swap_worktree_positions`]: the sidebar's manual
+    /// workspace analogue of `swap_worktree_positions`: the sidebar's manual
     /// workspace reorder (Ctrl+Alt+↑/↓) picks two adjacent workspaces and this
     /// exchanges their `position` so the new order survives restart.
     pub fn swap_workspace_positions(&self, a: &str, b: &str) -> Result<()> {
@@ -5196,5 +5196,292 @@ mod tests {
         };
         let id = db.put_proxy_request(&row).unwrap();
         assert!(id > 0);
+    }
+
+    // --- migration ladder ---------------------------------------------------
+    // A systematic upgrade harness. Each rung reconstructs a historical DB
+    // shape that is *derivable from the migration code itself* (the `ver < 3`
+    // remap, the additive ALTER/CREATE comments, `migrate_tab_layout_v6`),
+    // opens it through the normal `Db::open_at` path, and asserts:
+    //   (a) the version stamp reached SCHEMA_VERSION,
+    //   (b) seeded data survived wherever the migration preserves it,
+    //   (c) the migrated schema converged EXACTLY to a fresh DB's schema
+    //       (tables + column sets) — so "migration drift" (a migrated DB
+    //       missing a column a fresh DB has, or a legacy table lingering)
+    //       fails loudly.
+
+    /// table → column-name set (`sqlite_*` internals excluded). Compared as
+    /// sets, not ordered lists: additive ALTERs append columns in a different
+    /// order than a fresh CREATE, which is fine.
+    fn schema_snapshot(
+        conn: &Connection,
+    ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .unwrap();
+        let tables: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        tables
+            .into_iter()
+            .map(|t| {
+                let mut stmt = conn.prepare(&format!("PRAGMA table_info({t})")).unwrap();
+                let cols: std::collections::BTreeSet<String> = stmt
+                    .query_map([], |r| r.get::<_, String>(1))
+                    .unwrap()
+                    .filter_map(|r| r.ok())
+                    .collect();
+                (t, cols)
+            })
+            .collect()
+    }
+
+    /// Build a legacy DB file from raw SQL (no Db API), open it via the normal
+    /// migration path, and assert the version stamp + schema convergence with
+    /// a fresh DB. Returns the tempdir + migrated Db for rung-specific data
+    /// checks; the caller removes the dir when done.
+    fn open_ladder_fixture(tag: &str, seed_sql: &str) -> (std::path::PathBuf, Db) {
+        let dir = std::env::temp_dir().join(format!("sz-db-ladder-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(seed_sql).unwrap();
+        }
+        let db = Db::open_at(&path).unwrap();
+        // (a) the version stamp reached the current schema version.
+        let ver: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, SCHEMA_VERSION, "rung {tag}: version stamp");
+        // (c) the migration-drift gate: exactly the fresh tables + columns.
+        let fresh = Db::open_memory().unwrap();
+        assert_eq!(
+            schema_snapshot(&db.conn),
+            schema_snapshot(&fresh.conn),
+            "rung {tag}: migrated schema must converge to the fresh schema"
+        );
+        (dir, db)
+    }
+
+    #[test]
+    fn ladder_v2_per_session_schema_preserves_repos() {
+        // Oldest rung: the pre-v3 per-session schema. The `ver < 3` branch in
+        // `init` documents the old shape (worktrees/workspaces keyed by
+        // session, repos without `session_name`): the remap drops the session
+        // tables and preserves only the `repos` recents history.
+        let (dir, db) = open_ladder_fixture(
+            "v2",
+            r#"
+            PRAGMA user_version = 2;
+            CREATE TABLE repos (
+              path TEXT PRIMARY KEY, name TEXT, first_seen INTEGER,
+              last_opened INTEGER, open_count INTEGER, seq INTEGER);
+            INSERT INTO repos VALUES ('/keep','keep',1,2,3,4);
+            CREATE TABLE worktrees (worktree TEXT PRIMARY KEY, session_name TEXT);
+            CREATE TABLE workspaces (session_name TEXT PRIMARY KEY, name TEXT);
+            INSERT INTO worktrees VALUES ('/old','sess');
+            INSERT INTO workspaces VALUES ('sess','old');
+            "#,
+        );
+        assert!(db.is_known_repo("/keep").unwrap());
+        assert_eq!(db.recent_repos(5).unwrap(), vec!["/keep".to_string()]);
+        // The per-session tables were dropped and recreated empty.
+        assert!(db.worktrees().unwrap().is_empty());
+        assert!(db.workspaces().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ladder_v5_flat_tab_layout_becomes_groups() {
+        // The v5 shape (flat `tab_layout`, extra pages as " ·N" suffixes) from
+        // the existing v5 fixture. The v6 transform regroups it; the drift
+        // gate additionally proves the legacy table is gone (a fresh DB has
+        // no `tab_layout`). Detailed transform semantics stay covered by
+        // `migrates_v5_tab_layout_into_groups`.
+        let (dir, db) = open_ladder_fixture(
+            "v5",
+            r#"
+            PRAGMA user_version = 5;
+            CREATE TABLE tab_layout (
+              session_name TEXT, tab_name TEXT, kind TEXT, worktree TEXT,
+              pane_tree TEXT, ordinal INTEGER, focused_pane INTEGER,
+              PRIMARY KEY (session_name, tab_name));
+            CREATE TABLE session_state (
+              session_name TEXT PRIMARY KEY, active_tab TEXT, updated_at INTEGER);
+            INSERT INTO tab_layout VALUES
+              ('/r', 'app/home', 'home',     '/r',       '{"leaf":0}', 0, 0),
+              ('/r', 'app/feat', 'worktree', '/wt/feat', '{"leaf":1}', 1, 1);
+            INSERT INTO session_state VALUES ('/r', 'app/feat', 1);
+            "#,
+        );
+        let groups = db.groups_for_session("/r").unwrap();
+        assert_eq!(
+            groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(),
+            vec!["app/home", "app/feat"]
+        );
+        assert_eq!(db.active_tab("/r").unwrap().as_deref(), Some("app/feat"));
+        let tabs = db.group_tabs_for_session("/r").unwrap();
+        assert_eq!(tabs.len(), 2, "one migrated tab per legacy row");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ladder_v7_worktrees_position_backfilled_from_creation_order() {
+        // Pre-v8 worktrees: the v3-era column set — the `location`,
+        // `sandbox_backend` and `position` ALTER comments in `init` document
+        // that those columns did not exist yet. The migration must ALTER the
+        // missing columns in and backfill `position` by (created_at, worktree)
+        // without losing any row data.
+        let (dir, db) = open_ladder_fixture(
+            "v7",
+            r#"
+            PRAGMA user_version = 7;
+            CREATE TABLE worktrees (
+              worktree TEXT PRIMARY KEY, session_name TEXT, tab_name TEXT,
+              repo_path TEXT, branch TEXT, agent TEXT, created_at INTEGER);
+            INSERT INTO worktrees VALUES
+              ('/wt/b', 's', 'app/b', '/r', 'sz/b', '', 200),
+              ('/wt/c', 's', 'app/c', '/r', 'sz/c', '', 100),
+              ('/wt/a', 's', 'app/a', '/r', 'sz/a', '', 100);
+            "#,
+        );
+        let wts = db.worktrees().unwrap();
+        let order: Vec<&str> = wts.iter().map(|w| w.worktree.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["/wt/a", "/wt/c", "/wt/b"],
+            "backfill ranks by created_at with path as the tie-breaker"
+        );
+        assert_eq!(
+            wts.iter().map(|w| w.position).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "backfill assigns dense, collision-free positions"
+        );
+        // Pre-existing row data survived the ALTERs.
+        assert_eq!(wts[0].branch, "sz/a");
+        assert_eq!(wts[0].repo_root, "/r");
+        assert_eq!(wts[0].tab_name, "app/a");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ladder_v13_group_tabs_gain_pane_columns() {
+        // Pre-v14 group_tabs: the current CREATE minus the three additive
+        // columns (`pane_cwds` v14, `pane_cmds` v15, `pane_sessions` v23) —
+        // each ALTER comment documents that the column is absent on older
+        // rows. Legacy rows must survive with the new columns reading empty.
+        let (dir, db) = open_ladder_fixture(
+            "v13",
+            r#"
+            PRAGMA user_version = 13;
+            CREATE TABLE tab_groups (
+              session_name TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL,
+              worktree TEXT NOT NULL, ordinal INTEGER NOT NULL,
+              active_tab INTEGER NOT NULL DEFAULT 0,
+              PRIMARY KEY (session_name, name));
+            CREATE TABLE group_tabs (
+              session_name TEXT NOT NULL, group_name TEXT NOT NULL,
+              ordinal INTEGER NOT NULL, title TEXT NOT NULL,
+              pane_tree TEXT NOT NULL, focused_pane INTEGER NOT NULL DEFAULT 0,
+              PRIMARY KEY (session_name, group_name, ordinal));
+            INSERT INTO tab_groups VALUES ('/r', 'app/feat', 'branch', '/wt/feat', 0, 0);
+            INSERT INTO group_tabs VALUES ('/r', 'app/feat', 0, '1', '{"leaf":7}', 7);
+            "#,
+        );
+        let groups = db.groups_for_session("/r").unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].worktree, "/wt/feat");
+        let tabs = db.group_tabs_for_session("/r").unwrap();
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0].pane_tree, r#"{"leaf":7}"#);
+        assert_eq!(tabs[0].focused_pane, 7);
+        // The ALTERed columns read back as empty (NULL → default) on legacy rows.
+        assert_eq!(tabs[0].pane_cwds, "");
+        assert_eq!(tabs[0].pane_cmds, "");
+        assert_eq!(tabs[0].pane_sessions, "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ladder_v15_workspaces_position_backfilled_from_recency() {
+        // Pre-v16 workspaces (the existing v15 fixture shape): no `position`,
+        // `kind` or `env_name` — all three are additive ALTERs. `position`
+        // backfills from `last_active DESC` so the first post-upgrade launch
+        // keeps the old recency order.
+        let (dir, db) = open_ladder_fixture(
+            "v15",
+            r#"
+            PRAGMA user_version = 15;
+            CREATE TABLE workspaces (
+              repo_path TEXT PRIMARY KEY, name TEXT,
+              created_at INTEGER, last_active INTEGER);
+            INSERT INTO workspaces VALUES
+              ('/old',    'old',    1, 100),
+              ('/newest', 'newest', 1, 300),
+              ('/mid',    'mid',    1, 200);
+            "#,
+        );
+        let ws = db.workspaces().unwrap();
+        let order: Vec<&str> = ws.iter().map(|w| w.repo_path.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["/newest", "/mid", "/old"],
+            "position 0 = most-recently-active"
+        );
+        // The ALTERed `kind` reads back as the repo default on legacy rows.
+        assert!(ws.iter().all(|w| w.kind == "repo"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ladder_v21_gains_merge_queue_forwards_pool_and_registers() {
+        // Pre-v22: `merge_queue` (v22), `group_tabs.pane_sessions` (v23),
+        // `forwards` (v24), the pool tables + `provider_sandbox_id` (v26) and
+        // `registers` (v27) don't exist yet — every one is an additive
+        // CREATE/ALTER, so the old shape is exactly "current minus those".
+        // Seed cache rows to prove data survives, then exercise each
+        // newly-created table through the normal API.
+        let (dir, db) = open_ladder_fixture(
+            "v21",
+            r#"
+            PRAGMA user_version = 21;
+            CREATE TABLE repos (
+              path TEXT PRIMARY KEY, name TEXT, first_seen INTEGER,
+              last_opened INTEGER, open_count INTEGER DEFAULT 0,
+              seq INTEGER DEFAULT 0, session_name TEXT);
+            INSERT INTO repos(path,name,first_seen,last_opened,open_count,seq)
+              VALUES ('/keep','keep',1,1,1,1);
+            CREATE TABLE pr_cache (
+              worktree TEXT PRIMARY KEY, branch TEXT, json TEXT, fetched_at INTEGER);
+            INSERT INTO pr_cache VALUES ('/wt/x','sz/x','{"number":1}',42);
+            "#,
+        );
+        // Seeded data survived.
+        assert!(db.is_known_repo("/keep").unwrap());
+        let (json, at) = db.get_pr_cache("/wt/x").unwrap().unwrap();
+        assert_eq!((json.as_str(), at), (r#"{"number":1}"#, 42));
+        // Every post-v21 table is usable through the normal API.
+        db.enqueue_merge("/wt/x", "sz/x", "main").unwrap();
+        assert_eq!(db.list_merge_queue().unwrap().len(), 1);
+        db.upsert_forward("/wt/x", 3000, 3000, "http://127.0.0.1:3000")
+            .unwrap();
+        assert_eq!(db.list_forwards().unwrap().len(), 1);
+        db.insert_pool_spare("keep-pool-1", "/keep", "sprites")
+            .unwrap();
+        assert_eq!(db.pool_spares_for("/keep", "sprites").unwrap().len(), 1);
+        db.put_register('a', "migrated").unwrap();
+        assert_eq!(
+            db.all_registers().unwrap(),
+            vec![('a', "migrated".to_string())]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

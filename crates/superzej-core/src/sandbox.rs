@@ -239,7 +239,7 @@ pub struct SandboxSpec {
     pub network_block: Vec<String>,
     /// Hardening: mount the container root filesystem read-only (writable: the
     /// worktree, cache binds, and a tmpfs `/tmp`). Resolved from the active
-    /// [`SandboxProfile`](crate::config::SandboxProfile).
+    /// `SandboxProfile`.
     pub read_only_root: bool,
     /// Hardening: set `no-new-privileges` so setuid/setgid can't escalate.
     pub no_new_privileges: bool,
@@ -268,7 +268,7 @@ pub struct SandboxSpec {
     pub vpn: Option<VpnSpec>,
     /// Remote OCI daemon to drive (`[sandbox] oci_host`): a podman connection
     /// URL/name or docker host. `None` ⇒ the local daemon. Injected before every
-    /// container subcommand by [`oci_prefix`].
+    /// container subcommand by `oci_prefix`.
     pub oci_host: Option<String>,
 }
 
@@ -681,7 +681,7 @@ pub fn strip_agent_suffix(name: &str) -> &str {
 /// the tunnel's network namespace (the worktree container joins it via
 /// `--network container:<sidecar>`). Deterministic from the worktree container
 /// name so the bring-up (`superzej-svc::vpn`), the `--network` wiring
-/// ([`oci_create_opts`]), and teardown all agree without a registry lookup.
+/// (`oci_create_opts`), and teardown all agree without a registry lookup.
 pub const VPN_SIDECAR_SUFFIX: &str = "-szvpn";
 
 /// The VPN sidecar container name, derived from the worktree container name `base`.

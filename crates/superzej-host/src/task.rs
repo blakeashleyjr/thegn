@@ -252,6 +252,9 @@ fn task_command(loc: &GitLoc, inner: &[String], worktree: &Path, limits: &Limits
 /// Like [`run_capped`] but runs a prebuilt argv directly (no shell), so callers
 /// passing user/pattern data — e.g. the ripgrep source scan — never have to
 /// shell-quote. `inner[0]` is the program; the cap wrapper is prepended.
+// off-loop: only reached via run_task/discover_tests, which the loop always
+// dispatches on spawn_blocking (spawn_test_run_task / spawn_test_discovery).
+#[expect(clippy::disallowed_methods)]
 fn run_capped_argv(
     inner: &[String],
     loc: &GitLoc,
@@ -1520,6 +1523,8 @@ mod tests {
             .unwrap_or(false)
     }
 
+    // test code: fixture setup, never on the event loop.
+    #[expect(clippy::disallowed_methods)]
     fn git_init(dir: &Path) {
         // `git -C dir init` with GIT_DIR/GIT_WORK_TREE/etc. scrubbed: a raw
         // `git init <dir>` inheriting a commit hook's GIT_WORK_TREE writes

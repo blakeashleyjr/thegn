@@ -1,6 +1,6 @@
 //! Execution **placement** — *where* a worktree's processes run, decoupled from
 //! *how* they're isolated (the sandbox [`Backend`](crate::sandbox::Backend)) and
-//! *where* its files live ([`DataMode`](crate::env::DataMode)).
+//! *where* its files live (`DataMode`).
 //!
 //! This generalizes the old `Transport` (which only knew `Local | Remote(ssh)`):
 //! a placement owns the **exec primitive** that wraps a backend's argv. Local is
