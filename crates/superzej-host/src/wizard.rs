@@ -55,7 +55,8 @@ pub enum Field {
 /// What a key delivered to the wizard meant. `PrepChosen` fires whenever the
 /// user changes the host or sandbox selection, so the worker can start the
 /// placement bring-up / container ensure while they pick a program; `Submit`
-/// carries the full form.
+/// carries the full form and fires only from Enter on the Program list (Enter on
+/// any other field advances focus rather than creating).
 #[derive(Debug, Clone, PartialEq)]
 pub enum WizardOutcome {
     Pending,
@@ -310,15 +311,16 @@ impl NewWorktreeWizard {
         if crate::input::is_escape_key(key) {
             return WizardOutcome::Cancel;
         }
-        if matches!(key, KeyCode::Enter) {
-            return self.submit();
-        }
+        // Enter is field-specific: it *creates* only on the Program list (the
+        // terminal field the wizard opens on); on every other field it means
+        // "confirm this, move on" and advances focus toward Program — so an
+        // Enter while editing Name/Host/Sandbox never silently creates.
         match self.focus {
             // Text field: characters (including j/k/h/l) type literally; only
-            // the arrows move focus.
+            // the arrows (and Enter, as "next") move focus.
             Field::Name => {
                 match key {
-                    KeyCode::DownArrow => self.focus_down(),
+                    KeyCode::Enter | KeyCode::DownArrow => self.focus_down(),
                     KeyCode::UpArrow => self.focus_up(),
                     KeyCode::Backspace => {
                         // Popping marks the field edited; `|=` keeps an earlier
@@ -355,7 +357,7 @@ impl NewWorktreeWizard {
                     self.focus_up();
                     WizardOutcome::Pending
                 }
-                KeyCode::DownArrow | KeyCode::Char('j') => {
+                KeyCode::Enter | KeyCode::DownArrow | KeyCode::Char('j') => {
                     self.focus_down();
                     WizardOutcome::Pending
                 }
@@ -380,15 +382,17 @@ impl NewWorktreeWizard {
                     self.focus_up();
                     WizardOutcome::Pending
                 }
-                KeyCode::DownArrow | KeyCode::Char('j') => {
+                KeyCode::Enter | KeyCode::DownArrow | KeyCode::Char('j') => {
                     self.focus_down();
                     WizardOutcome::Pending
                 }
                 _ => WizardOutcome::Pending,
             },
             // Full list: ↑/↓ (or k/j) move within it; ↑ at the top moves focus
-            // up to the choice rows.
+            // up to the choice rows; Enter creates (this is the only field that
+            // submits).
             Field::Program => match key {
+                KeyCode::Enter => self.submit(),
                 KeyCode::DownArrow | KeyCode::Char('j') => {
                     let max = self.agent_rows.len().saturating_sub(1);
                     self.agent_sel = self.agent_sel.saturating_add(1).min(max);
@@ -566,6 +570,12 @@ impl NewWorktreeWizard {
             y += 1;
         }
 
+        // Enter creates only on the Program list; elsewhere it advances focus.
+        let enter_verb = if self.focus == Field::Program {
+            "enter create"
+        } else {
+            "enter next"
+        };
         seg::draw_line(
             surface,
             inner.x,
@@ -573,7 +583,7 @@ impl NewWorktreeWizard {
             inner.cols,
             &Line::segs(vec![seg(
                 Tok::Slot(S::Faint),
-                "↑↓ move · ←→ change · enter create · esc cancel".to_string(),
+                format!("↑↓ move · ←→ change · {enter_verb} · esc cancel"),
             )]),
             panel,
         );
@@ -1304,7 +1314,8 @@ mod tests {
         assert!(w.candidate().starts_with(&cfg.branch_prefix));
         assert!(w.candidate().len() > cfg.branch_prefix.len());
 
-        // Opens focused on the program list; Enter submits from any field.
+        // Opens focused on the program list, so Enter creates straight away
+        // (the accept-defaults fast path).
         let submit = key(&mut w, KeyCode::Enter);
         let WizardOutcome::Submit(choices) = submit else {
             panic!("expected Submit, got {submit:?}");
@@ -1313,6 +1324,36 @@ mod tests {
         assert!(!choices.env.is_empty());
         assert!(!choices.sandbox.is_empty());
         assert!(!choices.agent.is_empty());
+    }
+
+    #[test]
+    fn enter_advances_on_edit_fields_and_creates_only_on_program() {
+        let cfg = test_cfg();
+        let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
+
+        // Walk up to the Name field (Program → Sandbox → Host → Name).
+        key(&mut w, KeyCode::UpArrow);
+        key(&mut w, KeyCode::UpArrow);
+        key(&mut w, KeyCode::UpArrow);
+        assert_eq!(w.focus, Field::Name);
+
+        // Enter on Name advances to Host — it does not create.
+        assert_eq!(key(&mut w, KeyCode::Enter), WizardOutcome::Pending);
+        assert_eq!(w.focus, Field::Host);
+
+        // Enter on Host advances to Sandbox (local default keeps it in the ring).
+        assert_eq!(key(&mut w, KeyCode::Enter), WizardOutcome::Pending);
+        assert_eq!(w.focus, Field::Sandbox);
+
+        // Enter on Sandbox advances to Program.
+        assert_eq!(key(&mut w, KeyCode::Enter), WizardOutcome::Pending);
+        assert_eq!(w.focus, Field::Program);
+
+        // Enter on the Program list is the only Enter that creates.
+        assert!(matches!(
+            key(&mut w, KeyCode::Enter),
+            WizardOutcome::Submit(_)
+        ));
     }
 
     #[test]
@@ -1333,6 +1374,12 @@ mod tests {
         w.apply_name_suggestion("sz/other-name");
         assert_eq!(w.candidate(), typed, "typed name never clobbered");
 
+        // Enter on the Name field advances rather than creating; walk down to
+        // the Program list, where Enter submits the typed (Human) name.
+        key(&mut w, KeyCode::DownArrow);
+        key(&mut w, KeyCode::DownArrow);
+        key(&mut w, KeyCode::DownArrow);
+        assert_eq!(w.focus, Field::Program);
         let WizardOutcome::Submit(choices) = key(&mut w, KeyCode::Enter) else {
             panic!("expected Submit");
         };
@@ -1359,7 +1406,12 @@ mod tests {
         for _ in 0..64 {
             key(&mut w, KeyCode::Backspace);
         }
-        // An empty branch name never submits; Esc still cancels.
+        // Walk down to the Program list; an empty branch name still refuses to
+        // create there (submit() guards it). Esc still cancels.
+        key(&mut w, KeyCode::DownArrow);
+        key(&mut w, KeyCode::DownArrow);
+        key(&mut w, KeyCode::DownArrow);
+        assert_eq!(w.focus, Field::Program);
         assert_eq!(key(&mut w, KeyCode::Enter), WizardOutcome::Pending);
         assert_eq!(key(&mut w, KeyCode::Escape), WizardOutcome::Cancel);
     }
@@ -1421,7 +1473,12 @@ mod tests {
         // Program → up skips Sandbox and lands on Host directly.
         key(&mut w, KeyCode::UpArrow);
         assert_eq!(w.focus, Field::Host);
-        // Submit carries the non-local env; sandbox is the host-managed sentinel.
+        // Enter on Host advances (skipping the host-managed Sandbox) to Program
+        // rather than creating.
+        assert_eq!(key(&mut w, KeyCode::Enter), WizardOutcome::Pending);
+        assert_eq!(w.focus, Field::Program);
+        // A second Enter on the Program list submits: the non-local env is
+        // carried and sandbox is the host-managed sentinel.
         let WizardOutcome::Submit(choices) = key(&mut w, KeyCode::Enter) else {
             panic!("expected Submit");
         };
