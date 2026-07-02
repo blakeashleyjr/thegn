@@ -30,13 +30,17 @@ layers; AI is strictly additive.
   - `crates/superzej-host` — the compositor: tokio runtime, portable-pty panes
     through a pluggable `PaneEmulator` (vt100 today), termwiz `Surface`
     diff-flush rendering, in-process chrome.
-- **Event model (a hard invariant: ~0% idle CPU).** The loop blocks on termwiz
-  `poll_input(None)` — no tick, no timeout. Every off-thread producer (PTY
-  reader threads, model hydration on `spawn_blocking`, config/diff fs-watchers,
-  the 2s refresh-ticker thread) sends on a tokio mpsc channel **and pulses the
-  `TerminalWaker`**; the loop drains channels on wake and re-renders only when
-  dirty. Never put blocking I/O (git, DB, subprocess) on the loop; never add a
-  polling timeout.
+- **Event model (a hard invariant: ~0% idle CPU).** When idle, the loop blocks
+  on termwiz `poll_input(None)` — no tick, no timeout. (One sanctioned
+  exception: while there is already work in hand — `dirty`, queued input, or an
+  exhausted frame budget — the loop polls with a short 8ms timeout to _batch_
+  bursty input before the next flush. That is a busy-time heuristic; the
+  invariant is that an **idle** loop never polls.) Every off-thread producer
+  (PTY reader threads, model hydration on `spawn_blocking`, config/diff
+  fs-watchers, the 2s refresh-ticker thread) sends on a tokio mpsc channel
+  **and pulses the `TerminalWaker`**; the loop drains channels on wake and
+  re-renders only when dirty. Never put blocking I/O (git, DB, subprocess) on
+  the loop; never add a polling timeout to the idle path.
 - **Rendering** is a damage-region compositor (`src/render_plan.rs` + the
   `run.rs` render block). The loop tracks three damage channels — `full`
   (geometry), `chrome` (the master `dirty`: sidebar/panel/bars/overlays/model),
@@ -168,10 +172,26 @@ part of the shipped `szhost` binary.
 
 ## Conventions & gotchas
 
+- **God-file ratchet (`test/file-size-ratchet.sh`, runs in `just lint`).**
+  Source files are hard-capped at 3000 lines; the legacy oversized files
+  (run.rs, config.rs, db.rs, agent.rs, chrome.rs, sandbox.rs, keymap.rs) are
+  pinned at their recorded size in `test/file-size-ratchet.txt` and may only
+  shrink. Don't grow them: put new feature/Section key handlers and helpers in
+  a sibling module (e.g. `src/handlers/<area>.rs`) and call it from the loop.
+  After shrinking a pinned file, run `test/file-size-ratchet.sh --update` to
+  lock in the lower ceiling.
 - **Coverage gate: `superzej-core` only, 95% lines.** I/O / subprocess seams
   (the `cov_ignore` regex in the justfile) are excluded and exercised by
   `test/smoke.sh` instead. The host and svc crates carry their own unit tests
   but aren't gated. New core logic needs unit tests.
+- **Ignored `Result`s must be deliberate.** `let _ = …` / `.ok()` is the
+  sanctioned pattern for best-effort work whose failure must never take down
+  the compositor: DB cache/session persists (the DB is a cache; git is the
+  source of truth), waker pulses, cleanup, channel sends to a possibly-gone
+  consumer. Anywhere the ignore isn't obviously one of those, add a short
+  `// best-effort: <why>` comment — and never swallow errors on the primary
+  path of a user-invoked action (surface those via `model.status`, `msg`, or
+  `tracing`).
 - **This shell often runs _inside_ a live superzej.** Anything that opens the
   DB or spawns the host in tests/benches must isolate `XDG_STATE_HOME`
   (`just start`/`just bench` already do).
