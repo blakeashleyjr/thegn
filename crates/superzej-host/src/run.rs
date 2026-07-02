@@ -21,6 +21,7 @@ use termwiz::terminal::buffered::BufferedTerminal;
 use termwiz::terminal::{Terminal, TerminalWaker, new_terminal};
 use tokio::task;
 
+use crate::actions::{CiActionCtx, open_command_pane, open_command_tab, open_url_detached};
 use crate::chrome::{FrameModel, LoadStep, render_tab};
 use crate::compositor::Rect;
 use crate::gitmut::{GitOp, GitOpResult};
@@ -41,7 +42,6 @@ use crate::pane::PaneEvent;
 use crate::panel::gitui::{self, GitFlow, GitMsg, GitView, StagePane};
 use crate::panes::{
     Panes, prewarm_requests, relayout, relayout_strip, replace_single_dead_center_pane,
-    tool_drawer_argv,
 };
 use crate::recorder::Recorder;
 use crate::wizard;
@@ -1285,7 +1285,7 @@ fn collect_window_titles(
     out
 }
 
-fn refresh_tab_model(
+pub(crate) fn refresh_tab_model(
     model: &mut FrameModel,
     session: &crate::session::Session,
     sb: &mut SidebarState,
@@ -1329,7 +1329,7 @@ const SIDEBAR_SCOPE: &str = "sidebar";
 /// The single source of truth the event loop mutates; [`SidebarState::rebuild`]
 /// derives `FrameModel`'s sidebar fields from it plus the model's data carriers.
 #[derive(Default)]
-struct SidebarState {
+pub(crate) struct SidebarState {
     view: crate::sidebar::ViewState,
     focused: bool,
     /// Cursor over the *visible* rows.
@@ -2379,7 +2379,7 @@ fn group_cwd(g: &crate::session::WorktreeGroup) -> Option<std::path::PathBuf> {
 }
 
 /// The active worktree's working directory.
-fn active_cwd(session: &crate::session::Session) -> Option<std::path::PathBuf> {
+pub(crate) fn active_cwd(session: &crate::session::Session) -> Option<std::path::PathBuf> {
     session.active_group().and_then(group_cwd)
 }
 
@@ -4483,15 +4483,6 @@ fn render_marked_patch(git: &gitui::GitUi, reverse: bool) -> Option<String> {
 }
 
 /// Open a PR url in the browser, detached (no `gh` needed).
-fn open_url_detached(url: &str) {
-    let _ = std::process::Command::new("xdg-open")
-        .arg(url)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-}
-
 /// Turn one decoded [`GitMsg`] into ops / state changes. Navigation mutates
 /// [`gitui::GitUi`] directly; effects flow through the mutation runner (with
 /// destructive ones parked behind a confirm menu first).
@@ -6438,50 +6429,6 @@ fn smart_split_dir(cols: usize, rows: usize) -> crate::center::Dir {
 
 /// Spawn `command` (via the login-shell exec wrapper) into a fresh tab of the
 /// active worktree and focus it.
-fn open_command_tab(
-    session: &mut crate::session::Session,
-    panes: &mut Panes,
-    command: &str,
-    cwd: Option<&std::path::Path>,
-    center: Rect,
-) {
-    let argv = tool_drawer_argv(command);
-    let Ok(id) = panes.spawn_argv(&argv, cwd, center) else {
-        return;
-    };
-    if let Some(g) = session.active_group_mut() {
-        g.add_tab();
-        if let Some(tab) = g.active_tab_mut() {
-            tab.center = crate::center::CenterTree::Leaf(id);
-            tab.focused_pane = id;
-            return;
-        }
-    }
-    panes.table.remove(&id);
-}
-
-/// Spawn `command` into a new split beside the focused center pane.
-fn open_command_pane(
-    session: &mut crate::session::Session,
-    panes: &mut Panes,
-    focused: u32,
-    command: &str,
-    cwd: Option<&std::path::Path>,
-    center: Rect,
-) {
-    let argv = tool_drawer_argv(command);
-    let Ok(id) = panes.spawn_argv(&argv, cwd, center) else {
-        return;
-    };
-    if let Some(tab) = session.active_tab_mut()
-        && tab.center.split(focused, crate::center::Dir::Row, id)
-    {
-        tab.focused_pane = id;
-        return;
-    }
-    panes.table.remove(&id);
-}
-
 /// Keep-alive yazi drawers, one per worktree dir: hiding STASHES the pane
 /// (cursor position and yazi state survive), showing takes it back
 /// instantly, and the worktree-change detector pre-warms the pool so the
@@ -13920,6 +13867,24 @@ async fn event_loop<T: Terminal>(
                     match d.handle_key(&k.key, k.modifiers) {
                         crate::detail::DetailOutcome::Close => bar_detail = None,
                         crate::detail::DetailOutcome::Pending => {}
+                        // A row action fires and closes the overlay (open a URL,
+                        // drill into a pane, or run a CI mutation off the loop).
+                        crate::detail::DetailOutcome::Act(action) => {
+                            bar_detail = None;
+                            CiActionCtx {
+                                session: &mut session,
+                                panes: &mut panes,
+                                model: &mut model,
+                                focus: &mut focus,
+                                sb: &mut sb,
+                                need_relayout: &mut need_relayout,
+                                center: chrome.center,
+                                cfg: &current_config,
+                                refresh_tx: &refresh_tx,
+                                waker: &waker,
+                            }
+                            .run_detail_action(action);
+                        }
                     }
                     dirty = true;
                     continue;
@@ -16717,8 +16682,24 @@ async fn event_loop<T: Terminal>(
                                                 model.status = format!("Copied {url}");
                                             }
                                         }
+                                        Section::Ci => {
+                                            // Enter drills into the selected run (`ci view`).
+                                            CiActionCtx {
+                                                session: &mut session,
+                                                panes: &mut panes,
+                                                model: &mut model,
+                                                focus: &mut focus,
+                                                sb: &mut sb,
+                                                need_relayout: &mut need_relayout,
+                                                center: chrome.center,
+                                                cfg: &current_config,
+                                                refresh_tx: &refresh_tx,
+                                                waker: &waker,
+                                            }
+                                            .open_view_at(panel_ui.cursor);
+                                        }
                                         // Read-only / no-Enter-action sections
-                                        // (Ci, MergeQueue, Media, Logs, Across, …).
+                                        // (MergeQueue, Media, Logs, Across, …).
                                         _ => {}
                                     }
                                 } // match panel_ui.open + else
@@ -17936,6 +17917,25 @@ async fn event_loop<T: Terminal>(
                             panel_ui.symbols_cursor = 0;
                             panel_ui.cursor = 0;
                             true
+                        }
+                        // -- ci (AV group): drill in (v), open (o), re-run (r/R),
+                        // cancel (c). Provider is authority; bad ops decline off-loop.
+                        (Section::Ci, key)
+                            if matches!(key, KeyCode::Char('v' | 'o' | 'r' | 'R' | 'c')) =>
+                        {
+                            CiActionCtx {
+                                session: &mut session,
+                                panes: &mut panes,
+                                model: &mut model,
+                                focus: &mut focus,
+                                sb: &mut sb,
+                                need_relayout: &mut need_relayout,
+                                center: chrome.center,
+                                cfg: &current_config,
+                                refresh_tx: &refresh_tx,
+                                waker: &waker,
+                            }
+                            .panel_key(key, panel_ui.cursor)
                         }
                         // Esc in section mode returns to the terminal (row
                         // mode's Esc is claimed by the accordion map).
