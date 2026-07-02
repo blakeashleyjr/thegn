@@ -155,6 +155,9 @@ pub struct SidebarRow {
     /// Selected execution environment (`[env.<name>]`); `None`/`"default"` ⇒
     /// the implicit default (no badge shown).
     pub env_name: Option<String>,
+    /// Full placement label for a *remote* worktree (`ssh:host`, `k8s:ns/pod`,
+    /// `sprite:<id>`); `None` when the worktree runs locally (no badge shown).
+    pub placement_label: Option<String>,
     pub activity: ActivityState,
     /// Render/navigation visibility: false when hidden by a collapsed parent or
     /// filtered out.
@@ -253,6 +256,9 @@ pub struct DbWorktree {
     /// Selected execution environment (`[env.<name>]`); `None`/`"default"` ⇒
     /// the implicit default (no badge shown).
     pub env_name: Option<String>,
+    /// Full placement label for a *remote* worktree (`ssh:host`, `k8s:ns/pod`,
+    /// `sprite:<id>`); `None` when local. Derived from config at hydration time.
+    pub placement_label: Option<String>,
 }
 
 /// Split a `{repo}/{branch}` group name into its parts.
@@ -299,6 +305,7 @@ struct Group {
     activity: ActivityState,
     sandbox_backend: Option<String>,
     env_name: Option<String>,
+    placement_label: Option<String>,
     folder_id: Option<i64>,
 }
 
@@ -398,6 +405,7 @@ pub fn build_rows(
             agent: None,
             sandbox_backend: None,
             env_name: None,
+            placement_label: None,
             activity: ActivityState::None,
             visible: true,
             collapsed,
@@ -431,6 +439,10 @@ pub fn build_rows(
                     .iter()
                     .find(|w| w.tab_name == g.name)
                     .and_then(|w| w.env_name.clone()),
+                placement_label: db_worktrees
+                    .iter()
+                    .find(|w| w.tab_name == g.name)
+                    .and_then(|w| w.placement_label.clone()),
                 activity: activity.get(&g.name).copied().unwrap_or_default(),
                 folder_id: db_worktrees
                     .iter()
@@ -488,6 +500,7 @@ pub fn build_rows(
                 agent,
                 sandbox_backend: gr.sandbox_backend.clone(),
                 env_name: gr.env_name.clone(),
+                placement_label: gr.placement_label.clone(),
                 activity: gr.activity,
                 visible: !collapsed,
                 collapsed: false,
@@ -565,6 +578,7 @@ pub fn build_rows(
                 agent: None,
                 sandbox_backend: None,
                 env_name: None,
+                placement_label: None,
                 activity: ActivityState::None,
                 visible: !collapsed,
                 collapsed: folder_collapsed,
@@ -632,6 +646,7 @@ pub fn build_rows(
                             agent,
                             sandbox_backend: gr.sandbox_backend.clone(),
                             env_name: gr.env_name.clone(),
+                            placement_label: gr.placement_label.clone(),
                             activity: gr.activity,
                             visible: !collapsed,
                             collapsed: false,
@@ -656,7 +671,8 @@ pub fn build_rows(
                       group: Option<String>,
                       path: Option<String>,
                       backend: Option<String>,
-                      env: Option<String>| {
+                      env: Option<String>,
+                      placement: Option<String>| {
                 let pr_count = path
                     .as_deref()
                     .and_then(|p| status.pr_counts.get(p))
@@ -700,6 +716,7 @@ pub fn build_rows(
                     agent: path.as_deref().and_then(|p| status.agent.get(p)).cloned(),
                     sandbox_backend: backend,
                     env_name: env,
+                    placement_label: placement,
                     activity: act,
                     visible: !collapsed,
                     collapsed: false,
@@ -719,6 +736,7 @@ pub fn build_rows(
                 Some(repo_path.clone()),
                 None,
                 None,
+                None,
             ));
             // A registry row for the home checkout would duplicate the
             // synthesized row above — skip it.
@@ -732,6 +750,7 @@ pub fn build_rows(
                     Some(w.path.clone()),
                     w.sandbox_backend.clone(),
                     w.env_name.clone(),
+                    w.placement_label.clone(),
                 ));
             }
         }
@@ -752,6 +771,7 @@ pub fn build_rows(
             agent: None,
             sandbox_backend: None,
             env_name: None,
+            placement_label: None,
             activity: ActivityState::None,
             visible: true,
             collapsed: false,
@@ -783,6 +803,7 @@ pub fn build_rows(
             agent: None,
             sandbox_backend: None,
             env_name: None,
+            placement_label: None,
             activity: ActivityState::None,
             visible: true,
             collapsed: false,
@@ -828,6 +849,7 @@ pub fn build_rows(
                 agent: None,
                 sandbox_backend: None,
                 env_name: None,
+                placement_label: None,
                 activity: ActivityState::None,
                 visible: true,
                 collapsed,
@@ -874,6 +896,7 @@ pub fn build_rows(
                     agent: None,
                     sandbox_backend: None,
                     env_name: None,
+                    placement_label: None,
                     activity: ActivityState::None,
                     visible: true,
                     collapsed: false,
@@ -1305,6 +1328,7 @@ mod tests {
             folder_id: None,
             sandbox_backend: None,
             env_name: Some("company-k8s".into()),
+            placement_label: None,
         }];
         let rows = build_rows(
             &s,
@@ -1542,6 +1566,7 @@ mod tests {
                 folder_id: None,
                 sandbox_backend: None,
                 env_name: None,
+                placement_label: None,
             },
             DbWorktree {
                 slug: "app".into(),
@@ -1552,6 +1577,7 @@ mod tests {
                 folder_id: None,
                 sandbox_backend: None,
                 env_name: None,
+                placement_label: None,
             },
         ];
         let rows = build_rows(

@@ -532,7 +532,11 @@ pub(crate) fn merge_workspace_lists(
 
 /// Worktrees registered in the DB, ready for the sidebar's cross-workspace
 /// rows: one entry per registry row whose dir still exists (or is remote).
-pub(crate) fn db_worktree_list(db: &superzej_core::db::Db) -> Vec<crate::sidebar::DbWorktree> {
+pub(crate) fn db_worktree_list(
+    db: &superzej_core::db::Db,
+    cfg: &superzej_core::config::Config,
+) -> Vec<crate::sidebar::DbWorktree> {
+    use superzej_core::remote::GitLoc;
     let mut out = Vec::new();
     for w in db.worktrees().unwrap_or_default() {
         // git is the source of truth: a local registry row whose dir vanished
@@ -546,6 +550,20 @@ pub(crate) fn db_worktree_list(db: &superzej_core::db::Db) -> Vec<crate::sidebar
         let Some((slug, branch)) = crate::sidebar::split_tab(&w.tab_name) else {
             continue;
         };
+        // Resolve the worktree's execution env from config (pure, no I/O) so the
+        // sidebar can show a remote placement label (ssh/k8s/provider) next to
+        // the sandbox backend. `None` for local placements ⇒ no badge. Build the
+        // loc from this row's `location` column (already in hand) rather than
+        // `GitLoc::for_worktree`, which would reopen the DB per worktree.
+        let wt = std::path::Path::new(&w.worktree);
+        let loc = GitLoc::from_db(&w.worktree, Some(w.location.as_str()));
+        let env = cfg.resolve_env(
+            std::path::Path::new(&w.repo_root),
+            &loc,
+            wt,
+            w.env_name.as_deref(),
+        );
+        let placement_label = (!env.placement.is_local()).then(|| env.placement.label());
         out.push(crate::sidebar::DbWorktree {
             slug,
             branch,
@@ -555,6 +573,7 @@ pub(crate) fn db_worktree_list(db: &superzej_core::db::Db) -> Vec<crate::sidebar
             folder_id: w.folder_id,
             sandbox_backend: w.sandbox_backend.clone(),
             env_name: w.env_name.clone(),
+            placement_label,
         });
     }
     out
@@ -1110,7 +1129,7 @@ pub(crate) fn build_model(
         .filter(|(_, _, _, repo)| !repo.is_empty())
         .flat_map(|(_, _, _, repo)| db.folders_for_workspace(repo).unwrap_or_default())
         .collect();
-    let sidebar_db_worktrees = db_worktree_list(db);
+    let sidebar_db_worktrees = db_worktree_list(db, &app_cfg);
     let sidebar_db_terminals = db.terminals().unwrap_or_default();
     let sidebar_status = collect_sidebar_status(
         session,
@@ -1120,6 +1139,25 @@ pub(crate) fn build_model(
         &app_cfg.lifecycle,
     );
     let loc_count = worktree_loc(db, &cwd);
+
+    // Terse placement kind (ssh/mosh/k8s/<provider>) for the active worktree, for
+    // the center tab bar. Resolved from config (pure, no I/O); `None` when local.
+    // Reuse the canonical repo_root from the sidebar list so the kind matches the
+    // full label shown in the sidebar detail line.
+    let active_path = loc.path();
+    let active_repo = sidebar_db_worktrees
+        .iter()
+        .find(|w| w.path == active_path)
+        .map(|w| w.repo_path.clone())
+        .unwrap_or_else(|| active_path.clone());
+    let active_env = app_cfg.resolve_env(
+        std::path::Path::new(&active_repo),
+        &loc,
+        std::path::Path::new(&active_path),
+        db.worktree_env(&active_path).ok().flatten().as_deref(),
+    );
+    let active_placement_kind =
+        (!active_env.placement.is_local()).then(|| active_env.placement.kind());
 
     let panel = build_panel(&cwd, db, &hints, &app_cfg);
 
@@ -1161,6 +1199,7 @@ pub(crate) fn build_model(
             .ok()
             .flatten()
             .unwrap_or_default(),
+        active_placement_kind,
         // containers is populated by the dedicated container refresh ticker
         // (run.rs) rather than inline here, to avoid blocking model hydration
         // on `podman ps` subprocess calls.
