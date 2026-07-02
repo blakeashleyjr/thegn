@@ -1184,9 +1184,17 @@ pub fn run_worker(
             }
             let _ = db.set_worktree_sandbox(&path_s, &sandbox.backend_label);
             let _ = db.set_worktree_agent(&path_s, &choices.agent);
-            // Persist the chosen host verbatim (matches `set_worktree_env` /
-            // `--env`); the implicit "default" is left NULL to keep it clean.
-            if choices.env != "default" {
+            // Persist the chosen host only when it DIFFERS from the ambient
+            // default this worktree would otherwise inherit (repo `.superzej.*`
+            // env → global `[sandbox] default_env` → "default"). A divergent
+            // choice — including an explicit "default" against a provider
+            // ambient default — is pinned so every later re-resolution
+            // (`effective_env` → `resolve_env(Some(..))`) reproduces the
+            // wizard's placement instead of falling through to the ambient
+            // sprite. A choice equal to the ambient default stays NULL (clean
+            // inherit).
+            let ambient = default_env_name(cfg, root);
+            if choices.env != ambient {
                 let _ = db.set_worktree_env(&path_s, &choices.env);
             }
             step(CreateStep::Register, StepState::Done, None);
@@ -1273,7 +1281,18 @@ mod tests {
         cmds: Vec<WizardCmd>,
         db_path: &Path,
     ) -> Vec<CreateEvent> {
-        let cfg = test_cfg();
+        drive_worker_cfg(test_cfg(), repo, candidate, cmds, db_path)
+    }
+
+    /// Like [`drive_worker`] but with a caller-supplied config (e.g. to set a
+    /// non-local `[sandbox] default_env` ambient).
+    fn drive_worker_cfg(
+        cfg: Config,
+        repo: &Path,
+        candidate: &str,
+        cmds: Vec<WizardCmd>,
+        db_path: &Path,
+    ) -> Vec<CreateEvent> {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         for c in cmds {
             cmd_tx.send(c).unwrap();
@@ -1581,6 +1600,52 @@ mod tests {
         let rows = db.worktrees().unwrap();
         let row = rows.iter().find(|w| w.worktree == p.path).expect("db row");
         assert_eq!(row.env_name.as_deref(), Some("myenv"));
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn worker_persists_default_when_ambient_is_provider() {
+        use superzej_core::config::{EnvConfig, PlacementMode};
+        let repo = temp_repo("env-provider-default");
+        let db = repo.join("state/superzej.db");
+        // Ambient default is a provider (sprite) env; the user explicitly picks
+        // the local "host default" row. That divergent "default" must be pinned
+        // so later re-resolution stays local instead of falling through to the
+        // sprite.
+        let mut cfg = test_cfg();
+        cfg.sandbox.default_env = "sprite".into();
+        cfg.env.insert(
+            "sprite".into(),
+            EnvConfig {
+                placement: PlacementMode::Provider,
+                ..Default::default()
+            },
+        );
+        let events = drive_worker_cfg(
+            cfg,
+            &repo,
+            "sz/local-pick",
+            vec![
+                WizardCmd::PrepChosen {
+                    env: "default".into(),
+                    sandbox: "host".into(),
+                },
+                WizardCmd::Submit(WizardChoices {
+                    name: NameChoice::Generated,
+                    env: "default".into(),
+                    sandbox: "host".into(),
+                    agent: "shell".into(),
+                }),
+            ],
+            &db,
+        );
+        let p = done_payload(&events).expect("Done event");
+        let db = Db::open_at(&db).unwrap();
+        let rows = db.worktrees().unwrap();
+        let row = rows.iter().find(|w| w.worktree == p.path).expect("db row");
+        // Diverges from the sprite ambient default ⇒ "default" is persisted, so
+        // effective_env → resolve_env(Some("default")) resolves to Local.
+        assert_eq!(row.env_name.as_deref(), Some("default"));
         let _ = std::fs::remove_dir_all(&repo);
     }
 
