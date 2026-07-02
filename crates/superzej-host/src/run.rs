@@ -2209,20 +2209,87 @@ fn sidebar_workspace_order(rows: &[crate::sidebar::SidebarRow]) -> Vec<String> {
         .collect()
 }
 
+/// A stop in the unified Shift+Alt+↑/↓ ring: every visible workspace (repo)
+/// followed by every terminal host, in sidebar display order. Stepping wraps
+/// across the workspaces↔terminals boundary so the two sidebar sections read as
+/// one ring. Unlike [`sidebar_workspace_order`] this KEEPS live-fallback
+/// workspaces (they carry a real slug even without a DB `repo_path`), so the
+/// current position is always locatable and the motion never silently no-ops.
+#[derive(Debug, Clone, PartialEq)]
+enum RingStop {
+    /// A workspace header. `repo_path` is `None` for a live fallback (the
+    /// currently-resident workspace with no DB row yet), which is never a
+    /// `switch_workspace` target — landing on it just leaves the terminals
+    /// region for a worktree.
+    Workspace {
+        slug: String,
+        repo_path: Option<String>,
+    },
+    /// A terminal host (its collapse key), e.g. `local` / `prod`.
+    TerminalHost { key: String },
+}
+
+/// Build the unified ring in **visible sidebar order**: workspaces then terminal
+/// hosts. Pure over the row slice + DB terminal list so it's unit-testable
+/// straight from `build_rows` output.
+fn unified_ring(
+    rows: &[crate::sidebar::SidebarRow],
+    db_terminals: &[superzej_core::models::TerminalRow],
+) -> Vec<RingStop> {
+    let mut ring: Vec<RingStop> = rows
+        .iter()
+        .filter(|r| r.visible && r.kind == crate::sidebar::RowKind::Workspace)
+        .map(|r| RingStop::Workspace {
+            slug: r.workspace_slug.clone(),
+            repo_path: r.worktree_path.clone(),
+        })
+        .collect();
+    for (key, ..) in crate::sidebar::terminal_hosts_ordered(db_terminals) {
+        ring.push(RingStop::TerminalHost { key });
+    }
+    ring
+}
+
+/// The current index in [`unified_ring`], resolved by terminal host key when the
+/// active group is a terminal, else by workspace slug. Matching by slug (not by
+/// raw repo-path equality against `session.id`) makes the lookup robust to
+/// path-form differences and live fallbacks. `None` only when the active thing
+/// isn't on screen — the caller then starts from 0 rather than no-op.
+fn ring_current_index(
+    ring: &[RingStop],
+    active_workspace_slug: Option<&str>,
+    active_host_key: Option<&str>,
+) -> Option<usize> {
+    if let Some(key) = active_host_key {
+        return ring
+            .iter()
+            .position(|s| matches!(s, RingStop::TerminalHost { key: k } if k == key));
+    }
+    let slug = active_workspace_slug?;
+    ring.iter()
+        .position(|s| matches!(s, RingStop::Workspace { slug: s2, .. } if s2 == slug))
+}
+
 /// The repo path a `Ctrl+N` jump (`Action::SummonWorkspace(n)`) should switch
-/// to, given the visible sidebar rows and the active workspace id. `None` when
+/// to, given the visible sidebar rows and the active workspace slug. `None` when
 /// `n` is 0, past the last switchable workspace, or already the active one (all
-/// no-ops). The slot order is exactly `sidebar_workspace_order` so it matches
-/// the digit hints painted on the rows and the palette entry numbers.
+/// no-ops). The slot order counts only switchable (DB-backed, `worktree_path`)
+/// workspace rows — exactly the rows the digit painter numbers (chrome.rs) and
+/// the palette entries — so hints and jumps stay aligned. The already-active
+/// guard matches by slug, not raw repo-path, mirroring the Shift+Alt ring.
 fn summon_workspace_target(
     rows: &[crate::sidebar::SidebarRow],
     n: u8,
-    active_id: &str,
+    active_slug: Option<&str>,
 ) -> Option<String> {
-    sidebar_workspace_order(rows)
-        .get((n as usize).checked_sub(1)?)
-        .filter(|target| target.as_str() != active_id)
-        .cloned()
+    let idx = (n as usize).checked_sub(1)?;
+    rows.iter()
+        .filter(|r| {
+            r.visible && r.kind == crate::sidebar::RowKind::Workspace && r.worktree_path.is_some()
+        })
+        .nth(idx)
+        .filter(|r| Some(r.workspace_slug.as_str()) != active_slug)
+        .and_then(|r| r.worktree_path.clone())
 }
 
 /// The visible-row index of the active row, or 0.
@@ -18517,141 +18584,162 @@ async fn event_loop<T: Terminal>(
                                 persist_session_layout(&mut session, &panes);
                             }
                             Action::NextWorkspace | Action::PrevWorkspace => {
-                                // One combined ring: the switchable workspaces in
-                                // *visible* sidebar order (so the motion matches
-                                // the tree even with pins/filters), then the
-                                // terminal hosts. Stepping wraps across the whole
-                                // ring, so Shift+Alt+↓ overflows from the last
-                                // workspace into the terminals region and back.
-                                let workspaces = sidebar_workspace_order(&model.sidebar_rows);
-                                let host_keys: Vec<String> =
-                                    crate::sidebar::terminal_hosts_ordered(
-                                        &model.sidebar_db_terminals,
-                                    )
-                                    .into_iter()
-                                    .map(|(k, ..)| k)
-                                    .collect();
-                                let nw = workspaces.len();
-                                let total = nw + host_keys.len();
+                                // One combined ring: the visible workspaces (in
+                                // sidebar order, so the motion matches the tree
+                                // even with pins/filters) followed by the terminal
+                                // hosts. Stepping wraps across the whole ring, so
+                                // Shift+Alt+↓ overflows from the last workspace
+                                // into the terminals region and back — the two
+                                // sidebar sections read as one. The current stop is
+                                // resolved by slug / host key (not raw repo-path
+                                // equality against `session.id`), so a live-fallback
+                                // workspace or a differently-formatted path never
+                                // strands the ring at a silent no-op.
+                                let ring =
+                                    unified_ring(&model.sidebar_rows, &model.sidebar_db_terminals);
+                                let total = ring.len();
                                 let in_term = active_is_terminal(&session);
-                                let cur = if in_term {
+                                // The current workspace's slug — the anchor we
+                                // return to when a step lands back on it. Taken
+                                // from the first non-terminal group so it's valid
+                                // even while the active group is a terminal.
+                                let home_slug: Option<String> = session
+                                    .worktrees
+                                    .iter()
+                                    .find(|g| g.kind != crate::session::GroupKind::Terminal)
+                                    .and_then(|g| crate::sidebar::split_tab(&g.name))
+                                    .map(|(slug, _)| slug);
+                                let active_host = if in_term {
                                     active_terminal_host_key(&session, &model.sidebar_db_terminals)
-                                        .and_then(|k| host_keys.iter().position(|h| *h == k))
-                                        .map(|i| nw + i)
                                 } else {
-                                    workspaces.iter().position(|p| *p == session.id)
+                                    None
                                 };
-                                if let (Some(p), true) = (cur, total > 1) {
+                                let active_slug = if in_term { None } else { home_slug.clone() };
+                                let cur = ring_current_index(
+                                    &ring,
+                                    active_slug.as_deref(),
+                                    active_host.as_deref(),
+                                )
+                                // Fall back to the first stop rather than no-op when
+                                // the active thing somehow isn't on screen.
+                                .unwrap_or(0);
+                                if total > 1 {
                                     let next = if action == Action::NextWorkspace {
-                                        (p + 1) % total
+                                        (cur + 1) % total
                                     } else {
-                                        (p + total - 1) % total
+                                        (cur + total - 1) % total
                                     };
-                                    if next < nw {
-                                        // Target is a workspace.
-                                        let target = workspaces[next].clone();
-                                        if target == session.id {
-                                            // Wrapped back onto the current
-                                            // workspace from the terminals region:
-                                            // just leave terminals for a worktree.
-                                            if let Some(gi) =
-                                                worktree_landing(&session, region_last_w)
+                                    match ring[next].clone() {
+                                        RingStop::Workspace { slug, repo_path } => {
+                                            // Landing back on the current workspace
+                                            // (by slug), or on a live fallback (no DB
+                                            // row to switch to): just leave the
+                                            // terminals region for a worktree.
+                                            let onto_home = repo_path.is_none()
+                                                || Some(slug.as_str()) == home_slug.as_deref();
+                                            if onto_home {
+                                                if let Some(gi) =
+                                                    worktree_landing(&session, region_last_w)
+                                                {
+                                                    session.switch_to(gi);
+                                                }
+                                                focus.zone = crate::focus::Zone::Center;
+                                                region_last_w = Some(session.active);
+                                                refresh_tab_model(&mut model, &session, &mut sb);
+                                                need_relayout = true;
+                                                sync_drawer_persistence(
+                                                    &session,
+                                                    &mut panes,
+                                                    &mut drawer,
+                                                    &mut drawer_pool,
+                                                    &mut drawer_home,
+                                                    keymap.config(),
+                                                    chrome.center,
+                                                );
+                                                persist_session_layout(&mut session, &panes);
+                                            } else if let (Some(target), Ok(db)) =
+                                                (repo_path, superzej_core::db::Db::open())
+                                                && switch_workspace(
+                                                    &target,
+                                                    None,
+                                                    &mut session,
+                                                    &mut panes,
+                                                    &mut workspace_pool,
+                                                    &db,
+                                                    &mut need_relayout,
+                                                    &mut clear_on_next_frame,
+                                                )
                                             {
-                                                session.switch_to(gi);
+                                                focus.zone = crate::focus::Zone::Center;
+                                                // The new session re-indexes groups;
+                                                // drop the (now meaningless) memory.
+                                                region_last_w = Some(session.active);
+                                                region_last_t = None;
+                                                refresh_tab_model(&mut model, &session, &mut sb);
+                                                kick_model_hydration!();
+                                                need_relayout = true;
+                                                sync_drawer_persistence(
+                                                    &session,
+                                                    &mut panes,
+                                                    &mut drawer,
+                                                    &mut drawer_pool,
+                                                    &mut drawer_home,
+                                                    keymap.config(),
+                                                    chrome.center,
+                                                );
                                             }
-                                            focus.zone = crate::focus::Zone::Center;
-                                            region_last_w = Some(session.active);
-                                            refresh_tab_model(&mut model, &session, &mut sb);
-                                            need_relayout = true;
-                                            sync_drawer_persistence(
-                                                &session,
-                                                &mut panes,
-                                                &mut drawer,
-                                                &mut drawer_pool,
-                                                &mut drawer_home,
-                                                keymap.config(),
-                                                chrome.center,
-                                            );
-                                            persist_session_layout(&mut session, &panes);
-                                        } else if let Ok(db) = superzej_core::db::Db::open()
-                                            && switch_workspace(
-                                                &target,
-                                                None,
-                                                &mut session,
-                                                &mut panes,
-                                                &mut workspace_pool,
-                                                &db,
-                                                &mut need_relayout,
-                                                &mut clear_on_next_frame,
-                                            )
-                                        {
-                                            focus.zone = crate::focus::Zone::Center;
-                                            // The new session re-indexes groups;
-                                            // drop the (now meaningless) memory.
-                                            region_last_w = Some(session.active);
-                                            region_last_t = None;
-                                            refresh_tab_model(&mut model, &session, &mut sb);
-                                            kick_model_hydration!();
-                                            need_relayout = true;
-                                            sync_drawer_persistence(
-                                                &session,
-                                                &mut panes,
-                                                &mut drawer,
-                                                &mut drawer_pool,
-                                                &mut drawer_home,
-                                                keymap.config(),
-                                                chrome.center,
-                                            );
                                         }
-                                    } else {
-                                        // Target is a terminal host: activate its
-                                        // first terminal (or the remembered one if
-                                        // it belongs here), expanding the host.
-                                        let key = host_keys[next - nw].clone();
-                                        let pick: Option<String> = {
-                                            let hosts = crate::sidebar::terminal_hosts_ordered(
-                                                &model.sidebar_db_terminals,
-                                            );
-                                            hosts.iter().find(|(k, ..)| *k == key).and_then(
-                                                |(_, _, _, terms)| {
-                                                    region_last_t
-                                                        .as_ref()
-                                                        .filter(|n| {
-                                                            terms.iter().any(|t| &t.name == *n)
-                                                        })
-                                                        .cloned()
-                                                        .or_else(|| {
-                                                            terms.first().map(|t| t.name.clone())
-                                                        })
-                                                },
-                                            )
-                                        };
-                                        if let Some(name) = pick {
-                                            let slug = format!("terminals/host:{key}");
-                                            if sb.view.collapsed.remove(&slug) {
-                                                sb.persist(&format!("collapse:{slug}"), "0");
+                                        RingStop::TerminalHost { key } => {
+                                            // Target is a terminal host: activate its
+                                            // first terminal (or the remembered one if
+                                            // it belongs here), expanding the host.
+                                            let pick: Option<String> = {
+                                                let hosts = crate::sidebar::terminal_hosts_ordered(
+                                                    &model.sidebar_db_terminals,
+                                                );
+                                                hosts.iter().find(|(k, ..)| *k == key).and_then(
+                                                    |(_, _, _, terms)| {
+                                                        region_last_t
+                                                            .as_ref()
+                                                            .filter(|n| {
+                                                                terms.iter().any(|t| &t.name == *n)
+                                                            })
+                                                            .cloned()
+                                                            .or_else(|| {
+                                                                terms
+                                                                    .first()
+                                                                    .map(|t| t.name.clone())
+                                                            })
+                                                    },
+                                                )
+                                            };
+                                            if let Some(name) = pick {
+                                                let slug = format!("terminals/host:{key}");
+                                                if sb.view.collapsed.remove(&slug) {
+                                                    sb.persist(&format!("collapse:{slug}"), "0");
+                                                }
+                                                activate_row_target(
+                                                    terminal_target(&name),
+                                                    &mut session,
+                                                    &mut model,
+                                                    &mut sb,
+                                                    &mut panes,
+                                                    &mut drawer,
+                                                    &mut drawer_pool,
+                                                    &mut drawer_home,
+                                                    &mut workspace_pool,
+                                                    keymap.config(),
+                                                    chrome.center,
+                                                    &mut need_relayout,
+                                                    &mut clear_on_next_frame,
+                                                );
+                                                focus.zone = crate::focus::Zone::Center;
+                                                region_last_t = session
+                                                    .worktrees
+                                                    .get(session.active)
+                                                    .map(|g| g.name.clone());
+                                                need_relayout = true;
                                             }
-                                            activate_row_target(
-                                                terminal_target(&name),
-                                                &mut session,
-                                                &mut model,
-                                                &mut sb,
-                                                &mut panes,
-                                                &mut drawer,
-                                                &mut drawer_pool,
-                                                &mut drawer_home,
-                                                &mut workspace_pool,
-                                                keymap.config(),
-                                                chrome.center,
-                                                &mut need_relayout,
-                                                &mut clear_on_next_frame,
-                                            );
-                                            focus.zone = crate::focus::Zone::Center;
-                                            region_last_t = session
-                                                .worktrees
-                                                .get(session.active)
-                                                .map(|g| g.name.clone());
-                                            need_relayout = true;
                                         }
                                     }
                                 }
@@ -18737,9 +18825,17 @@ async fn event_loop<T: Terminal>(
                                 // same order Shift+Alt+↑/↓ walks and the digit
                                 // hints paint. Out-of-range N or already-active
                                 // target is a no-op.
-                                if let Some(target) =
-                                    summon_workspace_target(&model.sidebar_rows, n, &session.id)
-                                    && let Ok(db) = superzej_core::db::Db::open()
+                                let active_slug = session
+                                    .worktrees
+                                    .iter()
+                                    .find(|g| g.kind != crate::session::GroupKind::Terminal)
+                                    .and_then(|g| crate::sidebar::split_tab(&g.name))
+                                    .map(|(slug, _)| slug);
+                                if let Some(target) = summon_workspace_target(
+                                    &model.sidebar_rows,
+                                    n,
+                                    active_slug.as_deref(),
+                                ) && let Ok(db) = superzej_core::db::Db::open()
                                     && switch_workspace(
                                         &target,
                                         None,
@@ -20697,7 +20793,8 @@ mod tests {
             &[],
             &[],
         );
-        let active = &session.id;
+        // The active workspace is identified by slug ("app"), not raw path.
+        let active = Some("app");
         // Ctrl+1 → the first visible (pinned) workspace, "lib".
         assert_eq!(
             summon_workspace_target(&rows, 1, active),
@@ -20707,13 +20804,172 @@ mod tests {
         assert_eq!(summon_workspace_target(&rows, 2, active), None);
         // Ctrl+2 from a different active workspace → switches to "app".
         assert_eq!(
-            summon_workspace_target(&rows, 2, "/tmp/other"),
+            summon_workspace_target(&rows, 2, Some("other")),
             Some("/tmp/app".to_string()),
         );
         // n=0 and out-of-range are no-ops.
         assert_eq!(summon_workspace_target(&rows, 0, active), None);
         assert_eq!(summon_workspace_target(&rows, 3, active), None);
         assert_eq!(summon_workspace_target(&rows, 9, active), None);
+    }
+
+    /// A minimal terminal row for the unified-ring tests. `kind`/`connection`
+    /// drive the host grouping (see `sidebar::terminal_host`).
+    fn mk_term(name: &str, conn: &str, kind: &str) -> superzej_core::models::TerminalRow {
+        superzej_core::models::TerminalRow {
+            id: 0,
+            name: name.into(),
+            kind: kind.into(),
+            connection_string: conn.into(),
+            folder_id: None,
+            created_at: 0,
+            last_active: 0,
+            position: 0,
+        }
+    }
+
+    // Rebuild the ring + step helper the handler uses, purely.
+    fn ring_step(ring: &[RingStop], cur: usize, next_dir: bool) -> RingStop {
+        let total = ring.len();
+        let next = if next_dir {
+            (cur + 1) % total
+        } else {
+            (cur + total - 1) % total
+        };
+        ring[next].clone()
+    }
+
+    #[test]
+    fn unified_ring_crosses_workspaces_and_terminals() {
+        // One workspace + two terminal hosts (local sorts first, then "prod").
+        // The ring is [app, local, prod]; stepping from the workspace crosses
+        // into the terminals region and wraps back — the two sections read as
+        // one. This is exactly the traversal that was silently a no-op before.
+        let session = Session {
+            id: "/tmp/app".into(),
+            worktrees: vec![WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/app")],
+            active: 0,
+        };
+        let workspaces = vec![("app".into(), "app".into(), "repo".into(), "/tmp/app".into())];
+        let terminals = vec![
+            mk_term("shell1", "", "local"),
+            mk_term("box", "ssh dave@prod", "ssh"),
+        ];
+        let rows = crate::sidebar::build_rows(
+            &session,
+            &workspaces,
+            &crate::sidebar::ViewState::default(),
+            &crate::sidebar::SidebarStatus::default(),
+            &[],
+            &[],
+            &terminals,
+        );
+        let ring = unified_ring(&rows, &terminals);
+        assert_eq!(
+            ring,
+            vec![
+                RingStop::Workspace {
+                    slug: "app".into(),
+                    repo_path: Some("/tmp/app".into()),
+                },
+                RingStop::TerminalHost {
+                    key: "local".into()
+                },
+                RingStop::TerminalHost { key: "prod".into() },
+            ],
+        );
+        // From the workspace (resolved by slug), Next crosses into terminals…
+        let cur = ring_current_index(&ring, Some("app"), None).unwrap();
+        assert_eq!(cur, 0);
+        assert_eq!(
+            ring_step(&ring, cur, true),
+            RingStop::TerminalHost {
+                key: "local".into()
+            },
+        );
+        // …and Prev wraps backward from the workspace onto the last terminal host.
+        assert_eq!(
+            ring_step(&ring, cur, false),
+            RingStop::TerminalHost { key: "prod".into() },
+        );
+        // From a terminal host, resolution is by host key; Next wraps to the
+        // workspace, crossing the boundary the other way.
+        let cur_t = ring_current_index(&ring, None, Some("prod")).unwrap();
+        assert_eq!(cur_t, 2);
+        assert_eq!(
+            ring_step(&ring, cur_t, true),
+            RingStop::Workspace {
+                slug: "app".into(),
+                repo_path: Some("/tmp/app".into()),
+            },
+        );
+    }
+
+    #[test]
+    fn ring_resolves_by_slug_and_keeps_live_fallback() {
+        // A live-fallback workspace (empty repo_path in the workspace list) is
+        // DROPPED by `sidebar_workspace_order`, which is what made the old
+        // `position(|p| *p == session.id)` lookup return None → silent no-op.
+        // The ring KEEPS it (with `repo_path: None`) and resolves the current
+        // position by slug, so the motion still works.
+        let session = Session {
+            id: "/tmp/app".into(),
+            worktrees: vec![WorktreeGroup::new("app/home", GroupKind::Home, "/tmp/app")],
+            active: 0,
+        };
+        // Empty repo_path marks a live fallback (see hydrate::workspace_list).
+        let workspaces = vec![("app".into(), "app".into(), "repo".into(), String::new())];
+        let terminals = vec![mk_term("shell1", "", "local")];
+        let rows = crate::sidebar::build_rows(
+            &session,
+            &workspaces,
+            &crate::sidebar::ViewState::default(),
+            &crate::sidebar::SidebarStatus::default(),
+            &[],
+            &[],
+            &terminals,
+        );
+        // The old path-based order drops the live fallback entirely.
+        assert!(sidebar_workspace_order(&rows).is_empty());
+        // The ring keeps it, and slug resolution locates it (never a no-op).
+        let ring = unified_ring(&rows, &terminals);
+        assert_eq!(
+            ring,
+            vec![
+                RingStop::Workspace {
+                    slug: "app".into(),
+                    repo_path: None,
+                },
+                RingStop::TerminalHost {
+                    key: "local".into()
+                },
+            ],
+        );
+        assert_eq!(ring_current_index(&ring, Some("app"), None), Some(0));
+        // Next crosses into the terminals region rather than no-op.
+        assert_eq!(
+            ring_step(&ring, 0, true),
+            RingStop::TerminalHost {
+                key: "local".into()
+            },
+        );
+    }
+
+    #[test]
+    fn ring_current_index_none_when_active_absent() {
+        // When neither the active slug nor host key is on screen, the resolver
+        // returns None and the handler starts from 0 (still moves, never no-op).
+        let ring = vec![
+            RingStop::Workspace {
+                slug: "app".into(),
+                repo_path: Some("/tmp/app".into()),
+            },
+            RingStop::TerminalHost {
+                key: "local".into(),
+            },
+        ];
+        assert_eq!(ring_current_index(&ring, Some("ghost"), None), None);
+        assert_eq!(ring_current_index(&ring, None, Some("ghost")), None);
     }
 
     #[test]
