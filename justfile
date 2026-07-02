@@ -194,8 +194,17 @@ openspec-validate:
     OPENSPEC_TELEMETRY=0 DO_NOT_TRACK=1 openspec validate --all --strict
 
 # The full gate.
-ci: fmt-check lint build check-cross test doc-check openspec-validate coverage smoke sandbox-e2e-dns sandbox-e2e-db e2e nix-build
+ci: fmt-check lint deps-audit build check-cross test doc-check openspec-validate coverage smoke sandbox-e2e-dns sandbox-e2e-db e2e nix-build
     @echo "ci: all green"
+
+# Dependency gates: security advisories, license policy, duplicate majors
+# (cargo-deny; policy in deny.toml) and unused dependencies (cargo-machete).
+# `cargo deny check advisories` fetches the RustSec DB, so this needs network
+# on first run.
+deps-audit:
+    @for t in cargo-deny cargo-machete; do command -v "$t" >/dev/null 2>&1 || { echo "deps-audit: '$t' not found — run inside 'nix develop' (or 'direnv allow')"; exit 1; }; done
+    cargo deny check
+    cargo machete
 
 # Visual regression suite: run all muse specs against a live szhost binary.
 # Baselines live in test/muse/snapshots/ and are committed to git.
@@ -275,13 +284,16 @@ coverage-html:
 lint: _apps
     @for t in shellcheck yamllint taplo; do command -v "$t" >/dev/null 2>&1 || { echo "lint: '$t' not found — run inside 'nix develop' (or 'direnv allow'); 'just doctor' for details"; exit 1; }; done
     cargo clippy --workspace --all-targets -- -D warnings
-    shellcheck -x install.sh test/smoke.sh test/pty-smoke.sh test/install-plan.sh test/dev-tui-plan.sh test/sandbox-network.sh test/git-hooks/post-checkout.sh test/git-hooks/heal-worktree.sh
+    shellcheck -x install.sh test/smoke.sh test/pty-smoke.sh test/install-plan.sh test/dev-tui-plan.sh test/sandbox-network.sh test/file-size-ratchet.sh test/git-hooks/post-checkout.sh test/git-hooks/heal-worktree.sh
     yamllint .
     taplo lint
     # Guardrail: all git must route through util::git_cmd / GitLoc so GIT_ENV_VARS
     # is scrubbed (the core.worktree-pollution class). Only the builder in util.rs
     # may call `git` directly; raw `Command::new("git")` anywhere else is rejected.
     ! grep -rIn 'Command::new("git")' crates --include='*.rs' | grep -v 'superzej-core/src/util.rs' || (echo 'ERROR: raw Command::new("git") outside util::git_cmd — route through git_cmd/GitLoc to scrub GIT_ENV_VARS' && exit 1)
+    # Guardrail: god-file ratchet — legacy oversized files may only shrink, new
+    # files are hard-capped at 3000 lines. See test/file-size-ratchet.sh.
+    bash test/file-size-ratchet.sh
 
 # Repair a wedged checkout: strip a stray `core.worktree` that an external
 # worktree tool (herdr) or a GIT_*-exporting child leaked into the shared

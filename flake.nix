@@ -258,6 +258,10 @@
             shellcheck
             yamllint
             taplo
+            # dependency gates (`just deps-audit`): advisories/licenses/dupes
+            # (cargo-deny) + unused dependencies (cargo-machete)
+            cargo-deny
+            cargo-machete
             # startup benchmarks (`just bench`)
             hyperfine
             # pty visual-regression harnesses (test/*.py reconstruct the screen)
