@@ -35,6 +35,34 @@ pub fn run(action: Action) -> Result<()> {
     }
 }
 
+/// Run a setup subprocess. `setup` can run interactively (`szhost agent setup`)
+/// OR off-loop from the live compositor (provisioning a sprite's managed pi). In
+/// the latter, `msg::tui_active()` is set and the child's inherited stdio would
+/// paint over the alt-screen frame — so capture it and fold the output into the
+/// log / error message. On the CLI (flag clear) inherit stdio so npm/pi progress
+/// streams live. `fail` is the message when the child exits non-zero.
+fn run_setup_cmd(mut cmd: Command, ctx: &str, fail: &str) -> Result<()> {
+    if msg::tui_active() {
+        let out = cmd.output().with_context(|| ctx.to_string())?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !stdout.trim().is_empty() || !stderr.trim().is_empty() {
+            tracing::debug!(
+                target: "szhost::provision",
+                cmd = ctx,
+                stdout = %stdout.trim(),
+                stderr = %stderr.trim(),
+                "managed-pi setup subprocess output (captured; not painted on the frame)"
+            );
+        }
+        anyhow::ensure!(out.status.success(), "{fail}: {}", stderr.trim());
+    } else {
+        let status = cmd.status().with_context(|| ctx.to_string())?;
+        anyhow::ensure!(status.success(), "{fail}");
+    }
+    Ok(())
+}
+
 /// The pinned pi binary npm drops under the managed dir.
 pub fn managed_pi_bin() -> PathBuf {
     util::managed_pi_dir().join("node_modules/.bin/pi")
@@ -74,16 +102,15 @@ pub fn setup(force: bool) -> Result<()> {
             "installing pinned pi {pin} into {}",
             dir.display()
         ));
-        let status = Command::new("npm")
-            .args(["install", "--prefix"])
+        let mut cmd = Command::new("npm");
+        cmd.args(["install", "--prefix"])
             .arg(&dir)
-            .arg(format!("@earendil-works/pi-coding-agent@{pin}"))
-            .status()
-            .context("npm install pinned pi")?;
-        anyhow::ensure!(
-            status.success(),
-            "npm install @earendil-works/pi-coding-agent@{pin} failed"
-        );
+            .arg(format!("@earendil-works/pi-coding-agent@{pin}"));
+        run_setup_cmd(
+            cmd,
+            "npm install pinned pi",
+            &format!("npm install @earendil-works/pi-coding-agent@{pin} failed"),
+        )?;
     } else {
         msg::info(&format!("pinned pi {pin} already installed"));
     }
@@ -115,16 +142,14 @@ fn register(agent: &Path) -> Result<()> {
     } else {
         PathBuf::from("pi")
     };
-    let status = Command::new(&pi)
-        .arg("install")
+    let mut cmd = Command::new(&pi);
+    cmd.arg("install")
         .arg("packages/superzej-acp")
         .current_dir(agent)
-        .env("PI_CODING_AGENT_DIR", agent)
-        .status()
-        .with_context(|| format!("{} install packages/superzej-acp", pi.display()))?;
-    anyhow::ensure!(
-        status.success(),
-        "registering superzej-acp (pi install) failed"
-    );
-    Ok(())
+        .env("PI_CODING_AGENT_DIR", agent);
+    run_setup_cmd(
+        cmd,
+        &format!("{} install packages/superzej-acp", pi.display()),
+        "registering superzej-acp (pi install) failed",
+    )
 }

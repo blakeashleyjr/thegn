@@ -854,17 +854,25 @@ fn nix_install_script(
     // early-exit (a base image may ship a root store) and AFTER install (Determinate
     // leaves one). The early-exit now requires the db be WRITABLE, not just `nix`
     // present, so a present-but-unusable store falls through to the claim.
+    // `ensure_tools`: the OFFICIAL installer unpacks a `.xz` binary tarball, so a
+    // minimal microVM without `xz` (or `tar`/`curl`) fails mid-install with a
+    // shell "command not found" (exit 127) AFTER printing "downloading Nix …
+    // binary tarball" — the exact false failure seen on fresh sprites. Best-effort
+    // install the prerequisites via whatever package manager is present (needs
+    // passwordless sudo when non-root; a no-op otherwise). `do_install` +
+    // `{wait}` are wrapped in a bounded retry so a transient network/DNS flap on a
+    // cold sandbox doesn't red-X the step; each attempt re-checks `command -v nix`
+    // so a partial prior attempt that actually landed short-circuits.
     format!(
         "claim_store() {{ if [ \"$(id -u)\" != 0 ] && [ -d /nix/var/nix/db ] && [ \"$(stat -c %u /nix/var/nix/db 2>/dev/null)\" != \"$(id -u)\" ] && [ ! -S /nix/var/nix/daemon-socket/socket ] && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then sudo chown -R \"$(id -u):$(id -g)\" /nix 2>/dev/null || true; fi; }}; \
+         ensure_tools() {{ miss=; for t in xz tar curl; do command -v \"$t\" >/dev/null 2>&1 || miss=\"$miss $t\"; done; [ -z \"$miss\" ] && return 0; echo \"nix: installing missing prerequisites:$miss\"; if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then S='sudo -n'; else S=; fi; if command -v apt-get >/dev/null 2>&1; then $S apt-get update -y && $S apt-get install -y xz-utils tar curl ca-certificates; elif command -v apk >/dev/null 2>&1; then $S apk add --no-cache xz tar curl ca-certificates; elif command -v dnf >/dev/null 2>&1; then $S dnf install -y xz tar curl ca-certificates; elif command -v yum >/dev/null 2>&1; then $S yum install -y xz tar curl ca-certificates; fi; }}; \
+         do_install() {{ {install}; [ -r \"$HOME/.nix-profile/etc/profile.d/nix.sh\" ] && . \"$HOME/.nix-profile/etc/profile.d/nix.sh\" 2>/dev/null || true; [ -r /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ] && . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh 2>/dev/null || true; export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH\"; claim_store; command -v nix >/dev/null 2>&1; }}; \
          export HOME=${{HOME:-/root}}; \
          claim_store; \
          if command -v nix >/dev/null 2>&1 && {{ [ \"$(stat -c %u /nix/var/nix/db 2>/dev/null)\" = \"$(id -u)\" ] || [ -S /nix/var/nix/daemon-socket/socket ] || [ \"$(id -u)\" = 0 ]; }}; then exit 0; fi; \
          {wait}; \
-         {install}; \
-         [ -r \"$HOME/.nix-profile/etc/profile.d/nix.sh\" ] && . \"$HOME/.nix-profile/etc/profile.d/nix.sh\" 2>/dev/null || true; \
-         [ -r /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ] && . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh 2>/dev/null || true; \
-         export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH\"; \
-         claim_store; \
+         ensure_tools || true; \
+         i=1; while :; do do_install && break; [ $i -ge 3 ] && break; echo \"nix: install attempt $i failed; retrying in 5s\"; i=$((i+1)); sleep 5; done; \
          mkdir -p \"$HOME/.config/nix\"; \
          printf '{conf}' > \"$HOME/.config/nix/nix.conf\"; \
          command -v nix >/dev/null 2>&1"
@@ -1987,6 +1995,26 @@ mod tests {
             det.contains("nixos.org/nix/install"),
             "falls back to the official installer"
         );
+    }
+
+    #[test]
+    fn nix_install_ensures_prereqs_and_retries() {
+        use crate::config::NixInstaller;
+        // Hardening against the sprite `exit 127` (official installer can't unpack
+        // its .xz tarball on a minimal microVM): the script installs the missing
+        // decompression/download tools and retries a flaky install.
+        let s = nix_install_script(NixInstaller::Determinate, None, None, None);
+        assert!(s.contains("ensure_tools"), "installs prerequisites");
+        assert!(
+            s.contains("xz"),
+            "xz is a prerequisite (unpacks the tarball)"
+        );
+        // Covers the common package managers.
+        for pm in ["apt-get", "apk", "dnf", "yum"] {
+            assert!(s.contains(pm), "handles {pm}");
+        }
+        assert!(s.contains("retrying in 5s"), "bounded install retry");
+        assert!(s.contains("do_install"), "retry re-checks nix presence");
     }
 
     #[test]

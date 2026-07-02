@@ -1896,6 +1896,17 @@ pub fn provision_provider_env_named(
                     if code == 0 {
                         Ok(())
                     } else {
+                        // The splash detail is a clamped 4-line tail; log the FULL
+                        // captured output so the exact failing command (e.g. which
+                        // tool a nix `exit 127` couldn't find) is diagnosable from
+                        // the log without the truncation.
+                        tracing::warn!(
+                            target: "szhost::startup",
+                            step = %step.id,
+                            code,
+                            output = %out.trim(),
+                            "exec provision step failed"
+                        );
                         Err(anyhow::anyhow!(
                             "{} (exit {code}): {}",
                             step.label,
@@ -2963,6 +2974,26 @@ fn upload_agent_configs(
 ) -> anyhow::Result<()> {
     let host_home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
     let base = sandbox_home.trim_end_matches('/');
+    // Per-file BEST-EFFORT: one unwritable file (a transient `sprites write`
+    // 5xx, an oversized/odd path) must not `?`-abort the whole step and paint a
+    // red × over "Sync agent logins" while every other login uploaded fine. Warn
+    // + continue per file; only fail the step if NOTHING got through.
+    let mut ok = 0usize;
+    let mut failed = 0usize;
+    let mut upload = |dest: String, data: &[u8]| match block_on_provider(|| async {
+        provider.write(id, &dest, data).await
+    }) {
+        Ok(()) => ok += 1,
+        Err(e) => {
+            failed += 1;
+            tracing::warn!(
+                target: "szhost::startup",
+                dest = %dest,
+                error = %e,
+                "agent-config upload: skipping one file (best-effort)"
+            );
+        }
+    };
     for agent in agents {
         let (files, dirs) = superzej_core::envplan::agent_config_paths(agent);
         for f in files {
@@ -2970,8 +3001,7 @@ fn upload_agent_configs(
             let Ok(data) = std::fs::read(&src) else {
                 continue;
             };
-            let dest = format!("{base}/{f}");
-            block_on_provider(|| async { provider.write(id, &dest, &data).await })?;
+            upload(format!("{base}/{f}"), &data);
         }
         for d in dirs {
             let src = Path::new(&host_home).join(&d);
@@ -2984,11 +3014,23 @@ fn upload_agent_configs(
                 let Ok(data) = std::fs::read(&abs) else {
                     continue;
                 };
-                let dest = format!("{base}/{d}/{rel}");
-                block_on_provider(|| async { provider.write(id, &dest, &data).await })?;
+                upload(format!("{base}/{d}/{rel}"), &data);
             }
         }
     }
+    if failed > 0 {
+        tracing::warn!(
+            target: "szhost::startup",
+            ok, failed,
+            "agent-config upload finished with some files skipped"
+        );
+    }
+    // Nothing uploaded but files failed ⇒ a real problem (provider down / auth) —
+    // surface it. A partial success is a √ with logged warnings.
+    anyhow::ensure!(
+        ok > 0 || failed == 0,
+        "no agent-config files could be uploaded ({failed} failed)"
+    );
     Ok(())
 }
 

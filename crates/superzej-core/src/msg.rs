@@ -10,6 +10,30 @@
 
 use crate::theme;
 use std::io::IsTerminal;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set true while the native compositor owns the raw/alternate screen. When set,
+/// `info`/`warn`/`error` route to `tracing` (a no-op if no subscriber is
+/// installed) instead of `eprintln!` — a direct stderr write would paint over
+/// the alt-screen frame (the same reason `log_trace::Role::Host` drops its
+/// stderr layer). This matters even without `SUPERZEJ_LOG`, where no subscriber
+/// is installed and `ready()` is false, so the plain fallback would otherwise
+/// corrupt the frame (e.g. off-loop provisioning `msg::warn`s). `die` still
+/// writes to stderr — a fatal must be seen even if it scars the frame on exit.
+static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Toggle the alt-screen guard (see [`TUI_ACTIVE`]). The compositor sets it true
+/// right after entering the alternate screen and false on teardown.
+pub fn set_tui_active(active: bool) {
+    TUI_ACTIVE.store(active, Ordering::Relaxed);
+}
+
+/// Whether the compositor owns the raw/alternate screen (see [`TUI_ACTIVE`]).
+/// Callers that spawn subprocesses with inheritable stdio consult this to
+/// capture their output instead of letting it paint over the frame.
+pub fn tui_active() -> bool {
+    TUI_ACTIVE.load(Ordering::Relaxed)
+}
 
 /// A "✦ superzej" prefix in the given hue (faint star + faint name), tty-gated.
 fn tag(hue: &str) -> String {
@@ -24,7 +48,7 @@ fn tag(hue: &str) -> String {
 }
 
 pub fn info(s: &str) {
-    if crate::log_trace::ready() {
+    if crate::log_trace::ready() || tui_active() {
         tracing::info!("{s}");
     } else {
         eprintln!("{} {s}", tag(theme::DIM));
@@ -32,7 +56,7 @@ pub fn info(s: &str) {
 }
 
 pub fn warn(s: &str) {
-    if crate::log_trace::ready() {
+    if crate::log_trace::ready() || tui_active() {
         tracing::warn!("{s}");
     } else {
         eprintln!("{} {s}", tag(theme::AMBER));
@@ -40,7 +64,7 @@ pub fn warn(s: &str) {
 }
 
 pub fn error(s: &str) {
-    if crate::log_trace::ready() {
+    if crate::log_trace::ready() || tui_active() {
         tracing::error!("{s}");
     } else {
         eprintln!("{} {s}", tag(theme::RED));
