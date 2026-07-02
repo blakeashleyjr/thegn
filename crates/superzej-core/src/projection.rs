@@ -1,5 +1,5 @@
 //! Worktree **projection** — the pure plan for the `data` axis of a named
-//! [`Environment`](crate::env::Environment): how the worktree's files are made
+//! `Environment`: how the worktree's files are made
 //! available where the env runs.
 //!
 //! This mirrors the VPN split: the testable plan lives here in core; the *action*

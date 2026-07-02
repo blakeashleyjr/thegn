@@ -126,7 +126,7 @@ impl Predictor {
     }
 
     /// A printable keystroke was sent AND we're predicting: note it (srtt) and
-    /// add it to the overlay. Caller has already checked [`should_predict`].
+    /// add it to the overlay. Caller has already checked `should_predict`.
     pub fn on_key(&mut self, c: char, now_ms: u64) {
         self.note_key(now_ms);
         self.pending.push(c);

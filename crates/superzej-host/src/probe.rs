@@ -17,7 +17,7 @@
 //!
 //! Cost & safety: gated to a real tty on both stdin and stdout (skipped in
 //! pipes / CI / tests), and bounded by a short deadline so a terminal that
-//! never answers can't stall launch beyond [`PROBE_BUDGET`]. Interactive
+//! never answers can't stall launch beyond `PROBE_BUDGET`. Interactive
 //! terminals answer in a few ms; the read returns as soon as the DA terminator
 //! arrives.
 

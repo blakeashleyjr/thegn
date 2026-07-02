@@ -97,6 +97,8 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
             }
             // Block until the client exits (Ctrl-C tears down the group).
             let share::RunningShare { mut child, .. } = running;
+            // CLI path: `szhost share` runs the tunnel in the foreground by design.
+            #[expect(clippy::disallowed_methods)]
             let _ = child.wait();
             if let Some(db) = &db {
                 let _ = db.delete_share(&wt, port);

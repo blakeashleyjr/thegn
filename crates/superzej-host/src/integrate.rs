@@ -65,6 +65,9 @@ impl FoldGit for PlumbingAdapter {
 /// run `regenerate_command` to rebuild them, and write the merged tree. Returns
 /// the written tree oid, or `None` if anything fails (caller falls back to
 /// deferring). Never leaves a worktree behind.
+// off-loop: the fold runs from the CLI (`szhost integrate`) or from
+// spawn_fold's spawn_blocking (see the module doc) — never on the loop.
+#[expect(clippy::disallowed_methods)]
 fn regenerate_merge(
     repo_root: &Path,
     ours: &str,
@@ -294,6 +297,9 @@ pub fn persist(db: &Db, cands: &Candidates, report: &FoldReport) -> Result<()> {
 
 /// Build/test the folded tip in a throwaway detached worktree. Returns whether
 /// `gate_command` exited zero. The worktree is always removed afterward.
+// off-loop: the fold runs from the CLI (`szhost integrate`) or from
+// spawn_fold's spawn_blocking (see the module doc) — never on the loop.
+#[expect(clippy::disallowed_methods)]
 fn gate_tip(repo_root: &Path, oid: &str, gate_command: &str) -> Result<bool> {
     let tmp = std::env::temp_dir().join(format!(
         "sz-foldgate-{}-{}",
@@ -554,6 +560,8 @@ mod tests {
             self.commit(file, body, &format!("{branch} work"));
             git(&self.dir, &["checkout", "-q", "main"]);
         }
+        // test code: fixture plumbing, never on the event loop.
+        #[expect(clippy::disallowed_methods)]
         fn out(&self, args: &[&str]) -> String {
             String::from_utf8_lossy(&util::git_cmd(&self.dir).args(args).output().unwrap().stdout)
                 .trim()
@@ -576,6 +584,8 @@ mod tests {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
+    // test code: fixture plumbing, never on the event loop.
+    #[expect(clippy::disallowed_methods)]
     fn git(dir: &Path, args: &[&str]) {
         let ok = util::git_cmd(dir)
             .args(args)

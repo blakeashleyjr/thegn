@@ -283,6 +283,8 @@ impl ShareSupervisor {
 
 /// The per-share supervisor thread: build the plan, bring the tunnel up, report
 /// its URL, then block on the child and report when it goes down.
+// off-loop: runs on the per-share supervisor std::thread (see the spawn above).
+#[expect(clippy::disallowed_methods)]
 fn supervise(
     spec: superzej_core::share::ShareSpec,
     worktree: String,

@@ -164,9 +164,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
 name = "approx"
@@ -2856,12 +2856,8 @@ dependencies = [
 name = "gtui-app"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "chrono",
  "gtui-core",
- "gtui-query",
- "gtui-render",
- "sz-kit",
  "tokio",
 ]
 
@@ -2869,7 +2865,6 @@ dependencies = [
 name = "gtui-core"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "chrono",
  "polars",
  "serde",
@@ -2881,7 +2876,6 @@ dependencies = [
 name = "gtui-embed"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "chrono",
  "gtui-app",
  "gtui-core",
@@ -2892,13 +2886,10 @@ dependencies = [
 name = "gtui-query"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "chrono",
  "gtui-core",
- "reqwest",
  "serde",
  "serde_json",
- "superzej-metrics",
  "tokio",
 ]
 
@@ -2906,10 +2897,8 @@ dependencies = [
 name = "gtui-render"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "gtui-core",
  "ratatui",
- "sz-kit",
 ]
 
 [[package]]

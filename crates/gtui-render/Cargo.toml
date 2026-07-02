@@ -2,10 +2,10 @@
 name = "gtui-render"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+publish = false
 license.workspace = true
 
 [dependencies]
 gtui-core = { path = "../gtui-core" }
-sz-kit = { path = "../sz-kit" }
-anyhow = { workspace = true }
 ratatui = "0.30.2"

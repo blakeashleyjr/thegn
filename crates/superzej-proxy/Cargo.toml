@@ -2,6 +2,8 @@
 name = "superzej-proxy"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+publish = false
 license.workspace = true
 description = "superzej LLM proxy: dual-protocol router, failover, cost/budget control (groups U/V)"
 

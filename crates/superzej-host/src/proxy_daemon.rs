@@ -70,6 +70,8 @@ pub fn launch(spec: (String, Vec<String>, BTreeMap<String, String>)) -> Option<P
 }
 
 /// The supervisor loop: spawn → wait → respawn (with backoff) until shutdown.
+// off-loop: runs on its own supervisor std::thread (spawned in launch above).
+#[expect(clippy::disallowed_methods)]
 fn supervise(bin: PathBuf, args: Vec<String>, env: BTreeMap<String, String>, shared: Arc<Shared>) {
     let backoff = Duration::from_millis(500);
     loop {

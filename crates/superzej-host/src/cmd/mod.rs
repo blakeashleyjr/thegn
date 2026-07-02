@@ -44,6 +44,8 @@ pub fn resolve_worktree(arg: Option<String>) -> PathBuf {
 #[allow(clippy::disallowed_macros)] // a raw interactive prompt, not a log line
 pub fn confirm(message: &str) -> bool {
     if superzej_core::util::have("gum") {
+        // CLI path: interactive confirm prompt, no event loop.
+        #[expect(clippy::disallowed_methods)]
         return Command::new("gum")
             .args(["confirm", message])
             .status()

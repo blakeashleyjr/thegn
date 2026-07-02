@@ -25,6 +25,10 @@ exclude = ["apps", "vendor"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+# MSRV floor: edition 2024 + stable let-chains. The dev shell pins
+# stable.latest via rust-overlay; this field documents the oldest compiler
+# expected to work and lets cargo/cargo-deny flag deps that outrun it.
+rust-version = "1.88"
 
 [workspace.dependencies]
 # --- shared domain/runtime deps ---

@@ -93,6 +93,10 @@ pub fn paste() -> Option<String> {
 
 /// Spawn one read tool and capture its stdout as a `String`. `None` if it can't
 /// spawn, exits non-zero, or yields no output.
+// Accepted on-loop subprocess: a clipboard read is ms-scale and only runs on
+// an explicit `"+` paste keypress. Revisit (spawn_blocking + channel) if a
+// clipboard tool ever hangs in practice.
+#[expect(clippy::disallowed_methods)]
 fn read_from(argv: &[&str]) -> Option<String> {
     let (cmd, args) = argv.split_first()?;
     let out = Command::new(cmd)
@@ -109,6 +113,8 @@ fn read_from(argv: &[&str]) -> Option<String> {
 }
 
 /// Spawn one tool and write `text` to its stdin. Returns `true` if it spawned.
+// off-loop: only called from copy()'s detached std::thread.
+#[expect(clippy::disallowed_methods)]
 fn pipe_to(argv: &[&str], text: &str) -> bool {
     let Some((cmd, args)) = argv.split_first() else {
         return false;

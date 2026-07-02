@@ -2,6 +2,8 @@
 name = "superzej-media"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+publish = false
 license.workspace = true
 description = "Cross-platform media-player control (MPRIS / SMTC / mpv / AppleScript) for the superzej [media] feature"
 

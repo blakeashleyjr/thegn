@@ -1,7 +1,7 @@
 //! Backend-agnostic input. A tile never sees crossterm or termwiz types: each
 //! host maps its native events into these. superzej translates termwiz in
 //! `apps/input.rs`; the standalone harness translates crossterm via
-//! [`from_crossterm`] / [`from_crossterm_event`] (feature `standalone`).
+//! `from_crossterm` / `from_crossterm_event` (feature `standalone`).
 //!
 //! These types are the canonical definitions — embedded app crates re-export
 //! them so each app library and the host agree on one input vocabulary.

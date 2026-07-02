@@ -1760,7 +1760,7 @@ fn highlight_segs(
 /// Lay out the statusbar right cluster from [`statusbar_items`]: join items with
 /// separators (` │ ` between adjacent config widgets, a single space before each
 /// badge, trailing space) and, when `sel` is `Some`, highlight that item.
-/// Returns the seg run for [`draw_line`] plus each item's `(id, x_offset, width)`
+/// Returns the seg run for `draw_line` plus each item's `(id, x_offset, width)`
 /// WITHIN the cluster (offset 0 = the cluster's left cell). Separators add width
 /// but are not items, so offsets account for them.
 fn statusbar_right_layout(

@@ -2,6 +2,8 @@
 name = "superzej-svc"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+publish = false
 license.workspace = true
 description = "superzej native service layer: git/GitHub/ssh behind traits with CLI fallbacks"
 

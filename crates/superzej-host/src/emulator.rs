@@ -5,7 +5,7 @@
 //! panes still `advance()` (drain-without-render) so a backgrounded agent keeps
 //! progressing.
 //!
-//! The spike impl is [`Vt100Emulator`] (the `vt100` crate — a full, simple
+//! The spike impl is `Vt100Emulator` (the `vt100` crate — a full, simple
 //! emulator). It is intentionally behind a trait: high-fidelity + image-protocol
 //! support (sixel/kitty) swaps in a different impl (`alacritty_terminal` + an
 //! escape-interception passthrough layer, or a `wezterm-term` git dep — the

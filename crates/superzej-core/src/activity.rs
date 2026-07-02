@@ -6,7 +6,7 @@
 //! has gone idle is `waiting` (filled **red** dot — "stuck, look at me", an
 //! *unread* alert); focusing its tab marks it `read` (hollow red dot — seen but
 //! still stuck) via [`ack`]. A red worktree is **sticky**: it only leaves red
-//! when work *genuinely resumes* — sustained CPU over [`RESUME_GRACE_SECS`], not
+//! when work *genuinely resumes* — sustained CPU over `RESUME_GRACE_SECS`, not
 //! a one-window blip from a spinner redraw or a stray watcher.
 //!
 //!   none ─── cpu delta ≥ threshold ─────────▶ active

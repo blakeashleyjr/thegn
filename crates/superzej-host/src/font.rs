@@ -21,6 +21,9 @@ pub struct FontRow {
 }
 
 pub fn font_palette_items() -> Result<Vec<PaletteItem>, String> {
+    // Accepted on-loop subprocess: `fc-list` is ms-scale and only runs on the
+    // explicit SwitchFont action. Revisit if font enumeration ever grows.
+    #[expect(clippy::disallowed_methods)]
     let output = std::process::Command::new("fc-list")
         .args([":", "family"])
         .output()

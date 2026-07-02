@@ -393,6 +393,8 @@ fn kick_diff_doc_fetch(
     let wk = waker.clone();
     task::spawn_blocking(move || {
         let loc = superzej_core::remote::GitLoc::for_worktree(&wt);
+        // off-loop: inside spawn_blocking
+        #[expect(clippy::disallowed_methods)]
         let text = loc
             .git_command(&["diff", "--no-color", "HEAD", "--", &path])
             .output()
@@ -559,6 +561,8 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // session worktree paths). `--git-common-dir` resolves to `<canonical>/.git`,
     // whose parent is the main checkout — which is exactly where a stray
     // `core.worktree` actually lands. Scrubbed git env so this probe is itself safe.
+    // startup: runs once before the event loop exists
+    #[expect(clippy::disallowed_methods)]
     if let Some(common_parent) = superzej_core::util::git_cmd(&cwd)
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .output()
@@ -1334,7 +1338,7 @@ struct SidebarState {
     /// Adjustable bar width in columns (item 25); `None` = layout default.
     width: Option<usize>,
     /// Wide expand toggle (`e`): mirrors the panel's expand affordance. When
-    /// set, the sidebar claims ~half the window, ignoring [`width`].
+    /// set, the sidebar claims ~half the window, ignoring `width`.
     expanded: bool,
     /// Display mode cycled by `ToggleSidebar`: full panel, slim rail, hidden.
     mode: crate::layout::SidebarMode,
@@ -3866,6 +3870,8 @@ fn spawn_blame_fetch(
         args.push("--".to_string());
         args.push(path.clone());
         // Via the scrubbed `git_cmd` (supplies `-C wt` + strips GIT_ENV_VARS).
+        // off-loop: inside spawn_blocking
+        #[expect(clippy::disallowed_methods)]
         let output = superzej_core::util::git_cmd(&wt)
             .args(&args)
             .output()
@@ -4144,6 +4150,48 @@ enum WorkspaceResolution {
     NotARepo(std::path::PathBuf),
 }
 
+/// Where a cloned-by-URL workspace lands (`[ui].workspaces_dir` / repo name);
+/// `None` for local-path inputs.
+fn workspace_clone_dest(
+    input: &str,
+    cfg: &superzej_core::config::Config,
+) -> Option<std::path::PathBuf> {
+    looks_like_git_url(input).then(|| {
+        std::path::PathBuf::from(superzej_core::util::expand_tilde(&cfg.workspaces_dir))
+            .join(workspace_repo_name_from_url(input))
+    })
+}
+
+/// Clone `url` into `dest`. BLOCKING (a clone can take minutes) — only call
+/// inside `spawn_blocking`; the NewWorkspace flow completes over
+/// `workspace_clone_rx`.
+fn clone_workspace_repo(url: &str, dest: &std::path::Path) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    // Via the scrubbed git_cmd so a stray GIT_DIR can't redirect the
+    // clone; dest is absolute, so the `-C` only sets the working dir.
+    let cwd = dest.parent().unwrap_or(std::path::Path::new("."));
+    // off-loop: documented blocking helper, called inside spawn_blocking only
+    #[expect(clippy::disallowed_methods)]
+    let status = superzej_core::util::git_cmd(cwd)
+        .arg("clone")
+        .arg(url)
+        .arg(dest)
+        .status()
+        .with_context(|| format!("git clone {url} {}", dest.display()))?;
+    anyhow::ensure!(status.success(), "git clone failed for {url}");
+    Ok(())
+}
+
+/// Result of a background workspace clone, delivered to the loop's
+/// `workspace_clone_rx` drain arm.
+struct WorkspaceCloneOutcome {
+    url: String,
+    dest: std::path::PathBuf,
+    result: Result<()>,
+}
+
 fn create_workspace_from_input_with_config(
     input: &str,
     session: &mut crate::session::Session,
@@ -4153,26 +4201,15 @@ fn create_workspace_from_input_with_config(
     let input = input.trim();
     anyhow::ensure!(!input.is_empty(), "no workspace path or URL given");
 
-    let root = if looks_like_git_url(input) {
-        let repo_name = workspace_repo_name_from_url(input);
-        let dest = std::path::PathBuf::from(superzej_core::util::expand_tilde(&cfg.workspaces_dir))
-            .join(repo_name);
-        if !dest.exists() {
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("create {}", parent.display()))?;
-            }
-            // Via the scrubbed git_cmd so a stray GIT_DIR can't redirect the
-            // clone; dest is absolute, so the `-C` only sets the working dir.
-            let cwd = dest.parent().unwrap_or(std::path::Path::new("."));
-            let status = superzej_core::util::git_cmd(cwd)
-                .arg("clone")
-                .arg(input)
-                .arg(&dest)
-                .status()
-                .with_context(|| format!("git clone {input} {}", dest.display()))?;
-            anyhow::ensure!(status.success(), "git clone failed for {input}");
-        }
+    let root = if let Some(dest) = workspace_clone_dest(input, cfg) {
+        // URL inputs are cloned OFF the loop before this runs (NewWorkspace
+        // handler → spawn_blocking → workspace_clone_rx drain); by the time
+        // this is called the clone must already be on disk.
+        anyhow::ensure!(
+            dest.exists(),
+            "clone of {input} not materialized at {} (the clone runs off-loop first)",
+            dest.display()
+        );
         std::fs::canonicalize(&dest).unwrap_or(dest)
     } else {
         let expanded = superzej_core::util::expand_tilde(input);
@@ -4201,6 +4238,65 @@ fn create_workspace_from_input_with_config(
     db.touch_repo(&root_s, &name)?;
     session.switch_to_workspace(&root_s, db)?;
     Ok(WorkspaceResolution::Repo(root))
+}
+
+/// Create + switch to a workspace for a LOCAL `input` (a path, or the dest of
+/// a finished URL clone): park the outgoing workspace in the pool, resolve
+/// and persist the new one, and sync chrome state. Never clones — URL inputs
+/// go through the off-loop clone first (see `WorkspaceCloneOutcome`).
+/// Returns whether a relayout is needed.
+#[allow(clippy::too_many_arguments)]
+fn complete_workspace_create(
+    input: &str,
+    session: &mut crate::session::Session,
+    panes: &mut Panes,
+    workspace_pool: &mut WorkspacePool,
+    active_menu: &mut Option<MenuOverlay>,
+    focus: &mut crate::focus::FocusState,
+    model: &mut FrameModel,
+    sb: &mut SidebarState,
+    drawer: &mut Option<u32>,
+    drawer_pool: &mut DrawerPool,
+    drawer_home: &mut Option<std::path::PathBuf>,
+    cfg: &superzej_core::config::Config,
+    center: Rect,
+) -> bool {
+    persist_session_layout(session, panes);
+    let prev_id = session.id.clone();
+    let snapshot = ResidentWorkspace {
+        worktrees: session.worktrees.clone(),
+        active: session.active,
+    };
+    match superzej_core::db::Db::open()
+        .context("open superzej db")
+        .and_then(|db| create_workspace_from_input_with_config(input, session, &db, cfg))
+    {
+        Ok(WorkspaceResolution::Repo(path)) => {
+            workspace_pool.stash(prev_id, snapshot);
+            remap_cold_workspace_ids(session, panes);
+            focus.zone = crate::focus::Zone::Center;
+            refresh_tab_model(model, session, sb);
+            sync_drawer_persistence(
+                session,
+                panes,
+                drawer,
+                drawer_pool,
+                drawer_home,
+                cfg,
+                center,
+            );
+            model.status = format!("workspace created: {}", path.display());
+            true
+        }
+        Ok(WorkspaceResolution::NotARepo(path)) => {
+            *active_menu = Some(menu::init_git_menu(path.to_string_lossy().into_owned()));
+            false
+        }
+        Err(e) => {
+            model.status = format!("workspace create failed: {e}");
+            false
+        }
+    }
 }
 
 /// A follow-up only the loop body can perform (it owns session/panes).
@@ -6035,20 +6131,26 @@ fn resolve_loc_path(worktree: &std::path::Path, path: &str) -> String {
     }
 }
 
-/// Where to open the selected test: its captured `file:line` if present, else
-/// located by name with ripgrep/grep so *any* test opens (not just failures).
+/// Where to open the selected test: `Ready` when its `file:line` was captured
+/// (failures), `Locate` when it must be found by name — which shells out to
+/// ripgrep/grep and therefore runs off the loop (see `spawn_test_locate`).
+enum OpenTarget {
+    Ready(String, usize),
+    Locate(String),
+}
+
 fn resolve_open_target(
     ui: &crate::panel::PanelUi,
     worktree: &std::path::Path,
-) -> Option<(String, usize)> {
-    if let Some(node) = ui.tests.selected_node() {
-        if let Some(loc) = &node.location {
-            return Some((resolve_loc_path(worktree, &loc.path), loc.line));
-        }
-        return locate_test_in_repo(worktree, &node.id)
-            .map(|(rel, line)| (resolve_loc_path(worktree, &rel), line));
+) -> Option<OpenTarget> {
+    let node = ui.tests.selected_node()?;
+    if let Some(loc) = &node.location {
+        return Some(OpenTarget::Ready(
+            resolve_loc_path(worktree, &loc.path),
+            loc.line,
+        ));
     }
-    None
+    Some(OpenTarget::Locate(node.id.clone()))
 }
 
 fn on_path(bin: &str) -> bool {
@@ -6058,6 +6160,9 @@ fn on_path(bin: &str) -> bool {
 }
 
 /// Best-effort search for a test definition by name (ripgrep, then grep).
+/// BLOCKING (a repo-wide grep can take seconds) — only reached via
+/// `spawn_test_locate`'s spawn_blocking; never call from the loop.
+#[expect(clippy::disallowed_methods)]
 fn locate_test_in_repo(worktree: &std::path::Path, test_id: &str) -> Option<(String, usize)> {
     let rg = on_path("rg");
     for pat in crate::panel::locate_regexes(test_id) {
@@ -6092,6 +6197,92 @@ fn locate_test_in_repo(worktree: &std::path::Path, test_id: &str) -> Option<(Str
         }
     }
     None
+}
+
+/// Which UI action a background test-locate completes with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestOpenAction {
+    /// `o`: open the file in the editor, in a fresh tab.
+    Editor,
+    /// `b`: peek the file in bat, in a split pane.
+    Peek,
+}
+
+/// Result of a by-name test location run off the loop; `target` is the
+/// resolved `(absolute path, line)` when found.
+struct TestOpenOutcome {
+    generation: u64,
+    worktree: String,
+    action: TestOpenAction,
+    target: Option<(String, usize)>,
+}
+
+/// Locate a test definition by name off the loop — ripgrep/grep can take
+/// hundreds of ms on a large worktree — and ride the result back to the loop
+/// with a waker pulse (same shape as `spawn_test_discovery`).
+fn spawn_test_locate(
+    tx: tokio_mpsc::UnboundedSender<TestOpenOutcome>,
+    waker: TerminalWaker,
+    worktree: std::path::PathBuf,
+    generation: u64,
+    test_id: String,
+    action: TestOpenAction,
+) {
+    tokio::spawn(async move {
+        let wt_key = worktree.to_string_lossy().into_owned();
+        if let Ok(target) = tokio::task::spawn_blocking(move || {
+            locate_test_in_repo(&worktree, &test_id)
+                .map(|(rel, line)| (resolve_loc_path(&worktree, &rel), line))
+        })
+        .await
+        {
+            let _ = tx.send(TestOpenOutcome {
+                generation,
+                worktree: wt_key,
+                action,
+                target,
+            });
+            let _ = waker.wake();
+        }
+    });
+}
+
+/// Complete a Tests-section open action once the target `path:line` is known
+/// (immediately for captured failure locations, or from `spawn_test_locate`).
+/// The caller marks the frame for relayout.
+#[allow(clippy::too_many_arguments)]
+fn open_test_target(
+    action: TestOpenAction,
+    path: &str,
+    line: usize,
+    session: &mut crate::session::Session,
+    panes: &mut Panes,
+    cfg: &superzej_core::config::Config,
+    center: Rect,
+    focus: &mut crate::focus::FocusState,
+    model: &mut FrameModel,
+    sb: &mut SidebarState,
+) {
+    let cwd = active_cwd(session);
+    let cmd = match action {
+        TestOpenAction::Editor => editor_open_command(cfg, path, Some(line)),
+        TestOpenAction::Peek => {
+            let bat = cfg
+                .tool_command("bat")
+                .unwrap_or("bat --paging=always")
+                .to_string();
+            format!("{bat} --highlight-line {line} {}", test_shell_quote(path))
+        }
+    };
+    match action {
+        TestOpenAction::Editor => open_command_tab(session, panes, &cmd, cwd.as_deref(), center),
+        TestOpenAction::Peek => {
+            let focused = session.active_tab().map(|t| t.focused_pane).unwrap_or(0);
+            open_command_pane(session, panes, focused, &cmd, cwd.as_deref(), center);
+        }
+    }
+    focus.zone = crate::focus::Zone::Center;
+    refresh_tab_model(model, session, sb);
 }
 
 /// Which slice of the suite a tests-section run key targets.
@@ -6476,7 +6667,7 @@ fn spawn_worktree_shell_pane(
 /// Spawn a **clean, rc-free** shell pane in `dir` — the startup watchdog's
 /// fallback when the worktree's resolved login shell produced no output in time
 /// (a personal dotfile hanging/erroring in a provisioned env). Mirrors
-/// [`spawn_worktree_shell_pane`] but forces [`agent::clean_shell_inner`]: the
+/// `spawn_worktree_shell_pane` but forces `agent::clean_shell_inner`: the
 /// native-provider path opens the exec with `open_spec_clean`, and the
 /// local/sandbox path resolves the `clean-shell` choice (no rc, not persisted as
 /// the worktree's agent). Never edits the user's config.
@@ -6514,7 +6705,7 @@ fn spawn_clean_shell_pane(
     panes.spawn(cfg, dir, center)
 }
 
-/// Capture the active tab's pane layout as an abstract [`LayoutSpec`] (items
+/// Capture the active tab's pane layout as an abstract `LayoutSpec` (items
 /// 99/115). Each leaf records its program (a plain shell → `None`).
 fn active_tab_layout_spec(
     session: &crate::session::Session,
@@ -6534,7 +6725,7 @@ fn active_tab_layout_spec(
     ))
 }
 
-/// Apply a [`LayoutSpec`] to the active tab: spawn a pane per leaf in `dir`,
+/// Apply a `LayoutSpec` to the active tab: spawn a pane per leaf in `dir`,
 /// swap the tab's `center` to the new tree, drop the old panes, and refocus.
 /// Returns the new focused pane id, or `None` if nothing spawned.
 fn apply_layout_to_active_tab(
@@ -8433,6 +8624,13 @@ async fn event_loop<T: Terminal>(
         tokio_mpsc::unbounded_channel::<crate::task::TaskOutcome>();
     let (test_discovery_tx, mut test_discovery_rx) =
         tokio_mpsc::unbounded_channel::<crate::task::DiscoveryOutcome>();
+    // Test-explorer open-by-name results (Tests `o`/`b`): locating a test with
+    // ripgrep/grep runs off the loop and completes over this channel.
+    let (test_open_tx, mut test_open_rx) = tokio_mpsc::unbounded_channel::<TestOpenOutcome>();
+    // Workspace create-by-URL: the `git clone` runs off the loop (it can take
+    // minutes) and the create/switch completes over this channel.
+    let (workspace_clone_tx, mut workspace_clone_rx) =
+        tokio_mpsc::unbounded_channel::<WorkspaceCloneOutcome>();
     let mut test_generation: u64 = 0;
     let mut loaded_tests_worktree = String::new();
     // Bounds concurrent test/discovery jobs across worktrees so explicit runs
@@ -9219,6 +9417,8 @@ async fn event_loop<T: Terminal>(
             {
                 let wt = current_worktree.clone();
                 tokio::task::spawn_blocking(move || {
+                    // off-loop: inside spawn_blocking
+                    #[expect(clippy::disallowed_methods)]
                     if let Some(common_parent) = superzej_core::util::git_cmd(&wt)
                         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
                         .output()
@@ -9663,6 +9863,8 @@ async fn event_loop<T: Terminal>(
                                 let env_name = cfg
                                     .resolve_env(&repo_root, &loc, std::path::Path::new(&wt), None)
                                     .name;
+                                // off-loop: inside spawn_blocking
+                                #[expect(clippy::disallowed_methods)]
                                 let branch =
                                     superzej_core::util::git_cmd(std::path::Path::new(&wt))
                                         .args(["rev-parse", "--abbrev-ref", "HEAD"])
@@ -10420,6 +10622,62 @@ async fn event_loop<T: Terminal>(
                 persist_tests_for_worktree(&panel_ui, &d.worktree);
                 dirty = true;
             }
+        }
+        // Background test-locate results (Tests `o`/`b`): complete the open
+        // action unless the worktree/generation moved on during the search.
+        while let Ok(o) = test_open_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
+            if o.generation != test_generation || o.worktree != loaded_tests_worktree {
+                continue;
+            }
+            match o.target {
+                Some((path, line)) => {
+                    open_test_target(
+                        o.action,
+                        &path,
+                        line,
+                        &mut session,
+                        &mut panes,
+                        keymap.config(),
+                        chrome.center,
+                        &mut focus,
+                        &mut model,
+                        &mut sb,
+                    );
+                    need_relayout = true;
+                }
+                None => model.status = "Could not locate the selected test".into(),
+            }
+            dirty = true;
+        }
+        // Background workspace-clone results: finish the create/switch that
+        // the NewWorkspace prompt started for a URL input.
+        while let Ok(o) = workspace_clone_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Other);
+            match o.result {
+                Ok(()) => {
+                    let dest = o.dest.to_string_lossy().into_owned();
+                    if complete_workspace_create(
+                        &dest,
+                        &mut session,
+                        &mut panes,
+                        &mut workspace_pool,
+                        &mut active_menu,
+                        &mut focus,
+                        &mut model,
+                        &mut sb,
+                        &mut drawer,
+                        &mut drawer_pool,
+                        &mut drawer_home,
+                        &current_config,
+                        chrome.center,
+                    ) {
+                        need_relayout = true;
+                    }
+                }
+                Err(e) => model.status = format!("clone of {} failed: {e}", o.url),
+            }
+            dirty = true;
         }
         // Named task (Tasks section) run outcomes.
         while let Ok(outcome) = named_task_run_rx.try_recv() {
@@ -13896,55 +14154,43 @@ async fn event_loop<T: Terminal>(
                                         }
                                     }
                                     HostInputKind::NewWorkspace => {
-                                        // Snapshot the outgoing workspace (with
-                                        // fresh cwds) so its panes are parked
-                                        // alive in the pool rather than reaped
-                                        // when the new workspace takes over.
-                                        persist_session_layout(&mut session, &panes);
-                                        let prev_id = session.id.clone();
-                                        let snapshot = ResidentWorkspace {
-                                            worktrees: session.worktrees.clone(),
-                                            active: session.active,
-                                        };
-                                        match superzej_core::db::Db::open()
-                                            .context("open superzej db")
-                                            .and_then(|db| {
-                                                create_workspace_from_input_with_config(
-                                                    &text,
-                                                    &mut session,
-                                                    &db,
-                                                    &current_config,
-                                                )
-                                            }) {
-                                            Ok(WorkspaceResolution::Repo(path)) => {
-                                                workspace_pool.stash(prev_id, snapshot);
-                                                remap_cold_workspace_ids(&mut session, &mut panes);
-                                                focus.zone = crate::focus::Zone::Center;
-                                                refresh_tab_model(&mut model, &session, &mut sb);
-                                                sync_drawer_persistence(
-                                                    &session,
-                                                    &mut panes,
-                                                    &mut drawer,
-                                                    &mut drawer_pool,
-                                                    &mut drawer_home,
-                                                    keymap.config(),
-                                                    chrome.center,
-                                                );
-                                                model.status = format!(
-                                                    "workspace created: {}",
-                                                    path.display()
-                                                );
-                                                need_relayout = true;
-                                            }
-                                            Ok(WorkspaceResolution::NotARepo(path)) => {
-                                                active_menu = Some(menu::init_git_menu(
-                                                    path.to_string_lossy().into_owned(),
-                                                ));
-                                            }
-                                            Err(e) => {
-                                                model.status =
-                                                    format!("workspace create failed: {e}");
-                                            }
+                                        let input = text.trim().to_string();
+                                        if let Some(dest) =
+                                            workspace_clone_dest(&input, &current_config)
+                                            && !dest.exists()
+                                        {
+                                            // URL → clone OFF the loop (it can
+                                            // take minutes); the create/switch
+                                            // completes in the
+                                            // `workspace_clone_rx` drain arm.
+                                            model.status = format!("Cloning {input}…");
+                                            let tx = workspace_clone_tx.clone();
+                                            let wk = waker.clone();
+                                            tokio::task::spawn_blocking(move || {
+                                                let result = clone_workspace_repo(&input, &dest);
+                                                let _ = tx.send(WorkspaceCloneOutcome {
+                                                    url: input,
+                                                    dest,
+                                                    result,
+                                                });
+                                                let _ = wk.wake();
+                                            });
+                                        } else if complete_workspace_create(
+                                            &input,
+                                            &mut session,
+                                            &mut panes,
+                                            &mut workspace_pool,
+                                            &mut active_menu,
+                                            &mut focus,
+                                            &mut model,
+                                            &mut sb,
+                                            &mut drawer,
+                                            &mut drawer_pool,
+                                            &mut drawer_home,
+                                            &current_config,
+                                            chrome.center,
+                                        ) {
+                                            need_relayout = true;
                                         }
                                     }
 
@@ -14320,12 +14566,18 @@ async fn event_loop<T: Terminal>(
                                 continue;
                             }
                             if let menu::MenuChoice::ConfirmInitGit { path } = choice {
-                                if superzej_core::util::git_cmd(std::path::Path::new(&path))
-                                    .arg("init")
-                                    .status()
-                                    .map(|s| s.success())
-                                    .unwrap_or(false)
-                                {
+                                // Accepted on-loop subprocess: `git init` on a
+                                // local path is ms-scale and runs on an explicit
+                                // user confirm. Revisit if it ever targets slow
+                                // filesystems.
+                                #[expect(clippy::disallowed_methods)]
+                                let initialized =
+                                    superzej_core::util::git_cmd(std::path::Path::new(&path))
+                                        .arg("init")
+                                        .status()
+                                        .map(|s| s.success())
+                                        .unwrap_or(false);
+                                if initialized {
                                     model.status =
                                         format!("initialized git repository at {}", path);
 
@@ -16757,53 +17009,77 @@ async fn event_loop<T: Terminal>(
                         }
                         (Section::Tests, KeyCode::Char('o')) => {
                             // Open the explorer's selected test in the editor
-                            // (file:line when captured, name-located otherwise).
+                            // (file:line when captured; located by name off
+                            // the loop otherwise — rg/grep may take a while).
                             let wt = active_tab_path(&session);
-                            if let Some((path, line)) = resolve_open_target(&panel_ui, &wt) {
-                                let cmd = editor_open_command(keymap.config(), &path, Some(line));
-                                let cwd = active_cwd(&session);
-                                open_command_tab(
-                                    &mut session,
-                                    &mut panes,
-                                    &cmd,
-                                    cwd.as_deref(),
-                                    chrome.center,
-                                );
-                                focus.zone = crate::focus::Zone::Center;
-                                refresh_tab_model(&mut model, &session, &mut sb);
-                                need_relayout = true;
-                            } else {
-                                model.status = "Could not locate the selected test".into();
+                            match resolve_open_target(&panel_ui, &wt) {
+                                Some(OpenTarget::Ready(path, line)) => {
+                                    open_test_target(
+                                        TestOpenAction::Editor,
+                                        &path,
+                                        line,
+                                        &mut session,
+                                        &mut panes,
+                                        keymap.config(),
+                                        chrome.center,
+                                        &mut focus,
+                                        &mut model,
+                                        &mut sb,
+                                    );
+                                    need_relayout = true;
+                                }
+                                Some(OpenTarget::Locate(test_id)) => {
+                                    model.status = "Locating test…".into();
+                                    spawn_test_locate(
+                                        test_open_tx.clone(),
+                                        waker.clone(),
+                                        wt,
+                                        test_generation,
+                                        test_id,
+                                        TestOpenAction::Editor,
+                                    );
+                                }
+                                None => {
+                                    model.status = "Could not locate the selected test".into();
+                                }
                             }
                             true
                         }
                         (Section::Tests, KeyCode::Char('b')) => {
-                            // Peek the selected test in bat, in a split pane.
+                            // Peek the selected test in bat, in a split pane
+                            // (file:line when captured; located by name off
+                            // the loop otherwise — rg/grep may take a while).
                             let wt = active_tab_path(&session);
-                            if let Some((path, line)) = resolve_open_target(&panel_ui, &wt) {
-                                let bat = keymap
-                                    .config()
-                                    .tool_command("bat")
-                                    .unwrap_or("bat --paging=always")
-                                    .to_string();
-                                let cmd = format!(
-                                    "{bat} --highlight-line {line} {}",
-                                    test_shell_quote(&path)
-                                );
-                                let cwd = active_cwd(&session);
-                                open_command_pane(
-                                    &mut session,
-                                    &mut panes,
-                                    focused,
-                                    &cmd,
-                                    cwd.as_deref(),
-                                    chrome.center,
-                                );
-                                focus.zone = crate::focus::Zone::Center;
-                                refresh_tab_model(&mut model, &session, &mut sb);
-                                need_relayout = true;
-                            } else {
-                                model.status = "Could not locate the selected test".into();
+                            match resolve_open_target(&panel_ui, &wt) {
+                                Some(OpenTarget::Ready(path, line)) => {
+                                    open_test_target(
+                                        TestOpenAction::Peek,
+                                        &path,
+                                        line,
+                                        &mut session,
+                                        &mut panes,
+                                        keymap.config(),
+                                        chrome.center,
+                                        &mut focus,
+                                        &mut model,
+                                        &mut sb,
+                                    );
+                                    need_relayout = true;
+                                }
+                                Some(OpenTarget::Locate(test_id)) => {
+                                    model.status = "Locating test…".into();
+                                    spawn_test_locate(
+                                        test_open_tx.clone(),
+                                        waker.clone(),
+                                        wt,
+                                        test_generation,
+                                        test_id,
+                                        TestOpenAction::Peek,
+                                    );
+                                }
+                                None => {
+                                    model.status = "Could not locate the selected test".into();
+                                }
                             }
                             true
                         }

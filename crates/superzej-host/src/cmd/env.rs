@@ -322,6 +322,8 @@ fn forward(cfg: &Config, worktree: Option<String>, spec: &str) -> Result<()> {
         );
     };
     outln!("forwarding {spec} via: {}", argv.join(" "));
+    // CLI path: `szhost env forward` runs the tunnel in the foreground, no event loop.
+    #[expect(clippy::disallowed_methods)]
     let status = std::process::Command::new(&argv[0])
         .args(&argv[1..])
         .status()

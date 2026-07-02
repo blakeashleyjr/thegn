@@ -2,13 +2,11 @@
 name = "gtui-app"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+publish = false
 license.workspace = true
 
 [dependencies]
 gtui-core = { path = "../gtui-core" }
-gtui-query = { path = "../gtui-query" }
-gtui-render = { path = "../gtui-render" }
-sz-kit = { path = "../sz-kit" }
-anyhow = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }

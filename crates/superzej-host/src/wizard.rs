@@ -1139,6 +1139,8 @@ mod tests {
         cfg
     }
 
+    // test code: fixture setup, never on the event loop.
+    #[expect(clippy::disallowed_methods)]
     fn temp_repo(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("sz-wiz-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1396,6 +1398,8 @@ mod tests {
     }
 
     #[test]
+    // test code: fixture setup, never on the event loop.
+    #[expect(clippy::disallowed_methods)]
     fn worker_fails_cleanly_without_commits() {
         let dir = std::env::temp_dir().join(format!("sz-wiz-empty-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

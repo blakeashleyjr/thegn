@@ -10,13 +10,12 @@ impl StatRenderer {
 
         if !frame.fields.is_empty() {
             let y_field = frame.fields.iter().find(|f| f.ty == FieldType::Float64);
-            if let Some(y) = y_field {
-                if let Ok(y_vals) = y.series.f64() {
-                    // For MVP, just take the last non-null value
-                    if let Some(val) = y_vals.into_iter().rev().flatten().next() {
-                        text = format!("{:.2}", val);
-                    }
-                }
+            if let Some(y) = y_field
+                && let Ok(y_vals) = y.series.f64()
+                // For MVP, just take the last non-null value
+                && let Some(val) = y_vals.into_iter().rev().flatten().next()
+            {
+                text = format!("{:.2}", val);
             }
         }
 

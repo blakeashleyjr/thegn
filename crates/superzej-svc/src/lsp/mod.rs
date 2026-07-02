@@ -622,7 +622,7 @@ type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 /// A live connection to one language server. The transport is abstracted over
 /// `Read`/`Write` so the server may run locally (a child process) OR inside a
-/// sandbox/remote, driven over the resident bridge's stdio (see [`from_io`]).
+/// sandbox/remote, driven over the resident bridge's stdio (see `from_io`).
 pub struct LspClient {
     stdin: SharedWriter,
     /// The local child, if any. `None` for a bridge/remote server (its lifecycle

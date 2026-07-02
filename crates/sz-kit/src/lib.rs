@@ -14,7 +14,7 @@
 //! - [`Theme`] — semantic tokens → sRGB, with [`Theme::prism`] defaults that
 //!   mirror superzej's chrome palette and a tolerant config loader so a
 //!   standalone binary picks up the user's superzej theme.
-//! - [`standalone::run`] (feature `standalone`) — a ~zero-idle crossterm loop
+//! - `standalone::run` (feature `standalone`) — a ~zero-idle crossterm loop
 //!   that shrinks each app's `main` to a few lines.
 //!
 //! ## ratatui version pinning
