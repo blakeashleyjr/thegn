@@ -470,6 +470,10 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     let mut term = new_terminal(caps).context("open terminal")?;
     term.set_raw_mode().context("raw mode")?;
     term.enter_alternate_screen().context("alt screen")?;
+    // We now own the raw/alternate screen: silence branded `msg::*` stderr
+    // writes (they'd paint over the frame) — route them to the log instead.
+    // Cleared on teardown below. See `superzej_core::msg::set_tui_active`.
+    superzej_core::msg::set_tui_active(true);
     let size = term.get_screen_size().context("screen size")?;
     let (rows, cols) = (size.rows, size.cols);
 
@@ -943,6 +947,8 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     }
     let _ = buf.terminal().exit_alternate_screen();
     let _ = buf.terminal().set_cooked_mode();
+    // Frame is torn down; branded `msg::*` may print to stderr again.
+    superzej_core::msg::set_tui_active(false);
     result
 }
 
@@ -7699,6 +7705,20 @@ fn watchdog_deadline(remote_env: bool) -> std::time::Duration {
     std::time::Duration::from_secs(if remote_env { 300 } else { 8 })
 }
 
+/// The startup-shell watchdog deadline for a tab, driven by the per-tab
+/// remoteness captured at `loading_state` seed time (NOT the derived step Vec,
+/// which is byte-identical across a local and a remote shell-wait tab and
+/// previously leaked the wrong deadline across a tab switch). A MISSING entry
+/// defaults to the SAFE long window: unknown remoteness must never
+/// premature-drop a slowly-resuming sprite; a genuinely hung *local* shell is
+/// only delayed, not spared.
+fn active_watchdog_deadline(
+    remote: &std::collections::HashMap<(String, usize), bool>,
+    key: &(String, usize),
+) -> std::time::Duration {
+    watchdog_deadline(remote.get(key).copied().unwrap_or(true))
+}
+
 /// Whether a loading-step list is in the terminal "waiting on the shell" shape —
 /// sandbox + container done, the final `shell` step pending/active — as opposed to
 /// a still-live provisioning sequence (`workspace`/`clone`/`nix`/`direnv`/
@@ -8323,6 +8343,18 @@ async fn event_loop<T: Terminal>(
     // by the lazy-materialize seed + `provision_rx`/`spec_rx`; an entry is dropped
     // on the owning pane's first PTY output (loading done) or on a hard failure.
     let mut loading_state: std::collections::HashMap<(String, usize), Vec<LoadStep>> =
+        std::collections::HashMap::new();
+    // Per-worktree remoteness for the loading splash, keyed identically to
+    // `loading_state` and kept in LOCKSTEP with it (seeded/removed at the same
+    // sites). The startup-shell watchdog reads THIS — captured for certain when
+    // the pane is seeded (a provider stream, or `is_remote()` on the worktree
+    // path) — for its 8s-vs-300s deadline, instead of the frame's recomputed
+    // `model.load_context`. `load_context` only refreshes when the derived step
+    // Vec CHANGES, and the materialize splash uses byte-identical steps
+    // (`[sandbox, container, shell]`) for local AND remote tabs, so a tab switch
+    // between two shell-wait tabs left the sprite judged at the local 8s ⇒
+    // premature rc-free-bash fallback. A per-tab bool removes that coupling.
+    let mut loading_remote: std::collections::HashMap<(String, usize), bool> =
         std::collections::HashMap::new();
     // Active-tab keys (group name, tab) whose sandbox probe failed: skip
     // re-probing on the next tick for the same reason as prewarm_failed.
@@ -9579,6 +9611,11 @@ async fn event_loop<T: Terminal>(
                     && !materialize_failed.contains(&key)
                 {
                     materialize_inflight.insert(key.clone());
+                    loading_remote.insert(
+                        key.clone(),
+                        superzej_core::remote::GitLoc::for_worktree(std::path::Path::new(&path))
+                            .is_remote(),
+                    );
                     loading_state.insert(
                         key,
                         vec![
@@ -9862,6 +9899,7 @@ async fn event_loop<T: Terminal>(
                                     }
                                     if ready {
                                         loading_state.remove(&key);
+                                        loading_remote.remove(&key);
                                     }
                                 }
                                 if Some(id) == corner && corner_kitty {
@@ -10301,10 +10339,10 @@ async fn event_loop<T: Terminal>(
                                                     need_relayout = true;
                                                 }
                                                 Err(err) => {
-                                                    loading_state.remove(&(
-                                                        session.worktrees[gi].name.clone(),
-                                                        ti,
-                                                    ));
+                                                    let k =
+                                                        (session.worktrees[gi].name.clone(), ti);
+                                                    loading_state.remove(&k);
+                                                    loading_remote.remove(&k);
                                                     model.load_steps.clear();
                                                     center_dormant = true;
                                                     model.status =
@@ -10808,6 +10846,9 @@ async fn event_loop<T: Terminal>(
                 .iter()
                 .position(|g| g.name == name)
                 .is_some_and(|gi| gi == session.active && session.worktrees[gi].active_tab == ti);
+            // Eager provisioning only runs for a provider (remote) env, so this
+            // stream is unconditionally remote — the 300s watchdog window.
+            loading_remote.insert((name.clone(), ti), true);
             loading_state.insert((name, ti), steps);
             if active {
                 dirty = true;
@@ -10824,12 +10865,18 @@ async fn event_loop<T: Terminal>(
             let tab_key = (name.clone(), ti);
             materialize_inflight.remove(&tab_key);
             prewarm_inflight.remove(&tab_key);
+            // Remoteness of this worktree, resolved once from its path — seeds
+            // `loading_remote` alongside every `loading_state` write below so the
+            // startup-shell watchdog reads the correct 8s/300s deadline for THIS
+            // tab regardless of its (possibly identical) step Vec.
+            let tab_remote =
+                superzej_core::remote::GitLoc::for_worktree(std::path::Path::new(&wt)).is_remote();
             // A remote materialize may have just CLAIMED a warm spare (ready →
             // claimed), so the chip's count is now stale. Force the pool
             // maintainer to re-read on the next loop (it's otherwise throttled to
             // ~8s) so `warm N/M` drops promptly instead of showing a phantom
             // ready spare that was already handed off.
-            if superzej_core::remote::GitLoc::for_worktree(std::path::Path::new(&wt)).is_remote() {
+            if tab_remote {
                 last_pool_reconcile = None;
             }
             let Some(gi) = session.worktrees.iter().position(|g| g.name == name) else {
@@ -10846,6 +10893,7 @@ async fn event_loop<T: Terminal>(
                         .first()
                         .map(|(_, s)| s.backend.clone())
                         .unwrap_or_else(|| "host".into());
+                    loading_remote.insert(tab_key.clone(), tab_remote);
                     loading_state.insert(
                         tab_key.clone(),
                         vec![
@@ -10875,6 +10923,7 @@ async fn event_loop<T: Terminal>(
                             model.status = format!("Pane launch blocked: {s}");
                         }
                     }
+                    loading_remote.insert(tab_key.clone(), tab_remote);
                     loading_state.insert(tab_key.clone(), vec![LoadStep::failed("sandbox")]);
                     if is_active {
                         center_dormant = true;
@@ -10901,6 +10950,7 @@ async fn event_loop<T: Terminal>(
                     .first()
                     .map(|(_, s)| s.backend.clone())
                     .unwrap_or_else(|| "host".into());
+                loading_remote.insert(tab_key.clone(), tab_remote);
                 loading_state.insert(
                     tab_key.clone(),
                     vec![
@@ -10914,6 +10964,7 @@ async fn event_loop<T: Terminal>(
                 panes.materialize_with_specs(&current_config, tab, &wt, &specs, chrome.center)
             {
                 model.status = format!("Pane spawn failed: {e}");
+                loading_remote.insert(tab_key.clone(), tab_remote);
                 loading_state.insert(
                     tab_key.clone(),
                     vec![
@@ -11872,13 +11923,19 @@ async fn event_loop<T: Terminal>(
             let ti = session.worktrees.get(gi).map(|g| g.active_tab).unwrap_or(0);
             // A provider/remote worktree gets the long deadline (a silent devShell
             // build / cold-sprite resume is not a hang); local keeps the snappy 8s.
-            // Remoteness comes from the config-resolved ENV PLACEMENT via
-            // `load_context` (populated by `agent::loading_context`, non-empty only
-            // for a non-local provider/remote env) — NOT `GitLoc::for_worktree`,
-            // whose per-path `worktrees.location` DB lookup is empty on a fresh /
-            // just-cleared DB and would misclassify a sprite as local ⇒ the 8s
-            // deadline ⇒ premature rc-free-bash fallback.
-            let watchdog = watchdog_deadline(!model.load_context.is_empty());
+            // Remoteness comes from the PER-TAB `loading_remote` bool captured when
+            // this tab's splash was seeded (a provider stream, or `is_remote()` on
+            // the worktree path) — NOT `model.load_context`, which only refreshes
+            // when the derived step Vec CHANGES and so went stale when switching
+            // between two shell-wait tabs with byte-identical `[sandbox, container,
+            // shell]` steps (⇒ a sprite judged at the local 8s ⇒ premature
+            // rc-free-bash fallback). Missing ⇒ the safe 300s (never premature-drop
+            // a sprite). See `active_watchdog_deadline` / `loading_remote`.
+            let watchdog = session
+                .worktrees
+                .get(gi)
+                .map(|g| active_watchdog_deadline(&loading_remote, &(g.name.clone(), ti)))
+                .unwrap_or_else(|| watchdog_deadline(true));
             let leaf = (!shell_watchdog_fired.contains(&(gi, ti)))
                 .then(|| session.worktrees.get(gi).and_then(|g| g.tabs.get(ti)))
                 .flatten()
@@ -11913,7 +11970,9 @@ async fn event_loop<T: Terminal>(
                         if let Some(tab) = session.tab_mut(gi, ti) {
                             crate::panes::replace_single_dead_center_pane(tab, pid, fresh);
                         }
-                        loading_state.remove(&(session.worktrees[gi].name.clone(), ti));
+                        let k = (session.worktrees[gi].name.clone(), ti);
+                        loading_state.remove(&k);
+                        loading_remote.remove(&k);
                         model.load_steps.clear();
                         model.status = "Shell produced no output — fell back to a plain \
                             shell. Your login shell's startup files likely hang or error \
@@ -11923,7 +11982,9 @@ async fn event_loop<T: Terminal>(
                         need_relayout = true;
                     }
                     Err(e) => {
-                        loading_state.remove(&(session.worktrees[gi].name.clone(), ti));
+                        let k = (session.worktrees[gi].name.clone(), ti);
+                        loading_state.remove(&k);
+                        loading_remote.remove(&k);
                         model.load_steps.clear();
                         center_dormant = true;
                         model.status = format!(
@@ -20417,6 +20478,37 @@ mod tests {
         assert_eq!(watchdog_deadline(false), std::time::Duration::from_secs(8));
         assert_eq!(watchdog_deadline(true), std::time::Duration::from_secs(300));
         assert!(watchdog_deadline(true) > watchdog_deadline(false));
+    }
+
+    #[test]
+    fn active_watchdog_deadline_is_per_tab_not_step_shape() {
+        // The premature-shell regression: two shell-wait tabs whose LoadStep Vecs
+        // are byte-identical (`[sandbox, container, shell]`) must STILL get the
+        // right deadline from the per-tab remoteness bool — the deadline must not
+        // ride the (identical) step shape / a stale `load_context`.
+        let mut remote: std::collections::HashMap<(String, usize), bool> =
+            std::collections::HashMap::new();
+        let local = ("wt-local".to_string(), 0usize);
+        let sprite = ("wt-sprite".to_string(), 0usize);
+        remote.insert(local.clone(), false);
+        remote.insert(sprite.clone(), true);
+        assert_eq!(
+            active_watchdog_deadline(&remote, &local),
+            std::time::Duration::from_secs(8),
+            "a local tab keeps the snappy 8s"
+        );
+        assert_eq!(
+            active_watchdog_deadline(&remote, &sprite),
+            std::time::Duration::from_secs(300),
+            "a sprite tab keeps the long 300s even next to a local tab with matching steps"
+        );
+        // Missing entry ⇒ SAFE long window: never premature-drop an unknown pane.
+        let unknown = ("wt-unknown".to_string(), 0usize);
+        assert_eq!(
+            active_watchdog_deadline(&remote, &unknown),
+            std::time::Duration::from_secs(300),
+            "a missing entry defaults to the safe 300s window"
+        );
     }
 
     #[test]

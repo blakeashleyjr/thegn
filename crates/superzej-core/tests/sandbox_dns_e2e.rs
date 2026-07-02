@@ -9,10 +9,10 @@
 //! test threads.
 
 use std::net::UdpSocket;
-use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
-use superzej_core::dns_filter::{DnsPolicy, drain_events, get_or_start};
+use superzej_core::dns_filter::{DnsEvent, DnsPolicy, drain_events, get_or_start};
 
 // ── singleton initialisation ────────────────────────────────────────────────
 
@@ -28,6 +28,31 @@ fn dns_port() -> u16 {
         })
         .expect("dns filter start failed")
     })
+}
+
+/// Serialise ring-buffer tests, POISON-TOLERANTLY: a test that fails an
+/// assertion while holding the guard must not cascade `PoisonError` into every
+/// other test (turning one real failure into four). `into_inner` recovers the
+/// guard regardless of poisoning.
+fn test_lock() -> MutexGuard<'static, ()> {
+    TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Drain-and-accumulate DNS events until `want(&acc)` holds or `deadline`
+/// elapses. `drain_events()` clears the ring, so events are MOVED into `acc`
+/// across polls — when the whole test suite saturates the CPU the server thread
+/// just needs a few more polls to log a packet, so this never false-fails the
+/// way the old fixed 50/80ms sleeps did. Returns whatever accumulated.
+fn collect_events_until(deadline: Duration, want: impl Fn(&[DnsEvent]) -> bool) -> Vec<DnsEvent> {
+    let start = Instant::now();
+    let mut acc: Vec<DnsEvent> = Vec::new();
+    loop {
+        acc.extend(drain_events());
+        if want(&acc) || start.elapsed() >= deadline {
+            return acc;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 // ── DNS query helpers ────────────────────────────────────────────────────────
@@ -74,7 +99,7 @@ fn rcode(resp: &[u8]) -> u8 {
 
 #[test]
 fn a1_blocked_domain_returns_nxdomain() {
-    let _g = TEST_LOCK.lock().unwrap();
+    let _g = test_lock();
     let port = dns_port();
     drain_events(); // clear prior
     let resp = query(port, "evil.test").expect("no response from dns filter");
@@ -84,10 +109,11 @@ fn a1_blocked_domain_returns_nxdomain() {
         "expected NXDOMAIN (3), got {}",
         rcode(&resp)
     );
-    let events = drain_events();
-    let blocked = events.iter().find(|e| e.name == "evil.test" && !e.allowed);
+    let events = collect_events_until(Duration::from_secs(5), |e| {
+        e.iter().any(|x| x.name == "evil.test" && !x.allowed)
+    });
     assert!(
-        blocked.is_some(),
+        events.iter().any(|e| e.name == "evil.test" && !e.allowed),
         "expected a blocked event for evil.test; got {events:?}"
     );
 }
@@ -96,16 +122,21 @@ fn a1_blocked_domain_returns_nxdomain() {
 
 #[test]
 fn a2_drain_clears_ring() {
-    let _g = TEST_LOCK.lock().unwrap();
+    let _g = test_lock();
     let port = dns_port();
     drain_events(); // clear prior
     // Send two queries: one blocked, one allowed (not in block-list).
     let _r1 = query(port, "evil.test");
     let _r2 = query(port, "good.test");
-    // Tiny sleep to let the server thread process both packets.
-    std::thread::sleep(Duration::from_millis(50));
-    let first = drain_events();
-    assert!(!first.is_empty(), "expected events after queries");
+    // Poll until BOTH query events have been recorded (the server processed
+    // them) — this drains as it collects, so the ring is now empty.
+    let collected = collect_events_until(Duration::from_secs(5), |e| e.len() >= 2);
+    assert!(
+        collected.len() >= 2,
+        "expected events for both queries; got {collected:?}"
+    );
+    // Both queries returned synchronously and their events were collected, so
+    // nothing is in flight: a fresh drain must be empty (the ring was cleared).
     let second = drain_events();
     assert!(
         second.is_empty(),
@@ -117,6 +148,13 @@ fn a2_drain_clears_ring() {
 
 #[test]
 fn a3_singleton_reuses_port() {
+    let _g = test_lock();
+    // Initialise the singleton through the CANONICAL policy FIRST. Otherwise a3
+    // could win the init race and start the shared per-binary server with a
+    // block-list that omits `evil.test` (the policy of the FIRST `get_or_start`
+    // wins for the whole process), silently making a1/a4 fail — the actual
+    // contention flake this test file had.
+    let canonical = dns_port();
     let p1 = get_or_start(DnsPolicy {
         block: vec!["a.test".into()],
         allow: vec![],
@@ -127,7 +165,11 @@ fn a3_singleton_reuses_port() {
         allow: vec![],
         upstream: None,
     });
-    assert!(p1.is_some() && p2.is_some());
+    assert_eq!(
+        p1,
+        Some(canonical),
+        "get_or_start must reuse the canonical singleton, not start a new one"
+    );
     assert_eq!(p1, p2, "second get_or_start must reuse the existing server");
 }
 
@@ -135,7 +177,7 @@ fn a3_singleton_reuses_port() {
 
 #[test]
 fn a4_multiple_queries_all_logged() {
-    let _g = TEST_LOCK.lock().unwrap();
+    let _g = test_lock();
     let port = dns_port();
     drain_events();
     // blocked
@@ -144,12 +186,19 @@ fn a4_multiple_queries_all_logged() {
     let _ = query(port, "allowed.example");
     // not-blocked
     let _ = query(port, "other.example");
-    std::thread::sleep(Duration::from_millis(80));
-    let events = drain_events();
+    let events = collect_events_until(Duration::from_secs(5), |e| {
+        e.iter().filter(|x| !x.allowed).count() >= 1 && e.iter().filter(|x| x.allowed).count() >= 2
+    });
     let blocked_count = events.iter().filter(|e| !e.allowed).count();
     let allowed_count = events.iter().filter(|e| e.allowed).count();
-    assert!(blocked_count >= 1, "expected at least 1 blocked event");
-    assert!(allowed_count >= 2, "expected at least 2 allowed events");
+    assert!(
+        blocked_count >= 1,
+        "expected at least 1 blocked event; got {events:?}"
+    );
+    assert!(
+        allowed_count >= 2,
+        "expected at least 2 allowed events; got {events:?}"
+    );
 }
 
 // ── A5: non-blocked domain — response is NOT NXDOMAIN ───────────────────────
@@ -160,7 +209,7 @@ fn a4_multiple_queries_all_logged() {
 #[test]
 #[ignore]
 fn a5_allowed_domain_not_nxdomain() {
-    let _g = TEST_LOCK.lock().unwrap();
+    let _g = test_lock();
     let port = dns_port();
     drain_events();
     let resp = query(port, "example.com").expect("no response");
