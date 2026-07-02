@@ -817,16 +817,31 @@ fn nix_install_script(
         conf.push_str(&format!("extra-substituters = {url}\\n"));
         conf.push_str("require-sigs = false\\n");
     }
-    // Readiness wait (sudo available + DNS) shared by both installers; the sprite
-    // user has passwordless sudo and the installer creates /nix via sudo.
-    let wait = "n=0; while [ $n -lt 45 ]; do \
+    // Readiness wait (sudo + DNS + real egress) shared by both installers; the
+    // sprite user has passwordless sudo and the installer creates /nix via sudo.
+    // `claim_egress`: DNS alone is a FALSE ready-signal on a cold Fly microVM — the
+    // local resolver answers `getent` seconds before outbound TCP/TLS to the CDN is
+    // actually up, so the install fires into a dead network and `curl -fsSL` (silent)
+    // fails with no diagnostic (the exact cold-boot 127 seen on fresh sprites). Gate
+    // on an actual reachability probe (a 5s-bounded HTTPS GET of the tiny install
+    // script) so we don't start until egress genuinely works. 60×2s ceiling covers a
+    // slow cold boot; the whole loop short-circuits the instant the probe succeeds.
+    let wait = "n=0; while [ $n -lt 60 ]; do \
            { sudo -n true 2>/dev/null || [ \"$(id -u)\" = 0 ]; } && \
-             getent hosts nixos.org >/dev/null 2>&1 && break; \
+             getent hosts nixos.org >/dev/null 2>&1 && \
+             curl -fsS --max-time 5 -o /dev/null https://nixos.org/nix/install 2>/dev/null && break; \
            n=$((n+1)); sleep 2; \
          done";
     // Official: single-user (`--no-daemon`), POSIX sh (download then run — no
     // process substitution under dash). The proven default + fallback.
-    let official = "curl -fsSL https://nixos.org/nix/install -o /tmp/nix-install.sh && \
+    // `--retry`: the readiness probe above proves egress once, but a cold Fly
+    // network can still flap mid-run; the retry flags (with `--retry-all-errors`, so
+    // even a 5xx/28-timeout retries, not just connection refusals) make the tiny
+    // script fetch resilient instead of a silent one-shot. The 25MB tarball fetch is
+    // inside the vendored installer (no flags to pass), so the do_install retry loop
+    // + this egress gate are its safety net.
+    let official = "curl -fsSL --retry 5 --retry-connrefused --retry-delay 2 --retry-all-errors \
+             https://nixos.org/nix/install -o /tmp/nix-install.sh && \
            sh /tmp/nix-install.sh --no-daemon --yes";
     let install = match installer {
         NixInstaller::Official => official.to_string(),
@@ -834,7 +849,8 @@ fn nix_install_script(
         // microVM); falls back to the official single-user installer on ANY failure
         // so a determinate-incompatibility never wedges provisioning.
         NixInstaller::Determinate => format!(
-            "(curl -fsSL https://install.determinate.systems/nix -o /tmp/nix-ds.sh && \
+            "(curl -fsSL --retry 5 --retry-connrefused --retry-delay 2 --retry-all-errors \
+                 https://install.determinate.systems/nix -o /tmp/nix-ds.sh && \
                sh /tmp/nix-ds.sh install linux --no-confirm --init none) || ({official})"
         ),
     };
@@ -1319,6 +1335,43 @@ mod tests {
         // The clone step cds into the workdir first.
         let clone = p.steps.iter().find(|s| s.id == "clone").unwrap();
         assert!(matches!(&clone.kind, StepKind::Exec(s) if s.starts_with("cd ")));
+    }
+
+    #[test]
+    fn nix_step_gates_on_real_egress_and_retries_fetch() {
+        // Regression: a cold Fly microVM answers DNS before outbound TLS is up, so a
+        // DNS-only readiness gate + a no-retry `curl -fsSL` fired the install into a
+        // dead network and failed silently (the cold-boot "exit 127"). The gate must
+        // probe ACTUAL egress and the fetch must retry.
+        let req = EnvRequirements {
+            nix_flake_devshell: true,
+            ..Default::default()
+        };
+        let opts = PlanOpts {
+            origin: Some("git@github.com:o/r.git".into()),
+            ..Default::default()
+        };
+        let p = plan(&req, &opts);
+        let nix = p.steps.iter().find(|s| s.id == "nix").expect("nix step");
+        let StepKind::Exec(script) = &nix.kind else {
+            panic!("nix step is Exec");
+        };
+        // Readiness gate probes real reachability, not just DNS resolution.
+        assert!(
+            script.contains("curl -fsS --max-time 5 -o /dev/null https://nixos.org/nix/install"),
+            "readiness gate must probe actual egress: {script}"
+        );
+        assert!(
+            script.contains("getent hosts nixos.org"),
+            "readiness gate still resolves DNS first: {script}"
+        );
+        // The install-script fetch retries transient cold-boot failures.
+        assert!(
+            script.contains("--retry 5")
+                && script.contains("--retry-connrefused")
+                && script.contains("--retry-all-errors"),
+            "install fetch must retry all transient errors: {script}"
+        );
     }
 
     #[test]
