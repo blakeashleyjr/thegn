@@ -34,13 +34,60 @@ pub struct GraphDetail {
     pub series2: Option<(Vec<f32>, Tok, String)>, // (values, tone, half-label)
 }
 
+/// A side effect a detail-overlay row can fire (drilldown / open / mutation).
+/// The overlay snapshots its data at open time, so an action carries everything
+/// the loop needs to execute it without re-borrowing the model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetailAction {
+    /// Open a URL in the system browser.
+    OpenUrl(String),
+    /// Run `szhost <args>` in a new pane (e.g. `["ci","view",<id>]`). The exe
+    /// path is prepended by the loop.
+    RunCommand(Vec<String>),
+    /// Re-run a CI run (all jobs, or `failed` only), off the loop.
+    CiRerun { run_id: String, failed: bool },
+    /// Cancel an in-flight CI run, off the loop.
+    CiCancel { run_id: String },
+}
+
 /// One scrollable list row: a colored marker glyph, the body text, and an
-/// optional dim right-aligned note (relative time, count, …).
+/// optional dim right-aligned note (relative time, count, …). Rows may carry an
+/// `enter` action (fired by Enter/Return) and extra char-keyed `actions`; a list
+/// with any actionable row becomes navigable (a selection cursor, not just
+/// scroll).
 pub struct DetailRow {
     pub marker: Tok,
     pub glyph: String,
     pub text: String,
     pub note: Option<String>,
+    pub enter: Option<DetailAction>,
+    pub actions: Vec<(char, DetailAction)>,
+}
+
+impl DetailRow {
+    /// A plain (non-actionable) row.
+    pub fn new(marker: Tok, glyph: impl Into<String>, text: impl Into<String>) -> DetailRow {
+        DetailRow {
+            marker,
+            glyph: glyph.into(),
+            text: text.into(),
+            note: None,
+            enter: None,
+            actions: Vec::new(),
+        }
+    }
+    pub fn note(mut self, note: impl Into<String>) -> DetailRow {
+        self.note = Some(note.into());
+        self
+    }
+    pub fn on_enter(mut self, action: DetailAction) -> DetailRow {
+        self.enter = Some(action);
+        self
+    }
+    pub fn action(mut self, key: char, action: DetailAction) -> DetailRow {
+        self.actions.push((key, action));
+        self
+    }
 }
 
 /// A scrollable list (notifications, test failures, …).
@@ -109,13 +156,19 @@ pub struct DetailOverlay {
     placement: Placement,
     /// List scroll offset (rows scrolled off the top); ignored by Graph/KeyVal.
     scroll: usize,
+    /// Selected row (row-cursor), only meaningful for an actionable list.
+    sel: usize,
+    /// A dim key-hint footer line for actionable lists (drawn on the last row).
+    hint: Option<String>,
 }
 
 /// What a key delivered to the detail overlay meant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DetailOutcome {
     Pending,
     Close,
+    /// The overlay fired a row action; the loop executes it and closes.
+    Act(DetailAction),
 }
 
 impl DetailOverlay {
@@ -127,8 +180,46 @@ impl DetailOverlay {
         }
     }
 
-    /// Esc / q / Enter / Ctrl-C / Ctrl-G close; for a list, j/k/arrows/PageUp/
-    /// Down scroll (clamped); everything else is Pending.
+    /// A list is actionable (row-cursor, not just scroll) when any row carries an
+    /// `enter` or char-keyed action. Non-actionable lists keep pure scroll.
+    fn actionable(&self) -> bool {
+        matches!(&self.content, DetailContent::List(l)
+            if l.rows.iter().any(|r| r.enter.is_some() || !r.actions.is_empty()))
+    }
+
+    /// Visible body rows for a list (one row is reserved for the hint footer
+    /// when present).
+    fn visible_rows(&self) -> usize {
+        self.rows.saturating_sub(self.hint.is_some() as usize)
+    }
+
+    /// Keep the selected row inside the scroll window.
+    fn scroll_to_sel(&mut self) {
+        let vis = self.visible_rows().max(1);
+        if self.sel < self.scroll {
+            self.scroll = self.sel;
+        } else if self.sel >= self.scroll + vis {
+            self.scroll = self.sel + 1 - vis;
+        }
+    }
+
+    /// The action bound to `key` on the selected row (if any).
+    fn action_for(&self, key: char) -> Option<DetailAction> {
+        let DetailContent::List(l) = &self.content else {
+            return None;
+        };
+        l.rows.get(self.sel).and_then(|r| {
+            r.actions
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, a)| a.clone())
+        })
+    }
+
+    /// Esc / q / Ctrl-C / Ctrl-G close. A non-actionable list scrolls with
+    /// j/k/arrows/PageUp/Down and closes on Enter. An actionable list moves a
+    /// row cursor with j/k, fires the selected row's `enter` action on Enter,
+    /// and its char-keyed actions on the bound key (all as `Act`).
     pub fn handle_key(&mut self, key: &KeyCode, mods: Modifiers) -> DetailOutcome {
         if mods.contains(Modifiers::CTRL) {
             return match key {
@@ -142,28 +233,70 @@ impl DetailOverlay {
         if crate::input::is_escape_key(key) {
             return DetailOutcome::Close;
         }
+        let actionable = self.actionable();
+        let max = self.list_len().saturating_sub(1);
         match key {
-            KeyCode::Char('q') | KeyCode::Enter => DetailOutcome::Close,
+            KeyCode::Char('q') => DetailOutcome::Close,
+            KeyCode::Enter => {
+                if actionable {
+                    match self.selected_enter() {
+                        Some(a) => DetailOutcome::Act(a),
+                        None => DetailOutcome::Pending,
+                    }
+                } else {
+                    DetailOutcome::Close
+                }
+            }
             KeyCode::DownArrow | KeyCode::Char('j') => {
-                let max = self.list_len().saturating_sub(1);
-                self.scroll = (self.scroll + 1).min(max);
+                if actionable {
+                    self.sel = (self.sel + 1).min(max);
+                    self.scroll_to_sel();
+                } else {
+                    self.scroll = (self.scroll + 1).min(max);
+                }
                 DetailOutcome::Pending
             }
             KeyCode::UpArrow | KeyCode::Char('k') => {
-                self.scroll = self.scroll.saturating_sub(1);
+                if actionable {
+                    self.sel = self.sel.saturating_sub(1);
+                    self.scroll_to_sel();
+                } else {
+                    self.scroll = self.scroll.saturating_sub(1);
+                }
                 DetailOutcome::Pending
             }
             KeyCode::PageDown => {
-                let max = self.list_len().saturating_sub(1);
-                self.scroll = (self.scroll + 8).min(max);
+                if actionable {
+                    self.sel = (self.sel + 8).min(max);
+                    self.scroll_to_sel();
+                } else {
+                    self.scroll = (self.scroll + 8).min(max);
+                }
                 DetailOutcome::Pending
             }
             KeyCode::PageUp => {
-                self.scroll = self.scroll.saturating_sub(8);
+                if actionable {
+                    self.sel = self.sel.saturating_sub(8);
+                    self.scroll_to_sel();
+                } else {
+                    self.scroll = self.scroll.saturating_sub(8);
+                }
                 DetailOutcome::Pending
             }
+            KeyCode::Char(c) if actionable => match self.action_for(*c) {
+                Some(a) => DetailOutcome::Act(a),
+                None => DetailOutcome::Pending,
+            },
             _ => DetailOutcome::Pending,
         }
+    }
+
+    /// The Enter action for the selected row (if any).
+    fn selected_enter(&self) -> Option<DetailAction> {
+        let DetailContent::List(l) = &self.content else {
+            return None;
+        };
+        l.rows.get(self.sel).and_then(|r| r.enter.clone())
     }
 
     /// Paint the overlay as a summoned layer over the composed frame.
@@ -181,7 +314,10 @@ impl DetailOverlay {
         };
         match &self.content {
             DetailContent::Graph(g) => render_graph(surface, inner, g),
-            DetailContent::List(l) => render_list(surface, inner, l, self.scroll),
+            DetailContent::List(l) => {
+                let sel = self.actionable().then_some(self.sel);
+                render_list(surface, inner, l, self.scroll, sel, self.hint.as_deref());
+            }
             DetailContent::KeyVal(kv) => render_keyval(surface, inner, kv),
         }
     }
@@ -255,7 +391,14 @@ fn draw_series(
     }
 }
 
-fn render_list(surface: &mut Surface, inner: Rect, l: &ListDetail, scroll: usize) {
+fn render_list(
+    surface: &mut Surface,
+    inner: Rect,
+    l: &ListDetail,
+    scroll: usize,
+    sel: Option<usize>,
+    hint: Option<&str>,
+) {
     if l.rows.is_empty() {
         seg::draw_line(
             surface,
@@ -267,12 +410,26 @@ fn render_list(surface: &mut Surface, inner: Rect, l: &ListDetail, scroll: usize
         );
         return;
     }
+    // Reserve the last inner row for the key-hint footer, when present.
+    let body_rows = inner.rows.saturating_sub(hint.is_some() as usize);
     let scroll = scroll.min(l.rows.len().saturating_sub(1));
-    for (row, item) in l.rows.iter().skip(scroll).take(inner.rows).enumerate() {
-        let mut left = vec![
-            seg(item.marker, format!("{} ", item.glyph)),
-            seg(Tok::Slot(S::Text), item.text.clone()),
-        ];
+    // Actionable lists reserve a leading `❯`/space column for the row cursor;
+    // plain lists keep their original layout (no extra indent).
+    let cursored = sel.is_some();
+    for (row, item) in l.rows.iter().skip(scroll).take(body_rows).enumerate() {
+        let selected = sel == Some(scroll + row);
+        let pad = if selected { Tok::SelAccent } else { panel() };
+        let mut left = Vec::new();
+        if cursored {
+            // A `❯` marks the selected row (the same affordance the menu uses).
+            left.push(if selected {
+                seg(Tok::Slot(S::Accent), "❯").bold()
+            } else {
+                seg(item.marker, " ")
+            });
+        }
+        left.push(seg(item.marker, format!("{} ", item.glyph)));
+        left.push(seg(Tok::Slot(S::Text), item.text.clone()));
         let line = match &item.note {
             Some(n) => Line::split(left, vec![seg(Tok::Slot(S::Ghost), n.clone())]),
             None => {
@@ -280,7 +437,17 @@ fn render_list(surface: &mut Surface, inner: Rect, l: &ListDetail, scroll: usize
                 Line::segs(left)
             }
         };
-        seg::draw_line(surface, inner.x, inner.y + row, inner.cols, &line, panel());
+        seg::draw_line(surface, inner.x, inner.y + row, inner.cols, &line, pad);
+    }
+    if let Some(h) = hint {
+        seg::draw_line(
+            surface,
+            inner.x,
+            inner.y + inner.rows - 1,
+            inner.cols,
+            &Line::segs(vec![seg(Tok::Slot(S::Faint), h.to_string())]),
+            panel(),
+        );
     }
 }
 
@@ -359,6 +526,8 @@ fn graph(
         rows: 12,
         placement,
         scroll: 0,
+        sel: 0,
+        hint: None,
     }
 }
 
@@ -376,6 +545,8 @@ fn keyval(
         rows,
         placement,
         scroll: 0,
+        sel: 0,
+        hint: None,
     }
 }
 
@@ -396,6 +567,8 @@ fn list(
         rows: height,
         placement: Placement::Center,
         scroll: 0,
+        sel: 0,
+        hint: None,
     }
 }
 
@@ -678,12 +851,9 @@ fn badge_detail(b: BarBadge, near: Placement, model: &FrameModel) -> Option<Deta
                 .iter()
                 .map(|n| {
                     let (glyph, marker) = notif_glyph(n.kind);
-                    DetailRow {
-                        marker: if n.read { Tok::Slot(S::Ghost) } else { marker },
-                        glyph: glyph.into(),
-                        text: n.message.clone(),
-                        note: Some(rel_time(now_ms - n.created_at_ms)),
-                    }
+                    let marker = if n.read { Tok::Slot(S::Ghost) } else { marker };
+                    DetailRow::new(marker, glyph, n.message.clone())
+                        .note(rel_time(now_ms - n.created_at_ms))
                 })
                 .collect();
             Some(list("Notifications", rows, "no notifications", 60, 16))
@@ -735,15 +905,49 @@ fn badge_detail(b: BarBadge, near: Placement, model: &FrameModel) -> Option<Deta
                         CiState::Pass => ("✓", Tok::Hue(Hue::Green)),
                         _ => ("•", Tok::Slot(S::Dim)),
                     };
-                    DetailRow {
-                        marker,
-                        glyph: glyph.into(),
-                        text: r.name.clone(),
-                        note: None,
+                    // Enter drills into the run's jobs/steps in a pane; `o` opens
+                    // the run page; `r`/`R` re-run; `c` cancels an in-flight run.
+                    // Mutations the provider can't perform are declined off-loop.
+                    let mut row = DetailRow::new(marker, glyph, r.name.clone())
+                        .on_enter(DetailAction::RunCommand(vec![
+                            "ci".into(),
+                            "view".into(),
+                            r.id.clone(),
+                        ]))
+                        .action(
+                            'r',
+                            DetailAction::CiRerun {
+                                run_id: r.id.clone(),
+                                failed: false,
+                            },
+                        )
+                        .action(
+                            'R',
+                            DetailAction::CiRerun {
+                                run_id: r.id.clone(),
+                                failed: true,
+                            },
+                        );
+                    if !r.url.is_empty() {
+                        row = row.action('o', DetailAction::OpenUrl(r.url.clone()));
                     }
+                    if r.state == CiState::Running {
+                        row = row.action(
+                            'c',
+                            DetailAction::CiCancel {
+                                run_id: r.id.clone(),
+                            },
+                        );
+                    }
+                    if !r.branch.is_empty() {
+                        row = row.note(r.branch.clone());
+                    }
+                    row
                 })
                 .collect();
-            Some(list("CI runs", rows, "no CI runs", 56, 14))
+            let mut ov = list("CI runs", rows, "no CI runs", 56, 14);
+            ov.hint = Some("↵ view · o open · r/R rerun · c cancel".into());
+            Some(ov)
         }
         BarBadge::MergeQueue => {
             if model.panel.merge_queue.is_empty() {
@@ -765,12 +969,11 @@ fn badge_detail(b: BarBadge, near: Placement, model: &FrameModel) -> Option<Deta
                     } else {
                         None
                     };
-                    DetailRow {
-                        marker,
-                        glyph: glyph.into(),
-                        text: r.branch.clone(),
-                        note,
+                    let mut row = DetailRow::new(marker, glyph, r.branch.clone());
+                    if let Some(n) = note {
+                        row = row.note(n);
                     }
+                    row
                 })
                 .collect();
             Some(list("Merge queue", rows, "merge queue empty", 56, 14))
@@ -790,12 +993,11 @@ fn badge_detail(b: BarBadge, near: Placement, model: &FrameModel) -> Option<Deta
                     } else {
                         Tok::Hue(Hue::Teal)
                     };
-                    DetailRow {
-                        marker,
-                        glyph: "⇅".into(),
-                        text: format!("port {}", s.port),
-                        note: s.url.clone(),
+                    let mut row = DetailRow::new(marker, "⇅", format!("port {}", s.port));
+                    if let Some(u) = s.url.clone() {
+                        row = row.note(u);
                     }
+                    row
                 })
                 .collect();
             Some(list("Ingress shares", rows, "no shares", 60, 12))
@@ -1014,12 +1216,7 @@ mod tests {
     #[test]
     fn list_scroll_clamps_at_both_ends() {
         let rows: Vec<DetailRow> = (0..3)
-            .map(|i| DetailRow {
-                marker: Tok::Slot(S::Text),
-                glyph: "•".into(),
-                text: format!("row {i}"),
-                note: None,
-            })
+            .map(|i| DetailRow::new(Tok::Slot(S::Text), "•", format!("row {i}")))
             .collect();
         let mut ov = list("L", rows, "empty", 40, 10);
         // Up at the top is a no-op.
@@ -1033,6 +1230,95 @@ mod tests {
             ov.handle_key(&KeyCode::DownArrow, Modifiers::NONE);
         }
         assert_eq!(ov.scroll, 2);
+        // A plain (non-actionable) list scrolls but never fires an action.
+        assert!(!ov.actionable());
+    }
+
+    #[test]
+    fn actionable_list_moves_cursor_and_fires_actions() {
+        let rows: Vec<DetailRow> = (0..3)
+            .map(|i| {
+                DetailRow::new(Tok::Slot(S::Text), "•", format!("run {i}"))
+                    .on_enter(DetailAction::RunCommand(vec![
+                        "ci".into(),
+                        "view".into(),
+                        i.to_string(),
+                    ]))
+                    .action('o', DetailAction::OpenUrl(format!("https://ci/{i}")))
+            })
+            .collect();
+        let mut ov = list("CI", rows, "empty", 56, 6);
+        assert!(ov.actionable());
+        // j moves the row cursor, not the scroll.
+        assert_eq!(
+            ov.handle_key(&KeyCode::Char('j'), Modifiers::NONE),
+            DetailOutcome::Pending
+        );
+        assert_eq!(ov.sel, 1);
+        assert_eq!(ov.scroll, 0);
+        // Enter fires the selected row's drilldown action.
+        assert_eq!(
+            ov.handle_key(&KeyCode::Enter, Modifiers::NONE),
+            DetailOutcome::Act(DetailAction::RunCommand(vec![
+                "ci".into(),
+                "view".into(),
+                "1".into()
+            ]))
+        );
+        // A bound char fires that row's action; an unbound char is a no-op.
+        assert_eq!(
+            ov.handle_key(&KeyCode::Char('o'), Modifiers::NONE),
+            DetailOutcome::Act(DetailAction::OpenUrl("https://ci/1".into()))
+        );
+        assert_eq!(
+            ov.handle_key(&KeyCode::Char('z'), Modifiers::NONE),
+            DetailOutcome::Pending
+        );
+        // Esc still closes.
+        assert_eq!(
+            ov.handle_key(&KeyCode::Escape, Modifiers::NONE),
+            DetailOutcome::Close
+        );
+    }
+
+    #[test]
+    fn ci_badge_detail_is_actionable_with_a_hint() {
+        let model = FrameModel {
+            panel: crate::panel::PanelData {
+                ci_runs: vec![superzej_core::ci::CiRun {
+                    id: "42".into(),
+                    name: "CI".into(),
+                    state: superzej_core::ci::CiState::Running,
+                    url: "https://example/42".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut ov = open_detail_for(
+            &BarItemId::Badge(BarBadge::Ci),
+            item_at(39),
+            screen(),
+            &model,
+            &TelemetryHistory::default(),
+        )
+        .expect("ci badge opens a detail overlay");
+        assert!(ov.actionable());
+        assert!(ov.hint.is_some());
+        // Enter drills into `ci view 42`; `c` cancels the running run.
+        match ov.handle_key(&KeyCode::Enter, Modifiers::NONE) {
+            DetailOutcome::Act(DetailAction::RunCommand(a)) => {
+                assert_eq!(a, vec!["ci", "view", "42"]);
+            }
+            other => panic!("expected view command, got {other:?}"),
+        }
+        assert_eq!(
+            ov.handle_key(&KeyCode::Char('c'), Modifiers::NONE),
+            DetailOutcome::Act(DetailAction::CiCancel {
+                run_id: "42".into()
+            })
+        );
     }
 
     #[test]

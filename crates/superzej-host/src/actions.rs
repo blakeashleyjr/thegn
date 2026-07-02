@@ -1,0 +1,275 @@
+//! Loop-side side effects extracted from `run.rs` (god-file ratchet): spawning a
+//! command into a pane/tab, opening a URL in the browser, and the CI action
+//! dispatch (AV group) behind the CI badge overlay (`DetailOutcome::Act`) and
+//! the panel's `Section::Ci` action keys — drill into a run, open it, re-run,
+//! cancel. The event loop hands its mutable state in via [`CiActionCtx`] so the
+//! loop keeps only thin call sites.
+
+use termwiz::input::KeyCode;
+use termwiz::terminal::TerminalWaker;
+use tokio::sync::mpsc::UnboundedSender;
+
+use crate::chrome::FrameModel;
+use crate::compositor::Rect;
+use crate::detail::DetailAction;
+use crate::focus::{FocusState, Zone};
+use crate::hydrate::{RefreshKind, active_tab_path};
+use crate::panes::{Panes, tool_drawer_argv};
+use crate::run::SidebarState;
+use crate::session::Session;
+
+/// Spawn `command` into a brand-new tab in the active group.
+pub(crate) fn open_command_tab(
+    session: &mut Session,
+    panes: &mut Panes,
+    command: &str,
+    cwd: Option<&std::path::Path>,
+    center: Rect,
+) {
+    let argv = tool_drawer_argv(command);
+    let Ok(id) = panes.spawn_argv(&argv, cwd, center) else {
+        return;
+    };
+    if let Some(g) = session.active_group_mut() {
+        g.add_tab();
+        if let Some(tab) = g.active_tab_mut() {
+            tab.center = crate::center::CenterTree::Leaf(id);
+            tab.focused_pane = id;
+            return;
+        }
+    }
+    panes.table.remove(&id);
+}
+
+/// Spawn `command` into a new split beside the focused center pane.
+pub(crate) fn open_command_pane(
+    session: &mut Session,
+    panes: &mut Panes,
+    focused: u32,
+    command: &str,
+    cwd: Option<&std::path::Path>,
+    center: Rect,
+) {
+    let argv = tool_drawer_argv(command);
+    let Ok(id) = panes.spawn_argv(&argv, cwd, center) else {
+        return;
+    };
+    if let Some(tab) = session.active_tab_mut()
+        && tab.center.split(focused, crate::center::Dir::Row, id)
+    {
+        tab.focused_pane = id;
+        return;
+    }
+    panes.table.remove(&id);
+}
+
+/// Open a URL in the system browser, fully detached (no `gh`/toolchain needed).
+pub(crate) fn open_url_detached(url: &str) {
+    let _ = std::process::Command::new("xdg-open")
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Build a `szhost <args>` command line rooted at this process's own binary
+/// (falling back to the `szhost` name on PATH), for spawning a subcommand pane.
+pub(crate) fn szhost_cmd(args: &[&str]) -> String {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        .unwrap_or_else(|| "szhost".to_string());
+    std::iter::once(exe.as_str())
+        .chain(args.iter().copied())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Run a CI mutation (rerun / cancel) off the loop, then pulse a CI refresh so
+/// the badge + panel repaint. The provider is resolved inside the blocking task;
+/// ops it can't perform are declined with a warning (mirrors `cmd::ci`, keeping
+/// the provider the single authority on capabilities). Non-mutation actions are
+/// ignored here — they're handled inline on the loop.
+pub(crate) fn spawn_ci_action(
+    session: &Session,
+    cfg: &superzej_core::config::CiConfig,
+    refresh_tx: &UnboundedSender<RefreshKind>,
+    waker: &TerminalWaker,
+    action: DetailAction,
+) {
+    let wt = active_tab_path(session);
+    let cfg = cfg.clone();
+    let tx = refresh_tx.clone();
+    let waker = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        let loc = superzej_core::remote::GitLoc::for_worktree(&wt);
+        let Some(client) = superzej_svc::ci::provider_for(&loc, &cfg) else {
+            superzej_core::msg::warn("ci: no provider for this worktree");
+            return;
+        };
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        let caps = client.caps();
+        let res = match action {
+            DetailAction::CiRerun { run_id, failed } => {
+                if !caps.rerun {
+                    superzej_core::msg::warn("ci: this provider can't re-run runs");
+                    return;
+                }
+                let scope = if failed {
+                    superzej_core::ci::RerunScope::Failed
+                } else {
+                    superzej_core::ci::RerunScope::All
+                };
+                rt.block_on(client.rerun(&loc, &run_id, scope))
+            }
+            DetailAction::CiCancel { run_id } => {
+                if !caps.cancel {
+                    superzej_core::msg::warn("ci: this provider can't cancel runs");
+                    return;
+                }
+                rt.block_on(client.cancel(&loc, &run_id))
+            }
+            // OpenUrl / RunCommand never reach here (handled on the loop).
+            _ => return,
+        };
+        if let Err(e) = res {
+            superzej_core::msg::warn(&format!("ci action failed: {e}"));
+        }
+        if tx.send(RefreshKind::Ci).is_ok() {
+            let _ = waker.wake();
+        }
+    });
+}
+
+/// A transient status line for a CI mutation about to be spawned.
+fn status_for(action: &DetailAction) -> &'static str {
+    match action {
+        DetailAction::CiRerun { failed: true, .. } => "Re-running failed CI jobs…",
+        DetailAction::CiRerun { .. } => "Re-running CI…",
+        DetailAction::CiCancel { .. } => "Cancelling CI run…",
+        _ => "",
+    }
+}
+
+/// The mutable slice of event-loop state a CI action touches. Built inline at
+/// each call site (Act dispatch, panel Select, panel action keys) so the loop
+/// itself carries no CI logic.
+pub(crate) struct CiActionCtx<'a> {
+    pub session: &'a mut Session,
+    pub panes: &'a mut Panes,
+    pub model: &'a mut FrameModel,
+    pub focus: &'a mut FocusState,
+    pub sb: &'a mut SidebarState,
+    pub need_relayout: &'a mut bool,
+    pub center: Rect,
+    pub cfg: &'a superzej_core::config::Config,
+    pub refresh_tx: &'a UnboundedSender<RefreshKind>,
+    pub waker: &'a TerminalWaker,
+}
+
+impl CiActionCtx<'_> {
+    /// The run id at the panel's row cursor (if any).
+    fn run_id_at(&self, cursor: usize) -> Option<String> {
+        self.model.panel.ci_runs.get(cursor).map(|r| r.id.clone())
+    }
+
+    /// Spawn `szhost <args>` in a split beside the focused pane, then focus it.
+    fn open_szhost_pane(&mut self, args: &[&str]) {
+        let cmd = szhost_cmd(args);
+        let focused = self
+            .session
+            .active_tab()
+            .map(|t| t.focused_pane)
+            .unwrap_or(0);
+        let cwd = crate::run::active_cwd(self.session);
+        open_command_pane(
+            self.session,
+            self.panes,
+            focused,
+            &cmd,
+            cwd.as_deref(),
+            self.center,
+        );
+        self.focus.zone = Zone::Center;
+        crate::run::refresh_tab_model(self.model, self.session, self.sb);
+        *self.need_relayout = true;
+    }
+
+    /// Fire a CI mutation off the loop after posting an in-progress status.
+    fn spawn_mutation(&mut self, action: DetailAction) {
+        self.model.status = status_for(&action).into();
+        spawn_ci_action(
+            self.session,
+            &self.cfg.ci,
+            self.refresh_tx,
+            self.waker,
+            action,
+        );
+    }
+
+    /// Execute a CI badge-overlay row action (the overlay is already closed).
+    pub(crate) fn run_detail_action(&mut self, action: DetailAction) {
+        match action {
+            DetailAction::OpenUrl(u) => {
+                open_url_detached(&u);
+                self.model.status = "Opened CI run in the browser".into();
+            }
+            DetailAction::RunCommand(args) => {
+                let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                self.open_szhost_pane(&refs);
+            }
+            DetailAction::CiRerun { .. } | DetailAction::CiCancel { .. } => {
+                self.spawn_mutation(action)
+            }
+        }
+    }
+
+    /// Enter on a panel `Section::Ci` row: drill into the selected run.
+    pub(crate) fn open_view_at(&mut self, cursor: usize) {
+        if let Some(id) = self.run_id_at(cursor) {
+            self.open_szhost_pane(&["ci", "view", &id]);
+        }
+    }
+
+    /// A `Section::Ci` action key; returns whether it was claimed. `v` drills in,
+    /// `o` opens the run page, `r`/`R` re-run (all/failed), `c` cancels.
+    pub(crate) fn panel_key(&mut self, key: KeyCode, cursor: usize) -> bool {
+        match key {
+            KeyCode::Char('v') => {
+                self.open_view_at(cursor);
+                true
+            }
+            KeyCode::Char('o') => {
+                if let Some(url) = self.model.panel.ci_runs.get(cursor).map(|r| r.url.clone())
+                    && !url.is_empty()
+                {
+                    open_url_detached(&url);
+                    self.model.status = "Opened CI run in the browser".into();
+                }
+                true
+            }
+            KeyCode::Char(c @ ('r' | 'R')) => {
+                if let Some(run_id) = self.run_id_at(cursor) {
+                    self.spawn_mutation(DetailAction::CiRerun {
+                        run_id,
+                        failed: c == 'R',
+                    });
+                }
+                true
+            }
+            KeyCode::Char('c') => {
+                if let Some(run_id) = self.run_id_at(cursor) {
+                    self.spawn_mutation(DetailAction::CiCancel { run_id });
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+}

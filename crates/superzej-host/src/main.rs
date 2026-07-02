@@ -4,6 +4,7 @@
 //! portable-pty pane through a `PaneEmulator` grid, composited into a termwiz
 //! `Surface` that diff-flushes to the outer terminal (the "no-flash" mechanism).
 
+mod actions;
 mod agent;
 mod agent_configs;
 mod apps;

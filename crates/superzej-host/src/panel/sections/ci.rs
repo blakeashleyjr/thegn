@@ -9,7 +9,7 @@ use superzej_core::theme::Hue;
 
 use crate::seg::{Line, Seg, seg};
 
-use super::{PanelRow, SectionCtx, d, f, fmt_secs, g, g2, hue};
+use super::{PanelHit, PanelRow, Section, SectionCtx, d, f, fmt_secs, g, g2, hint_row, hue};
 
 /// A state's hued glyph (shared by run rows and job rows).
 pub(super) fn state_glyph(s: CiState) -> Seg {
@@ -62,7 +62,9 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
     rows.push(PanelRow::plain(Line::segs(sum_segs)));
 
-    for r in data.ci_runs.iter().take(limit) {
+    // Each run row carries a `Row` hit (the summary/job rows don't), so the
+    // enumerate index lines up with `ui.cursor` and with `ci_runs`.
+    for (i, r) in data.ci_runs.iter().take(limit).enumerate() {
         let dur = r
             .duration_secs(now)
             .map(fmt_secs)
@@ -71,7 +73,10 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
         if !r.branch.is_empty() {
             left.push(seg(g(), format!("  {}", r.branch)));
         }
-        rows.push(PanelRow::plain(Line::split(left, vec![seg(g(), dur)])));
+        rows.push(
+            PanelRow::plain(Line::split(left, vec![seg(g(), dur)]))
+                .with_hit(PanelHit::Row(Section::Ci, i)),
+        );
     }
     // Deep (Half): expand the most-recent run's jobs.
     if ctx.deep()
@@ -85,7 +90,19 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
             ])));
         }
     }
+    rows.push(ci_hint_row());
     rows
+}
+
+/// The per-section key hints (the same keys the event loop dispatches, so they
+/// can't drift): drill in, open in browser, re-run, cancel.
+fn ci_hint_row() -> PanelRow {
+    hint_row(&[
+        ("↵", "view"),
+        ("o", "browser"),
+        ("r/R", "rerun"),
+        ("c", "cancel"),
+    ])
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -131,7 +148,7 @@ fn full(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
     rows.push(PanelRow::plain(Line::segs(sum_segs)));
 
-    for r in data.ci_runs.iter().take(ctx.rows.max(1)) {
+    for (i, r) in data.ci_runs.iter().take(ctx.rows.max(1)).enumerate() {
         let dur = r
             .duration_secs(now)
             .map(fmt_secs)
@@ -146,7 +163,10 @@ fn full(ctx: &SectionCtx) -> Vec<PanelRow> {
         if !r.title.is_empty() {
             left.push(seg(g2(), format!("  {}", truncate(&r.title, 40))));
         }
-        rows.push(PanelRow::plain(Line::split(left, vec![seg(g(), dur)])));
+        rows.push(
+            PanelRow::plain(Line::split(left, vec![seg(g(), dur)]))
+                .with_hit(PanelHit::Row(Section::Ci, i)),
+        );
     }
 
     // Detailed view of the latest run's jobs and steps
@@ -180,5 +200,6 @@ fn full(ctx: &SectionCtx) -> Vec<PanelRow> {
             }
         }
     }
+    rows.push(ci_hint_row());
     rows
 }
