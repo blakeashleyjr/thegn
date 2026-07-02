@@ -334,6 +334,21 @@ impl Placement {
         matches!(self, Placement::Local)
     }
 
+    /// The transport/provider *family* only — no host/id — for terse chrome
+    /// (e.g. the center tab bar): `local`, `ssh`, `mosh`, `k8s`, or the provider
+    /// id (`sprite`, `daytona`, …). See [`Placement::label`] for the full detail.
+    pub fn kind(&self) -> String {
+        match self {
+            Placement::Local => "local".into(),
+            Placement::Ssh(s) => match s.kind {
+                TransportKind::Mosh => "mosh".into(),
+                TransportKind::Ssh => "ssh".into(),
+            },
+            Placement::K8s(_) => "k8s".into(),
+            Placement::Provider(p) => p.provider.clone(),
+        }
+    }
+
     /// A short, human-readable label for status surfaces (sidebar/panel).
     pub fn label(&self) -> String {
         match self {
@@ -671,6 +686,55 @@ mod tests {
         // No up/down command ⇒ ensure/teardown are no-ops.
         assert!(prov.ensure().is_ok());
         assert!(prov.teardown().is_ok());
+    }
+
+    #[test]
+    fn kind_is_the_transport_family_only() {
+        assert_eq!(Placement::Local.kind(), "local");
+        assert_eq!(
+            Placement::Ssh(SshPlacement::plain(
+                "dev@box".into(),
+                22,
+                false,
+                TransportKind::Ssh
+            ))
+            .kind(),
+            "ssh"
+        );
+        assert_eq!(
+            Placement::Ssh(SshPlacement::plain(
+                "dev@box".into(),
+                22,
+                false,
+                TransportKind::Mosh
+            ))
+            .kind(),
+            "mosh"
+        );
+        assert_eq!(
+            Placement::K8s(K8sPlacement {
+                kubectl: "kubectl".into(),
+                context: None,
+                namespace: Some("ns".into()),
+                pod: "p".into(),
+                container: None,
+                pod_template: None,
+                image: None,
+            })
+            .kind(),
+            "k8s"
+        );
+        // Provider kind is the provider id (no sandbox id), unlike `label`.
+        let prov = Placement::Provider(ProviderPlacement {
+            provider: "sprite".into(),
+            id: "abc123".into(),
+            interactive_prefix: vec!["a".into()],
+            control_prefix: vec!["b".into()],
+            up_command: Vec::new(),
+            down_command: Vec::new(),
+        });
+        assert_eq!(prov.kind(), "sprite");
+        assert_eq!(prov.label(), "sprite:abc123");
     }
 
     #[test]

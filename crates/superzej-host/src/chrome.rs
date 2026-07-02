@@ -436,6 +436,10 @@ pub struct FrameModel {
     /// "podman-rootless", "host"). Used to show non-OCI sandboxes (bwrap,
     /// systemd) as green even though they have no container entry.
     pub active_sandbox_backend: String,
+    /// Terse placement kind for the active worktree (`ssh`, `mosh`, `k8s`, or the
+    /// provider id like `sprite`); `None` when it runs locally. Shown as a chip in
+    /// the center tab bar. The full detail (`ssh:host`, …) lives on each sidebar row.
+    pub active_placement_kind: Option<String>,
     /// Running containers (superzej-owned first) for the SANDBOXES section.
     pub containers: Vec<superzej_core::sandbox::ContainerInfo>,
     /// Health of the active worktree's container (updated on the container refresh tick).
@@ -564,6 +568,7 @@ impl FrameModel {
             && self.loc == other.loc
             && self.active_container_name == other.active_container_name
             && self.active_sandbox_backend == other.active_sandbox_backend
+            && self.active_placement_kind == other.active_placement_kind
             && self.container_events == other.container_events
             && self.timeline == other.timeline
             && self.status == other.status
@@ -853,6 +858,17 @@ fn draw_center_tabs(surface: &mut Surface, strip: Rect, model: &FrameModel) {
             chips_end.saturating_sub(x),
         );
         x += leaf.chars().count();
+        // Remote placement kind (ssh/mosh/k8s/<provider>) next to the active
+        // worktree name; nothing for a local worktree. The full detail
+        // (ssh:host, sprite:<id>, …) lives in the sidebar detail line.
+        if let Some(kind) = &model.active_placement_kind {
+            let chip = format!(" [{kind}]");
+            let avail = chips_end.saturating_sub(x);
+            if avail >= chip.chars().count() {
+                draw_text(surface, x, strip.y, &chip, col(S::Dim), bg, avail);
+                x += chip.chars().count();
+            }
+        }
         // Issue badge: show the first linked issue's status + number next to
         // the active worktree name when at least one issue is linked.
         if let Some(issue_id) = model.panel.tracker_links.first()
@@ -2574,6 +2590,12 @@ fn compose_detail_line(row: &crate::sidebar::SidebarRow) -> Option<crate::seg::L
     {
         segs.push(seg(Tok::Slot(S::Faint), format!("({backend}) ")));
     }
+    // Remote placement (ssh/mosh/k8s/provider) with full detail; only set for
+    // non-local worktrees, so a local one shows nothing here. Bracketed so it
+    // reads distinctly from the env «name» and the sandbox (backend) chips.
+    if let Some(placement) = &row.placement_label {
+        segs.push(seg(Tok::Slot(S::Faint), format!("[{placement}] ")));
+    }
     if let Some(pr) = row.pr_count.filter(|&c| c > 0) {
         segs.push(seg(Tok::Hue(theme::Hue::Green), format!("\u{2b21}{pr} "))); // ⬡N
     }
@@ -3268,6 +3290,7 @@ mod tests {
             agent: None,
             sandbox_backend: None,
             env_name: None,
+            placement_label: None,
             activity: crate::sidebar::ActivityState::None,
             visible: true,
             collapsed: false,
@@ -3280,6 +3303,41 @@ mod tests {
             target_bytes: None,
             terminal_connection: None,
         }
+    }
+
+    /// Flatten a `Line` to its concatenated segment text (test helper).
+    fn line_text(line: &crate::seg::Line) -> String {
+        use crate::seg::Line;
+        match line {
+            Line::Segs(s) => s.iter().map(|g| g.text.clone()).collect(),
+            Line::Split { l, r } => l.iter().chain(r.iter()).map(|g| g.text.clone()).collect(),
+            _ => String::new(),
+        }
+    }
+
+    #[test]
+    fn detail_line_shows_remote_placement_only_when_set() {
+        // A local worktree (no placement) shows no bracketed remote label.
+        let local = row(crate::sidebar::RowKind::Worktree, "feat");
+        let local_text = compose_detail_line(&local)
+            .map(|l| line_text(&l))
+            .unwrap_or_default();
+        assert!(
+            !local_text.contains('['),
+            "local row must not show a placement badge: {local_text:?}"
+        );
+
+        // A remote worktree shows the full placement label in brackets, distinct
+        // from the env «name» and the sandbox (backend) chips.
+        let mut remote = row(crate::sidebar::RowKind::Worktree, "feat");
+        remote.placement_label = Some("ssh:dev@box".into());
+        let text = compose_detail_line(&remote)
+            .map(|l| line_text(&l))
+            .unwrap_or_default();
+        assert!(
+            text.contains("[ssh:dev@box]"),
+            "expected bracketed placement, got {text:?}"
+        );
     }
 
     #[test]
