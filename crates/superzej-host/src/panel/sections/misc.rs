@@ -588,6 +588,14 @@ fn timeline_section(events: &[superzej_core::models::TimelineEvent]) -> Vec<Pane
 pub(super) fn sandbox(ctx: &SectionCtx) -> Vec<PanelRow> {
     let (model, deep, full) = (ctx.model, ctx.deep(), ctx.full());
     let mut rows: Vec<PanelRow> = Vec::new();
+    // Full remote-placement detail (ssh:host, k8s:ns/pod, sprite:<id>); the
+    // tab bar carries only the terse kind chip. Local worktrees show nothing.
+    if let Some(placement) = &model.active_placement_label {
+        rows.push(PanelRow::plain(Line::segs(vec![
+            seg(g(), "host "),
+            seg(f(), placement.clone()),
+        ])));
+    }
     let active = model
         .containers
         .iter()

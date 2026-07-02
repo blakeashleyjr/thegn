@@ -22187,7 +22187,6 @@ mod tests {
             folder_id: None,
             sandbox_backend: None,
             env_name: None,
-            placement_label: None,
         }];
 
         // The synchronous prune the RemoveWorkspace handler performs (same code).

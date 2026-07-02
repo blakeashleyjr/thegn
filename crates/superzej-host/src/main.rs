@@ -71,6 +71,7 @@ mod session;
 mod share;
 mod sidebar;
 mod subsystem;
+mod tabbar_env;
 mod task;
 mod telemetry;
 #[cfg(test)]
