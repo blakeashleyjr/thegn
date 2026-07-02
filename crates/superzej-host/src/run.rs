@@ -31,6 +31,10 @@ use crate::hydrate::{
 };
 use crate::input::key_bytes;
 use crate::layout;
+use crate::loading::{
+    SpecOrigin, active_watchdog_deadline, apply_spec_batch, is_shell_wait, provision_load_steps,
+    provision_owns_tab, watchdog_deadline,
+};
 use crate::menu::{self, MenuChoice, MenuOverlay};
 use crate::palette::build_palette;
 use crate::pane::PaneEvent;
@@ -7881,68 +7885,6 @@ fn sandbox_halt_in(e: &anyhow::Error) -> Option<&crate::agent::SandboxHalt> {
         .find_map(|src| src.downcast_ref::<crate::agent::SandboxHalt>())
 }
 
-/// Map provisioning step views (from the off-loop env provisioner) into the
-/// splash's [`LoadStep`]s for a live "setting up your environment" loading screen.
-/// The startup-shell watchdog deadline: how long a just-attached login shell may
-/// emit no PTY output before it's treated as hung and swapped for a clean rc-free
-/// shell. A LOCAL shell should prompt in ~1-2s, so 8s is snappy-but-safe. A
-/// REMOTE/provider pane (`remote_env == true`) legitimately stays silent for far
-/// longer — opening a provider exec, resuming a cold sandbox, and (the big one) a
-/// first `direnv`/`nix develop` that builds the repo's devShell can sit silent for
-/// minutes — so it gets a generous 300s window; a genuinely hung remote shell still
-/// falls back, just later. Pure so the remote-vs-local choice is unit-tested (it
-/// regressed once when driven off a per-path DB blob that read empty for sprites).
-fn watchdog_deadline(remote_env: bool) -> std::time::Duration {
-    std::time::Duration::from_secs(if remote_env { 300 } else { 8 })
-}
-
-/// The startup-shell watchdog deadline for a tab, driven by the per-tab
-/// remoteness captured at `loading_state` seed time (NOT the derived step Vec,
-/// which is byte-identical across a local and a remote shell-wait tab and
-/// previously leaked the wrong deadline across a tab switch). A MISSING entry
-/// defaults to the SAFE long window: unknown remoteness must never
-/// premature-drop a slowly-resuming sprite; a genuinely hung *local* shell is
-/// only delayed, not spared.
-fn active_watchdog_deadline(
-    remote: &std::collections::HashMap<(String, usize), bool>,
-    key: &(String, usize),
-) -> std::time::Duration {
-    watchdog_deadline(remote.get(key).copied().unwrap_or(true))
-}
-
-/// Whether a loading-step list is in the terminal "waiting on the shell" shape —
-/// sandbox + container done, the final `shell` step pending/active — as opposed to
-/// a still-live provisioning sequence (`workspace`/`clone`/`nix`/`direnv`/
-/// `devshell_push`/`setup`/`agents`/`atuin`/…). Both the materialize
-/// (`[sandbox, container, shell]`) and eager-provision streams flow through
-/// `load_steps`; the difference is the LAST step's label. Used to gate actions
-/// that must only fire once provisioning is DONE and we're merely waiting on the
-/// shell to speak: the startup-shell watchdog (catch a hung *login shell*, not a
-/// slow provision) and the first-output splash-clear (never drop the splash
-/// mid-provision → a premature/bare shell).
-fn is_shell_wait(steps: &[LoadStep]) -> bool {
-    steps.last().is_some_and(|s| s.label == "shell")
-}
-
-fn provision_load_steps(views: &[crate::agent::ProvisionStepView]) -> Vec<LoadStep> {
-    use crate::agent::ProvisionState;
-    views
-        .iter()
-        .map(|v| {
-            let step = match v.state {
-                ProvisionState::Pending => LoadStep::pending(v.label.clone()),
-                ProvisionState::Active => LoadStep::active(v.label.clone()),
-                ProvisionState::Done => LoadStep::done(v.label.clone()),
-                ProvisionState::Failed => LoadStep::failed(v.label.clone()),
-            };
-            match &v.detail {
-                Some(d) => step.with_detail(d.clone()),
-                None => step,
-            }
-        })
-        .collect()
-}
-
 /// Adjust the warm-spare-pool target for the ACTIVE workspace's `(repo, env)` by
 /// `delta`, persisting the override in the DB (the `+`/`-` hotkeys). Returns a
 /// status message (the new target, or why it didn't apply). The caller resets the
@@ -7993,6 +7935,10 @@ fn pool_target_adjust(
 enum SpecError {
     Halt(crate::agent::SandboxHalt),
     Other(String),
+    /// Benign pre-warm skip (provider env not provisioned yet). Clears
+    /// `prewarm_inflight` on arrival; paints NO failed splash and sets NO
+    /// failed mark — the tab is simply left for materialize to bring up.
+    PrewarmSkipped,
 }
 
 /// Lower an `anyhow::Error` from `launch_spec` into a channel-safe [`SpecError`],
@@ -8509,9 +8455,10 @@ async fn event_loop<T: Terminal>(
     // active tab and a same-path neighbor both fire for one key. The batch also
     // carries the path so the spawn (cwd) still lands in the worktree dir.
     type SpecBatch = (
-        String, // group name (routing key)
-        String, // worktree path (spawn cwd)
-        usize,  // tab index
+        String,     // group name (routing key)
+        String,     // worktree path (spawn cwd)
+        usize,      // tab index
+        SpecOrigin, // which inflight set to clear; prewarm batches may be dropped
         std::result::Result<Vec<(u32, crate::agent::LaunchSpec)>, SpecError>,
     );
     let (spec_tx, mut spec_rx) = tokio_mpsc::unbounded_channel::<SpecBatch>();
@@ -9546,8 +9493,18 @@ async fn event_loop<T: Terminal>(
             // Pre-warm sibling tabs so first focus of a neighbor is instant.
             for (name, wt, ti, missing, is_terminal) in prewarm_requests(&panes, &mut session) {
                 let key = (name.clone(), ti);
-                if prewarm_inflight.contains(&key) || prewarm_failed.contains(&key) {
-                    continue; // in-flight or previously failed — skip
+                if prewarm_inflight.contains(&key)
+                    || prewarm_failed.contains(&key)
+                    // A materialize/provision OWNS this tab's bring-up (in-flight
+                    // materialize, or live eager/materialize provisioning steps on
+                    // the splash): pre-warming it would race the provision and
+                    // attach a premature bare shell. The owner opens the panes.
+                    || provision_owns_tab(
+                        materialize_inflight.contains(&key),
+                        loading_state.get(&key).map(Vec::as_slice),
+                    )
+                {
+                    continue;
                 }
                 prewarm_inflight.insert(key);
                 let cfg = keymap.config().clone();
@@ -9562,12 +9519,19 @@ async fn event_loop<T: Terminal>(
                         // Non-local env, failover off, known-down (token unset /
                         // exec cooldown): halt rather than degrade to host.
                         Err(SpecError::Halt(halt))
+                    } else if crate::agent::provision_pending(&cfg, &wt) {
+                        // Provider env not provisioned yet (sandbox missing, or
+                        // bare — no provision marker): `launch_spec` would
+                        // ensure_exists a BARE sprite and attach a premature raw
+                        // shell. Benign skip; the focused materialize provisions
+                        // (with the loading splash) and opens it.
+                        Err(SpecError::PrewarmSkipped)
                     } else {
                         crate::agent::launch_spec(&cfg, &wt, None, "shell")
                             .map(|spec| missing.into_iter().map(|id| (id, spec.clone())).collect())
                             .map_err(spec_err)
                     };
-                    if tx.send((name, wt, ti, specs)).is_ok() {
+                    if tx.send((name, wt, ti, SpecOrigin::Prewarm, specs)).is_ok() {
                         let _ = wk.wake();
                     }
                 });
@@ -9575,7 +9539,7 @@ async fn event_loop<T: Terminal>(
             // Eager provisioning ([lifecycle] eager): front-run the one-time
             // provisioning (nix + devShell, minutes) for provider worktrees AHEAD
             // of focus, in the background, so opening them is instant. Budget-safe:
-            // `needs_eager_provision` only fires when the sandbox does NOT exist yet
+            // `provision_pending` only fires when the sandbox does NOT exist yet
             // (a list() GET — never wakes an idle/provisioned one). Scope: active
             // worktree only, or the whole session (workspace/all). Once per session.
             {
@@ -9607,7 +9571,7 @@ async fn event_loop<T: Terminal>(
                         let wk = waker.clone();
                         let ptx = provision_tx.clone();
                         task::spawn_blocking(move || {
-                            if crate::agent::needs_eager_provision(&cfg, &wt) {
+                            if crate::agent::provision_pending(&cfg, &wt) {
                                 // Lock the loading screen up the moment we commit to
                                 // provisioning (before the first step), so switching
                                 // here can never catch a half-ready shell — the splash
@@ -9933,7 +9897,10 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                         };
-                        if tx.send((gname, wt, ti, specs)).is_ok() {
+                        if tx
+                            .send((gname, wt, ti, SpecOrigin::Materialize, specs))
+                            .is_ok()
+                        {
                             let _ = wk.wake();
                         }
                     });
@@ -11118,11 +11085,29 @@ async fn event_loop<T: Terminal>(
         // unique name (a path can be shared by two groups); results for a group
         // /tab that vanished mid-flight are dropped, and `materialize_with_specs`
         // itself skips leaves that came alive some other way in the meantime.
-        while let Ok((name, wt, ti, specs)) = spec_rx.try_recv() {
+        while let Ok((name, wt, ti, origin, specs)) = spec_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Spec);
             let tab_key = (name.clone(), ti);
-            materialize_inflight.remove(&tab_key);
-            prewarm_inflight.remove(&tab_key);
+            match origin {
+                SpecOrigin::Materialize => {
+                    materialize_inflight.remove(&tab_key);
+                }
+                SpecOrigin::Prewarm => {
+                    prewarm_inflight.remove(&tab_key);
+                }
+            }
+            // A stale PREWARM batch that lands while a materialize/provision owns
+            // this tab (its provision is still running) must be dropped whole:
+            // applying it would flip the splash to the shell-wait shape and attach
+            // a pane to a half-provisioned sandbox — the premature-shell bug. Not
+            // gated on tab activity: the user may have already switched back.
+            if !apply_spec_batch(
+                origin,
+                materialize_inflight.contains(&tab_key),
+                loading_state.get(&tab_key).map(Vec::as_slice),
+            ) {
+                continue;
+            }
             // Remoteness of this worktree, resolved once from its path — seeds
             // `loading_remote` alongside every `loading_state` write below so the
             // startup-shell watchdog reads the correct 8s/300s deadline for THIS
@@ -11170,6 +11155,10 @@ async fn event_loop<T: Terminal>(
                     // warning modal instead of just a status line. Otherwise a
                     // plain blocked-launch status.
                     match e {
+                        // Benign prewarm skip (provider env not provisioned yet):
+                        // no failed splash, no failed mark — the tab is left for
+                        // the focused materialize to provision + open.
+                        SpecError::PrewarmSkipped => continue,
                         SpecError::Halt(halt) => {
                             model.status =
                                 format!("{} unavailable: {}", halt.placement, halt.reason);
@@ -11183,11 +11172,16 @@ async fn event_loop<T: Terminal>(
                     }
                     loading_remote.insert(tab_key.clone(), tab_remote);
                     loading_state.insert(tab_key.clone(), vec![LoadStep::failed("sandbox")]);
-                    if is_active {
-                        center_dormant = true;
-                        materialize_failed.insert(tab_key);
-                    } else {
-                        prewarm_failed.insert(tab_key);
+                    match origin {
+                        SpecOrigin::Materialize => {
+                            if is_active {
+                                center_dormant = true;
+                            }
+                            materialize_failed.insert(tab_key);
+                        }
+                        SpecOrigin::Prewarm => {
+                            prewarm_failed.insert(tab_key);
+                        }
                     }
                     dirty = true;
                     continue;
@@ -20745,67 +20739,6 @@ mod tests {
     use crate::center::CenterTree;
     use crate::hydrate::build_model;
     use crate::session::{GroupKind, Session, WorktreeGroup};
-
-    #[test]
-    fn watchdog_deadline_gives_provider_panes_the_long_window() {
-        // Local shell: snappy 8s. A remote/provider (sprite) pane: 300s, so a cold
-        // resume + devShell build isn't mistaken for a hung shell (the restart→bash
-        // regression). The bool is the config-resolved placement signal.
-        assert_eq!(watchdog_deadline(false), std::time::Duration::from_secs(8));
-        assert_eq!(watchdog_deadline(true), std::time::Duration::from_secs(300));
-        assert!(watchdog_deadline(true) > watchdog_deadline(false));
-    }
-
-    #[test]
-    fn active_watchdog_deadline_is_per_tab_not_step_shape() {
-        // The premature-shell regression: two shell-wait tabs whose LoadStep Vecs
-        // are byte-identical (`[sandbox, container, shell]`) must STILL get the
-        // right deadline from the per-tab remoteness bool — the deadline must not
-        // ride the (identical) step shape / a stale `load_context`.
-        let mut remote: std::collections::HashMap<(String, usize), bool> =
-            std::collections::HashMap::new();
-        let local = ("wt-local".to_string(), 0usize);
-        let sprite = ("wt-sprite".to_string(), 0usize);
-        remote.insert(local.clone(), false);
-        remote.insert(sprite.clone(), true);
-        assert_eq!(
-            active_watchdog_deadline(&remote, &local),
-            std::time::Duration::from_secs(8),
-            "a local tab keeps the snappy 8s"
-        );
-        assert_eq!(
-            active_watchdog_deadline(&remote, &sprite),
-            std::time::Duration::from_secs(300),
-            "a sprite tab keeps the long 300s even next to a local tab with matching steps"
-        );
-        // Missing entry ⇒ SAFE long window: never premature-drop an unknown pane.
-        let unknown = ("wt-unknown".to_string(), 0usize);
-        assert_eq!(
-            active_watchdog_deadline(&remote, &unknown),
-            std::time::Duration::from_secs(300),
-            "a missing entry defaults to the safe 300s window"
-        );
-    }
-
-    #[test]
-    fn is_shell_wait_only_in_the_shell_attach_shape() {
-        use crate::chrome::LoadStep;
-        // Nothing / live provisioning steps ⇒ NOT shell-wait: the splash must stay
-        // up and the first-output clear must be held (premature-shell guard).
-        assert!(!is_shell_wait(&[]));
-        assert!(!is_shell_wait(&[LoadStep::active("provisioning")]));
-        assert!(!is_shell_wait(&[
-            LoadStep::done("nix"),
-            LoadStep::active("direnv"),
-        ]));
-        // Terminal materialize shape (sandbox+container done, waiting on the shell)
-        // ⇒ shell-wait: ok to clear on first output / arm the watchdog.
-        assert!(is_shell_wait(&[
-            LoadStep::done("sandbox"),
-            LoadStep::active("container"),
-            LoadStep::pending("shell"),
-        ]));
-    }
 
     #[test]
     fn read_scoped_file_reads_inside_and_rejects_escape() {
