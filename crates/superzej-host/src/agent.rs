@@ -222,18 +222,7 @@ pub enum SandboxScope {
     Agent,
 }
 
-pub fn prepare_sandbox(
-    cfg: &Config,
-    repo_root: &Path,
-    worktree: &str,
-    loc: &GitLoc,
-    backend_choice: Option<&str>,
-    scope: SandboxScope,
-) -> anyhow::Result<SandboxOutcome> {
-    prepare_sandbox_env(cfg, repo_root, worktree, loc, backend_choice, scope, None)
-}
-
-/// Like [`prepare_sandbox`] but with an explicitly-selected execution
+/// Prepare the sandbox for a worktree with an explicitly-selected execution
 /// environment name (the DB worktree/workspace `env_name`, or a `--env` flag).
 /// `None` lets [`Config::resolve_env`] fall through to repo/global selection.
 /// No DB access — the caller resolves the name (which needs the DB).
@@ -4726,25 +4715,27 @@ mod tests {
         let mut cfg = Config::default();
         cfg.sandbox.backend = superzej_core::config::SandboxBackend::None;
         let loc = GitLoc::from_db("/wt/x", None);
-        let out = prepare_sandbox(
+        let out = prepare_sandbox_env(
             &cfg,
             Path::new("/repo"),
             "/wt/x",
             &loc,
             None,
             SandboxScope::Shell,
+            None,
         )
         .unwrap();
         assert!(out.spec.is_none());
         assert_eq!(out.backend_label, "host");
         // An explicit "none" choice behaves the same as the configured backend.
-        let out = prepare_sandbox(
+        let out = prepare_sandbox_env(
             &cfg,
             Path::new("/repo"),
             "/wt/x",
             &loc,
             Some("none"),
             SandboxScope::Shell,
+            None,
         )
         .unwrap();
         assert!(out.spec.is_none());

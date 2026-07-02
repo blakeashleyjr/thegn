@@ -4026,7 +4026,7 @@ fn begin_worktree_wizard(
 
 /// Non-interactive worktree creation for a `[[actions]] action = "new-worktree"`
 /// keybind: spawn the same worker as the wizard, then immediately synthesize the
-/// `SandboxChosen` + `Submit` decisions so there is no overlay to drive. The
+/// `Submit` decision so there is no overlay to drive. The
 /// creation-progress overlay is revealed straight away for feedback; the
 /// `CreateEvent::Done` handler builds the tab + pane exactly as for the wizard.
 #[allow(clippy::too_many_arguments)]
@@ -4051,6 +4051,7 @@ fn begin_worktree_preset(
     }
     *create_gen += 1;
     let candidate = superzej_core::worktree::candidate_name(cfg);
+    let env = wizard::default_env_name(cfg, &root);
     let sandbox = sandbox.unwrap_or_else(|| cfg.sandbox.default_backend.as_str().to_string());
     let agent = agent.unwrap_or_else(|| "shell".to_string());
     let name_choice = match name {
@@ -4073,11 +4074,10 @@ fn begin_worktree_preset(
             let _ = wk.wake();
         });
     });
-    // Drive the worker headlessly — the mpsc channel buffers these until the
-    // worker reaches its command loop (after the speculative create).
-    let _ = cmd_tx.send(wizard::WizardCmd::SandboxChosen(sandbox.clone()));
+    // Drive the worker headlessly: Submit alone preps (no user to overlap).
     let _ = cmd_tx.send(wizard::WizardCmd::Submit(wizard::WizardChoices {
         name: name_choice,
+        env,
         sandbox,
         agent,
     }));
@@ -14023,9 +14023,9 @@ async fn event_loop<T: Terminal>(
                             create_gen += 1;
                             model.status = "worktree creation cancelled".into();
                         }
-                        wizard::WizardOutcome::SandboxChosen(backend) => {
+                        wizard::WizardOutcome::PrepChosen { env, sandbox } => {
                             if let Some(tx) = wizard_cmd_tx.as_ref() {
-                                let _ = tx.send(wizard::WizardCmd::SandboxChosen(backend));
+                                let _ = tx.send(wizard::WizardCmd::PrepChosen { env, sandbox });
                             }
                         }
                         wizard::WizardOutcome::Submit(choices) => {

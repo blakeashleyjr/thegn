@@ -540,6 +540,61 @@ pub(crate) fn build_sandbox_palette(
         })
         .collect()
 }
+
+/// Build the host picker shown for a new worktree: one row per execution
+/// environment (`[env.<name>]`) plus an implicit `default` (host / base
+/// `[sandbox]`) when none is defined. The key is the bare env name — it is
+/// passed straight to [`superzej_core::config::Config::resolve_env`]. The label
+/// carries the placement kind so the user can tell local from ssh/k8s/provider.
+/// The config-default env (`[sandbox] default_env`, else `default`) sorts first.
+pub(crate) fn build_env_palette(
+    cfg: &superzej_core::config::Config,
+) -> Vec<crate::palette::PaletteItem> {
+    use superzej_core::config::PlacementMode as P;
+    let def = {
+        let d = cfg.sandbox.default_env.trim();
+        if d.is_empty() { "default" } else { d }.to_string()
+    };
+    let mut items = Vec::new();
+    if !cfg.env.contains_key("default") {
+        items.push(crate::palette::PaletteItem::new(
+            "default",
+            "host default [local]",
+        ));
+    }
+    for (name, e) in &cfg.env {
+        let kind = match e.placement {
+            P::Local => "local".to_string(),
+            P::Ssh => {
+                if e.ssh.host.is_empty() {
+                    "ssh".to_string()
+                } else {
+                    format!("ssh:{}", e.ssh.host)
+                }
+            }
+            P::K8s => {
+                if e.k8s.namespace.is_empty() {
+                    format!("k8s:{}", e.k8s.pod)
+                } else {
+                    format!("k8s:{}/{}", e.k8s.namespace, e.k8s.pod)
+                }
+            }
+            P::Provider => {
+                if e.provider.id.is_empty() {
+                    e.provider.provider.clone()
+                } else {
+                    format!("{}:{}", e.provider.provider, e.provider.id)
+                }
+            }
+        };
+        items.push(crate::palette::PaletteItem::new(
+            name.clone(),
+            format!("host {name} [{kind}]"),
+        ));
+    }
+    items.sort_by_key(|i| if i.key == def { 0 } else { 1 });
+    items
+}
 /// Build the agent-picker palette items for `cfg`: one row per agent/tool, plus
 /// a literal shell. The key is the bare choice name (the `PendingAgent` gate in
 /// the Enter handler routes it to a launch, not a command dispatch).
@@ -779,6 +834,44 @@ mod tests {
             workspace_palette_label("w8", "/repo/w8", &long),
             "\u{2726} 9 \u{b7} w8"
         );
+    }
+
+    #[test]
+    fn build_env_palette_lists_default_first_and_labels_placement() {
+        use superzej_core::config::{
+            Config, EnvConfig, EnvProviderConfig, EnvSshConfig, PlacementMode,
+        };
+        let mut cfg = Config::default();
+        cfg.env.insert(
+            "remote".into(),
+            EnvConfig {
+                placement: PlacementMode::Ssh,
+                ssh: EnvSshConfig {
+                    host: "build-box".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        cfg.env.insert(
+            "sprite".into(),
+            EnvConfig {
+                placement: PlacementMode::Provider,
+                provider: EnvProviderConfig {
+                    provider: "sprites".into(),
+                    id: "s-123".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let items = build_env_palette(&cfg);
+        // No [env.default] defined ⇒ synthetic default row, and it sorts first.
+        assert_eq!(items.first().map(|i| i.key.as_str()), Some("default"));
+        let find = |k: &str| items.iter().find(|i| i.key == k).unwrap();
+        assert!(find("remote").label.contains("[ssh:build-box]"));
+        assert!(find("sprite").label.contains("[sprites:s-123]"));
     }
 
     #[test]

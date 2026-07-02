@@ -1,7 +1,8 @@
 //! The new-worktree wizard (Alt+w) and its creation pipeline.
 //!
-//! The wizard collects every choice up front — branch name (prefilled with a
-//! pregenerated adjective-noun candidate), sandbox backend, agent — while a
+//! The wizard collects every choice up front on one plane — branch name
+//! (prefilled with a pregenerated adjective-noun candidate), host (execution
+//! environment), sandbox backend, program — while a
 //! background worker speculatively creates the worktree under the candidate
 //! name the moment the wizard opens, so the dominant cost (`git worktree
 //! add`'s full checkout) overlaps with the user reading the form. Accepting
@@ -38,27 +39,37 @@ use superzej_core::{repo, util, worktree};
 // Wizard state machine
 // ---------------------------------------------------------------------------
 
+/// Which field of the single-plane form has focus, top-to-bottom. All fields
+/// render at once; focus moves with Up/Down. The `Sandbox` field is skipped
+/// (see [`NewWorktreeWizard::host_is_local`]) when the selected host is a
+/// non-local placement — there the placement *is* the isolation boundary, so
+/// the sandbox backend is managed by the host, not chosen here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WizardStep {
+pub enum Field {
     Name,
+    Host,
     Sandbox,
-    Agent,
+    Program,
 }
 
-/// What a key delivered to the wizard meant. `SandboxChosen` fires when the
-/// user confirms the sandbox step (so the worker can start the container
-/// ensure while they pick an agent); `Submit` carries the full form.
+/// What a key delivered to the wizard meant. `PrepChosen` fires whenever the
+/// user changes the host or sandbox selection, so the worker can start the
+/// placement bring-up / container ensure while they pick a program; `Submit`
+/// carries the full form.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WizardOutcome {
     Pending,
     Cancel,
-    SandboxChosen(String),
+    PrepChosen { env: String, sandbox: String },
     Submit(WizardChoices),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WizardChoices {
     pub name: NameChoice,
+    /// Selected execution environment / host (bare env name, passed to
+    /// [`superzej_core::config::Config::resolve_env`]). `"default"` = implicit.
+    pub env: String,
     pub sandbox: String,
     pub agent: String,
 }
@@ -72,17 +83,36 @@ pub enum NameChoice {
     Human(String),
 }
 
-/// The Alt+w modal: name input (the configured branch prefix is fixed chrome,
-/// the tail is editable) → sandbox list → agent list. Pure over keys; the
-/// loop dispatches on [`WizardOutcome`].
+/// The default execution-environment (host) name, matching the head of
+/// [`Config::resolve_env`]'s precedence (repo `.superzej.*` `env =` →
+/// `[sandbox] default_env` → `"default"`), so the wizard's Host row opens on
+/// the same env a pane would resolve to.
+pub(crate) fn default_env_name(cfg: &Config, repo_root: &Path) -> String {
+    let pick = |s: &str| {
+        let t = s.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    };
+    pick(&cfg.repo_env_name(repo_root))
+        .or_else(|| pick(&cfg.repo_sandbox(repo_root).default_env))
+        .unwrap_or_else(|| "default".to_string())
+}
+
+/// The Alt+w modal, a single-plane form: branch name (the configured prefix is
+/// fixed chrome, the tail is editable), host (execution env), sandbox backend,
+/// and program. All render at once; focus starts on the program list. Pure over
+/// keys; the loop dispatches on [`WizardOutcome`].
 #[derive(Debug)]
 pub struct NewWorktreeWizard {
     pub repo_slug: String,
     prefix: String,
-    step: WizardStep,
+    focus: Field,
     tail: String,
     name_edited: bool,
     name_checked: bool,
+    /// (env key, label, is_local) — `is_local` gates whether the sandbox row is
+    /// an editable choice or a host-managed static line.
+    host_rows: Vec<(String, String, bool)>,
+    host_sel: usize,
     sandbox_rows: Vec<(String, String)>,
     sandbox_sel: usize,
     agent_rows: Vec<(String, String)>,
@@ -99,6 +129,25 @@ impl NewWorktreeWizard {
             .strip_prefix(&prefix)
             .unwrap_or(&candidate)
             .to_string();
+        // Host rows carry a local-ness flag: local means "pick a sandbox
+        // backend below"; a non-local placement is its own boundary.
+        let host_rows: Vec<(String, String, bool)> = crate::palette::build_env_palette(cfg)
+            .into_iter()
+            .map(|i| {
+                let local = i.key == "default"
+                    || cfg
+                        .env
+                        .get(&i.key)
+                        .map(|e| matches!(e.placement, superzej_core::config::PlacementMode::Local))
+                        .unwrap_or(true);
+                (i.key, i.label, local)
+            })
+            .collect();
+        let default_env = default_env_name(cfg, &repo_root);
+        let host_sel = host_rows
+            .iter()
+            .position(|(k, _, _)| *k == default_env)
+            .unwrap_or(0);
         let sandbox_rows = crate::palette::build_sandbox_palette(cfg)
             .into_iter()
             .map(|i| {
@@ -113,15 +162,102 @@ impl NewWorktreeWizard {
         NewWorktreeWizard {
             repo_slug: repo::repo_slug(&repo_root),
             prefix,
-            step: WizardStep::Agent,
+            focus: Field::Program,
             tail,
             name_edited: false,
             name_checked: false,
+            host_rows,
+            host_sel,
             sandbox_rows,
             sandbox_sel: 0,
             agent_rows,
             agent_sel: 0,
         }
+    }
+
+    /// True when the selected host runs on the local machine (so a sandbox
+    /// backend is a real choice). A non-local placement (ssh/k8s/provider) is
+    /// its own isolation boundary — the sandbox field is host-managed.
+    fn host_is_local(&self) -> bool {
+        self.host_rows
+            .get(self.host_sel)
+            .map(|(_, _, local)| *local)
+            .unwrap_or(true)
+    }
+
+    /// Current host env key (bare env name for `resolve_env`).
+    fn host_key(&self) -> String {
+        self.host_rows
+            .get(self.host_sel)
+            .map(|(k, _, _)| k.clone())
+            .unwrap_or_else(|| "default".into())
+    }
+
+    /// Current sandbox backend key. A non-local host manages its own isolation,
+    /// so we submit `"auto"` there and let the env's overlay govern.
+    fn sandbox_key(&self) -> String {
+        if !self.host_is_local() {
+            return "auto".into();
+        }
+        self.sandbox_rows
+            .get(self.sandbox_sel)
+            .map(|(k, _)| k.clone())
+            .unwrap_or_else(|| "auto".into())
+    }
+
+    /// Focus one field up (Name is the top). Skips Sandbox for a non-local host.
+    fn focus_up(&mut self) {
+        self.focus = match self.focus {
+            Field::Name => Field::Name,
+            Field::Host => Field::Name,
+            Field::Sandbox => Field::Host,
+            Field::Program if self.host_is_local() => Field::Sandbox,
+            Field::Program => Field::Host,
+        };
+    }
+
+    /// Focus one field down (Program is the bottom). Skips Sandbox for a
+    /// non-local host.
+    fn focus_down(&mut self) {
+        self.focus = match self.focus {
+            Field::Name => Field::Host,
+            Field::Host if self.host_is_local() => Field::Sandbox,
+            Field::Host => Field::Program,
+            Field::Sandbox => Field::Program,
+            Field::Program => Field::Program,
+        };
+    }
+
+    /// The prep command for the current (host, sandbox) selection — the loop
+    /// forwards it to the worker so bring-up overlaps the user's remaining time.
+    fn prep_outcome(&self) -> WizardOutcome {
+        WizardOutcome::PrepChosen {
+            env: self.host_key(),
+            sandbox: self.sandbox_key(),
+        }
+    }
+
+    /// Build a `Submit` from the current selections, or `Pending` if the branch
+    /// name is empty (the name field must not be blank).
+    fn submit(&self) -> WizardOutcome {
+        if self.tail.trim().is_empty() {
+            return WizardOutcome::Pending;
+        }
+        let name = if self.name_edited {
+            NameChoice::Human(self.tail.clone())
+        } else {
+            NameChoice::Generated
+        };
+        WizardOutcome::Submit(WizardChoices {
+            name,
+            env: self.host_key(),
+            sandbox: self.sandbox_key(),
+            agent: self
+                .agent_rows
+                .get(self.agent_sel)
+                .map(|(k, _)| k.clone())
+                .unwrap_or_else(|| "shell".into()),
+        })
     }
 
     /// The full branch-name candidate (prefix + tail) the worker speculates on.
@@ -174,41 +310,16 @@ impl NewWorktreeWizard {
         if crate::input::is_escape_key(key) {
             return WizardOutcome::Cancel;
         }
-        match self.step {
-            WizardStep::Name => {
+        if matches!(key, KeyCode::Enter) {
+            return self.submit();
+        }
+        match self.focus {
+            // Text field: characters (including j/k/h/l) type literally; only
+            // the arrows move focus.
+            Field::Name => {
                 match key {
-                    KeyCode::DownArrow | KeyCode::Char('j') => {
-                        let max = self.agent_rows.len().saturating_sub(1);
-                        self.agent_sel = self.agent_sel.saturating_add(1).min(max);
-                    }
-                    KeyCode::UpArrow | KeyCode::Char('k') => {
-                        if self.agent_sel > 0 {
-                            self.agent_sel -= 1;
-                        }
-                    }
-                    KeyCode::Enter if !self.tail.trim().is_empty() => {
-                        let backend = self
-                            .sandbox_rows
-                            .iter()
-                            .find(|(k, _)| k == "auto")
-                            .map(|(k, _)| k.clone())
-                            .unwrap_or_else(|| "auto".into());
-                        let agent = self
-                            .agent_rows
-                            .get(self.agent_sel)
-                            .map(|(k, _)| k.clone())
-                            .unwrap_or_else(|| "shell".into());
-                        let name = if self.name_edited {
-                            NameChoice::Human(self.tail.clone())
-                        } else {
-                            NameChoice::Generated
-                        };
-                        return WizardOutcome::Submit(WizardChoices {
-                            name,
-                            sandbox: backend,
-                            agent,
-                        });
-                    }
+                    KeyCode::DownArrow => self.focus_down(),
+                    KeyCode::UpArrow => self.focus_up(),
                     KeyCode::Backspace => {
                         // Popping marks the field edited; `|=` keeps an earlier
                         // edit flag set and avoids a nested `if`.
@@ -222,36 +333,62 @@ impl NewWorktreeWizard {
                 }
                 WizardOutcome::Pending
             }
-            WizardStep::Sandbox => match key {
-                KeyCode::DownArrow | KeyCode::Char('j') => {
-                    let max = self.sandbox_rows.len().saturating_sub(1);
-                    if self.sandbox_sel == max {
-                        self.step = WizardStep::Agent;
-                    } else {
-                        self.sandbox_sel += 1;
+            // Inline cycle rows: ←/→ (or h/l) cycle the value; ↑/↓ (or k/j)
+            // move focus. A changed value fires PrepChosen so the worker can
+            // begin bring-up.
+            Field::Host => match key {
+                KeyCode::LeftArrow | KeyCode::Char('h') => {
+                    if self.host_sel > 0 {
+                        self.host_sel -= 1;
+                        return self.prep_outcome();
+                    }
+                    WizardOutcome::Pending
+                }
+                KeyCode::RightArrow | KeyCode::Char('l') => {
+                    if self.host_sel + 1 < self.host_rows.len() {
+                        self.host_sel += 1;
+                        return self.prep_outcome();
                     }
                     WizardOutcome::Pending
                 }
                 KeyCode::UpArrow | KeyCode::Char('k') => {
-                    if self.sandbox_sel == 0 {
-                        self.step = WizardStep::Name;
-                    } else {
-                        self.sandbox_sel -= 1;
-                    }
+                    self.focus_up();
                     WizardOutcome::Pending
                 }
-                KeyCode::Enter => {
-                    let backend = self
-                        .sandbox_rows
-                        .get(self.sandbox_sel)
-                        .map(|(k, _)| k.clone())
-                        .unwrap_or_else(|| "auto".into());
-                    self.step = WizardStep::Agent;
-                    WizardOutcome::SandboxChosen(backend)
+                KeyCode::DownArrow | KeyCode::Char('j') => {
+                    self.focus_down();
+                    WizardOutcome::Pending
                 }
                 _ => WizardOutcome::Pending,
             },
-            WizardStep::Agent => match key {
+            Field::Sandbox => match key {
+                KeyCode::LeftArrow | KeyCode::Char('h') => {
+                    if self.sandbox_sel > 0 {
+                        self.sandbox_sel -= 1;
+                        return self.prep_outcome();
+                    }
+                    WizardOutcome::Pending
+                }
+                KeyCode::RightArrow | KeyCode::Char('l') => {
+                    if self.sandbox_sel + 1 < self.sandbox_rows.len() {
+                        self.sandbox_sel += 1;
+                        return self.prep_outcome();
+                    }
+                    WizardOutcome::Pending
+                }
+                KeyCode::UpArrow | KeyCode::Char('k') => {
+                    self.focus_up();
+                    WizardOutcome::Pending
+                }
+                KeyCode::DownArrow | KeyCode::Char('j') => {
+                    self.focus_down();
+                    WizardOutcome::Pending
+                }
+                _ => WizardOutcome::Pending,
+            },
+            // Full list: ↑/↓ (or k/j) move within it; ↑ at the top moves focus
+            // up to the choice rows.
+            Field::Program => match key {
                 KeyCode::DownArrow | KeyCode::Char('j') => {
                     let max = self.agent_rows.len().saturating_sub(1);
                     self.agent_sel = self.agent_sel.saturating_add(1).min(max);
@@ -259,55 +396,29 @@ impl NewWorktreeWizard {
                 }
                 KeyCode::UpArrow | KeyCode::Char('k') => {
                     if self.agent_sel == 0 {
-                        self.step = WizardStep::Sandbox;
+                        self.focus_up();
                     } else {
                         self.agent_sel -= 1;
                     }
                     WizardOutcome::Pending
-                }
-                KeyCode::Enter => {
-                    let sandbox = self
-                        .sandbox_rows
-                        .get(self.sandbox_sel)
-                        .map(|(k, _)| k.clone())
-                        .unwrap_or_else(|| "auto".into());
-                    let agent = self
-                        .agent_rows
-                        .get(self.agent_sel)
-                        .map(|(k, _)| k.clone())
-                        .unwrap_or_else(|| "shell".into());
-                    let name = if self.name_edited {
-                        NameChoice::Human(self.tail.clone())
-                    } else {
-                        NameChoice::Generated
-                    };
-                    WizardOutcome::Submit(WizardChoices {
-                        name,
-                        sandbox,
-                        agent,
-                    })
                 }
                 _ => WizardOutcome::Pending,
             },
         }
     }
 
-    /// Paint as a centered layer: breadcrumb, step body, footer hints.
+    /// Paint the single-plane form as a centered layer: name, host, sandbox,
+    /// program list, and a footer hint.
     pub fn render(&self, surface: &mut Surface, screen: Rect) {
-        let body_rows = 1
-            + 1
-            + if self.step == WizardStep::Sandbox {
-                self.sandbox_rows.len()
-            } else if self.step == WizardStep::Agent || self.step == WizardStep::Name {
-                self.agent_rows.len()
-            } else {
-                0
-            };
+        let show_collision = self.focus == Field::Name && !self.name_checked && !self.name_edited;
+        // name + host + sandbox + program header + the program list, plus the
+        // transient collision line and a footer/gap.
+        let body_rows = 4 + usize::from(show_collision) + self.agent_rows.len();
         let spec = LayerSpec {
             title: format!("new worktree — {}", self.repo_slug),
             badge: Some(" Alt+w ".into()),
             cols: 54,
-            rows: body_rows + 4,
+            rows: body_rows + 2,
             anchor: Anchor::Center,
             ..LayerSpec::default()
         };
@@ -315,68 +426,28 @@ impl NewWorktreeWizard {
             return;
         };
         let panel = Tok::Slot(S::Panel);
-
-        // Breadcrumb: done steps green, current accent-bold, rest faint.
-        // Numbers rendered as padded chip boxes matching the tab-bar style.
-        let crumb = |step: WizardStep, n: &str, label: &str| -> Vec<Seg> {
-            let done = (self.step == WizardStep::Sandbox && step == WizardStep::Name)
-                || (self.step == WizardStep::Agent && step != WizardStep::Agent);
-            let (chip, text) = if done {
-                (
-                    Seg::chip(Tok::Hue(Hue::Green), format!(" {n} ")),
-                    seg(Tok::Hue(Hue::Green), label.to_string()),
-                )
-            } else if self.step == step {
-                (
-                    Seg::chip(Tok::Slot(S::Accent), format!(" {n} ")),
-                    seg(Tok::Slot(S::Accent), label.to_string()).bold(),
-                )
+        // Label foreground: accent+bold for the focused field, faint otherwise.
+        let label_fg = |focused: bool| {
+            if focused {
+                Tok::Slot(S::Accent)
             } else {
-                (
-                    Seg::chip(Tok::Slot(S::Faint), format!(" {n} ")),
-                    seg(Tok::Slot(S::Faint), label.to_string()),
-                )
-            };
-            vec![
-                chip,
-                sp(1),
-                text,
-                seg(Tok::Slot(S::Faint), "  ›  ".to_string()),
-            ]
+                Tok::Slot(S::Faint)
+            }
         };
-        let mut crumbs: Vec<Seg> = Vec::new();
-        crumbs.extend(crumb(WizardStep::Name, "1", "name"));
-        crumbs.extend(crumb(WizardStep::Sandbox, "2", "sandbox"));
-        crumbs.extend(crumb(WizardStep::Agent, "3", "agent"));
-        crumbs.pop(); // trailing separator
-        seg::draw_line(
-            surface,
-            inner.x,
-            inner.y,
-            inner.cols,
-            &Line::segs(crumbs),
-            panel,
-        );
+        let mut y = inner.y;
 
-        let mut y = inner.y + 2;
-
-        // 1. Render Name
-        let name_fg = if self.step == WizardStep::Name {
-            Tok::Slot(S::Accent)
-        } else {
-            Tok::Slot(S::Faint)
-        };
-        let name_label = seg(name_fg, "branch ❯ ".to_string()).bold();
+        // --- branch name (editable) ---------------------------------------
+        let name_focused = self.focus == Field::Name;
         seg::draw_line(
             surface,
             inner.x,
             y,
             inner.cols,
             &Line::segs(vec![
-                name_label,
+                seg(label_fg(name_focused), "branch  ❯ ".to_string()).bold(),
                 seg(Tok::Slot(S::Faint), self.prefix.clone()),
                 seg(Tok::Slot(S::Text), self.tail.clone()),
-                if self.step == WizardStep::Name {
+                if name_focused {
                     seg(Tok::Slot(S::Accent), "▏")
                 } else {
                     sp(0)
@@ -385,14 +456,14 @@ impl NewWorktreeWizard {
             panel,
         );
         y += 1;
-        if self.step == WizardStep::Name && !self.name_checked && !self.name_edited {
+        if show_collision {
             seg::draw_line(
                 surface,
                 inner.x,
                 y,
                 inner.cols,
                 &Line::segs(vec![
-                    sp(9),
+                    sp(10),
                     seg(Tok::Slot(S::Faint), "checking collisions…".to_string()),
                 ]),
                 panel,
@@ -400,134 +471,131 @@ impl NewWorktreeWizard {
             y += 1;
         }
 
-        // 2. Render Sandbox
-        let sb_label = self
-            .sandbox_rows
-            .get(self.sandbox_sel)
-            .map(|(_, l)| l.as_str())
-            .unwrap_or("auto");
-        if self.step == WizardStep::Sandbox {
-            // Render full list
-            for (row, (_, label)) in self.sandbox_rows.iter().enumerate() {
-                let selected = row == self.sandbox_sel;
-                let pad = if selected { Tok::SelAccent } else { panel };
-                let marker = if selected {
-                    seg(Tok::Slot(S::Accent), "❯ ").bold()
-                } else {
-                    sp(2)
-                };
-                let mut l = seg(
-                    if selected {
-                        Tok::Slot(S::Text)
-                    } else {
-                        Tok::Slot(S::Dim)
-                    },
-                    label.clone(),
-                );
-                if selected {
-                    l = l.bold();
-                }
-                seg::draw_line(
-                    surface,
-                    inner.x,
-                    y,
-                    inner.cols,
-                    &Line::segs(vec![marker, l]),
-                    pad,
-                );
-                y += 1;
-            }
+        // --- host (inline cycle) ------------------------------------------
+        let host_focused = self.focus == Field::Host;
+        let host_label = self
+            .host_rows
+            .get(self.host_sel)
+            .map(|(_, l, _)| l.as_str())
+            .unwrap_or("default");
+        seg::draw_line(
+            surface,
+            inner.x,
+            y,
+            inner.cols,
+            &Line::segs(self.cycle_row("host   ", host_focused, host_label)),
+            panel,
+        );
+        y += 1;
+
+        // --- sandbox (inline cycle when local; host-managed otherwise) -----
+        let sb_focused = self.focus == Field::Sandbox;
+        if self.host_is_local() {
+            let sb_label = self
+                .sandbox_rows
+                .get(self.sandbox_sel)
+                .map(|(_, l)| l.as_str())
+                .unwrap_or("auto");
+            seg::draw_line(
+                surface,
+                inner.x,
+                y,
+                inner.cols,
+                &Line::segs(self.cycle_row("sandbox", sb_focused, sb_label)),
+                panel,
+            );
         } else {
-            // Render single compact row
-            let sb_fg = if self.step == WizardStep::Sandbox {
-                Tok::Slot(S::Accent)
-            } else {
-                Tok::Slot(S::Faint)
-            };
             seg::draw_line(
                 surface,
                 inner.x,
                 y,
                 inner.cols,
                 &Line::segs(vec![
-                    seg(sb_fg, "sandbox ❯ ".to_string()).bold(),
-                    seg(Tok::Slot(S::Text), sb_label.to_string()),
+                    seg(Tok::Slot(S::Faint), "sandbox   ".to_string()),
+                    seg(Tok::Slot(S::Dim), "· managed by host".to_string()),
                 ]),
                 panel,
+            );
+        }
+        y += 1;
+
+        // --- program (full list, the primary selection) -------------------
+        let prog_focused = self.focus == Field::Program;
+        seg::draw_line(
+            surface,
+            inner.x,
+            y,
+            inner.cols,
+            &Line::segs(vec![
+                seg(label_fg(prog_focused), "program".to_string()).bold(),
+            ]),
+            panel,
+        );
+        y += 1;
+        for (row, (_, label)) in self.agent_rows.iter().enumerate() {
+            let selected = row == self.agent_sel;
+            let pad = if selected && prog_focused {
+                Tok::SelAccent
+            } else {
+                panel
+            };
+            let marker = if selected {
+                seg(Tok::Slot(S::Accent), "❯ ").bold()
+            } else {
+                sp(2)
+            };
+            let mut l = seg(
+                if selected {
+                    Tok::Slot(S::Text)
+                } else {
+                    Tok::Slot(S::Dim)
+                },
+                label.clone(),
+            );
+            if selected {
+                l = l.bold();
+            }
+            seg::draw_line(
+                surface,
+                inner.x,
+                y,
+                inner.cols,
+                &Line::segs(vec![marker, l]),
+                pad,
             );
             y += 1;
         }
 
-        // 3. Render Agent
-        let agent_label = self
-            .agent_rows
-            .get(self.agent_sel)
-            .map(|(_, l)| l.as_str())
-            .unwrap_or("shell");
-        if self.step == WizardStep::Agent || self.step == WizardStep::Name {
-            // Render full list
-            for (row, (_, label)) in self.agent_rows.iter().enumerate() {
-                let selected = row == self.agent_sel;
-                let pad = if selected { Tok::SelAccent } else { panel };
-                let marker = if selected {
-                    seg(Tok::Slot(S::Accent), "❯ ").bold()
-                } else {
-                    sp(2)
-                };
-                let mut l = seg(
-                    if selected {
-                        Tok::Slot(S::Text)
-                    } else {
-                        Tok::Slot(S::Dim)
-                    },
-                    label.clone(),
-                );
-                if selected {
-                    l = l.bold();
-                }
-                seg::draw_line(
-                    surface,
-                    inner.x,
-                    y,
-                    inner.cols,
-                    &Line::segs(vec![marker, l]),
-                    pad,
-                );
-                y += 1;
-            }
-        } else {
-            // Render single compact row
-            let ag_fg = if self.step == WizardStep::Agent {
-                Tok::Slot(S::Accent)
-            } else {
-                Tok::Slot(S::Faint)
-            };
-            seg::draw_line(
-                surface,
-                inner.x,
-                y,
-                inner.cols,
-                &Line::segs(vec![
-                    seg(ag_fg, "agent ❯ ".to_string()).bold(),
-                    seg(Tok::Slot(S::Text), agent_label.to_string()),
-                ]),
-                panel,
-            );
-        }
-
-        let footer = match self.step {
-            WizardStep::Name => "enter create · j/k agent · esc cancel",
-            WizardStep::Sandbox => "enter choose · j/k move · esc back",
-            WizardStep::Agent => "enter create · j/k move · esc back",
-        };
         seg::draw_line(
             surface,
             inner.x,
             inner.y + inner.rows - 1,
             inner.cols,
-            &Line::segs(vec![seg(Tok::Slot(S::Faint), footer.to_string())]),
+            &Line::segs(vec![seg(
+                Tok::Slot(S::Faint),
+                "↑↓ move · ←→ change · enter create · esc cancel".to_string(),
+            )]),
             panel,
         );
+    }
+
+    /// A `label  ‹ value ›` inline choice row; the chevrons appear only when the
+    /// field is focused (signalling it is cyclable with ←/→).
+    fn cycle_row(&self, label: &str, focused: bool, value: &str) -> Vec<Seg> {
+        let fg = if focused {
+            Tok::Slot(S::Accent)
+        } else {
+            Tok::Slot(S::Faint)
+        };
+        let mut segs = vec![seg(fg, format!("{label} ")).bold()];
+        if focused {
+            segs.push(seg(Tok::Slot(S::Accent), "‹ ".to_string()));
+            segs.push(seg(Tok::Slot(S::Text), value.to_string()).bold());
+            segs.push(seg(Tok::Slot(S::Accent), " ›".to_string()));
+        } else {
+            segs.push(seg(Tok::Slot(S::Text), value.to_string()));
+        }
+        segs
     }
 }
 
@@ -621,7 +689,12 @@ pub struct CreatedWorktree {
 /// Commands from the loop (wizard decisions) to the worker.
 #[derive(Debug)]
 pub enum WizardCmd {
-    SandboxChosen(String),
+    /// The user settled on a (host env, sandbox) pair — start bring-up/ensure
+    /// early so it overlaps the rest of the wizard.
+    PrepChosen {
+        env: String,
+        sandbox: String,
+    },
     Submit(WizardChoices),
     Cancel,
 }
@@ -817,7 +890,7 @@ pub struct WorkerCtx {
 /// The blocking half of worktree creation, run on a `spawn_blocking` thread:
 /// preflight (collision-free name + base), speculative `git worktree add`
 /// under the suggested name, then a command loop driven by the wizard —
-/// sandbox prep on `SandboxChosen`, rename/register/compose on `Submit`,
+/// sandbox prep on `PrepChosen`, rename/register/compose on `Submit`,
 /// cleanup on `Cancel`. Every transition is an event + `notify()`.
 pub fn run_worker(
     ctx: WorkerCtx,
@@ -893,14 +966,18 @@ pub fn run_worker(
 
     // --- command loop: the wizard drives the rest.
     let slug = repo::repo_slug(root);
-    let mut prepped: Option<(String, crate::agent::SandboxOutcome)> = None;
-    let prep = |backend: &str,
+    // Keyed on (env, backend): both the host env and the sandbox backend feed
+    // the placement/isolation bring-up, so a change to either invalidates a
+    // prior prep.
+    let mut prepped: Option<(String, String, crate::agent::SandboxOutcome)> = None;
+    let prep = |env: &str,
+                backend: &str,
                 wt: &Path,
                 scope: crate::agent::SandboxScope|
      -> anyhow::Result<crate::agent::SandboxOutcome> {
         let wt_s = wt.to_string_lossy();
         let loc = GitLoc::from_db(&wt_s, None);
-        crate::agent::prepare_sandbox(cfg, root, &wt_s, &loc, Some(backend), scope)
+        crate::agent::prepare_sandbox_env(cfg, root, &wt_s, &loc, Some(backend), scope, Some(env))
     };
     // The auto chain's host fallback is visible in the step detail; an
     // explicit choice that can't be honored errors instead (no silent host
@@ -926,19 +1003,21 @@ pub fn run_worker(
                 );
                 return;
             }
-            Ok(WizardCmd::SandboxChosen(backend)) => {
-                if prepped.as_ref().map(|(b, _)| b.as_str()) == Some(backend.as_str()) {
-                    continue; // re-entered the step, same choice
+            Ok(WizardCmd::PrepChosen { env, sandbox }) => {
+                if prepped.as_ref().map(|(e, b, _)| (e.as_str(), b.as_str()))
+                    == Some((env.as_str(), sandbox.as_str()))
+                {
+                    continue; // re-fired with the same (env, backend)
                 }
                 step(CreateStep::SandboxPrep, StepState::Running, None);
-                match prep(&backend, &path, crate::agent::SandboxScope::Shell) {
+                match prep(&env, &sandbox, &path, crate::agent::SandboxScope::Shell) {
                     Ok(outcome) => {
                         step(
                             CreateStep::SandboxPrep,
                             StepState::Done,
                             Some(sandbox_detail(&outcome)),
                         );
-                        prepped = Some((backend, outcome));
+                        prepped = Some((env, sandbox, outcome));
                     }
                     Err(e) => {
                         worktree::remove(root, &path, &branch, true);
@@ -972,12 +1051,13 @@ pub fn run_worker(
                         path = new_path;
                         // A sandbox container is keyed by the worktree path —
                         // re-ensure for the moved path (cheap next to a checkout).
-                        if let Some((backend, outcome)) = prepped.as_mut()
+                        if let Some((env, backend, outcome)) = prepped.as_mut()
                             && outcome.spec.is_some()
                         {
+                            let env = env.clone();
                             let backend = backend.clone();
                             step(CreateStep::SandboxPrep, StepState::Running, None);
-                            match prep(&backend, &path, crate::agent::SandboxScope::Shell) {
+                            match prep(&env, &backend, &path, crate::agent::SandboxScope::Shell) {
                                 Ok(redo) => {
                                     step(
                                         CreateStep::SandboxPrep,
@@ -1013,26 +1093,35 @@ pub fn run_worker(
         }
     }
 
-    // Submit without a sandbox prep (defensive — the wizard always emits
-    // SandboxChosen before Submit): prepare now with the submitted choice.
-    let (backend_label, mut sandbox) = match prepped {
-        Some(p) => p,
-        None => {
-            step(CreateStep::SandboxPrep, StepState::Running, None);
-            match prep(&choices.sandbox, &path, crate::agent::SandboxScope::Shell) {
-                Ok(outcome) => {
-                    step(
-                        CreateStep::SandboxPrep,
-                        StepState::Done,
-                        Some(sandbox_detail(&outcome)),
-                    );
-                    (choices.sandbox.clone(), outcome)
-                }
-                Err(e) => {
-                    worktree::remove(root, &path, &branch, true);
-                    fail(CreateStep::SandboxPrep, e.to_string());
-                    return;
-                }
+    // Reuse the speculative prep only when it matches the submitted (env,
+    // backend); otherwise (no prep, or the user changed host/sandbox after the
+    // last PrepChosen) prepare now with the submitted choice.
+    let reuse = prepped
+        .as_ref()
+        .map(|(e, b, _)| *e == choices.env && *b == choices.sandbox)
+        .unwrap_or(false);
+    let (env_used, backend_label, mut sandbox) = if reuse {
+        prepped.expect("reuse implies prepped is Some")
+    } else {
+        step(CreateStep::SandboxPrep, StepState::Running, None);
+        match prep(
+            &choices.env,
+            &choices.sandbox,
+            &path,
+            crate::agent::SandboxScope::Shell,
+        ) {
+            Ok(outcome) => {
+                step(
+                    CreateStep::SandboxPrep,
+                    StepState::Done,
+                    Some(sandbox_detail(&outcome)),
+                );
+                (choices.env.clone(), choices.sandbox.clone(), outcome)
+            }
+            Err(e) => {
+                worktree::remove(root, &path, &branch, true);
+                fail(CreateStep::SandboxPrep, e.to_string());
+                return;
             }
         }
     };
@@ -1042,7 +1131,12 @@ pub fn run_worker(
     // scope so the agent gets (and ensures) its own hardened container.
     if crate::agent::launch_scope(cfg, &choices.agent) == crate::agent::SandboxScope::Agent {
         step(CreateStep::SandboxPrep, StepState::Running, None);
-        match prep(&backend_label, &path, crate::agent::SandboxScope::Agent) {
+        match prep(
+            &env_used,
+            &backend_label,
+            &path,
+            crate::agent::SandboxScope::Agent,
+        ) {
             Ok(redo) => {
                 step(
                     CreateStep::SandboxPrep,
@@ -1080,6 +1174,11 @@ pub fn run_worker(
             }
             let _ = db.set_worktree_sandbox(&path_s, &sandbox.backend_label);
             let _ = db.set_worktree_agent(&path_s, &choices.agent);
+            // Persist the chosen host verbatim (matches `set_worktree_env` /
+            // `--env`); the implicit "default" is left NULL to keep it clean.
+            if choices.env != "default" {
+                let _ = db.set_worktree_env(&path_s, &choices.env);
+            }
             step(CreateStep::Register, StepState::Done, None);
         }
         Err(e) => {
@@ -1205,11 +1304,13 @@ mod tests {
         assert!(w.candidate().starts_with(&cfg.branch_prefix));
         assert!(w.candidate().len() > cfg.branch_prefix.len());
 
+        // Opens focused on the program list; Enter submits from any field.
         let submit = key(&mut w, KeyCode::Enter);
         let WizardOutcome::Submit(choices) = submit else {
             panic!("expected Submit, got {submit:?}");
         };
         assert_eq!(choices.name, NameChoice::Generated);
+        assert!(!choices.env.is_empty());
         assert!(!choices.sandbox.is_empty());
         assert!(!choices.agent.is_empty());
     }
@@ -1218,17 +1319,20 @@ mod tests {
     fn typing_marks_edited_and_blocks_suggestion() {
         let cfg = test_cfg();
         let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
-        // Navigate back to the name step
+        // Focus starts on Program; walk up to the Name field (Sandbox, Host,
+        // Name — a local default host keeps the Sandbox row in the ring).
+        key(&mut w, KeyCode::UpArrow);
         key(&mut w, KeyCode::UpArrow);
         key(&mut w, KeyCode::UpArrow);
 
+        // j/k/h/l type literally into the branch name (no longer navigation).
+        key(&mut w, KeyCode::Char('j'));
         key(&mut w, KeyCode::Char('x'));
+        assert!(w.candidate().ends_with("jx"), "j typed into the name");
         let typed = w.candidate();
         w.apply_name_suggestion("sz/other-name");
         assert_eq!(w.candidate(), typed, "typed name never clobbered");
 
-        key(&mut w, KeyCode::Enter); // Name -> Sandbox
-        key(&mut w, KeyCode::Enter); // Sandbox -> Agent
         let WizardOutcome::Submit(choices) = key(&mut w, KeyCode::Enter) else {
             panic!("expected Submit");
         };
@@ -1247,49 +1351,82 @@ mod tests {
     fn empty_name_refuses_to_advance() {
         let cfg = test_cfg();
         let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
-        // Navigate back to name step
+        // Walk up to the Name field.
+        key(&mut w, KeyCode::UpArrow);
         key(&mut w, KeyCode::UpArrow);
         key(&mut w, KeyCode::UpArrow);
 
         for _ in 0..64 {
             key(&mut w, KeyCode::Backspace);
         }
+        // An empty branch name never submits; Esc still cancels.
         assert_eq!(key(&mut w, KeyCode::Enter), WizardOutcome::Pending);
-        // Still on the name step: typing edits, Esc cancels.
         assert_eq!(key(&mut w, KeyCode::Escape), WizardOutcome::Cancel);
     }
 
     #[test]
-    fn esc_cancels_from_any_step_and_ctrl_c_cancels_anywhere() {
+    fn esc_cancels_from_any_field_and_ctrl_c_cancels_anywhere() {
         let cfg = test_cfg();
-        // Escape cancels immediately from the Agent step.
-        let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
-        assert_eq!(key(&mut w, KeyCode::Escape), WizardOutcome::Cancel);
+        // Escape cancels from every field along the focus ring.
+        for ups in 0..=3 {
+            let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
+            for _ in 0..ups {
+                key(&mut w, KeyCode::UpArrow);
+            }
+            assert_eq!(key(&mut w, KeyCode::Escape), WizardOutcome::Cancel);
+        }
 
-        // Escape cancels immediately from the Sandbox step.
+        // Ctrl+c cancels regardless of focus.
         let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
-        key(&mut w, KeyCode::UpArrow); // Agent -> Sandbox
-        assert_eq!(key(&mut w, KeyCode::Escape), WizardOutcome::Cancel);
-
-        // Escape cancels immediately from the Name step.
-        let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
-        key(&mut w, KeyCode::UpArrow); // Agent -> Sandbox
-        key(&mut w, KeyCode::UpArrow); // Sandbox -> Name
-        assert_eq!(key(&mut w, KeyCode::Escape), WizardOutcome::Cancel);
-
-        // Escape cancels immediately from the agent step.
-        let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
-        key(&mut w, KeyCode::Enter); // name → sandbox
-        key(&mut w, KeyCode::Enter); // sandbox → agent
-        assert_eq!(key(&mut w, KeyCode::Escape), WizardOutcome::Cancel);
-
-        // Ctrl+c cancels from any step.
-        let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
-        key(&mut w, KeyCode::Enter);
         assert_eq!(
             w.handle_key(&KeyCode::Char('c'), Modifiers::CTRL),
             WizardOutcome::Cancel
         );
+    }
+
+    #[test]
+    fn host_defaults_and_cycles() {
+        let cfg = test_cfg();
+        let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
+        // No named envs ⇒ the default host is the implicit "default".
+        assert_eq!(w.host_key(), "default");
+        assert!(w.host_is_local());
+        // Focus the Host row and cycle: with only one host, → is a no-op; with
+        // named envs it would return PrepChosen. Assert the local-only case.
+        key(&mut w, KeyCode::UpArrow); // Program -> Sandbox
+        key(&mut w, KeyCode::UpArrow); // Sandbox -> Host
+        assert_eq!(key(&mut w, KeyCode::RightArrow), WizardOutcome::Pending);
+    }
+
+    #[test]
+    fn non_local_host_skips_sandbox_in_focus_ring() {
+        let mut cfg = test_cfg();
+        cfg.env.insert(
+            "remote".into(),
+            superzej_core::config::EnvConfig {
+                placement: superzej_core::config::PlacementMode::Ssh,
+                ssh: superzej_core::config::EnvSshConfig {
+                    host: "build-box".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        // Make the ssh env the default host so it opens selected.
+        cfg.sandbox.default_env = "remote".into();
+
+        let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
+        assert_eq!(w.host_key(), "remote");
+        assert!(!w.host_is_local(), "ssh host is non-local");
+        // Program → up skips Sandbox and lands on Host directly.
+        key(&mut w, KeyCode::UpArrow);
+        assert_eq!(w.focus, Field::Host);
+        // Submit carries the non-local env; sandbox is the host-managed sentinel.
+        let WizardOutcome::Submit(choices) = key(&mut w, KeyCode::Enter) else {
+            panic!("expected Submit");
+        };
+        assert_eq!(choices.env, "remote");
+        assert_eq!(choices.sandbox, "auto");
     }
 
     #[test]
@@ -1319,9 +1456,13 @@ mod tests {
             &repo,
             "sz/test-one",
             vec![
-                WizardCmd::SandboxChosen("host".into()),
+                WizardCmd::PrepChosen {
+                    env: "default".into(),
+                    sandbox: "host".into(),
+                },
                 WizardCmd::Submit(WizardChoices {
                     name: NameChoice::Generated,
+                    env: "default".into(),
                     sandbox: "host".into(),
                     agent: "shell".into(),
                 }),
@@ -1351,6 +1492,38 @@ mod tests {
         let rows = db.worktrees().unwrap();
         let row = rows.iter().find(|w| w.worktree == p.path).expect("db row");
         assert_eq!(row.branch, "sz/test-one");
+        // The implicit "default" host is stored as NULL (not a literal).
+        assert_eq!(row.env_name, None);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn worker_persists_selected_host_env() {
+        let repo = temp_repo("env");
+        let db = repo.join("state/superzej.db");
+        let events = drive_worker(
+            &repo,
+            "sz/env-one",
+            vec![
+                WizardCmd::PrepChosen {
+                    env: "myenv".into(),
+                    sandbox: "host".into(),
+                },
+                WizardCmd::Submit(WizardChoices {
+                    name: NameChoice::Generated,
+                    env: "myenv".into(),
+                    sandbox: "host".into(),
+                    agent: "shell".into(),
+                }),
+            ],
+            &db,
+        );
+        let p = done_payload(&events).expect("Done event");
+        // A non-default host is persisted verbatim on the worktree row.
+        let db = Db::open_at(&db).unwrap();
+        let rows = db.worktrees().unwrap();
+        let row = rows.iter().find(|w| w.worktree == p.path).expect("db row");
+        assert_eq!(row.env_name.as_deref(), Some("myenv"));
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -1362,9 +1535,13 @@ mod tests {
             &repo,
             "sz/generated-x",
             vec![
-                WizardCmd::SandboxChosen("host".into()),
+                WizardCmd::PrepChosen {
+                    env: "default".into(),
+                    sandbox: "host".into(),
+                },
                 WizardCmd::Submit(WizardChoices {
                     name: NameChoice::Human("My Fix".into()),
+                    env: "default".into(),
                     sandbox: "host".into(),
                     agent: "shell".into(),
                 }),
@@ -1446,12 +1623,12 @@ mod tests {
         w.render(&mut s, screen);
         let frame = text(&mut s);
         assert!(frame.contains("new worktree"));
-        // Step numbers now render as padded chip boxes; the text and number
-        // are separate segments so assert them individually.
-        assert!(frame.contains(" 1 "));
-        assert!(frame.contains("name"));
-        assert!(frame.contains("branch ❯"));
-        assert!(frame.contains("esc back"));
+        // Single-plane form: every section renders at once.
+        assert!(frame.contains("branch  ❯"));
+        assert!(frame.contains("host"));
+        assert!(frame.contains("sandbox"));
+        assert!(frame.contains("program"));
+        assert!(frame.contains("enter create"));
 
         let mut cp = CreationProgress::new(1, "sz/swift-reef".into());
         cp.apply(
