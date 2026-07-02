@@ -16717,15 +16717,9 @@ async fn event_loop<T: Terminal>(
                                                 model.status = format!("Copied {url}");
                                             }
                                         }
-                                        Section::Ci
-                                        | Section::MergeQueue
-                                        | Section::Debug
-                                        | Section::Sandbox
-                                        | Section::Db
-                                        | Section::Telemetry
-                                        | Section::Keys
-                                        | Section::Media
-                                        | Section::Logs => {}
+                                        // Read-only / no-Enter-action sections
+                                        // (Ci, MergeQueue, Media, Logs, Across, …).
+                                        _ => {}
                                     }
                                 } // match panel_ui.open + else
                             }

@@ -3015,29 +3015,6 @@ impl Default for ForwardConfig {
     }
 }
 
-impl ForwardConfig {
-    /// Whether a newly-detected `container_port` should be auto-forwarded:
-    /// `auto` is on, the port is not in `ignore`, and (if `only` is set) it is
-    /// allow-listed.
-    pub fn should_auto_forward(&self, container_port: u16) -> bool {
-        self.auto
-            && !self.ignore.contains(&container_port)
-            && (self.only.is_empty() || self.only.contains(&container_port))
-    }
-
-    /// Parse `range` into an inclusive `(lo, hi)`, falling back to `(8000, 8999)`
-    /// on a malformed or inverted value.
-    pub fn port_range(&self) -> (u16, u16) {
-        let parsed = || -> Option<(u16, u16)> {
-            let (lo, hi) = self.range.split_once('-')?;
-            let lo: u16 = lo.trim().parse().ok()?;
-            let hi: u16 = hi.trim().parse().ok()?;
-            (lo != 0 && hi >= lo).then_some((lo, hi))
-        };
-        parsed().unwrap_or((8000, 8999))
-    }
-}
-
 /// `[share.bore]` — <https://github.com/ekzhang/bore>, a tiny TCP tunnel. The
 /// client connects out to a relay (`to`) and exposes the local port at
 /// `to:<remote_port>`. Run your own `bore server` and set `to`/`secret`.
@@ -4500,6 +4477,17 @@ pub struct Config {
     /// [`crate::bundle`].
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub bundle: std::collections::BTreeMap<String, Bundle>,
+    /// Per-tool binary overrides (`[managed_tools.<name>]`) for the managed-tool
+    /// resolver: an explicit `path` (highest-priority tier) + optional `args`,
+    /// consulted before PATH lookup and the managed download. See
+    /// [`crate::managed_tool`].
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub managed_tools: std::collections::BTreeMap<String, crate::managed_tool::ToolOverride>,
+    /// User-declared MCP servers (`[mcp_servers.<name>]`) the agent consumes,
+    /// acquired via the managed-tool resolver and gated by capability grants.
+    /// See [`crate::mcp::config`].
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub mcp_servers: std::collections::BTreeMap<String, crate::mcp::config::McpServerConfig>,
     /// `[secrets.resolvers]` — external secret-resolver commands used to expand
     /// `<scheme>:<ref>` bundle values at launch without persisting the secret.
     #[serde(skip_serializing_if = "SecretsConfig::is_empty")]
@@ -4583,6 +4571,8 @@ impl Default for Config {
             workspace: std::collections::BTreeMap::new(),
             env: std::collections::BTreeMap::new(),
             bundle: std::collections::BTreeMap::new(),
+            managed_tools: std::collections::BTreeMap::new(),
+            mcp_servers: std::collections::BTreeMap::new(),
             secrets: SecretsConfig::default(),
             program_keybinds: std::collections::BTreeMap::new(),
             program_remap: std::collections::BTreeMap::new(),

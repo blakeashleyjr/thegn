@@ -108,6 +108,10 @@ pub enum Section {
     /// Unified cross-repo, cross-tool "My Work" feed: assigned issues (all
     /// providers), review-requested / authored PRs, high-priority notifications.
     Mine,
+    /// Cross-worktree attention stream (multibuffer-style): failing CI (and,
+    /// later, dirty files / content matches) across *all* worktrees, grouped by
+    /// worktree with per-row source labels. Read-only.
+    Across,
     /// Pull-request state, CI checks, review threads. (Renamed from "git".)
     Pr,
     /// CI/CD runs across providers (AV group): run history + per-run state.
@@ -147,12 +151,12 @@ pub enum Section {
 /// The accordion's built-in display order — the default when `[panel]
 /// sections` is unset. Grouped by tab:
 /// - Git (5): Changes, Commits, Branches, Stash, Files
-/// - Work (9): Mine, Pr, Ci, MergeQueue, Issues, Problems, Jobs, Tests, Symbols
+/// - Work (10): Mine, Across, Pr, Ci, MergeQueue, Issues, Problems, Jobs, Tests, Symbols
 /// - System (8): Notifications, Logs, Sandbox, Share, Forward, Telemetry, Media, Keys
 ///
 /// The live order (config-reordered, possibly trimmed) rides on
 /// [`PanelUi::order`]; numbered jump keys index the ACTIVE TAB's slice.
-pub const SECTION_ORDER: [Section; 22] = [
+pub const SECTION_ORDER: [Section; 23] = [
     // Git tab
     Section::Changes,
     Section::Commits,
@@ -161,6 +165,7 @@ pub const SECTION_ORDER: [Section; 22] = [
     Section::Files,
     // Work tab
     Section::Mine,
+    Section::Across,
     Section::Pr,
     Section::Ci,
     Section::MergeQueue,
@@ -189,6 +194,7 @@ impl Section {
             Section::Branches => "branches",
             Section::Stash => "stash",
             Section::Mine => "mine",
+            Section::Across => "across",
             Section::Pr => "pr",
             Section::Ci => "ci",
             Section::MergeQueue => "merge",
@@ -220,6 +226,7 @@ impl Section {
             | Section::Stash
             | Section::Files => PanelTab::Git,
             Section::Mine
+            | Section::Across
             | Section::Pr
             | Section::Ci
             | Section::MergeQueue
@@ -475,6 +482,11 @@ pub struct PanelData {
     /// Recent CI runs (newest first) for the current branch, from `ci_runs_cache`
     /// — feeds the `Ci` section rollup (AV group). Empty when CI is off/undetected.
     pub ci_runs: Vec<superzej_core::ci::CiRun>,
+    /// Cross-worktree attention stream (the `Across` section): failing CI and
+    /// (later) dirty files / content matches from *all* worktrees, grouped by
+    /// worktree. Built off-loop during hydration; empty when nothing needs
+    /// attention. See [`superzej_core::aggregate`].
+    pub across: superzej_core::aggregate::Aggregation,
     /// The local merge queue (the fold-actor), from `merge_queue` — feeds the
     /// `MergeQueue` section + statusbar badge. Empty when the queue is unused.
     pub merge_queue: Vec<superzej_core::db::MergeQueueRow>,
@@ -1087,7 +1099,7 @@ mod tests {
 
     #[test]
     fn section_order_jump_and_cycle() {
-        assert_eq!(SECTION_ORDER.len(), 22);
+        assert_eq!(SECTION_ORDER.len(), 23);
         // Default tab = Git; Changes is in Git tab.
         let ui = PanelUi::default(); // open = Changes, tab = Git
         assert_eq!(ui.next_section(), Section::Commits); // next in Git tab
@@ -1329,8 +1341,8 @@ mod tests {
         );
         // A digit past the tab's section count is not an accordion intent.
         assert_eq!(accordion_key(&KeyCode::Char('6'), none, &ui), None);
-        // In Work tab, digits index Work sections (Mine, Pr, Ci, Issues,
-        // Problems, Jobs, Tests, Symbols).
+        // In Work tab, digits index Work sections (Mine, Across, Pr, Ci,
+        // MergeQueue, Issues, Problems, Jobs, Tests, Symbols).
         let work_ui = PanelUi {
             tab: PanelTab::Work,
             open: Section::Pr,
@@ -1342,20 +1354,20 @@ mod tests {
         );
         assert_eq!(
             accordion_key(&KeyCode::Char('2'), none, &work_ui),
-            Some(PanelMsg::Open(Section::Pr))
+            Some(PanelMsg::Open(Section::Across))
         );
-        // Work order: Mine, Pr, Ci, MergeQueue, Issues, … → '3' Ci, '4' MergeQueue, '5' Issues.
+        // Work order: Mine, Across, Pr, Ci, MergeQueue, … → '3' Pr, '4' Ci, '5' MergeQueue.
         assert_eq!(
             accordion_key(&KeyCode::Char('3'), none, &work_ui),
-            Some(PanelMsg::Open(Section::Ci))
+            Some(PanelMsg::Open(Section::Pr))
         );
         assert_eq!(
             accordion_key(&KeyCode::Char('4'), none, &work_ui),
-            Some(PanelMsg::Open(Section::MergeQueue))
+            Some(PanelMsg::Open(Section::Ci))
         );
         assert_eq!(
             accordion_key(&KeyCode::Char('5'), none, &work_ui),
-            Some(PanelMsg::Open(Section::Issues))
+            Some(PanelMsg::Open(Section::MergeQueue))
         );
         // A custom order filters to the tab's sections.
         let trimmed = PanelUi {

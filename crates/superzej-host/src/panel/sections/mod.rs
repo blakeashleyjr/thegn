@@ -11,6 +11,7 @@ use crate::seg::{self, Line, Seg, Tok, seg, sp};
 
 use super::{ChangeRow, PanelData, PanelHit, PanelUi, Section, Stage};
 
+mod across;
 mod branches;
 mod changes;
 mod ci;
@@ -483,6 +484,24 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
                 v
             }
         }
+        Section::Across => {
+            let s = model.panel.across.summary();
+            if s.failures + s.dirty + s.matches == 0 {
+                vec![seg(g2(), "clear")]
+            } else {
+                let mut v = Vec::new();
+                if s.failures > 0 {
+                    v.push(seg(hue(Hue::Red), format!("{}✗", s.failures)));
+                }
+                if s.dirty > 0 {
+                    v.push(seg(hue(Hue::Amber), format!(" {}●", s.dirty)));
+                }
+                if s.matches > 0 {
+                    v.push(seg(g(), format!(" {}·", s.matches)));
+                }
+                v
+            }
+        }
         Section::Issues => {
             let n = model.panel.tracker_issues.len();
             let open = model
@@ -664,6 +683,7 @@ pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
         Section::Telemetry => telemetry::content(ctx),
         Section::Keys => keys::content(ctx),
         Section::Mine => my_work::content(ctx),
+        Section::Across => across::content(ctx),
         Section::Issues => issues::content(ctx),
         Section::Notifications => notifications::content(ctx),
         Section::Logs => logs::content(ctx),
@@ -1070,7 +1090,8 @@ mod spec {
             assert!(!h.is_empty(), "{section:?} half");
             assert!(!f.is_empty(), "{section:?} full");
             // Debug/Db are dead-code placeholder sections — distinctness is waived.
-            // Logs/Share/Forward/MergeQueue are flat lists, no width-specific full view.
+            // Logs/Share/Forward/MergeQueue/Across are flat lists whose empty/default
+            // render has no width-specific full view.
             if matches!(
                 section,
                 Section::Debug
@@ -1079,6 +1100,7 @@ mod spec {
                     | Section::Share
                     | Section::Forward
                     | Section::MergeQueue
+                    | Section::Across
             ) {
                 continue;
             }

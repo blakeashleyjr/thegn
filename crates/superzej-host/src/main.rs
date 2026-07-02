@@ -38,6 +38,7 @@ mod lifecycle;
 mod loading;
 mod logotype;
 mod lsp;
+mod managed_tool;
 mod mem;
 mod menu;
 mod metrics;
@@ -207,6 +208,19 @@ pub enum Command {
     Agent {
         #[command(subcommand)]
         action: cmd::agent::Action,
+    },
+    /// BugStalker debugger: install/pin `bs`, or start a session (`debug run
+    /// <program>` / `debug attach <pid>`) — run inside a pane to debug within
+    /// its sandbox/placement.
+    Debug {
+        #[command(subcommand)]
+        action: cmd::debug::Action,
+    },
+    /// User-declared MCP servers (`[mcp_servers.<name>]`): list, emit the
+    /// `mcpServers` settings block, or install a server's binary (grant-checked).
+    Mcp {
+        #[command(subcommand)]
+        action: cmd::mcp::Action,
     },
     /// Print the exact sandbox argv for a worktree (for debugging).
     SandboxArgv {
@@ -429,7 +443,9 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Recent { count } => cmd::repos::recent(count),
         Command::Config { action } => cmd::config::run(&cfg, action, config_path),
         Command::Env { action } => cmd::env::run(&cfg, action),
-        Command::Agent { action } => cmd::agent::run(action),
+        Command::Agent { action } => cmd::agent::run(&cfg, action),
+        Command::Debug { action } => cmd::debug::run(&cfg, action),
+        Command::Mcp { action } => cmd::mcp::run(&cfg, action),
         Command::Notify { action } => cmd::notify::run(action),
         Command::Logs { action } => cmd::logs::run(&cfg, action),
         Command::Doctor { json } => cmd::doctor::run(&cfg, json),

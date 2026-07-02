@@ -557,6 +557,36 @@ name = "Agent"
 command = 'PI_CODING_AGENT_DIR="$HOME/.superzej/pi/agent" exec "$HOME/.superzej/pi/node_modules/.bin/pi"'
 provider = "pi"
 
+# ── Managed tools ([managed_tools.<name>]) ──────────────────────────────────
+# Per-tool overrides for superzej's managed-tool resolver (the pinned external
+# binaries it acquires: the pi agent, the `bs` debugger, MCP servers). The
+# resolver picks a binary in a fixed order — this override → the tool's name on
+# PATH → superzej's own pinned download under `~/.superzej`. Declare an override
+# only to force a specific binary; omit the table to use PATH/managed. Inspect
+# resolution with `szhost doctor`.
+# [managed_tools.pi]
+# path = "/usr/local/bin/pi"      # explicit binary (highest-priority tier)
+# args = ["--flag"]               # optional extra launch arguments
+
+# ── MCP servers ([mcp_servers.<name>]) ──────────────────────────────────────
+# User-declared Model Context Protocol servers the agent consumes. `szhost agent
+# setup` merges these into the managed pi's settings (the de-facto `mcpServers`
+# key) alongside the built-in superzej-acp house tools. Inspect with `szhost mcp
+# list` / `szhost mcp emit`; install a server's binary (grant-checked) with
+# `szhost mcp install <name>`.
+# [mcp_servers.git]
+# command = ["npx", "-y", "@modelcontextprotocol/server-git"]  # launch argv
+# args    = ["--repo", "."]                                     # extra args
+# source  = { type = "npm", package = "@modelcontextprotocol/server-git", version = "0.5.0" }
+#                                 # optional: acquire the binary (type = npm | cargo)
+# Capability grants gate acquisition (Zed-style, least-privilege): an install is
+# refused unless a matching grant covers it. Kinds: process:exec, download_file,
+# npm:install, cargo:install. `scope` is a glob (`*` within a path segment, `**`
+# across). Omit for none (acquisition then refused).
+# [[mcp_servers.git.grants]]
+# kind  = "npm:install"
+# scope = "@modelcontextprotocol/*"
+
 [[agents]]
 name = "shell"
 command = "__shell__"

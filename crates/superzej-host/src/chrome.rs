@@ -2892,9 +2892,8 @@ pub(crate) fn panel_help_pairs(ui: &crate::panel::PanelUi) -> Vec<(String, Strin
         ],
         Section::Share => &[("j/k", "row"), ("↵", "copy url")],
         Section::Forward => &[("j/k", "row"), ("o", "open in browser"), ("↵", "copy url")],
-        Section::Debug | Section::Sandbox | Section::Db | Section::Telemetry | Section::Keys => {
-            &[("j/k", "row")]
-        }
+        // Row-nav-only sections (Debug, Sandbox, Db, Telemetry, Keys, Across, …).
+        _ => &[("j/k", "row")],
     };
     // "esc back" leads every row-mode hint list so the exit path is always visible.
     let mut result: Vec<(String, String)> = vec![("esc".to_string(), "back".to_string())];
