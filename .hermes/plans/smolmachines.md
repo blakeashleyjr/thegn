@@ -15,18 +15,22 @@
 **Objective:** Add `Smol` to the config-facing `SandboxBackend` enum with its string aliases.
 
 **Files:**
+
 - Modify: `crates/superzej-core/src/config.rs`
 
 **Step 1: Write failing test**
 Update the `config_enum_every_variant_roundtrips_canon_and_aliases` test to include:
+
 ```rust
 ("smol", SandboxBackend::Smol),
 ("smolvm", SandboxBackend::Smol),
 ```
+
 Run `cargo test -p superzej-core --lib config::tests`
 
 **Step 2: Minimal Implementation**
 Add `Smol` to the `SandboxBackend` enum:
+
 ```rust
 pub enum SandboxBackend: "sandbox backend" {
     // ...
@@ -36,6 +40,7 @@ pub enum SandboxBackend: "sandbox backend" {
     None = "none" | "host",
 }
 ```
+
 Update `as_str()` assertions if needed.
 
 **Step 3: Verify Pass**
@@ -52,6 +57,7 @@ Run tests, ensure PASS.
 **Objective:** Add `Smol` to the runtime `Backend` enum and implement its mapping logic.
 
 **Files:**
+
 - Modify: `crates/superzej-core/src/sandbox.rs`
 
 **Step 1: Write failing test**
@@ -60,6 +66,7 @@ Create/Update backend string parsing tests if they exist, or verify compiler err
 **Step 2: Minimal Implementation**
 In `crates/superzej-core/src/sandbox.rs`:
 Add variant:
+
 ```rust
 pub enum Backend {
     // ...
@@ -68,23 +75,33 @@ pub enum Backend {
     None,
 }
 ```
+
 Add to `parse`:
+
 ```rust
 "smol" | "smolvm" => Backend::Smol,
 ```
+
 Add to `from_config`:
+
 ```rust
 SandboxBackend::Smol => Backend::Smol,
 ```
+
 Add to `label()`:
+
 ```rust
 Backend::Smol => "smolvm",
 ```
+
 Add to `binary()`:
+
 ```rust
 Backend::Smol => "smolvm",
 ```
+
 Add to `is_oci()`: (smol uses images and persistent named machines, so treat as OCI)
+
 ```rust
 | Backend::Smol
 ```
@@ -102,6 +119,7 @@ Run `cargo check -p superzej-core` and fix any other `match backend { ... }` exh
 **Objective:** Implement `machine create` command generation for `smolvm` in the sandbox module.
 
 **Files:**
+
 - Modify: `crates/superzej-core/src/sandbox.rs`
 
 **Step 1: Design CLI Map**
@@ -111,6 +129,7 @@ And `smolvm machine start --name <container_name>`
 **Step 2: Update `ensure` function**
 Find where `podman container create` is generated. Add a branch for `Backend::Smol`.
 Implement a new `smol_create_opts(spec: &SandboxSpec) -> Vec<String>` helper to translate the spec to `smolvm machine create` args.
+
 - `--net` if spec implies network
 - `--image` `spec.image`
 - `-v` `spec.mounts`
@@ -133,10 +152,12 @@ Add a unit test `test_smolvm_create_opts` mirroring `oci_create_opts_map_userns_
 **Objective:** Implement execution inside the VM and teardown.
 
 **Files:**
+
 - Modify: `crates/superzej-core/src/sandbox.rs`
 
 **Step 1: Enter ARGV**
 Update `enter_argv`:
+
 ```rust
         Backend::Smol => {
             let mut v = backend_prefix(Backend::Smol);
@@ -155,6 +176,7 @@ Update `enter_argv`:
 
 **Step 2: Teardown**
 Update `teardown`:
+
 ```rust
         Backend::Smol => {
             let mut v = backend_prefix(Backend::Smol);
@@ -174,10 +196,12 @@ Run all tests.
 **Objective:** Add `smolvm` to the default auto-detection chain.
 
 **Files:**
+
 - Modify: `crates/superzej-core/src/config.rs`
 
 **Step 1: Update Default Chain**
 Update `impl Default for SandboxConfig`:
+
 ```rust
             backend_chain: vec![
                 "smolvm".into(),
