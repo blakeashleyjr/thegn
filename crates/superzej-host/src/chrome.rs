@@ -438,8 +438,12 @@ pub struct FrameModel {
     pub active_sandbox_backend: String,
     /// Terse placement kind for the active worktree (`ssh`, `mosh`, `k8s`, or the
     /// provider id like `sprite`); `None` when it runs locally. Shown as a chip in
-    /// the center tab bar. The full detail (`ssh:host`, …) lives on each sidebar row.
+    /// the center tab bar's right-aligned env cluster.
     pub active_placement_kind: Option<String>,
+    /// Full placement detail for the active worktree (`ssh:host`, `k8s:ns/pod`,
+    /// `sprite:<id>`); `None` when it runs locally. Shown in the System → Sandbox
+    /// panel section (the terse `active_placement_kind` covers the tab-bar chip).
+    pub active_placement_label: Option<String>,
     /// Running containers (superzej-owned first) for the SANDBOXES section.
     pub containers: Vec<superzej_core::sandbox::ContainerInfo>,
     /// Health of the active worktree's container (updated on the container refresh tick).
@@ -569,6 +573,7 @@ impl FrameModel {
             && self.active_container_name == other.active_container_name
             && self.active_sandbox_backend == other.active_sandbox_backend
             && self.active_placement_kind == other.active_placement_kind
+            && self.active_placement_label == other.active_placement_label
             && self.container_events == other.container_events
             && self.timeline == other.timeline
             && self.status == other.status
@@ -614,7 +619,9 @@ fn strip_chip_spans(model: &FrameModel, strip: Rect) -> Vec<(usize, usize, usize
     if strip.rows == 0 || strip.cols == 0 {
         return spans;
     }
-    let end = pin_chips_start(model, strip);
+    let end = pin_chips_start(model, strip)
+        .saturating_sub(crate::tabbar_env::env_cluster_width(model))
+        .max(strip.x);
     let mut x = strip.x + 1;
     if let Some((ws, leaf)) = worktree_parts(model) {
         if !ws.is_empty() {
@@ -822,7 +829,10 @@ fn draw_center_tabs(surface: &mut Surface, strip: Rect, model: &FrameModel) {
     );
 
     draw_pin_chips(surface, strip, end, model, accent, dim);
-    let chips_end = pin_chips_start(model, strip);
+    // Env cluster (sandbox `(backend)` + remote `[kind]`) right-aligned just
+    // left of the pins; its left edge is the boundary the tab chips stop before.
+    let pins_start = pin_chips_start(model, strip);
+    let chips_end = crate::tabbar_env::draw_env_chips(surface, strip, pins_start, model);
 
     let mut x = strip.x + 1;
     if let Some((ws, leaf)) = worktree_parts(model) {
@@ -858,17 +868,6 @@ fn draw_center_tabs(surface: &mut Surface, strip: Rect, model: &FrameModel) {
             chips_end.saturating_sub(x),
         );
         x += leaf.chars().count();
-        // Remote placement kind (ssh/mosh/k8s/<provider>) next to the active
-        // worktree name; nothing for a local worktree. The full detail
-        // (ssh:host, sprite:<id>, …) lives in the sidebar detail line.
-        if let Some(kind) = &model.active_placement_kind {
-            let chip = format!(" [{kind}]");
-            let avail = chips_end.saturating_sub(x);
-            if avail >= chip.chars().count() {
-                draw_text(surface, x, strip.y, &chip, col(S::Dim), bg, avail);
-                x += chip.chars().count();
-            }
-        }
         // Issue badge: show the first linked issue's status + number next to
         // the active worktree name when at least one issue is linked.
         if let Some(issue_id) = model.panel.tracker_links.first()
@@ -2590,12 +2589,6 @@ fn compose_detail_line(row: &crate::sidebar::SidebarRow) -> Option<crate::seg::L
     {
         segs.push(seg(Tok::Slot(S::Faint), format!("({backend}) ")));
     }
-    // Remote placement (ssh/mosh/k8s/provider) with full detail; only set for
-    // non-local worktrees, so a local one shows nothing here. Bracketed so it
-    // reads distinctly from the env «name» and the sandbox (backend) chips.
-    if let Some(placement) = &row.placement_label {
-        segs.push(seg(Tok::Slot(S::Faint), format!("[{placement}] ")));
-    }
     if let Some(pr) = row.pr_count.filter(|&c| c > 0) {
         segs.push(seg(Tok::Hue(theme::Hue::Green), format!("\u{2b21}{pr} "))); // ⬡N
     }
@@ -3290,7 +3283,6 @@ mod tests {
             agent: None,
             sandbox_backend: None,
             env_name: None,
-            placement_label: None,
             activity: crate::sidebar::ActivityState::None,
             visible: true,
             collapsed: false,
@@ -3303,41 +3295,6 @@ mod tests {
             target_bytes: None,
             terminal_connection: None,
         }
-    }
-
-    /// Flatten a `Line` to its concatenated segment text (test helper).
-    fn line_text(line: &crate::seg::Line) -> String {
-        use crate::seg::Line;
-        match line {
-            Line::Segs(s) => s.iter().map(|g| g.text.clone()).collect(),
-            Line::Split { l, r } => l.iter().chain(r.iter()).map(|g| g.text.clone()).collect(),
-            _ => String::new(),
-        }
-    }
-
-    #[test]
-    fn detail_line_shows_remote_placement_only_when_set() {
-        // A local worktree (no placement) shows no bracketed remote label.
-        let local = row(crate::sidebar::RowKind::Worktree, "feat");
-        let local_text = compose_detail_line(&local)
-            .map(|l| line_text(&l))
-            .unwrap_or_default();
-        assert!(
-            !local_text.contains('['),
-            "local row must not show a placement badge: {local_text:?}"
-        );
-
-        // A remote worktree shows the full placement label in brackets, distinct
-        // from the env «name» and the sandbox (backend) chips.
-        let mut remote = row(crate::sidebar::RowKind::Worktree, "feat");
-        remote.placement_label = Some("ssh:dev@box".into());
-        let text = compose_detail_line(&remote)
-            .map(|l| line_text(&l))
-            .unwrap_or_default();
-        assert!(
-            text.contains("[ssh:dev@box]"),
-            "expected bracketed placement, got {text:?}"
-        );
     }
 
     #[test]
@@ -4114,6 +4071,46 @@ mod tests {
         // The pins are right of the tab chip.
         let mail_at = row.find("mail").unwrap();
         assert!(mail_at > spans[0].0, "pins render to the right of tabs");
+    }
+
+    #[test]
+    fn center_tabs_env_cluster_right_aligned_and_never_overlapped() {
+        // A remote, sandboxed worktree: the env cluster is `(podman) [sprite]`.
+        let mut s = Surface::new(80, 1);
+        let model = FrameModel {
+            worktree: "washu/home".into(),
+            tabs: vec!["1".into(), "2".into()],
+            active_tab: 0,
+            active_sandbox_backend: "podman".into(),
+            active_placement_kind: Some("sprite".into()),
+            ..Default::default()
+        };
+        let strip = Rect {
+            x: 0,
+            y: 0,
+            cols: 80,
+            rows: 1,
+        };
+        draw_center_tabs(&mut s, strip, &model);
+        let row = &lines(&s)[0];
+        // The bug being fixed: the tab pill used to paint over the chip. Both
+        // chips render intact, and the sandbox chip reads before the placement.
+        assert!(row.contains("(podman)"), "backend chip intact: {row:?}");
+        let backend_at = row.find("(podman)").unwrap();
+        let kind_at = row.find("[sprite]").expect("placement chip intact");
+        assert!(backend_at < kind_at, "reads (backend) then [kind]: {row:?}");
+        // The cluster is right-aligned: it sits past all tab chips (compare in
+        // char columns — the slug separator `▸` is multi-byte). The chip's char
+        // column is its byte offset minus the extra bytes the `▸` contributes.
+        let extra = "WASHU \u{25b8}".len() - "WASHU \u{25b8}".chars().count();
+        let backend_col = backend_at - extra;
+        let spans = strip_chip_spans(&model, strip);
+        assert_eq!(spans.len(), 2, "both tab chips present: {row:?}");
+        let last_tab_end = spans[1].0 + spans[1].1;
+        assert!(
+            backend_col >= last_tab_end,
+            "env cluster is right of the tabs (no overlap): tab end {last_tab_end}, chip at col {backend_col}: {row:?}"
+        );
     }
 
     #[test]

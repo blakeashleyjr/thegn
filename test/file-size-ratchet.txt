@@ -3,6 +3,6 @@
 5487 crates/superzej-core/src/db.rs
 3137 crates/superzej-core/src/sandbox.rs
 4846 crates/superzej-host/src/agent.rs
-4819 crates/superzej-host/src/chrome.rs
+4816 crates/superzej-host/src/chrome.rs
 3028 crates/superzej-host/src/keymap.rs
-23232 crates/superzej-host/src/run.rs
+23231 crates/superzej-host/src/run.rs
