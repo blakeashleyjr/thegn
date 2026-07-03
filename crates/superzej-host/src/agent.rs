@@ -1535,7 +1535,7 @@ pub fn destroy_spare(cfg: &Config, env_name: &str, name: &str) -> anyhow::Result
 /// devshell, clone, language runtimes) can legitimately run for many minutes; the
 /// rest are quick, so a short ceiling there turns an otherwise-infinite hang (a
 /// suspended sandbox, a lost exit frame) into a clear step failure.
-fn provision_step_timeout(step_id: &str) -> std::time::Duration {
+pub(crate) fn provision_step_timeout(step_id: &str) -> std::time::Duration {
     use std::time::Duration;
     // Only `workspace` (mkdir) and `git_auth` (git config) are truly instant — a
     // stall there is the suspended-sandbox hang we want to catch fast. Everything
@@ -1949,7 +1949,9 @@ pub fn provision_provider_env_named(
                 // "Agent" entry's `$HOME/.superzej/pi` snippet resolves in-sprite.
                 // Best-effort throughout — a failure just means the Agent entry won't
                 // work in this sprite (the host one still does).
-                if let Err(e) = provision_managed_pi(&provider, &id, &sprite_home, &exec_env) {
+                if let Err(e) =
+                    crate::agent_pi::provision_managed_pi(&provider, &id, &sprite_home, &exec_env)
+                {
                     superzej_core::msg::warn(&format!(
                         "managed pi: {e}; the \"Agent\" entry may not work in this sandbox."
                     ));
@@ -2531,45 +2533,6 @@ fn apply_local_parity(
     block_on_provider(|| async { provider.run_exec(id, &argv, None, exec_env).await })
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("replay exec failed: {e}"))
-}
-
-/// Provision the MANAGED pi inside the sandbox: carry the host's seeded agent dir
-/// (`~/.superzej/pi/agent` → `<sprite_home>/.superzej/pi/agent`) and npm-install the
-/// pinned binary there, so the "Agent" picker entry's `$HOME/.superzej/pi` snippet
-/// resolves in-sprite exactly as on the host. Best-effort.
-fn provision_managed_pi(
-    provider: &superzej_svc::provider::Provider,
-    id: &str,
-    sprite_home: &str,
-    exec_env: &[(String, String)],
-) -> anyhow::Result<()> {
-    // Make sure the host's managed agent dir is seeded — it's the bytes we carry.
-    if let Err(e) = crate::cmd::agent::setup(false) {
-        superzej_core::msg::warn(&format!("managed pi: host setup before carry failed: {e}"));
-    }
-    let host_agent = superzej_core::util::managed_pi_agent_dir();
-    anyhow::ensure!(
-        host_agent.is_dir(),
-        "host managed pi agent dir missing ({}); run `szhost agent setup`",
-        host_agent.display()
-    );
-
-    // 1. Carry the agent dir (superzej-acp package + settings) into the sandbox.
-    let dest = format!("{}/.superzej/pi/agent", sprite_home.trim_end_matches('/'));
-    block_on_provider(|| async { provider.upload_dir(id, &host_agent, &dest).await })
-        .map_err(|e| anyhow::anyhow!("carry managed agent dir → {dest}: {e}"))?;
-
-    // 2. Install the pinned pi binary in the sandbox (best-effort — needs node/npm;
-    //    a missing npm just means the Agent entry won't work here, not a hard fail).
-    let pin = crate::pi_assets::PI_PIN;
-    let script = format!(
-        "command -v npm >/dev/null 2>&1 || {{ echo 'npm not found — managed pi binary not installed'; exit 0; }}; \
-         npm install --prefix \"$HOME/.superzej/pi\" @earendil-works/pi-coding-agent@{pin} 2>&1"
-    );
-    let argv = vec!["/bin/sh".to_string(), "-lc".to_string(), script];
-    block_on_provider(|| async { provider.run_exec(id, &argv, None, exec_env).await })
-        .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("npm install managed pi in sandbox: {e}"))
 }
 
 // off-loop: provisioning path — reached only via spawn_blocking / the pool thread / CLI.
