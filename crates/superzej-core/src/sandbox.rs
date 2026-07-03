@@ -23,6 +23,9 @@ use crate::config::{
 };
 use crate::placement::{Placement, SshPlacement, TransportKind};
 use crate::remote::GitLoc;
+use crate::sandbox_mounts::{
+    auto_cache_mounts, default_writable_carveouts, host_toolchain_mounts_ro_home, keep_cfg_mount,
+};
 use crate::{msg, util};
 use std::path::PathBuf;
 use std::process::Command;
@@ -473,11 +476,19 @@ pub fn resolve_placed(
     //   bwrap picks them up via spec.mounts → --ro-bind flags.
     // systemd/host: full host filesystem, no extra mounts needed.
     let inject_host_toolchain = (backend.is_oci() || backend == Backend::Bwrap) && cfg.auto_caches;
-    // OCI: mount home ro (running as root in a foreign image, must not write).
-    // bwrap: mount home rw (running as the real user; zsh history, zoxide,
-    //   keychain etc. need to write to $HOME — ro causes blank/broken prompts).
-    let home_ro = backend.is_oci();
+    // Read-only-outside-the-worktree by default: mount $HOME read-only unless the
+    // profile explicitly opts out. OCI always mounts home ro (root in a foreign
+    // image, must not write). bwrap/systemd honor the hardening profile: the
+    // default `hardened`/`sealed` (read_only_root) → ro $HOME so a sandboxed
+    // agent can't `cd` out of the worktree and modify/delete host files;
+    // `profile = "open"` → rw $HOME as the escape hatch. Writes tools genuinely
+    // need (zsh history, zoxide, atuin) are carved back narrowly below.
+    let home_ro = backend.is_oci() || profile.read_only_root();
 
+    // Emit the host-toolchain substrate (ro $HOME) BEFORE the worktree/caches so
+    // the read-write worktree, git dir, and caches — which live *under* $HOME —
+    // overmount the read-only $HOME parent (bwrap applies binds in order; a later
+    // child bind wins). Same mechanism as the `.git`(rw) → `.git/config`(ro) pin.
     match cfg.file_access {
         FileAccess::All | FileAccess::Host => {
             mounts.push(Mount {
@@ -488,22 +499,34 @@ pub fn resolve_placed(
             });
         }
         FileAccess::Worktree => {
-            add_worktree_mounts(&mut mounts);
             if inject_host_toolchain {
                 mounts.extend(host_toolchain_mounts_ro_home(home_ro));
             }
+            add_worktree_mounts(&mut mounts);
         }
         FileAccess::WorktreePlusCaches => {
+            if inject_host_toolchain {
+                mounts.extend(host_toolchain_mounts_ro_home(home_ro));
+            }
             add_worktree_mounts(&mut mounts);
             if cfg.auto_caches {
                 mounts.extend(auto_cache_mounts());
             }
-            if inject_host_toolchain {
-                mounts.extend(host_toolchain_mounts_ro_home(home_ro));
-            }
         }
         FileAccess::Custom => add_worktree_mounts(&mut mounts),
         FileAccess::None => {}
+    }
+
+    // Under a read-only $HOME, carve narrow read-write paths back so shell/tool
+    // state (history, zoxide, atuin) and a personal scratch dir keep working.
+    // Only when $HOME was actually injected read-only: `all`/`host` are already
+    // fully writable, and `custom`/`none` withhold $HOME entirely.
+    if inject_host_toolchain && home_ro {
+        for cv in default_writable_carveouts() {
+            if keep_cfg_mount(&mounts, &cv) {
+                mounts.push(cv);
+            }
+        }
     }
 
     for m in &cfg.mounts {
@@ -513,14 +536,12 @@ pub fn resolve_placed(
         if !std::path::Path::new(&parsed.host).exists() {
             continue;
         }
-        // Skip mounts already covered by a parent directory that's already in
-        // the list (e.g. ~/.gitconfig when $HOME is already bind-mounted): bwrap
-        // cannot create a file mount-point inside an already-bound directory and
-        // returns "Can't create file". Exact-path duplicates are also redundant.
-        let covered = mounts
-            .iter()
-            .any(|e| std::path::Path::new(&parsed.host).starts_with(&e.host));
-        if !covered {
+        // A read-write *directory* under a read-only parent (e.g. `~/.gnupg` under
+        // the read-only $HOME) is kept — it overmounts the parent read-write. A
+        // read-only entry already covered, an exact duplicate, or a *file*
+        // mount-point inside a bound dir (bwrap "Can't create file", e.g.
+        // `~/.gitconfig`) is skipped. See `keep_cfg_mount`.
+        if keep_cfg_mount(&mounts, &parsed) {
             mounts.push(parsed);
         }
     }
@@ -1483,16 +1504,25 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
                 v.extend(["-p".into(), "PrivateNetwork=yes".into()]);
             }
             // Hardening (systemd unit properties). ProtectSystem=yes keeps /usr
-            // & /boot read-only while leaving $HOME/etc writable (the OCI path
-            // uses a full read-only root, but systemd runs on the host fs where
-            // that would break $HOME); the worktree stays writable via
-            // ReadWritePaths, and PrivateTmp=yes already gives a writable /tmp.
+            // & /boot read-only; ProtectHome=read-only closes the $HOME gap so a
+            // sandboxed process can't `cd` out of the worktree and modify/delete
+            // host files (the reported bwrap escape, same class here). The
+            // read-write paths — worktree, git dir, build caches, and the narrow
+            // $HOME carve-outs — are carved back from the non-ro `spec.mounts`;
+            // PrivateTmp=yes already gives a writable /tmp.
             if spec.read_only_root {
                 v.extend(["-p".into(), "ProtectSystem=yes".into()]);
-                v.extend([
-                    "-p".into(),
-                    format!("ReadWritePaths={}", spec.worktree.display()),
-                ]);
+                v.extend(["-p".into(), "ProtectHome=read-only".into()]);
+                for m in &spec.mounts {
+                    if !m.ro {
+                        v.extend(["-p".into(), format!("ReadWritePaths={}", m.dest)]);
+                    }
+                }
+                // $HOME is otherwise read-only; carve the same narrow writable
+                // state dirs as bwrap so shell history/zoxide keep working.
+                for cv in default_writable_carveouts() {
+                    v.extend(["-p".into(), format!("ReadWritePaths={}", cv.dest)]);
+                }
             }
             if spec.no_new_privileges {
                 v.extend(["-p".into(), "NoNewPrivileges=yes".into()]);
@@ -1831,162 +1861,6 @@ fn local_uid_gid() -> Option<(u32, u32)> {
     Some((u, g))
 }
 
-/// Mounts that bring the host toolchain into an OCI container so the user's
-/// real shell, dotfiles, and tools work identically inside the sandbox.
-///
-/// This is most useful on NixOS, where everything lives in `/nix/store` and
-/// `/run/current-system/sw`, but the same logic also picks up conventional
-/// FHS paths (`/usr`, `/lib`, `/bin`) on non-NixOS hosts.
-///
-/// Only paths that **exist on the host** at spec-build time are included —
-/// the list is always a subset of what's actually present, never a wish list.
-/// All mounts are **read-only** (the container should not modify host system
-/// files).
-/// `ro_home`: mount `$HOME` read-only (OCI) or read-write (bwrap).
-/// See the comment on the home-directory section below.
-pub fn host_toolchain_mounts() -> Vec<Mount> {
-    host_toolchain_mounts_ro_home(true) // public API defaults to safe (ro)
-}
-
-fn host_toolchain_mounts_ro_home(ro_home: bool) -> Vec<Mount> {
-    let mut mounts = Vec::new();
-    let home = std::env::var("HOME").unwrap_or_default();
-
-    let ro = |path: &str| Mount {
-        host: path.to_string(),
-        dest: path.to_string(),
-        ro: true,
-        cache: false,
-    };
-
-    let exists = |p: &str| std::path::Path::new(p).exists();
-
-    // ── NixOS / Nix-on-anything paths ───────────────────────────────────────
-    // /nix/store  — every binary, library, and config file Nix manages lives
-    //               here. Mounting it ro brings in the shell ($SHELL resolves
-    //               to a store path), starship, completions, dotfile symlink
-    //               targets, etc. without any per-package enumeration.
-    if exists("/nix/store") {
-        mounts.push(ro("/nix/store"));
-    }
-    // /run/current-system — the stable generation symlinks:
-    //   sw/bin/zsh, sw/share/zsh, etc. The container's $SHELL will resolve
-    //   correctly once /nix/store is present.
-    if exists("/run/current-system") {
-        mounts.push(ro("/run/current-system"));
-    }
-    // /nix/var/nix/profiles — user profiles (alternative to per-user path).
-    if exists("/nix/var/nix/profiles") {
-        mounts.push(ro("/nix/var/nix/profiles"));
-    }
-    // /etc/profiles/per-user/<user> — per-user packages installed by
-    // home-manager (e.g. zsh plugins, starship when not in system profile).
-    if !home.is_empty() {
-        let username = std::path::Path::new(&home)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        if !username.is_empty() {
-            let p = format!("/etc/profiles/per-user/{username}");
-            if exists(&p) {
-                mounts.push(ro(&p));
-            }
-        }
-    }
-    // /etc/static — NixOS-managed /etc entries (zshrc, zshenv, zprofile, …).
-    if exists("/etc/static") {
-        mounts.push(ro("/etc/static"));
-    }
-
-    // ── Conventional FHS paths (non-NixOS, or mixed systems) ────────────────
-    // These are absent on pure NixOS (everything is in /nix) but present on
-    // Ubuntu/Debian/Fedora/Arch and WSL; include them when they exist.
-    for path in &["/usr", "/lib", "/lib64", "/bin"] {
-        // Skip /bin and /lib if they're just symlinks into /usr (common on
-        // modern FHS systems) to avoid duplicate mounts.
-        let p = std::path::Path::new(path);
-        if p.exists() && !p.is_symlink() {
-            mounts.push(ro(path));
-        }
-    }
-
-    // ── Identity/locale files every process expects ──────────────────────────
-    // passwd/group are needed for getpwuid() (shell prompts, git author, etc.)
-    // Overlaying the host files means the container sees the real username.
-    for path in &[
-        "/etc/passwd",
-        "/etc/group",
-        "/etc/hosts",
-        "/etc/localtime",
-        "/etc/resolv.conf",
-        "/etc/zshrc", // NixOS system-wide zsh init (sourced by /etc/static/zshrc)
-        "/etc/zshenv",
-        "/etc/zprofile",
-    ] {
-        if exists(path) {
-            mounts.push(ro(path));
-        }
-    }
-
-    // ── User home directory (dotfiles) ───────────────────────────────────────
-    // Mount $HOME so ~/.zshrc, ~/.config/starship.toml, ~/.gitconfig and similar
-    // dotfiles are visible. On NixOS these are symlinks into /nix/store, so this
-    // mount is complementary: symlink + /nix/store (target).
-    //
-    // ro_home controls read-only vs read-write:
-    //   OCI (podman/docker) — ro: the container runs as root in a foreign image;
-    //     we expose dotfiles for reading but must not let root write to the host.
-    //   bwrap — rw: the process runs as the real user on the host filesystem;
-    //     zsh history, zoxide DB, keychain, and many other tools need to write
-    //     to $HOME and will silently fail or produce a blank prompt with ro.
-    if !home.is_empty() && exists(&home) {
-        mounts.push(Mount {
-            host: home.clone(),
-            dest: home,
-            ro: ro_home,
-            cache: false,
-        });
-    }
-
-    mounts
-}
-
-fn auto_cache_mounts() -> Vec<Mount> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    if home.is_empty() {
-        return Vec::new();
-    }
-    let candidates = [
-        ".cargo/registry",
-        ".cargo/git",
-        ".rustup",
-        ".npm",
-        ".cache/pnpm",
-        ".cache/yarn",
-        "go/pkg/mod",
-        ".cache/go-build",
-        ".cache/pip",
-        ".cache/uv",
-        ".m2/repository",
-        ".gradle/caches",
-    ];
-    candidates
-        .iter()
-        .filter_map(|rel| {
-            let p = std::path::Path::new(&home).join(rel);
-            p.is_dir().then(|| {
-                let s = p.to_string_lossy().into_owned();
-                Mount {
-                    host: s.clone(),
-                    dest: s,
-                    ro: false,
-                    cache: true,
-                }
-            })
-        })
-        .collect()
-}
-
 /// ssh refuses a config file — or any file it `Include`s — unless it is owned
 /// by the invoking user or root. Under unprivileged bwrap the whole nix store
 /// (where home-manager keeps `~/.ssh/config` and its includes) is owned by
@@ -2256,6 +2130,7 @@ pub fn run_gc(db_worktrees: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox_mounts::host_toolchain_mounts;
 
     fn vpn_cfg(provider: VpnProviderKind) -> VpnConfig {
         VpnConfig {
@@ -2940,14 +2815,18 @@ mod tests {
         if let Some(spec) = resolve(&cfg, &loc, "test") {
             // host_toolchain_mounts() entries: not the fake worktree, not the
             // rw language caches from auto_cache_mounts (those are !ro && cache),
-            // and not the $HOME bind-mount (parallel tests may temporarily set
-            // HOME to a temp dir that's deleted mid-assertion).
+            // and nothing under $HOME — the $HOME bind-mount itself (parallel
+            // tests may temporarily set HOME to a temp dir that's deleted
+            // mid-assertion) and the rw writable carve-outs (~/tmp,
+            // ~/.local/state, …) both live there and are not ro.
             let home = std::env::var("HOME").unwrap_or_default();
             let toolchain: Vec<_> = spec
                 .mounts
                 .iter()
                 .filter(|m| {
-                    !m.host.starts_with("/wt/") && !m.cache && (home.is_empty() || m.host != home)
+                    !m.host.starts_with("/wt/")
+                        && !m.cache
+                        && (home.is_empty() || !m.host.starts_with(&home))
                 })
                 .collect();
             for m in &toolchain {

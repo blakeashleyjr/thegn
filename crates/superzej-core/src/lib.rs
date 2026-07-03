@@ -69,6 +69,7 @@ pub mod remote;
 pub mod repo;
 pub mod revtunnel;
 pub mod sandbox;
+pub mod sandbox_mounts;
 pub mod search;
 pub mod semantic;
 pub mod share;
