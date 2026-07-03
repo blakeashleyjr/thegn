@@ -683,7 +683,7 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
     if opts.managed_pi {
         steps.push(ProvisionStep {
             id: "managed_pi".into(),
-            label: "Install managed pi".into(),
+            label: "Set up Agent".into(),
             kind: StepKind::ManagedPi,
         });
     }
