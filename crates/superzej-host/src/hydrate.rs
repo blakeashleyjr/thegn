@@ -1040,6 +1040,7 @@ fn apply_pr_cache(panel: &mut crate::panel::PanelData, cached: superzej_core::gi
         PanelState::NotAuthenticated => panel.pr_note = Some("gh not authenticated".into()),
         PanelState::NoPr => panel.pr_note = Some("no pull request".into()),
         PanelState::RateLimited => panel.pr_note = Some("GitHub rate limited".into()),
+        PanelState::Offline => panel.pr_note = Some("GitHub unreachable".into()),
         PanelState::Error { message } => panel.pr_note = Some(message),
     }
     panel.threads = cached.threads;

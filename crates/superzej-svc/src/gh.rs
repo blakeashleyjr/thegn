@@ -238,6 +238,72 @@ pub fn parse_owner_repo(url: &str) -> Option<(String, String)> {
     ))
 }
 
+/// Per-request timeout on octocrab GraphQL calls. A stalled TLS handshake to
+/// api.github.com blocks the refresh task for up to the reqwest default (15s)
+/// with no user feedback; cap it at 10s so the fallback kicks in promptly.
+const OCTOCRAB_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Open the circuit after this many consecutive transient failures. When open,
+/// we skip the octocrab path entirely (going straight to the CLI fallback) for
+/// `CIRCUIT_OPEN_SECS` seconds so a network partition doesn't spawn a hanging
+/// octocrab task every 20s.
+const CIRCUIT_OPEN_AFTER: u32 = 3;
+const CIRCUIT_OPEN_SECS: u64 = 60;
+
+/// Simple half-open circuit breaker shared across all `GhNative` calls
+/// (process-global, since `GhNative::new()` is cheap and short-lived).
+static CIRCUIT: std::sync::OnceLock<GhCircuit> = std::sync::OnceLock::new();
+
+struct GhCircuit {
+    failures: std::sync::atomic::AtomicU32,
+    open_until: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl GhCircuit {
+    fn new() -> Self {
+        Self {
+            failures: std::sync::atomic::AtomicU32::new(0),
+            open_until: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Returns `true` if the circuit is open (skip octocrab this call).
+    fn is_open(&self) -> bool {
+        let guard = self.open_until.lock().unwrap_or_else(|e| e.into_inner());
+        guard.map_or(false, |until| std::time::Instant::now() < until)
+    }
+
+    fn record_success(&self) {
+        self.failures.store(0, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut g) = self.open_until.lock() {
+            *g = None;
+        }
+    }
+
+    fn record_failure(&self) {
+        let prev = self
+            .failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if prev + 1 >= CIRCUIT_OPEN_AFTER {
+            if let Ok(mut g) = self.open_until.lock() {
+                *g = Some(
+                    std::time::Instant::now() + std::time::Duration::from_secs(CIRCUIT_OPEN_SECS),
+                );
+            }
+            tracing::warn!(
+                target: "szhost::gh",
+                consecutive_failures = prev + 1,
+                open_secs = CIRCUIT_OPEN_SECS,
+                "GitHub API unreachable — pausing native octocrab path"
+            );
+        }
+    }
+}
+
+fn circuit() -> &'static GhCircuit {
+    CIRCUIT.get_or_init(GhCircuit::new)
+}
+
 /// The native GitHub backend: octocrab GraphQL for `pr_status` (one round trip)
 /// on local locs with a resolvable token; everything else (writes, remote, or
 /// any failure) delegates to the `gh`-CLI fallback. Mirrors the gix/CliGit split.
@@ -274,6 +340,10 @@ impl GhBackend for GhNative {
         if loc.is_remote() {
             return self.fallback.pr_status(loc).await;
         }
+        // Skip octocrab if the circuit is open (repeated connect failures).
+        if circuit().is_open() {
+            return self.fallback.pr_status(loc).await;
+        }
         let (Some(token), Some((owner, repo))) = (resolve_token(), self.owner_repo(loc)) else {
             return self.fallback.pr_status(loc).await;
         };
@@ -289,15 +359,53 @@ impl GhBackend for GhNative {
             "query": PR_QUERY,
             "variables": { "owner": owner, "repo": repo, "head": branch },
         });
-        match client.graphql::<Value>(&body).await {
-            Ok(resp) if resp.get("errors").is_none() => Ok(parse_graphql_pr(
-                &resp,
-                &loc.path(),
-                &branch,
-                superzej_core::util::now(),
-            )),
-            // GraphQL errors or transport failure → CLI fallback (keeps working).
-            _ => self.fallback.pr_status(loc).await,
+        let result =
+            tokio::time::timeout(OCTOCRAB_REQUEST_TIMEOUT, client.graphql::<Value>(&body)).await;
+        match result {
+            Ok(Ok(resp)) if resp.get("errors").is_none() => {
+                circuit().record_success();
+                Ok(parse_graphql_pr(
+                    &resp,
+                    &loc.path(),
+                    &branch,
+                    superzej_core::util::now(),
+                ))
+            }
+            Ok(Ok(resp)) => {
+                // GraphQL-level errors (not a network failure) — CLI fallback.
+                tracing::debug!(
+                    target: "szhost::gh",
+                    errors = ?resp.get("errors"),
+                    "octocrab GraphQL errors, falling back to cli"
+                );
+                self.fallback.pr_status(loc).await
+            }
+            Ok(Err(e)) => {
+                // Octocrab transport/HTTP error — could be transient.
+                let is_connect = e.to_string().to_lowercase().contains("connect")
+                    || e.to_string().to_lowercase().contains("dns")
+                    || e.to_string().to_lowercase().contains("tls");
+                tracing::warn!(
+                    target: "szhost::gh",
+                    error = %e,
+                    is_connect,
+                    "octocrab pr_status failed, falling back to cli"
+                );
+                if is_connect {
+                    circuit().record_failure();
+                }
+                self.fallback.pr_status(loc).await
+            }
+            Err(_elapsed) => {
+                // Request timed out — treat as a transient connect failure.
+                tracing::warn!(
+                    target: "szhost::gh",
+                    timeout_secs = OCTOCRAB_REQUEST_TIMEOUT.as_secs(),
+                    "octocrab pr_status timed out, falling back to cli"
+                );
+                circuit().record_failure();
+                self.fallback.pr_status(loc).await
+            }
         }
     }
 
@@ -326,6 +434,9 @@ impl GhBackend for GhNative {
         if loc.is_remote() {
             return self.fallback.pr_list(loc).await;
         }
+        if circuit().is_open() {
+            return self.fallback.pr_list(loc).await;
+        }
         let (Some(token), Some((owner, repo))) = (resolve_token(), self.owner_repo(loc)) else {
             return self.fallback.pr_list(loc).await;
         };
@@ -339,9 +450,37 @@ impl GhBackend for GhNative {
             "query": PR_LIST_QUERY,
             "variables": { "owner": owner, "repo": repo },
         });
-        match client.graphql::<Value>(&body).await {
-            Ok(resp) if resp.get("errors").is_none() => Ok(parse_graphql_pr_list(&resp)),
-            _ => self.fallback.pr_list(loc).await,
+        let result =
+            tokio::time::timeout(OCTOCRAB_REQUEST_TIMEOUT, client.graphql::<Value>(&body)).await;
+        match result {
+            Ok(Ok(resp)) if resp.get("errors").is_none() => {
+                circuit().record_success();
+                Ok(parse_graphql_pr_list(&resp))
+            }
+            Ok(Ok(_)) => self.fallback.pr_list(loc).await,
+            Ok(Err(e)) => {
+                let is_connect = e.to_string().to_lowercase().contains("connect")
+                    || e.to_string().to_lowercase().contains("dns")
+                    || e.to_string().to_lowercase().contains("tls");
+                tracing::warn!(
+                    target: "szhost::gh",
+                    error = %e,
+                    "octocrab pr_list failed, falling back to cli"
+                );
+                if is_connect {
+                    circuit().record_failure();
+                }
+                self.fallback.pr_list(loc).await
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    target: "szhost::gh",
+                    timeout_secs = OCTOCRAB_REQUEST_TIMEOUT.as_secs(),
+                    "octocrab pr_list timed out, falling back to cli"
+                );
+                circuit().record_failure();
+                self.fallback.pr_list(loc).await
+            }
         }
     }
 }

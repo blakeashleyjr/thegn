@@ -137,6 +137,7 @@ fn print_summary(p: &PrPanel) {
             p.branch
         ),
         PanelState::RateLimited => outln!("GitHub API rate limited; try again shortly"),
+        PanelState::Offline => outln!("GitHub unreachable (network error)"),
         PanelState::Error { message } => outln!("error: {message}"),
         PanelState::Pr(pr) => {
             let draft = if pr.is_draft { " (draft)" } else { "" };

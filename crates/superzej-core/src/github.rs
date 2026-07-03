@@ -16,6 +16,9 @@ pub enum GhError {
     NotAuthenticated,
     NoPr,
     RateLimited,
+    /// Transient network failure (DNS, TCP connect, TLS). Separate from `Other`
+    /// so the UI can show "GitHub unreachable" and callers can circuit-break.
+    Offline,
     Other(String),
 }
 
@@ -99,8 +102,15 @@ impl GhError {
             GhError::NotAuthenticated => "gh not authenticated (run: gh auth login)".into(),
             GhError::NoPr => "no PR for this branch".into(),
             GhError::RateLimited => "GitHub API rate limited".into(),
+            GhError::Offline => "GitHub unreachable".into(),
             GhError::Other(m) => m.clone(),
         }
+    }
+
+    /// Whether this is a transient network error (as opposed to a permanent
+    /// config/auth issue). Used by the circuit breaker in `GhNative`.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, GhError::Offline)
     }
 }
 
@@ -132,7 +142,13 @@ pub enum PanelState {
     NotAuthenticated,
     NoPr,
     RateLimited,
-    Error { message: String },
+    /// GitHub API was unreachable (network partition, no egress). Stale cached
+    /// data may still be shown; the panel distinguishes this from a permanent
+    /// error so the chrome can render "unreachable" rather than a raw error.
+    Offline,
+    Error {
+        message: String,
+    },
     Pr(Box<PrStatus>),
 }
 
@@ -302,6 +318,7 @@ pub fn pr_status(loc: &GitLoc) -> PrPanel {
         Err(GhError::NotAuthenticated) => PanelState::NotAuthenticated,
         Err(GhError::NoPr) => PanelState::NoPr,
         Err(GhError::RateLimited) => PanelState::RateLimited,
+        Err(GhError::Offline) => PanelState::Offline,
         Err(GhError::Other(m)) => PanelState::Error { message: m },
     };
     PrPanel {

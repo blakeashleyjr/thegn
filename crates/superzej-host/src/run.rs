@@ -7509,52 +7509,62 @@ fn attach_agent_pane(
                 emit(crate::chrome::AgentConn::Connecting);
 
                 tokio::spawn(async move {
-                    let _relay = relay; // keep alive until the task returns
-                    let connected = connect_agent_channel(&acp_channel).await;
-                    match connected {
-                        Ok((client, mut rx)) => {
-                            let client = std::sync::Arc::new(client);
-                            // Negotiate capabilities before servicing anything.
-                            if let Err(e) = client.initialize().await {
-                                tracing::error!(target: "szhost::acp", "ACP initialize failed: {e}");
-                                emit(crate::chrome::AgentConn::Error);
-                            }
-                            // Open the MCP-over-ACP bridge so the agent discovers
-                            // and registers superzej's house tools/resources.
-                            if let Err(e) = client.connect_mcp("superzej-house").await {
-                                tracing::warn!(target: "szhost::acp", "mcp/connect failed: {e}");
-                            }
-
-                            // Hand the client to the loop so it can reply to requests.
-                            if reg_tx.send((wt_name.clone(), client.clone())).is_err() {
-                                if let Some(key) = &revoke_key {
-                                    crate::agent::revoke_agent_proxy_key(key);
+                    let _relay = relay; // keep alive for the life of this task
+                    // Supervisor: retry with bounded backoff (500ms→30s) so a
+                    // slow-booting agent doesn't get a permanent red chip.
+                    let finish = |conn| {
+                        emit(conn);
+                        if let Some(key) = &revoke_key {
+                            crate::agent::revoke_agent_proxy_key(key);
+                        }
+                    };
+                    let mut backoff = std::time::Duration::from_millis(500);
+                    let mut failures: u32 = 0;
+                    loop {
+                        match connect_agent_channel(&acp_channel).await {
+                            Ok((client, mut rx)) => {
+                                failures = 0;
+                                backoff = std::time::Duration::from_millis(500);
+                                let client = std::sync::Arc::new(client);
+                                if let Err(e) = client.initialize().await {
+                                    tracing::error!(target: "szhost::acp", "ACP initialize failed: {e}");
+                                    failures += 1;
+                                    if failures >= 5 {
+                                        finish(crate::chrome::AgentConn::Error);
+                                        return;
+                                    }
+                                    emit(crate::chrome::AgentConn::Connecting);
+                                } else {
+                                    if let Err(e) = client.connect_mcp("superzej-house").await {
+                                        tracing::warn!(target: "szhost::acp", "mcp/connect failed: {e}");
+                                    }
+                                    if reg_tx.send((wt_name.clone(), client.clone())).is_err() {
+                                        finish(crate::chrome::AgentConn::Exited);
+                                        return;
+                                    }
+                                    emit(crate::chrome::AgentConn::Online);
+                                    while let Some(msg) = rx.recv().await {
+                                        if inbound_tx.send((wt_name.clone(), msg)).is_err() {
+                                            break;
+                                        }
+                                        let _ = waker_clone.wake();
+                                    }
+                                    finish(crate::chrome::AgentConn::Exited);
+                                    return;
                                 }
-                                return; // loop gone
                             }
-                            emit(crate::chrome::AgentConn::Online);
-
-                            // Forward inbound messages to the loop, tagged by worktree.
-                            while let Some(msg) = rx.recv().await {
-                                if inbound_tx.send((wt_name.clone(), msg)).is_err() {
-                                    break; // loop gone
+                            Err(e) => {
+                                failures += 1;
+                                tracing::error!(target: "szhost::acp", attempt = failures, "failed to connect to agent ACP channel: {e}");
+                                if failures >= 5 {
+                                    finish(crate::chrome::AgentConn::Error);
+                                    return;
                                 }
-                                let _ = waker_clone.wake();
-                            }
-
-                            // The agent disconnected: surface it + revoke its key.
-                            emit(crate::chrome::AgentConn::Exited);
-                            if let Some(key) = &revoke_key {
-                                crate::agent::revoke_agent_proxy_key(key);
+                                emit(crate::chrome::AgentConn::Connecting);
                             }
                         }
-                        Err(e) => {
-                            tracing::error!(target: "szhost::acp", "failed to connect to agent ACP channel: {e}");
-                            emit(crate::chrome::AgentConn::Error);
-                            if let Some(key) = &revoke_key {
-                                crate::agent::revoke_agent_proxy_key(key);
-                            }
-                        }
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
                     }
                 });
             }
