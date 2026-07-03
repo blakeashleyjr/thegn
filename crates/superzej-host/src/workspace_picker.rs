@@ -115,6 +115,14 @@ impl WorkspacePicker {
         p
     }
 
+    /// Open directly in manual-entry mode, optionally pre-filled — the
+    /// clone-and-open palette action (paste a URL) and connect-to-root's
+    /// "add this path as a workspace" offer. Tab still flips back to fuzzy.
+    pub(crate) fn start_manual(&mut self, prefill: impl Into<String>) {
+        self.mode = PickerMode::Manual;
+        self.manual = prefill.into();
+    }
+
     /// Kick the (potentially slow — it walks every `repo_roots` tree) repo
     /// scan on `spawn_blocking`; results land via [`drain_discovery`].
     ///

@@ -1,13 +1,14 @@
 //! Search Everywhere — the palette's multi-mode async search layer.
 //!
-//! The command palette (Ctrl+Space) gains five search modes selected by a
-//! leading prefix character in the query:
+//! The command palette (Ctrl+Space) gains search modes selected by a leading
+//! prefix character in the query:
 //!
-//!   (none)  All      — existing palette items + recent files
-//!   `>`     Files    — gitignore-respecting file index, nucleo fuzzy
-//!   `/`     Content  — grep-searcher streaming, 20-result batches
-//!   `@`     Git      — branches, commits (recent), stashes, tags
-//!   `#`     Symbols  — pattern grep filtered by language extension
+//!   (none)  All       — existing palette items + recent files
+//!   `~`     Worktrees — workspaces + worktrees, frecency-ranked opener
+//!   `>`     Files     — gitignore-respecting file index, nucleo fuzzy
+//!   `/`     Content   — grep-searcher streaming, 20-result batches
+//!   `@`     Git       — branches, commits (recent), stashes, tags
+//!   `#`     Symbols   — pattern grep filtered by language extension
 //!
 //! Tab cycles modes. A mode chip appears in the header.
 //!
@@ -37,6 +38,8 @@ use crate::seg::{self, Line, Tok, seg, sp};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaletteMode {
     All,
+    /// `~` — workspaces + worktrees, frecency-ranked (the fast opener).
+    Worktrees,
     Files,
     Content,
     Git,
@@ -53,6 +56,7 @@ impl PaletteMode {
     /// Split a raw query string into (mode, query_without_prefix).
     pub fn parse(raw: &str) -> (Self, &str) {
         match raw.chars().next() {
+            Some('~') => (PaletteMode::Worktrees, raw[1..].trim_start()),
             Some('>') => (PaletteMode::Files, raw[1..].trim_start()),
             Some('/') => (PaletteMode::Content, raw[1..].trim_start()),
             Some('@') => (PaletteMode::Git, raw[1..].trim_start()),
@@ -67,6 +71,7 @@ impl PaletteMode {
     pub fn prefix(self) -> &'static str {
         match self {
             PaletteMode::All => "",
+            PaletteMode::Worktrees => "~",
             PaletteMode::Files => ">",
             PaletteMode::Content => "/",
             PaletteMode::Git => "@",
@@ -80,6 +85,7 @@ impl PaletteMode {
     pub fn chip_label(self) -> &'static str {
         match self {
             PaletteMode::All => " all ",
+            PaletteMode::Worktrees => " worktrees ",
             PaletteMode::Files => " files ",
             PaletteMode::Content => " content ",
             PaletteMode::Git => " git ",
@@ -91,17 +97,22 @@ impl PaletteMode {
     }
 
     /// Whether this mode's results are filled synchronously from in-memory
-    /// panel state (tasks/tests/problems) rather than via the async workers.
+    /// state (tasks/tests/problems from panel state, worktrees from the
+    /// palette's own item list) rather than via the async workers.
     pub fn is_local(self) -> bool {
         matches!(
             self,
-            PaletteMode::Tasks | PaletteMode::Problems | PaletteMode::Tests
+            PaletteMode::Worktrees
+                | PaletteMode::Tasks
+                | PaletteMode::Problems
+                | PaletteMode::Tests
         )
     }
 
     pub fn cycle(self) -> Self {
         match self {
-            PaletteMode::All => PaletteMode::Files,
+            PaletteMode::All => PaletteMode::Worktrees,
+            PaletteMode::Worktrees => PaletteMode::Files,
             PaletteMode::Files => PaletteMode::Content,
             PaletteMode::Content => PaletteMode::Git,
             PaletteMode::Git => PaletteMode::Symbols,
@@ -196,6 +207,15 @@ pub struct SymbolMatch {
     pub kind: Option<String>,
 }
 
+/// A workspace/worktree navigation match (`~` mode). `key` is an existing
+/// palette dispatch key (`tab:…` / `wt:…` / `repo:…`), so selection rides the
+/// same switch + frecency-bump path as an All-mode pick.
+#[derive(Debug, Clone)]
+pub struct WorktreeNavMatch {
+    pub key: String,
+    pub label: String,
+}
+
 /// A runnable task match (item 523, `!` mode).
 #[derive(Debug, Clone)]
 pub struct TaskMatch {
@@ -263,6 +283,8 @@ pub struct AsyncResults {
     pub tasks: Vec<TaskMatch>,
     pub problems: Vec<ProblemMatch>,
     pub tests: Vec<TestMatch>,
+    /// Synchronous: filled from the palette's own item list (`~` mode).
+    pub worktrees: Vec<WorktreeNavMatch>,
 }
 
 impl AsyncResults {
@@ -275,6 +297,7 @@ impl AsyncResults {
         self.tasks.clear();
         self.problems.clear();
         self.tests.clear();
+        self.worktrees.clear();
     }
 }
 
@@ -394,6 +417,7 @@ impl PaletteSession {
     fn visible_count(&self) -> usize {
         match self.mode {
             PaletteMode::All => self.palette.matches().len(),
+            PaletteMode::Worktrees => self.async_results.worktrees.len(),
             PaletteMode::Files => self.async_results.files.len(),
             PaletteMode::Content => self.async_results.content.len(),
             PaletteMode::Git => self.async_results.git.len(),
@@ -408,6 +432,11 @@ impl PaletteSession {
     pub fn selected_key(&self) -> Option<String> {
         match self.mode {
             PaletteMode::All => self.palette.selected_item().map(|i| i.key.clone()),
+            PaletteMode::Worktrees => self
+                .async_results
+                .worktrees
+                .get(self.selected)
+                .map(|m| m.key.clone()),
             PaletteMode::Files => self
                 .async_results
                 .files
@@ -451,6 +480,47 @@ impl PaletteSession {
                 (!m.path.is_empty()).then(|| format!("open-file:{}:{}", m.path, m.line))
             }),
         }
+    }
+
+    /// Fill the `~` Worktrees mode synchronously from the palette's own item
+    /// list: the workspace/worktree/tab rows (`tab:` / `wt:` / `repo:` keys)
+    /// that `build_palette` already assembled in frecency order. An empty
+    /// query keeps that frecency order; a non-empty query nucleo-filters the
+    /// labels (the sort is stable, so equal-score matches stay
+    /// frecency-ordered). No I/O, no worker.
+    pub fn fill_worktree_matches(&mut self, query: &str) {
+        let candidates = self.palette.items().iter().filter(|i| {
+            i.key.starts_with("tab:") || i.key.starts_with("wt:") || i.key.starts_with("repo:")
+        });
+        if query.is_empty() {
+            self.async_results.worktrees = candidates
+                .map(|i| WorktreeNavMatch {
+                    key: i.key.clone(),
+                    label: i.label.clone(),
+                })
+                .collect();
+            return;
+        }
+        let mut matcher = Matcher::new(NucleoConfig::DEFAULT);
+        let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+        let mut buf = Vec::new();
+        let mut scored: Vec<(u32, WorktreeNavMatch)> = candidates
+            .filter_map(|i| {
+                pattern
+                    .score(Utf32Str::new(&i.label, &mut buf), &mut matcher)
+                    .map(|s| {
+                        (
+                            s,
+                            WorktreeNavMatch {
+                                key: i.key.clone(),
+                                label: i.label.clone(),
+                            },
+                        )
+                    })
+            })
+            .collect();
+        scored.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
+        self.async_results.worktrees = scored.into_iter().map(|(_, m)| m).collect();
     }
 
     /// Drain the async result channel. Returns `true` if any new results arrived.
@@ -587,6 +657,32 @@ impl PaletteSession {
                         selected,
                     );
                     row_y += 1;
+                }
+            }
+            PaletteMode::Worktrees => {
+                let offset = self.scroll_offset;
+                for (row, m) in self
+                    .async_results
+                    .worktrees
+                    .iter()
+                    .enumerate()
+                    .skip(offset)
+                    .take(rows_avail)
+                {
+                    let selected = row == self.selected;
+                    draw_single_line_item(surface, inner.x, row_y, inner.cols, &m.label, selected);
+                    row_y += 1;
+                }
+                if self.async_results.worktrees.is_empty() {
+                    let msg = seg(Tok::Slot(S::Ghost2), "No workspaces or worktrees matched");
+                    seg::draw_line(
+                        surface,
+                        inner.x,
+                        row_y,
+                        inner.cols,
+                        &Line::segs(vec![sp(1), msg]),
+                        panel,
+                    );
                 }
             }
             PaletteMode::Files => {
@@ -1333,6 +1429,174 @@ fn lsp_workspace_symbols(
     hits
 }
 
+// ── Search dispatch ───────────────────────────────────────────────────────────
+
+/// Map a `TaskKind` to the short label shown in the Tasks search rows.
+fn task_kind_str(k: &superzej_core::config::TaskKind) -> &'static str {
+    use superzej_core::config::TaskKind::*;
+    match k {
+        Custom => "custom",
+        Test => "test",
+        Build => "build",
+        Lint => "lint",
+        Run => "run",
+    }
+}
+
+/// Severity → the lowercase tag the Problems search rows key their glyph on.
+fn severity_str(s: crate::panel::Severity) -> &'static str {
+    use crate::panel::Severity::*;
+    match s {
+        Error => "error",
+        Warning => "warning",
+        Info => "info",
+        Hint => "hint",
+    }
+}
+
+/// TestState → the lowercase tag the Tests search rows key their glyph on.
+fn test_state_str(s: &crate::panel::TestState) -> &'static str {
+    use crate::panel::TestState::*;
+    match s {
+        Pass => "pass",
+        Fail => "fail",
+        Skip => "skip",
+        Running => "running",
+        Unknown => "",
+    }
+}
+
+/// Dispatch a search query to the right provider based on the current palette
+/// mode. All-mode is synchronous (nucleo on pre-built items); the local
+/// providers (worktrees/tasks/problems/tests) fill synchronously from
+/// in-memory state; the rest spawn a `spawn_blocking` worker and wake the loop
+/// on completion. (Extracted from `run.rs` — god-file ratchet.)
+#[allow(clippy::too_many_arguments)]
+pub fn kick_palette_search(
+    session: &mut PaletteSession,
+    mode: PaletteMode,
+    file_index: &Option<FileIndex>,
+    worktree_root: PathBuf,
+    cfg: &superzej_core::config::Config,
+    lsp: std::sync::Arc<crate::lsp::LspInner>,
+    panel: &crate::panel::PanelData,
+    tests: &crate::panel::TestPanelState,
+    waker: &termwiz::terminal::TerminalWaker,
+) {
+    let (_, inner_query) = PaletteMode::parse(&session.raw_query);
+    let query = inner_query.to_string();
+    let sg = session.search_gen;
+    let tx = session.result_tx.clone();
+    let max_content = cfg.palette.content_max_results;
+    let max_file = cfg.palette.file_max_results;
+    let max_sym = cfg.palette.symbol_max_results;
+    let hidden = cfg.palette.content_search_hidden;
+
+    match mode {
+        PaletteMode::All => {
+            // Already updated synchronously in apply_query; nothing to do.
+        }
+        // The frecency opener: filled synchronously from the palette's own
+        // frecency-ordered item list — no I/O, no worker.
+        PaletteMode::Worktrees => {
+            session.fill_worktree_matches(&query);
+        }
+        PaletteMode::Files => {
+            if query.is_empty() {
+                return;
+            }
+            match file_index {
+                Some(idx) => {
+                    spawn_file_search(idx.paths.clone(), query, sg, max_file, tx, waker.clone());
+                }
+                None => {
+                    // Index not built yet; start build.
+                    spawn_file_index_build(worktree_root, sg, tx, waker.clone(), hidden);
+                }
+            }
+        }
+        PaletteMode::Content => {
+            if query.is_empty() {
+                return;
+            }
+            session.async_results.content.clear();
+            session.async_results.content_done = false;
+            spawn_content_search(
+                worktree_root,
+                query,
+                sg,
+                max_content,
+                hidden,
+                tx,
+                waker.clone(),
+            );
+        }
+        PaletteMode::Git => {
+            spawn_git_search(worktree_root, query, sg, tx, waker.clone());
+        }
+        PaletteMode::Symbols => {
+            if query.is_empty() {
+                return;
+            }
+            spawn_symbol_search(worktree_root, query, sg, max_sym, lsp, tx, waker.clone());
+        }
+        // Local providers (item 523): filtered synchronously from in-memory
+        // panel state — no async worker, no generation tag.
+        PaletteMode::Tasks => {
+            let q = query.to_lowercase();
+            session.async_results.tasks = panel
+                .task_specs
+                .iter()
+                .filter(|t| q.is_empty() || t.name.to_lowercase().contains(&q))
+                .map(|t| TaskMatch {
+                    name: t.name.clone(),
+                    kind: task_kind_str(&t.kind).to_string(),
+                })
+                .collect();
+        }
+        PaletteMode::Problems => {
+            let q = query.to_lowercase();
+            session.async_results.problems = panel
+                .diagnostics
+                .iter()
+                .filter(|d| {
+                    q.is_empty()
+                        || d.message.to_lowercase().contains(&q)
+                        || d.file.to_lowercase().contains(&q)
+                })
+                .map(|d| ProblemMatch {
+                    file: d.file.clone(),
+                    line: d.line,
+                    severity: severity_str(d.severity).to_string(),
+                    message: d.message.clone(),
+                })
+                .collect();
+        }
+        PaletteMode::Tests => {
+            let q = query.to_lowercase();
+            session.async_results.tests = tests
+                .nodes
+                .iter()
+                .filter(|n| n.kind == crate::panel::TestNodeKind::Test && !n.placeholder)
+                .filter(|n| q.is_empty() || n.label.to_lowercase().contains(&q))
+                .map(|n| {
+                    let (path, line) = n
+                        .location
+                        .as_ref()
+                        .map(|l| (l.path.clone(), l.line as u64))
+                        .unwrap_or_default();
+                    TestMatch {
+                        label: n.label.clone(),
+                        path,
+                        line,
+                        state: test_state_str(&n.state).to_string(),
+                    }
+                })
+                .collect();
+        }
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Escape a string so it can be used as a literal grep-regex pattern.
@@ -1398,8 +1662,10 @@ mod tests {
 
     #[test]
     fn mode_cycle() {
-        assert_eq!(PaletteMode::All.cycle(), PaletteMode::Files);
-        // Symbols now leads into the local providers before wrapping to All.
+        // The frecency opener sits right after All.
+        assert_eq!(PaletteMode::All.cycle(), PaletteMode::Worktrees);
+        assert_eq!(PaletteMode::Worktrees.cycle(), PaletteMode::Files);
+        // Symbols leads into the local providers before wrapping to All.
         assert_eq!(PaletteMode::Symbols.cycle(), PaletteMode::Tasks);
         assert_eq!(PaletteMode::Tasks.cycle(), PaletteMode::Tests);
         assert_eq!(PaletteMode::Tests.cycle(), PaletteMode::Problems);
@@ -1407,12 +1673,60 @@ mod tests {
         // The full cycle visits every mode exactly once and returns home.
         let mut seen = vec![PaletteMode::All];
         let mut m = PaletteMode::All;
-        for _ in 0..8 {
+        for _ in 0..9 {
             m = m.cycle();
             seen.push(m);
         }
         assert_eq!(seen.first(), seen.last());
-        assert_eq!(seen.len(), 9, "8 modes + wrap");
+        assert_eq!(seen.len(), 10, "9 modes + wrap");
+    }
+
+    #[test]
+    fn mode_parse_worktrees() {
+        let (mode, inner) = PaletteMode::parse("~api");
+        assert_eq!(mode, PaletteMode::Worktrees);
+        assert_eq!(inner, "api");
+        assert!(PaletteMode::Worktrees.is_local());
+    }
+
+    #[test]
+    fn worktrees_mode_filters_palette_nav_items_by_frecency_order() {
+        use crate::palette::PaletteItem;
+        // build_palette hands items over already frecency-ordered; the mode
+        // must keep that order for an empty query and drop non-nav rows.
+        let mut s = PaletteSession::new(vec![
+            PaletteItem::new("wt:/repo\trepo/feat", "⎇ feat"),
+            PaletteItem::new("new-worktree", "New worktree"),
+            PaletteItem::new("tab:repo/home", "→ repo/home"),
+            PaletteItem::new("repo:/other", "✦ other"),
+        ]);
+        s.mode = PaletteMode::Worktrees;
+        s.fill_worktree_matches("");
+        let keys: Vec<&str> = s
+            .async_results
+            .worktrees
+            .iter()
+            .map(|m| m.key.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["wt:/repo\trepo/feat", "tab:repo/home", "repo:/other"]
+        );
+        // The dispatch key is the item key itself — the existing switch path.
+        assert_eq!(s.selected_key(), Some("wt:/repo\trepo/feat".into()));
+        // A query nucleo-filters the labels.
+        s.fill_worktree_matches("other");
+        let keys: Vec<&str> = s
+            .async_results
+            .worktrees
+            .iter()
+            .map(|m| m.key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["repo:/other"]);
+        // No match: empty, and selection dispatches nothing.
+        s.fill_worktree_matches("zzz-no-match");
+        assert!(s.async_results.worktrees.is_empty());
+        assert_eq!(s.selected_key(), None);
     }
 
     #[test]
@@ -1485,6 +1799,9 @@ mod tests {
     #[test]
     fn palette_session_cycle_mode_updates_prefix() {
         let mut s = PaletteSession::new(vec![]);
+        let (mode, _) = s.cycle_mode();
+        assert_eq!(mode, PaletteMode::Worktrees);
+        assert!(s.raw_query.starts_with('~'));
         let (mode, _) = s.cycle_mode();
         assert_eq!(mode, PaletteMode::Files);
         assert!(s.raw_query.starts_with('>'));

@@ -946,8 +946,24 @@ max_results = 1000
 
 # Search Everywhere palette (Ctrl+Space). Mode prefixes:
 #   (none) = All (actions + recent files)   > = Files   / = Content
-#   @      = Git refs/commits/stashes       # = Symbols
+#   ~      = Worktrees (frecency opener)    @ = Git refs/commits/stashes
+#   #      = Symbols
 # Tab cycles modes; Esc closes.
+#
+# Navigation (no config needed):
+# - `~` lists workspaces + worktrees ranked by frecency (open count × recency
+#   decay, 7-day half-life) — type a fragment, Enter lands in that worktree's
+#   tab. Every palette pick feeds the ranking.
+# - "Connect to root" (palette command) jumps from the focused pane's cwd —
+#   however deeply nested — to the tab of the worktree that owns it; a cwd
+#   outside any registered workspace offers to add it.
+# - "Clone and open" (palette command) takes a git URL, clones it off the
+#   event loop into `workspaces_dir`, registers the workspace, and opens its
+#   first worktree tab. (Alt+W manual entry does the same.)
+# - Layout import: tmuxinator projects (`~/.config/tmuxinator/*.yml`) and sesh
+#   sessions (`~/.config/sesh/sesh.toml`) appear automatically as templates in
+#   the new-worktree template picker (window commands → an even pane split);
+#   `[[worktree_templates]]` entries win name collisions. Read-only.
 [palette]
 # content_max_results = 500    # max grep matches before streaming stops
 # file_max_results    = 200    # max file-path fuzzy results

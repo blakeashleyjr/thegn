@@ -6845,188 +6845,6 @@ fn session_cancel_key(
     palette_cancel_key(&session.palette, key, modifiers)
 }
 
-/// Dispatch a search query to the right async worker based on the current
-/// palette mode. All-mode is synchronous (nucleo on pre-built items); the
-/// others spawn a `spawn_blocking` worker and wake the loop on completion.
-#[allow(clippy::too_many_arguments)]
-/// Map a `TaskKind` to the short label shown in the Tasks search rows.
-fn task_kind_str(k: &superzej_core::config::TaskKind) -> &'static str {
-    use superzej_core::config::TaskKind::*;
-    match k {
-        Custom => "custom",
-        Test => "test",
-        Build => "build",
-        Lint => "lint",
-        Run => "run",
-    }
-}
-
-/// Severity → the lowercase tag the Problems search rows key their glyph on.
-fn severity_str(s: crate::panel::Severity) -> &'static str {
-    use crate::panel::Severity::*;
-    match s {
-        Error => "error",
-        Warning => "warning",
-        Info => "info",
-        Hint => "hint",
-    }
-}
-
-/// TestState → the lowercase tag the Tests search rows key their glyph on.
-fn test_state_str(s: &crate::panel::TestState) -> &'static str {
-    use crate::panel::TestState::*;
-    match s {
-        Pass => "pass",
-        Fail => "fail",
-        Skip => "skip",
-        Running => "running",
-        Unknown => "",
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn kick_palette_search(
-    session: &mut crate::search_everywhere::PaletteSession,
-    mode: crate::search_everywhere::PaletteMode,
-    file_index: &Option<crate::search_everywhere::FileIndex>,
-    worktree_root: std::path::PathBuf,
-    cfg: &superzej_core::config::Config,
-    lsp: std::sync::Arc<crate::lsp::LspInner>,
-    panel: &crate::panel::PanelData,
-    tests: &crate::panel::TestPanelState,
-    waker: &termwiz::terminal::TerminalWaker,
-) {
-    use crate::search_everywhere::PaletteMode;
-    let (_, inner_query) = PaletteMode::parse(&session.raw_query);
-    let query = inner_query.to_string();
-    let sg = session.search_gen;
-    let tx = session.result_tx.clone();
-    let max_content = cfg.palette.content_max_results;
-    let max_file = cfg.palette.file_max_results;
-    let max_sym = cfg.palette.symbol_max_results;
-    let hidden = cfg.palette.content_search_hidden;
-
-    match mode {
-        PaletteMode::All => {
-            // Already updated synchronously in apply_query; nothing to do.
-        }
-        PaletteMode::Files => {
-            if query.is_empty() {
-                return;
-            }
-            match file_index {
-                Some(idx) => {
-                    crate::search_everywhere::spawn_file_search(
-                        idx.paths.clone(),
-                        query,
-                        sg,
-                        max_file,
-                        tx,
-                        waker.clone(),
-                    );
-                }
-                None => {
-                    // Index not built yet; start build.
-                    crate::search_everywhere::spawn_file_index_build(
-                        worktree_root,
-                        sg,
-                        tx,
-                        waker.clone(),
-                        hidden,
-                    );
-                }
-            }
-        }
-        PaletteMode::Content => {
-            if query.is_empty() {
-                return;
-            }
-            session.async_results.content.clear();
-            session.async_results.content_done = false;
-            crate::search_everywhere::spawn_content_search(
-                worktree_root,
-                query,
-                sg,
-                max_content,
-                hidden,
-                tx,
-                waker.clone(),
-            );
-        }
-        PaletteMode::Git => {
-            crate::search_everywhere::spawn_git_search(worktree_root, query, sg, tx, waker.clone());
-        }
-        PaletteMode::Symbols => {
-            if query.is_empty() {
-                return;
-            }
-            crate::search_everywhere::spawn_symbol_search(
-                worktree_root,
-                query,
-                sg,
-                max_sym,
-                lsp,
-                tx,
-                waker.clone(),
-            );
-        }
-        // Local providers (item 523): filtered synchronously from in-memory
-        // panel state — no async worker, no generation tag.
-        PaletteMode::Tasks => {
-            let q = query.to_lowercase();
-            session.async_results.tasks = panel
-                .task_specs
-                .iter()
-                .filter(|t| q.is_empty() || t.name.to_lowercase().contains(&q))
-                .map(|t| crate::search_everywhere::TaskMatch {
-                    name: t.name.clone(),
-                    kind: task_kind_str(&t.kind).to_string(),
-                })
-                .collect();
-        }
-        PaletteMode::Problems => {
-            let q = query.to_lowercase();
-            session.async_results.problems = panel
-                .diagnostics
-                .iter()
-                .filter(|d| {
-                    q.is_empty()
-                        || d.message.to_lowercase().contains(&q)
-                        || d.file.to_lowercase().contains(&q)
-                })
-                .map(|d| crate::search_everywhere::ProblemMatch {
-                    file: d.file.clone(),
-                    line: d.line,
-                    severity: severity_str(d.severity).to_string(),
-                    message: d.message.clone(),
-                })
-                .collect();
-        }
-        PaletteMode::Tests => {
-            let q = query.to_lowercase();
-            session.async_results.tests = tests
-                .nodes
-                .iter()
-                .filter(|n| n.kind == crate::panel::TestNodeKind::Test && !n.placeholder)
-                .filter(|n| q.is_empty() || n.label.to_lowercase().contains(&q))
-                .map(|n| {
-                    let (path, line) = n
-                        .location
-                        .as_ref()
-                        .map(|l| (l.path.clone(), l.line as u64))
-                        .unwrap_or_default();
-                    crate::search_everywhere::TestMatch {
-                        label: n.label.clone(),
-                        path,
-                        line,
-                        state: test_state_str(&n.state).to_string(),
-                    }
-                })
-                .collect();
-        }
-    }
-}
-
 /// Capture each live pane's current working directory into its tab's
 /// `pane_cwds` so the next resurrect respawns panes where they were. Only
 /// materialized (live) leaves are updated; tabs that were never opened keep the
@@ -14169,11 +13987,11 @@ async fn event_loop<T: Terminal>(
                                     }
                                     HostInputKind::NewWorktreeFromTemplate { repo_root } => {
                                         let name = text.trim();
-                                        match current_config
-                                            .worktree_templates
-                                            .iter()
-                                            .find(|t| t.name == name)
-                                            .cloned()
+                                        match crate::layout_spec::worktree_templates_with_imports(
+                                            &current_config,
+                                        )
+                                        .into_iter()
+                                        .find(|t| t.name == name)
                                         {
                                             Some(tmpl) => {
                                                 let base =
@@ -14791,7 +14609,7 @@ async fn event_loop<T: Terminal>(
                         KeyCode::Tab => {
                             let (mode, query) = p.cycle_mode();
                             drop(query);
-                            kick_palette_search(
+                            crate::search_everywhere::kick_palette_search(
                                 p,
                                 mode,
                                 &file_index,
@@ -15069,6 +14887,120 @@ async fn event_loop<T: Terminal>(
                                     need_relayout = true;
                                     dirty = true;
                                     continue;
+                                } else if key == "connect-root" {
+                                    // Connect-to-root (the sesh `root` jump):
+                                    // resolve the focused pane's cwd to its
+                                    // owning worktree and reveal that tab. The
+                                    // rev-parse is ms-scale on an explicit user
+                                    // action (same stance as ConfirmInitGit).
+                                    let cwd = panes
+                                        .table
+                                        .get(&focused)
+                                        .and_then(|p| p.cwd())
+                                        .or_else(|| active_cwd(&session));
+                                    let root = cwd
+                                        .as_deref()
+                                        .and_then(superzej_core::repo::worktree_root_for_cwd);
+                                    let group_paths: Vec<String> =
+                                        session.worktrees.iter().map(|g| g.path.clone()).collect();
+                                    let (db_wts, wss) = superzej_core::db::Db::open()
+                                        .map(|db| {
+                                            (
+                                                db.worktrees()
+                                                    .unwrap_or_default()
+                                                    .into_iter()
+                                                    .map(|w| (w.worktree, w.repo_root, w.tab_name))
+                                                    .collect::<Vec<_>>(),
+                                                db.workspaces()
+                                                    .unwrap_or_default()
+                                                    .into_iter()
+                                                    .map(|w| w.repo_path)
+                                                    .collect::<Vec<_>>(),
+                                            )
+                                        })
+                                        .unwrap_or_default();
+                                    match crate::nav::connect_target(
+                                        root.as_deref(),
+                                        cwd.as_deref(),
+                                        &group_paths,
+                                        &db_wts,
+                                        &wss,
+                                    ) {
+                                        Some(crate::nav::ConnectTarget::CurrentTab(i)) => {
+                                            session.switch_to(i);
+                                            refresh_tab_model(&mut model, &session, &mut sb);
+                                            need_relayout = true;
+                                            sync_drawer_persistence(
+                                                &session,
+                                                &mut panes,
+                                                &mut drawer,
+                                                &mut drawer_pool,
+                                                &mut drawer_home,
+                                                keymap.config(),
+                                                chrome.center,
+                                            );
+                                        }
+                                        Some(crate::nav::ConnectTarget::Workspace {
+                                            repo_path,
+                                            tab,
+                                        }) => {
+                                            if let Ok(db) = superzej_core::db::Db::open()
+                                                && switch_workspace(
+                                                    &repo_path,
+                                                    tab.as_deref(),
+                                                    &mut session,
+                                                    &mut panes,
+                                                    &mut workspace_pool,
+                                                    &db,
+                                                    &mut need_relayout,
+                                                    &mut clear_on_next_frame,
+                                                )
+                                            {
+                                                refresh_tab_model(&mut model, &session, &mut sb);
+                                                kick_model_hydration!();
+                                                need_relayout = true;
+                                                sync_drawer_persistence(
+                                                    &session,
+                                                    &mut panes,
+                                                    &mut drawer,
+                                                    &mut drawer_pool,
+                                                    &mut drawer_home,
+                                                    keymap.config(),
+                                                    chrome.center,
+                                                );
+                                            }
+                                        }
+                                        Some(crate::nav::ConnectTarget::OfferAdd(path)) => {
+                                            let seed = superzej_core::db::Db::open()
+                                                .map(|db| crate::workspace_picker::seed_repos(&db))
+                                                .unwrap_or_default();
+                                            let mut p =
+                                                crate::workspace_picker::WorkspacePicker::new(seed);
+                                            p.start_manual(path.clone());
+                                            workspace_picker = Some(p);
+                                            model.status = format!(
+                                                "{path} is not a registered workspace — Enter adds it"
+                                            );
+                                        }
+                                        None => {
+                                            model.status =
+                                                "Connect to root: no working directory".into();
+                                        }
+                                    }
+                                } else if key == "clone-open" {
+                                    // Clone-and-open: the new-workspace picker in
+                                    // manual mode; a pasted URL clones OFF the loop
+                                    // (spawn_workspace_clone → workspace_clone_rx
+                                    // drain), then registers + opens the first tab.
+                                    let seed = superzej_core::db::Db::open()
+                                        .map(|db| crate::workspace_picker::seed_repos(&db))
+                                        .unwrap_or_default();
+                                    let mut p = crate::workspace_picker::WorkspacePicker::new(seed);
+                                    p.start_manual("");
+                                    workspace_picker = Some(p);
+                                    model.status =
+                                        "Clone and open: paste a git URL or path (Esc cancels)"
+                                            .into();
                                 } else if key == "quit" {
                                     return Ok(());
                                 } else if let Some(payload) = key.strip_prefix("wt:") {
@@ -15282,7 +15214,7 @@ async fn event_loop<T: Terminal>(
                         KeyCode::DownArrow => p.move_down(),
                         KeyCode::Backspace => {
                             let (mode, _query) = p.backspace();
-                            kick_palette_search(
+                            crate::search_everywhere::kick_palette_search(
                                 p,
                                 mode,
                                 &file_index,
@@ -15296,7 +15228,7 @@ async fn event_loop<T: Terminal>(
                         }
                         KeyCode::Char(c) if !k.modifiers.contains(Modifiers::CTRL) => {
                             let (mode, _query) = p.push_char(c);
-                            kick_palette_search(
+                            crate::search_everywhere::kick_palette_search(
                                 p,
                                 mode,
                                 &file_index,
@@ -19206,8 +19138,11 @@ async fn event_loop<T: Terminal>(
                                     "Import layout: enter a file path (Esc cancels)".into();
                             }
                             Action::NewWorktreeFromTemplate => {
-                                let names: Vec<String> = current_config
-                                    .worktree_templates
+                                // Config templates + discovered tmuxinator/sesh imports.
+                                let names: Vec<String> =
+                                    crate::layout_spec::worktree_templates_with_imports(
+                                        &current_config,
+                                    )
                                     .iter()
                                     .map(|t| t.name.clone())
                                     .filter(|n| !n.is_empty())

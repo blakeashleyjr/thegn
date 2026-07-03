@@ -175,6 +175,39 @@ impl LayoutSpec {
     }
 }
 
+/// The new-worktree template list: `[[worktree_templates]]` from config plus
+/// tmuxinator/sesh projects discovered under the user config dir (the layout
+/// importer — each project's window commands become a `commands` even-split).
+/// Config templates win name collisions; window-less imports are skipped.
+/// Discovery is a handful of small file reads on an explicit user action
+/// (opening the template picker) — ms-scale, never on the idle loop.
+pub(crate) fn worktree_templates_with_imports(
+    cfg: &superzej_core::config::Config,
+) -> Vec<superzej_core::config::WorktreeTemplate> {
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")));
+    merged_worktree_templates(cfg, config_home.as_deref())
+}
+
+/// [`worktree_templates_with_imports`] with an explicit config home for tests.
+fn merged_worktree_templates(
+    cfg: &superzej_core::config::Config,
+    config_home: Option<&std::path::Path>,
+) -> Vec<superzej_core::config::WorktreeTemplate> {
+    let mut out = cfg.worktree_templates.clone();
+    if let Some(home) = config_home {
+        for layout in superzej_core::layout_import::discover_layouts(home) {
+            if layout.windows.is_empty() || out.iter().any(|t| t.name == layout.name) {
+                continue;
+            }
+            out.push(layout.to_worktree_template());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +351,42 @@ mod tests {
         let (tree, focus) = spec.apply(&mut spawn).unwrap();
         assert_eq!(focus, 5);
         assert_eq!(tree, CenterTree::Leaf(5));
+    }
+
+    #[test]
+    fn merged_templates_add_imports_without_clobbering_config() {
+        let home = std::env::temp_dir().join(format!("sj-tmplmerge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("tmuxinator")).unwrap();
+        std::fs::write(
+            home.join("tmuxinator/widget.yml"),
+            "name: widget\nwindows:\n  - editor: nvim\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("tmuxinator/rust-feature.yml"),
+            "name: rust-feature\nwindows:\n  - shell: htop\n",
+        )
+        .unwrap();
+        std::fs::write(home.join("tmuxinator/empty.yml"), "name: empty\n").unwrap();
+
+        let mut cfg = superzej_core::config::Config::default();
+        cfg.worktree_templates
+            .push(superzej_core::config::WorktreeTemplate {
+                name: "rust-feature".into(),
+                commands: vec!["cargo watch".into()],
+                ..Default::default()
+            });
+
+        let merged = merged_worktree_templates(&cfg, Some(&home));
+        let names: Vec<&str> = merged.iter().map(|t| t.name.as_str()).collect();
+        // Config template wins the name collision; the window-less import is
+        // skipped; the new import lands with its window command.
+        assert_eq!(names, vec!["rust-feature", "widget"]);
+        assert_eq!(merged[0].commands, vec!["cargo watch"]);
+        assert_eq!(merged[1].commands, vec!["nvim"]);
+        // No config home: just the config templates.
+        assert_eq!(merged_worktree_templates(&cfg, None).len(), 1);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
