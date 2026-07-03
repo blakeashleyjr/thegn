@@ -2,7 +2,7 @@
 
 ## Purpose
 
-TBD - created by archiving change add-time-travel-replay. Update Purpose after archive.
+Per-pane time-travel recording with an Alt+r scrub and search overlay, vim registers, and replay-subsumed screen swapping.
 
 ## Requirements
 

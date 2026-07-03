@@ -2,7 +2,7 @@
 
 ## Purpose
 
-TBD - created by archiving change add-terminal-compat. Update Purpose after archive.
+Detecting the outer terminal's capabilities (color depth, glyph level, undercurl, mouse) and degrading color and glyphs at the render edges while composing in truecolor+Unicode.
 
 ## Requirements
 

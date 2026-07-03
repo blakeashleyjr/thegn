@@ -2,7 +2,7 @@
 
 ## Purpose
 
-TBD - created by archiving change add-terminal-hosts. Update Purpose after archive.
+First-class terminal groups (local, ssh, mosh, container) persisted and rendered in the sidebar alongside worktrees, with connection-kind-driven spawning and graceful degradation.
 
 ## Requirements
 

@@ -20,16 +20,26 @@ verified against the codebase. See `CLAUDE.md` for architecture.
 
 ---
 
-## Progress summary (as of 2026-06-26)
+## Progress summary (as of 2026-07-03)
 
 **Where we are:** **Phase 1** (the AI-free shell) is **essentially complete** — native
 git management, the notification/event bus, and IDE panels (problems/tasks/tests/symbols)
 have all landed. **Phase 2's substrate** (sandbox + remote) and **the proxy** (U/V/W) are
-in. The **CI/CD inspection** layer (AV) has Phase A complete; the **Log Analyzer** (AW) has
-its parser/buffer/DSL wired (UI pending); the headless **MCP server** (AL) ships a tool/
-resource subset. Environment bundles (AU), the true AI layers (Q–T, the rest of AL/R), and
-multi-forge/jujutsu/Windows are unstarted. **Tally: 212 done · 87 partial · 426 not started**
-of 725.
+in. Since the prior audit, three big tranches shipped: **environment bundles (AU)** +
+**profiles/subprofiles (H)** — the identity/credential firewall with a single pane-spawn
+`compose` seam, opt-in `.env`, secret resolvers, and bundle/profile/subprofile switchers;
+**notification routing (AI)** — user rules, DND/quiet-hours, per-profile routing, sound/bell;
+and the **remote/terminal-hosts** stack — first-class terminal groups (ssh/mosh), native
+provider exec, warm-spare sandbox pool, and sprite reliability hardening. **Time-travel
+replay (AN 482)** landed. New tooling capabilities arrived: **managed-tool resolver**,
+**BugStalker debugger**, **cross-worktree aggregation** (read-only "Across" panel), and
+**MCP servers + capability grants**. The **CI/CD inspection** layer (AV) has Phase A complete
+(+ actionable badge/panel); the **Log Analyzer** (AW) has its parser/buffer/DSL wired (UI
+pending); the headless **MCP server** (AL) ships a tool/resource subset; and the **ACP client
+seam (R)** is partially wired (`initialize`, `session/update`, fs/terminal surfaces,
+`providers/set` routing, MCP-over-ACP). The true AI layers (Q–T, the rest of AL/R/AR) and
+multi-forge/jujutsu/Windows remain unstarted. **Tally: 245 done · 94 partial · 386 not
+started** of 725.
 
 **Shipped & solid:**
 
@@ -63,6 +73,22 @@ of 725.
 - **Pins (E, 57–74)** — config-driven `PinSupervisor` owning daemon panes across tab/
   workspace switches, top-strip + tabbar chips, eager/lazy, restart/health, promote/unpin,
   resurrect via `session_state.pin_state`.
+- **Env bundles + profiles (AU 735–748, H 101–109/536–539)** — one `compose` seam routes
+  every pane spawn (shell + agent) through named bundles; clear-then-allowlist base env,
+  opt-in allowlisted `.env`, secret resolvers, per-scope binding; profiles are firewalled
+  separate processes (reroot + `flock` singleton) with in-process subprofile rescoping;
+  bundle/profile/subprofile switchers. See `openspec/specs/{env-bundles,profiles}`.
+- **Notification routing (AI 420/424/426/427/429)** — user-defined event→action rules,
+  DND/quiet-hours, per-profile routing, sound/bell tiers. See `openspec/specs/notifications`.
+- **Remote / terminal-hosts (J, terminal-hosts, provider-native-exec)** — first-class
+  terminal groups (ssh/mosh) in the sidebar, native provider exec (CLI-free managed
+  providers), warm-spare sandbox pool, sprite reliability hardening. See
+  `openspec/specs/{terminal-hosts,provider-native-exec}`.
+- **Time-travel replay (AN 482)** — per-pane recording ring + `Alt+r` scrub/search +
+  vim registers. See `openspec/specs/time-travel`.
+- **New tooling capabilities** — managed-tool resolver, BugStalker debugger, cross-worktree
+  aggregation (read-only "Across" panel), MCP servers + capability grants. See
+  `openspec/specs/{managed-tools,debugger,cross-worktree-aggregation,mcp-servers,capability-grants}`.
 
 **Notable remaining gaps (candidate next work):**
 
@@ -72,8 +98,9 @@ of 725.
   first sequencing landed (embedding seam → proxy model path → sandbox boundary →
   notifications → spend observability); the agent/observability/review surfaces are
   unstarted. See the embedded-agent + two-layer-control-plane specs.
-- **Notification polish** — user-defined action rules (420), DND/quiet hours (426), per-
-  profile routing (427), sound/bell (429), push-to-phone (422/423).
+- **Notification polish tail** — push-to-phone (422 ntfy / 423 Telegram) and in-app
+  diagnostic surfacing / toasts (749–753). The routing engine, DND, per-profile routing,
+  and sound/bell (420/426/427/429) all landed.
 - **IDE Tier 1 tail** — GUI editor handoff / per-workspace editor override (407/410);
   badge PR-count data source (28). Search Everywhere, visual staging, problems/tasks/tests/
   symbols all landed.
@@ -81,11 +108,54 @@ of 725.
 - **Imports not yet started** — Orca adds (654–658: AI/human line attribution, worktree
   status field, account hot-swap chip, hook passthrough, session hibernation), deadbranch
   stale-branch cleanup (659–671), brows release mgmt (672–683), jujutsu VCS backend (AS),
-  multi-forge (AT), env bundles (AU), native Windows (AX), Log Analyzer UI (AW 721/723–728).
+  multi-forge (AT), native Windows (AX), Log Analyzer UI (AW 721/723–728). (Env bundles AU
+  now landed — Phase A–C done, dotfile tiers D partial.)
 - **Media player** (AM 476, optional `[media]` feature, off by default) and the headless
   **MCP server** (AL 455–457/461/464/465) landed since the prior audit.
 
 ---
+
+## OpenSpec is the source of truth
+
+**This file is the _map_; `openspec/specs/<capability>/spec.md` is the _territory_.**
+Where a capability spec exists, it — not this roadmap — is the authoritative,
+behavior-first record of how the shipped `szhost` behaves _today_ (`### Requirement:`
+SHALL/MUST + `#### Scenario:` WHEN/THEN). This roadmap owns the numbered backlog and
+the phasing; OpenSpec owns per-capability detail. When they disagree, the spec wins
+and this file is stale — fix it. In-flight work lives in `openspec/changes/<name>/`
+and merges into `openspec/specs/` on archive (`/opsx:archive`), at which point the
+corresponding roadmap items flip to `[x]`.
+
+**Capability index (31 specs) → roadmap groups.** Run `just openspec validate --all
+--strict` to confirm all specs + changes are green (currently 50/50).
+
+| OpenSpec capability                                 | Roadmap group(s)                                 |
+| --------------------------------------------------- | ------------------------------------------------ |
+| `event-loop`, `rendering`, `state-db`, `perf-suite` | A. Core architecture / perf invariants           |
+| `sidebar`, `navigation`                             | B. Workspace bar/tree · L. Status bar            |
+| `workspace`                                         | C. Workspaces                                    |
+| `pins`                                              | E. Pinned programs                               |
+| `keybindings`                                       | F. Keybindings                                   |
+| `profiles`                                          | H. Profiles & subprofiles                        |
+| `env-bundles`                                       | AU. Environment bundles                          |
+| `command-palette`                                   | M. Command palette                               |
+| `theming`, `terminal-compat`                        | N. Theming · terminal degradation                |
+| `agent`                                             | Q/R/S/T. Agent layer                             |
+| `managed-tools`, `debugger`                         | managed-tool resolver · BugStalker (AQ-adjacent) |
+| `cross-worktree-aggregation`                        | S. Agent observability ("Across" panel)          |
+| `mcp-servers`, `capability-grants`                  | AL. MCP server · AJ 432 scoped tokens            |
+| `llm-proxy`                                         | U/V/W. Proxy / cost / token reduction            |
+| `git-backend`                                       | Y/X. Git integration / semantic git              |
+| `file-explorer`                                     | AF. File viewer/search                           |
+| `sandbox`, `provider-native-exec`, `terminal-hosts` | AB/AC. Containers · J. Remote                    |
+| `notifications`                                     | AI. Notifications                                |
+| `panel`, `test-explorer`                            | Panel tabs · AQ. IDE tooling                     |
+| `ci-inspection`                                     | AV. CI/CD inspection                             |
+| `time-travel`                                       | AN 482. Per-task replay                          |
+
+Groups without a capability spec yet (AA Linear, AK API, AM tiles, AR gateway, AS
+jujutsu, AT multi-forge, AW Log Analyzer, AX Windows, …) are governed by the
+`docs/superpowers/{plans,specs}/` design docs until their first `/opsx:propose`.
 
 ## The dependency spine
 
@@ -319,7 +389,7 @@ close, `<`/`>` width, digits quick-jump._
 - [ ] 35. Per-workspace default program set
 - [x] 36. Per-workspace keybinds _(`WorkspaceConfig::keybinds`; `[workspace.<name>.keybinds]`)_
 - [x] 37. Non-git directory as workspace _(workspace `kind` repo|dir; insert-only; folder glyph in sidebar)_
-- [ ] 38. Workspace-level env vars _(subsumed by env bundles — AU 735–748; a workspace binds a bundle via `[workspace.<slug>].env_bundle`)_
+- [x] 38. Workspace-level env vars _(subsumed by env bundles — AU 736; a workspace binds a bundle via `[workspace.<slug>].env_bundle`)_
 - [ ] 39. Workspace icon/color label
 - [x] 40. Recent/favorite workspaces _(upgraded to a frecency-ranked `~` palette opener + connect-to-root + clone-and-open + tmuxinator/sesh layout import — openspec `2026-07-03-add-frecency-navigation`)_
 
@@ -428,20 +498,20 @@ environment once at startup** (the codebase is already env-driven). A
 inside a profile and switches **in-process** — e.g. unified dev but Comms split
 into work/personal (see AM. 479–480, 536–539 below).
 
-- [ ] 101. Profiles (work/personal/etc.)
-- [ ] 102. Per-profile workspaces
-- [ ] 103. Per-profile config/keybinds/theme
-- [ ] 104. Per-profile proxy keys + budgets
-- [ ] 105. Per-profile credential isolation
-- [ ] 106. Per-profile notification routing
-- [ ] 107. Per-profile container network policy
-- [ ] 108. Profile switcher
-- [ ] 109. Separate state dirs per profile
+- [x] 101. Profiles (work/personal/etc.) _(`profile.rs`: firewalled separate process, reroot; `openspec/specs/profiles`)_
+- [x] 102. Per-profile workspaces _(separate state dir per profile → own DB/workspaces)_
+- [x] 103. Per-profile config/keybinds/theme _(shared base → per-profile overlay layer)_
+- [~] 104. Per-profile proxy keys + budgets _(proxy budgets are per-scope; per-profile key selection via bundle/account)_
+- [x] 105. Per-profile credential isolation _(clear-then-allowlist pane env + profile git/gh/gpg identity)_
+- [x] 106. Per-profile notification routing _(routing rules + per-profile config overlay; cf. AI 427)_
+- [~] 107. Per-profile container network policy _(sandbox config layers per profile; policy depth partial)_
+- [x] 108. Profile switcher _(`Action::SwitchProfile` + `palette.rs` profile switcher; launch/focus per-process)_
+- [x] 109. Separate state dirs per profile _(reroot: DB/logs/activity/sockets under `profiles/<name>/`)_
 - [ ] 110. Profile-scoped audit logs
-- [ ] 536. Subprofiles — per-subsystem identity/storage split within a profile (Comms work/personal)
-- [ ] 537. Subprofile switcher — in-subsystem, in-process rebind (teardown + bind)
-- [ ] 538. Subsystem abstraction — `workspace`/`comms`/`ai` own storage + cred scope + pane set
-- [ ] 539. Multi-process model — one window per profile, `flock` singleton, terminal-spawn switcher
+- [x] 536. Subprofiles — per-subsystem identity/storage split within a profile _(`subsystem.rs`)_
+- [x] 537. Subprofile switcher — in-subsystem, in-process rebind _(`subsystem.rs` teardown → bind, no polling)_
+- [x] 538. Subsystem abstraction — `workspace`/`comms`/`ai` own storage + cred scope + pane set
+- [x] 539. Multi-process model — one window per profile, `flock` singleton, terminal-spawn switcher
 
 ### I. Session persistence
 
@@ -458,8 +528,8 @@ into work/personal (see AM. 479–480, 536–539 below).
 
 ### J. Remote access
 
-- [~] 121. SSH attach
-- [~] 122. Mosh support
+- [x] 121. SSH attach _(terminal-hosts: `ssh` terminal groups exec the connection binary; `openspec/specs/terminal-hosts`)_
+- [x] 122. Mosh support _(terminal-hosts: `mosh` connection kind)_
 - [~] 123. Tailscale zero-config path
 - [ ] 124. iroh embedded p2p — dial by NodeId
 - [ ] 125. iroh hole-punching + relay fallback
@@ -469,8 +539,8 @@ into work/personal (see AM. 479–480, 536–539 below).
 - [~] 129. Local UI → remote agents
 - [ ] 130. Mobile client attach (Blink/Termius)
 - [ ] 131. QR/NodeID pairing for phone
-- [~] 132. Connection status indicator
-- [ ] 133. Reconnect/resume on drop
+- [x] 132. Connection status indicator _(remote placement chip in tabbar; sprite connection lifecycle)_
+- [~] 133. Reconnect/resume on drop _(sprite tunnel resync + reattach recovery; not general SSH resume)_
 - [ ] 134. Bandwidth-adaptive rendering
 
 ### K. Adaptive / mobile UI
@@ -625,9 +695,9 @@ only if the minimal model proves insufficient._
 
 **R1 · ACP Client — consume foreign harnesses:**
 
-- [ ] 229. ACP client core — `initialize` + capability negotiation (protocolVersion; advertise `clientCapabilities` fs+terminal+`clientInfo`; parse `agentCapabilities`/`promptCapabilities`/`mcpCapabilities`/`authMethods`/`agentInfo`); `authenticate`/`logout`
+- [~] 229. ACP client core — `initialize` + capability negotiation (protocolVersion; advertise `clientCapabilities` fs+terminal+`clientInfo`; parse `agentCapabilities`/`promptCapabilities`/`mcpCapabilities`/`authMethods`/`agentInfo`); `authenticate`/`logout`
 - [ ] 230. ACP session lifecycle — `session/new`, `session/load`, `session/resume` (reconnect, no replay), `session/list`, `session/close`, `session/delete`, `session/fork`, `session_info_update`; map to worktree-tabs + session resurrection + time-travel-replay
-- [ ] 231. ACP streaming updates — full `session/update` set: `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, `available_commands_update`, `usage_update`, `config_option_update`; StopReason handling + `session/cancel`
+- [~] 231. ACP streaming updates — full `session/update` set: `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, `available_commands_update`, `usage_update`, `config_option_update`; StopReason handling + `session/cancel`
 - [ ] 232. ACP permission requests → UI — `session/request_permission` (allow_once/allow_always/reject_once/reject_always → optionId|cancelled), remember-choice persistence, native overlay
 - [ ] 233. ACP diff rendering — `tool_call` diff content (`oldText`/`newText`/`path`) into the existing diff/review pane (T 260)
 - [ ] 234. ACP plan/tool-call events — tool kinds (read/edit/delete/move/search/execute/think/fetch/other), status (pending/in_progress/completed/failed), `locations` (path+line) → sidebar/editor follow-along
@@ -635,9 +705,9 @@ only if the minimal model proves insufficient._
 - [ ] 684. Session Config Options surfacing — render `configOptions` (model/mode/thought_level selectors) in palette/statusbar; `session/set_config_option` + `config_option_update` (supersedes Session Modes)
 - [ ] 685. `usage_update` consumption — context-window `used`/`size` + optional `cost{amount,currency}` per session → feeds S 246/249/250 and V 289/290 spend attribution
 - [ ] 686. ACP Elicitation — `elicitation/create` form mode (restricted JSON Schema) + URL mode (OAuth); accept/decline/cancel → native iocraft form UI (shares AL 459)
-- [ ] 687. Client filesystem surface — serve `fs/read_text_file`/`fs/write_text_file`, unsaved-buffer aware, scoped to the worktree
-- [ ] 688. Client terminal surface — serve `terminal/create`/`output`/`wait_for_exit`/`kill`/`release` (env/cwd/outputByteLimit) through our PTY + `sandbox::enter_argv`; embed in tool calls. _We are a terminal multiplexer — this makes us a premier ACP terminal client._
-- [ ] 689. **Configurable LLM Providers** — `providers/list`/`providers/set`/`providers/disable` (id/apiType/baseUrl/headers) to route any ACP agent's model traffic through `szproxy`. **The R↔U bridge** _(connects U 271/287; powers U 283 local upstreams)_
+- [~] 687. Client filesystem surface — serve `fs/read_text_file`/`fs/write_text_file`, unsaved-buffer aware, scoped to the worktree
+- [~] 688. Client terminal surface — serve `terminal/create`/`output`/`wait_for_exit`/`kill`/`release` (env/cwd/outputByteLimit) through our PTY + `sandbox::enter_argv`; embed in tool calls. _We are a terminal multiplexer — this makes us a premier ACP terminal client._
+- [~] 689. **Configurable LLM Providers** — `providers/list`/`providers/set`/`providers/disable` (id/apiType/baseUrl/headers) to route any ACP agent's model traffic through `szproxy`. **The R↔U bridge** _(connects U 271/287; powers U 283 local upstreams)_
 - [ ] 690. Agent Telemetry Export — inject `OTEL_EXPORTER_OTLP_ENDPOINT` + `params._meta` traceparent into agent subprocs; ingest into the perf/observability suite _(feeds S 254)_
 - [ ] 691. Protocol-version negotiation + `_meta`/extensibility + **v2 readiness** — track the ACP v2 redesign (unified `capabilities`, object-valued markers, item-based `plan_update`, upsert `tool_call`, content chunks) and build v2-shaped
 
@@ -650,7 +720,7 @@ only if the minimal model proves insufficient._
 **R3 · ACP Proxy — the convergence (AR realized over ACP):**
 
 - [ ] 695. AR gateway as an **ACP proxy** — `proxy/initialize` + `proxy/successor` + conductor so capability injection / prompt layering / tool filtering (AR 541–551) work with **any** ACP agent, not just termite _(upper-layer twin of AR; subsumes AGENTS.md/hooks/plugins)_
-- [ ] 696. **MCP-over-ACP** — expose the central MCP registry over the ACP channel (`mcp/connect`/`mcp/message`/`mcp/disconnect`, `mcpCapabilities.acp`) with brokered creds, no open ports _(transport for AL 455 / AR 541–543)_
+- [~] 696. **MCP-over-ACP** — expose the central MCP registry over the ACP channel (`mcp/connect`/`mcp/message`/`mcp/disconnect`, `mcpCapabilities.acp`) with brokered creds, no open ports _(transport for AL 455 / AR 541–543)_
 
 **Native adapters — fallback for non-ACP harnesses (ACP-registry-first):**
 
@@ -862,7 +932,7 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 - [~] 356. Resource caps (cgroup)
 - [~] 357. Per-container env from broker
 - [~] 358. devcontainer.json support
-- [~] 359. Nix devshell per worktree
+- [x] 359. Nix devshell per worktree _(sandbox devshell injection + direnv warm; `openspec/specs/sandbox`)_
 - [~] 360. Ephemeral reset between runs
 - [x] 361. Container↔worktree binding
 - [x] 362. Default-on with --no-sandbox escape
@@ -898,7 +968,7 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 ### AE. Container provisioning
 
 - [ ] 385. CoW overlay from base image
-- [ ] 386. Prewarmed pool (fast spawn)
+- [x] 386. Prewarmed pool (fast spawn) _(`[lifecycle.pool]` warm-spare sandbox pool, DB v26)_
 - [ ] 387. Intelligent resource caching (node/cargo/pip)
 - [x] 388. Shared cache across worktrees _(`[disk].sccache` → `RUSTC_WRAPPER`/`SCCACHE_DIR` + `[disk].shared_target_dir` → `CARGO_TARGET_DIR` injected into pane env at `agent::launch_spec`; shared-target serializes builds, opt-in)_
 - [x] 389. Auto cache cleanup _(see 48: PR-merge/close auto `cargo clean`; manual `superzej clean [--all]`)_
@@ -949,16 +1019,16 @@ notifications, and aggregation. AQ 524 extends the same attention model to
 non-agent processes and plain task panes._
 
 - [~] 419. fs-watch triggers (notify) _(drives panel diff refresh; also feeds the event bus)_
-- [~] 420. Rules engine — event→action _(fixed event→notification mapping + urgency thresholds; no user-defined action rules yet)_
+- [x] 420. Rules engine — event→action _(user-defined routing rules; `openspec/specs/notifications`)_
 - [x] 421. Desktop notifications _(via `notify-send`, gated by `desktop_min_urgency`; not the notify-rust crate)_
 - [ ] 422. Push to phone (ntfy)
 - [ ] 423. Push to phone (Telegram)
 - [~] 424. Per-event opt-in _(urgency-threshold gating, not yet per-event)_
 - [x] 425. Contextual tree dots _(activity-dot state machine)_
-- [ ] 426. Do-not-disturb / quiet hours
-- [ ] 427. Per-profile routing
+- [x] 426. Do-not-disturb / quiet hours _(DND config + scheduled quiet-hours gating)_
+- [x] 427. Per-profile routing _(routing overlay merges global/profile/workspace)_
 - [x] 428. Notification history/center _(notifications panel section + inbox, Enter-to-expand)_
-- [ ] 429. Sound/bell config
+- [x] 429. Sound/bell config _(bell/command/off modes, per-priority gates)_
 - [x] 430. Aggregated bus across all sources _(core `EventBus` aggregates PR/agent/test/log/worktree/process events)_
 
 _**Near-term (flagged 2026-06-29): sophisticated in-app diagnostic / toast surfacing.**
@@ -980,7 +1050,7 @@ notifications inbox (428)._
 ### AJ. Security / opsec
 
 - [ ] 431. Credential brokerage — agents never see raw keys
-- [ ] 432. Scoped capability tokens per agent
+- [~] 432. Scoped capability tokens per agent _(`grants.rs` capability-grants foundation; `openspec/specs/capability-grants`)_
 - [ ] 433. Per-agent virtual keys
 - [~] 434. Egress consolidation + audit
 - [~] 435. Approval gates — push/rm/exec/egress
@@ -1050,8 +1120,8 @@ brokered creds and no open ports. This is what lets AR 541–543 reach any harne
 ### AN. Audit / logging / replay
 
 - [~] 481. Central event log (all sources)
-- [~] 482. Per-task replay — time-travel recording + scrub/search overlay (`Alt+r`) +
-  vim registers + replay-subsumed screen swap (`openspec/changes/add-time-travel-replay`)
+- [x] 482. Per-task replay — time-travel recording + scrub/search overlay (`Alt+r`) +
+       vim registers + replay-subsumed screen swap (`openspec/specs/time-travel`)
 - [ ] 483. Session recording
 - [ ] 484. Exportable audit trail
 - [ ] 485. Searchable history
@@ -1308,20 +1378,23 @@ HOME); **(3)** named bundles **+** opt-in allowlisted `.env`; **(4)** `env:` + p
 secret resolvers, never persisted. Closes the `spawn_with_env` inherit-everything leak
 (shared with H) and fills item 38 + the env-restore half of 54/657.
 
-- [ ] 735. `env::compose()` + `ResolvedEnv` — single resolution seam returning overrides/block/mounts; subsumes the account/scoped-key logic in `agent::launch_spec_with_key` (Phase A)
-- [ ] 736. Bundle config schema — `[bundle.<name>]` (env/accounts/config_dirs/dotfiles/home/dotenv/extends) + `[workspace.<slug>].env_bundle` (Phase A)
-- [ ] 737. Per-scope bundle bindings — generalize `account.rs` precedence to `bundle:[ws:|wt:]` over `ui_state` (worktree → workspace cfg → workspace ptr → global) (Phase A)
-- [ ] 738. Tier-1 config-dir redirection — `CLAUDE_CONFIG_DIR`/`CODEX_HOME`/`GIT_CONFIG_GLOBAL`/`GH_CONFIG_DIR`/`GNUPGHOME`, no file ops; the implicit default tier (Phase A)
-- [ ] 739. Shell-pane wiring — route **every** pane spawn (agent _and_ plain shell) through `env::compose`, so shells inherit the bundle identity (Phase A)
-- [ ] 740. Clear-then-allowlist base env in `spawn_with_env` — curated base + bundle on top; closes the inherit-everything cred leak (shared prerequisite with H) (Phase A)
-- [ ] 741. `account.rs` becomes a bundle consumer — account selection is a bundle field; precedence helpers lifted to bundle scopes (Phase A)
-- [ ] 742. Pluggable secret resolvers — `pass:`/`sops:`/`op://`/`agenix:`/`cmd:` over `expand_env_ref`; resolved off-loop at launch, never persisted, graceful degrade (Phase B)
-- [ ] 743. Opt-in `.env` loading — direnv-style discovery gated by `dotenv = true` + per-path content-hash allowlist in `ui_state` (Phase C)
-- [ ] 744. `.env` security boundary — low precedence (never overrides bundle creds) + credential-shaped-key filter (`*_TOKEN`/`*_KEY`/`*_SECRET`/`*_PASSWORD`) (Phase C)
-- [ ] 745. Tier-2 materialized dotfiles — symlink/template a source tree into a managed per-bundle HOME; idempotent, off the event loop (diff-watcher pattern) (Phase D)
-- [ ] 746. Tier-3 synthetic HOME — `home = "managed"` roots panes at the bundle HOME; path-preserving sandbox mount (Phase D)
-- [ ] 747. Bundle switcher UI — status-bar chip (extends the account chip 656) + palette command to bind the active bundle at worktree/workspace/global scope (Phase E)
-- [ ] 748. Multiple Claude profiles (worked example) — `work`/`personal` bundles selecting `accounts.claude` + git identity + proxy endpoint, hot-swapped per scope (consumes 735–747; ties 656, AR virtual keys 287)
+_Phases A–C landed (`bundle.rs`, `openspec/specs/env-bundles`); Tier-2/3 dotfile
+materialization (Phase D) is partial._
+
+- [x] 735. `env::compose()` + `ResolvedEnv` — single resolution seam returning overrides/block/mounts (Phase A) _(`bundle::compose`)_
+- [x] 736. Bundle config schema — `[bundle.<name>]` (env/accounts/config_dirs/dotfiles/home/dotenv/extends) + `[workspace.<slug>].env_bundle` (Phase A)
+- [x] 737. Per-scope bundle bindings — `bundle:[ws:|wt:]` precedence over `ui_state` (worktree → workspace cfg → workspace ptr → global) (Phase A)
+- [x] 738. Tier-1 config-dir redirection — `CLAUDE_CONFIG_DIR`/`CODEX_HOME`/`GIT_CONFIG_GLOBAL`/`GH_CONFIG_DIR`/`GNUPGHOME`, no file ops; the implicit default tier (Phase A)
+- [x] 739. Shell-pane wiring — **every** pane spawn (agent _and_ plain shell) routed through `env::compose`, so shells inherit the bundle identity (Phase A)
+- [x] 740. Clear-then-allowlist base env in `spawn_with_env` — curated base + bundle on top; closes the inherit-everything cred leak (shared with H) (Phase A)
+- [x] 741. `account.rs` becomes a bundle consumer — account selection is a bundle field; precedence helpers lifted to bundle scopes (Phase A)
+- [x] 742. Pluggable secret resolvers — resolved off-loop at launch, never persisted, graceful degrade (Phase B) _(env-bundles spec: "Secrets resolve at launch")_
+- [x] 743. Opt-in `.env` loading — gated by `dotenv = true` + per-path content-hash allowlist in `ui_state` (Phase C)
+- [x] 744. `.env` security boundary — low precedence (never overrides bundle creds) + credential-shaped-key filter (`*_TOKEN`/`*_KEY`/`*_SECRET`/`*_PASSWORD`) (Phase C)
+- [~] 745. Tier-2 materialized dotfiles — symlink/template a source tree into a managed per-bundle HOME; idempotent, off the event loop (Phase D) _(bundle `dotfiles` field present; local materialization depth partial)_
+- [~] 746. Tier-3 synthetic HOME — `home = "managed"` roots panes at the bundle HOME; path-preserving sandbox mount (Phase D) _(bundle `home` field present; full synthetic-HOME rooting partial)_
+- [x] 747. Bundle switcher UI — `Action::SwitchBundle` + `palette.rs` bundle switcher bind the active bundle at worktree/workspace/global scope (Phase E)
+- [~] 748. Multiple Claude profiles (worked example) — `work`/`personal` bundles selecting `accounts.claude` + git identity + proxy endpoint (consumes 735–747; ties 656, AR virtual keys 287) _(building blocks all present; documented worked example pending)_
 
 ### AV. CI/CD inspection (cross-provider pipelines, runs, jobs, logs)
 

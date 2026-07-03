@@ -2,7 +2,7 @@
 
 ## Purpose
 
-TBD - created by archiving change add-profiles-and-subprofiles. Update Purpose after archive.
+Firewalled per-profile isolation: each profile is a separate rerooted process (state, config, credentials, sandbox) guarded by a flock singleton, with in-process subprofile rescoping of a single subsystem.
 
 ## Requirements
 
