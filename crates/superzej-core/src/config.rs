@@ -4290,7 +4290,7 @@ impl Default for PaletteConfig {
 }
 
 /// `[panel]` — the right accordion panel.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct PanelConfig {
     /// Section display order, by key (`"changes"`, `"git"`, `"files"`,
@@ -4298,6 +4298,20 @@ pub struct PanelConfig {
     /// Sections omitted from the list are hidden; an empty list (the default)
     /// shows every section in its built-in order. Unknown keys are ignored.
     pub sections: Vec<String>,
+    /// When Esc returns focus to the center terminal from any chrome zone,
+    /// snap the right panel back to its default (Normal) width and close the
+    /// bottom file drawer. `false` leaves both exactly as the user left them.
+    #[serde(default = "default_true")]
+    pub collapse_on_escape: bool,
+}
+
+impl Default for PanelConfig {
+    fn default() -> Self {
+        Self {
+            sections: Vec::new(),
+            collapse_on_escape: true,
+        }
+    }
 }
 
 /// Default `keymap_preset` (no IDE overlay). A free function so both the field
@@ -6447,6 +6461,17 @@ command = "git notes add {{.SelectedCommit.Sha}}"
         // Absent table → empty list (the host shows every section).
         let cfg: Config = toml::from_str("").unwrap();
         assert!(cfg.panel.sections.is_empty());
+    }
+
+    #[test]
+    fn panel_collapse_on_escape_defaults_true_and_parses() {
+        // Default (both the Rust `Default` and the absent-table serde path).
+        assert!(PanelConfig::default().collapse_on_escape);
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.panel.collapse_on_escape);
+        // Explicit opt-out.
+        let cfg: Config = toml::from_str("[panel]\ncollapse_on_escape = false\n").unwrap();
+        assert!(!cfg.panel.collapse_on_escape);
     }
 
     #[test]

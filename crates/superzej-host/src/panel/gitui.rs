@@ -326,6 +326,52 @@ impl GitUi {
             ..GitUi::default()
         };
     }
+
+    /// Step the focused view's own cursor up/down. The flow-through list views
+    /// (files/branches/commits/stash) are driven by the accordion; the
+    /// line-cursor and drill-list views own their cursor and step it here.
+    pub fn step_view_cursor(&mut self, down: bool) {
+        match self.focus {
+            GitView::RebaseTodo => {
+                if let GitFlow::Rebase(r) = &mut self.flow {
+                    let max = r.todos.len().saturating_sub(1);
+                    r.cursor = if down {
+                        (r.cursor + 1).min(max)
+                    } else {
+                        r.cursor.saturating_sub(1)
+                    };
+                }
+            }
+            GitView::Staging | GitView::PatchBuilding => {
+                let cur = self.staging.as_ref().map_or(0, |s| s.cursor);
+                let doc = match self.focus {
+                    GitView::Staging => self.stage_doc.as_ref(),
+                    _ => self.patch_doc.as_ref(),
+                };
+                let next = doc.map(|d| step_cursor(&d.doc, cur, down));
+                if let (Some(next), Some(s)) = (next, self.staging.as_mut()) {
+                    s.cursor = next;
+                }
+            }
+            GitView::Blame => {
+                let max = self.blame_rows.len().saturating_sub(1);
+                self.blame_cursor = if down {
+                    (self.blame_cursor + 1).min(max)
+                } else {
+                    self.blame_cursor.saturating_sub(1)
+                };
+            }
+            GitView::CommitFiles => {
+                let max = self.commit_files.len().saturating_sub(1);
+                self.cur.commit_files = if down {
+                    (self.cur.commit_files + 1).min(max)
+                } else {
+                    self.cur.commit_files.saturating_sub(1)
+                };
+            }
+            _ => {}
+        }
+    }
 }
 
 /// A decoded git intent. Everything that mutates the repo flows through the
@@ -396,6 +442,8 @@ pub enum GitMsg {
     Cheatsheet,
     /// Open the blame view for the selected file (Files / CommitFiles).
     BlameFile,
+    /// Open the selected file in `$EDITOR` (CommitFiles).
+    OpenFile,
 }
 
 /// One context key: chord text (display + parse), help label, message.
@@ -505,6 +553,7 @@ pub fn context_keys(view: GitView) -> Vec<CtxKey> {
         ],
         GitView::CommitFiles => vec![
             k("enter", "patch lines", GitMsg::Drill),
+            k("o", "open in editor", GitMsg::OpenFile),
             k("b", "blame", GitMsg::BlameFile),
             k("z", "undo", GitMsg::Undo),
             k("/", "filter", GitMsg::FilterStart),
@@ -944,9 +993,15 @@ pub fn git_key(key: &KeyCode, mods: Modifiers, ui: &crate::panel::PanelUi) -> Op
     }
     // Plain cursor keys belong to the accordion in list views (it owns
     // flow-through navigation); the line-cursor views claim them.
+    // CommitFiles is a drill list with its own cursor (`git.cur.commit_files`),
+    // so it claims j/k/↑↓ too — otherwise the highlight would never move.
     if matches!(
         view,
-        GitView::Staging | GitView::PatchBuilding | GitView::RebaseTodo | GitView::Blame
+        GitView::Staging
+            | GitView::PatchBuilding
+            | GitView::RebaseTodo
+            | GitView::Blame
+            | GitView::CommitFiles
     ) && !mods.contains(Modifiers::SHIFT)
         && !mods.contains(Modifiers::CTRL)
     {
@@ -1040,6 +1095,47 @@ mod tests {
             git_key(&KeyCode::Char(' '), none, &ui_at(GitView::Stash, full)),
             Some(GitMsg::StashApply)
         );
+    }
+
+    #[test]
+    fn commit_files_claims_cursor_keys_and_open() {
+        let none = Modifiers::NONE;
+        let ui = ui_at(GitView::CommitFiles, PanelWidth::Half);
+        // j/k drive the drill-list cursor rather than falling through to the
+        // accordion (which would move the section cursor, not the file list).
+        assert_eq!(
+            git_key(&KeyCode::Char('j'), none, &ui),
+            Some(GitMsg::CursorDown)
+        );
+        assert_eq!(
+            git_key(&KeyCode::Char('k'), none, &ui),
+            Some(GitMsg::CursorUp)
+        );
+        // `o` opens the highlighted file in the editor.
+        assert_eq!(
+            git_key(&KeyCode::Char('o'), none, &ui),
+            Some(GitMsg::OpenFile)
+        );
+    }
+
+    #[test]
+    fn step_view_cursor_walks_and_clamps_commit_files() {
+        let mut git = GitUi {
+            focus: GitView::CommitFiles,
+            commit_files: vec![("a".into(), 1, 0), ("b".into(), 0, 2), ("c".into(), 3, 3)],
+            ..Default::default()
+        };
+        assert_eq!(git.cur.commit_files, 0);
+        git.step_view_cursor(true);
+        assert_eq!(git.cur.commit_files, 1);
+        git.step_view_cursor(true);
+        git.step_view_cursor(true); // clamps at len - 1
+        assert_eq!(git.cur.commit_files, 2);
+        git.step_view_cursor(false);
+        assert_eq!(git.cur.commit_files, 1);
+        git.step_view_cursor(false);
+        git.step_view_cursor(false); // clamps at 0
+        assert_eq!(git.cur.commit_files, 0);
     }
 
     #[test]
