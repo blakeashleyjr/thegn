@@ -1836,6 +1836,34 @@ impl Default for DiskConfig {
     }
 }
 
+/// `[session]` — session snapshot/restore hardening. Two knobs on the
+/// resurrection path: how much per-pane scrollback is captured and repainted so a
+/// restored pane shows its recent history, and how long a persisted
+/// running/active agent dot may age before it is coerced to a settled state at
+/// restore (so a session killed mid-run never resurrects a phantom running dot).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct SessionConfig {
+    /// Max plain-text scrollback lines captured per pane on snapshot and
+    /// repainted on restore. 0 disables scrollback capture (panes restore blank,
+    /// exactly the pre-feature behavior).
+    pub scrollback_lines: u32,
+    /// Restore-time stale-state grace (seconds). A persisted `active`/`running`
+    /// activity dot whose last live signal is older than this at resurrection is
+    /// downgraded to a settled state. Applied once at restore; the live activity
+    /// FSM is untouched.
+    pub restore_grace_secs: u64,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        SessionConfig {
+            scrollback_lines: 500,
+            restore_grace_secs: 600,
+        }
+    }
+}
+
 /// `[pr]` — GitHub PR data feeding the right panel.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -4470,6 +4498,8 @@ pub struct Config {
     pub limits: LimitsConfig,
     /// `[disk]` — disk-usage visibility, cleanup, and shared build caches.
     pub disk: DiskConfig,
+    /// `[session]` — scrollback capture + restore-time stale-state grace.
+    pub session: SessionConfig,
     pub drawer: DrawerConfig,
     pub notifications: NotificationsConfig,
     pub strip: StripConfig,
@@ -4587,6 +4617,7 @@ impl Default for Config {
             sandbox: SandboxConfig::default(),
             limits: LimitsConfig::default(),
             disk: DiskConfig::default(),
+            session: SessionConfig::default(),
             drawer: DrawerConfig::default(),
             notifications: NotificationsConfig::default(),
             strip: StripConfig::default(),

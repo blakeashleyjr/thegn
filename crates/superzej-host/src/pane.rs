@@ -669,6 +669,41 @@ impl PtyPane {
         self.emulator.as_ref()
     }
 
+    /// The last `n` lines of this pane's plain-text history, newline-joined
+    /// (ANSI already stripped by the history ring). Empty when `n` is 0 or the
+    /// pane has produced no output. Captured at persist time for the session
+    /// snapshot; trailing blank lines are trimmed so a restored pane doesn't
+    /// repaint a wall of emptiness.
+    pub fn history_tail(&self, n: usize) -> String {
+        if n == 0 || self.history.is_empty() {
+            return String::new();
+        }
+        let total = self.history.len();
+        let start = total.saturating_sub(n);
+        let mut lines: Vec<&str> = (start..total).filter_map(|i| self.history.get(i)).collect();
+        while lines.last().is_some_and(|l| l.trim().is_empty()) {
+            lines.pop();
+        }
+        lines.join("\n")
+    }
+
+    /// Repaint captured scrollback into the emulator on restore, so a resurrected
+    /// pane shows its recent history before the (fresh) shell produces new output.
+    /// The text is fed straight to the emulator (CRLF-normalized) — it is context,
+    /// not live output, so it is neither re-recorded into the history ring nor the
+    /// replay tap. No-op on empty text.
+    pub fn repaint_scrollback(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        // Newlines in the stored tail are bare '\n'; a terminal needs CRLF to
+        // return the cursor to column 0, and a trailing CRLF so the live prompt
+        // starts on its own line below the restored history.
+        let mut bytes = text.replace('\n', "\r\n").into_bytes();
+        bytes.extend_from_slice(b"\r\n");
+        self.emulator.advance(&bytes);
+    }
+
     /// Scroll the pane's viewport into/out of scrollback history.
     pub fn scroll_up(&mut self, n: usize) {
         self.emulator.scroll_up(n);
@@ -1048,6 +1083,56 @@ mod tests {
             line.contains("TOK=[]"),
             "launcher-shell GH_TOKEN must be firewalled out of the pane: {line:?}"
         );
+    }
+
+    #[test]
+    fn history_tail_captures_recent_output_and_repaint_repaints_it() {
+        // A pane that prints three lines: the history ring should hold them, and
+        // history_tail returns the bounded, blank-trimmed tail.
+        let (tx, mut rx) = tokio_mpsc::channel(1024);
+        let mut pane = PtyPane::spawn_with_env(
+            0,
+            &sh(r"printf 'l1\nl2\nl3\n'"),
+            None,
+            &[],
+            24,
+            80,
+            tx,
+            None,
+        )
+        .unwrap();
+        assert!(drain_until_exit(&mut pane, &mut rx, 5000), "child exits");
+        let tail = pane.history_tail(10);
+        assert!(
+            tail.contains("l2") && tail.contains("l3"),
+            "tail keeps recent history: {tail:?}"
+        );
+        // A cap of 1 keeps at most the single last non-blank line; 0 disables.
+        assert!(pane.history_tail(1).lines().count() <= 1);
+        assert_eq!(pane.history_tail(0), "");
+
+        // repaint_scrollback feeds captured text straight into a fresh pane's
+        // emulator so the restored history lands in the grid before new output.
+        let (tx2, _rx2) = tokio_mpsc::channel(1024);
+        let mut fresh =
+            PtyPane::spawn_with_env(0, &sh("sleep 0.2"), None, &[], 24, 80, tx2, None).unwrap();
+        fresh.repaint_scrollback("restored-a\nrestored-b");
+        let seen = |needle: &str| {
+            (0..24).any(|r| {
+                fresh
+                    .emulator()
+                    .row_text(r)
+                    .unwrap_or_default()
+                    .contains(needle)
+            })
+        };
+        assert!(seen("restored-a"), "first repainted line lands in the grid");
+        assert!(
+            seen("restored-b"),
+            "second repainted line lands in the grid"
+        );
+        // Empty text is a no-op (no panic, nothing painted over row 0).
+        fresh.repaint_scrollback("");
     }
 
     #[test]

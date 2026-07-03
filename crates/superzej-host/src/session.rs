@@ -94,6 +94,12 @@ pub struct Tab {
     /// (replaying scrollback) instead of spawning fresh. Only set for `Stream`
     /// panes whose provider has announced a session id.
     pub pane_sessions: std::collections::BTreeMap<u32, ProviderSession>,
+    /// Bounded plain-text scrollback tail of each leaf pane (`pane id → text`),
+    /// captured at persist time and repainted into the pane on restore so a
+    /// resurrected pane shows its recent history rather than a blank screen. Only
+    /// set for host PTY panes (native-exec streams replay scrollback server-side);
+    /// bounded by `[session] scrollback_lines`.
+    pub pane_scrollback: std::collections::BTreeMap<u32, String>,
 }
 
 impl Tab {
@@ -105,6 +111,7 @@ impl Tab {
             pane_cwds: std::collections::BTreeMap::new(),
             pane_cmds: std::collections::BTreeMap::new(),
             pane_sessions: std::collections::BTreeMap::new(),
+            pane_scrollback: std::collections::BTreeMap::new(),
         }
     }
 
@@ -130,6 +137,11 @@ impl Tab {
         } else {
             serde_json::from_str(&row.pane_sessions).unwrap_or_default()
         };
+        let pane_scrollback = if row.scrollback_snapshot.is_empty() {
+            std::collections::BTreeMap::new()
+        } else {
+            serde_json::from_str(&row.scrollback_snapshot).unwrap_or_default()
+        };
         Tab {
             title: if row.title.is_empty() {
                 (row.ordinal + 1).to_string()
@@ -141,6 +153,7 @@ impl Tab {
             pane_cwds,
             pane_cmds,
             pane_sessions,
+            pane_scrollback,
         }
     }
 
@@ -164,6 +177,11 @@ impl Tab {
             .iter()
             .filter(|(id, _)| ids.contains(id))
             .collect();
+        let live_scrollback: std::collections::BTreeMap<&u32, &String> = self
+            .pane_scrollback
+            .iter()
+            .filter(|(id, _)| ids.contains(id))
+            .collect();
         GroupTabRow {
             group_name: group.to_string(),
             ordinal,
@@ -184,6 +202,11 @@ impl Tab {
                 String::new()
             } else {
                 serde_json::to_string(&live_sessions).unwrap_or_default()
+            },
+            scrollback_snapshot: if live_scrollback.is_empty() {
+                String::new()
+            } else {
+                serde_json::to_string(&live_scrollback).unwrap_or_default()
             },
         }
     }
@@ -476,6 +499,11 @@ impl Session {
                     .iter()
                     .map(|(id, s)| (f(*id), s.clone()))
                     .collect();
+                tab.pane_scrollback = tab
+                    .pane_scrollback
+                    .iter()
+                    .map(|(id, s)| (f(*id), s.clone()))
+                    .collect();
             }
         }
     }
@@ -668,6 +696,7 @@ mod tests {
             pane_cwds: std::collections::BTreeMap::new(),
             pane_cmds: std::collections::BTreeMap::new(),
             pane_sessions: std::collections::BTreeMap::new(),
+            pane_scrollback: std::collections::BTreeMap::new(),
         };
         let back = Tab::from_row(&tab.to_row("app/feat", 1));
         assert_eq!(tab, back);
@@ -771,6 +800,27 @@ mod tests {
     }
 
     #[test]
+    fn tab_row_roundtrip_preserves_pane_scrollback() {
+        let mut tab = Tab::new("1");
+        tab.center = CenterTree::Leaf(3);
+        tab.focused_pane = 3;
+        tab.pane_scrollback
+            .insert(3, "$ echo hi\nhi\n$ ls\na  b".into());
+        // A stale entry for a leaf no longer in the tree is pruned on serialize.
+        tab.pane_scrollback.insert(99, "gone".into());
+
+        let back = Tab::from_row(&tab.to_row("app/feat", 0));
+        assert_eq!(
+            back.pane_scrollback.get(&3).map(String::as_str),
+            Some("$ echo hi\nhi\n$ ls\na  b")
+        );
+        assert!(
+            !back.pane_scrollback.contains_key(&99),
+            "stale leaf scrollback pruned"
+        );
+    }
+
+    #[test]
     fn malformed_pane_tree_degrades_to_single_pane() {
         let row = GroupTabRow {
             group_name: "x/home".into(),
@@ -781,6 +831,7 @@ mod tests {
             pane_cwds: String::new(),
             pane_cmds: String::new(),
             pane_sessions: String::new(),
+            scrollback_snapshot: String::new(),
         };
         let tab = Tab::from_row(&row);
         assert_eq!(tab.center, CenterTree::Leaf(0));

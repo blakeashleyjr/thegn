@@ -78,6 +78,7 @@ mod sequence;
 mod session;
 mod share;
 mod sidebar;
+mod snapshot;
 mod ssh_shim;
 mod subsystem;
 mod tabbar_env;
