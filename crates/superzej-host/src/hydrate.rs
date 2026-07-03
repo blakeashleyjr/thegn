@@ -421,6 +421,28 @@ pub(crate) fn load_or_seed_session(cwd: &std::path::Path) -> (crate::session::Se
         let _ = session.persist(&db, &session_name, now_secs());
     }
     session.id = session_name; // Need to add id to session
+    // Register the resolved workspace so it survives switches: without a
+    // `workspaces` row it exists only as a live fallback in `workspace_list`
+    // (empty repo_path) and vanishes from the sidebar the moment another
+    // workspace becomes active. Unconditional — it also self-heals installs
+    // whose bootstrap workspace predates this registration. Safe upsert:
+    // `put_workspace` assigns `position` (sidebar order) only on first insert.
+    if Path::new(&session.id).is_dir() {
+        let name = Path::new(&session.id)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "workspace".into());
+        // A path that resolves to a git main-worktree is a "repo" workspace;
+        // anything else is a plain "dir" workspace (mirrors switch_to_workspace).
+        let kind = if superzej_core::repo::main_worktree(Path::new(&session.id)).is_some() {
+            "repo"
+        } else {
+            "dir"
+        };
+        // best-effort: the DB is a cache; git is the source of truth
+        let _ = db.put_workspace(&session.id, &name, kind);
+        let _ = db.touch_repo(&session.id, &name);
+    }
     // Record the resolved workspace as the active pointer so the next cold
     // start reopens it even on a first run (where no switch has happened yet).
     let _ = db.set_active_workspace(&session.id);
@@ -2722,5 +2744,89 @@ mod tests {
             0,
             "pr_every={pr_every} not a multiple of model_every={model_every}"
         );
+    }
+
+    #[test]
+    fn load_or_seed_session_registers_bootstrap_workspace() {
+        // The bootstrap workspace must land in the `workspaces` table: without
+        // a row it exists only as a live fallback in `workspace_list` and
+        // vanishes from the sidebar after the first switch away.
+        let state_home =
+            std::env::temp_dir().join(format!("sj-hydrate-bootstrap-{}-state", std::process::id()));
+        let ws_dir =
+            std::env::temp_dir().join(format!("sj-hydrate-bootstrap-{}-ws", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state_home);
+        let _ = std::fs::remove_dir_all(&ws_dir);
+        std::fs::create_dir_all(state_home.join("superzej")).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let ws_str = ws_dir.to_string_lossy().into_owned();
+
+        // Pin SUPERZEJ_SESSION so resolution is deterministic even when the
+        // test itself runs inside a live superzej.
+        let _env = crate::testenv::EnvVarGuard::set(&[
+            ("XDG_STATE_HOME", state_home.to_str().unwrap()),
+            ("SUPERZEJ_SESSION", &ws_str),
+        ]);
+        let (session, seeded) = load_or_seed_session(&ws_dir);
+
+        assert!(seeded);
+        assert_eq!(session.id, ws_str);
+        let db = superzej_core::db::Db::open_at(&state_home.join("superzej/superzej.db")).unwrap();
+        let rows = db.workspaces().unwrap();
+        let row = rows
+            .iter()
+            .find(|w| w.repo_path == ws_str)
+            .expect("bootstrap workspace registered in the workspaces table");
+        assert_eq!(row.kind, "dir", "a plain dir bootstraps as a dir workspace");
+
+        drop(_env);
+        let _ = std::fs::remove_dir_all(&state_home);
+        let _ = std::fs::remove_dir_all(&ws_dir);
+    }
+
+    #[test]
+    fn bootstrap_workspace_survives_switch_in_workspace_list() {
+        // End-to-end regression for the disappearing-original-workspace bug:
+        // bootstrap, switch to a second workspace, and the original must still
+        // be listed (DB-backed, non-empty path) — not dropped as a stale live
+        // fallback by merge_workspace_lists.
+        let state_home =
+            std::env::temp_dir().join(format!("sj-hydrate-survive-{}-state", std::process::id()));
+        let ws_a =
+            std::env::temp_dir().join(format!("sj-hydrate-survive-{}-a", std::process::id()));
+        let ws_b =
+            std::env::temp_dir().join(format!("sj-hydrate-survive-{}-b", std::process::id()));
+        for d in [&state_home, &ws_a, &ws_b] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        std::fs::create_dir_all(state_home.join("superzej")).unwrap();
+        std::fs::create_dir_all(&ws_a).unwrap();
+        std::fs::create_dir_all(&ws_b).unwrap();
+        let a_str = ws_a.to_string_lossy().into_owned();
+        let b_str = ws_b.to_string_lossy().into_owned();
+
+        let _env = crate::testenv::EnvVarGuard::set(&[
+            ("XDG_STATE_HOME", state_home.to_str().unwrap()),
+            ("SUPERZEJ_SESSION", &a_str),
+        ]);
+        let (mut session, _) = load_or_seed_session(&ws_a);
+        let db = superzej_core::db::Db::open_at(&state_home.join("superzej/superzej.db")).unwrap();
+        session.switch_to_workspace(&b_str, &db).unwrap();
+
+        let list = workspace_list(&session, Some(&db));
+        let a_slug = superzej_core::repo::repo_slug_with(&db, &ws_a);
+        let entry = list
+            .iter()
+            .find(|(slug, _, _, _)| *slug == a_slug)
+            .expect("original workspace still listed after switching away");
+        assert_eq!(
+            entry.3, a_str,
+            "original workspace is DB-backed (non-empty path), not a live fallback"
+        );
+
+        drop(_env);
+        for d in [&state_home, &ws_a, &ws_b] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 }
