@@ -1115,9 +1115,13 @@ enabled = true
 # OUTSIDE the worktree is read-only — including your $HOME — so a sandboxed
 # agent can't `cd` out and modify/delete host files. Writable: the worktree, its
 # git dir, build caches, /tmp, and a narrow set of $HOME carve-outs for shell
-# state (~/tmp, ~/.local/state, ~/.local/share). `profile = "open"` restores a
-# fully-writable $HOME (zsh history/zoxide/keychain) as the escape hatch; add
-# more writable paths under `mounts` below.
+# state (~/tmp, ~/.local/state, ~/.local/share). The launched agent's own config
+# dir (CLAUDE_CONFIG_DIR / CODEX_HOME, or its ~/.claude / ~/.codex default) is
+# also carved writable so the CLI can persist its runtime state (session-env,
+# todos, shell snapshots) — otherwise its startup hooks die "read-only file
+# system". `profile = "open"` restores a fully-writable $HOME (zsh
+# history/zoxide/keychain) as the escape hatch; add more writable paths under
+# `mounts` below.
 profile = "hardened"
 
 # Hardening preset for the embedded agent's tool container. When it differs from
