@@ -366,19 +366,34 @@ fn compose_inner(
 
     // Back-compat: fold the legacy per-provider active account for `choice` if a
     // bundle didn't already select that provider's credential home. Keeps the
-    // account-switcher (item 656) working through the unified seam.
+    // account-switcher (item 656) working through the unified seam. `.or_else`
+    // covers an ad-hoc `claude` launch with no matching `[[agents]]` entry.
     if let Some(choice) = choice
-        && let Some(p) = account::provider_for(cfg, choice)
+        && let Some(p) =
+            account::provider_for(cfg, choice).or_else(|| account::infer_provider(choice))
         && !overrides.contains_key(p.home_env)
-        && let Some((var, dir)) = account::launch_env(cfg, db, worktree, slug, choice)
     {
-        fold_cred_dir(
-            &var,
-            &dir.to_string_lossy(),
-            &mut overrides,
-            &mut mounts,
-            &mut ensure_dirs,
-        );
+        if let Some((var, dir)) = account::launch_env(cfg, db, worktree, slug, choice) {
+            fold_cred_dir(
+                &var,
+                &dir.to_string_lossy(),
+                &mut overrides,
+                &mut mounts,
+                &mut ensure_dirs,
+            );
+        } else if let Some(dir) = account::effective_config_dir(p) {
+            // No superzej-managed account, but the agent still writes runtime
+            // state (session-env, todos, shell snapshots) into its inherited
+            // config dir. Under a read-only $HOME that fails EROFS, so carve it
+            // read-write path-preserving — parity with the managed path above.
+            fold_cred_dir(
+                p.home_env,
+                &dir,
+                &mut overrides,
+                &mut mounts,
+                &mut ensure_dirs,
+            );
+        }
     }
 
     // Opt-in `.env` (lowest precedence): only when an active bundle set
@@ -840,6 +855,40 @@ mod tests {
             get(&r.overrides, "CLAUDE_CONFIG_DIR"),
             Some("/creds/claude-work")
         );
+    }
+
+    #[test]
+    fn unmanaged_agent_carves_inherited_config_dir_writable() {
+        let db = Db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.agents.push(NamedCommand {
+            name: "claude".into(),
+            command: "claude".into(),
+            hints: vec![],
+            provider: None,
+        });
+        // No `[[accounts]]` for claude and no active pointer: superzej doesn't
+        // manage it. The agent's inherited config dir (existing on disk) must
+        // still be folded read-write so it can write session-env etc. under a
+        // read-only $HOME.
+        let dir = std::env::temp_dir().join(format!("sz-unmanaged-cfg-{}", crate::util::now()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_s = dir.to_string_lossy().into_owned();
+        // SAFETY: single-threaded test setup; CLAUDE_CONFIG_DIR is only read by
+        // `account::effective_config_dir`, reached solely on this unmanaged path.
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &dir_s) };
+
+        let r = compose(&cfg, &db, "/wt", None, Some("claude"));
+
+        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(get(&r.overrides, "CLAUDE_CONFIG_DIR"), Some(dir_s.as_str()));
+        assert!(
+            r.mounts.iter().any(|m| m.dest == dir_s && !m.ro),
+            "config dir must be a read-write path-preserving overmount"
+        );
+        assert!(r.ensure_dirs.contains(&dir_s));
     }
 
     #[test]

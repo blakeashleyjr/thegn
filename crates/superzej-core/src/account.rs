@@ -130,6 +130,35 @@ pub fn account_dir(cfg: &Config, db: &Db, provider_id: &str, name: &str) -> Opti
         .map(PathBuf::from)
 }
 
+/// The agent's effective on-host config dir when superzej does **not** manage
+/// an account for it: the inherited `home_env` env var (tilde-expanded) if set,
+/// else `~/<default_dir>`. Returns `Some` only when the dir already exists — we
+/// carve an existing dir writable in the sandbox, we don't fabricate one from a
+/// stray env var. Used to overmount the agent's config dir read-write under a
+/// read-only `$HOME` so it can write its runtime state (`session-env`, `todos`,
+/// shell snapshots) — parity with the managed-account path.
+pub fn effective_config_dir(p: &Provider) -> Option<String> {
+    let env_val = std::env::var(p.home_env).ok();
+    let home = std::env::var("HOME").ok();
+    resolve_config_dir(env_val.as_deref(), home.as_deref(), p.default_dir)
+}
+
+/// Pure core of [`effective_config_dir`]: pick the config dir from the resolved
+/// env var (tilde-expanded) or `<home>/<default_dir>`, returning it only when it
+/// exists on disk. Split out so the env reads stay at the edge and the choice is
+/// unit-testable without mutating process-global env.
+fn resolve_config_dir(
+    env_val: Option<&str>,
+    home: Option<&str>,
+    default_dir: &str,
+) -> Option<String> {
+    let dir = match env_val {
+        Some(v) if !v.is_empty() => util::expand_tilde(v),
+        _ => format!("{}/{default_dir}", home.filter(|h| !h.is_empty())?),
+    };
+    std::path::Path::new(&dir).is_dir().then_some(dir)
+}
+
 /// The full merged account list for a provider (config + DB-managed), for the
 /// picker. Config entries take precedence on name collisions.
 pub fn list(cfg: &Config, db: &Db, provider_id: &str) -> Vec<AccountInfo> {
@@ -436,6 +465,48 @@ mod tests {
         // Unknown provider has no marker concept → never authed.
         assert!(!marked_authed("nope", &tmp));
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn resolve_config_dir_prefers_env_then_default_and_needs_existence() {
+        let base = std::env::temp_dir().join(format!("sz-acct-cfg-{}", util::now()));
+        let env_dir = base.join("explicit");
+        let home = base.join("home");
+        std::fs::create_dir_all(&env_dir).unwrap();
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let (env_s, home_s) = (
+            env_dir.to_string_lossy().into_owned(),
+            home.to_string_lossy().into_owned(),
+        );
+
+        // Explicit env var (existing dir) wins over the default.
+        assert_eq!(
+            resolve_config_dir(Some(&env_s), Some(&home_s), ".claude"),
+            Some(env_s.clone())
+        );
+        // No env var → falls back to <home>/<default_dir> when it exists.
+        assert_eq!(
+            resolve_config_dir(None, Some(&home_s), ".claude"),
+            Some(format!("{home_s}/.claude"))
+        );
+        // Empty env var is treated as unset → default fallback.
+        assert_eq!(
+            resolve_config_dir(Some(""), Some(&home_s), ".claude"),
+            Some(format!("{home_s}/.claude"))
+        );
+        // Non-existent dir → None (we carve existing dirs, never fabricate).
+        assert_eq!(resolve_config_dir(None, Some(&home_s), ".codex"), None);
+        assert_eq!(
+            resolve_config_dir(
+                Some(&base.join("missing").to_string_lossy()),
+                None,
+                ".claude"
+            ),
+            None
+        );
+        // No env var and no HOME → None.
+        assert_eq!(resolve_config_dir(None, None, ".claude"), None);
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
