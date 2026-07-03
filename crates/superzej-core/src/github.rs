@@ -869,7 +869,10 @@ mod tests {
             nwo_from_remote_url("git@ghe.corp.example:org/repo").as_deref(),
             Some("org/repo")
         );
-        assert_eq!(nwo_from_remote_url("git@github.com:onlyowner").as_deref(), None);
+        assert_eq!(
+            nwo_from_remote_url("git@github.com:onlyowner").as_deref(),
+            None
+        );
         assert_eq!(nwo_from_remote_url("not a url"), None);
         assert_eq!(nwo_from_remote_url(""), None);
     }

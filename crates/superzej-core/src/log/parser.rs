@@ -164,7 +164,11 @@ mod spec {
         assert_eq!(p.level, LogLevel::Warn);
         assert_eq!(p.worktree.as_deref(), Some("sz-solid-glen"));
         // The wt token is lifted out of the visible message.
-        assert!(!p.message.contains("wt="), "message still has token: {}", p.message);
+        assert!(
+            !p.message.contains("wt="),
+            "message still has token: {}",
+            p.message
+        );
         assert!(p.message.contains("boom"));
     }
 

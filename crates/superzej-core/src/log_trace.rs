@@ -379,7 +379,10 @@ mod tests {
 
     #[test]
     fn wt_slug_is_basename_slug() {
-        assert_eq!(wt_slug(Path::new("/home/me/wt/sz-solid-glen")), "sz-solid-glen");
+        assert_eq!(
+            wt_slug(Path::new("/home/me/wt/sz-solid-glen")),
+            "sz-solid-glen"
+        );
         assert_eq!(wt_slug(Path::new("/repo/app feat")), "app-feat");
         assert_eq!(wt_slug(Path::new("")), "");
     }
