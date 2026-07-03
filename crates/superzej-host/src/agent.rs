@@ -3437,7 +3437,7 @@ pub fn launch_spec_with_key(
     // interactive `cargo build` dedups compilation / shares a target across
     // worktrees. Inside a sandbox it must ride the container env (overrides +
     // unblock); on the host it rides the pane env below.
-    let build_env = build_env_vars(cfg, &repo_root);
+    let build_env = crate::build_cache::build_env_vars(cfg, &repo_root);
 
     if let Some(spec) = outcome.spec.as_mut() {
         crate::ssh_shim::apply(spec);
@@ -3446,6 +3446,11 @@ pub fn launch_spec_with_key(
         for (k, v) in &build_env {
             spec.env_overrides.insert(k.clone(), v.clone());
         }
+        // Under a read-only $HOME the pre-commit hook toolchain (prek/sccache)
+        // and any out-of-tree target dir can't write their caches — `git commit`
+        // hooks then die "Read-only file system" and fall back to --no-verify.
+        // Overmount those caches read-write (no-op on a writable-$HOME profile).
+        crate::build_cache::inject_cache_mounts(spec, cfg, &repo_root);
     }
 
     // Tier A: inject the repo's flake `devShell` toolchain (PATH + safe vars) so
@@ -3713,42 +3718,6 @@ pub fn apply_bouncer_launch(
         };
     }
     BouncerLaunch::default()
-}
-
-/// Resolve a configured build path: `~`/`~/…` expands to home; a relative path
-/// resolves against the repo root (so a shared `target/` is per-repo).
-fn resolve_build_path(raw: &str, repo_root: &Path) -> String {
-    let expanded = superzej_core::util::expand_tilde(raw);
-    let p = Path::new(&expanded);
-    if p.is_absolute() {
-        expanded
-    } else {
-        repo_root.join(p).to_string_lossy().into_owned()
-    }
-}
-
-/// Build-tooling env injected into interactive panes from `[disk]`: a shared
-/// `sccache` compile cache and/or a shared `CARGO_TARGET_DIR`. Empty when both
-/// are off (the common case), so panes are untouched unless opted in.
-fn build_env_vars(cfg: &Config, repo_root: &Path) -> Vec<(String, String)> {
-    let d = &cfg.disk;
-    let mut out = Vec::new();
-    if d.sccache && superzej_core::util::have("sccache") {
-        out.push(("RUSTC_WRAPPER".to_string(), "sccache".to_string()));
-        if !d.sccache_dir.is_empty() {
-            out.push((
-                "SCCACHE_DIR".to_string(),
-                resolve_build_path(&d.sccache_dir, repo_root),
-            ));
-        }
-    }
-    if !d.shared_target_dir.is_empty() {
-        out.push((
-            "CARGO_TARGET_DIR".to_string(),
-            resolve_build_path(&d.shared_target_dir, repo_root),
-        ));
-    }
-    out
 }
 
 /// Map `[sandbox] warm_direnv` to a host-side `direnv` cache warm for
@@ -4091,34 +4060,6 @@ mod tests {
         assert_eq!(kinds, vec!["pi", "claude", "hermes", "codex"]); // deduped, shell skipped
         // No picker → empty (the caller then falls back to host detection).
         assert!(provisioned_agent_kinds(&Config::default()).is_empty());
-    }
-
-    #[test]
-    fn build_env_vars_off_by_default() {
-        let cfg = Config::default();
-        assert!(
-            build_env_vars(&cfg, Path::new("/repo")).is_empty(),
-            "no build env injected unless opted in"
-        );
-    }
-
-    #[test]
-    fn build_env_vars_injects_sccache_and_shared_target() {
-        let mut cfg = Config::default();
-        cfg.disk.shared_target_dir = "shared-target".into();
-        let env = build_env_vars(&cfg, Path::new("/repo"));
-        // shared_target_dir present → CARGO_TARGET_DIR resolved against repo root.
-        assert!(env.contains(&(
-            "CARGO_TARGET_DIR".to_string(),
-            "/repo/shared-target".to_string()
-        )));
-        // sccache off → no RUSTC_WRAPPER regardless of PATH.
-        assert!(!env.iter().any(|(k, _)| k == "RUSTC_WRAPPER"));
-
-        // An absolute shared dir is used verbatim.
-        cfg.disk.shared_target_dir = "/abs/target".into();
-        let env = build_env_vars(&cfg, Path::new("/repo"));
-        assert!(env.contains(&("CARGO_TARGET_DIR".to_string(), "/abs/target".to_string())));
     }
 
     #[test]

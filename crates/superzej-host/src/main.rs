@@ -12,6 +12,7 @@ mod apps;
 mod borders;
 mod bouncer;
 mod bridge_sup;
+mod build_cache;
 mod caps;
 mod center;
 mod chrome;
