@@ -45,6 +45,7 @@ use crate::panes::{
 };
 use crate::recorder::Recorder;
 use crate::wizard;
+use crate::workspace_create::{WorkspaceCloneOutcome, complete_workspace_create};
 
 /// Bounded PTY event queue depth. Reader threads use `blocking_send`, so this
 /// is the backpressure valve for chatty panes: large enough for bursts, small
@@ -2970,16 +2971,16 @@ fn prune_vanished_group(session: &mut crate::session::Session, gi: usize) -> Vec
 /// the active group index. Its `PtyPane`s stay live in `Panes` (we never reap on
 /// a switch), so restoring it reattaches the still-running processes by id. The
 /// drawer rides the shared (dir-keyed) `DrawerPool`, so it isn't parked here.
-struct ResidentWorkspace {
-    worktrees: Vec<crate::session::WorktreeGroup>,
-    active: usize,
+pub(crate) struct ResidentWorkspace {
+    pub(crate) worktrees: Vec<crate::session::WorktreeGroup>,
+    pub(crate) active: usize,
 }
 
 /// Keeps every visited workspace's panes alive in memory, keyed by `repo_path`
 /// (`Session::id`). Switching parks the outgoing workspace and restores the
 /// target's live panes instead of killing and respawning them.
 #[derive(Default)]
-struct WorkspacePool {
+pub(crate) struct WorkspacePool {
     map: std::collections::HashMap<String, ResidentWorkspace>,
 }
 
@@ -2990,7 +2991,7 @@ impl WorkspacePool {
     fn take(&mut self, repo: &str) -> Option<ResidentWorkspace> {
         self.map.remove(repo)
     }
-    fn stash(&mut self, repo: String, rw: ResidentWorkspace) {
+    pub(crate) fn stash(&mut self, repo: String, rw: ResidentWorkspace) {
         self.map.insert(repo, rw);
     }
 }
@@ -2999,7 +3000,7 @@ impl WorkspacePool {
 /// reserved past every live pane, so its persisted tree can't alias a live pane
 /// of another resident workspace (the bleed the old reap-on-switch prevented).
 /// `materialize_with_specs` then spawns real panes over these placeholders.
-fn remap_cold_workspace_ids(session: &mut crate::session::Session, panes: &mut Panes) {
+pub(crate) fn remap_cold_workspace_ids(session: &mut crate::session::Session, panes: &mut Panes) {
     for g in &mut session.worktrees {
         for tab in &mut g.tabs {
             let mut uniq = tab.center.pane_ids();
@@ -3936,8 +3937,7 @@ enum GitInputKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum HostInputKind {
-    NewWorkspace,
+pub(crate) enum HostInputKind {
     NewTerminal,
     /// Rename the worktree group at this session index from its old branch
     /// (item 53). Carries the repo root + old path/branch so the off-thread
@@ -4116,191 +4116,6 @@ fn issue_branch_tail(number: &str, title: &str, hint: Option<&str>) -> String {
         }
     }
     out.trim_matches('-').chars().take(48).collect()
-}
-
-fn begin_new_workspace_prompt(
-    host_input: &mut Option<(menu::InputOverlay, HostInputKind)>,
-    model: &mut FrameModel,
-) {
-    *host_input = Some((
-        menu::InputOverlay::new("new workspace — path or URL", ""),
-        HostInputKind::NewWorkspace,
-    ));
-    model.status = "Create workspace: enter path or URL (Esc cancels)".into();
-}
-
-fn looks_like_git_url(input: &str) -> bool {
-    input.starts_with("http://")
-        || input.starts_with("https://")
-        || input.starts_with("ssh://")
-        || input.starts_with("git://")
-        || input.starts_with("git@")
-}
-
-fn workspace_repo_name_from_url(input: &str) -> String {
-    let trimmed = input.trim_end_matches('/');
-    let tail = trimmed.rsplit(['/', ':']).next().unwrap_or(trimmed);
-    let name = tail.strip_suffix(".git").unwrap_or(tail);
-    let slug = superzej_core::util::slugify(name);
-    if slug.is_empty() {
-        "workspace".into()
-    } else {
-        name.to_string()
-    }
-}
-
-enum WorkspaceResolution {
-    Repo(std::path::PathBuf),
-    NotARepo(std::path::PathBuf),
-}
-
-/// Where a cloned-by-URL workspace lands (`[ui].workspaces_dir` / repo name);
-/// `None` for local-path inputs.
-fn workspace_clone_dest(
-    input: &str,
-    cfg: &superzej_core::config::Config,
-) -> Option<std::path::PathBuf> {
-    looks_like_git_url(input).then(|| {
-        std::path::PathBuf::from(superzej_core::util::expand_tilde(&cfg.workspaces_dir))
-            .join(workspace_repo_name_from_url(input))
-    })
-}
-
-/// Clone `url` into `dest`. BLOCKING (a clone can take minutes) — only call
-/// inside `spawn_blocking`; the NewWorkspace flow completes over
-/// `workspace_clone_rx`.
-fn clone_workspace_repo(url: &str, dest: &std::path::Path) -> Result<()> {
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    // Via the scrubbed git_cmd so a stray GIT_DIR can't redirect the
-    // clone; dest is absolute, so the `-C` only sets the working dir.
-    let cwd = dest.parent().unwrap_or(std::path::Path::new("."));
-    // off-loop: documented blocking helper, called inside spawn_blocking only
-    #[expect(clippy::disallowed_methods)]
-    let status = superzej_core::util::git_cmd(cwd)
-        .arg("clone")
-        .arg(url)
-        .arg(dest)
-        .status()
-        .with_context(|| format!("git clone {url} {}", dest.display()))?;
-    anyhow::ensure!(status.success(), "git clone failed for {url}");
-    Ok(())
-}
-
-/// Result of a background workspace clone, delivered to the loop's
-/// `workspace_clone_rx` drain arm.
-struct WorkspaceCloneOutcome {
-    url: String,
-    dest: std::path::PathBuf,
-    result: Result<()>,
-}
-
-fn create_workspace_from_input_with_config(
-    input: &str,
-    session: &mut crate::session::Session,
-    db: &superzej_core::db::Db,
-    cfg: &superzej_core::config::Config,
-) -> Result<WorkspaceResolution> {
-    let input = input.trim();
-    anyhow::ensure!(!input.is_empty(), "no workspace path or URL given");
-
-    let root = if let Some(dest) = workspace_clone_dest(input, cfg) {
-        // URL inputs are cloned OFF the loop before this runs (NewWorkspace
-        // handler → spawn_blocking → workspace_clone_rx drain); by the time
-        // this is called the clone must already be on disk.
-        anyhow::ensure!(
-            dest.exists(),
-            "clone of {input} not materialized at {} (the clone runs off-loop first)",
-            dest.display()
-        );
-        std::fs::canonicalize(&dest).unwrap_or(dest)
-    } else {
-        let expanded = superzej_core::util::expand_tilde(input);
-        let path = std::path::PathBuf::from(expanded);
-        let path = if path.is_absolute() {
-            path
-        } else {
-            std::env::current_dir()?.join(path)
-        };
-        anyhow::ensure!(path.is_dir(), "path does not exist: {}", path.display());
-        let canonical = std::fs::canonicalize(&path).unwrap_or(path);
-        superzej_core::repo::main_worktree(&canonical).unwrap_or(canonical)
-    };
-
-    let root_s = root.to_string_lossy().into_owned();
-    let name = root
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "workspace".into());
-    let kind = if superzej_core::repo::main_worktree(&root).is_some() {
-        "repo"
-    } else {
-        return Ok(WorkspaceResolution::NotARepo(root));
-    };
-    db.put_workspace(&root_s, &name, kind)?;
-    db.touch_repo(&root_s, &name)?;
-    session.switch_to_workspace(&root_s, db)?;
-    Ok(WorkspaceResolution::Repo(root))
-}
-
-/// Create + switch to a workspace for a LOCAL `input` (a path, or the dest of
-/// a finished URL clone): park the outgoing workspace in the pool, resolve
-/// and persist the new one, and sync chrome state. Never clones — URL inputs
-/// go through the off-loop clone first (see `WorkspaceCloneOutcome`).
-/// Returns whether a relayout is needed.
-#[allow(clippy::too_many_arguments)]
-fn complete_workspace_create(
-    input: &str,
-    session: &mut crate::session::Session,
-    panes: &mut Panes,
-    workspace_pool: &mut WorkspacePool,
-    active_menu: &mut Option<MenuOverlay>,
-    focus: &mut crate::focus::FocusState,
-    model: &mut FrameModel,
-    sb: &mut SidebarState,
-    drawer: &mut Option<u32>,
-    drawer_pool: &mut DrawerPool,
-    drawer_home: &mut Option<std::path::PathBuf>,
-    cfg: &superzej_core::config::Config,
-    center: Rect,
-) -> bool {
-    persist_session_layout(session, panes);
-    let prev_id = session.id.clone();
-    let snapshot = ResidentWorkspace {
-        worktrees: session.worktrees.clone(),
-        active: session.active,
-    };
-    match superzej_core::db::Db::open()
-        .context("open superzej db")
-        .and_then(|db| create_workspace_from_input_with_config(input, session, &db, cfg))
-    {
-        Ok(WorkspaceResolution::Repo(path)) => {
-            workspace_pool.stash(prev_id, snapshot);
-            remap_cold_workspace_ids(session, panes);
-            focus.zone = crate::focus::Zone::Center;
-            refresh_tab_model(model, session, sb);
-            sync_drawer_persistence(
-                session,
-                panes,
-                drawer,
-                drawer_pool,
-                drawer_home,
-                cfg,
-                center,
-            );
-            model.status = format!("workspace created: {}", path.display());
-            true
-        }
-        Ok(WorkspaceResolution::NotARepo(path)) => {
-            *active_menu = Some(menu::init_git_menu(path.to_string_lossy().into_owned()));
-            false
-        }
-        Err(e) => {
-            model.status = format!("workspace create failed: {e}");
-            false
-        }
-    }
 }
 
 /// A follow-up only the loop body can perform (it owns session/panes).
@@ -5697,9 +5512,9 @@ fn dispatch_menu_choice(
         MenuChoice::ShareReach(_) => {}
         MenuChoice::ConfirmDeleteWorkspace { .. } => {}
         MenuChoice::ConfirmInitGit { .. } => {}
-        // The new-workspace discovery picker is intercepted at the call site (it
-        // owns session/panes/pool); never routes through this git dispatcher.
-        MenuChoice::CreateWorkspaceFromPath(_) | MenuChoice::NewWorkspacePrompt => {}
+        // New-project creation is intercepted at the call site (it owns
+        // session/panes/pool); never routes through this git dispatcher.
+        MenuChoice::ConfirmCreateProject { .. } => {}
         // The bouncer approval gate is resolved directly in the loop (it owns the
         // approval queue + oneshots); it never routes through this git dispatcher.
         MenuChoice::ApproveTool { .. } => {}
@@ -6439,7 +6254,7 @@ fn smart_split_dir(cols: usize, rows: usize) -> crate::center::Dir {
 /// limit is exceeded, so invisible yazi instances cannot accumulate without
 /// limit. `pool_limit = 0` disables pooling entirely (hiding kills the pane).
 #[derive(Default)]
-struct DrawerPool {
+pub(crate) struct DrawerPool {
     /// `(dir-key, pane-id)` in insertion order; front is the oldest (next to evict).
     hidden: std::collections::VecDeque<(String, u32)>,
 }
@@ -7304,7 +7119,7 @@ fn capture_pane_sessions(session: &mut crate::session::Session, panes: &Panes) {
     }
 }
 
-fn persist_session_layout(session: &mut crate::session::Session, panes: &Panes) {
+pub(crate) fn persist_session_layout(session: &mut crate::session::Session, panes: &Panes) {
     capture_pane_cwds(session, panes);
     capture_pane_cmds(session, panes);
     capture_pane_sessions(session, panes);
@@ -8080,7 +7895,7 @@ fn apply_scoped_edits(worktree: &str, path: &str, edits: &serde_json::Value) -> 
     std::fs::write(&target, text).map_err(|e| format!("{path}: {e}"))
 }
 
-fn sync_drawer_persistence(
+pub(crate) fn sync_drawer_persistence(
     session: &crate::session::Session,
     panes: &mut Panes,
     drawer: &mut Option<u32>,
@@ -8813,6 +8628,8 @@ async fn event_loop<T: Terminal>(
     wire_renderer.set_depth(crate::caps::color_depth());
     let use_termwiz_renderer = crate::wire::use_termwiz_renderer();
     let mut palette: Option<crate::search_everywhere::PaletteSession> = None;
+    // The Alt+W new-workspace fuzzy picker (fuzzy repo list ⇄ manual entry).
+    let mut workspace_picker: Option<crate::workspace_picker::WorkspacePicker> = None;
     // Per-worktree file index for the `>` search mode. Invalidated by the
     // FS watcher's create/remove events.
     let mut file_index: Option<crate::search_everywhere::FileIndex> = None;
@@ -10533,6 +10350,12 @@ async fn event_loop<T: Terminal>(
         }
         // Background workspace-clone results: finish the create/switch that
         // the NewWorkspace prompt started for a URL input.
+        // Off-loop repo discovery for the new-workspace fuzzy picker.
+        if let Some(p) = workspace_picker.as_mut()
+            && p.drain_discovery()
+        {
+            dirty = true;
+        }
         while let Ok(o) = workspace_clone_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Other);
             match o.result {
@@ -10554,6 +10377,7 @@ async fn event_loop<T: Terminal>(
                         chrome.center,
                     ) {
                         need_relayout = true;
+                        kick_model_hydration!();
                     }
                 }
                 Err(e) => model.status = format!("clone of {} failed: {e}", o.url),
@@ -12493,6 +12317,7 @@ async fn event_loop<T: Terminal>(
                 && git_input.is_none()
                 && host_input.is_none()
                 && wizard_ui.is_none()
+                && workspace_picker.is_none()
                 && hover_popup.is_none()
                 && search.is_none()
                 && bar_detail.is_none()
@@ -12516,6 +12341,7 @@ async fn event_loop<T: Terminal>(
                 && git_input.is_none()
                 && host_input.is_none()
                 && wizard_ui.is_none()
+                && workspace_picker.is_none()
                 && hover_popup.is_none()
                 && search.is_none()
                 && bar_detail.is_none()
@@ -12534,7 +12360,10 @@ async fn event_loop<T: Terminal>(
                 menu: active_menu.is_some(),
                 git_input: git_input.is_some(),
                 host_input: host_input.is_some(),
-                wizard: wizard_ui.is_some(),
+                // The workspace picker is a centered modal like the wizard;
+                // fold it into the same overlay flag so pane-only damage can't
+                // erase it.
+                wizard: wizard_ui.is_some() || workspace_picker.is_some(),
                 hover: hover_popup.is_some(),
                 search: search.is_some(),
                 which_key: !which_key.is_empty(),
@@ -12912,6 +12741,9 @@ async fn event_loop<T: Terminal>(
             }
             if let Some(w) = &wizard_ui {
                 w.render(&mut scratch, screen);
+            }
+            if let Some(p) = &workspace_picker {
+                p.render(&mut scratch, screen);
             }
             if let Some(cp) = &creating
                 && cp.revealed
@@ -13989,6 +13821,86 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+                // Modal: the new-workspace fuzzy picker captures all keys, like
+                // the wizard; outcomes route through the shared workspace_create
+                // flows (open / clone / init-offer / new-project confirm).
+                if let Some(p) = workspace_picker.as_mut() {
+                    match p.handle_key(&k.key, k.modifiers) {
+                        crate::workspace_picker::PickerOutcome::Pending => {}
+                        crate::workspace_picker::PickerOutcome::Cancel => {
+                            workspace_picker = None;
+                            model.status = "workspace creation cancelled".into();
+                        }
+                        crate::workspace_picker::PickerOutcome::OpenRepo(path) => {
+                            workspace_picker = None;
+                            if complete_workspace_create(
+                                &path,
+                                &mut session,
+                                &mut panes,
+                                &mut workspace_pool,
+                                &mut active_menu,
+                                &mut focus,
+                                &mut model,
+                                &mut sb,
+                                &mut drawer,
+                                &mut drawer_pool,
+                                &mut drawer_home,
+                                &current_config,
+                                chrome.center,
+                            ) {
+                                need_relayout = true;
+                                kick_model_hydration!();
+                            }
+                        }
+                        crate::workspace_picker::PickerOutcome::Manual(input) => {
+                            workspace_picker = None;
+                            match crate::workspace_create::plan_new_workspace_input(
+                                &input,
+                                &current_config,
+                            ) {
+                                crate::workspace_create::SubmitPlan::Clone { url, dest } => {
+                                    model.status = format!("Cloning {url}…");
+                                    crate::workspace_create::spawn_workspace_clone(
+                                        url,
+                                        dest,
+                                        workspace_clone_tx.clone(),
+                                        waker.clone(),
+                                    );
+                                }
+                                crate::workspace_create::SubmitPlan::Local(input) => {
+                                    if complete_workspace_create(
+                                        &input,
+                                        &mut session,
+                                        &mut panes,
+                                        &mut workspace_pool,
+                                        &mut active_menu,
+                                        &mut focus,
+                                        &mut model,
+                                        &mut sb,
+                                        &mut drawer,
+                                        &mut drawer_pool,
+                                        &mut drawer_home,
+                                        &current_config,
+                                        chrome.center,
+                                    ) {
+                                        need_relayout = true;
+                                        kick_model_hydration!();
+                                    }
+                                }
+                                crate::workspace_create::SubmitPlan::CreateNew { leaf } => {
+                                    active_menu = Some(menu::create_project_menu(
+                                        leaf.to_string_lossy().into_owned(),
+                                    ));
+                                }
+                                crate::workspace_create::SubmitPlan::Invalid(msg) => {
+                                    model.status = format!("workspace create failed: {msg}");
+                                }
+                            }
+                        }
+                    }
+                    dirty = true;
+                    continue;
+                }
                 // Modal: host text input overlays (workspace creation, etc.)
                 // capture all keys before palettes/panels so the shortcut gives
                 // immediate visible feedback and a focused input target.
@@ -14079,47 +13991,6 @@ async fn event_loop<T: Terminal>(
                                             need_relayout = true;
                                         }
                                     }
-                                    HostInputKind::NewWorkspace => {
-                                        let input = text.trim().to_string();
-                                        if let Some(dest) =
-                                            workspace_clone_dest(&input, &current_config)
-                                            && !dest.exists()
-                                        {
-                                            // URL → clone OFF the loop (it can
-                                            // take minutes); the create/switch
-                                            // completes in the
-                                            // `workspace_clone_rx` drain arm.
-                                            model.status = format!("Cloning {input}…");
-                                            let tx = workspace_clone_tx.clone();
-                                            let wk = waker.clone();
-                                            tokio::task::spawn_blocking(move || {
-                                                let result = clone_workspace_repo(&input, &dest);
-                                                let _ = tx.send(WorkspaceCloneOutcome {
-                                                    url: input,
-                                                    dest,
-                                                    result,
-                                                });
-                                                let _ = wk.wake();
-                                            });
-                                        } else if complete_workspace_create(
-                                            &input,
-                                            &mut session,
-                                            &mut panes,
-                                            &mut workspace_pool,
-                                            &mut active_menu,
-                                            &mut focus,
-                                            &mut model,
-                                            &mut sb,
-                                            &mut drawer,
-                                            &mut drawer_pool,
-                                            &mut drawer_home,
-                                            &current_config,
-                                            chrome.center,
-                                        ) {
-                                            need_relayout = true;
-                                        }
-                                    }
-
                                     HostInputKind::RenameWorktree {
                                         gi,
                                         repo_root,
@@ -14504,46 +14375,23 @@ async fn event_loop<T: Terminal>(
                                         .map(|s| s.success())
                                         .unwrap_or(false);
                                 if initialized {
-                                    model.status =
-                                        format!("initialized git repository at {}", path);
-
-                                    // Proceed with creating the workspace
-                                    persist_session_layout(&mut session, &panes);
-                                    let prev_id = session.id.clone();
-                                    let snapshot = ResidentWorkspace {
-                                        worktrees: session.worktrees.clone(),
-                                        active: session.active,
-                                    };
-                                    match superzej_core::db::Db::open()
-                                        .context("open superzej db")
-                                        .and_then(|db| {
-                                            create_workspace_from_input_with_config(
-                                                &path,
-                                                &mut session,
-                                                &db,
-                                                &current_config,
-                                            )
-                                        }) {
-                                        Ok(WorkspaceResolution::Repo(_)) => {
-                                            workspace_pool.stash(prev_id, snapshot);
-                                            remap_cold_workspace_ids(&mut session, &mut panes);
-                                            focus.zone = crate::focus::Zone::Center;
-                                            refresh_tab_model(&mut model, &session, &mut sb);
-                                            sync_drawer_persistence(
-                                                &session,
-                                                &mut panes,
-                                                &mut drawer,
-                                                &mut drawer_pool,
-                                                &mut drawer_home,
-                                                keymap.config(),
-                                                chrome.center,
-                                            );
-                                            need_relayout = true;
-                                        }
-                                        _ => {
-                                            model.status =
-                                                "failed to switch to initialized workspace".into();
-                                        }
+                                    if complete_workspace_create(
+                                        &path,
+                                        &mut session,
+                                        &mut panes,
+                                        &mut workspace_pool,
+                                        &mut active_menu,
+                                        &mut focus,
+                                        &mut model,
+                                        &mut sb,
+                                        &mut drawer,
+                                        &mut drawer_pool,
+                                        &mut drawer_home,
+                                        &current_config,
+                                        chrome.center,
+                                    ) {
+                                        need_relayout = true;
+                                        kick_model_hydration!();
                                     }
                                 } else {
                                     model.status =
@@ -14552,59 +14400,33 @@ async fn event_loop<T: Terminal>(
                                 dirty = true;
                                 continue;
                             }
-                            // Discovery picker → "enter a path or URL…": open the
-                            // typed-input overlay (URL clone + git-init offer live
-                            // there, in the NewWorkspace submit handler).
-                            if let menu::MenuChoice::NewWorkspacePrompt = choice {
-                                begin_new_workspace_prompt(&mut host_input, &mut model);
-                                dirty = true;
-                                continue;
-                            }
-                            // Discovery picker → a chosen repo: create + switch via
-                            // the same path as the typed-input submit / init-git
-                            // flows above.
-                            if let menu::MenuChoice::CreateWorkspaceFromPath(path) = choice {
-                                persist_session_layout(&mut session, &panes);
-                                let prev_id = session.id.clone();
-                                let snapshot = ResidentWorkspace {
-                                    worktrees: session.worktrees.clone(),
-                                    active: session.active,
-                                };
-                                match superzej_core::db::Db::open()
-                                    .context("open superzej db")
-                                    .and_then(|db| {
-                                        create_workspace_from_input_with_config(
+                            // New-project confirm (fuzzy picker / typed prompt →
+                            // a leaf whose parent exists): mkdir + git init, then
+                            // the shared create+switch.
+                            if let menu::MenuChoice::ConfirmCreateProject { path } = choice {
+                                match crate::workspace_create::init_new_project(Path::new(&path)) {
+                                    Ok(()) => {
+                                        if complete_workspace_create(
                                             &path,
                                             &mut session,
-                                            &db,
-                                            &current_config,
-                                        )
-                                    }) {
-                                    Ok(WorkspaceResolution::Repo(created)) => {
-                                        workspace_pool.stash(prev_id, snapshot);
-                                        remap_cold_workspace_ids(&mut session, &mut panes);
-                                        focus.zone = crate::focus::Zone::Center;
-                                        refresh_tab_model(&mut model, &session, &mut sb);
-                                        sync_drawer_persistence(
-                                            &session,
                                             &mut panes,
+                                            &mut workspace_pool,
+                                            &mut active_menu,
+                                            &mut focus,
+                                            &mut model,
+                                            &mut sb,
                                             &mut drawer,
                                             &mut drawer_pool,
                                             &mut drawer_home,
-                                            keymap.config(),
+                                            &current_config,
                                             chrome.center,
-                                        );
-                                        model.status =
-                                            format!("workspace created: {}", created.display());
-                                        need_relayout = true;
-                                    }
-                                    Ok(WorkspaceResolution::NotARepo(p)) => {
-                                        active_menu = Some(menu::init_git_menu(
-                                            p.to_string_lossy().into_owned(),
-                                        ));
+                                        ) {
+                                            need_relayout = true;
+                                            kick_model_hydration!();
+                                        }
                                     }
                                     Err(e) => {
-                                        model.status = format!("workspace create failed: {e}");
+                                        model.status = format!("create project failed: {e}");
                                     }
                                 }
                                 dirty = true;
@@ -19633,18 +19455,18 @@ async fn event_loop<T: Terminal>(
                                 ));
                             }
                             Action::NewWorkspace => {
-                                // Discovery-first: offer repos found under the
-                                // configured `repo_roots` (item 31). With none
-                                // discovered, fall straight through to the typed
-                                // path/URL prompt (today's behavior).
-                                let repos = superzej_core::repo::discover_repos(&current_config);
-                                if repos.is_empty() {
-                                    begin_new_workspace_prompt(&mut host_input, &mut model);
-                                } else {
-                                    active_menu = Some(menu::new_workspace_menu(&repos));
-                                    model.status =
-                                        "New workspace: pick a repo or [p] to type a path".into();
-                                }
+                                // Fuzzy picker, seeded instantly from the DB;
+                                // the `repo_roots` scan (a filesystem walk that
+                                // can take a while on big trees) runs off-loop
+                                // and streams in via `drain_discovery`.
+                                let seed = superzej_core::db::Db::open()
+                                    .map(|db| crate::workspace_picker::seed_repos(&db))
+                                    .unwrap_or_default();
+                                let mut p = crate::workspace_picker::WorkspacePicker::new(seed);
+                                p.spawn_discovery(current_config.clone(), waker.clone());
+                                workspace_picker = Some(p);
+                                model.status =
+                                    "New workspace: type to filter · Tab for manual entry".into();
                             }
                             Action::DeleteWorkspace => {
                                 // Remove the *active* workspace. Same modal + path
@@ -21344,27 +21166,6 @@ mod tests {
     }
 
     #[test]
-    fn new_workspace_action_starts_path_or_url_input() {
-        let mut model = FrameModel::default();
-        let mut host_input = None;
-
-        begin_new_workspace_prompt(&mut host_input, &mut model);
-
-        let (input, kind) = host_input.expect("new workspace should open an input overlay");
-        assert_eq!(kind, HostInputKind::NewWorkspace);
-        assert!(
-            input.title.contains("path or URL"),
-            "prompt title should explain accepted input: {:?}",
-            input.title
-        );
-        assert!(
-            model.status.contains("path or URL"),
-            "status should make shortcut/menu feedback visible: {:?}",
-            model.status
-        );
-    }
-
-    #[test]
     fn center_context_hints_include_close_tab_and_split_controls() {
         let cfg = superzej_core::config::Config::default();
         let focus = crate::focus::FocusState::default();
@@ -22384,10 +22185,9 @@ mod tests {
     }
 
     #[test]
-    fn new_workspace_menu_offers_discovered_repos() {
-        // With repo_roots pointing at a dir containing a git repo, the create
-        // action's discovery source finds it and the picker lists it as a
-        // CreateWorkspaceFromPath — alongside the always-present manual-entry item.
+    fn new_workspace_discovery_finds_repos_under_repo_roots() {
+        // With repo_roots pointing at a dir containing a git repo, the fuzzy
+        // picker's off-loop discovery source finds it.
         let tmp = std::env::temp_dir().join(format!(
             "sj-host-discover-{}-{}",
             std::process::id(),
@@ -22406,22 +22206,6 @@ mod tests {
         assert!(
             repos.iter().any(|p| p == &repo_s),
             "discover_repos should find the temp repo: {repos:?}"
-        );
-
-        let overlay = menu::new_workspace_menu(&repos);
-        let choices: Vec<&menu::MenuChoice> = overlay.items().iter().map(|i| &i.choice).collect();
-        assert!(
-            choices.iter().any(|c| matches!(
-                c,
-                menu::MenuChoice::CreateWorkspaceFromPath(p) if *p == repo_s
-            )),
-            "picker lists the discovered repo: {choices:?}"
-        );
-        assert!(
-            choices
-                .iter()
-                .any(|c| matches!(c, menu::MenuChoice::NewWorkspacePrompt)),
-            "picker always offers manual entry: {choices:?}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);

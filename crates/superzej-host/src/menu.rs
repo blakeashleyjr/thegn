@@ -81,10 +81,8 @@ pub enum MenuChoice {
     ConfirmDeleteWorkspace { keep_files: bool },
     // init git confirm
     ConfirmInitGit { path: String },
-    // new-workspace discovery picker: create+switch to this discovered repo path.
-    CreateWorkspaceFromPath(String),
-    // new-workspace discovery picker: fall through to the typed path/URL prompt.
-    NewWorkspacePrompt,
+    // new-project confirm: mkdir the leaf (parent exists) + git init + open.
+    ConfirmCreateProject { path: String },
     // first-launch keymap picker (item 621): the chosen preset id
     // ("default" | "vscode" | "jetbrains").
     SetKeymapPreset(String),
@@ -112,7 +110,6 @@ pub enum MenuKindTag {
     UndoConfirm,
     RedoConfirm,
     Confirm,
-    NewWorkspace,
     KeymapPicker,
     Approval,
     ShareReach,
@@ -411,55 +408,6 @@ pub fn delete_workspace_menu(display: &str) -> MenuOverlay {
         0,
     )
     .with_body("the home checkout is kept; branch worktrees are deleted")
-}
-
-/// Max discovered repos to list before the picker gets unwieldy (the render
-/// clips to the available rows anyway). When more are found, a note row says so
-/// and the always-present manual-entry item keeps every repo reachable.
-const MAX_DISCOVERED: usize = 20;
-
-/// The `Alt W` new-workspace picker: pick a repo discovered under the configured
-/// `repo_roots`, or fall through to typing a path/URL. Repo rows carry no hotkey
-/// (there can be many) — navigate with j/k and Enter; `[p]` opens the prompt.
-/// Only built when `repos` is non-empty; otherwise the caller opens the prompt
-/// directly.
-pub fn new_workspace_menu(repos: &[String]) -> MenuOverlay {
-    let shown = repos.len().min(MAX_DISCOVERED);
-    let mut items: Vec<MenuItem> = repos
-        .iter()
-        .take(shown)
-        .map(|path| {
-            let name = std::path::Path::new(path)
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.clone());
-            item(
-                None,
-                name,
-                MenuChoice::CreateWorkspaceFromPath(path.clone()),
-            )
-            .note(path.clone())
-        })
-        .collect();
-    items.push(item(
-        Some('p'),
-        "enter a path or URL…",
-        MenuChoice::NewWorkspacePrompt,
-    ));
-    let overlay = MenuOverlay::new_with_default(
-        MenuKindTag::NewWorkspace,
-        "New workspace — pick a repo",
-        items,
-        0,
-    );
-    if repos.len() > shown {
-        overlay.with_body(format!(
-            "{} repos found (showing {shown}); use [p] to type any path",
-            repos.len()
-        ))
-    } else {
-        overlay
-    }
 }
 
 /// A 2-item yes/no confirm built on the same component: `[y]` resolves to
@@ -804,6 +752,24 @@ pub fn init_git_menu(path: String) -> MenuOverlay {
         ],
     )
     .with_body(format!("{} is not a git repository", path))
+}
+
+/// Confirm creating a brand-new project dir (parent already exists) with a
+/// fresh `git init`, then opening it as a workspace.
+pub fn create_project_menu(path: String) -> MenuOverlay {
+    MenuOverlay::new(
+        MenuKindTag::Confirm,
+        "create new project?".to_string(),
+        vec![
+            item(
+                Some('y'),
+                "create directory + git init",
+                MenuChoice::ConfirmCreateProject { path: path.clone() },
+            ),
+            item(Some('n'), "cancel", MenuChoice::Dismiss),
+        ],
+    )
+    .with_body(format!("{} does not exist yet", path))
 }
 
 /// Branch actions including create + merge (the full `m`/`n` menu); merge
