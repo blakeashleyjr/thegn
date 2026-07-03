@@ -270,7 +270,7 @@ impl GhCircuit {
     /// Returns `true` if the circuit is open (skip octocrab this call).
     fn is_open(&self) -> bool {
         let guard = self.open_until.lock().unwrap_or_else(|e| e.into_inner());
-        guard.map_or(false, |until| std::time::Instant::now() < until)
+        guard.is_some_and(|until| std::time::Instant::now() < until)
     }
 
     fn record_success(&self) {
