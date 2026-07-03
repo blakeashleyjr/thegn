@@ -18,6 +18,7 @@ pub mod disk;
 pub mod doctor;
 pub mod env;
 pub mod forward;
+pub mod host;
 pub mod integrate;
 pub mod issue;
 pub mod list;

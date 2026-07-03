@@ -59,10 +59,20 @@ use std::path::PathBuf;
 /// v29: adds `group_tabs.scrollback_snapshot` (per-leaf captured scrollback tail,
 /// JSON `pane id → text`) so a resurrected pane repaints its recent history
 /// instead of a blank screen. Additive; absent/NULL on pre-v29 rows = no history.
-const SCHEMA_VERSION: i64 = 29;
+/// v30: adds `hosts` + `host_inventory` + `host_events` (hosts as first-class
+/// resources; see [`crate::host_db`]).
+const SCHEMA_VERSION: i64 = 30;
 
 pub struct Db {
     conn: Connection,
+}
+
+impl Db {
+    /// Connection accessor for sibling `impl Db` query modules (host_db) —
+    /// `conn` stays private so all SQL lives in this crate.
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
 }
 
 /// One row of the local merge queue (`[merge_queue]`, v22). Keyed by worktree;
@@ -624,172 +634,12 @@ impl Db {
             COMMIT;
             "#,
         )?;
-        // Additive: a pre-existing v3 worktrees table predates the remote-worktree
-        // `location` column. Add it in place (ignored if already present) so local
-        // worktree history survives — no full migration/reset needed.
-        let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN location TEXT", []);
-        // Additive: running-pin set per session (JSON), so the native host can
-        // resurrect strip/float pins (the pin supervisor re-launches them).
-        let _ = conn.execute("ALTER TABLE session_state ADD COLUMN pin_state TEXT", []);
-        // Additive: a workspace's kind — "repo" (a git repo) or "dir" (a plain
-        // non-git directory). Defaults keep every pre-existing workspace a repo.
-        let _ = conn.execute(
-            "ALTER TABLE workspaces ADD COLUMN kind TEXT DEFAULT 'repo'",
-            [],
-        );
-        // v8: a persistent per-worktree sort key — the single source of truth
-        // for sidebar order (loaded + unloaded). Additive; backfilled below.
-        let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN position INTEGER", []);
-        // v14: per-leaf working directories (JSON map of pane id → cwd) so
-        // resurrected panes respawn where they last were, not at the worktree
-        // root. Additive; absent/NULL on pre-v14 rows = no cwd hints.
-        let _ = conn.execute("ALTER TABLE group_tabs ADD COLUMN pane_cwds TEXT", []);
-        // v15: per-leaf last foreground command (JSON map of pane id →
-        // {argv, cwd}) so a resurrected/crashed pane can offer to relaunch the
-        // program it was running. Additive; absent/NULL on pre-v15 rows = none.
-        let _ = conn.execute("ALTER TABLE group_tabs ADD COLUMN pane_cmds TEXT", []);
-        // v23: per-leaf provider exec session (JSON map of pane id →
-        // {provider, id, session}) so a native-exec pane reattaches to its live
-        // remote session on restart. Additive; absent/NULL on pre-v23 rows = none.
-        let _ = conn.execute("ALTER TABLE group_tabs ADD COLUMN pane_sessions TEXT", []);
-        // v29: per-leaf captured scrollback tail (JSON map of pane id → text) so a
-        // resurrected pane repaints its recent history. Additive; NULL pre-v29.
-        let _ = conn.execute(
-            "ALTER TABLE group_tabs ADD COLUMN scrollback_snapshot TEXT",
-            [],
-        );
-        // v26: warm spare-sandbox pool. `pool_spares` tracks pre-provisioned,
-        // UNCLAIMED sandboxes per (repo, env) so a new worktree opens instantly by
-        // claiming one; `pool_targets` is the runtime +/- override of the configured
-        // `[lifecycle.pool]` size; `worktrees.provider_sandbox_id` binds a worktree
-        // to the spare it claimed (overrides the derived sandbox name).
-        let _ = conn.execute(
-            "CREATE TABLE IF NOT EXISTS pool_spares (
-               sandbox_name  TEXT PRIMARY KEY,
-               repo_path     TEXT NOT NULL,
-               env_name      TEXT NOT NULL,
-               state         TEXT NOT NULL,
-               checkpoint_id TEXT,
-               lock_hash     TEXT,
-               created_at    INTEGER NOT NULL,
-               updated_at    INTEGER NOT NULL
-             )",
-            [],
-        );
-        let _ = conn.execute(
-            "CREATE TABLE IF NOT EXISTS pool_targets (
-               repo_path TEXT NOT NULL,
-               env_name  TEXT NOT NULL,
-               target    INTEGER NOT NULL,
-               PRIMARY KEY (repo_path, env_name)
-             )",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE worktrees ADD COLUMN provider_sandbox_id TEXT",
-            [],
-        );
-        // Backfill any unset positions deterministically by creation order
-        // (path as the tie-breaker), giving pre-v8 worktrees a stable,
-        // collision-free order on first launch after upgrade. Runs once: after
-        // this every row has a position, and `put_worktree` assigns MAX+1.
-        let _ = conn.execute(
-            "UPDATE worktrees SET position = (
-                 SELECT COUNT(*) FROM worktrees AS w2
-                 WHERE (w2.created_at, w2.worktree) < (worktrees.created_at, worktrees.worktree)
-             ) WHERE position IS NULL",
-            [],
-        );
-        // v16: a persistent per-workspace sort key — the source of truth for
-        // sidebar workspace order (was `last_active DESC`). Additive; backfilled
-        // below.
-        let _ = conn.execute("ALTER TABLE workspaces ADD COLUMN position INTEGER", []);
-        // Backfill from the prior recency order: position 0 = most-recently
-        // active (recency is DESC, hence `>` here vs the worktrees' `<`), with
-        // repo_path as the collision-free tie-breaker. Runs once: after this
-        // every row has a position, and `put_workspace` assigns MAX+1.
-        let _ = conn.execute(
-            "UPDATE workspaces SET position = (
-                 SELECT COUNT(*) FROM workspaces AS w2
-                 WHERE (w2.last_active, w2.repo_path) > (workspaces.last_active, workspaces.repo_path)
-             ) WHERE position IS NULL",
-            [],
-        );
-
-        // v17: folders table and worktrees.folder_id
-        let _ = conn.execute(
-            "CREATE TABLE IF NOT EXISTS folders (
-                folder_id INTEGER PRIMARY KEY,
-                repo_path TEXT NOT NULL REFERENCES workspaces(repo_path) ON DELETE CASCADE,
-                name TEXT NOT NULL,
-                position INTEGER NOT NULL,
-                created_at INTEGER NOT NULL
-             )",
-            [],
-        );
-        let _ = conn.execute(
-            "CREATE TABLE IF NOT EXISTS terminals (
-              id                INTEGER PRIMARY KEY AUTOINCREMENT,
-              name              TEXT    NOT NULL UNIQUE,
-              kind              TEXT    NOT NULL,
-              connection_string TEXT    NOT NULL,
-              folder_id         INTEGER,
-              created_at        INTEGER NOT NULL,
-              last_active       INTEGER NOT NULL,
-              position          INTEGER NOT NULL DEFAULT 0
-            )",
-            [],
-        );
-        let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN folder_id INTEGER", []);
-        // v21: per-worktree ingress shares (`[share]`). A worktree can expose
-        // several ports, so the key is (worktree, local_port). Additive; a row
-        // is the resurrection record for a tunnel the host respawns on restart.
-        let _ = conn.execute(
-            "CREATE TABLE IF NOT EXISTS shares (
-              worktree   TEXT    NOT NULL,
-              local_port INTEGER NOT NULL,
-              provider   TEXT    NOT NULL,
-              public_url TEXT,
-              state      TEXT    NOT NULL,
-              created_at INTEGER NOT NULL,
-              PRIMARY KEY (worktree, local_port)
-            )",
-            [],
-        );
-        // v23: auto port forwards (`[forward]`). A worktree can forward several
-        // ports, so the key is (worktree, container_port). Additive; a row is the
-        // resurrection record so the host re-detects forwards on restart.
-        let _ = conn.execute(
-            "CREATE TABLE IF NOT EXISTS forwards (
-              worktree       TEXT    NOT NULL,
-              container_port INTEGER NOT NULL,
-              host_port      INTEGER NOT NULL,
-              url            TEXT    NOT NULL,
-              created_at     INTEGER NOT NULL,
-              PRIMARY KEY (worktree, container_port)
-            )",
-            [],
-        );
-        // v18: the named execution environment selected per workspace/worktree
-        // (`[env.<name>]`). Additive; absent/NULL = inherit the next layer down
-        // (worktree → workspace → repo `.superzej.*` → global default → default).
-        let _ = conn.execute("ALTER TABLE workspaces ADD COLUMN env_name TEXT", []);
-        let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN env_name TEXT", []);
-        // v27: persisted vim-style registers (Phase 3 of time-travel-replay).
-        // Additive; keyed by the single-char register id. The `"+` clipboard
-        // register is volatile and never written here.
-        let _ = conn.execute(
-            "CREATE TABLE IF NOT EXISTS registers (
-              name       TEXT PRIMARY KEY,
-              value      BLOB NOT NULL,
-              updated_at INTEGER NOT NULL
-            )",
-            [],
-        );
+        crate::db_migrate::additive_schema(&conn);
         // v6: transform any remaining flat v4/v5 `tab_layout` into worktree
         // groups. Keyed on the legacy table's existence (not the version) so
         // it is idempotent and a failed earlier attempt retries next open.
         migrate_tab_layout_v6(&conn);
+        crate::host_db::migrate_v30(&conn)?;
         Ok(Db { conn })
     }
 
@@ -3154,161 +3004,9 @@ impl Db {
     }
 }
 
-/// Split a legacy v4/v5 tab name into its worktree-group base and page number:
-/// `"app/feat ·3"` → `("app/feat", Some(3))`, `"app/feat"` → `("app/feat", None, None)`.
-fn split_page_suffix(name: &str) -> (&str, Option<u32>) {
-    if let Some((base, page)) = name.rsplit_once(" ·")
-        && !base.is_empty()
-        && let Ok(n) = page.parse::<u32>()
-    {
-        return (base, Some(n));
-    }
-    (name, None)
-}
-
-/// v5 → v6: transform the flat `tab_layout` (one row per worktree, extra pages
-/// as " ·N" name suffixes) into `tab_groups` + `group_tabs`, remap each
-/// session's `session_state.active_tab` from a tab name to its group name, and
-/// drop the legacy table. Runs in one transaction; on failure the legacy table
-/// (and the old active markers) survive untouched and the host boots with a
-/// fresh layout — the next open retries.
-fn migrate_tab_layout_v6(conn: &Connection) {
-    let has_legacy = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tab_layout'",
-            [],
-            |_| Ok(()),
-        )
-        .optional()
-        .ok()
-        .flatten()
-        .is_some();
-    if !has_legacy {
-        return;
-    }
-    let run = || -> Result<()> {
-        let tx = conn.unchecked_transaction()?;
-        struct Legacy {
-            session: String,
-            name: String,
-            kind: String,
-            worktree: String,
-            pane_tree: String,
-            focused: i64,
-        }
-        let legacy: Vec<Legacy> = {
-            let mut stmt = tx.prepare(
-                "SELECT session_name, tab_name, kind, worktree, pane_tree, focused_pane
-                   FROM tab_layout ORDER BY session_name, ordinal",
-            )?;
-            let rows = stmt.query_map([], |r| {
-                Ok(Legacy {
-                    session: r.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                    name: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                    kind: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    worktree: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                    pane_tree: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                    focused: r.get::<_, Option<i64>>(5)?.unwrap_or(0),
-                })
-            })?;
-            rows.filter_map(|r| r.ok()).collect()
-        };
-
-        // Group rows by (session, base name) preserving first-seen order; track
-        // each tab's original full name so active markers can be remapped.
-        struct Group {
-            session: String,
-            name: String,
-            kind: String,
-            worktree: String,
-            tabs: Vec<(String, String, i64)>, // (orig full name, pane_tree, focused)
-        }
-        let mut groups: Vec<Group> = Vec::new();
-        for row in legacy {
-            if row.name.is_empty() {
-                continue;
-            }
-            let (base, _) = split_page_suffix(&row.name);
-            let kind = if row.kind == "home" { "home" } else { "branch" };
-            let g = match groups
-                .iter_mut()
-                .find(|g| g.session == row.session && g.name == base)
-            {
-                Some(g) => g,
-                None => {
-                    groups.push(Group {
-                        session: row.session.clone(),
-                        name: base.to_string(),
-                        kind: kind.to_string(),
-                        worktree: String::new(),
-                        tabs: Vec::new(),
-                    });
-                    groups.last_mut().expect("just pushed")
-                }
-            };
-            if g.worktree.is_empty() && !row.worktree.is_empty() {
-                g.worktree = row.worktree.clone();
-            }
-            g.tabs.push((row.name, row.pane_tree, row.focused));
-        }
-
-        let mut ordinal_in: std::collections::HashMap<String, i64> = Default::default();
-        for g in &groups {
-            let ord = ordinal_in.entry(g.session.clone()).or_insert(0);
-            // The group's active tab: the session's recorded active tab name if
-            // it lives in this group, else the first tab.
-            let active_name: Option<String> = tx
-                .query_row(
-                    "SELECT active_tab FROM session_state WHERE session_name=?1",
-                    params![g.session],
-                    |r| r.get::<_, Option<String>>(0),
-                )
-                .optional()?
-                .flatten();
-            let active_idx = active_name
-                .as_deref()
-                .and_then(|an| g.tabs.iter().position(|(orig, _, _)| orig == an))
-                .unwrap_or(0) as i64;
-            tx.execute(
-                "INSERT OR REPLACE INTO tab_groups
-                   (session_name, name, kind, worktree, ordinal, active_tab)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![g.session, g.name, g.kind, g.worktree, *ord, active_idx],
-            )?;
-            *ord += 1;
-            for (i, (_, pane_tree, focused)) in g.tabs.iter().enumerate() {
-                tx.execute(
-                    "INSERT OR REPLACE INTO group_tabs
-                       (session_name, group_name, ordinal, title, pane_tree, focused_pane)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        g.session,
-                        g.name,
-                        i as i64,
-                        (i + 1).to_string(),
-                        pane_tree,
-                        focused
-                    ],
-                )?;
-            }
-            // Remap the session's active marker from tab name to group name.
-            if let Some(an) = active_name.as_deref()
-                && g.tabs.iter().any(|(orig, _, _)| orig == an)
-            {
-                tx.execute(
-                    "UPDATE session_state SET active_tab=?2 WHERE session_name=?1",
-                    params![g.session, g.name],
-                )?;
-            }
-        }
-        tx.execute("DROP TABLE tab_layout", [])?;
-        tx.commit()?;
-        Ok(())
-    };
-    if let Err(e) = run() {
-        tracing::warn!(target: "superzej::db", error = %e, "v6 tab_layout migration failed; keeping legacy table");
-    }
-}
+pub(crate) use crate::db_migrate::migrate_tab_layout_v6;
+#[cfg(test)]
+pub(crate) use crate::db_migrate::split_page_suffix;
 
 #[cfg(test)]
 mod tests {

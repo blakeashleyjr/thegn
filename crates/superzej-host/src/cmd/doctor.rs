@@ -193,6 +193,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
     sandbox_report(cfg);
 
     outln!("");
+    hosts_report(cfg);
+
+    outln!("");
     home_layer_report(cfg);
 
     outln!("");
@@ -205,6 +208,58 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
     outln!("Summary");
     outln!("  {}", summary(&resolved));
     Ok(())
+}
+
+/// Hosts-as-resources: every [host.*] (config + DB-added), its reach, recorded
+/// provisioning state, probe age, and the local-side delivery abilities the
+/// registry-less transfer depends on. Detection only.
+fn hosts_report(cfg: &Config) {
+    outln!("Hosts ([host.*] + `superzej host add`)");
+    if cfg.host.is_empty() {
+        outln!("  (none — add one with `superzej host add user@box` or [host.<name>])");
+        return;
+    }
+    let db = superzej_core::db::Db::open().ok();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    for (name, hc) in &cfg.host {
+        let state = cfg
+            .host_binding(name)
+            .and_then(|b| db.as_ref().and_then(|db| db.host_get(&b.id).ok().flatten()))
+            .map(|row| {
+                let age = row
+                    .last_probe
+                    .map(|t| format!("probed {}s ago", now.saturating_sub(t)))
+                    .unwrap_or_else(|| "never probed".into());
+                format!(
+                    "{} · {age}",
+                    row.state.durable_tag().unwrap_or("provisioning")
+                )
+            })
+            .unwrap_or_else(|| "unprovisioned".into());
+        outln!("  {name:<16} {:<6} {state}", hc.reach.as_str());
+    }
+    // Local delivery abilities: what the default registry-less transfer can use.
+    let has = |bin: &str| which_ok(bin);
+    outln!(
+        "  local tools:  podman {} · skopeo {} · rsync {} (registry-less transfer wants podman or skopeo)",
+        yn(has("podman")),
+        yn(has("skopeo")),
+        yn(has("rsync")),
+    );
+}
+
+/// Cheap PATH probe (doctor is a diagnostic CLI; subprocess is fine here).
+// off-loop: doctor is a synchronous CLI verb
+#[expect(clippy::disallowed_methods)]
+fn which_ok(bin: &str) -> bool {
+    std::process::Command::new("sh")
+        .args(["-c", &format!("command -v {bin}")])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// "Will my shell work here?" — the personal-shell layer: the resolved strategy,

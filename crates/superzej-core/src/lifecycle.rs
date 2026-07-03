@@ -158,14 +158,43 @@ pub fn decide(input: &WarmInputs) -> WarmDecision {
     }
 }
 
+/// Why a ready spare is being released. The host treats these differently: an
+/// [`DestroyReason::OverTarget`] spare is genuinely surplus (recycling it would
+/// keep the pool over target), while a [`DestroyReason::Stale`] one only aged
+/// out — restoring it in place from its provisioned-base checkpoint resets its
+/// idle clock, so the host may RECYCLE it instead of destroy+rebuild.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DestroyReason {
+    /// More ready spares than the target: this one is surplus.
+    OverTarget,
+    /// Idle past `max_idle_secs`: freshness expired, not surplus.
+    Stale,
+}
+
 /// What the warm-spare-pool maintainer should do this tick: how many new spares
 /// to provision and which existing ones to destroy. Pure output of [`decide_pool`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PoolAction {
     /// How many fresh spares to provision (toward the target).
     pub create: usize,
-    /// Spare sandbox names to destroy (over-target or idle past the TTL).
-    pub destroy: Vec<String>,
+    /// Spare sandbox names to destroy, tagged with why (over-target or idle
+    /// past the TTL — the latter is a recycle candidate).
+    pub destroy: Vec<(String, DestroyReason)>,
+}
+
+/// Whether a released spare can be RECYCLED by an in-place provider restore
+/// instead of destroyed: it must carry a provisioned-base checkpoint AND have
+/// been built against the current `flake.lock` (a changed lockfile invalidates
+/// the checkpoint's toolchain). Empty hashes never match — an unknown lock
+/// state must fall back to the destroy+rebuild path, not fake freshness.
+pub fn recyclable(
+    checkpoint_id: Option<&str>,
+    spare_lock_hash: &str,
+    current_lock_hash: &str,
+) -> bool {
+    checkpoint_id.is_some_and(|c| !c.is_empty())
+        && !spare_lock_hash.is_empty()
+        && spare_lock_hash == current_lock_hash
 }
 
 /// Decide the warm-spare-pool actions for one `(repo, env)`. Pure + deterministic.
@@ -179,6 +208,8 @@ pub struct PoolAction {
 /// Keeps the `target` freshest ready spares; destroys the rest (over-target) plus
 /// any ready spare past the idle TTL (recycled). `create` fills toward the target,
 /// counting in-flight provisions; if a stale one is destroyed the next tick refills.
+/// A spare that is BOTH over target and stale is tagged `OverTarget` (surplus
+/// wins: recycling it would still leave the pool over target).
 pub fn decide_pool(
     target: usize,
     provisioning: usize,
@@ -191,8 +222,15 @@ pub fn decide_pool(
     let destroy = by_fresh
         .iter()
         .enumerate()
-        .filter(|(i, (_, idle))| *i >= target || (max_idle_secs > 0 && *idle >= max_idle_secs))
-        .map(|(_, (name, _))| name.clone())
+        .filter_map(|(i, (name, idle))| {
+            if i >= target {
+                Some((name.clone(), DestroyReason::OverTarget))
+            } else if max_idle_secs > 0 && *idle >= max_idle_secs {
+                Some((name.clone(), DestroyReason::Stale))
+            } else {
+                None
+            }
+        })
         .collect();
     PoolAction { create, destroy }
 }
@@ -244,15 +282,22 @@ mod tests {
         // 3 ready, target 2 ⇒ destroy the most-idle (c, idle 30); keep a,b.
         let d = decide_pool(2, 0, &ready(&[("a", 5), ("b", 10), ("c", 30)]), 600);
         assert_eq!(d.create, 0);
-        assert_eq!(d.destroy, vec!["c".to_string()]);
+        assert_eq!(
+            d.destroy,
+            vec![("c".to_string(), DestroyReason::OverTarget)]
+        );
     }
 
     #[test]
     fn decide_pool_recycles_idle_expired() {
-        // Within target but past the idle TTL ⇒ destroy it (next tick refills).
+        // Within target but past the idle TTL ⇒ destroy it (next tick refills),
+        // tagged Stale so the host may recycle it by restore-in-place.
         let d = decide_pool(2, 0, &ready(&[("a", 5), ("stale", 999)]), 600);
-        assert!(d.destroy.contains(&"stale".to_string()));
-        assert!(!d.destroy.contains(&"a".to_string()));
+        assert!(
+            d.destroy
+                .contains(&("stale".to_string(), DestroyReason::Stale))
+        );
+        assert!(!d.destroy.iter().any(|(n, _)| n == "a"));
         // max_idle_secs = 0 disables idle recycling.
         assert!(
             decide_pool(2, 0, &ready(&[("a", 99999)]), 0)
@@ -262,10 +307,40 @@ mod tests {
     }
 
     #[test]
+    fn decide_pool_over_target_wins_over_stale() {
+        // A spare BOTH surplus and past the TTL is tagged OverTarget (recycling
+        // it would still leave the pool over target ⇒ it must be destroyed).
+        let d = decide_pool(1, 0, &ready(&[("a", 5), ("old", 999)]), 600);
+        assert_eq!(
+            d.destroy,
+            vec![("old".to_string(), DestroyReason::OverTarget)]
+        );
+    }
+
+    #[test]
     fn decide_pool_target_zero_tears_down() {
         let d = decide_pool(0, 0, &ready(&[("a", 1), ("b", 2)]), 600);
         assert_eq!(d.create, 0);
         assert_eq!(d.destroy.len(), 2);
+        assert!(
+            d.destroy
+                .iter()
+                .all(|(_, r)| *r == DestroyReason::OverTarget)
+        );
+    }
+
+    #[test]
+    fn recyclable_needs_checkpoint_and_matching_lock() {
+        // The happy path: id + matching non-empty hashes.
+        assert!(recyclable(Some("cp-1"), "lock-a", "lock-a"));
+        // No / empty checkpoint id ⇒ never.
+        assert!(!recyclable(None, "lock-a", "lock-a"));
+        assert!(!recyclable(Some(""), "lock-a", "lock-a"));
+        // Lock hash drift (flake.lock changed) ⇒ the base is stale.
+        assert!(!recyclable(Some("cp-1"), "lock-a", "lock-b"));
+        // Empty hashes never match (unknown lock state ⇒ rebuild, not recycle).
+        assert!(!recyclable(Some("cp-1"), "", ""));
+        assert!(!recyclable(Some("cp-1"), "", "lock-a"));
     }
 
     #[test]

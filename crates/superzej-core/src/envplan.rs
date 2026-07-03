@@ -31,6 +31,10 @@ pub struct EnvRequirements {
     pub direnv_uses_flake: bool,
     /// `.tool-versions` (asdf) or a `mise` config — version-pinned toolchains.
     pub tool_versions: bool,
+    /// Classic (non-flake) Nix: `shell.nix` or `default.nix`, with no flake
+    /// devShell / devenv outranking it. Folded into [`Tier::Nix`]; the devShell
+    /// warm uses `nix-shell --run true` instead of `nix develop`.
+    pub nix_classic: bool,
     /// Language ecosystems detected from manifests (for the non-Nix tiers).
     pub languages: Vec<Language>,
 }
@@ -43,17 +47,19 @@ pub enum Language {
     Rust,
     Go,
     Ruby,
+    Deno,
+    Jvm,
 }
 
 impl EnvRequirements {
     /// The highest-fidelity tier this repo supports.
     pub fn tier(&self) -> Tier {
-        if self.nix_flake_devshell || self.devenv {
+        if self.nix_flake_devshell || self.devenv || self.nix_classic {
             Tier::Nix
         } else if self.tool_versions {
             Tier::ToolVersions
         } else if !self.languages.is_empty() {
-            Tier::Languages
+            Tier::SynthNix
         } else {
             Tier::Bare
         }
@@ -63,11 +69,16 @@ impl EnvRequirements {
 /// Provisioning fidelity tiers, best → fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
-    /// Nix flake/devenv present — install Nix and reproduce the exact devShell.
+    /// Nix flake/devenv/classic present — install Nix, reproduce the devShell.
     Nix,
     /// `.tool-versions`/mise — install mise and `mise install`.
     ToolVersions,
-    /// Only language manifests — best-effort native runtimes.
+    /// Only language manifests — synthesize a Nix devShell for the detected
+    /// languages (batteries included). [`plan`] downgrades this to
+    /// [`Tier::ToolVersions`] (mode `mise`) or [`Tier::Languages`] (mode `off`
+    /// or Nix disallowed) per `[toolchain]`.
+    SynthNix,
+    /// Only language manifests — best-effort native runtimes (apt).
     Languages,
     /// Nothing declared — just the repo + a shell.
     Bare,
@@ -75,6 +86,56 @@ pub enum Tier {
 
 /// Detect a worktree's environment requirements from the files it ships. Pure
 /// over the filesystem: reads a handful of well-known paths, never executes.
+/// The remote-detection probe: emits the same facts [`detect`] reads from the
+/// local fs as `KEY=VALUE` lines, for worktrees that live on a HOST (ssh envs)
+/// where the repo files aren't local. Run with `cd <workdir> && sh -c ...`;
+/// parse with [`detect_from_probe`]. Extend both together.
+pub const DETECT_PROBE_SCRIPT: &str = r#"
+[ -f flake.nix ] && grep -Eq 'devShells?' flake.nix && echo FLAKE_DEVSHELL=1
+[ -f devenv.nix ] && echo DEVENV=1
+[ -f .envrc ] && echo DIRENV=1
+[ -f .envrc ] && grep -Eq 'use[ _]flake' .envrc && echo DIRENV_FLAKE=1
+{ [ -f .tool-versions ] || [ -f mise.toml ] || [ -f .mise.toml ] || [ -f .nvmrc ]; } && echo TOOL_VERSIONS=1
+{ [ -f shell.nix ] || [ -f default.nix ]; } && echo NIX_CLASSIC=1
+[ -f package.json ] && echo LANG_NODE=1
+{ [ -f pyproject.toml ] || [ -f requirements.txt ] || [ -f setup.py ]; } && echo LANG_PYTHON=1
+[ -f Cargo.toml ] && echo LANG_RUST=1
+[ -f go.mod ] && echo LANG_GO=1
+[ -f Gemfile ] && echo LANG_RUBY=1
+{ [ -f deno.json ] || [ -f deno.jsonc ]; } && echo LANG_DENO=1
+{ [ -f build.sbt ] || [ -f project/build.properties ] || [ -f .scala-version ]; } && echo LANG_JVM=1
+true
+"#;
+
+/// Parse [`DETECT_PROBE_SCRIPT`] output into the same [`EnvRequirements`]
+/// shape [`detect`] produces locally. Unknown keys are ignored.
+pub fn detect_from_probe(out: &str) -> EnvRequirements {
+    let has = |k: &str| out.lines().any(|l| l.trim() == format!("{k}=1"));
+    let mut languages = Vec::new();
+    for (key, lang) in [
+        ("LANG_NODE", Language::Node),
+        ("LANG_PYTHON", Language::Python),
+        ("LANG_RUST", Language::Rust),
+        ("LANG_GO", Language::Go),
+        ("LANG_RUBY", Language::Ruby),
+        ("LANG_DENO", Language::Deno),
+        ("LANG_JVM", Language::Jvm),
+    ] {
+        if has(key) {
+            languages.push(lang);
+        }
+    }
+    EnvRequirements {
+        nix_flake_devshell: has("FLAKE_DEVSHELL"),
+        devenv: has("DEVENV"),
+        direnv: has("DIRENV"),
+        direnv_uses_flake: has("DIRENV_FLAKE"),
+        tool_versions: has("TOOL_VERSIONS"),
+        nix_classic: has("NIX_CLASSIC"),
+        languages,
+    }
+}
+
 pub fn detect(worktree: &Path) -> EnvRequirements {
     let read = |name: &str| std::fs::read_to_string(worktree.join(name)).ok();
     let exists = |name: &str| worktree.join(name).exists();
@@ -114,13 +175,26 @@ pub fn detect(worktree: &Path) -> EnvRequirements {
     if exists("Gemfile") {
         push(Language::Ruby);
     }
+    if exists("deno.json") || exists("deno.jsonc") {
+        push(Language::Deno);
+    }
+    if exists("build.sbt") || exists("project/build.properties") || exists(".scala-version") {
+        push(Language::Jvm);
+    }
+
+    let devenv = exists("devenv.nix");
+    // Classic (non-flake) Nix only counts when no flake devShell / devenv
+    // outranks it — those already own the Nix tier with `nix develop`.
+    let nix_classic =
+        (exists("shell.nix") || exists("default.nix")) && !nix_flake_devshell && !devenv;
 
     EnvRequirements {
         nix_flake_devshell,
-        devenv: exists("devenv.nix"),
+        devenv,
         direnv,
         direnv_uses_flake,
         tool_versions,
+        nix_classic,
         languages,
     }
 }
@@ -372,6 +446,11 @@ pub struct PlanOpts {
     /// host. `false` ⇒ skip (no managed-pi agent configured). Emits a
     /// `managed_pi` step. Best-effort.
     pub managed_pi: bool,
+    /// `[toolchain]` — how the [`Tier::SynthNix`] tier resolves language
+    /// manifests into a synthesized Nix devShell (mode + per-language package
+    /// overrides). The default (`mode = "auto"`) keeps SynthNix; `mise`/`off`
+    /// downgrade it (see [`plan`]).
+    pub toolchain: crate::toolchain::ToolchainConfig,
 }
 
 /// A Nix binary-cache substituter (and optional push) for fast devShells.
@@ -412,6 +491,7 @@ impl Default for PlanOpts {
             local_parity: None,
             host_cache_url: None,
             managed_pi: false,
+            toolchain: crate::toolchain::ToolchainConfig::default(),
         }
     }
 }
@@ -495,7 +575,20 @@ impl EnvPlan {
 /// produces shell strings, runs nothing.
 pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
     let wd = sh_quote(&opts.workdir);
-    let tier = req.tier();
+    // Resolve the effective tier: SynthNix (languages-only, batteries-included
+    // synthesized Nix devShell) is gated by `[toolchain] mode` + `allow_nix` —
+    // `mise` keeps the mise behavior (ToolVersions), `off`/no-Nix falls back to
+    // today's best-effort native runtimes (Languages).
+    use crate::toolchain::ToolchainMode;
+    let tier = match req.tier() {
+        Tier::SynthNix => match opts.toolchain.mode {
+            ToolchainMode::Mise => Tier::ToolVersions,
+            ToolchainMode::Off => Tier::Languages,
+            ToolchainMode::Auto | ToolchainMode::Nix if !opts.allow_nix => Tier::Languages,
+            ToolchainMode::Auto | ToolchainMode::Nix => Tier::SynthNix,
+        },
+        t => t,
+    };
     let mut steps = Vec::new();
 
     // 1. Workspace dir.
@@ -619,6 +712,27 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
                 kind: StepKind::Exec(mise_install_script(&opts.workdir)),
             });
         }
+        Tier::SynthNix => {
+            // Batteries included: install Nix, then synthesize + warm a
+            // devShell flake covering the detected languages (only reached
+            // when `opts.allow_nix` — see the tier resolution above).
+            steps.push(ProvisionStep {
+                id: "nix".into(),
+                label: "Install Nix".into(),
+                kind: StepKind::Exec(nix_install_script(
+                    opts.nix_installer,
+                    opts.nix_parallel,
+                    opts.binary_cache.as_ref(),
+                    opts.host_cache_url.as_deref(),
+                )),
+            });
+            let packages = crate::toolchain::packages_for(&req.languages, &opts.toolchain);
+            steps.push(ProvisionStep {
+                id: "toolchain".into(),
+                label: "Synthesize toolchain (nix)".into(),
+                kind: StepKind::Exec(crate::toolchain::synth_dir_script(&packages)),
+            });
+        }
         Tier::Languages => {
             steps.push(ProvisionStep {
                 id: "languages".into(),
@@ -629,7 +743,7 @@ pub fn plan(req: &EnvRequirements, opts: &PlanOpts) -> EnvPlan {
         Tier::Bare => {}
     }
     // Did the toolchain tier already install Nix? Host-parity needs it on any tier.
-    let nix_installed = matches!(tier, Tier::Nix) && opts.allow_nix;
+    let nix_installed = matches!(tier, Tier::Nix | Tier::SynthNix) && opts.allow_nix;
 
     // 4. Personal layer (`[sandbox.home]`) — generic, repo-independent. Runs
     // after the project toolchain so the tool installer can use Nix when present.
@@ -912,7 +1026,7 @@ fn nix_install_script(
 ///
 /// Trailing `;` so it composes as a prefix; a no-op for the token half when no
 /// token is present.
-fn nix_runtime_prelude() -> &'static str {
+pub(crate) fn nix_runtime_prelude() -> &'static str {
     "tok=\"${GH_TOKEN:-${GITHUB_TOKEN:-}}\"; \
      if [ -n \"$tok\" ]; then export NIX_CONFIG=\"access-tokens = github.com=$tok\"; fi; \
      sudo -n rm -rf /homeless-shelter 2>/dev/null || true; \
@@ -966,6 +1080,10 @@ fn devshell_warm_script(workdir: &str, req: &EnvRequirements) -> String {
         format!(
             "{nixsh}; cd {wd} 2>/dev/null && (command -v devenv >/dev/null 2>&1 || nix profile install nixpkgs#devenv 2>/dev/null) || true; devenv shell true 2>/dev/null || true; true"
         )
+    } else if req.nix_classic {
+        // Classic (non-flake) nix: `shell.nix`/`default.nix` — warm with
+        // `nix-shell`, which evaluates exactly what an interactive shell will.
+        format!("{nixsh}; cd {wd} 2>/dev/null && nix-shell --run true 2>/dev/null || true; true")
     } else {
         format!(
             "{nixsh}; cd {wd} 2>/dev/null && nix develop --command true 2>/dev/null || true; true"
@@ -1085,6 +1203,10 @@ fn languages_install_script(langs: &[Language]) -> String {
             Language::Rust => pkgs.push("cargo rustc"),
             Language::Go => pkgs.push("golang"),
             Language::Ruby => pkgs.push("ruby"),
+            // No deno package in the Debian/Ubuntu repos — the SynthNix tier
+            // covers it; the apt fallback can only skip it.
+            Language::Deno => {}
+            Language::Jvm => pkgs.push("default-jdk"),
         }
     }
     if pkgs.is_empty() {
@@ -1272,6 +1394,35 @@ fn dotfiles_repo_script(repo: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn detect_probe_round_trips_the_local_detector_shape() {
+        let out =
+            "FLAKE_DEVSHELL=1\nDIRENV=1\nDIRENV_FLAKE=1\nLANG_PYTHON=1\nLANG_DENO=1\nLANG_JVM=1\n";
+        let req = detect_from_probe(out);
+        assert!(req.nix_flake_devshell && req.direnv && req.direnv_uses_flake);
+        assert_eq!(
+            req.languages,
+            vec![Language::Python, Language::Deno, Language::Jvm]
+        );
+        assert_eq!(req.tier(), Tier::Nix);
+
+        let bare = detect_from_probe("junk\nWHAT=1\n");
+        assert_eq!(bare.tier(), Tier::Bare);
+        let synth = detect_from_probe("LANG_NODE=1\n");
+        assert_eq!(synth.tier(), Tier::SynthNix);
+        let classic = detect_from_probe("NIX_CLASSIC=1\n");
+        assert!(classic.nix_classic);
+        assert_eq!(classic.tier(), Tier::Nix);
+    }
+
+    #[test]
+    fn plan_opts_default_is_bare_and_clone_free() {
+        let opts = PlanOpts::default();
+        assert!(opts.origin.is_none());
+        let plan = plan(&EnvRequirements::default(), &opts);
+        assert!(plan.steps.iter().all(|s| s.id != "clone"));
+    }
     use super::*;
 
     fn tmp(tag: &str) -> std::path::PathBuf {
@@ -1330,6 +1481,235 @@ mod tests {
         write(&d, "README.md", "hi");
         assert_eq!(detect(&d).tier(), Tier::Bare);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn detect_deno_json() {
+        let d = tmp("deno_json");
+        write(&d, "deno.json", "{}");
+        let r = detect(&d);
+        assert_eq!(r.languages, vec![Language::Deno]);
+        assert_eq!(r.tier(), Tier::SynthNix);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn detect_deno_jsonc() {
+        let d = tmp("deno_jsonc");
+        write(&d, "deno.jsonc", "// jsonc\n{}");
+        assert_eq!(detect(&d).languages, vec![Language::Deno]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn detect_jvm_from_build_sbt() {
+        let d = tmp("jvm_sbt");
+        write(&d, "build.sbt", "name := \"x\"\n");
+        assert_eq!(detect(&d).languages, vec![Language::Jvm]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn detect_jvm_from_nested_build_properties() {
+        let d = tmp("jvm_props");
+        std::fs::create_dir_all(d.join("project")).unwrap();
+        write(&d, "project/build.properties", "sbt.version=1.10.0\n");
+        let r = detect(&d);
+        assert_eq!(r.languages, vec![Language::Jvm]);
+        assert_eq!(r.tier(), Tier::SynthNix);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn detect_jvm_from_scala_version() {
+        let d = tmp("jvm_scala_version");
+        write(&d, ".scala-version", "3.4.2\n");
+        assert_eq!(detect(&d).languages, vec![Language::Jvm]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn detect_shell_nix_only_is_classic_nix_tier() {
+        let d = tmp("shell_nix");
+        write(
+            &d,
+            "shell.nix",
+            "{ pkgs ? import <nixpkgs> {} }: pkgs.mkShell {}",
+        );
+        // A language manifest alongside must not outrank the classic nix shell.
+        write(&d, "package.json", "{}");
+        let r = detect(&d);
+        assert!(r.nix_classic);
+        assert!(!r.nix_flake_devshell && !r.devenv);
+        assert_eq!(r.tier(), Tier::Nix);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn detect_default_nix_is_classic_nix_tier() {
+        let d = tmp("default_nix");
+        write(&d, "default.nix", "{ }: { }");
+        let r = detect(&d);
+        assert!(r.nix_classic);
+        assert_eq!(r.tier(), Tier::Nix);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn flake_devshell_or_devenv_outrank_classic_nix() {
+        let d = tmp("flake_over_classic");
+        write(&d, "flake.nix", "{ outputs = { devShells.default = 1; }; }");
+        write(&d, "shell.nix", "{ }: { }");
+        let r = detect(&d);
+        assert!(r.nix_flake_devshell && !r.nix_classic);
+        let _ = std::fs::remove_dir_all(&d);
+        let d2 = tmp("devenv_over_classic");
+        write(&d2, "devenv.nix", "{ }\n");
+        write(&d2, "default.nix", "{ }: { }");
+        let r2 = detect(&d2);
+        assert!(r2.devenv && !r2.nix_classic);
+        assert_eq!(r2.tier(), Tier::Nix);
+        let _ = std::fs::remove_dir_all(&d2);
+    }
+
+    #[test]
+    fn tier_ranking_matrix() {
+        // Nix (incl. classic) > ToolVersions > SynthNix > Bare.
+        let both = EnvRequirements {
+            nix_classic: true,
+            tool_versions: true,
+            languages: vec![Language::Node],
+            ..Default::default()
+        };
+        assert_eq!(both.tier(), Tier::Nix);
+        let tv = EnvRequirements {
+            tool_versions: true,
+            languages: vec![Language::Node],
+            ..Default::default()
+        };
+        assert_eq!(tv.tier(), Tier::ToolVersions);
+        let langs = EnvRequirements {
+            languages: vec![Language::Python, Language::Deno],
+            ..Default::default()
+        };
+        assert_eq!(langs.tier(), Tier::SynthNix);
+        assert_eq!(EnvRequirements::default().tier(), Tier::Bare);
+    }
+
+    #[test]
+    fn classic_nix_warm_uses_nix_shell() {
+        let req = EnvRequirements {
+            nix_classic: true,
+            ..Default::default()
+        };
+        let s = devshell_warm_script("/workspace", &req);
+        assert!(s.contains("nix-shell --run true"), "{s}");
+        assert!(!s.contains("nix develop"), "{s}");
+        // ...and it flows through a full plan's devshell step.
+        let p = plan(&req, &PlanOpts::default());
+        assert_eq!(p.tier, Tier::Nix);
+        let dev = p.steps.iter().find(|s| s.id == "devshell").unwrap();
+        assert!(matches!(&dev.kind, StepKind::Exec(s) if s.contains("nix-shell --run true")));
+    }
+
+    #[test]
+    fn plan_synth_nix_installs_nix_then_synthesizes_toolchain() {
+        let req = EnvRequirements {
+            languages: vec![Language::Python, Language::Node],
+            ..Default::default()
+        };
+        let p = plan(&req, &PlanOpts::default());
+        assert_eq!(p.tier, Tier::SynthNix);
+        let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+        let nix = ids.iter().position(|i| *i == "nix").expect("nix step");
+        let tc = ids
+            .iter()
+            .position(|i| *i == "toolchain")
+            .expect("toolchain step");
+        assert!(nix < tc, "nix before toolchain: {ids:?}");
+        assert!(!ids.contains(&"languages"), "no apt fallback: {ids:?}");
+        // The toolchain step targets the hashed synth dir for this package set.
+        let pkgs = crate::toolchain::packages_for(&req.languages, &PlanOpts::default().toolchain);
+        let dir = crate::toolchain::synth_dir(&pkgs);
+        let StepKind::Exec(script) = &p.steps[tc].kind else {
+            panic!("toolchain step is Exec");
+        };
+        assert!(script.contains(&dir), "targets {dir}: {script}");
+    }
+
+    #[test]
+    fn plan_toolchain_mode_mise_keeps_mise_tier() {
+        let req = EnvRequirements {
+            languages: vec![Language::Python],
+            ..Default::default()
+        };
+        let opts = PlanOpts {
+            toolchain: crate::toolchain::ToolchainConfig {
+                mode: crate::toolchain::ToolchainMode::Mise,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let p = plan(&req, &opts);
+        assert_eq!(p.tier, Tier::ToolVersions);
+        let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"mise"), "mise step: {ids:?}");
+        assert!(!ids.contains(&"toolchain") && !ids.contains(&"languages"));
+    }
+
+    #[test]
+    fn plan_toolchain_mode_off_falls_back_to_languages_tier() {
+        let req = EnvRequirements {
+            languages: vec![Language::Python],
+            ..Default::default()
+        };
+        let opts = PlanOpts {
+            toolchain: crate::toolchain::ToolchainConfig {
+                mode: crate::toolchain::ToolchainMode::Off,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let p = plan(&req, &opts);
+        assert_eq!(p.tier, Tier::Languages);
+        let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"languages"), "apt fallback: {ids:?}");
+        assert!(!ids.contains(&"toolchain") && !ids.contains(&"nix"));
+    }
+
+    #[test]
+    fn plan_synth_nix_requires_allow_nix() {
+        let req = EnvRequirements {
+            languages: vec![Language::Go],
+            ..Default::default()
+        };
+        let opts = PlanOpts {
+            allow_nix: false,
+            ..Default::default()
+        };
+        let p = plan(&req, &opts);
+        assert_eq!(p.tier, Tier::Languages);
+        assert!(!p.steps.iter().any(|s| s.id == "nix" || s.id == "toolchain"));
+    }
+
+    #[test]
+    fn plan_synth_nix_deduplicates_host_parity_nix_install() {
+        // SynthNix already installs nix; host-parity must not add a second step.
+        let req = EnvRequirements {
+            languages: vec![Language::Node],
+            ..Default::default()
+        };
+        let opts = PlanOpts {
+            strategy: crate::config::ShellStrategy::HostParity,
+            home_store_roots: vec!["/nix/store/abc-zsh".into()],
+            ..Default::default()
+        };
+        let p = plan(&req, &opts);
+        assert_eq!(
+            p.steps.iter().filter(|s| s.id == "nix").count(),
+            1,
+            "exactly one nix install"
+        );
     }
 
     #[test]

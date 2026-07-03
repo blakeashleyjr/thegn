@@ -61,7 +61,7 @@ pub fn resolve_command(cfg: &Config, choice: &str) -> String {
 ///
 /// On the host fallback path `in_oci = false` keeps the existing behaviour:
 /// use `$SHELL` verbatim so NixOS users get the right store-path shell.
-fn shell_inner(in_oci: bool) -> String {
+pub(crate) fn shell_inner(in_oci: bool) -> String {
     if in_oci {
         // Preference order: honour the host shell name if it's a known shell,
         // then try zsh/bash/fish/sh in that order.  The outer /bin/sh -lc
@@ -426,6 +426,9 @@ pub fn prepare_sandbox_env(
                     spec.backend.label()
                 );
             }
+            // A Ready host's assets (digest-pinned image, warm volumes, remote
+            // OCI url) pin the spec; explicit user values win inside.
+            crate::host_flow::apply_ready(worktree, &mut spec);
             // Bring the VPN tunnel up BEFORE the worktree container is created
             // (it joins the sidecar's netns). A tunnel failure must never fall
             // through to a less-isolated backend, so it bails the whole resolve.
@@ -903,173 +906,10 @@ pub fn provider_proxy_target(
     Some((provider, p.id.clone(), pc.sync_workdir()))
 }
 
-/// In-sandbox sshd listen port for the SSH-over-WSS transport. A high port — the
-/// sprite user isn't root, so it can't bind 22.
-pub const SPRITE_SSHD_PORT: u16 = 2222;
-
-/// The superzej-managed ssh keypair for the sprite SSH-over-WSS transport, under
-/// `$XDG_STATE/superzej/ssh/`. Generated (ed25519, no passphrase) on first use.
-/// Returns `(private key path, public key line)`.
-// off-loop: ssh-keygen runs once, on the provisioning path (spawn_blocking /
-// pool thread / CLI); loop-side callers (sprite_ssh_connect) find the key
-// already cached and skip the subprocess.
-#[expect(clippy::disallowed_methods)]
-pub fn sprite_ssh_keypair() -> anyhow::Result<(PathBuf, String)> {
-    let dir = superzej_core::util::superzej_dir().join("ssh");
-    std::fs::create_dir_all(&dir)?;
-    let key = dir.join("sprite_ed25519");
-    let pubp = dir.join("sprite_ed25519.pub");
-    if !pubp.exists() {
-        let out = std::process::Command::new("ssh-keygen")
-            .args([
-                "-t",
-                "ed25519",
-                "-N",
-                "",
-                "-C",
-                "superzej-sprite",
-                "-q",
-                "-f",
-            ])
-            .arg(&key)
-            .output()
-            .map_err(|e| anyhow::anyhow!("ssh-keygen: {e}"))?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "ssh-keygen failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-    }
-    let pubkey = std::fs::read_to_string(&pubp)?.trim().to_string();
-    Ok((key, pubkey))
-}
-
-/// Idempotent in-sandbox setup for the SSH-over-WSS transport (run during
-/// provisioning when `connect = "ssh"`): install openssh, generate a user-owned
-/// host key, authorize `pubkey`, and write a minimal sshd_config listening on
-/// `127.0.0.1:SPRITE_SSHD_PORT`. Pure (shell string).
-pub fn sprite_sshd_setup_script(pubkey: &str) -> String {
-    let pk = superzej_core::util::sh_quote(pubkey);
-    format!(
-        "command -v sshd >/dev/null 2>&1 || nix profile install nixpkgs#openssh 2>/dev/null || \
-           (export DEBIAN_FRONTEND=noninteractive; sudo apt-get update -y && sudo apt-get install -y openssh-server) 2>/dev/null || true; \
-         mkdir -p \"$HOME/.ssh\"; chmod 700 \"$HOME/.ssh\"; \
-         touch \"$HOME/.ssh/authorized_keys\"; chmod 600 \"$HOME/.ssh/authorized_keys\"; \
-         grep -qF {pk} \"$HOME/.ssh/authorized_keys\" 2>/dev/null || printf '%s\\n' {pk} >> \"$HOME/.ssh/authorized_keys\"; \
-         [ -f \"$HOME/.ssh/sprite_host_ed25519\" ] || ssh-keygen -t ed25519 -N '' -q -f \"$HOME/.ssh/sprite_host_ed25519\"; \
-         printf 'Port {port}\\nListenAddress 127.0.0.1\\nHostKey %s/.ssh/sprite_host_ed25519\\nAuthorizedKeysFile %s/.ssh/authorized_keys\\nPasswordAuthentication no\\nPidFile %s/.ssh/sprite_sshd.pid\\nPrintMotd no\\n' \"$HOME\" \"$HOME\" \"$HOME\" > \"$HOME/.ssh/sprite_sshd_config\"; \
-         true",
-        port = SPRITE_SSHD_PORT,
-    )
-}
-
-/// Idempotent: ensure the in-sandbox sshd is listening (start it if not). Run at
-/// connect time by the `sprite-proxy` ProxyCommand. Pure (shell string).
-pub fn sprite_sshd_start_script() -> String {
-    "SSHD=$(command -v sshd || echo \"$HOME/.nix-profile/bin/sshd\"); \
-     pgrep -f sprite_sshd_config >/dev/null 2>&1 || \
-       (\"$SSHD\" -f \"$HOME/.ssh/sprite_sshd_config\" 2>/dev/null || true); true"
-        .to_string()
-}
-
-/// When `worktree`'s resolved provider env has `connect = "ssh"`, the inputs to
-/// spawn the interactive pane as a local `ssh` client tunneled over the provider
-/// proxy: `(private key path, ssh user, in-sandbox workdir)`. `None` otherwise.
-pub fn sprite_ssh_connect(cfg: &Config, worktree: &str) -> Option<(PathBuf, String, String)> {
-    use superzej_core::config::ProviderConnect;
-    let loc = GitLoc::for_worktree(Path::new(worktree));
-    let repo_root: PathBuf = Db::open()
-        .ok()
-        .and_then(|db| db.repo_root_for(worktree).ok().flatten())
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| repo::main_worktree(Path::new(worktree)))
-        .unwrap_or_else(|| PathBuf::from(worktree));
-    let selected_env = Db::open()
-        .ok()
-        .and_then(|db| db.effective_env(worktree, &repo_root.to_string_lossy()));
-    let environment = cfg.resolve_env(
-        &repo_root,
-        &loc,
-        Path::new(worktree),
-        selected_env.as_deref(),
-    );
-    let superzej_core::placement::Placement::Provider(_) = &environment.placement else {
-        return None;
-    };
-    let pc = &cfg.env.get(&environment.name)?.provider;
-    tracing::debug!(
-        target: "szhost::sandbox",
-        env = %environment.name,
-        connect = ?pc.connect,
-        "sprite_ssh_connect: resolved provider env"
-    );
-    if pc.connect != ProviderConnect::Ssh {
-        return None;
-    }
-    let (key, _pubkey) = match sprite_ssh_keypair() {
-        Ok(k) => k,
-        Err(e) => {
-            superzej_core::msg::warn(&format!(
-                "connect=ssh: managed key generation failed ({e}); falling back to the WSS exec pane"
-            ));
-            return None;
-        }
-    };
-    // The sprite user owns the in-sandbox sshd + authorized_keys (non-root sshd
-    // can only authenticate as itself), so ssh logs in as that user.
-    Some((key, "sprite".to_string(), pc.sync_workdir()))
-}
-
-/// Build the local `ssh` argv for the SSH-over-WSS pane: a real ssh client whose
-/// transport is the `sprite-proxy` ProxyCommand. `szhost_exe` is this binary (for
-/// the ProxyCommand); `key`/`user`/`workdir` come from [`sprite_ssh_connect`].
-pub fn sprite_ssh_argv(
-    szhost_exe: &str,
-    worktree: &str,
-    key: &Path,
-    user: &str,
-    workdir: &str,
-) -> Vec<String> {
-    let proxy = format!(
-        "{} sprite-proxy {}",
-        superzej_core::util::sh_quote(szhost_exe),
-        superzej_core::util::sh_quote(worktree),
-    );
-    // Run the user's login shell, not the sprite's default `$SHELL` (which is
-    // bash → no zsh / no host-parity prompt). The same runtime probe chain the
-    // native pane uses (`command -v zsh && exec zsh -l; …`) so the uploaded
-    // `.zshrc` (and starship/etc.) loads exactly like local.
-    let shell = shell_inner(true);
-    let remote = if workdir.is_empty() {
-        shell
-    } else {
-        format!(
-            "cd {} 2>/dev/null; {shell}",
-            superzej_core::util::sh_quote(workdir)
-        )
-    };
-    vec![
-        "ssh".into(),
-        "-tt".into(),
-        "-o".into(),
-        format!("ProxyCommand={proxy}"),
-        "-o".into(),
-        "StrictHostKeyChecking=no".into(),
-        "-o".into(),
-        "UserKnownHostsFile=/dev/null".into(),
-        "-o".into(),
-        "LogLevel=ERROR".into(),
-        "-i".into(),
-        key.to_string_lossy().into_owned(),
-        "-p".into(),
-        SPRITE_SSHD_PORT.to_string(),
-        format!("{user}@sprite"),
-        "--".into(),
-        remote,
-    ]
-}
+pub(crate) use crate::agent_ssh::{
+    SPRITE_SSHD_PORT, sprite_ssh_argv, sprite_ssh_connect, sprite_ssh_keypair,
+    sprite_sshd_setup_script, sprite_sshd_start_script,
+};
 
 /// Decide whether `worktree`'s interactive shell should attach via a provider's
 /// **native exec API** instead of the CLI/PTY path. `Some` when the resolved env
@@ -1085,7 +925,7 @@ pub fn sprite_ssh_argv(
 /// kinds dedup (so "Agent" + "Vanilla Pi" → one `pi`). This makes the config the
 /// source of truth: a custom agent you add is provisioned; one you remove is
 /// disabled — instead of sniffing the host. `[sandbox.home] agents` overrides.
-fn provisioned_agent_kinds(cfg: &Config) -> Vec<String> {
+pub(crate) fn provisioned_agent_kinds(cfg: &Config) -> Vec<String> {
     let mut kinds: Vec<String> = Vec::new();
     for a in &cfg.agents {
         if a.name == "shell" || a.command.trim() == "__shell__" {
@@ -1445,7 +1285,7 @@ pub fn provision_provider_env(
     env_name: &str,
     mut progress: impl FnMut(&[ProvisionStepView]),
 ) -> anyhow::Result<bool> {
-    provision_provider_env_named(cfg, worktree, env_name, None, &mut progress)
+    provision_provider_env_named(cfg, worktree, env_name, None, &mut progress).map(|(ok, _)| ok)
 }
 
 /// Provision a provider env into a sandbox. `name_override` forces the sandbox
@@ -1453,18 +1293,21 @@ pub fn provision_provider_env(
 /// derives it from the worktree as usual. `worktree` always provides the env-
 /// resolution + repo-origin context (for a spare, pass the repo's main worktree).
 /// The clone is branch-less (`opts.branch = None`) either way, so a spare and a
-/// worktree provision identically apart from the name.
+/// worktree provision identically apart from the name. Returns `(provisioned,
+/// checkpoint_id)` — the "superzej-provisioned" base checkpoint taken this run,
+/// if any (recorded per (repo, env) and, for spares, on the pool row so a stale
+/// spare can be recycled by restore-in-place instead of destroy+rebuild).
 pub fn provision_provider_env_named(
     cfg: &Config,
     worktree: &str,
     env_name: &str,
     name_override: Option<&str>,
     progress: &mut impl FnMut(&[ProvisionStepView]),
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<(bool, Option<String>)> {
     use superzej_core::envplan::{self, EnvPlan, PlanOpts, StepKind};
 
     let Some(env) = cfg.env.get(env_name) else {
-        return Ok(false);
+        return Ok((false, None));
     };
     let pc = &env.provider;
     let Some(id) = name_override
@@ -1472,15 +1315,15 @@ pub fn provision_provider_env_named(
         .or_else(|| provider_sandbox_name(cfg, worktree, env_name))
         .filter(|s| !s.is_empty())
     else {
-        return Ok(false);
+        return Ok((false, None));
     };
     // Bake the resolved id so a recreate (`ensure_exists`→`create`) names the
     // sandbox correctly (the id embeds the repo/worktree tokens + a path-hash).
     let Some(provider) = provider_for_named(pc, &id) else {
-        return Ok(false);
+        return Ok((false, None));
     };
     if !provider.caps().files {
-        return Ok(false); // can't provision without the fs API
+        return Ok((false, None)); // can't provision without the fs API
     }
     // Serialize concurrent provisions of the same sandbox (eager vs focused
     // materialize): the loser blocks here (off-loop by contract), then the
@@ -1499,9 +1342,9 @@ pub fn provision_provider_env_named(
         return Err(anyhow::anyhow!("ensure sandbox {id}: {e}"));
     }
 
-    // Idempotent: already provisioned ⇒ nothing to do.
+    // Idempotent: already provisioned ⇒ nothing to do (no new checkpoint).
     if block_on_provider(|| async { provider.read(&id, &marker).await }).is_ok() {
-        return Ok(true);
+        return Ok((true, None));
     }
 
     // Resolve the repo origin so the sprite can clone it.
@@ -1670,6 +1513,7 @@ pub fn provision_provider_env_named(
                 .agents
                 .iter()
                 .any(|a| a.command.contains(".superzej/pi")),
+        toolchain: cfg.toolchain.clone(),
     };
     let plan = envplan::plan(&req, &opts);
 
@@ -1713,6 +1557,9 @@ pub fn provision_provider_env_named(
     .filter(|h| h.starts_with('/'))
     .unwrap_or_else(|| "/root".to_string());
 
+    // The "superzej-provisioned" base checkpoint taken by this run's Checkpoint
+    // step (if the plan has one) — persisted below + returned to the caller.
+    let mut base_checkpoint: Option<String> = None;
     // Seed the loading screen with every step pending (the original dot).
     let mut views: Vec<ProvisionStepView> = plan
         .steps
@@ -1854,7 +1701,7 @@ pub fn provision_provider_env_named(
             StepKind::Checkpoint => block_on_provider(|| async {
                 provider.checkpoint(&id, Some("superzej-provisioned")).await
             })
-            .map(|_| ()),
+            .map(|cp| base_checkpoint = Some(cp)),
             StepKind::HomeClosurePush(roots) => {
                 // Host-executed: push the host store → sandbox store over the WSS
                 // ssh tunnel (host's `nix copy --to ssh-ng://`). Best-effort — a
@@ -1908,100 +1755,19 @@ pub fn provision_provider_env_named(
 
     // Drop the marker so a later open skips re-provisioning.
     let _ = block_on_provider(|| async { provider.write(&id, &marker, b"ok\n").await });
-    Ok(true)
-}
-
-/// The final personal setup commands: the inline `[sandbox.home] setup` list,
-/// then `setup_script` resolved — if it names an existing HOST file, its contents
-/// are inlined (so no upload is needed); otherwise it's treated as an in-sandbox
-/// path and run with `sh`. Bring-your-own escape hatch (agent CLIs, internal
-/// tooling, anything not a package).
-fn resolve_setup(home: &superzej_core::config::HomeConfig) -> Vec<String> {
-    let mut cmds = home.setup.clone();
-    let script = home.setup_script.trim();
-    if !script.is_empty() {
-        let host_path = if let Some(rest) = script.strip_prefix("~/") {
-            std::env::var("HOME")
-                .map(|h| format!("{h}/{rest}"))
-                .unwrap_or_else(|_| script.to_string())
-        } else {
-            script.to_string()
-        };
-        match std::fs::read_to_string(&host_path) {
-            Ok(body) => cmds.push(body),
-            Err(_) => cmds.push(format!("sh {}", superzej_core::util::sh_quote(script))),
+    // Record the provisioned-base checkpoint per (repo, env), keyed by the
+    // flake.lock hash so a lockfile change invalidates it (see env_base_snapshots).
+    if let Some(cp) = &base_checkpoint {
+        let lock = crate::provision_gate::flake_lock_hash(&repo_root);
+        if let Ok(db) = Db::open() {
+            // best-effort: the DB is a cache
+            let _ = db.set_base_snapshot(&repo_root.to_string_lossy(), env_name, cp, &lock);
         }
     }
-    cmds
+    Ok((true, base_checkpoint))
 }
 
-/// Resolve which host dotfiles to upload under the env's `ShellStrategy`, and
-/// (for host-parity) the host `/nix/store` roots they reference.
-///
-/// - `Clean`: upload nothing (the plan drops the dotfiles step too).
-/// - `Portable`/`ToolParity` with `portable_dotfiles_only` (the default): read each
-///   candidate on the host and **skip** any that hard-codes absent store paths,
-///   warning which file + why. Portable files (`.gitconfig`, …) still upload.
-/// - `HostParity`: upload everything unfiltered and collect the store roots so the
-///   provisioner can reproduce their closure before the upload.
-///
-/// `home_dir` is the host `$HOME` (a param so it's unit-testable with a fixture).
-fn resolve_personal_dotfiles(
-    home_dir: &Path,
-    home: &superzej_core::config::HomeConfig,
-    env_name: &str,
-) -> (Vec<String>, Vec<String>) {
-    use superzej_core::config::ShellStrategy;
-    use superzej_core::envplan::{PitfallKind, scan_dotfile, store_roots_in};
-
-    let candidates = if home.dotfiles.is_empty() {
-        default_dotfiles()
-    } else {
-        home.dotfiles.clone()
-    };
-    let mut dotfiles = Vec::new();
-    let mut roots: Vec<String> = Vec::new();
-    for name in candidates {
-        let contents = std::fs::read_to_string(home_dir.join(&name)).ok();
-        match home.strategy {
-            ShellStrategy::Clean => {} // nothing personal under clean
-            ShellStrategy::HostParity => {
-                if let Some(c) = &contents {
-                    for r in store_roots_in(c) {
-                        if !roots.contains(&r) {
-                            roots.push(r);
-                        }
-                    }
-                }
-                dotfiles.push(name);
-            }
-            ShellStrategy::Portable | ShellStrategy::ToolParity => {
-                if home.portable_dotfiles_only
-                    && let Some(c) = &contents
-                {
-                    let absent: Vec<String> = scan_dotfile(&name, c, &home.tools)
-                        .into_iter()
-                        .filter(|p| p.kind == PitfallKind::AbsentStorePath)
-                        .map(|p| p.detail)
-                        .collect();
-                    if !absent.is_empty() {
-                        superzej_core::msg::warn(&format!(
-                            "[sandbox.home] {name} references {} path(s) absent in env {env_name:?} \
-                             (e.g. {}); skipping its upload (strategy=portable). Set \
-                             strategy=\"host-parity\" to reproduce the closure, or make the rc \
-                             portable (init tools by command name).",
-                            absent.len(),
-                            absent[0],
-                        ));
-                        continue;
-                    }
-                }
-                dotfiles.push(name);
-            }
-        }
-    }
-    (dotfiles, roots)
-}
+pub(crate) use crate::agent_home::{resolve_personal_dotfiles, resolve_setup};
 
 /// Pure: the `nix copy` argv to push the closure of `roots` to a binary cache.
 /// (Split out so the command shape is unit-testable without invoking `nix`.)
@@ -2645,7 +2411,7 @@ fn sanitize_detail(s: &str) -> String {
 
 /// Host dotfiles to carry into a sandbox `$HOME` so the shell feels like home.
 /// Only those that exist on the host are uploaded (see [`upload_dotfiles`]).
-fn default_dotfiles() -> Vec<String> {
+pub(crate) fn default_dotfiles() -> Vec<String> {
     [
         ".gitconfig",
         ".zshrc",
@@ -3074,6 +2840,13 @@ pub fn destroy_provider_sandbox(worktree: &str, env_name: &str) {
     else {
         return;
     };
+    // A CLAIMED pool spare with a fresh provisioned-base checkpoint is RECYCLED
+    // back into the pool (restore-in-place, row → `ready`) instead of destroyed
+    // — see `lifecycle::recycle_claimed_on_delete`. `false` ⇒ destroy as usual.
+    if crate::lifecycle::recycle_claimed_on_delete(&cfg, env_name, &name) {
+        superzej_core::msg::info(&format!("recycled spare {name} into the pool on delete"));
+        return;
+    }
     let Some(provider) = provider_for_named(pc, &name) else {
         return;
     };

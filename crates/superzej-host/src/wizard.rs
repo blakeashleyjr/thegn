@@ -59,9 +59,15 @@ pub enum Field {
 /// any other field advances focus rather than creating).
 #[derive(Debug, Clone, PartialEq)]
 pub enum WizardOutcome {
+    /// The "+ add host…" row was chosen: the loop closes the wizard, opens the
+    /// add-host input, and re-opens the wizard once the host exists.
+    AddHost,
     Pending,
     Cancel,
-    PrepChosen { env: String, sandbox: String },
+    PrepChosen {
+        env: String,
+        sandbox: String,
+    },
     Submit(WizardChoices),
 }
 
@@ -102,9 +108,14 @@ pub(crate) fn default_env_name(cfg: &Config, repo_root: &Path) -> String {
 /// fixed chrome, the tail is editable), host (execution env), sandbox backend,
 /// and program. All render at once; focus starts on the program list. Pure over
 /// keys; the loop dispatches on [`WizardOutcome`].
+/// Sentinel env key for the wizard's "+ add host…" row.
+pub const ADD_HOST_KEY: &str = "__add_host__";
+
 #[derive(Debug)]
 pub struct NewWorktreeWizard {
     pub repo_slug: String,
+    /// Repo root, kept so the add-host flow can re-open the wizard after.
+    root: PathBuf,
     prefix: String,
     focus: Field,
     tail: String,
@@ -114,6 +125,10 @@ pub struct NewWorktreeWizard {
     /// an editable choice or a host-managed static line.
     host_rows: Vec<(String, String, bool)>,
     host_sel: usize,
+    /// Env key → host-readiness badge ("✓ ready" / "◐ …" / "✗ failed" /
+    /// "○ new") for envs bound to a `[host.*]` entry; rendered dim after the
+    /// host label. Empty unless the launcher provided one (hosts-as-resources).
+    host_badges: std::collections::HashMap<String, String>,
     sandbox_rows: Vec<(String, String)>,
     sandbox_sel: usize,
     agent_rows: Vec<(String, String)>,
@@ -144,6 +159,10 @@ impl NewWorktreeWizard {
                 (i.key, i.label, local)
             })
             .collect();
+        let mut host_rows = host_rows;
+        // Trailing "+ add host…" row: Enter on it opens the add-host input
+        // (cycling onto it is inert — no PrepChosen fires for the sentinel).
+        host_rows.push((ADD_HOST_KEY.to_string(), "+ add host…".to_string(), true));
         let default_env = default_env_name(cfg, &repo_root);
         let host_sel = host_rows
             .iter()
@@ -162,6 +181,7 @@ impl NewWorktreeWizard {
             .collect();
         NewWorktreeWizard {
             repo_slug: repo::repo_slug(&repo_root),
+            root: repo_root.clone(),
             prefix,
             focus: Field::Program,
             tail,
@@ -169,11 +189,23 @@ impl NewWorktreeWizard {
             name_checked: false,
             host_rows,
             host_sel,
+            host_badges: std::collections::HashMap::new(),
             sandbox_rows,
             sandbox_sel: 0,
             agent_rows,
             agent_sel: 0,
         }
+    }
+
+    /// The repo root this wizard creates worktrees under.
+    pub fn root(&self) -> &PathBuf {
+        &self.root
+    }
+
+    /// Attach per-env host-readiness badges (see
+    /// [`crate::host_ui::wizard_host_badges`]); rendered after the host label.
+    pub fn set_host_badges(&mut self, badges: std::collections::HashMap<String, String>) {
+        self.host_badges = badges;
     }
 
     /// True when the selected host runs on the local machine (so a sandbox
@@ -232,6 +264,9 @@ impl NewWorktreeWizard {
     /// The prep command for the current (host, sandbox) selection — the loop
     /// forwards it to the worker so bring-up overlaps the user's remaining time.
     fn prep_outcome(&self) -> WizardOutcome {
+        if self.host_key() == ADD_HOST_KEY {
+            return WizardOutcome::Pending; // sentinel row: nothing to bring up
+        }
         WizardOutcome::PrepChosen {
             env: self.host_key(),
             sandbox: self.sandbox_key(),
@@ -241,6 +276,9 @@ impl NewWorktreeWizard {
     /// Build a `Submit` from the current selections, or `Pending` if the branch
     /// name is empty (the name field must not be blank).
     fn submit(&self) -> WizardOutcome {
+        if self.host_key() == ADD_HOST_KEY {
+            return WizardOutcome::AddHost;
+        }
         if self.tail.trim().is_empty() {
             return WizardOutcome::Pending;
         }
@@ -357,6 +395,7 @@ impl NewWorktreeWizard {
                     self.focus_up();
                     WizardOutcome::Pending
                 }
+                KeyCode::Enter if self.host_key() == ADD_HOST_KEY => WizardOutcome::AddHost,
                 KeyCode::Enter | KeyCode::DownArrow | KeyCode::Char('j') => {
                     self.focus_down();
                     WizardOutcome::Pending
@@ -482,12 +521,18 @@ impl NewWorktreeWizard {
             .get(self.host_sel)
             .map(|(_, l, _)| l.as_str())
             .unwrap_or("default");
+        let mut host_segs = self.cycle_row("host   ", host_focused, host_label);
+        // Host-readiness badge (hosts-as-resources): dim, after the label, for
+        // envs bound to a `[host.*]` entry.
+        if let Some(badge) = self.host_badges.get(&self.host_key()) {
+            host_segs.push(seg(Tok::Slot(S::Dim), format!("  {badge}")));
+        }
         seg::draw_line(
             surface,
             inner.x,
             y,
             inner.cols,
-            &Line::segs(self.cycle_row("host   ", host_focused, host_label)),
+            &Line::segs(host_segs),
             panel,
         );
         y += 1;
@@ -1751,6 +1796,18 @@ mod tests {
         assert!(frame.contains("sandbox"));
         assert!(frame.contains("program"));
         assert!(frame.contains("enter create"));
+
+        // Host-readiness badge (hosts-as-resources): rendered dim after the
+        // selected env's label when the launcher provided one; absent otherwise.
+        assert!(!frame.contains("✓ ready"), "no badge without a map");
+        let mut w = NewWorktreeWizard::new(std::env::temp_dir(), &cfg);
+        w.set_host_badges(std::collections::HashMap::from([(
+            w.host_key(),
+            "✓ ready".to_string(),
+        )]));
+        let mut s = Surface::new(80, 24);
+        w.render(&mut s, screen);
+        assert!(text(&mut s).contains("✓ ready"), "badge for selected env");
 
         let mut cp = CreationProgress::new(1, "sz/swift-reef".into());
         cp.apply(
